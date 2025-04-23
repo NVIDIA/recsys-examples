@@ -43,7 +43,6 @@ _dtype_str_to_type = {
     "bfloat16": torch.bfloat16,
 }
 
-
 @click.group()
 def cli() -> None:
     pass
@@ -112,6 +111,7 @@ def create_hstu_layer(
 @click.option("--batchsize", type=int, default=32, required=True)
 @click.option("--profiler-start", type=int, default=20, required=False)
 @click.option("--profiler-end", type=int, default=40, required=False)
+@click.option("--dump-memory-snapshot", type=bool, default=True, required=False)
 def run(
     iters,
     warmup_iters,
@@ -126,6 +126,7 @@ def run(
     profiler_end,
     full_sequence,
     async_wgrad,
+    dump_memory_snapshot,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -173,10 +174,15 @@ def run(
     jagged_input = JaggedData(values=input, **ctor_nograd_dict)
     grad_output = torch.randn_like(input)
     # warmup
+    if dump_memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=200)
     for _ in range(warmup_iters):
         ret_jd = hstu_layer(jagged_input)
         ret_jd.values.backward(grad_output)
-
+    if dump_memory_snapshot:
+        torch.cuda.memory._dump_snapshot(f"{log_layer_type}_memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+    
     # benchmark
     igpu_timer = IGPUTimer(max_iters=iters)
     # fwd
