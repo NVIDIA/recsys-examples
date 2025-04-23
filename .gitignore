@@ -25,3 +25,5 @@ version.py
 tmp_data/
 checkpoints
 embedding_checkpoint/
+.idea/
+.DS_Store
