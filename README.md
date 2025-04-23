@@ -15,6 +15,7 @@ We provide [dockerfile](./docker/Dockerfile) for users to build environment.
 ```
 docker build -f docker/Dockerfile -t recsys-examples:latest .
 ```
+You can also set your own base image with args `--build-arg <BASE_IMAGE>`.
 
 ## Start from source file
 Before running examples, build and install libs under corelib following instruction in documentation:
