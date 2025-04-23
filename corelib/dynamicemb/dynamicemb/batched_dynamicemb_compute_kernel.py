@@ -19,6 +19,9 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.dynamicemb_config import DEFAULT_INDEX_TYPE, DynamicEmbPoolingMode
+from dynamicemb.optimizer import string_to_opt_type
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn
 from torchrec.distributed.batched_embedding_kernel import (
@@ -37,10 +40,6 @@ from torchrec.distributed.embedding_types import (  # EmbeddingComputeKernel,; G
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata
 from torchrec.modules.embedding_configs import data_type_to_dtype
 from torchrec.optim.fused import EmptyFusedOptimizer, FusedOptimizer
-
-from . import BatchedDynamicEmbeddingTables
-from .dynamicemb_config import DEFAULT_INDEX_TYPE, DynamicEmbPoolingMode
-from .optimizer import string_to_opt_type
 
 
 def pooling_mode_to_dynamicemb(pooling: PoolingMode) -> DynamicEmbPoolingMode:

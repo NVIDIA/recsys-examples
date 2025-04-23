@@ -16,6 +16,9 @@
 from typing import List
 
 import torch
+from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, dyn_emb_to_torch
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
     find_or_insert,
@@ -25,10 +28,6 @@ from dynamicemb_extensions import (
     lookup_forward,
     lookup_forward_dense,
 )
-
-from .dynamicemb_config import DynamicEmbPoolingMode, dyn_emb_to_torch
-from .optimizer import BaseDynamicEmbeddingOptimizer
-from .unique_op import UniqueOp
 
 
 # TODO: BatchedDynamicEmbeddingFunction is more concrete.

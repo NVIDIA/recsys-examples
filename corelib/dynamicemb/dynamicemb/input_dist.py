@@ -16,14 +16,13 @@
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
 from torchrec.distributed.dist_data import KJTAllToAll
 from torchrec.distributed.embedding_sharding import BaseSparseFeaturesDist
 from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-
-from . import block_bucketize_sparse_features
 
 torch.fx.wrap("len")
 

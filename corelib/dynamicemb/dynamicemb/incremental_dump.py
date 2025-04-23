@@ -18,10 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb_extensions import DynamicEmbTable
 from torch import nn
-
-from .dump_load import find_sharded_modules, get_dynamic_emb_module
 
 
 def is_valid_score_threshold(score_threshold: Any) -> bool:

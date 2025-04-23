@@ -21,6 +21,10 @@ from typing import List, Optional, Tuple
 
 import torch  # usort:skip
 import torch.distributed as dist
+from dynamicemb.batched_dynamicemb_function import *
+from dynamicemb.dynamicemb_config import *
+from dynamicemb.optimizer import *
+from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
     count_matched,
@@ -30,11 +34,6 @@ from dynamicemb_extensions import (
     export_batch_matched,
 )
 from torch import Tensor, nn  # usort:skip
-
-from .batched_dynamicemb_function import *
-from .dynamicemb_config import *
-from .optimizer import *
-from .unique_op import UniqueOp
 
 
 @enum.unique

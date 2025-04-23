@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import torch  # usort:skip
+from dynamicemb.dynamicemb_config import *
 from dynamicemb_extensions import (
     DynamicEmbTable,
     dynamic_emb_adagrad_with_table,
@@ -27,8 +28,6 @@ from dynamicemb_extensions import (
     dynamic_emb_rowwise_adagrad_with_table,
     dynamic_emb_sgd_with_table,
 )
-
-from .dynamicemb_config import *
 
 
 @dataclass

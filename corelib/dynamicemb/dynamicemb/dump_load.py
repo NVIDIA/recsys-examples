@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.dynamicemb_config import dyn_emb_to_torch
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
@@ -37,9 +39,6 @@ from torch import nn
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_parallel import get_unwrapped_module
-
-from .batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
-from .dynamicemb_config import dyn_emb_to_torch
 
 
 def debug_check_dynamic_table_is_zero(dynamic_table):

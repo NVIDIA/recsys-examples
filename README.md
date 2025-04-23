@@ -8,8 +8,15 @@ The project includes:
 - HSTU (Hierarchical Sequential Transduction Unit) attention operator support
 - Dynamic Embeddings with GPU acceleration
 
-# Get Started
+# Environment Setup
+## Start from dockerfile
 
+We provide [dockerfile](./docker/Dockerfile) for users to build environment. 
+```
+docker build -f docker/Dockerfile -t recsys-examples:latest .
+```
+
+## Start from source file
 Before running examples, build and install libs under corelib following instruction in documentation:
 - [HSTU attention documentation](./corelib/hstu/README.md)
 - [Dynamic Embeddings documentation](./corelib/dynamicemb/README.md)
@@ -27,6 +34,7 @@ git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm &
 pip install -e ./megatron-lm
 ```
 
+# Get Started
 The examples we supported:
 - [HSTU recommender examples](./examples/hstu/README.md)
 

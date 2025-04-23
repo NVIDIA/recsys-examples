@@ -365,7 +365,7 @@ class ShardedEmbedding(torch.nn.Module):
                     batchsize = 65536
                     accumulated_counts = 0
                     while offset < search_capacity:
-                        keys, values, d_counter = export_keys_values(
+                        keys, values, _, d_counter = export_keys_values(
                             dynamic_table, offset, device, batchsize
                         )
                         acutual_counts = d_counter.cpu().item()

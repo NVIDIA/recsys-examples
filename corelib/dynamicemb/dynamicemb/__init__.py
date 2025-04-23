@@ -12,3 +12,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from .dump_load import DynamicEmbDump, DynamicEmbLoad
+from .dynamicemb_config import (
+    DynamicEmbCheckMode,
+    DynamicEmbEvictStrategy,
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
+    DynamicEmbPoolingMode,
+    DynamicEmbScoreStrategy,
+    DynamicEmbTableOptions,
+    data_type_to_dtype,
+    data_type_to_dyn_emb,
+    dyn_emb_to_torch,
+    string_to_evict_strategy,
+    torch_to_dyn_emb,
+)
+from .optimizer import EmbOptimType, OptimizerArgs
+
+__all__ = [
+    "DynamicEmbCheckMode",
+    "DynamicEmbInitializerArgs",
+    "DynamicEmbInitializerMode",
+    "DynamicEmbTableOptions",
+    "DynamicEmbPoolingMode",
+    "DynamicEmbEvictStrategy",
+    "DynamicEmbScoreStrategy",
+    "data_type_to_dyn_emb",
+    "data_type_to_dtype",
+    "dyn_emb_to_torch",
+    "torch_to_dyn_emb",
+    "string_to_evict_strategy",
+    "DynamicEmbDump",
+    "DynamicEmbLoad",
+    "EmbOptimType",
+    "OptimizerArgs",
+]
