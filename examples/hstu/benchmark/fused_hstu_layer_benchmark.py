@@ -180,7 +180,7 @@ def run(
         ret_jd = hstu_layer(jagged_input)
         ret_jd.values.backward(grad_output)
     if dump_memory_snapshot:
-        torch.cuda.memory._dump_snapshot(f"{log_layer_type}_memory_snapshot.pickle")
+        torch.cuda.memory._dump_snapshot(f"bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_snapshot.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
     
     # benchmark
