@@ -23,13 +23,13 @@ import torch
 import torch.distributed as dist
 import torchrec
 from dynamicemb import (
-    BatchedDynamicEmbeddingTables,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbPoolingMode,
     DynamicEmbTableOptions,
     EmbOptimType,
 )
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
 from torch.distributed.elastic.multiprocessing.errors import record
 
 

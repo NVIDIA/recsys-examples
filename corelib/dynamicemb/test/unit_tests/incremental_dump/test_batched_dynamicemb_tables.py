@@ -20,12 +20,12 @@ import pytest
 import torch
 from dynamicemb import (
     BATCH_SIZE_PER_DUMP,
-    BatchedDynamicEmbeddingTables,
     DynamicEmbCheckMode,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
 
 
 @pytest.fixture

@@ -15,6 +15,7 @@
 
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
+    BATCH_SIZE_PER_DUMP,
     DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
     DynamicEmbInitializerArgs,
@@ -38,6 +39,7 @@ __all__ = [
     "DynamicEmbPoolingMode",
     "DynamicEmbEvictStrategy",
     "DynamicEmbScoreStrategy",
+    "BATCH_SIZE_PER_DUMP",
     "data_type_to_dyn_emb",
     "data_type_to_dtype",
     "dyn_emb_to_torch",

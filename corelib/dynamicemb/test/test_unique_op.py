@@ -15,7 +15,7 @@
 
 import pytest
 import torch
-from dynamicemb import UniqueOp
+from dynamicemb.unique_op import UniqueOp
 
 
 def generate_random_integers(length, device, low=0, high=100, dtype=torch.int64):

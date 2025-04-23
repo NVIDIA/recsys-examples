@@ -90,7 +90,7 @@ Make sure your code adheres to linting standards. You can run the lint tests usi
 ```python
 pre-commit run -a
 ```
-By following these guidelines, you help ensure that contributions are integrated smoothly into the project. Thank you for contributing to **distributed-recommender**! We look forward to your contributions!
+By following these guidelines, you help ensure that contributions are integrated smoothly into the project. Thank you for contributing to **recsys-examples**! We look forward to your contributions!
 
 ## Signing Your Work
 We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.
