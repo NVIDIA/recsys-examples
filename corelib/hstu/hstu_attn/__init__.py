@@ -13,3 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 __version__ = "1.0"
+from .hstu_attn_interface import hstu_attn_varlen_func
+
+__all__ = ["hstu_attn_varlen_func"]
