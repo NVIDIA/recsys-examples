@@ -5,7 +5,8 @@ FROM ${BASE_IMAGE} AS devel
 WORKDIR /workspace/deps
 
 RUN git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
-    pip install -e ./megatron-lm
+    pip install ./megatron-lm  && \
+    rm -rf /workspace/deps/megatron-lm
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath
 
@@ -14,12 +15,14 @@ RUN pip install --no-cache setuptools==69.5.1 setuptools-git-versioning scikit-b
   cd fbgemm/fbgemm_gpu && \
   git checkout 642ccb980d05aa1be00ccd131c5991b0914e2e64 && \
   python setup.py bdist_wheel --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0" && \
-  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
+  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0" && \
+  rm -rf /workspace/deps/fbgemm
 
 RUN pip install --no-deps tensordict orjson && \
   git clone --recursive -b main https://github.com/pytorch/torchrec.git torchrec && \
   cd torchrec && git checkout 6aaf1fa72e884642f39c49ef232162fa3772055e && \
-  pip install --no-deps .
+  pip install --no-deps . && \
+  rm -rf /workspace/deps/torchrec
 
 RUN test -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 || ln -s /usr/local/cuda-12.6/targets/x86_64-linux/lib/stubs/libnvidia-ml.so  /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
 
