@@ -43,6 +43,7 @@ _dtype_str_to_type = {
     "bfloat16": torch.bfloat16,
 }
 
+
 @click.group()
 def cli() -> None:
     pass
@@ -180,9 +181,11 @@ def run(
         ret_jd = hstu_layer(jagged_input)
         ret_jd.values.backward(grad_output)
     if dump_memory_snapshot:
-        torch.cuda.memory._dump_snapshot(f"bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_snapshot.pickle")
+        torch.cuda.memory._dump_snapshot(
+            f"{log_layer_type}_bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_snapshot.pickle"
+        )
         torch.cuda.memory._record_memory_history(enabled=None)
-    
+
     # benchmark
     igpu_timer = IGPUTimer(max_iters=iters)
     # fwd
