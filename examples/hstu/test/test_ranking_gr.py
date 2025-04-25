@@ -23,7 +23,7 @@ from configs import (
     ShardedEmbeddingConfig,
     get_hstu_config,
 )
-from data.utils import RankingBatch, RetrievalBatch
+from data.utils import FeatureConfig, RankingBatch, RetrievalBatch
 from megatron.core import tensor_parallel
 from model.ranking_gr import RankingGR
 from model.retrieval_gr import RetrievalGR
@@ -95,7 +95,7 @@ def test_gr_forward_backward(
         ),
     ]
     feature_configs = [
-        data.utils.FeatureConfig(
+        FeatureConfig(
             feature_names=["item_feat", "act_feat"],
             max_item_ids=[item_emb_size, action_vocab_size],
             max_sequence_length=item_max_seqlen + max_num_candidates,
@@ -104,7 +104,7 @@ def test_gr_forward_backward(
     ]
     if max_contextual_seqlen > 0:
         feature_configs.append(
-            data.utils.FeatureConfig(
+            FeatureConfig(
                 feature_names=["context_feat"],
                 max_item_ids=[context_emb_size],
                 max_sequence_length=10,
@@ -134,7 +134,6 @@ def test_gr_forward_backward(
         model_train = RetrievalGR(hstu_config=hstu_config, task_config=task_config)
         with tensor_parallel.get_cuda_rng_tracker().fork():
             batch = RetrievalBatch.random(**batch_kwargs)
-
     loss, _ = model_train(batch)
     loss.sum().backward()
 
