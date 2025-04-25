@@ -176,7 +176,7 @@ def run(
     grad_output = torch.randn_like(input)
     # warmup
     if dump_memory_snapshot:
-        torch.cuda.memory._record_memory_history(max_entries=200)
+        torch.cuda.memory._record_memory_history(max_entries=10000)
     for _ in range(warmup_iters):
         ret_jd = hstu_layer(jagged_input)
         ret_jd.values.backward(grad_output)
