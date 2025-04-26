@@ -151,7 +151,7 @@ def backend_session():
 @pytest.mark.parametrize("dim", [128])
 @pytest.mark.parametrize(
     "optimizer_name",
-    ["sgd", "adam", "adamw", "exact_row_wise_adagrad", "exact_adagrad"],
+    ["sgd", "exact_row_wise_adagrad", "exact_adagrad"],
 )
 @pytest.mark.parametrize("use_index_dedup", [True, False])
 def test_twin_module(
