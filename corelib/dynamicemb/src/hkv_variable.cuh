@@ -141,16 +141,17 @@ struct BaseEmbeddingGenerator {
   DEVICE_INLINE
   void set_state(uint64_t emb_id) {
     hkv_ptr_ = hkv_ptrs_[emb_id];
-    if (founds_[emb_id]) {
+    bool found_ = founds_[emb_id];
+    if (hkv_ptr_ == nullptr) {
+      action_ = Action::ZERO_TO_TENSOR;
+    } else if (found_) {
       action_ = Action::FROM_HKV_TO_TENSOR;
-    } else if (hkv_ptr_ != nullptr) {
+    } else {
       action_ = Action::TO_HKV_TO_TENSOR;
       if (!load_) {
         localState_ = state_[GlobalThreadId()];
         load_ = true;
       }
-    } else {
-      action_ = Action::ZERO_TO_TENSOR;
     }
   }
 

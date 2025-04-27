@@ -38,6 +38,7 @@ public:
 
   uint64_t get(const cudaStream_t& stream) {
     device_nano_kernel<uint64_t><<<1, 1, 0, stream>>>(d_timestamp);
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
     CUDACHECK(cudaMemcpyAsync(&h_timestamp, d_timestamp, sizeof(uint64_t), 
       cudaMemcpyDeviceToHost, stream));
     CUDACHECK(cudaStreamSynchronize(stream));
