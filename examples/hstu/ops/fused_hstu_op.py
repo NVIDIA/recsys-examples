@@ -395,11 +395,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 _split_arg_list,
                 dim=-1,
             )
-        with nvtx.annotate("hstu attn fwd", color="BLUE"):
             # TODO: remove contiguous once flash_attn is updated
             tv = tv.view(-1, num_heads, linear_dim_per_head).contiguous()
             tq = tq.view(-1, num_heads, attention_dim_per_head).contiguous()
             tk = tk.view(-1, num_heads, attention_dim_per_head).contiguous()
+            tu = tu.contiguous()
+            # we are safe to delete because contiguous creates a copy
+            del act_linear_uvqk
+        with nvtx.annotate("hstu attn fwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 # attn_output: [T, num_heads * attention_dim_per_head]
                 attn_output = _hstu_attn_cutlass_fwd(
