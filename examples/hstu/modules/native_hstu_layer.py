@@ -117,9 +117,13 @@ class HSTULayer(JaggedModule):
             self._split_arg_list,
             dim=-1,
         )
-        value = value.view(-1, self._num_heads * self._linear_dim_per_head)
-        query = query.view(-1, self._num_heads * self._attention_dim_per_head)
-        key = key.view(-1, self._num_heads * self._attention_dim_per_head)
+        value = value.view(-1, self._num_heads * self._linear_dim_per_head).contiguous()
+        query = query.view(
+            -1, self._num_heads * self._attention_dim_per_head
+        ).contiguous()
+        key = key.view(-1, self._num_heads * self._attention_dim_per_head).contiguous()
+        user = user.contiguous()
+        del mixed_uvqk
         return user, value, query, key
 
     @output_nvtx_hook(nvtx_tag="HSTULayer", hook_tensor_attr_name="values")
@@ -147,9 +151,9 @@ class HSTULayer(JaggedModule):
         # TODO: remove contiguous once cutlass backend is ready
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
             jagged_attn_output = self._attn_func(
-                tq.contiguous(),
-                tk.contiguous(),
-                tv.contiguous(),
+                tq,
+                tk,
+                tv,
                 jd.seqlen_offsets,
                 num_contextuals=jd.contextual_seqlen,
                 num_candidates=jd.num_candidates,
