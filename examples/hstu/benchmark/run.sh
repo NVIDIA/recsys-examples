@@ -1,16 +1,16 @@
 #!/bin/bash
 gpu_arch=$(nvidia-smi -L |head -n 1| cut -d' ' -f4)
-PROFILE=${1:-0}
+num_layers=${1:-1}
+PROFILE=${PROFILE:-0}
 nsys_profile_args='-f true -s none -t cuda,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node'
 
 # dim_per_head=(64 128 256)
 # num_heads=(1 4 8) 
 # max_seqlen=(512 1024 2048 4096)
 # batchsize=(32 64 128)
-
-dim_per_heads=(128 256)
+dim_per_heads=(128 )
 num_heads=(8 )
-max_seqlens=(1024 2048)
+max_seqlens=(1024 )
 batchsizes=(32 )
 
 profiler_start=20
@@ -41,6 +41,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --kernel-backend cutlass \
                     --dim-per-head $dim_per_head \
                     --num-heads $num_head \
+                    --num-layers $num_layers \
                     --dtype bfloat16 \
                     --max-seqlen $max_seqlen \
                     --batchsize $batchsize \
@@ -56,6 +57,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --kernel-backend cutlass \
                     --dim-per-head $dim_per_head \
                     --num-heads $num_head \
+                    --num-layers $num_layers \
                     --dtype bfloat16 \
                     --max-seqlen $max_seqlen \
                     --batchsize $batchsize \
