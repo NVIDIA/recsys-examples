@@ -101,7 +101,7 @@ def test_embedding(
                 assert param_sharding.compute_kernel == "dense"
             if param_name == "table2":
                 assert param_sharding.sharding_type == "row_wise"
-                assert param_sharding.compute_kernel == "DynamicEmb"
+                assert param_sharding.compute_kernel == "customized_kernel"
 
     world_size = torch.distributed.get_world_size()
     sharded_module = checkpoint.find_sharded_modules(embedding)
