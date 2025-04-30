@@ -292,12 +292,12 @@ def incremental_dump(
         return
     if not set_all_table:
         # filter the embedding collection
-        collection_names_in_module = set()
+        collection_paths_in_module = set()
         filtered_collections_list = []
 
         for tmp_module_path, tmp_module_name, module in collections_list:
-            collection_names_in_module.add(tmp_module_name)
-            if tmp_module_name in score_threshold.keys():
+            collection_paths_in_module.add(tmp_module_path)
+            if tmp_module_path in score_threshold.keys():
                 filtered_collections_list.append(
                     (tmp_module_path, tmp_module_name, module)
                 )
@@ -306,7 +306,7 @@ def incremental_dump(
 
         # maybe user input shared module name wrong ,here raise a warning tell user that model don't have the module name
         for tmp_input_collection_name in score_threshold.keys():
-            if tmp_input_collection_name not in collection_names_in_module:
+            if tmp_input_collection_name not in collection_paths_in_module:
                 warnings.warn(
                     f"sharded module '{tmp_input_collection_name}' specified in score_threshold not found in the model",
                     UserWarning,
