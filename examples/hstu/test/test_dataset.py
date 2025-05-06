@@ -44,12 +44,15 @@ def batch_slice(
         sliced_lengths = torch.split(feature.lengths(), split_size)[rank]
         segment_start = feature.offsets()[rank * batch_size]
         segment_end = feature.offsets()[(rank + 1) * batch_size]
-        sliced_values = feature.values()[segment_start:segment_end]
+        # in case of zero-sized segment
+        sliced_values = feature.values()[segment_start:segment_end].to(
+            feature.values().dtype
+        )
         values.extend(sliced_values)
         lengths.extend(sliced_lengths)
     sliced_feature = KeyedJaggedTensor.from_lengths_sync(
         keys=keys,
-        values=torch.tensor(values, device=batch.features.device()),
+        values=torch.tensor(values, device=batch.features.device()).long(),
         lengths=torch.tensor(lengths, device=batch.features.device()),
     )
 
