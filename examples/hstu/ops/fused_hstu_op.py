@@ -21,6 +21,7 @@ import hstu_hopper_cuda as flash_attn_cuda_hopper
 import nvtx
 import torch
 from configs import KernelBackend
+from ops.pt_ops.torch_addmm import torch_addmm_fwd
 from ops.triton_ops.triton_addmm import triton_addmm_bwd, triton_addmm_fwd
 from ops.triton_ops.triton_hstu_attention import (
     triton_hstu_attention_bwd,
@@ -169,10 +170,16 @@ class FusedHSTULayerFunction(torch.autograd.Function):
 
             ctx.input_BLOCK_D = input_BLOCK_D
             ctx.input_num_warps = input_num_warps
-
+            sm = torch.cuda.get_device_properties(0).major
+            if sm == 8:
+                addmm_fwd_impl = triton_addmm_fwd
+            elif sm == 9:
+                addmm_fwd_impl = torch_addmm_fwd
+            else:
+                raise ValueError(f"Unsupported SM major version: {sm}")
             # 2. linear & silu
             # bias is 1D
-            linear_uvqk, silu_linear_uvqk = triton_addmm_fwd(
+            linear_uvqk, silu_linear_uvqk = addmm_fwd_impl(
                 x=normed_input,
                 w=linear_weight,
                 y=linear_bias,
@@ -348,7 +355,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             x,
             w,
         ):
-            y, _ = triton_addmm_fwd(
+            sm = torch.cuda.get_device_properties(0).major
+            if sm == 8:
+                addmm_fwd_impl = triton_addmm_fwd
+            elif sm == 9:
+                addmm_fwd_impl = torch_addmm_fwd
+            else:
+                raise ValueError(f"Unsupported SM major version: {sm}")
+            y, _ = addmm_fwd_impl(
                 x=x,
                 w=w,
                 y=residual,
@@ -475,6 +489,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             x,
             w,
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            # triton_addmm_bwd are cublas-based even though the name starts with triton
             grad_x, grad_w, grad_residual = triton_addmm_bwd(
                 x=x,
                 w=w,
