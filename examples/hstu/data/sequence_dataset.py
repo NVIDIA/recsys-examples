@@ -109,7 +109,7 @@ class SequenceDataset(IterableDataset[Batch]):
                 seq_logs_file, delimiter=",", nrows=nrows
             )
         num_total_samples = len(self._seq_logs_frame)
-        train_samples = int(num_total_samples * 0.7)
+        train_samples = int(num_total_samples * 0.8)
         test_samples = num_total_samples - train_samples
         if is_train_dataset:
             self._seq_logs_frame = self._seq_logs_frame.head(train_samples)
@@ -147,8 +147,8 @@ class SequenceDataset(IterableDataset[Batch]):
         return math.ceil(self._num_samples / self._global_batch_size)
 
     def __iter__(self) -> Iterator[Batch]:
-        for i in range(len(self)):
-            yield self._batches[i]
+        for idx in range(len(self)):
+            yield self._batches[idx]
 
     def _shuffle_batch(self):
         """
@@ -183,24 +183,37 @@ class SequenceDataset(IterableDataset[Batch]):
             # labels dtype: int
             labels = []
             for sample_id in sample_ids:
+                print('sample_id', sample_id)
                 data = self._seq_logs_frame.iloc[sample_id]
                 for contextual_feature_name in self._contextual_feature_names:
                     contextual_features[contextual_feature_name].append(
                         data[contextual_feature_name]
                     )
                     contextual_features_seqlen[contextual_feature_name].append(1)
-
+                item_seq = load_seq(data[self._item_feature_name])
+                candidate_seq = item_seq[-self._max_num_candidates:]
+                item_seq = item_seq[:-self._max_num_candidates]
                 item_seq = maybe_truncate_seq(
-                    load_seq(data[self._item_feature_name]),
-                    self._max_seqlen - len(self._contextual_feature_names),
+                    item_seq, 
+                    self._max_seqlen - len(self._contextual_feature_names) - self._max_num_candidates
                 )
+                item_seq = item_seq + candidate_seq
+                # item_seq = maybe_truncate_seq(
+                #     load_seq(data[self._item_feature_name]),
+                #     self._max_seqlen - len(self._contextual_feature_names),
+                # )
                 item_features.extend(item_seq)
                 item_features_seqlen.append(len(item_seq))
 
+                action_seq = load_seq(data[self._action_feature_name])
+                candidate_action_seq = action_seq[-self._max_num_candidates:]
+                action_seq = action_seq[:-self._max_num_candidates]
                 action_seq = maybe_truncate_seq(
-                    load_seq(data[self._action_feature_name]),
-                    self._max_seqlen - len(self._contextual_feature_names),
+                    action_seq,
+                    self._max_seqlen - len(self._contextual_feature_names) - self._max_num_candidates,
                 )
+                action_seq = action_seq + candidate_action_seq
+
                 action_features.extend(action_seq)
                 action_features_seqlen.append(len(action_seq))
                 label = action_seq
@@ -210,7 +223,13 @@ class SequenceDataset(IterableDataset[Batch]):
                     label = action_seq[-num_candidate:]
 
                 if self._num_tasks > 0:
-                    labels.extend(label)
+                    for l in label:
+                        binary_list = [int(x) for x in bin(l)[2:]]
+                        for i in range(self._num_tasks):
+                            if i < len(binary_list):
+                                labels.append(binary_list[i])
+                            else:
+                                labels.append(0)
             if len(item_features_seqlen) < self._batch_size:
                 padded_size = self._batch_size - len(item_features_seqlen)
                 for name in self._contextual_feature_names:
@@ -259,7 +278,7 @@ class SequenceDataset(IterableDataset[Batch]):
                 feature_to_max_seqlen=feature_to_max_seqlen,
                 contextual_feature_names=self._contextual_feature_names,
                 item_feature_name=self._item_feature_name,
-                action_feature_name=self._action_feature_name,
+                action_feature_name=None,
                 max_num_candidates=self._max_num_candidates,
                 num_candidates=torch.tensor(num_candidates, device=self._device)
                 if self._max_num_candidates > 0
@@ -312,7 +331,6 @@ def get_dataset(
     Returns:
         Tuple[SequenceDataset, Optional[SequenceDataset]]: A tuple containing the training dataset and the evaluation dataset (if `eval_batch_size` is provided).
     """
-    assert num_tasks == 0 or num_tasks == 1
     common_preprocessors = get_common_preprocessors()
     if dataset_name not in common_preprocessors:
         raise ValueError(f"{dataset_name} not in preprocessors")

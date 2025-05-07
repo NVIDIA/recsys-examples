@@ -200,7 +200,7 @@ class ShardedEmbedding(torch.nn.Module):
                         embedding_dim=config.dim,
                         num_embeddings=config.vocab_size,  # To
                         feature_names=config.feature_names,
-                        init_fn=config.initializer,
+                        # init_fn=config.initializer,
                         data_type=dtype_to_data_type(
                             torch.float32
                         ),  # weight storage precision is alrways float32
@@ -231,47 +231,47 @@ class ShardedEmbedding(torch.nn.Module):
                 ),
             ]
 
-            embedding_collection = EmbeddingCollection(
+            self._embedding_collection = EmbeddingCollection(
                 tables=eb_configs,
                 device=torch.device("meta"),  # do not allocate memory right now
             )
-            self._plan = planner.collective_plan(
-                embedding_collection, sharders, self._pg
-            )
+            # self._plan = planner.collective_plan(
+            #     embedding_collection, sharders, self._pg
+            # )
 
-            self._embedding_collection = DMP(
-                module=embedding_collection,
-                env=ShardingEnv.from_process_group(self._pg),
-                device=self._device,
-                sharders=sharders,
-                plan=self._plan,
-            )
-            data_parallel_parameters = list(
-                dict(in_backward_optimizer_filter(self.named_parameters())).values()
-            )
-            if len(data_parallel_parameters) > 0:
-                if fused_params["optimizer"] == EmbOptimType.ADAM:
-                    optimizer_fn = partial(
-                        torch.optim.Adam,
-                        lr=fused_params["learning_rate"],
-                        betas=(
-                            fused_params["beta1"],
-                            fused_params["beta2"],
-                        ),
-                        eps=fused_params["eps"],
-                        weight_decay=0,
-                    )
-                elif fused_params["optimizer"] == EmbOptimType.EXACT_SGD:
-                    optimizer_fn = partial(
-                        torch.optim.SGD,
-                        lr=fused_params["learning_rate"],
-                        weight_decay=0,
-                    )
-                else:
-                    raise ValueError(f"{opt_param.optimizer_str} not support.")
-                self._nonfused_embedding_optimizer = optimizer_fn(
-                    data_parallel_parameters
-                )
+            # self._embedding_collection = DMP(
+            #     module=embedding_collection,
+            #     env=ShardingEnv.from_process_group(self._pg),
+            #     device=self._device,
+            #     # sharders=sharders,
+            #     # plan=self._plan,
+            # )
+            # data_parallel_parameters = list(
+            #     dict(in_backward_optimizer_filter(self.named_parameters())).values()
+            # )
+            # if len(data_parallel_parameters) > 0:
+            #     if fused_params["optimizer"] == EmbOptimType.ADAM:
+            #         optimizer_fn = partial(
+            #             torch.optim.Adam,
+            #             lr=fused_params["learning_rate"],
+            #             betas=(
+            #                 fused_params["beta1"],
+            #                 fused_params["beta2"],
+            #             ),
+            #             eps=fused_params["eps"],
+            #             weight_decay=0,
+            #         )
+            #     elif fused_params["optimizer"] == EmbOptimType.EXACT_SGD:
+            #         optimizer_fn = partial(
+            #             torch.optim.SGD,
+            #             lr=fused_params["learning_rate"],
+            #             weight_decay=0,
+            #         )
+            #     else:
+            #         raise ValueError(f"{opt_param.optimizer_str} not support.")
+            #     self._nonfused_embedding_optimizer = optimizer_fn(
+            #         data_parallel_parameters
+            #     )
 
     @property
     def module(self):

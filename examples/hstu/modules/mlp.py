@@ -15,11 +15,11 @@
 from typing import Callable, List, Optional, Union
 
 import torch
-from megatron.core.transformer.module import MegatronModule
-from modules.jagged_module import JaggedData, JaggedModule
+from modules.jagged_module import JaggedData
+from modules.utils import init_mlp_weights_optional_bias
+from torch import nn
 
-
-class MLP(JaggedModule):
+class MLP(nn.Module):
     """
     Multi-Layer Perceptron (MLP) module wrapper for processing jagged data.
 
@@ -46,12 +46,16 @@ class MLP(JaggedModule):
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
-        super(MegatronModule, self).__init__()
+        super().__init__()
         from torchrec.modules.mlp import MLP as torchrec_MLP
 
-        self._mlp = torchrec_MLP(in_size, layer_sizes, bias, activation, device, dtype)
+        self._mlp = torch.nn.Sequential(
+            torch.nn.Linear(in_features=in_size, out_features=512),
+            torch.nn.ReLU(),
+            torch.nn.Linear(in_features=512, out_features=layer_sizes[-1]),
+        ).apply(init_mlp_weights_optional_bias)
 
-    def forward(self, jd: JaggedData) -> JaggedData:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the MLP module.
 
@@ -61,10 +65,10 @@ class MLP(JaggedModule):
         Returns:
             JaggedData: The output jagged data.
         """
-        assert jd.values.dim() == 2, "Tensor must be 2-dimensional"
-        return JaggedData(
-            values=self._mlp(jd.values),
-            seqlen=jd.seqlen,
-            seqlen_offsets=jd.seqlen_offsets,
-            max_seqlen=jd.max_seqlen,
-        )
+        assert input.dim() == 2, "Tensor must be 2-dimensional"
+        with torch.autocast(
+            "cuda",
+            dtype=torch.bfloat16,
+            enabled=True
+        ):
+            return self._mlp(input)

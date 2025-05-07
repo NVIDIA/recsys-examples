@@ -261,12 +261,12 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 q,
                 k,
                 v,
-                seq_offsets_q,
-                seq_offsets_q,
+                seq_offsets_q.to(torch.int32),
+                seq_offsets_q.to(torch.int32),
                 max_seqlen_q,
                 max_seqlen_q,
-                num_contexts,
-                num_targets,
+                num_contexts.to(torch.int32),
+                num_targets.to(torch.int32),
                 target_group_size,
                 -1,  # window_size_left
                 0,  # window_size_right
@@ -327,7 +327,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 concat_ux=False,
                 seed=dropout_seed,
             )
-
             ctx.dropout_seed = ret_seed
             ctx.output_BLOCK_D = BLOCK_D
             ctx.output_num_warps = num_warps
@@ -361,7 +360,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 }
             )
             return y
-
         with nvtx.annotate("hstu ln+linear_bias+silu fwd", color="RED"):
             act_linear_uvqk = _ln_linear_silu_fwd(
                 input=input,
@@ -545,12 +543,12 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 q,
                 k,
                 v,
-                seq_offsets_q,
-                seq_offsets_q,
+                seq_offsets_q.to(torch.int32),
+                seq_offsets_q.to(torch.int32),
                 max_seqlen_q,
                 max_seqlen_q,
-                num_contexts,
-                num_targets,
+                num_contexts.to(torch.int32),
+                num_targets.to(torch.int32),
                 target_group_size,
                 window_size_left,
                 window_size_right,

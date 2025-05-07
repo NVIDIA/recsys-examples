@@ -17,7 +17,7 @@ import sys
 from dataclasses import dataclass
 from functools import partial  # pylint: disable-unused-import
 from itertools import islice
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import commons.checkpoint as checkpoint
 import configs
@@ -42,6 +42,7 @@ from modules.embedding import (
     get_nonfused_embedding_optimizer,
 )
 
+from torchrec.metrics.auc import AUCMetricComputation
 
 @gin.configurable
 @dataclass
@@ -195,8 +196,7 @@ class NetworkArgs:
     kernel_backend: str = "cutlass"
     target_group_size: int = 1
 
-    num_position_buckets: Optional[int] = None
-    num_time_buckets: Optional[int] = None
+    num_position_buckets: int = 8192
 
     def __post_init__(self):
         assert self.dtype_str in [
@@ -273,16 +273,11 @@ def create_hstu_config(network_args: NetworkArgs):
         raise ValueError(
             f"Kernel backend {network_args.kernel_backend} is not supported."
         )
-    if network_args.num_position_buckets is not None:
-        position_encoding_config = PositionEncodingConfig(
-            num_position_buckets=network_args.num_position_buckets,
-            num_time_buckets=0
-            if network_args.num_time_buckets is None
-            else network_args.num_time_buckets,
-            use_time_encoding=(network_args.num_time_buckets is not None),
-        )
-    else:
-        position_encoding_config = None
+    position_encoding_config = PositionEncodingConfig(
+        num_position_buckets=network_args.num_position_buckets,
+        num_time_buckets=2048,
+        use_time_encoding=False,
+    )
     return get_hstu_config(
         hidden_size=network_args.hidden_size,
         kv_channels=network_args.kv_channels,
@@ -360,7 +355,7 @@ def get_data_loader(
             dataset_name=dataset_args.dataset_name,
             max_sequence_length=dataset_args.max_sequence_length,
             max_num_candidates=dataset_args.max_num_candidates,
-            num_tasks=1 if task_type == "ranking" else 0,
+            num_tasks=8,
             batch_size=trainer_args.train_batch_size,
             rank=dist.get_rank(),
             world_size=dist.get_world_size(),
@@ -446,31 +441,125 @@ def create_embedding_config(
     )
 
 
+class MetricsLogger:
+    def __init__(
+        self,
+        all_classification_tasks: List[str],
+        batch_size: int,
+        window_size: int,
+        device: torch.device,
+        rank: int,
+    ) -> None:
+        self.task_names: List[str] = all_classification_tasks
+
+        self.class_metrics: List[RecMetricComputation] = []
+        if all_classification_tasks:
+            # self.class_metrics.append(
+            #     NEMetricComputation(
+            #         my_rank=rank,
+            #         batch_size=batch_size,
+            #         n_tasks=len(all_classification_tasks),
+            #         window_size=window_size,
+            #     ).to(device)
+            # )
+            self.class_metrics.append(
+                AUCMetricComputation(
+                    my_rank=rank,
+                    batch_size=batch_size,
+                    n_tasks=len(all_classification_tasks),
+                    window_size=window_size,
+                ).to(device)
+            )
+        self.all_metrics = self.class_metrics
+        self.global_step = 0
+
+    def update(
+        self, predictions: torch.Tensor, weights: torch.Tensor, labels: torch.Tensor
+    ) -> None:
+        for metric in self.all_metrics:
+            metric.update(
+                predictions=predictions,
+                weights=weights,
+                labels=labels,
+            )
+        self.global_step += 1
+
+    def compute(self) -> Dict[str, float]:
+        all_computed_metrics = {}
+
+        for metric in self.all_metrics:
+            predictions = torch.concat(metric.predictions, dim=1)
+            labels = torch.concat(metric.labels, dim=1)
+            # print('metrics logger predictions', predictions.shape, predictions[0, :])
+            # print('metrics logger labels', labels.shape, labels[0, :])
+            computed_metrics = metric.compute()
+            for computed in computed_metrics:
+                all_values = computed.value.cpu()
+                for i, task_name in enumerate(self.task_names):
+                    key = f"metric/{str(computed.metric_prefix) + str(computed.name)}/{task_name}"
+                    all_computed_metrics[key] = all_values[i]
+        print(f"Step {self.global_step} metrics: {all_computed_metrics}")
+        return all_computed_metrics
+
+    def reset(self):
+        for metric in self.all_metrics:
+            metric.reset()
+
 def evaluate(
     model: Union[RankingGR, RetrievalGR],
     trainer_args: TrainerArgs,
     eval_loader: torch.utils.data.DataLoader,
     max_eval_iters: Optional[int] = None,
+    metric_logger: MetricsLogger = None,
 ):
+    torch.set_printoptions(profile="full")
     eval_iter = 0
     torch.cuda.nvtx.range_push(f"#evaluate")
+    for eval_metric_module in model.module._metric_module._eval_metrics_modules:
+        print('eval_metric_module', eval_metric_module._defaults)
+        print('eval_metric_module.preds', eval_metric_module.preds)
+        print('eval_metric_module.target', eval_metric_module.target)
+    if metric_logger is not None:
+        metric_logger.reset()
+    model.module._metric_module.reset()
+    eval_module = model.module._metric_module._eval_metrics_modules[0]
+    eval_module.reset()
     with torch.no_grad():
         # drop last batch
         for batch in islice(eval_loader, len(eval_loader)):
             batch = batch.to("cuda")
             eval_iter += 1
-            model.evaluate_one_batch(batch)
+            # model.module.evaluate_one_batch(batch)
             if max_eval_iters is not None and eval_iter == max_eval_iters:
                 break
 
-        eval_metric_dict = model.compute_metric()
+            logits, labels = model.module.get_logit_and_labels(batch)
+            logits = torch.nn.functional.sigmoid(logits)
+            eval_module.update(logits[:, 0], labels[:, 0])
+            # print('logits', logits, logits.shape)
+            # print('labels', labels, labels.shape)
+            if metric_logger is not None:                
+                metric_logger.update(logits.t(), torch.ones_like(logits.t()).cuda(), labels.t())
+        
+        # predictions = torch.concat(eval_module.preds, dim=0)
+        # targets = torch.concat(eval_module.target, dim=0)
+        # print('compute preds', predictions, predictions.shape)
+        # print('compute target', targets, targets.shape)
+        ret_dict = eval_module.compute()
+        print('ret_dict', ret_dict)
+        if metric_logger is not None:
+            metric_logger.compute()
+                
+        # eval_metric_dict = model.module.compute_metric()
         dp_size = parallel_state.get_data_parallel_world_size()
     # TODO, fix the samples when there is incomplete batch
-    print_rank_0(
-        f"[eval] [eval {eval_iter * dp_size * trainer_args.eval_batch_size} samples]:\n    "
-        + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
-    )
+    # print_rank_0(
+    #     f"[eval] [eval {eval_iter * dp_size * trainer_args.eval_batch_size} samples]:\n    "
+    #     + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
+    # )
+    eval_module.reset()
     torch.cuda.nvtx.range_pop()
+    torch.set_printoptions(profile="default") # reset
 
 
 def maybe_load_ckpts(
@@ -522,7 +611,6 @@ def train(
     # drop last batch
     iters_per_epoch = len(train_loader)
     max_train_iters = trainer_args.max_train_iters or iters_per_epoch
-    max_train_iters = min(max_train_iters, iters_per_epoch)
     train_iter = 0
     dp_size = parallel_state.get_data_parallel_world_size() * 1.0
     gpu_timer.start()
@@ -530,22 +618,62 @@ def train(
     # using a tensor on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
     nonfused_embedding_optimizers = get_nonfused_embedding_optimizer(model)
-    for batch in islice(train_loader, iters_per_epoch):
+    test_metrics = MetricsLogger(
+        all_classification_tasks=[
+            "is_click",
+            "is_like",
+            "is_follow",
+            "is_comment",
+            "is_forward",
+            "is_hate",
+            "long_view",
+            "is_profile_enter",
+        ],
+        batch_size=trainer_args.train_batch_size,
+        window_size=1000000000000,
+        device=torch.device("cuda"),
+        rank=dist.get_rank(),
+    )
+
+    model.eval()
+    evaluate(
+        model,
+        trainer_args=trainer_args,
+        eval_loader=eval_loader,
+        max_eval_iters=None,
+        metric_logger=test_metrics,
+    )
+    model.train()
+    # torch.save(model.state_dict(), 'model.pth')
+    
+    # Create iterator once outside the loop
+    train_loader_iter = iter(train_loader)
+    
+    for batch_idx in range(max_train_iters):
         if trainer_args.profile and train_iter == trainer_args.profile_step_start:
             torch.cuda.profiler.start()
         torch.cuda.nvtx.range_push(f"step {train_iter}")
+        
+        try:
+            batch = next(train_loader_iter)
+        except StopIteration:
+            # Reset iterator when we reach the end
+            train_loader_iter = iter(train_loader)
+            batch = next(train_loader_iter)
+            
+        # print('batch', batch.features)
         batch = batch.to("cuda")
-        model._dense_module.zero_grad_buffer()
+        # model._dense_module.zero_grad_buffer()
         dense_optimizer.zero_grad()
-        if (
-            train_iter * trainer_args.ckpt_save_interval > 0
-            and train_iter % trainer_args.ckpt_save_interval == 0
-        ):
-            save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
-            save_ckpts(save_path, model, dense_optimizer)
+        # if (
+        #     train_iter * trainer_args.ckpt_save_interval > 0
+        #     and train_iter % trainer_args.ckpt_save_interval == 0
+        # ):
+        #     save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
+        #     save_ckpts(save_path, model, dense_optimizer)
 
-        for optim in nonfused_embedding_optimizers:
-            optim.zero_grad()
+        # for optim in nonfused_embedding_optimizers:
+        #     optim.zero_grad()
 
         # shape = [T, num_event]
         losses, (_, logits, labels) = model(batch)
@@ -553,43 +681,52 @@ def train(
         jagged_size = logits.size(0)
         local_tokens = torch.tensor(jagged_size).cuda().float()
 
-        losses = torch.sum(losses, dim=0)
-        if event_loss_weight is not None:
-            losses = losses * event_loss_weight
+        # losses = torch.sum(losses, dim=0) / 
+        # print('losses', train_iter, losses)
+        # losses.backward()
+        # if train_iter > trainer_args.eval_interval:
+        #     raise Exception('stop')
+        # if event_loss_weight is not None:
+        #     losses = losses * event_loss_weight
         local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
         reporting_loss = local_loss.clone().detach()
         # [allreduced_sum_loss, allreduced_sum_tokens]
         torch.distributed.all_reduce(
             reporting_loss, group=parallel_state.get_data_parallel_group()
         )
-        tokens_logged += reporting_loss[1]
-        if train_iter >= 0 and train_iter % trainer_args.log_interval == 0:
-            gpu_timer.stop()
-            cur_td = gpu_timer.elapsed_time() - last_td
-            print_rank_0(
-                f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
-            )
-            last_td = cur_td + last_td
-            tokens_logged.zero_()
+        # tokens_logged += reporting_loss[1]
+        # if train_iter >= 0 and train_iter % trainer_args.log_interval == 0:
+        #     gpu_timer.stop()
+        #     cur_td = gpu_timer.elapsed_time() - last_td
+        #     print_rank_0(
+        #         f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+        #     )
+        #     last_td = cur_td + last_td
+        #     tokens_logged.zero_()
 
-        # backward, loss_sum / total_tokens * mcore_dp_size
-        local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
+        # # backward, loss_sum / total_tokens * mcore_dp_size
+        local_loss_average = torch.sum(losses) / reporting_loss[1] * dp_size
+        # print('local_loss_average', local_loss_average, local_loss_average.shape, torch.sum(local_loss_average))
         local_loss_average.backward()
 
         # dense gradient allreduce
-        finalize_model_grads([model._dense_module], None)
+        # finalize_model_grads([model._dense_module], None)
         torch.cuda.nvtx.range_push(f"#dense opt")
         dense_optimizer.step()
         torch.cuda.nvtx.range_pop()
-        for optim in nonfused_embedding_optimizers:
-            optim.step()
-        if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
+        # for optim in nonfused_embedding_optimizers:
+        #     optim.step()
+        # model.module._metric_module(logits, labels)
+        # train_metric_dict = model.module._metric_module.compute()
+        # print('train_metric_dict', stringify_dict(train_metric_dict, prefix="Train Metrics", sep="\n    "))
+        if train_iter % trainer_args.eval_interval == 0:
             model.eval()
             evaluate(
                 model,
                 trainer_args=trainer_args,
                 eval_loader=eval_loader,
                 max_eval_iters=None,
+                metric_logger=test_metrics,
             )
             model.train()
         torch.cuda.nvtx.range_pop()
@@ -601,8 +738,8 @@ def train(
         if max_train_iters is not None and train_iter == max_train_iters:
             break
 
-    if trainer_args.ckpt_save_interval == -1:
-        save_ckpts(trainer_args.ckpt_save_dir, model, dense_optimizer)
+    # if trainer_args.ckpt_save_interval == -1:
+    #     save_ckpts(trainer_args.ckpt_save_dir, model, dense_optimizer)
 
 
 def get_dataset_and_embedding_args() -> (
@@ -663,7 +800,20 @@ def get_dataset_and_embedding_args() -> (
             ),
         ]
     elif dataset_args.dataset_name == "kuairand-1k":
+        HASH_SIZE = 10_000_000
         return dataset_args, [
+            EmbeddingArgs(
+                feature_names=["video_id"],
+                table_name="video_id",
+                item_vocab_size_or_capacity=HASH_SIZE,
+                sharding_type="model_parallel",
+            ),
+            EmbeddingArgs(
+                feature_names=["user_id"],
+                table_name="user_id",
+                item_vocab_size_or_capacity=HASH_SIZE,
+                sharding_type="model_parallel",
+            ),
             EmbeddingArgs(
                 feature_names=["user_active_degree"],
                 table_name="user_active_degree",
@@ -694,18 +844,20 @@ def get_dataset_and_embedding_args() -> (
                 item_vocab_size_or_capacity=8,
                 sharding_type="data_parallel",
             ),
-            EmbeddingArgs(
-                feature_names=["action_weights"],
-                table_name="action_weights",
-                item_vocab_size_or_capacity=233,
-                sharding_type="data_parallel",
-            ),
-            DynamicEmbeddingArgs(
-                feature_names=["video_id"],
-                table_name="video_id",
-                item_vocab_size_or_capacity=4371900,
-                item_vocab_gpu_capacity_ratio=1.0,
-            ),
+            # EmbeddingArgs(
+            #     feature_names=["action_weights"],
+            #     table_name="action_weights",
+            #     item_vocab_size_or_capacity=233,
+            #     sharding_type="data_parallel",
+            # ),
+            
+            
+            # DynamicEmbeddingArgs(
+            #     feature_names=["video_id"],
+            #     table_name="video_id",
+            #     item_vocab_size_or_capacity=10_000_000, # 4371900
+            #     item_vocab_gpu_capacity_ratio=1.0,
+            # ),
         ]
     elif dataset_args.dataset_name == "kuairand-27k":
         return dataset_args, [

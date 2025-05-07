@@ -7,7 +7,7 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
 from data.utils import RankingBatch
 from modules.fused_hstu_layer import FusedHSTULayer
-from modules.jagged_module import JaggedData, JaggedModule
+from modules.jagged_module import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.jagged_tensor_op import concat_2D_jagged_tensors
@@ -17,9 +17,9 @@ from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
     triton_split_2D_jagged,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor
+from megatron.core.transformer.module import MegatronModule
 
-
-class HSTUBlock(JaggedModule):
+class HSTUBlock(MegatronModule):
     """
     HSTUBlock module. A stack of HSTULayers.
 
@@ -39,6 +39,7 @@ class HSTUBlock(JaggedModule):
             self._training_dtype = torch.float16
 
         self._positional_encoder: Optional[HSTUPositionalEncoder] = None
+        print('config.position_encoding_config', config.position_encoding_config)
         if config.position_encoding_config is not None:
             self._positional_encoder = HSTUPositionalEncoder(
                 num_position_buckets=config.position_encoding_config.num_position_buckets,
@@ -56,6 +57,7 @@ class HSTUBlock(JaggedModule):
         self._attention_layers = torch.nn.ModuleList(
             [HSTULayerImpl(config) for l in range(self.config.num_layers)]
         )
+        self._training = self.training
 
     @output_nvtx_hook(nvtx_tag="hstu_preprocess")
     def hstu_preprocess(
@@ -147,6 +149,13 @@ class HSTUBlock(JaggedModule):
                 seq_embeddings=sequence_embeddings,
                 num_targets=num_candidates,
             )
+
+        sequence_embeddings = torch.nn.functional.dropout(
+            sequence_embeddings,
+            p=0.2,
+            training=self._training,
+        )
+
         return JaggedData(
             values=sequence_embeddings.to(self._training_dtype),
             seqlen=sequence_embeddings_lengths,  # contextual + history + candidate
@@ -176,7 +185,6 @@ class HSTUBlock(JaggedModule):
         Returns:
             JaggedData: The postprocessed jagged data.
         """
-
         sequence_embeddings: torch.Tensor
         seqlen_offsets: torch.Tensor
         max_seqlen: int
@@ -207,6 +215,9 @@ class HSTUBlock(JaggedModule):
             sequence_embeddings = sequence_embeddings[0::2, ...]
             seqlen_offsets = seqlen_offsets // 2
             max_seqlen = max_seqlen // 2
+        sequence_embeddings = sequence_embeddings / torch.linalg.norm(
+            sequence_embeddings, ord=2, dim=-1, keepdim=True
+        ).clamp(min=1e-6)
         return JaggedData(
             values=sequence_embeddings,
             seqlen=(seqlen_offsets[1:] - seqlen_offsets[:-1]).to(jd.seqlen.dtype),
@@ -215,8 +226,8 @@ class HSTUBlock(JaggedModule):
             has_interleaved_action=False,
         )
 
-    @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_tensor_attr_name="values")
-    def forward(self, jd: JaggedData) -> JaggedData:
+    # @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_tensor_attr_name="values")
+    def forward(self, embeddings: Dict[str, JaggedTensor], batch: RankingBatch) -> torch.Tensor:
         """
         Forward pass of the HSTUBlock.
 
@@ -226,6 +237,7 @@ class HSTUBlock(JaggedModule):
         Returns:
             JaggedData: The output jagged data.
         """
+        jd = self.hstu_preprocess(embeddings, batch)
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
-        return self.hstu_postprocess(jd)
+        return self.hstu_postprocess(jd).values
