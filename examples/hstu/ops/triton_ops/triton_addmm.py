@@ -15,7 +15,7 @@
 #!/usr/bin/env python3
 
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -278,6 +278,8 @@ def triton_addmm_bwd(
     grad_output: torch.Tensor,
     is_y_1d: bool,
     silu: bool = False,
+    wgrad_stream: Optional[torch.cuda.Stream] = None,
+    wgrad_event: Optional[torch.cuda.Event] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if silu:
         dz = triton_silu_bwd(grad_output, z)
@@ -288,8 +290,17 @@ def triton_addmm_bwd(
     else:
         dy = dz
     # will be under no_grad semantic
-    dw = torch.mm(x.t(), dz)
+    if wgrad_stream is not None:
+        wgrad_event.record(torch.cuda.current_stream())
+        # wait for the event to be ready
+        wgrad_event.wait(wgrad_stream)
+
     dx = torch.mm(dz, w.t())
+    if wgrad_stream is not None:
+        with torch.cuda.stream(wgrad_stream):
+            dw = torch.mm(x.t(), dz)
+    else:
+        dw = torch.mm(x.t(), dz)
     return dx, dw, dy
 
 

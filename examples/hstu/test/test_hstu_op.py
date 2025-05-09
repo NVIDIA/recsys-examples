@@ -413,6 +413,7 @@ def test_hstu_attn(
 @pytest.mark.parametrize("learnable_ln", [True])
 @pytest.mark.parametrize("upcast_reference", [False])
 @pytest.mark.parametrize("residual", [False])
+@pytest.mark.parametrize("async_wgrad", [True, False])
 def test_fused_hstu_op(
     dtype: torch.dtype,
     batchsize: int,
@@ -431,6 +432,7 @@ def test_fused_hstu_op(
     learnable_ln: bool,
     upcast_reference: bool,
     residual: bool,
+    async_wgrad: bool,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -450,6 +452,7 @@ def test_fused_hstu_op(
         hstu_layer_type=HSTULayerType.NATIVE,
         learnable_input_layernorm=learnable_ln,
         residual=residual,
+        async_wgrad=async_wgrad,
     )
     ref_hstu_layer = HSTULayer(hstu_config)
 
@@ -602,6 +605,8 @@ def test_fused_hstu_op(
         causal=causal,
         seed=seed,
         residual=residual,
+        wgrad_stream=None,
+        wgrad_event=None,
     )
     ref_out = ref_out.values
     fp32_ref_out = fp32_ref_out.values

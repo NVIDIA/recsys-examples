@@ -21,8 +21,8 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 from typing import Union
 
 import click
+import commons.utils.initialize as init
 import nvtx
-import utils.initialize as init
 from commons.utils.gpu_timer import IGPUTimer
 from configs.hstu_config import HSTULayerType, KernelBackend, get_hstu_config
 from modules.fused_hstu_layer import FusedHSTULayer
@@ -57,6 +57,7 @@ def create_hstu_layer(
     dtype: torch.dtype,
     kernel_backend: KernelBackend,
     learnable_input_layernorm: bool = False,
+    async_wgrad: bool = False,
 ) -> Union[HSTULayer, FusedHSTULayer]:
     hstu_config = get_hstu_config(
         hidden_size=hidden_size,
@@ -67,6 +68,7 @@ def create_hstu_layer(
         kernel_backend=kernel_backend,
         hstu_layer_type=layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
+        async_wgrad=async_wgrad,
     )
     if layer_type == HSTULayerType.NATIVE:
         module = HSTULayer(hstu_config).to(dtype).cuda()
@@ -83,6 +85,12 @@ def create_hstu_layer(
     "--layer-type",
     type=click.Choice(_layer_type_str_to_type.keys()),
     default="fused",
+    required=False,
+)
+@click.option(
+    "--async-wgrad",
+    type=bool,
+    default=True,
     required=False,
 )
 @click.option(
@@ -117,6 +125,7 @@ def run(
     profiler_start,
     profiler_end,
     full_sequence,
+    async_wgrad,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -132,6 +141,7 @@ def run(
         dtype=dtype,
         kernel_backend=kernel_backend,
         learnable_input_layernorm=True,
+        async_wgrad=async_wgrad,
     )
     # generate random input
     if full_sequence:

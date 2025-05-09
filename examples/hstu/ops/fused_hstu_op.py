@@ -82,6 +82,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         seed: Optional[int] = None,
         # only for debug purpose!
         residual: bool = True,
+        wgrad_stream: Optional[torch.cuda.Stream] = None,
+        wgrad_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """Forward pass of the fused HSTU layer.
         Args:
@@ -109,7 +111,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             causal (bool): Whether to use causal attention. Defaults to True.
             seed (Optional[int]): Random seed for dropout(required by triton dropout). Defaults to None.
             residual (bool): Whether to use residual connection. Defaults to True.
-
+            wgrad_stream (Optional[torch.cuda.Stream]): CUDA stream for weight gradient computation. Defaults to None.
+            wgrad_event (Optional[torch.cuda.Event]): CUDA event for weight gradient computation. Defaults to None.
         Returns:
             torch.Tensor: Output tensor of shape [T, hidden_size]
         """
@@ -125,6 +128,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.alpha = alpha
         ctx.training = training
         ctx.residual = residual
+        ctx.wgrad_stream = wgrad_stream
+        ctx.wgrad_event = wgrad_event
         saved_tensor_map = OrderedDict()
 
         assert input.dim() == 2, "input tensor must be 2D"
@@ -483,6 +488,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         None,
         None,
         None,
+        None,
     ]:
         def _linear_residual_bwd(
             grad_output,
@@ -496,7 +502,10 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 z=None,
                 grad_output=grad_output,
                 is_y_1d=False,
+                wgrad_stream=ctx.wgrad_stream,
+                wgrad_event=ctx.wgrad_event,
             )
+
             return grad_x, grad_w, grad_residual
 
         def _norm_mul_dropout_bwd(
@@ -641,6 +650,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output=grad_output,
                 is_y_1d=True,
                 silu=True,
+                wgrad_stream=ctx.wgrad_stream,
+                wgrad_event=ctx.wgrad_event,
             )
             # # 2. ln
             grad_input, grad_ln_weight, grad_ln_bias = triton_weighted_layer_norm_bwd(
@@ -792,6 +803,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -824,6 +837,8 @@ def fused_hstu_op(
     seed: Optional[int] = None,
     # only for debug purpose!
     residual: bool = True,
+    wgrad_stream: Optional[torch.cuda.Stream] = None,
+    wgrad_event: Optional[torch.cuda.Event] = None,
 ):
     out = FusedHSTULayerFunction.apply(
         input,
@@ -850,6 +865,8 @@ def fused_hstu_op(
         causal,
         seed,
         residual,
+        wgrad_stream,
+        wgrad_event,
     )
 
     return out
