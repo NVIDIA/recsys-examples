@@ -92,6 +92,8 @@ class HSTUConfig(TransformerConfig):
     learnable_input_layernorm: bool = False
     # whether to add residual connection
     residual: bool = True
+    # whether to use async wgrad
+    async_wgrad: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -113,6 +115,7 @@ def get_hstu_config(
     hstu_layer_type: HSTULayerType = HSTULayerType.NATIVE,
     learnable_input_layernorm: bool = False,
     residual: bool = True,
+    async_wgrad: bool = False,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -156,4 +159,5 @@ def get_hstu_config(
         hstu_layer_type=hstu_layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
         residual=residual,
+        async_wgrad=async_wgrad,
     )
