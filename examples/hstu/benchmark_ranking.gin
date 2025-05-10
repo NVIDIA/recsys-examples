@@ -44,7 +44,6 @@ NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 256
 # per head dim
 NetworkArgs.kv_channels = 256
-NetworkArgs.dense_initializer_type = 'xavier_uniform'
 NetworkArgs.kernel_backend = 'cutlass'
 
 RankingArgs.prediction_head_arch = [

@@ -18,16 +18,14 @@ import shutil
 
 import commons.checkpoint as checkpoint
 import commons.utils as init
-import commons.utils as utils
 import configs
-import data
+import dataset
 import model
 import modules
 import pytest
 import torch
 import torch.distributed as dist
 from commons.utils.distributed_utils import collective_assert
-from commons.utils.tensor_initializer import NormalInitializer
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from modules.embedding import EmbeddingOptimizerParam, ShardedEmbedding
 from torch.distributed._shard.sharded_tensor import ShardedTensor
@@ -82,11 +80,9 @@ def create_model(
         kv_channels=128,
         num_attention_heads=4,
         num_layers=1,
-        init_method=torch.nn.init.xavier_uniform_,
         hidden_dropout=0.2,
         dtype=dtype,
     )
-    embedding_initializer = NormalInitializer()
     embedding_optimizer_param = EmbeddingOptimizerParam(
         optimizer_str=optimizer_type_str,
         learning_rate=1e-3,
@@ -103,7 +99,6 @@ def create_model(
             vocab_size=action_vocab_size,
             dim=embdim,
             sharding_type="data_parallel",
-            initializer=embedding_initializer,
             optimizer_param=embedding_optimizer_param,
         ),
         configs.DynamicShardedEmbeddingConfig(
@@ -111,7 +106,6 @@ def create_model(
             table_name="item",
             vocab_size=item_emb_size,
             dim=embdim,
-            initializer=embedding_initializer,
             optimizer_param=embedding_optimizer_param,
             global_hbm_for_values=0,
         ),
@@ -119,13 +113,13 @@ def create_model(
     batch_kwargs = dict(
         batch_size=32,
         feature_configs=[
-            data.utils.FeatureConfig(
+            dataset.utils.FeatureConfig(
                 feature_names=contextual_feature_names,
                 max_item_ids=[item_emb_size for _ in contextual_feature_names],
                 max_sequence_length=10,
                 is_jagged=True,
             ),
-            data.utils.FeatureConfig(
+            dataset.utils.FeatureConfig(
                 feature_names=[item_feature_name, action_feature_name],
                 max_item_ids=[item_emb_size, action_vocab_size],
                 max_sequence_length=100,
@@ -145,14 +139,14 @@ def create_model(
             prediction_head_arch=[[128, 10, 1] for _ in range(num_tasks)],
         )
         model_train = model.RankingGR(hstu_config=hstu_config, task_config=task_config)
-        batch = data.utils.RankingBatch.random(num_tasks=num_tasks, **batch_kwargs)
+        batch = dataset.utils.RankingBatch.random(num_tasks=num_tasks, **batch_kwargs)
     else:
         assert task_type == "retrieval"
         task_config = configs.RetrievalConfig(embedding_configs=emb_configs)
         model_train = model.RetrievalGR(
             hstu_config=hstu_config, task_config=task_config
         )
-        batch = data.utils.RetrievalBatch.random(**batch_kwargs)
+        batch = dataset.utils.RetrievalBatch.random(**batch_kwargs)
     dense_optimizer_config = OptimizerConfig(
         optimizer=optimizer_type_str,
         lr=1e-3,
@@ -287,7 +281,6 @@ def test_checkpoint_embedding(
     init.set_random_seed(1234)
 
     embdim = 128
-    embedding_initializer = utils.tensor_initializer.NormalInitializer()
     embedding_optimizer_param = EmbeddingOptimizerParam(
         optimizer_str=optimizer_type_str,
         learning_rate=1e-3,
@@ -299,7 +292,6 @@ def test_checkpoint_embedding(
             vocab_size=10000,
             dim=embdim,
             sharding_type="model_parallel",
-            initializer=embedding_initializer,
             optimizer_param=embedding_optimizer_param,
         ),
         configs.ShardedEmbeddingConfig(
@@ -308,7 +300,6 @@ def test_checkpoint_embedding(
             vocab_size=10000,
             dim=embdim,
             sharding_type="data_parallel",
-            initializer=embedding_initializer,
             optimizer_param=embedding_optimizer_param,
         ),
         configs.DynamicShardedEmbeddingConfig(
@@ -316,7 +307,6 @@ def test_checkpoint_embedding(
             table_name="table2",
             vocab_size=10000,
             dim=embdim,
-            initializer=embedding_initializer,
             optimizer_param=embedding_optimizer_param,
             global_hbm_for_values=0,
         ),

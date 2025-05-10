@@ -15,9 +15,8 @@
 import commons.utils.initialize as init
 import pytest
 import torch
-from commons.utils.tensor_initializer import UniformInitializer
 from configs import get_hstu_config
-from data.utils import Batch, FeatureConfig
+from dataset.utils import Batch, FeatureConfig
 from modules.hstu_block import HSTUBlock
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -78,7 +77,6 @@ def test_hstu_preprocess(
         kv_channels=128,
         num_attention_heads=4,
         num_layers=1,
-        init_method=UniformInitializer,
         position_encoding_config=None,
         dtype=torch.float,
     )

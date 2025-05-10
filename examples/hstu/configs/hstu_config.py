@@ -102,7 +102,6 @@ def get_hstu_config(
     kv_channels,
     num_attention_heads,
     num_layers,
-    init_method,
     dtype,
     position_encoding_config: Optional[PositionEncodingConfig] = None,
     hidden_dropout=0.2,
@@ -122,7 +121,6 @@ def get_hstu_config(
         kv_channels (int): Number of key-value channels (per attention head).
         num_attention_heads (int): Number of attention heads.
         num_layers (int): Number of attention layers.
-        init_method (Callable): Initialization method. A callable that takes a tensor and initializes it. Note that this is only used to initialize the weight of the linear layers. The bias is initialized to zero.
         dtype (torch.dtype): Data type (e.g., torch.float16).
         position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.
         hidden_dropout (float, optional): Dropout rate for hidden layers. Defaults to 0.2.
@@ -148,7 +146,6 @@ def get_hstu_config(
         tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
         pipeline_model_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
         context_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
-        init_method=init_method,
         fp16=is_fp16,
         is_causal=is_causal,
         kernel_backend=kernel_backend,

@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RetrievalConfig
-from data.utils import RetrievalBatch
+from dataset.utils import RetrievalBatch
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
