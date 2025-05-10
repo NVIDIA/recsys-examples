@@ -18,7 +18,7 @@ import torch
 
 
 def init_mlp_weights_optional_bias(
-    m, inplace_initializer: Callable[[torch.Tensor], None]
+    m, inplace_initializer: Callable[[torch.Tensor], None] = None
 ) -> None:
     """
     Initialize the weights of a linear layer and optionally the bias.
@@ -28,7 +28,8 @@ def init_mlp_weights_optional_bias(
         inplace_initializer: A function that takes a tensor and modifies it in place.
     """
     if isinstance(m, torch.nn.Linear):
-        inplace_initializer(m.weight)
+        # inplace_initializer(m.weight)
+        torch.nn.init.xavier_uniform_(m.weight)
         # Always initialize bias to zero.
         if m.bias is not None:
             m.bias.data.fill_(0.0)

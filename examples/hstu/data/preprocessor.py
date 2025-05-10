@@ -163,7 +163,7 @@ class MovielensDataProcessor(DataProcessor):
         self._item_feature_name = "movie_id"
         self._action_feature_name = "rating"
         if self._prefix == "ml-1m":
-            self._contextual_feature_names = [
+            self._contextual_feature_names_wo_user_id = [
                 "sex",
                 "age_group",
                 "occupation",
@@ -173,7 +173,8 @@ class MovielensDataProcessor(DataProcessor):
             assert self._prefix == "ml-20m"
             # ml-20m
             # ml-20m doesn't have user data.
-            self._contextual_feature_names = []
+            self._contextual_feature_names_wo_user_id = []
+        self._contextual_feature_names = ['user_id'] + self._contextual_feature_names_wo_user_id 
         self._output_file: str = f"{data_path}{prefix}/processed_seqs.csv"
 
     def download(self) -> None:
@@ -266,13 +267,14 @@ class DLRMKuaiRandProcessor(DataProcessor):
         super().__init__(download_url, data_path, file_name, prefix)
         self._item_feature_name = "video_id"
         self._action_feature_name = "action_weights"
-        self._contextual_feature_names = [
+        self._contextual_feature_names_wo_user_id = [
             "user_active_degree",
             "follow_user_num_range",
             "fans_user_num_range",
             "friend_user_num_range",
             "register_days_range",
         ]
+        self._contextual_feature_names = ['user_id'] + self._contextual_feature_names_wo_user_id
         if prefix == "KuaiRand-Pure":
             self._log_files = [
                 f"{data_path}{prefix}/data/log_standard_4_08_to_4_21_pure.csv",
@@ -368,14 +370,14 @@ class DLRMKuaiRandProcessor(DataProcessor):
         log.info("Merging user features...")
         user_features_df = pd.read_csv(self._user_features_file, delimiter=",")
 
-        for col in self._contextual_feature_names:
+        for col in self._contextual_feature_names_wo_user_id:
             user_features_df[col] = _one_hot_encode(user_features_df[col])
 
         self._post_process(
             user_features_df,
             df,
             "user_id",
-            contextual_feature_names=self._contextual_feature_names,
+            contextual_feature_names=self._contextual_feature_names_wo_user_id,
             item_feature_name="video_id",
             action_feature_name="action_weights",
             output_file=self._output_file,

@@ -89,7 +89,7 @@ class HSTUConfig(TransformerConfig):
     hstu_layer_type: HSTULayerType = HSTULayerType.NATIVE
 
     target_group_size: int = 1
-    learnable_input_layernorm: bool = False
+    learnable_input_layernorm: bool = True
     # whether to add residual connection
     residual: bool = True
 
@@ -110,8 +110,8 @@ def get_hstu_config(
     is_causal: bool = True,
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     target_group_size: int = 1,
-    hstu_layer_type: HSTULayerType = HSTULayerType.NATIVE,
-    learnable_input_layernorm: bool = False,
+    hstu_layer_type: HSTULayerType = HSTULayerType.FUSED,
+    learnable_input_layernorm: bool = True,
     residual: bool = True,
 ) -> HSTUConfig:
     """

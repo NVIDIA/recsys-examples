@@ -236,26 +236,3 @@ class JaggedData:
             else self.contextual_seqlen_offsets,
             has_interleaved_action=self.has_interleaved_action,
         )
-
-
-class JaggedModule(MegatronModule, abc.ABC):
-    """
-    Abstract base class for a module that processes jagged data.
-
-    This class inherits from `MegatronModule` and `abc.ABC`, and defines an abstract method `forward` that must be implemented by any subclass.
-    """
-
-    @abc.abstractmethod
-    def forward(
-        self,
-        jagged_data: JaggedData,
-    ) -> JaggedData:
-        """
-        Abstract method for the forward pass of a JaggedModule.
-
-        Args:
-            jagged_data (JaggedData): The input jagged data.
-
-        Returns:
-            JaggedData: The output jagged data.
-        """

@@ -31,8 +31,7 @@ from modules.embedding import ShardedEmbedding
 from modules.hstu_block import HSTUBlock
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP
-from modules.multi_task_loss_module import MultiTaskLossModule
-from modules.multi_task_over_arch import MultiTaskOverArch
+from modules.multi_task_loss_module import MultiTaskLossModule, _compute_loss
 
 
 class RankingGR(BaseModel):
@@ -70,55 +69,23 @@ class RankingGR(BaseModel):
             ), "hstu layer hidden size should equal to embedding dim"
 
         self._logit_dim_list = [
-            layer_sizes[-1] for layer_sizes in task_config.prediction_head_arch
+            1 for _ in range(8)
         ]
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
 
         self._hstu_block = HSTUBlock(hstu_config)
-        self._dense_module = torch.nn.Sequential(
-            self._hstu_block,
-            MultiTaskOverArch(
-                [
-                    MLP(
-                        self._embedding_dim,
-                        layer_sizes,
-                        has_bias,
-                        head_act_type,
-                        device=self._device,
-                    )
-                    for layer_sizes, head_act_type, has_bias in zip(
-                        task_config.prediction_head_arch,
-                        task_config.prediction_head_act_type,
-                        task_config.prediction_head_bias,  # type: ignore[arg-type]
-                    )
-                ]
-            ),
+        
+        self._mlp = MLP(
+            self._embedding_dim,
+            task_config.prediction_head_arch[0],
+            task_config.prediction_head_bias[0],
+            task_config.prediction_head_act_type[0],
+            device=self._device,
         )
-
-        self._dense_module = self._dense_module.cuda()
-        # TODO, add ddp optimizer flag
-        if hstu_config.bf16 or hstu_config.fp16:
-            self._dense_module = Float16Module(hstu_config, self._dense_module)
-        if ddp_config is None:
-            ddp_config = DistributedDataParallelConfig(
-                grad_reduce_in_fp32=True,
-                overlap_grad_reduce=False,
-                use_distributed_optimizer=False,
-                check_for_nan_in_grad=False,
-                bucket_size=True,
-            )
-        self._dense_module = DDP(
-            hstu_config,
-            ddp_config,
-            self._dense_module,
-        )
-        # mcore DDP requires manual broadcast
-        self._dense_module.broadcast_params()
-        hstu_config.finalize_model_grads_func = finalize_model_grads
         # TODO, make reduction configurable
-        self._loss_module = MultiTaskLossModule(
-            logit_dim_list=self._logit_dim_list, reduction="none"
-        )
+        # self._loss_module = MultiTaskLossModule(
+        #     logit_dim_list=self._logit_dim_list, reduction="none"
+        # )
         self._metric_module = get_multi_event_metric_module(
             self._logit_dim_list,
             metric_types=task_config.eval_metrics,
@@ -157,11 +124,10 @@ class RankingGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The logits and labels.
         """
-        jagged_data = self._hstu_block.hstu_preprocess(
-            embeddings=self._embedding_collection(batch.features),
-            batch=batch,
+        hidden_states = self._hstu_block(
+            embeddings=self._embedding_collection(batch.features), batch=batch
         )
-        return self._dense_module(jagged_data).values, batch.labels
+        return self._mlp(hidden_states), batch.labels
 
     @output_nvtx_hook(nvtx_tag="RankingModel", backward=False)
     def forward(  # type: ignore[override]
@@ -178,7 +144,7 @@ class RankingGR(BaseModel):
             Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]: The losses and a tuple of losses, logits, and labels.
         """
         jagged_item_logit, labels = self.get_logit_and_labels(batch)
-        losses = self._loss_module(jagged_item_logit.float(), labels)
+        losses = _compute_loss(jagged_item_logit.float(), labels.float())
         return losses, (
             losses.detach(),
             jagged_item_logit.detach(),
@@ -194,6 +160,7 @@ class RankingGR(BaseModel):
         """
         with torch.no_grad():
             jagged_item_logit, redistributed_labels = self.get_logit_and_labels(batch)
+            # print('batch', batch.features, batch.labels)
             self._metric_module(jagged_item_logit.float(), redistributed_labels)
 
     def compute_metric(self) -> "OrderedDict":

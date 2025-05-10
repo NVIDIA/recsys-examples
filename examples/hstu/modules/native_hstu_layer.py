@@ -21,12 +21,13 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
 from modules.hstu_attention import create_hstu_attention
-from modules.jagged_module import JaggedData, JaggedModule
+from modules.jagged_module import JaggedData
 from modules.utils import init_mlp_weights_optional_bias
 from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
+from megatron.core.transformer.module import MegatronModule
 
 
-class HSTULayer(JaggedModule):
+class HSTULayer(MegatronModule):
     """
     One basic unit of HSTUBlock. Input and output are all JaggedData.
 
@@ -154,7 +155,7 @@ class HSTULayer(JaggedModule):
                 bias=self._input_layernorm_bias,
                 eps=self._eps,
             )
-            tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
+        tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
         # TODO: remove contiguous once cutlass backend is ready
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
             jagged_attn_output = self._attn_func(
