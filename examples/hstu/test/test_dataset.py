@@ -15,13 +15,13 @@
 from typing import Optional, Union
 
 import commons.utils.initialize as init
-import data
 import fbgemm_gpu  # to load permute_2D_sparse_data
 import pytest
 import torch
-from data.dummy_dataset import DummySequenceDataset
-from data.sequence_dataset import get_dataset
-from data.utils import FeatureConfig, RankingBatch, RetrievalBatch, is_batch_valid
+from dataset import get_data_loader
+from dataset.dummy_dataset import DummySequenceDataset
+from dataset.sequence_dataset import get_dataset
+from dataset.utils import FeatureConfig, RankingBatch, RetrievalBatch, is_batch_valid
 from torch import distributed as dist
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -153,7 +153,7 @@ def test_dummy_dataset(
     )
     print("start generating")
 
-    dataloader = data.get_data_loader(dataset=dataset)
+    dataloader = get_data_loader(dataset=dataset)
 
     for batch in dataloader:
         batch.to(device)
@@ -225,9 +225,9 @@ def test_sequence_dataset(
         nrows=1000,
     )
     batch_size_per_rank * world_size
-    dataloader = data.get_data_loader(dataset=dataset)  # type: ignore[attr-defined]
+    dataloader = get_data_loader(dataset=dataset)
     dataloader_iter = iter(dataloader)
-    ref_dataloader = data.get_data_loader(dataset=reference_dataset)  # type: ignore[attr-defined]
+    ref_dataloader = get_data_loader(dataset=reference_dataset)
 
     for ref_batch in ref_dataloader:
         is_batch_valid(ref_batch)

@@ -15,7 +15,6 @@
 import commons.utils.initialize as init
 import pytest
 import torch
-from commons.utils.tensor_initializer import UniformInitializer
 from configs import (
     DynamicShardedEmbeddingConfig,
     RankingConfig,
@@ -23,7 +22,7 @@ from configs import (
     ShardedEmbeddingConfig,
     get_hstu_config,
 )
-from data.utils import FeatureConfig, RankingBatch, RetrievalBatch
+from dataset.utils import FeatureConfig, RankingBatch, RetrievalBatch
 from megatron.core import tensor_parallel
 from model.ranking_gr import RankingGR
 from model.retrieval_gr import RetrievalGR
@@ -61,7 +60,6 @@ def test_gr_forward_backward(
         kv_channels=128,
         num_attention_heads=4,
         num_layers=3,
-        init_method=UniformInitializer,
         dtype=torch.bfloat16,
     )
 
@@ -79,7 +77,6 @@ def test_gr_forward_backward(
             vocab_size=action_vocab_size,
             dim=dim_size,
             sharding_type="data_parallel",
-            initializer=UniformInitializer(),
             optimizer_param=embedding_optimizer_param,
         ),
         DynamicShardedEmbeddingConfig(
@@ -89,7 +86,6 @@ def test_gr_forward_backward(
             table_name="item",
             vocab_size=item_emb_size,
             dim=dim_size,
-            initializer=UniformInitializer(),
             optimizer_param=embedding_optimizer_param,
             global_hbm_for_values=1000,
         ),

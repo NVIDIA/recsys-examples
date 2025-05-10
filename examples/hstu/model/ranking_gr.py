@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RankingConfig
-from data.utils import RankingBatch
+from dataset.utils import RankingBatch
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
