@@ -17,7 +17,7 @@ import sys
 from dataclasses import dataclass
 from functools import partial  # pylint: disable-unused-import
 from itertools import islice
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import commons.checkpoint as checkpoint
 import configs
@@ -25,21 +25,23 @@ import dataset
 import gin
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
+from commons.checkpoint import get_unwrapped_module
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logging import print_rank_0
 from commons.utils.stringify import stringify_dict
-from configs import KernelBackend, PositionEncodingConfig, get_hstu_config
+from configs import (
+    KernelBackend,
+    OptimizerParam,
+    PositionEncodingConfig,
+    get_hstu_config,
+)
+from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.optimizer import OptimizerConfig
 from model import RankingGR, RetrievalGR
-from modules.embedding import (
-    DynamicShardedEmbeddingConfig,
-    EmbeddingOptimizerParam,
-    ShardedEmbeddingConfig,
-    get_nonfused_embedding_optimizer,
-)
+from modules.embedding import ShardedEmbeddingConfig
+from torchrec.distributed.model_parallel import DistributedModelParallel
 
 
 @gin.configurable
@@ -93,7 +95,7 @@ class EmbeddingArgs(BaseEmbeddingArgs):
 
 @gin.configurable
 @dataclass
-class DynamicEmbeddingArgs(BaseEmbeddingArgs):
+class DynamicEmbeddingArgs(EmbeddingArgs):
     # the precedence is global_hbm_for_values > item_vocab_gpu_capacity > item_vocab_gpu_capacity_ratio
     # without optimizer consideration
     global_hbm_for_values: Optional[int] = None
@@ -183,16 +185,6 @@ class OptimizerArgs:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
-
-
-@gin.configurable
-@dataclass
-class DistributedDataParallelArgs:
-    grad_reduce_in_fp32: bool = True
-    overlap_grad_reduce: bool = False
-    use_distributed_optimizer: bool = False
-    check_for_nan_in_grad: bool = False
-    bucket_size: bool = True
 
 
 @gin.configurable
@@ -312,28 +304,8 @@ def get_data_loader(
     return dataset.get_data_loader(train_dataset), dataset.get_data_loader(test_dataset)  # type: ignore[attr-defined]
 
 
-def create_optimizer_config(network_args: NetworkArgs, optimizer_args: OptimizerArgs):
-    params_dtype = torch.float32
-    if network_args.dtype_str == "bfloat16":
-        params_dtype = torch.bfloat16
-    if network_args.dtype_str == "float16":
-        params_dtype = torch.float16
-    return OptimizerConfig(
-        optimizer=optimizer_args.optimizer_str,
-        lr=optimizer_args.learning_rate,
-        adam_beta1=optimizer_args.adam_beta1,
-        adam_beta2=optimizer_args.adam_beta2,
-        adam_eps=optimizer_args.adam_eps,
-        params_dtype=params_dtype,
-        bf16=network_args.dtype_str == "bfloat16",
-        fp16=network_args.dtype_str == "float16",
-    )
-
-
-def create_embedding_config(
-    hidden_size: int, embedding_args: EmbeddingArgs, optimizer_args: OptimizerArgs
-) -> Union[DynamicShardedEmbeddingConfig, ShardedEmbeddingConfig]:
-    embedding_optimizer_param = EmbeddingOptimizerParam(
+def create_optimizer_params(optimizer_args: OptimizerArgs):
+    return OptimizerParam(
         optimizer_str=optimizer_args.optimizer_str,
         learning_rate=optimizer_args.learning_rate,
         adam_beta1=optimizer_args.adam_beta1,
@@ -341,22 +313,17 @@ def create_embedding_config(
         adam_eps=optimizer_args.adam_eps,
     )
 
-    if isinstance(embedding_args, DynamicEmbeddingArgs):
-        from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
 
-        embedding_args.calculate_and_reset_global_hbm_for_values(hidden_size)
-        return configs.DynamicShardedEmbeddingConfig(
+def create_embedding_config(
+    hidden_size: int, embedding_args: EmbeddingArgs
+) -> ShardedEmbeddingConfig:
+    if isinstance(embedding_args, DynamicEmbeddingArgs):
+        return configs.ShardedEmbeddingConfig(
             feature_names=embedding_args.feature_names,
             table_name=embedding_args.table_name,
             vocab_size=embedding_args.item_vocab_size_or_capacity,
             dim=hidden_size,
-            optimizer_param=embedding_optimizer_param,
-            global_hbm_for_values=embedding_args.global_hbm_for_values,
-            evict_strategy=DynamicEmbEvictStrategy.LRU
-            if embedding_args.evict_strategy == "lru"
-            else DynamicEmbEvictStrategy.LFU,
-            safe_check_mode=DynamicEmbCheckMode.IGNORE,
-            bucket_capacity=128,
+            sharding_type="model_parallel",
         )
     return configs.ShardedEmbeddingConfig(
         feature_names=embedding_args.feature_names,
@@ -364,8 +331,28 @@ def create_embedding_config(
         vocab_size=embedding_args.item_vocab_size_or_capacity,
         dim=hidden_size,
         sharding_type=embedding_args.sharding_type,
-        optimizer_param=embedding_optimizer_param,
     )
+
+
+def create_dynamic_optitons_dict(
+    embedding_args_list: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]],
+    hidden_size: int,
+) -> Dict[str, DynamicEmbTableOptions]:
+    dynamic_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    for embedding_args in embedding_args_list:
+        if isinstance(embedding_args, DynamicEmbeddingArgs):
+            from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
+
+            embedding_args.calculate_and_reset_global_hbm_for_values(hidden_size)
+            dynamic_options_dict[embedding_args.table_name] = DynamicEmbTableOptions(
+                global_hbm_for_values=embedding_args.global_hbm_for_values,
+                evict_strategy=DynamicEmbEvictStrategy.LRU
+                if embedding_args.evict_strategy == "lru"
+                else DynamicEmbEvictStrategy.LFU,
+                safe_check_mode=DynamicEmbCheckMode.IGNORE,
+                bucket_capacity=128,
+            )
+    return dynamic_options_dict
 
 
 def evaluate(
@@ -433,12 +420,11 @@ def save_ckpts(
 
 
 def train(
-    model: Union[RankingGR, RetrievalGR],
+    model: DistributedModelParallel,
     trainer_args: TrainerArgs,
     train_loader: torch.utils.data.DataLoader,
     eval_loader: torch.utils.data.DataLoader,
     dense_optimizer: torch.optim.Optimizer,
-    event_loss_weight: Optional[torch.Tensor] = None,
 ):
     gpu_timer = GPUTimer()
     max_train_iters = trainer_args.max_train_iters or len(train_loader)
@@ -447,11 +433,17 @@ def train(
     last_td = 0
     # using a tensor on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
-    nonfused_embedding_optimizers = get_nonfused_embedding_optimizer(model)
     train_loader_iter = iter(train_loader)
     for train_iter in range(max_train_iters):
         if trainer_args.profile and train_iter == trainer_args.profile_step_start:
             torch.cuda.profiler.start()
+        if (
+            train_iter * trainer_args.ckpt_save_interval > 0
+            and train_iter % trainer_args.ckpt_save_interval == 0
+        ):
+            save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
+            save_ckpts(save_path, model, dense_optimizer)
+
         torch.cuda.nvtx.range_push(f"step {train_iter}")
 
         try:
@@ -462,17 +454,8 @@ def train(
             batch = next(train_loader_iter)
 
         batch = batch.to("cuda")
-        model._dense_module.zero_grad_buffer()
+        model.module.zero_grad_buffer()
         dense_optimizer.zero_grad()
-        if (
-            train_iter * trainer_args.ckpt_save_interval > 0
-            and train_iter % trainer_args.ckpt_save_interval == 0
-        ):
-            save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
-            save_ckpts(save_path, model, dense_optimizer)
-
-        for optim in nonfused_embedding_optimizers:
-            optim.zero_grad()
 
         # shape = [T, num_event]
         losses, (_, logits, labels) = model(batch)
@@ -481,8 +464,6 @@ def train(
         local_tokens = torch.tensor(jagged_size).cuda().float()
 
         losses = torch.sum(losses, dim=0)
-        if event_loss_weight is not None:
-            losses = losses * event_loss_weight
         local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
         reporting_loss = local_loss.clone().detach()
         # [allreduced_sum_loss, allreduced_sum_tokens]
@@ -504,16 +485,14 @@ def train(
         local_loss_average.backward()
 
         # dense gradient allreduce
-        finalize_model_grads([model._dense_module], None)
+        finalize_model_grads([model.module], None)
         torch.cuda.nvtx.range_push(f"#dense opt")
         dense_optimizer.step()
         torch.cuda.nvtx.range_pop()
-        for optim in nonfused_embedding_optimizers:
-            optim.step()
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
             model.eval()
             evaluate(
-                model,
+                get_unwrapped_module(model),
                 trainer_args=trainer_args,
                 eval_loader=eval_loader,
                 max_eval_iters=None,
