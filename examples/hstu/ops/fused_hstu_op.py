@@ -641,6 +641,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             linear_weight,
             # silu
             silu_input,
+            # grad residual out
+            dx_residual: Optional[torch.Tensor] = None,
         ):
             assert (
                 grad_output.dim() == 2
@@ -668,6 +670,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 eps=ln_eps,
                 BLOCK_D=BLOCK_D,
                 num_warps=num_warps,
+                dx_accumulate=dx_residual,
             )
             return (
                 grad_input,
@@ -776,9 +779,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 linear_input=saved_tensor_map["linear_uvqk_input"],
                 linear_weight=saved_tensor_map["linear_uvqk_weight"],
                 silu_input=saved_tensor_map["silu_input"],
+                dx_residual=grad_proj_residual if ctx.residual else None,
             )
-        if ctx.residual:
-            grad_input = grad_input + grad_proj_residual
         del saved_tensor_map
 
         return (
