@@ -2,6 +2,7 @@
 gpu_arch=$(nvidia-smi -L |head -n 1| cut -d' ' -f4)
 num_layers=${1:-1}
 PROFILE=${PROFILE:-0}
+ASYNC_WGRAD=${ASYNC_WGRAD:-True}
 nsys_profile_args='-f true -s none -t cuda,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node'
 
 # dim_per_head=(64 128 256)
@@ -22,8 +23,8 @@ for dim_per_head in ${dim_per_heads[@]}; do
             for batchsize in ${batchsizes[@]}; do
 
                 echo "==== dim_per_head: $dim_per_head, num_heads: $num_head, max_seqlen: $max_seqlen, batchsize: $batchsize ==== "
-                native_output_profile_name=${gpu_arch}_native_bs${batchsize}_dim${dim_per_head}_heads${num_head}_seqlen${max_seqlen}
-                fused_output_profile_name=${gpu_arch}_fused_bs${batchsize}_dim${dim_per_head}_heads${num_head}_seqlen${max_seqlen}
+                native_output_profile_name=${gpu_arch}_native_bs${batchsize}_dim${dim_per_head}_heads${num_head}_seqlen${max_seqlen}_async${ASYNC_WGRAD}
+                fused_output_profile_name=${gpu_arch}_fused_bs${batchsize}_dim${dim_per_head}_heads${num_head}_seqlen${max_seqlen}_async${ASYNC_WGRAD}
 
                 if [ $PROFILE -eq 1 ]; then
                     fused_nsys_cmd="nsys profile -o ./profile/fused_op/${fused_output_profile_name} ${nsys_profile_args}"
@@ -45,6 +46,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --dtype bfloat16 \
                     --max-seqlen $max_seqlen \
                     --batchsize $batchsize \
+                    --async-wgrad $ASYNC_WGRAD \
                     --profiler-start $profiler_start \
                     --profiler-end $profiler_end | tee ./profile/fused_op/${gpu_arch}_${fused_output_profile_name}.log
 
@@ -61,6 +63,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --dtype bfloat16 \
                     --max-seqlen $max_seqlen \
                     --batchsize $batchsize \
+                    --async-wgrad $ASYNC_WGRAD \
                     --profiler-start $profiler_start \
                     --profiler-end $profiler_end | tee ./profile/fused_op/${gpu_arch}_${native_output_profile_name}.log
                   sleep 1
