@@ -20,15 +20,8 @@ import commons.utils.initialize as init
 import pytest
 import torch
 from megatron.core import parallel_state, tensor_parallel
-from modules.embedding import (
-    DynamicShardedEmbeddingConfig,
-    EmbeddingOptimizerParam,
-    ShardedEmbedding,
-    ShardedEmbeddingConfig,
-)
 from modules.metrics.metric_modules import RetrievalTaskMetricWithSampling
 from ops.collective_ops import grouped_allgatherv_tensor_list
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 @pytest.mark.parametrize("num_embeddings", [10000])
@@ -42,53 +35,14 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
     init.set_random_seed(1234)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    embedding_optimizer_param = EmbeddingOptimizerParam(
-        optimizer_str="sgd", learning_rate=1e-5
-    )
-    emb_configs = [
-        ShardedEmbeddingConfig(
-            feature_names=["context0"],
-            table_name="context0_table",
-            vocab_size=num_embeddings,
-            dim=embedding_dim,
-            sharding_type="model_parallel",
-            optimizer_param=embedding_optimizer_param,
-        ),
-        ShardedEmbeddingConfig(
-            feature_names=["context1"],
-            table_name="context1_table",
-            vocab_size=1000,
-            dim=embedding_dim,
-            sharding_type="data_parallel",
-            optimizer_param=embedding_optimizer_param,
-        ),
-        DynamicShardedEmbeddingConfig(
-            feature_names=["item"],
-            table_name="item_table",
-            vocab_size=num_embeddings,
-            dim=embedding_dim,
-            optimizer_param=embedding_optimizer_param,
-            global_hbm_for_values=0,
-        ),
-    ]
-    embedding = ShardedEmbedding(emb_configs)
-
     metric_module = RetrievalTaskMetricWithSampling(MAX_K=max_k)
 
     # Create the JaggedTensor
     with tensor_parallel.get_cuda_rng_tracker().fork("sharded-embedding-group-seed"):
-        context0 = torch.randint(num_embeddings, (100000,), device=device)
-        context1 = torch.randint(1000, (100000,), device=device)
-        item = torch.randint(num_embeddings, (100000,), device=device)
-        lengths = torch.tensor(
-            [context0.numel(), context1.numel(), item.numel()], device=device
+        keys_array = (
+            torch.randint(num_embeddings, (100000,), device=device).cpu().numpy()
         )
-        kjt = KeyedJaggedTensor.from_lengths_sync(
-            keys=["context0", "context1", "item"],
-            values=torch.concat([context0, context1, item]),
-            lengths=lengths,
-        )
-        embedding(kjt)
+        values_array = torch.rand(100000, embedding_dim, device=device).cpu().numpy()
 
     sum_seqlen = random.randint(0, 100)
     query_embeddings = torch.rand(sum_seqlen, embedding_dim, device=device)
@@ -96,7 +50,7 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
 
     metric_module(query_embeddings, target_ids)
     eval_dict_all, global_topk_logits, global_topk_keys = metric_module.compute(
-        embedding, "item_table"
+        keys_array, values_array
     )
 
     (all_query_embeddings, all_target_ids), _ = grouped_allgatherv_tensor_list(
@@ -106,7 +60,6 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
     )
 
     # 2. export local embedding
-    keys_array, values_array = embedding.export_local_embedding("item_table")
     local_keys = torch.tensor(keys_array, device=device)
     local_values = torch.tensor(values_array, device=device)
     (global_keys, global_values), _ = grouped_allgatherv_tensor_list(

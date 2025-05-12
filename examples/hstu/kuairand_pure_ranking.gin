@@ -3,7 +3,6 @@ TrainerArgs.eval_batch_size = 32
 TrainerArgs.log_interval = 50
 TrainerArgs.eval_interval = 50
 TrainerArgs.profile = True
-DistributedDataParallelArgs.check_for_nan_in_grad = True
 
 DatasetArgs.dataset_name = 'kuairand-pure'
 DatasetArgs.max_sequence_length = 910

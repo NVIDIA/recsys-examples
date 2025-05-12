@@ -6,8 +6,7 @@ from .hstu_config import (
     get_hstu_config,
 )
 from .task_config import (
-    DynamicShardedEmbeddingConfig,
-    EmbeddingOptimizerParam,
+    OptimizerParam,
     RankingConfig,
     RetrievalConfig,
     ShardedEmbeddingConfig,
@@ -22,8 +21,7 @@ __all__ = [
     "get_hstu_config",
     "RankingConfig",
     "RetrievalConfig",
-    "EmbeddingOptimizerParam",
+    "OptimizerParam",
     "ShardedEmbeddingConfig",
     "KernelBackend",
-    "DynamicShardedEmbeddingConfig",
 ]

@@ -29,7 +29,6 @@ from configs import RetrievalConfig
 from megatron.core.optimizer import get_megatron_optimizer
 from model import get_retrieval_model
 from utils import (
-    DistributedDataParallelArgs,
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
@@ -64,7 +63,6 @@ trainer_args = TrainerArgs()
 dataset_args, embedding_args = get_dataset_and_embedding_args()
 network_args = NetworkArgs()
 optimizer_args = OptimizerArgs()
-ddp_args = DistributedDataParallelArgs()
 tp_args = TensorModelParallelArgs()
 
 

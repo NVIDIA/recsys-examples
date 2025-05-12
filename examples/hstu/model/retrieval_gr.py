@@ -13,19 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections import OrderedDict
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RetrievalConfig
 from dataset.utils import RetrievalBatch
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import (
-    DistributedDataParallelConfig,
-    finalize_model_grads,
-)
-from megatron.core.transformer.module import Float16Module
 from model.base_model import BaseModel
 from modules.embedding import ShardedEmbedding
 from modules.hstu_block import HSTUBlock
@@ -54,47 +48,24 @@ class RetrievalGR(BaseModel):
         self,
         hstu_config: HSTUConfig,
         task_config: RetrievalConfig,
-        ddp_config: Optional[DistributedDataParallelConfig] = None,
     ):
         super().__init__()
         self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
         assert (
             self._tp_size == 1
         ), "RetrievalGR does not support tensor model parallel for now"
-        self._device = torch.cuda.current_device()
+        self._device = torch.device("cuda", torch.cuda.current_device())
         self._hstu_config = hstu_config
         self._task_config = task_config
-        self._ddp_config = ddp_config
 
         self._embedding_dim = hstu_config.hidden_size
         for ebc_config in task_config.embedding_configs:
             assert (
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
-
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
 
-        self._hstu_block = HSTUBlock(hstu_config).cuda()
-
-        self._dense_module = self._hstu_block
-        # TODO, add ddp optimizer flag
-        if hstu_config.bf16 or hstu_config.fp16:
-            self._dense_module = Float16Module(hstu_config, self._hstu_block)
-        if ddp_config is None:
-            ddp_config = DistributedDataParallelConfig(
-                grad_reduce_in_fp32=True,
-                overlap_grad_reduce=False,
-                use_distributed_optimizer=False,
-                check_for_nan_in_grad=False,
-                bucket_size=True,
-            )
-        self._dense_module = DDP(
-            hstu_config,
-            ddp_config,
-            self._dense_module,
-        )
-        self._dense_module.broadcast_params()
-        hstu_config.finalize_model_grads_func = finalize_model_grads
+        self._hstu_block = HSTUBlock(hstu_config)
 
         self._loss_module = SampledSoftmaxLoss(
             num_to_sample=task_config.num_negatives,
@@ -120,7 +91,7 @@ class RetrievalGR(BaseModel):
         Returns:
             RetrievalGR: The model with bfloat16 precision.
         """
-        self._dense_module.bfloat16()
+        self._hstu_block.bfloat16()
         return self
 
     def half(self):
@@ -130,7 +101,7 @@ class RetrievalGR(BaseModel):
         Returns:
             RetrievalGR: The model with half precision.
         """
-        self._dense_module.half()
+        self._hstu_block.half()
         return self
 
     def get_logit_and_labels(
@@ -146,11 +117,10 @@ class RetrievalGR(BaseModel):
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The logits, supervision item IDs, and supervision embeddings.
         """
         embeddings = self._embedding_collection(batch.features)
-        jagged_data = self._hstu_block.hstu_preprocess(
+        jagged_data = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
         )
-        jagged_data = self._dense_module(jagged_data)
         pred_item_embeddings = jagged_data.values
         pred_item_max_seqlen = jagged_data.max_seqlen
         pred_item_seqlen_offsets = jagged_data.seqlen_offsets
@@ -259,6 +229,6 @@ class RetrievalGR(BaseModel):
             if self._item_feature_name in embedding_config.feature_names:
                 table_name = embedding_config.table_name
         eval_dict, _, _ = self._metric_module.compute(
-            self._embedding_collection, table_name=table_name
+            *self._embedding_collection.export_local_embedding(table_name),
         )
         return eval_dict
