@@ -52,12 +52,13 @@ def _silu_forward(
     mask = x_offset + tl.arange(0, x_block_size) < x_size
     output_block_ptr = output_ptr + x_offset
     input_block_ptr = input_ptr + x_offset
+    cols = tl.arange(0, x_block_size)
 
-    input = tl.load(input_block_ptr, mask=mask, other=0.0).to(tl.float32)
+    input = tl.load(input_block_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
     output = fast_dividef(input, 1.0 + tl.exp(-input)).to(output_ptr.dtype.element_ty)
 
-    tl.store(output_block_ptr, output, mask=mask)
+    tl.store(output_block_ptr + cols, output, mask=mask)
 
 
 @triton_autotune(silu_configs(), key=["x_size"])
