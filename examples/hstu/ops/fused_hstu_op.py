@@ -497,6 +497,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             grad_output,
             x,
             w,
+            wgrad_stream: Optional[torch.cuda.Stream] = None,
+            wgrad_event: Optional[torch.cuda.Event] = None,
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             # triton_addmm_bwd are cublas-based even though the name starts with triton
             grad_x, grad_w, grad_residual = triton_addmm_bwd(
@@ -505,8 +507,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 z=None,
                 grad_output=grad_output,
                 is_y_1d=False,
-                wgrad_stream=ctx.wgrad_stream,
-                wgrad_event=ctx.wgrad_event,
+                wgrad_stream=wgrad_stream,
+                wgrad_event=wgrad_event,
             )
 
             return grad_x, grad_w, grad_residual
@@ -525,6 +527,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             training: bool,
             dropout_ratio: float,
             seed: Optional[int] = None,
+            wait_event: Optional[torch.cuda.Event] = None,
         ):
             dx, du, dweight, dbias, _ = triton_layer_norm_mul_dropout_bwd(
                 dy=dy,
@@ -542,6 +545,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 seed=seed,
                 concat_ux=False,
                 compute_y=False,
+                wait_event=wait_event,
             )
             return dx, du, dweight, dbias
 
@@ -643,6 +647,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             silu_input,
             # grad residual out
             dx_residual: Optional[torch.Tensor] = None,
+            wgrad_stream: Optional[torch.cuda.Stream] = None,
+            wgrad_event: Optional[torch.cuda.Event] = None,
         ):
             assert (
                 grad_output.dim() == 2
@@ -655,8 +661,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output=grad_output,
                 is_y_1d=True,
                 silu=True,
-                wgrad_stream=ctx.wgrad_stream,
-                wgrad_event=ctx.wgrad_event,
+                wgrad_stream=wgrad_stream,
+                wgrad_event=wgrad_event,
             )
             # # 2. ln
             grad_input, grad_ln_weight, grad_ln_bias = triton_weighted_layer_norm_bwd(
@@ -671,6 +677,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 BLOCK_D=BLOCK_D,
                 num_warps=num_warps,
                 dx_accumulate=dx_residual,
+                wait_event=wgrad_event,
             )
             return (
                 grad_input,
@@ -693,6 +700,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output=grad_output,
                 x=saved_tensor_map["linear_proj_input"],
                 w=saved_tensor_map["linear_proj_weight"],
+                wgrad_stream=ctx.wgrad_stream,
+                wgrad_event=ctx.wgrad_event,
             )
         with nvtx.annotate("norm_mul_dropout bwd", color="GREEN"):
             (
@@ -714,6 +723,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 training=ctx.training,
                 dropout_ratio=ctx.dropout_ratio,
                 seed=ctx.dropout_seed,
+                wait_event=ctx.wgrad_event,
             )
 
         with nvtx.annotate("hstu attn bwd", color="BLUE"):
@@ -780,6 +790,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 linear_weight=saved_tensor_map["linear_uvqk_weight"],
                 silu_input=saved_tensor_map["silu_input"],
                 dx_residual=grad_proj_residual if ctx.residual else None,
+                wgrad_stream=ctx.wgrad_stream,
+                wgrad_event=ctx.wgrad_event,
             )
         del saved_tensor_map
 

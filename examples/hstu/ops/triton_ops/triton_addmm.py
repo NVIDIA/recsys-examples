@@ -270,7 +270,6 @@ def _addmm_optional_silu_fwd(
     tl.store(z_ptrs, z.to(z_ptr.dtype.element_ty), mask=z_mask)
 
 
-# TODO, make it multi-streamable
 def triton_addmm_bwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -289,16 +288,16 @@ def triton_addmm_bwd(
         dy = torch.sum(dz, dim=0)
     else:
         dy = dz
-    # will be under no_grad semantic
     if wgrad_stream is not None:
         wgrad_event.record(torch.cuda.current_stream())
-        # wait for the event to be ready
+        # wait for dz and x to be ready
         wgrad_event.wait(wgrad_stream)
 
     dx = torch.mm(dz, w.t())
     if wgrad_stream is not None:
         with torch.cuda.stream(wgrad_stream):
             dw = torch.mm(x.t(), dz)
+            wgrad_event.record(wgrad_stream)
     else:
         dw = torch.mm(x.t(), dz)
     return dx, dw, dy

@@ -388,6 +388,7 @@ def triton_weighted_layer_norm_bwd(
     BLOCK_D: int,
     num_warps: int,
     dx_accumulate: Optional[torch.Tensor] = None,
+    wait_event: Optional[torch.cuda.Event] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if learnable:
         assert weight is not None and bias is not None
@@ -403,6 +404,9 @@ def triton_weighted_layer_norm_bwd(
             dweight.zero_()
             dbias.zero_()
             return dx, dweight, dbias
+        # wait for the event to be ready
+        if wait_event is not None:
+            wait_event.wait(torch.cuda.current_stream())
         # pyre-ignore[28]
         _weighted_layer_norm_bwd_dx[(tile_num,)](
             dx,
