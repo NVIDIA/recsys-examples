@@ -93,14 +93,14 @@ def create_model(
     action_feature_name = "action_feat"
     contextual_emb_size = 1000
     item_emb_size = 1000
-    action_vocab_size = 10
+    action_vocab_size = 1000
     emb_configs = [
         configs.ShardedEmbeddingConfig(
             feature_names=[action_feature_name],
             table_name="act",
             vocab_size=action_vocab_size,
             dim=embdim,
-            sharding_type="model_parallel",
+            sharding_type="data_parallel",
         ),
         configs.ShardedEmbeddingConfig(
             feature_names=[item_feature_name],
@@ -135,7 +135,7 @@ def create_model(
                 table_name="context",
                 vocab_size=contextual_emb_size,
                 dim=embdim,
-                sharding_type="data_parallel",
+                sharding_type="model_parallel",
             )
         )
 
@@ -200,6 +200,8 @@ def create_model(
         for r in range(world_size):
             if r == torch.distributed.get_rank():
                 continue
+            if p.numel() == 0:
+                continue
             if isinstance(p, TableBatchedEmbeddingSlice):
                 assert not torch.allclose(
                     p.flatten(), output[r].flatten()
@@ -207,7 +209,7 @@ def create_model(
             else:
                 assert torch.allclose(
                     p.flatten(), output[r].flatten()
-                ), "data parallel embedding table and dense embedding table should be initialized the same on each rank."
+                ), f"parameter {n} shape {p.shape} should be initialized the same on each rank."
 
     model_train.train()
     if forward:
@@ -225,10 +227,7 @@ def create_model(
 
 @pytest.mark.parametrize(
     "task_type",
-    [
-        # "ranking",
-        "retrieval"
-    ],
+    ["ranking", "retrieval"],
 )
 @pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"], []])
 @pytest.mark.parametrize("max_num_candidates", [10, 0])

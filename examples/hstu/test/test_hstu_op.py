@@ -441,7 +441,6 @@ def test_fused_hstu_op(
         kv_channels=hidden_dim_per_head,
         num_attention_heads=num_heads,
         num_layers=1,
-        init_method=torch.nn.init.xavier_uniform_,
         dtype=dtype,
         hidden_dropout=dropout_ratio,
         norm_epsilon=ln_eps,

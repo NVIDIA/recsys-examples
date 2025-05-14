@@ -18,7 +18,7 @@ import torch
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
-from typing import Callable, Union
+from typing import Union
 
 import click
 import nvtx
@@ -54,7 +54,6 @@ def create_hstu_layer(
     hidden_size: int,
     kv_channels: int,
     num_attention_heads: int,
-    init_method: Callable[[torch.Tensor], torch.Tensor],
     dtype: torch.dtype,
     kernel_backend: KernelBackend,
     learnable_input_layernorm: bool = False,
@@ -63,7 +62,6 @@ def create_hstu_layer(
         hidden_size=hidden_size,
         kv_channels=kv_channels,
         num_attention_heads=num_attention_heads,
-        init_method=init_method,
         num_layers=1,
         dtype=dtype,
         kernel_backend=kernel_backend,
@@ -126,13 +124,11 @@ def run(
     dtype = _dtype_str_to_type[dtype]
 
     hidden_size = dim_per_head * num_heads
-    init_method = torch.nn.init.xavier_uniform_
     hstu_layer = create_hstu_layer(
         layer_type=layer_type,
         hidden_size=hidden_size,
         kv_channels=dim_per_head,
         num_attention_heads=num_heads,
-        init_method=init_method,
         dtype=dtype,
         kernel_backend=kernel_backend,
         learnable_input_layernorm=True,
