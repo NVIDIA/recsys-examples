@@ -5,7 +5,7 @@ from typing import Dict, Optional
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
-from data.utils import RankingBatch
+from dataset.utils import RankingBatch
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_module import JaggedData, JaggedModule
 from modules.native_hstu_layer import HSTULayer

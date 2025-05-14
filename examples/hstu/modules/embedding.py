@@ -18,17 +18,12 @@ from typing import Dict, Iterator, List, Optional, Tuple, Union, cast
 import numpy as np
 import torch
 import torch.distributed as dist
-from commons.utils.tensor_initializer import BaseInitializer
 from configs.task_config import (
     DynamicShardedEmbeddingConfig,
     EmbeddingOptimizerParam,
     ShardedEmbeddingConfig,
 )
-from dynamicemb import (
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
-    DynamicEmbTableOptions,
-)
+from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.planner import DynamicEmbeddingEnumerator
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
@@ -59,44 +54,6 @@ _optimizer_str_to_optim_type = {
     "sgd": EmbOptimType.EXACT_SGD,
     # 'adamw': EmbOptimType.ADAMW,
 }
-
-
-def _extract_initializer_args(
-    initializer: BaseInitializer,
-) -> DynamicEmbInitializerArgs:
-    """
-    Extracts the initializer arguments from a BaseInitializer instance.
-
-    Args:
-        initializer (BaseInitializer): The initializer instance.
-
-    Returns:
-        DynamicEmbInitializerArgs: The extracted initializer arguments.
-
-    Raises:
-        ValueError: If the initializer type is unsupported.
-    """
-    assert isinstance(
-        initializer, BaseInitializer
-    ), "dynamicemb only support BaseInitializer"
-    init_params = initializer.get_params()
-    if initializer.get_type_str() == "normal":
-        return DynamicEmbInitializerArgs(
-            mode=DynamicEmbInitializerMode.NORMAL,
-            mean=init_params["mean"],
-            std_dev=init_params["std"],
-        )
-    if initializer.get_type_str() == "constant":
-        return DynamicEmbInitializerArgs(
-            mode=DynamicEmbInitializerMode.CONSTANT, value=init_params["value"]
-        )
-    elif initializer.get_type_str() == "uniform":
-        return DynamicEmbInitializerArgs(
-            mode=DynamicEmbInitializerMode.UNIFORM,
-            lower=init_params["low"],
-            upper=init_params["high"],
-        )
-    raise ValueError(f"unsupported init method {initializer}")
 
 
 class ShardedEmbedding(torch.nn.Module):
@@ -152,11 +109,9 @@ class ShardedEmbedding(torch.nn.Module):
             for config in self._configs:
                 if isinstance(config, DynamicShardedEmbeddingConfig):
                     sharding_types = [ShardingType.ROW_WISE.value]
-                    init_args = _extract_initializer_args(config.initializer)
                     # use default value in dynamicemb
                     dynamicemb_options = DynamicEmbTableOptions(
                         global_hbm_for_values=config.global_hbm_for_values,
-                        initializer_args=init_args,
                         evict_strategy=config.evict_strategy,
                         bucket_capacity=config.bucket_capacity,
                         safe_check_mode=config.safe_check_mode,
@@ -200,7 +155,6 @@ class ShardedEmbedding(torch.nn.Module):
                         embedding_dim=config.dim,
                         num_embeddings=config.vocab_size,  # To
                         feature_names=config.feature_names,
-                        init_fn=config.initializer,
                         data_type=dtype_to_data_type(
                             torch.float32
                         ),  # weight storage precision is alrways float32

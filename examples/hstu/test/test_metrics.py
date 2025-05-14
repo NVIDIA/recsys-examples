@@ -19,7 +19,6 @@ import random
 import commons.utils.initialize as init
 import pytest
 import torch
-from commons.utils.tensor_initializer import NormalInitializer
 from megatron.core import parallel_state, tensor_parallel
 from modules.embedding import (
     DynamicShardedEmbeddingConfig,
@@ -53,7 +52,6 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
             vocab_size=num_embeddings,
             dim=embedding_dim,
             sharding_type="model_parallel",
-            initializer=NormalInitializer(),
             optimizer_param=embedding_optimizer_param,
         ),
         ShardedEmbeddingConfig(
@@ -62,7 +60,6 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
             vocab_size=1000,
             dim=embedding_dim,
             sharding_type="data_parallel",
-            initializer=NormalInitializer(),
             optimizer_param=embedding_optimizer_param,
         ),
         DynamicShardedEmbeddingConfig(
@@ -70,7 +67,6 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
             table_name="item_table",
             vocab_size=num_embeddings,
             dim=embedding_dim,
-            initializer=NormalInitializer(),
             optimizer_param=embedding_optimizer_param,
             global_hbm_for_values=0,
         ),

@@ -14,13 +14,10 @@
 # limitations under the License.
 
 
-from typing import Callable
-
 import commons.checkpoint as checkpoint
 import commons.utils.initialize as init
 import pytest
 import torch
-from commons.utils.tensor_initializer import NormalInitializer, UniformInitializer
 from modules.embedding import (
     DynamicShardedEmbeddingConfig,
     EmbeddingOptimizerParam,
@@ -33,18 +30,10 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 @pytest.mark.parametrize("num_embeddings", [10000])
 @pytest.mark.parametrize("embedding_dim", [128])
 @pytest.mark.parametrize("tp", [1, 2])
-@pytest.mark.parametrize(
-    "initializer",
-    [
-        NormalInitializer(),
-        UniformInitializer(),
-    ],
-)
 @pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
 def test_embedding(
     num_embeddings: int,
     embedding_dim: int,
-    initializer: Callable,
     tp: int,
     optimizer_type_str: str,
 ):
@@ -68,7 +57,6 @@ def test_embedding(
             vocab_size=num_embeddings,
             dim=embedding_dim,
             sharding_type="model_parallel",
-            initializer=initializer,
             optimizer_param=embedding_optimizer_param,
         ),
         ShardedEmbeddingConfig(
@@ -77,7 +65,6 @@ def test_embedding(
             vocab_size=num_embeddings,
             dim=embedding_dim,
             sharding_type="data_parallel",
-            initializer=initializer,
             optimizer_param=embedding_optimizer_param,
         ),
         DynamicShardedEmbeddingConfig(
@@ -85,7 +72,6 @@ def test_embedding(
             table_name="table2",
             vocab_size=num_embeddings,
             dim=embedding_dim,
-            initializer=initializer,
             optimizer_param=embedding_optimizer_param,
             global_hbm_for_values=0,
         ),

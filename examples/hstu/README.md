@@ -69,14 +69,14 @@ Before getting started, please make sure that all pre-requisites are fulfilled. 
 ### Dataset Preprocessing
 We provides preprocessor scripts to assist in downloading raw data if it is not already present. It processes the raw data into csv files.
 ```bash
-mkdir -p ./tmp_data && python3 data/preprocessor.py --dataset_name <dataset-name>
+mkdir -p ./tmp_data && python3 preprocessor.py --dataset_name <dataset-name>
 ```
 The following dataset-name is supported:
 * ml-1m
 * ml-20m
 * kuairand-pure
-* kuairand-1K
-* kuairand-27K
+* kuairand-1k
+* kuairand-27k
 * all: preprocess all above datasets
 
 

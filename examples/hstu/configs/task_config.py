@@ -15,7 +15,6 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Union, cast
 
-from commons.utils.tensor_initializer import BaseInitializer
 from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
 
 
@@ -49,7 +48,6 @@ class BaseShardedEmbeddingConfig:
         table_name (str): The name of the table.
         vocab_size (int): The size of the vocabulary.
         dim (int): The dimension size of the embeddings.
-        initializer (BaseInitializer): The initializer for the embeddings.
         optimizer_param (EmbeddingOptimizerParam): The optimizer parameters for the embeddings.
     """
 
@@ -57,7 +55,6 @@ class BaseShardedEmbeddingConfig:
     table_name: str
     vocab_size: int
     dim: int
-    initializer: BaseInitializer
     optimizer_param: EmbeddingOptimizerParam
 
 
