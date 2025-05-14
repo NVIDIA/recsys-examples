@@ -117,7 +117,6 @@ def main():
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
     )
-
     train_dataloader, test_dataloader = get_data_loader(
         "ranking", dataset_args, trainer_args
     )
