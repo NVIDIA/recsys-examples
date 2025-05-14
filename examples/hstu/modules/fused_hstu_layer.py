@@ -59,9 +59,6 @@ class FusedHSTULayer(JaggedModule):
         self._residual = config.residual
         self._attn_backend = config.kernel_backend
 
-        # all weights and biases are float32 unless module.to(dtype) is called
-        linear_weight_init_method = config.init_method
-
         self._linear_uvqk_weight = torch.nn.Parameter(
             torch.empty(
                 (
@@ -79,7 +76,7 @@ class FusedHSTULayer(JaggedModule):
                 )
             )
         )
-        linear_weight_init_method(self._linear_uvqk_weight)
+        torch.nn.init.xavier_uniform_(self._linear_uvqk_weight)
 
         self._residual = config.residual
         device = torch.cuda.current_device()
@@ -111,7 +108,7 @@ class FusedHSTULayer(JaggedModule):
             )
         )
 
-        linear_weight_init_method(self._linear_proj_weight)
+        torch.nn.init.xavier_uniform_(self._linear_proj_weight)
 
     @output_nvtx_hook(nvtx_tag="FusedHSTULayer", hook_tensor_attr_name="values")
     def forward(self, jd: JaggedData) -> JaggedData:

@@ -5,7 +5,7 @@ from typing import Dict, Optional
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
-from data.utils import RankingBatch
+from dataset.utils import RankingBatch
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_module import JaggedData, JaggedModule
 from modules.native_hstu_layer import HSTULayer
@@ -163,7 +163,7 @@ class HSTUBlock(JaggedModule):
             has_interleaved_action=batch.action_feature_name is not None,
         )
 
-    @output_nvtx_hook(nvtx_tag="hstu_preprocess")
+    @output_nvtx_hook(nvtx_tag="hstu_postprocess")
     def hstu_postprocess(self, jd: JaggedData) -> JaggedData:
         """
         Postprocess the output from the HSTU architecture.
@@ -216,16 +216,20 @@ class HSTUBlock(JaggedModule):
         )
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_tensor_attr_name="values")
-    def forward(self, jd: JaggedData) -> JaggedData:
+    def forward(
+        self, embeddings: Dict[str, JaggedTensor], batch: RankingBatch
+    ) -> JaggedData:
         """
         Forward pass of the HSTUBlock.
 
         Args:
-            jd (JaggedData): The input jagged data.
+            embeddings (Dict[str, JaggedTensor]): The input embeddings.
+            batch (RankingBatch): The batch of ranking data.
 
         Returns:
             JaggedData: The output jagged data.
         """
+        jd = self.hstu_preprocess(embeddings, batch)
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
         return self.hstu_postprocess(jd)

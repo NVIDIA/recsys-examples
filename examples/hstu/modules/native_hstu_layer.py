@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from functools import partial
 
 import nvtx
 import torch
@@ -81,23 +80,13 @@ class HSTULayer(JaggedModule):
             self._embedding_dim,
             sum(self._split_arg_list),
             bias=True,
-        ).apply(
-            partial(
-                init_mlp_weights_optional_bias,
-                inplace_initializer=self.config.init_method,
-            )
-        )
+        ).apply(init_mlp_weights_optional_bias)
 
         self._linear_proj = torch.nn.Linear(
             self._linear_dim_per_head * self._num_heads,
             self._embedding_dim,
             bias=False,
-        ).apply(
-            partial(
-                init_mlp_weights_optional_bias,
-                inplace_initializer=self.config.init_method,
-            )
-        )
+        ).apply(init_mlp_weights_optional_bias)
 
         self._eps = config.layernorm_epsilon
         self._target_group_size = config.target_group_size

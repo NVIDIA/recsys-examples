@@ -27,17 +27,17 @@ import gin
 import torch  # pylint: disable-unused-import
 from commons.utils.logging import print_rank_0
 from configs import RankingConfig
-from megatron.core.optimizer import get_megatron_optimizer
+from distributed.sharding import make_optimizer_and_shard
 from model import get_ranking_model
 from utils import (
-    DistributedDataParallelArgs,
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
     TrainerArgs,
+    create_dynamic_optitons_dict,
     create_embedding_config,
     create_hstu_config,
-    create_optimizer_config,
+    create_optimizer_params,
     get_data_loader,
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
@@ -73,7 +73,6 @@ trainer_args = TrainerArgs()
 dataset_args, embedding_args = get_dataset_and_embedding_args()
 network_args = NetworkArgs()
 optimizer_args = OptimizerArgs()
-ddp_args = DistributedDataParallelArgs()
 tp_args = TensorModelParallelArgs()
 
 
@@ -82,7 +81,7 @@ def create_ranking_config() -> RankingConfig:
 
     return RankingConfig(
         embedding_configs=[
-            create_embedding_config(network_args.hidden_size, arg, optimizer_args)
+            create_embedding_config(network_args.hidden_size, arg)
             for arg in embedding_args
         ],
         prediction_head_arch=ranking_args.prediction_head_arch,
@@ -106,11 +105,18 @@ def main():
     task_config = create_ranking_config()
     model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
 
-    dense_optimizer_config = create_optimizer_config(network_args, optimizer_args)
-    dense_optimizer = get_megatron_optimizer(
-        dense_optimizer_config, [model._dense_module]
+    dynamic_options_dict = create_dynamic_optitons_dict(
+        embedding_args, network_args.hidden_size
     )
 
+    optimizer_param = create_optimizer_params(optimizer_args)
+    model_train, dense_optimizer = make_optimizer_and_shard(
+        model,
+        config=hstu_config,
+        sparse_optimizer_param=optimizer_param,
+        dense_optimizer_param=optimizer_param,
+        dynamicemb_options_dict=dynamic_options_dict,
+    )
     train_dataloader, test_dataloader = get_data_loader(
         "ranking", dataset_args, trainer_args
     )
@@ -122,7 +128,7 @@ def main():
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
 
     train(
-        model,
+        model_train,
         trainer_args,
         train_dataloader,
         test_dataloader,
