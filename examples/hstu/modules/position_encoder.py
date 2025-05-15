@@ -124,7 +124,6 @@ class HSTUPositionalEncoder(torch.nn.Module):
                 )
                 _, D2 = self._position_embeddings_weight.shape
                 torch._assert(D2 == D, "wrong dense shape[1]")
-
             seq_embeddings = triton_add_position_embeddings(
                 jagged=seq_embeddings,
                 jagged_offsets=seq_offsets,

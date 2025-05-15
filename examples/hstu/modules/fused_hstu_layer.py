@@ -16,11 +16,12 @@ import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
-from modules.jagged_module import JaggedData, JaggedModule
+from modules.jagged_module import JaggedData
+from megatron.core.transformer.module import MegatronModule
 from ops.fused_hstu_op import fused_hstu_op
 
 
-class FusedHSTULayer(JaggedModule):
+class FusedHSTULayer(MegatronModule):
     """
     x = ln(x)
     u,v,q,k = silu(linear_bias(x))
@@ -55,7 +56,7 @@ class FusedHSTULayer(JaggedModule):
         self._eps = config.layernorm_epsilon
         self._is_causal = config.is_causal
         self._target_group_size = config.target_group_size
-        self._alpha = 1.0
+        self._alpha = 1. / (self._attention_dim_per_head**0.5)
         self._residual = config.residual
         self._attn_backend = config.kernel_backend
 
@@ -121,20 +122,20 @@ class FusedHSTULayer(JaggedModule):
             seqlen_offsets=jd.seqlen_offsets,
             max_seqlen=jd.max_seqlen,
             # linear weights and biases
-            linear_uvqk_weight=self._linear_uvqk_weight,
-            linear_uvqk_bias=self._linear_uvqk_bias,
-            linear_proj_weight=self._linear_proj_weight,
+            linear_uvqk_weight=self._linear_uvqk_weight.to(input.dtype),
+            linear_uvqk_bias=self._linear_uvqk_bias.to(input.dtype),
+            linear_proj_weight=self._linear_proj_weight.to(input.dtype),
             num_heads=self._num_heads,
             linear_dim_per_head=self._linear_dim_per_head,
             attention_dim_per_head=self._attention_dim_per_head,
             ln_eps=self._eps,
             dropout_ratio=self._dropout_ratio,
-            training=self.training,
+            training=False,
             # layer norm weight and bias
-            input_norm_weight=self._input_layernorm_weight,
-            input_norm_bias=self._input_layernorm_bias,
-            output_norm_weight=self._output_layernorm_weight,
-            output_norm_bias=self._output_layernorm_bias,
+            input_norm_weight=self._input_layernorm_weight.to(input.dtype),
+            input_norm_bias=self._input_layernorm_bias.to(input.dtype),
+            output_norm_weight=self._output_layernorm_weight.to(input.dtype),
+            output_norm_bias=self._output_layernorm_bias.to(input.dtype),
             # attn related
             attn_backend=self._attn_backend,
             num_targets=jd.num_candidates,

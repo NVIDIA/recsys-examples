@@ -16,6 +16,19 @@ from typing import List
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
+import torch.nn.functional as F
+
+
+def _compute_loss(
+    mt_logits: torch.Tensor,
+    mt_labels: torch.Tensor,
+) -> torch.Tensor:
+    mt_losses = F.binary_cross_entropy_with_logits(
+        input=mt_logits,
+        target=mt_labels,
+        reduction="none",
+    )
+    return mt_losses.sum(-1)
 
 
 class MultiTaskLossModule(torch.nn.Module):

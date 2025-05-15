@@ -171,7 +171,7 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
             label_dim = logit_dim_per_event[task_id]
             task = "binary" if label_dim == 1 else "multiclass"
             module = metric_factory(
-                task=task, num_classes=num_classes, process_group=process_group
+                task=task, num_classes=num_classes, process_group=process_group,
             )
             self._logit_preprocessors.append(
                 self._label_dim_to_logit_preprocessor_map[task]
@@ -207,7 +207,9 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
             # target must be long
             # Metric forward returns the metric of current batch
             if pred.numel() > 0:
-                _ = self._eval_metrics_modules[task_id](pred, target)
+                self._eval_metrics_modules[task_id].update(pred, target)
+
+                # self._eval_metrics_modules[task_id](pred, target)
 
         return None
 
@@ -223,9 +225,18 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
             ret_dict[
                 self._task_names[task_id] + "." + self._metric_type.value
             ] = eval_module.compute()
-            eval_module.reset()
+            predictions = torch.concat(eval_module.preds, dim=0)
+            targets = torch.concat(eval_module.target, dim=0)
+            if task_id == 0:
+                print('compute preds', predictions, predictions.shape)
+                print('compute target', targets, targets.shape)
+        for eval_metric_module in self._eval_metrics_modules:
+            eval_metric_module.reset()
         return ret_dict
 
+    def reset(self):
+        for eval_metric_module in self._eval_metrics_modules:
+            eval_metric_module.reset()
 
 # TODO, use torchmetrics instead
 class RetrievalTaskMetricWithSampling(BaseTaskMetric):
