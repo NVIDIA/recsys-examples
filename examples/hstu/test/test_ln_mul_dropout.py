@@ -12,10 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import commons.utils.initialize as init
+
 import pytest
 import torch
+from commons.utils import initialize as init
 from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
+from ops.triton_ops.triton_layer_norm import (
+    triton_weighted_layer_norm_bwd,
+    triton_weighted_layer_norm_fwd,
+)
 from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 
 
@@ -74,3 +79,61 @@ def test_ln_mul_dropout(
         torch.testing.assert_close(ln_bias.grad, ref_bias.grad)
         torch.testing.assert_close(x.grad, ref_x.grad)
         torch.testing.assert_close(u.grad, ref_u.grad)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.bfloat16,
+    ],
+)
+@pytest.mark.parametrize("batch_size", [200, 500, 1000])
+@pytest.mark.parametrize("hidden_dim", [128, 256, 512])
+def test_triton_layer_norm_with_grad_residual(dtype, batch_size, hidden_dim):
+    input = (
+        torch.empty(batch_size, hidden_dim, device="cuda", dtype=dtype)
+        .uniform_(-1, 1)
+        .requires_grad_(True)
+    )
+    ref_input = input.detach().clone().requires_grad_(True)
+
+    weight = torch.nn.Parameter(
+        torch.ones(hidden_dim, dtype=dtype).uniform_(-0.1, 0.1).cuda()
+    )
+    bias = torch.nn.Parameter(
+        torch.zeros(hidden_dim, dtype=dtype).uniform_(-0.1, 0.1).cuda()
+    )
+    eps = 1e-5
+
+    ref_output = (
+        torch.nn.functional.layer_norm(ref_input, (hidden_dim,), weight, bias, eps)
+        + ref_input
+    )
+    grad_output = torch.ones_like(ref_output) / hidden_dim
+    ref_output.backward(grad_output)
+
+    with torch.no_grad():
+        output, mean, rstd, BLOCK_D, num_warps = triton_weighted_layer_norm_fwd(
+            x=input,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+        )
+        output = output + ref_input
+        dx, dweight, dbias = triton_weighted_layer_norm_bwd(
+            dy=grad_output,
+            x=input,
+            weight=weight,
+            bias=bias,
+            mean=mean,
+            rstd=rstd,
+            learnable=True,
+            eps=eps,
+            BLOCK_D=BLOCK_D,
+            num_warps=num_warps,
+            dx_accumulate=grad_output,
+        )
+
+    torch.testing.assert_close(output, ref_output)
+    torch.testing.assert_close(dx, ref_input.grad)
