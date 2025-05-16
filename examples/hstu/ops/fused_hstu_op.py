@@ -21,8 +21,8 @@ import hstu_hopper_cuda as flash_attn_cuda_hopper
 import nvtx
 import torch
 from configs import KernelBackend
-from ops.pt_ops.torch_addmm import torch_addmm_fwd
-from ops.triton_ops.triton_addmm import triton_addmm_bwd, triton_addmm_fwd
+from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
+from ops.triton_ops.triton_addmm import triton_addmm_silu_bwd, triton_addmm_silu_fwd
 from ops.triton_ops.triton_hstu_attention import (
     triton_hstu_attention_bwd,
     triton_hstu_attention_fwd,
@@ -177,14 +177,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             ctx.input_num_warps = input_num_warps
             sm = torch.cuda.get_device_properties(0).major
             if sm == 8:
-                addmm_fwd_impl = triton_addmm_fwd
+                addmm_silu_fwd_impl = triton_addmm_silu_fwd
             elif sm == 9:
-                addmm_fwd_impl = torch_addmm_fwd
+                addmm_silu_fwd_impl = torch_addmm_silu_fwd
             else:
                 raise ValueError(f"Unsupported SM major version: {sm}")
             # 2. linear & silu
             # bias is 1D
-            linear_uvqk, silu_linear_uvqk = addmm_fwd_impl(
+            linear_uvqk, silu_linear_uvqk = addmm_silu_fwd_impl(
                 x=normed_input,
                 w=linear_weight,
                 y=linear_bias,
@@ -362,12 +362,12 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ):
             sm = torch.cuda.get_device_properties(0).major
             if sm == 8:
-                addmm_fwd_impl = triton_addmm_fwd
+                addmm_silu_fwd_impl = triton_addmm_silu_fwd
             elif sm == 9:
-                addmm_fwd_impl = torch_addmm_fwd
+                addmm_silu_fwd_impl = torch_addmm_silu_fwd
             else:
                 raise ValueError(f"Unsupported SM major version: {sm}")
-            y, _ = addmm_fwd_impl(
+            y, _ = addmm_silu_fwd_impl(
                 x=x,
                 w=w,
                 y=residual,
@@ -500,11 +500,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             wgrad_stream: Optional[torch.cuda.Stream] = None,
             wgrad_event: Optional[torch.cuda.Event] = None,
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            # triton_addmm_bwd are cublas-based even though the name starts with triton
-            grad_x, grad_w, grad_residual = triton_addmm_bwd(
+            # triton_addmm_silu_bwd are cublas-based even though the name starts with triton
+            grad_x, grad_w, grad_residual = triton_addmm_silu_bwd(
                 x=x,
                 w=w,
-                z=None,
+                z=None,  # silu is False, and thus z is not used
                 grad_output=grad_output,
                 is_y_1d=False,
                 wgrad_stream=wgrad_stream,
@@ -654,7 +654,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output.dim() == 2
             ), "grad_output shape should be (T, num_heads * attention_dim_per_head)"
             # 1. silu + linear
-            grad_linear_input, grad_linear_weight, grad_lienar_bias = triton_addmm_bwd(
+            (
+                grad_linear_input,
+                grad_linear_weight,
+                grad_lienar_bias,
+            ) = triton_addmm_silu_bwd(
                 x=linear_input,
                 w=linear_weight,
                 z=silu_input,

@@ -270,7 +270,7 @@ def _addmm_optional_silu_fwd(
     tl.store(z_ptrs, z.to(z_ptr.dtype.element_ty), mask=z_mask)
 
 
-def triton_addmm_bwd(
+def triton_addmm_silu_bwd(
     x: torch.Tensor,
     w: torch.Tensor,
     z: torch.Tensor,
@@ -281,6 +281,7 @@ def triton_addmm_bwd(
     wgrad_event: Optional[torch.cuda.Event] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if silu:
+        assert z is not None, "z is required for silu"
         dz = triton_silu_bwd(grad_output, z)
     else:
         dz = grad_output
@@ -303,7 +304,7 @@ def triton_addmm_bwd(
     return dx, dw, dy
 
 
-def triton_addmm_fwd(
+def triton_addmm_silu_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
@@ -371,7 +372,7 @@ class _AddMmFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         ctx.is_y_1d = y.dim() == 1
         ctx.silu = silu
-        z, silu_z = triton_addmm_fwd(x, w, y, silu)
+        z, silu_z = triton_addmm_silu_fwd(x, w, y, silu)
 
         saved_tensors = (x, w, z) if silu else (x, w, None)
         ctx.save_for_backward(*saved_tensors)
@@ -384,7 +385,7 @@ class _AddMmFunction(torch.autograd.Function):
         ctx, dz: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
         (x, w, z) = ctx.saved_tensors
-        return triton_addmm_bwd(x, w, z, dz, ctx.is_y_1d, ctx.silu) + (None,)
+        return triton_addmm_silu_bwd(x, w, z, dz, ctx.is_y_1d, ctx.silu) + (None,)
 
 
 def triton_addmm(
