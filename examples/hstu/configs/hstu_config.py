@@ -86,7 +86,7 @@ class HSTUConfig(TransformerConfig):
     enable_relative_attention_bias: bool = False
 
     kernel_backend: KernelBackend = KernelBackend.CUTLASS
-    hstu_layer_type: HSTULayerType = HSTULayerType.NATIVE
+    hstu_layer_type: HSTULayerType = HSTULayerType.FUSED
 
     target_group_size: int = 1
     learnable_input_layernorm: bool = False
@@ -111,7 +111,7 @@ def get_hstu_config(
     is_causal: bool = True,
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     target_group_size: int = 1,
-    hstu_layer_type: HSTULayerType = HSTULayerType.NATIVE,
+    hstu_layer_type: HSTULayerType = HSTULayerType.FUSED,
     learnable_input_layernorm: bool = False,
     residual: bool = True,
     async_wgrad: bool = False,
