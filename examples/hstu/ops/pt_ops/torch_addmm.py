@@ -17,7 +17,7 @@
 import torch
 
 
-def torch_addmm_fwd(
+def torch_addmm_silu_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
@@ -34,7 +34,7 @@ def torch_addmm_fwd(
     return z, silu_z
 
 
-# def torch_addmm_fwd(
+# def torch_addmm_silu_fwd(
 #     x: torch.Tensor,
 #     w: torch.Tensor,
 #     z: torch.Tensor,
