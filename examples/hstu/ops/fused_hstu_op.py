@@ -269,6 +269,13 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             assert q.dim() == 3, "q shape should be (L, num_heads, head_dim)"
             assert k.dim() == 3, "k shape should be (L, num_heads, head_dim)"
             assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
+            seq_offsets_q = seq_offsets_q.to(torch.int32)
+            num_contexts = (
+                num_contexts.to(torch.int32) if num_contexts is not None else None
+            )
+            num_targets = (
+                num_targets.to(torch.int32) if num_targets is not None else None
+            )
             jagged_attn_output, _ = cutlass_hstu_varlen_fwd(
                 q,
                 k,
