@@ -328,6 +328,7 @@ void dynamic_emb_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
+  const float initial_accumulator_value,
   DataType weight_type,const std::optional<uint64_t> score){
   if (n == 0) return;
 
@@ -360,9 +361,10 @@ void dynamic_emb_adagrad_with_table(
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
 
-      AdaGradVecOptimizer<g_t,w_t> opt{reinterpret_cast<w_t**>(gt.data_ptr()),lr, eps,
-                                     founds.data_ptr<bool>(),
-                                     founds_gt.data_ptr<bool>()};
+      AdaGradVecOptimizer<g_t,w_t> opt{reinterpret_cast<w_t**>(gt.data_ptr()),
+                                      lr, eps, initial_accumulator_value,
+                                      founds.data_ptr<bool>(),
+                                      founds_gt.data_ptr<bool>()};
 
       if (dim % 4 == 0) {
         const int max_grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
@@ -471,6 +473,7 @@ void dynamic_emb_rowwise_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
+  const float initial_accumulator_value,
   DataType weight_type,const std::optional<uint64_t> score) {
   if (n == 0) return;
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
@@ -502,9 +505,10 @@ void dynamic_emb_rowwise_adagrad_with_table(
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(weight_type, w_t, [&] {
 
-      RowWiseAdaGradVecOptimizer<g_t,w_t> opt{reinterpret_cast<w_t**>(gt.data_ptr()),lr, eps,
-                                     founds.data_ptr<bool>(),
-                                     founds_gt.data_ptr<bool>()};
+      RowWiseAdaGradVecOptimizer<g_t,w_t> opt{reinterpret_cast<w_t**>(gt.data_ptr()),
+                                              lr, eps, initial_accumulator_value,
+                                              founds.data_ptr<bool>(),
+                                              founds_gt.data_ptr<bool>()};
 
       if (dim % 4 == 0) {
         const int max_grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
@@ -624,13 +628,13 @@ void bind_optimizer_kernel_op(py::module &m) {
 
   m.def("dynamic_emb_adagrad_with_table", &dyn_emb::dynamic_emb_adagrad_with_table,
         "Adagrad optimizer for Dynamic Emb", py::arg("ht"), py::arg("gt_ht"), 
-        py::arg("n"), py::arg("indices"), py::arg("grads"),py::arg("lr"),
-        py::arg("eps"),
+        py::arg("n"), py::arg("indices"), py::arg("grads"), py::arg("lr"),
+        py::arg("eps"), py::arg("initial_accumulator_value"),
         py::arg("weight_type"), py::arg("score") = py::none());
 
   m.def("dynamic_emb_rowwise_adagrad_with_table", &dyn_emb::dynamic_emb_rowwise_adagrad_with_table,
         "Row Wise Adagrad optimizer for Dynamic Emb", py::arg("ht"), py::arg("gt_ht"),
-        py::arg("n"), py::arg("indices"), py::arg("grads"),py::arg("lr"),
-        py::arg("eps"),
+        py::arg("n"), py::arg("indices"), py::arg("grads"), py::arg("lr"),
+        py::arg("eps"), py::arg("initial_accumulator_value"),
         py::arg("weight_type"), py::arg("score") = py::none());
 }
