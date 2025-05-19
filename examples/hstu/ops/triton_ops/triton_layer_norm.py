@@ -174,11 +174,14 @@ def _weighted_layer_norm_bwd_dx(
     stride_dx,
     stride_dy,
     stride_x,
+    stride_acc,
     D,
     eps,
     IS_SWISH: tl.constexpr,
     N,
+    DX_ACC,
     BLOCK_D: tl.constexpr,
+    DGRAD_ACCUM: tl.constexpr,
 ):  # type: ignore
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
@@ -193,6 +196,8 @@ def _weighted_layer_norm_bwd_dx(
 
     for idx in range(rows_per_tile):
         x_ptrs = X + row.to(tl.int64) * stride_x
+        if DGRAD_ACCUM:
+            dx_acc_ptrs = DX_ACC + row.to(tl.int64) * stride_acc
         dy_ptrs = DY + row.to(tl.int64) * stride_dy
         dx_ptrs = DX + row.to(tl.int64) * stride_dx
         dw_ptrs = DW + pid.to(tl.int64) * D
@@ -203,6 +208,8 @@ def _weighted_layer_norm_bwd_dx(
         # Load data to SRAM
         x = tl.load(x_ptrs + cols, mask=mask, other=0).to(tl.float32)
         dy = tl.load(dy_ptrs + cols, mask=mask, other=0).to(tl.float32)
+        if DGRAD_ACCUM:
+            dx_acc = tl.load(dx_acc_ptrs + cols, mask=mask, other=0).to(tl.float32)
         mean = tl.load(Mean + row)
         rstd = tl.load(Rstd + row)
 
@@ -228,9 +235,10 @@ def _weighted_layer_norm_bwd_dx(
             c1 = tl.sum(xhat * wdy, axis=0) / D
             c2 = tl.sum(wdy, axis=0) / D
             dx = (wdy - (xhat * c1 + c2)) * rstd
-
+        if DGRAD_ACCUM:
+            dx += dx_acc
         # Write dx
-        tl.store(dx_ptrs + cols, dx, mask=mask)
+        tl.store(dx_ptrs + cols, dx.to(dx_ptrs.dtype.element_ty), mask=mask)
 
         # Accumulate partial sums for dw/db
         if IS_SWISH:
@@ -379,6 +387,8 @@ def triton_weighted_layer_norm_bwd(
     eps: float,
     BLOCK_D: int,
     num_warps: int,
+    dx_accumulate: Optional[torch.Tensor] = None,
+    wait_event: Optional[torch.cuda.Event] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if learnable:
         assert weight is not None and bias is not None
@@ -394,6 +404,9 @@ def triton_weighted_layer_norm_bwd(
             dweight.zero_()
             dbias.zero_()
             return dx, dweight, dbias
+        # wait for the event to be ready
+        if wait_event is not None:
+            wait_event.wait(torch.cuda.current_stream())
         # pyre-ignore[28]
         _weighted_layer_norm_bwd_dx[(tile_num,)](
             dx,
@@ -408,12 +421,17 @@ def triton_weighted_layer_norm_bwd(
             dx.stride(0),
             dy.stride(0),
             x.stride(0),
+            dx_accumulate.stride(0)
+            if dx_accumulate is not None
+            else 0,  # pyre-ignore [16]
             D,
             eps,
             IS_SWISH=False,
             N=N,
+            DX_ACC=dx_accumulate,  # pyre-ignore [16]
             BLOCK_D=BLOCK_D,
             num_warps=num_warps,
+            DGRAD_ACCUM=dx_accumulate is not None,
         )
 
         def grid(META):
@@ -822,10 +840,13 @@ class SwishLayerNormFunction(torch.autograd.Function):
             dx.stride(0),
             dy.stride(0),
             x.stride(0),
+            0,  # pyre-ignore [16]
             D,
             ctx.eps,
             IS_SWISH=True,
             N=N,
+            DX_ACC=None,  # pyre-ignore [16]
+            DGRAD_ACCUM=False,
             BLOCK_D=ctx.BLOCK_D,
             num_warps=ctx.num_warps,
         )

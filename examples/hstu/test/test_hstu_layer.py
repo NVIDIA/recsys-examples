@@ -66,6 +66,7 @@ def init_weights_from_native(native_module: HSTULayer, fused_module: FusedHSTULa
 @pytest.mark.parametrize("learnable_ln", [True])
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("input_sparsity", [0.75])
+@pytest.mark.parametrize("async_wgrad", [True, False])
 def test_fused_hstu_layer(
     dtype: torch.dtype,
     batchsize: int,
@@ -82,6 +83,7 @@ def test_fused_hstu_layer(
     learnable_ln: bool,
     residual: bool,
     input_sparsity: float,
+    async_wgrad: bool,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -101,6 +103,7 @@ def test_fused_hstu_layer(
         hstu_layer_type=HSTULayerType.NATIVE,
         learnable_input_layernorm=learnable_ln,
         residual=residual,
+        async_wgrad=async_wgrad,
     )
     # hstu_config.kernel_backend = KernelBackend.PYTORCH
     ref_hstu_layer = HSTULayer(hstu_config)

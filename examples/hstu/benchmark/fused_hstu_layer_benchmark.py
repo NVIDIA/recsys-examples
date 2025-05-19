@@ -21,8 +21,8 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 from typing import Callable, Union
 
 import click
+import commons.utils.initialize as init
 import nvtx
-import utils.initialize as init
 from commons.utils.gpu_timer import IGPUTimer
 from configs.hstu_config import HSTULayerType, KernelBackend, get_hstu_config
 from modules.fused_hstu_layer import FusedHSTULayer
@@ -58,6 +58,7 @@ def create_hstu_layer(
     dtype: torch.dtype,
     kernel_backend: KernelBackend,
     learnable_input_layernorm: bool = False,
+    async_wgrad: bool = False,
 ) -> Union[HSTULayer, FusedHSTULayer]:
     hstu_config = get_hstu_config(
         hidden_size=hidden_size,
@@ -69,6 +70,7 @@ def create_hstu_layer(
         kernel_backend=kernel_backend,
         hstu_layer_type=layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
+        async_wgrad=async_wgrad,
     )
     if layer_type == HSTULayerType.NATIVE:
         module = HSTULayer(hstu_config).to(dtype).cuda()
@@ -85,6 +87,12 @@ def create_hstu_layer(
     "--layer-type",
     type=click.Choice(_layer_type_str_to_type.keys()),
     default="fused",
+    required=False,
+)
+@click.option(
+    "--async-wgrad",
+    type=bool,
+    default=True,
     required=False,
 )
 @click.option(
@@ -106,6 +114,8 @@ def create_hstu_layer(
 @click.option("--batchsize", type=int, default=32, required=True)
 @click.option("--profiler-start", type=int, default=20, required=False)
 @click.option("--profiler-end", type=int, default=40, required=False)
+@click.option("--dump-memory-snapshot", type=bool, default=True, required=False)
+@click.option("--num-layers", type=int, default=1, required=False)
 def run(
     iters,
     warmup_iters,
@@ -119,6 +129,9 @@ def run(
     profiler_start,
     profiler_end,
     full_sequence,
+    async_wgrad,
+    dump_memory_snapshot,
+    num_layers,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -127,16 +140,21 @@ def run(
 
     hidden_size = dim_per_head * num_heads
     init_method = torch.nn.init.xavier_uniform_
-    hstu_layer = create_hstu_layer(
-        layer_type=layer_type,
-        hidden_size=hidden_size,
-        kv_channels=dim_per_head,
-        num_attention_heads=num_heads,
-        init_method=init_method,
-        dtype=dtype,
-        kernel_backend=kernel_backend,
-        learnable_input_layernorm=True,
-    )
+
+    hstu_blocks = [
+        create_hstu_layer(
+            layer_type=layer_type,
+            hidden_size=hidden_size,
+            kv_channels=dim_per_head,
+            num_attention_heads=num_heads,
+            init_method=init_method,
+            dtype=dtype,
+            kernel_backend=kernel_backend,
+            learnable_input_layernorm=True,
+            async_wgrad=async_wgrad,
+        )
+        for _ in range(num_layers)
+    ]
     # generate random input
     if full_sequence:
         lengths = torch.full((batchsize,), max_seqlen, dtype=torch.int32, device="cuda")
@@ -167,16 +185,28 @@ def run(
     jagged_input = JaggedData(values=input, **ctor_nograd_dict)
     grad_output = torch.randn_like(input)
     # warmup
+    if dump_memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=10000)
     for _ in range(warmup_iters):
-        ret_jd = hstu_layer(jagged_input)
+        ret_jd = hstu_blocks[0](jagged_input)
+        for hstu_layer in hstu_blocks[1:]:
+            ret_jd = hstu_layer(ret_jd)
         ret_jd.values.backward(grad_output)
+
+    if dump_memory_snapshot:
+        torch.cuda.memory._dump_snapshot(
+            f"{log_layer_type}x{num_layers}_bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_snapshot.pickle"
+        )
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     # benchmark
     igpu_timer = IGPUTimer(max_iters=iters)
     # fwd
     for iteration in range(iters):
         igpu_timer.start(iteration)
-        ret_jd = hstu_layer(jagged_input)
+        ret_jd = hstu_blocks[0](jagged_input)
+        for hstu_layer in hstu_blocks[1:]:
+            ret_jd = hstu_layer(ret_jd)
         # ret_jd.values.backward(grad_output)
         igpu_timer.stop(iteration)
 
@@ -187,7 +217,9 @@ def run(
 
     # bwd
     for iteration in range(iters):
-        ret_jd = hstu_layer(jagged_input)
+        ret_jd = hstu_blocks[0](jagged_input)
+        for hstu_layer in hstu_blocks[1:]:
+            ret_jd = hstu_layer(ret_jd)
         igpu_timer.start(iteration)
         ret_jd.values.backward(grad_output)
         igpu_timer.stop(iteration)
@@ -205,7 +237,9 @@ def run(
             torch.cuda.profiler.start()
 
         with nvtx.annotate(f"hstu_layer_fwd {iteration}", color="ORANGE"):
-            ret_jd = hstu_layer(jagged_input)
+            ret_jd = hstu_blocks[0](jagged_input)
+            for hstu_layer in hstu_blocks[1:]:
+                ret_jd = hstu_layer(ret_jd)
 
         with nvtx.annotate(f"hstu_layer_bwd {iteration}", color="PURPLE"):
             ret_jd.values.backward(grad_output)

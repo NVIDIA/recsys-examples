@@ -58,6 +58,13 @@ class FusedHSTULayer(JaggedModule):
         self._alpha = 1.0
         self._residual = config.residual
         self._attn_backend = config.kernel_backend
+        self._wgrad_stream = None
+        self._wgrad_event = None
+        if config.async_wgrad:
+            self._wgrad_stream = torch.cuda.Stream()
+            self._wgrad_event = torch.cuda.Event(enable_timing=False)
+        # all weights and biases are float32 unless module.to(dtype) is called
+        linear_weight_init_method = config.init_method
 
         self._linear_uvqk_weight = torch.nn.Parameter(
             torch.empty(
@@ -141,6 +148,8 @@ class FusedHSTULayer(JaggedModule):
             causal=self._is_causal,
             seed=self._seed,
             residual=self._residual,
+            wgrad_stream=self._wgrad_stream,
+            wgrad_event=self._wgrad_event,
         )
         return JaggedData(
             values=output,

@@ -387,6 +387,7 @@ def triton_layer_norm_mul_dropout_bwd(
     seed: Optional[int] = None,
     concat_ux: bool = False,
     compute_y: bool = False,
+    wait_event: Optional[torch.cuda.Event] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
 ]:  # type: ignore
@@ -413,6 +414,8 @@ def triton_layer_norm_mul_dropout_bwd(
     _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
     dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
     dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    if wait_event is not None:
+        wait_event.wait(torch.cuda.current_stream())
     # pyre-ignore[28]
     _ln_mul_dropout_bwd_dx_du[(tile_num,)](
         dx,
