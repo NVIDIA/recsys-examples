@@ -94,6 +94,14 @@ void dynamic_emb_sgd_with_table(
           kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
             ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
             reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+          auto kernel = update4_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
+            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
         } else if (initializer_ == "uniform") {
           using Generator = UniformEmbeddingGenerator;
           using Args = typename Generator::Args;
@@ -130,6 +138,14 @@ void dynamic_emb_sgd_with_table(
           using Generator = NormalEmbeddingGenerator;
           using Args = typename Generator::Args;
           auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+          auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, block_size, 0, stream>>>(
+              ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+              reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
           auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
           kernel<<<grid_size, block_size, 0, stream>>>(
               ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
@@ -247,6 +263,14 @@ void dynamic_emb_adam_with_table(
           kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
             ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
             reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+          auto kernel = update4_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
+            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
         } else if (initializer_ == "uniform") {
           using Generator = UniformEmbeddingGenerator;
           using Args = typename Generator::Args;
@@ -283,6 +307,14 @@ void dynamic_emb_adam_with_table(
           using Generator = NormalEmbeddingGenerator;
           using Args = typename Generator::Args;
           auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+          auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, block_size, 0, stream>>>(
+              ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+              reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
           auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
           kernel<<<grid_size, block_size, 0, stream>>>(
               ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
@@ -387,6 +419,14 @@ void dynamic_emb_adagrad_with_table(
           kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
             ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
             reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+          auto kernel = update4_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
+            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
         } else if (initializer_ == "uniform") {
           using Generator = UniformEmbeddingGenerator;
           using Args = typename Generator::Args;
@@ -425,6 +465,14 @@ void dynamic_emb_adagrad_with_table(
           using Generator = NormalEmbeddingGenerator;
           using Args = typename Generator::Args;
           auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+          auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, block_size, 0, stream>>>(
+              ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+              reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
           auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
           kernel<<<grid_size, block_size, 0, stream>>>(
               ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
@@ -529,6 +577,14 @@ void dynamic_emb_rowwise_adagrad_with_table(
           kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
             ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
             reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+          auto kernel = update4_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
+            ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+            reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
         } else if (initializer_ == "uniform") {
           using Generator = UniformEmbeddingGenerator;
           using Args = typename Generator::Args;
@@ -568,6 +624,14 @@ void dynamic_emb_rowwise_adagrad_with_table(
           using Generator = NormalEmbeddingGenerator;
           using Args = typename Generator::Args;
           auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+          auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
+          kernel<<<grid_size, block_size, shared_memory_bytes, stream>>>(
+              ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+              reinterpret_cast<w_t **>(weight_ptrs.data_ptr()), opt, args);
+        } else if (initializer_ == "truncated_normal") {
+          using Generator = TruncatedNormalEmbeddingGenerator;
+          using Args = typename Generator::Args;
+          auto args = Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
           auto kernel = update_kernel_with_generator<g_t, w_t, decltype(opt), Generator, Args>;
           kernel<<<grid_size, block_size, shared_memory_bytes, stream>>>(
               ev_nums, dim, reinterpret_cast<const g_t *>(grads.data_ptr()),

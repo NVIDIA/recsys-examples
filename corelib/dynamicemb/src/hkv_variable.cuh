@@ -226,6 +226,52 @@ struct NormalEmbeddingGenerator : public BaseEmbeddingGenerator<NormalEmbeddingG
   float std_dev;
 };
 
+template <typename T>
+struct TruncatedNormalEmbeddingGenerator : public BaseEmbeddingGenerator<TruncatedNormalEmbeddingGenerator<T>, T> {
+  using Base = BaseEmbeddingGenerator<TruncatedNormalEmbeddingGenerator<T>, T>;
+  struct Args {
+    curandState* state;
+    T** hkv_ptrs;
+    bool* founds;
+    float mean;
+    float std_dev;
+    float lower;
+    float upper;
+  };
+
+  DEVICE_INLINE
+  TruncatedNormalEmbeddingGenerator(Args args): Base(args.state, args.founds, args.hkv_ptrs),
+    mean(args.mean), std_dev(args.std_dev), lower(args.lower), upper(args.upper) {}
+
+  DEVICE_INLINE
+  T generate_impl(uint32_t i) {
+    auto l = normcdf((lower - mean) / std_dev);
+    auto u = normcdf((upper - mean) / std_dev);
+    u = 2 * u - 1;
+    l = 2 * l - 1;
+    T tmp = curand_uniform_double(&this->localState_);
+    if constexpr (std::is_same_v<T, __half>) {
+      tmp = __half2float(tmp) * (u - l) + l;
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      tmp = __bfloat162float(tmp) * (u - l) + l;
+    } else {
+      tmp = tmp * (u - l) + l;
+    }
+    tmp = erfinv(tmp);
+    tmp *= scale * std_dev;
+    tmp += mean;
+    tmp = max(tmp, lower);
+    tmp = min(tmp, upper);
+    return TypeConvertFunc<T, float>::convert(tmp);
+  }
+
+  float mean;
+  float std_dev;
+  float lower;
+  float upper;
+  double scale = sqrt(2.0f);
+};
+
 template <typename K, typename V>
 struct MappingEmbeddingGenerator : public BaseEmbeddingGenerator<MappingEmbeddingGenerator<K,V>, V> {
   using Base = BaseEmbeddingGenerator<MappingEmbeddingGenerator<K,V>, V>;
@@ -475,6 +521,13 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
     using Args = typename Generator::Args;
     auto args = Args {curand_states_, reinterpret_cast<ValueType **>(value_ptrs),
       d_found, initializer_args.mean, initializer_args.std_dev};
+    fill_embedding_from_generator<ValueType, Generator, Args><<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), args);
+  } else if (initializer_ == "truncated_normal") {
+    using Generator = TruncatedNormalEmbeddingGenerator<ValueType>;
+    using Args = typename Generator::Args;
+    auto args = Args {curand_states_, reinterpret_cast<ValueType **>(value_ptrs),
+      d_found, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
     fill_embedding_from_generator<ValueType, Generator, Args><<<grid_size, block_size, 0, stream>>>(
       n, dim, reinterpret_cast<ValueType *>(values), args);
   } else if (initializer_ == "uniform") {

@@ -61,6 +61,7 @@ class DynamicEmbInitializerMode(enum.Enum):
     """
 
     NORMAL = "normal"
+    TRUNCATED_NORMAL = "truncated_normal"
     UNIFORM = "uniform"
     CONSTANT = "constant"
     DEBUG = "debug"
@@ -76,13 +77,13 @@ class DynamicEmbInitializerArgs:
     mode : DynamicEmbInitializerMode
         The mode of initialization, one of the DynamicEmbInitializerMode values.
     mean : float, optional
-        The mean value for normal distributions. Defaults to 0.0.
+        The mean value for (truncated) normal distributions. Defaults to 0.0.
     std_dev : float, optional
-        The standard deviation for normal and distributions. Defaults to 1.0.
+        The standard deviation for (truncated) normal distributions. Defaults to 1.0.
     lower : float, optional
-        The lower bound for uniform distribution. Defaults to 0.0.
+        The lower bound for uniform/truncated_normal distribution. Defaults to 0.0.
     upper : float, optional
-        The upper bound for uniform distribution. Defaults to 1.0.
+        The upper bound for uniform/truncated_normal distribution. Defaults to 1.0.
     value : float, optional
         The constant value for constant initialization. Defaults to 0.0.
     """
@@ -99,6 +100,8 @@ class DynamicEmbInitializerArgs:
             return NotImplementedError
         if self.mode == DynamicEmbInitializerMode.NORMAL:
             return self.mean == other.mean and self.std_dev == other.std_dev
+        elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
+            return self.mean == other.mean and self.std_dev == other.std_dev and self.lower == other.lower and self.upper == other.upper
         elif self.mode == DynamicEmbInitializerMode.UNIFORM:
             return self.lower == other.lower and self.upper == other.upper
         elif self.mode == DynamicEmbInitializerMode.CONSTANT:
