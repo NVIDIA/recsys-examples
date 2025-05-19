@@ -677,6 +677,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self.training,
                 self._empty_tensor,
             )
         else:
@@ -697,10 +698,12 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self.training,
                 self._empty_tensor,
             )
 
-        self._update_score()
+        if self.training:
+            self._update_score()
         return res
 
     def set_score(

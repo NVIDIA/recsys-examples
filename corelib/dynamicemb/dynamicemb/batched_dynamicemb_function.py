@@ -21,6 +21,7 @@ from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
+    find,
     find_or_insert,
     lookup_backward,
     lookup_backward_dense,
@@ -51,6 +52,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         unique_op: UniqueOp,
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
+        training: bool,
         *args
     ):
         # TODO: remove unnecessary params.
@@ -114,13 +116,23 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
                 num_unique_indices, dims[i], dtype=tmp_value_type_torch, device=device
             )
 
-            find_or_insert(
-                tables[i],
-                num_unique_indices,
-                unique_indices,
-                tmp_unique_embs,
-                scores[i],
-            )
+            if training:
+                find_or_insert(
+                    tables[i],
+                    num_unique_indices,
+                    unique_indices,
+                    tmp_unique_embs,
+                    scores[i],
+                )
+            else:
+                tmp_founds = torch.empty(num_unique_indices, dtype=torch.bool, device=device)
+                find(
+                    tables[i],
+                    num_unique_indices,
+                    unique_indices,
+                    tmp_unique_embs,
+                    tmp_founds,
+                )
 
             unique_embedding_list.append(tmp_unique_embs)
 
@@ -162,19 +174,20 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
             accum_D += dims[i] * (num_embeddings // batch_size)
             assert num_embeddings % batch_size == 0
 
-        backward_tensors = [indices, offsets]
-        ctx.save_for_backward(*backward_tensors)
-        ctx.tables = tables
-        ctx.unique_indices_list = unique_indices_list
-        ctx.inverse_indices_list = inverse_indices_list
-        ctx.biased_offsets_list = biased_offsets_list
-        ctx.dims = dims
-        ctx.batch_size = batch_size
-        ctx.feature_num = feature_num
-        ctx.feature_table_map = feature_table_map
-        ctx.device = device
-        ctx.optimizer = optimizer
-        ctx.scores = scores
+        if training:
+            backward_tensors = [indices, offsets]
+            ctx.save_for_backward(*backward_tensors)
+            ctx.tables = tables
+            ctx.unique_indices_list = unique_indices_list
+            ctx.inverse_indices_list = inverse_indices_list
+            ctx.biased_offsets_list = biased_offsets_list
+            ctx.dims = dims
+            ctx.batch_size = batch_size
+            ctx.feature_num = feature_num
+            ctx.feature_table_map = feature_table_map
+            ctx.device = device
+            ctx.optimizer = optimizer
+            ctx.scores = scores
 
         return embs
 
@@ -257,7 +270,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
             tables, unique_indices_list, unique_grads_per_table, [], scores
         )
 
-        return (None,) * 17
+        return (None,) * 18
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
@@ -280,7 +293,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         unique_op: UniqueOp,
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
-        *args
+        training: bool,
+        *args,
     ):
         # TODO:need check dimension is right
         table_num = len(tables)
@@ -289,18 +303,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         feature_batch_size = offsets.shape[0] - 1
         batch_size = feature_batch_size // feature_num
         assert feature_batch_size % feature_num == 0
-
-        d_unique_offsets = torch.zeros(table_num + 1, dtype=torch.uint64, device=device)
-        h_unique_offsets = torch.empty(table_num + 1, dtype=torch.uint64, device="cpu")
-        table_offsets = torch.empty(table_num + 1, dtype=offsets.dtype, device=device)
-        # table' dtype
-        unique_embs = torch.empty(
-            indices.shape[0], dim, dtype=embedding_dtype, device=device
-        )
-        # output' dtype
-        output_embs = torch.empty(
-            indices.shape[0], dim, dtype=output_dtype, device=device
-        )
 
         # #TODO: if global dedup is done:
         # if use_index_dedup:
@@ -317,58 +319,52 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         #         output_embs)
         # else:
         # TODO:in our case , maybe uint32 is enough for reverse_idx
-        reverse_idx = torch.empty_like(indices, dtype=torch.uint64, device=device)
-        unique_idx = torch.empty_like(indices, dtype=indices.dtype, device=device)
-        h_unique_nums = torch.empty(table_num, dtype=torch.uint64, device="cpu")
-        d_unique_nums = torch.empty(table_num, dtype=torch.uint64, device=device)
-        lookup_forward_dense(
+        # reverse_idx = torch.empty_like(indices, dtype=torch.uint64, device=device)
+        # unique_idx = torch.empty_like(indices, dtype=indices.dtype, device=device)
+        output_embs, table_offsets, unique_idx, reverse_idx, h_unique_offsets = \
+            lookup_forward_dense(
             tables,
             indices,
             offsets,
-            scores,
+            scores if training else [],
             table_offsets_in_feature,
-            table_offsets,
+            embedding_dtype,
+            output_dtype,
             table_num,
             batch_size,
             dim,
             use_index_dedup,
-            unique_idx,
-            reverse_idx,
-            h_unique_nums,
-            d_unique_nums,
-            h_unique_offsets,
-            d_unique_offsets,
-            unique_embs,
-            output_embs,
             device_num_sms,
             unique_op,
+            device,
+            training,
         )
-        if use_index_dedup:
-            unique_idx_forback = torch.empty(
-                h_unique_offsets[-1], dtype=indices.dtype, device=device
-            )
-            unique_idx_forback.copy_(
-                unique_idx[: h_unique_offsets[-1]], non_blocking=True
-            )
-            unique_emb_forback = unique_embs[: h_unique_offsets[-1], :]
+        
+        if training:
+            if use_index_dedup:
+                unique_idx_forback = torch.empty(
+                    h_unique_offsets[-1], dtype=indices.dtype, device=device
+                )
+                unique_idx_forback.copy_(
+                    unique_idx[: h_unique_offsets[-1]], non_blocking=True
+                )
 
-        backward_tensors = [indices, offsets]
-        ctx.save_for_backward(*backward_tensors)
-        ctx.tables = tables
-        ctx.dim = dim
-        ctx.device = device
-        ctx.optimizer = optimizer
+            backward_tensors = [indices, offsets]
+            ctx.save_for_backward(*backward_tensors)
+            ctx.tables = tables
+            ctx.dim = dim
+            ctx.device = device
+            ctx.optimizer = optimizer
 
-        # optimize need
-        ctx.h_unique_offsets = h_unique_offsets
-        ctx.table_offsets = table_offsets
-        ctx.use_index_dedup = use_index_dedup
-        ctx.device_num_sms = device_num_sms
-        if use_index_dedup:
-            ctx.reverse_idx = reverse_idx
-            ctx.unique_idx_forback = unique_idx_forback
-            ctx.unique_emb_forback = unique_emb_forback
-        ctx.scores = scores
+            # optimize need
+            ctx.h_unique_offsets = h_unique_offsets
+            ctx.table_offsets = table_offsets
+            ctx.use_index_dedup = use_index_dedup
+            ctx.device_num_sms = device_num_sms
+            if use_index_dedup:
+                ctx.reverse_idx = reverse_idx
+                ctx.unique_idx_forback = unique_idx_forback
+            ctx.scores = scores
 
         return output_embs
 
@@ -444,7 +440,5 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
         scores = ctx.scores
         # optimizer: update tables.
-        optimizer.update(
-            tables, unique_indices_list, unique_grads_list, unique_embs_list, scores
-        )
-        return (None,) * 17
+        optimizer.update(tables, unique_indices_list, unique_grads_list, unique_embs_list, scores)
+        return (None,) * 18
