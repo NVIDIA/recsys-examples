@@ -65,7 +65,7 @@ class TrainerArgs:
     max_eval_iters: Optional[int] = None
 
     # ckpt args
-    ckpt_save_interval: int = -1  # -1 means only save at the end
+    ckpt_save_interval: int = -1  # -1 means not save ckpt
     ckpt_save_dir: str = "./checkpoints"
     ckpt_load_dir: str = ""
 
@@ -514,9 +514,6 @@ def train(
         if trainer_args.profile and train_iter == trainer_args.profile_step_end:
             torch.cuda.profiler.stop()
 
-    if trainer_args.ckpt_save_interval == -1:
-        save_ckpts(trainer_args.ckpt_save_dir, model, dense_optimizer)
-
 
 def get_dataset_and_embedding_args() -> (
     Tuple[
@@ -530,6 +527,7 @@ def get_dataset_and_embedding_args() -> (
         benchmark_dataset_args = BenchmarkDatasetArgs()  # type: ignore[call-arg]
         return benchmark_dataset_args, benchmark_dataset_args.embedding_args
     assert isinstance(dataset_args, DatasetArgs)
+    HASH_SIZE = 10_000_000
     if dataset_args.dataset_name == "kuairand-pure":
         return dataset_args, [
             EmbeddingArgs(
@@ -571,7 +569,13 @@ def get_dataset_and_embedding_args() -> (
             DynamicEmbeddingArgs(
                 feature_names=["video_id"],
                 table_name="video_id",
-                item_vocab_size_or_capacity=7583,
+                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_gpu_capacity_ratio=1.0,
+            ),
+            DynamicEmbeddingArgs(
+                feature_names=["user_id"],
+                table_name="user_id",
+                item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=1.0,
             ),
         ]
@@ -616,8 +620,14 @@ def get_dataset_and_embedding_args() -> (
             DynamicEmbeddingArgs(
                 feature_names=["video_id"],
                 table_name="video_id",
-                item_vocab_size_or_capacity=4371900,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_gpu_capacity_ratio=0.5,
+            ),
+            DynamicEmbeddingArgs(
+                feature_names=["user_id"],
+                table_name="user_id",
+                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_gpu_capacity_ratio=0.5,
             ),
         ]
     elif dataset_args.dataset_name == "kuairand-27k":
@@ -664,6 +674,12 @@ def get_dataset_and_embedding_args() -> (
                 item_vocab_size_or_capacity=32038725,
                 item_vocab_gpu_capacity_ratio=1.0,
             ),
+            DynamicEmbeddingArgs(
+                feature_names=["user_id"],
+                table_name="user_id",
+                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_gpu_capacity_ratio=1.0,
+            ),
         ]
     elif dataset_args.dataset_name == "ml-1m":
         return dataset_args, [
@@ -700,7 +716,13 @@ def get_dataset_and_embedding_args() -> (
             DynamicEmbeddingArgs(
                 feature_names=["movie_id"],
                 table_name="movie_id",
-                item_vocab_size_or_capacity=3953,
+                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_gpu_capacity_ratio=1.0,
+            ),
+            DynamicEmbeddingArgs(
+                feature_names=["user_id"],
+                table_name="user_id",
+                item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=1.0,
             ),
         ]
@@ -715,7 +737,13 @@ def get_dataset_and_embedding_args() -> (
             DynamicEmbeddingArgs(
                 feature_names=["movie_id"],
                 table_name="movie_id",
-                item_vocab_size_or_capacity=131263,
+                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_gpu_capacity_ratio=1.0,
+            ),
+            DynamicEmbeddingArgs(
+                feature_names=["user_id"],
+                table_name="user_id",
+                item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=1.0,
             ),
         ]

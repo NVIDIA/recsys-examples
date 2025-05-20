@@ -1,22 +1,22 @@
-TrainerArgs.train_batch_size = 32
+TrainerArgs.train_batch_size = 8
 TrainerArgs.eval_batch_size = 16
 TrainerArgs.log_interval = 10
 TrainerArgs.eval_interval = 10
 TrainerArgs.log_interval = 10
 
 DatasetArgs.dataset_name = 'kuairand-1k'
-DatasetArgs.max_sequence_length = 1024
-DatasetArgs.max_num_candidates = 256
-DatasetArgs.shuffle = True
+DatasetArgs.max_sequence_length = 4096
+DatasetArgs.max_num_candidates = 100
+DatasetArgs.shuffle = False
 
 NetworkArgs.num_layers = 3
 NetworkArgs.num_attention_heads = 4
-NetworkArgs.hidden_size = 128
+NetworkArgs.hidden_size = 512
 NetworkArgs.kv_channels = 128
 
 RankingArgs.prediction_head_arch = [
-    [233],
-    ]
+    512, 8
+]
 RankingArgs.prediction_head_bias = True
 
 OptimizerArgs.optimizer_str = 'adam'
