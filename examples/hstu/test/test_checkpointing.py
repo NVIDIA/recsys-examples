@@ -305,3 +305,87 @@ def test_checkpoint_model(
     #     eval_result == new_eval_result
     # ), "loaded model should have same eval result with original model"
     init.destroy_global_state()
+
+
+from modules.embedding import DataParallelEmbeddingCollection
+from torchrec.distributed.planner import EmbeddingShardingPlanner
+from torchrec.distributed.planner.types import ParameterConstraints
+from torchrec.distributed.types import BoundsCheckMode, ShardingEnv, ShardingType
+from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
+from torchrec.modules.embedding_modules import EmbeddingCollection
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+
+def test_data_parallel_embedding_collection():
+    init.initialize_distributed()
+    init.initialize_model_parallel(1)
+
+    embedding_configs = [
+        EmbeddingConfig(
+            name="item",
+            embedding_dim=128,
+            num_embeddings=10000,
+            feature_names=["item_feat"],
+            data_type=dtype_to_data_type(torch.float32),
+        ),
+        EmbeddingConfig(
+            name="context",
+            embedding_dim=128,
+            num_embeddings=10000,
+            feature_names=["context_feat"],
+            data_type=dtype_to_data_type(torch.float32),
+        ),
+        EmbeddingConfig(
+            name="action",
+            embedding_dim=128,
+            num_embeddings=10000,
+            feature_names=["action_feat"],
+            data_type=dtype_to_data_type(torch.float32),
+        ),
+    ]
+
+    embedding_collection = EmbeddingCollection(
+        tables=embedding_configs,
+        device=torch.device("meta"),
+    )
+    constraints = {}
+    for config in embedding_configs:
+        constraints[config.name] = ParameterConstraints(
+            sharding_types=[ShardingType.DATA_PARALLEL.value],
+            bounds_check_mode=BoundsCheckMode.NONE,
+        )
+    planner = EmbeddingShardingPlanner(constraints=constraints)
+
+    plan = planner.collective_plan(embedding_collection)
+    sharding_plan = plan.plan[""]
+    data_parallel_embedding_collection = DataParallelEmbeddingCollection(
+        data_parallel_embedding_collection=embedding_collection,
+        data_parallel_sharding_plan=sharding_plan,
+        env=ShardingEnv.from_process_group(dist.group.WORLD),
+        device=torch.device("cuda"),
+    )
+
+    kjt = KeyedJaggedTensor.from_lengths_sync(
+        keys=["item_feat", "action_feat", "user0", "user1", "context_feat"],
+        lengths=torch.tensor([5, 10, 15, 20, 25]),
+        values=torch.randint(0, 10000, (135,)),
+    ).to(torch.device("cuda"))
+    output = data_parallel_embedding_collection(kjt)
+    assert "item_feat" in output, "item_feat should be in output"
+    assert "action_feat" in output, "action_feat should be in output"
+    assert "user0" not in output, "user0 should not be in output"
+    assert "user1" not in output, "user1 should not be in output"
+    assert "context_feat" in output, "context_feat should be in output"
+    for feature_name, table_name in zip(
+        ["item_feat", "action_feat", "context_feat"], ["item", "action", "context"]
+    ):
+        weights = data_parallel_embedding_collection.embedding_weights[table_name].data
+        feature = kjt[feature_name]
+        res_embedding = output[feature_name]
+        ref_embedding = weights[feature.values().long(), :]
+        assert torch.allclose(
+            feature.lengths(), res_embedding.lengths()
+        ), f"lengths of {feature_name} should be the same"
+        assert torch.allclose(
+            ref_embedding, res_embedding.values()
+        ), f"values of {feature_name} should be the same"

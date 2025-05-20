@@ -28,8 +28,6 @@ from dynamicemb.planner import (
 from torch import distributed as dist
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-
-# from torchrec.distributed import ModuleShardingPlan
 from torchrec.distributed.sharding.dp_sequence_sharding import (
     DpSequenceEmbeddingSharding,
 )
@@ -240,6 +238,7 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
             torch.tensor(self._features_order, device=self._device, dtype=torch.int32),
             persistent=False,
         )
+        self._feature_splits = [len(self._feature_names)]
 
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         if self._has_uninitialized_input_dist:
@@ -251,6 +250,7 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
                     self._features_order,
                     self._features_order_tensor,
                 )
+            features = features.split(self._feature_splits)[0]
         embeddings = self._dp_lookups[0](features).view(-1, self._embedding_dim)
         kjt = KeyedJaggedTensor(
             values=embeddings,
@@ -266,16 +266,12 @@ class ShardedEmbedding(torch.nn.Module):
     ShardedEmbedding is a module for handling sharded embeddings in a distributed setting.
 
     Args:
-        embedding_configs (List[Union[ShardedEmbeddingConfig, DynamicShardedEmbeddingConfig]]): Configuration for the sharded embedding.
-        batch_size_per_rank (int, optional): Batch size per rank, used as a hint for sharder. Defaults to 512.
-        pg (Optional[dist.ProcessGroup], optional): Process group for distributed embedding. Defaults to None.
+        embedding_configs (List[ShardedEmbeddingConfig]): Configuration for the sharded embedding.
     """
 
     def __init__(
         self,
         embedding_configs: List[ShardedEmbeddingConfig],
-        batch_size_per_rank: int = 512,
-        pg: Optional[dist.ProcessGroup] = None,
     ):
         super(ShardedEmbedding, self).__init__()
 

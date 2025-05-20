@@ -70,24 +70,6 @@ class ShardedEmbeddingConfig:
         ], "sharding type should be data_parallel or model_parallel"
 
 
-# @dataclass
-# class DynamicShardedEmbeddingConfig(BaseShardedEmbeddingConfig):
-#     """
-#     Configuration for dynamic sharded embeddings. Inherits from BaseShardedEmbeddingConfig.
-
-#     Args:
-#         global_hbm_for_values (int, optional): Global HBM capacity size in bytes for storing values. Defaults to 0.
-#         evict_strategy (DynamicEmbEvictStrategy, optional): Eviction strategy. Defaults to ``DynamicEmbEvictStrategy.LRU``.
-#         safe_check_mode (DynamicEmbCheckMode, optional): Safe check mode. Defaults to ``DynamicEmbCheckMode.IGNORE``.
-#         bucket_capacity (int, optional): The number of entries each bucket can hold. Defaults to 128.
-#     """
-
-#     global_hbm_for_values: int = 0
-#     evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
-#     safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
-#     bucket_capacity: int = 128
-
-
 @dataclass
 class BaseTaskConfig:
     """
