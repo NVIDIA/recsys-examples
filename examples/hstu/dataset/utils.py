@@ -241,7 +241,7 @@ class RankingBatch(Batch):
             total_num_labels = torch.sum(batch.num_candidates)
         else:
             total_num_labels = torch.sum(batch.features[item_feature_name].lengths())
-        labels = torch.randint(2, (total_num_labels, num_tasks), device=device)
+        labels = torch.randint(1 << num_tasks, (total_num_labels,), device=device)
         return RankingBatch(
             features=batch.features,
             batch_size=batch.batch_size,

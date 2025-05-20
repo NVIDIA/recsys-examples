@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 import argparse
 from dataclasses import dataclass
 from functools import partial  # pylint: disable-unused-import
-from typing import List, Tuple, Union, cast
+from typing import List, Tuple, cast
 
 import commons.utils.initialize as init
 import gin
@@ -48,9 +48,9 @@ from utils import (
 @gin.configurable
 @dataclass
 class RankingArgs:
-    prediction_head_arch: List[List[int]] = cast(List[List[int]], None)
-    prediction_head_act_type: Union[str, List[str]] = "relu"
-    prediction_head_bias: Union[bool, List[bool]] = True
+    prediction_head_arch: List[int] = cast(List[int], None)
+    prediction_head_act_type: str = "relu"
+    prediction_head_bias: bool = True
     eval_metrics: Tuple[str, ...] = ("AUC",)
 
     def __post_init__(self):
@@ -59,8 +59,9 @@ class RankingArgs:
         ), "Please provide prediction head arch for ranking model"
         if isinstance(self.prediction_head_act_type, str):
             assert self.prediction_head_act_type.lower() in [
-                "relu"
-            ], "prediction_head_act_type should be in ['relu']"
+                "relu",
+                "gelu",
+            ], "prediction_head_act_type should be in ['relu', 'gelu']"
 
 
 parser = argparse.ArgumentParser(

@@ -152,7 +152,7 @@ def create_model(
         num_tasks = 1
         task_config = configs.RankingConfig(
             embedding_configs=emb_configs,
-            prediction_head_arch=[[128, 10, 1] for _ in range(num_tasks)],
+            prediction_head_arch=[128, 10, num_tasks],
         )
         model_train = model.RankingGR(hstu_config=hstu_config, task_config=task_config)
 
