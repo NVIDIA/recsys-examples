@@ -22,7 +22,6 @@ item_embedding/DynamicEmbeddingArgs.table_name = 'item'
 item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 400000000 # gross 400M embedding rows
 item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1
 item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
-item_embedding/DynamicEmbeddingArgs.bucket_capacity = 128
 
 action_embedding/EmbeddingArgs.feature_names = ['action']
 action_embedding/EmbeddingArgs.table_name = 'action'
@@ -41,9 +40,9 @@ BenchmarkDatasetArgs.max_num_candidates=0
 
 NetworkArgs.num_layers = 8
 NetworkArgs.num_attention_heads = 4
-NetworkArgs.hidden_size = 256
+NetworkArgs.hidden_size = 512
 # per head dim
-NetworkArgs.kv_channels = 256
+NetworkArgs.kv_channels = 128
 NetworkArgs.kernel_backend = 'cutlass'
 
 RankingArgs.prediction_head_arch = [
@@ -54,4 +53,3 @@ RankingArgs.prediction_head_bias = True
 OptimizerArgs.optimizer_str = 'adam'
 OptimizerArgs.learning_rate = 1e-3
 
-TensorModelParallelArgs.tensor_model_parallel_size = 1

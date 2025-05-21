@@ -99,6 +99,7 @@ def create_hstu_layer(
     default="cutlass",
     required=False,
 )
+@click.option("--embedding-dim", type=int, default=0, required=True)
 @click.option("--dim-per-head", type=int, default=128, required=True)
 @click.option("--num-heads", type=int, default=8, required=True)
 @click.option(
@@ -118,6 +119,7 @@ def run(
     iters,
     warmup_iters,
     layer_type,
+    embedding_dim,
     dim_per_head,
     num_heads,
     dtype,
@@ -136,7 +138,7 @@ def run(
     kernel_backend = _backend_str_to_type[kernel_backend]
     dtype = _dtype_str_to_type[dtype]
 
-    hidden_size = dim_per_head * num_heads
+    hidden_size = embedding_dim if embedding_dim > 0 else dim_per_head * num_heads
 
     hstu_blocks = [
         create_hstu_layer(

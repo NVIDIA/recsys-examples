@@ -6,9 +6,11 @@ ASYNC_WGRAD=${ASYNC_WGRAD:-False}
 nsys_profile_args='-f true -s none -t cuda,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node'
 
 dim_per_heads=(128 )
-num_heads=(8 )
-max_seqlens=(1024 )
+num_heads=(4 )
+max_seqlens=(4096 )
 batchsizes=(32 )
+embedding_dims=(512 )
+full_sequence=True
 
 profiler_start=20
 profiler_end=40
@@ -37,6 +39,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --warmup-iters 50 \
                     --layer-type fused \
                     --kernel-backend cutlass \
+                    --full-sequence $full_sequence \
                     --dim-per-head $dim_per_head \
                     --num-heads $num_head \
                     --num-layers $num_layers \
@@ -54,6 +57,7 @@ for dim_per_head in ${dim_per_heads[@]}; do
                     --warmup-iters 50 \
                     --layer-type native \
                     --kernel-backend cutlass \
+                    --full-sequence $full_sequence \
                     --dim-per-head $dim_per_head \
                     --num-heads $num_head \
                     --num-layers $num_layers \
