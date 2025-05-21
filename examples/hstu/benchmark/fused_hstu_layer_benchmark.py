@@ -18,7 +18,7 @@ import torch
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
-from typing import Callable, Union
+from typing import Union
 
 import click
 import commons.utils.initialize as init
@@ -54,7 +54,6 @@ def create_hstu_layer(
     hidden_size: int,
     kv_channels: int,
     num_attention_heads: int,
-    init_method: Callable[[torch.Tensor], torch.Tensor],
     dtype: torch.dtype,
     kernel_backend: KernelBackend,
     learnable_input_layernorm: bool = False,
@@ -64,7 +63,6 @@ def create_hstu_layer(
         hidden_size=hidden_size,
         kv_channels=kv_channels,
         num_attention_heads=num_attention_heads,
-        init_method=init_method,
         num_layers=1,
         dtype=dtype,
         kernel_backend=kernel_backend,
@@ -101,6 +99,7 @@ def create_hstu_layer(
     default="cutlass",
     required=False,
 )
+@click.option("--embedding-dim", type=int, default=0, required=True)
 @click.option("--dim-per-head", type=int, default=128, required=True)
 @click.option("--num-heads", type=int, default=8, required=True)
 @click.option(
@@ -120,6 +119,7 @@ def run(
     iters,
     warmup_iters,
     layer_type,
+    embedding_dim,
     dim_per_head,
     num_heads,
     dtype,
@@ -138,8 +138,7 @@ def run(
     kernel_backend = _backend_str_to_type[kernel_backend]
     dtype = _dtype_str_to_type[dtype]
 
-    hidden_size = dim_per_head * num_heads
-    init_method = torch.nn.init.xavier_uniform_
+    hidden_size = embedding_dim if embedding_dim > 0 else dim_per_head * num_heads
 
     hstu_blocks = [
         create_hstu_layer(
@@ -147,7 +146,6 @@ def run(
             hidden_size=hidden_size,
             kv_channels=dim_per_head,
             num_attention_heads=num_heads,
-            init_method=init_method,
             dtype=dtype,
             kernel_backend=kernel_backend,
             learnable_input_layernorm=True,
