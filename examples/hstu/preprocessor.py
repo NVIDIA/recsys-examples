@@ -171,11 +171,11 @@ class MovielensDataProcessor(DataProcessor):
                 "zip_code",
             ]
             self._rating_mapping = {
-                1: 0b000,
-                2: 0b001,
-                3: 0b010,
-                4: 0b011,
-                5: 0b100,
+                1: 0,
+                2: 1,
+                3: 2,
+                4: 3,
+                5: 4,
             }
         else:
             assert self._prefix == "ml-20m"
@@ -185,16 +185,16 @@ class MovielensDataProcessor(DataProcessor):
                 "user_id",
             ]
             self._rating_mapping = {
-                1: 0b000,
-                2: 0b001,
-                3: 0b010,
-                4: 0b011,
-                5: 0b100,
-                6: 0b101,
-                7: 0b110,
-                8: 0b111,
-                9: 0b1000,
-                10: 0b1001,
+                1: 0,
+                2: 1,
+                3: 2,
+                4: 3,
+                5: 4,
+                6: 5,
+                7: 6,
+                8: 7,
+                9: 8,
+                10: 9,
             }
         self._output_file: str = f"{data_path}{prefix}/processed_seqs.csv"
 

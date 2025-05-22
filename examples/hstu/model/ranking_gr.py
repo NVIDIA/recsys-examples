@@ -72,10 +72,13 @@ class RankingGR(BaseModel):
 
         # TODO, make reduction configurable
         self._loss_module = MultiTaskLossModule(
-            num_tasks=task_config.prediction_head_arch[-1], reduction="none"
+            num_classes=task_config.prediction_head_arch[-1],
+            num_tasks=task_config.num_tasks,
+            reduction="none",
         )
         self._metric_module = get_multi_event_metric_module(
-            task_config.prediction_head_arch[-1],
+            num_classes=task_config.prediction_head_arch[-1],
+            num_tasks=task_config.num_tasks,
             metric_types=task_config.eval_metrics,
             comm_pg=parallel_state.get_data_parallel_group(with_context_parallel=True),
         )

@@ -109,6 +109,7 @@ class RankingConfig(BaseTaskConfig):
     prediction_head_arch: List[int] = cast(List[int], None)
     prediction_head_act_type: str = "relu"
     prediction_head_bias: bool = True
+    num_tasks: int = 1
     # one head per event
     # [binary cross entropy or multicross]
     # number of tasks/events
