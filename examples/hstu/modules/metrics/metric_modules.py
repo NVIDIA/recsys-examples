@@ -15,6 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from enum import Enum
+from functools import partial
 
 # pyre-strict
 from typing import Dict, List, Optional, Tuple
@@ -139,12 +140,16 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
 
     def __init__(
         self,
+        num_classes: int,
         number_of_tasks: int,
         metric_types: Tuple[str, ...] = ("AUC",),
         process_group: torch.distributed.ProcessGroup = None,
         task_names: Optional[List[str]] = None,
     ):
         super().__init__()
+        self._num_classes = num_classes
+        self._number_of_tasks = number_of_tasks
+
         assert len(metric_types) == 1, "Only one ranking metric type is supported now"
         global _metric_type_to_cls_map
         mtype = (
@@ -163,14 +168,27 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
             ), " please specify task names of same size as number of tasks"
         self._task_names = task_names
         self._eval_metrics_modules: torch.nn.ModuleList = torch.nn.ModuleList()
-
         self._logit_preprocessors = []
-        for _ in range(number_of_tasks):
-            module = metric_factory(task="binary", process_group=process_group)
-            self._eval_metrics_modules.append(module)
+        if num_classes == number_of_tasks:
+            for _ in range(number_of_tasks):
+                module = metric_factory(task="binary", process_group=process_group)
+                self._eval_metrics_modules.append(module)
 
-            self._logit_preprocessors.append(torch.nn.functional.sigmoid)
-
+                self._logit_preprocessors.append(torch.nn.functional.sigmoid)
+        else:
+            assert (
+                number_of_tasks == 1
+            ), "num_tasks should be 1 for multi-class classification"
+            self._eval_metrics_modules.append(
+                metric_factory(
+                    task="multiclass",
+                    num_classes=num_classes,
+                    process_group=process_group,
+                )
+            )
+            self._logit_preprocessors.append(
+                partial(torch.nn.functional.softmax, dim=-1)
+            )
         self.training = False
 
     # return a
@@ -186,14 +204,19 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
         Returns:
             None
         """
-        for task_id, task_name in enumerate(self._task_names):
-            logit = multi_task_logits[..., task_id]
-            target = (torch.bitwise_and(targets, 1 << task_id) > 0).long()
-            pred = self._logit_preprocessors[task_id](logit)
-            # target must be long
-            # Metric forward returns the metric of current batch
+        if self._num_classes == self._number_of_tasks:
+            for task_id, task_name in enumerate(self._task_names):
+                logit = multi_task_logits[..., task_id]
+                target = (torch.bitwise_and(targets, 1 << task_id) > 0).long()
+                pred = self._logit_preprocessors[task_id](logit)
+                # target must be long
+                # Metric forward returns the metric of current batch
+                if pred.numel() > 0:
+                    _ = self._eval_metrics_modules[task_id](pred, target)
+        else:
+            pred = self._logit_preprocessors[0](multi_task_logits)
             if pred.numel() > 0:
-                _ = self._eval_metrics_modules[task_id](pred, target)
+                _ = self._eval_metrics_modules[0](pred, targets)
         return None
 
     def compute(self):

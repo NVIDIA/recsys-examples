@@ -17,6 +17,7 @@ RankingArgs.prediction_head_arch = [
     512, 8
 ]
 RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 8
 
 OptimizerArgs.optimizer_str = 'adam'
 OptimizerArgs.learning_rate = 1e-3

@@ -247,6 +247,7 @@ def get_data_loader(
     task_type: str,
     dataset_args: Union[DatasetArgs, BenchmarkDatasetArgs],
     trainer_args: TrainerArgs,
+    num_tasks: int,
 ):
     assert task_type in [
         "ranking",
@@ -287,7 +288,7 @@ def get_data_loader(
             action_feature_name=dataset_args.action_feature_name,
             max_num_candidates=dataset_args.max_num_candidates,
             num_generated_batches=100,
-            num_tasks=1 if task_type == "ranking" else None,
+            num_tasks=num_tasks,
         )
         train_dataset = dataset.dummy_dataset.DummySequenceDataset(
             batch_size=trainer_args.train_batch_size, **kwargs
@@ -304,7 +305,7 @@ def get_data_loader(
             dataset_name=dataset_args.dataset_name,
             max_sequence_length=dataset_args.max_sequence_length,
             max_num_candidates=dataset_args.max_num_candidates,
-            num_tasks=1 if task_type == "ranking" else 0,
+            num_tasks=num_tasks,
             batch_size=trainer_args.train_batch_size,
             rank=dist.get_rank(),
             world_size=dist.get_world_size(),

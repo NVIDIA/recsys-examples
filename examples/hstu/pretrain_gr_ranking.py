@@ -51,6 +51,7 @@ class RankingArgs:
     prediction_head_arch: List[int] = cast(List[int], None)
     prediction_head_act_type: str = "relu"
     prediction_head_bias: bool = True
+    num_tasks: int = 1
     eval_metrics: Tuple[str, ...] = ("AUC",)
 
     def __post_init__(self):
@@ -88,6 +89,7 @@ def create_ranking_config() -> RankingConfig:
         prediction_head_arch=ranking_args.prediction_head_arch,
         prediction_head_act_type=ranking_args.prediction_head_act_type,
         prediction_head_bias=ranking_args.prediction_head_bias,
+        num_tasks=ranking_args.num_tasks,
         eval_metrics=ranking_args.eval_metrics,
     )
 
@@ -119,7 +121,7 @@ def main():
         dynamicemb_options_dict=dynamic_options_dict,
     )
     train_dataloader, test_dataloader = get_data_loader(
-        "ranking", dataset_args, trainer_args
+        "ranking", dataset_args, trainer_args, task_config.num_tasks
     )
     free_memory, total_memory = torch.cuda.mem_get_info()
     print_rank_0(

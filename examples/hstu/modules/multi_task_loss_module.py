@@ -28,12 +28,21 @@ class MultiTaskLossModule(torch.nn.Module):
           ``'none'`` | ``'mean'`` | ``'sum'``. Defaults to ``'none'``.
     """
 
-    def __init__(self, num_tasks: int, reduction="none"):
+    def __init__(self, num_classes: int, num_tasks: int, reduction="none"):
         super().__init__()
         self._loss_modules = torch.nn.ModuleList()
         self._num_tasks = num_tasks
-        for _ in range(self._num_tasks):
-            self._loss_modules.append(torch.nn.BCEWithLogitsLoss(reduction=reduction))
+        self._num_classes = num_classes
+        if self._num_classes == self._num_tasks:
+            for _ in range(self._num_tasks):
+                self._loss_modules.append(
+                    torch.nn.BCEWithLogitsLoss(reduction=reduction)
+                )
+        else:
+            assert (
+                self._num_tasks == 1
+            ), "num_tasks should be 1 for multi-class classification"
+            self._loss_modules.append(torch.nn.CrossEntropyLoss(reduction=reduction))
 
     @output_nvtx_hook(nvtx_tag="loss computation")
     def forward(self, merged_logits, labels):
@@ -53,10 +62,15 @@ class MultiTaskLossModule(torch.nn.Module):
             labels.dtype == torch.int32 or labels.dtype == torch.int64
         ), "labels dtype should be integer"
 
-        losses = []
-        for task_idx in range(self._num_tasks):
-            task_logits = merged_logits[:, task_idx]
-            task_labels = (torch.bitwise_and(labels, 1 << task_idx) > 0).to(torch.float)
-            loss = self._loss_modules[task_idx](task_logits, task_labels)
-            losses.append(loss)
-        return torch.stack(losses, dim=1)
+        if self._num_classes == self._num_tasks:
+            losses = []
+            for task_idx in range(self._num_tasks):
+                task_logits = merged_logits[:, task_idx]
+                task_labels = (torch.bitwise_and(labels, 1 << task_idx) > 0).to(
+                    torch.float
+                )
+                loss = self._loss_modules[task_idx](task_logits, task_labels)
+                losses.append(loss)
+            return torch.stack(losses, dim=1)
+        else:
+            return self._loss_modules[0](merged_logits, labels)

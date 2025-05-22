@@ -22,6 +22,7 @@ NetworkArgs.target_group_size = 1
 # ratings 0-5
 RankingArgs.prediction_head_arch = [512, 10]
 RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 1
 RankingArgs.eval_metrics = ("AUC",)
 
 OptimizerArgs.optimizer_str = 'adam'
