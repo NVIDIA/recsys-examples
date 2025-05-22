@@ -239,7 +239,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 seq_offsets=seq_offsets,
                 causal=causal,
                 num_targets=num_targets,
-                max_attn_len=None,
+                max_attn_len=0,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
             ).reshape(-1, num_heads * attention_dim_per_head)
@@ -628,7 +628,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 num_targets=num_targets,
                 N=N,
                 alpha=alpha,
-                max_attn_len=None,
+                max_attn_len=0,
                 causal=causal,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
