@@ -1542,7 +1542,7 @@ def triton_hstu_attention_fwd(
     seq_offsets: torch.Tensor,
     causal: bool,
     num_targets: Optional[torch.Tensor],
-    max_attn_len: Optional[int],
+    max_attn_len: int,
     contextual_seq_len: int,
     sort_by_length_indices: Optional[torch.Tensor],
 ) -> torch.Tensor:
@@ -1703,7 +1703,7 @@ class _AttentionFunction(torch.autograd.Function):
         seq_offsets: torch.Tensor,
         causal: bool,
         num_targets: Optional[torch.Tensor],
-        max_attn_len: Optional[int],
+        max_attn_len: int,
         contextual_seq_len: int,
         sort_by_length: bool,
     ) -> torch.Tensor:
@@ -1816,7 +1816,7 @@ def native_triton_hstu_mha(
     seq_offsets: torch.Tensor,
     causal: bool,
     num_targets: Optional[torch.Tensor] = None,
-    max_attn_len: Optional[int] = None,
+    max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     sort_by_length: bool = False,
 ) -> torch.Tensor:
@@ -1844,7 +1844,7 @@ def triton_hstu_mha(
     seq_offsets: torch.Tensor,
     causal: bool,
     num_targets: Optional[torch.Tensor] = None,
-    max_attn_len: Optional[int] = None,
+    max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     sort_by_length: bool = False,
     triton_cc: bool = False,
@@ -1893,7 +1893,7 @@ def native_triton_cached_hstu_mha(
     delta_x_offsets: torch.Tensor,
     seq_offsets: torch.Tensor,
     num_targets: Optional[torch.Tensor] = None,
-    max_attn_len: Optional[int] = None,
+    max_attn_len: int = 0,
 ) -> torch.Tensor:
     Z = seq_offsets.size(0) - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
@@ -1954,7 +1954,7 @@ def triton_cached_hstu_mha(
     delta_x_offsets: torch.Tensor,
     seq_offsets: torch.Tensor,
     num_targets: Optional[torch.Tensor] = None,
-    max_attn_len: Optional[int] = None,
+    max_attn_len: int = 0,
     triton_cc: bool = False,
 ) -> torch.Tensor:
     seq_offsets = seq_offsets.contiguous()
