@@ -131,7 +131,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.wgrad_stream = wgrad_stream
         ctx.wgrad_event = wgrad_event
         saved_tensor_map = OrderedDict()
-
+        num_contextuals = num_contextuals if num_contextuals is not None else 0
         assert input.dim() == 2, "input tensor must be 2D"
         assert linear_uvqk_bias.dim() == 1, "linear_uvqk_bias must be 1D"
 
