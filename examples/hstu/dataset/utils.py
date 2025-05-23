@@ -400,8 +400,8 @@ def is_batch_valid(
 
     if isinstance(batch, RankingBatch):
         assert (
-            batch.labels.dim() == 2
-        ), f"labe dim() should equal to 2 but got {batch.labels.dim()}"
+            batch.labels.dim() == 1
+        ), f"label dim() should equal to 1 but got {batch.labels.dim()}"
         assert (
             batch.labels.size(0) == expected_label_size
         ), f"label seqlen sum should be {expected_label_size}, but got {batch.labels.size(0)}"
