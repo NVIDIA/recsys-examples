@@ -25,18 +25,21 @@ subprocess.run(
     ["git", "submodule", "update", "--init", "../../third_party/HierarchicalKV"]
 )
 
+# TODO: update when torchrec release compatible commit.
+compatible_versions = "1.1.0"
+
 
 def check_torchrec_version():
     try:
         import torchrec
 
         version = torchrec.__version__
-        if version >= "0.7.0":
+        if version >= compatible_versions:
             print(f"torchrec version {version} is installed.")
             return True
         else:
             print(
-                f"torchrec version {version} is installed, but version >= 0.7.0 is required."
+                f"torchrec version {version} is installed, but version >= {compatible_versions} is required."
             )
             return False
     except ImportError:
@@ -45,8 +48,10 @@ def check_torchrec_version():
 
 
 def install_torchrec():
-    print("Installing torchrec version 0.7.0...")
-    # subprocess.check_call([sys.executable, "-m", "pip", "install", "torchrec==0.7.0"])
+    print(f"Installing torchrec version {compatible_versions}...")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", f"torchrec=={compatible_versions}"]
+    )
 
 
 def find_source_files(directory, extension_pattern, exclude_dirs=[]):
@@ -80,6 +85,10 @@ def get_extensions():
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "--use_fast_math",
+            "-gencode",
+            "arch=compute_70,code=sm_70",
+            "-gencode",
+            "arch=compute_75,code=sm_75",
             "-gencode",
             "arch=compute_80,code=sm_80",
             "-gencode",
