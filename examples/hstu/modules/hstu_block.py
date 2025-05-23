@@ -9,6 +9,7 @@ from dataset.utils import RankingBatch
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_module import JaggedData, JaggedModule
 from modules.native_hstu_layer import HSTULayer
+from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.jagged_tensor_op import concat_2D_jagged_tensors
 from ops.length_to_offsets import length_to_complete_offsets
@@ -30,6 +31,7 @@ class HSTUBlock(JaggedModule):
     def __init__(
         self,
         config: HSTUConfig,
+        inference_mode: bool = False,
     ):
         super().__init__(config=config)
         self._training_dtype = torch.float32
@@ -48,14 +50,20 @@ class HSTUBlock(JaggedModule):
                 use_time_encoding=config.position_encoding_config.use_time_encoding,
                 training_dtype=self._training_dtype,
             )
-        HSTULayerImpl = (
-            FusedHSTULayer
-            if config.hstu_layer_type == HSTULayerType.FUSED
-            else HSTULayer
-        )
-        self._attention_layers = torch.nn.ModuleList(
-            [HSTULayerImpl(config) for l in range(self.config.num_layers)]
-        )
+        
+        if not inference_mode:
+            HSTULayerImpl = (
+                FusedHSTULayer
+                if config.hstu_layer_type == HSTULayerType.FUSED
+                else HSTULayer
+            )
+            self._attention_layers = torch.nn.ModuleList(
+                [HSTULayerImpl(config) for l in range(self.config.num_layers)]
+            )
+        else:
+            self._attention_layers = torch.nn.ModuleList(
+                [PagedHSTUInferLayer(config, layer_idx) for layer_idx in range(self.config.num_layers)]
+            )
 
     @output_nvtx_hook(nvtx_tag="hstu_preprocess")
     def hstu_preprocess(
@@ -232,4 +240,11 @@ class HSTUBlock(JaggedModule):
         jd = self.hstu_preprocess(embeddings, batch)
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
+        return self.hstu_postprocess(jd)
+
+    @output_nvtx_hook(nvtx_tag="hstu_predict")
+    @torch.inference_mode()
+    def predict(self, jd: JaggedData, kv_cache_handler) -> JaggedData:
+        for hstu_layer in self._attention_layers:
+            jd = hstu_layer(jd, kv_cache_handler)
         return self.hstu_postprocess(jd)

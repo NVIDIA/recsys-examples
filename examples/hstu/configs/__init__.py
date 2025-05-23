@@ -5,6 +5,11 @@ from .hstu_config import (
     PositionEncodingConfig,
     get_hstu_config,
 )
+from .kv_cache_config import (
+    KVCacheMetadata,
+    KVCacheConfig,
+    get_kvcache_config,
+)
 from .task_config import (
     OptimizerParam,
     RankingConfig,
@@ -19,6 +24,9 @@ __all__ = [
     "PositionEncodingConfig",
     "HSTUConfig",
     "get_hstu_config",
+    "KVCacheMetadata",
+    "KVCacheConfig",
+    "get_kvcache_config",
     "RankingConfig",
     "RetrievalConfig",
     "OptimizerParam",
