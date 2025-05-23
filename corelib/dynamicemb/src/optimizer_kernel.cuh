@@ -376,6 +376,7 @@ struct AdaGradVecOptimizer {
   weight_t** gt;
   const float lr;
   const float eps;
+  const float initial_accumulator_value;
   const bool* masks;
   const bool* masks_gt;
 
@@ -409,7 +410,7 @@ struct AdaGradVecOptimizer {
             gt_vec.load(gt_ptr+idx4);
         }
         else{
-            gt_vec.reset();
+            gt_vec.reset(initial_accumulator_value);
         }
 
         Vec4T<float> grad_vec;
@@ -454,7 +455,7 @@ struct AdaGradVecOptimizer {
 
     for (int i = threadIdx.x; i < input.dim; i+=blockDim.x) {
       float tmp_grad =  TypeConvertFunc<float, wgrad_t>::convert(wgrad_ptr[i]);
-      float tmp_gt = mask_gt ? TypeConvertFunc<float, weight_t>::convert(gt_ptr[i]) : 0.0f;
+      float tmp_gt = mask_gt ? TypeConvertFunc<float, weight_t>::convert(gt_ptr[i]) : initial_accumulator_value;
       float tmp_weight = mask ?
           TypeConvertFunc<float, weight_t>::convert(weight_ptr[i]) : gen.generate();
 
@@ -493,6 +494,7 @@ struct RowWiseAdaGradVecOptimizer {
   weight_t** gt;
   const float lr;
   const float eps;
+  const float initial_accumulator_value;
   const bool* masks;
   const bool* masks_gt;
 
@@ -512,7 +514,7 @@ struct RowWiseAdaGradVecOptimizer {
     bool mask = masks[ev_id];
     bool mask_gt = masks_gt[ev_id];
 
-    float tmp_gt =  mask_gt ? TypeConvertFunc<float, weight_t>::convert(gt_ptr[0]) : 0.0f;
+    float tmp_gt =  mask_gt ? TypeConvertFunc<float, weight_t>::convert(gt_ptr[0]) : initial_accumulator_value;
     float tmp_g_pow = 0;
     for (int i = lane_id; i < input.dim; i+=kWarpSize){
         float tmp_g = TypeConvertFunc<float, wgrad_t>::convert(wgrad_ptr[i]);
@@ -573,7 +575,7 @@ struct RowWiseAdaGradVecOptimizer {
 
     bool mask = masks[ev_id];
     bool mask_gt = masks_gt[ev_id];
-    float tmp_gt = mask_gt ? TypeConvertFunc<float, weight_t>::convert(gt_ptr[0]) : 0.0f;
+    float tmp_gt = mask_gt ? TypeConvertFunc<float, weight_t>::convert(gt_ptr[0]) : initial_accumulator_value;
     float tmp_g_pow = 0;
     for (int i = tid; i < input.dim; i+=blockSize){
         float tmp_g = TypeConvertFunc<float, wgrad_t>::convert(wgrad_ptr[i]);

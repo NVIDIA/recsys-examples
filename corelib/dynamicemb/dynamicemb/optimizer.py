@@ -38,6 +38,7 @@ class OptimizerArgs:
     max_norm: float = 0.0
     learning_rate: float = 0.01
     eps: float = 1.0e-8
+    initial_accumulator_value: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.999
     weight_decay: float = 0.0
@@ -335,6 +336,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 )
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
+        initial_accumulator_value = self._opt_args.initial_accumulator_value
 
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
@@ -349,20 +351,21 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             score = scores[i] if scores is not None else None
 
             dynamic_emb_adagrad_with_table(
-                ht, gt_ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                ht, gt_ht, num_indice, indice, grad, lr, eps, initial_accumulator_value, weight_dtype, score
             )
 
     def get_opt_args(self):
         ret_args = {
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
+            "initial_accumulator_value": self._opt_args.initial_accumulator_value,
         }
         return ret_args
 
     def set_opt_args(self, args: Dict[str, Any]):
         self._opt_args.learning_rate = get_required_arg(args, "lr")
         self._opt_args.eps = get_required_arg(args, "eps")
-
+        self._opt_args.initial_accumulator_value = get_required_arg(args, "initial_accumulator_value")
         return
 
 
@@ -408,7 +411,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 )
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
-
+        initial_accumulator_value = self._opt_args.initial_accumulator_value
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
@@ -422,18 +425,19 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             score = scores[i] if scores is not None else None
 
             dynamic_emb_rowwise_adagrad_with_table(
-                ht, gt_ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                ht, gt_ht, num_indice, indice, grad, lr, eps, initial_accumulator_value, weight_dtype, score
             )
 
     def get_opt_args(self):
         ret_args = {
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
+            "initial_accumulator_value": self._opt_args.initial_accumulator_value,
         }
         return ret_args
 
     def set_opt_args(self, args: Dict[str, Any]):
         self._opt_args.learning_rate = get_required_arg(args, "lr")
         self._opt_args.eps = get_required_arg(args, "eps")
-
+        self._opt_args.initial_accumulator_value = get_required_arg(args, "initial_accumulator_value")
         return
