@@ -36,9 +36,6 @@ struct Qkv_params {
     void *__restrict__ v_ptr;
 
     // The stride between rows of the Q, K and V matrices.
-    index_t q_batch_stride;
-    index_t k_batch_stride;
-    index_t v_batch_stride;
     index_t q_row_stride;
     index_t k_row_stride;
     index_t v_row_stride;
@@ -48,21 +45,15 @@ struct Qkv_params {
 
     // The number of heads.
     int h, h_k;
-    // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
-    // different from nheads (query).
-    int h_h_k_ratio; // precompute h / h_k,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Flash_fwd_params : public Qkv_params {
-
+struct Hstu_fwd_params : public Qkv_params {
     // The O matrix (output).
     void * __restrict__ o_ptr;
-    void * __restrict__ oaccum_ptr;
 
     // The stride between rows of O.
-    index_t o_batch_stride;
     index_t o_row_stride;
     index_t o_head_stride;
 
@@ -70,13 +61,13 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ p_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q, total_k;
-    int seqlen_t;
+    int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, total_q, total_k;
     int seqlen_i;
     float alpha;
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+
     int * __restrict__ num_contexts;
     int * __restrict__ num_targets;
 
@@ -86,7 +77,6 @@ struct Flash_fwd_params : public Qkv_params {
     index_t rab_head_stride;
     // The number of rab heads.
     int h_rab;
-    int h_h_rab_ratio;
 
     // Local window size
     int window_size_left, window_size_right;
@@ -101,21 +91,19 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_delta_q;
     bool is_context;
 
-    // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
-    // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
-    bool is_seqlens_k_cumulative;
-
-    int * __restrict__ tile_count_semaphore;
     float * __restrict__ descale_q_ptr;
     float * __restrict__ descale_k_ptr;
     float * __restrict__ descale_v_ptr;
 
     int arch;
+
+    bool is_balance_fwd;
+    bool is_balance_bwd;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Flash_bwd_params : public Flash_fwd_params {
+struct Hstu_bwd_params : public Hstu_fwd_params {
 
     // The dO and dQKVRab matrices.
     void *__restrict__ do_ptr;
@@ -127,28 +115,20 @@ struct Flash_bwd_params : public Flash_fwd_params {
     // To accumulate dQ
     void *__restrict__ dq_accum_ptr;
 
-    // // To accumulate dK and dV in case we're splitting the bwd along seqlen_q
-    // dimension void *__restrict__ dk_accum_ptr; void *__restrict__
-    // dv_accum_ptr;
-
     // The stride between rows of the dO, dQ, dK and dV matrices.
     // TD [2022-04-16]: We're using 32-bit indexing to save registers.
     // The code probably won't work for arrays larger than 2GB.
-    index_t do_batch_stride;
     index_t do_row_stride;
     index_t do_head_stride;
-    index_t dq_batch_stride;
-    index_t dk_batch_stride;
-    index_t dv_batch_stride;
     index_t dq_row_stride;
     index_t dk_row_stride;
     index_t dv_row_stride;
     index_t dq_head_stride;
     index_t dk_head_stride;
     index_t dv_head_stride;
-    index_t drab_batch_stride;
     index_t drab_row_stride;
     index_t drab_head_stride;
+    index_t drab_batch_stride;
 
     int *__restrict__ dq_semaphore;
 
@@ -158,5 +138,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int Arch, typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-template<int Arch, typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template<int Arch, typename T, int Headdim, bool Has_rab, bool Is_local,
+         bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+void run_hstu_fwd_(Hstu_fwd_params &params, cudaStream_t stream);
+template<int Arch, typename T, int Headdim, bool Has_rab, bool Has_drab, bool Is_local,
+         bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+void run_hstu_bwd_(Hstu_bwd_params &params, cudaStream_t stream);

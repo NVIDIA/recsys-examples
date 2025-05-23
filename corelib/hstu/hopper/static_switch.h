@@ -32,131 +32,86 @@
 /// ```
 //
 
-#define BOOL_SWITCH(COND, CONST_NAME, ...)                                     \
-  [&] {                                                                        \
-    if (COND) {                                                                \
-      constexpr static bool CONST_NAME = true;                                 \
-      return __VA_ARGS__();                                                    \
-    } else {                                                                   \
-      constexpr static bool CONST_NAME = false;                                \
-      return __VA_ARGS__();                                                    \
-    }                                                                          \
+#define BOOL_SWITCH(COND, CONST_NAME, ...)       \
+  [&] {                                          \
+    if (COND) {                                  \
+      constexpr static bool CONST_NAME = true;   \
+      return __VA_ARGS__();                      \
+    } else {                                     \
+      constexpr static bool CONST_NAME = false;  \
+      return __VA_ARGS__();                      \
+    }                                            \
+  }()
+
+#define TWO_BOOL_SWITCH(COND1, COND2, CONST_NAME1, CONST_NAME2, ...)  \
+  [&] {                                                               \
+    if (COND1) {                                                      \
+      constexpr static bool CONST_NAME1 = true;                       \
+      if (COND2) {                                                    \
+        constexpr static bool CONST_NAME2 = true;                     \
+        return __VA_ARGS__();                                         \
+      } else {                                                        \
+        constexpr static bool CONST_NAME2 = false;                    \
+        return __VA_ARGS__();                                         \
+      }                                                               \
+    } else {                                                          \
+      constexpr static bool CONST_NAME1 = false;                      \
+      constexpr static bool CONST_NAME2 = false;                      \
+      return __VA_ARGS__();                                           \
+    }                                                                 \
   }()
 
 #ifdef HSTU_DISABLE_CONTEXT
-  #define CONTEXT_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                         \
-    constexpr static bool CONST_NAME = true;    \
-    return __VA_ARGS__();                       \
+  #define CONTEXT_SWITCH(COND, CONST_NAME, ...)  \
+  [&] {                                          \
+    constexpr static bool CONST_NAME = false;    \
+    return __VA_ARGS__();                        \
   }()
 #else
   #define CONTEXT_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef HSTU_DISABLE_LOCAL
-  #define LOCAL_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                         \
-    constexpr static bool CONST_NAME = false;    \
-    return __VA_ARGS__();                       \
-  }()
-#else
-  #define LOCAL_SWITCH BOOL_SWITCH
-#endif
-
-#ifdef HSTU_DISABLE_CAUSAL
-  #define CAUSAL_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                         \
-    constexpr static bool CONST_NAME = false;    \
-    return __VA_ARGS__();                       \
-  }()
-#else
-  #define CAUSAL_SWITCH BOOL_SWITCH
-#endif
-
 #ifdef HSTU_DISABLE_TARGET
-  #define TARGET_SWITCH(COND, CONST_NAME, ...)   \
+  #define TARGET_SWITCH(COND, CONST_NAME, ...)  \
   [&] {                                         \
-    constexpr static bool CONST_NAME = false;    \
+    constexpr static bool CONST_NAME = false;   \
     return __VA_ARGS__();                       \
   }()
 #else
   #define TARGET_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef HSTU_DISABLE_DELTA_Q
-  #define DELTA_Q_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                         \
-    constexpr static bool CONST_NAME = false;    \
-    return __VA_ARGS__();                       \
-  }()
-#else
-  #define DELTA_Q_SWITCH BOOL_SWITCH
-#endif
-
 #ifdef HSTU_DISABLE_RAB
-  #define RAB_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                         \
-    constexpr static bool CONST_NAME = false;    \
-    return __VA_ARGS__();                       \
+  #define RAB_SWITCH(COND, CONST_NAME, ...)    \
+  [&] {                                        \
+    constexpr static bool CONST_NAME = false;  \
+    return __VA_ARGS__();                      \
   }()
 #else
   #define RAB_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef HSTU_DISABLE_DRAB
-  #define DRAB_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                         \
-    constexpr static bool CONST_NAME = false;    \
-    return __VA_ARGS__();                       \
+#ifdef HSTU_DISABLE_RAB
+  #define RAB_DRAB_SWITCH(RAB_COND, DRAB_COND, RAB_CONST_NAME, DRAB_CONST_NAME, ...)  \
+  [&] {                                                                               \
+    constexpr static bool RAB_CONST_NAME = false;                                     \
+    constexpr static bool DRAB_CONST_NAME = false;                                    \
+    return __VA_ARGS__();                                                             \
   }()
 #else
-  #define DRAB_SWITCH BOOL_SWITCH
+  #ifdef HSTU_DISABLE_DRAB
+    #define RAB_DRAB_SWITCH(RAB_COND, DRAB_COND, RAB_CONST_NAME, DRAB_CONST_NAME, ...)  \
+    [&] {                                                                               \
+      constexpr static bool DRAB_CONST_NAME = false;                                    \
+      if (RAB_COND) {                                                                   \
+        constexpr static bool RAB_CONST_NAME = true;                                    \
+        return __VA_ARGS__();                                                           \
+      } else {                                                                          \
+        constexpr static bool RAB_CONST_NAME = false;                                   \
+        return __VA_ARGS__();                                                           \
+      }                                                                                 \
+    }()
+  #else
+    #define RAB_DRAB_SWITCH TWO_BOOL_SWITCH
+  #endif
 #endif
-
-#ifdef HSTU_DISABLE_SM8x
-  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                    \
-  [&] {                                                                        \
-    constexpr static int ARCH_NAME = 90;                                       \
-    return __VA_ARGS__();                                                      \
-  }()
-#else
-  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                    \
-  [&] {                                                                        \
-    if (ARCH == 86 || ARCH == 89) {                                            \
-      constexpr static int ARCH_NAME = 86;                                     \
-      return __VA_ARGS__();                                                    \
-    } else if (ARCH < 90) {                                                    \
-      constexpr static int ARCH_NAME = 80;                                     \
-      return __VA_ARGS__();                                                    \
-    } else {                                                                   \
-      constexpr static int ARCH_NAME = 90;                                     \
-      return __VA_ARGS__();                                                    \
-    }                                                                          \
-  }()
-#endif
-
-#define HEADDIM_SWITCH(HEADDIM, ...)                                           \
-  [&] {                                                                        \
-    if (HEADDIM == 64) {                                                       \
-      constexpr static int kHeadSize = 64;                                     \
-      return __VA_ARGS__();                                                    \
-    } else if (HEADDIM == 128) {                                               \
-      constexpr static int kHeadSize = 128;                                    \
-      return __VA_ARGS__();                                                    \
-    } else if (HEADDIM == 256) {                                               \
-      constexpr static int kHeadSize = 256;                                    \
-      return __VA_ARGS__();                                                    \
-    }                                                                          \
-  }()
-
-#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, NAME, ...)                              \
-  [&] {                                                                        \
-    bool useSeqLen = USE_VAR_SEQ_LEN;                                          \
-    if (useSeqLen) {                                                           \
-      using NAME = flash::VarSeqLenTraits;                                     \
-      return __VA_ARGS__();                                                    \
-    } else {                                                                   \
-      using NAME = flash::VarSeqLenTraits;                                 \
-      return __VA_ARGS__();                                                    \
-    }                                                                          \
-  }()
