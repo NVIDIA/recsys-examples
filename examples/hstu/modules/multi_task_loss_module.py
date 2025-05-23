@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
@@ -29,17 +28,21 @@ class MultiTaskLossModule(torch.nn.Module):
           ``'none'`` | ``'mean'`` | ``'sum'``. Defaults to ``'none'``.
     """
 
-    def __init__(self, logit_dim_list: List[int], reduction="none"):
+    def __init__(self, num_classes: int, num_tasks: int, reduction="none"):
         super().__init__()
         self._loss_modules = torch.nn.ModuleList()
-        self._logit_dim_list = logit_dim_list
-        for dim_size in self._logit_dim_list:
-            self._loss_modules.append(
-                torch.nn.BCEWithLogitsLoss(reduction=reduction)
-                if dim_size == 1
-                else torch.nn.CrossEntropyLoss(reduction=reduction)
-            )
-        self._loss_modules.cuda()
+        self._num_tasks = num_tasks
+        self._num_classes = num_classes
+        if self._num_classes == self._num_tasks:
+            for _ in range(self._num_tasks):
+                self._loss_modules.append(
+                    torch.nn.BCEWithLogitsLoss(reduction=reduction)
+                )
+        else:
+            assert (
+                self._num_tasks == 1
+            ), "num_tasks should be 1 for multi-class classification"
+            self._loss_modules.append(torch.nn.CrossEntropyLoss(reduction=reduction))
 
     @output_nvtx_hook(nvtx_tag="loss computation")
     def forward(self, merged_logits, labels):
@@ -47,8 +50,8 @@ class MultiTaskLossModule(torch.nn.Module):
         Forward pass of the MultiTaskLossModule.
 
         Args:
-            merged_logits (torch.Tensor): The merged logits tensor. Must be 2D tensor of float dtype.
-            labels (torch.Tensor): The labels tensor.
+            merged_logits (torch.Tensor): (N, num_tasks),The merged logits tensor. Must be 2D tensor of float dtype.
+            labels (torch.Tensor): (N,), The labels tensor.
 
         Returns:
             torch.Tensor: The computed losses for each task.
@@ -58,22 +61,16 @@ class MultiTaskLossModule(torch.nn.Module):
         assert (
             labels.dtype == torch.int32 or labels.dtype == torch.int64
         ), "labels dtype should be integer"
-        logits_per_head = torch.split(merged_logits, self._logit_dim_list, dim=-1)
-        labels_per_head = torch.split(labels, 1, dim=1)
 
-        assert len(logits_per_head) == len(
-            labels_per_head
-        ), f"num head should match the input label"
-        losses = []
-
-        for head_logits, head_labels, loss_module in zip(
-            logits_per_head, labels_per_head, self._loss_modules
-        ):
-            # for bce, the target must be float
-            # for CE,  the target must be Long
-            head_labels = (
-                head_labels.float() if head_logits.size(1) == 1 else head_labels.long()
-            )
-            loss = loss_module(head_logits.squeeze(-1), head_labels.view(-1))
-            losses.append(loss)
-        return torch.stack(losses, dim=1)
+        if self._num_classes == self._num_tasks:
+            losses = []
+            for task_idx in range(self._num_tasks):
+                task_logits = merged_logits[:, task_idx]
+                task_labels = (torch.bitwise_and(labels, 1 << task_idx) > 0).to(
+                    torch.float
+                )
+                loss = self._loss_modules[task_idx](task_logits, task_labels)
+                losses.append(loss)
+            return torch.stack(losses, dim=1)
+        else:
+            return self._loss_modules[0](merged_logits, labels)

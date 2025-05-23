@@ -4,6 +4,7 @@ TrainerArgs.eval_batch_size = 128
 TrainerArgs.eval_interval = 100
 TrainerArgs.log_interval = 100
 TrainerArgs.seed = 1234
+TrainerArgs.max_train_iters = 1000
 TrainerArgs.profile = True
 
 DatasetArgs.dataset_name = 'ml-20m'
@@ -19,10 +20,9 @@ NetworkArgs.kv_channels = 128
 NetworkArgs.target_group_size = 1
 
 # ratings 0-5
-RankingArgs.prediction_head_arch = [
-    [11],
-]
+RankingArgs.prediction_head_arch = [512, 10]
 RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 1
 RankingArgs.eval_metrics = ("AUC",)
 
 OptimizerArgs.optimizer_str = 'adam'

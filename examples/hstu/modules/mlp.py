@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, List, Optional, Union
+from typing import List, Optional
 
 import torch
 from megatron.core.transformer.module import MegatronModule
-from modules.jagged_module import JaggedData, JaggedModule
+from modules.utils import init_mlp_weights_optional_bias
 
 
-class MLP(JaggedModule):
+class MLP(MegatronModule):
     """
     Multi-Layer Perceptron (MLP) module wrapper for processing jagged data.
 
@@ -36,35 +36,49 @@ class MLP(JaggedModule):
         self,
         in_size: int,
         layer_sizes: List[int],
+        activation: str = "relu",
         bias: bool = True,
-        activation: Union[
-            str,
-            Callable[[], torch.nn.Module],
-            torch.nn.Module,
-            Callable[[torch.Tensor], torch.Tensor],
-        ] = torch.relu,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
         super(MegatronModule, self).__init__()
-        from torchrec.modules.mlp import MLP as torchrec_MLP
 
-        self._mlp = torchrec_MLP(in_size, layer_sizes, bias, activation, device, dtype)
+        if activation == "relu":
+            activation_fn = torch.nn.ReLU
+        elif activation == "gelu":
+            activation_fn = torch.nn.GELU
+        else:
+            raise ValueError(f"Activation function {activation} not supported")
 
-    def forward(self, jd: JaggedData) -> JaggedData:
+        layers = []
+        for i in range(len(layer_sizes)):
+            layers.extend(
+                [
+                    torch.nn.Linear(
+                        layer_sizes[i - 1] if i > 0 else in_size,
+                        layer_sizes[i],
+                        bias=bias,
+                        device=device,
+                        dtype=dtype,
+                    ),
+                    activation_fn()
+                    if i < len(layer_sizes) - 1
+                    else torch.nn.Identity(),
+                ]
+            )
+
+        self._mlp = torch.nn.Sequential(*layers)
+        self._mlp.apply(init_mlp_weights_optional_bias)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the MLP module.
 
         Args:
-            jd (JaggedData): The input jagged data.
+            input (torch.Tensor): The input tensor.
 
         Returns:
-            JaggedData: The output jagged data.
+            torch.Tensor: The output tensor.
         """
-        assert jd.values.dim() == 2, "Tensor must be 2-dimensional"
-        return JaggedData(
-            values=self._mlp(jd.values),
-            seqlen=jd.seqlen,
-            seqlen_offsets=jd.seqlen_offsets,
-            max_seqlen=jd.max_seqlen,
-        )
+        assert input.dim() == 2, "Tensor must be 2-dimensional"
+        return self._mlp(input)
