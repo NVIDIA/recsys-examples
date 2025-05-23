@@ -41,16 +41,7 @@ vt:
 	pytest -q -s test.py
 
 fm:
-	ncu --set full --import-source yes --nvtx --nvtx-include "triton/" --nvtx-include  "hstu_varlen_fwd_kernel1/"  -f -o hstu.%p python3 test.py
+	ncu --set full --import-source yes --nvtx --nvtx-include "triton/" --nvtx-include  "hstu_varlen_fwd_kernel/"  -f -o hstu.%p python3 test.py
 
 bm:
-	ncu --set full --nvtx --nvtx-include "triton/" --nvtx-include "hstu_varlen_fwd_kernel1/" --nvtx-include "hstu_varlen_fwd_kernel2/" --nvtx-include "hstu_varlen_bwd_kernel2/" --nvtx-include "hstu_varlen_bwd_kernel1/" -f -o hstu.%p python3 test.py
-
-custom:
-	ncu --set full --import-source yes --nvtx --nvtx-include "triton/" --nvtx-include  "hstu_varlen_fwd_kernel1/"  -f -o smem_block_32 python3 test.py
-	
-custom2:
-	ncu --set full --import-source yes --nvtx --nvtx-include "profile/"  --clock-control none -f -o triton_h20 --kernel-id ::regex:"compute_attn_ws|device_kernel|_ragged_hstu_attn_fwd|_ragged_hstu_attn_bwd": python /home/scratch.cjerry_sw/GR/hstu/tests/hstu/test_less_mem.py
-
-custom3:
-	ncu --set full --import-source yes --nvtx --nvtx-include "profile/"  --clock-control none -f -o ampere_h20 --kernel-id ::regex:"compute_attn_ws|device_kernel|_ragged_hstu_attn_fwd|_ragged_hstu_attn_bwd": make tt
+	ncu --set full --nvtx --nvtx-include "triton/" --nvtx-include "hstu_varlen_fwd_kernel/" --nvtx-include "hstu_varlen_bwd_kernel/"  -f -o hstu.%p python3 test.py

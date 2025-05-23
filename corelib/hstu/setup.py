@@ -161,19 +161,20 @@ template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}>
         HEAD_DIMENSIONS, DTYPE_FWD_SM80, RAB, MASK
     ):
         file_name = f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm80.cu"
-        with open(file_name, "w") as f:
-            f.write(
-                fwd_file_head.format(
-                    dtype_to_str[dtype],
-                    hdim,
-                    "true" if "_rab" in rab else "false",
-                    "true" if "local" in mask else "false",
-                    "true" if "causal" in mask else "false",
-                    "true" if "context" in mask else "false",
-                    "true" if "target" in mask else "false",
-                    "true" if "deltaq" in mask else "false",
+        if not os.path.exists(file_name):
+            with open(file_name, "w") as f:
+                f.write(
+                    fwd_file_head.format(
+                        dtype_to_str[dtype],
+                        hdim,
+                        "true" if "_rab" in rab else "false",
+                        "true" if "local" in mask else "false",
+                        "true" if "causal" in mask else "false",
+                        "true" if "context" in mask else "false",
+                        "true" if "target" in mask else "false",
+                        "true" if "deltaq" in mask else "false",
+                    )
                 )
-            )
         sources_fwd_sm80.append(file_name)
 
     sources_bwd_sm80 = []
@@ -193,20 +194,21 @@ template void run_hstu_bwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}>
             HEAD_DIMENSIONS, DTYPE_BWD_SM80, RAB_DRAB, MASK
         ):
             file_name = f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_sm80.cu"
-            with open(file_name, "w") as f:
-                f.write(
-                    bwd_file_head.format(
-                        dtype_to_str[dtype],
-                        hdim,
-                        "true" if "_rab" in rab_drab else "false",
-                        "true" if "drab" in rab_drab else "false",
-                        "true" if "local" in mask else "false",
-                        "true" if "causal" in mask else "false",
-                        "true" if "context" in mask else "false",
-                        "true" if "target" in mask else "false",
-                        "true" if "deltaq" in mask else "false",
+            if not os.path.exists(file_name):
+                with open(file_name, "w") as f:
+                    f.write(
+                        bwd_file_head.format(
+                            dtype_to_str[dtype],
+                            hdim,
+                            "true" if "_rab" in rab_drab else "false",
+                            "true" if "drab" in rab_drab else "false",
+                            "true" if "local" in mask else "false",
+                            "true" if "causal" in mask else "false",
+                            "true" if "context" in mask else "false",
+                            "true" if "target" in mask else "false",
+                            "true" if "deltaq" in mask else "false",
+                        )
                     )
-                )
             sources_bwd_sm80.append(file_name)
 
     return sources_fwd_sm80 + sources_bwd_sm80
@@ -270,7 +272,7 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_CAUSAL and not DISABLE_TARGET:
         raise ValueError("Cannot support target without causal")
 
-    torch_cpp_sources = ["csrc/hstu_attn/flash_api.cpp"]
+    torch_cpp_sources = ["csrc/hstu_attn/hstu_api.cpp"]
     cuda_sources = generate_cuda_sources()
 
     nvcc_flags = [

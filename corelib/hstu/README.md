@@ -1,8 +1,8 @@
 # HSTU
 
 HSTU is a high-performance attention implementation for different NVIDIA GPU architectures:
-- **HSTU-2**: Runs on Ampere and Ada GPUs (A100, RTX 3090, RTX 4090)
-- **HSTU-3**: Optimized for Hopper GPUs (H100, H20)
+- **HSTU-2**: Runs on Ampere and Ada GPUs (A100, L20...)
+- **HSTU-3**: Optimized for Hopper GPUs (H100, H20...)
 
 ## Installation
 
@@ -25,7 +25,22 @@ make install
 - **Supported GPUs**: Ampere, Ada, Hopper (without Hopper-specific features)
 - **Data types**: FP16, BF16
 - **Head dimensions**: 32, 64, 128, 256
-- **Attention masks**: No mask, local mask, group target mask, contextual mask, causal mask
+- **Attention masks**:
+  * No mask
+  * Local mask (0 <= window_size_left < max_seqlen_k or 0 <= window_size_right < max_seqlen_k)
+  * Causal mask (window_size_left = -1 and window_size_right = 0)
+  * Context mask + causal mask
+  * Target mask + causal mask
+  * Context mask + causal mask + target mask
+
+    ![Context+causal+target mask](context_causal_target.png)
+  * Delta_q ('seqlen_q <= seqlen_k')
+  * Delta_q + local mask
+
+    ![Delta_q+local mask](deltaq_local.png)
+  * Delta_q + causal mask
+
+    ![Delta_q+causal mask](deltaq_causal.png)
 
 ### HSTU-3
 - **Source**: `hopper/`
@@ -33,7 +48,12 @@ make install
 - **Supported GPUs**: Hopper only (H100, H20)
 - **Data types**: FP16, BF16 (forward and backward), FP8 (forward only)
 - **Head dimensions**: 32, 64, 128, 256 for FP16/BF16; 64, 128, 256 for FP8
-- **Attention masks**: No mask, local mask, causal mask, target mask (not supported in FP8)
+- **Attention masks**:
+  * For FP16/BF16, same as HSTU-2
+  * For FP8, only supports:
+    + No mask
+    + Causal mask
+    + Local mask
 - **Note**: Only undeterministic backward implementation
 
 ## Unified Interface
@@ -43,7 +63,7 @@ Both HSTU-2 and HSTU-3 share the same function signature:
 ```python
 def hstu_attn_varlen_func(
     q,                      # (total_q, nheads, headdim)
-    k,                      # (total_k, nheads_k, headdim), nheads should be divisible by nhead_k
+    k,                      # (total_k, nheads_k, headdim), nheads should be equal to nhead_k
     v,                      # (total_k, nheads_k, headdim)
     seq_offsets_q,          # (batch_size + 1,), cumulative sequence lengths for q
     seq_offsets_k,          # (batch_size + 1,), cumulative sequence lengths for k/v
@@ -52,7 +72,7 @@ def hstu_attn_varlen_func(
     num_contexts=None,      # (batch_size,), context tokens per batch
     num_targets=None,       # (batch_size,), target tokens per batch
     target_group_size=1,    # Number of target tokens per group
-    window_size=(-1, -1),   # (left, right) for sliding window; (-1, 0) for causal
+    window_size=(-1, -1),   # (left, right) for sliding window, -1 means infinite window size
     alpha=1.0,              # Scaling factor between add rab and silu
     rab=None,               # (batch_size, nhead_rab, max_seqlen_k, max_seqlen_k), relative attention bias
                             # nheads should be divisible by nhead_rab

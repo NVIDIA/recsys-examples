@@ -39,3 +39,5 @@ hopper/.hypothesis/*
 *.ncu-rep
 csrc/hstu_attn/src/generated/*
 !csrc/hstu_attn/src/generated/.gitkeep
+hopper/instantiations/*
+!hopper/instantiations/.gitkeep

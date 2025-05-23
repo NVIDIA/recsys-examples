@@ -18,8 +18,8 @@ import torch
 sm_major_version = torch.cuda.get_device_properties(0).major
 sm_minor_version = torch.cuda.get_device_properties(0).minor
 if sm_major_version == 9 and sm_minor_version == 0:
-    from flash_attn_interface import hstu_attn_varlen_func
-elif sm_major_version == 8 and sm_minor_version == 0:
+    from hstu_attn_interface import hstu_attn_varlen_func
+elif sm_major_version == 8:
     from hstu_attn import hstu_attn_varlen_func
 
 import math
@@ -442,7 +442,6 @@ def _hstu_attention_maybe_from_cache(
 
 @pytest.mark.parametrize("batch_size", [32])
 @pytest.mark.parametrize("heads", [2])
-@pytest.mark.parametrize("heads_rab", [None, 1])  # None is heads_rab=heads
 @pytest.mark.parametrize(
     "max_seq_len_q, max_seq_len_k, is_delta_q",
     [
@@ -484,11 +483,13 @@ def _hstu_attention_maybe_from_cache(
     ],
 )  # attn_dim & hidden_dim cannot exceed 256
 @pytest.mark.parametrize(
-    "has_rab, has_drab",
+    "has_rab, has_drab, heads_rab",
     [
-        (False, False),
-        (True, False),
-        (True, True),
+        (False, False, None),
+        (True, False, None),  # None is heads_rab=heads
+        (True, True, None),
+        (True, False, 1),
+        (True, True, 1),
     ],
 )
 @pytest.mark.parametrize("run_benchmark", [None])
@@ -538,8 +539,6 @@ def test_fused_attn(
     if group_target and not has_target:
         raise ValueError("group_target is True but has_target is False")
     # TODO: find a better way to avoid these combinations
-    if is_delta_q and window_size[1] < 0:
-        return
     if is_delta_q and has_target:
         return
     if is_delta_q and has_context:
@@ -555,8 +554,8 @@ def test_fused_attn(
             0,
             1,
         ]  # 0 is run hstu benchmark and 1 is run torch benchmark
-        iterations = 100
-        profiler_step_start = 50
+        iterations = 20
+        profiler_step_start = 10
 
         input_datas = []
         for i in range(2):
@@ -645,9 +644,6 @@ def test_fused_attn(
         fwd_time = fwd_event_start.elapsed_time(fwd_event_stop) / (
             iterations - profiler_step_start
         )
-
-        if dtype == torch.float8_e4m3fn:
-            return fwd_time, 0
 
         grads = []
         for i in range(iterations):
@@ -807,9 +803,6 @@ def test_fused_attn(
     assert (hstu_out.view(L_q, -1) - out_ref).abs().max().item() <= 2 * (
         torch_out - out_ref
     ).abs().max().item()
-
-    if sm_major_version == 9 and (has_context or group_target):
-        return
     g = torch.rand_like(torch_out)
     if not has_drab:
         (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
@@ -1090,9 +1083,10 @@ def _bwd_reference_fp8(
         )
         rab = F.pad(rab, padding, value=0)
         qk_attn = qk_attn + rab
-    qk_attn_silu = F.silu(qk_attn * alpha) / ori_n_k
+    qk_attn = qk_attn * alpha
+    qk_attn_silu = F.silu(qk_attn) / ori_n_k
     if invalid_attn_mask is not None:
-        if invalid_attn_mask.shape[0] != B:
+        if invalid_attn_mask.ndim == 2:
             if invalid_attn_mask.shape[0] != n_q or invalid_attn_mask.shape[1] != n_k:
                 invalid_attn_mask = F.pad(
                     invalid_attn_mask, (0, n_q - ori_n_q, 0, n_k - ori_n_k), value=1
@@ -1235,7 +1229,6 @@ def _bwd_reference_fp8(
 )
 @pytest.mark.parametrize("batch_size", [32])
 @pytest.mark.parametrize("heads", [2])
-@pytest.mark.parametrize("heads_rab", [None, 1])  # None is heads_rab=heads
 @pytest.mark.parametrize(
     "max_seq_len_q, max_seq_len_k, is_delta_q",
     [
@@ -1265,10 +1258,11 @@ def _bwd_reference_fp8(
     ],
 )  # attn_dim & hidden_dim cannot exceed 256
 @pytest.mark.parametrize(
-    "has_rab, has_drab",
+    "has_rab, has_drab, heads_rab",
     [
-        (False, False),
-        (True, False),
+        (False, False, None),
+        (True, False, None),  # None is heads_rab=heads
+        (True, False, 1),
     ],
 )
 @pytest.mark.parametrize("run_benchmark", [None])
@@ -1313,8 +1307,8 @@ def test_fused_attn_fp8(
             0,
             1,
         ]  # 0 is run hstu benchmark and 1 is run torch benchmark
-        iterations = 100
-        profiler_step_start = 50
+        iterations = 20
+        profiler_step_start = 10
 
         input_datas = []
         for i in range(2):
@@ -1350,7 +1344,7 @@ def test_fused_attn_fp8(
                 _,
                 seq_offsets_q,
                 seq_offsets_k,
-                num_targets,
+                _,
                 q,
                 k,
                 v,
@@ -1367,7 +1361,7 @@ def test_fused_attn_fp8(
                     max_seqlen_q=max_seq_len_q,
                     max_seqlen_k=max_seq_len_k,
                     num_contexts=None,
-                    num_targets=num_targets,
+                    num_targets=None,
                     target_group_size=1,
                     window_size=window_size,
                     alpha=alpha,
@@ -1617,62 +1611,60 @@ def test_fused_attn_fp8(
 
 
 if __name__ == "__main__":
-    torch.set_printoptions(profile="full")
-    test_fused_attn(
-        batch_size=128,
-        heads=1,
-        heads_rab=1,
-        max_seq_len_q=1618,
-        max_seq_len_k=1618,
-        max_context_len=0,
-        max_target_len=0,
-        target_group_size=1,
-        attn_dim=128,
-        hidden_dim=128,
-        alpha=1.0,
-        has_rab=True,
-        has_drab=True,
-        window_size=(-1, 0),
-        dtype=torch.bfloat16,
-        run_benchmark=None,
-        full_batch=True,
-        is_delta_q=False,
-    )
+    # test_fused_attn(
+    #     batch_size=128,
+    #     heads=1,
+    #     heads_rab=1,
+    #     max_seq_len_q=1024,
+    #     max_seq_len_k=1024,
+    #     max_context_len=0,
+    #     max_target_len=0,
+    #     target_group_size=1,
+    #     attn_dim=256,
+    #     hidden_dim=256,
+    #     alpha=1.0,
+    #     has_rab=True,
+    #     has_drab=True,
+    #     window_size=(-1, 0),
+    #     dtype=torch.bfloat16,
+    #     run_benchmark=None,
+    #     full_batch=False,
+    #     is_delta_q=False,
+    # )
 
-    test_fused_attn_fp8(
-        batch_size=1,
-        heads=1,
-        heads_rab=None,
-        max_seq_len_q=200,
-        max_seq_len_k=200,
-        max_target_len=0,
-        attn_dim=64,
-        hidden_dim=64,
-        alpha=1.0,
-        has_rab=False,
-        has_drab=False,
-        window_size=(-1, -1),
-        dtype=torch.float8_e4m3fn,
-        run_benchmark=None,
-        full_batch=True,
-        is_delta_q=False,
-    )
+    # test_fused_attn_fp8(
+    #     batch_size=1,
+    #     heads=1,
+    #     heads_rab=None,
+    #     max_seq_len_q=200,
+    #     max_seq_len_k=200,
+    #     max_target_len=0,
+    #     attn_dim=64,
+    #     hidden_dim=64,
+    #     alpha=1.0,
+    #     has_rab=False,
+    #     has_drab=False,
+    #     window_size=(-1, -1),
+    #     dtype=torch.float8_e4m3fn,
+    #     run_benchmark=None,
+    #     full_batch=True,
+    #     is_delta_q=False,
+    # )
 
-    b = 4
-    dim = [32, 64, 128, 256]
+    bs = [1, 2, 4, 8]
+    dim = [128, 256]
     num_heads = 4
 
-    is_causals = [True]
     has_rabs = [True]
-    seq_lens = [8192, 4096]
-    seq_lens_t = [0, 4096]
-    has_drabs = [False]
+    seq_lens = [8192]
+    seq_lens_t = [0]
+    has_drabs = [True]
     dytpes = [torch.bfloat16]
     for run_benchmark in [0]:
         for h in [num_heads]:
-            for d in dim:
-                for seq_len, seq_len_t in zip(seq_lens, seq_lens_t):
-                    for is_causal in is_causals:
+            for b in bs:
+                for d in dim:
+                    for seq_len, seq_len_t in zip(seq_lens, seq_lens_t):
                         for dtype in dytpes:
                             for has_rab in has_rabs:
                                 for has_drab in has_drabs:

@@ -57,6 +57,10 @@ struct Hstu_params {
   // could be different from nheads (query).
   int h_h_k_ratio;  // precompute h / h_k,
   bool is_delta_q;
+
+  bool is_balance_fwd;
+  bool is_balance_bwd;
+  int arch;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -81,7 +85,7 @@ struct Hstu_fwd_params : public Hstu_params {
   index_t rab_seqlen_k_stride;
 
   // The dimensions.
-  int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+  int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded;
   float alpha;
 
   int target_group_size;

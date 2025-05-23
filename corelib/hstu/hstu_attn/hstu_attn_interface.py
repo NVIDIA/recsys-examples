@@ -16,7 +16,7 @@
 # Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
 
 
-import hstu_attn_2_cuda as flash_attn_cuda
+import hstu_attn_2_cuda as hstu_attn_cuda
 import torch
 
 
@@ -46,7 +46,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         num_heads = q.size(1)
         head_dim = q.size(2)
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
-            out, rab_padded = flash_attn_cuda.hstu_varlen_fwd(
+            out, rab_padded = hstu_attn_cuda.varlen_fwd(
                 q,
                 k,
                 v,
@@ -111,7 +111,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         is_delta_q = ctx.is_delta_q
 
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
-            dq, dk, dv, dRab = flash_attn_cuda.hstu_varlen_bwd(
+            dq, dk, dv, dRab = hstu_attn_cuda.varlen_bwd(
                 dout.view(-1, num_heads, head_dim),
                 q,
                 k,
