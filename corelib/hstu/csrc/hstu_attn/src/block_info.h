@@ -35,13 +35,6 @@ struct HstuBlockInfo {
         actual_seqlen_q(params.cu_seqlens_q[bidb + 1] - sum_s_q),
         actual_seqlen_k(params.cu_seqlens_k[bidb + 1] - sum_s_k),
         actual_seqlen_t(params.num_targets == nullptr ? 0 : params.num_targets[bidb]) {}
-
-  template <typename Params>
-  __device__ HstuBlockInfo(const Params& params, const int bidb, const bool padding)
-      : sum_s_q(params.seqlen_q * bidb),
-        sum_s_k(params.seqlen_k * bidb),
-        actual_seqlen_q(params.seqlen_q),
-        actual_seqlen_k(params.seqlen_k) {}
     
   template <typename index_t>
   __forceinline__ __device__ index_t q_offset(const index_t row_stride) const {
