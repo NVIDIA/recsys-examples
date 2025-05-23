@@ -29,7 +29,12 @@ from commons.utils.distributed_utils import collective_assert
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logging import print_rank_0
 from commons.utils.stringify import stringify_dict
-from configs import KernelBackend, PositionEncodingConfig, get_hstu_config
+from configs import (
+    HSTULayerType,
+    KernelBackend,
+    PositionEncodingConfig,
+    get_hstu_config,
+)
 from megatron.core import parallel_state
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import OptimizerConfig
@@ -162,6 +167,7 @@ class NetworkArgs:
     dtype_str: str = "bfloat16"
 
     kernel_backend: str = "cutlass"
+    layer_type: str = "fused"
     target_group_size: int = 1
 
     num_position_buckets: int = 8192
@@ -173,6 +179,7 @@ class NetworkArgs:
         ], "Only support bfloat16 and float16 precision for Network."
 
         assert self.kernel_backend.lower() in ["cutlass", "triton", "pytorch"]
+        assert self.layer_type.lower() in ["fused", "native"]
 
 
 @gin.configurable
@@ -220,6 +227,13 @@ def create_hstu_config(network_args: NetworkArgs):
         raise ValueError(
             f"Kernel backend {network_args.kernel_backend} is not supported."
         )
+    layer_type = None
+    if network_args.layer_type == "fused":
+        layer_type = HSTULayerType.FUSED
+    elif network_args.layer_type == "native":
+        layer_type = HSTULayerType.NATIVE
+    else:
+        raise ValueError(f"Layer type {network_args.layer_type} is not supported.")
     position_encoding_config = PositionEncodingConfig(
         num_position_buckets=network_args.num_position_buckets,
         num_time_buckets=2048,
@@ -237,6 +251,7 @@ def create_hstu_config(network_args: NetworkArgs):
         kernel_backend=kernel_backend,
         position_encoding_config=position_encoding_config,
         target_group_size=network_args.target_group_size,
+        hstu_layer_type=layer_type,
     )
 
 
