@@ -65,28 +65,42 @@ class ScoreAdaptor:
         self.device_ = device
 
         min_step = 0
-        self.min_score_: int = (
-            device_timestamp() if evict_strategy == EvictStrategy.KLru else min_step
-        )
+        if evict_strategy == EvictStrategy.KLru:
+            self.min_score_: int = device_timestamp()
+        elif evict_strategy == EvictStrategy.KLfu:
+            # LFU 模式：使用单调递增的分数
+            self.min_score_: int = min_step
+        else:
+            self.min_score_: int = min_step
         self.step_: int = min_step + 1
 
     def min_score(self):
         return self.min_score_
 
+    #   add LFU here same to customized
     def next_score(self) -> int:
-        next_score = self.step_
-        return (
-            device_timestamp()
-            if self.evict_strategy_ == EvictStrategy.KLru
-            else next_score
-        )
+        if self.evict_strategy_ == EvictStrategy.KLru:
+            return device_timestamp()
+        else:
+            # LFU 和其他模式：返回单调递增的分数
+            next_score = self.step_
+            self.step_ += 1
+            return next_score
 
+    # add LFU here
     def score(self):
         if self.evict_strategy_ == EvictStrategy.KLru:
             return None
-        score = self.step_
-        self.step_ += 1
-        return score
+        elif self.evict_strategy_ == EvictStrategy.KLfu:
+            # score = self.step_
+            # self.step_ += 1
+            # return score
+            # LFU 应给merlin hashtable频率增量1 
+            return 1 
+        else:
+            score = self.step_
+            self.step_ += 1
+            return score
 
 
 def random_indices(batch, min_index, max_index):
@@ -125,9 +139,12 @@ def score_type():
 def counter_dtype():
     return torch.uint64
 
-
+# add LFU here
+# @pytest.mark.parametrize(
+#     "evict_strategy", [EvictStrategy.KLru, EvictStrategy.KCustomized, EvictStrategy.KLfu]
+# )
 @pytest.mark.parametrize(
-    "evict_strategy", [EvictStrategy.KLru, EvictStrategy.KCustomized]
+    "evict_strategy", [EvictStrategy.KLfu]
 )
 @pytest.mark.parametrize(
     "bucket_capacity, batch, capacity, num_iteration, dump_interval",
@@ -168,6 +185,7 @@ def test_dynamicemb_extensions(
     assert ext_option.dim * ext_option.max_capacity <= ext_option.local_hbm_for_values
 
     table = DynamicEmbTable(*astuple(ext_option))
+    # import pdb; pdb.set_trace() 
     device = torch.device(f"cuda:{ext_option.device_id}")
     score_adaptor = ScoreAdaptor(evict_strategy, score_type, device)
     init_score: int = score_adaptor.min_score()
@@ -245,6 +263,7 @@ def test_dynamicemb_extensions(
             )
             new_size = dyn_emb_rows(table)
             num_evict = evict_counter.cpu().item()
+            # 插入驱逐后的tablesize - 原本的table szize == 新增的值减去驱逐的值 
             assert new_size - old_size == torch.sum(founds == False).item() - num_evict
 
             # convert to torch.int64 to compare, check highest bit not 1.
@@ -292,3 +311,6 @@ def test_dynamicemb_extensions(
         d_num_matched.fill_(0)
         count_matched(table, undump_score, d_num_matched)
         assert d_num_matched.cpu().item() == 0
+
+if __name__ == "__main__":
+    test_dynamicemb_extensions(evict_strategy=EvictStrategy.KLfu, bucket_capacity=128, batch=128, capacity=512 * 1024, num_iteration=8192, dump_interval=1024)

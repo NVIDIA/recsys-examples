@@ -605,6 +605,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         self._update_score()
         return res
 
+    # Todo: add LFU here, LFU really need to set score?
     def set_score(
         self,
         named_score: Dict[str, int],
@@ -646,6 +647,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._scores[table_name] = 1
             elif option.score_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
+            elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
+                option.evict_strategy = DynamicEmbEvictStrategy.LFU #ADD LFU here
 
     def _update_score(self):
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
@@ -669,6 +672,9 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                     self._scores[table_name] = 0
                 else:
                     self._scores[table_name] = new_score
+            elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
+                new_score = old_score + 1 # Todo : confirm score update logic
+                self._scores[table_name] = new_score + old_score
 
     def incremental_dump(
         self,
