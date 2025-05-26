@@ -37,6 +37,7 @@ from configs import (
     PositionEncodingConfig,
     get_hstu_config,
 )
+from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state
 from megatron.core.distributed import finalize_model_grads
 from model import RankingGR, RetrievalGR

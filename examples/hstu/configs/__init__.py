@@ -1,6 +1,7 @@
 from . import hstu_config, task_config
 from .hstu_config import (
     HSTUConfig,
+    HSTULayerType,
     KernelBackend,
     PositionEncodingConfig,
     get_hstu_config,
@@ -24,4 +25,5 @@ __all__ = [
     "OptimizerParam",
     "ShardedEmbeddingConfig",
     "KernelBackend",
+    "HSTULayerType",
 ]
