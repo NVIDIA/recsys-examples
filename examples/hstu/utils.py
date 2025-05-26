@@ -17,30 +17,32 @@ import sys
 from dataclasses import dataclass
 from functools import partial  # pylint: disable-unused-import
 from itertools import islice
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import commons.checkpoint as checkpoint
 import configs
-import data
+import dataset
 import gin
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
+from commons.checkpoint import get_unwrapped_module
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logging import print_rank_0
 from commons.utils.stringify import stringify_dict
-from commons.utils.tensor_initializer import get_initializer_from_type
-from configs import KernelBackend, PositionEncodingConfig, get_hstu_config
+from configs import (
+    HSTULayerType,
+    KernelBackend,
+    OptimizerParam,
+    PositionEncodingConfig,
+    get_hstu_config,
+)
+from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.optimizer import OptimizerConfig
 from model import RankingGR, RetrievalGR
-from modules.embedding import (
-    DynamicShardedEmbeddingConfig,
-    EmbeddingOptimizerParam,
-    ShardedEmbeddingConfig,
-    get_nonfused_embedding_optimizer,
-)
+from modules.embedding import ShardedEmbeddingConfig
+from torchrec.distributed.model_parallel import DistributedModelParallel
 
 
 @gin.configurable
@@ -79,22 +81,6 @@ class BaseEmbeddingArgs:
     table_name: str
     item_vocab_size_or_capacity: int
 
-    embedding_initializer_type: str = "normal"
-    embedding_initializer_normal_mean: float = 0.0
-    embedding_initializer_normal_std: float = 1.0
-
-    embedding_initializer_uniform_low: float = 0.0
-    embedding_initializer_uniform_high: float = 1.0
-
-    embedding_initializer_constant_value: float = 0.0
-
-    def __post_init__(self):
-        assert self.embedding_initializer_type.lower() in [
-            "normal",
-            "uniform",
-            "constant",
-        ]
-
 
 @gin.configurable
 @dataclass
@@ -110,7 +96,7 @@ class EmbeddingArgs(BaseEmbeddingArgs):
 
 @gin.configurable
 @dataclass
-class DynamicEmbeddingArgs(BaseEmbeddingArgs):
+class DynamicEmbeddingArgs(EmbeddingArgs):
     # the precedence is global_hbm_for_values > item_vocab_gpu_capacity > item_vocab_gpu_capacity_ratio
     # without optimizer consideration
     global_hbm_for_values: Optional[int] = None
@@ -118,14 +104,9 @@ class DynamicEmbeddingArgs(BaseEmbeddingArgs):
     item_vocab_gpu_capacity_ratio: Optional[float] = None
 
     evict_strategy: str = "lru"
-    safe_check_mode: str = "ignore"
-
-    bucket_capacity: int = 128
 
     def __post_init__(self):
-        super().__post_init__()
         assert self.evict_strategy.lower() in ["lru", "lfu"]
-        assert self.safe_check_mode.lower() in ["ignore", "warning", "error"]
 
     def calculate_and_reset_global_hbm_for_values(self, hidden_size):
         if self.global_hbm_for_values is not None:
@@ -176,15 +157,6 @@ class NetworkArgs:
     hidden_size: int
     num_attention_heads: int
     kv_channels: int
-    # dense weight initializer
-    # note that bias is alwarys init'd as zero
-    dense_initializer_type: str = "xavier_uniform"
-    dense_initializer_uniform_low: float = 0.0
-    dense_initializer_uniform_high: float = 1.0
-
-    dense_initializer_normal_mean: float = 0.0
-    dense_initializer_normal_std: float = 1.0
-    dense_initializer_constant_value: float = 0.0
 
     hidden_dropout: float = 0.2
     norm_epsilon: float = 1e-5
@@ -193,10 +165,10 @@ class NetworkArgs:
     dtype_str: str = "bfloat16"
 
     kernel_backend: str = "cutlass"
+    layer_type: str = "fused"
     target_group_size: int = 1
 
-    num_position_buckets: Optional[int] = None
-    num_time_buckets: Optional[int] = None
+    num_position_buckets: int = 8192
 
     def __post_init__(self):
         assert self.dtype_str in [
@@ -204,15 +176,8 @@ class NetworkArgs:
             "float16",
         ], "Only support bfloat16 and float16 precision for Network."
 
-        assert self.dense_initializer_type.lower() in [
-            "normal",
-            "uniform",
-            "constant",
-            "xavier_uniform",
-            "xavier_normal",
-        ]
-
         assert self.kernel_backend.lower() in ["cutlass", "triton", "pytorch"]
+        assert self.layer_type.lower() in ["fused", "native"]
 
 
 @gin.configurable
@@ -223,16 +188,6 @@ class OptimizerArgs:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
-
-
-@gin.configurable
-@dataclass
-class DistributedDataParallelArgs:
-    grad_reduce_in_fp32: bool = True
-    overlap_grad_reduce: bool = False
-    use_distributed_optimizer: bool = False
-    check_for_nan_in_grad: bool = False
-    bucket_size: bool = True
 
 
 @gin.configurable
@@ -249,19 +204,6 @@ def create_hstu_config(network_args: NetworkArgs):
         dtype = torch.float16
     assert dtype is not None, "dtype not selected. Check your input."
 
-    init_kwargs = {}
-    if network_args.dense_initializer_type == "normal":
-        init_kwargs["mean"] = network_args.dense_initializer_normal_mean
-        init_kwargs["std"] = network_args.dense_initializer_normal_std
-    elif network_args.dense_initializer_type == "uniform":
-        init_kwargs["low"] = network_args.dense_initializer_uniform_low
-        init_kwargs["high"] = network_args.dense_initializer_uniform_high
-    elif network_args.dense_initializer_type == "constant":
-        init_kwargs["value"] = network_args.dense_initializer_constant_value
-    dense_init_method = get_initializer_from_type(
-        network_args.dense_initializer_type, **init_kwargs
-    )
-
     kernel_backend = None
     if network_args.kernel_backend == "cutlass":
         kernel_backend = KernelBackend.CUTLASS
@@ -273,22 +215,23 @@ def create_hstu_config(network_args: NetworkArgs):
         raise ValueError(
             f"Kernel backend {network_args.kernel_backend} is not supported."
         )
-    if network_args.num_position_buckets is not None:
-        position_encoding_config = PositionEncodingConfig(
-            num_position_buckets=network_args.num_position_buckets,
-            num_time_buckets=0
-            if network_args.num_time_buckets is None
-            else network_args.num_time_buckets,
-            use_time_encoding=(network_args.num_time_buckets is not None),
-        )
+    layer_type = None
+    if network_args.layer_type == "fused":
+        layer_type = HSTULayerType.FUSED
+    elif network_args.layer_type == "native":
+        layer_type = HSTULayerType.NATIVE
     else:
-        position_encoding_config = None
+        raise ValueError(f"Layer type {network_args.layer_type} is not supported.")
+    position_encoding_config = PositionEncodingConfig(
+        num_position_buckets=network_args.num_position_buckets,
+        num_time_buckets=2048,
+        use_time_encoding=False,
+    )
     return get_hstu_config(
         hidden_size=network_args.hidden_size,
         kv_channels=network_args.kv_channels,
         num_attention_heads=network_args.num_attention_heads,
         num_layers=network_args.num_layers,
-        init_method=dense_init_method,
         hidden_dropout=network_args.hidden_dropout,
         norm_epsilon=network_args.norm_epsilon,
         is_causal=network_args.is_causal,
@@ -296,6 +239,7 @@ def create_hstu_config(network_args: NetworkArgs):
         kernel_backend=kernel_backend,
         position_encoding_config=position_encoding_config,
         target_group_size=network_args.target_group_size,
+        hstu_layer_type=layer_type,
     )
 
 
@@ -309,7 +253,7 @@ def get_data_loader(
         "retrieval",
     ], f"task type should be ranking or retrieval not {task_type}"
     if isinstance(dataset_args, BenchmarkDatasetArgs):
-        from data.utils import FeatureConfig
+        from dataset.utils import FeatureConfig
 
         assert (
             trainer_args.max_train_iters is not None
@@ -345,10 +289,10 @@ def get_data_loader(
             num_generated_batches=100,
             num_tasks=1 if task_type == "ranking" else None,
         )
-        train_dataset = data.dummy_dataset.DummySequenceDataset(
+        train_dataset = dataset.dummy_dataset.DummySequenceDataset(
             batch_size=trainer_args.train_batch_size, **kwargs
         )
-        test_dataset = data.dummy_dataset.DummySequenceDataset(
+        test_dataset = dataset.dummy_dataset.DummySequenceDataset(
             batch_size=trainer_args.eval_batch_size, **kwargs
         )
     else:
@@ -356,7 +300,7 @@ def get_data_loader(
         (
             train_dataset,
             test_dataset,
-        ) = data.sequence_dataset.get_dataset(
+        ) = dataset.sequence_dataset.get_dataset(
             dataset_name=dataset_args.dataset_name,
             max_sequence_length=dataset_args.max_sequence_length,
             max_num_candidates=dataset_args.max_num_candidates,
@@ -368,72 +312,29 @@ def get_data_loader(
             random_seed=trainer_args.seed,
             eval_batch_size=trainer_args.eval_batch_size,
         )
-    return data.get_data_loader(train_dataset), data.get_data_loader(test_dataset)  # type: ignore[attr-defined]
+    return dataset.get_data_loader(train_dataset), dataset.get_data_loader(test_dataset)  # type: ignore[attr-defined]
 
 
-def create_optimizer_config(network_args: NetworkArgs, optimizer_args: OptimizerArgs):
-    params_dtype = torch.float32
-    if network_args.dtype_str == "bfloat16":
-        params_dtype = torch.bfloat16
-    if network_args.dtype_str == "float16":
-        params_dtype = torch.float16
-    return OptimizerConfig(
-        optimizer=optimizer_args.optimizer_str,
-        lr=optimizer_args.learning_rate,
-        adam_beta1=optimizer_args.adam_beta1,
-        adam_beta2=optimizer_args.adam_beta2,
-        adam_eps=optimizer_args.adam_eps,
-        params_dtype=params_dtype,
-        bf16=network_args.dtype_str == "bfloat16",
-        fp16=network_args.dtype_str == "float16",
-    )
-
-
-def create_embedding_config(
-    hidden_size: int, embedding_args: EmbeddingArgs, optimizer_args: OptimizerArgs
-) -> Union[DynamicShardedEmbeddingConfig, ShardedEmbeddingConfig]:
-    embedding_optimizer_param = EmbeddingOptimizerParam(
+def create_optimizer_params(optimizer_args: OptimizerArgs):
+    return OptimizerParam(
         optimizer_str=optimizer_args.optimizer_str,
         learning_rate=optimizer_args.learning_rate,
         adam_beta1=optimizer_args.adam_beta1,
         adam_beta2=optimizer_args.adam_beta2,
         adam_eps=optimizer_args.adam_eps,
     )
-    init_kwargs = {}
-    if embedding_args.embedding_initializer_type == "normal":
-        init_kwargs["mean"] = embedding_args.embedding_initializer_normal_mean
-        init_kwargs["std"] = embedding_args.embedding_initializer_normal_std
-    elif embedding_args.embedding_initializer_type == "uniform":
-        init_kwargs["low"] = embedding_args.embedding_initializer_uniform_low
-        init_kwargs["high"] = embedding_args.embedding_initializer_uniform_high
-    elif embedding_args.embedding_initializer_type == "constant":
-        init_kwargs["value"] = embedding_args.embedding_initializer_constant_value
-    embedding_initializer = get_initializer_from_type(
-        embedding_args.embedding_initializer_type, **init_kwargs
-    )
-    if isinstance(embedding_args, DynamicEmbeddingArgs):
-        from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
 
-        embedding_args.calculate_and_reset_global_hbm_for_values(hidden_size)
-        if embedding_args.safe_check_mode.lower() == "error":
-            safe_check_mode = DynamicEmbCheckMode.ERROR
-        elif embedding_args.safe_check_mode.lower() == "warning":
-            safe_check_mode = DynamicEmbCheckMode.WARNING
-        else:
-            safe_check_mode = DynamicEmbCheckMode.IGNORE
-        return configs.DynamicShardedEmbeddingConfig(
+
+def create_embedding_config(
+    hidden_size: int, embedding_args: EmbeddingArgs
+) -> ShardedEmbeddingConfig:
+    if isinstance(embedding_args, DynamicEmbeddingArgs):
+        return configs.ShardedEmbeddingConfig(
             feature_names=embedding_args.feature_names,
             table_name=embedding_args.table_name,
             vocab_size=embedding_args.item_vocab_size_or_capacity,
             dim=hidden_size,
-            initializer=embedding_initializer,
-            optimizer_param=embedding_optimizer_param,
-            global_hbm_for_values=embedding_args.global_hbm_for_values,
-            evict_strategy=DynamicEmbEvictStrategy.LRU
-            if embedding_args.evict_strategy == "lru"
-            else DynamicEmbEvictStrategy.LFU,
-            safe_check_mode=safe_check_mode,
-            bucket_capacity=embedding_args.bucket_capacity,
+            sharding_type="model_parallel",
         )
     return configs.ShardedEmbeddingConfig(
         feature_names=embedding_args.feature_names,
@@ -441,9 +342,28 @@ def create_embedding_config(
         vocab_size=embedding_args.item_vocab_size_or_capacity,
         dim=hidden_size,
         sharding_type=embedding_args.sharding_type,
-        initializer=embedding_initializer,
-        optimizer_param=embedding_optimizer_param,
     )
+
+
+def create_dynamic_optitons_dict(
+    embedding_args_list: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]],
+    hidden_size: int,
+) -> Dict[str, DynamicEmbTableOptions]:
+    dynamic_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    for embedding_args in embedding_args_list:
+        if isinstance(embedding_args, DynamicEmbeddingArgs):
+            from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
+
+            embedding_args.calculate_and_reset_global_hbm_for_values(hidden_size)
+            dynamic_options_dict[embedding_args.table_name] = DynamicEmbTableOptions(
+                global_hbm_for_values=embedding_args.global_hbm_for_values,
+                evict_strategy=DynamicEmbEvictStrategy.LRU
+                if embedding_args.evict_strategy == "lru"
+                else DynamicEmbEvictStrategy.LFU,
+                safe_check_mode=DynamicEmbCheckMode.IGNORE,
+                bucket_capacity=128,
+            )
+    return dynamic_options_dict
 
 
 def evaluate(
@@ -511,32 +431,23 @@ def save_ckpts(
 
 
 def train(
-    model: Union[RankingGR, RetrievalGR],
+    model: DistributedModelParallel,
     trainer_args: TrainerArgs,
     train_loader: torch.utils.data.DataLoader,
     eval_loader: torch.utils.data.DataLoader,
     dense_optimizer: torch.optim.Optimizer,
-    event_loss_weight: Optional[torch.Tensor] = None,
 ):
     gpu_timer = GPUTimer()
-    # drop last batch
-    iters_per_epoch = len(train_loader)
-    max_train_iters = trainer_args.max_train_iters or iters_per_epoch
-    max_train_iters = min(max_train_iters, iters_per_epoch)
-    train_iter = 0
+    max_train_iters = trainer_args.max_train_iters or len(train_loader)
     dp_size = parallel_state.get_data_parallel_world_size() * 1.0
     gpu_timer.start()
     last_td = 0
     # using a tensor on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
-    nonfused_embedding_optimizers = get_nonfused_embedding_optimizer(model)
-    for batch in islice(train_loader, iters_per_epoch):
+    train_loader_iter = iter(train_loader)
+    for train_iter in range(max_train_iters):
         if trainer_args.profile and train_iter == trainer_args.profile_step_start:
             torch.cuda.profiler.start()
-        torch.cuda.nvtx.range_push(f"step {train_iter}")
-        batch = batch.to("cuda")
-        model._dense_module.zero_grad_buffer()
-        dense_optimizer.zero_grad()
         if (
             train_iter * trainer_args.ckpt_save_interval > 0
             and train_iter % trainer_args.ckpt_save_interval == 0
@@ -544,8 +455,18 @@ def train(
             save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
             save_ckpts(save_path, model, dense_optimizer)
 
-        for optim in nonfused_embedding_optimizers:
-            optim.zero_grad()
+        torch.cuda.nvtx.range_push(f"step {train_iter}")
+
+        try:
+            batch = next(train_loader_iter)
+        except StopIteration:
+            # Reset iterator when we reach the end
+            train_loader_iter = iter(train_loader)
+            batch = next(train_loader_iter)
+
+        batch = batch.to("cuda")
+        model.module.zero_grad_buffer()
+        dense_optimizer.zero_grad()
 
         # shape = [T, num_event]
         losses, (_, logits, labels) = model(batch)
@@ -554,8 +475,6 @@ def train(
         local_tokens = torch.tensor(jagged_size).cuda().float()
 
         losses = torch.sum(losses, dim=0)
-        if event_loss_weight is not None:
-            losses = losses * event_loss_weight
         local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
         reporting_loss = local_loss.clone().detach()
         # [allreduced_sum_loss, allreduced_sum_tokens]
@@ -577,16 +496,14 @@ def train(
         local_loss_average.backward()
 
         # dense gradient allreduce
-        finalize_model_grads([model._dense_module], None)
+        finalize_model_grads([model.module], None)
         torch.cuda.nvtx.range_push(f"#dense opt")
         dense_optimizer.step()
         torch.cuda.nvtx.range_pop()
-        for optim in nonfused_embedding_optimizers:
-            optim.step()
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
             model.eval()
             evaluate(
-                model,
+                get_unwrapped_module(model),
                 trainer_args=trainer_args,
                 eval_loader=eval_loader,
                 max_eval_iters=None,
@@ -594,12 +511,8 @@ def train(
             model.train()
         torch.cuda.nvtx.range_pop()
 
-        train_iter += 1
         if trainer_args.profile and train_iter == trainer_args.profile_step_end:
             torch.cuda.profiler.stop()
-
-        if max_train_iters is not None and train_iter == max_train_iters:
-            break
 
     if trainer_args.ckpt_save_interval == -1:
         save_ckpts(trainer_args.ckpt_save_dir, model, dense_optimizer)

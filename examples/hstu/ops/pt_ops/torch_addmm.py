@@ -12,20 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 import torch
 
 
-def init_mlp_weights_optional_bias(
-    m: torch.nn.Module,
-) -> None:
+def torch_addmm_silu_fwd(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    silu: bool = False,
+) -> torch.Tensor:
     """
-    Initialize the weights of a linear layer and optionally the bias.
-
-    Args:
-        m: The module to initialize.
+    compute z = silu(y + x @ w); silu is optional
     """
-    if isinstance(m, torch.nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight)
-        # Always initialize bias to zero.
-        if m.bias is not None:
-            m.bias.data.fill_(0.0)
+    z = torch.addmm(y, x, w)
+    if silu:
+        silu_z = torch.nn.functional.silu(z)
+    else:
+        silu_z = None
+    return z, silu_z

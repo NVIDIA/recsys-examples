@@ -29,16 +29,15 @@
 import json
 import math
 from collections import defaultdict
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+from dataset.utils import Batch, RankingBatch, RetrievalBatch
+from preprocessor import get_common_preprocessors
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-
-from .preprocessor import get_common_preprocessors
-from .utils import Batch, RankingBatch, RetrievalBatch
 
 
 def load_seq(x: str):
@@ -87,8 +86,8 @@ class SequenceDataset(IterableDataset[Batch]):
         batch_size: int,
         max_seqlen: int,
         item_feature_name: str,
-        contextual_feature_names: List[str] = [],
-        action_feature_name: Optional[str] = None,
+        contextual_feature_names: List[str],
+        action_feature_name: str,
         max_num_candidates: int = 0,
         num_tasks: int = 0,
         *,
@@ -140,29 +139,12 @@ class SequenceDataset(IterableDataset[Batch]):
 
         self._sample_ids = np.arange(self._num_samples)
         self._shuffle_batch()
-        self._preload_data_for_rank()
 
     # We do batching in our own
     def __len__(self) -> int:
         return math.ceil(self._num_samples / self._global_batch_size)
 
     def __iter__(self) -> Iterator[Batch]:
-        for i in range(len(self)):
-            yield self._batches[i]
-
-    def _shuffle_batch(self):
-        """
-        currently, only inter global batch shuffle is supported
-        """
-        rng_state = np.random.get_state()
-        np.random.seed(self._random_seed)
-        if self._shuffle:
-            self._sample_ids = np.random.permutation(self._sample_ids)
-        # do not miss restoring the random state
-        np.random.set_state(rng_state)
-
-    def _preload_data_for_rank(self):
-        self._batches = []
         for i in range(len(self)):
             local_batch_start = (
                 i * self._global_batch_size + self._rank * self._batch_size
@@ -173,15 +155,15 @@ class SequenceDataset(IterableDataset[Batch]):
             )
             sample_ids = self._sample_ids[local_batch_start:local_batch_end]
 
-            contextual_features = defaultdict(list)
-            contextual_features_seqlen = defaultdict(list)
-            item_features = []
-            item_features_seqlen = []
-            action_features = []
-            action_features_seqlen = []
-            num_candidates = []
+            contextual_features: Dict[str, List[int]] = defaultdict(list)
+            contextual_features_seqlen: Dict[str, List[int]] = defaultdict(list)
+            item_features: List[int] = []
+            item_features_seqlen: List[int] = []
+            action_features: List[int] = []
+            action_features_seqlen: List[int] = []
+            num_candidates: List[int] = []
             # labels dtype: int
-            labels = []
+            labels: List[int] = []
             for sample_id in sample_ids:
                 data = self._seq_logs_frame.iloc[sample_id]
                 for contextual_feature_name in self._contextual_feature_names:
@@ -267,16 +249,25 @@ class SequenceDataset(IterableDataset[Batch]):
             )
             if self._num_tasks > 0:
                 # TODO: Need to considering using float in the future.
-                self._batches.append(
-                    RankingBatch(
-                        labels=torch.tensor(
-                            labels, device=self._device, dtype=torch.int64
-                        ).view(-1, self._num_tasks),
-                        **batch_kwargs,
-                    )
+                yield RankingBatch(
+                    labels=torch.tensor(
+                        labels, device=self._device, dtype=torch.int64
+                    ).view(-1, self._num_tasks),
+                    **batch_kwargs,
                 )
             else:
-                self._batches.append(RetrievalBatch(**batch_kwargs))
+                yield RetrievalBatch(**batch_kwargs)
+
+    def _shuffle_batch(self):
+        """
+        currently, only inter global batch shuffle is supported
+        """
+        rng_state = np.random.get_state()
+        np.random.seed(self._random_seed)
+        if self._shuffle:
+            self._sample_ids = np.random.permutation(self._sample_ids)
+        # do not miss restoring the random state
+        np.random.set_state(rng_state)
 
 
 def get_dataset(

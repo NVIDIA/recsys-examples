@@ -16,7 +16,7 @@ import abc
 from typing import Tuple
 
 import torch
-from data.utils import Batch
+from dataset.utils import Batch
 
 
 class BaseModel(torch.nn.Module):

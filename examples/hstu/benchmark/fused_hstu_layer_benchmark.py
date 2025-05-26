@@ -18,13 +18,18 @@ import torch
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
-from typing import Callable, Union
+from typing import Union
 
 import click
+import commons.utils.initialize as init
 import nvtx
-import utils.initialize as init
 from commons.utils.gpu_timer import IGPUTimer
-from configs.hstu_config import HSTULayerType, KernelBackend, get_hstu_config
+from configs.hstu_config import (
+    HSTUConfig,
+    HSTULayerType,
+    KernelBackend,
+    get_hstu_config,
+)
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_module import JaggedData
 from modules.native_hstu_layer import HSTULayer
@@ -50,27 +55,10 @@ def cli() -> None:
 
 
 def create_hstu_layer(
-    layer_type: HSTULayerType,
-    hidden_size: int,
-    kv_channels: int,
-    num_attention_heads: int,
-    init_method: Callable[[torch.Tensor], torch.Tensor],
-    dtype: torch.dtype,
-    kernel_backend: KernelBackend,
-    learnable_input_layernorm: bool = False,
+    hstu_config: HSTUConfig,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> Union[HSTULayer, FusedHSTULayer]:
-    hstu_config = get_hstu_config(
-        hidden_size=hidden_size,
-        kv_channels=kv_channels,
-        num_attention_heads=num_attention_heads,
-        init_method=init_method,
-        num_layers=1,
-        dtype=dtype,
-        kernel_backend=kernel_backend,
-        hstu_layer_type=layer_type,
-        learnable_input_layernorm=learnable_input_layernorm,
-    )
-    if layer_type == HSTULayerType.NATIVE:
+    if hstu_config.hstu_layer_type == HSTULayerType.NATIVE:
         module = HSTULayer(hstu_config).to(dtype).cuda()
     else:
         module = FusedHSTULayer(hstu_config).to(dtype).cuda()
@@ -88,11 +76,18 @@ def create_hstu_layer(
     required=False,
 )
 @click.option(
+    "--async-wgrad",
+    type=bool,
+    default=True,
+    required=False,
+)
+@click.option(
     "--kernel-backend",
     type=click.Choice(_backend_str_to_type.keys()),
     default="cutlass",
     required=False,
 )
+@click.option("--embedding-dim", type=int, default=0, required=True)
 @click.option("--dim-per-head", type=int, default=128, required=True)
 @click.option("--num-heads", type=int, default=8, required=True)
 @click.option(
@@ -106,10 +101,13 @@ def create_hstu_layer(
 @click.option("--batchsize", type=int, default=32, required=True)
 @click.option("--profiler-start", type=int, default=20, required=False)
 @click.option("--profiler-end", type=int, default=40, required=False)
+@click.option("--dump-memory-snapshot", type=bool, default=True, required=False)
+@click.option("--num-layers", type=int, default=1, required=False)
 def run(
     iters,
     warmup_iters,
     layer_type,
+    embedding_dim,
     dim_per_head,
     num_heads,
     dtype,
@@ -119,24 +117,34 @@ def run(
     profiler_start,
     profiler_end,
     full_sequence,
+    async_wgrad,
+    dump_memory_snapshot,
+    num_layers,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
     kernel_backend = _backend_str_to_type[kernel_backend]
     dtype = _dtype_str_to_type[dtype]
 
-    hidden_size = dim_per_head * num_heads
-    init_method = torch.nn.init.xavier_uniform_
-    hstu_layer = create_hstu_layer(
-        layer_type=layer_type,
+    hidden_size = embedding_dim if embedding_dim > 0 else dim_per_head * num_heads
+    hstu_config = get_hstu_config(
         hidden_size=hidden_size,
         kv_channels=dim_per_head,
         num_attention_heads=num_heads,
-        init_method=init_method,
+        num_layers=num_layers,
         dtype=dtype,
         kernel_backend=kernel_backend,
+        hstu_layer_type=layer_type,
         learnable_input_layernorm=True,
+        async_wgrad=async_wgrad,
     )
+    hstu_blocks = [
+        create_hstu_layer(
+            hstu_config=hstu_config,
+            dtype=dtype,
+        )
+        for _ in range(num_layers)
+    ]
     # generate random input
     if full_sequence:
         lengths = torch.full((batchsize,), max_seqlen, dtype=torch.int32, device="cuda")
@@ -167,16 +175,28 @@ def run(
     jagged_input = JaggedData(values=input, **ctor_nograd_dict)
     grad_output = torch.randn_like(input)
     # warmup
+    if dump_memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=10000)
     for _ in range(warmup_iters):
-        ret_jd = hstu_layer(jagged_input)
+        ret_jd = hstu_blocks[0](jagged_input)
+        for hstu_layer in hstu_blocks[1:]:
+            ret_jd = hstu_layer(ret_jd)
         ret_jd.values.backward(grad_output)
+
+    if dump_memory_snapshot:
+        torch.cuda.memory._dump_snapshot(
+            f"{log_layer_type}x{num_layers}_bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_snapshot.pickle"
+        )
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     # benchmark
     igpu_timer = IGPUTimer(max_iters=iters)
     # fwd
     for iteration in range(iters):
         igpu_timer.start(iteration)
-        ret_jd = hstu_layer(jagged_input)
+        ret_jd = hstu_blocks[0](jagged_input)
+        for hstu_layer in hstu_blocks[1:]:
+            ret_jd = hstu_layer(ret_jd)
         # ret_jd.values.backward(grad_output)
         igpu_timer.stop(iteration)
 
@@ -187,7 +207,9 @@ def run(
 
     # bwd
     for iteration in range(iters):
-        ret_jd = hstu_layer(jagged_input)
+        ret_jd = hstu_blocks[0](jagged_input)
+        for hstu_layer in hstu_blocks[1:]:
+            ret_jd = hstu_layer(ret_jd)
         igpu_timer.start(iteration)
         ret_jd.values.backward(grad_output)
         igpu_timer.stop(iteration)
@@ -205,7 +227,9 @@ def run(
             torch.cuda.profiler.start()
 
         with nvtx.annotate(f"hstu_layer_fwd {iteration}", color="ORANGE"):
-            ret_jd = hstu_layer(jagged_input)
+            ret_jd = hstu_blocks[0](jagged_input)
+            for hstu_layer in hstu_blocks[1:]:
+                ret_jd = hstu_layer(ret_jd)
 
         with nvtx.annotate(f"hstu_layer_bwd {iteration}", color="PURPLE"):
             ret_jd.values.backward(grad_output)

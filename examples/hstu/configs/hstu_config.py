@@ -86,12 +86,16 @@ class HSTUConfig(TransformerConfig):
     enable_relative_attention_bias: bool = False
 
     kernel_backend: KernelBackend = KernelBackend.CUTLASS
-    hstu_layer_type: HSTULayerType = HSTULayerType.NATIVE
+    hstu_layer_type: HSTULayerType = HSTULayerType.FUSED
 
     target_group_size: int = 1
     learnable_input_layernorm: bool = False
     # whether to add residual connection
     residual: bool = True
+    # whether to use async wgrad
+    async_wgrad: bool = False
+    async_wgrad_stream: Optional[torch.cuda.Stream] = None
+    async_wgrad_event: Optional[torch.cuda.Event] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -102,7 +106,6 @@ def get_hstu_config(
     kv_channels,
     num_attention_heads,
     num_layers,
-    init_method,
     dtype,
     position_encoding_config: Optional[PositionEncodingConfig] = None,
     hidden_dropout=0.2,
@@ -110,9 +113,10 @@ def get_hstu_config(
     is_causal: bool = True,
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     target_group_size: int = 1,
-    hstu_layer_type: HSTULayerType = HSTULayerType.NATIVE,
+    hstu_layer_type: HSTULayerType = HSTULayerType.FUSED,
     learnable_input_layernorm: bool = False,
     residual: bool = True,
+    async_wgrad: bool = False,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -122,7 +126,6 @@ def get_hstu_config(
         kv_channels (int): Number of key-value channels (per attention head).
         num_attention_heads (int): Number of attention heads.
         num_layers (int): Number of attention layers.
-        init_method (Callable): Initialization method. A callable that takes a tensor and initializes it. Note that this is only used to initialize the weight of the linear layers. The bias is initialized to zero.
         dtype (torch.dtype): Data type (e.g., torch.float16).
         position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.
         hidden_dropout (float, optional): Dropout rate for hidden layers. Defaults to 0.2.
@@ -135,7 +138,12 @@ def get_hstu_config(
     """
     is_bf16 = dtype == torch.bfloat16
     is_fp16 = dtype == torch.float16
-
+    if async_wgrad:
+        async_wgrad_stream = torch.cuda.Stream()
+        async_wgrad_event = torch.cuda.Event(enable_timing=False)
+    else:
+        async_wgrad_stream = None
+        async_wgrad_event = None
     return HSTUConfig(  # type: ignore
         position_encoding_config=position_encoding_config,
         hidden_size=hidden_size,
@@ -148,7 +156,6 @@ def get_hstu_config(
         tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
         pipeline_model_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
         context_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
-        init_method=init_method,
         fp16=is_fp16,
         is_causal=is_causal,
         kernel_backend=kernel_backend,
@@ -156,4 +163,7 @@ def get_hstu_config(
         hstu_layer_type=hstu_layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
         residual=residual,
+        async_wgrad=async_wgrad,
+        async_wgrad_stream=async_wgrad_stream,
+        async_wgrad_event=async_wgrad_event,
     )
