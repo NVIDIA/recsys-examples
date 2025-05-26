@@ -8,7 +8,7 @@ from configs.hstu_config import HSTUConfig, HSTULayerType
 from dataset.utils import RankingBatch, RetrievalBatch
 from megatron.core.transformer.module import MegatronModule
 from modules.fused_hstu_layer import FusedHSTULayer
-from modules.jagged_module import JaggedData
+from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.jagged_tensor_op import concat_2D_jagged_tensors

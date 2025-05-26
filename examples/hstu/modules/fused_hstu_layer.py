@@ -17,7 +17,7 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
 from megatron.core.transformer.module import MegatronModule
-from modules.jagged_module import JaggedData
+from modules.jagged_data import JaggedData
 from ops.fused_hstu_op import fused_hstu_op
 
 

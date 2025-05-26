@@ -100,8 +100,9 @@ class RankingConfig(BaseTaskConfig):
 
     Args:
         prediction_head_arch (List[int]): Architecture of the prediction head.
-        prediction_head_act_type (str): Activation types for the prediction head. Defaults to ``'relu'``
-        prediction_head_bias (bool): Bias flags for the prediction head. Defaults to ``True``
+        prediction_head_act_type (str): Activation function type for the prediction head layers. Must be one of: ``'relu'`` | ``'gelu'``. Defaults to ``'relu'``.
+        prediction_head_bias (bool): Whether to use bias terms in the prediction head layers. Defaults to ``True``.
+        num_tasks (int): Number of tasks. Defaults to ``1``.
         eval_metrics (Tuple[str], optional): Tuple of evaluation metric type str during training. Refer to :obj:`~modules.metrics.metric_modules.MetricType`
           for available metrics. Defaults to ``'AUC'``.
     """
@@ -110,9 +111,6 @@ class RankingConfig(BaseTaskConfig):
     prediction_head_act_type: str = "relu"
     prediction_head_bias: bool = True
     num_tasks: int = 1
-    # one head per event
-    # [binary cross entropy or multicross]
-    # number of tasks/events
     eval_metrics: Tuple[str, ...] = ("AUC",)
 
     def __post_init__(self):
