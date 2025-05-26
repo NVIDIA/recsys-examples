@@ -24,7 +24,12 @@ import click
 import commons.utils.initialize as init
 import nvtx
 from commons.utils.gpu_timer import IGPUTimer
-from configs.hstu_config import HSTULayerType, KernelBackend, get_hstu_config
+from configs.hstu_config import (
+    HSTUConfig,
+    HSTULayerType,
+    KernelBackend,
+    get_hstu_config,
+)
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_module import JaggedData
 from modules.native_hstu_layer import HSTULayer
@@ -50,27 +55,10 @@ def cli() -> None:
 
 
 def create_hstu_layer(
-    layer_type: HSTULayerType,
-    hidden_size: int,
-    kv_channels: int,
-    num_attention_heads: int,
-    dtype: torch.dtype,
-    kernel_backend: KernelBackend,
-    learnable_input_layernorm: bool = False,
-    async_wgrad: bool = False,
+    hstu_config: HSTUConfig,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> Union[HSTULayer, FusedHSTULayer]:
-    hstu_config = get_hstu_config(
-        hidden_size=hidden_size,
-        kv_channels=kv_channels,
-        num_attention_heads=num_attention_heads,
-        num_layers=1,
-        dtype=dtype,
-        kernel_backend=kernel_backend,
-        hstu_layer_type=layer_type,
-        learnable_input_layernorm=learnable_input_layernorm,
-        async_wgrad=async_wgrad,
-    )
-    if layer_type == HSTULayerType.NATIVE:
+    if hstu_config.hstu_layer_type == HSTULayerType.NATIVE:
         module = HSTULayer(hstu_config).to(dtype).cuda()
     else:
         module = FusedHSTULayer(hstu_config).to(dtype).cuda()
@@ -139,17 +127,21 @@ def run(
     dtype = _dtype_str_to_type[dtype]
 
     hidden_size = embedding_dim if embedding_dim > 0 else dim_per_head * num_heads
-
+    hstu_config = get_hstu_config(
+        hidden_size=hidden_size,
+        kv_channels=dim_per_head,
+        num_attention_heads=num_heads,
+        num_layers=num_layers,
+        dtype=dtype,
+        kernel_backend=kernel_backend,
+        hstu_layer_type=layer_type,
+        learnable_input_layernorm=True,
+        async_wgrad=async_wgrad,
+    )
     hstu_blocks = [
         create_hstu_layer(
-            layer_type=layer_type,
-            hidden_size=hidden_size,
-            kv_channels=dim_per_head,
-            num_attention_heads=num_heads,
+            hstu_config=hstu_config,
             dtype=dtype,
-            kernel_backend=kernel_backend,
-            learnable_input_layernorm=True,
-            async_wgrad=async_wgrad,
         )
         for _ in range(num_layers)
     ]

@@ -32,19 +32,3 @@ def torch_addmm_silu_fwd(
     else:
         silu_z = None
     return z, silu_z
-
-
-# def torch_addmm_silu_fwd(
-#     x: torch.Tensor,
-#     w: torch.Tensor,
-#     z: torch.Tensor,
-#     grad_output: torch.Tensor,
-#     is_y_1d: bool,
-#     silu: bool = False,
-# ) -> torch.Tensor:
-#     z = torch.addmm(y, x, w)
-#     if silu:
-#         silu_z = torch.nn.functional.silu(z)
-#     else:
-#         silu_z = None
-#     return z, silu_z
