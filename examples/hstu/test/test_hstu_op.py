@@ -407,7 +407,6 @@ def test_hstu_attn(
 @pytest.mark.parametrize("training", [True])
 @pytest.mark.parametrize("attn_backend", [KernelBackend.CUTLASS])
 @pytest.mark.parametrize("target_group_size", [1, 4])
-@pytest.mark.parametrize("alpha", [1.0])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("seed", [None])
 @pytest.mark.parametrize("learnable_ln", [True])
@@ -426,7 +425,6 @@ def test_fused_hstu_op(
     training: bool,
     attn_backend: KernelBackend,
     target_group_size: int,
-    alpha: float,
     causal: bool,
     seed: Optional[int],
     learnable_ln: bool,
@@ -601,7 +599,7 @@ def test_fused_hstu_op(
         num_targets=num_targets,
         num_contextuals=num_contextuals,
         target_group_size=target_group_size,
-        alpha=alpha,
+        alpha=1.0 / (hidden_dim_per_head**0.5),
         causal=causal,
         seed=seed,
         residual=residual,

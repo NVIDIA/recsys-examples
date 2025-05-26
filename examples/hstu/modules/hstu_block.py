@@ -164,7 +164,9 @@ class HSTUBlock(MegatronModule):
             seqlen_offsets=sequence_embeddings_lengths_offsets.to(torch.int32),
             max_seqlen=sequence_max_seqlen,
             max_num_candidates=max_num_candidates,
-            num_candidates=num_candidates.to(torch.int32),
+            num_candidates=num_candidates.to(torch.int32)
+            if num_candidates is not None
+            else None,
             num_candidates_offsets=length_to_complete_offsets(num_candidates).to(
                 torch.int32
             )

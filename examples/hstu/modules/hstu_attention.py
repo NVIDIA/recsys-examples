@@ -389,6 +389,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
             target_group_size=target_group_size,
             window_size=(-1, 0) if self.is_causal else (-1, -1),
             rab=None,
+            alpha=1.0 / (self.attention_dim**0.5),
         ).view(-1, self.num_heads * self.linear_dim)
 
 
