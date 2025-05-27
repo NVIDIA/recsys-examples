@@ -218,6 +218,7 @@ The initialization method for each embedding vector in the dynamic embedding tab
             Debug value generation mode for testing.
         """
         NORMAL = "normal"
+        TRUNCATED_NORMAL = "truncated_normal"
         UNIFORM = "uniform"
         CONSTANT = "constant"
         DEBUG = "debug"

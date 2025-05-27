@@ -104,6 +104,58 @@ struct NormalEmbeddingGenerator {
   float std_dev;
 };
 
+struct TruncatedNormalEmbeddingGenerator {
+  struct Args {
+    curandState* state;
+    float mean;
+    float std_dev;
+    float lower;
+    float upper;
+  };
+
+  DEVICE_INLINE
+  TruncatedNormalEmbeddingGenerator(Args args): load_(false), state_(args.state),
+    mean(args.mean), std_dev(args.std_dev), lower(args.lower), upper(args.upper) {}
+
+  DEVICE_INLINE
+  void set_state(uint64_t emb_id) {}
+
+  DEVICE_INLINE
+  float generate() {
+    if (!load_) {
+      localState_ = state_[GlobalThreadId()];
+      load_ = true;
+    }
+    auto l = normcdf((lower - mean) / std_dev);
+    auto u = normcdf((upper - mean) / std_dev);
+    u = 2 * u - 1;
+    l = 2 * l - 1;
+    double tmp = curand_uniform_double(&this->localState_);
+    tmp = tmp * (u - l) + l;
+    tmp = erfinv(tmp);
+    tmp *= scale * std_dev;
+    tmp += mean;
+    tmp = max(tmp, lower);
+    tmp = min(tmp, upper);
+    return static_cast<float>(tmp);
+  }
+
+  DEVICE_INLINE void destroy() {
+    if (load_) {
+      state_[GlobalThreadId()] = localState_;
+    }
+  }
+
+  bool load_;
+  curandState localState_;
+  curandState* state_;
+  float mean;
+  float std_dev;
+  float lower;
+  float upper;
+  double scale = sqrt(2.0f);
+};
+
 template <typename K>
 struct MappingEmbeddingGenerator {
   struct Args {
