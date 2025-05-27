@@ -1,13 +1,13 @@
 from . import hstu_config, task_config
 from .hstu_config import (
     HSTUConfig,
+    HSTULayerType,
     KernelBackend,
     PositionEncodingConfig,
     get_hstu_config,
 )
 from .task_config import (
-    DynamicShardedEmbeddingConfig,
-    EmbeddingOptimizerParam,
+    OptimizerParam,
     RankingConfig,
     RetrievalConfig,
     ShardedEmbeddingConfig,
@@ -22,8 +22,8 @@ __all__ = [
     "get_hstu_config",
     "RankingConfig",
     "RetrievalConfig",
-    "EmbeddingOptimizerParam",
+    "OptimizerParam",
     "ShardedEmbeddingConfig",
     "KernelBackend",
-    "DynamicShardedEmbeddingConfig",
+    "HSTULayerType",
 ]

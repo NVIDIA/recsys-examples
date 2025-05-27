@@ -16,14 +16,21 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from enum import Enum
 from functools import partial
+
+# pyre-strict
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torchmetrics.classification as classification_metrics
 from commons.utils.nvtx_op import output_nvtx_hook
+from dynamicemb.planner import (
+    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
+)
 from megatron.core import parallel_state
-from modules.embedding import ShardedEmbedding
 from ops.collective_ops import grouped_allgatherv_tensor_list
+
+# from torchrec.distributed import ModuleShardingPlan
 from tqdm import tqdm
 
 
@@ -280,7 +287,7 @@ class RetrievalTaskMetricWithSampling(BaseTaskMetric):
         self._cache_query_embeddings.append(query_embeddings)
         self._cache_target_ids.append(target_ids)
 
-    def compute(self, item_embedding: ShardedEmbedding, table_name: str):
+    def compute(self, keys_array: np.ndarray, values_array: np.ndarray):
         """
         Compute the final retrieval metrics after all eval batches are done.
 
@@ -293,7 +300,6 @@ class RetrievalTaskMetricWithSampling(BaseTaskMetric):
                                                      global top-K logits, and global top-K keys.
         """
         # 1. export local embedding
-        keys_array, values_array = item_embedding.export_local_embedding(table_name)
         local_shard_rows = keys_array.size
         if local_shard_rows == 0:
             raise ValueError(

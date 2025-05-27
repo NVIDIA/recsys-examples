@@ -15,7 +15,7 @@
 #!/usr/bin/env python3
 
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -270,16 +270,18 @@ def _addmm_optional_silu_fwd(
     tl.store(z_ptrs, z.to(z_ptr.dtype.element_ty), mask=z_mask)
 
 
-# TODO, make it multi-streamable
-def triton_addmm_bwd(
+def triton_addmm_silu_bwd(
     x: torch.Tensor,
     w: torch.Tensor,
     z: torch.Tensor,
     grad_output: torch.Tensor,
     is_y_1d: bool,
     silu: bool = False,
+    wgrad_stream: Optional[torch.cuda.Stream] = None,
+    wgrad_event: Optional[torch.cuda.Event] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if silu:
+        assert z is not None, "z is required for silu"
         dz = triton_silu_bwd(grad_output, z)
     else:
         dz = grad_output
@@ -287,13 +289,22 @@ def triton_addmm_bwd(
         dy = torch.sum(dz, dim=0)
     else:
         dy = dz
-    # will be under no_grad semantic
-    dw = torch.mm(x.t(), dz)
+    if wgrad_stream is not None:
+        wgrad_event.record(torch.cuda.current_stream())
+        # wait for dz and x to be ready
+        wgrad_event.wait(wgrad_stream)
+
     dx = torch.mm(dz, w.t())
+    if wgrad_stream is not None:
+        with torch.cuda.stream(wgrad_stream):
+            dw = torch.mm(x.t(), dz)
+            wgrad_event.record(wgrad_stream)
+    else:
+        dw = torch.mm(x.t(), dz)
     return dx, dw, dy
 
 
-def triton_addmm_fwd(
+def triton_addmm_silu_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
@@ -361,7 +372,7 @@ class _AddMmFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         ctx.is_y_1d = y.dim() == 1
         ctx.silu = silu
-        z, silu_z = triton_addmm_fwd(x, w, y, silu)
+        z, silu_z = triton_addmm_silu_fwd(x, w, y, silu)
 
         saved_tensors = (x, w, z) if silu else (x, w, None)
         ctx.save_for_backward(*saved_tensors)
@@ -374,7 +385,7 @@ class _AddMmFunction(torch.autograd.Function):
         ctx, dz: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
         (x, w, z) = ctx.saved_tensors
-        return triton_addmm_bwd(x, w, z, dz, ctx.is_y_1d, ctx.silu) + (None,)
+        return triton_addmm_silu_bwd(x, w, z, dz, ctx.is_y_1d, ctx.silu) + (None,)
 
 
 def triton_addmm(
