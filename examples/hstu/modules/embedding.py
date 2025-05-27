@@ -12,48 +12,253 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from functools import partial
-from typing import Dict, Iterator, List, Optional, Tuple, Union, cast
+import copy
+
+# pyre-strict
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
-from configs.task_config import (
-    DynamicShardedEmbeddingConfig,
-    EmbeddingOptimizerParam,
-    ShardedEmbeddingConfig,
-)
-from dynamicemb import DynamicEmbTableOptions
-from dynamicemb.planner import DynamicEmbeddingEnumerator
+import torch.nn as nn
+from configs.task_config import ShardedEmbeddingConfig
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
-from dynamicemb.planner import DynamicEmbParameterConstraints
-from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
-from megatron.core import tensor_parallel
-from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.model_parallel import DistributedModelParallel as DMP
-from torchrec.distributed.planner import Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
+from torch import distributed as dist
+from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.sharding.dp_sequence_sharding import (
+    DpSequenceEmbeddingSharding,
 )
-from torchrec.distributed.types import (
-    BoundsCheckMode,
-    ModuleSharder,
-    ShardingEnv,
-    ShardingType,
+from torchrec.distributed.types import ParameterSharding, ShardingEnv
+from torchrec.distributed.utils import (
+    add_params_from_parameter_sharding,
+    convert_to_fbgemm_types,
+    merge_fused_params,
+    optimizer_type_to_emb_opt_type,
 )
-from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
-from torchrec.modules.embedding_modules import EmbeddingCollection
-from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.modules.embedding_configs import (
+    EmbeddingConfig,
+    EmbeddingTableConfig,
+    PoolingType,
+    dtype_to_data_type,
+)
+from torchrec.modules.embedding_modules import (
+    EmbeddingCollection,
+    EmbeddingCollectionInterface,
+)
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
-_optimizer_str_to_optim_type = {
-    "adam": EmbOptimType.ADAM,
-    "sgd": EmbOptimType.EXACT_SGD,
-    # 'adamw': EmbOptimType.ADAMW,
-}
+
+def create_data_parallel_sharding_infos_by_sharding(
+    module: EmbeddingCollectionInterface,
+    table_name_to_parameter_sharding: Dict[str, ParameterSharding],
+    fused_params: Optional[Dict[str, Any]],
+) -> List[EmbeddingShardingInfo]:
+    if fused_params is None:
+        fused_params = {}
+
+    sharding_type_to_sharding_infos: List[EmbeddingShardingInfo] = []
+    # state_dict returns parameter.Tensor, which loses parameter level attributes
+    parameter_by_name = dict(module.named_parameters())
+    # QuantEBC registers weights as buffers (since they are INT8), and so we need to grab it    there
+    state_dict = module.state_dict()
+
+    for (
+        config,
+        embedding_names,
+    ) in zip(module.embedding_configs(), module.embedding_names_by_table()):
+        table_name = config.name
+        assert table_name in table_name_to_parameter_sharding
+
+        parameter_sharding = table_name_to_parameter_sharding[table_name]
+        if parameter_sharding.compute_kernel != EmbeddingComputeKernel.DENSE.value:
+            raise ValueError(
+                f"Compute kernel not supported {parameter_sharding.compute_kernel}"
+            )
+
+        param_name = "embeddings." + config.name + ".weight"
+        assert param_name in parameter_by_name or param_name in state_dict
+        param = parameter_by_name.get(param_name, state_dict[param_name])
+
+        optimizer_params = getattr(param, "_optimizer_kwargs", [{}])
+        optimizer_classes = getattr(param, "_optimizer_classes", [None])
+
+        assert (
+            len(optimizer_classes) == 1 and len(optimizer_params) == 1
+        ), f"Only support 1 optimizer, given {len(optimizer_classes)}"
+
+        optimizer_class = optimizer_classes[0]
+        optimizer_params = optimizer_params[0]
+        if optimizer_class:
+            optimizer_params["optimizer"] = optimizer_type_to_emb_opt_type(
+                optimizer_class
+            )
+        per_table_fused_params = merge_fused_params(fused_params, optimizer_params)
+        per_table_fused_params = add_params_from_parameter_sharding(
+            per_table_fused_params, parameter_sharding
+        )
+        per_table_fused_params = convert_to_fbgemm_types(per_table_fused_params)
+
+        sharding_type_to_sharding_infos.append(
+            (
+                EmbeddingShardingInfo(
+                    embedding_config=EmbeddingTableConfig(
+                        num_embeddings=config.num_embeddings,
+                        embedding_dim=config.embedding_dim,
+                        name=config.name,
+                        data_type=config.data_type,
+                        feature_names=copy.deepcopy(config.feature_names),
+                        pooling=PoolingType.NONE,
+                        is_weighted=False,
+                        has_feature_processor=False,
+                        embedding_names=embedding_names,
+                        weight_init_max=config.weight_init_max,
+                        weight_init_min=config.weight_init_min,
+                    ),
+                    param_sharding=parameter_sharding,
+                    param=param,
+                    fused_params=per_table_fused_params,
+                )
+            )
+        )
+    return sharding_type_to_sharding_infos
+
+
+class DataParallelEmbeddingCollection(torch.nn.Module):
+    """
+    Sharded implementation of `EmbeddingCollection`.
+    This is part of the public API to allow for manual data dist pipelining.
+    """
+
+    def __init__(
+        self,
+        data_parallel_embedding_collection: EmbeddingCollection,
+        data_parallel_sharding_plan,
+        env: ShardingEnv,
+        fused_params: Optional[Dict[str, Any]] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self._embedding_dim: int = data_parallel_embedding_collection.embedding_dim()
+        self._embedding_configs: List[
+            EmbeddingConfig
+        ] = data_parallel_embedding_collection.embedding_configs()
+        self._table_names: List[str] = [
+            config.name for config in self._embedding_configs
+        ]
+        self._table_name_to_config: Dict[str, EmbeddingConfig] = {
+            config.name: config for config in self._embedding_configs
+        }
+        self._feature_names: List[str] = [
+            feature
+            for config in self._embedding_configs
+            for feature in config.feature_names
+        ]
+
+        data_parallel_sharding_infos = create_data_parallel_sharding_infos_by_sharding(
+            data_parallel_embedding_collection,
+            data_parallel_sharding_plan,
+            fused_params,
+        )
+        assert (
+            len(data_parallel_sharding_infos) > 0
+        ), "data_parallel_sharding_infos should not be empty"
+        dp_sharding = DpSequenceEmbeddingSharding(
+            sharding_infos=data_parallel_sharding_infos,
+            env=env,
+            device=device,
+        )
+        self._dp_lookups = [
+            dp_sharding.create_lookup(
+                device=device,
+                fused_params=fused_params,
+            )
+        ]
+
+        self._env = env
+        self._device = device
+
+        self._initialize_torch_state()
+        self._has_uninitialized_input_dist: bool = True
+
+    def _initialize_torch_state(self) -> None:  # noqa
+        """
+        This provides consistency between this class and the EmbeddingCollection's
+        nn.Module API calls (state_dict, named_modules, etc)
+        """
+        self.embeddings: nn.ModuleDict = nn.Module()
+        assert len(self._dp_lookups[0]._emb_modules) == 1
+        self.embeddings.register_parameter(
+            f"{'/'.join(self._table_names)}_weights",
+            self._dp_lookups[0]._emb_modules[0].emb_module.weights,
+        )
+
+        self.embedding_weights: Dict[str, torch.Tensor] = {}
+
+        for (
+            table_name,
+            tbe_slice,
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
+            #  `named_parameters_by_table`.
+        ) in self._dp_lookups[0].named_parameters_by_table():
+            # for virtual table, currently we don't expose id tensor and bucket tensor
+            # because they are not updated in real time, and they are created on the fly
+            # whenever state_dict is called
+            # reference: ƒbgs _gen_named_parameters_by_table_ssd_pmt
+            self.embedding_weights[table_name] = tbe_slice
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self._device and self._device.type == "meta":
+            return
+        # Initialize embedding weights with init_fn
+        for table_config in self._embedding_configs:
+            assert table_config.init_fn is not None
+            param = self.embedding_weights[f"{table_config.name}"]
+            # pyre-ignore
+            table_config.init_fn(param)
+
+    def _create_input_dist(
+        self,
+        input_feature_names: List[str],
+    ) -> None:
+        self._features_order: List[int] = []
+        for f in self._feature_names:
+            self._features_order.append(input_feature_names.index(f))
+        self._features_order = (
+            []
+            if self._features_order == list(range(len(self._features_order)))
+            else self._features_order
+        )
+        self.register_buffer(
+            "_features_order_tensor",
+            torch.tensor(self._features_order, device=self._device, dtype=torch.int32),
+            persistent=False,
+        )
+        self._feature_splits = [len(self._feature_names)]
+
+    def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
+        if self._has_uninitialized_input_dist:
+            self._create_input_dist(input_feature_names=features.keys())
+            self._has_uninitialized_input_dist = False
+        with torch.no_grad():
+            if self._features_order:
+                features = features.permute(
+                    self._features_order,
+                    self._features_order_tensor,
+                )
+            features = features.split(self._feature_splits)[0]
+        embeddings = self._dp_lookups[0](features).view(-1, self._embedding_dim)
+        kjt = KeyedJaggedTensor(
+            values=embeddings,
+            keys=features.keys(),
+            lengths=features.lengths(),
+            offsets=features.offsets(),
+        )
+        return kjt.to_dict()
 
 
 class ShardedEmbedding(torch.nn.Module):
@@ -61,181 +266,49 @@ class ShardedEmbedding(torch.nn.Module):
     ShardedEmbedding is a module for handling sharded embeddings in a distributed setting.
 
     Args:
-        embedding_configs (List[Union[ShardedEmbeddingConfig, DynamicShardedEmbeddingConfig]]): Configuration for the sharded embedding.
-        batch_size_per_rank (int, optional): Batch size per rank, used as a hint for sharder. Defaults to 512.
-        pg (Optional[dist.ProcessGroup], optional): Process group for distributed embedding. Defaults to None.
+        embedding_configs (List[ShardedEmbeddingConfig]): Configuration for the sharded embedding.
     """
 
     def __init__(
         self,
-        embedding_configs: List[
-            Union[ShardedEmbeddingConfig, DynamicShardedEmbeddingConfig]
-        ],
-        batch_size_per_rank: int = 512,
-        pg: Optional[dist.ProcessGroup] = None,
+        embedding_configs: List[ShardedEmbeddingConfig],
     ):
         super(ShardedEmbedding, self).__init__()
-        # torchrec DP embedding itself will handle broadcast
-        with tensor_parallel.get_cuda_rng_tracker().fork(
-            "sharded-embedding-group-seed"
-        ):
-            self._configs = embedding_configs
-            self._device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            self._batch_size_per_rank = (
-                batch_size_per_rank if batch_size_per_rank else 512
-            )
-            self._pg = pg if pg else dist.group.WORLD
 
-            # fused_params is used to create FBGEMM TBE object, it includes learning rate, beta1 & beta2
-            opt_param: EmbeddingOptimizerParam = self._configs[0].optimizer_param
-            assert (
-                opt_param.optimizer_str in _optimizer_str_to_optim_type
-            ), f"embedding optimizer only support {list(_optimizer_str_to_optim_type.keys())}"
-            fused_params = {
-                "optimizer": _optimizer_str_to_optim_type[opt_param.optimizer_str],
-                "learning_rate": opt_param.learning_rate,
-                "beta1": opt_param.adam_beta1,
-                "beta2": opt_param.adam_beta2,
-                "eps": opt_param.adam_eps,
-                # 'weight_decay_mode' : WeightDecayMode.NONE,
-                "output_dtype": SparseType.FP32,
-            }
-
-            """
-            Shards the embedding collection based on the provided configuration. Memory allocation happens during this step.
-            """
-            self._has_dynamic_embedding = False
-            constraints = {}
-            for config in self._configs:
-                if isinstance(config, DynamicShardedEmbeddingConfig):
-                    sharding_types = [ShardingType.ROW_WISE.value]
-                    # use default value in dynamicemb
-                    dynamicemb_options = DynamicEmbTableOptions(
-                        global_hbm_for_values=config.global_hbm_for_values,
-                        evict_strategy=config.evict_strategy,
-                        bucket_capacity=config.bucket_capacity,
-                        safe_check_mode=config.safe_check_mode,
-                    )
-                    constraint = DynamicEmbParameterConstraints(
-                        sharding_types=sharding_types,
-                        bounds_check_mode=BoundsCheckMode.NONE,  # dynamic embedding has no bounding!
-                        enforce_hbm=True,
-                        use_dynamicemb=True,
-                        dynamicemb_options=dynamicemb_options,
-                    )
-                    self._has_dynamic_embedding = True
-                else:
-                    sharding_types = [
-                        ShardingType.ROW_WISE.value
-                        if config.sharding_type == "model_parallel"
-                        else ShardingType.DATA_PARALLEL.value
-                    ]
-                    constraint = DynamicEmbParameterConstraints(
-                        sharding_types=sharding_types,
-                        bounds_check_mode=BoundsCheckMode.NONE,  # dynamic embedding has no bounding!
-                        enforce_hbm=True,
-                        use_dynamicemb=False,
-                    )
-                constraints.update({config.table_name: constraint})
-
-            topology = Topology(
-                local_world_size=get_local_size(),
-                world_size=dist.get_world_size(self._pg),
-                compute_device=self._device.type,
-            )
-            estimated_global_batch_size = (
-                self._batch_size_per_rank * dist.get_world_size(self._pg)
-            )
-
-            eb_configs = []
-            for config in self._configs:
-                eb_configs.append(
+        def create_embedding_collection(configs):
+            return EmbeddingCollection(
+                tables=[
                     EmbeddingConfig(
                         name=config.table_name,
                         embedding_dim=config.dim,
-                        num_embeddings=config.vocab_size,  # To
+                        num_embeddings=config.vocab_size,
                         feature_names=config.feature_names,
-                        data_type=dtype_to_data_type(
-                            torch.float32
-                        ),  # weight storage precision is alrways float32
+                        data_type=dtype_to_data_type(torch.float32),
                     )
-                )
-
-            enumerator = DynamicEmbeddingEnumerator(
-                topology=topology,
-                batch_size=estimated_global_batch_size,
-                constraints=constraints,
+                    for config in configs
+                ],
+                device=torch.device("meta"),
             )
 
-            planner = DynamicEmbeddingShardingPlanner(
-                eb_configs=eb_configs,
-                batch_size=estimated_global_batch_size,
-                topology=topology,
-                constraints=constraints,
-                enumerator=enumerator,
-                storage_reservation=HeuristicalStorageReservation(percentage=0.05),
-            )
+        model_parallel_embedding_configs = []
+        data_parallel_embedding_configs = []
+        for config in embedding_configs:
+            if config.sharding_type == "data_parallel":
+                data_parallel_embedding_configs.append(config)
+            else:
+                model_parallel_embedding_configs.append(config)
 
-            sharders = [
-                cast(
-                    ModuleSharder[torch.nn.Module],
-                    DynamicEmbeddingCollectionSharder(
-                        use_index_dedup=True, fused_params=fused_params
-                    ),
-                ),
-            ]
+        self._model_parallel_embedding_collection = create_embedding_collection(
+            configs=model_parallel_embedding_configs
+        )
 
-            embedding_collection = EmbeddingCollection(
-                tables=eb_configs,
-                device=torch.device("meta"),  # do not allocate memory right now
+        if len(data_parallel_embedding_configs) > 0:
+            self._data_parallel_embedding_collection = create_embedding_collection(
+                configs=data_parallel_embedding_configs
             )
-            self._plan = planner.collective_plan(
-                embedding_collection, sharders, self._pg
-            )
-
-            self._embedding_collection = DMP(
-                module=embedding_collection,
-                env=ShardingEnv.from_process_group(self._pg),
-                device=self._device,
-                sharders=sharders,
-                plan=self._plan,
-            )
-            data_parallel_parameters = list(
-                dict(in_backward_optimizer_filter(self.named_parameters())).values()
-            )
-            if len(data_parallel_parameters) > 0:
-                if fused_params["optimizer"] == EmbOptimType.ADAM:
-                    optimizer_fn = partial(
-                        torch.optim.Adam,
-                        lr=fused_params["learning_rate"],
-                        betas=(
-                            fused_params["beta1"],
-                            fused_params["beta2"],
-                        ),
-                        eps=fused_params["eps"],
-                        weight_decay=0,
-                    )
-                elif fused_params["optimizer"] == EmbOptimType.EXACT_SGD:
-                    optimizer_fn = partial(
-                        torch.optim.SGD,
-                        lr=fused_params["learning_rate"],
-                        weight_decay=0,
-                    )
-                else:
-                    raise ValueError(f"{opt_param.optimizer_str} not support.")
-                self._nonfused_embedding_optimizer = optimizer_fn(
-                    data_parallel_parameters
-                )
-
-    @property
-    def module(self):
-        """
-        Returns the underlying embedding collection module.
-
-        Returns:
-            torch.nn.Module: The embedding collection module.
-        """
-        return self._embedding_collection.module
+            self._side_stream = torch.cuda.Stream()
+        else:
+            self._data_parallel_embedding_collection = None
 
     # @output_nvtx_hook(nvtx_tag="ShardedEmbedding", hook_tensor_attr_name="_values")
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
@@ -248,7 +321,15 @@ class ShardedEmbedding(torch.nn.Module):
         Returns:
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
-        return self._embedding_collection(kjt).wait()
+        mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+        if self._data_parallel_embedding_collection is not None:
+            with torch.cuda.stream(self._side_stream):
+                dp_embeddings = self._data_parallel_embedding_collection(kjt)
+            torch.cuda.current_stream().wait_stream(self._side_stream)
+            embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
+        else:
+            embeddings = mp_embeddings_awaitables.wait()
+        return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -278,9 +359,6 @@ class ShardedEmbedding(torch.nn.Module):
             ...     dim=32,
             ...     vocab_size=100,
             ...     sharding_type="model_parallel",
-            ...     optimizer_param=EmbeddingOptimizerParam(
-            ...       optimizer_str='sgd', learning_rate=1e-5
-            ...     )
             ... )
             >>> embedding = ShardedEmbedding(embedding_configs=[config])
             >>> keys, values = embedding.export_local_embedding("test_table")
@@ -290,10 +368,14 @@ class ShardedEmbedding(torch.nn.Module):
         """
         keys_list = []
         values_list = []
+        from dynamicemb.dump_load import get_dynamic_emb_module
 
+        dynamicemb_modules = get_dynamic_emb_module(
+            self._model_parallel_embedding_collection
+        )
         dynamic_table_names = set()
-        if self._has_dynamic_embedding:
-            from dynamicemb.dump_load import export_keys_values, get_dynamic_emb_module
+        if len(dynamicemb_modules) > 0:
+            from dynamicemb.dump_load import export_keys_values
             from dynamicemb_extensions import (
                 dyn_emb_capacity,
                 dyn_emb_cols,
@@ -301,9 +383,6 @@ class ShardedEmbedding(torch.nn.Module):
             )
 
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            dynamicemb_modules = get_dynamic_emb_module(
-                self._embedding_collection.module
-            )
 
             for m in dynamicemb_modules:
                 for dynamic_table_name, dynamic_table in zip(m.table_names, m.tables):
@@ -335,7 +414,10 @@ class ShardedEmbedding(torch.nn.Module):
                             f"difference: {accumulated_counts - local_max_rows}"
                         )
         if table_name not in dynamic_table_names:
-            for name, t in self._embedding_collection.state_dict().items():
+            for (
+                name,
+                t,
+            ) in self._model_parallel_embedding_collection.state_dict().items():
                 if table_name not in name:
                     continue
                 if not hasattr(t, "local_shards"):

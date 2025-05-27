@@ -27,3 +27,5 @@ checkpoints
 embedding_checkpoint/
 .idea/
 .DS_Store
+*.pickle
+*.xlsx

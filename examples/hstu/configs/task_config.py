@@ -15,11 +15,9 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Union, cast
 
-from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
-
 
 @dataclass
-class EmbeddingOptimizerParam:
+class OptimizerParam:
     """
     Configuration for the embedding optimizer.
 
@@ -39,7 +37,15 @@ class EmbeddingOptimizerParam:
 
 
 @dataclass
-class BaseShardedEmbeddingConfig:
+class ShardedEmbeddingConfig:
+    """
+    Configuration for sharded embeddings with sharding type. Inherits from BaseShardedEmbeddingConfig.
+
+    Args:
+        config (EmbeddingConfig): The embedding configuration.
+        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
+    """
+
     """
     Base configuration for sharded embeddings.
 
@@ -48,25 +54,13 @@ class BaseShardedEmbeddingConfig:
         table_name (str): The name of the table.
         vocab_size (int): The size of the vocabulary.
         dim (int): The dimension size of the embeddings.
-        optimizer_param (EmbeddingOptimizerParam): The optimizer parameters for the embeddings.
+        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
     """
 
     feature_names: List[str]
     table_name: str
     vocab_size: int
     dim: int
-    optimizer_param: EmbeddingOptimizerParam
-
-
-@dataclass
-class ShardedEmbeddingConfig(BaseShardedEmbeddingConfig):
-    """
-    Configuration for sharded embeddings with sharding type. Inherits from BaseShardedEmbeddingConfig.
-
-    Args:
-        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
-    """
-
     sharding_type: str
 
     def __post_init__(self):
@@ -77,37 +71,17 @@ class ShardedEmbeddingConfig(BaseShardedEmbeddingConfig):
 
 
 @dataclass
-class DynamicShardedEmbeddingConfig(BaseShardedEmbeddingConfig):
-    """
-    Configuration for dynamic sharded embeddings. Inherits from BaseShardedEmbeddingConfig.
-
-    Args:
-        global_hbm_for_values (int, optional): Global HBM capacity size in bytes for storing values. Defaults to 0.
-        evict_strategy (DynamicEmbEvictStrategy, optional): Eviction strategy. Defaults to ``DynamicEmbEvictStrategy.LRU``.
-        safe_check_mode (DynamicEmbCheckMode, optional): Safe check mode. Defaults to ``DynamicEmbCheckMode.IGNORE``.
-        bucket_capacity (int, optional): The number of entries each bucket can hold. Defaults to 128.
-    """
-
-    global_hbm_for_values: int = 0
-    evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
-    safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
-    bucket_capacity: int = 128
-
-
-@dataclass
 class BaseTaskConfig:
     """
     Base configuration for tasks.
 
     Args:
-        embedding_configs (List[Union[ShardedEmbeddingConfig, DynamicShardedEmbeddingConfig]]): A list of embedding configurations. Each configuration can be either a `ShardedEmbeddingConfig` or a `DynamicShardedEmbeddingConfig`.
+        embedding_configs (List[ShardedEmbeddingConfig]): A list of embedding configurations.
         user_embedding_norm (str, optional): Normalization for user embeddings. ``'layer_norm'`` | ``'l2_norm'``. Defaults to ``'l2_norm'``.
         item_l2_norm (bool, optional): Whether to apply L2 normalization to item embeddings. Defaults to False.
     """
 
-    embedding_configs: List[
-        Union[ShardedEmbeddingConfig, DynamicShardedEmbeddingConfig]
-    ]
+    embedding_configs: List[ShardedEmbeddingConfig]
 
     user_embedding_norm: str = "l2_norm"
     item_l2_norm: bool = False

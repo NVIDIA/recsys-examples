@@ -13,19 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections import OrderedDict
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RankingConfig
 from dataset.utils import RankingBatch
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import (
-    DistributedDataParallelConfig,
-    finalize_model_grads,
-)
-from megatron.core.transformer.module import Float16Module
 from model.base_model import BaseModel
 from modules.embedding import ShardedEmbedding
 from modules.hstu_block import HSTUBlock
@@ -44,24 +38,21 @@ class RankingGR(BaseModel):
     Args:
         hstu_config (HSTUConfig): The HSTU configuration.
         task_config (RankingConfig): The ranking task configuration.
-        ddp_config (Optional[DistributedDataParallelConfig]): The distributed data parallel configuration. If not provided, will use default value.
     """
 
     def __init__(
         self,
         hstu_config: HSTUConfig,
         task_config: RankingConfig,
-        ddp_config: Optional[DistributedDataParallelConfig] = None,
     ):
         super().__init__()
         self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
         assert (
             self._tp_size == 1
         ), "RankingGR does not support tensor model parallel for now"
-        self._device = torch.cuda.current_device()
+        self._device = torch.device("cuda", torch.cuda.current_device())
         self._hstu_config = hstu_config
         self._task_config = task_config
-        self._ddp_config = ddp_config
 
         self._embedding_dim = hstu_config.hidden_size
         for ebc_config in task_config.embedding_configs:
@@ -75,46 +66,23 @@ class RankingGR(BaseModel):
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
 
         self._hstu_block = HSTUBlock(hstu_config)
-        self._dense_module = torch.nn.Sequential(
-            self._hstu_block,
-            MultiTaskOverArch(
-                [
-                    MLP(
-                        self._embedding_dim,
-                        layer_sizes,
-                        has_bias,
-                        head_act_type,
-                        device=self._device,
-                    )
-                    for layer_sizes, head_act_type, has_bias in zip(
-                        task_config.prediction_head_arch,
-                        task_config.prediction_head_act_type,
-                        task_config.prediction_head_bias,  # type: ignore[arg-type]
-                    )
-                ]
-            ),
+        self._multi_task_over_arch = MultiTaskOverArch(
+            [
+                MLP(
+                    self._embedding_dim,
+                    layer_sizes,
+                    has_bias,
+                    head_act_type,
+                    device=self._device,
+                )
+                for layer_sizes, head_act_type, has_bias in zip(
+                    task_config.prediction_head_arch,
+                    task_config.prediction_head_act_type,
+                    task_config.prediction_head_bias,  # type: ignore[arg-type]
+                )
+            ]
         )
 
-        self._dense_module = self._dense_module.cuda()
-        # TODO, add ddp optimizer flag
-        if hstu_config.bf16 or hstu_config.fp16:
-            self._dense_module = Float16Module(hstu_config, self._dense_module)
-        if ddp_config is None:
-            ddp_config = DistributedDataParallelConfig(
-                grad_reduce_in_fp32=True,
-                overlap_grad_reduce=False,
-                use_distributed_optimizer=False,
-                check_for_nan_in_grad=False,
-                bucket_size=True,
-            )
-        self._dense_module = DDP(
-            hstu_config,
-            ddp_config,
-            self._dense_module,
-        )
-        # mcore DDP requires manual broadcast
-        self._dense_module.broadcast_params()
-        hstu_config.finalize_model_grads_func = finalize_model_grads
         # TODO, make reduction configurable
         self._loss_module = MultiTaskLossModule(
             logit_dim_list=self._logit_dim_list, reduction="none"
@@ -132,7 +100,8 @@ class RankingGR(BaseModel):
         Returns:
             RankingGR: The model with bfloat16 precision.
         """
-        self._dense_module.bfloat16()
+        self._hstu_block.bfloat16()
+        self._multi_task_over_arch.bfloat16()
         return self
 
     def half(self):
@@ -142,7 +111,8 @@ class RankingGR(BaseModel):
         Returns:
             RankingGR: The model with half precision.
         """
-        self._dense_module.half()
+        self._hstu_block.half()
+        self._multi_task_over_arch.half()
         return self
 
     def get_logit_and_labels(
@@ -157,11 +127,13 @@ class RankingGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The logits and labels.
         """
-        jagged_data = self._hstu_block.hstu_preprocess(
-            embeddings=self._embedding_collection(batch.features),
+        embeddings = self._embedding_collection(batch.features)
+        hidden_states = self._hstu_block(
+            embeddings=embeddings,
             batch=batch,
         )
-        return self._dense_module(jagged_data).values, batch.labels
+
+        return self._multi_task_over_arch(hidden_states).values, batch.labels
 
     @output_nvtx_hook(nvtx_tag="RankingModel", backward=False)
     def forward(  # type: ignore[override]
