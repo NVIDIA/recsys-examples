@@ -180,11 +180,11 @@ def generate_or_copy_parameters(
 @pytest.mark.parametrize("target_group_size", [2, 16, 256, 1])
 @pytest.mark.parametrize("batchsize", [32])
 @pytest.mark.parametrize(
-    "is_causal,kernel_backend,fwd_rtol,fwd_atol,bwd_rtol,bwd_atol",
+    "is_causal,kernel_backend",
     [
-        (True, KernelBackend.TRITON, 1e-7, 1e-5, 1e-7, 1e-5),
-        (True, KernelBackend.CUTLASS, 1e-7, 1e-5, 1e-7, 1e-5),
-        (False, KernelBackend.CUTLASS, 1e-7, 1e-5, 1e-7, 1e-5),
+        (True, KernelBackend.TRITON),
+        (True, KernelBackend.CUTLASS),
+        (False, KernelBackend.CUTLASS),
     ],
 )
 @pytest.mark.parametrize("from_scratch", [True, False])
@@ -200,10 +200,6 @@ def test_hstu_attn(
     batchsize,
     kernel_backend,
     from_scratch,
-    fwd_rtol,
-    fwd_atol,
-    bwd_rtol,
-    bwd_atol,
 ):
     if kernel_backend == KernelBackend.TRITON and target_group_size > 1:
         pytest.skip("Triton is not supported when target_group_size > 1")
@@ -212,10 +208,6 @@ def test_hstu_attn(
     # TODO: uncomment this once cutlass supports causal attention
     if not is_causal and max_num_contextuals > 0:
         pytest.skip("Only causal attention is supported when max_num_contextuals > 0")
-    # TODO: remove this once Hopper supports contextual mask
-    sm_major_version = torch.cuda.get_device_properties(0).major
-    if sm_major_version > 8 and max_num_contextuals > 0:
-        pytest.skip("Hopper does not support contextual mask")
 
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -489,16 +481,6 @@ def test_fused_hstu_op(
 
     if attn_backend == KernelBackend.TRITON and target_group_size > 1:
         pytest.skip("TRITON does not support target grouped attention")
-    sm_major_version = torch.cuda.get_device_properties(0).major
-
-    if (
-        attn_backend == KernelBackend.CUTLASS
-        and sm_major_version == 9
-        and (target_group_size > 1 or max_num_contextuals > 0)
-    ):
-        pytest.skip(
-            "CUTLASS does not support Hopper with target group size > 1 or contextuals"
-        )
     num_targets = None
     num_contextuals = None
 

@@ -318,7 +318,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         is_causal: bool,
     ):
         super().__init__()
-        from hopper.flash_attn_interface import hstu_attn_varlen_func
+        from hopper.hstu_attn_interface import hstu_attn_varlen_func
 
         self._hstu_attn_varlen_func = hstu_attn_varlen_func
         self.num_heads = num_heads
@@ -371,8 +371,6 @@ class FusedHSTUAttentionHopper(HSTUAttention):
                 .expand(offsets.size(0) - 1)
                 .contiguous()
             )
-        # TODO: remove this once Hopper supports contextual mask bwd
-        num_contextuals = None
         return self._hstu_attn_varlen_func(
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),

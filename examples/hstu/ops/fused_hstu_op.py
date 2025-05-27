@@ -262,7 +262,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm_major_version = torch.cuda.get_device_properties(0).major
             hopper_fp8_args = ()
             if sm_major_version == 8:
-                cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.hstu_varlen_fwd
+                cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
             elif sm_major_version == 9:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
                 hopper_fp8_args = (None, None, None)
@@ -575,7 +575,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
             if sm_major_version == 8:
-                cutlass_hstu_varlen_bwd = flash_attn_cuda_ampere.hstu_varlen_bwd
+                cutlass_hstu_varlen_bwd = flash_attn_cuda_ampere.varlen_bwd
             elif sm_major_version == 9:
                 cutlass_hstu_varlen_bwd = flash_attn_cuda_hopper.varlen_bwd
             else:
