@@ -1,5 +1,6 @@
 ARG BASE_IMAGE=pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
 ARG DEVEL_IMAGE=devel
+ARG RUNTIME_IMAGE=pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
 FROM ${BASE_IMAGE} AS devel
 WORKDIR /workspace/deps
@@ -7,7 +8,7 @@ WORKDIR /workspace/deps
 RUN ls -la /usr/local/cuda && echo "/usr/local/cuda exists" || echo "/usr/local/cuda does NOT exist"
 
 # Set CUDA_HOME and update PATH and LD_LIBRARY_PATH
-ENV CUDA_HOME=/usr/local/cuda-12.6
+ENV CUDA_HOME=/usr/local/cuda
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${CUDA_HOME}/compat:${LD_LIBRARY_PATH}
 
 # Install git first
@@ -27,11 +28,13 @@ RUN git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath
 
 RUN pip install --no-cache setuptools==69.5.1 setuptools-git-versioning scikit-build && \
-  git clone --recursive -b main https://github.com/pytorch/FBGEMM.git fbgemm && \
-  cd fbgemm/fbgemm_gpu && \
+  git clone --recursive -b main https://github.com/pytorch/FBGEMM.git /tmp/fbgemm && \
+  cd /tmp/fbgemm/fbgemm_gpu && \
   git checkout 642ccb980d05aa1be00ccd131c5991b0914e2e64 && \
   python setup.py bdist_wheel --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0" && \
-  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
+  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0" && \
+  cd / && \
+  rm -rf /tmp/fbgemm_build
 
 RUN pip install --no-deps tensordict orjson && \
   git clone --recursive -b main https://github.com/pytorch/torchrec.git torchrec && \
@@ -69,3 +72,9 @@ RUN cd /workspace/recsys-examples/corelib/hstu && \
     HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
     cd hopper && \
     HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install .
+
+FROM ${RUNTIME_IMAGE} AS runtime
+WORKDIR /workspace
+COPY --from=build /opt/conda /opt/conda
+COPY --from=build /workspace/recsys-examples /workspace/recsys-examples
+ENV PATH=/opt/conda/bin:$PATH
