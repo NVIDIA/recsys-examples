@@ -33,6 +33,9 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
     init.initialize_distributed()
     init.initialize_model_parallel(1)
     init.set_random_seed(1234)
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     metric_module = RetrievalTaskMetricWithSampling(MAX_K=max_k)

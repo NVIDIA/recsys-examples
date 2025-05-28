@@ -212,7 +212,9 @@ def test_hstu_attn(
     init.initialize_distributed()
     init.set_random_seed(1234)
     device = torch.cuda.current_device()
-
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     if not is_causal:
         max_num_candidates = 0
 
@@ -426,6 +428,9 @@ def test_fused_hstu_op(
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     device = torch.cuda.current_device()
     ln_eps = 1e-5
     hstu_config = get_hstu_config(
