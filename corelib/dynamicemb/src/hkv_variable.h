@@ -162,7 +162,7 @@ private:
   DataType value_type_;
   SafeCheckMode safe_check_mode_;
   OptimizerType optimizer_type_;
-  ValueType initial_optstate_ {0.};
+  float initial_optstate_ {0.};
 
 };
 
