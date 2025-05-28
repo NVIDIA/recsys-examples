@@ -270,7 +270,7 @@ def main(argv: List[str]) -> None:
         "--optimizer_type",
         type=str,
         default="adam",
-        choices=["sgd", "adam", "exact_adagrad", "row_wise_adagrad"],
+        choices=["sgd", "adam", "exact_adagrad", "exact_row_wise_adagrad"],
         help="optimizer type.",
     )
     parser.add_argument(

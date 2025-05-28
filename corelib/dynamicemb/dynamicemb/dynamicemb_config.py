@@ -25,6 +25,7 @@ from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
     InitializerArgs,
+    OptimizerType,
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
@@ -101,7 +102,12 @@ class DynamicEmbInitializerArgs:
         if self.mode == DynamicEmbInitializerMode.NORMAL:
             return self.mean == other.mean and self.std_dev == other.std_dev
         elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-            return self.mean == other.mean and self.std_dev == other.std_dev and self.lower == other.lower and self.upper == other.upper
+            return (
+                self.mean == other.mean
+                and self.std_dev == other.std_dev
+                and self.lower == other.lower
+                and self.upper == other.upper
+            )
         elif self.mode == DynamicEmbInitializerMode.UNIFORM:
             return self.lower == other.lower and self.upper == other.upper
         elif self.mode == DynamicEmbInitializerMode.CONSTANT:
@@ -211,6 +217,7 @@ class GroupedHKVConfig:
     embedding_dtype: Optional[torch.dtype] = None
     score_type: torch.dtype = torch.uint64
     device_id: Optional[int] = None
+    optimizer_type: OptimizerType = OptimizerType.Null
 
 
 # HKV configs can't be inferred by context.
@@ -266,6 +273,10 @@ class DynamicEmbTableOptions(HKVConfig):
     device_id : Optional[int], optional
         CUDA device index.
 
+    optimizer_type: OptimizerType
+        Optimizer type used to create HKV table, because different optimizers bring different states consume.
+        It only used internally, and default to `OptimizerType.Null`.
+
     dim : Optional[int], optional
         The dimensionality of the value vectors. Default is -1, indicating it should be set explicitly.
     max_capacity : Optional[int], optional
@@ -306,6 +317,8 @@ class DynamicEmbTableOptions(HKVConfig):
     safe_check_mode : DynamicEmbCheckMode
         Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
         Please refer to the API documentation for DynamicEmbCheckMode for more information.
+    training: bool
+        Flag to indicate dynamic embedding tables is working on training mode or evaluation mode, default to `True`.
 
     Notes
     -----
@@ -317,6 +330,7 @@ class DynamicEmbTableOptions(HKVConfig):
         default_factory=DynamicEmbInitializerArgs
     )
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
+    training: bool = True
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
@@ -332,6 +346,7 @@ class DynamicEmbTableOptions(HKVConfig):
 
     def get_grouped_key(self):
         grouped_key = {f.name: getattr(self, f.name) for f in fields(GroupedHKVConfig)}
+        grouped_key["training"] = self.training
         return grouped_key
 
     def __hash__(self):
@@ -419,6 +434,27 @@ def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:
         raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
 
 
+def dtype_to_bytes(dtype: torch.dtype) -> int:
+    dtype_size_map = {
+        torch.float16: 2,
+        torch.bfloat16: 2,
+        torch.float32: 4,
+        torch.float64: 8,
+        torch.int8: 1,
+        torch.uint8: 1,
+        torch.int16: 2,
+        torch.uint16: 2,
+        torch.int32: 4,
+        torch.uint32: 4,
+        torch.int64: 8,
+        torch.uint64: 8,
+        torch.bool: 1,
+    }
+    if dtype not in dtype_size_map:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    return dtype_size_map[dtype]
+
+
 def string_to_evict_strategy(strategy_str: str) -> EvictStrategy:
     if strategy_str == "KLru":
         return EvictStrategy.KLru
@@ -454,6 +490,7 @@ def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmb
         table_options.num_of_buckets_per_alloc,
         table_options.initializer_args.as_ctype(),
         table_options.safe_check_mode.value,
+        table_options.optimizer_type,
     )
 
 

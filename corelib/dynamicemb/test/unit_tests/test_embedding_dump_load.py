@@ -392,15 +392,20 @@ def run(args):
     DynamicEmbDump("debug_weight", model, optim=True)
     DynamicEmbLoad("debug_weight", model, optim=True)
 
+    table_names = {"model": ["t_0"]}
+    DynamicEmbDump("debug_weight_t0", model, table_names=table_names, optim=True)
+    DynamicEmbLoad("debug_weight_t0", model, table_names=table_names, optim=False)
+
     table_names = {"model": ["t_1"]}
-    DynamicEmbDump("debug_weight_sep", model, table_names=table_names, optim=True)
-    DynamicEmbLoad("debug_weight_sep", model, table_names=table_names, optim=True)
+    DynamicEmbDump("debug_weight_t1", model, table_names=table_names, optim=False)
+    DynamicEmbLoad("debug_weight_t1", model, table_names=table_names, optim=False)
 
     dist.barrier()
 
     if local_rank == 0:
         shutil.rmtree("debug_weight")
-        shutil.rmtree("debug_weight_sep")
+        shutil.rmtree("debug_weight_t0")
+        shutil.rmtree("debug_weight_t1")
 
     dist.barrier()
     dist.destroy_process_group()

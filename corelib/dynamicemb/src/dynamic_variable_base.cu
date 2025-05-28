@@ -26,7 +26,8 @@ std::shared_ptr<DynamicVariableBase> VariableFactory::create(
     int block_size, int io_block_size, int device_id, bool io_by_cpu,
     bool use_constant_memory, int reserved_key_start_bit,
     size_t num_of_buckets_per_alloc, const InitializerArgs &initializer_args,
-    const SafeCheckMode safe_check_mode = SafeCheckMode::IGNORE) {
+    const SafeCheckMode safe_check_mode = SafeCheckMode::IGNORE,
+    const OptimizerType optimizer_type = OptimizerType::Null) {
   // TODO:check input datetype , now only support key type is int64_t uint64_t ,
   // value type float
   std::shared_ptr<DynamicVariableBase> table;
@@ -38,7 +39,7 @@ std::shared_ptr<DynamicVariableBase> VariableFactory::create(
             max_hbm_for_vectors, max_bucket_size, max_load_factor, block_size,
             io_block_size, device_id, io_by_cpu, use_constant_memory,
             reserved_key_start_bit, num_of_buckets_per_alloc, initializer_args,
-            safe_check_mode);
+            safe_check_mode, optimizer_type);
       });
     });
   });

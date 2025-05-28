@@ -27,6 +27,7 @@ from dynamicemb.optimizer import *
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
+    OptimizerType,
     count_matched,
     device_timestamp,
     dyn_emb_capacity,
@@ -348,6 +349,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         for option in self._dynamicemb_options:
             if option.init_capacity is None:
                 option.init_capacity = option.max_capacity
+        self._optimizer_type = optimizer
         self._tables: List[DynamicEmbTable] = []
         self._create_tables()
         # add placeholder require_grad param tensor to enable autograd with int8 weights
@@ -357,7 +359,6 @@ class BatchedDynamicEmbeddingTables(nn.Module):
 
         # TODO: review this code block
         self.stochastic_rounding = stochastic_rounding
-        self._optimizer_type = optimizer
 
         self.weight_decay_mode = weight_decay_mode
         if (weight_decay_mode == WeightDecayMode.COUNTER) != (
@@ -464,6 +465,22 @@ class BatchedDynamicEmbeddingTables(nn.Module):
 
     def _create_tables(self) -> None:
         for option in self._dynamicemb_options:
+            if option.training:
+                if self._optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+                    option.optimizer_type = OptimizerType.RowWiseAdaGrad
+                elif (
+                    self._optimizer_type == EmbOptimType.SGD
+                    or self._optimizer_type == EmbOptimType.EXACT_SGD
+                ):
+                    option.optimizer_type = OptimizerType.SGD
+                elif self._optimizer_type == EmbOptimType.ADAM:
+                    option.optimizer_type = OptimizerType.Adam
+                elif self._optimizer_type == EmbOptimType.EXACT_ADAGRAD:
+                    option.optimizer_type = OptimizerType.AdaGrad
+                else:
+                    raise ValueError(
+                        f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
+                    )
             self._tables.append(create_dynamicemb_table(option))
 
     def _create_optimizer(
