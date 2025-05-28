@@ -664,7 +664,9 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     // If max_seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
     dk.zero_();
     dv.zero_();
-    dRab.zero_();
+    if(has_drab) {
+      dRab.zero_();
+    }
   }
 
   if (has_drab && seqlen_k_rounded != max_seqlen_k) {
