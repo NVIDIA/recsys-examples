@@ -47,6 +47,7 @@ FORCE_CXX11_ABI = os.getenv("HSTU_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 DISABLE_BACKWARD = os.getenv("HSTU_DISABLE_BACKWARD", "FALSE") == "TRUE"
 DISABLE_LOCAL = os.getenv("HSTU_DISABLE_LOCAL", "FALSE") == "TRUE"
 DISABLE_CAUSAL = os.getenv("HSTU_DISABLE_CAUSAL", "FALSE") == "TRUE"
+DISABLE_CONTEXT = os.getenv("HSTU_DISABLE_CONTEXT", "FALSE") == "TRUE"
 DISABLE_TARGET = os.getenv("HSTU_DISABLE_TARGET", "FALSE") == "TRUE"
 DISABLE_DELTA_Q = os.getenv("HSTU_DISABLE_DELTA_Q", "FALSE") == "TRUE"
 DISABLE_RAB = os.getenv("HSTU_DISABLE_RAB", "FALSE") == "TRUE"
@@ -128,6 +129,30 @@ else:
     from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 
+class NinjaBuildExtension(BuildExtension):
+    def __init__(self, *args, **kwargs) -> None:
+        # do not override env MAX_JOBS if already exists
+        if not os.environ.get("MAX_JOBS"):
+            import psutil
+
+            # calculate the maximum allowed NUM_JOBS based on cores
+            max_num_jobs_cores = max(1, os.cpu_count() // 2)
+
+            # calculate the maximum allowed NUM_JOBS based on free memory
+            free_memory_gb = psutil.virtual_memory().available / (
+                1024**3
+            )  # free memory in GB
+            max_num_jobs_memory = int(
+                free_memory_gb / 9
+            )  # each JOB peak memory cost is ~8-9GB when threads = 4
+
+            # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
+            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
+            os.environ["MAX_JOBS"] = str(max_jobs)
+
+        super().__init__(*args, **kwargs)
+
+
 def get_platform():
     """
     Returns the platform name as used in wheel filenames.
@@ -171,6 +196,155 @@ def nvcc_threads_args():
     return ["--threads", nvcc_threads]
 
 
+def generate_cuda_sources():
+    DTYPE_16 = (["bf16"] if not DISABLE_BF16 else []) + (
+        ["fp16"] if not DISABLE_FP16 else []
+    )
+    HEAD_DIMENSIONS = (
+        []
+        + ([32] if not DISABLE_HDIM32 else [])
+        + ([64] if not DISABLE_HDIM64 else [])
+        + ([128] if not DISABLE_HDIM128 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
+    )
+    RAB = [""] + (["_rab"] if not DISABLE_RAB else [])
+    RAB_DRAB = [""] + (
+        (["_rab_drab", "_rab"])
+        if not DISABLE_DRAB
+        else ["_rab"]
+        if not DISABLE_RAB
+        else []
+    )
+    MASK = [""]
+    FP8_MASK = [""]
+    if not DISABLE_LOCAL:
+        MASK += ["_local"]
+        FP8_MASK += ["_local"]
+        MASK += ["_local_deltaq"] if not DISABLE_DELTA_Q else []
+    if not DISABLE_CAUSAL:
+        CAUSAL_MASK = ["_causal"]
+        FP8_MASK += ["_causal"]
+        CONTEXT_MASK = [""] + (["_context"] if not DISABLE_CONTEXT else [])
+        TARGET_MASK = [""] + (["_target"] if not DISABLE_TARGET else [])
+        MASK += [
+            f"{c}{x}{t}"
+            for c, x, t in itertools.product(CAUSAL_MASK, CONTEXT_MASK, TARGET_MASK)
+        ]
+        MASK += ["_causal_deltaq"] if not DISABLE_DELTA_Q else []
+
+    dtype_to_str = {
+        "bf16": "cutlass::bfloat16_t",
+        "fp16": "cutlass::half_t",
+    }
+
+    sources_fwd = []
+    fwd_file_head = """
+// Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
+// Splitting different head dimensions, data types and masks to different files to speed up
+// compilation. This file is auto-generated. See generate_cuda_sources() in setup.py
+
+#include "hstu_fwd_launch_template.h"
+
+template void run_hstu_fwd_<90, {}, {}, {}, {}, {}, {}, {}, {}>
+                           (Hstu_fwd_params& params, cudaStream_t stream);
+
+    """
+    for hdim, dtype, rab, mask in itertools.product(
+        HEAD_DIMENSIONS, DTYPE_16, RAB, MASK
+    ):
+        file_name = f"instantiations/hstu_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm90.cu"
+        if not os.path.exists(file_name):
+            with open(file_name, "w") as f:
+                f.write(
+                    fwd_file_head.format(
+                        dtype_to_str[dtype],
+                        hdim,
+                        "true" if "_rab" in rab else "false",
+                        "true" if "local" in mask else "false",
+                        "true" if "causal" in mask else "false",
+                        "true" if "context" in mask else "false",
+                        "true" if "target" in mask else "false",
+                        "true" if "deltaq" in mask else "false",
+                    )
+                )
+        sources_fwd.append(file_name)
+    if not DISABLE_FP8:
+        for hdim, rab, mask in itertools.product(HEAD_DIMENSIONS, RAB, FP8_MASK):
+            if hdim == 32:
+                continue
+            file_name = f"instantiations/hstu_fwd_hdim{hdim}_e4m3{rab}{mask}_sm90.cu"
+            if not os.path.exists(file_name):
+                with open(file_name, "w") as f:
+                    f.write(
+                        fwd_file_head.format(
+                            "cutlass::float_e4m3_t",
+                            hdim,
+                            "true" if "_rab" in rab else "false",
+                            "true" if "local" in mask else "false",
+                            "true" if "causal" in mask else "false",
+                            "false",  # context
+                            "false",  # target
+                            "false",
+                        )
+                    )  # deltaq
+            sources_fwd.append(file_name)
+
+    sources_bwd = []
+    bwd_file_head = """
+// Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
+// Splitting different head dimensions, data types and masks to different files to speed up
+// compilation. This file is auto-generated. See generate_cuda_sources() in setup.py
+
+#include "hstu_bwd_launch_template.h"
+
+template void run_hstu_bwd_<90, {}, {}, {}, {}, {}, {}, {}, {}, {}>
+                           (Hstu_bwd_params& params, cudaStream_t stream);
+
+    """
+    if not DISABLE_BACKWARD:
+        for hdim, dtype, rab_drab, mask in itertools.product(
+            HEAD_DIMENSIONS, DTYPE_16, RAB_DRAB, MASK
+        ):
+            file_name = (
+                f"instantiations/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_sm90.cu"
+            )
+            if not os.path.exists(file_name):
+                with open(file_name, "w") as f:
+                    f.write(
+                        bwd_file_head.format(
+                            dtype_to_str[dtype],
+                            hdim,
+                            "true" if "_rab" in rab_drab else "false",
+                            "true" if "drab" in rab_drab else "false",
+                            "true" if "local" in mask else "false",
+                            "true" if "causal" in mask else "false",
+                            "true" if "context" in mask else "false",
+                            "true" if "target" in mask else "false",
+                            "true" if "deltaq" in mask else "false",
+                        )
+                    )
+            sources_bwd.append(file_name)
+        # if not DISABLE_FP8:
+        #     for hdim, rab_drab, mask in itertools.product(HEAD_DIMENSIONS, RAB_DRAB, FP8_MASK):
+        #         if hdim == 32:
+        #             continue
+        #         file_name = f"instantiations/hstu_bwd_hdim{hdim}_e4m3{rab_drab}{mask}_sm90.cu"
+        #         with open(file_name, "w") as f:
+        #             f.write(bwd_file_head.format("90",
+        #                                         "cutlass::float_e4m3_t",
+        #                                         hdim,
+        #                                         "true" if "_rab" in rab_drab else "false",
+        #                                         "false", # drab
+        #                                         "true" if "local" in mask else "false",
+        #                                         "true" if "causal" in mask else "false",
+        #                                         "false", # context
+        #                                         "false", # target
+        #                                         "false")) # deltaq
+        #         sources_bwd.append(file_name)
+
+    return sources_fwd + sources_bwd
+
+
 cmdclass = {}
 ext_modules = []
 
@@ -209,6 +383,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DHSTU_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
         + (["-DHSTU_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
         + (["-DHSTU_DISABLE_CAUSAL"] if DISABLE_CAUSAL else [])
+        + (["-DHSTU_DISABLE_CONTEXT"] if DISABLE_CONTEXT else [])
         + (["-DHSTU_DISABLE_TARGET"] if DISABLE_TARGET else [])
         + (["-DHSTU_DISABLE_DELTA_Q"] if DISABLE_DELTA_Q else [])
         + (["-DHSTU_DISABLE_RAB"] if DISABLE_RAB else [])
@@ -237,57 +412,13 @@ if not SKIP_CUDA_BUILD:
         raise ValueError("Cannot support drab without rab")
     if DISABLE_CAUSAL and not DISABLE_TARGET:
         raise ValueError("Cannot support target without causal")
+    if DISABLE_CAUSAL and not DISABLE_CONTEXT:
+        raise ValueError("Cannot support context without causal")
 
-    DTYPE_FWD_SM80 = (["bf16"] if not DISABLE_BF16 else []) + (
-        ["fp16"] if not DISABLE_FP16 else []
-    )
-    DTYPE_FWD_SM90 = (
-        (["bf16"] if not DISABLE_BF16 else [])
-        + (["fp16"] if not DISABLE_FP16 else [])
-        + (["e4m3"] if not DISABLE_FP8 else [])
-    )
-    DTYPE_BWD_SM80 = (["bf16"] if not DISABLE_BF16 else []) + (
-        ["fp16"] if not DISABLE_FP16 else []
-    )
-    DTYPE_BWD_SM90 = (["bf16"] if not DISABLE_BF16 else []) + (
-        ["fp16"] if not DISABLE_FP16 else []
-    )
-    HEAD_DIMENSIONS = (
-        []
-        + ([32] if not DISABLE_HDIM32 else [])
-        + ([64] if not DISABLE_HDIM64 else [])
-        + ([128] if not DISABLE_HDIM128 else [])
-        + ([256] if not DISABLE_HDIM256 else [])
-    )
+    torch_cpp_sources = ["hstu_api.cpp"]
+    subprocess.run(["rm", "-rf", "instantiations/*"])
+    cuda_sources = generate_cuda_sources()
 
-    sources_fwd_sm80 = [
-        f"instantiations/flash_fwd_hdim{hdim}_{dtype}_sm80.cu"
-        for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_FWD_SM80)
-    ]
-    sources_fwd_sm90 = [
-        f"instantiations/flash_fwd_hdim{hdim}_{dtype}_sm90.cu"
-        for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_FWD_SM90)
-    ]
-    sources_bwd_sm80 = [
-        f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm80.cu"
-        for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_BWD_SM80)
-    ]
-    sources_bwd_sm90 = [
-        f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm90.cu"
-        for hdim, dtype in itertools.product(HEAD_DIMENSIONS, DTYPE_BWD_SM90)
-    ]
-
-    if DISABLE_BACKWARD:
-        sources_bwd_sm90 = []
-        sources_bwd_sm80 = []
-    torch_cpp_sources = ["flash_api.cpp"]
-    cuda_sources = (
-        []
-        + (sources_fwd_sm80 if not DISABLE_SM8x else [])
-        + sources_fwd_sm90
-        + (sources_bwd_sm80 if not DISABLE_SM8x else [])
-        + sources_bwd_sm90
-    )
     nvcc_flags = [
         "-O3",
         "-std=c++17",
@@ -304,7 +435,7 @@ if not SKIP_CUDA_BUILD:
         # "--resource-usage",  # printing out number of registers
         # "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
-        # "-lineinfo",
+        "-lineinfo",
     ]
     if get_platform() == "win_amd64":
         nvcc_flags.extend(
@@ -354,7 +485,7 @@ setup(
         )
     ),
     author="NVIDIA-DevTech",
-    py_modules=["flash_attn_interface"],
+    py_modules=["hstu_attn_interface"],
     description="HSTU Attention",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -364,7 +495,7 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
         "torch",

@@ -1,4 +1,3 @@
-/******************************************************************************
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -13,14 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-******************************************************************************/
-// Copyright (c) 2024, Tri Dao.
-// Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
-// Splitting the different head dimensions to different files to speed up compilation.
 
-#include "flash_bwd_launch_template.h"
 
-template<>
-void run_mha_bwd_<90, cutlass::bfloat16_t, 128>(Flash_bwd_params &params, cudaStream_t stream) {
-    run_mha_bwd_hdim128<90, cutlass::bfloat16_t>(params, stream);
-}
+import torch
+
+
+def torch_addmm_silu_fwd(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    silu: bool = False,
+) -> torch.Tensor:
+    """
+    compute z = silu(y + x @ w); silu is optional
+    """
+    z = torch.addmm(y, x, w)
+    if silu:
+        silu_z = torch.nn.functional.silu(z)
+    else:
+        silu_z = None
+    return z, silu_z

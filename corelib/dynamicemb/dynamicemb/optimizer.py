@@ -38,6 +38,7 @@ class OptimizerArgs:
     max_norm: float = 0.0
     learning_rate: float = 0.01
     eps: float = 1.0e-8
+    initial_accumulator_value: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.999
     weight_decay: float = 0.0
@@ -222,17 +223,8 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         super().__init__(opt_args, table_options, hashtables)
 
         self._iterations: int = 0
-
-        for table_option in self._table_options:
-            table_option.initializer_args = DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.CONSTANT,
-                value=0.0,
-            )
-
         self._state_dict["m"] = []
         self._state_dict["v"] = []
-        self._create_tables(self._state_dict["m"])
-        self._create_tables(self._state_dict["v"])
 
     def update(
         self,
@@ -256,8 +248,6 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
-            m_ht = self._state_dict["m"][state_idx]
-            v_ht = self._state_dict["v"][state_idx]
 
             indice = indices[i]
             grad = grads[i]
@@ -267,8 +257,6 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             score = scores[i] if scores is not None else None
             dynamic_emb_adam_with_table(
                 ht,
-                m_ht,
-                v_ht,
                 num_indice,
                 indice,
                 grad,
@@ -312,14 +300,10 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     ) -> None:
         super().__init__(opt_args, table_options, hashtables)
 
-        for table_option in self._table_options:
-            table_option.initializer_args = DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.CONSTANT,
-                value=0.0,
-            )
+        self._state_dict["Gt"] = hashtables
 
-        self._state_dict["Gt"] = []
-        self._create_tables(self._state_dict["Gt"])
+        for table in hashtables:
+            table.set_initial_optstate(self._opt_args.initial_accumulator_value)
 
     def update(
         self,
@@ -339,7 +323,6 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
-            gt_ht = self._state_dict["Gt"][state_idx]
 
             indice = indices[i]
             grad = grads[i]
@@ -349,20 +332,24 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             score = scores[i] if scores is not None else None
 
             dynamic_emb_adagrad_with_table(
-                ht, gt_ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                ht, num_indice, indice, grad, lr, eps, weight_dtype, score
             )
 
     def get_opt_args(self):
         ret_args = {
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
+            "initial_accumulator_value": self._opt_args.initial_accumulator_value,
         }
         return ret_args
 
     def set_opt_args(self, args: Dict[str, Any]):
         self._opt_args.learning_rate = get_required_arg(args, "lr")
         self._opt_args.eps = get_required_arg(args, "eps")
-
+        initial_value = get_required_arg(args, "initial_accumulator_value")
+        self._opt_args.initial_accumulator_value = initial_value
+        for table in self._state_dict["Gt"]:
+            table.set_initial_optstate(initial_value)
         return
 
 
@@ -375,24 +362,10 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     ) -> None:
         super().__init__(opt_args, table_options, hashtables)
 
-        for table_option in self._table_options:
-            old_dim = table_option.dim
-            old_global_hbm_for_values = table_option.global_hbm_for_values
-            old_local_hbm_for_values = table_option.local_hbm_for_values
+        self._state_dict["Gt"] = hashtables
 
-            new_global_hbm_for_values = old_global_hbm_for_values // old_dim
-            new_local_hbm_for_values = old_local_hbm_for_values // old_dim
-
-            table_option.initializer_args = DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.CONSTANT,
-                value=0.0,
-            )
-            table_option.dim = 1
-            table_option.global_hbm_for_values = new_global_hbm_for_values
-            table_option.local_hbm_for_values = new_local_hbm_for_values
-
-        self._state_dict["Gt"] = []
-        self._create_tables(self._state_dict["Gt"])
+        for table in hashtables:
+            table.set_initial_optstate(self._opt_args.initial_accumulator_value)
 
     def update(
         self,
@@ -408,11 +381,9 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 )
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
-
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
-            gt_ht = self._state_dict["Gt"][state_idx]
 
             indice = indices[i]
             grad = grads[i]
@@ -422,18 +393,22 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             score = scores[i] if scores is not None else None
 
             dynamic_emb_rowwise_adagrad_with_table(
-                ht, gt_ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                ht, num_indice, indice, grad, lr, eps, weight_dtype, score
             )
 
     def get_opt_args(self):
         ret_args = {
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
+            "initial_accumulator_value": self._opt_args.initial_accumulator_value,
         }
         return ret_args
 
     def set_opt_args(self, args: Dict[str, Any]):
         self._opt_args.learning_rate = get_required_arg(args, "lr")
         self._opt_args.eps = get_required_arg(args, "eps")
-
+        initial_value = get_required_arg(args, "initial_accumulator_value")
+        self._opt_args.initial_accumulator_value = initial_value
+        for table in self._state_dict["Gt"]:
+            table.set_initial_optstate(initial_value)
         return

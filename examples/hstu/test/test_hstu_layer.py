@@ -14,8 +14,6 @@
 # limitations under the License.
 
 
-from typing import Optional
-
 import commons.utils.initialize as init
 import fbgemm_gpu  # pylint: disable-unused-import
 import pytest
@@ -62,10 +60,10 @@ def init_weights_from_native(native_module: HSTULayer, fused_module: FusedHSTULa
 @pytest.mark.parametrize("attn_backend", [KernelBackend.CUTLASS])
 @pytest.mark.parametrize("target_group_size", [1])
 @pytest.mark.parametrize("causal", [True])
-@pytest.mark.parametrize("seed", [None])
 @pytest.mark.parametrize("learnable_ln", [True])
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("input_sparsity", [0.75])
+@pytest.mark.parametrize("async_wgrad", [True, False])
 def test_fused_hstu_layer(
     dtype: torch.dtype,
     batchsize: int,
@@ -78,10 +76,10 @@ def test_fused_hstu_layer(
     attn_backend: KernelBackend,
     target_group_size: int,
     causal: bool,
-    seed: Optional[int],
     learnable_ln: bool,
     residual: bool,
     input_sparsity: float,
+    async_wgrad: bool,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -101,6 +99,7 @@ def test_fused_hstu_layer(
         hstu_layer_type=HSTULayerType.NATIVE,
         learnable_input_layernorm=learnable_ln,
         residual=residual,
+        async_wgrad=async_wgrad,
     )
     # hstu_config.kernel_backend = KernelBackend.PYTORCH
     ref_hstu_layer = HSTULayer(hstu_config)
@@ -143,16 +142,6 @@ def test_fused_hstu_layer(
 
     if attn_backend == KernelBackend.TRITON and target_group_size > 1:
         pytest.skip("TRITON does not support target grouped attention")
-    sm_major_version = torch.cuda.get_device_properties(0).major
-
-    if (
-        attn_backend == KernelBackend.CUTLASS
-        and sm_major_version == 9
-        and (target_group_size > 1 or max_num_contextuals > 0)
-    ):
-        pytest.skip(
-            "CUTLASS does not support Hopper with target group size > 1 or contextuals"
-        )
 
     num_targets = None
     num_contextuals = None

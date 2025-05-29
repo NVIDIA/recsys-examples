@@ -37,16 +37,6 @@
 #define CHECK_CONTIGUOUS(x) \
   TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-#define cudaCheck(cmd)                                            \
-  {                                                               \
-    cudaError_t err = cmd;                                        \
-    if (err != cudaSuccess) {                                     \
-      fprintf(stderr, "CUDA error: %s in file '%s' at line %d\n", \
-              cudaGetErrorString(err), __FILE__, __LINE__);       \
-      exit(EXIT_FAILURE);                                         \
-    }                                                             \
-  }
-
 void set_params_fprop(Hstu_fwd_params* params,
                       // sizes
                       const size_t b,
@@ -59,7 +49,6 @@ void set_params_fprop(Hstu_fwd_params* params,
                       const size_t h_k,
                       const size_t h_rab,
                       const size_t d,
-                      const size_t d_rounded,
                       const float alpha,
                       // device pointers
                       const at::Tensor q,
@@ -77,6 +66,8 @@ void set_params_fprop(Hstu_fwd_params* params,
                       int window_size_right) {
   // Reset the parameters
   *params = {};
+
+  params->arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
 
   // Set the pointers and strides.
   params->q_ptr = q.data_ptr();
@@ -118,6 +109,31 @@ void set_params_fprop(Hstu_fwd_params* params,
   params->cu_seqlens_k = static_cast<int*>(cu_seqlens_k_d);
   params->num_targets = static_cast<int*>(num_targets_d);
 
+  params->is_bf16 = q.dtype() == torch::kBFloat16;
+  #ifdef HSTU_DISABLE_BF16
+    TORCH_CHECK(!params->is_bf16, "This hstu attention build does not support bf16.");
+  #endif
+  #ifdef HSTU_DISABLE_FP16
+    TORCH_CHECK(q.dtype() != torch::kFloat16, "This hstu attention build does not support fp16.");
+  #endif
+
+  // Set the block scheduling
+  // float coeff = 0.3;
+  params->is_balance_fwd = false;
+  params->is_balance_bwd = false;
+  // auto dprops = at::cuda::getCurrentDeviceProperties();
+  // int l2_size = dprops->l2CacheSize;
+  // int sm_count = dprops->multiProcessorCount;
+  // int num_KV = std::min(sm_count, int(b * h_k));
+  // int kv_cache_size = 2 * seqlen_k * num_KV * d * sizeof(k.dtype()) * coeff;
+  // int do_cache_size = seqlen_q * num_KV * d * sizeof(out.dtype()) * coeff;
+  // if (kv_cache_size < l2_size) {
+  //   params->is_balance_fwd = true;
+  // }
+  // if (kv_cache_size + do_cache_size < l2_size) {
+  //   params->is_balance_bwd = true;
+  // }
+
   // Set the dimensions.
   params->b = b;
   params->h = h;
@@ -125,48 +141,51 @@ void set_params_fprop(Hstu_fwd_params* params,
   params->h_h_k_ratio = h / h_k;
   params->seqlen_q = seqlen_q;
   params->seqlen_k = seqlen_k;
-  params->is_target = num_targets_d != nullptr;
-  #ifdef HSTU_DISABLE_TARGET
-      TORCH_CHECK(!params->is_target, "This hstu attention build does not support target mask.");
-  #endif
-  params->is_context = num_contexts_d != nullptr;
-  #ifdef HSTU_DISABLE_CONTEXT
-      TORCH_CHECK(!params->is_context, "This hstu attention build does not support context mask.");
-  #endif
-  params->target_group_size = target_group_size;
-  params->is_delta_q = is_delta_q;
-  #ifdef HSTU_DISABLE_DELTA_Q
-      TORCH_CHECK(!params->is_delta_q, "This hstu attention build does not support delta_q.");
-  #endif
-  TORCH_CHECK(is_delta_q || params->seqlen_q == params->seqlen_k,
-              "For delta_q = False, only support seqlen_q == seqlen_k case now.");
   params->seqlen_q_rounded = seqlen_q_rounded;
   params->seqlen_k_rounded = seqlen_k_rounded;
   params->d = d;
-  params->d_rounded = d_rounded;
   params->alpha = alpha;
+  // Set the masks.
+  params->is_target = num_targets_d != nullptr;
+  #ifdef HSTU_DISABLE_TARGET
+    TORCH_CHECK(!params->is_target, "This hstu attention build does not support target mask.");
+  #endif
+  params->target_group_size = target_group_size;
+  if (params->is_target) {
+    TORCH_CHECK(target_group_size > 0, "target_group_size must be greater than 0 when target is True");
+  }
+  params->is_context = num_contexts_d != nullptr;
+  #ifdef HSTU_DISABLE_CONTEXT
+    TORCH_CHECK(!params->is_context, "This hstu attention build does not support context mask.");
+  #endif
+  params->is_delta_q = is_delta_q;
+  #ifdef HSTU_DISABLE_DELTA_Q
+    TORCH_CHECK(!params->is_delta_q, "This hstu attention build does not support delta_q.");
+  #endif
+  if (is_delta_q) {
+    TORCH_CHECK(params->seqlen_q <= params->seqlen_k,
+                "For delta_q = True, seqlen_q must be less than or equal to seqlen_k.");
+    TORCH_CHECK(!params->is_target, "For delta_q = True, target mask must be False.");
+    TORCH_CHECK(!params->is_context, "For delta_q = True, context mask must be False.");
+  } else {
+    TORCH_CHECK(params->seqlen_q == params->seqlen_k,
+                "For delta_q = False, seqlen_q must be equal to seqlen_k.");
+  }
 
-  if (window_size_left < 0) { window_size_left = seqlen_k; }
-  if (window_size_right < 0) { window_size_right = seqlen_k; }
+  if (window_size_left < 0 || window_size_left > (int)seqlen_k) { window_size_left = seqlen_k; }
+  if (window_size_right < 0 || window_size_right > (int)seqlen_k) { window_size_right = seqlen_k; }
   params->window_size_left = window_size_left;
   params->window_size_right = window_size_right;
 
-  params->is_bf16 = q.dtype() == torch::kBFloat16;
-  #ifdef HSTU_DISABLE_BF16
-      TORCH_CHECK(!params->is_bf16, "This hstu attention build does not support bf16.");
-  #endif
-  #ifdef HSTU_DISABLE_FP16
-      TORCH_CHECK(q.dtype() != torch::kFloat16, "This hstu attention build does not support fp16.");
-  #endif
-
   params->is_causal = params->window_size_left == (int)seqlen_k && params->window_size_right == 0;
-  params->is_causal = params->is_causal || params->is_target || params->is_context;
   #ifdef HSTU_DISABLE_CAUSAL
-      TORCH_CHECK(!params->is_causal, "This hstu attention build does not support causal mask.");
+    TORCH_CHECK(!params->is_causal, "This hstu attention build does not support causal mask.");
   #endif
+  TORCH_CHECK(!(!params->is_causal && params->is_target), "Target mask is True, but causal mask is False, this is undefined behavior.");
+  TORCH_CHECK(!(!params->is_causal && params->is_context), "Context mask is True, but causal mask is False, this is undefined behavior.");
   params->is_local = (window_size_left < (int)seqlen_k || window_size_right < (int)seqlen_k) && !params->is_causal;
   #ifdef HSTU_DISABLE_LOCAL
-      TORCH_CHECK(!params->is_local, "This hstu attention build does not support local mask.");
+    TORCH_CHECK(!params->is_local, "This hstu attention build does not support local mask.");
   #endif
 }
 
@@ -182,7 +201,6 @@ void set_params_dgrad(Hstu_bwd_params* params,
                       const size_t h_k,
                       const size_t h_rab,
                       const size_t d,
-                      const size_t d_rounded,
                       const float alpha,
                       // device pointers
                       const at::Tensor q,
@@ -207,14 +225,14 @@ void set_params_dgrad(Hstu_bwd_params* params,
                       bool is_delta_q) {
   *params = {};
   set_params_fprop(params, b, seqlen_q, seqlen_k, target_group_size, seqlen_q_rounded,
-                   seqlen_k_rounded, h, h_k, h_rab, d, d_rounded, alpha, q, k, v, rab,
+                   seqlen_k_rounded, h, h_k, h_rab, d, alpha, q, k, v, rab,
                    /*out=*/torch::Tensor(),
                    num_contexts_d, cu_seqlens_q_d, cu_seqlens_k_d, num_targets_d,
                    has_rab, is_delta_q, window_size_left, window_size_right);
 
   params->has_drab = has_drab;
   #ifdef HSTU_DISABLE_DRAB
-      TORCH_CHECK(!has_drab, "This hstu attention build does not support has_drab.");
+    TORCH_CHECK(!has_drab, "This hstu attention build does not support has_drab.");
   #endif
   if (has_rab && has_drab) {
     params->dRab_ptr = dRab.data_ptr();
@@ -299,24 +317,22 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor& cu_seqlens_q,  // b+1
     const at::Tensor& cu_seqlens_k,  // b+1
-    int max_seqlen_q,
-    int max_seqlen_k,
-    std::optional<at::Tensor>& num_contexts,  // b
-    std::optional<at::Tensor>& num_targets,  // b
-    int target_group_size,
+    const int max_seqlen_q,
+    const int max_seqlen_k,
+    std::optional<const at::Tensor>& num_contexts,  // b
+    std::optional<const at::Tensor>& num_targets,  // b
+    const int target_group_size,
     int window_size_left,
     int window_size_right,
     const float alpha,
     std::optional<at::Tensor>& rab,
-    bool is_delta_q) {
+    const bool is_delta_q) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
-  bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-  bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-  TORCH_CHECK(is_sm90 || is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+  TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
 
   auto q_dtype = q.dtype();
   TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-              "FlashAttention only support fp16 and bf16 data type");
+              "HSTU only support fp16 and bf16 data type");
   TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
   TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
   TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
@@ -333,22 +349,22 @@ std::vector<at::Tensor> hstu_varlen_fwd(
   CHECK_CONTIGUOUS(cu_seqlens_q);
   CHECK_CONTIGUOUS(cu_seqlens_k);
 
-  const auto sizes = q.sizes();
   const int batch_size = cu_seqlens_q.numel() - 1;
-  int num_heads = sizes[1];
-  const int head_size_og = sizes[2];
+  const int num_heads = q.size(1);
+  const int head_size = q.size(2);
+  const int total_k = k.size(0);
   const int num_heads_k = k.size(1);
 
+  CHECK_SHAPE(k, total_k, num_heads_k, head_size);
+  CHECK_SHAPE(v, total_k, num_heads_k, head_size);
   TORCH_CHECK(batch_size > 0, "batch size must be positive");
-  TORCH_CHECK(head_size_og % 8 == 0, "head_size should be a multiple of 8");
-  TORCH_CHECK(head_size_og <= 256,
-              "FlashAttention forward only supports head dimension at most 256");
   TORCH_CHECK(num_heads % num_heads_k == 0,
               "Number of heads in key/value must divide number of heads in query");
-  TORCH_CHECK(v.size(1) == num_heads_k, "Number of heads in key/value must match.");
-  window_size_left = std::min(window_size_left, max_seqlen_k);
-  window_size_right = std::min(window_size_right, max_seqlen_k);
+  TORCH_CHECK(head_size == 32 || head_size == 64 || head_size == 128 || head_size == 256,
+              "head_size should be 32, 64, 128, or 256");
 
+  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
   if (num_contexts.has_value()) {
     TORCH_CHECK(num_contexts.value().dtype() == torch::kInt32,
                 "num_contexts must have dtype int32");
@@ -356,8 +372,6 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     CHECK_CONTIGUOUS(num_contexts.value());
     CHECK_SHAPE(num_contexts.value(), batch_size);
   }
-  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
   if (num_targets.has_value()) {
     TORCH_CHECK(num_targets.value().dtype() == torch::kInt32,
                 "num_targets must have dtype int32");
@@ -366,40 +380,25 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     CHECK_SHAPE(num_targets.value(), batch_size);
   }
 
-  at::Tensor q_padded, k_padded, v_padded;
-  if (head_size_og % 8 != 0) {
-    q_padded = torch::nn::functional::pad(
-        q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    k_padded = torch::nn::functional::pad(
-        k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-    v_padded = torch::nn::functional::pad(
-        v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-  } else {
-    q_padded = q;
-    k_padded = k;
-    v_padded = v;
-  }
-
-  at::Tensor out = torch::empty_like(q_padded);
+  at::Tensor out = torch::empty_like(q);
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-  const int head_size = round_multiple(head_size_og, 8);
-  const int head_size_rounded = round_multiple(head_size, 32);
   const int seqlen_q_rounded = round_multiple(max_seqlen_q, sizeof(cutlass::uint128_t) / sizeof(q_dtype));
   const int seqlen_k_rounded = round_multiple(max_seqlen_k, sizeof(cutlass::uint128_t) / sizeof(q_dtype));
 
-  bool has_rab = false;
-  int head_rab = num_heads;
-
-  if (rab.has_value()) {
-    head_rab = rab.value().size(1);
-    CHECK_SHAPE(rab.value(), batch_size, head_rab, max_seqlen_k, max_seqlen_k);
+  bool has_rab = rab.has_value();
+  int num_heads_rab = num_heads;
+  if (has_rab) {
+    num_heads_rab = rab.value().size(1);
+    CHECK_DEVICE(rab.value());
+    TORCH_CHECK(rab.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(num_heads == num_heads_rab || num_heads_rab == 1,
+                "Number of heads in rab must be 1 or equal to number of heads in query");
+    CHECK_SHAPE(rab.value(), batch_size, num_heads_rab, max_seqlen_k, max_seqlen_k);
     if (seqlen_k_rounded != max_seqlen_k) {
-      rab = torch::nn::functional::pad(
-          rab.value(), torch::nn::functional::PadFuncOptions(
+      rab = torch::nn::functional::pad(rab.value(), torch::nn::functional::PadFuncOptions(
                            {0, seqlen_k_rounded - max_seqlen_k}));
     }
-    has_rab = true;
   }
 
   Hstu_fwd_params params;
@@ -412,14 +411,13 @@ std::vector<at::Tensor> hstu_varlen_fwd(
                    seqlen_k_rounded,         //
                    num_heads,                //
                    num_heads_k,              //
-                   head_rab,                 //
+                   num_heads_rab,                 //
                    head_size,                //
-                   head_size_rounded,        //
                    alpha,                    //
-                   q_padded,                 //
-                   k_padded,                 //
-                   v_padded,                 //
-                   rab.has_value() ? rab.value() : torch::Tensor(),              //
+                   q,                        //
+                   k,                        //
+                   v,                        //
+                   has_rab ? rab.value() : torch::Tensor(),              //
                    out,                      //
                    num_contexts.has_value() ? num_contexts.value().data_ptr() : nullptr,  //
                    cu_seqlens_q.data_ptr(),  //
@@ -436,12 +434,7 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     out.zero_();
   }
 
-  if (head_size_og % 8 != 0) {
-    out = out.index(
-        {"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-  }
-
-  return {out, rab.has_value() ? rab.value() : torch::Tensor()};
+  return {out, has_rab ? rab.value() : torch::Tensor()};
 }
 
 template <typename Dtype, bool Has_rab, bool Has_drab, bool Is_local,
@@ -492,7 +485,7 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
 }
 
 std::vector<at::Tensor> hstu_varlen_bwd(
-    const at::Tensor& dout,  // total_q x num_heads, x head_size
+    const at::Tensor& dout,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const at::Tensor& q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const at::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -500,25 +493,24 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     const at::Tensor& cu_seqlens_k,  // b+1
     const int max_seqlen_q,
     const int max_seqlen_k,
-    std::optional<at::Tensor>& num_contexts,  // b
-    std::optional<at::Tensor>& num_targets,  // b
+    std::optional<const at::Tensor>& num_contexts,  // b
+    std::optional<const at::Tensor>& num_targets,  // b
     const int target_group_size,
     int window_size_left,
     int window_size_right,
     const float alpha,
     std::optional<at::Tensor>& rab,
-    bool has_drab,
-    bool is_delta_q,
-    bool deterministic) {
+    const bool has_drab,
+    const bool is_delta_q,
+    const bool deterministic) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
-  bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-  bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-  TORCH_CHECK(is_sm90 || is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+  TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
+  TORCH_CHECK(dprops->major == 8 && dprops->minor == 0, "HSTU backward does not support sm86 or sm89.");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   auto q_dtype = q.dtype();
   TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-              "FlashAttention only support fp16 and bf16 data type");
+              "HSTU only support fp16 and bf16 data type");
   TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
   TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
   TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
@@ -538,36 +530,28 @@ std::vector<at::Tensor> hstu_varlen_bwd(
   CHECK_CONTIGUOUS(cu_seqlens_q);
   CHECK_CONTIGUOUS(cu_seqlens_k);
 
-  const auto sizes = q.sizes();
-
-  const int total_q = sizes[0];
   const int batch_size = cu_seqlens_q.numel() - 1;
-  const int num_heads = sizes[1];
-  const int head_size_og = dout.size(2);
-  const int head_size = sizes[2];
+  const int total_q = q.size(0);
+  const int num_heads = q.size(1);
+  const int head_size = q.size(2);
   const int total_k = k.size(0);
   const int num_heads_k = k.size(1);
+
+  CHECK_SHAPE(k, total_k, num_heads_k, head_size);
+  CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+  CHECK_SHAPE(dout, total_q, num_heads, head_size);
   TORCH_CHECK(batch_size > 0, "batch size must be positive");
-  TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
-  TORCH_CHECK(head_size <= 256,
-              "FlashAttention backward only supports head dimension at most 256");
+  TORCH_CHECK(head_size == 32 || head_size == 64 || head_size == 128 || head_size == 256,
+              "head_size should be 32, 64, 128, or 256");
   TORCH_CHECK(num_heads % num_heads_k == 0,
               "Number of heads in key/value must divide number of heads in query");
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-  const int head_size_rounded = round_multiple(head_size, 32);
   const int seqlen_q_rounded = round_multiple(max_seqlen_q, sizeof(cutlass::uint128_t) / sizeof(q_dtype));
   const int seqlen_k_rounded = round_multiple(max_seqlen_k, sizeof(cutlass::uint128_t) / sizeof(q_dtype));
 
-  window_size_left = std::min(window_size_left, max_seqlen_k);
-  window_size_right = std::min(window_size_right, max_seqlen_k);
-
-  TORCH_CHECK(head_size == round_multiple(head_size_og, 8),
-              "head_size must be head_size_og rounded to a multiple of 8");
-
-  CHECK_SHAPE(k, total_k, num_heads_k, head_size);
-  CHECK_SHAPE(v, total_k, num_heads_k, head_size);
-  CHECK_SHAPE(dout, total_q, num_heads, head_size_og);
+  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
   if (num_contexts.has_value()) {
     TORCH_CHECK(num_contexts.value().dtype() == torch::kInt32,
                 "num_contexts must have dtype int32");
@@ -585,25 +569,20 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     CHECK_SHAPE(num_targets.value(), batch_size);
   }
 
-  bool has_rab = false;
-  int head_rab = num_heads;
-  if (rab.has_value()) {
-    head_rab = rab.value().size(1);
-    CHECK_SHAPE(rab.value(), batch_size, head_rab, max_seqlen_k, seqlen_k_rounded);
-    has_rab = true;
+  bool has_rab = rab.has_value();
+  int num_heads_rab = num_heads;
+  if (has_rab) {
+    num_heads_rab = rab.value().size(1);
+    CHECK_DEVICE(rab.value());
+    TORCH_CHECK(rab.value().stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(num_heads == num_heads_rab || num_heads_rab == 1,
+                "Number of heads in rab must be 1 or equal to number of heads in query");
+    CHECK_SHAPE(rab.value(), batch_size, num_heads_rab, max_seqlen_k, seqlen_k_rounded);
   }
 
   at::Tensor dq = torch::empty_like(q);
   at::Tensor dk = torch::empty_like(k);
   at::Tensor dv = torch::empty_like(v);
-
-  at::Tensor dout_padded;
-  if (head_size_og % 8 != 0) {
-    dout_padded = torch::nn::functional::pad(
-        dout, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-  } else {
-    dout_padded = dout;
-  }
 
   // Otherwise the kernel will be launched from cuda:0 device
   at::cuda::CUDAGuard device_guard{q.get_device()};
@@ -611,38 +590,39 @@ std::vector<at::Tensor> hstu_varlen_bwd(
   auto opts = q.options();
   at::Tensor dq_accum;
   // We don't want to allocate dq_accum of size (batch, seqlen_q_rounded,
-  // num_heads, head_size_rounded) because that would be too large if there is a
+  // num_heads, head_size) because that would be too large if there is a
   // very long sequence and the rest of the sequences are short. Instead, we
-  // allocate dq_accum of size (total_q + 128 * batch, num_heads,
-  // head_size_rounded). Note that 128 is the max block size on the seqlen_q
-  // dimension. For dQ, the i-th sequence is stored in indices from
-  // cu_seqlens[i] + 128 * i to cu_seqlens[i + 1] * 128 * i - 1. This ensures
-  // that the i-th sequence and (i + 1)-th sequence will be at least 128 apart.
+  // allocate dq_accum of size (total_q + 128 * batch, num_heads, head_size).
+  // Note that 128 is the max block size on the seqlen_q dimension. For dQ,
+  // the i-th sequence is stored in indices from cu_seqlens[i] + 128 * i to
+  // cu_seqlens[i + 1] * 128 * i - 1. This ensures that the i-th sequence and
+  // (i + 1)-th sequence will be at least 128 apart.
   // It's ok for us to do atomicAdds up to 128 rows beyond what we're normally
   // allowed to do. So we won't have to do any bound checking, and performance
   // should stay the same.
   if (!deterministic) {
     dq_accum =
-        torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded},
+        torch::zeros({total_q + 128 * batch_size, num_heads, head_size},
                      opts.dtype(at::kFloat));
   } else {
     const int nsplits =
         (dprops->multiProcessorCount + batch_size * num_heads - 1) /
         (batch_size * num_heads);
     dq_accum = torch::zeros(
-        {nsplits, total_q + 128 * batch_size, num_heads, head_size_rounded},
+        {nsplits, total_q + 128 * batch_size, num_heads, head_size},
         opts.dtype(at::kFloat));
   }
 
   Hstu_bwd_params params;
   at::Tensor dRab;
   if (has_drab) {
-    TORCH_CHECK(has_rab == true, "rab must exist when using has_drab");
+    TORCH_CHECK(has_rab, "rab must exist when using has_drab");
     /*
-    Due to the demand for unequal lengths of q and k, and the customer's desire to support large and complete rab bias, 
-    it is directly defined here as the size of (max_seqlen_k, max_seqlen_k) to be compatible with both equal and unequal lengths of q and kv
+    Due to the demand for unequal lengths of q and k, and the customer's desire to support large and complete rab bias,
+    it is directly defined here as the size of (max_seqlen_k, seqlen_k_rounded) to be compatible with both equal and unequal lengths of q and kv.
+    Some tiles will not write back so we give zeros.
     */
-    dRab = torch::zeros({batch_size, num_heads, max_seqlen_k, seqlen_k_rounded}, opts); // some tile will not write back so need give zeros
+    dRab = torch::zeros({batch_size, num_heads, max_seqlen_k, seqlen_k_rounded}, opts);
   }
 
   set_params_dgrad(&params,
@@ -654,15 +634,14 @@ std::vector<at::Tensor> hstu_varlen_bwd(
                    seqlen_k_rounded,         //
                    num_heads,                //
                    num_heads_k,              //
-                   head_rab,                 //
+                   num_heads_rab,                 //
                    head_size,                //
-                   head_size_rounded,        //
                    alpha,                    //
                    q,                        //
                    k,                        //
                    v,                        //
-                   dout_padded,              //
-                   rab.has_value() ? rab.value() : torch::Tensor(),              //
+                   dout,                     //
+                   has_rab ? rab.value() : torch::Tensor(),              //
                    dRab,                     //
                    dq,                       //
                    dk,                       //
@@ -682,31 +661,23 @@ std::vector<at::Tensor> hstu_varlen_bwd(
   if (max_seqlen_q > 0) {
     run_hstu_bwd(params, stream);
   } else {
-    // If seqlen_q == 0, then we have an empty tensor. We need to set the output
-    // to 0.
+    // If max_seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
     dk.zero_();
     dv.zero_();
-  }
-
-  if (head_size_og % 8 != 0) {
-    dq = dq.index(
-        {"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    dk = dk.index(
-        {"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-    dv = dv.index(
-        {"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+    if(has_drab) {
+      dRab.zero_();
+    }
   }
 
   if (has_drab && seqlen_k_rounded != max_seqlen_k) {
-    dRab = dRab.index(
-        {"...", torch::indexing::Slice(torch::indexing::None, max_seqlen_k)}); // TODO: need discuss with customer
+    dRab = dRab.index({"...", torch::indexing::Slice(torch::indexing::None, max_seqlen_k)});
   }
 
-  return {dq, dk, dv, dRab};
+  return { dq, dk, dv, dRab };
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.doc() = "FlashAttention";
-  m.def("hstu_varlen_fwd", &hstu_varlen_fwd, "HSTU forward kernel 1 pass");
-  m.def("hstu_varlen_bwd", &hstu_varlen_bwd, "HSTU backward kernel 1 pass");
+  m.doc() = "HstuAttention";
+  m.def("varlen_fwd", &hstu_varlen_fwd, "Varlen hstu forward pass");
+  m.def("varlen_bwd", &hstu_varlen_bwd, "Varlen hstu backward pass");
 }

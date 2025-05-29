@@ -118,179 +118,312 @@ __global__ static void setup_kernel(unsigned long long seed,
   curand_init(seed, grid.thread_rank(), 0, &states[grid.thread_rank()]);
 }
 
-template <typename ConcretEmbeddingGenerator, typename T>
-struct BaseEmbeddingGenerator {
-  enum class Action : uint8_t {
-    INIT = 0,
-    FROM_HKV_TO_TENSOR, // Load embedding from HKV to output Tensor.
-    ZERO_TO_TENSOR, // Not found in or inserted into HKV, fill 0 by default.
-    TO_HKV_TO_TENSOR, // Generate embedding and store to both HKV and output Tensor.
+struct UniformEmbeddingGenerator {
+  struct Args {
+    curandState* state;
+    float lower;
+    float upper;
   };
 
-  DEVICE_INLINE
-  BaseEmbeddingGenerator(curandState* state, bool* founds, T** hkv_ptrs) :
-    state_(state), founds_(founds), hkv_ptrs_(hkv_ptrs), load_(false), action_(Action::INIT) {}
-  
-  DEVICE_INLINE
-  void destroy() {
+  DEVICE_INLINE UniformEmbeddingGenerator(Args args): load_(false), state_(args.state), 
+    lower(args.lower), upper(args.upper) {}
+
+  DEVICE_INLINE float generate(int64_t vec_id) {
+    if (!load_) {
+      localState_ = state_[GlobalThreadId()];
+      load_ = true;
+    }
+    auto tmp = curand_uniform_double(&this->localState_);
+    return static_cast<float>((upper - lower) * tmp + lower);
+  }
+
+  DEVICE_INLINE void destroy() {
     if (load_) {
       state_[GlobalThreadId()] = localState_;
     }
   }
 
-  DEVICE_INLINE
-  void set_state(uint64_t emb_id) {
-    hkv_ptr_ = hkv_ptrs_[emb_id];
-    bool found_ = founds_[emb_id];
-    if (hkv_ptr_ == nullptr) {
-      action_ = Action::ZERO_TO_TENSOR;
-    } else if (found_) {
-      action_ = Action::FROM_HKV_TO_TENSOR;
-    } else {
-      action_ = Action::TO_HKV_TO_TENSOR;
-      if (!load_) {
-        localState_ = state_[GlobalThreadId()];
-        load_ = true;
-      }
-    }
-  }
-
-  DEVICE_INLINE
-  T generate(uint32_t i) {
-    if (action_ == Action::FROM_HKV_TO_TENSOR) {
-      return hkv_ptr_[i];
-    } else if (action_ == Action::TO_HKV_TO_TENSOR) {
-      auto tmp = static_cast<ConcretEmbeddingGenerator*>(this)->generate_impl(i);
-      hkv_ptr_[i] = tmp;
-      return tmp;
-    }
-    return TypeConvertFunc<T, float>::convert(0.0f);
-  }
-
   bool load_;
-  Action action_;
   curandState localState_;
   curandState* state_;
-  bool* founds_;
-  T** hkv_ptrs_;
-  T* hkv_ptr_;
-};
-
-template <typename T>
-struct UniformEmbeddingGenerator : public BaseEmbeddingGenerator<UniformEmbeddingGenerator<T>, T> {
-  using Base = BaseEmbeddingGenerator<UniformEmbeddingGenerator<T>, T>;
-  struct Args {
-    curandState* state;
-    T** hkv_ptrs;
-    bool* founds;
-    float lower;
-    float upper;
-  };
-
-  DEVICE_INLINE
-  UniformEmbeddingGenerator(Args args): Base(args.state, args.founds, args.hkv_ptrs), 
-    lower(args.lower), upper(args.upper) {}
-
-  DEVICE_INLINE
-  T generate_impl(uint32_t i) {
-    auto tmp = curand_uniform_double(&this->localState_);
-    return TypeConvertFunc<T, float>::convert((upper - lower) * tmp + lower);
-  }
-
   float lower;
   float upper;
 };
 
-template <typename T>
-struct NormalEmbeddingGenerator : public BaseEmbeddingGenerator<NormalEmbeddingGenerator<T>, T> {
-  using Base = BaseEmbeddingGenerator<NormalEmbeddingGenerator<T>, T>;
+struct NormalEmbeddingGenerator {
   struct Args {
     curandState* state;
-    T** hkv_ptrs;
-    bool* founds;
     float mean;
     float std_dev;
   };
 
   DEVICE_INLINE
-  NormalEmbeddingGenerator(Args args): Base(args.state, args.founds, args.hkv_ptrs), 
+  NormalEmbeddingGenerator(Args args): load_(false), state_(args.state),
     mean(args.mean), std_dev(args.std_dev) {}
 
   DEVICE_INLINE
-  T generate_impl(uint32_t i) {
+  float generate(int64_t vec_id) {
+    if (!load_) {
+      localState_ = state_[GlobalThreadId()];
+      load_ = true;
+    }
     auto tmp = curand_normal_double(&this->localState_);
-    return TypeConvertFunc<T, float>::convert(std_dev * tmp + mean);
+    return static_cast<float>(std_dev * tmp + mean);
   }
 
+  DEVICE_INLINE void destroy() {
+    if (load_) {
+      state_[GlobalThreadId()] = localState_;
+    }
+  }
+
+  bool load_;
+  curandState localState_;
+  curandState* state_;
   float mean;
   float std_dev;
 };
 
-template <typename K, typename V>
-struct MappingEmbeddingGenerator : public BaseEmbeddingGenerator<MappingEmbeddingGenerator<K,V>, V> {
-  using Base = BaseEmbeddingGenerator<MappingEmbeddingGenerator<K,V>, V>;
+struct TruncatedNormalEmbeddingGenerator {
   struct Args {
     curandState* state;
-    V** hkv_ptrs;
-    bool* founds;
+    float mean;
+    float std_dev;
+    float lower;
+    float upper;
+  };
+
+  DEVICE_INLINE
+  TruncatedNormalEmbeddingGenerator(Args args): load_(false), state_(args.state),
+    mean(args.mean), std_dev(args.std_dev), lower(args.lower), upper(args.upper) {}
+
+  DEVICE_INLINE
+  float generate(int64_t vec_id) {
+    if (!load_) {
+      localState_ = state_[GlobalThreadId()];
+      load_ = true;
+    }
+    auto l = normcdf((lower - mean) / std_dev);
+    auto u = normcdf((upper - mean) / std_dev);
+    u = 2 * u - 1;
+    l = 2 * l - 1;
+    float tmp = curand_uniform_double(&this->localState_);
+    tmp = tmp * (u - l) + l;
+    tmp = erfinv(tmp);
+    tmp *= scale * std_dev;
+    tmp += mean;
+    tmp = max(tmp, lower);
+    tmp = min(tmp, upper);
+    return tmp;
+  }
+
+  DEVICE_INLINE void destroy() {
+    if (load_) {
+      state_[GlobalThreadId()] = localState_;
+    }
+  }
+
+  bool load_;
+  curandState localState_;
+  curandState* state_;
+  float mean;
+  float std_dev;
+  float lower;
+  float upper;
+  double scale = sqrt(2.0f);
+};
+
+template <typename K>
+struct MappingEmbeddingGenerator {
+  struct Args {
     const K* keys;
     uint64_t mod;
   };
 
   DEVICE_INLINE
-  MappingEmbeddingGenerator(Args args): Base(args.state, args.founds, args.hkv_ptrs), 
-    mod(args.mod), keys(args.keys) {}
+  MappingEmbeddingGenerator(Args args): mod(args.mod), keys(args.keys) {}
 
   DEVICE_INLINE
-  void set_state(uint64_t emb_id) {
-    Base::set_state(emb_id);
-    key = keys[emb_id];
+  float generate(int64_t vec_id) {
+    K key = keys[vec_id];
+    return static_cast<float>(key % mod);
   }
 
-  DEVICE_INLINE
-  V generate_impl(uint32_t i) {
-    auto k = static_cast<float>(key % mod);
-    return TypeConvertFunc<V, float>::convert(k);
-  }
+  DEVICE_INLINE void destroy() {}
 
   uint64_t mod;
   const K* keys;
-  K key;
 };
 
-template <typename T>
-struct ConstEmbeddingGenerator : public BaseEmbeddingGenerator<ConstEmbeddingGenerator<T>, T> {
-  using Base = BaseEmbeddingGenerator<ConstEmbeddingGenerator<T>, T>;
+struct ConstEmbeddingGenerator {
   struct Args {
-    curandState* state;
-    T** hkv_ptrs;
-    bool* founds;
     float val;
   };
 
   DEVICE_INLINE
-  ConstEmbeddingGenerator(Args args): Base(args.state, args.founds, args.hkv_ptrs), 
-    val(args.val) {}
-
+  ConstEmbeddingGenerator(Args args): val(args.val) {}
+  
   DEVICE_INLINE
-  T generate_impl(uint32_t i) {
-    return TypeConvertFunc<T, float>::convert(val);
+  float generate(int64_t vec_id) {
+    return val;
   }
+
+  DEVICE_INLINE void destroy() {}
 
   float val;
 };
 
-template <typename T, typename EmbeddingGenerator, typename Args>
-__global__ void fill_embedding_from_generator(
-    uint64_t n, uint32_t dim, T* embs, Args args) {
-  EmbeddingGenerator generator(args);
-  for (uint64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
-    generator.set_state(emb_id);
-    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
-      embs[emb_id * dim + i] = generator.generate(i);
+template <typename ElementType, typename SizeType>
+struct OptStateInitializer {
+  SizeType dim;
+  ElementType initial_optstate;
+  DEVICE_INLINE void init(ElementType* vec_ptr) {
+    if (vec_ptr == nullptr) return;
+    for (SizeType i = threadIdx.x; i < dim; i ++) {
+      vec_ptr[i] = initial_optstate;
     }
   }
-  generator.destroy();
+  DEVICE_INLINE void init4(ElementType* vec_ptr) {
+    if (vec_ptr == nullptr) return;
+    Vec4T<ElementType> state;
+    state.reset(initial_optstate);
+
+    constexpr int VecSize = 4;
+    constexpr int kWarpSize = 32;
+    const int lane_id = threadIdx.x % kWarpSize;
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < dim; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      state.store(vec_ptr + idx4);
+    }
+  }
+};
+
+template <typename ElementType>
+struct TableVector {
+
+  struct Args {
+    ElementType** vec_ptrs {nullptr};
+    bool* founds {nullptr};
+  };
+
+  DEVICE_INLINE TableVector(Args args) : vec_ptrs_(args.vec_ptrs), 
+    founds_(args.founds), vec_id_(-1), vec_ptr_(nullptr),  found_(false) {}
+
+  DEVICE_INLINE bool isInitialized(int64_t vec_id) {
+    if (vec_id != vec_id_) {
+      load(vec_id);
+    }
+    return found_;
+  }
+
+  DEVICE_INLINE bool isValid(int64_t vec_id) {
+    if (vec_id != vec_id_) {
+      load(vec_id);
+    }
+    return vec_ptr_ != nullptr;
+  }
+
+  DEVICE_INLINE ElementType* data_ptr(int64_t vec_id, int i = 0) {
+    if (vec_id != vec_id_) {
+      load(vec_id);
+    }
+    if (vec_ptr_ != nullptr) {
+      return vec_ptr_ + i;
+    } else {
+      return nullptr;
+    }
+  }
+
+private:
+  DEVICE_INLINE void load(int64_t vec_id) {
+    vec_id_ = vec_id;
+    found_ = founds_[vec_id];
+    vec_ptr_ = vec_ptrs_[vec_id];
+  }
+
+  ElementType** vec_ptrs_;
+  bool* founds_;
+  int64_t vec_id_;
+  ElementType* vec_ptr_;
+  bool found_;
+};
+
+template <
+  typename T, 
+  typename EmbeddingGenerator,
+  typename TableVector>
+__global__ void fill_output_with_table_vectors_kernel(
+    uint64_t n,
+    int emb_dim,
+    T* outputs, 
+    typename TableVector::Args vector_args,
+    typename EmbeddingGenerator::Args generator_args) {
+  
+  TableVector vectors(vector_args);
+  EmbeddingGenerator emb_gen(generator_args);
+
+  for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    if (vectors.isInitialized(emb_id)) { // copy embedding from table to outputs.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        outputs[emb_id * emb_dim + i] = *vectors.data_ptr(emb_id, i);
+      }
+    } else if (vectors.isValid(emb_id)) { // initialize the embedding as well as outputs.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        auto tmp = emb_gen.generate(emb_id);
+        outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(tmp);
+        *vectors.data_ptr(emb_id, i) = TypeConvertFunc<T, float>::convert(tmp);
+      }
+    } else { // vector not exists in table, set the output to 0.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(0.0f);
+      }
+    }
+  }
+
+  emb_gen.destroy();
+}
+
+template <
+  typename T,
+  typename OptStateInitializer,
+  typename TableVector>
+__global__ void initialize_optimizer_state_kernel_vec4(
+    uint64_t n,
+    int emb_dim,
+    typename TableVector::Args vector_args,
+    OptStateInitializer optstate_initailizer) {
+  
+  TableVector vectors(vector_args);
+
+  constexpr int kWarpSize = 32;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+
+  for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+      emb_id < n; emb_id += gridDim.x * warp_num_per_block) {
+    if ((!vectors.isInitialized(emb_id)) and vectors.isValid(emb_id)) {
+      optstate_initailizer.init4(vectors.data_ptr(emb_id, emb_dim));
+    }
+  }
+}
+
+template <
+  typename T,
+  typename OptStateInitializer,
+  typename TableVector>
+__global__ void initialize_optimizer_state_kernel(
+    uint64_t n,
+    int emb_dim,
+    typename TableVector::Args vector_args,
+    OptStateInitializer optstate_initailizer) {
+  
+  TableVector vectors(vector_args);
+
+  for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    if ((!vectors.isInitialized(emb_id)) and vectors.isValid(emb_id)) {
+      optstate_initailizer.init(vectors.data_ptr(emb_id, emb_dim));
+    }
+  }
 }
 
 static void set_curand_states(curandState **states,
@@ -313,11 +446,11 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
     float max_load_factor, int block_size, int io_block_size, int device_id,
     bool io_by_cpu, bool use_constant_memory, int reserved_key_start_bit,
     size_t num_of_buckets_per_alloc, const InitializerArgs &initializer_args_,
-    const SafeCheckMode safe_check_mode)
+    const SafeCheckMode safe_check_mode, const OptimizerType optimizer_type)
     : dim_(dim), max_capacity_(max_capacity),
       initializer_args(initializer_args_), curand_states_(nullptr),
       key_type_(key_type), value_type_(value_type),
-      safe_check_mode_(safe_check_mode) {
+      safe_check_mode_(safe_check_mode), optimizer_type_(optimizer_type) {
   if (dim <= 0) {
     throw std::invalid_argument("dimension must > 0 but got " +
                                 std::to_string(dim));
@@ -350,7 +483,7 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   hkv_table_option_.max_hbm_for_vectors =
       max_hbm_for_vectors; // nv::merlin::GB(max_hbm_for_vectors);
   hkv_table_option_.max_bucket_size = max_bucket_size;
-  hkv_table_option_.dim = dim;
+  hkv_table_option_.dim = dim + get_optimizer_state_dim<ValueType>(optimizer_type, dim);
   hkv_table_option_.max_load_factor = max_load_factor;
   hkv_table_option_.block_size = block_size;
   hkv_table_option_.io_block_size = io_block_size;
@@ -442,9 +575,6 @@ void HKVVariable<KeyType, ValueType, Strategy>::accum_or_assign(
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-
-
-
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
     const size_t n, const void *keys, void **value_ptrs, void *values,
@@ -469,38 +599,81 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
                        ? dim
                        : device_prop.max_thread_per_block;
   int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
+  using TableVector = TableVector<ValueType>;
+  auto table_vec_args = typename TableVector::Args {reinterpret_cast<ValueType **>(value_ptrs), d_found};
+
   auto &initializer_ = initializer_args.mode;
   if (initializer_ == "normal") {
-    using Generator = NormalEmbeddingGenerator<ValueType>;
-    using Args = typename Generator::Args;
-    auto args = Args {curand_states_, reinterpret_cast<ValueType **>(value_ptrs),
-      d_found, initializer_args.mean, initializer_args.std_dev};
-    fill_embedding_from_generator<ValueType, Generator, Args><<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), args);
+    using Generator = NormalEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
+  } else if (initializer_ == "truncated_normal") {
+    using Generator = TruncatedNormalEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "uniform") {
-    using Generator = UniformEmbeddingGenerator<ValueType>;
-    using Args = typename Generator::Args;
-    auto args = Args {curand_states_, reinterpret_cast<ValueType **>(value_ptrs),
-      d_found, initializer_args.lower, initializer_args.upper};
-    fill_embedding_from_generator<ValueType, Generator, Args><<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), args);
+    using Generator = UniformEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "debug") {
-    using Generator = MappingEmbeddingGenerator<KeyType, ValueType>;
-    using Args = typename Generator::Args;
-    auto args = Args {curand_states_, reinterpret_cast<ValueType **>(value_ptrs),
-      d_found, reinterpret_cast<const KeyType *>(keys), 100000};
-    fill_embedding_from_generator<ValueType, Generator, Args><<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), args);
+    using Generator = MappingEmbeddingGenerator<KeyType>;
+    auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys), 100000};
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else if (initializer_ == "constant") {
-    using Generator = ConstEmbeddingGenerator<ValueType>;
-    using Args = typename Generator::Args;
-    auto args = Args {curand_states_, reinterpret_cast<ValueType **>(value_ptrs),
-      d_found, initializer_args.value};
-    fill_embedding_from_generator<ValueType, Generator, Args><<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), args);
+    using Generator = ConstEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {initializer_args.value};
+    fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
   } else {
     throw std::runtime_error("Unrecognized initializer {" + initializer_ + "}");
   }
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+
+  int optstate_dim = get_optimizer_state_dim<ValueType>(optimizer_type_, dim);
+  if (optstate_dim == 0) return;
+  using OptStateInitializer = OptStateInitializer<ValueType, int>;
+  OptStateInitializer optstate_initializer {optstate_dim, initial_optstate_};
+
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  const int max_grid_size =
+      device_prop.num_sms *
+      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+  
+  int grid_size_opt = 0;
+  if (n / WARP_PER_BLOCK < max_grid_size) {
+    grid_size_opt = (n - 1) / WARP_PER_BLOCK + 1;
+  } else if (n / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size_opt = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size_opt = max_grid_size;
+  }
+
+  if (dim % 4 == 0 and optstate_dim % 4 == 0) {
+    initialize_optimizer_state_kernel_vec4<ValueType, OptStateInitializer, TableVector>
+      <<<grid_size_opt, BLOCK_SIZE_VEC, 0, stream>>>(
+      n, dim, table_vec_args, optstate_initializer);
+  } else {
+    int block_size = optstate_dim < device_prop.max_thread_per_block
+                        ? optstate_dim
+                        : device_prop.max_thread_per_block;
+    int grid_size = n;
+    initialize_optimizer_state_kernel<ValueType, OptStateInitializer, TableVector>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, table_vec_args, optstate_initializer);
+  }
+
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -521,6 +694,17 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert_pointers(
     check_safe_pointers_sync<ValueType>(n, hkv_ptrs, this->safe_check_mode_,
                                         stream);
   }
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::find_pointers(
+    const size_t n, const void *keys, void **value_ptrs, bool *founds,
+    void *scores, cudaStream_t stream) const {
+  if (n == 0)
+    return;
+  hkv_table_->find(n, (KeyType *)keys, (ValueType **)value_ptrs,
+                   founds, (uint64_t *)scores, stream);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -616,6 +800,21 @@ curandState* HKVVariable<KeyType, ValueType, Strategy>::get_curand_states() cons
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 const InitializerArgs&  HKVVariable<KeyType, ValueType, Strategy>::get_initializer_args() const {
   return initializer_args;
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+const int  HKVVariable<KeyType, ValueType, Strategy>::optstate_dim() const {
+  return hkv_table_option_.dim - dim_;
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::set_initial_optstate(const float value) {
+  this->initial_optstate_ = value;
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+const float HKVVariable<KeyType, ValueType, Strategy>::get_initial_optstate() const {
+  return this->initial_optstate_;
 }
 
 } // namespace dyn_emb
