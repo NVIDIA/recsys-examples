@@ -413,8 +413,8 @@ def get_planner(device, eb_configs, batch_size):
     )
 
 
-def get_dynamicemb_dmp(ebc, args):
-    eb_configs = ebc.embedding_configs()
+def apply_dmp(model, args):
+    eb_configs = model.embedding_module.embedding_configs()
     # set optimizer args
     learning_rate = args.lr
     beta1 = 0.9
@@ -461,11 +461,11 @@ def get_dynamicemb_dmp(ebc, args):
 
     planner = get_planner(device, eb_configs, args.batch_size)
     # Same usage of TorchREC
-    plan = planner.collective_plan(ebc, [sharder], dist.GroupMember.WORLD)
+    plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
 
     # Same usage of TorchREC
     dmp = DistributedModelParallel(
-        module=ebc,
+        module=model,
         device=device,
         # pyre-ignore
         sharders=[sharder],
@@ -529,7 +529,7 @@ def create_model(args):
         over_arch_layer_sizes=mlp_dims,
     )
 
-    model.embedding_module = get_dynamicemb_dmp(ec, args)
+    model = apply_dmp(model, args)
 
     return model
 
