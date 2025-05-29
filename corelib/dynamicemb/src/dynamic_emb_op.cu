@@ -138,11 +138,11 @@ void insert_and_evict(
     bool unique_key = true,
     bool ignore_evict_strategy = false) {
 
-  if (not score and table->evict_strategy() == EvictStrategy::kCustomized) {
-    throw std::invalid_argument("Must specify the score when evict strategy is customized.");
+  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
   }
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  if (table->evict_strategy() == EvictStrategy::kCustomized) {
+  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
     auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
     // broadcast scores
     at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
@@ -188,8 +188,8 @@ void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                   bool ignore_evict_strategy = false
                   )
 {
-  if (not score and table->evict_strategy() == EvictStrategy::kCustomized) {
-    throw std::invalid_argument("Must specify the score when evict strategy is customized.");
+  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
   }
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -203,7 +203,7 @@ void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
 
   auto found_tensor_data_ptr = found_tensor.data_ptr<bool>();
 
-  if (table->evict_strategy() == EvictStrategy::kCustomized) {
+  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
     auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
     // broadcast scores
     at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
@@ -226,15 +226,15 @@ void find_or_insert_pointers(
   const std::optional<uint64_t> score = std::nullopt,
   bool unique_key = true,
   bool ignore_evict_strategy = false) {
-  if (not score and table->evict_strategy() == EvictStrategy::kCustomized) {
-    throw std::invalid_argument("Must specify the score when evict strategy is customized.");
+  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
   }
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto values_data_ptr = reinterpret_cast<void**>(values.data_ptr<int64_t>());
   auto found_tensor_data_ptr = founds.data_ptr<bool>();
 
-  if (table->evict_strategy() == EvictStrategy::kCustomized) {
+  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
     auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
     // broadcast scores
     at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);

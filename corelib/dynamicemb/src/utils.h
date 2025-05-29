@@ -104,6 +104,7 @@ enum class EvictStrategy : uint32_t {
   switch (EVICT_TYPE) {                                                 \
     CASE_ENUM_USING_HINT(EvictStrategy::kLru, HINT, __VA_ARGS__)        \
     CASE_ENUM_USING_HINT(EvictStrategy::kCustomized, HINT, __VA_ARGS__) \
+    CASE_ENUM_USING_HINT(EvictStrategy::kLfu, HINT, __VA_ARGS__) \
     default:                                                            \
       exit(EXIT_FAILURE);                                               \
   }
