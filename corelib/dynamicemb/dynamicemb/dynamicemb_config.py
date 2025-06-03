@@ -208,7 +208,7 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     TIMESTAMP = 0
     STEP = 1
     CUSTOMIZED = 2
-    LFU = 3 #ADD LFU here
+    LFU = 3 
 
 # Configs used as keys to group HKV variables(considering kernel behaviors, result type).
 @dataclass
