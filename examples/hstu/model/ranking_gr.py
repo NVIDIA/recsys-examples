@@ -26,7 +26,6 @@ from modules.hstu_block import HSTUBlock
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP
 from modules.multi_task_loss_module import MultiTaskLossModule
-from modules.multi_task_over_arch import MultiTaskOverArch
 
 
 class RankingGR(BaseModel):
@@ -60,35 +59,26 @@ class RankingGR(BaseModel):
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
 
-        self._logit_dim_list = [
-            layer_sizes[-1] for layer_sizes in task_config.prediction_head_arch
-        ]
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
 
         self._hstu_block = HSTUBlock(hstu_config)
-        self._multi_task_over_arch = MultiTaskOverArch(
-            [
-                MLP(
-                    self._embedding_dim,
-                    layer_sizes,
-                    has_bias,
-                    head_act_type,
-                    device=self._device,
-                )
-                for layer_sizes, head_act_type, has_bias in zip(
-                    task_config.prediction_head_arch,
-                    task_config.prediction_head_act_type,
-                    task_config.prediction_head_bias,  # type: ignore[arg-type]
-                )
-            ]
+        self._mlp = MLP(
+            self._embedding_dim,
+            task_config.prediction_head_arch,
+            task_config.prediction_head_act_type,
+            task_config.prediction_head_bias,
+            device=self._device,
         )
 
         # TODO, make reduction configurable
         self._loss_module = MultiTaskLossModule(
-            logit_dim_list=self._logit_dim_list, reduction="none"
+            num_classes=task_config.prediction_head_arch[-1],
+            num_tasks=task_config.num_tasks,
+            reduction="none",
         )
         self._metric_module = get_multi_event_metric_module(
-            self._logit_dim_list,
+            num_classes=task_config.prediction_head_arch[-1],
+            num_tasks=task_config.num_tasks,
             metric_types=task_config.eval_metrics,
             comm_pg=parallel_state.get_data_parallel_group(with_context_parallel=True),
         )
@@ -101,7 +91,7 @@ class RankingGR(BaseModel):
             RankingGR: The model with bfloat16 precision.
         """
         self._hstu_block.bfloat16()
-        self._multi_task_over_arch.bfloat16()
+        self._mlp.bfloat16()
         return self
 
     def half(self):
@@ -112,7 +102,7 @@ class RankingGR(BaseModel):
             RankingGR: The model with half precision.
         """
         self._hstu_block.half()
-        self._multi_task_over_arch.half()
+        self._mlp.half()
         return self
 
     def get_logit_and_labels(
@@ -133,7 +123,7 @@ class RankingGR(BaseModel):
             batch=batch,
         )
 
-        return self._multi_task_over_arch(hidden_states).values, batch.labels
+        return self._mlp(hidden_states.values), batch.labels
 
     @output_nvtx_hook(nvtx_tag="RankingModel", backward=False)
     def forward(  # type: ignore[override]

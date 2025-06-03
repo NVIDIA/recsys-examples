@@ -26,6 +26,7 @@ from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
     InitializerArgs,
+    OptimizerType,
     count_matched,
     device_timestamp,
     dyn_emb_rows,
@@ -59,6 +60,7 @@ class ExtensionsTableOption:
     num_of_buckets_par_alloc: int = 1
     initializer_args: InitializerArgs = DynamicEmbInitializerArgs().as_ctype()
     safe_check_mode: int = DynamicEmbCheckMode.IGNORE.value
+    optimizer_type: OptimizerType = OptimizerType.Null
 
 
 class ScoreAdaptor:

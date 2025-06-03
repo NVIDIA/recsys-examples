@@ -84,7 +84,7 @@ def batch_slice(
             segment_start = item_seqlen_offsets[batch_size * rank]
             segment_end = item_seqlen_offsets[batch_size * (rank + 1)]
         return RankingBatch(
-            labels=batch.labels[segment_start:segment_end, :], **batch_kwargs
+            labels=batch.labels[segment_start:segment_end], **batch_kwargs
         )
     else:
         return RetrievalBatch(**batch_kwargs)

@@ -119,7 +119,7 @@ class TorchHSTUAttention(HSTUAttention):
 
         return pytorch_hstu_mha(
             max_seq_len=max_seqlen,
-            alpha=1.0,
+            alpha=1.0 / (self.attention_dim**0.5),
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),
             v=tv.view(-1, self.num_heads, self.linear_dim),
@@ -197,7 +197,7 @@ class TritonHSTUAttention(HSTUAttention):
         ), "num_contextuals must be an integer in TritonHSTUAttention"
         return triton_hstu_mha(
             N=max_seqlen,
-            alpha=1.0,
+            alpha=1.0 / (self.attention_dim**0.5),
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),
             v=tv.view(-1, self.num_heads, self.linear_dim),
@@ -296,6 +296,7 @@ class FusedHSTUAttention(HSTUAttention):
             target_group_size=target_group_size,
             window_size=(-1, 0) if self.is_causal else (-1, -1),
             rab=None,
+            alpha=1.0 / (self.attention_dim**0.5),
         ).view(-1, self.num_heads * self.linear_dim)
 
 
@@ -318,7 +319,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         is_causal: bool,
     ):
         super().__init__()
-        from hopper.flash_attn_interface import hstu_attn_varlen_func
+        from hopper.hstu_attn_interface import hstu_attn_varlen_func
 
         self._hstu_attn_varlen_func = hstu_attn_varlen_func
         self.num_heads = num_heads
@@ -371,8 +372,6 @@ class FusedHSTUAttentionHopper(HSTUAttention):
                 .expand(offsets.size(0) - 1)
                 .contiguous()
             )
-        # TODO: remove this once Hopper supports contextual mask bwd
-        num_contextuals = None
         return self._hstu_attn_varlen_func(
             q=tq.view(-1, self.num_heads, self.attention_dim),
             k=tk.view(-1, self.num_heads, self.attention_dim),
@@ -388,6 +387,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
             target_group_size=target_group_size,
             window_size=(-1, 0) if self.is_causal else (-1, -1),
             rab=None,
+            alpha=1.0 / (self.attention_dim**0.5),
         ).view(-1, self.num_heads * self.linear_dim)
 
 

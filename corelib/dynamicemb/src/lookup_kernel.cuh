@@ -61,6 +61,13 @@ template <> struct Vec4T<__half> {
     value.h[1].y = 0.f;
   }
 
+  DEVICE_INLINE void reset(const __half initial_value) {
+    value.h[0].x = initial_value;
+    value.h[0].y = initial_value;
+    value.h[1].x = initial_value;
+    value.h[1].y = initial_value;
+  }
+
   DEVICE_INLINE void load(const float *p, int n) {
     if (n == 4) {
       float4 f = *(reinterpret_cast<const float4 *>(p));
@@ -286,6 +293,13 @@ template <> struct Vec4T<__nv_bfloat16> {
     value.h[1].y = 0.f;
   }
 
+  DEVICE_INLINE void reset(const __nv_bfloat16 initial_value) {
+    value.h[0].x = initial_value;
+    value.h[0].y = initial_value;
+    value.h[1].x = initial_value;
+    value.h[1].y = initial_value;
+  }
+
   DEVICE_INLINE void load(const float *p, int n) {
     if (n == 4) {
       float4 f = *(reinterpret_cast<const float4 *>(p));
@@ -495,6 +509,13 @@ template <> struct Vec4T<float> {
     val.y = 0.f;
     val.z = 0.f;
     val.w = 0.f;
+  }
+
+  DEVICE_INLINE void reset(const float initial_value) {
+    val.x = initial_value;
+    val.y = initial_value;
+    val.z = initial_value;
+    val.w = initial_value;
   }
 
   DEVICE_INLINE void load(const float *p, int n) {

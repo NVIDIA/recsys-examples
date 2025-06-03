@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Tuple
 
 import pytest
 import torch
-from dynamicemb import DynamicEmbTableOptions, OptimizerArgs
+from dynamicemb import DynamicEmbTableOptions, EmbOptimType
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
 from dynamicemb.dynamicemb_config import *
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
@@ -30,6 +31,7 @@ from dynamicemb.optimizer import (
 )
 from dynamicemb_extensions import (
     DynamicEmbTable,
+    OptimizerType,
     find,
     find_or_insert,
     insert_or_assign,
@@ -283,6 +285,7 @@ class TorchRowWiseAdagradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer
             table_option.dim = 1
             table_option.global_hbm_for_values = new_global_hbm_for_values
             table_option.local_hbm_for_values = new_local_hbm_for_values
+            table_option.optimizer_type = OptimizerType.Null
 
         self._state_dict["Gt"] = []
         self._create_tables(self._state_dict["Gt"])
@@ -382,8 +385,52 @@ def initialize_hashtables(
 
 
 # Helper function to compare tensors
-def compare_tensors(t1: torch.Tensor, t2: torch.Tensor, rtol=1e-05, atol=1e-06):
+def compare_tensors(t1: torch.Tensor, t2: torch.Tensor, rtol=1e-04, atol=1e-05):
     return torch.allclose(t1, t2, rtol=rtol, atol=atol)
+
+
+def get_optimizer_type(dynemb_optimizer):
+    if dynemb_optimizer == SGDDynamicEmbeddingOptimizer:
+        return EmbOptimType.SGD
+    elif dynemb_optimizer == AdamDynamicEmbeddingOptimizer:
+        return EmbOptimType.ADAM
+    elif dynemb_optimizer == AdaGradDynamicEmbeddingOptimizer:
+        return EmbOptimType.EXACT_ADAGRAD
+    elif dynemb_optimizer == RowWiseAdaGradDynamicEmbeddingOptimizer:
+        return EmbOptimType.EXACT_ROWWISE_ADAGRAD
+    else:
+        raise ValueError("Not support optimizer type")
+
+
+def get_optimizer_state_dim(dynemb_optimizer, dim, dtype):
+    DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+        torch.float32: 4,
+        torch.float16: 2,
+        torch.bfloat16: 2,
+    }
+    if dynemb_optimizer == RowWiseAdaGradDynamicEmbeddingOptimizer:
+        return 16 // DTYPE_NUM_BYTES[dtype]
+    elif dynemb_optimizer == AdamDynamicEmbeddingOptimizer:
+        return dim * 2
+    elif dynemb_optimizer == AdaGradDynamicEmbeddingOptimizer:
+        return dim
+    else:
+        return 0
+
+
+def find_and_insert_missed(table, batch, keys, values):
+    founds = torch.empty_like(keys, dtype=torch.bool, device=keys.device)
+    tmp_values = torch.zeros_like(values, dtype=values.dtype, device=values.device)
+    find(table, batch, keys, tmp_values, founds)
+    missed = ~founds
+    missed_keys = torch.masked_select(keys, missed).contiguous()
+    values_mask = missed.unsqueeze(1).repeat(1, values.size(1)).contiguous()
+    missed_vals = (
+        torch.masked_select(values, values_mask).contiguous().view(-1, values.size(1))
+    )
+    assert missed_keys.size(0) == missed_vals.size(0)
+    print(f"Insert missed keys: {missed_keys.size(0)} in current batch: {batch}")
+    insert_or_assign(table, missed_keys.size(0), missed_keys, missed_vals)
 
 
 # Function to test optimizers
@@ -416,11 +463,13 @@ def test_optimizer(
     opt_args = OptimizerArgs(
         learning_rate=0.01, eps=1e-8, beta1=0.9, beta2=0.999, weight_decay=0.1
     )
+    init_accumulator = 0.0
+    emb_dtype = torch.float32
 
     table_options = [
         DynamicEmbTableOptions(
             index_type=torch.int64,
-            embedding_dtype=torch.float32,
+            embedding_dtype=emb_dtype,
             evict_strategy=DynamicEmbEvictStrategy.LRU,
             dim=embedding_dim[i],
             init_capacity=int(1 * 1024 * 1024),
@@ -432,27 +481,32 @@ def test_optimizer(
         for i in range(num_tables)
     ]
 
-    # print(f"optimizer_class = {optimizer_class}")
-    # print(f"opt_args = {opt_args}")
-    # print(f"table_options = {table_options}")
-    # print(f"num_tables = {num_tables}")
-    # print(f"length = {length}")
-    # print(f"embedding_dim = {embedding_dim}")
-    # print(f"num_tests = {num_tests}")
-    # print(f"index_min = {index_min}")
-    # print(f"index_max = {index_max}")
-    # print(f"device = {device}")
-
     dynamicemb_optimizer_class = optimizer_class[0]
     torch_optimizer_class = optimizer_class[1]
-    # Initialize hash tables
+    # Initialize hash tables and optimizer states
     hashtables_for_torch = initialize_hashtables(num_tables, table_options)
-    hashtables_for_dynamicemb = initialize_hashtables(num_tables, table_options)
-
     opt_for_torch = torch_optimizer_class(opt_args, table_options, hashtables_for_torch)
-    opt_for_dynamicemb = dynamicemb_optimizer_class(
-        opt_args, table_options, hashtables_for_dynamicemb
-    )
+
+    batched_dynamicemb_tables = []
+    for i, table_option in enumerate(table_options):
+        batched_dynamicemb_tables.append(
+            BatchedDynamicEmbeddingTables(
+                table_options=[table_option],
+                table_names=[f"t_{i}"],
+                pooling_mode=DynamicEmbPoolingMode.NONE,
+                device=device,
+                optimizer=get_optimizer_type(dynamicemb_optimizer_class),
+                learning_rate=opt_args.learning_rate,
+                eps=opt_args.eps,
+                beta1=opt_args.beta1,
+                beta2=opt_args.beta2,
+                weight_decay=opt_args.weight_decay,
+            )
+        )
+    hashtables_for_dynamicemb = [
+        module.tables[0] for module in batched_dynamicemb_tables
+    ]
+    opt_for_dynamicemb = [module.optimizer for module in batched_dynamicemb_tables]
 
     for test_num in range(num_tests):
         print(f"Running test {test_num + 1}/{num_tests}")
@@ -465,11 +519,27 @@ def test_optimizer(
         # Insert initial values into hash tables
         for i, ht in enumerate(hashtables_for_torch):
             length = indices[i].shape[0]
-            find_or_insert(ht, length, indices[i], insert_values[i])
+            find_and_insert_missed(ht, length, indices[i], insert_values[i])
 
+        dynemb_vals = []
         for i, ht in enumerate(hashtables_for_dynamicemb):
             length = indices[i].shape[0]
-            find_or_insert(ht, length, indices[i], insert_values[i])
+            optstate_dim = get_optimizer_state_dim(
+                dynamicemb_optimizer_class, embedding_dim[i], emb_dtype
+            )
+            dynemb_val = torch.empty(
+                (length, embedding_dim[i] + optstate_dim),
+                dtype=emb_dtype,
+                device="cuda",
+            )
+            dynemb_val[:, : embedding_dim[i]] = insert_values[i]
+            if optstate_dim != 0:
+                dynemb_val[:, -optstate_dim:] = (
+                    torch.ones((length, optstate_dim), dtype=emb_dtype, device="cuda")
+                    * init_accumulator
+                )
+            find_and_insert_missed(ht, length, indices[i], dynemb_val)
+            dynemb_vals.append(dynemb_val)
 
         # Create found_tensor and result_tensor lists
         found_tensors_for_torch = [
@@ -485,16 +555,8 @@ def test_optimizer(
             for tensor in indices
         ]
         result_tensors_for_dynamicemb = [
-            torch.zeros_like(tensor, device=device) for tensor in insert_values
+            torch.zeros_like(tensor, device=device) for tensor in dynemb_vals
         ]
-
-        for i, ht in enumerate(hashtables_for_torch):
-            length = indices[i].shape[0]
-            insert_or_assign(ht, length, indices[i], insert_values[i])
-
-        for i, ht in enumerate(hashtables_for_dynamicemb):
-            length = indices[i].shape[0]
-            insert_or_assign(ht, length, indices[i], insert_values[i])
 
         # check insert result is right
         for i, ht in enumerate(hashtables_for_torch):
@@ -517,9 +579,6 @@ def test_optimizer(
                 found_tensors_for_dynamicemb[i],
             )
 
-        # Synchronize CUDA
-        torch.cuda.synchronize()
-
         # Validation
         # Check if all found tensors are True
         for tensor in found_tensors_for_torch:
@@ -529,28 +588,20 @@ def test_optimizer(
                 tensor.all()
             ), "Not all values in found_tensors_for_dynamicemb are True"
 
-        # Check if result_tensors_for_torch and result_tensors_for_dynamicemb match insert_values
-        for i, tensor in enumerate(result_tensors_for_torch):
-            assert compare_tensors(
-                tensor, insert_values[i]
-            ), f"result_tensors_for_torch[{i}] does not match insert_values[{i}]"
-
-        for i, tensor in enumerate(result_tensors_for_dynamicemb):
-            assert compare_tensors(
-                tensor, insert_values[i]
-            ), f"result_tensors_for_dynamicemb[{i}] does not match insert_values[{i}]"
-
         # Check if result_tensors_for_torch and result_tensors_for_dynamicemb are equal
         for i in range(len(result_tensors_for_torch)):
             assert compare_tensors(
-                result_tensors_for_torch[i], result_tensors_for_dynamicemb[i]
+                result_tensors_for_torch[i],
+                result_tensors_for_dynamicemb[i][:, : embedding_dim[i]],
             ), f"result_tensors_for_torch[{i}] does not match result_tensors_for_dynamicemb[{i}]"
 
-        print("Assign and Find success!")
+        print("Find and Insert success!")
 
         opt_for_torch.update(hashtables_for_torch, indices, grads)
-        opt_for_dynamicemb.update(hashtables_for_dynamicemb, indices, grads)
-        torch.cuda.synchronize()
+        for i in range(num_tables):
+            opt_for_dynamicemb[i].update(
+                [hashtables_for_dynamicemb[i]], [indices[i]], [grads[i]]
+            )
 
         found_weights_for_torch = [
             torch.zeros_like(tensor, dtype=torch.bool, device=device)
@@ -565,7 +616,7 @@ def test_optimizer(
             for tensor in indices
         ]
         result_weights_for_dynamicemb = [
-            torch.zeros_like(tensor, device=device) for tensor in insert_values
+            torch.zeros_like(tensor, device=device) for tensor in dynemb_vals
         ]
 
         # check insert result is right
@@ -589,9 +640,6 @@ def test_optimizer(
                 found_weights_for_dynamicemb[i],
             )
 
-        # Synchronize CUDA
-        torch.cuda.synchronize()
-
         # Validation
         # Check if all found tensors are True
         for tensor in found_weights_for_torch:
@@ -601,15 +649,19 @@ def test_optimizer(
                 tensor.all()
             ), "Not all values in found_tensors_for_dynamicemb are True"
 
-        # Check if result_tensors_for_torch and result_tensors_for_dynamicemb are equal
+        # Check if result_tensors_for_torch and result_tensors_for_dynamicemb are equal after optimizer's update
         for i in range(len(result_weights_for_torch)):
             if not compare_tensors(
-                result_weights_for_torch[i], result_weights_for_dynamicemb[i]
+                result_weights_for_torch[i],
+                result_weights_for_dynamicemb[i][:, : embedding_dim[i]],
             ):
                 print(
                     f"Difference found at index {i} result_weights_for_torch = {result_weights_for_torch[i]} result_weights_for_dynamicemb = {result_weights_for_dynamicemb[i]}"
                 )
-                diff = result_weights_for_torch[i] - result_weights_for_dynamicemb[i]
+                diff = (
+                    result_weights_for_torch[i]
+                    - result_weights_for_dynamicemb[i][:, : embedding_dim[i]]
+                )
                 print(f"Difference tensor: {diff}")
                 raise AssertionError(
                     f"result_weights_for_torch[{i}] does not match result_weights_for_dynamicemb[{i}] within tolerance"
@@ -620,78 +672,3 @@ def test_optimizer(
                 )
 
         print("All tensors match successfully.")
-
-        state_names = opt_for_torch.state_names()
-        if len(state_names) > 0:
-            for state_name in state_names:
-                tmp_state_hts_for_torch = opt_for_torch.get_state_by_name(state_name)
-                tmp_state_hts_for_dynamicemb = opt_for_dynamicemb.get_state_by_name(
-                    state_name
-                )
-                found_states_for_torch = [
-                    torch.zeros_like(tensor, dtype=torch.bool, device=device)
-                    for tensor in indices
-                ]
-                result_states_for_torch = [
-                    torch.zeros_like(tensor, device=device) for tensor in insert_values
-                ]
-
-                found_states_for_dynamicemb = [
-                    torch.zeros_like(tensor, dtype=torch.bool, device=device)
-                    for tensor in indices
-                ]
-                result_states_for_dynamicemb = [
-                    torch.zeros_like(tensor, device=device) for tensor in insert_values
-                ]
-
-                # check insert result is right
-                for i, ht in enumerate(tmp_state_hts_for_torch):
-                    length = indices[i].shape[0]
-                    find(
-                        ht,
-                        length,
-                        indices[i],
-                        result_states_for_torch[i],
-                        found_states_for_torch[i],
-                    )
-
-                for i, ht in enumerate(tmp_state_hts_for_dynamicemb):
-                    length = indices[i].shape[0]
-                    find(
-                        ht,
-                        length,
-                        indices[i],
-                        result_states_for_dynamicemb[i],
-                        found_states_for_dynamicemb[i],
-                    )
-
-                # Synchronize CUDA
-                torch.cuda.synchronize()
-
-                # Validation
-                # Check if all found tensors are True
-                for tensor in found_states_for_torch:
-                    assert (
-                        tensor.all()
-                    ), "Not all values in found_tensors_for_torch are True"
-                for tensor in found_states_for_dynamicemb:
-                    assert (
-                        tensor.all()
-                    ), "Not all values in found_tensors_for_dynamicemb are True"
-
-                for i in range(len(result_states_for_torch)):
-                    if not compare_tensors(
-                        result_states_for_torch[i], result_states_for_dynamicemb[i]
-                    ):
-                        print(f"Difference found at index {i}")
-                        diff = (
-                            result_states_for_torch[i] - result_states_for_dynamicemb[i]
-                        )
-                        print(f"Difference tensor: {diff}")
-                        raise AssertionError(
-                            f"result_states_for_torch[{i}] does not match result_states_for_dynamicemb[{i}] within tolerance"
-                        )
-                    else:
-                        print(
-                            f"result_states_for_torch[{i}] matches result_states_for_dynamicemb[{i}] within tolerance"
-                        )

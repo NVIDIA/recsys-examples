@@ -1,4 +1,19 @@
-# Copyright (c) 2023, Tri Dao.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
+# # Copyright (c) 2023, Tri Dao.
 # Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
 
 
@@ -195,14 +210,6 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
             num_contexts,
             num_targets,
         ) = ctx.saved_tensors
-        if num_contexts is not None:
-            raise ValueError(
-                "AssertError: context currently is not supported in backward"
-            )
-        if num_targets is None and ctx.target_group_size > 1:
-            raise ValueError(
-                "AssertError: group target currently is not supported in backward"
-            )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             dq, dk, dv, drab = _hstu_attn_varlen_backward(
                 dout,

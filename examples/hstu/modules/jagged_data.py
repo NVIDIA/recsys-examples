@@ -12,14 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import abc
 import dataclasses
 import pprint
 from typing import Optional
 
 import fbgemm_gpu  # pylint: disable-unused-import
 import torch
-from megatron.core.transformer.module import MegatronModule
 
 
 @dataclasses.dataclass
@@ -236,26 +234,3 @@ class JaggedData:
             else self.contextual_seqlen_offsets,
             has_interleaved_action=self.has_interleaved_action,
         )
-
-
-class JaggedModule(MegatronModule, abc.ABC):
-    """
-    Abstract base class for a module that processes jagged data.
-
-    This class inherits from `MegatronModule` and `abc.ABC`, and defines an abstract method `forward` that must be implemented by any subclass.
-    """
-
-    @abc.abstractmethod
-    def forward(
-        self,
-        jagged_data: JaggedData,
-    ) -> JaggedData:
-        """
-        Abstract method for the forward pass of a JaggedModule.
-
-        Args:
-            jagged_data (JaggedData): The input jagged data.
-
-        Returns:
-            JaggedData: The output jagged data.
-        """

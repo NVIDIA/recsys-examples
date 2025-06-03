@@ -1,13 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
-from dataset.utils import RankingBatch
+from dataset.utils import RankingBatch, RetrievalBatch
+from megatron.core.transformer.module import MegatronModule
 from modules.fused_hstu_layer import FusedHSTULayer
-from modules.jagged_module import JaggedData, JaggedModule
+from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.jagged_tensor_op import concat_2D_jagged_tensors
@@ -19,7 +20,7 @@ from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
-class HSTUBlock(JaggedModule):
+class HSTUBlock(MegatronModule):
     """
     HSTUBlock module. A stack of HSTULayers.
 
@@ -117,7 +118,9 @@ class HSTUBlock(JaggedModule):
                 max_seqlens=contextual_max_seqlens,
             )
 
-            contextual_max_seqlen = sum(contextual_max_seqlens)
+            contextual_max_seqlen = max(
+                len(batch.contextual_feature_names), sum(contextual_max_seqlens)
+            )
             contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
                 contextual_seqlen
             )
@@ -147,19 +150,35 @@ class HSTUBlock(JaggedModule):
                 seq_embeddings=sequence_embeddings,
                 num_targets=num_candidates,
             )
+
+        sequence_embeddings = torch.nn.functional.dropout(
+            sequence_embeddings,
+            p=0.2,
+            training=self.training,
+        )
         return JaggedData(
             values=sequence_embeddings.to(self._training_dtype),
-            seqlen=sequence_embeddings_lengths,  # contextual + history + candidate
-            seqlen_offsets=sequence_embeddings_lengths_offsets,
+            seqlen=sequence_embeddings_lengths.to(
+                torch.int32
+            ),  # contextual + history + candidate
+            seqlen_offsets=sequence_embeddings_lengths_offsets.to(torch.int32),
             max_seqlen=sequence_max_seqlen,
             max_num_candidates=max_num_candidates,
-            num_candidates=num_candidates,
-            num_candidates_offsets=length_to_complete_offsets(num_candidates)
+            num_candidates=num_candidates.to(torch.int32)
+            if num_candidates is not None
+            else None,
+            num_candidates_offsets=length_to_complete_offsets(num_candidates).to(
+                torch.int32
+            )
             if num_candidates is not None
             else None,
             contextual_max_seqlen=contextual_max_seqlen,
-            contextual_seqlen=contextual_seqlen,
-            contextual_seqlen_offsets=contextual_seqlen_offsets,
+            contextual_seqlen=contextual_seqlen.to(torch.int32)
+            if contextual_seqlen is not None
+            else None,
+            contextual_seqlen_offsets=contextual_seqlen_offsets.to(torch.int32)
+            if contextual_seqlen_offsets is not None
+            else None,
             has_interleaved_action=batch.action_feature_name is not None,
         )
 
@@ -207,6 +226,11 @@ class HSTUBlock(JaggedModule):
             sequence_embeddings = sequence_embeddings[0::2, ...]
             seqlen_offsets = seqlen_offsets // 2
             max_seqlen = max_seqlen // 2
+
+        sequence_embeddings = sequence_embeddings / torch.linalg.norm(
+            sequence_embeddings, ord=2, dim=-1, keepdim=True
+        ).clamp(min=1e-6)
+
         return JaggedData(
             values=sequence_embeddings,
             seqlen=(seqlen_offsets[1:] - seqlen_offsets[:-1]).to(jd.seqlen.dtype),
@@ -217,14 +241,16 @@ class HSTUBlock(JaggedModule):
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_tensor_attr_name="values")
     def forward(
-        self, embeddings: Dict[str, JaggedTensor], batch: RankingBatch
+        self,
+        embeddings: Dict[str, JaggedTensor],
+        batch: Union[RankingBatch, RetrievalBatch],
     ) -> JaggedData:
         """
         Forward pass of the HSTUBlock.
 
         Args:
             embeddings (Dict[str, JaggedTensor]): The input embeddings.
-            batch (RankingBatch): The batch of ranking data.
+            batch (RankingBatch): The input batch.
 
         Returns:
             JaggedData: The output jagged data.

@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
-from dynamicemb.dynamicemb_config import dyn_emb_to_torch
+from dynamicemb.dynamicemb_config import dtype_to_bytes, dyn_emb_to_torch
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
@@ -48,13 +48,16 @@ def debug_check_dynamic_table_is_zero(dynamic_table):
     key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
     value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
     dim = dyn_emb_cols(dynamic_table)
+    optstate_dim = dynamic_table.optstate_dim()
 
     search_capacity = dyn_emb_capacity(dynamic_table)
 
     local_max_rows = dyn_emb_rows(dynamic_table)
 
     keys = torch.ones(local_max_rows, dtype=key_dtype, device=device)
-    values = torch.ones(local_max_rows * dim, dtype=value_dtype, device=device)
+    values = torch.ones(
+        local_max_rows * (dim + optstate_dim), dtype=value_dtype, device=device
+    )
     d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
 
     if need_dump_score:
@@ -64,6 +67,8 @@ def debug_check_dynamic_table_is_zero(dynamic_table):
         export_batch(dynamic_table, search_capacity, 0, d_counter, keys, values, scores)
     else:
         export_batch(dynamic_table, search_capacity, 0, d_counter, keys, values)
+
+    values = values.reshape(-1, dim + optstate_dim)[:, :dim].contiguous().reshape(-1)
 
     value_is_zero = torch.all(values == 0)
     score_is_one = True
@@ -90,7 +95,7 @@ def debug_check_dynamic_table_is_zero(dynamic_table):
 
 
 def debug_dump(embedding_collections_list, path, table_names, optim, pg):
-    def debug_export(dynamic_table, root_path, name):
+    def debug_export(dynamic_table, root_path, name, optim):
         rank = dist.get_rank(group=pg)
         world_size = dist.get_world_size(group=pg)
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -110,10 +115,12 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
 
         key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
         value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-        dim = dyn_emb_cols(dynamic_table)
+        optstate_dim = dynamic_table.optstate_dim()
 
         keys = torch.empty(local_max_rows, dtype=key_dtype, device=device)
-        values = torch.empty(local_max_rows * dim, dtype=value_dtype, device=device)
+        values = torch.empty(
+            local_max_rows * (dim + optstate_dim), dtype=value_dtype, device=device
+        )
         d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
 
         if need_dump_score:
@@ -141,7 +148,9 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
             )
 
         keys_int64 = keys.to(torch.int64)
-        values_float = values.to(torch.float)
+        values_float = values.reshape(-1, dim + optstate_dim)[
+            :, : dim + optstate_dim if optim else dim
+        ].to(torch.float)
 
         fkey.write(keys_int64.cpu().numpy().tobytes())
         fvalue.write(values_float.cpu().numpy().tobytes())
@@ -249,9 +258,6 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
 
             if optim:
                 optimizer = dynamic_emb_module.optimizer
-                state_names = optimizer.state_names()
-                states = optimizer.get_state()
-                table_state_map = optimizer.table_state_map()
                 optimizer.get_opt_args()
 
             tmp_tables_dict: Dict[str, DynamicEmbTable] = {
@@ -263,18 +269,11 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
             for k, dump_name in enumerate(filtered_table_names):
                 dynamic_table = filtered_dynamic_tables[k]
                 debug_export(
-                    dynamic_table, debug_root_path, dump_name + "_" + str(rank)
+                    dynamic_table,
+                    debug_root_path,
+                    dump_name + "_" + str(rank),
+                    optim=optim,
                 )
-
-                if optim:
-                    for state_name in state_names:
-                        tmp_state_list = states[state_name]
-                        state_ind = table_state_map[dynamic_table]
-                        tmp_state = tmp_state_list[state_ind]
-                        tmp_state_name = dump_name + "_opt_state_" + state_name
-                        debug_export(
-                            tmp_state, debug_root_path, tmp_state_name + "_" + str(rank)
-                        )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -282,7 +281,9 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
 
 
 def debug_load(embedding_collections_list, path, table_names, optim, pg):
-    def validate_dynamic_embedding(debug_root_path, dump_name, rank, dynamic_table):
+    def validate_dynamic_embedding(
+        debug_root_path, dump_name, rank, dynamic_table, optim
+    ):
         need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
 
         key_name = dump_name + "_" + str(rank) + "_keys"
@@ -292,7 +293,20 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
         value_path = os.path.join(debug_root_path, value_name)
 
         key_file_size = os.path.getsize(key_path)
-        os.path.getsize(value_path)
+        value_file_size = os.path.getsize(value_path)
+
+        key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
+        value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
+
+        key_bytes = dtype_to_bytes(key_dtype)
+        value_bytes = dtype_to_bytes(value_dtype)
+
+        total_keys = key_file_size // key_bytes
+        total_dim = value_file_size // (total_keys * value_bytes)
+
+        dim = dyn_emb_cols(dynamic_table)
+        optstate_dim = dynamic_table.optstate_dim()
+        exist_optstate: bool = total_dim > dim
 
         if need_dump_score:
             score_name = dump_name + "_" + str(rank) + "_scores"
@@ -304,8 +318,6 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
 
         local_max_rows = dyn_emb_rows(dynamic_table)
 
-        dim = dyn_emb_cols(dynamic_table)
-
         key_dtype_in_table = dyn_emb_to_torch(dynamic_table.key_type())
         value_dtype_in_table = dyn_emb_to_torch(dynamic_table.value_type())
 
@@ -315,7 +327,9 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
             local_max_rows, dtype=key_dtype_in_table, device=device
         )
         values_in_dynemb = torch.empty(
-            local_max_rows * dim, dtype=value_dtype_in_table, device=device
+            local_max_rows * (dim + optstate_dim),
+            dtype=value_dtype_in_table,
+            device=device,
         )
 
         with open(key_path, "rb") as fkey:
@@ -359,6 +373,12 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
                 keys_in_dynemb,
                 values_in_dynemb,
             )
+        if not optim:
+            values_in_dynemb = (
+                values_in_dynemb.reshape(-1, dim + optstate_dim)[:, :dim]
+                .contiguous()
+                .reshape(-1)
+            )
 
         keys_in_dynemb_int64 = keys_in_dynemb.to(torch.int64)
         values_in_dynemb_float = values_in_dynemb.to(torch.float)
@@ -368,11 +388,11 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
             keys_in_dynemb_int64
         )
 
-        sorted_values_device = values_device.view(local_max_rows, dim)[
-            sorted_indices_device
-        ].view(-1)
+        sorted_values_device = values_device.view(
+            local_max_rows, dim + optstate_dim if exist_optstate else dim
+        )[:, : dim + optstate_dim if optim else dim][sorted_indices_device].view(-1)
         sorted_values_in_dynemb_float = values_in_dynemb_float.view(
-            local_max_rows, dim
+            local_max_rows, dim + optstate_dim if optim else dim
         )[sorted_indices_in_dynemb_int64].view(-1)
 
         if sorted_keys_device.shape != sorted_keys_in_dynemb_int64.shape:
@@ -487,27 +507,11 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
                 for name, table in zip(filtered_table_names, filtered_dynamic_tables)
             }
 
-            if optim:
-                optimizer = dynamic_emb_module.optimizer
-                state_names = optimizer.state_names()
-                states = optimizer.get_state()
-                table_state_map = optimizer.table_state_map()
-
             for k, dump_name in enumerate(filtered_table_names):
                 dynamic_table = tmp_tables_dict[dump_name]
                 validate_dynamic_embedding(
-                    debug_root_path, dump_name, rank, dynamic_table
+                    debug_root_path, dump_name, rank, dynamic_table, optim=optim
                 )
-
-                if optim:
-                    for state_name in state_names:
-                        tmp_state_list = states[state_name]
-                        state_ind = table_state_map[filtered_dynamic_tables[k]]
-                        tmp_state = tmp_state_list[state_ind]
-                        tmp_state_name = dump_name + "_opt_state_" + state_name
-                        validate_dynamic_embedding(
-                            debug_root_path, tmp_state_name, rank, tmp_state
-                        )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -628,18 +632,23 @@ def broadcast_string(
     return result_str
 
 
-def export_keys_values(dynamic_table, offset, device, batch_size=65536):
+def export_keys_values(dynamic_table, offset, device, batch_size=65536, optim=False):
     key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
     value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
     score_dtype = torch.uint64
     dim = dyn_emb_cols(dynamic_table)
+    optstate_dim = dynamic_table.optstate_dim()
+    total_dim = dim + optstate_dim
 
     keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    values = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    values = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
     scores = torch.zeros(batch_size, dtype=score_dtype, device=device)
     d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
 
     export_batch(dynamic_table, batch_size, offset, d_counter, keys, values, scores)
+
+    if not optim:
+        values = values.reshape(batch_size, total_dim)[:, :dim].contiguous().reshape(-1)
 
     return keys, values, scores, d_counter
 
@@ -650,6 +659,7 @@ def gather_and_export(
     name,
     batch_size=65536,
     pg: Optional[dist.ProcessGroup] = None,
+    optim: bool = False,
 ):
     rank = dist.get_rank(group=pg)
     world_size = dist.get_world_size(group=pg)
@@ -675,6 +685,10 @@ def gather_and_export(
 
     local_max_rows = dyn_emb_rows(dynamic_table)
     dim = dyn_emb_cols(dynamic_table)
+    optstate_dim = dynamic_table.optstate_dim()
+    if optim:
+        dim += optstate_dim
+
     search_capacity = dyn_emb_capacity(dynamic_table)
 
     max_rows_tensor = torch.tensor(local_max_rows, dtype=torch.int64, device=device)
@@ -695,7 +709,7 @@ def gather_and_export(
 
     while offset < search_capacity:
         keys, values, scores, d_counter = export_keys_values(
-            dynamic_table, offset, device, batch_size
+            dynamic_table, offset, device, batch_size, optim=optim
         )
         d_counter = d_counter.to(dtype=torch.int64)
 
@@ -774,6 +788,7 @@ def load_table(
     batch_size=65536,
     pg: Optional[dist.ProcessGroup] = None,
     debug_mode: Optional[bool] = False,
+    optim: bool = False,
 ):
     rank = dist.get_rank(group=pg)
     world_size = dist.get_world_size(group=pg)
@@ -792,18 +807,29 @@ def load_table(
     if not os.path.exists(value_path):
         raise Exception("can't find path to load, path:", value_path)
 
-    dim = dyn_emb_cols(dynamic_table)
-    dyn_emb_capacity(dynamic_table)
-    # reserve(dynamic_table,table_capacity)
+    key_file_size = os.path.getsize(key_path)
+    value_file_size = os.path.getsize(value_path)
 
     key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
     value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
 
-    keys_read_bytes = batch_size * 8  # key in file always int64 ,so is 8
-    values_read_bytes = batch_size * dim * 4  # value in file always float , so is 4
+    key_bytes = dtype_to_bytes(key_dtype)
+    value_bytes = dtype_to_bytes(value_dtype)
 
-    key_file_size = os.path.getsize(key_path)
-    value_file_size = os.path.getsize(value_path)
+    total_keys = key_file_size // key_bytes
+    total_dim = value_file_size // (total_keys * value_bytes)
+
+    dim = dyn_emb_cols(dynamic_table)
+    optstate_dim = dynamic_table.optstate_dim()
+    if total_dim < dim or ((total_dim != dim + optstate_dim) and optim):
+        raise Exception(
+            "Can't load as mismatch of embedding dtype, dim or optimizer type"
+        )
+
+    keys_read_bytes = batch_size * 8  # key in file always int64 ,so is 8
+    values_read_bytes = (
+        batch_size * total_dim * 4
+    )  # value in file always float , so is 4
 
     if debug_mode:
         debug_check_dynamic_table_is_zero(dynamic_table)
@@ -835,7 +861,9 @@ def load_table(
             num_keys = len(key_bytes) // 8  # key in file always int64 ,so is 8
 
             key_array = np.frombuffer(key_bytes, dtype=np.int64)
-            value_array = np.frombuffer(value_bytes, dtype=np.float32).reshape(-1, dim)
+            value_array = np.frombuffer(value_bytes, dtype=np.float32).reshape(
+                -1, total_dim
+            )
 
             if need_dump_score:
                 remaining_score_bytes = score_file_size - fscore.tell()
@@ -854,6 +882,19 @@ def load_table(
                 values_tensor = torch.tensor(
                     masked_values, dtype=value_dtype, device=device
                 )
+                if not optim:
+                    optstate = (
+                        torch.ones(
+                            values_tensor.size(0),
+                            optstate_dim,
+                            dtype=value_dtype,
+                            device=device,
+                        )
+                        * dynamic_table.get_initial_optstate()
+                    )
+                    values_tensor = torch.cat(
+                        (values_tensor[:, :dim], optstate), dim=1
+                    ).contiguous()
                 if need_dump_score:
                     scores_tensor = torch.tensor(
                         masked_scores, dtype=score_dtype, device=device
@@ -1054,9 +1095,6 @@ def DynamicEmbDump(
 
             if optim:
                 optimizer = dynamic_emb_module.optimizer
-                state_names = optimizer.state_names()
-                states = optimizer.get_state()
-                table_state_map = optimizer.table_state_map()
                 opt_args = optimizer.get_opt_args()
 
             tmp_tables_dict: Dict[str, DynamicEmbTable] = {
@@ -1076,20 +1114,14 @@ def DynamicEmbDump(
 
             for k, dump_name in enumerate(ordered_keys):
                 dynamic_table = tmp_tables_dict[dump_name]
-                gather_and_export(dynamic_table, full_collection_path, dump_name, pg=pg)
+                gather_and_export(
+                    dynamic_table, full_collection_path, dump_name, pg=pg, optim=optim
+                )
 
                 if optim:
                     args_filename = dump_name + "_opt_args.json"
                     args_path = os.path.join(full_collection_path, args_filename)
                     save_to_json(opt_args, args_path)
-                    for state_name in state_names:
-                        tmp_state_list = states[state_name]
-                        state_ind = table_state_map[dynamic_table]
-                        tmp_state = tmp_state_list[state_ind]
-                        tmp_state_name = dump_name + "_opt_state_" + state_name
-                        gather_and_export(
-                            tmp_state, full_collection_path, tmp_state_name, pg=pg
-                        )
                 if rank == 0:
                     print(
                         f"DynamicEmb dump table {dump_name} from module {tmp_collection_name} success!"
@@ -1100,6 +1132,9 @@ def DynamicEmbDump(
 
     if debug_mode:
         debug_dump(collections_list, path, table_names, optim, pg)
+
+    # add this barrier to guarantee they finish dump at the same time.
+    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
 
     return
 
@@ -1239,9 +1274,6 @@ def DynamicEmbLoad(
 
             if optim:
                 optimizer = dynamic_emb_module.optimizer
-                state_names = optimizer.state_names()
-                states = optimizer.get_state()
-                table_state_map = optimizer.table_state_map()
 
             tmp_tables_dict: Dict[str, DynamicEmbTable] = {
                 name: table
@@ -1249,36 +1281,27 @@ def DynamicEmbLoad(
             }
 
             for k, load_name in enumerate(filtered_table_names):
-                load_table(
-                    filtered_dynamic_tables[k],
-                    full_collection_path,
-                    load_name,
-                    pg=pg,
-                    debug_mode=debug_mode,
-                )
-
+                # load optimizer args firstly then can check if has already dumped the optimizer states.
                 if optim:
                     args_filename = load_name + "_opt_args.json"
                     args_path = os.path.join(full_collection_path, args_filename)
                     opt_args = load_from_json(args_path)
                     # TODO: A single set of optimizer arguments is sufficient for a dynamic module set.
                     optimizer.set_opt_args(opt_args)
-                    for state_name in state_names:
-                        tmp_state_list = states[state_name]
-                        state_ind = table_state_map[filtered_dynamic_tables[k]]
-                        tmp_state = tmp_state_list[state_ind]
-                        tmp_state_name = load_name + "_opt_state_" + state_name
-                        load_table(
-                            tmp_state,
-                            full_collection_path,
-                            tmp_state_name,
-                            pg=pg,
-                            debug_mode=debug_mode,
-                        )
-                    if rank == 0:
-                        print(
-                            f"DynamicEmb load table {load_name} from module {tmp_collection_name} success!"
-                        )
+
+                load_table(
+                    filtered_dynamic_tables[k],
+                    full_collection_path,
+                    load_name,
+                    pg=pg,
+                    debug_mode=debug_mode,
+                    optim=optim,
+                )
+
+                if rank == 0:
+                    print(
+                        f"DynamicEmb load table {load_name} from module {tmp_collection_name} success!"
+                    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 

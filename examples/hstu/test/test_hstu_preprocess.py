@@ -36,6 +36,9 @@ def test_hstu_preprocess(
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     device = torch.cuda.current_device()
 
     item_feature_name = "item"

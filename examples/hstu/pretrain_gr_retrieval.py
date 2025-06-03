@@ -106,7 +106,7 @@ def main():
     )
 
     train_dataloader, test_dataloader = get_data_loader(
-        "retrieval", dataset_args, trainer_args
+        "retrieval", dataset_args, trainer_args, 0
     )
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
     train(

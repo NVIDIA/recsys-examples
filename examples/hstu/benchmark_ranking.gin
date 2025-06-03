@@ -47,9 +47,10 @@ NetworkArgs.kernel_backend = 'cutlass'
 NetworkArgs.layer_type = 'fused'
 
 RankingArgs.prediction_head_arch = [
-    [1],
+    [512, 8],
 ]
 RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 8
 
 OptimizerArgs.optimizer_str = 'adam'
 OptimizerArgs.learning_rate = 1e-3

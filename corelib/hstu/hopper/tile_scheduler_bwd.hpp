@@ -30,32 +30,31 @@ namespace flash {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+template<bool Is_balance_bwd = false>
 class SingleTileSchedulerBwd {
 
 public:
 
-    using SharedStorage = int;
-
     // Host side kernel arguments
     struct Arguments {
         int const num_blocks_m, num_head, num_batch;
-        int* const tile_count_semaphore = nullptr;
-        int* const cu_seqlens = nullptr;
     };
 
     // Device side kernel params
-    struct Params {
-        int const num_blocks_m, num_head, num_batch;
-    };
+    struct Params {};
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        return {args.num_blocks_m, args.num_head, args.num_batch};
+        return {};
     }
 
     static dim3
-    get_grid_shape(Params const& params, int num_sm) {
-        return {uint32_t(params.num_blocks_m), uint32_t(params.num_head), uint32_t(params.num_batch)};
+    get_grid_dim(Arguments const& args) {
+        if constexpr (Is_balance_bwd) {
+            return {uint32_t(args.num_head), uint32_t(args.num_batch), uint32_t(args.num_blocks_m)};
+        } else {
+            return {uint32_t(args.num_blocks_m), uint32_t(args.num_head), uint32_t(args.num_batch)};
+        }
     }
 
     struct WorkTileInfo {
@@ -79,13 +78,16 @@ public:
     };
 
     CUTLASS_DEVICE
-    SingleTileSchedulerBwd(SharedStorage* const smem_scheduler) { }
+    SingleTileSchedulerBwd() { }
 
-    template<bool IsProducer=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work(Params const& params) const {
-        return {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
+    get_initial_work() const {
+        if constexpr (Is_balance_bwd) {
+            return {int(blockIdx.z), int(blockIdx.x), int(blockIdx.y), true};
+        } else {
+            return {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
+        }
     }
 
     CUTLASS_DEVICE
@@ -104,6 +106,5 @@ public:
     }
 
 };
-
 
 } // flash

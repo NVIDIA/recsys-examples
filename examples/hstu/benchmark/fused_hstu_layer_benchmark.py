@@ -31,7 +31,7 @@ from configs.hstu_config import (
     get_hstu_config,
 )
 from modules.fused_hstu_layer import FusedHSTULayer
-from modules.jagged_module import JaggedData
+from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from ops.length_to_offsets import length_to_complete_offsets
 

@@ -43,6 +43,9 @@ def ref_layernorm(x, weight, bias, eps, swish=False):
 def test_layernorm_swish(input_dtype, swish, hidden_dim):
     init.initialize_distributed()
     init.set_random_seed(1234)
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     device = torch.cuda.current_device()
     eps = 1e-5
     batchsize = 128

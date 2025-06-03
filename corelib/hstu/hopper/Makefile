@@ -22,7 +22,7 @@ install:
 clean:
 	rm -rf build/*
 	rm -rf dist/*
-	rm -rf hstu_attn.egg-info/*
+	rm -rf hstu_hopper.egg-info/*
 
 tt:
 	export PYTHONPATH=${PWD}
@@ -32,7 +32,7 @@ vt:
 	pytest -q -s ../test.py
 
 fm:
-	ncu --set full --nvtx --nvtx-include  "hstu_varlen_fwd_kernel1/"  -f -o hstu_fwd.%p --import-source yes make tt
+	ncu --set full --nvtx --nvtx-include  "hstu_varlen_fwd_kernel/"  -f -o hstu_fwd.%p --import-source yes make tt
 
 bm:
-	ncu --set full --import-source yes --clock-control none -f -o hstu.%p --kernel-id ::regex:"compute_attn_ws|device_kernel": python test.py
+	ncu --set full --import-source yes --clock-control none -f -o hstu.%p --kernel-id ::regex:"compute_attn_ws|device_kernel": python ../test.py

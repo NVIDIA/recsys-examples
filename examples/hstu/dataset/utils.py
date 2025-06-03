@@ -241,7 +241,7 @@ class RankingBatch(Batch):
             total_num_labels = torch.sum(batch.num_candidates)
         else:
             total_num_labels = torch.sum(batch.features[item_feature_name].lengths())
-        labels = torch.randint(2, (total_num_labels, num_tasks), device=device)
+        labels = torch.randint(1 << num_tasks, (total_num_labels,), device=device)
         return RankingBatch(
             features=batch.features,
             batch_size=batch.batch_size,
@@ -400,8 +400,8 @@ def is_batch_valid(
 
     if isinstance(batch, RankingBatch):
         assert (
-            batch.labels.dim() == 2
-        ), f"labe dim() should equal to 2 but got {batch.labels.dim()}"
+            batch.labels.dim() == 1
+        ), f"label dim() should equal to 1 but got {batch.labels.dim()}"
         assert (
             batch.labels.size(0) == expected_label_size
         ), f"label seqlen sum should be {expected_label_size}, but got {batch.labels.size(0)}"

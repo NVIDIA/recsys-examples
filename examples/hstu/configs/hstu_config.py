@@ -79,6 +79,8 @@ class HSTUConfig(TransformerConfig):
       enable_relative_attention_bias (bool): Flag to enable relative attention bias. Defaults to False.
       kernel_backend (KernelBackend): Backend for kernel operations. Defaults to KernelBackend.CUTLASS.
       target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
+      learnable_input_layernorm (bool): Flag to enable learnable input layernorm. Defaults to True.
+      residual (bool): Flag to enable residual connection. Defaults to True.
     """
 
     position_encoding_config: Optional[PositionEncodingConfig] = None
@@ -89,7 +91,7 @@ class HSTUConfig(TransformerConfig):
     hstu_layer_type: HSTULayerType = HSTULayerType.FUSED
 
     target_group_size: int = 1
-    learnable_input_layernorm: bool = False
+    learnable_input_layernorm: bool = True
     # whether to add residual connection
     residual: bool = True
     # whether to use async wgrad
@@ -114,7 +116,7 @@ def get_hstu_config(
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     target_group_size: int = 1,
     hstu_layer_type: HSTULayerType = HSTULayerType.FUSED,
-    learnable_input_layernorm: bool = False,
+    learnable_input_layernorm: bool = True,
     residual: bool = True,
     async_wgrad: bool = False,
 ) -> HSTUConfig:

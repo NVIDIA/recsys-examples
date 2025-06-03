@@ -42,8 +42,6 @@ void dynamic_emb_sgd_with_table(std::shared_ptr<dyn_emb::DynamicVariableBase> ta
 
 void dynamic_emb_adam_with_table(
   std::shared_ptr<dyn_emb::DynamicVariableBase> ht,
-  std::shared_ptr<dyn_emb::DynamicVariableBase> m_ht,
-  std::shared_ptr<dyn_emb::DynamicVariableBase> v_ht,
   const uint64_t n, const at::Tensor indices, const at::Tensor grads, 
   const float lr, const float beta1, const float beta2, const float eps,
   const float weight_decay, const uint32_t iter_num, DataType weight_type, 
@@ -52,7 +50,6 @@ void dynamic_emb_adam_with_table(
 
 void dynamic_emb_adagrad_with_table(
   std::shared_ptr<dyn_emb::DynamicVariableBase> ht,
-  std::shared_ptr<dyn_emb::DynamicVariableBase> gt_ht,
   const uint64_t n, const at::Tensor indices,
   const at::Tensor grads,
   const float lr,
@@ -61,7 +58,6 @@ void dynamic_emb_adagrad_with_table(
 
 void dynamic_emb_rowwise_adagrad_with_table(
   std::shared_ptr<dyn_emb::DynamicVariableBase> ht,
-  std::shared_ptr<dyn_emb::DynamicVariableBase> gt_ht,
   const uint64_t n, const at::Tensor indices,
   const at::Tensor grads,
   const float lr,

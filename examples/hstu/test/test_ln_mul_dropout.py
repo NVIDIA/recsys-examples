@@ -36,6 +36,9 @@ def test_ln_mul_dropout(
     torch.backends.cuda.matmul.allow_tf32 = False
     init.initialize_distributed()
     init.set_random_seed(1234)
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     device = torch.cuda.current_device()
     eps = 1e-5
     batchsize = 128

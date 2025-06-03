@@ -164,16 +164,38 @@ class MovielensDataProcessor(DataProcessor):
         self._action_feature_name = "rating"
         if self._prefix == "ml-1m":
             self._contextual_feature_names = [
+                "user_id",
                 "sex",
                 "age_group",
                 "occupation",
                 "zip_code",
             ]
+            self._rating_mapping = {
+                1: 0,
+                2: 1,
+                3: 2,
+                4: 3,
+                5: 4,
+            }
         else:
             assert self._prefix == "ml-20m"
             # ml-20m
             # ml-20m doesn't have user data.
-            self._contextual_feature_names = []
+            self._contextual_feature_names = [
+                "user_id",
+            ]
+            self._rating_mapping = {
+                1: 0,
+                2: 1,
+                3: 2,
+                4: 3,
+                5: 4,
+                6: 5,
+                7: 6,
+                8: 7,
+                9: 8,
+                10: 9,
+            }
         self._output_file: str = f"{data_path}{prefix}/processed_seqs.csv"
 
     def download(self) -> None:
@@ -196,11 +218,10 @@ class MovielensDataProcessor(DataProcessor):
         """
         self.download()
         if self._prefix == "ml-1m":
-            contextual_feature_names = ["sex", "age_group", "occupation", "zip_code"]
             users = pd.read_csv(
                 f"{self._data_path}{self._prefix}/users.dat",
                 sep="::",
-                names=["user_id", "sex", "age_group", "occupation", "zip_code"],
+                names=self._contextual_feature_names,
             )
             log_df = pd.read_csv(
                 f"{self._data_path}{self._prefix}/ratings.dat",
@@ -212,7 +233,6 @@ class MovielensDataProcessor(DataProcessor):
             # ml-20m
             # ml-20m doesn't have user data.
             users = None
-            contextual_feature_names = []
             # ratings: userId,movieId,rating,timestamp
             log_df = pd.read_csv(
                 f"{self._data_path}{self._prefix}/ratings.csv",
@@ -226,20 +246,23 @@ class MovielensDataProcessor(DataProcessor):
                 },
                 inplace=True,
             )
-        # 2.5 -> 5
+            log_df["rating"] = (log_df["rating"] * 2).astype(int)
+
         log_df["movie_id"] = log_df["movie_id"].astype(int)
-        log_df["rating"] = (log_df["rating"] * 2).astype(int)
+        log_df["rating"] = log_df["rating"].map(self._rating_mapping).astype(int)
         df_grouped_by_user = log_df.groupby("user_id").agg(list).reset_index()
 
+        contextual_feature_names = self._contextual_feature_names.copy()
+        contextual_feature_names.remove("user_id")
         for col in contextual_feature_names:
             users[col] = _one_hot_encode(users[col])
         self._post_process(
             users,
             df_grouped_by_user,
             "user_id",
-            contextual_feature_names=contextual_feature_names,
-            item_feature_name="movie_id",
-            action_feature_name="rating",
+            contextual_feature_names=self._contextual_feature_names,
+            item_feature_name=self._item_feature_name,
+            action_feature_name=self._action_feature_name,
             output_file=self._output_file,
         )
 
@@ -267,6 +290,7 @@ class DLRMKuaiRandProcessor(DataProcessor):
         self._item_feature_name = "video_id"
         self._action_feature_name = "action_weights"
         self._contextual_feature_names = [
+            "user_id",
             "user_active_degree",
             "follow_user_num_range",
             "fans_user_num_range",
@@ -368,7 +392,9 @@ class DLRMKuaiRandProcessor(DataProcessor):
         log.info("Merging user features...")
         user_features_df = pd.read_csv(self._user_features_file, delimiter=",")
 
-        for col in self._contextual_feature_names:
+        contextual_feature_names = self._contextual_feature_names.copy()
+        contextual_feature_names.remove("user_id")
+        for col in contextual_feature_names:
             user_features_df[col] = _one_hot_encode(user_features_df[col])
 
         self._post_process(

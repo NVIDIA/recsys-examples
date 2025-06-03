@@ -41,6 +41,40 @@ struct InitializerArgs {
       : InitializerArgs("uniform", 0.0f, 1.0f, 0.0f, 1.0f, 0.0f) {}
 };
 
+enum class OptimizerType : int {
+  Null = 0, // used in inference mode.
+  SGD,
+  Adam,
+  AdaGrad,
+  RowWiseAdaGrad,
+};
+
+template <typename T>
+uint32_t get_optimizer_state_dim(OptimizerType opt_type, uint32_t emb_dim) {
+  uint32_t optstate_dim = 0;
+  switch (opt_type) {
+    case OptimizerType::Null:
+    case OptimizerType::SGD: {
+      break;
+    }
+    case OptimizerType::Adam: {
+      optstate_dim = emb_dim * 2;
+      break;
+    }
+    case OptimizerType::AdaGrad: {
+      optstate_dim = emb_dim;
+      break;
+    }
+    case OptimizerType::RowWiseAdaGrad: {
+      optstate_dim = 16 / sizeof(T);
+      break;
+    }
+    default:
+      throw std::invalid_argument("Unsupported optimizer type.");
+  }
+  return optstate_dim;
+}
+
 enum class SafeCheckMode : int { ERROR = 0, WARNING = 1, IGNORE = 2 };
 
 class DynamicVariableBase {
@@ -109,6 +143,14 @@ public:
                     void *scores = nullptr,           // (n)
                     cudaStream_t stream = 0) const = 0;
 
+
+  virtual void find_pointers(
+    const size_t n, const void* keys,         // (n)
+    void** values,                            // (n)
+    bool* founds,                             // (n)
+    void* scores = nullptr,                   // (n)
+    cudaStream_t stream = 0) const = 0;
+
   virtual void erase(const size_t n, const void *keys,
                      cudaStream_t stream = 0) = 0;
     virtual void clear(cudaStream_t stream = 0) = 0;
@@ -139,6 +181,9 @@ public:
       cudaStream_t stream = 0) const = 0;
   virtual curandState* get_curand_states() const = 0;
   virtual const InitializerArgs& get_initializer_args() const = 0;
+  virtual const int optstate_dim() const = 0;
+  virtual void set_initial_optstate(const float value) = 0;
+  virtual const float get_initial_optstate() const = 0;
 };
 
 class VariableFactory {
@@ -151,7 +196,8 @@ public:
          int device_id, bool io_by_cpu, bool use_constant_memory,
          int reserved_key_start_bit, size_t num_of_buckets_per_alloc,
          const InitializerArgs &initializer_args,
-         const SafeCheckMode safe_check_mode);
+         const SafeCheckMode safe_check_mode,
+         const OptimizerType optimizer_type);
 };
 
 } // namespace dyn_emb

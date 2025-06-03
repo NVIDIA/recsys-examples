@@ -38,7 +38,8 @@ public:
               int reserved_key_start_bit = 0,
               size_t num_of_buckets_per_alloc = 1,
               const InitializerArgs &initializer = InitializerArgs(),
-              const SafeCheckMode safe_check_mode = SafeCheckMode::IGNORE);
+              const SafeCheckMode safe_check_mode = SafeCheckMode::IGNORE,
+              const OptimizerType optimizer_type = OptimizerType::Null);
 
   ~HKVVariable() override;
 
@@ -102,6 +103,13 @@ public:
             void *scores = nullptr,           // (n)
             cudaStream_t stream = 0) const override;
 
+  void find_pointers(
+    const size_t n, const void* keys,         // (n)
+    void** values,                            // (n)
+    bool* founds,                             // (n)
+    void* scores = nullptr,                   // (n)
+    cudaStream_t stream = 0) const override;
+
   void erase(const size_t n, const void* keys,
            cudaStream_t stream = 0) override;
   
@@ -135,6 +143,9 @@ public:
   
   curandState* get_curand_states() const override;
   const InitializerArgs& get_initializer_args() const override;
+  const int optstate_dim() const override;
+  void set_initial_optstate(const float value) override;
+  const float get_initial_optstate() const override;
 
 
 private:
@@ -150,6 +161,8 @@ private:
   DataType key_type_;
   DataType value_type_;
   SafeCheckMode safe_check_mode_;
+  OptimizerType optimizer_type_;
+  ValueType initial_optstate_ {0.};
 
 };
 

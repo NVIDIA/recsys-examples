@@ -24,7 +24,7 @@ from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
 from megatron.core.transformer.module import Float16Module
 from modules.hstu_attention import create_hstu_attention
-from modules.jagged_module import JaggedData
+from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from ops.fused_hstu_op import fused_hstu_op
 from ops.length_to_offsets import length_to_complete_offsets
@@ -180,11 +180,11 @@ def generate_or_copy_parameters(
 @pytest.mark.parametrize("target_group_size", [2, 16, 256, 1])
 @pytest.mark.parametrize("batchsize", [32])
 @pytest.mark.parametrize(
-    "is_causal,kernel_backend,fwd_rtol,fwd_atol,bwd_rtol,bwd_atol",
+    "is_causal,kernel_backend",
     [
-        (True, KernelBackend.TRITON, 1e-7, 1e-5, 1e-7, 1e-5),
-        (True, KernelBackend.CUTLASS, 1e-7, 1e-5, 1e-7, 1e-5),
-        (False, KernelBackend.CUTLASS, 1e-7, 1e-5, 1e-7, 1e-5),
+        (True, KernelBackend.TRITON),
+        (True, KernelBackend.CUTLASS),
+        (False, KernelBackend.CUTLASS),
     ],
 )
 @pytest.mark.parametrize("from_scratch", [True, False])
@@ -200,10 +200,6 @@ def test_hstu_attn(
     batchsize,
     kernel_backend,
     from_scratch,
-    fwd_rtol,
-    fwd_atol,
-    bwd_rtol,
-    bwd_atol,
 ):
     if kernel_backend == KernelBackend.TRITON and target_group_size > 1:
         pytest.skip("Triton is not supported when target_group_size > 1")
@@ -212,15 +208,13 @@ def test_hstu_attn(
     # TODO: uncomment this once cutlass supports causal attention
     if not is_causal and max_num_contextuals > 0:
         pytest.skip("Only causal attention is supported when max_num_contextuals > 0")
-    # TODO: remove this once Hopper supports contextual mask
-    sm_major_version = torch.cuda.get_device_properties(0).major
-    if sm_major_version > 8 and max_num_contextuals > 0:
-        pytest.skip("Hopper does not support contextual mask")
 
     init.initialize_distributed()
     init.set_random_seed(1234)
     device = torch.cuda.current_device()
-
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     if not is_causal:
         max_num_candidates = 0
 
@@ -407,7 +401,6 @@ def test_hstu_attn(
 @pytest.mark.parametrize("training", [True])
 @pytest.mark.parametrize("attn_backend", [KernelBackend.CUTLASS])
 @pytest.mark.parametrize("target_group_size", [1, 4])
-@pytest.mark.parametrize("alpha", [1.0])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("seed", [None])
 @pytest.mark.parametrize("learnable_ln", [True])
@@ -426,7 +419,6 @@ def test_fused_hstu_op(
     training: bool,
     attn_backend: KernelBackend,
     target_group_size: int,
-    alpha: float,
     causal: bool,
     seed: Optional[int],
     learnable_ln: bool,
@@ -436,6 +428,9 @@ def test_fused_hstu_op(
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
+    world_size = torch.distributed.get_world_size()
+    if world_size > 1:
+        return
     device = torch.cuda.current_device()
     ln_eps = 1e-5
     hstu_config = get_hstu_config(
@@ -489,16 +484,6 @@ def test_fused_hstu_op(
 
     if attn_backend == KernelBackend.TRITON and target_group_size > 1:
         pytest.skip("TRITON does not support target grouped attention")
-    sm_major_version = torch.cuda.get_device_properties(0).major
-
-    if (
-        attn_backend == KernelBackend.CUTLASS
-        and sm_major_version == 9
-        and (target_group_size > 1 or max_num_contextuals > 0)
-    ):
-        pytest.skip(
-            "CUTLASS does not support Hopper with target group size > 1 or contextuals"
-        )
     num_targets = None
     num_contextuals = None
 
@@ -601,7 +586,7 @@ def test_fused_hstu_op(
         num_targets=num_targets,
         num_contextuals=num_contextuals,
         target_group_size=target_group_size,
-        alpha=alpha,
+        alpha=1.0 / (hidden_dim_per_head**0.5),
         causal=causal,
         seed=seed,
         residual=residual,

@@ -524,11 +524,25 @@ class ConstructTwinModule:
                 filtered_indices, return_inverse=True
             )
             unique_values = filtered_values[unique_inverse_indices, :]
+
+            tmp_table_name = feature.replace("f_", "t_")
+            cur_hkv_table = table_name_map_hkv_table[tmp_table_name]
+            optstate_dim = cur_hkv_table.optstate_dim()
+            initial_accumulator = cur_hkv_table.get_initial_optstate()
+            optstate = (
+                torch.ones(
+                    unique_values.size(0),
+                    optstate_dim,
+                    dtype=unique_values.dtype,
+                    device=unique_values.device,
+                )
+                * initial_accumulator
+            )
+            unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
             unique_values = unique_values.reshape(-1)
 
             n = unique_indices.shape[0]
-            tmp_table_name = feature.replace("f_", "t_")
-            cur_hkv_table = table_name_map_hkv_table[tmp_table_name]
+
             insert_or_assign(cur_hkv_table, n, unique_indices, unique_values)
         # In TorchREC, once a forward lookup occurs, the iteration in the module gets updated(even you don't do backward).
         # This makes it difficult to accurately test ADAM since the iteration count affects the optimizer's behavior.
