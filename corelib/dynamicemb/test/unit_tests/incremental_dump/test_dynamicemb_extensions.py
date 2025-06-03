@@ -314,11 +314,8 @@ def counter_dtype():
 
 @pytest.mark.parametrize(
     "evict_strategy",
-    [EvictStrategy.KLru, EvictStrategy.KCustomized, EvictStrategy.KLfu],
+    [EvictStrategy.KLru, EvictStrategy.KCustomized],
 )
-# @pytest.mark.parametrize(
-#     "evict_strategy", [EvictStrategy.KLfu]
-# )
 @pytest.mark.parametrize(
     "bucket_capacity, batch, capacity, num_iteration, dump_interval",
     [
@@ -555,23 +552,18 @@ def export_all_keys_values_scores(table, device):
 
 @pytest.mark.parametrize("evict_strategy", [EvictStrategy.KLfu])
 @pytest.mark.parametrize(
-    "bucket_capacity, batch, capacity, num_iteration, dump_interval",
+    "bucket_capacity, batch, capacity, num_iteration",
     [
-        pytest.param(128, 3, 512, 5, 1, id="Small scale LFU vs HKV"),
-        # pytest.param(
-        #     128, 128, 512 * 1024, 8192, 1024, id="Never evict keys from current batch"
-        # ),
-        # pytest.param(128, 65536, 512 * 1024, 32, 8),
+        pytest.param(128, 3, 512, 5, id="Small scale LFU vs HKV"),
         pytest.param(
-            128, 1024 + 13, 1024, 12, 3, id="Always evict keys from current batch"
+            128, 1024 + 13, 1024, 12, id="Always evict keys from current batch"
         ),
         pytest.param(
-            128, 1024 + 13, 2048, 32, 3, id="Always evict keys from current batch"
+            128, 1024 + 13, 2048, 32, id="Always evict keys from current batch"
         ),
-        # pytest.param(
-        #     128, 1024, 4 * 1024, 32, 4, id="Always evict keys from last dump_interval"
-        # ),
-        # pytest.param(512, 512, 512 * 1024, 2048, 256, id="Different bucket capacity"),
+        pytest.param(
+            128, 1024, 4 * 1024, 32, id="Always evict keys from last dump_interval"
+        ),
     ],
 )
 def test_dynamicemb_extensions_lfu(
@@ -584,7 +576,6 @@ def test_dynamicemb_extensions_lfu(
     batch,
     capacity,
     num_iteration,
-    dump_interval,
 ):
     print(f"\n{request.node.name} - LFU Algorithm Consistency Test")
     print(f"Testing high-level LFU algorithm behavior between HKV table and simulator")
@@ -802,15 +793,4 @@ def test_dynamicemb_extensions_lfu(
     print(f"   Total simulator evictions: {total_sim_evictions}")
     print(
         f"   Passed: All eviction count and net change assertions passed - LFU insertion/eviction logic is consistent"
-    )
-
-
-if __name__ == "__main__":
-    test_dynamicemb_extensions(
-        evict_strategy=EvictStrategy.KLfu,
-        bucket_capacity=128,
-        batch=128,
-        capacity=512 * 1024,
-        num_iteration=8192,
-        dump_interval=1024,
     )
