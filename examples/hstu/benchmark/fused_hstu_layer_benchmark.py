@@ -82,6 +82,12 @@ def create_hstu_layer(
     required=False,
 )
 @click.option(
+    "--recompute-input-layernorm",
+    type=bool,
+    default=False,
+    required=False,
+)
+@click.option(
     "--kernel-backend",
     type=click.Choice(_backend_str_to_type.keys()),
     default="cutlass",
@@ -120,6 +126,7 @@ def run(
     async_wgrad,
     dump_memory_snapshot,
     num_layers,
+    recompute_input_layernorm,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -137,6 +144,7 @@ def run(
         hstu_layer_type=layer_type,
         learnable_input_layernorm=True,
         async_wgrad=async_wgrad,
+        recompute_input_layernorm=recompute_input_layernorm,
     )
     hstu_blocks = [
         create_hstu_layer(
