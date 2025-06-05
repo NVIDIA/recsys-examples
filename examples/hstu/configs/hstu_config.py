@@ -81,6 +81,10 @@ class HSTUConfig(TransformerConfig):
       target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
       learnable_input_layernorm (bool): Flag to enable learnable input layernorm. Defaults to True.
       residual (bool): Flag to enable residual connection. Defaults to True.
+      async_wgrad (bool): Flag to enable async wgrad. Defaults to False.
+      async_wgrad_stream (torch.cuda.Stream): Stream for async wgrad. Defaults to None.
+      async_wgrad_event (torch.cuda.Event): Event for async wgrad. Defaults to None.
+      recompute_input_layernorm (bool): Flag to enable recompute input layernorm. Defaults to False.
     """
 
     position_encoding_config: Optional[PositionEncodingConfig] = None
