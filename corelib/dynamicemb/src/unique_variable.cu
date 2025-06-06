@@ -226,6 +226,7 @@ void unique_op<KeyType, CounterType, empty_key, empty_val, hasher>::unique(
       <<<(len - 1) / BLOCK_SIZE_ + 1, BLOCK_SIZE_, 0, stream>>>(
           d_key, d_unique_key, d_output_index, len, keys_, vals_, capacity_,
           counter_, empty_key, empty_val, offset_ptr);
+  // replace counter_ with input d_output_counter
   cudaMemcpyAsync(d_output_counter, counter_, sizeof(CounterType),
                   cudaMemcpyDeviceToDevice, stream);
 

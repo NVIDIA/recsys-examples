@@ -84,6 +84,10 @@ public:
                          cudaStream_t stream = 0, bool unique_key = true,
                          bool ignore_evict_strategy = false) override;
 
+  void find_and_initialize(
+    const size_t n, const void *keys, void **value_ptrs, void *values,
+    bool *founds, const cudaStream_t& stream) override;
+
   void find_or_insert_pointers(const size_t n, const void *keys, // (n)
                                void **value_ptrs,                // (n * ptrs)
                                bool *d_found,                    // (n * 1)
@@ -162,7 +166,7 @@ private:
   DataType value_type_;
   SafeCheckMode safe_check_mode_;
   OptimizerType optimizer_type_;
-  ValueType initial_optstate_ {0.};
+  float initial_optstate_ {0.};
 
 };
 

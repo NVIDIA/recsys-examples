@@ -384,6 +384,37 @@ __global__ void fill_output_with_table_vectors_kernel(
 }
 
 template <
+  typename T, 
+  typename EmbeddingGenerator>
+__global__ void load_or_initialize_embeddings_kernel(
+    uint64_t n,
+    int emb_dim,
+    T* outputs, 
+    T** inputs_ptr,
+    bool* masks,
+    typename EmbeddingGenerator::Args generator_args) {
+
+  EmbeddingGenerator emb_gen(generator_args);
+
+  for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    T* input_ptr = inputs_ptr[emb_id];
+    bool mask = masks[emb_id];
+    if (mask) { // copy embedding from inputs to outputs.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        outputs[emb_id * emb_dim + i] = input_ptr[i];
+      }
+    } else { // initialize the embeddings directly.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        auto tmp = emb_gen.generate(emb_id);
+        outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(tmp);
+      }
+    }
+  }
+
+  emb_gen.destroy();
+}
+
+template <
   typename T,
   typename OptStateInitializer,
   typename TableVector>
@@ -572,6 +603,57 @@ void HKVVariable<KeyType, ValueType, Strategy>::accum_or_assign(
   hkv_table_->accum_or_assign(n, (KeyType *)keys, (ValueType *)value_or_deltas,
                               accum_or_assigns, (uint64_t *)scores, stream,
                               ignore_evict_strategy);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
+    const size_t n, const void *keys, void **value_ptrs, void *values,
+    bool *d_found, const cudaStream_t& stream) {
+  if (n == 0)
+    return;
+  int dim = dim_;
+  this->find_pointers(n, keys, value_ptrs, d_found, nullptr, stream);
+  auto &device_prop = DeviceProp::getDeviceProp();
+  int block_size = dim < device_prop.max_thread_per_block
+                       ? dim
+                       : device_prop.max_thread_per_block;
+  int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
+
+  auto &initializer_ = initializer_args.mode;
+  if (initializer_ == "normal") {
+    using Generator = NormalEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "truncated_normal") {
+    using Generator = TruncatedNormalEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "uniform") {
+    using Generator = UniformEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "debug") {
+    using Generator = MappingEmbeddingGenerator<KeyType>;
+    auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys), 100000};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "constant") {
+    using Generator = ConstEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {initializer_args.value};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else {
+    throw std::runtime_error("Unrecognized initializer {" + initializer_ + "}");
+  }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

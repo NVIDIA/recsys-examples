@@ -253,7 +253,9 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
 
         scores = ctx.scores
 
-        optimizer.update(tables, unique_indices_list, unique_grads_per_table, scores)
+        optimizer.update(
+            tables, unique_indices_list, unique_grads_per_table, [], scores
+        )
 
         return (None,) * 17
 
@@ -348,6 +350,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             unique_idx_forback.copy_(
                 unique_idx[: h_unique_offsets[-1]], non_blocking=True
             )
+            unique_emb_forback = unique_embs[: h_unique_offsets[-1], :]
 
         backward_tensors = [indices, offsets]
         ctx.save_for_backward(*backward_tensors)
@@ -364,6 +367,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         if use_index_dedup:
             ctx.reverse_idx = reverse_idx
             ctx.unique_idx_forback = unique_idx_forback
+            ctx.unique_emb_forback = unique_emb_forback
         ctx.scores = scores
 
         return output_embs
@@ -384,10 +388,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         if use_index_dedup:
             reverse_idx = ctx.reverse_idx
             unique_idx_forback = ctx.unique_idx_forback
+            unique_emb_forback = ctx.unique_emb_forback
 
         table_num = len(tables)
         unique_indices_list = []
         unique_grads_list = []
+        unique_embs_list = []
 
         if use_index_dedup:
             unique_grads = torch.zeros(
@@ -408,6 +414,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 )
                 unique_grads_list.append(
                     unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
+                )
+                unique_embs_list.append(
+                    unique_emb_forback[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
                 )
         else:
             # backward: reduce the grad.
@@ -435,5 +444,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
         scores = ctx.scores
         # optimizer: update tables.
-        optimizer.update(tables, unique_indices_list, unique_grads_list, scores)
+        optimizer.update(
+            tables, unique_indices_list, unique_grads_list, unique_embs_list, scores
+        )
         return (None,) * 17

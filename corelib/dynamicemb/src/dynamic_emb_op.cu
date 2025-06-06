@@ -179,6 +179,25 @@ void accum_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
   }
 }
 
+
+void find_and_initialize(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+    const size_t n,
+    const at::Tensor keys,
+    const at::Tensor values) {
+
+  if (n == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  at::Tensor vals_ptr_tensor = at::empty({static_cast<int64_t>(n)}, 
+    at::TensorOptions().dtype(at::kLong).device(values.device()));
+  auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
+  at::Tensor founds_tensor = at::empty({static_cast<int64_t>(n)},
+     at::TensorOptions().dtype(at::kBool).device(keys.device()));
+  auto founds = founds_tensor.data_ptr<bool>();
+
+  table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, stream);
+}
+
 void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                   const size_t n,
                   const at::Tensor keys,
@@ -461,16 +480,18 @@ void lookup_forward_dense(
     if (tmp_unique_num != 0) {
       at::Tensor tmp_unique_embs =
           create_sub_tensor(unique_embs, unique_embs_offset * dim);
-      auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
-      find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
-                     tmp_unique_embs, score);
       if (use_index_dedup) {
+        find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
         void *dst_ptr = reinterpret_cast<char *>(unique_idx.data_ptr()) +
                         unique_embs_offset * unique_idx.element_size();
         void *src_ptr = tmp_unique_indices[i].data_ptr();
         size_t copy_size = tmp_unique_num * unique_idx.element_size();
         AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                       cudaMemcpyDeviceToDevice, stream));
+      } else {
+        auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
+        find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
+                      tmp_unique_embs, score);
       }
     }
     unique_embs_offset += tmp_unique_num;
