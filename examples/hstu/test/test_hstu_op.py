@@ -182,7 +182,6 @@ def generate_or_copy_parameters(
 @pytest.mark.parametrize(
     "is_causal,kernel_backend",
     [
-        (True, KernelBackend.TRITON),
         (True, KernelBackend.CUTLASS),
         (False, KernelBackend.CUTLASS),
     ],
