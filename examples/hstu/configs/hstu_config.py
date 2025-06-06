@@ -81,6 +81,10 @@ class HSTUConfig(TransformerConfig):
       target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
       learnable_input_layernorm (bool): Flag to enable learnable input layernorm. Defaults to True.
       residual (bool): Flag to enable residual connection. Defaults to True.
+      async_wgrad (bool): Flag to enable async wgrad. Defaults to False.
+      async_wgrad_stream (torch.cuda.Stream): Stream for async wgrad. Defaults to None.
+      async_wgrad_event (torch.cuda.Event): Event for async wgrad. Defaults to None.
+      recompute_input_layernorm (bool): Flag to enable recompute input layernorm. Defaults to False.
     """
 
     position_encoding_config: Optional[PositionEncodingConfig] = None
@@ -98,6 +102,8 @@ class HSTUConfig(TransformerConfig):
     async_wgrad: bool = False
     async_wgrad_stream: Optional[torch.cuda.Stream] = None
     async_wgrad_event: Optional[torch.cuda.Event] = None
+    # whether to recompute input layernorm
+    recompute_input_layernorm: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -119,6 +125,7 @@ def get_hstu_config(
     learnable_input_layernorm: bool = True,
     residual: bool = True,
     async_wgrad: bool = False,
+    recompute_input_layernorm: bool = False,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -134,6 +141,12 @@ def get_hstu_config(
         norm_epsilon (float, optional): Epsilon value for normalization. Defaults to 1e-5.
         is_causal (bool, optional): Whether the attention is causal. Defaults to False.
         kernel_backend (KernelBackend, optional): Backend for kernel operations. Defaults to KernelBackend.CUTLASS.
+        target_group_size (int, optional): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
+        hstu_layer_type (HSTULayerType, optional): The type of HSTU layer. Defaults to HSTULayerType.FUSED.
+        learnable_input_layernorm (bool, optional): Whether to use learnable input layernorm. Defaults to True.
+        residual (bool, optional): Whether to add residual connection. Defaults to True.
+        async_wgrad (bool, optional): Whether to use async wgrad. Defaults to False.
+        recompute_input_layernorm (bool, optional): Whether to recompute input layernorm. Defaults to False.
 
     Returns:
         HSTUConfig: The HSTU configuration object.
@@ -168,4 +181,5 @@ def get_hstu_config(
         async_wgrad=async_wgrad,
         async_wgrad_stream=async_wgrad_stream,
         async_wgrad_event=async_wgrad_event,
+        recompute_input_layernorm=recompute_input_layernorm,
     )
