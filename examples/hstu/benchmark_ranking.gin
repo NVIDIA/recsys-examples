@@ -46,6 +46,9 @@ NetworkArgs.kv_channels = 256
 NetworkArgs.kernel_backend = 'cutlass'
 NetworkArgs.layer_type = 'fused'
 
+# recompute can incurs perf regression, but save memory
+NetworkArgs.recompute_input_layernorm = True
+
 RankingArgs.prediction_head_arch = [
     512, 8,
 ]
