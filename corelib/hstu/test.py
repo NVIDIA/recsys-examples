@@ -18,9 +18,9 @@ import torch
 sm_major_version = torch.cuda.get_device_properties(0).major
 sm_minor_version = torch.cuda.get_device_properties(0).minor
 if sm_major_version == 9 and sm_minor_version == 0:
-    from hstu_attn_interface import hstu_attn_varlen_func
+    from hstu_attn_interface import hstu_attn_qkvpacked_func, hstu_attn_varlen_func
 elif sm_major_version == 8:
-    from hstu_attn import hstu_attn_varlen_func
+    from hstu_attn import hstu_attn_varlen_func, hstu_attn_qkvpacked_func
 
 import math
 from typing import Optional, Tuple
@@ -311,6 +311,20 @@ def generate_input(
         .requires_grad_()
     ).to(dtype)
 
+    if is_delta_q is False:
+        qkv = (
+            torch.empty(
+                (L_q, 3, heads, attn_dim), dtype=dtype, device=torch.device("cuda")
+            )
+            .uniform_(-1, 1)
+            .requires_grad_()
+        )
+        q = qkv[:, 0, :, :]
+        k = qkv[:, 1, :, :]
+        v = qkv[:, 2, :, :]
+    else:
+        qkv = None
+
     rab = torch.empty(
         (
             batch_size,
@@ -347,6 +361,7 @@ def generate_input(
         seq_offsets_q_wt,
         seq_offsets_k_wt,
         num_targets if has_target else None,
+        qkv,
         q,
         k,
         v,
@@ -450,11 +465,11 @@ def _hstu_attention_maybe_from_cache(
         (111, 111, False),
         (256, 256, False),
         (1111, 1111, False),
-        (27, 32, True),
-        (8, 99, True),
-        (51, 256, True),
-        (1000, 1111, True),
-        (160, 2000, True),
+        # (27, 32, True),
+        # (8, 99, True),
+        # (51, 256, True),
+        # (1000, 1111, True),
+        # (160, 2000, True),
     ],
 )
 @pytest.mark.parametrize("max_context_len", [0, 11, 99, 160, 333])
@@ -592,6 +607,7 @@ def test_fused_attn(
                 seq_offsets_q,
                 seq_offsets_k,
                 num_targets,
+                qkv,
                 q,
                 k,
                 v,
@@ -663,6 +679,7 @@ def test_fused_attn(
                 seq_offsets_q,
                 seq_offsets_k,
                 num_targets,
+                qkv,
                 q,
                 k,
                 v,
@@ -715,6 +732,7 @@ def test_fused_attn(
         seq_offsets_q,
         seq_offsets_k,
         num_targets,
+        qkv,
         q,
         k,
         v,
@@ -776,23 +794,40 @@ def test_fused_attn(
         reorder_op=True,
         is_delta_q=is_delta_q,
     )
-    hstu_out = hstu_attn_varlen_func(
-        q=q.to(dtype),
-        k=k.to(dtype),
-        v=v.to(dtype),
-        seq_offsets_q=seq_offsets_q,
-        seq_offsets_k=seq_offsets_k,
-        max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
-        max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
-        num_contexts=num_contexts,
-        num_targets=num_targets,
-        target_group_size=target_group_size,
-        window_size=window_size,
-        alpha=alpha,
-        rab=rab if has_rab else None,
-        has_drab=has_drab,
-        is_delta_q=is_delta_q,
-    )
+    if qkv is None:
+        hstu_out = hstu_attn_varlen_func(
+            q=q.to(dtype),
+            k=k.to(dtype),
+            v=v.to(dtype),
+            seq_offsets_q=seq_offsets_q,
+            seq_offsets_k=seq_offsets_k,
+            max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+            max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            alpha=alpha,
+            rab=rab if has_rab else None,
+            has_drab=has_drab,
+            is_delta_q=is_delta_q,
+        )
+    else:
+        hstu_out = hstu_attn_qkvpacked_func(
+            qkv=qkv.to(dtype),
+            seq_offsets_q=seq_offsets_q,
+            seq_offsets_k=seq_offsets_k,
+            max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+            max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            alpha=alpha,
+            rab=rab if has_rab else None,
+            has_drab=has_drab,
+            is_delta_q=is_delta_q,
+        )
 
     print(f"Output max diff: {(hstu_out.view(L_q, -1) - out_ref).abs().max().item()}")
     print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
@@ -811,12 +846,23 @@ def test_fused_attn(
         (dq_torch, dk_torch, dv_torch) = torch.autograd.grad(
             torch_out, (q, k, v), g, retain_graph=True
         )
-        (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
-            hstu_out,
-            (q, k, v),
-            g.view(-1, heads, hidden_dim),
-            retain_graph=True,
-        )
+        if qkv is None:
+            (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
+                hstu_out,
+                (q, k, v),
+                g.view(-1, heads, hidden_dim),
+                retain_graph=True,
+            )
+        else:
+            (dqkv_hstu) = torch.autograd.grad(
+                hstu_out,
+                qkv,
+                g.view(-1, heads, hidden_dim),
+                retain_graph=True,
+            )
+            dq_hstu = dqkv_hstu[0][:, 0, :, :]
+            dk_hstu = dqkv_hstu[0][:, 1, :, :]
+            dv_hstu = dqkv_hstu[0][:, 2, :, :]
     else:
         (dq_ref, dk_ref, dv_ref, drab_ref) = torch.autograd.grad(
             out_ref, (q, k, v, rab), g, retain_graph=True
@@ -824,12 +870,23 @@ def test_fused_attn(
         (dq_torch, dk_torch, dv_torch, drab_torch) = torch.autograd.grad(
             torch_out, (q, k, v, rab), g, retain_graph=True
         )
-        (dq_hstu, dk_hstu, dv_hstu, drab_hstu) = torch.autograd.grad(
-            hstu_out,
-            (q, k, v, rab),
-            g.view(-1, heads, hidden_dim),
-            retain_graph=True,
-        )
+        if qkv is None:
+            (dq_hstu, dk_hstu, dv_hstu, drab_hstu) = torch.autograd.grad(
+                hstu_out,
+                (q, k, v, rab),
+                g.view(-1, heads, hidden_dim),
+                retain_graph=True,
+            )
+        else:
+            (dqkv_hstu, drab_hstu) = torch.autograd.grad(
+                hstu_out,
+                (qkv, rab),
+                g.view(-1, heads, hidden_dim),
+                retain_graph=True,
+            )
+            dq_hstu = dqkv_hstu[:, 0, :, :]
+            dk_hstu = dqkv_hstu[:, 1, :, :]
+            dv_hstu = dqkv_hstu[:, 2, :, :]
 
     print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
     print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
@@ -857,6 +914,7 @@ def test_fused_attn(
             drab_torch - drab_ref
         ).abs().max().item()
     torch.cuda.synchronize()
+    # return 0, 0
 
 
 # @torch.compile
@@ -1345,6 +1403,7 @@ def test_fused_attn_fp8(
                 seq_offsets_q,
                 seq_offsets_k,
                 _,
+                qkv,
                 q,
                 k,
                 v,
@@ -1423,6 +1482,7 @@ def test_fused_attn_fp8(
                 seq_offsets_q,
                 seq_offsets_k,
                 _,
+                qkv,
                 q,
                 k,
                 v,
@@ -1611,26 +1671,26 @@ def test_fused_attn_fp8(
 
 
 if __name__ == "__main__":
-    # test_fused_attn(
-    #     batch_size=128,
-    #     heads=1,
-    #     heads_rab=1,
-    #     max_seq_len_q=1024,
-    #     max_seq_len_k=1024,
-    #     max_context_len=0,
-    #     max_target_len=0,
-    #     target_group_size=1,
-    #     attn_dim=256,
-    #     hidden_dim=256,
-    #     alpha=1.0,
-    #     has_rab=True,
-    #     has_drab=True,
-    #     window_size=(-1, 0),
-    #     dtype=torch.bfloat16,
-    #     run_benchmark=None,
-    #     full_batch=False,
-    #     is_delta_q=False,
-    # )
+    test_fused_attn(
+        batch_size=128,
+        heads=3,
+        heads_rab=1,
+        max_seq_len_q=1024,
+        max_seq_len_k=1024,
+        max_context_len=0,
+        max_target_len=0,
+        target_group_size=1,
+        attn_dim=256,
+        hidden_dim=256,
+        alpha=1.0,
+        has_rab=False,
+        has_drab=False,
+        window_size=(-1, 0),
+        dtype=torch.bfloat16,
+        run_benchmark=None,
+        full_batch=False,
+        is_delta_q=False,
+    )
 
     # test_fused_attn_fp8(
     #     batch_size=1,

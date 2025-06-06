@@ -262,6 +262,9 @@ void set_params_dgrad(Hstu_bwd_params* params,
   params->dv_head_stride = dv.stride(-2);
 
   params->dq_accum_ptr = dq_accum.data_ptr();
+  params->dq_accum_row_stride = dq_accum.stride(-3);
+  params->dq_accum_head_stride = dq_accum.stride(-2);
+
   params->deterministic = deterministic;
   params->dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 }
@@ -489,6 +492,9 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     const at::Tensor& q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const at::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+    std::optional<const at::Tensor> &dq_,
+    std::optional<const at::Tensor> &dk_,
+    std::optional<const at::Tensor> &dv_,
     const at::Tensor& cu_seqlens_q,  // b+1
     const at::Tensor& cu_seqlens_k,  // b+1
     const int max_seqlen_q,
@@ -580,9 +586,9 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     CHECK_SHAPE(rab.value(), batch_size, num_heads_rab, max_seqlen_k, seqlen_k_rounded);
   }
 
-  at::Tensor dq = torch::empty_like(q);
-  at::Tensor dk = torch::empty_like(k);
-  at::Tensor dv = torch::empty_like(v);
+  at::Tensor dq = dq_.has_value() ? dq_.value() : torch::empty_like(q);
+  at::Tensor dk = dk_.has_value() ? dk_.value() : torch::empty_like(k);
+  at::Tensor dv = dv_.has_value() ? dv_.value() : torch::empty_like(v);
 
   // Otherwise the kernel will be launched from cuda:0 device
   at::cuda::CUDAGuard device_guard{q.get_device()};
