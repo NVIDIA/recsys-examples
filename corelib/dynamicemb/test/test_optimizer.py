@@ -52,6 +52,7 @@ class TorchSGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
+        embs: List[torch.Tensor] = None,
         scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
@@ -112,6 +113,7 @@ class TorchAdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
+        embs: List[torch.Tensor] = None,
         scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
@@ -207,6 +209,7 @@ class TorchAdagradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
+        embs: List[torch.Tensor] = None,
         scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
@@ -295,6 +298,7 @@ class TorchRowWiseAdagradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
+        embs: List[torch.Tensor] = None,
         scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
@@ -429,7 +433,7 @@ def find_and_insert_missed(table, batch, keys, values):
         torch.masked_select(values, values_mask).contiguous().view(-1, values.size(1))
     )
     assert missed_keys.size(0) == missed_vals.size(0)
-    print(f"Insert missed keys: {missed_keys.size(0)} in current batch: {batch}")
+    # print(f"Insert missed keys: {missed_keys.size(0)} in current batch: {batch}")
     insert_or_assign(table, missed_keys.size(0), missed_keys, missed_vals)
 
 
@@ -501,6 +505,7 @@ def test_optimizer(
                 beta1=opt_args.beta1,
                 beta2=opt_args.beta2,
                 weight_decay=opt_args.weight_decay,
+                use_index_dedup=True,
             )
         )
     hashtables_for_dynamicemb = [
@@ -600,7 +605,10 @@ def test_optimizer(
         opt_for_torch.update(hashtables_for_torch, indices, grads)
         for i in range(num_tables):
             opt_for_dynamicemb[i].update(
-                [hashtables_for_dynamicemb[i]], [indices[i]], [grads[i]]
+                [hashtables_for_dynamicemb[i]],
+                [indices[i]],
+                [grads[i]],
+                [result_tensors_for_dynamicemb[i][:, : embedding_dim[i]].contiguous()],
             )
 
         found_weights_for_torch = [

@@ -38,14 +38,16 @@ namespace dyn_emb {
 
 void dynamic_emb_sgd_with_table(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                                 const uint64_t n, const at::Tensor indices, const at::Tensor grads, 
-                                const float lr, DataType weight_type, const std::optional<uint64_t> score = std::nullopt);
+                                const float lr, DataType weight_type, const std::optional<uint64_t> score = std::nullopt, 
+                                const c10::optional<at::Tensor>& embs = c10::nullopt);
 
 void dynamic_emb_adam_with_table(
   std::shared_ptr<dyn_emb::DynamicVariableBase> ht,
   const uint64_t n, const at::Tensor indices, const at::Tensor grads, 
   const float lr, const float beta1, const float beta2, const float eps,
   const float weight_decay, const uint32_t iter_num, DataType weight_type, 
-  const std::optional<uint64_t> score = std::nullopt
+  const std::optional<uint64_t> score = std::nullopt,
+  const c10::optional<at::Tensor>& embs = c10::nullopt
 );
 
 void dynamic_emb_adagrad_with_table(
@@ -54,7 +56,8 @@ void dynamic_emb_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  DataType weight_type,const std::optional<uint64_t> score = std::nullopt);
+  DataType weight_type,const std::optional<uint64_t> score = std::nullopt,
+  const c10::optional<at::Tensor>& embs = c10::nullopt);
 
 void dynamic_emb_rowwise_adagrad_with_table(
   std::shared_ptr<dyn_emb::DynamicVariableBase> ht,
@@ -62,7 +65,8 @@ void dynamic_emb_rowwise_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  DataType weight_type,const std::optional<uint64_t> score = std::nullopt);
+  DataType weight_type,const std::optional<uint64_t> score = std::nullopt,
+  const c10::optional<at::Tensor>& embs = c10::nullopt);
 
 } // namespace dyn_emb
 #endif // OPTIMIZER_H
