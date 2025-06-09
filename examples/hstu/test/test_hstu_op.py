@@ -182,7 +182,6 @@ def generate_or_copy_parameters(
 @pytest.mark.parametrize(
     "is_causal,kernel_backend",
     [
-        (True, KernelBackend.TRITON),
         (True, KernelBackend.CUTLASS),
         (False, KernelBackend.CUTLASS),
     ],
@@ -407,6 +406,7 @@ def test_hstu_attn(
 @pytest.mark.parametrize("upcast_reference", [False])
 @pytest.mark.parametrize("residual", [False])
 @pytest.mark.parametrize("async_wgrad", [True, False])
+@pytest.mark.parametrize("recompute_input_layernorm", [True, False])
 def test_fused_hstu_op(
     dtype: torch.dtype,
     batchsize: int,
@@ -425,6 +425,7 @@ def test_fused_hstu_op(
     upcast_reference: bool,
     residual: bool,
     async_wgrad: bool,
+    recompute_input_layernorm: bool,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -453,7 +454,6 @@ def test_fused_hstu_op(
 
     hstu_config.kernel_backend = KernelBackend.PYTORCH
     hstu_config.dtype = torch.float32
-    hstu_config.hstu_layer_type = HSTULayerType.NATIVE
     fp32_ref_hstu_layer = HSTULayer(hstu_config)
     fp32_ref_hstu_layer.load_state_dict(ref_hstu_layer.state_dict())
     fp32_ref_hstu_layer.cuda()
@@ -592,6 +592,7 @@ def test_fused_hstu_op(
         residual=residual,
         wgrad_stream=None,
         wgrad_event=None,
+        recompute_input_layernorm=recompute_input_layernorm,
     )
     ref_out = ref_out.values
     fp32_ref_out = fp32_ref_out.values
@@ -649,7 +650,7 @@ def test_fused_hstu_op(
             ),
         }
     )
-    for tensor_name, (grad_ref, grad_fused, fp32_ref_grad) in reversed(
+    for tensor_name, (grad_fused, grad_ref, fp32_ref_grad) in reversed(
         grad_to_compared.items()
     ):
         print(

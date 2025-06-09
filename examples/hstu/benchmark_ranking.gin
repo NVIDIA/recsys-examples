@@ -19,7 +19,7 @@ BenchmarkDatasetArgs.feature_args = [
 
 item_embedding/DynamicEmbeddingArgs.feature_names = ['item']
 item_embedding/DynamicEmbeddingArgs.table_name = 'item'
-item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 100000000 # gross 100M embedding rows
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000 # gross 50M embedding rows
 item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1
 item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
 
@@ -46,8 +46,11 @@ NetworkArgs.kv_channels = 256
 NetworkArgs.kernel_backend = 'cutlass'
 NetworkArgs.layer_type = 'fused'
 
+# recompute can incurs perf regression, but save memory
+NetworkArgs.recompute_input_layernorm = True
+
 RankingArgs.prediction_head_arch = [
-    [512, 8],
+    512, 8,
 ]
 RankingArgs.prediction_head_bias = True
 RankingArgs.num_tasks = 8

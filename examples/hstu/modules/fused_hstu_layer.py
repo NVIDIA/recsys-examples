@@ -112,7 +112,7 @@ class FusedHSTULayer(MegatronModule):
                 )
             )
         )
-
+        self._recompute_input_layernorm = config.recompute_input_layernorm
         torch.nn.init.xavier_uniform_(self._linear_proj_weight)
 
     @output_nvtx_hook(nvtx_tag="FusedHSTULayer", hook_tensor_attr_name="values")
@@ -148,6 +148,7 @@ class FusedHSTULayer(MegatronModule):
             residual=self._residual,
             wgrad_stream=self._wgrad_stream,
             wgrad_event=self._wgrad_event,
+            recompute_input_layernorm=self._recompute_input_layernorm,
         )
         return JaggedData(
             values=output,
