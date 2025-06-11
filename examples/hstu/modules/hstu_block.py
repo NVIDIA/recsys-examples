@@ -3,7 +3,6 @@
 from typing import Dict, Optional, Union
 
 import torch
-from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
 from dataset.utils import RankingBatch, RetrievalBatch
 from megatron.core.transformer.module import MegatronModule
@@ -58,7 +57,7 @@ class HSTUBlock(MegatronModule):
             [HSTULayerImpl(config) for l in range(self.config.num_layers)]
         )
 
-    @output_nvtx_hook(nvtx_tag="hstu_preprocess")
+    # @output_nvtx_hook(nvtx_tag="hstu_preprocess")
     def hstu_preprocess(
         self, embeddings: Dict[str, JaggedTensor], batch: RankingBatch
     ) -> JaggedData:
@@ -182,7 +181,7 @@ class HSTUBlock(MegatronModule):
             has_interleaved_action=batch.action_feature_name is not None,
         )
 
-    @output_nvtx_hook(nvtx_tag="hstu_postprocess")
+    # @output_nvtx_hook(nvtx_tag="hstu_postprocess")
     def hstu_postprocess(self, jd: JaggedData) -> JaggedData:
         """
         Postprocess the output from the HSTU architecture.
@@ -239,7 +238,7 @@ class HSTUBlock(MegatronModule):
             has_interleaved_action=False,
         )
 
-    @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_tensor_attr_name="values")
+    # @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_tensor_attr_name="values")
     def forward(
         self,
         embeddings: Dict[str, JaggedTensor],

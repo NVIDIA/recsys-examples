@@ -29,12 +29,14 @@ from commons.utils.logging import print_rank_0
 from configs import RankingConfig
 from distributed.sharding import make_optimizer_and_shard
 from model import get_ranking_model
+from pipeline.train_pipeline import JaggedMegatronPrefetchTrainPipelineSparseDist
 from utils import (
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
     TrainerArgs,
     create_dynamic_optitons_dict,
+    create_embedding_compute_kernels,
     create_embedding_config,
     create_hstu_config,
     create_optimizer_params,
@@ -42,6 +44,7 @@ from utils import (
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
     train,
+    train_with_pipeline,
 )
 
 
@@ -111,6 +114,7 @@ def main():
     dynamic_options_dict = create_dynamic_optitons_dict(
         embedding_args, network_args.hidden_size
     )
+    compute_kernels = create_embedding_compute_kernels(embedding_args)
 
     optimizer_param = create_optimizer_params(optimizer_args)
     model_train, dense_optimizer = make_optimizer_and_shard(
@@ -119,6 +123,8 @@ def main():
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
+        allowed_compute_kernels=compute_kernels,
+        enable_prefetch_pipeline=trainer_args.enable_prefetch_pipeline,
     )
     train_dataloader, test_dataloader = get_data_loader(
         "ranking", dataset_args, trainer_args, task_config.num_tasks
@@ -129,14 +135,27 @@ def main():
     )
 
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
-
-    train(
-        model_train,
-        trainer_args,
-        train_dataloader,
-        test_dataloader,
-        dense_optimizer,
-    )
+    if trainer_args.enable_prefetch_pipeline:
+        pipeline = JaggedMegatronPrefetchTrainPipelineSparseDist(
+            model_train,
+            dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        train_with_pipeline(
+            pipeline,
+            trainer_args,
+            train_dataloader,
+            test_dataloader,
+            dense_optimizer,
+        )
+    else:
+        train(
+            model_train,
+            trainer_args,
+            train_dataloader,
+            test_dataloader,
+            dense_optimizer,
+        )
     init.destroy_global_state()
 
 

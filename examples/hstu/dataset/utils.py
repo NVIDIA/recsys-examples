@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.streamable import Pipelineable
 
 
 @dataclass
@@ -148,10 +149,10 @@ class Batch:
 
 
 @dataclass
-class RankingBatch(Batch):
+class RankingBatch(Batch, Pipelineable):
     labels: torch.Tensor  # shape: (T, num_tasks)
 
-    def to(self, device: torch.device, non_blocking: bool = False) -> "RankingBatch":
+    def to(self, device: torch.device, non_blocking: bool = False) -> "RankingBatch":  # type: ignore
         """
         Move the batch to the specified device.
 
@@ -177,6 +178,12 @@ class RankingBatch(Batch):
             else None,
             labels=self.labels.to(device=device, non_blocking=non_blocking),
         )
+
+    def record_stream(self, stream: torch.cuda.Stream):
+        self.features.record_stream(stream)
+        if self.num_candidates is not None:
+            self.num_candidates.record_stream(stream)
+        self.labels.record_stream(stream)
 
     def pin_memory(self) -> "RankingBatch":
         """
@@ -256,8 +263,8 @@ class RankingBatch(Batch):
 
 
 @dataclass
-class RetrievalBatch(Batch):
-    def to(self, device: torch.device, non_blocking: bool = False) -> "RetrievalBatch":
+class RetrievalBatch(Batch, Pipelineable):
+    def to(self, device: torch.device, non_blocking: bool = False) -> "RetrievalBatch":  # type: ignore
         """
         Move the batch to the specified device.
 
@@ -282,6 +289,11 @@ class RetrievalBatch(Batch):
             if self.num_candidates is not None
             else None,
         )
+
+    def record_stream(self, stream: torch.cuda.Stream):
+        self.features.record_stream(stream)
+        if self.num_candidates is not None:
+            self.num_candidates.record_stream(stream)
 
     def pin_memory(self) -> "RetrievalBatch":
         """

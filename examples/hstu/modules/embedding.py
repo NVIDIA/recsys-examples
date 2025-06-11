@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.fx
 import torch.nn as nn
 from configs.task_config import ShardedEmbeddingConfig
 from dynamicemb.planner import (
@@ -28,10 +29,18 @@ from dynamicemb.planner import (
 from torch import distributed as dist
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.sharding.dp_sequence_sharding import (
     DpSequenceEmbeddingSharding,
 )
-from torchrec.distributed.types import ParameterSharding, ShardingEnv
+from torchrec.distributed.types import (
+    Awaitable,
+    CompIn,
+    DistOut,
+    ParameterSharding,
+    ShardingEnv,
+    ShrdCtx,
+)
 from torchrec.distributed.utils import (
     add_params_from_parameter_sharding,
     convert_to_fbgemm_types,
@@ -49,6 +58,49 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from torchrec.types import ModuleNoCopyMixin
+
+
+class AwaitableEmptyDict(Awaitable):
+    def __init__(self):
+        super().__init__()
+
+    def _wait_impl(self):
+        return {}
+
+
+_aux_awaitable_empty_dict = AwaitableEmptyDict()
+
+
+@torch.fx.wrap
+def _get_mp_embeddings(
+    mp_collection, kjt: KeyedJaggedTensor
+) -> Dict[str, JaggedTensor]:
+    """Helper function to get model parallel embeddings safely during tracing."""
+    if mp_collection is None:
+        return {}
+    result = mp_collection(kjt)
+    if hasattr(result, "wait"):
+        return result.wait()
+    return result
+
+
+@torch.fx.wrap
+def _get_dp_embeddings(
+    dp_collection, kjt: KeyedJaggedTensor
+) -> Dict[str, JaggedTensor]:
+    """Helper function to get data parallel embeddings safely during tracing."""
+    if dp_collection is None:
+        return {}
+    return dp_collection(kjt)
+
+
+@torch.fx.wrap
+def _merge_embeddings(
+    mp_embeddings: Dict[str, JaggedTensor], dp_embeddings: Dict[str, JaggedTensor]
+) -> Dict[str, JaggedTensor]:
+    """Helper function to merge embeddings safely during tracing."""
+    return {**mp_embeddings, **dp_embeddings}
 
 
 def create_data_parallel_sharding_infos_by_sharding(
@@ -126,7 +178,8 @@ def create_data_parallel_sharding_infos_by_sharding(
     return sharding_type_to_sharding_infos
 
 
-class DataParallelEmbeddingCollection(torch.nn.Module):
+# To enable pipeline, we need to inherit from ShardedModule
+class DataParallelEmbeddingCollection(ShardedModule, ModuleNoCopyMixin):
     """
     Sharded implementation of `EmbeddingCollection`.
     This is part of the public API to allow for manual data dist pipelining.
@@ -170,6 +223,8 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
             env=env,
             device=device,
         )
+        self._input_dist = [dp_sharding.create_input_dist()]
+        self._output_dist = [dp_sharding.create_output_dist()]
         self._dp_lookups = [
             dp_sharding.create_lookup(
                 device=device,
@@ -182,6 +237,25 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
 
         self._initialize_torch_state()
         self._has_uninitialized_input_dist: bool = True
+
+    def create_context(self) -> None:
+        return None
+
+    def input_dist(
+        self,
+        ctx: ShrdCtx,
+        # pyre-ignore[2]
+        *input,
+        # pyre-ignore[2]
+        **kwargs,
+    ) -> Awaitable[Awaitable[CompIn]]:
+        return None
+
+    def compute(self, ctx: ShrdCtx, dist_input: CompIn) -> None:
+        return None
+
+    def output_dist(self, ctx: ShrdCtx, output: DistOut) -> None:
+        return None
 
     def _initialize_torch_state(self) -> None:  # noqa
         """
@@ -240,6 +314,7 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
         )
         self._feature_splits = [len(self._feature_names)]
 
+    # return Tensor! Not awaitable!
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys())
@@ -298,13 +373,17 @@ class ShardedEmbedding(torch.nn.Module):
             else:
                 model_parallel_embedding_configs.append(config)
 
-        self._model_parallel_embedding_collection = create_embedding_collection(
-            configs=model_parallel_embedding_configs
+        self._model_parallel_embedding_collection = (
+            create_embedding_collection(configs=model_parallel_embedding_configs)
+            if len(model_parallel_embedding_configs) > 0
+            else None
         )
 
         if len(data_parallel_embedding_configs) > 0:
-            self._data_parallel_embedding_collection = create_embedding_collection(
-                configs=data_parallel_embedding_configs
+            self._data_parallel_embedding_collection = (
+                create_embedding_collection(configs=data_parallel_embedding_configs)
+                if len(data_parallel_embedding_configs) > 0
+                else None
             )
             self._side_stream = torch.cuda.Stream()
         else:
@@ -314,6 +393,7 @@ class ShardedEmbedding(torch.nn.Module):
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         """
         Forward pass of the sharded embedding module.
+        Must be symbolic-traceable!
 
         Args:
             kjt (`KeyedJaggedTensor <https://pytorch.org/torchrec/concepts.html#keyedjaggedtensor>`): The input tokens.
@@ -321,15 +401,14 @@ class ShardedEmbedding(torch.nn.Module):
         Returns:
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
-        mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
-        if self._data_parallel_embedding_collection is not None:
-            with torch.cuda.stream(self._side_stream):
-                dp_embeddings = self._data_parallel_embedding_collection(kjt)
-            torch.cuda.current_stream().wait_stream(self._side_stream)
-            embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
-        else:
-            embeddings = mp_embeddings_awaitables.wait()
-        return embeddings
+        # Use wrapped helper functions for better traceability
+        mp_embeddings = _get_mp_embeddings(
+            self._model_parallel_embedding_collection, kjt
+        )
+        dp_embeddings = _get_dp_embeddings(
+            self._data_parallel_embedding_collection, kjt
+        )
+        return _merge_embeddings(mp_embeddings, dp_embeddings)
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
         """
