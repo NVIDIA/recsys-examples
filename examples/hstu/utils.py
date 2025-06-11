@@ -14,7 +14,7 @@
 # limitations under the License.
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial  # pylint: disable-unused-import
 from itertools import islice
 from typing import Dict, List, Optional, Tuple, Union
@@ -42,6 +42,7 @@ from megatron.core import parallel_state
 from megatron.core.distributed import finalize_model_grads
 from model import RankingGR, RetrievalGR
 from modules.embedding import ShardedEmbeddingConfig
+from pipeline.train_pipeline import JaggedMegatronPrefetchTrainPipelineSparseDist
 from torchrec.distributed.model_parallel import DistributedModelParallel
 
 
@@ -68,6 +69,7 @@ class TrainerArgs:
     ckpt_save_interval: int = -1  # -1 means not save ckpt
     ckpt_save_dir: str = "./checkpoints"
     ckpt_load_dir: str = ""
+    enable_prefetch_pipeline: bool = False
 
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
@@ -87,11 +89,18 @@ class BaseEmbeddingArgs:
 class EmbeddingArgs(BaseEmbeddingArgs):
     sharding_type: str = "None"
 
+    # refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91
+    allowed_compute_kernels: List[str] = field(default_factory=list)
+
     def __post_init__(self):
         assert self.sharding_type.lower() in [
             "data_parallel",
             "model_parallel",
         ]
+        if self.sharding_type.lower() == "model_parallel":
+            self.allowed_compute_kernels = [
+                x for x in self.allowed_compute_kernels if x.lower() != "dense"
+            ]
 
 
 @gin.configurable
@@ -372,6 +381,18 @@ def create_dynamic_optitons_dict(
     return dynamic_options_dict
 
 
+def create_embedding_compute_kernels(
+    embedding_args_list: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]],
+) -> Dict[str, List[str]]:
+    compute_kernels: Dict[str, List[str]] = {}
+    for embedding_args in embedding_args_list:
+        if len(embedding_args.allowed_compute_kernels) > 0:
+            compute_kernels[
+                embedding_args.table_name
+            ] = embedding_args.allowed_compute_kernels
+    return compute_kernels
+
+
 def evaluate(
     model: Union[RankingGR, RetrievalGR],
     trainer_args: TrainerArgs,
@@ -517,6 +538,63 @@ def train(
             model.train()
         torch.cuda.nvtx.range_pop()
 
+        if trainer_args.profile and train_iter == trainer_args.profile_step_end:
+            torch.cuda.profiler.stop()
+
+
+def train_with_pipeline(
+    pipeline: JaggedMegatronPrefetchTrainPipelineSparseDist,
+    trainer_args: TrainerArgs,
+    train_loader: torch.utils.data.DataLoader,
+    eval_loader: torch.utils.data.DataLoader,
+    dense_optimizer: torch.optim.Optimizer,
+):
+    gpu_timer = GPUTimer()
+    max_train_iters = trainer_args.max_train_iters or len(train_loader)
+    gpu_timer.start()
+    last_td = 0
+    # using a tensor on gpu to avoid d2h copy
+    tokens_logged = torch.zeros(1).cuda().float()
+    train_loader_iter = iter(train_loader)
+    for train_iter in range(max_train_iters):
+        pipeline._model.train()
+        if trainer_args.profile and train_iter == trainer_args.profile_step_start:
+            torch.cuda.profiler.start()
+        if (
+            train_iter * trainer_args.ckpt_save_interval > 0
+            and train_iter % trainer_args.ckpt_save_interval == 0
+        ):
+            save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
+            save_ckpts(save_path, pipeline._model, dense_optimizer)
+        torch.cuda.nvtx.range_push(f"step {train_iter}")
+        try:
+            reporting_loss, (local_loss, logits, labels) = pipeline.progress(
+                train_loader_iter
+            )
+        except StopIteration:
+            train_loader_iter = iter(train_loader)  # more than one epoch!
+            reporting_loss, (local_loss, logits, labels) = pipeline.progress(
+                train_loader_iter
+            )
+        tokens_logged += reporting_loss[1]
+        if train_iter > 0 and train_iter % trainer_args.log_interval == 0:
+            gpu_timer.stop()
+            cur_td = gpu_timer.elapsed_time() - last_td
+            print_rank_0(
+                f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+            )
+            last_td = cur_td + last_td
+            tokens_logged.zero_()
+
+        if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
+            pipeline._model.eval()
+            evaluate(
+                get_unwrapped_module(pipeline._model),
+                trainer_args=trainer_args,
+                eval_loader=eval_loader,
+                max_eval_iters=None,
+            )
+        torch.cuda.nvtx.range_pop()
         if trainer_args.profile and train_iter == trainer_args.profile_step_end:
             torch.cuda.profiler.stop()
 
