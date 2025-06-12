@@ -86,6 +86,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         wgrad_stream: Optional[torch.cuda.Stream] = None,
         wgrad_event: Optional[torch.cuda.Event] = None,
         recompute_input_layernorm: bool = False,
+        recompute_input_silu: bool = False,
     ) -> torch.Tensor:
         """Forward pass of the fused HSTU layer.
         Args:
@@ -115,6 +116,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             residual (bool): Whether to use residual connection. Defaults to True.
             wgrad_stream (Optional[torch.cuda.Stream]): CUDA stream for weight gradient computation. Defaults to None.
             wgrad_event (Optional[torch.cuda.Event]): CUDA event for weight gradient computation. Defaults to None.
+            recompute_input_layernorm (bool): Whether to recompute the input layer norm. Defaults to False.
+            recompute_input_silu (bool): Whether to recompute the input silu. Defaults to False.
         Returns:
             torch.Tensor: Output tensor of shape [T, hidden_size]
         """
@@ -133,6 +136,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.wgrad_stream = wgrad_stream
         ctx.wgrad_event = wgrad_event
         ctx.recompute_input_layernorm = recompute_input_layernorm
+        ctx.recompute_input_silu = recompute_input_silu
         saved_tensor_map = OrderedDict()
         if num_contextuals is None and attn_backend == KernelBackend.TRITON:
             num_contextuals = 0
@@ -206,7 +210,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 }
             )
             if recompute_input_layernorm:
-                clear_tensor_data(normed_input)
+                clear_tensor_data(normed_input, clear_storage=True)
                 del normed_input
             saved_tensor_map.update(
                 {
@@ -228,9 +232,9 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ):
             saved_tensor_map.update(
                 {
-                    "q": q,
-                    "k": k,
-                    "v": v,
+                    "q": q if not recompute_input_silu else None,
+                    "k": k if not recompute_input_silu else None,
+                    "v": v if not recompute_input_silu else None,
                     "seq_offsets": seq_offsets,
                     "num_contexts": None,
                     "num_targets": num_targets,
@@ -311,15 +315,15 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             )
             saved_tensor_map.update(
                 {
-                    "q": q,
-                    "k": k,
-                    "v": v,
+                    "q": q if not recompute_input_silu else None,
+                    "k": k if not recompute_input_silu else None,
+                    "v": v if not recompute_input_silu else None,
                     "seq_offsets_q": seq_offsets_q,
                     "num_contexts": num_contexts,
                     "num_targets": num_targets,
                 }
             )
-
+            del jagged_attn_output
             ctx.max_seqlen_q = max_seqlen_q
             ctx.target_group_size = target_group_size
             ctx.window_size_left = -1
@@ -364,7 +368,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             saved_tensor_map.update(
                 {
                     "out_ln_input": x,
-                    "u": u,
+                    "u": u if not recompute_input_silu else None,
                     "out_ln_weight": weight,
                     "out_ln_bias": bias,
                     "out_ln_mean": mean,
@@ -416,12 +420,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             tv = tv.view(-1, num_heads, linear_dim_per_head)
             tq = tq.view(-1, num_heads, attention_dim_per_head)
             tk = tk.view(-1, num_heads, attention_dim_per_head)
-            # # to make a copy here because we need to delete act_linear_uvqk
-            # tu = tu.contiguous()
-            clear_tensor_data(act_linear_uvqk)
-            # we are safe to delete because contiguous creates a copy
-            # in the future, we can recompute silu in the backward pass with saved_tensor_map['silu_input']
-            del act_linear_uvqk
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 # attn_output: [T, num_heads * attention_dim_per_head]
@@ -470,6 +468,12 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 training=ctx.training,
                 dropout_seed=seed,
             )
+        if ctx.recompute_input_silu:
+            clear_tensor_data(tu, tq, tk, tv)
+            del tu, tq, tk, tv
+        # if recompute is disabled, we cannot clear storage because saved u,q,k,v refers to the same storage
+        clear_tensor_data(act_linear_uvqk, clear_storage=ctx.recompute_input_silu)
+        del act_linear_uvqk
         with nvtx.annotate("hstu linear_residual fwd", color="YELLOW"):
             # Note that when residual is off, there might be slightly perf loss due to the tensor construction
             residual_tensor = torch.zeros_like(input) if not ctx.residual else input
@@ -506,6 +510,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         None,
         Optional[torch.Tensor],
         Optional[torch.Tensor],
+        None,
         None,
         None,
         None,
@@ -723,8 +728,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         saved_tensor_name = ctx.saved_tensor_name
         saved_tensors = ctx.saved_tensors
         saved_tensor_map = OrderedDict(zip(saved_tensor_name, saved_tensors))
-        # split does nothing
-        duvqk = torch.ones_like(saved_tensor_map["silu_input"])
+        duvqk = torch.empty_like(saved_tensor_map["silu_input"])
         pre_du, pre_dv, pre_dq, pre_dk = duvqk.split(ctx.split_arg_list, dim=-1)
         with nvtx.annotate("hstu linear_residual bwd", color="YELLOW"):
             (
@@ -737,6 +741,21 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 w=saved_tensor_map["linear_proj_weight"],
                 wgrad_stream=ctx.wgrad_stream,
                 wgrad_event=ctx.wgrad_event,
+            )
+        if ctx.recompute_input_silu:
+            silu_input = saved_tensor_map["silu_input"]
+            merged_logit = torch.ops.aten.silu(silu_input)
+            # split does nothing
+            u, v, q, k = merged_logit.split(ctx.split_arg_list, dim=-1)
+            saved_tensor_map["u"] = u
+            saved_tensor_map["v"] = v.view(
+                -1, ctx.num_heads, ctx.attention_dim_per_head
+            )
+            saved_tensor_map["q"] = q.view(
+                -1, ctx.num_heads, ctx.attention_dim_per_head
+            )
+            saved_tensor_map["k"] = k.view(
+                -1, ctx.num_heads, ctx.attention_dim_per_head
             )
         with nvtx.annotate("norm_mul_dropout bwd", color="GREEN"):
             (
@@ -762,7 +781,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 du=pre_du,
             )
         with nvtx.annotate("hstu attn bwd", color="BLUE"):
-            # TODO q,k,v can be recomputed via silu_fwd(saved_tensor_map['silu_input'])
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 grad_q, grad_k, grad_v = _hstu_attn_cutlass_bwd(
                     dout=grad_output.view(
@@ -878,6 +896,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -913,6 +932,7 @@ def fused_hstu_op(
     wgrad_stream: Optional[torch.cuda.Stream] = None,
     wgrad_event: Optional[torch.cuda.Event] = None,
     recompute_input_layernorm: bool = False,
+    recompute_input_silu: bool = False,
 ):
     out = FusedHSTULayerFunction.apply(
         input,
@@ -942,6 +962,7 @@ def fused_hstu_op(
         wgrad_stream,
         wgrad_event,
         recompute_input_layernorm,
+        recompute_input_silu,
     )
 
     return out

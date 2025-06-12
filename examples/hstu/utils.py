@@ -171,6 +171,7 @@ class NetworkArgs:
     num_position_buckets: int = 8192
 
     recompute_input_layernorm: bool = False
+    recompute_input_silu: bool = False
 
     def __post_init__(self):
         assert self.dtype_str in [
@@ -243,6 +244,7 @@ def create_hstu_config(network_args: NetworkArgs):
         target_group_size=network_args.target_group_size,
         hstu_layer_type=layer_type,
         recompute_input_layernorm=network_args.recompute_input_layernorm,
+        recompute_input_silu=network_args.recompute_input_silu,
     )
 
 

@@ -12,6 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#!/usr/bin/env python3
+#! example:
+# python ./benchmark/fused_hstu_layer_benchmark.py run \
+# --iters 100 --warmup-iters 50 --layer-type fused \
+# --kernel-backend cutlass --full-sequence True \
+# --dim-per-head 128 --num-heads 4 --num-layers 3 \
+# --dtype bfloat16 --max-seqlen 4096 --batchsize 32 \
+# --async-wgrad False \
+# --recompute-input-silu  True \
+# --recompute-input-layernorm True
+
+
 import warnings
 
 import torch
@@ -88,6 +100,12 @@ def create_hstu_layer(
     required=False,
 )
 @click.option(
+    "--recompute-input-silu",
+    type=bool,
+    default=False,
+    required=False,
+)
+@click.option(
     "--kernel-backend",
     type=click.Choice(_backend_str_to_type.keys()),
     default="cutlass",
@@ -127,6 +145,7 @@ def run(
     dump_memory_snapshot,
     num_layers,
     recompute_input_layernorm,
+    recompute_input_silu,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -145,6 +164,7 @@ def run(
         learnable_input_layernorm=True,
         async_wgrad=async_wgrad,
         recompute_input_layernorm=recompute_input_layernorm,
+        recompute_input_silu=recompute_input_silu,
     )
     hstu_blocks = [
         create_hstu_layer(

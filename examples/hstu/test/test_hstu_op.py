@@ -407,6 +407,7 @@ def test_hstu_attn(
 @pytest.mark.parametrize("residual", [False])
 @pytest.mark.parametrize("async_wgrad", [True, False])
 @pytest.mark.parametrize("recompute_input_layernorm", [True, False])
+@pytest.mark.parametrize("recompute_input_silu", [True, False])
 def test_fused_hstu_op(
     dtype: torch.dtype,
     batchsize: int,
@@ -426,6 +427,7 @@ def test_fused_hstu_op(
     residual: bool,
     async_wgrad: bool,
     recompute_input_layernorm: bool,
+    recompute_input_silu: bool,
 ):
     init.initialize_distributed()
     init.set_random_seed(1234)
@@ -593,6 +595,7 @@ def test_fused_hstu_op(
         wgrad_stream=None,
         wgrad_event=None,
         recompute_input_layernorm=recompute_input_layernorm,
+        recompute_input_silu=recompute_input_silu,
     )
     ref_out = ref_out.values
     fp32_ref_out = fp32_ref_out.values
