@@ -272,6 +272,9 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         cowclip_regularization: Optional[
             CowClipDefinition
         ] = None,  # used by Rowwise Adagrad
+        # TO align with FBGEMM TBE
+        *args,
+        **kwargs,
     ) -> None:
         super().__init__()
         assert len(table_options) >= 1

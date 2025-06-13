@@ -16,7 +16,6 @@ from collections import OrderedDict
 from typing import Tuple
 
 import torch
-from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RankingConfig
 from dataset.utils import RankingBatch
 from megatron.core import parallel_state
@@ -125,7 +124,6 @@ class RankingGR(BaseModel):
 
         return self._mlp(hidden_states.values), batch.labels
 
-    @output_nvtx_hook(nvtx_tag="RankingModel", backward=False)
     def forward(  # type: ignore[override]
         self,
         batch: RankingBatch,
