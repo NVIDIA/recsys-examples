@@ -49,7 +49,8 @@ We cover sequence from 1k~8k, other hyper-params are as followed:
 | num_heads     | 4     |
 | embedding dim | 1024  |
 
-## latency
+All results are conducted on single H100-SXM5-80G
+## Latency
 
 | seqlen | Baseline (ms) | + cutlass kernel | +fusion | +layer norm recompute (ms) | +silu recompute (ms) |
 | ------ | ------------- | ---------------- | ------- | -------------------------- | -------------------- |
@@ -60,3 +61,8 @@ We cover sequence from 1k~8k, other hyper-params are as followed:
 
 The columns other than the first column are incrementally tested based on the previous column.
 
+## Peak memory
+We trace the peak memory with the help of torch memory snapshot. To better identify the boundary forward and backward process, we have run 2 HSTU layers.
+Below are the memory usage for seqlen=4K:
+
+![image](./memory_snapshot.png)
