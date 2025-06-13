@@ -29,18 +29,10 @@ from dynamicemb.planner import (
 from torch import distributed as dist
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.sharding.dp_sequence_sharding import (
     DpSequenceEmbeddingSharding,
 )
-from torchrec.distributed.types import (
-    Awaitable,
-    CompIn,
-    DistOut,
-    ParameterSharding,
-    ShardingEnv,
-    ShrdCtx,
-)
+from torchrec.distributed.types import Awaitable, ParameterSharding, ShardingEnv
 from torchrec.distributed.utils import (
     add_params_from_parameter_sharding,
     convert_to_fbgemm_types,
@@ -72,7 +64,6 @@ class AwaitableEmptyDict(Awaitable):
 _aux_awaitable_empty_dict = AwaitableEmptyDict()
 
 
-@torch.fx.wrap
 def _get_mp_embeddings(
     mp_collection, kjt: KeyedJaggedTensor
 ) -> Dict[str, JaggedTensor]:
@@ -80,12 +71,9 @@ def _get_mp_embeddings(
     if mp_collection is None:
         return {}
     result = mp_collection(kjt)
-    if hasattr(result, "wait"):
-        return result.wait()
-    return result
+    return result.wait()
 
 
-@torch.fx.wrap
 def _get_dp_embeddings(
     dp_collection, kjt: KeyedJaggedTensor
 ) -> Dict[str, JaggedTensor]:
@@ -179,7 +167,7 @@ def create_data_parallel_sharding_infos_by_sharding(
 
 
 # To enable pipeline, we need to inherit from ShardedModule
-class DataParallelEmbeddingCollection(ShardedModule, ModuleNoCopyMixin):
+class DataParallelEmbeddingCollection(torch.nn.Module, ModuleNoCopyMixin):
     """
     Sharded implementation of `EmbeddingCollection`.
     This is part of the public API to allow for manual data dist pipelining.
@@ -223,8 +211,6 @@ class DataParallelEmbeddingCollection(ShardedModule, ModuleNoCopyMixin):
             env=env,
             device=device,
         )
-        self._input_dist = [dp_sharding.create_input_dist()]
-        self._output_dist = [dp_sharding.create_output_dist()]
         self._dp_lookups = [
             dp_sharding.create_lookup(
                 device=device,
@@ -237,25 +223,6 @@ class DataParallelEmbeddingCollection(ShardedModule, ModuleNoCopyMixin):
 
         self._initialize_torch_state()
         self._has_uninitialized_input_dist: bool = True
-
-    def create_context(self) -> None:
-        return None
-
-    def input_dist(
-        self,
-        ctx: ShrdCtx,
-        # pyre-ignore[2]
-        *input,
-        # pyre-ignore[2]
-        **kwargs,
-    ) -> Awaitable[Awaitable[CompIn]]:
-        return None
-
-    def compute(self, ctx: ShrdCtx, dist_input: CompIn) -> None:
-        return None
-
-    def output_dist(self, ctx: ShrdCtx, output: DistOut) -> None:
-        return None
 
     def _initialize_torch_state(self) -> None:  # noqa
         """
