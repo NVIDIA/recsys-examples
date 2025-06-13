@@ -25,7 +25,6 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 from ops.triton_ops.common import triton_autotune
-from ops.triton_ops.triton_silu import triton_silu_bwd
 
 ENABLE_FULL_TURNING_SPACE = False
 
@@ -282,7 +281,7 @@ def triton_addmm_silu_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if silu:
         assert z is not None, "z is required for silu"
-        dz = triton_silu_bwd(grad_output, z)
+        dz = torch.ops.aten.silu_backward(grad_output, z)
     else:
         dz = grad_output
     if is_y_1d:

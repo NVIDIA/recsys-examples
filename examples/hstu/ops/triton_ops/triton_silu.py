@@ -101,6 +101,7 @@ def triton_silu_fwd(input: torch.Tensor) -> torch.Tensor:
     return output.view(input.shape)
 
 
+# TODO: compare performance with torch.ops.aten.silu_backward
 def triton_silu_bwd(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
     shape = input.shape
     input_1d = input.view(-1).contiguous()

@@ -801,7 +801,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     dk=pre_dk.view(-1, ctx.num_heads, ctx.attention_dim_per_head),
                     dv=pre_dv.view(-1, ctx.num_heads, ctx.attention_dim_per_head),
                 )
-                grad_output = duvqk.view(-1, ctx.num_heads * ctx.attention_dim_per_head)
+                grad_output = duvqk
             else:
                 grad_q, grad_k, grad_v = _hstu_attn_triton_bwd(
                     dout=grad_output.view(
@@ -841,7 +841,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     rstd=saved_tensor_map["input_ln_rstd"],
                 )
                 saved_tensor_map["linear_uvqk_input"] = normed_input
-
             (
                 grad_input,
                 grad_input_ln_weight,
