@@ -48,6 +48,7 @@ NetworkArgs.layer_type = 'fused'
 
 # recompute can incurs perf regression, but save memory
 NetworkArgs.recompute_input_layernorm = True
+NetworkArgs.recompute_input_silu = False
 
 RankingArgs.prediction_head_arch = [
     512, 8,

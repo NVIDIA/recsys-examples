@@ -132,6 +132,8 @@ struct Hstu_bwd_params : public Hstu_fwd_params {
   void* __restrict__ dq_accum_ptr;
   bool deterministic;
   index_t dq_accum_split_stride;
+  index_t dq_accum_row_stride;
+  index_t dq_accum_head_stride;
 
   index_t drab_seqlen_qk_stride;
   index_t drab_seqlen_q_stride;

@@ -10,7 +10,13 @@ def _empty_tensor() -> torch.Tensor:
     return torch.Tensor().cuda()
 
 
-def clear_tensor_data(*tensors: Tuple[Optional[torch.Tensor]]) -> None:
+def _resize_storage(t: torch.Tensor) -> None:
+    t.untyped_storage().resize_(0)
+
+
+def clear_tensor_data(
+    *tensors: Tuple[Optional[torch.Tensor]], clear_storage: bool = False
+) -> None:
     """
     Trick to deallocate tensor memory when delete operation does not
     release the tensor due to PyTorch override.
@@ -23,4 +29,6 @@ def clear_tensor_data(*tensors: Tuple[Optional[torch.Tensor]]) -> None:
                 t.clear()  # type: ignore
             else:
                 t.data = _empty_tensor()  # type: ignore
+            if clear_storage:
+                _resize_storage(t)
             del t

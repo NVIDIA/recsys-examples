@@ -388,6 +388,7 @@ def triton_layer_norm_mul_dropout_bwd(
     concat_ux: bool = False,
     compute_y: bool = False,
     wait_event: Optional[torch.cuda.Event] = None,
+    du: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
 ]:  # type: ignore
@@ -407,7 +408,8 @@ def triton_layer_norm_mul_dropout_bwd(
             y,
         )
     dx = torch.empty_like(x)
-    du = torch.empty_like(u)
+    if du is None:
+        du = torch.empty_like(u)
     sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     tile_num = max(1, min(sms * 64, N // 4))
     _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)

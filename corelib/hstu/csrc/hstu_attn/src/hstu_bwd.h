@@ -200,12 +200,12 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
                         make_coord(_, 0));
 
   const index_t row_offset_dq_accum1 =
-      binfo.q_offset(params.q_row_stride) + 128 * bidb * params.q_row_stride +
+      binfo.q_offset(params.dq_accum_row_stride) + 128 * bidb * params.dq_accum_row_stride +
       // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
       + (!Is_deterministic ? 0 : blockIdx.x * params.dq_accum_split_stride);
   Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.dq_accum_ptr) + row_offset_dq_accum1),
                   make_shape(actual_seqlen_q, params.h, params.d),
-                  make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+                  make_stride(params.dq_accum_row_stride, params.dq_accum_head_stride, _1{}));
   Tensor gdQaccum = local_tile(mdQaccum(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                         make_coord(_, 0));
 
@@ -882,10 +882,10 @@ __global__ void hstu_bwd_convert_dq_kernel(const Hstu_bwd_params params,
                                 m_block * kBlockM * params.dq_row_stride +
                                 bidh * params.dq_head_stride;
   const index_t row_offset_dq_accum =
-      binfo.q_offset(params.h * params.d) +
+      binfo.q_offset(params.dq_accum_row_stride) +
       (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) *
-          params.h * params.d +
-      bidh * params.d;
+          params.dq_accum_row_stride +
+      bidh * params.dq_accum_head_stride;
 
   Tensor gdQ = make_tensor(
       make_gmem_ptr(reinterpret_cast<Element*>(params.dq_ptr) + row_offset_dq),
@@ -895,7 +895,7 @@ __global__ void hstu_bwd_convert_dq_kernel(const Hstu_bwd_params params,
       make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.dq_accum_ptr) +
                     row_offset_dq_accum),
       Shape<Int<kBlockM>, Int<kHeadDim>>{},
-      make_stride(params.h * params.d, _1{}));
+      make_stride(params.dq_accum_row_stride, _1{}));
 
   Tensor sdQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
                            typename Kernel_traits::SmemLayoutdQ{});
