@@ -205,21 +205,14 @@ def run(
     # warmup
     if dump_memory_snapshot:
         torch.cuda.memory._record_memory_history(max_entries=10000)
-    init_peak_mem = torch.cuda.max_memory_allocated() / 1024**2
     for _ in range(warmup_iters):
         ret_jd = hstu_blocks[0](jagged_input)
         for hstu_layer in hstu_blocks[1:]:
             ret_jd = hstu_layer(ret_jd)
         ret_jd.values.backward(grad_output)
-        if _ == 1:
-            peak_mem = torch.cuda.max_memory_allocated() / 1024**2
-            print(
-                f"[{log_layer_type}] [memory] peak: {peak_mem - init_peak_mem :.4f} MB."
-            )
-
     if dump_memory_snapshot:
         torch.cuda.memory._dump_snapshot(
-            f"{log_layer_type}x{num_layers}_bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_snapshot.pickle"
+            f"{log_layer_type}x{num_layers}_bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_recomputeln{recompute_input_layernorm}_recomputesilu{recompute_input_silu}_snapshot.pickle"
         )
         torch.cuda.memory._record_memory_history(enabled=None)
 
