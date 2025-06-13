@@ -149,9 +149,11 @@ def get_planner(
     data_parallel_embedding_table_names: Set[str],
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
     device: torch.device,
+    allowed_compute_kernels: Dict[str, List[str]] = {},
 ):
     constraints = {}
     for config in eb_configs:
+        compute_kernel_type = allowed_compute_kernels.get(config.name, None)
         if config.name in data_parallel_embedding_table_names:
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[
@@ -161,6 +163,9 @@ def get_planner(
                 use_dynamicemb=False,
             )
         elif config.name in dynamicemb_options_dict:
+            assert (
+                compute_kernel_type is None
+            ), "dynamic embedding should not have compute kernel type"
             dynamicemb_options = dynamicemb_options_dict[config.name]
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[ShardingType.ROW_WISE.value],
@@ -178,6 +183,7 @@ def get_planner(
                 ],
                 bounds_check_mode=BoundsCheckMode.NONE,
                 use_dynamicemb=False,
+                compute_kernels=compute_kernel_type,
             )
         constraints.update({config.name: constraint})
     hbm_cap = torch.cuda.get_device_properties(0).total_memory
@@ -256,6 +262,8 @@ def apply_dmp(
     sparse_optimizer_param: OptimizerParam,
     pg: torch.distributed.ProcessGroup,
     device: torch.device,
+    allowed_compute_kernels: Dict[str, List[str]] = {},
+    enable_prefetch_pipeline: bool = False,
 ):
     optimizer_str = "sgd"
 
@@ -280,7 +288,12 @@ def apply_dmp(
         "beta2": sparse_optimizer_param.adam_beta2,
         "eps": sparse_optimizer_param.adam_eps,
         # 'weight_decay_mode' : WeightDecayMode.NONE,
+        # TODO, expose below params to users
         "output_dtype": SparseType.FP32,
+        # only when compute kernel is FUSED_UVM_CACHING or KEY_VALUE are the below params effective.
+        "cache_precision": SparseType.FP32,
+        "stochastic_rounding": False,
+        "prefetch_pipeline": enable_prefetch_pipeline,
     }
     eb_configs = []
     data_parallel_embedding_table_names = []
@@ -303,6 +316,7 @@ def apply_dmp(
         set(data_parallel_embedding_table_names),
         dynamicemb_options_dict,
         device,
+        allowed_compute_kernels,
     )
     qcomm_codecs_registry = get_qcomm_codecs_registry(
         qcomms_config=QCommsConfig(
@@ -380,6 +394,8 @@ def make_optimizer_and_shard(
     sparse_optimizer_param: OptimizerParam,
     dense_optimizer_param: OptimizerParam,
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {},
+    allowed_compute_kernels: Dict[str, List[str]] = {},
+    enable_prefetch_pipeline: bool = False,
     device: torch.device = None,
     pg: torch.distributed.ProcessGroup = None,
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
@@ -389,7 +405,13 @@ def make_optimizer_and_shard(
         pg = dist.group.WORLD
 
     model = apply_dmp(
-        model, dynamicemb_options_dict, sparse_optimizer_param, pg, device
+        model,
+        dynamicemb_options_dict,
+        sparse_optimizer_param,
+        pg,
+        device,
+        allowed_compute_kernels,
+        enable_prefetch_pipeline,
     )
     model, dense_optimizer = apply_megatron_ddp(
         model, config, dense_optimizer_param, device
