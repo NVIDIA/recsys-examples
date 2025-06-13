@@ -15,6 +15,7 @@
 
 import enum
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import List, Optional, Tuple
@@ -351,6 +352,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 option.init_capacity = option.max_capacity
         self._optimizer_type = optimizer
         self._tables: List[DynamicEmbTable] = []
+        self._host_tables: List[DynamicEmbTable] = []
+        self._caching = self._dynamicemb_options[0].caching
         self._create_tables()
         # add placeholder require_grad param tensor to enable autograd with int8 weights
         # self.placeholder_autograd_tensor = nn.Parameter(
@@ -481,7 +484,39 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                     raise ValueError(
                         f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
                     )
-            self._tables.append(create_dynamicemb_table(option))
+            if option.caching:
+                gpu_option = deepcopy(option)
+                capacity = get_constraint_capacity(
+                    option.local_hbm_for_values,
+                    option.embedding_dtype,
+                    option.dim,
+                    option.optimizer_type,
+                    option.bucket_capacity,
+                )
+                if capacity == 0:
+                    raise ValueError(
+                        "Can't use caching mode as the reserved HBM size is too small."
+                    )
+                if gpu_option.max_capacity > capacity:
+                    gpu_option.init_capacity = capacity
+                    gpu_option.max_capacity = capacity
+                self._tables.append(create_dynamicemb_table(gpu_option))
+                rest_capacity = option.max_capacity - gpu_option.max_capacity
+                host_capacity = (
+                    (rest_capacity + option.bucket_capacity - 1)
+                    // option.bucket_capacity
+                ) * option.bucket_capacity
+                if host_capacity != 0:
+                    host_option = deepcopy(option)
+                    host_option.init_capacity = host_capacity
+                    host_option.max_capacity = host_capacity
+                    host_option.local_hbm_for_values = 0
+                    self._host_tables.append(create_dynamicemb_table(host_option))
+                else:
+                    self._host_tables.append(None)
+            else:
+                self._tables.append(create_dynamicemb_table(option))
+                self._host_tables.append(None)
 
     def _create_optimizer(
         self,
@@ -493,26 +528,35 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 optimizer_args,
                 self._dynamicemb_options,
                 self._tables,
+                self._host_tables,
             )
         elif optimizer_type == EmbOptimType.EXACT_SGD:
             self._optimizer = SGDDynamicEmbeddingOptimizer(
                 optimizer_args,
                 self._dynamicemb_options,
                 self._tables,
+                self._host_tables,
             )
         elif optimizer_type == EmbOptimType.ADAM:
             self._optimizer = AdamDynamicEmbeddingOptimizer(
                 optimizer_args,
                 self._dynamicemb_options,
                 self._tables,
+                self._host_tables,
             )
         elif optimizer_type == EmbOptimType.EXACT_ADAGRAD:
             self._optimizer = AdaGradDynamicEmbeddingOptimizer(
-                optimizer_args, self._dynamicemb_options, self._tables
+                optimizer_args,
+                self._dynamicemb_options,
+                self._tables,
+                self._host_tables,
             )
         elif optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
             self._optimizer = RowWiseAdaGradDynamicEmbeddingOptimizer(
-                optimizer_args, self._dynamicemb_options, self._tables
+                optimizer_args,
+                self._dynamicemb_options,
+                self._tables,
+                self._host_tables,
             )
         else:
             raise ValueError(
@@ -599,6 +643,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self._host_tables if self._caching else None,
                 self._empty_tensor,
             )
         else:

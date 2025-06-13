@@ -524,11 +524,13 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   hkv_table_option_.reserved_key_start_bit = reserved_key_start_bit;
   hkv_table_option_.num_of_buckets_per_alloc = num_of_buckets_per_alloc;
 
-  /// TODO: make HKV's init async.
-  hkv_table_->init(hkv_table_option_);
-  // HKV itself has cuda check, however, it invokes exit() rather than throw
-  // error, so we need to disable the HKV check
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  if (max_capacity != 0) {
+    /// TODO: make HKV's init async.
+    hkv_table_->init(hkv_table_option_);
+    // HKV itself has cuda check, however, it invokes exit() rather than throw
+    // error, so we need to disable the HKV check
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>

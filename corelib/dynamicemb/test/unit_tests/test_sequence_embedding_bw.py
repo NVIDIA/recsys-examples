@@ -112,6 +112,7 @@ def test(args):
             initializer_args=DynamicEmbInitializerArgs(
                 mode=DynamicEmbInitializerMode.DEBUG,
             ),
+            caching=True if args.use_index_dedup else False,
         )
         for num_emb in args.num_embeddings_per_feature
     ]
