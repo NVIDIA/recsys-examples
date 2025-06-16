@@ -37,6 +37,7 @@ from typing import (
     cast,
 )
 
+import nvtx
 import torch
 from commons.utils.distributed_utils import collective_assert
 from megatron.core import parallel_state
@@ -755,30 +756,32 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         self._fill_pipeline(dataloader_iter)
 
         if self._model.training:
-            with record_function("## zero_grad ##"):
+            with nvtx.annotate("## zero_grad ##"):
                 if hasattr(self._model.module, "zero_grad_buffer"):
                     self._model.module.zero_grad_buffer()
                 self._optimizer.zero_grad()
 
-        with record_function("## wait_for_batch ##"):
+        with nvtx.annotate("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
 
-        self._batch_ip2 = self._copy_batch_to_gpu(dataloader_iter)
+        with nvtx.annotate("## copy_batch_to_gpu ##"):
+            self._batch_ip2 = self._copy_batch_to_gpu(dataloader_iter)
 
         self._wait_sparse_data_dist()
         # forward
         reporting_loss = None
-        with record_function("## forward ##"):
+        with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self._batch_i)
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
             local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
             reporting_loss = local_loss.clone().detach()
-        self._prefetch(self._batch_ip1)
+        with nvtx.annotate("## prefetch ##"):
+            self._prefetch(self._batch_ip1)
 
         if self._model.training:
             # backward
-            with record_function("## backward ##"):
+            with nvtx.annotate("## backward ##"):
                 dp_size = parallel_state.get_data_parallel_world_size()
                 local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
                 local_loss_average.backward()
@@ -791,10 +794,11 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
                     finalize_model_grads([self._model.module], None)
 
             # update
-            with record_function("## optimizer ##"):
+            with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
 
-        self._start_sparse_data_dist(self._batch_ip2)
+        with nvtx.annotate("## input_dist ##"):
+            self._start_sparse_data_dist(self._batch_ip2)
 
         self._batch_i = self._batch_ip1
         self._batch_ip1 = self._batch_ip2

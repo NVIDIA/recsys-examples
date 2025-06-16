@@ -15,6 +15,7 @@
 from typing import List, Optional
 
 import torch
+from commons.utils.nvtx_op import output_nvtx_hook
 from megatron.core.transformer.module import MegatronModule
 from modules.utils import init_mlp_weights_optional_bias
 
@@ -70,6 +71,7 @@ class MLP(MegatronModule):
         self._mlp = torch.nn.Sequential(*layers)
         self._mlp.apply(init_mlp_weights_optional_bias)
 
+    @output_nvtx_hook(nvtx_tag="mlp")
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the MLP module.
