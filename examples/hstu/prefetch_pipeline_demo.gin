@@ -22,7 +22,7 @@ BenchmarkDatasetArgs.feature_args = [
 
 item_embedding/EmbeddingArgs.feature_names = ['item']
 item_embedding/EmbeddingArgs.table_name = 'item'
-item_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 50000 # gross 50M embedding rows
+item_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 5000000 # gross 50M embedding rows
 item_embedding/EmbeddingArgs.sharding_type = 'model_parallel'
 item_embedding/EmbeddingArgs.allowed_compute_kernels = ['fused_uvm_caching',"dense"]
 

@@ -32,7 +32,7 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.sharding.dp_sequence_sharding import (
     DpSequenceEmbeddingSharding,
 )
-from torchrec.distributed.types import Awaitable, ParameterSharding, ShardingEnv
+from torchrec.distributed.types import ParameterSharding, ShardingEnv
 from torchrec.distributed.utils import (
     add_params_from_parameter_sharding,
     convert_to_fbgemm_types,
@@ -51,17 +51,6 @@ from torchrec.modules.embedding_modules import (
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.types import ModuleNoCopyMixin
-
-
-class AwaitableEmptyDict(Awaitable):
-    def __init__(self):
-        super().__init__()
-
-    def _wait_impl(self):
-        return {}
-
-
-_aux_awaitable_empty_dict = AwaitableEmptyDict()
 
 
 def _get_mp_embeddings(
