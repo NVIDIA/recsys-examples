@@ -57,6 +57,8 @@ else:
         pass
 
 
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.transformer.module import Float16Module
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.fx.immutable_collections import immutable_dict as fx_immutable_dict
 from torch.fx.immutable_collections import immutable_list as fx_immutable_list
@@ -1046,7 +1048,6 @@ def _get_node_args_helper_inner(
                 num_found += 1
             break
         child_node = arg
-        print(f"child_node: {child_node}, child_node.op: {child_node.op}")
         if child_node.op == "placeholder":
             if hasattr(child_node, "ph_key"):
                 # pyre-ignore[16]
@@ -1456,7 +1457,10 @@ def _rewrite_model(  # noqa C901
     # Get underlying nn.Module
     if isinstance(model, DistributedModelParallel):
         model = model.module
-
+    if isinstance(model, DDP):
+        model = model.module
+    if isinstance(model, Float16Module):
+        model = model.module
     # Collect a list of sharded modules.
     sharded_modules = {}
     for name, m in model.named_modules():
@@ -1493,9 +1497,7 @@ def _rewrite_model(  # noqa C901
     def mod_with_trace():
         tracer = Tracer(leaf_modules=_get_leaf_module_names(model))
         graph = tracer.trace(model, concrete_args=concrete_args)
-        list(graph.nodes)
         graph.print_tabular()
-
         for node in graph.nodes:
             if node.op == "call_module" and node.target in sharded_modules:
                 total_num_args = len(node.args) + len(node.kwargs)
