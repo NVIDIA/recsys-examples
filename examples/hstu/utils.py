@@ -28,7 +28,7 @@ import torch.distributed as dist
 from commons.checkpoint import get_unwrapped_module
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.gpu_timer import GPUTimer
-from commons.utils.logging import print_rank_0
+from commons.utils.logger import print_rank_0
 from commons.utils.stringify import stringify_dict
 from configs import (
     HSTULayerType,
