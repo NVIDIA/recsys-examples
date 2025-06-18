@@ -28,6 +28,10 @@ import torch  # pylint: disable-unused-import
 from configs import RetrievalConfig
 from distributed.sharding import make_optimizer_and_shard
 from model import get_retrieval_model
+from pipeline.train_pipeline import (
+    JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainPipelineSparseDist,
+)
 from utils import (
     NetworkArgs,
     OptimizerArgs,
@@ -42,6 +46,7 @@ from utils import (
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
     train,
+    train_with_pipeline,
 )
 
 
@@ -113,13 +118,32 @@ def main():
         "retrieval", dataset_args, trainer_args, 0
     )
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
-    train(
-        model_train,
-        trainer_args,
-        train_dataloader,
-        test_dataloader,
-        dense_optimizer,
-    )
+    if trainer_args.pipeline_type in ["prefetch", "native"]:
+        pipeline_factory = (
+            JaggedMegatronPrefetchTrainPipelineSparseDist
+            if trainer_args.pipeline_type == "prefetch"
+            else JaggedMegatronTrainPipelineSparseDist
+        )
+        pipeline = pipeline_factory(
+            model_train,
+            dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        train_with_pipeline(
+            pipeline,
+            trainer_args,
+            train_dataloader,
+            test_dataloader,
+            dense_optimizer,
+        )
+    else:
+        train(
+            model_train,
+            trainer_args,
+            train_dataloader,
+            test_dataloader,
+            dense_optimizer,
+        )
     init.destroy_global_state()
 
 

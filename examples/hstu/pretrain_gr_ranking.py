@@ -29,7 +29,10 @@ from commons.utils.logger import print_rank_0
 from configs import RankingConfig
 from distributed.sharding import make_optimizer_and_shard
 from model import get_ranking_model
-from pipeline.train_pipeline import JaggedMegatronPrefetchTrainPipelineSparseDist
+from pipeline.train_pipeline import (
+    JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainPipelineSparseDist,
+)
 from utils import (
     NetworkArgs,
     OptimizerArgs,
@@ -117,6 +120,7 @@ def main():
     compute_kernels = create_embedding_compute_kernels(embedding_args)
 
     optimizer_param = create_optimizer_params(optimizer_args)
+    enable_prefetch_pipeline = trainer_args.pipeline_type == "prefetch"
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
         config=hstu_config,
@@ -124,7 +128,7 @@ def main():
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
         allowed_compute_kernels=compute_kernels,
-        enable_prefetch_pipeline=trainer_args.enable_prefetch_pipeline,
+        enable_prefetch_pipeline=enable_prefetch_pipeline,
     )
     train_dataloader, test_dataloader = get_data_loader(
         "ranking", dataset_args, trainer_args, task_config.num_tasks
@@ -135,8 +139,13 @@ def main():
     )
 
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
-    if trainer_args.enable_prefetch_pipeline:
-        pipeline = JaggedMegatronPrefetchTrainPipelineSparseDist(
+    if trainer_args.pipeline_type in ["prefetch", "native"]:
+        pipeline_factory = (
+            JaggedMegatronPrefetchTrainPipelineSparseDist
+            if trainer_args.pipeline_type == "prefetch"
+            else JaggedMegatronTrainPipelineSparseDist
+        )
+        pipeline = pipeline_factory(
             model_train,
             dense_optimizer,
             device=torch.device("cuda", torch.cuda.current_device()),

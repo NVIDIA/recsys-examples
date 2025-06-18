@@ -9,7 +9,7 @@ TrainerArgs.max_train_iters = 512
 TrainerArgs.max_eval_iters = 16
 
 # Is compatible with any compute kernel!
-TrainerArgs.enable_prefetch_pipeline = True
+TrainerArgs.pipeline_type = "prefetch"
 
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
 item_and_action_feature/FeatureArgs.max_sequence_length = 400

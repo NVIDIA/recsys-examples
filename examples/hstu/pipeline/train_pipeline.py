@@ -727,6 +727,102 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                     ] = self._context.module_contexts.pop(forward._name)
 
 
+class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        execute_all_batches: bool = True,
+        apply_jit: bool = False,
+        # keep for backward compatibility
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+    ) -> None:
+        super().__init__(
+            model,
+            optimizer,
+            device,
+            execute_all_batches,
+            apply_jit,
+            TrainPipelineContext,
+            pipeline_postproc,
+            custom_model_fwd,
+        )
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        """
+        For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
+            batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt (expecting input_dist)
+            batches[1]: next batch, for input_dist (expecting copied to device)
+            batches[2]: i+2 batch, for copy_batch_to_gpu (expecting non-exhausted dataloader iter)
+        """
+
+        # attach the model just in case the user forgets to call it, especially when the user
+        # pauses the pipeline.progress and detach the model for other purpose.
+        if not self._model_attached:
+            self.attach(self._model)
+
+        # fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
+        self.fill_pipeline(dataloader_iter)
+
+        # here is the expected stop after exhausting all batches
+        if not self.batches:
+            raise StopIteration
+
+        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
+        self._set_module_context(self.contexts[0])
+
+        if self._model.training:
+            with nvtx.annotate("## zero_grad ##"):
+                if hasattr(self._model.module, "zero_grad_buffer"):
+                    self._model.module.zero_grad_buffer()
+                self._optimizer.zero_grad()
+
+        # wait for batches[0] being available on device, this should always be completed since
+        # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
+        with nvtx.annotate("## wait_for_batch ##"):
+            self._wait_for_batch()
+
+        if len(self.batches) >= 2:
+            # invoke splits all_to_all comms (first part of input_dist)
+            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+
+        # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
+        with nvtx.annotate("## enqueue_batch ##"):
+            self.enqueue_batch(dataloader_iter)
+
+        # forward
+        with record_function("## forward ##"):
+            losses, output = self._model_fwd(self.batches[0])
+            collective_assert(not torch.isnan(losses).any(), "loss has nan value")
+            local_tokens = torch.tensor(losses.size(0), device=self._device).float()
+            local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
+            reporting_loss = local_loss.clone().detach()
+
+        if len(self.batches) >= 2:
+            # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
+            self.wait_sparse_data_dist(self.contexts[1])
+
+        if self._model.training:
+            # backward
+            with nvtx.annotate("## backward ##"):
+                dp_size = parallel_state.get_data_parallel_world_size()
+                local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
+                local_loss_average.backward()
+                torch.distributed.all_reduce(
+                    reporting_loss, group=parallel_state.get_data_parallel_group()
+                )
+
+            # update
+            with nvtx.annotate("## optimizer ##"):
+                self._optimizer.step()
+        self.dequeue_batch()
+        return reporting_loss, output
+
+
 class JaggedMegatronPrefetchTrainPipelineSparseDist(
     PrefetchTrainPipelineSparseDist[In, Out]
 ):
