@@ -62,7 +62,7 @@ class MultiTaskLossModule(torch.nn.Module):
             self._loss_modules = torch.nn.CrossEntropyLoss(reduction=reduction)
 
     @output_nvtx_hook(nvtx_tag="loss computation")
-    def forward(self, merged_logits, labels):
+    def forward(self, merged_logits, labels) -> torch.Tensor:
         """
         Forward pass of the MultiTaskLossModule.
 

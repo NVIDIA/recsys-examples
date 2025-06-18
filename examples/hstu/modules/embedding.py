@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.fx
 import torch.nn as nn
+from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from configs.task_config import ShardedEmbeddingConfig
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
@@ -56,7 +57,6 @@ from torchrec.types import ModuleNoCopyMixin
 def _get_mp_embeddings(
     mp_collection, kjt: KeyedJaggedTensor
 ) -> Dict[str, JaggedTensor]:
-    """Helper function to get model parallel embeddings safely during tracing."""
     if mp_collection is None:
         return {}
     result = mp_collection(kjt)
@@ -64,12 +64,15 @@ def _get_mp_embeddings(
 
 
 def _get_dp_embeddings(
-    dp_collection, kjt: KeyedJaggedTensor
+    dp_collection, kjt: KeyedJaggedTensor, stream: Optional[torch.cuda.Stream] = None
 ) -> Dict[str, JaggedTensor]:
-    """Helper function to get data parallel embeddings safely during tracing."""
     if dp_collection is None:
         return {}
-    return dp_collection(kjt)
+    with torch.cuda.stream(stream):
+        result = dp_collection(kjt)
+    # wait till the stream is finished
+    torch.cuda.current_stream().wait_stream(stream)
+    return result
 
 
 @torch.fx.wrap
@@ -155,7 +158,6 @@ def create_data_parallel_sharding_infos_by_sharding(
     return sharding_type_to_sharding_infos
 
 
-# To enable pipeline, we need to inherit from ShardedModule
 class DataParallelEmbeddingCollection(torch.nn.Module, ModuleNoCopyMixin):
     """
     Sharded implementation of `EmbeddingCollection`.
@@ -344,8 +346,15 @@ class ShardedEmbedding(torch.nn.Module):
             self._side_stream = torch.cuda.Stream()
         else:
             self._data_parallel_embedding_collection = None
+            self._side_stream = None
 
-    # @output_nvtx_hook(nvtx_tag="ShardedEmbedding", hook_tensor_attr_name="_values")
+        # for nvtx setting, we need to get the tensor from the output dict and set it back to the output dict
+        register_setter_and_getter_for_nvtx(
+            ShardedEmbedding.forward,
+            key_or_attr_name=[embedding_configs[0].feature_names[0], "_values"],
+        )
+
+    @output_nvtx_hook(nvtx_tag="ShardedEmbedding")
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         """
         Forward pass of the sharded embedding module.
@@ -362,7 +371,7 @@ class ShardedEmbedding(torch.nn.Module):
             self._model_parallel_embedding_collection, kjt
         )
         dp_embeddings = _get_dp_embeddings(
-            self._data_parallel_embedding_collection, kjt
+            self._data_parallel_embedding_collection, kjt, stream=self._side_stream
         )
         return _merge_embeddings(mp_embeddings, dp_embeddings)
 
@@ -386,7 +395,7 @@ class ShardedEmbedding(torch.nn.Module):
             >>> from modules.embedding import ShardedEmbedding
             >>> from configs.task_config import ShardedEmbeddingConfig
             >>> from commons.utils.initialize as init
-            >>> from commons.utils.logging import print_rank_0
+            >>> from commons.utils.logger import print_rank_0
             >>> init.initialize_model_parallel(1) # dp size is 1
             >>> config = ShardedEmbeddingConfig(
             ...     feature_names=["test"],

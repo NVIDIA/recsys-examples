@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from functools import partial, wraps
 
 import torch
@@ -42,6 +43,69 @@ def register_nvtx_for_module(module: torch.nn.Module, msg=""):
         partial(backward_nvtx_push_hook, msg=msg + " backward")
     )
     module.register_full_backward_hook(backward_nvtx_pop_hook)
+
+
+# default key_or_attr_name is "data" for tensor
+def hook_setter(x, y, key_or_attr_name=["data"]):
+    if not isinstance(key_or_attr_name, tuple) and not isinstance(
+        key_or_attr_name, list
+    ):
+        key_or_attr_name = [key_or_attr_name]
+
+    leaf_key_or_attr_name = key_or_attr_name[-1]
+    current = x
+
+    access_path = []
+    for key in key_or_attr_name[:-1]:
+        access_path.append(str(key))
+        try:
+            current = current[key]
+        # default path for tensor
+        except (TypeError, KeyError, IndexError):
+            current = getattr(current, key)
+        except AttributeError as e:
+            raise e(f"Error accessing member {access_path} of {x}")
+        except Exception as e:
+            raise e(f"Error accessing member {access_path} of {x}")
+    try:
+        current[leaf_key_or_attr_name] = y
+    # default path for tensor
+    except (TypeError, KeyError, IndexError):
+        setattr(current, leaf_key_or_attr_name, y)
+    except AttributeError as e:
+        raise e(f"Error setting attribute {key_or_attr_name} of {x} to {y}")
+    except Exception as e:
+        raise e(f"Error setting attribute {key_or_attr_name} of {x} to {y}")
+
+
+def hook_getter(x, key_or_attr_name=["data"]):
+    if not isinstance(key_or_attr_name, tuple) and not isinstance(
+        key_or_attr_name, list
+    ):
+        key_or_attr_name = [key_or_attr_name]
+    current = x
+    access_path = []
+    for key in key_or_attr_name:
+        access_path.append(str(key))
+        try:
+            current = current[key]
+        # default path for tensor
+        except (TypeError, KeyError, IndexError):
+            current = getattr(current, key)
+        except AttributeError as e:
+            raise e(f"Error accessing member {access_path} of {x}")
+        except Exception as e:
+            raise e(f"Error accessing member {access_path} of {x}")
+    return current
+
+
+def register_setter_and_getter_for_nvtx(forward_func, key_or_attr_name=["data"]):
+    forward_func.hook_tensor_getter = partial(
+        hook_getter, key_or_attr_name=key_or_attr_name
+    )
+    forward_func.hook_tensor_setter = partial(
+        hook_setter, key_or_attr_name=key_or_attr_name
+    )
 
 
 class _NvtxRangePush(torch.autograd.Function):
@@ -91,7 +155,7 @@ NvtxRangePop = _NvtxRangePop.apply
 binary_identity_op = _binary_identity_op.apply
 
 
-def output_nvtx_hook(nvtx_tag, hook_tensor_attr_name: str = "", backward=True):
+def output_nvtx_hook(nvtx_tag, backward=True, hook_key_or_attr_name="data"):
     def decorator_forward_only(module):
         @wraps(module)
         def forward(*args, **kwags):
@@ -102,36 +166,43 @@ def output_nvtx_hook(nvtx_tag, hook_tensor_attr_name: str = "", backward=True):
 
         return forward
 
-    def jagged_decorator_include_backward(module):
-        @wraps(module)
-        def forward(*args, **kwags):
-            _placeholder = torch.zeros(1, device="cuda").requires_grad_()
+    def decorator_nvtx(module_or_func):
+        @wraps(module_or_func)
+        def wrapper(*args, **kwargs):
+            _placeholder = torch.empty(1, device="cuda").requires_grad_()
             hook_r = NvtxRangePush(_placeholder, nvtx_tag + " forward")
-            output = module(*args, **kwags)
-            hook_l = getattr(output, hook_tensor_attr_name)
-            hook_l, _ = binary_identity_op(hook_l, hook_r)
-            hook_l = NvtxRangePop(hook_l, nvtx_tag + " backward")
-            setattr(output, hook_tensor_attr_name, hook_l)
+            output = module_or_func(*args, **kwargs)
+
+            getter = getattr(
+                wrapper,
+                "hook_tensor_getter",
+                partial(hook_getter, key_or_attr_name=hook_key_or_attr_name),
+            )
+            setter = getattr(
+                wrapper,
+                "hook_tensor_setter",
+                partial(hook_setter, key_or_attr_name=hook_key_or_attr_name),
+            )
+            try:
+                if isinstance(output, torch.Tensor):
+                    hook_l = output
+                else:
+                    hook_l = getter(output)
+                hook_l, _ = binary_identity_op(hook_l, hook_r)
+                hook_l = NvtxRangePop(hook_l, nvtx_tag + " backward")
+                if isinstance(output, torch.Tensor):
+                    output = hook_l
+                else:
+                    setter(output, hook_l)
+            except Exception:
+                # silently ignore
+                NvtxRangePop(hook_r, nvtx_tag + " backward")
             return output
 
-        return forward
-
-    def decorator_include_backward(module):
-        @wraps(module)
-        def forward(*args, **kwags):
-            _placeholder = torch.zeros(1, device="cuda").requires_grad_()
-            hook_r = NvtxRangePush(_placeholder, nvtx_tag + " forward")
-            output = module(*args, **kwags)
-            output, _ = binary_identity_op(output, hook_r)
-            output = NvtxRangePop(output, nvtx_tag + " backward")
-            return output
-
-        return forward
+        return wrapper
 
     if not backward:
         decorator = decorator_forward_only
-    elif hook_tensor_attr_name:
-        decorator = jagged_decorator_include_backward
     else:
-        decorator = decorator_include_backward
+        decorator = decorator_nvtx
     return decorator

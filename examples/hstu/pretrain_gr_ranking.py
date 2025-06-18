@@ -25,7 +25,7 @@ from typing import List, Tuple, cast
 import commons.utils.initialize as init
 import gin
 import torch  # pylint: disable-unused-import
-from commons.utils.logging import print_rank_0
+from commons.utils.logger import print_rank_0
 from configs import RankingConfig
 from distributed.sharding import make_optimizer_and_shard
 from model import get_ranking_model
