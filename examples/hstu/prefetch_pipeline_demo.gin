@@ -8,7 +8,7 @@ TrainerArgs.profile_step_end = 80
 TrainerArgs.max_train_iters = 512
 TrainerArgs.max_eval_iters = 16
 
-TrainerArgs.pipeline_type = "none" # none, native, prefetch
+TrainerArgs.pipeline_type = "prefetch" # none, native, prefetch
 
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
 item_and_action_feature/FeatureArgs.max_sequence_length = 400
