@@ -23,7 +23,11 @@ import torch
 import torch.distributed as dist
 from commons.utils.distributed_utils import collective_assert
 from megatron.core.distributed import finalize_model_grads
-from pipeline.train_pipeline import JaggedMegatronTrainPipelineSparseDist, NoPipeline
+from pipeline.train_pipeline import (
+    JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainNonePipeline,
+    JaggedMegatronTrainPipelineSparseDist,
+)
 from test_utils import create_model
 
 
@@ -95,21 +99,28 @@ def test_pipeline(
         shutil.rmtree(save_path)
     dist.barrier(device_ids=[torch.cuda.current_device()])
 
-    no_pipeline = NoPipeline(
+    no_pipeline = JaggedMegatronTrainNonePipeline(
         model,
         dense_optimizer,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
-    native_pipeline = JaggedMegatronTrainPipelineSparseDist(
-        pipelined_model,
-        pipelined_dense_optimizer,
-        device=torch.device("cuda", torch.cuda.current_device()),
-    )
+    if pipeline_type == "native":
+        target_pipeline = JaggedMegatronTrainPipelineSparseDist(
+            pipelined_model,
+            pipelined_dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    else:
+        target_pipeline = JaggedMegatronPrefetchTrainPipelineSparseDist(
+            pipelined_model,
+            pipelined_dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
     iter_history_batches = iter(history_batches)
     no_pipeline_batches = iter(history_batches)
     for i, batch in enumerate(history_batches):
         reporting_loss, (_, logits, _) = no_pipeline.progress(no_pipeline_batches)
-        pipelined_reporting_loss, (_, pipelined_logits, _) = native_pipeline.progress(
+        pipelined_reporting_loss, (_, pipelined_logits, _) = target_pipeline.progress(
             iter_history_batches
         )
         collective_assert(

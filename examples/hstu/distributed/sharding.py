@@ -153,7 +153,7 @@ def get_planner(
 ):
     constraints = {}
     for config in eb_configs:
-        compute_kernel_type = allowed_compute_kernels.get(config.name, None)
+        compute_kernel_type = allowed_compute_kernels.get(config.name, [])
         if config.name in data_parallel_embedding_table_names:
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[
@@ -164,7 +164,7 @@ def get_planner(
             )
         elif config.name in dynamicemb_options_dict:
             assert (
-                compute_kernel_type is None
+                len(compute_kernel_type) == 0
             ), "dynamic embedding should not have compute kernel type"
             dynamicemb_options = dynamicemb_options_dict[config.name]
             constraint = DynamicEmbParameterConstraints(

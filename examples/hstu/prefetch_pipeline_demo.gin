@@ -1,14 +1,14 @@
 TrainerArgs.train_batch_size = 32
 TrainerArgs.eval_batch_size = 32
 TrainerArgs.log_interval = 50
-TrainerArgs.eval_interval = 5000
+TrainerArgs.eval_interval = 500
 TrainerArgs.profile = True
 TrainerArgs.profile_step_start = 50
 TrainerArgs.profile_step_end = 80
 TrainerArgs.max_train_iters = 512
 TrainerArgs.max_eval_iters = 16
 
-TrainerArgs.pipeline_type = "native"
+TrainerArgs.pipeline_type = "none" # none, native, prefetch
 
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
 item_and_action_feature/FeatureArgs.max_sequence_length = 400

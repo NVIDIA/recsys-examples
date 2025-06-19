@@ -28,12 +28,15 @@ import torch  # pylint: disable-unused-import
 from commons.utils.logger import print_rank_0
 from configs import RankingConfig
 from distributed.sharding import make_optimizer_and_shard
+from megatron.core import parallel_state
 from model import get_ranking_model
+from modules.metrics import get_multi_event_metric_module
 from pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
 )
-from utils import (
+from training import (
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
@@ -46,7 +49,6 @@ from utils import (
     get_data_loader,
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
-    train,
     train_with_pipeline,
 )
 
@@ -132,6 +134,16 @@ def main():
         allowed_compute_kernels=compute_kernels,
         enable_prefetch_pipeline=enable_prefetch_pipeline,
     )
+
+    stateful_metric_module = get_multi_event_metric_module(
+        num_classes=task_config.prediction_head_arch[-1],
+        num_tasks=task_config.num_tasks,
+        metric_types=task_config.eval_metrics,
+        comm_pg=parallel_state.get_data_parallel_group(
+            with_context_parallel=True
+        ),  # ranks in the same TP group do the same compute
+    )
+
     train_dataloader, test_dataloader = get_data_loader(
         "ranking", dataset_args, trainer_args, task_config.num_tasks
     )
@@ -152,21 +164,20 @@ def main():
             dense_optimizer,
             device=torch.device("cuda", torch.cuda.current_device()),
         )
-        train_with_pipeline(
-            pipeline,
-            trainer_args,
-            train_dataloader,
-            test_dataloader,
-            dense_optimizer,
-        )
     else:
-        train(
+        pipeline = JaggedMegatronTrainNonePipeline(
             model_train,
-            trainer_args,
-            train_dataloader,
-            test_dataloader,
             dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
         )
+    train_with_pipeline(
+        pipeline,
+        stateful_metric_module,
+        trainer_args,
+        train_dataloader,
+        test_dataloader,
+        dense_optimizer,
+    )
     init.destroy_global_state()
 
 
