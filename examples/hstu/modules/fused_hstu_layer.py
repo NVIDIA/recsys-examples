@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
-from commons.utils.nvtx_op import output_nvtx_hook
+from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
 from megatron.core.transformer.module import MegatronModule
@@ -115,8 +115,12 @@ class FusedHSTULayer(MegatronModule):
         self._recompute_input_layernorm = config.recompute_input_layernorm
         self._recompute_input_silu = config.recompute_input_silu
         torch.nn.init.xavier_uniform_(self._linear_proj_weight)
+        # nvtx setting
+        register_setter_and_getter_for_nvtx(
+            FusedHSTULayer.forward, key_or_attr_name="values"
+        )
 
-    @output_nvtx_hook(nvtx_tag="FusedHSTULayer", hook_tensor_attr_name="values")
+    @output_nvtx_hook(nvtx_tag="FusedHSTULayer")
     def forward(self, jd: JaggedData) -> JaggedData:
         input = jd.values
         output = fused_hstu_op(

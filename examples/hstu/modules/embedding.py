@@ -20,7 +20,9 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.fx
 import torch.nn as nn
+from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from configs.task_config import ShardedEmbeddingConfig
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
@@ -49,6 +51,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from torchrec.types import ModuleNoCopyMixin
 
 
 def create_data_parallel_sharding_infos_by_sharding(
@@ -126,7 +129,7 @@ def create_data_parallel_sharding_infos_by_sharding(
     return sharding_type_to_sharding_infos
 
 
-class DataParallelEmbeddingCollection(torch.nn.Module):
+class DataParallelEmbeddingCollection(torch.nn.Module, ModuleNoCopyMixin):
     """
     Sharded implementation of `EmbeddingCollection`.
     This is part of the public API to allow for manual data dist pipelining.
@@ -240,6 +243,7 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
         )
         self._feature_splits = [len(self._feature_names)]
 
+    # return Tensor! Not awaitable!
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys())
@@ -298,22 +302,34 @@ class ShardedEmbedding(torch.nn.Module):
             else:
                 model_parallel_embedding_configs.append(config)
 
-        self._model_parallel_embedding_collection = create_embedding_collection(
-            configs=model_parallel_embedding_configs
+        self._model_parallel_embedding_collection = (
+            create_embedding_collection(configs=model_parallel_embedding_configs)
+            if len(model_parallel_embedding_configs) > 0
+            else None
         )
 
         if len(data_parallel_embedding_configs) > 0:
-            self._data_parallel_embedding_collection = create_embedding_collection(
-                configs=data_parallel_embedding_configs
+            self._data_parallel_embedding_collection = (
+                create_embedding_collection(configs=data_parallel_embedding_configs)
+                if len(data_parallel_embedding_configs) > 0
+                else None
             )
             self._side_stream = torch.cuda.Stream()
         else:
             self._data_parallel_embedding_collection = None
+            self._side_stream = None
 
-    # @output_nvtx_hook(nvtx_tag="ShardedEmbedding", hook_tensor_attr_name="_values")
+        # for nvtx setting, we need to get the tensor from the output dict and set it back to the output dict
+        register_setter_and_getter_for_nvtx(
+            ShardedEmbedding.forward,
+            key_or_attr_name=[embedding_configs[0].feature_names[0], "_values"],
+        )
+
+    @output_nvtx_hook(nvtx_tag="ShardedEmbedding")
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         """
         Forward pass of the sharded embedding module.
+        Must be symbolic-traceable!
 
         Args:
             kjt (`KeyedJaggedTensor <https://pytorch.org/torchrec/concepts.html#keyedjaggedtensor>`): The input tokens.
@@ -351,7 +367,7 @@ class ShardedEmbedding(torch.nn.Module):
             >>> from modules.embedding import ShardedEmbedding
             >>> from configs.task_config import ShardedEmbeddingConfig
             >>> from commons.utils.initialize as init
-            >>> from commons.utils.logging import print_rank_0
+            >>> from commons.utils.logger import print_rank_0
             >>> init.initialize_model_parallel(1) # dp size is 1
             >>> config = ShardedEmbeddingConfig(
             ...     feature_names=["test"],

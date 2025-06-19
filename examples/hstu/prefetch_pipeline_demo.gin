@@ -1,0 +1,61 @@
+TrainerArgs.train_batch_size = 32
+TrainerArgs.eval_batch_size = 32
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 500
+TrainerArgs.profile = True
+TrainerArgs.profile_step_start = 50
+TrainerArgs.profile_step_end = 80
+TrainerArgs.max_train_iters = 512
+TrainerArgs.max_eval_iters = 16
+
+TrainerArgs.pipeline_type = "prefetch" # none, native, prefetch
+
+item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
+item_and_action_feature/FeatureArgs.max_sequence_length = 400
+# if False, the generated sequence length per user is fixed to max_sequence_length
+item_and_action_feature/FeatureArgs.is_jagged = False
+
+BenchmarkDatasetArgs.feature_args = [
+    @item_and_action_feature/FeatureArgs(),
+]
+
+item_embedding/EmbeddingArgs.feature_names = ['item']
+item_embedding/EmbeddingArgs.table_name = 'item'
+item_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 5000000 # gross 50M embedding rows
+item_embedding/EmbeddingArgs.sharding_type = 'model_parallel' # when pipeline_type is prefetch, the compute kernel is fused_uvm_caching
+
+action_embedding/EmbeddingArgs.feature_names = ['action']
+action_embedding/EmbeddingArgs.table_name = 'action'
+action_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 100
+action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
+
+BenchmarkDatasetArgs.embedding_args = [
+    @item_embedding/EmbeddingArgs(),
+    @action_embedding/EmbeddingArgs(),
+]
+
+BenchmarkDatasetArgs.item_feature_name='item'
+BenchmarkDatasetArgs.contextual_feature_names=[]
+BenchmarkDatasetArgs.action_feature_name='action'
+BenchmarkDatasetArgs.max_num_candidates=0
+
+NetworkArgs.num_layers = 2
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 1024
+# per head dim
+NetworkArgs.kv_channels = 256
+NetworkArgs.kernel_backend = 'cutlass'
+NetworkArgs.layer_type = 'fused'
+
+# recompute can incurs perf regression, but save memory
+NetworkArgs.recompute_input_layernorm = True
+
+RankingArgs.prediction_head_arch = [
+    512, 8,
+]
+RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 8
+
+OptimizerArgs.optimizer_str = 'adam'
+OptimizerArgs.learning_rate = 1e-3
+

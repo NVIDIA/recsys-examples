@@ -28,19 +28,26 @@ import torch  # pylint: disable-unused-import
 from configs import RetrievalConfig
 from distributed.sharding import make_optimizer_and_shard
 from model import get_retrieval_model
-from utils import (
+from modules.metrics import RetrievalTaskMetricWithSampling
+from pipeline.train_pipeline import (
+    JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainNonePipeline,
+    JaggedMegatronTrainPipelineSparseDist,
+)
+from training import (
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
     TrainerArgs,
     create_dynamic_optitons_dict,
+    create_embedding_compute_kernels,
     create_embedding_config,
     create_hstu_config,
     create_optimizer_params,
     get_data_loader,
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
-    train,
+    train_with_pipeline,
 )
 
 
@@ -97,20 +104,45 @@ def main():
         embedding_args, network_args.hidden_size
     )
     optimizer_param = create_optimizer_params(optimizer_args)
+    compute_kernels = create_embedding_compute_kernels(
+        embedding_args, trainer_args.pipeline_type
+    )
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
         config=hstu_config,
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
+        allowed_compute_kernels=compute_kernels,
+        enable_prefetch_pipeline=trainer_args.pipeline_type == "prefetch",
     )
-
+    stateful_metric_module = RetrievalTaskMetricWithSampling(
+        metric_types=task_config.eval_metrics, MAX_K=500
+    )
     train_dataloader, test_dataloader = get_data_loader(
         "retrieval", dataset_args, trainer_args, 0
     )
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
-    train(
-        model_train,
+    if trainer_args.pipeline_type in ["prefetch", "native"]:
+        pipeline_factory = (
+            JaggedMegatronPrefetchTrainPipelineSparseDist
+            if trainer_args.pipeline_type == "prefetch"
+            else JaggedMegatronTrainPipelineSparseDist
+        )
+        pipeline = pipeline_factory(
+            model_train,
+            dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    else:
+        pipeline = JaggedMegatronTrainNonePipeline(
+            model_train,
+            dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    train_with_pipeline(
+        pipeline,
+        stateful_metric_module,  # no stateful_metric_module
         trainer_args,
         train_dataloader,
         test_dataloader,

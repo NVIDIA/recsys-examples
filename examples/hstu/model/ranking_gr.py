@@ -12,11 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections import OrderedDict
 from typing import Tuple
 
 import torch
-from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RankingConfig
 from dataset.utils import RankingBatch
 from megatron.core import parallel_state
@@ -125,7 +123,6 @@ class RankingGR(BaseModel):
 
         return self._mlp(hidden_states.values), batch.labels
 
-    @output_nvtx_hook(nvtx_tag="RankingModel", backward=False)
     def forward(  # type: ignore[override]
         self,
         batch: RankingBatch,
@@ -146,24 +143,3 @@ class RankingGR(BaseModel):
             jagged_item_logit.detach(),
             labels.detach(),
         )
-
-    def evaluate_one_batch(self, batch: RankingBatch) -> None:
-        """
-        Evaluate one batch of data.
-
-        Args:
-            batch (RankingBatch): The batch of ranking data.
-        """
-        with torch.no_grad():
-            jagged_item_logit, redistributed_labels = self.get_logit_and_labels(batch)
-            self._metric_module(jagged_item_logit.float(), redistributed_labels)
-
-    def compute_metric(self) -> "OrderedDict":
-        """
-        Compute the evaluation metrics.
-
-        Returns:
-            OrderedDict: The computed metrics.
-        """
-        ret_dict = self._metric_module.compute()
-        return ret_dict

@@ -57,8 +57,9 @@ class HSTUBlock(MegatronModule):
         self._attention_layers = torch.nn.ModuleList(
             [HSTULayerImpl(config) for l in range(self.config.num_layers)]
         )
+        self._dropout_ratio = config.hidden_dropout
 
-    @output_nvtx_hook(nvtx_tag="hstu_preprocess")
+    @output_nvtx_hook(nvtx_tag="HSTUBlock preprocess", hook_key_or_attr_name="values")
     def hstu_preprocess(
         self, embeddings: Dict[str, JaggedTensor], batch: RankingBatch
     ) -> JaggedData:
@@ -153,7 +154,7 @@ class HSTUBlock(MegatronModule):
 
         sequence_embeddings = torch.nn.functional.dropout(
             sequence_embeddings,
-            p=0.2,
+            p=self._dropout_ratio,
             training=self.training,
         )
         return JaggedData(
@@ -182,7 +183,7 @@ class HSTUBlock(MegatronModule):
             has_interleaved_action=batch.action_feature_name is not None,
         )
 
-    @output_nvtx_hook(nvtx_tag="hstu_postprocess")
+    @output_nvtx_hook(nvtx_tag="HSTUBlock postprocess", hook_key_or_attr_name="values")
     def hstu_postprocess(self, jd: JaggedData) -> JaggedData:
         """
         Postprocess the output from the HSTU architecture.
@@ -239,7 +240,7 @@ class HSTUBlock(MegatronModule):
             has_interleaved_action=False,
         )
 
-    @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_tensor_attr_name="values")
+    @output_nvtx_hook(nvtx_tag="HSTUBlock", hook_key_or_attr_name="values")
     def forward(
         self,
         embeddings: Dict[str, JaggedTensor],
