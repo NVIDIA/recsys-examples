@@ -57,6 +57,7 @@ class HSTUBlock(MegatronModule):
         self._attention_layers = torch.nn.ModuleList(
             [HSTULayerImpl(config) for l in range(self.config.num_layers)]
         )
+        self._dropout_ratio = config.hidden_dropout
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock preprocess", hook_key_or_attr_name="values")
     def hstu_preprocess(
@@ -153,7 +154,7 @@ class HSTUBlock(MegatronModule):
 
         sequence_embeddings = torch.nn.functional.dropout(
             sequence_embeddings,
-            p=0.2,
+            p=self._dropout_ratio,
             training=self.training,
         )
         return JaggedData(

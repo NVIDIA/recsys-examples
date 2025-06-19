@@ -117,7 +117,9 @@ def main():
     dynamic_options_dict = create_dynamic_optitons_dict(
         embedding_args, network_args.hidden_size
     )
-    compute_kernels = create_embedding_compute_kernels(embedding_args)
+    compute_kernels = create_embedding_compute_kernels(
+        embedding_args, trainer_args.pipeline_type
+    )
 
     optimizer_param = create_optimizer_params(optimizer_args)
     enable_prefetch_pipeline = trainer_args.pipeline_type == "prefetch"

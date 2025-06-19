@@ -54,35 +54,6 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.types import ModuleNoCopyMixin
 
 
-def _get_mp_embeddings(
-    mp_collection, kjt: KeyedJaggedTensor
-) -> Dict[str, JaggedTensor]:
-    if mp_collection is None:
-        return {}
-    result = mp_collection(kjt)
-    return result.wait()
-
-
-def _get_dp_embeddings(
-    dp_collection, kjt: KeyedJaggedTensor, stream: Optional[torch.cuda.Stream] = None
-) -> Dict[str, JaggedTensor]:
-    if dp_collection is None:
-        return {}
-    with torch.cuda.stream(stream):
-        result = dp_collection(kjt)
-    # wait till the stream is finished
-    torch.cuda.current_stream().wait_stream(stream)
-    return result
-
-
-@torch.fx.wrap
-def _merge_embeddings(
-    mp_embeddings: Dict[str, JaggedTensor], dp_embeddings: Dict[str, JaggedTensor]
-) -> Dict[str, JaggedTensor]:
-    """Helper function to merge embeddings safely during tracing."""
-    return {**mp_embeddings, **dp_embeddings}
-
-
 def create_data_parallel_sharding_infos_by_sharding(
     module: EmbeddingCollectionInterface,
     table_name_to_parameter_sharding: Dict[str, ParameterSharding],
@@ -366,14 +337,15 @@ class ShardedEmbedding(torch.nn.Module):
         Returns:
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
-        # Use wrapped helper functions for better traceability
-        mp_embeddings = _get_mp_embeddings(
-            self._model_parallel_embedding_collection, kjt
-        )
-        dp_embeddings = _get_dp_embeddings(
-            self._data_parallel_embedding_collection, kjt, stream=self._side_stream
-        )
-        return _merge_embeddings(mp_embeddings, dp_embeddings)
+        mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+        if self._data_parallel_embedding_collection is not None:
+            with torch.cuda.stream(self._side_stream):
+                dp_embeddings = self._data_parallel_embedding_collection(kjt)
+            torch.cuda.current_stream().wait_stream(self._side_stream)
+            embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
+        else:
+            embeddings = mp_embeddings_awaitables.wait()
+        return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
         """

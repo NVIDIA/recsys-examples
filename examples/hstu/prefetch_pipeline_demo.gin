@@ -8,8 +8,7 @@ TrainerArgs.profile_step_end = 80
 TrainerArgs.max_train_iters = 512
 TrainerArgs.max_eval_iters = 16
 
-# Is compatible with any compute kernel!
-TrainerArgs.pipeline_type = "prefetch"
+TrainerArgs.pipeline_type = "native"
 
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
 item_and_action_feature/FeatureArgs.max_sequence_length = 400
@@ -23,14 +22,12 @@ BenchmarkDatasetArgs.feature_args = [
 item_embedding/EmbeddingArgs.feature_names = ['item']
 item_embedding/EmbeddingArgs.table_name = 'item'
 item_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 5000000 # gross 50M embedding rows
-item_embedding/EmbeddingArgs.sharding_type = 'model_parallel'
-item_embedding/EmbeddingArgs.allowed_compute_kernels = ['fused_uvm_caching',"dense"]
+item_embedding/EmbeddingArgs.sharding_type = 'model_parallel' # when pipeline_type is prefetch, the compute kernel is fused_uvm_caching
 
 action_embedding/EmbeddingArgs.feature_names = ['action']
 action_embedding/EmbeddingArgs.table_name = 'action'
 action_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 100
 action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
-action_embedding/EmbeddingArgs.allowed_compute_kernels = ['fused','dense'] # HBM-only
 
 BenchmarkDatasetArgs.embedding_args = [
     @item_embedding/EmbeddingArgs(),

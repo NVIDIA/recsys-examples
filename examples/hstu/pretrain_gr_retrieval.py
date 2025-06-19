@@ -103,7 +103,9 @@ def main():
         embedding_args, network_args.hidden_size
     )
     optimizer_param = create_optimizer_params(optimizer_args)
-    compute_kernels = create_embedding_compute_kernels(embedding_args)
+    compute_kernels = create_embedding_compute_kernels(
+        embedding_args, trainer_args.pipeline_type
+    )
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
         config=hstu_config,
