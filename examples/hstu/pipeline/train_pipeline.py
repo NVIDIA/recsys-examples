@@ -786,16 +786,17 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         with nvtx.annotate("## wait_for_batch ##"):
             self._wait_for_batch()
 
-        if len(self.batches) >= 2:
-            # invoke splits all_to_all comms (first part of input_dist)
-            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+        with nvtx.annotate("## start_sparse_data_dist ##"):
+            if len(self.batches) >= 2:
+                # invoke splits all_to_all comms (first part of input_dist)
+                self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
         # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
         with nvtx.annotate("## enqueue_batch ##"):
             self.enqueue_batch(dataloader_iter)
 
         # forward
-        with record_function("## forward ##"):
+        with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self.batches[0])
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
@@ -862,8 +863,8 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
 
         with nvtx.annotate("## copy_batch_to_gpu ##"):
             self._batch_ip2 = self._copy_batch_to_gpu(dataloader_iter)
-
-        self._wait_sparse_data_dist()
+        with nvtx.annotate("## wait_sparse_data_dist ##"):
+            self._wait_sparse_data_dist()
         # forward
         reporting_loss = None
         with nvtx.annotate("## forward ##"):
@@ -898,5 +899,54 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
 
         self._batch_i = self._batch_ip1
         self._batch_ip1 = self._batch_ip2
+
+        return reporting_loss, output
+
+
+class NoPipeline:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+    ):
+        self._model = model
+        self._optimizer = optimizer
+        self._device = device
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        dp_size = parallel_state.get_data_parallel_world_size() * 1.0
+        with nvtx.annotate("## zero_grad ##"):
+            if hasattr(self._model.module, "zero_grad_buffer"):
+                self._model.module.zero_grad_buffer()
+            self._optimizer.zero_grad()
+        with nvtx.annotate("## H2D ##"):
+            batch = next(dataloader_iter).to(self._device)
+            # print(f'nopipeline batch.features: {batch.features.values()}')
+
+        with nvtx.annotate("## forward ##"):
+            losses, output = self._model(batch)
+
+        with nvtx.annotate("## loss postprocess ##"):
+            local_tokens = torch.tensor(
+                losses.size(0), device=torch.device("cuda", torch.cuda.current_device())
+            ).float()
+            local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
+            reporting_loss = local_loss.clone().detach()
+            # [allreduced_sum_loss, allreduced_sum_tokens]
+            torch.distributed.all_reduce(
+                reporting_loss, group=parallel_state.get_data_parallel_group()
+            )
+        if self._model.training:
+            with nvtx.annotate("## backward ##"):
+                local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
+                local_loss_average.backward()
+
+            with nvtx.annotate("## finalize_model_grads ##"):
+                if isinstance(self._model.module, DistributedDataParallel):
+                    finalize_model_grads([self._model.module], None)
+
+            with nvtx.annotate("## optimizer step ##"):
+                self._optimizer.step()
 
         return reporting_loss, output

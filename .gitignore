@@ -19,6 +19,7 @@ ckpt
 *.npy
 *.npz
 tmp/
+tmp_data
 gr_checkpoint
 _build/
 version.py

@@ -30,7 +30,6 @@ std::shared_ptr<DynamicVariableBase> VariableFactory::create(
     const OptimizerType optimizer_type = OptimizerType::Null) {
   // TODO:check input datetype , now only support key type is int64_t uint64_t ,
   // value type float
-  printf("create dynamic variable base\n");
   std::shared_ptr<DynamicVariableBase> table;
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, key_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, value_t, [&] {

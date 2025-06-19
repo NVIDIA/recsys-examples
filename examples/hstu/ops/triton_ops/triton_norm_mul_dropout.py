@@ -81,19 +81,19 @@ def _ln_mul_dropout_fwd(
         if CONCAT_UX:
             # apply dropout on u
             random_u = tl.rand(seed, random_offsets)
-            u_keep = random_u > dropout_ratio
+            u_keep = (random_u > dropout_ratio) | (dropout_ratio == 0.0)
             u = tl.where(u_keep, u / (1.0 - dropout_ratio), 0.0)
             # apply dropout on x
             random_x = tl.rand(seed, random_offsets + D)
-            x_keep = random_x > dropout_ratio
+            x_keep = (random_x > dropout_ratio) | (dropout_ratio == 0.0)
             x = tl.where(x_keep, x / (1.0 - dropout_ratio), 0.0)
             # apply dropout on y
             random_y = tl.rand(seed, random_offsets + 2 * D)
-            y_keep = random_y > dropout_ratio
+            y_keep = (random_y > dropout_ratio) | (dropout_ratio == 0.0)
             y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
         else:
             random = tl.rand(seed, random_offsets)
-            y_keep = random > dropout_ratio
+            y_keep = (random > dropout_ratio) | (dropout_ratio == 0.0)
             # write-back
             y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
 
@@ -175,19 +175,19 @@ def _ln_mul_dropout_bwd_dx_du(
             if CONCAT_UX:
                 # apply dropout on du
                 random_du = tl.rand(seed, random_offsets)
-                du_keep = random_du > dropout_ratio
+                du_keep = (random_du > dropout_ratio) | (dropout_ratio == 0.0)
                 du = tl.where(du_keep, du / (1.0 - dropout_ratio), 0.0)
                 # apply dropout on dx
                 random_dx = tl.rand(seed, random_offsets + D)
-                dx_keep = random_dx > dropout_ratio
+                dx_keep = (random_dx > dropout_ratio) | (dropout_ratio == 0.0)
                 dx = tl.where(dx_keep, dx / (1.0 - dropout_ratio), 0.0)
                 # apply dropout on dy
                 random_dy = tl.rand(seed, random_offsets + 2 * D)
-                dy_keep = random_dy > dropout_ratio
+                dy_keep = (random_dy > dropout_ratio) | (dropout_ratio == 0.0)
                 dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
             else:
                 random = tl.rand(seed, random_offsets)
-                dy_keep = random > dropout_ratio
+                dy_keep = (random > dropout_ratio) | (dropout_ratio == 0.0)
                 # write-back
                 dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
 
@@ -602,20 +602,20 @@ def _group_norm_mul_dropout_fwd(
             random_offsets = row * 3 * D * Heads + offsets
             # apply dropout on u
             random_u = tl.rand(seed, random_offsets)
-            u_keep = random_u > dropout_ratio
+            u_keep = (random_u > dropout_ratio) | (dropout_ratio == 0.0)
             u = tl.where(u_keep, u / (1.0 - dropout_ratio), 0.0)
             # apply dropout on x
             random_x = tl.rand(seed, random_offsets + Heads * D)
-            x_keep = random_x > dropout_ratio
+            x_keep = (random_x > dropout_ratio) | (dropout_ratio == 0.0)
             x = tl.where(x_keep, x / (1.0 - dropout_ratio), 0.0)
             # apply dropout on y
             random_y = tl.rand(seed, random_offsets + 2 * Heads * D)
-            y_keep = random_y > dropout_ratio
+            y_keep = (random_y > dropout_ratio) | (dropout_ratio == 0.0)
             y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
         else:
             random_offsets = row * D * Heads + offsets
             random = tl.rand(seed, random_offsets)
-            y_keep = random > dropout_ratio
+            y_keep = (random > dropout_ratio) | (dropout_ratio == 0.0)
             # write-back
             y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
 
@@ -688,20 +688,20 @@ def _group_norm_mul_dropout_bwd_dx_du(
             random_offsets = row * 3 * D * Heads + offsets
             # apply dropout on du
             random_du = tl.rand(seed, random_offsets)
-            du_keep = random_du > dropout_ratio
+            du_keep = (random_du > dropout_ratio) | (dropout_ratio == 0.0)
             du = tl.where(du_keep, du / (1.0 - dropout_ratio), 0.0)
             # apply dropout on dx
             random_dx = tl.rand(seed, random_offsets + Heads * D)
-            dx_keep = random_dx > dropout_ratio
+            dx_keep = (random_dx > dropout_ratio) | (dropout_ratio == 0.0)
             dx = tl.where(dx_keep, dx / (1.0 - dropout_ratio), 0.0)
             # apply dropout on dy
             random_dy = tl.rand(seed, random_offsets + 2 * Heads * D)
-            dy_keep = random_dy > dropout_ratio
+            dy_keep = (random_dy > dropout_ratio) | (dropout_ratio == 0.0)
             dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
         else:
             random_offsets = row * D * Heads + offsets
             random = tl.rand(seed, random_offsets)
-            dy_keep = random > dropout_ratio
+            dy_keep = (random > dropout_ratio) | (dropout_ratio == 0.0)
             # write-back
             dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
 

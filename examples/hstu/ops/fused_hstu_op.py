@@ -420,6 +420,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             tv = tv.view(-1, num_heads, linear_dim_per_head)
             tq = tq.view(-1, num_heads, attention_dim_per_head)
             tk = tk.view(-1, num_heads, attention_dim_per_head)
+
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 # attn_output: [T, num_heads * attention_dim_per_head]
