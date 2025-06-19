@@ -834,5 +834,455 @@ __global__ void update_kernel_v2(const uint32_t num_keys, const uint32_t dim, co
   }
 }
 
+template <typename grad_t, typename emb_t> struct OptimizierInputV3 {
+  const grad_t* grad_;
+  const emb_t* emb_;
+  emb_t* table_vector_;
+  const uint32_t dim;
+  bool initialized;
+  emb_t* output_buffer;
+
+  DEVICE_INLINE const grad_t* grad_ptr() const {
+    return grad_;
+  }
+
+  DEVICE_INLINE const emb_t* emb_input_ptr() const {
+    return emb_;
+  }
+
+  DEVICE_INLINE emb_t* emb_output_ptr() const {
+    return output_buffer;
+  }
+
+  DEVICE_INLINE bool state_initialized() const {
+    return initialized;
+  }
+
+  DEVICE_INLINE emb_t* state_input_ptr() const {
+    return table_vector_ + dim;
+  }
+
+  DEVICE_INLINE emb_t* state_output_ptr() const {
+    return output_buffer + dim;
+  }
+};
+
+template <typename grad_t, typename emb_t, int kWarpSize = 32>
+struct SgdVecOptimizerV3 {
+  const float lr;
+
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update4(
+      const OptimizierInput &input) {
+
+    constexpr int VecSize = 4;
+    const int lane_id = threadIdx.x % kWarpSize;
+
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < input.dim;
+         ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      Vec4T<grad_t> grad_vec;
+      Vec4T<float> weight_vec;
+      grad_vec.load(input.grad_ptr() + idx4);
+      weight_vec.load(input.emb_input_ptr() + idx4);
+      weight_vec.accumulate_multiply(grad_vec, -lr);
+      weight_vec.store(input.emb_output_ptr() + idx4);
+    }
+  }
+
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update(
+      const OptimizierInput &input) {
+
+    for (int i = threadIdx.x; i < input.dim; i += blockDim.x) {
+      grad_t tmp_grad = input.grad_ptr()[i];
+      float tmp_weight = input.emb_input_ptr()[i];
+      tmp_weight -= ((float)(tmp_grad)*lr);
+      input.emb_output_ptr()[i] = TypeConvertFunc<emb_t, float>::convert(tmp_weight);
+    }
+  }
+};
+
+template <typename grad_t, typename emb_t, int kWarpSize = 32>
+struct AdamVecOptimizerV3 {
+  const float lr;
+  const float beta1;
+  const float beta2;
+  const float eps;
+  const float weight_decay;
+  const uint32_t iter_num;
+
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update4(
+      const OptimizierInput &input) {
+
+    constexpr int VecSize = 4;
+    const int lane_id = threadIdx.x % kWarpSize;
+
+    Vec4T<float> weight_vec;
+    Vec4T<float> m_vec;
+    Vec4T<float> v_vec;
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < input.dim; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      weight_vec.load(input.emb_input_ptr() + idx4);
+      if (input.state_initialized()) {
+        m_vec.load(input.state_input_ptr() + idx4); // m_ptr
+        v_vec.load(input.state_input_ptr() + input.dim + idx4); // v_ptr
+      } else {
+        m_vec.reset();
+        v_vec.reset();
+      }
+
+      // update m and v
+      {
+        Vec4T<float> grad_vec;
+        grad_vec.load(input.grad_ptr() + idx4);
+        {
+          m_vec.val.x = beta1 * m_vec.val.x + (1.0f - beta1) * grad_vec.val.x;
+          m_vec.val.y = beta1 * m_vec.val.y + (1.0f - beta1) * grad_vec.val.y;
+          m_vec.val.z = beta1 * m_vec.val.z + (1.0f - beta1) * grad_vec.val.z;
+          m_vec.val.w = beta1 * m_vec.val.w + (1.0f - beta1) * grad_vec.val.w;
+          m_vec.store(input.state_output_ptr() + idx4);
+        }
+
+        {
+
+          v_vec.val.x = beta2 * v_vec.val.x +
+                        (1.0f - beta2) * grad_vec.val.x * grad_vec.val.x;
+          v_vec.val.y = beta2 * v_vec.val.y +
+                        (1.0f - beta2) * grad_vec.val.y * grad_vec.val.y;
+          v_vec.val.z = beta2 * v_vec.val.z +
+                        (1.0f - beta2) * grad_vec.val.z * grad_vec.val.z;
+          v_vec.val.w = beta2 * v_vec.val.w +
+                        (1.0f - beta2) * grad_vec.val.w * grad_vec.val.w;
+          v_vec.store(input.state_output_ptr() + input.dim + idx4);
+        }
+      }
+
+      // Get mhat and vhat
+      {
+        {
+          m_vec.val.x = m_vec.val.x / (1.0f - __powf(beta1, iter_num));
+          m_vec.val.y = m_vec.val.y / (1.0f - __powf(beta1, iter_num));
+          m_vec.val.z = m_vec.val.z / (1.0f - __powf(beta1, iter_num));
+          m_vec.val.w = m_vec.val.w / (1.0f - __powf(beta1, iter_num));
+        }
+
+        {
+          v_vec.val.x = v_vec.val.x / (1.0f - __powf(beta2, iter_num));
+          v_vec.val.y = v_vec.val.y / (1.0f - __powf(beta2, iter_num));
+          v_vec.val.z = v_vec.val.z / (1.0f - __powf(beta2, iter_num));
+          v_vec.val.w = v_vec.val.w / (1.0f - __powf(beta2, iter_num));
+        }
+        // Use m_vec as weight_update
+        {
+          m_vec.val.x = lr * ((m_vec.val.x / (sqrt(v_vec.val.x) + eps)) +
+                              weight_vec.val.x * weight_decay);
+          m_vec.val.y = lr * ((m_vec.val.y / (sqrt(v_vec.val.y) + eps)) +
+                              weight_vec.val.y * weight_decay);
+          m_vec.val.z = lr * ((m_vec.val.z / (sqrt(v_vec.val.z) + eps)) +
+                              weight_vec.val.z * weight_decay);
+          m_vec.val.w = lr * ((m_vec.val.w / (sqrt(v_vec.val.w) + eps)) +
+                              weight_vec.val.w * weight_decay);
+        }
+
+        weight_vec.val.x -= m_vec.val.x;
+        weight_vec.val.y -= m_vec.val.y;
+        weight_vec.val.z -= m_vec.val.z;
+        weight_vec.val.w -= m_vec.val.w;
+
+        weight_vec.store(input.emb_output_ptr() + idx4);
+      }
+    }
+  }
+
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update(
+      const OptimizierInput &input) {
+
+    for (int i = threadIdx.x; i < input.dim; i += blockDim.x) {
+      float tmp_grad = TypeConvertFunc<float, grad_t>::convert(input.grad_ptr()[i]);
+      float tmp_m = input.state_initialized() ? TypeConvertFunc<float, emb_t>::convert(input.state_input_ptr()[i]) : 0.0f;
+      float tmp_v = input.state_initialized() ? TypeConvertFunc<float, emb_t>::convert((input.state_input_ptr() + input.dim)[i]) : 0.0f;
+      float tmp_weight = TypeConvertFunc<float, emb_t>::convert(input.emb_input_ptr()[i]);
+
+      tmp_m = beta1 * tmp_m + (1.0f - beta1) * tmp_grad;
+      tmp_v = beta2 * tmp_v + (1.0f - beta2) * tmp_grad * tmp_grad;
+
+      float tmp_mhat = tmp_m / (1.0f - __powf(beta1, iter_num));
+      float tmp_vhat = tmp_v / (1.0f - __powf(beta2, iter_num));
+
+      tmp_weight -= lr * ((tmp_mhat / (sqrtf(tmp_vhat) + eps)) +
+                          weight_decay * tmp_weight);
+      input.emb_output_ptr()[i] = TypeConvertFunc<emb_t, float>::convert(tmp_weight);
+      input.state_output_ptr()[i] = TypeConvertFunc<emb_t, float>::convert(tmp_m);
+      (input.state_output_ptr() + input.dim)[i] = TypeConvertFunc<emb_t, float>::convert(tmp_v);
+    }
+  }
+};
+
+template <typename grad_t, typename emb_t ,int kWarpSize = 32>
+struct AdaGradVecOptimizerV3 {
+  const float lr;
+  const float eps;
+  const float initial_accumulator;
+
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update4(const OptimizierInput &input) {
+
+    constexpr int VecSize = 4;
+    const int lane_id = threadIdx.x%kWarpSize;
+
+    Vec4T<float> weight_vec;
+    Vec4T<float> gt_vec;
+
+    for (int i = 0; VecSize * kWarpSize * i + VecSize * lane_id < input.dim; ++i) {
+        int idx4 = VecSize * kWarpSize * i + VecSize * lane_id;
+        weight_vec.load(input.emb_input_ptr() + idx4);
+        if (input.state_initialized()) {
+          gt_vec.load(input.state_input_ptr() + idx4);
+        } else {
+          gt_vec.reset(initial_accumulator);
+        }
+        
+
+        Vec4T<float> grad_vec;
+        grad_vec.load(input.grad_ptr() + idx4);
+        {
+            gt_vec.val.x += grad_vec.val.x * grad_vec.val.x;
+            gt_vec.val.y += grad_vec.val.y * grad_vec.val.y;
+            gt_vec.val.z += grad_vec.val.z * grad_vec.val.z;
+            gt_vec.val.w += grad_vec.val.w * grad_vec.val.w;
+            gt_vec.store(input.state_output_ptr() + idx4);
+        }
+
+        {
+            grad_vec.val.x = lr * grad_vec.val.x /(sqrtf(gt_vec.val.x) + eps);
+            grad_vec.val.y = lr * grad_vec.val.y /(sqrtf(gt_vec.val.y) + eps);
+            grad_vec.val.z = lr * grad_vec.val.z /(sqrtf(gt_vec.val.z) + eps);
+            grad_vec.val.w = lr * grad_vec.val.w /(sqrtf(gt_vec.val.w) + eps);
+        }
+
+        weight_vec.val.x -= grad_vec.val.x;
+        weight_vec.val.y -= grad_vec.val.y;
+        weight_vec.val.z -= grad_vec.val.z;
+        weight_vec.val.w -= grad_vec.val.w;
+
+        weight_vec.store(input.emb_output_ptr() + idx4);
+
+      }
+  }
+
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update(
+      const OptimizierInput &input) {
+
+    for (int i = threadIdx.x; i < input.dim; i+=blockDim.x) {
+      float tmp_grad =  TypeConvertFunc<float, grad_t>::convert(input.grad_ptr()[i]);
+      float tmp_gt = input.state_initialized() ? TypeConvertFunc<float, emb_t>::convert(input.state_input_ptr()[i]) : initial_accumulator;
+      float tmp_weight = TypeConvertFunc<float, emb_t>::convert(input.emb_input_ptr()[i]);
+
+      tmp_gt = tmp_gt + tmp_grad * tmp_grad;
+      tmp_grad = lr * tmp_grad / (sqrtf(tmp_gt) + eps);
+
+      tmp_weight -= tmp_grad;
+      input.emb_output_ptr()[i] = TypeConvertFunc<emb_t, float>::convert(tmp_weight);
+      input.state_output_ptr()[i] = TypeConvertFunc<emb_t, float>::convert(tmp_gt);
+    }
+  }
+};
+
+template <
+  typename grad_t,
+  typename emb_t,
+  int kWarpSize = 32>
+struct RowWiseAdaGradVecOptimizerV3 {
+  const float lr;
+  const float eps;
+  const float initial_accumulator;
+
+  ///TODO: whether can load grad once like online-softmax.
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update4(const OptimizierInput& input) {
+
+    constexpr int VecSize = 4;
+    const int lane_id = threadIdx.x % kWarpSize;
+
+    float tmp_gt = input.state_initialized() ? TypeConvertFunc<float, emb_t>::convert(*(input.state_input_ptr())) : initial_accumulator;
+    float tmp_g_pow = 0;
+    ///TODO: vectorize
+    for (int i = lane_id; i < input.dim; i += kWarpSize) {
+      float tmp_g = TypeConvertFunc<float, grad_t>::convert(input.grad_ptr()[i]);
+      tmp_g_pow += tmp_g * tmp_g;
+    }
+
+    tmp_g_pow = warp_reduce_sum_xor(tmp_g_pow, kWarpSize);
+    tmp_g_pow /= input.dim;
+    tmp_gt += tmp_g_pow;
+
+    if (lane_id == 0) {
+      *(input.state_output_ptr()) = TypeConvertFunc<emb_t, float>::convert(tmp_gt);
+    }
+
+    Vec4T<float> weight_vec;
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < input.dim; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);  
+      Vec4T<float> grad_vec;
+
+      grad_vec.load(input.grad_ptr() + idx4);
+      weight_vec.load(input.emb_input_ptr() + idx4);
+
+      {
+        grad_vec.val.x = lr * grad_vec.val.x /(sqrtf(tmp_gt) + eps);
+        grad_vec.val.y = lr * grad_vec.val.y /(sqrtf(tmp_gt) + eps);
+        grad_vec.val.z = lr * grad_vec.val.z /(sqrtf(tmp_gt) + eps);
+        grad_vec.val.w = lr * grad_vec.val.w /(sqrtf(tmp_gt) + eps);
+      }
+
+      weight_vec.val.x -= grad_vec.val.x;
+      weight_vec.val.y -= grad_vec.val.y;
+      weight_vec.val.z -= grad_vec.val.z;
+      weight_vec.val.w -= grad_vec.val.w;
+
+      weight_vec.store(input.emb_output_ptr() + idx4);
+    }
+  }
+
+  template <typename OptimizierInput>
+  DEVICE_INLINE void update(const OptimizierInput& input) {
+
+    extern __shared__ float sdata[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t blockSize = blockDim.x;
+    const unsigned int pow2_size = nextPow2(blockSize) >> 1;
+
+    float tmp_gt = input.state_initialized() ? TypeConvertFunc<float, emb_t>::convert(*(input.state_input_ptr())) : initial_accumulator;
+    float tmp_g_pow = 0;
+    for (int i = tid; i < input.dim; i += blockSize) {
+      float tmp_g = TypeConvertFunc<float, grad_t>::convert(input.grad_ptr()[i]);
+      tmp_g_pow += tmp_g * tmp_g;
+    }
+
+    sdata[tid] = tmp_g_pow;
+    __syncthreads();
+
+    if (pow2_size >= 1) {
+      for(unsigned s = pow2_size; s > 0; s >>= 1) {
+        if(tid < s && (tid + s) < blockSize) {
+          sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+      }
+    }
+
+    tmp_g_pow = sdata[0];
+    tmp_g_pow /= input.dim;
+    tmp_gt += tmp_g_pow;
+    if (tid == 0) {
+      *(input.state_output_ptr()) = TypeConvertFunc<emb_t, float>::convert(tmp_gt);
+    }
+
+    for (int i = tid; i < input.dim; i += blockSize) {
+      float tmp_grad = TypeConvertFunc<float, grad_t>::convert(input.grad_ptr()[i]);
+      float tmp_weight = TypeConvertFunc<float, emb_t>::convert(input.emb_input_ptr()[i]);
+
+      tmp_grad = lr * tmp_grad / (sqrtf(tmp_gt) + eps);
+
+      tmp_weight -= tmp_grad;
+      input.emb_output_ptr()[i] = TypeConvertFunc<emb_t, float>::convert(tmp_weight);
+    }
+  }
+};
+
+template <typename T>
+struct TwoStageFoundResult {
+T ** vals1;
+bool* founds1;
+int* missed_ids;
+T ** vals2;
+bool* founds2;
+
+DEVICE_INLINE bool found1(int id) {
+  return founds1[id];
+}
+
+DEVICE_INLINE T* result1(int id) {
+  return vals1[id];
+}
+
+DEVICE_INLINE int stage2_id(int id) {
+  return missed_ids[id];
+}
+
+DEVICE_INLINE bool found2(int id) {
+  return founds2[id];
+}
+
+DEVICE_INLINE T* result2(int id) {
+  return vals2[id];
+}
+
+};
+
+template <typename grad_t, typename emb_t, typename OptimizerFunc>
+__global__ void update4_kernel_v3(
+    const uint32_t num_keys,
+    const uint32_t dim, 
+    const uint32_t optstate_dim,
+    const grad_t *grad_evs,
+    const emb_t* emb_evs,
+    emb_t* outputs_buffer,
+    OptimizerFunc optimizer,
+    TwoStageFoundResult<emb_t> found_res) {
+  constexpr int kWarpSize = 32;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+
+  for (uint32_t ev_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+       ev_id < num_keys; ev_id += gridDim.x * warp_num_per_block) {
+    const grad_t *grad_ptr = grad_evs + ev_id * dim;
+    const emb_t* emb_ptr = emb_evs + ev_id * dim;
+    emb_t* output_buffer = outputs_buffer + ev_id * (dim + optstate_dim);
+    bool found = found_res.found1(ev_id);
+    auto val_ptr = found_res.result1(ev_id);
+    if (not found) {
+      auto stage2_id = found_res.stage2_id(ev_id);
+      found = found_res.found2(stage2_id);
+      val_ptr = found_res.result2(stage2_id);
+    }
+    OptimizierInputV3<grad_t, emb_t> input {grad_ptr, emb_ptr, val_ptr, dim, found, output_buffer};
+    optimizer.template update4<OptimizierInputV3<grad_t, emb_t>>(input);
+  }
+}
+
+template <typename grad_t, typename emb_t, typename OptimizerFunc>
+__global__ void update_kernel_v3(
+    const uint32_t num_keys, 
+    const uint32_t dim,
+    const uint32_t optstate_dim,
+    const grad_t *grad_evs,
+    const emb_t* emb_evs,
+    emb_t* outputs_buffer,
+    OptimizerFunc optimizer,
+    TwoStageFoundResult<emb_t> found_res) {
+  constexpr int kWarpSize = 32;
+
+  for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
+
+    const grad_t *grad_ptr = grad_evs + ev_id * dim;
+    const emb_t* emb_ptr = emb_evs + ev_id * dim;
+    emb_t* output_buffer = outputs_buffer + ev_id * (dim + optstate_dim);
+    bool found = found_res.found1(ev_id);
+    auto val_ptr = found_res.result1(ev_id);
+    if (not found) {
+      auto stage2_id = found_res.stage2_id(ev_id);
+      found = found_res.found2(stage2_id);
+      val_ptr = found_res.result2(stage2_id);
+    }
+    OptimizierInputV3<grad_t, emb_t> input {grad_ptr, emb_ptr, val_ptr, dim, found, output_buffer};
+    optimizer.template update<OptimizierInputV3<grad_t, emb_t>>(input);
+  }
+}
+
 } // namespace dyn_emb
 #endif // OPTIMIZER_KERNEL_H
