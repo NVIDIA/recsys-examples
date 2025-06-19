@@ -903,7 +903,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         return reporting_loss, output
 
 
-class NoPipeline:
+class JaggedMegatronTrainNonePipeline:
     def __init__(
         self,
         model: torch.nn.Module,

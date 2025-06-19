@@ -415,4 +415,4 @@ class RetrievalTaskMetricWithSampling(BaseTaskMetric):
         self._cache_query_embeddings.clear()
         self._cache_target_ids.clear()
 
-        return final_eval_dict, global_topk_logits, global_topk_keys
+        return final_eval_dict
