@@ -9,7 +9,7 @@ from dataset.utils import RankingBatch, RetrievalBatch
 from megatron.core.transformer.module import MegatronModule
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
-from modules.native_hstu_layer import HSTULayer
+from modules.legacy.native_hstu_layer import HSTULayer
 from modules.position_encoder import HSTUPositionalEncoder
 from modules.utils import hstu_postprocess_embeddings, hstu_preprocess_embeddings
 from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
