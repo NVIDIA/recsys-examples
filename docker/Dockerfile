@@ -49,6 +49,8 @@ FROM ${DEVEL_IMAGE} AS build
 
 WORKDIR /workspace/recsys-examples
 COPY . .
+RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+    pip install ./megatron-lm
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     python setup.py install
