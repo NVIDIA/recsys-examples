@@ -25,7 +25,7 @@ from configs.hstu_config import HSTULayerType, KernelBackend
 from megatron.core.transformer.module import Float16Module
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
-from modules.native_hstu_layer import HSTULayer
+from modules.legacy.native_hstu_layer import HSTULayer
 from ops.fused_hstu_op import fused_hstu_op
 from ops.length_to_offsets import length_to_complete_offsets
 
