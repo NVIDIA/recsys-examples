@@ -142,7 +142,7 @@ def main():
         )
     train_with_pipeline(
         pipeline,
-        stateful_metric_module,  # no stateful_metric_module
+        stateful_metric_module,
         trainer_args,
         train_dataloader,
         test_dataloader,

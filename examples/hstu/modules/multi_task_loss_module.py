@@ -84,4 +84,4 @@ class MultiTaskLossModule(torch.nn.Module):
             losses = self._loss_modules(merged_logits, decoded_labels)
             return losses
         else:
-            return self._loss_modules[0](merged_logits, labels)
+            return self._loss_modules(merged_logits, labels)

@@ -62,7 +62,7 @@ def evaluate(
         if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):
             retrieval_gr = get_unwrapped_module(pipeline._model)
             export_table_name = retrieval_gr.get_item_feature_table_name()
-            eval_metric_dict = stateful_metric_module.compute(
+            eval_metric_dict, _, _ = stateful_metric_module.compute(
                 *retrieval_gr._embedding_collection.export_local_embedding(
                     export_table_name
                 ),
