@@ -208,6 +208,7 @@ class TritonHSTUAttention(HSTUAttention):
         ).view(-1, self.num_heads * self.linear_dim)
 
 
+# TODO, support packed qkv attention
 class FusedHSTUAttention(HSTUAttention):
     """
     Cutlass-based HUST implementations. This is the default implementation on pre hopper GPU.
@@ -300,6 +301,7 @@ class FusedHSTUAttention(HSTUAttention):
         ).view(-1, self.num_heads * self.linear_dim)
 
 
+# TODO, support packed qkv attention
 class FusedHSTUAttentionHopper(HSTUAttention):
     """
     Cutlass-based HUST implementation. This is the specialized implementation on hopper.

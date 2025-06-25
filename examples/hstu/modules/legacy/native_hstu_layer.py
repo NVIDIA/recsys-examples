@@ -29,6 +29,7 @@ from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
 class HSTULayer(MegatronModule):
     """
     One basic unit of HSTUBlock. Input and output are all JaggedData.
+    This module does not support TP.
 
     Args:
         config (HSTUConfig): Configuration for the HSTU layer.
