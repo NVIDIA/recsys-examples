@@ -84,6 +84,7 @@ def test_hstu_preprocess(
         dtype=torch.float,
     )
     hstu_block = HSTUBlock(hstu_config)
+    hstu_block = hstu_block.eval()
 
     seqlen_sum = torch.sum(batch.features.lengths()).cpu().item()
     embeddings = KeyedJaggedTensor.from_lengths_sync(
@@ -111,6 +112,7 @@ def test_hstu_preprocess(
                 contextual_embedding_offsets_cpu[sample_id],
                 contextual_embedding_offsets_cpu[sample_id + 1],
             )
+
             for i in range(cur_start, cur_end):
                 assert torch.allclose(
                     cur_sequence_embedding[idx, :], contextual_embedding[i, :]
@@ -148,11 +150,17 @@ def test_hstu_preprocess(
             candidate_embedding = item_embedding[
                 cur_end - cur_num_candidates_cpu : cur_end, :
             ]
+            candidate_embedding = candidate_embedding / torch.linalg.norm(
+                candidate_embedding, ord=2, dim=-1, keepdim=True
+            ).clamp(min=1e-6)
             assert torch.allclose(
                 result_embedding, candidate_embedding
             ), "candidate embedding not match"
         else:
             all_item_embedding = item_embedding[cur_start:cur_end, :]
+            all_item_embedding = all_item_embedding / torch.linalg.norm(
+                all_item_embedding, ord=2, dim=-1, keepdim=True
+            ).clamp(min=1e-6)
             assert torch.allclose(
                 result_embedding, all_item_embedding
             ), "all item embedding not match"
