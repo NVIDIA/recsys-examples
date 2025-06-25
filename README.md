@@ -13,7 +13,11 @@ The project includes:
 
 We provide [dockerfile](./docker/Dockerfile) for users to build environment. 
 ```
-docker build -f docker/Dockerfile -t recsys-examples:latest .
+docker build -f docker/Dockerfile --platform linux/amd64 -t recsys-examples:latest .
+```
+If you want to build image for Grace, you can use 
+```
+docker build -f docker/Dockerfile --platform linux/arm64 -t recsys-examples:latest .
 ```
 You can also set your own base image with args `--build-arg <BASE_IMAGE>`.
 
