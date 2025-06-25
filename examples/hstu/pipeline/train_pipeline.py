@@ -798,11 +798,14 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         # forward
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self.batches[0])
+        with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
             local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
             reporting_loss = local_loss.clone().detach()
-
+            torch.distributed.all_reduce(
+                reporting_loss, group=parallel_state.get_data_parallel_group()
+            )
         if len(self.batches) >= 2:
             # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
             self.wait_sparse_data_dist(self.contexts[1])
@@ -813,10 +816,10 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                 dp_size = parallel_state.get_data_parallel_world_size()
                 local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
                 local_loss_average.backward()
-                torch.distributed.all_reduce(
-                    reporting_loss, group=parallel_state.get_data_parallel_group()
-                )
 
+            with nvtx.annotate("## finalize_model_grads ##"):
+                if isinstance(self._model.module, DistributedDataParallel):
+                    finalize_model_grads([self._model.module], None)
             # update
             with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
@@ -869,10 +872,14 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         reporting_loss = None
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self._batch_i)
+        with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
             local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
             reporting_loss = local_loss.clone().detach()
+            torch.distributed.all_reduce(
+                reporting_loss, group=parallel_state.get_data_parallel_group()
+            )
         with nvtx.annotate("## prefetch ##"):
             self._prefetch(self._batch_ip1)
 
@@ -882,9 +889,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
                 dp_size = parallel_state.get_data_parallel_world_size()
                 local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
                 local_loss_average.backward()
-                torch.distributed.all_reduce(
-                    reporting_loss, group=parallel_state.get_data_parallel_group()
-                )
+
                 # self._model is a DistributedModelParallel
                 # self._model.module could be is a DistributedDataParallel
                 if isinstance(self._model.module, DistributedDataParallel):
@@ -928,6 +933,7 @@ class JaggedMegatronTrainNonePipeline:
             losses, output = self._model(batch)
 
         with nvtx.annotate("## loss postprocess ##"):
+            collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(
                 losses.size(0), device=torch.device("cuda", torch.cuda.current_device())
             ).float()

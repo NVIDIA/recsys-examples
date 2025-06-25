@@ -89,7 +89,9 @@ def test_pipeline(
             shutil.rmtree(save_path)
     dist.barrier(device_ids=[torch.cuda.current_device()])
 
-    os.makedirs(save_path, exist_ok=True)
+    if dist.get_rank() == 0:
+        os.makedirs(save_path, exist_ok=True)
+    dist.barrier(device_ids=[torch.cuda.current_device()])
     checkpoint.save(save_path, model, dense_optimizer=dense_optimizer)
     checkpoint.load(
         save_path, pipelined_model, dense_optimizer=pipelined_dense_optimizer
@@ -97,7 +99,6 @@ def test_pipeline(
     dist.barrier(device_ids=[torch.cuda.current_device()])
     if dist.get_rank() == 0:
         shutil.rmtree(save_path)
-    dist.barrier(device_ids=[torch.cuda.current_device()])
 
     no_pipeline = JaggedMegatronTrainNonePipeline(
         model,

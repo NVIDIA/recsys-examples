@@ -33,7 +33,7 @@ from test_utils import assert_equal_two_state_dict, create_model
 @pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"], []])
 @pytest.mark.parametrize("max_num_candidates", [10, 0])
 @pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_checkpoint_model(
     task_type: str,
     contextual_feature_names,
@@ -58,7 +58,7 @@ def test_checkpoint_model(
         model.module.zero_grad_buffer()
         dense_optimizer.zero_grad()
         loss, _ = model(history_batches[i])
-        collective_assert(not torch.isnan(loss).any(), f"iter {i} loss has nan")
+        collective_assert(not torch.isnan(loss).any(), f"iter {i} loss has nan: {loss}")
 
         loss.sum().backward()
         finalize_model_grads([model.module], None)

@@ -175,11 +175,12 @@ def get_planner(
                 dynamicemb_options=dynamicemb_options,
             )
         else:
+            # TODO: save and load does not support table-wise sharding, disable them for now
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[
                     ShardingType.ROW_WISE.value,
-                    ShardingType.TABLE_WISE.value,
-                    ShardingType.TABLE_ROW_WISE.value,
+                    # ShardingType.TABLE_WISE.value,
+                    # ShardingType.TABLE_ROW_WISE.value,
                 ],
                 bounds_check_mode=BoundsCheckMode.NONE,
                 use_dynamicemb=False,
