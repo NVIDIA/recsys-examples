@@ -4,7 +4,7 @@ ARG DEVEL_IMAGE=devel
 FROM ${BASE_IMAGE} AS devel
 WORKDIR /workspace/deps
 
-RUN git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install -e ./megatron-lm
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath
