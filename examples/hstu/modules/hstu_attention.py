@@ -417,7 +417,7 @@ def create_hstu_attention(
     if kernel_backend == KernelBackend.CUTLASS:
         sm_major_version = torch.cuda.get_device_properties(0).major
         sm_minor_version = torch.cuda.get_device_properties(0).minor
-        if sm_major_version == 9 and sm_minor_version == 0:
+        if sm_major_version >= 9 and sm_minor_version == 0:
             return FusedHSTUAttentionHopper(
                 num_heads,
                 attention_dim,

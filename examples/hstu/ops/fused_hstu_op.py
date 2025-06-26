@@ -188,7 +188,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm = torch.cuda.get_device_properties(0).major
             if sm == 8:
                 addmm_silu_fwd_impl = triton_addmm_silu_fwd
-            elif sm == 9:
+            elif sm >= 9:
                 addmm_silu_fwd_impl = torch_addmm_silu_fwd
             else:
                 raise ValueError(f"Unsupported SM major version: {sm}")
@@ -275,7 +275,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             hopper_fp8_args = ()
             if sm_major_version == 8:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
-            elif sm_major_version == 9:
+            elif sm_major_version >= 9:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
                 hopper_fp8_args = (None, None, None)
 
@@ -596,7 +596,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm_major_version = torch.cuda.get_device_properties(0).major
             if sm_major_version == 8:
                 cutlass_hstu_varlen_bwd = flash_attn_cuda_ampere.varlen_bwd
-            elif sm_major_version == 9:
+            elif sm_major_version >= 9:
                 cutlass_hstu_varlen_bwd = flash_attn_cuda_hopper.varlen_bwd
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")

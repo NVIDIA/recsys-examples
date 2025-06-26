@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.11-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.03-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE} AS devel
@@ -11,10 +11,10 @@ RUN git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath
 
-RUN pip install --no-cache setuptools==69.5.1 setuptools-git-versioning scikit-build && \
+RUN pip install --no-cache setuptools==75.8.2 setuptools-git-versioning scikit-build && \
   git clone --recursive -b v1.2.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
   cd fbgemm/fbgemm_gpu && \
-  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 9.0"
+  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 9.0 10.0"
 
 RUN pip install --no-deps tensordict orjson && \
   git clone --recursive -b v1.2.0 https://github.com/pytorch/torchrec.git torchrec && \
@@ -24,9 +24,9 @@ RUN pip install --no-deps tensordict orjson && \
 RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
   if [ ! -f /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1 ]; then \
     if [ ${ARCH} = "aarch64" ]; then \
-      ln -s /usr/local/cuda-12.6/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      ln -s /usr/local/cuda-12.8/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     else \
-      ln -s /usr/local/cuda-12.6/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      ln -s /usr/local/cuda-12.8/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     fi \
   fi
 
