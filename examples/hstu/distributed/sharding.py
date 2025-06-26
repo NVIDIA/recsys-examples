@@ -285,7 +285,7 @@ def apply_dmp(
     sparse_optimizer_param: OptimizerParam,
     pg: torch.distributed.ProcessGroup,
     device: torch.device,
-    pipeline_type: str = "none",
+    pipeline_type: str = "native",
 ):
     enable_prefetch_pipeline = pipeline_type == "prefetch"
     (
@@ -415,7 +415,7 @@ def make_optimizer_and_shard(
     sparse_optimizer_param: OptimizerParam,
     dense_optimizer_param: OptimizerParam,
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {},
-    pipeline_type: str = "none",
+    pipeline_type: str = "native",
     device: torch.device = None,
     pg: torch.distributed.ProcessGroup = None,
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:

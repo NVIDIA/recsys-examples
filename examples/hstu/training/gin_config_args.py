@@ -41,7 +41,7 @@ class TrainerArgs:
     ckpt_save_interval: int = -1  # -1 means not save ckpt
     ckpt_save_dir: str = "./checkpoints"
     ckpt_load_dir: str = ""
-    pipeline_type: str = "none"  # none, native, prefetch
+    pipeline_type: str = "native"  # none, native, prefetch
 
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
