@@ -10,6 +10,7 @@ from megatron.core.transformer.module import MegatronModule
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
+from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.jagged_tensor_op import concat_2D_jagged_tensors
 from ops.length_to_offsets import length_to_complete_offsets
@@ -18,6 +19,8 @@ from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
     triton_split_2D_jagged,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor
+from configs.kv_cache_config import KVCacheConfig, KVCacheMetadata
+import math
 
 
 class HSTUBlock(MegatronModule):
@@ -31,6 +34,9 @@ class HSTUBlock(MegatronModule):
     def __init__(
         self,
         config: HSTUConfig,
+        inference_mode: bool = False,
+        kvcache_config: KVCacheConfig = None,
+
     ):
         super().__init__(config=config)
         self._training_dtype = torch.float32
@@ -38,7 +44,7 @@ class HSTUBlock(MegatronModule):
             self._training_dtype = torch.bfloat16
         if self.config.fp16:
             self._training_dtype = torch.float16
-
+        
         self._positional_encoder: Optional[HSTUPositionalEncoder] = None
         if config.position_encoding_config is not None:
             self._positional_encoder = HSTUPositionalEncoder(
@@ -49,14 +55,23 @@ class HSTUBlock(MegatronModule):
                 use_time_encoding=config.position_encoding_config.use_time_encoding,
                 training_dtype=self._training_dtype,
             )
-        HSTULayerImpl = (
-            FusedHSTULayer
-            if config.hstu_layer_type == HSTULayerType.FUSED
-            else HSTULayer
-        )
-        self._attention_layers = torch.nn.ModuleList(
-            [HSTULayerImpl(config) for l in range(self.config.num_layers)]
-        )
+        
+        self._inference = inference_mode
+        if not self._inference:
+            HSTULayerImpl = (
+                FusedHSTULayer
+                if config.hstu_layer_type == HSTULayerType.FUSED
+                else HSTULayer
+            )
+            self._attention_layers = torch.nn.ModuleList(
+                [HSTULayerImpl(config) for l in range(self.config.num_layers)]
+            )
+        else:
+            self._attention_layers = torch.nn.ModuleList(
+                [PagedHSTUInferLayer(config, kvcache_config, layer_idx) for layer_idx in range(self.config.num_layers)]
+            )
+        
+        self._hstu_graph = None
 
     @output_nvtx_hook(nvtx_tag="hstu_preprocess")
     def hstu_preprocess(
@@ -151,11 +166,12 @@ class HSTUBlock(MegatronModule):
                 num_targets=num_candidates,
             )
 
-        sequence_embeddings = torch.nn.functional.dropout(
-            sequence_embeddings,
-            p=0.2,
-            training=self.training,
-        )
+        if not self._inference:
+            sequence_embeddings = torch.nn.functional.dropout(
+                sequence_embeddings,
+                p=0.2,
+                training=self.training,
+            )
         return JaggedData(
             values=sequence_embeddings.to(self._training_dtype),
             seqlen=sequence_embeddings_lengths.to(
@@ -259,3 +275,109 @@ class HSTUBlock(MegatronModule):
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
         return self.hstu_postprocess(jd)
+
+    @output_nvtx_hook(nvtx_tag="hstu_predict")
+    def predict(self, batch_size: int, num_tokens: int, hidden_states: torch.Tensor, jd: JaggedData, kv_cache_metadata) -> JaggedData:
+        if self._hstu_graph is None:
+            hidden_data = hidden_states
+            for hstu_layer in self._attention_layers:
+                hidden_data = hstu_layer(num_tokens, hidden_data, jd, kv_cache_metadata)
+            jd.values = hidden_data
+            return jd
+        else:
+            batch_size = 2**math.ceil(math.log2(batch_size))
+            num_tokens_pow2 = max(32, 2**math.ceil(math.log2(num_tokens)))
+            self._hstu_graph[batch_size][num_tokens_pow2].replay()
+            hidden_states[:num_tokens, ...].copy_(
+                self._attention_layers[-1].output_buffer_[:num_tokens, ...], non_blocking = True)
+            jd.values = hidden_states
+            return jd
+
+    def predict_naive(self, batch_size: int, num_tokens: int, hidden_states: torch.Tensor, jd: JaggedData, kv_cache_metadata) -> JaggedData:
+        with torch.inference_mode():
+            jagged_metadata = JaggedData(
+                values=None,
+                max_seqlen=jd.max_seqlen,
+                seqlen=jd.seqlen[:batch_size],
+                seqlen_offsets=jd.seqlen_offsets[:batch_size+1],
+                max_num_candidates=jd.max_num_candidates,
+                num_candidates=jd.num_candidates[:batch_size],
+                num_candidates_offsets=jd.num_candidates_offsets[:batch_size+1],
+                contextual_max_seqlen=jd.contextual_max_seqlen,
+                contextual_seqlen=jd.contextual_seqlen,
+                contextual_seqlen_offsets=jd.contextual_seqlen_offsets,
+                has_interleaved_action=jd.has_interleaved_action,
+            )
+            kv_cache_metadata.delta_history_token_nnz = num_tokens
+            hidden_data = hidden_states
+            for hstu_layer in self._attention_layers:
+                hidden_data = hstu_layer(batch_size, num_tokens, hidden_data, jagged_metadata, kv_cache_metadata)
+            jd.values = hidden_data
+            return jd
+
+    def set_cudagraph(self, max_batch_size, max_seq_len, static_hidden_states, static_jagged_metadata, static_kvcache_metadata):
+        if self._hstu_graph is None:
+
+            self._hstu_graph = dict()
+            self._hstu_graph[max_batch_size] = dict()
+
+            start_free_memory = torch.cuda.mem_get_info()[0]
+
+            max_num_tokens = max_batch_size * max_seq_len
+            graph_max = self.capture_graph(max_batch_size, max_num_tokens, static_hidden_states, static_jagged_metadata, static_kvcache_metadata)
+            self._hstu_graph[max_batch_size][max_num_tokens] = graph_max
+
+            bs_list = [ 2 ** i for i in range(math.ceil(math.log2(max_batch_size)) + 1) ]
+            num_tokens_list =  [ 2 ** i for i in range(5, math.ceil(math.log2(max_num_tokens)) + 1) ]
+
+            for batch_size in bs_list:
+                if batch_size not in self._hstu_graph:
+                    self._hstu_graph[batch_size] = dict()
+                for num_tokens in num_tokens_list:
+                    if num_tokens // batch_size > max_seq_len:
+                        break
+                    if num_tokens in self._hstu_graph[batch_size]:
+                        continue
+                    self._hstu_graph[batch_size][num_tokens] = self.capture_graph(batch_size, num_tokens, 
+                        static_hidden_states, static_jagged_metadata, static_kvcache_metadata,
+                        graph_max.pool())
+            
+            end_free_memory = torch.cuda.mem_get_info()[0]
+            print('total cuda graph memory: %fGB'%((start_free_memory - end_free_memory) / 1024 / 1024 / 1024))
+        
+    
+    def capture_graph(self, batch_size, num_tokens, static_hidden_states, static_jagged_metadata, static_kvcache_metadata, memory_pool=None):
+        start_free_memory = torch.cuda.mem_get_info()[0]
+
+        # Create CUDA stream
+        graph_capture_warmup_stream = torch.cuda.Stream()
+        graph_capture_warmup_stream.wait_stream(torch.cuda.current_stream())
+
+        seqlen = num_tokens // batch_size
+        static_jagged_metadata.seqlen_offsets[:batch_size+1].copy_(
+            torch.arange(end=batch_size+1,
+                         dtype = static_jagged_metadata.num_candidates.dtype,
+                         device = static_jagged_metadata.num_candidates.device
+            ) * seqlen)
+        
+        default_num_candidates = seqlen // 2
+        torch.full((batch_size, ), default_num_candidates, out=static_jagged_metadata.num_candidates[:batch_size])
+        static_jagged_metadata.num_candidates_offsets[:batch_size+1].copy_(
+            torch.arange(end=batch_size+1,
+                         dtype = static_jagged_metadata.num_candidates.dtype,
+                         device = static_jagged_metadata.num_candidates.device
+            ) * default_num_candidates)
+
+        # Warmup
+        with torch.cuda.stream(graph_capture_warmup_stream):
+            for _ in range(3):
+                static_output = self.predict_naive(batch_size, num_tokens, static_hidden_states, static_jagged_metadata, static_kvcache_metadata)
+                torch.cuda.synchronize()
+
+        # Create and capture the graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=memory_pool):
+            static_output = self.predict_naive(batch_size, num_tokens, static_hidden_states, static_jagged_metadata, static_kvcache_metadata)
+        end_free_memory = torch.cuda.mem_get_info()[0]
+        print("Capture graph for", (batch_size, num_tokens), 'cuda graph memory: %fGB'%((start_free_memory - end_free_memory) / 1024 / 1024 / 1024))
+        return graph

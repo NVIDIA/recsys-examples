@@ -326,9 +326,11 @@ class ShardedEmbedding(torch.nn.Module):
             with torch.cuda.stream(self._side_stream):
                 dp_embeddings = self._data_parallel_embedding_collection(kjt)
             torch.cuda.current_stream().wait_stream(self._side_stream)
-            embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
+            # embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
+            embeddings = {**mp_embeddings_awaitables, **dp_embeddings}
         else:
-            embeddings = mp_embeddings_awaitables.wait()
+            # embeddings = mp_embeddings_awaitables.wait()
+            embeddings = mp_embeddings_awaitables
         return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
