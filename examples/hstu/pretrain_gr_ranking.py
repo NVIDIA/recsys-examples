@@ -42,7 +42,6 @@ from training import (
     TensorModelParallelArgs,
     TrainerArgs,
     create_dynamic_optitons_dict,
-    create_embedding_compute_kernels,
     create_embedding_config,
     create_hstu_config,
     create_optimizer_params,
@@ -119,20 +118,15 @@ def main():
     dynamic_options_dict = create_dynamic_optitons_dict(
         embedding_args, network_args.hidden_size
     )
-    compute_kernels = create_embedding_compute_kernels(
-        embedding_args, trainer_args.pipeline_type
-    )
 
     optimizer_param = create_optimizer_params(optimizer_args)
-    enable_prefetch_pipeline = trainer_args.pipeline_type == "prefetch"
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
         config=hstu_config,
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
-        allowed_compute_kernels=compute_kernels,
-        enable_prefetch_pipeline=enable_prefetch_pipeline,
+        pipeline_type=trainer_args.pipeline_type,
     )
 
     stateful_metric_module = get_multi_event_metric_module(

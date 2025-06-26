@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
 
 import commons.utils as init
 import configs
@@ -72,17 +71,6 @@ def create_model(
     *,
     seed: int,
 ):
-    allowed_compute_kernels: Dict[str, List[str]] = {}
-    enable_prefetch_pipeline = pipeline_type == "prefetch"
-    if enable_prefetch_pipeline:
-        allowed_compute_kernels = {
-            "item": ["fused_uvm_caching"],
-        }
-    else:
-        allowed_compute_kernels = {
-            "item": ["fused"],
-        }
-
     init.set_random_seed(seed)
     device = torch.device("cuda", torch.cuda.current_device())
     embdim = 128
@@ -197,8 +185,7 @@ def create_model(
         else {},
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
-        allowed_compute_kernels=allowed_compute_kernels if not use_dynamic_emb else {},
-        enable_prefetch_pipeline=enable_prefetch_pipeline,
+        pipeline_type=pipeline_type,
         device=device,
     )
 

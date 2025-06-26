@@ -40,7 +40,6 @@ from training import (
     TensorModelParallelArgs,
     TrainerArgs,
     create_dynamic_optitons_dict,
-    create_embedding_compute_kernels,
     create_embedding_config,
     create_hstu_config,
     create_optimizer_params,
@@ -104,17 +103,13 @@ def main():
         embedding_args, network_args.hidden_size
     )
     optimizer_param = create_optimizer_params(optimizer_args)
-    compute_kernels = create_embedding_compute_kernels(
-        embedding_args, trainer_args.pipeline_type
-    )
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
         config=hstu_config,
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
-        allowed_compute_kernels=compute_kernels,
-        enable_prefetch_pipeline=trainer_args.pipeline_type == "prefetch",
+        pipeline_type=trainer_args.pipeline_type,
     )
     stateful_metric_module = RetrievalTaskMetricWithSampling(
         metric_types=task_config.eval_metrics, MAX_K=500

@@ -213,41 +213,6 @@ def create_dynamic_optitons_dict(
     return dynamic_options_dict
 
 
-# refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91
-# compute_kernel is somehow coupled with sharding_type.
-_pipeline_type_to_model_parallel_allowed_compute_kernels = {
-    "prefetch": ["fused_uvm_caching"],
-    "native": ["fused", "fused_uvm"],
-    "none": [],  # none does not constrain the compute kernels
-}
-_pipeline_type_to_data_parallel_allowed_compute_kernels = {
-    "prefetch": ["dense"],
-    "native": ["dense"],
-    "none": [],
-}
-_sharding_type_to_allowed_compute_kernels = {
-    "data_parallel": _pipeline_type_to_data_parallel_allowed_compute_kernels,
-    "model_parallel": _pipeline_type_to_model_parallel_allowed_compute_kernels,
-}
-
-
-def create_embedding_compute_kernels(
-    embedding_args_list: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]],
-    pipeline_type: str,
-) -> Dict[str, List[str]]:
-    compute_kernels: Dict[str, List[str]] = {}
-    for embedding_args in embedding_args_list:
-        if isinstance(embedding_args, EmbeddingArgs):
-            allowed_compute_kernels = _sharding_type_to_allowed_compute_kernels[
-                embedding_args.sharding_type
-            ][pipeline_type]
-        else:
-            # TODO add dynamic emb support
-            allowed_compute_kernels = []
-        compute_kernels[embedding_args.table_name] = allowed_compute_kernels
-    return compute_kernels
-
-
 def get_dataset_and_embedding_args() -> (
     Tuple[
         Union[DatasetArgs, BenchmarkDatasetArgs],
