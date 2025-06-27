@@ -11,7 +11,7 @@ from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from modules.position_encoder import HSTUPositionalEncoder
-from ops.jagged_tensor_op import concat_2D_jagged_tensors
+from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from ops.length_to_offsets import length_to_complete_offsets
 from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
     triton_concat_2D_jagged,
@@ -112,34 +112,41 @@ class HSTUBlock(MegatronModule):
                 batch.feature_to_max_seqlen[name]
                 for name in batch.contextual_feature_names
             ]
-            contextual_embedding, contextual_seqlen = concat_2D_jagged_tensors(
-                jagged_tensors=[
-                    embeddings[name] for name in batch.contextual_feature_names
-                ],
-                max_seqlens=contextual_max_seqlens,
+            contextual_jts = [
+                embeddings[name] for name in batch.contextual_feature_names
+            ]
+            all_values = [jt.values() for jt in contextual_jts] + [sequence_embeddings]
+            all_offsets = [jt.offsets() for jt in contextual_jts] + [
+                sequence_embeddings_lengths_offsets
+            ]
+            all_max_seqlens = contextual_max_seqlens + [sequence_max_seqlen]
+            (
+                sequence_embeddings,
+                sequence_embeddings_lengths_after_concat,
+            ) = jagged_2D_tensor_concat(
+                all_values,
+                all_offsets,
+                all_max_seqlens,
             )
-
             contextual_max_seqlen = max(
                 len(batch.contextual_feature_names), sum(contextual_max_seqlens)
             )
+
+            contextual_seqlen = (
+                sequence_embeddings_lengths_after_concat - sequence_embeddings_lengths
+            )
+            sequence_embeddings_lengths = sequence_embeddings_lengths_after_concat
+
+            sequence_embeddings_lengths_offsets = (
+                torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    sequence_embeddings_lengths
+                )
+            )
+
             contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
                 contextual_seqlen
             )
 
-            sequence_embeddings = triton_concat_2D_jagged(
-                max_seq_len=contextual_max_seqlen + sequence_max_seqlen,
-                values_a=contextual_embedding,
-                values_b=sequence_embeddings,
-                offsets_a=contextual_seqlen_offsets,
-                offsets_b=sequence_embeddings_lengths_offsets,
-            )
-
-            sequence_embeddings_lengths = (
-                contextual_seqlen + sequence_embeddings_lengths
-            )
-            sequence_embeddings_lengths_offsets = (
-                contextual_seqlen_offsets + sequence_embeddings_lengths_offsets
-            )
             sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
 
         if self._positional_encoder is not None:
