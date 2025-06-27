@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from itertools import islice
-from typing import Optional, Union
+from itertools import chain, count, cycle, islice
+from typing import Iterator, Optional, Union
 
 import commons.checkpoint as checkpoint
 import torch  # pylint: disable-unused-import
@@ -115,6 +115,13 @@ def save_ckpts(
     print_rank_0(f"Checkpoints saved!!")
 
 
+# TODO. Use itertools.batched if python version is 3.12+
+def batched(it: Iterator, n: int):
+    assert n >= 1
+    for x in it:
+        yield chain((x,), islice(it, n - 1))
+
+
 def train_with_pipeline(
     pipeline: Union[
         JaggedMegatronPrefetchTrainPipelineSparseDist,
@@ -133,37 +140,52 @@ def train_with_pipeline(
     last_td = 0
     # using a tensor on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
-    train_loader_iter = iter(train_loader)
-    for train_iter in range(max_train_iters):
-        pipeline._model.train()
-        if trainer_args.profile and train_iter == trainer_args.profile_step_start:
-            torch.cuda.profiler.start()
-        if (
-            train_iter * trainer_args.ckpt_save_interval > 0
-            and train_iter % trainer_args.ckpt_save_interval == 0
-        ):
-            save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
-            save_ckpts(save_path, pipeline._model, dense_optimizer)
-        torch.cuda.nvtx.range_push(f"step {train_iter}")
-        try:
-            reporting_loss, (local_loss, logits, labels) = pipeline.progress(
-                train_loader_iter
-            )
-        except StopIteration:
-            train_loader_iter = iter(train_loader)  # more than one epoch!
-            reporting_loss, (local_loss, logits, labels) = pipeline.progress(
-                train_loader_iter
-            )
-        tokens_logged += reporting_loss[1]
-        if train_iter > 0 and train_iter % trainer_args.log_interval == 0:
-            gpu_timer.stop()
-            cur_td = gpu_timer.elapsed_time() - last_td
-            print_rank_0(
-                f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
-            )
-            last_td = cur_td + last_td
-            tokens_logged.zero_()
+    # limit the number of iters to max_train_iters
+    # we support max_train_iters > n_batches, i.e. multiple epochs
+    train_loader_iter = islice(cycle(iter(train_loader)), max_train_iters)
 
+    # every eval iter
+    n = trainer_args.eval_interval if trainer_args.eval_interval else max_train_iters
+    # data loader is split into num_iters / eval_interval (iters) slices where each slice contains n batches
+    iter_slices = batched(train_loader_iter, n)
+    start_iter = 0
+    pipeline._model.train()
+    for batched_iterator in iter_slices:
+        # for one slice(every eval interval)
+        for train_iter in count(start_iter):
+            if trainer_args.profile and train_iter == trainer_args.profile_step_start:
+                torch.cuda.profiler.start()
+            if trainer_args.profile and train_iter == trainer_args.profile_step_end:
+                torch.cuda.profiler.stop()
+            if (
+                train_iter * trainer_args.ckpt_save_interval > 0
+                and train_iter % trainer_args.ckpt_save_interval == 0
+            ):
+                save_path = os.path.join(
+                    trainer_args.ckpt_save_dir, f"iter{train_iter}"
+                )
+                save_ckpts(save_path, pipeline._model, dense_optimizer)
+            try:
+                torch.cuda.nvtx.range_push(f"step {train_iter}")
+                reporting_loss, (local_loss, logits, labels) = pipeline.progress(
+                    batched_iterator
+                )
+                tokens_logged += reporting_loss[1]
+                torch.cuda.nvtx.range_pop()
+            except StopIteration:
+                start_iter = train_iter
+                torch.cuda.nvtx.range_pop()
+                break
+            # log
+            if train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0:
+                gpu_timer.stop()
+                cur_td = gpu_timer.elapsed_time() - last_td
+                print_rank_0(
+                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                )
+                last_td = cur_td + last_td
+                tokens_logged.zero_()
+        # TODO CHECK if train pipeline is flushed
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
             pipeline._model.eval()
             evaluate(
@@ -172,6 +194,4 @@ def train_with_pipeline(
                 trainer_args=trainer_args,
                 eval_loader=eval_loader,
             )
-        torch.cuda.nvtx.range_pop()
-        if trainer_args.profile and train_iter == trainer_args.profile_step_end:
-            torch.cuda.profiler.stop()
+            pipeline._model.train()
