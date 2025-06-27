@@ -120,6 +120,7 @@ def get_planner(args, device, eb_configs):
                         mode=DynamicEmbInitializerMode.DEBUG
                     ),
                     safe_check_mode=DynamicEmbCheckMode.WARNING,
+                    caching=True if args.use_index_dedup else False,
                 ),
             )
 

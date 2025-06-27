@@ -524,11 +524,13 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   hkv_table_option_.reserved_key_start_bit = reserved_key_start_bit;
   hkv_table_option_.num_of_buckets_per_alloc = num_of_buckets_per_alloc;
 
-  /// TODO: make HKV's init async.
-  hkv_table_->init(hkv_table_option_);
-  // HKV itself has cuda check, however, it invokes exit() rather than throw
-  // error, so we need to disable the HKV check
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  if (max_capacity != 0) {
+    /// TODO: make HKV's init async.
+    hkv_table_->init(hkv_table_option_);
+    // HKV itself has cuda check, however, it invokes exit() rather than throw
+    // error, so we need to disable the HKV check
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
@@ -875,6 +877,38 @@ void HKVVariable<KeyType, ValueType,Strategy >::export_batch_matched(
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::lock(
+    const size_t n,
+    const void* keys,            // (n)
+    void** locked_keys_ptr,      // (n)
+    bool* flags,                 // (n)
+    cudaStream_t stream
+)  {
+  hkv_table_->lock_keys(
+    n,
+    reinterpret_cast<const KeyType*>(keys),
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    flags, stream);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::unlock(
+    const size_t n,
+    void** locked_keys_ptr,      // (n)
+    const void* keys,            // (n)
+    bool* flags,                 // (n)
+    cudaStream_t stream
+) {
+  hkv_table_->unlock_keys(
+    n,
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    reinterpret_cast<const KeyType*>(keys),
+    flags, stream);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 curandState* HKVVariable<KeyType, ValueType, Strategy>::get_curand_states() const {
   return curand_states_;
 }
@@ -899,4 +933,8 @@ const float HKVVariable<KeyType, ValueType, Strategy>::get_initial_optstate() co
   return this->initial_optstate_;
 }
 
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+const bool HKVVariable<KeyType, ValueType, Strategy>::need_score() const {
+  return Strategy == EvictStrategy::kCustomized || Strategy == EvictStrategy::kLfu;
+}
 } // namespace dyn_emb

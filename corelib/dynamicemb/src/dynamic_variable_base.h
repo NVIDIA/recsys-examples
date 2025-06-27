@@ -183,11 +183,24 @@ public:
       uint64_t threshold, 
       uint64_t* d_counter, 
       cudaStream_t stream = 0) const = 0;
+  virtual void lock(const size_t n,
+                    const void* keys,            // (n)
+                    void** locked_keys_ptr,      // (n)
+                    bool* flags = nullptr,       // (n)
+                    cudaStream_t stream = 0) = 0;
+
+  virtual void unlock(const size_t n,
+                      void** locked_keys_ptr,      // (n)
+                      const void* keys,            // (n)
+                      bool* flags = nullptr,       // (n)
+                      cudaStream_t stream = 0) = 0;
+  
   virtual curandState* get_curand_states() const = 0;
   virtual const InitializerArgs& get_initializer_args() const = 0;
   virtual const int optstate_dim() const = 0;
   virtual void set_initial_optstate(const float value) = 0;
   virtual const float get_initial_optstate() const = 0;
+  virtual const bool need_score() const = 0;
 };
 
 class VariableFactory {
