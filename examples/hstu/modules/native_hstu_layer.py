@@ -16,8 +16,8 @@
 import nvtx
 import torch
 import torch.nn.functional as F
-from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from commons.utils.clear_tensor_data import clear_tensor_data
+from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
 from megatron.core import parallel_state
@@ -92,7 +92,7 @@ class HSTULayer(MegatronModule):
         # [embedding_dim, 4 * num_head * head_dim]
         self._linear_uvqk = TEColumnParallelLinear(
             input_size=self._embedding_dim,
-            output_size=self._tp_size * sum(self._split_arg_list) * self._num_heads,
+            output_size=sum(self._split_arg_list) * self._num_heads,
             init_method=config.init_method,
             config=config,
             bias=True,
@@ -100,15 +100,8 @@ class HSTULayer(MegatronModule):
             skip_bias_add=False,  # note: TEColumnParallelLinear does not support bias fusion!
             is_expert=False,
         )
-
-        # torch.nn.Linear(
-        #     self._embedding_dim,
-        #     sum(self._split_arg_list),
-        #     bias=True,
-        # ).apply(init_mlp_weights_optional_bias)
-
         self._linear_proj = TERowParallelLinear(
-            input_size=self._linear_dim_per_head * self._num_heads_per_partition,
+            input_size=self._linear_dim_per_head * self._num_heads,
             output_size=self._embedding_dim,
             init_method=config.init_method,
             config=config,
@@ -117,12 +110,6 @@ class HSTULayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
         )
-        # torch.nn.Linear(
-        #     self._linear_dim_per_head * self._num_heads,
-        #     self._embedding_dim,
-        #     bias=False,
-        # ).apply(init_mlp_weights_optional_bias)
-
         self._eps = config.layernorm_epsilon
         self._target_group_size = config.target_group_size
 
