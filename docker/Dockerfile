@@ -2,6 +2,8 @@ ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.11-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE} AS devel
+ARG TARGETPLATFORM
+
 WORKDIR /workspace/deps
 
 RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
@@ -10,18 +12,23 @@ RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath
 
 RUN pip install --no-cache setuptools==69.5.1 setuptools-git-versioning scikit-build && \
-  git clone --recursive -b main https://github.com/pytorch/FBGEMM.git fbgemm && \
+  git clone --recursive -b v1.2.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
   cd fbgemm/fbgemm_gpu && \
-  git checkout 642ccb980d05aa1be00ccd131c5991b0914e2e64 && \
-  python setup.py bdist_wheel --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0" && \
-  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
+  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 9.0"
 
 RUN pip install --no-deps tensordict orjson && \
-  git clone --recursive -b main https://github.com/pytorch/torchrec.git torchrec && \
-  cd torchrec && git checkout 6aaf1fa72e884642f39c49ef232162fa3772055e && \
+  git clone --recursive -b v1.2.0 https://github.com/pytorch/torchrec.git torchrec && \
+  cd torchrec && \
   pip install --no-deps .
 
-RUN test -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 || ln -s /usr/local/cuda-12.6/targets/x86_64-linux/lib/stubs/libnvidia-ml.so  /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
+  if [ ! -f /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1 ]; then \
+    if [ ${ARCH} = "aarch64" ]; then \
+      ln -s /usr/local/cuda-12.6/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+    else \
+      ln -s /usr/local/cuda-12.6/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+    fi \
+  fi
 
 # for dev
 RUN apt update -y --fix-missing && \
