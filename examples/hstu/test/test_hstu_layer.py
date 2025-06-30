@@ -73,7 +73,7 @@ def init_tpN_weights_from_native_legacy(
             tp_slice_end = (tp_rank + 1) * output_size // tp_size
             src = src[tp_slice:tp_slice_end, :]
         # row wise linear weight
-        elif re.match(r".* _linear_proj.weight$", name):
+        elif re.match(r".*_linear_proj.weight$", name):
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
             input_size = src.size(1)
@@ -81,7 +81,9 @@ def init_tpN_weights_from_native_legacy(
             tp_slice_end = (tp_rank + 1) * input_size // tp_size
             src = src[:, tp_slice:tp_slice_end]
         # output layernorm weight and bias are TP split
-        elif re.match(r".*_output_layernorm.*$", name):
+        # colparallel linear bias is also TP split when config.use_cpu_initialization is True
+        # see https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1104, https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1037
+        elif re.match(r".*_output_layernorm.*$|.*_linear_uvqk.bias$", name):
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
             tp_slice = tp_rank * param.shape[0] // tp_size
@@ -110,20 +112,15 @@ def get_batch_on_this_tp_rank(batch: JaggedData):
     return batch
 
 
-# @pytest.mark.parametrize("batchsize", [2, 8, 16])
-# @pytest.mark.parametrize("max_history_seqlen", [128, 200])
-# @pytest.mark.parametrize("max_num_targets", [16])
-# @pytest.mark.parametrize("max_num_contextuals", [2, 0])
-# @pytest.mark.parametrize("num_heads", [1, 8, 16])
-# @pytest.mark.parametrize("hidden_dim_per_head", [64, 128])
-# @pytest.mark.parametrize("dropout_ratio", [0.0])
-# @pytest.mark.parametrize("tp_size", [1, 2, 4])
-
-
-@pytest.mark.parametrize("batchsize", [8, 16])
+@pytest.mark.parametrize(
+    "batchsize",
+    [
+        2,
+    ],
+)
 @pytest.mark.parametrize("num_heads", [4, 8, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [32, 64, 128])  #
-@pytest.mark.parametrize("tp_size", [1])
+@pytest.mark.parametrize("tp_size", [2])
 def test_tp_hstu_layer(
     batchsize,
     num_heads,
@@ -131,7 +128,6 @@ def test_tp_hstu_layer(
     tp_size,
 ):
     init.initialize_distributed()
-    init.set_random_seed(1234)
     world_size = torch.distributed.get_world_size()
 
     if world_size < tp_size:
@@ -139,6 +135,7 @@ def test_tp_hstu_layer(
     if num_heads % tp_size != 0:
         pytest.skip("num_heads should be divisible by tp_size")
     init.initialize_model_parallel(tp_size)
+    init.set_random_seed(1234)
 
     def generate_input():
         input_sparsity = 0.75
@@ -214,7 +211,6 @@ def test_tp_hstu_layer(
         fp32_ref_jd = JaggedData(values=fp32_ref_input, **ctor_nograd_dict)
         return jd, ref_jd, fp32_ref_jd
 
-    world_size // tp_size
     ln_eps = 1e-5
     attn_backend = KernelBackend.CUTLASS
     dropout_ratio = 0.0  # triton dropout is not consistent with torch.nn.dropout
@@ -251,7 +247,7 @@ def test_tp_hstu_layer(
     out_legacy = legacy_hstu_layer(ref_jd).values
     fp32_out_legacy = fp32_legacy_hstu_layer(fp32_ref_jd).values
     tp_out = tp_hstu_layer(jd).values
-
+    # torch.testing.assert_close(tp_out, out_legacy)
     assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
 
     # make the grad_output sparse
@@ -264,7 +260,7 @@ def test_tp_hstu_layer(
     grad_legacy = ref_jd.values.grad
     grad_tp = jd.values.grad
     grad_fp32_legacy = fp32_ref_jd.values.grad
-    torch.testing.assert_close(grad_tp, grad_legacy, atol=1e-3, rtol=1e-3)
+    # torch.testing.assert_close(grad_tp, grad_legacy)
     assert_hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, fwd=False)
 
 

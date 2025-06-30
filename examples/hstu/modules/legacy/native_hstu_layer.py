@@ -39,9 +39,6 @@ class HSTULayer(MegatronModule):
         assert (
             config.hstu_layer_type == HSTULayerType.NATIVE
         ), "HSTULayer expects native hstu layer type"
-        assert (
-            config.tensor_model_parallel_size == 1
-        ), "HSTULayer does not support tensor model parallel"
         super().__init__(config=config)
         self._embedding_dim: int = config.hidden_size
         # per head dim;
@@ -128,7 +125,7 @@ class HSTULayer(MegatronModule):
         del mixed_uvqk
         return user, value, query, key
 
-    @output_nvtx_hook(nvtx_tag="HSTULayer", hook_tensor_attr_name="values")
+    @output_nvtx_hook(nvtx_tag="HSTULayer", hook_key_or_attr_name="values")
     def forward(self, jd: JaggedData) -> JaggedData:
         """
         Forward pass of the HSTULayer

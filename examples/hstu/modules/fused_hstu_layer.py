@@ -37,9 +37,9 @@ class FusedHSTULayer(MegatronModule):
         assert (
             config.hstu_layer_type == HSTULayerType.FUSED
         ), "FusedHSTULayer expects fused hstu layer type"
-        assert (
-            config.tensor_model_parallel_size == 1
-        ), "FusedHSTULayer does not support tensor model parallel"
+        # assert (
+        #     config.tensor_model_parallel_size == 1
+        # ), "FusedHSTULayer does not support tensor model parallel"
         super().__init__(config=config)
         self._embedding_dim: int = config.hidden_size
         # per head dim;
