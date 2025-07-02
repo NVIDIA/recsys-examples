@@ -122,6 +122,7 @@ def _weighted_layer_norm_fwd(
     tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
+# each CTA calculates one row of dx
 @triton.jit
 def _layer_norm_bwd_dx(
     DX,
@@ -157,7 +158,7 @@ def _layer_norm_bwd_dx(
     c2 = tl.sum(dy, axis=0) / D
     dx = (dy - (xhat * c1 + c2)) * rstd
     # Write dx
-    tl.store(DX + cols, dx, mask=mask)
+    tl.store(DX + cols, dx.to(DX.dtype.element_ty), mask=mask)
 
 
 @triton.jit
