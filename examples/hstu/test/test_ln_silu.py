@@ -16,6 +16,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 from commons.utils import initialize as init
+from megatron.core import parallel_state
+from modules.tp_layer_norm import TPLayerNorm, _divide_with_exception
 from ops.triton_ops.triton_layer_norm import (  # triton_rms_norm,
     triton_layer_norm,
     triton_swish_layer_norm,
@@ -45,7 +47,7 @@ def test_layernorm_swish(input_dtype, swish, hidden_dim):
     init.set_random_seed(1234)
     world_size = torch.distributed.get_world_size()
     if world_size > 1:
-        return
+        pytest.skip("Skip test in distributed mode")
     device = torch.cuda.current_device()
     eps = 1e-5
     batchsize = 128
@@ -77,3 +79,154 @@ def test_layernorm_swish(input_dtype, swish, hidden_dim):
     # import pdb; pdb.set_trace()
     torch.testing.assert_close(ln_weight.grad, ref_weight.grad)
     torch.testing.assert_close(ln_bias.grad, ref_bias.grad)
+
+
+@pytest.mark.parametrize("hidden_dim", [32, 128, 256])
+@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
+@pytest.mark.parametrize("trainable", [True, False])
+@pytest.mark.parametrize("shard_weight", [True, False])
+def test_tp_layernorm(
+    hidden_dim,
+    tp_size,
+    trainable,
+    shard_weight,
+):
+    init.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+    if tp_size > world_size:
+        pytest.skip("Skip tp size is greater than world size")
+    if shard_weight and not trainable:
+        pytest.skip("Skip shard weight is True but trainable is False")
+    device = torch.cuda.current_device()
+    init.initialize_model_parallel(tp_size)
+    init.set_random_seed(1234)
+    # no need to broadcast the weight and bias because they are initialized the same on all ranks
+    ref_weight = (
+        torch.nn.Parameter(torch.ones(hidden_dim, device=device)) if trainable else None
+    )
+    ref_bias = (
+        torch.nn.Parameter(torch.zeros(hidden_dim, device=device))
+        if trainable
+        else None
+    )
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    hidden_dim_per_partition = _divide_with_exception(hidden_dim, tp_size)
+    if shard_weight:
+        tp_weight = (
+            ref_weight[
+                tp_rank
+                * hidden_dim_per_partition : (tp_rank + 1)
+                * hidden_dim_per_partition
+            ]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+            if trainable
+            else None
+        )
+        tp_bias = (
+            ref_bias[
+                tp_rank
+                * hidden_dim_per_partition : (tp_rank + 1)
+                * hidden_dim_per_partition
+            ]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+            if trainable
+            else None
+        )
+    else:
+        tp_weight = (
+            ref_weight.detach().clone().requires_grad_(True) if trainable else None
+        )
+        tp_bias = ref_bias.detach().clone().requires_grad_(True) if trainable else None
+
+    batchsize = 128
+    eps = 1e-5
+    # do not gather output!
+    tp_layernorm = TPLayerNorm(
+        hidden_dim,
+        eps,
+        trainable=trainable,
+        shard_weight=shard_weight,
+        gather_output=False,
+    ).cuda()
+    if trainable:
+        tp_layernorm.weight.data.copy_(tp_weight)
+        tp_layernorm.bias.data.copy_(tp_bias)
+    # test 10 forward-backward
+    for i in range(10):
+        ref_x = torch.empty(
+            batchsize, hidden_dim, device=device, dtype=torch.bfloat16
+        ).uniform_(-0.1, 0.1)
+        # to ensure the same input within tp group
+        torch.distributed.broadcast(
+            ref_x,
+            parallel_state.get_tensor_model_parallel_src_rank(),
+            group=parallel_state.get_tensor_model_parallel_group(),
+        )
+        ref_x = ref_x.requires_grad_(True)
+        tp_x = (
+            ref_x[
+                ...,
+                tp_rank
+                * hidden_dim_per_partition : (tp_rank + 1)
+                * hidden_dim_per_partition,
+            ]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+        ref_y = ref_layernorm(ref_x, ref_weight, ref_bias, eps, False)
+        ref_tp_y = ref_y[
+            ...,
+            tp_rank
+            * hidden_dim_per_partition : (tp_rank + 1)
+            * hidden_dim_per_partition,
+        ]
+        tp_y = tp_layernorm(tp_x)
+        torch.testing.assert_close(tp_y, ref_tp_y)
+
+        dout = torch.empty_like(ref_y).uniform_(-0.1, 0.1)
+        # to ensure the same dout within tp group
+        torch.distributed.broadcast(
+            dout,
+            parallel_state.get_tensor_model_parallel_src_rank(),
+            group=parallel_state.get_tensor_model_parallel_group(),
+        )
+        tp_dout = dout[
+            ...,
+            tp_rank
+            * hidden_dim_per_partition : (tp_rank + 1)
+            * hidden_dim_per_partition,
+        ].contiguous()
+
+        tp_y.backward(tp_dout)
+        ref_y.backward(dout)
+        if trainable:
+            if shard_weight:
+                ref_tp_weight_grad = ref_weight.grad[
+                    tp_rank
+                    * hidden_dim_per_partition : (tp_rank + 1)
+                    * hidden_dim_per_partition
+                ]
+                ref_tp_bias_grad = ref_bias.grad[
+                    tp_rank
+                    * hidden_dim_per_partition : (tp_rank + 1)
+                    * hidden_dim_per_partition
+                ]
+            else:
+                ref_tp_weight_grad = ref_weight.grad
+                ref_tp_bias_grad = ref_bias.grad
+            torch.testing.assert_close(tp_layernorm.weight.grad, ref_tp_weight_grad)
+            torch.testing.assert_close(tp_layernorm.bias.grad, ref_tp_bias_grad)
+        ref_tp_x_grad = ref_x.grad[
+            ...,
+            tp_rank
+            * hidden_dim_per_partition : (tp_rank + 1)
+            * hidden_dim_per_partition,
+        ]
+
+        torch.testing.assert_close(tp_x.grad, ref_tp_x_grad)
