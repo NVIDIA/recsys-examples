@@ -38,6 +38,9 @@
 #include <torch/torch.h>
 #include <cooperative_groups.h>
 #include <optional>
+#include "hkv_variable.cuh"
+// #include <source_location>
+#include <cstring>
 
 namespace py = pybind11;
 using namespace dyn_emb;
@@ -113,11 +116,15 @@ void insert_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                       bool ignore_evict_strategy = false) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  if (score.has_value()) {
-    at::Tensor score_ = score.value();
-    table->insert_or_assign(n, keys.data_ptr(), values.data_ptr(),
-                            score_.data_ptr(), stream, unique_key,
-                            ignore_evict_strategy);
+  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
+    if (score.has_value()) {
+      at::Tensor score_ = score.value();
+      table->insert_or_assign(n, keys.data_ptr(), values.data_ptr(),
+                              score_.data_ptr(), stream, unique_key,
+                              ignore_evict_strategy);
+    } else {
+      throw std::runtime_error("Not provide score in Customized or LFU mode.");
+    }
   } else {
     table->insert_or_assign(n, keys.data_ptr(), values.data_ptr(), nullptr,
                             stream, unique_key, ignore_evict_strategy);
@@ -197,6 +204,328 @@ void find_and_initialize(
 
   table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, stream);
 }
+
+namespace dyn_emb {
+
+template<
+  typename key_t,
+  typename idx_t>
+__global__ void get_missed_keys_kernel(
+    int64_t n, const bool* founds, const key_t* keys, key_t* missed_keys, idx_t* missed_ids, int64_t* missed_counter, idx_t* reverse_ids=nullptr) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  cg::thread_block_tile<32> g = cg::tiled_partition<32>(cg::this_thread_block());
+  int64_t group_begin = (tid >> 5) * 32;
+  int lane = tid % 32;
+  for (int64_t i = group_begin; i < n; i += gridDim.x * blockDim.x) {
+    bool missed;
+    key_t key;
+    if (i + lane < n) {
+      missed = not founds[i + lane];
+      key = keys[i + lane];
+    } else {
+      missed = false;
+    }
+    uint32_t vote = g.ballot(missed);
+    int group_cnt = __popc(vote);
+    int64_t group_offset = 0;
+    if (g.thread_rank() == 0) {
+      group_offset = atomicAdd(missed_counter, static_cast<int64_t>(group_cnt));
+    }
+    group_offset = g.shfl(group_offset, 0);
+    // Each thread gets the count of previous missed ranks.
+    int previous_cnt = group_cnt - __popc(vote >> g.thread_rank());
+    if (missed) {
+      missed_keys[group_offset + previous_cnt] = key;
+      missed_ids[i + lane] = static_cast<idx_t>(group_offset + previous_cnt);
+      if (reverse_ids) {
+        reverse_ids[group_offset + previous_cnt] = i + lane;
+      }
+    }
+  }
+}
+
+template<
+  typename key_t,
+  typename idx_t,
+  typename double_counter>
+__global__ void get_classified_keys_kernel(
+    int n, const bool* founds, const key_t* keys, key_t* classified_keys,
+    uint64_t* classified_ids, idx_t* original_ids, double_counter counter) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  cg::thread_block_tile<32> g = cg::tiled_partition<32>(cg::this_thread_block());
+  int64_t group_begin = (tid >> 5) * 32;
+  int lane = tid % 32;
+  for (int64_t i = group_begin; i < n; i += gridDim.x * blockDim.x) {
+    bool found = false;
+    key_t key;
+    if (i + lane < n) {
+      key = keys[i + lane];
+      found = founds[i + lane];
+    } else {
+      found = false;
+    }
+    uint32_t found_vote = g.ballot(found);
+    int found_cnt = __popc(found_vote);
+    uint32_t missed_vote = ~found_vote;
+    int missed_cnt;
+    if (i + 31 < n) {
+      missed_cnt = 32 - found_cnt;
+    } else {
+      missed_cnt = (n - i) - found_cnt;
+    }
+    idx_t found_offset = 0;
+    idx_t missed_offset = 0;
+    if (g.thread_rank() == 0) {
+      ///TODO: if cnt = 0 then not to get offset.
+      found_offset = counter.get_offset1(found_cnt);
+      missed_offset = counter.get_offset2(missed_cnt);
+    }
+    found_offset = g.shfl(found_offset, 0);
+    missed_offset = g.shfl(missed_offset, 0);
+    // Each thread gets the count of before lanes.
+    uint32_t before_mask = (1u << lane) - 1;
+    int prefix_found_count = __popc(found_vote & before_mask);
+    int prefix_missed_cnt = __popc(missed_vote & before_mask);
+    
+    if (found) {
+      idx_t dst_id = found_offset + prefix_found_count;
+      classified_keys[dst_id] = key;
+      original_ids[dst_id] = static_cast<idx_t>(i + lane);
+      classified_ids[i + lane] = static_cast<uint64_t>(dst_id);
+    } else if (i + lane < n)  {
+      idx_t dst_id = (n - 1) - (missed_offset + prefix_missed_cnt);
+      classified_keys[dst_id] = key;
+      classified_ids[i + lane] = static_cast<uint64_t>(dst_id);
+    }
+  }
+}
+
+__global__ void remapping_reverse_ids_kernel(
+  uint64_t n,
+  uint64_t* reverse_ids,
+  uint64_t const * remapping_ids,
+  uint64_t const * offset_ptr
+) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  for (uint64_t i = tid; i < n; i += blockDim.x * gridDim.x) {
+    auto offset = offset_ptr[0];
+    uint64_t reverse_id = reverse_ids[i] - offset;
+    uint64_t remapping_id = remapping_ids[reverse_id];
+    reverse_ids[i] = remapping_id + offset;
+  }
+}
+
+template <
+  typename T,
+  typename Idx,
+  typename EmbeddingGenerator>
+__global__ void load_twice_or_initialize_embeddings_kernel(
+    uint64_t n,
+    int emb_dim,
+    T* outputs, 
+    T** inputs_ptr,
+    bool* masks,
+    Idx* missed_ids,
+    T** inputs_ptr2,
+    bool* masks2,
+    typename EmbeddingGenerator::Args generator_args) {
+
+  EmbeddingGenerator emb_gen(generator_args);
+
+  for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    bool mask = masks[emb_id];
+    T* input_ptr = inputs_ptr[emb_id];
+    Idx missed_id = missed_ids[emb_id];
+    if (mask) { // copy embedding from inputs to outputs.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        outputs[emb_id * emb_dim + i] = input_ptr[i];
+      }
+    } else {
+      bool mask2 = masks2[missed_id];
+      T* input_ptr2 = inputs_ptr2[missed_id];
+      if (mask2) {
+        for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+          outputs[emb_id * emb_dim + i] = input_ptr2[i];
+        }
+      } else { // initialize the embeddings directly.
+        for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+          auto tmp = emb_gen.generate(emb_id);
+          outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(tmp);
+        }
+      }
+    }
+  }
+
+  emb_gen.destroy();
+}
+
+template <
+  typename T,
+  typename Idx,
+  typename EmbeddingGenerator>
+__global__ void load_or_initialize_classified_embeddings_kernel(
+    int n,
+    int emb_dim,
+    T* outputs, 
+    T** inputs_ptr,
+    int found_counter,
+    Idx* original_ids,
+    T** inputs_ptr2,
+    bool* masks2,
+    typename EmbeddingGenerator::Args generator_args) {
+
+  EmbeddingGenerator emb_gen(generator_args);
+
+  for (int emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
+    bool mask = false;
+    T* input_ptr = nullptr;
+    if (emb_id < found_counter) {
+      mask = true;
+      Idx original_id = original_ids[emb_id];
+      input_ptr = inputs_ptr[original_id];
+    } else {
+      mask = masks2[emb_id - found_counter];
+      input_ptr = inputs_ptr2[emb_id - found_counter];
+    }
+  
+    if (mask) { // copy embedding from inputs to outputs.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        outputs[emb_id * emb_dim + i] = input_ptr[i];
+      }
+    } else { // initialize the embeddings directly.
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        auto tmp = emb_gen.generate(emb_id);
+        outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(tmp);
+      }
+    }
+  }
+
+  emb_gen.destroy();
+}
+
+template <typename CounterType>
+struct DoubleCounter {
+CounterType * counter;
+
+DEVICE_INLINE
+CounterType get_offset1(CounterType increment) {
+  return atomicAdd(counter, increment);
+}
+
+DEVICE_INLINE
+CounterType get_offset2(CounterType increment) {
+  return atomicAdd(counter + 1, increment);
+}
+};
+
+void find_and_initialize_from_hierarchical_table(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> device_table,
+    std::shared_ptr<dyn_emb::DynamicVariableBase> host_table,
+    const size_t n,
+    const at::Tensor keys,
+    at::Tensor classified_keys,
+    at::Tensor classified_ids,
+    const at::Tensor values,
+    const c10::optional<at::Tensor>& cache_metrics=c10::nullopt
+  ) {
+
+  if (n == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  at::Tensor vals_dev_ptr_tensor = at::empty({static_cast<int64_t>(n)}, 
+    at::TensorOptions().dtype(at::kLong).device(values.device()));
+  auto vals_dev_ptr = reinterpret_cast<void**>(vals_dev_ptr_tensor.data_ptr<int64_t>());
+  at::Tensor founds_dev_tensor = at::empty({static_cast<int64_t>(n)},
+     at::TensorOptions().dtype(at::kBool).device(keys.device()));
+  auto founds_dev = founds_dev_tensor.data_ptr<bool>();
+
+  device_table->find_pointers(n, keys.data_ptr(), vals_dev_ptr, founds_dev, nullptr, stream);
+
+  auto original_ids = at::empty({static_cast<int64_t>(n)},
+     at::TensorOptions().dtype(at::kInt).device(keys.device()));
+  auto counter = at::zeros({static_cast<int64_t>(2)},
+     at::TensorOptions().dtype(at::kInt).device(keys.device()));
+  DISPATCH_INTEGER_DATATYPE_FUNCTION(host_table->key_type(), key_t, [&] {
+    get_classified_keys_kernel<key_t, int, DoubleCounter<int>><<<(n + 127) / 128, 128, 0, stream>>>(
+      n, founds_dev, reinterpret_cast<key_t*>(keys.data_ptr()), 
+      reinterpret_cast<key_t*>(classified_keys.data_ptr()), reinterpret_cast<uint64_t*>(classified_ids.data_ptr()), 
+      original_ids.data_ptr<int>(), DoubleCounter<int> {counter.data_ptr<int>()}
+    );
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  int found_counter = 0;
+  AT_CUDA_CHECK(cudaMemcpyAsync(&found_counter, counter.data_ptr(),
+      sizeof(int), cudaMemcpyDeviceToHost, stream));
+  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  int missed_counter = n - found_counter;
+  if (cache_metrics.has_value()) {
+    cache_metrics.value()[0] = static_cast<int>(n);
+    cache_metrics.value()[1] = static_cast<int>(found_counter);
+  }
+
+  auto vals_host_ptr_tensor = at::empty({static_cast<int64_t>(missed_counter)}, vals_dev_ptr_tensor.options());
+  auto vals_host_ptr = reinterpret_cast<void**>(vals_host_ptr_tensor.data_ptr<int64_t>());
+  auto founds_host = at::empty({static_cast<int64_t>(missed_counter)}, founds_dev_tensor.options()).data_ptr<bool>();
+
+  auto missed_keys_ptr = reinterpret_cast<char*>(classified_keys.data_ptr()) + classified_keys.element_size() * found_counter;
+
+  host_table->find_pointers(missed_counter, (void*)missed_keys_ptr, vals_host_ptr, founds_host, nullptr, stream);
+
+  int dim = host_table->cols();
+  auto &device_prop = DeviceProp::getDeviceProp();
+  int block_size = dim < device_prop.max_thread_per_block
+                       ? dim
+                       : device_prop.max_thread_per_block;
+  int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
+
+  auto &initializer_args = device_table->get_initializer_args();
+  auto* curand_states_ = device_table->get_curand_states();
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(device_table->value_type(), ValueType, [&] {
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(device_table->key_type(), KeyType, [&] {
+      if (initializer_args.mode == "normal") {
+        using Generator = NormalEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+        load_or_initialize_classified_embeddings_kernel<ValueType, int, Generator>
+          <<<grid_size, block_size, 0, stream>>>(
+          n, dim, reinterpret_cast<ValueType *>(values.data_ptr()), (ValueType **)(vals_dev_ptr), found_counter,
+          original_ids.data_ptr<int>(), (ValueType **)(vals_host_ptr), founds_host, generator_args);
+      } else if (initializer_args.mode == "truncated_normal") {
+        using Generator = TruncatedNormalEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+        load_or_initialize_classified_embeddings_kernel<ValueType, int, Generator>
+          <<<grid_size, block_size, 0, stream>>>(
+          n, dim, reinterpret_cast<ValueType *>(values.data_ptr()), (ValueType **)(vals_dev_ptr), found_counter,
+          original_ids.data_ptr<int>(), (ValueType **)(vals_host_ptr), founds_host, generator_args);
+      } else if (initializer_args.mode == "uniform") {
+        using Generator = UniformEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
+        load_or_initialize_classified_embeddings_kernel<ValueType, int, Generator>
+          <<<grid_size, block_size, 0, stream>>>(
+          n, dim, (ValueType *)(values.data_ptr()), (ValueType **)(vals_dev_ptr), found_counter,
+          original_ids.data_ptr<int>(), (ValueType **)(vals_host_ptr), founds_host,generator_args);
+      } else if (initializer_args.mode == "debug") {
+        using Generator = MappingEmbeddingGenerator<KeyType>;
+        auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(classified_keys.data_ptr()), 100000};
+        load_or_initialize_classified_embeddings_kernel<ValueType, int, Generator>
+          <<<grid_size, block_size, 0, stream>>>(
+          n, dim, reinterpret_cast<ValueType *>(values.data_ptr()), (ValueType **)(vals_dev_ptr), found_counter,
+          original_ids.data_ptr<int>(), (ValueType **)(vals_host_ptr), founds_host, generator_args);
+      } else if (initializer_args.mode == "constant") {
+        using Generator = ConstEmbeddingGenerator;
+        auto generator_args = typename Generator::Args {initializer_args.value};
+        load_or_initialize_classified_embeddings_kernel<ValueType, int, Generator>
+          <<<grid_size, block_size, 0, stream>>>(
+          n, dim, reinterpret_cast<ValueType *>(values.data_ptr()), (ValueType **)(vals_dev_ptr), found_counter,
+          original_ids.data_ptr<int>(), (ValueType **)(vals_host_ptr), founds_host, generator_args);
+      } else {
+        throw std::runtime_error("Unrecognized initializer {" + initializer_args.mode + "}");
+      }
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+    });
+  });
+}
+
+} // namespace dyn_emb
 
 void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                   const size_t n,
@@ -281,6 +610,37 @@ void find_pointers(
 
   table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, 
       nullptr, stream);
+}
+
+int64_t find_and_get_missed(
+  std::shared_ptr<dyn_emb::DynamicVariableBase> ht,
+  uint64_t n,
+  at::Tensor keys,
+  at::Tensor founds,
+  at::Tensor vals_ptr,
+  at::Tensor missed_keys,
+  at::Tensor missed_ids,
+  at::Tensor reverse_ids
+) {
+
+  find_pointers(ht, n, keys, vals_ptr, founds);
+  auto missed_counter = at::zeros({static_cast<int64_t>(1)},
+    at::TensorOptions().dtype(at::kLong).device(keys.device()));
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  DISPATCH_INTEGER_DATATYPE_FUNCTION(ht->key_type(), key_t, [&] {
+    get_missed_keys_kernel<key_t, int><<<(n + 127) / 128, 128, 0, stream>>>(
+      n, founds.data_ptr<bool>(), reinterpret_cast<key_t*>(keys.data_ptr()), 
+      reinterpret_cast<key_t*>(missed_keys.data_ptr()), missed_ids.data_ptr<int>(),
+      missed_counter.data_ptr<int64_t>(), reverse_ids.data_ptr<int>()
+    );
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  int64_t missed_host_counter = 0;
+  AT_CUDA_CHECK(cudaMemcpyAsync(&missed_host_counter, missed_counter.data_ptr(),
+      sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
+  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+  return missed_host_counter;
 }
 
 void assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
@@ -382,7 +742,9 @@ void lookup_forward_dense(
     const at::Tensor h_unique_nums, const at::Tensor d_unique_nums,
     const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
     const at::Tensor unique_embs, const at::Tensor output_embs,
-    int device_num_sms, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
+    int device_num_sms, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
+    const c10::optional<at::Tensor>& cache_metrics=c10::nullopt,
+    std::optional<std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>> host_tables = std::nullopt) {
 
   if (!offsets.is_cuda() || !indices.is_cuda()) {
     throw std::runtime_error(
@@ -476,22 +838,63 @@ void lookup_forward_dense(
 
   int64_t unique_embs_offset = 0;
   for (int i = 0; i < table_num; ++i) {
+    int table_offset_begin = table_offsets_in_feature[i];
+    int table_offset_end = table_offsets_in_feature[i + 1];
+    int offset_begin = table_offset_begin * batch_size;
+    int offset_end = table_offset_end * batch_size;
+
+    int64_t indices_begin = h_offset[offset_begin].item<int64_t>();
+    int64_t indices_end = h_offset[offset_end].item<int64_t>();
+    int64_t indices_length = indices_end - indices_begin;
     int64_t tmp_unique_num = h_unique_nums[i].item<int64_t>();
     if (tmp_unique_num != 0) {
       at::Tensor tmp_unique_embs =
           create_sub_tensor(unique_embs, unique_embs_offset * dim);
       if (use_index_dedup) {
-        find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+        auto classified_unique_indices = at::empty({tmp_unique_num}, tmp_unique_indices[i].options());
+        auto classified_ids = at::empty({tmp_unique_num}, tmp_unique_indices[i].options().dtype(at::kUInt64));
+        bool classified = false;
+        if (host_tables.has_value()) {
+          auto& host_table = host_tables.value()[i];
+          if (host_table != nullptr) {
+            classified = true;
+            find_and_initialize_from_hierarchical_table(tables[i], host_table, tmp_unique_num, tmp_unique_indices[i], classified_unique_indices, classified_ids, tmp_unique_embs, cache_metrics);
+          } else {
+            find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+          }
+        } else {
+          find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+        }
         void *dst_ptr = reinterpret_cast<char *>(unique_idx.data_ptr()) +
                         unique_embs_offset * unique_idx.element_size();
-        void *src_ptr = tmp_unique_indices[i].data_ptr();
+        void *src_ptr = nullptr;
+        if (classified) {
+          src_ptr = classified_unique_indices.data_ptr();
+          at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
+          at::Tensor tmp_reverse_idx = create_sub_tensor(reverse_idx, indices_begin);
+          constexpr int BLOCK_SIZE_ = 1024;
+          remapping_reverse_ids_kernel<<<(indices_length + BLOCK_SIZE_ - 1) / BLOCK_SIZE_, BLOCK_SIZE_, 0, stream >>>(
+            indices_length,
+            reinterpret_cast<uint64_t*>(tmp_reverse_idx.data_ptr()),
+            reinterpret_cast<uint64_t*>(classified_ids.data_ptr()),
+            reinterpret_cast<uint64_t*>(previous_d_unique_num.data_ptr())
+          );
+          DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+        } else {
+          src_ptr = tmp_unique_indices[i].data_ptr();
+        }
         size_t copy_size = tmp_unique_num * unique_idx.element_size();
         AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                       cudaMemcpyDeviceToDevice, stream));
       } else {
         auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
-        find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
-                      tmp_unique_embs, score);
+        if (host_tables.has_value()) {
+          throw std::runtime_error(
+              "Not support caching mode when used_index_dedup is True");
+        } else {
+          find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
+                                tmp_unique_embs, score); 
+        }
       }
     }
     unique_embs_offset += tmp_unique_num;
@@ -850,7 +1253,8 @@ void bind_dyn_emb_op(py::module &m) {
           .def("set_initial_optstate", &dyn_emb::DynamicVariableBase::set_initial_optstate,
             "Set initial value of optimizer state.")
           .def("get_initial_optstate", &dyn_emb::DynamicVariableBase::get_initial_optstate,
-            "Get initial value of optimizer state.");
+            "Get initial value of optimizer state.")
+          .def("load_factor", &dyn_emb::DynamicVariableBase::load_factor, "Get the load factor of the table");
 
   m.def("dyn_emb_rows", &dyn_emb_rows, "Get the number of rows in the table",
         py::arg("table"));
@@ -989,7 +1393,9 @@ void bind_dyn_emb_op(py::module &m) {
                   const at::Tensor, const at::Tensor, const at::Tensor,
                   const at::Tensor, const at::Tensor, const at::Tensor,
                   const at::Tensor, int,
-                  std::shared_ptr<dyn_emb::UniqueOpBase>)) &
+                  std::shared_ptr<dyn_emb::UniqueOpBase>,
+                  const c10::optional<at::Tensor>& cache_metrics,
+                  std::optional<std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>> host_tables)) &
             lookup_forward_dense,
         "lookup forward dense for duplicated keys", py::arg("tables"),
         py::arg("indices"), py::arg("offsets"), py::arg("scores"),
@@ -1000,7 +1406,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("d_unique_nums"), py::arg("h_unique_offsets"),
         py::arg("d_unique_offsets"), py::arg("unique_embs"),
         py::arg("output_embs"), py::arg("device_num_sms"),
-        py::arg("unique_op"));
+        py::arg("unique_op"), py::arg("cache_metrics") = c10::nullopt,  py::arg("host_tables") = py::none());
 
   m.def("lookup_forward_dense",
         (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,
