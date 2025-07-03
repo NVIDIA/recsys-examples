@@ -18,7 +18,7 @@ from enum import Enum
 from functools import partial
 
 # pyre-strict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -289,7 +289,9 @@ class RetrievalTaskMetricWithSampling(BaseTaskMetric):
         self._cache_query_embeddings.append(query_embeddings)
         self._cache_target_ids.append(target_ids)
 
-    def compute(self, keys_array: np.ndarray, values_array: np.ndarray):
+    def compute(
+        self, keys_array: np.ndarray, values_array: np.ndarray
+    ) -> Tuple[Dict[Any, Any], Any, Any]:
         """
         Compute the final retrieval metrics after all eval batches are done.
 
@@ -315,11 +317,8 @@ class RetrievalTaskMetricWithSampling(BaseTaskMetric):
             (
                 global_query_embeddings,
                 global_target_ids,
-            ), _ = grouped_allgatherv_tensor_list(
+            ) = grouped_allgatherv_tensor_list(
                 [query_embeddings, target_ids],
-                torch.tensor(
-                    [target_ids.numel()], dtype=torch.int64, device=self._device
-                ),
                 pg=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
             # 3. calc topk largest in a streaming way
@@ -363,13 +362,8 @@ class RetrievalTaskMetricWithSampling(BaseTaskMetric):
             (
                 t_global_n_topk_logits,
                 t_global_n_topk_keys,
-            ), _ = grouped_allgatherv_tensor_list(
+            ) = grouped_allgatherv_tensor_list(
                 [t_local_topk_logits, t_local_topk_keys],
-                torch.tensor(
-                    [t_local_topk_logits.size(0)],
-                    dtype=torch.int64,
-                    device=self._device,
-                ),
                 pg=torch.distributed.group.WORLD,
             )
 
@@ -414,5 +408,4 @@ class RetrievalTaskMetricWithSampling(BaseTaskMetric):
 
         self._cache_query_embeddings.clear()
         self._cache_target_ids.clear()
-
         return final_eval_dict, global_topk_logits, global_topk_keys

@@ -52,7 +52,7 @@ class RetrievalGR(BaseModel):
         self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
         assert (
             self._tp_size == 1
-        ), "RetrievalGR does not support tensor model parallel, because of the sampled softmax loss"
+        ), "RetrievalGR does not support tensor model parallel, because of the sampled softmax loss and evaluation"
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._hstu_config = hstu_config
         self._task_config = task_config

@@ -56,18 +56,16 @@ def test_distributed_topk(num_embeddings: int, embedding_dim: int, tp: int, max_
         keys_array, values_array
     )
 
-    (all_query_embeddings, all_target_ids), _ = grouped_allgatherv_tensor_list(
+    (all_query_embeddings, all_target_ids) = grouped_allgatherv_tensor_list(
         [query_embeddings, target_ids],
-        torch.tensor([target_ids.numel()], dtype=torch.int64, device=device),
         pg=parallel_state.get_data_parallel_group(with_context_parallel=True),
     )
 
     # 2. export local embedding
     local_keys = torch.tensor(keys_array, device=device)
     local_values = torch.tensor(values_array, device=device)
-    (global_keys, global_values), _ = grouped_allgatherv_tensor_list(
+    (global_keys, global_values) = grouped_allgatherv_tensor_list(
         [local_keys, local_values],
-        torch.tensor([local_keys.numel()], dtype=torch.int64, device=device),
         pg=torch.distributed.group.WORLD,
     )
 
