@@ -31,7 +31,7 @@ from dynamicemb.shard import (
     DynamicEmbeddingCollectionSharder,
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -109,15 +109,10 @@ def apply_megatron_ddp(
     )
 
     def broadcast_params_for_non_model_parallel_embedding_modules():
+        # Table are replicated across all TPxCPxDP ranks, so we need to broadcast them
         for p in dmp._dmp_wrapped_module.parameters():
             if not isinstance(p, TableBatchedEmbeddingSlice):
-                dist.broadcast(
-                    p.data,
-                    src=0,
-                    group=parallel_state.get_data_parallel_group(
-                        with_context_parallel=True
-                    ),
-                )
+                dist.broadcast(p.data, src=0, group=dist.group.WORLD)
 
     broadcast_params_for_non_model_parallel_embedding_modules()
     config.finalize_model_grads_func = finalize_model_grads
@@ -362,7 +357,7 @@ def apply_dmp(
         data_parallel_sharding_plans.append(
             plan.plan.pop(data_parallel_embedding_module_name, None)
         )
-    # Shard model
+    # Shard model, the seed is forked to ensure different random state across all ranks
     with tensor_parallel.get_cuda_rng_tracker().fork("sharded-embedding-group-seed"):
         model = DistributedModelParallel(
             module=model,
