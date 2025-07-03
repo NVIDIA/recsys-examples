@@ -29,7 +29,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import divide
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
-from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
+from modules.tp_layer_norm import TPLayerNormDropoutMul
 
 
 class HSTULayer(MegatronModule):
@@ -51,6 +51,7 @@ class HSTULayer(MegatronModule):
         # per head dim;
         self._linear_dim_per_head: int = config.kv_channels
         self._attention_dim_per_head: int = config.kv_channels
+        self._eps = config.layernorm_epsilon
         # dropout on proj_linear
         self._dropout_ratio: float = config.hidden_dropout
         # dropout on QK; not used now
@@ -67,6 +68,7 @@ class HSTULayer(MegatronModule):
         ]
         self._residual = config.residual
         device = torch.cuda.current_device()
+        # input layernorm
         if config.learnable_input_layernorm:
             self._input_layernorm_weight = torch.nn.Parameter(
                 torch.ones(self._embedding_dim, device=device)
@@ -77,17 +79,12 @@ class HSTULayer(MegatronModule):
         else:
             self._input_layernorm_weight = None
             self._input_layernorm_bias = None
-        # output norm weight and bias are mandatory
-        # this should be a TP LayerNorm
-        self._output_layernorm_weight = torch.nn.Parameter(
-            torch.ones(
-                self._num_heads_per_partition * self._linear_dim_per_head, device=device
-            )
-        )
-        self._output_layernorm_bias = torch.nn.Parameter(
-            torch.zeros(
-                self._num_heads_per_partition * self._linear_dim_per_head, device=device
-            )
+        self._output_ln_dropout_mul = TPLayerNormDropoutMul(
+            hidden_size=self._num_heads * self._linear_dim_per_head,
+            eps=self._eps,
+            trainable=True,
+            shard_weight=False,
+            dropout_ratio=self._dropout_ratio,
         )
         # [embedding_dim, 4 * num_head * head_dim]
         self._linear_uvqk = TEColumnParallelLinear(
@@ -110,7 +107,7 @@ class HSTULayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
         )
-        self._eps = config.layernorm_epsilon
+
         self._target_group_size = config.target_group_size
 
         self._attn_func = create_hstu_attention(
@@ -146,15 +143,7 @@ class HSTULayer(MegatronModule):
             self._split_arg_list,
             dim=-1,
         )
-        value = value.reshape(
-            -1, self._num_heads_per_partition * self._linear_dim_per_head
-        )
-        query = query.reshape(
-            -1, self._num_heads_per_partition * self._attention_dim_per_head
-        )
-        key = key.reshape(
-            -1, self._num_heads_per_partition * self._attention_dim_per_head
-        )
+
         # this contiguous is inevitable, because output layout is (T, head_dim * 4, num_heads)
         user = user.reshape(
             -1, self._num_heads_per_partition * self._linear_dim_per_head
@@ -197,15 +186,7 @@ class HSTULayer(MegatronModule):
                 target_group_size=self._target_group_size,
             )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
-            parallel_input = triton_norm_mul_dropout(
-                jagged_attn_output,
-                tu,
-                self._output_layernorm_weight,
-                self._output_layernorm_bias,
-                self._eps,
-                self._dropout_ratio,
-                self.training,
-            )
+            parallel_input = self._output_ln_dropout_mul(jagged_attn_output, tu)
         with nvtx.annotate("hstu linear_residual fwd", color="YELLOW"):
             # Note that output is a pair of (output, bias)
             output, _ = self._linear_proj(parallel_input)

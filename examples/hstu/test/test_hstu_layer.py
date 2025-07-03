@@ -47,6 +47,12 @@ def init_fused_weights_from_native_legacy(
             fused_module.state_dict()[fused_accessor].data.copy_(src_data)
 
 
+native_legacy_module_path_to_tpN_module_path = {
+    "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
+    "_output_layernorm_bias": "_output_ln_dropout_mul.bias",
+}
+
+
 # allgather weights from tp1 to tpN (slice tp1 to tpN)
 def init_tpN_weights_from_native_legacy(
     legacy_module: LegacyHSTULayer, tpN_module: HSTULayer
@@ -83,13 +89,19 @@ def init_tpN_weights_from_native_legacy(
         # output layernorm weight and bias are TP split
         # colparallel linear bias is also TP split when config.use_cpu_initialization is True
         # see https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1104, https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1037
-        elif re.match(r".*_output_layernorm.*$|.*_linear_uvqk.bias$", name):
+        elif re.match(r".*_linear_uvqk.bias$", name):
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
             tp_slice = tp_rank * param.shape[0] // tp_size
             tp_slice_end = (tp_rank + 1) * param.shape[0] // tp_size
             src = src[tp_slice:tp_slice_end, ...]
-        tpN_module.state_dict()[name].data.copy_(src)
+        elif re.match(r".*_output_layernorm.*$", name):
+            child_name = name.split(".")[-1]
+            name = name.replace(
+                child_name, native_legacy_module_path_to_tpN_module_path[child_name]
+            )
+        dst = tpN_module.state_dict()[name]
+        dst.data.copy_(src)
 
 
 def get_batch_on_this_tp_rank(batch: JaggedData):
@@ -120,7 +132,7 @@ def get_batch_on_this_tp_rank(batch: JaggedData):
 )
 @pytest.mark.parametrize("num_heads", [4, 8, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [32, 64, 128])  #
-@pytest.mark.parametrize("tp_size", [2])
+@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 def test_tp_hstu_layer(
     batchsize,
     num_heads,
@@ -247,8 +259,11 @@ def test_tp_hstu_layer(
     out_legacy = legacy_hstu_layer(ref_jd).values
     fp32_out_legacy = fp32_legacy_hstu_layer(fp32_ref_jd).values
     tp_out = tp_hstu_layer(jd).values
-    # torch.testing.assert_close(tp_out, out_legacy)
-    assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
+
+    if tp_size == 1:
+        torch.testing.assert_close(tp_out, out_legacy)
+    else:
+        assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
 
     # make the grad_output sparse
     with torch.no_grad():
@@ -260,8 +275,8 @@ def test_tp_hstu_layer(
     grad_legacy = ref_jd.values.grad
     grad_tp = jd.values.grad
     grad_fp32_legacy = fp32_ref_jd.values.grad
-    # torch.testing.assert_close(grad_tp, grad_legacy)
     assert_hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, fwd=False)
+    init.destroy_global_state()
 
 
 @pytest.mark.parametrize(

@@ -1,8 +1,8 @@
 import megatron.core.parallel_state as parallel_state
 import torch
 from ops.collective_ops import gather_along_last_dim, split_along_last_dim
-from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
 from ops.triton_ops.triton_layer_norm import triton_layer_norm
+from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 
 
 def _divide_with_exception(x, y):
@@ -86,7 +86,7 @@ class TPLayerNorm(torch.nn.Module):
         return normed_x
 
 
-class TPLayerNormDropoutMul(torch.nn.Module):
+class TPLayerNormMulDropout(torch.nn.Module):
     def __init__(
         self,
         hidden_size,
@@ -146,7 +146,7 @@ class TPLayerNormDropoutMul(torch.nn.Module):
         full_x = gather_along_last_dim(x, self._tp_pg)
         full_u = gather_along_last_dim(u, self._tp_pg)
         # we use triton layer norm such that full_x can be of different dtype from weight/bias
-        normed_x = pytorch_norm_mul_dropout(
+        normed_x = triton_norm_mul_dropout(
             full_x,
             full_u,
             weight,

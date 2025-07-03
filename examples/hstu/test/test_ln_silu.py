@@ -19,7 +19,7 @@ from commons.utils import initialize as init
 from megatron.core import parallel_state
 from modules.tp_layer_norm import (
     TPLayerNorm,
-    TPLayerNormDropoutMul,
+    TPLayerNormMulDropout,
     _divide_with_exception,
 )
 from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
@@ -301,7 +301,7 @@ def test_tp_layernorm_dropout_mul(
     batchsize = 128
     eps = 1e-5
     # do not gather output!
-    tp_layernorm_dropout_mul = TPLayerNormDropoutMul(
+    tp_layernorm_dropout_mul = TPLayerNormMulDropout(
         hidden_dim,
         eps,
         dropout_ratio,
