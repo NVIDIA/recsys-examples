@@ -29,7 +29,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import divide
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
-from modules.tp_layer_norm import TPLayerNormDropoutMul
+from modules.tp_layer_norm import TPLayerNormMulDropout
 
 
 class HSTULayer(MegatronModule):
@@ -79,7 +79,7 @@ class HSTULayer(MegatronModule):
         else:
             self._input_layernorm_weight = None
             self._input_layernorm_bias = None
-        self._output_ln_dropout_mul = TPLayerNormDropoutMul(
+        self._output_ln_dropout_mul = TPLayerNormMulDropout(
             hidden_size=self._num_heads * self._linear_dim_per_head,
             eps=self._eps,
             trainable=True,

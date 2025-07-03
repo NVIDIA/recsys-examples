@@ -51,7 +51,6 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-from torchrec.types import ModuleNoCopyMixin
 
 
 def create_data_parallel_sharding_infos_by_sharding(
@@ -129,7 +128,8 @@ def create_data_parallel_sharding_infos_by_sharding(
     return sharding_type_to_sharding_infos
 
 
-class DataParallelEmbeddingCollection(torch.nn.Module, ModuleNoCopyMixin):
+# TODO add wgrad allreduce sum across tp ranks in finalize model grads!
+class DataParallelEmbeddingCollection(torch.nn.Module):
     """
     Sharded implementation of `EmbeddingCollection`.
     This is part of the public API to allow for manual data dist pipelining.
@@ -193,9 +193,15 @@ class DataParallelEmbeddingCollection(torch.nn.Module, ModuleNoCopyMixin):
         """
         self.embeddings: nn.ModuleDict = nn.Module()
         assert len(self._dp_lookups[0]._emb_modules) == 1
+        param_name = f"{'/'.join(self._table_names)}_weights"
         self.embeddings.register_parameter(
-            f"{'/'.join(self._table_names)}_weights",
+            param_name,
             self._dp_lookups[0]._emb_modules[0].emb_module.weights,
+        )
+        setattr(
+            self._dp_lookups[0]._emb_modules[0].emb_module.weights,
+            "need_tp_allreduce_sum",
+            True,
         )
 
         self.embedding_weights: Dict[str, torch.Tensor] = {}

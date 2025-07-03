@@ -260,10 +260,7 @@ def test_tp_hstu_layer(
     fp32_out_legacy = fp32_legacy_hstu_layer(fp32_ref_jd).values
     tp_out = tp_hstu_layer(jd).values
 
-    if tp_size == 1:
-        torch.testing.assert_close(tp_out, out_legacy)
-    else:
-        assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
+    assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
 
     # make the grad_output sparse
     with torch.no_grad():

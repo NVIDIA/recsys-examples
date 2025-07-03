@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Tuple
+from typing import Dict, Tuple
 
 import torch
 from configs import HSTUConfig, RankingConfig
 from dataset.utils import RankingBatch
+from distributed.dmp_to_tp import dmp_batch_to_tp, jt_dict_grad_scaling_and_allgather
 from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.embedding import ShardedEmbedding
@@ -24,6 +25,7 @@ from modules.hstu_block import HSTUBlock
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP
 from modules.multi_task_loss_module import MultiTaskLossModule
+from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
 class RankingGR(BaseModel):
@@ -44,9 +46,6 @@ class RankingGR(BaseModel):
     ):
         super().__init__()
         self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        assert (
-            self._tp_size == 1
-        ), "RankingGR does not support tensor model parallel for now"
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._hstu_config = hstu_config
         self._task_config = task_config
@@ -115,7 +114,15 @@ class RankingGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The logits and labels.
         """
-        embeddings = self._embedding_collection(batch.features)
+        # DMP embedding
+        embeddings: Dict[str, JaggedTensor] = self._embedding_collection(batch.features)
+        # This is the tricky part. The micro-batch should be b * tp_size which is consistent with dense module.
+        # While for Model-parallel Emb jagged_tensor_allgather values edding, the micro-batch batchsize is b. Therefore, we need to scale the gradient by tp_size.
+        embeddings = jt_dict_grad_scaling_and_allgather(
+            embeddings, parallel_state.get_tensor_model_parallel_group()
+        )
+        batch = dmp_batch_to_tp(batch)
+        # hidden_states is a JaggedData
         hidden_states = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
