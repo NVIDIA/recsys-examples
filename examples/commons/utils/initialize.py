@@ -54,16 +54,18 @@ def initialize_model_parallel(tensor_model_parallel_size=1):
 
 def destroy_global_state():
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
-    torch.distributed.destroy_process_group(
-        group=parallel_state.get_data_parallel_group(with_context_parallel=True)
-    )
+
+    # TODO, find the reason why destroying pg hit nccl error when tpsize > 1
     if parallel_state.model_parallel_is_initialized():
-        torch.distributed.destroy_process_group(
-            group=parallel_state.get_tensor_model_parallel_group()
-        )
+        # torch.distributed.destroy_process_group(
+        #     group=parallel_state.get_tensor_model_parallel_group()
+        # )
+        # torch.distributed.destroy_process_group(
+        #     group=parallel_state.get_data_parallel_group(with_context_parallel=True)
+        # )
         parallel_state.destroy_model_parallel()
-    gc.collect()
     torch.cuda.empty_cache()
+    gc.collect()
 
 
 def set_random_seed(seed_):
