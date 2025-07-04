@@ -39,6 +39,13 @@ git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm &
 pip install -e ./megatron-lm
 ```
 
+We provide our custom HSTU CUDA operators for enhanced performance. You need to install these operators using the following command:
+
+```bash
+cd /workspace/recsys-examples/examples/hstu && \
+python setup.py install
+```
+
 # Get Started
 The examples we supported:
 - [HSTU recommender examples](./examples/hstu/README.md)
