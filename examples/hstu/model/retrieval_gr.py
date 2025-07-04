@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections import OrderedDict
 from typing import Tuple
 
 import torch
@@ -23,7 +22,6 @@ from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.embedding import ShardedEmbedding
 from modules.hstu_block import HSTUBlock
-from modules.metrics.metric_modules import RetrievalTaskMetricWithSampling
 from modules.negatives_sampler import InBatchNegativesSampler
 from modules.output_postprocessors import L2NormEmbeddingPostprocessor
 from modules.sampled_softmax_loss import SampledSoftmaxLoss
@@ -80,9 +78,7 @@ class RetrievalGR(BaseModel):
                 dtype=torch.bfloat16 if hstu_config.bf16 else torch.float16
             ),
         )
-        self._metric_module = RetrievalTaskMetricWithSampling(
-            metric_types=task_config.eval_metrics, MAX_K=500
-        )
+        self._item_feature_name = None
 
     def bfloat16(self):
         """
@@ -189,6 +185,9 @@ class RetrievalGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]: The losses and a tuple of losses, logits, and supervision embeddings.
         """
+        if self._item_feature_name is None:
+            self._item_feature_name = batch.item_feature_name
+
         (
             jagged_item_logit,
             supervision_item_ids,
@@ -201,34 +200,12 @@ class RetrievalGR(BaseModel):
         return losses, (
             losses.detach(),
             jagged_item_logit.detach(),
-            supervision_emb.detach(),
+            supervision_item_ids.detach(),
         )
 
-    def evaluate_one_batch(self, batch: RetrievalBatch) -> None:
-        """
-        Evaluate one batch of data.
-
-        Args:
-            batch (RetrievalBatch): The batch of retrieval data.
-        """
-        with torch.no_grad():
-            jagged_item_logit, supervision_item_ids, _ = self.get_logit_and_labels(
-                batch
-            )
-            self._metric_module(jagged_item_logit.float(), supervision_item_ids)
-        self._item_feature_name = batch.item_feature_name
-
-    def compute_metric(self) -> "OrderedDict":
-        """
-        Compute the evaluation metrics.
-
-        Returns:
-            OrderedDict: The computed metrics.
-        """
+    # used for evaluation
+    def get_item_feature_table_name(self) -> str:
         for embedding_config in self._task_config.embedding_configs:
             if self._item_feature_name in embedding_config.feature_names:
                 table_name = embedding_config.table_name
-        eval_dict, _, _ = self._metric_module.compute(
-            *self._embedding_collection.export_local_embedding(table_name),
-        )
-        return eval_dict
+        return table_name

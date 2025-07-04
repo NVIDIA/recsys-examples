@@ -6,7 +6,7 @@ ARG TARGETPLATFORM
 
 WORKDIR /workspace/deps
 
-RUN git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install -e ./megatron-lm
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath
@@ -51,3 +51,6 @@ RUN cd /workspace/recsys-examples/corelib/hstu && \
     HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
     cd hopper && \
     HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=TRUE HSTU_DISABLE_DRAB=TRUE pip install .
+
+RUN cd /workspace/recsys-examples/examples/hstu && \
+    python setup.py install

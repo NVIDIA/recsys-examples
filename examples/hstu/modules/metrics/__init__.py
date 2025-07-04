@@ -2,7 +2,10 @@ from typing import Tuple
 
 import torch
 
-from .metric_modules import MultiClassificationTaskMetric
+from .metric_modules import (
+    MultiClassificationTaskMetric,
+    RetrievalTaskMetricWithSampling,
+)
 
 
 def get_multi_event_metric_module(
@@ -17,3 +20,10 @@ def get_multi_event_metric_module(
         metric_types=metric_types,
         process_group=comm_pg,
     )
+
+
+__all__ = [
+    "MultiClassificationTaskMetric",
+    "RetrievalTaskMetricWithSampling",
+    "get_multi_event_metric_module",
+]

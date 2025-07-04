@@ -17,6 +17,26 @@ import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 
 
+def _decode_bits(encoded_labels: torch.Tensor, bit_width: int) -> torch.Tensor:
+    """
+    decode an integer to a list of bits
+
+    Args:
+        encoded_labels (torch.Tensor): (N,), The encoded labels tensor.
+        bit_width (int): The bit width of the encoded labels.
+
+    Returns:
+        torch.Tensor: (N, bit_width), The decoded labels tensor.
+
+    e.g [2,1,0,3], bit_width = 2, then the output is [[0,1], [1,0], [0,0], [1,1]]
+    Most-significant bit is the last task, least-significant bit is the first task
+    """
+    bit_positions = torch.arange(bit_width, device=encoded_labels.device)
+
+    encoded_labels = encoded_labels.unsqueeze(-1)
+    return (encoded_labels >> bit_positions) & 1
+
+
 class MultiTaskLossModule(torch.nn.Module):
     """
     Multi-task loss module for handling multiple loss functions. A loss head is either a
@@ -30,22 +50,19 @@ class MultiTaskLossModule(torch.nn.Module):
 
     def __init__(self, num_classes: int, num_tasks: int, reduction="none"):
         super().__init__()
-        self._loss_modules = torch.nn.ModuleList()
+        self._loss_modules: torch.nn.Module
         self._num_tasks = num_tasks
         self._num_classes = num_classes
         if self._num_classes == self._num_tasks:
-            for _ in range(self._num_tasks):
-                self._loss_modules.append(
-                    torch.nn.BCEWithLogitsLoss(reduction=reduction)
-                )
+            self._loss_modules = torch.nn.BCEWithLogitsLoss(reduction=reduction)
         else:
             assert (
                 self._num_tasks == 1
             ), "num_tasks should be 1 for multi-class classification"
-            self._loss_modules.append(torch.nn.CrossEntropyLoss(reduction=reduction))
+            self._loss_modules = torch.nn.CrossEntropyLoss(reduction=reduction)
 
     @output_nvtx_hook(nvtx_tag="loss computation")
-    def forward(self, merged_logits, labels):
+    def forward(self, merged_logits, labels) -> torch.Tensor:
         """
         Forward pass of the MultiTaskLossModule.
 
@@ -63,14 +80,8 @@ class MultiTaskLossModule(torch.nn.Module):
         ), "labels dtype should be integer"
 
         if self._num_classes == self._num_tasks:
-            losses = []
-            for task_idx in range(self._num_tasks):
-                task_logits = merged_logits[:, task_idx]
-                task_labels = (torch.bitwise_and(labels, 1 << task_idx) > 0).to(
-                    torch.float
-                )
-                loss = self._loss_modules[task_idx](task_logits, task_labels)
-                losses.append(loss)
-            return torch.stack(losses, dim=1)
+            decoded_labels = _decode_bits(labels, self._num_tasks).float()
+            losses = self._loss_modules(merged_logits, decoded_labels)
+            return losses
         else:
-            return self._loss_modules[0](merged_logits, labels)
+            return self._loss_modules(merged_logits, labels)

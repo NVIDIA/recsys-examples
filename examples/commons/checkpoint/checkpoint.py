@@ -18,7 +18,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from commons.utils.logging import print_rank_0
+from commons.utils.logger import print_rank_0
 from dynamicemb.dump_load import DynamicEmbDump as dynamic_emb_save
 from dynamicemb.dump_load import DynamicEmbLoad as dynamic_emb_load
 from megatron.core.distributed import DistributedDataParallel

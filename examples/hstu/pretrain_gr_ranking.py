@@ -25,11 +25,18 @@ from typing import List, Tuple, cast
 import commons.utils.initialize as init
 import gin
 import torch  # pylint: disable-unused-import
-from commons.utils.logging import print_rank_0
+from commons.utils.logger import print_rank_0
 from configs import RankingConfig
 from distributed.sharding import make_optimizer_and_shard
+from megatron.core import parallel_state
 from model import get_ranking_model
-from utils import (
+from modules.metrics import get_multi_event_metric_module
+from pipeline.train_pipeline import (
+    JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainNonePipeline,
+    JaggedMegatronTrainPipelineSparseDist,
+)
+from training import (
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
@@ -41,7 +48,7 @@ from utils import (
     get_data_loader,
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
-    train,
+    train_with_pipeline,
 )
 
 
@@ -119,7 +126,18 @@ def main():
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
         dynamicemb_options_dict=dynamic_options_dict,
+        pipeline_type=trainer_args.pipeline_type,
     )
+
+    stateful_metric_module = get_multi_event_metric_module(
+        num_classes=task_config.prediction_head_arch[-1],
+        num_tasks=task_config.num_tasks,
+        metric_types=task_config.eval_metrics,
+        comm_pg=parallel_state.get_data_parallel_group(
+            with_context_parallel=True
+        ),  # ranks in the same TP group do the same compute
+    )
+
     train_dataloader, test_dataloader = get_data_loader(
         "ranking", dataset_args, trainer_args, task_config.num_tasks
     )
@@ -129,9 +147,26 @@ def main():
     )
 
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
-
-    train(
-        model_train,
+    if trainer_args.pipeline_type in ["prefetch", "native"]:
+        pipeline_factory = (
+            JaggedMegatronPrefetchTrainPipelineSparseDist
+            if trainer_args.pipeline_type == "prefetch"
+            else JaggedMegatronTrainPipelineSparseDist
+        )
+        pipeline = pipeline_factory(
+            model_train,
+            dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    else:
+        pipeline = JaggedMegatronTrainNonePipeline(
+            model_train,
+            dense_optimizer,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    train_with_pipeline(
+        pipeline,
+        stateful_metric_module,
         trainer_args,
         train_dataloader,
         test_dataloader,

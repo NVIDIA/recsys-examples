@@ -144,23 +144,48 @@ def apply_megatron_ddp(
     return dmp, dense_optimizer
 
 
+# refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91
+# compute_kernel is somehow coupled with sharding_type.
+_pipeline_type_to_model_parallel_allowed_compute_kernels = {
+    "prefetch": ["fused_uvm_caching"],
+    "native": ["fused", "fused_uvm"],
+    "none": [],  # none does not constrain the compute kernels
+}
+_pipeline_type_to_data_parallel_allowed_compute_kernels = {
+    "prefetch": ["dense"],
+    "native": ["dense"],
+    "none": [],
+}
+_sharding_type_to_allowed_compute_kernels = {
+    "data_parallel": _pipeline_type_to_data_parallel_allowed_compute_kernels,
+    "model_parallel": _pipeline_type_to_model_parallel_allowed_compute_kernels,
+}
+
+
 def get_planner(
     eb_configs: List[EmbeddingConfig],
     data_parallel_embedding_table_names: Set[str],
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
     device: torch.device,
+    pipeline_type: str = "none",
 ):
     constraints = {}
     for config in eb_configs:
         if config.name in data_parallel_embedding_table_names:
+            compute_kernel_type = _sharding_type_to_allowed_compute_kernels[
+                "data_parallel"
+            ][pipeline_type]
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[
                     ShardingType.DATA_PARALLEL.value,
                 ],
                 bounds_check_mode=BoundsCheckMode.NONE,
                 use_dynamicemb=False,
+                compute_kernels=compute_kernel_type,
             )
         elif config.name in dynamicemb_options_dict:
+            # TODO add dynamic embedding compute kernels
+            compute_kernel_type = []
             dynamicemb_options = dynamicemb_options_dict[config.name]
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[ShardingType.ROW_WISE.value],
@@ -170,14 +195,19 @@ def get_planner(
                 dynamicemb_options=dynamicemb_options,
             )
         else:
+            compute_kernel_type = _sharding_type_to_allowed_compute_kernels[
+                "model_parallel"
+            ][pipeline_type]
+            # TODO: save and load does not support table-wise sharding, disable them for now
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[
                     ShardingType.ROW_WISE.value,
-                    ShardingType.TABLE_WISE.value,
-                    ShardingType.TABLE_ROW_WISE.value,
+                    # ShardingType.TABLE_WISE.value,
+                    # ShardingType.TABLE_ROW_WISE.value,
                 ],
                 bounds_check_mode=BoundsCheckMode.NONE,
                 use_dynamicemb=False,
+                compute_kernels=compute_kernel_type,
             )
         constraints.update({config.name: constraint})
     hbm_cap = torch.cuda.get_device_properties(0).total_memory
@@ -211,7 +241,6 @@ _optimizer_str_to_optim_type = {
     "adam": EmbOptimType.ADAM,
     "sgd": EmbOptimType.EXACT_SGD,
     "row_wise_adagrad": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
-    # 'adamw': EmbOptimType.ADAMW,
 }
 
 
@@ -256,9 +285,9 @@ def apply_dmp(
     sparse_optimizer_param: OptimizerParam,
     pg: torch.distributed.ProcessGroup,
     device: torch.device,
+    pipeline_type: str = "native",
 ):
-    optimizer_str = "sgd"
-
+    enable_prefetch_pipeline = pipeline_type == "prefetch"
     (
         sparse_opt_cls,
         sparse_opt_args,
@@ -271,7 +300,7 @@ def apply_dmp(
         learning_rate=sparse_optimizer_param.learning_rate,
     )
     assert (
-        optimizer_str in _optimizer_str_to_optim_type
+        sparse_optimizer_param.optimizer_str in _optimizer_str_to_optim_type
     ), f"embedding optimizer only support {list(_optimizer_str_to_optim_type.keys())}"
     fused_params = {
         "optimizer": _optimizer_str_to_optim_type[sparse_optimizer_param.optimizer_str],
@@ -280,7 +309,12 @@ def apply_dmp(
         "beta2": sparse_optimizer_param.adam_beta2,
         "eps": sparse_optimizer_param.adam_eps,
         # 'weight_decay_mode' : WeightDecayMode.NONE,
+        # TODO, expose below params to users
         "output_dtype": SparseType.FP32,
+        # only when compute kernel is FUSED_UVM_CACHING or KEY_VALUE are the below params effective.
+        "cache_precision": SparseType.FP32,
+        "stochastic_rounding": False,
+        "prefetch_pipeline": enable_prefetch_pipeline,
     }
     eb_configs = []
     data_parallel_embedding_table_names = []
@@ -303,6 +337,7 @@ def apply_dmp(
         set(data_parallel_embedding_table_names),
         dynamicemb_options_dict,
         device,
+        pipeline_type,
     )
     qcomm_codecs_registry = get_qcomm_codecs_registry(
         qcomms_config=QCommsConfig(
@@ -380,6 +415,7 @@ def make_optimizer_and_shard(
     sparse_optimizer_param: OptimizerParam,
     dense_optimizer_param: OptimizerParam,
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {},
+    pipeline_type: str = "native",
     device: torch.device = None,
     pg: torch.distributed.ProcessGroup = None,
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
@@ -389,7 +425,12 @@ def make_optimizer_and_shard(
         pg = dist.group.WORLD
 
     model = apply_dmp(
-        model, dynamicemb_options_dict, sparse_optimizer_param, pg, device
+        model,
+        dynamicemb_options_dict,
+        sparse_optimizer_param,
+        pg,
+        device,
+        pipeline_type,
     )
     model, dense_optimizer = apply_megatron_ddp(
         model, config, dense_optimizer_param, device

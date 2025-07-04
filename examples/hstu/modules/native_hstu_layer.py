@@ -16,7 +16,7 @@
 import nvtx
 import torch
 import torch.nn.functional as F
-from commons.utils.nvtx_op import output_nvtx_hook
+from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
 from megatron.core.transformer.module import MegatronModule
@@ -99,6 +99,9 @@ class HSTULayer(MegatronModule):
             linear_dim=self._linear_dim_per_head,
             is_causal=config.is_causal,
         )
+        register_setter_and_getter_for_nvtx(
+            HSTULayer.forward, key_or_attr_name="values"
+        )
 
     def get_user_value_query_key_tensors(self, hidden_states: torch.Tensor):
         """
@@ -127,7 +130,7 @@ class HSTULayer(MegatronModule):
         del mixed_uvqk
         return user, value, query, key
 
-    @output_nvtx_hook(nvtx_tag="HSTULayer", hook_tensor_attr_name="values")
+    @output_nvtx_hook(nvtx_tag="HSTULayer")
     def forward(self, jd: JaggedData) -> JaggedData:
         """
         Forward pass of the HSTULayer

@@ -12,24 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import sys
-from dataclasses import dataclass
 from functools import partial  # pylint: disable-unused-import
-from itertools import islice
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
-import commons.checkpoint as checkpoint
 import configs
 import dataset
-import gin
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
-from commons.checkpoint import get_unwrapped_module
-from commons.utils.distributed_utils import collective_assert
-from commons.utils.gpu_timer import GPUTimer
-from commons.utils.logging import print_rank_0
-from commons.utils.stringify import stringify_dict
 from configs import (
     HSTULayerType,
     KernelBackend,
@@ -38,165 +28,16 @@ from configs import (
     get_hstu_config,
 )
 from dynamicemb import DynamicEmbTableOptions
-from megatron.core import parallel_state
-from megatron.core.distributed import finalize_model_grads
-from model import RankingGR, RetrievalGR
 from modules.embedding import ShardedEmbeddingConfig
-from torchrec.distributed.model_parallel import DistributedModelParallel
-
-
-@gin.configurable
-@dataclass
-class TrainerArgs:
-    # below batchsize is batchsize_per_gpu
-    train_batch_size: int
-    eval_batch_size: int
-
-    eval_interval: int = 100
-    log_interval: int = 100
-
-    seed: int = 1234
-    # ==nsys args==
-    profile: bool = False
-    profile_step_start: int = 100
-    profile_step_end: int = 200
-    # ==nsys args==
-    max_train_iters: Optional[int] = None
-    max_eval_iters: Optional[int] = None
-
-    # ckpt args
-    ckpt_save_interval: int = -1  # -1 means not save ckpt
-    ckpt_save_dir: str = "./checkpoints"
-    ckpt_load_dir: str = ""
-
-    def __post_init__(self):
-        if isinstance(self.max_train_iters, str):
-            self.max_train_iters = int(self.max_train_iters)
-
-
-@dataclass
-class BaseEmbeddingArgs:
-    # for dynamic emb, it serves as capacity, while for static emb, it serves as vocab size
-    feature_names: List[str]
-    table_name: str
-    item_vocab_size_or_capacity: int
-
-
-@gin.configurable
-@dataclass
-class EmbeddingArgs(BaseEmbeddingArgs):
-    sharding_type: str = "None"
-
-    def __post_init__(self):
-        assert self.sharding_type.lower() in [
-            "data_parallel",
-            "model_parallel",
-        ]
-
-
-@gin.configurable
-@dataclass
-class DynamicEmbeddingArgs(EmbeddingArgs):
-    # the precedence is global_hbm_for_values > item_vocab_gpu_capacity > item_vocab_gpu_capacity_ratio
-    # without optimizer consideration
-    global_hbm_for_values: Optional[int] = None
-    item_vocab_gpu_capacity: Optional[float] = None
-    item_vocab_gpu_capacity_ratio: Optional[float] = None
-
-    evict_strategy: str = "lru"
-
-    def __post_init__(self):
-        assert self.evict_strategy.lower() in ["lru", "lfu"]
-
-    def calculate_and_reset_global_hbm_for_values(self, hidden_size):
-        if self.global_hbm_for_values is not None:
-            return
-        assert (
-            self.item_vocab_gpu_capacity_ratio is not None
-            or self.item_vocab_gpu_capacity is not None
-        ), "Please provide either item_vocab_gpu_capacity_ratio or item_vocab_gpu_capacity"
-        if self.item_vocab_gpu_capacity is None:
-            self.item_vocab_gpu_capacity = int(
-                self.item_vocab_size_or_capacity * self.item_vocab_gpu_capacity_ratio
-            )
-        self.global_hbm_for_values = self.item_vocab_gpu_capacity * hidden_size * 4
-
-
-@gin.configurable
-@dataclass
-class DatasetArgs:
-    dataset_name: str
-    max_sequence_length: int
-    max_num_candidates: int = 0
-    shuffle: bool = False
-
-
-@gin.configurable
-@dataclass
-class FeatureArgs:
-    feature_names: List[str]
-    max_sequence_length: int
-    is_jagged: bool = False
-
-
-@gin.configurable
-@dataclass
-class BenchmarkDatasetArgs:
-    feature_args: List[FeatureArgs]
-    embedding_args: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]]
-    item_feature_name: str
-    contextual_feature_names: List[str]
-    action_feature_name: Optional[str] = None
-    max_num_candidates: int = 0
-
-
-@gin.configurable
-@dataclass
-class NetworkArgs:
-    num_layers: int
-    hidden_size: int
-    num_attention_heads: int
-    kv_channels: int
-
-    hidden_dropout: float = 0.2
-    norm_epsilon: float = 1e-5
-    is_causal: bool = True
-
-    dtype_str: str = "bfloat16"
-
-    kernel_backend: str = "cutlass"
-    layer_type: str = "fused"
-    target_group_size: int = 1
-
-    num_position_buckets: int = 8192
-
-    recompute_input_layernorm: bool = False
-    recompute_input_silu: bool = False
-
-    def __post_init__(self):
-        assert self.dtype_str in [
-            "bfloat16",
-            "float16",
-        ], "Only support bfloat16 and float16 precision for Network."
-
-        assert self.kernel_backend.lower() in ["cutlass", "triton", "pytorch"]
-        assert self.layer_type.lower() in ["fused", "native"]
-
-
-@gin.configurable
-@dataclass
-class OptimizerArgs:
-    optimizer_str: str
-    learning_rate: float
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_eps: float = 1e-8
-
-
-@gin.configurable
-@dataclass
-class TensorModelParallelArgs:
-    tensor_model_parallel_size: int = 1
+from training.gin_config_args import (
+    BenchmarkDatasetArgs,
+    DatasetArgs,
+    DynamicEmbeddingArgs,
+    EmbeddingArgs,
+    NetworkArgs,
+    OptimizerArgs,
+    TrainerArgs,
+)
 
 
 def create_hstu_config(network_args: NetworkArgs):
@@ -370,155 +211,6 @@ def create_dynamic_optitons_dict(
                 bucket_capacity=128,
             )
     return dynamic_options_dict
-
-
-def evaluate(
-    model: Union[RankingGR, RetrievalGR],
-    trainer_args: TrainerArgs,
-    eval_loader: torch.utils.data.DataLoader,
-    max_eval_iters: Optional[int] = None,
-):
-    eval_iter = 0
-    torch.cuda.nvtx.range_push(f"#evaluate")
-    with torch.no_grad():
-        # drop last batch
-        for batch in islice(eval_loader, len(eval_loader)):
-            batch = batch.to("cuda")
-            eval_iter += 1
-            model.evaluate_one_batch(batch)
-            if max_eval_iters is not None and eval_iter == max_eval_iters:
-                break
-
-        eval_metric_dict = model.compute_metric()
-        dp_size = parallel_state.get_data_parallel_world_size()
-    # TODO, fix the samples when there is incomplete batch
-    print_rank_0(
-        f"[eval] [eval {eval_iter * dp_size * trainer_args.eval_batch_size} samples]:\n    "
-        + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
-    )
-    torch.cuda.nvtx.range_pop()
-
-
-def maybe_load_ckpts(
-    ckpt_load_dir: str,
-    model: Union[RankingGR, RetrievalGR],
-    dense_optimizer: Optional[torch.optim.Optimizer] = None,
-):
-    if ckpt_load_dir == "":
-        return
-
-    assert os.path.exists(
-        ckpt_load_dir
-    ), f"ckpt_load_dir {ckpt_load_dir} does not exist"
-
-    print_rank_0(f"Loading checkpoints from {ckpt_load_dir}")
-    checkpoint.load(ckpt_load_dir, model, dense_optimizer=dense_optimizer)
-    print_rank_0(f"Checkpoints loaded!!")
-
-
-def save_ckpts(
-    ckpt_save_dir: str,
-    model: Union[RankingGR, RetrievalGR],
-    dense_optimizer: Optional[torch.optim.Optimizer] = None,
-):
-    print_rank_0(f"Saving checkpoints to {ckpt_save_dir}")
-    import shutil
-
-    if dist.get_rank() == 0:
-        if os.path.exists(ckpt_save_dir):
-            shutil.rmtree(ckpt_save_dir)
-        try:
-            os.makedirs(ckpt_save_dir, exist_ok=True)
-        except Exception as e:
-            raise Exception("can't build path:", ckpt_save_dir) from e
-    dist.barrier(device_ids=[torch.cuda.current_device()])
-    checkpoint.save(ckpt_save_dir, model, dense_optimizer=dense_optimizer)
-    print_rank_0(f"Checkpoints saved!!")
-
-
-def train(
-    model: DistributedModelParallel,
-    trainer_args: TrainerArgs,
-    train_loader: torch.utils.data.DataLoader,
-    eval_loader: torch.utils.data.DataLoader,
-    dense_optimizer: torch.optim.Optimizer,
-):
-    gpu_timer = GPUTimer()
-    max_train_iters = trainer_args.max_train_iters or len(train_loader)
-    dp_size = parallel_state.get_data_parallel_world_size() * 1.0
-    gpu_timer.start()
-    last_td = 0
-    # using a tensor on gpu to avoid d2h copy
-    tokens_logged = torch.zeros(1).cuda().float()
-    train_loader_iter = iter(train_loader)
-    for train_iter in range(max_train_iters):
-        if trainer_args.profile and train_iter == trainer_args.profile_step_start:
-            torch.cuda.profiler.start()
-        if (
-            train_iter * trainer_args.ckpt_save_interval > 0
-            and train_iter % trainer_args.ckpt_save_interval == 0
-        ):
-            save_path = os.path.join(trainer_args.ckpt_save_dir, f"iter{train_iter}")
-            save_ckpts(save_path, model, dense_optimizer)
-
-        torch.cuda.nvtx.range_push(f"step {train_iter}")
-
-        try:
-            batch = next(train_loader_iter)
-        except StopIteration:
-            # Reset iterator when we reach the end
-            train_loader_iter = iter(train_loader)
-            batch = next(train_loader_iter)
-
-        batch = batch.to("cuda")
-        model.module.zero_grad_buffer()
-        dense_optimizer.zero_grad()
-
-        # shape = [T, num_event]
-        losses, (_, logits, labels) = model(batch)
-        collective_assert(not torch.isnan(losses).any(), "loss has nan value")
-        jagged_size = logits.size(0)
-        local_tokens = torch.tensor(jagged_size).cuda().float()
-
-        losses = torch.sum(losses, dim=0)
-        local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
-        reporting_loss = local_loss.clone().detach()
-        # [allreduced_sum_loss, allreduced_sum_tokens]
-        torch.distributed.all_reduce(
-            reporting_loss, group=parallel_state.get_data_parallel_group()
-        )
-        tokens_logged += reporting_loss[1]
-        if train_iter >= 0 and train_iter % trainer_args.log_interval == 0:
-            gpu_timer.stop()
-            cur_td = gpu_timer.elapsed_time() - last_td
-            print_rank_0(
-                f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
-            )
-            last_td = cur_td + last_td
-            tokens_logged.zero_()
-
-        # backward, loss_sum / total_tokens * mcore_dp_size
-        local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
-        local_loss_average.backward()
-
-        # dense gradient allreduce
-        finalize_model_grads([model.module], None)
-        torch.cuda.nvtx.range_push(f"#dense opt")
-        dense_optimizer.step()
-        torch.cuda.nvtx.range_pop()
-        if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
-            model.eval()
-            evaluate(
-                get_unwrapped_module(model),
-                trainer_args=trainer_args,
-                eval_loader=eval_loader,
-                max_eval_iters=None,
-            )
-            model.train()
-        torch.cuda.nvtx.range_pop()
-
-        if trainer_args.profile and train_iter == trainer_args.profile_step_end:
-            torch.cuda.profiler.stop()
 
 
 def get_dataset_and_embedding_args() -> (
