@@ -34,12 +34,14 @@ class HSTULayerType(Enum):
     Enum class representing different HSTU layer types.
 
     Attributes:
-      FUSED: Represents the fused type. The fused layer is scheduleable and pipelineable
-      NATIVE: Represents the non-fused type.
+      FUSED: Represents the fused type. The fused layer is scheduleable and pipelineable. Does not support TP. This will be deprecated in the future.
+      NATIVE: Represents the non-fused type. Support TP.
+      DEBUG: Represents the debug type. This does not support TP and is used for debugging.
     """
 
     FUSED = "FUSED"
     NATIVE = "NATIVE"
+    DEBUG = "DEBUG"
 
 
 @unique

@@ -59,7 +59,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
                     python ./benchmark/fused_hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
-                    --layer-type native \
+                    --layer-type debug \
                     --kernel-backend cutlass \
                     --full-sequence "$full_sequence" \
                     --dim-per-head "$dim_per_head" \

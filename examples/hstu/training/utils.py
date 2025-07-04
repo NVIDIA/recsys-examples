@@ -62,6 +62,8 @@ def create_hstu_config(network_args: NetworkArgs):
     layer_type = None
     if network_args.layer_type == "fused":
         layer_type = HSTULayerType.FUSED
+    elif network_args.layer_type == "debug":
+        layer_type = HSTULayerType.DEBUG
     elif network_args.layer_type == "native":
         layer_type = HSTULayerType.NATIVE
     else:
