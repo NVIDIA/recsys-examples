@@ -86,7 +86,7 @@ def create_model(
     item_feature_name = "item_feat"
     action_feature_name = "action_feat"
     contextual_emb_size = 1000
-    item_emb_size = 1000
+    item_emb_size = 1024 * 1024
     action_vocab_size = 1000
     emb_configs = [
         configs.ShardedEmbeddingConfig(
@@ -107,7 +107,10 @@ def create_model(
     feature_configs = [
         dataset.utils.FeatureConfig(
             feature_names=[item_feature_name, action_feature_name],
-            max_item_ids=[item_emb_size, action_vocab_size],
+            max_item_ids=[
+                item_emb_size // 2,
+                action_vocab_size,
+            ],  # restrict the item emb size to half of the capacity to avoid eviction
             max_sequence_length=100,
             is_jagged=True,
         )
