@@ -200,10 +200,9 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
         )
         setattr(
             self._dp_lookups[0]._emb_modules[0].emb_module.weights,
-            "need_tp_allreduce_sum",
+            "need_tp_allreduce",
             True,
         )
-
         self.embedding_weights: Dict[str, torch.Tensor] = {}
 
         for (

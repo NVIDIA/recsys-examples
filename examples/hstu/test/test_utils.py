@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+from typing import Optional
+
 import commons.utils as init
 import configs
 import dataset
@@ -27,14 +29,47 @@ from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
 from torch.distributed._shard.sharded_tensor import ShardedTensor
-from torchrec.distributed.composable.table_batched_embedding_slice import (
-    TableBatchedEmbeddingSlice,
-)
 
 debug_module_path_to_tpN_module_path = {
     "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
     "_output_layernorm_bias": "_output_ln_dropout_mul.bias",
 }
+
+
+def collective_assert_tensor(
+    tensor: torch.Tensor,
+    compare_type: str = "equal",
+    pg: Optional[torch.distributed.ProcessGroup] = None,
+):
+    cur_rank = torch.distributed.get_rank(group=pg)
+    world_size = torch.distributed.get_world_size(group=pg)
+
+    gathered_tensors = [torch.empty_like(tensor) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_tensors, tensor.contiguous(), group=pg)
+    torch.distributed.barrier(group=pg)
+
+    for i in range(world_size):
+        if i == cur_rank:
+            continue
+
+        if compare_type == "equal":
+            assert torch.equal(
+                tensor, gathered_tensors[i]
+            ), f"rank {cur_rank} and rank {i} tensor are not equal"
+        elif compare_type == "not_equal":
+            assert not torch.equal(
+                tensor, gathered_tensors[i]
+            ), f"rank {cur_rank} and rank {i} tensor are equal"
+        elif compare_type == "close":
+            assert torch.allclose(
+                tensor, gathered_tensors[i]
+            ), f"rank {cur_rank} and rank {i} tensor are not close"
+        elif compare_type == "not_close":
+            assert not torch.allclose(
+                tensor, gathered_tensors[i]
+            ), f"rank {cur_rank} and rank {i} tensor are close"
+        else:
+            raise ValueError(f"compare_type {compare_type} is not supported")
 
 
 def init_fused_weights_from_debug(
@@ -272,25 +307,4 @@ def create_model(
         pipeline_type=pipeline_type,
         device=device,
     )
-
-    world_size = torch.distributed.get_world_size()
-    for n, p in model_train.named_parameters():
-        output = torch.empty(world_size * p.numel(), device=p.device, dtype=p.dtype)
-        torch.distributed.all_gather_into_tensor(output, p.contiguous())
-        sliced_shape = [world_size, p.numel()]
-        output = output.reshape(sliced_shape)
-        for r in range(world_size):
-            if r == torch.distributed.get_rank():
-                continue
-            if p.numel() == 0:
-                continue
-            if isinstance(p, TableBatchedEmbeddingSlice):
-                assert not torch.allclose(
-                    p.flatten(), output[r].flatten()
-                ), "embedding table should be initialized differently on each rank for mp and dynamic embedding."
-            else:
-                assert torch.allclose(
-                    p.flatten(), output[r].flatten()
-                ), f"parameter {n} shape {p.shape} should be initialized the same on each rank."
-
     return model_train, dense_optimizer, history_batches

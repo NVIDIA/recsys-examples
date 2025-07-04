@@ -116,8 +116,10 @@ class RankingGR(BaseModel):
         """
         # DMP embedding
         embeddings: Dict[str, JaggedTensor] = self._embedding_collection(batch.features)
-        # This is the tricky part. The micro-batch should be b * tp_size which is consistent with dense module.
-        # While for Model-parallel Emb jagged_tensor_allgather values edding, the micro-batch batchsize is b. Therefore, we need to scale the gradient by tp_size.
+        # For model-parallel embedding, torchrec does gradient division by (tp_size * dp_size). However, we only need to divide by dp size. In such case, we need to scale the gradient by tp_size.
+        # For data-parallel embedding, torchrec does nothing on the gradient. It will be handed over to the DDP -- which will divide the gradient by dp_size (allreduce avg).
+        # As a side effect, we scale the dp embedding gradient by tp_size unintentionally, so that we need to perform allreduce avg across tp ranks after/before the DDP allreduce avg.
+        # Beaware that, this scaling is not related to the uneven jagged size issues.
         embeddings = jt_dict_grad_scaling_and_allgather(
             embeddings, parallel_state.get_tensor_model_parallel_group()
         )

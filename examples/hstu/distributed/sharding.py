@@ -82,6 +82,7 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
 }
 
 DATA_PARALLEL_EMBEDDING_MODULE_NAME = "_data_parallel_embedding_collection"
+from megatron.core import parallel_state
 
 
 def apply_megatron_ddp(
@@ -102,17 +103,25 @@ def apply_megatron_ddp(
         check_for_nan_in_grad=False,
         bucket_size=True,
     )
+    # MCORE DDP does not broadcast parameters implicitly
     dmp._dmp_wrapped_module = DDP(
         config,
         ddp_config,
         model,
     )
 
+    # only broadcast parameters within DataParallel group, TP group weights are initialized with the same rng states!
     def broadcast_params_for_non_model_parallel_embedding_modules():
-        # Table are replicated across all TPxCPxDP ranks, so we need to broadcast them
+        data_parallel_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True
+        )
         for p in dmp._dmp_wrapped_module.parameters():
             if not isinstance(p, TableBatchedEmbeddingSlice):
-                dist.broadcast(p.data, src=0, group=dist.group.WORLD)
+                dist.broadcast(
+                    p.data,
+                    src=torch.distributed.get_global_rank(data_parallel_group, 0),
+                    group=data_parallel_group,
+                )
 
     broadcast_params_for_non_model_parallel_embedding_modules()
     config.finalize_model_grads_func = finalize_model_grads
