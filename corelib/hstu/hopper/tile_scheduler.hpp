@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -38,6 +22,7 @@ public:
     // Host side kernel arguments
     struct Arguments {
         int const num_blocks_m, num_head, num_batch;
+        int* const tile_count_semaphore;
     };
 
     // Device side kernel params
@@ -49,7 +34,7 @@ public:
     }
 
     static dim3
-    get_grid_dim(Arguments const& args) {
+    get_grid_dim(Arguments const& args, int num_sm) {
         if constexpr (Is_balance_fwd) {
             return {uint32_t(args.num_head), uint32_t(args.num_batch), uint32_t(args.num_blocks_m)};
         } else {
@@ -78,7 +63,7 @@ public:
     };
 
     CUTLASS_DEVICE
-    SingleTileScheduler() { }
+    SingleTileScheduler(int* tile_count_smem_) { }
 
     CUTLASS_DEVICE
     WorkTileInfo
@@ -110,5 +95,121 @@ public:
     }
 
 };
+
+template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads = cutlass::NumThreadsPerWarp>
+class DynamicPersistentTileScheduler {
+
+    static constexpr int NumThreads = NumMmaThreads + NumProducerThreads;
+
+protected:
+    int* const tile_count_smem;
+
+public:
+
+    // Host side kernel arguments
+    struct Arguments {
+        int const num_blocks_m, num_head, num_batch;
+        int* const tile_count_semaphore;
+    };
+
+    // Device side kernel params
+    struct Params {
+        int const total_blocks;
+        int const num_blocks_m;
+        cutlass::FastDivmod const m_block_divmod, head_divmod;
+        int* const tile_count_semaphore;
+    };
+
+    static Params
+    to_underlying_arguments(Arguments const& args) {
+        return {args.num_blocks_m * args.num_head * args.num_batch,
+                args.num_blocks_m,
+                cutlass::FastDivmod(args.num_blocks_m), cutlass::FastDivmod(args.num_head),
+                args.tile_count_semaphore};
+    }
+
+    static dim3
+    get_grid_dim(Arguments const& args, int num_sm) {
+        return {uint32_t(num_sm)};
+    }
+
+    struct WorkTileInfo {
+        int tile_idx;
+
+        CUTLASS_DEVICE
+        bool
+        is_valid(Params const& params) const {
+            return tile_idx < params.total_blocks;
+        }
+
+        CUTLASS_DEVICE
+        cute::tuple<int32_t, int32_t, int32_t>
+        get_block_coord(Params const& params) const {
+            int m_block, bidh, bidb;
+            bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, tile_idx));
+            m_block = params.num_blocks_m - 1 - m_block;
+            return {m_block, bidh, bidb};
+        }
+
+    };
+
+    CUTLASS_DEVICE
+    DynamicPersistentTileScheduler(int* tile_count_smem_) : tile_count_smem(tile_count_smem_) {};
+
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_initial_work() const {
+        return {int(blockIdx.x)};
+    }
+
+    CUTLASS_DEVICE
+    void
+    init_consumer() const {
+        if (cutlass::canonical_warp_idx_sync() > 0) {
+            flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
+        }
+    }
+
+    CUTLASS_DEVICE
+    void
+    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
+        if (threadIdx.x % NumProducerThreads == 0) {
+            current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
+        }
+    }
+
+    CUTLASS_DEVICE
+    void
+    broadcast_next_work(WorkTileInfo& current_work) const {
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+        if (threadIdx.x % NumProducerThreads == 0) {
+            *tile_count_smem = current_work.tile_idx;
+        }
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+    }
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        if constexpr (IsProducerWarp) {
+            // thread 0 already has the right tile_idx, just need to broadcast to the rest of warp 0
+            int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
+            flash::named_barrier_sync(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
+            if (threadIdx.x % NumProducerThreads == 0) {
+                *tile_count_smem = current_work.tile_idx;
+            }
+            flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
+            return {new_tile_idx};
+        } else {
+            flash::named_barrier_sync(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
+            int tile_idx = *tile_count_smem;
+            flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
+            return {tile_idx};
+        }
+    }
+
+};
+
 
 } // flash

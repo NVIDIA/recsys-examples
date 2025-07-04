@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2023, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -40,8 +24,20 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define __debug_print \
-  if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && blockIdx.x == 0)
+#ifndef HSTU_DEBUG_ENABLED
+#define HSTU_DEBUG_ENABLED 0
+#endif
+
+#if HSTU_DEBUG_ENABLED
+#define HSTU_DEBUG_INFO(cond, ...)                 \
+ do {                                              \
+   if (cond) {                                     \
+     printf(__VA_ARGS__);                          \
+   }                                               \
+ } while (0)
+#else
+#define HSTU_DEBUG_INFO(cond, ...) do {} while (0)
+#endif
 
 namespace flash {
 
@@ -328,14 +324,10 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
 // {kBlockM, kBlockN, kNWarps}
 template <int kHeadDim, bool Has_rab>
 constexpr std::tuple<int, int, int> get_tile_size_bwd() {
-  if constexpr (Has_rab) {
-    return {64, 64, 8};
+  if constexpr (kHeadDim <= 128) {
+    return {128, 64, 8};
   } else {
-    if constexpr (kHeadDim <= 128) {
-      return {128, 64, 8};
-    } else {
-      return {64, 64, 8};
-    }
+    return {64, 64, 8};
   }
 }
 

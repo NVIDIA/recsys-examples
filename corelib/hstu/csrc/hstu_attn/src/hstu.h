@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
 
@@ -84,11 +68,26 @@ struct Hstu_fwd_params : public Hstu_params {
   index_t rab_seqlen_q_stride;
   index_t rab_seqlen_k_stride;
 
+  // for paged kv cache
+  void* __restrict__ kv_cache_ptr;
+  index_t kv_cache_row_stride;
+  index_t kv_cache_head_stride;
+  index_t kv_cache_page_stride;
+  index_t kv_cache_kvtensor_stride;
+  int page_size;
+  int total_pages; 
+
+  int*  __restrict__ page_offsets;
+  int*  __restrict__ page_ids;
+  int*  __restrict__ last_page_lens;
+  int*  __restrict__ cu_seqlens_t;
+
   // The dimensions.
   int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded;
   float alpha;
 
   int target_group_size;
+  float target_group_size_inv;
 
   int window_size_left;
   int window_size_right;
@@ -99,6 +98,7 @@ struct Hstu_fwd_params : public Hstu_params {
   bool is_local;
   bool is_target;
   bool is_context;
+  bool is_paged_kv;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -144,7 +144,7 @@ struct Hstu_bwd_params : public Hstu_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T, int Headdim, bool Has_rab, bool Is_local,
+template <int Arch, typename T, int Headdim, bool Has_rab, bool Is_local,
           bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
 void run_hstu_fwd_(Hstu_fwd_params& params, cudaStream_t stream);
 

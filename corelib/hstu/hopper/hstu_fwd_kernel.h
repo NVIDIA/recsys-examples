@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -186,7 +170,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
 
       int work_idx = 0;
 
-      TileScheduler scheduler;
+      TileScheduler scheduler(&shared_storage.tile_count_semaphore);
       for (auto work_tile_info = scheduler.get_initial_work();
             work_tile_info.is_valid(scheduler_params);
             work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params, work_tile_info)) {
@@ -195,12 +179,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
 
         auto [n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, actual_seqlen_q] = get_block_info(m_block, bidb);
         if (m_block * kBlockM >= actual_seqlen_q) {
+          scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           continue;
         }
 
         if ((Is_causal || Is_local) && n_block_max <= n_block_min) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-          scheduler.broadcast_next_work(work_tile_info);
           continue;
         }
         collective_mainloop.load(mainloop_params, pipeline_k, pipeline_rab, pipeline_v, smem_pipe_write_k, smem_pipe_write_rab, smem_pipe_write_v,
@@ -215,7 +199,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
     // TODO: Tune the reg num
     cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 240 : 160>();
 
-    TileScheduler scheduler;
+    TileScheduler scheduler(&shared_storage.tile_count_semaphore);
     // Initialize matmul objects.
     typename Ktraits::TiledMma1 tiled_mma1;
 
@@ -354,7 +338,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
   static_assert(Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
   if (warp_group_idx == 0) {
     // Producer
-    // TODO: Tune the reg num
     cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 12 ? 40 : 32>();
 
     PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
@@ -362,7 +345,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
 
     int work_idx = 0;
 
-    TileScheduler scheduler;
+    TileScheduler scheduler(&shared_storage.tile_count_semaphore);
     for (auto work_tile_info = scheduler.get_initial_work();
           work_tile_info.is_valid(scheduler_params);
           work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params, work_tile_info)) {
@@ -379,7 +362,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
       if constexpr (Is_causal) {
         if (n_block_max <= 0) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-          scheduler.broadcast_next_work(work_tile_info);
           // need to sync producer warpgroup
           cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG));
           continue;
@@ -395,9 +377,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
     collective_mainloop.load_tail_one_write(pipeline_k, pipeline_rab, pipeline_v, smem_pipe_write);
   } else {
     // Consumer
-    // TODO: Tune the reg num
     cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 232 : 160>();
-    TileScheduler scheduler;
+    TileScheduler scheduler(&shared_storage.tile_count_semaphore);
     // Initialize matmul objects.
     typename Ktraits::TiledMma1 tiled_mma1;
     PipelineState smem_pipe_read;

@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -119,6 +103,7 @@ public:
         typename Seqlen_traits::LayoutT layout_dQ;
         const int total_q;
         const int seqlen_q;
+        const float alpha;
         const int* cu_seqlens_q;
         const int* num_targets;
         const int* num_contexts;
@@ -132,6 +117,7 @@ public:
         typename Seqlen_traits::LayoutT layout_dQ;
         const int total_q;
         const int seqlen_q;
+        const float alpha;
         const int* cu_seqlens_q;
         const int* num_targets;
         const int* num_contexts;
@@ -155,6 +141,7 @@ public:
             args.layout_dQ,
             args.total_q,
             args.seqlen_q,
+            args.alpha,
             args.cu_seqlens_q,
             args.num_targets,
             args.num_contexts
@@ -182,6 +169,7 @@ public:
         Seqlen_traits seqlen_traits_q(
             params.total_q, params.seqlen_q, params.cu_seqlens_q, params.num_targets, params.num_contexts);
         seqlen_traits_q.init(bidb);
+        int const max_seq_len_q = seqlen_traits_q.max_seq_len;
         int const seqlen = seqlen_traits_q.actual_seq_len;
         if (m_block * kBlockM >= seqlen) { return; }
 
@@ -217,6 +205,13 @@ public:
         CUTE_STATIC_ASSERT_V(size(taccdQrdQaccum) == size(tdQsdQaccum));
         Tensor tdQrdQaccum = s2r_thr_copy_dQaccum.retile_D(taccdQrdQaccum);
         cute::copy(s2r_tiled_copy_dQaccum, tdQsdQaccum, tdQrdQaccum);
+        if constexpr (!Ktraits::Has_drab) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tdQrdQaccum); ++i) {
+                tdQrdQaccum(i) /= max_seq_len_q;
+                tdQrdQaccum(i) *= params.alpha;
+            }
+        }
         // Convert tdQrdQ from fp32 to fp16
         Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum);
         flash::convert_type_safe(taccdQrdQaccum, rdQ);

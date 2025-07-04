@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2023, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -117,10 +101,10 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   constexpr int MMA_N_SdP =
       kBlockN / decltype(typename Kernel_traits::TiledMmaSdP{}
                              .template tile_size_mnk<1>())::value;
-  constexpr bool Double_buffer = Kernel_traits::Double_buffer;
+  constexpr int kStages = Kernel_traits::kStages;
   constexpr bool Is_V_in_regs = Kernel_traits::Is_V_in_regs;
 
-  const HstuBlockInfo binfo(params, bidb);
+  const HstuBlockInfo<Kernel_traits, Hstu_bwd_params> binfo(params, bidb);
   if (n_block * kBlockN >= binfo.actual_seqlen_k)
     return;
 
@@ -225,16 +209,15 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
                         make_coord(_, n_block));
 
   Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
-                          typename Kernel_traits::SmemLayoutQdO{});
-  Tensor sQt = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutQdOtransposed{});
+                          typename Kernel_traits::SmemLayoutQ{});
+  Tensor sQt = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutQtransposed{});
   Tensor sQtNoSwizzle = make_tensor(
-      sQ.data(), typename Kernel_traits::SmemLayoutQdOtransposedNoSwizzle{});
+      sQ.data(), typename Kernel_traits::SmemLayoutQtransposedNoSwizzle{});
   // Double buffer for sQ
-  Tensor sdO = make_tensor(sQ.data() + (Double_buffer ? 2 : 1) * size(sQ),
-                           typename Kernel_traits::SmemLayoutQdO{});
-  Tensor sdOt = make_tensor(sdO.data(), typename Kernel_traits::SmemLayoutQdOtransposed{});
+  Tensor sdO = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutdO{});
+  Tensor sdOt = make_tensor(sdO.data(), typename Kernel_traits::SmemLayoutdOtransposed{});
   Tensor sdOtNoSwizzle = make_tensor(
-      sdO.data(), typename Kernel_traits::SmemLayoutQdOtransposedNoSwizzle{});
+      sdO.data(), typename Kernel_traits::SmemLayoutdOtransposedNoSwizzle{});
   Tensor sK = make_tensor(sdO.data() + size(sdO), typename Kernel_traits::SmemLayoutKV{});
   Tensor sKt = make_tensor(sK.data(), typename Kernel_traits::SmemLayoutKtransposed{});
   Tensor sKtNoSwizzle = make_tensor(
@@ -280,7 +263,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   // MMA tiling
   typename Kernel_traits::TiledMmaSdP tiled_mma_sdp;
   auto thr_mma_sdp = tiled_mma_sdp.get_thread_slice(tidx);
-  Tensor tSrQ = thr_mma_sdp.partition_fragment_A(sQ);
+  Tensor tSrQ = thr_mma_sdp.partition_fragment_A(sQ(_, _, 0));
   Tensor tSrK = thr_mma_sdp.partition_fragment_B(sK);
   Tensor tdPrdO = thr_mma_sdp.partition_fragment_A(sdO);
   Tensor tdPrV = thr_mma_sdp.partition_fragment_B(sV);
@@ -288,7 +271,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   typename Kernel_traits::TiledMmadKV tiled_mma_dkv;
   auto thr_mma_dkv = tiled_mma_dkv.get_thread_slice(tidx);
   Tensor tdKrdSt = thr_mma_dkv.partition_fragment_A(sdStNoSwizzle);
-  Tensor tdKrQt = thr_mma_dkv.partition_fragment_B(sQtNoSwizzle);
+  Tensor tdKrQt = thr_mma_dkv.partition_fragment_B(sQtNoSwizzle(_, _, 0));
   Tensor tdVrPt = thr_mma_dkv.partition_fragment_A(sPtNoSwizzle);
   Tensor tdVrdOt = thr_mma_dkv.partition_fragment_B(sdOtNoSwizzle);
 
@@ -366,7 +349,6 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   Tensor cRab = make_identity_tensor(make_shape(size<0>(sRab), size<1>(sRab)));
   Tensor tQcRab = gmem_thr_copy_QKV.partition_D(cRab);
 
-  int rab_pipe_id = 0;
   auto copy_if_g2s_rab = [&](int m_block_id) {
     auto ctQgRab_view = tQgRab(_, _, _, m_block_id);
     #pragma unroll
@@ -375,13 +357,13 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
         #pragma unroll
         for (int k = 0; k < size<2>(ctQgRab_view); ++k) {
           if (Is_even_rab || get<1>(tQcRab(0, m, k)) < (actual_seqlen_k - n_block * kBlockN)) {
-            cute::copy(gmem_tiled_copy_QKV, ctQgRab_view(_, m, k), tQsRab(_, m, k, rab_pipe_id));
+            cute::copy(gmem_tiled_copy_QKV, ctQgRab_view(_, m, k), tQsRab(_, m, k));
           } else {
-            cute::clear(tQsRab(_, m, k, rab_pipe_id));
+            cute::clear(tQsRab(_, m, k));
           }
         }
       } else {
-        cute::clear(tQsRab(_, m, _, rab_pipe_id));
+        cute::clear(tQsRab(_, m, _));
       }
     }
   };
@@ -392,9 +374,9 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
       #pragma unroll
       for (int k = 0; k < size<2>(ctQgRab_view); ++k) {
         if (Is_even_rab || get<1>(tQcRab(0, m, k)) < (actual_seqlen_k - n_block * kBlockN)) {
-          cute::copy(gmem_tiled_copy_QKV, ctQgRab_view(_, m, k), tQsRab(_, m, k, rab_pipe_id));
+          cute::copy(gmem_tiled_copy_QKV, ctQgRab_view(_, m, k), tQsRab(_, m, k));
         } else {
-          cute::clear(tQsRab(_, m, k, rab_pipe_id));
+          cute::clear(tQsRab(_, m, k));
         }
       }
     }
@@ -451,12 +433,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
     return;
   }
 
-  int buffer = 0;
-  if (Double_buffer) {  // Double buffer for sQ
-    tQsQ.data() = tQsQ.data() + size(sQ);
-    tSsQ.data() = tSsQ.data() + size(sQ);
-    tdKsQt.data() = tdKsQt.data() + size(sQ);
-  }
+  int buffer_stage = 0;
 
   // prefill v
   flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/true>(
@@ -477,8 +454,9 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
       actual_seqlen_q - m_block * kBlockM);
 
   // prefill q
+  auto tQsQ_view = tQsQ(_, _, _, buffer_stage);
   flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/true>(
-      gmem_tiled_copy_QKV, tQgQ(_, _, _, m_block), tQsQ, tQcQ,
+      gmem_tiled_copy_QKV, tQgQ(_, _, _, m_block), tQsQ_view, tQcQ,
       actual_seqlen_q - m_block * kBlockM);
 
   // prefill k
@@ -542,12 +520,10 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
             }
           }
           if constexpr (Is_target) {
-            if (row >= actual_seqlen_h && col >= actual_seqlen_h) {
-              const int target_index = (row - actual_seqlen_h) / params.target_group_size;
-              const int target_col_limit_left = actual_seqlen_h + target_index * params.target_group_size;
-              if (col < target_col_limit_left) {
-                tSrS(i) = -INFINITY;
-              }
+            const int target_index = (row - actual_seqlen_h) / params.target_group_size;
+            const int target_col_limit_left = actual_seqlen_h + target_index * params.target_group_size;
+            if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left) {
+              tSrS(i) = -INFINITY;
             }
           }
         }
@@ -572,9 +548,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
       static_assert(size<1>(tSrRab_view) == size<1>(tSsRab));
       static_assert(size<2>(tSrRab_view) == size<2>(tSsRab));
 
-      cute::copy(smem_tiled_copy_rab, tSsRab(_, _, _, rab_pipe_id),
-                 tSrRab_view);
-
+      cute::copy(smem_tiled_copy_rab, tSsRab, tSrRab_view);
       #pragma unroll
       for (int i = 0; i < size(rRab); ++i) {
         acc_s(i) = static_cast<float>(rRab(i));
@@ -583,7 +557,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
       clear(acc_s);
     }
 
-    flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
+    flash::gemm(acc_s, tSrQ, tSrK, tSsQ(_, _, _, buffer_stage), tSsK, tiled_mma_sdp,
                 smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO,
                 smem_thr_copy_KV);
 
@@ -606,6 +580,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
       if constexpr (Is_context) {
         m_block_next = (m_block == m_block_min && m_block >= m_block_context) ? m_block_context - 1 : m_block_next;
       }
+      __syncthreads();
       copy_g2s_rab(m_block_next);
     }
 
@@ -636,17 +611,14 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
       acc_dp(i) *= params.alpha;
     }
 
-    if (Double_buffer && (m_block > m_block_min || (is_in_context && m_block > 0))) {
-      // Double buffer for sQ
-      const int sQ_offset = buffer == 1 ? size(sQ) : -size(sQ);
-      tQsQ.data() = tQsQ.data() + sQ_offset;
-      tSsQ.data() = tSsQ.data() + sQ_offset;
+    if (kStages == 2 && (m_block > m_block_min || (is_in_context && m_block > 0))) {
       // async load(next(q))
       int m_block_next = m_block - 1;
       if constexpr (Is_context) {
         m_block_next = (m_block == m_block_min && m_block >= m_block_context) ? m_block_context - 1 : m_block_next;
       }
-      flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tQgQ(_, _, _, m_block_next), tQsQ, tQcQ);
+      auto tQsQ_next_view = tQsQ(_, _, _, buffer_stage ^ 1);
+      flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tQgQ(_, _, _, m_block_next), tQsQ_next_view, tQcQ);
       cute::cp_async_fence();
     }
 
@@ -734,13 +706,12 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
     }
 
     // calculate dSt @ Qt
-    flash::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
+    flash::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt(_, _, _, buffer_stage), tiled_mma_dkv,
                 smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt,
                 smem_thr_copy_QdOt);
 
-    if (Double_buffer) {  // Double buffer for sQ
-      tdKsQt.data() = tdKsQt.data() + (buffer == 1 ? size(sQ) : -size(sQ));
-      buffer ^= 1;
+    if constexpr (kStages == 2) {  // Double buffer for sQ
+      buffer_stage ^= 1;
     } else if (m_block > m_block_min || (is_in_context && m_block > 0)) {
       __syncthreads();
       // async load(next(q))
@@ -748,7 +719,8 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
       if constexpr (Is_context) {
         m_block_next = (m_block == m_block_min && m_block >= m_block_context) ? m_block_context - 1 : m_block_next;
       }
-      flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tQgQ(_, _, _, m_block_next), tQsQ, tQcQ);
+      auto tQsQ_next_view = tQsQ(_, _, _, buffer_stage);
+      flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV, tQgQ(_, _, _, m_block_next), tQsQ_next_view, tQcQ);
       cute::cp_async_fence();
     }
     if constexpr (Is_context) {
@@ -874,7 +846,7 @@ __global__ void hstu_bwd_convert_dq_kernel(const Hstu_bwd_params params,
   constexpr int kBlockM = Kernel_traits::kBlockM;
   constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
-  const HstuBlockInfo binfo(params, bidb);
+  const HstuBlockInfo<Kernel_traits, Hstu_bwd_params> binfo(params, bidb);
   if (m_block * kBlockM >= binfo.actual_seqlen_q)
     return;
 
@@ -1016,17 +988,16 @@ template <typename elem_type, int kHeadDim, bool Has_rab, bool Has_drab, bool Is
           bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
 void run_hstu_bwd_(Hstu_bwd_params& params, cudaStream_t stream) {
   const bool rab_one_head = params.h_rab != params.h && params.h_rab == 1;
-  const bool even_rab = params.seqlen_q % 64 == 0 && (kHeadDim <= 128 ?
-      params.seqlen_k % 128 == 0 : params.seqlen_k % 64 == 0);
   // BOOL_SWITCH(params.is_balance_bwd, Is_balance, [&] {
   static constexpr bool Is_balance = false;
   BOOL_SWITCH(rab_one_head, Rab_one_head, [&] {
-    BOOL_SWITCH(even_rab, Is_even_rab, [&] {
-      BOOL_SWITCH(params.deterministic, Is_deterministic, [&] {
-        static constexpr auto tile_size = flash::get_tile_size_bwd<kHeadDim, Has_rab>();
-        static constexpr int kBlockM = std::get<0>(tile_size);
-        static constexpr int kBlockN = std::get<1>(tile_size);
-        static constexpr int kNWarps = std::get<2>(tile_size);
+    BOOL_SWITCH(params.deterministic, Is_deterministic, [&] {
+      static constexpr auto tile_size = flash::get_tile_size_bwd<kHeadDim, Has_rab>();
+      static constexpr int kBlockM = std::get<0>(tile_size);
+      static constexpr int kBlockN = std::get<1>(tile_size);
+      static constexpr int kNWarps = std::get<2>(tile_size);
+      const bool even_rab = params.seqlen_q % kBlockM == 0 && params.seqlen_k % kBlockN == 0;
+      BOOL_SWITCH(even_rab, Is_even_rab, [&] {
         run_hstu_bwd_impl_<elem_type, kHeadDim, kBlockM, kBlockN, Is_causal, Is_target, Is_context,
                           Is_delta_q, Is_local, Is_deterministic, Has_rab, Has_drab, Is_balance,
                           Is_even_rab, Rab_one_head, kNWarps, 2, 4, 4, false>(params, stream);

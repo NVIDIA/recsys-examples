@@ -272,12 +272,15 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             alpha,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
-            hopper_fp8_args = ()
+            extension_args = ()
             if sm_major_version == 8:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
+		ampere_paged_kv_args = (None, None, None, None, None)
+		extension_args = ampere_paged_kv_args
             elif sm_major_version == 9:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
                 hopper_fp8_args = (None, None, None)
+		extension_args = hopper_fp8_args
 
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
@@ -307,7 +310,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 alpha,
                 None,  # rab
                 False,  # is_delta_q
-                *hopper_fp8_args,
+                *extension_args,
             )
             # in case of padding
             P = jagged_attn_output[:, :, :linear_dim_per_head].reshape(

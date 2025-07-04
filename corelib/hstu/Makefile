@@ -9,11 +9,12 @@ install:
 		export HSTU_DISABLE_RAB=FALSE; \
 		export HSTU_DISABLE_DRAB=FALSE; \
 		export HSTU_DISABLE_BF16=FALSE; \
-		export HSTU_DISABLE_FP16=FALSE; \
+		export HSTU_DISABLE_FP16=TRUE; \
 		export HSTU_DISABLE_HDIM32=FALSE; \
 		export HSTU_DISABLE_HDIM64=FALSE; \
 		export HSTU_DISABLE_HDIM128=FALSE; \
 		export HSTU_DISABLE_HDIM256=FALSE; \
+		export HSTU_DISABLE_86OR89=TRUE; \
 		python setup.py install \
 	)
 

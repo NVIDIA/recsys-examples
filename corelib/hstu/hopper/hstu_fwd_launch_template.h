@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -46,7 +30,11 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
   using Seqlen_traits = flash::VarSeqLenTraits;
   using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Seqlen_traits>;
   using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
-  using Scheduler = flash::SingleTileScheduler<Kernel_traits::Is_balance_fwd>;
+  using Scheduler = std::conditional_t<
+    cutlass::sizeof_bits_v<Element> == 8,
+    flash::SingleTileScheduler<Kernel_traits::Is_balance_fwd>,
+    flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup, Kernel_traits::NumProducerThreads>
+  >;
   Seqlen_traits seqlen_traits_q(
       params.total_q, params.seqlen_q, params.cu_seqlens_q, params.num_targets, params.num_contexts);
   Seqlen_traits seqlen_traits_k(
@@ -73,13 +61,9 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
               params.seqlen_k, params.d, params.h_k, params.b,
               params.v_row_stride, params.v_head_stride
           ),  // layout_V
-          params.descale_q_ptr,
-          params.descale_k_ptr,
-          params.descale_v_ptr,
-          params.window_size_left,
-          params.window_size_right,
-          params.target_group_size,
-          params.alpha
+          params.descale_q_ptr, params.descale_k_ptr, params.descale_v_ptr,
+          params.window_size_left, params.window_size_right,
+          params.target_group_size, 1.0f / params.target_group_size, params.alpha
       });
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
@@ -92,7 +76,7 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
 
   int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
   num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
-  typename Scheduler::Arguments scheduler_args = {num_blocks_m, params.h, params.b};
+  typename Scheduler::Arguments scheduler_args = {num_blocks_m, params.h, params.b, params.tile_count_semaphore};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
@@ -106,9 +90,7 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
       CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   }
 
-  int device;
-  cudaGetDevice(&device);
-  dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args);
+  dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, params.num_sm);
   static constexpr int ctaSize = Kernel_traits::kNWarps * cutlass::NumThreadsPerWarp;
   dim3 block_dims(ctaSize);
   dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));

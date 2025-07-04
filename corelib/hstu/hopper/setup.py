@@ -1,33 +1,25 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 # Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
 
-import copy
-import itertools
-import os
-import platform
-import shutil
-import subprocess
 import sys
 import warnings
+import os
+import copy
+import re
+import shutil
+import ast
 from pathlib import Path
+from packaging.version import parse, Version
+import platform
+import itertools
 
-from packaging.version import Version, parse
-from setuptools import Extension, find_packages, setup
+from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
+import subprocess
+
+import urllib.request
+import urllib.error
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 with open("../README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -64,93 +56,66 @@ DISABLE_SM8x = os.getenv("HSTU_DISABLE_SM8x", "FALSE") == "TRUE"
 ONLY_COMPILE_SO = os.getenv("HSTU_ONLY_COMPILE_SO", "FALSE") == "TRUE"
 
 if ONLY_COMPILE_SO:
-    CUDA_HOME = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    CUDA_HOME = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
     if CUDA_HOME is None:
         # Guess #2
         nvcc_path = shutil.which("nvcc")
         CUDA_HOME = os.path.dirname(os.path.dirname(nvcc_path))
 
     COMMON_NVCC_FLAGS = [
-        "-D__CUDA_NO_HALF_OPERATORS__",
-        "-D__CUDA_NO_HALF_CONVERSIONS__",
-        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-D__CUDA_NO_HALF2_OPERATORS__",
-        "--expt-relaxed-constexpr",
-        "--compiler-options",
-        "'-fPIC'",
+        '-D__CUDA_NO_HALF_OPERATORS__',
+        '-D__CUDA_NO_HALF_CONVERSIONS__',
+        '-D__CUDA_NO_BFLOAT16_CONVERSIONS__',
+        '-D__CUDA_NO_HALF2_OPERATORS__',
+        '--expt-relaxed-constexpr',
+        '--compiler-options', "'-fPIC'"
     ]
 
     # a navie/minial way to build a cuda so, should only work under unix and may have differences compared to torch's BuildExtension
     def CUDAExtension(name, sources, *args, **kwargs):
-        library_dirs = kwargs.get("library_dirs", [])
-        library_dirs.append(os.path.join(CUDA_HOME, "lib64"))
-        kwargs["library_dirs"] = library_dirs
-        libraries = kwargs.get("libraries", [])
-        kwargs["libraries"] = libraries
+        library_dirs = kwargs.get('library_dirs', [])
+        library_dirs.append(os.path.join(CUDA_HOME, 'lib64'))
+        kwargs['library_dirs'] = library_dirs
+        libraries = kwargs.get('libraries', [])
+        kwargs['libraries'] = libraries
 
-        include_dirs = kwargs.get("include_dirs", [])
-        include_dirs.append(os.path.join(CUDA_HOME, "include"))
-        kwargs["include_dirs"] = include_dirs
+        include_dirs = kwargs.get('include_dirs', [])
+        include_dirs.append(os.path.join(CUDA_HOME, 'include'))
+        kwargs['include_dirs'] = include_dirs
 
-        kwargs["language"] = "c++"
+        kwargs['language'] = 'c++'
         return Extension(name, sources, *args, **kwargs)
 
     class BuildExtension(build_ext):
         def build_extensions(self):
-            self.compiler.src_extensions += [".cu", ".cuh"]
+            self.compiler.src_extensions += ['.cu', '.cuh']
             original_compile = self.compiler._compile
 
-            def unix_wrap_single_compile(
-                obj, src, ext, cc_args, extra_postargs, pp_opts
-            ) -> None:
+            def unix_wrap_single_compile(obj, src, ext, cc_args, extra_postargs, pp_opts) -> None:
                 # Copy before we make any modifications.
                 cflags = copy.deepcopy(extra_postargs)
                 try:
                     original_compiler = self.compiler.compiler_so
                     if src.endswith(".cu"):
-                        nvcc = [os.path.join(CUDA_HOME, "bin", "nvcc")]
-                        self.compiler.set_executable("compiler_so", nvcc)
+                        nvcc = [os.path.join(CUDA_HOME, 'bin', 'nvcc')]
+                        self.compiler.set_executable('compiler_so', nvcc)
                         if isinstance(cflags, dict):
-                            cflags = COMMON_NVCC_FLAGS + cflags["nvcc"]
+                            cflags = COMMON_NVCC_FLAGS + cflags['nvcc']
                     elif isinstance(cflags, dict):
-                        cflags = cflags["cxx"]
+                        cflags = cflags['cxx']
                     cflags += ["-std=c++17"]
 
                     original_compile(obj, src, ext, cc_args, cflags, pp_opts)
                 finally:
                     # Put the original compiler back in place.
-                    self.compiler.set_executable("compiler_so", original_compiler)
+                    self.compiler.set_executable(
+                        'compiler_so', original_compiler)
 
             self.compiler._compile = unix_wrap_single_compile
             super().build_extensions()
-
 else:
     import torch
-    from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
-
-
-class NinjaBuildExtension(BuildExtension):
-    def __init__(self, *args, **kwargs) -> None:
-        # do not override env MAX_JOBS if already exists
-        if not os.environ.get("MAX_JOBS"):
-            import psutil
-
-            # calculate the maximum allowed NUM_JOBS based on cores
-            max_num_jobs_cores = max(1, os.cpu_count() // 2)
-
-            # calculate the maximum allowed NUM_JOBS based on free memory
-            free_memory_gb = psutil.virtual_memory().available / (
-                1024**3
-            )  # free memory in GB
-            max_num_jobs_memory = int(
-                free_memory_gb / 9
-            )  # each JOB peak memory cost is ~8-9GB when threads = 4
-
-            # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-            os.environ["MAX_JOBS"] = str(max_jobs)
-
-        super().__init__(*args, **kwargs)
+    from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
 
 def get_platform():
@@ -169,9 +134,7 @@ def get_platform():
 
 
 def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output(
-        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
-    )
+    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
     output = raw_output.split()
     release_idx = output.index("release") + 1
     bare_metal_version = parse(output[release_idx].split(",")[0])
@@ -197,9 +160,7 @@ def nvcc_threads_args():
 
 
 def generate_cuda_sources():
-    DTYPE_16 = (["bf16"] if not DISABLE_BF16 else []) + (
-        ["fp16"] if not DISABLE_FP16 else []
-    )
+    DTYPE_16 = (["bf16"] if not DISABLE_BF16 else []) + (["fp16"] if not DISABLE_FP16 else [])
     HEAD_DIMENSIONS = (
         []
         + ([32] if not DISABLE_HDIM32 else [])
@@ -208,13 +169,7 @@ def generate_cuda_sources():
         + ([256] if not DISABLE_HDIM256 else [])
     )
     RAB = [""] + (["_rab"] if not DISABLE_RAB else [])
-    RAB_DRAB = [""] + (
-        (["_rab_drab", "_rab"])
-        if not DISABLE_DRAB
-        else ["_rab"]
-        if not DISABLE_RAB
-        else []
-    )
+    RAB_DRAB = [""] + ((["_rab_drab", "_rab"]) if not DISABLE_DRAB else ["_rab"] if not DISABLE_RAB else [])
     MASK = [""]
     FP8_MASK = [""]
     if not DISABLE_LOCAL:
@@ -226,10 +181,7 @@ def generate_cuda_sources():
         FP8_MASK += ["_causal"]
         CONTEXT_MASK = [""] + (["_context"] if not DISABLE_CONTEXT else [])
         TARGET_MASK = [""] + (["_target"] if not DISABLE_TARGET else [])
-        MASK += [
-            f"{c}{x}{t}"
-            for c, x, t in itertools.product(CAUSAL_MASK, CONTEXT_MASK, TARGET_MASK)
-        ]
+        MASK += [f"{c}{x}{t}" for c, x, t in itertools.product(CAUSAL_MASK, CONTEXT_MASK, TARGET_MASK)]
         MASK += ["_causal_deltaq"] if not DISABLE_DELTA_Q else []
 
     dtype_to_str = {
@@ -238,7 +190,8 @@ def generate_cuda_sources():
     }
 
     sources_fwd = []
-    fwd_file_head = """
+    fwd_file_head =\
+    """
 // Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
 // Splitting different head dimensions, data types and masks to different files to speed up
 // compilation. This file is auto-generated. See generate_cuda_sources() in setup.py
@@ -249,24 +202,18 @@ template void run_hstu_fwd_<90, {}, {}, {}, {}, {}, {}, {}, {}>
                            (Hstu_fwd_params& params, cudaStream_t stream);
 
     """
-    for hdim, dtype, rab, mask in itertools.product(
-        HEAD_DIMENSIONS, DTYPE_16, RAB, MASK
-    ):
+    for hdim, dtype, rab, mask in itertools.product(HEAD_DIMENSIONS, DTYPE_16, RAB, MASK):
         file_name = f"instantiations/hstu_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm90.cu"
         if not os.path.exists(file_name):
             with open(file_name, "w") as f:
-                f.write(
-                    fwd_file_head.format(
-                        dtype_to_str[dtype],
-                        hdim,
-                        "true" if "_rab" in rab else "false",
-                        "true" if "local" in mask else "false",
-                        "true" if "causal" in mask else "false",
-                        "true" if "context" in mask else "false",
-                        "true" if "target" in mask else "false",
-                        "true" if "deltaq" in mask else "false",
-                    )
-                )
+                f.write(fwd_file_head.format(dtype_to_str[dtype],
+                                            hdim,
+                                            "true" if "_rab" in rab else "false",
+                                            "true" if "local" in mask else "false",
+                                            "true" if "causal" in mask else "false",
+                                            "true" if "context" in mask else "false",
+                                            "true" if "target" in mask else "false",
+                                            "true" if "deltaq" in mask else "false"))
         sources_fwd.append(file_name)
     if not DISABLE_FP8:
         for hdim, rab, mask in itertools.product(HEAD_DIMENSIONS, RAB, FP8_MASK):
@@ -275,22 +222,19 @@ template void run_hstu_fwd_<90, {}, {}, {}, {}, {}, {}, {}, {}>
             file_name = f"instantiations/hstu_fwd_hdim{hdim}_e4m3{rab}{mask}_sm90.cu"
             if not os.path.exists(file_name):
                 with open(file_name, "w") as f:
-                    f.write(
-                        fwd_file_head.format(
-                            "cutlass::float_e4m3_t",
-                            hdim,
-                            "true" if "_rab" in rab else "false",
-                            "true" if "local" in mask else "false",
-                            "true" if "causal" in mask else "false",
-                            "false",  # context
-                            "false",  # target
-                            "false",
-                        )
-                    )  # deltaq
+                    f.write(fwd_file_head.format("cutlass::float_e4m3_t",
+                                                hdim,
+                                                "true" if "_rab" in rab else "false",
+                                                "true" if "local" in mask else "false",
+                                                "true" if "causal" in mask else "false",
+                                                "false", # context
+                                                "false", # target
+                                                "false")) # deltaq
             sources_fwd.append(file_name)
 
     sources_bwd = []
-    bwd_file_head = """
+    bwd_file_head =\
+    """
 // Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
 // Splitting different head dimensions, data types and masks to different files to speed up
 // compilation. This file is auto-generated. See generate_cuda_sources() in setup.py
@@ -302,27 +246,19 @@ template void run_hstu_bwd_<90, {}, {}, {}, {}, {}, {}, {}, {}, {}>
 
     """
     if not DISABLE_BACKWARD:
-        for hdim, dtype, rab_drab, mask in itertools.product(
-            HEAD_DIMENSIONS, DTYPE_16, RAB_DRAB, MASK
-        ):
-            file_name = (
-                f"instantiations/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_sm90.cu"
-            )
+        for hdim, dtype, rab_drab, mask in itertools.product(HEAD_DIMENSIONS, DTYPE_16, RAB_DRAB, MASK):
+            file_name = f"instantiations/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_sm90.cu"
             if not os.path.exists(file_name):
                 with open(file_name, "w") as f:
-                    f.write(
-                        bwd_file_head.format(
-                            dtype_to_str[dtype],
-                            hdim,
-                            "true" if "_rab" in rab_drab else "false",
-                            "true" if "drab" in rab_drab else "false",
-                            "true" if "local" in mask else "false",
-                            "true" if "causal" in mask else "false",
-                            "true" if "context" in mask else "false",
-                            "true" if "target" in mask else "false",
-                            "true" if "deltaq" in mask else "false",
-                        )
-                    )
+                    f.write(bwd_file_head.format(dtype_to_str[dtype],
+                                                hdim,
+                                                "true" if "_rab" in rab_drab else "false",
+                                                "true" if "drab" in rab_drab else "false",
+                                                "true" if "local" in mask else "false",
+                                                "true" if "causal" in mask else "false",
+                                                "true" if "context" in mask else "false",
+                                                "true" if "target" in mask else "false",
+                                                "true" if "deltaq" in mask else "false"))
             sources_bwd.append(file_name)
         # if not DISABLE_FP8:
         #     for hdim, rab_drab, mask in itertools.product(HEAD_DIMENSIONS, RAB_DRAB, FP8_MASK):
@@ -350,7 +286,7 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-subprocess.run(["git", "submodule", "update", "--init", "../../../third_party/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
 
 cmdclass = []
 install_requires = []
@@ -376,7 +312,7 @@ if not SKIP_CUDA_BUILD:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     repo_dir = Path(this_dir).parent
-    cutlass_dir = repo_dir / "../../third_party/cutlass"
+    cutlass_dir = repo_dir / "csrc" / "cutlass"
 
     feature_args = (
         []
@@ -399,13 +335,9 @@ if not SKIP_CUDA_BUILD:
     )
 
     if DISABLE_BF16 and DISABLE_FP16 and DISABLE_FP8:
-        raise ValueError(
-            "At least one of DISABLE_BF16, DISABLE_FP16, or DISABLE_FP8 must be False"
-        )
+        raise ValueError("At least one of DISABLE_BF16, DISABLE_FP16, or DISABLE_FP8 must be False")
     if DISABLE_HDIM32 and DISABLE_HDIM64 and DISABLE_HDIM128 and DISABLE_HDIM256:
-        raise ValueError(
-            "At least one of DISABLE_HDIM32, DISABLE_HDIM64, DISABLE_HDIM128, or DISABLE_HDIM256 must be False"
-        )
+        raise ValueError("At least one of DISABLE_HDIM32, DISABLE_HDIM64, DISABLE_HDIM128, or DISABLE_HDIM256 must be False")
     if DISABLE_BACKWARD and not DISABLE_DRAB:
         raise ValueError("Cannot support drab without backward")
     if DISABLE_RAB and not DISABLE_DRAB:
@@ -465,14 +397,14 @@ if not SKIP_CUDA_BUILD:
             },
             include_dirs=include_dirs,
             # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"],
+            libraries=["cuda"]
         )
     )
 
 
 setup(
     name=PACKAGE_NAME,
-    version="0.1.0" + "+cu" + str(bare_metal_version),
+    version="0.1.0" + '+cu' + str(bare_metal_version),
     packages=find_packages(
         exclude=(
             "build",
@@ -495,7 +427,7 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.8",
     install_requires=[
         "torch",

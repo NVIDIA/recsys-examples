@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -86,7 +70,7 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
       make_layout(make_shape(Is_delta_q ? params.seqlen_k : params.seqlen_q, params.seqlen_k, params.h_rab, params.b),
                   make_stride((int64_t)params.drab_row_stride, _1{}, (int64_t)params.drab_head_stride, (int64_t)params.drab_batch_stride)),  // layout_dRab
       params.b, params.window_size_left, params.window_size_right,
-      params.target_group_size, params.alpha, params.dq_semaphore
+      params.target_group_size, 1.0f / params.target_group_size, params.alpha, params.dq_semaphore
   });
 
   typename CollectiveEpilogue::Params epilogue_params = CollectiveEpilogue::to_underlying_arguments({
@@ -136,6 +120,7 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
       ),  // layout_dQ
       params.total_q,
       params.seqlen_q,
+      params.alpha,
       params.cu_seqlens_q,
       params.num_targets,
       params.num_contexts

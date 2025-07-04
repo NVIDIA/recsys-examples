@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -60,6 +44,7 @@ template <
     bool Is_context_,
     bool Is_local_,
     bool Has_rab_,
+    bool Paged_KV_,
     bool Is_balance_,
     bool Is_even_rab_,
     bool Is_Q_in_regs_ = false,
@@ -74,6 +59,7 @@ struct Hstu_fwd_kernel_traits : public Base {
   static constexpr bool Is_context = Is_context_;
   static constexpr bool Is_local = Is_local_;
   static constexpr bool Has_rab = Has_rab_;
+  static constexpr bool Paged_KV = Paged_KV_;
   static constexpr bool Is_balance = Is_balance_;
   static constexpr bool Is_even_rab = Is_even_rab_;
 
@@ -95,11 +81,12 @@ struct Hstu_fwd_kernel_traits : public Base {
   static constexpr int kHeadDim = kHeadDim_;
   static_assert(kHeadDim % 32 == 0);
   static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
-  static constexpr int kBlockKSmem_Rab = kBlockN % 64 == 0 ? 64 : 32;
+  static constexpr int kBlockKSmemRab = kBlockN % 64 == 0 ? 64 : 32;
   static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 :
                                      (kHeadDim % 64 == 0 ? 64 : 32);
   static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
-  static constexpr int kSwizzle_Rab = kBlockKSmem_Rab == 32 ? 2 : 3;
+  static constexpr int kSwizzleRab = kBlockKSmemRab == 32 ? 2 : 3;
+  static constexpr int kStages = kHeadDim <= 64 ? 2 : 1;
 
   using TiledMma =
       TiledMMA<typename Base::MMA_Atom_Arch,
@@ -112,24 +99,25 @@ struct Hstu_fwd_kernel_traits : public Base {
       Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
 
   using SmemLayoutAtomRab = decltype(composition(
-      Swizzle<kSwizzle_Rab, 3, 3>{},
-      Layout<Shape<_8, Int<kBlockKSmem_Rab>>, Stride<Int<kBlockKSmem_Rab>, _1>>{}));
+      Swizzle<kSwizzleRab, 3, 3>{},
+      Layout<Shape<_8, Int<kBlockKSmemRab>>, Stride<Int<kBlockKSmemRab>, _1>>{}));
 
   using SmemLayoutQ =
       decltype(tile_to_shape(SmemLayoutAtomQ{},
                              Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemLayoutRab =
       decltype(tile_to_shape(SmemLayoutAtomRab{},
-                             Shape<Int<kBlockM>, Int<kBlockN>>{}));
+                             Shape<Int<kBlockM>, Int<kBlockN>, Int<kStages>>{}));
 
   using SmemLayoutKV =
       decltype(tile_to_shape(SmemLayoutAtomQ{},
-                             Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+                             Shape<Int<kBlockN>, Int<kHeadDim>, Int<kStages>>{}));
 
   // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
   using SmemLayoutVtransposed = decltype(composition(
       SmemLayoutKV{},
-      make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
+      make_layout(Shape<Int<kHeadDim>, Int<kBlockN>, Int<kStages>>{},
+                  Stride<Int<kBlockN>, _1, Int<kHeadDim * kBlockN>>{})));
   using SmemLayoutVtransposedNoSwizzle =
       decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
@@ -150,7 +138,6 @@ struct Hstu_fwd_kernel_traits : public Base {
   static constexpr int kSmemSize = kSmemSizeQKV + kSmemRabSize;
 
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-
   static_assert(kHeadDim % kGmemElemsPerLoad == 0,
                 "kHeadDim must be a multiple of kGmemElemsPerLoad");
   // Using kBlockKSmem here is 6-10% faster than kBlockKGmem for d=128 because
@@ -160,18 +147,18 @@ struct Hstu_fwd_kernel_traits : public Base {
   // first page and thread 8 - 15 will write to the second page, to the same
   // banks.
   static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
-  static constexpr int kGmemThreadsPerRow_Rab = kBlockKSmem_Rab / kGmemElemsPerLoad;
+  static constexpr int kGmemThreadsPerRowRab = kBlockKSmemRab / kGmemElemsPerLoad;
   static_assert(kNThreads % kGmemThreadsPerRow == 0,
                 "kNThreads must be a multiple of kGmemThreadsPerRow");
-  static_assert(kNThreads % kGmemThreadsPerRow_Rab == 0,
+  static_assert(kNThreads % kGmemThreadsPerRowRab == 0,
                 "kNThreads must be a multiple of kGmemThreadsPerRow_Rab");
 
   using GmemLayoutAtom = Layout<
       Shape<Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
       Stride<Int<kGmemThreadsPerRow>, _1>>; // (128/4, 4) or (128/8, 8)
-  using GmemLayoutAtom_Rab = Layout<
-        Shape<Int<kNThreads / kGmemThreadsPerRow_Rab>, Int<kGmemThreadsPerRow_Rab>>,
-        Stride<Int<kGmemThreadsPerRow_Rab>, _1>>; // (128/4, 4) or (128/8, 8)
+  using GmemLayoutAtomRab = Layout<
+        Shape<Int<kNThreads / kGmemThreadsPerRowRab>, Int<kGmemThreadsPerRowRab>>,
+        Stride<Int<kGmemThreadsPerRowRab>, _1>>; // (128/4, 4) or (128/8, 8)
 
   // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we
   // won't be reading from the same address by the same threadblock. This is
@@ -182,10 +169,11 @@ struct Hstu_fwd_kernel_traits : public Base {
       GmemLayoutAtom{}, // 16*8
       Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read kGmemElemsPerLoad
 
+  static constexpr int rab_row_size = Has_rab ? kBlockN / 16 : 1;
   using GmemTiledCopyRab = decltype(make_tiled_copy(
       Copy_Atom<Gmem_copy_struct, Element>{},
-      GmemLayoutAtom_Rab{}, // 16*8
-      Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read kGmemElemsPerLoad
+      GmemLayoutAtomRab{}, // 16*8
+      Layout<Shape<Int<rab_row_size>, _8>, Stride<_8, _1>>{}));
 
   using GmemTiledCopyO = decltype(make_tiled_copy(
       Copy_Atom<AutoVectorizingCopy, Element>{},
@@ -230,12 +218,12 @@ struct Hstu_bwd_kernel_traits : public Base {
   static constexpr bool Is_local = Is_local_;
   static constexpr bool Is_deterministic = Is_deterministic_;
   static constexpr bool Has_rab = Has_rab_;
+  static constexpr bool Paged_KV = false;
   static constexpr bool Has_drab = Has_drab_;
   static constexpr bool Is_balance = Is_balance_;
   static constexpr bool Is_even_rab = Is_even_rab_;
   static constexpr bool Rab_one_head = Rab_one_head_;
   static constexpr bool Is_V_in_regs = Is_V_in_regs_;
-  static constexpr bool Double_buffer = kHeadDim_ > 128 ? false : true;
 
   // The number of threads.
   static constexpr int kNWarps = kNWarps_;
@@ -244,8 +232,10 @@ struct Hstu_bwd_kernel_traits : public Base {
   static constexpr int kBlockM = kBlockM_;
   static constexpr int kBlockN = kBlockN_;
   static constexpr int kHeadDim = kHeadDim_;
+  static constexpr int kStages = kHeadDim <= 64 ? 2 : 1;
   static_assert(kHeadDim % 32 == 0);
   static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+  static constexpr int kBlockKSmemRab = kBlockN % 64 == 0 ? 64 : 32;
   static constexpr int kBlockKGmem =
       kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
   static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
@@ -278,14 +268,24 @@ struct Hstu_bwd_kernel_traits : public Base {
   using SmemLayoutAtomQdO = decltype(composition(
       Swizzle<kSwizzle, 3, 3>{},
       Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
-  using SmemLayoutQdO =
+  using SmemLayoutdO =
       decltype(tile_to_shape(SmemLayoutAtomQdO{},
                              make_shape(Int<kBlockM>{}, Int<kHeadDim>{})));
-  using SmemLayoutQdOtransposed = decltype(composition(
-      SmemLayoutQdO{},
+  using SmemLayoutdOtransposed = decltype(composition(
+      SmemLayoutdO{},
       make_layout(Shape<Int<kHeadDim>, Int<kBlockM>>{}, GenRowMajor{})));
-  using SmemLayoutQdOtransposedNoSwizzle =
-      decltype(get_nonswizzle_portion(SmemLayoutQdOtransposed{}));
+  using SmemLayoutdOtransposedNoSwizzle =
+      decltype(get_nonswizzle_portion(SmemLayoutdOtransposed{}));
+
+  using SmemLayoutQ =
+      decltype(tile_to_shape(SmemLayoutAtomQdO{},
+                             make_shape(Int<kBlockM>{}, Int<kHeadDim>{}, Int<kStages>{})));
+  using SmemLayoutQtransposed = decltype(composition(
+      SmemLayoutQ{},
+      make_layout(Shape<Int<kHeadDim>, Int<kBlockM>, Int<kStages>>{},
+                  Stride<Int<kBlockM>, _1, Int<kHeadDim * kBlockM>>{})));
+  using SmemLayoutQtransposedNoSwizzle =
+      decltype(get_nonswizzle_portion(SmemLayoutQtransposed{}));
 
   using SmemLayoutAtomKV = decltype(composition(
       Swizzle<kSwizzle, 3, 3>{},
@@ -302,7 +302,6 @@ struct Hstu_bwd_kernel_traits : public Base {
 
   static_assert(kBlockN >= 32);
   static constexpr int kPBlockN = kBlockN >= 64 ? 64 : 32;
-  static_assert(kPBlockN == 16 || kPBlockN == 32 || kPBlockN == 64);
   static constexpr int kSwizzlePdS = 3;
 
   using SmemLayoutAtomPdS = decltype(composition(
@@ -317,10 +316,9 @@ struct Hstu_bwd_kernel_traits : public Base {
   using SmemLayoutPdStransposedNoSwizzle =
       decltype(get_nonswizzle_portion(SmemLayoutPdStransposed{}));
 
-  static constexpr int kRabPipe = 1;
   using SmemLayoutRab = decltype(tile_to_shape(
       SmemLayoutAtomPdS{},
-      Shape<Int<kBlockM>, Int<kBlockN>, Int<kRabPipe>>{}));
+      Shape<Int<kBlockM>, Int<kBlockN>>{}));
 
   using SmemLayoutAtomdKV = decltype(composition(
       Swizzle<kSwizzle, 3, 3>{},
@@ -337,8 +335,8 @@ struct Hstu_bwd_kernel_traits : public Base {
                              make_shape(Int<kBlockM>{}, Int<kHeadDim>{})));
 
   // Double buffer for sQ
-  static constexpr int kSmemQdOSize =
-      size(SmemLayoutQdO{}) * (Double_buffer ? 3 : 2) * sizeof(Element);
+  static constexpr int kSmemdOSize = size(SmemLayoutdO{}) * sizeof(Element);
+  static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
   static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
   static constexpr int kSmemdSSize = size(SmemLayoutPdS{}) * sizeof(Element);
   static constexpr int kSmemPSize = size(SmemLayoutPdS{}) * sizeof(Element);
@@ -346,7 +344,7 @@ struct Hstu_bwd_kernel_traits : public Base {
       Has_rab ? size(SmemLayoutRab{}) * sizeof(Element) : 0;
   static constexpr int kSmemdQSize = size(SmemLayoutdQ{}) * sizeof(Element);
   static constexpr int kSmemSize1colblock =
-      kSmemQdOSize + kSmemRabSize +
+      kSmemdOSize + kSmemQSize + kSmemRabSize +
       (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + kSmemPSize
            : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize));

@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -121,6 +105,8 @@ void set_params_fprop(Hstu_fwd_params &params,
       bool(params.cu_seqlens_q) == bool(params.cu_seqlens_k),
       "cu_seqlens_q and cu_seqlens_k must be both null or non-null"
   );
+  // Set num SM
+  params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
   // Set the block scheduling
   // float coeff = 0.3;
@@ -487,6 +473,10 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                     is_delta_q,
                     window_size_left,
                     window_size_right);
+
+  auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
+  params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+
   params.total_q = total_q;
   params.total_k = total_k;
 

@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -196,6 +180,7 @@ struct CollectiveMainloopFwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const float target_group_size_inv;
     const float alpha;
   };
 
@@ -217,6 +202,7 @@ struct CollectiveMainloopFwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const float target_group_size_inv;
     const float alpha;
   };
 
@@ -255,7 +241,7 @@ struct CollectiveMainloopFwd {
             cutlass::FastDivmod(cute::ceil_div(get<2>(args.layout_Q.shape()), get<2>(args.layout_Rab.shape()))),
             tma_load_Q, tma_load_Rab, tma_load_K, tma_load_V,
             args.descale_q_ptr, args.descale_k_ptr, args.descale_v_ptr,
-            args.window_size_left, args.window_size_right, args.target_group_size, args.alpha};
+            args.window_size_left, args.window_size_right, args.target_group_size, args.target_group_size_inv, args.alpha};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -473,7 +459,6 @@ struct CollectiveMainloopFwd {
         ++smem_pipe_write_v;
       }
     }
-    scheduler.broadcast_next_work(work_tile_info);
   }
 
   template <typename Scheduler, typename SharedStorage>
@@ -641,7 +626,6 @@ struct CollectiveMainloopFwd {
       }
 
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-      scheduler.broadcast_next_work(work_tile_info);
 
       pipeline_v.consumer_wait(smem_pipe_read);
       if (n_block_max > kStages)
@@ -910,9 +894,9 @@ struct CollectiveMainloopFwd {
             }
           }
           if constexpr (Is_target) {
+            const int target_index = (row - actual_seqlen_h) * mainloop_params.target_group_size_inv;
+            const int target_col_limit_left = actual_seqlen_h + target_index * mainloop_params.target_group_size;
             if (row >= actual_seqlen_h) {
-              const int target_index = (row - actual_seqlen_h) / mainloop_params.target_group_size;
-              const int target_col_limit_left = actual_seqlen_h + target_index * mainloop_params.target_group_size;
               if (col < target_col_limit_left && col >= actual_seqlen_h) {
                 tensor(i) = -INFINITY;
               }

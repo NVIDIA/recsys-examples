@@ -1,20 +1,4 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-******************************************************************************/
-/******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  ******************************************************************************/
@@ -252,6 +236,7 @@ struct CollectiveMainloopBwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const float target_group_size_inv;
     const float alpha;
     int* dq_semaphore;
   };
@@ -277,6 +262,7 @@ struct CollectiveMainloopBwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const float target_group_size_inv;
     const float alpha;
     int* dq_semaphore;
   };
@@ -338,7 +324,7 @@ struct CollectiveMainloopBwd {
             cutlass::FastDivmod(cute::ceil_div(get<2>(args.layout_Q.shape()), get<2>(args.layout_Rab.shape()))),
             tma_load_Q, tma_load_dO, tma_load_Rab, tma_load_K, tma_load_V, tma_add_dQ, tma_store_dRab,
             args.num_batch, args.window_size_left, args.window_size_right,
-            args.target_group_size, args.alpha, args.dq_semaphore};
+            args.target_group_size, args.target_group_size_inv, args.alpha, args.dq_semaphore};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -819,7 +805,9 @@ struct CollectiveMainloopBwd {
         pipeline.consumer_wait(smem_pipe_read, barrier_token);
     };
 
-    auto [n_block, bidh, bidb] = block_coord;
+    int n_block = get<0>(block_coord);
+    int bidh = get<1>(block_coord);
+    int bidb = get<2>(block_coord);
     constexpr int kBlockM = get<0>(TileShape_MNK{});
     constexpr int kBlockN = get<1>(TileShape_MNK{});
 
@@ -862,8 +850,8 @@ struct CollectiveMainloopBwd {
       constexpr bool Is_in_causal = decltype(is_causal_type)::value;
       constexpr bool Is_in_local = decltype(is_local_type)::value;
       constexpr bool Is_in_context = decltype(is_context_type)::value;
-      if (threadIdx.x > 9999) {
-          printf("This would never run. But this is neccessary to avoid register overflow.\n");
+      if (threadIdx.x > 9999) { // This would never run. But this is neccessary to avoid register overflow
+          __syncwarp();
       }
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tSrS); ++i) {
@@ -891,12 +879,10 @@ struct CollectiveMainloopBwd {
             }
           }
           if constexpr (Is_target) {
-            if (row >= actual_seqlen_h && col >= actual_seqlen_h) {
-              const int target_index = (row - actual_seqlen_h) / mainloop_params.target_group_size;
-              const int target_col_limit_left = actual_seqlen_h + target_index * mainloop_params.target_group_size;
-              if (col < target_col_limit_left) {
-                tSrS(i) = -INFINITY;
-              }
+            const int target_index = (row - actual_seqlen_h) * mainloop_params.target_group_size_inv;
+            const int target_col_limit_left = actual_seqlen_h + target_index * mainloop_params.target_group_size;
+            if (row >= actual_seqlen_h && col >= actual_seqlen_h && col < target_col_limit_left) {
+              tSrS(i) = -INFINITY;
             }
           }
         }
@@ -913,7 +899,7 @@ struct CollectiveMainloopBwd {
       Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
       pipeline_q.consumer_wait(smem_pipe_read);
       flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
-      if constexpr (Has_rab){
+      if constexpr (Has_rab) {
         pipeline_rab.consumer_wait(smem_pipe_read);
         cute::copy(smem_tiled_copy_rab, tSsRab(_, _, _, smem_pipe_read.index()), tSrRab_copy_view);
         flash::convert_type_safe(tSrRab, tSrRab_accum);
@@ -922,12 +908,14 @@ struct CollectiveMainloopBwd {
       PipelineState_dO smem_pipe_read_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_read, smem_pipe_read_do);
       pipeline_do.consumer_wait(smem_pipe_read_do_cur);
       flash::gemm</*zero_init=*/true, /*wg_wait=*/1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tdPrdO(_, _, _, smem_pipe_read_do_cur.index()), tdPrV, tdPrdP);
-      if constexpr (Has_rab){
+      if constexpr (Has_rab) {
+        CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tSrS); ++i) {
           tSrS(i) += tSrRab_accum(i);
         }
         pipeline_rab.consumer_release(smem_pipe_read);
       }
+      CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tSrS); ++i) {
         tSrS(i) *= mainloop_params.alpha;
       }
@@ -935,9 +923,7 @@ struct CollectiveMainloopBwd {
       mask_fn(tSrS, m_block);
       auto tSrS_silu = make_fragment_like(tSrS);
       silu_bwd(tSrS, tSrS_silu);
-      for (int i = 0; i < size(tSrS_silu); ++i) {
-        tSrS_silu(i) /= max_seq_len_q;
-      }
+
       // Convert scores from fp32 to fp16/bf16
       Tensor rP = make_tensor_like<Element>(tSrS_silu);
       flash::convert_type_safe(tSrS_silu, rP);
@@ -948,13 +934,14 @@ struct CollectiveMainloopBwd {
       } else {
         warpgroup_wait<0>();
       }
-      for (int i = 0; i < size(tdPrdP); ++i) {
-        tdPrdP(i) /= max_seq_len_q;
+      if constexpr (Has_drab) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tdPrdP); ++i) {
+          tdPrdP(i) /= max_seq_len_q;
+          tdPrdP(i) *= mainloop_params.alpha;
+        }
       }
       dsilu_bwd(tdPrdP, tSrS);
-      for (int i = 0; i < size(tdPrdP); ++i) {
-        tdPrdP(i) *= mainloop_params.alpha;
-      }
 
       if constexpr (!Mma_dKV_is_RS) {
         Tensor tPaP = smem_thr_copy_PdS.retile_S(rP);
@@ -1089,6 +1076,19 @@ struct CollectiveMainloopBwd {
       CUTLASS_PRAGMA_NO_UNROLL
       for (; m_block < m_block_max; ++m_block) {
         bwd_step(m_block, mask_fn);
+      }
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tdVrdV); ++i) {
+      tdVrdV(i) /= max_seq_len_q;
+    }
+
+    if constexpr (!Has_drab) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tdKrdK); ++i) {
+        tdKrdK(i) /= max_seq_len_q;
+        tdKrdK(i) *= mainloop_params.alpha;
       }
     }
 
