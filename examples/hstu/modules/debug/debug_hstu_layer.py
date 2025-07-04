@@ -37,7 +37,7 @@ class HSTULayer(MegatronModule):
 
     def __init__(self, config: HSTUConfig):
         assert (
-            config.hstu_layer_type == HSTULayerType.NATIVE
+            config.hstu_layer_type == HSTULayerType.DEBUG
         ), "HSTULayer expects native hstu layer type"
         super().__init__(config=config)
         self._embedding_dim: int = config.hidden_size

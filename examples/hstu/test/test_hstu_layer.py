@@ -23,85 +23,12 @@ from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
 from megatron.core import parallel_state
 from megatron.core.transformer.module import Float16Module
+from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
-from modules.legacy.native_hstu_layer import HSTULayer as LegacyHSTULayer
 from modules.native_hstu_layer import HSTULayer
 from ops.length_to_offsets import length_to_complete_offsets
-
-
-def init_fused_weights_from_native_legacy(
-    native_module: LegacyHSTULayer, fused_module: FusedHSTULayer
-):
-    import re
-
-    for name, param in native_module.named_parameters():
-        # linear layer weight is transposed in the fused module
-        fused_accessor = name.replace(".weight", "_weight").replace(".bias", "_bias")
-        src_data = (
-            param.data.t()
-            if re.match(r".*linear\w*_weight$", fused_accessor)
-            else param.data
-        )
-        if param.requires_grad:
-            fused_module.state_dict()[fused_accessor].data.copy_(src_data)
-
-
-native_legacy_module_path_to_tpN_module_path = {
-    "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
-    "_output_layernorm_bias": "_output_ln_dropout_mul.bias",
-}
-
-
-# allgather weights from tp1 to tpN (slice tp1 to tpN)
-def init_tpN_weights_from_native_legacy(
-    legacy_module: LegacyHSTULayer, tpN_module: HSTULayer
-):
-    import re
-
-    for name, param in legacy_module.state_dict().items():
-        src = param.data
-        # col parallel linear weight
-        if re.match(r".*_linear_uvqk.weight$", name):
-            # TP u,v,q,k layout is different from native
-            # (output_size, input_size) => (num_heads, sum(split_arg_list), input_size) => transpose(0, 1) => (sum(split_arg_list), num_heads, input_size) => reshape(-1, input_size)
-            # split_arg_list = legacy_module._split_arg_list
-            output_size = src.size(0)
-            input_size = src.size(1)
-            src = (
-                src.view(4, legacy_module._num_heads, -1, input_size)
-                .transpose(0, 1)
-                .reshape(output_size, input_size)
-            )
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            tp_slice = tp_rank * output_size // tp_size
-            tp_slice_end = (tp_rank + 1) * output_size // tp_size
-            src = src[tp_slice:tp_slice_end, :]
-        # row wise linear weight
-        elif re.match(r".*_linear_proj.weight$", name):
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            input_size = src.size(1)
-            tp_slice = tp_rank * input_size // tp_size
-            tp_slice_end = (tp_rank + 1) * input_size // tp_size
-            src = src[:, tp_slice:tp_slice_end]
-        # output layernorm weight and bias are TP split
-        # colparallel linear bias is also TP split when config.use_cpu_initialization is True
-        # see https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1104, https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1037
-        elif re.match(r".*_linear_uvqk.bias$", name):
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            tp_slice = tp_rank * param.shape[0] // tp_size
-            tp_slice_end = (tp_rank + 1) * param.shape[0] // tp_size
-            src = src[tp_slice:tp_slice_end, ...]
-        elif re.match(r".*_output_layernorm.*$", name):
-            child_name = name.split(".")[-1]
-            name = name.replace(
-                child_name, native_legacy_module_path_to_tpN_module_path[child_name]
-            )
-        dst = tpN_module.state_dict()[name]
-        dst.data.copy_(src)
+from test_utils import init_fused_weights_from_debug, init_tpN_weights_from_debug
 
 
 def get_batch_on_this_tp_rank(batch: JaggedData):
@@ -239,25 +166,28 @@ def test_tp_hstu_layer(
         is_causal=True,
         kernel_backend=attn_backend,  # attn_backend
         target_group_size=1,
-        hstu_layer_type=HSTULayerType.NATIVE,
+        hstu_layer_type=HSTULayerType.DEBUG,
         learnable_input_layernorm=True,
         residual=True,
     )
     torch.cuda.current_device()
 
-    legacy_hstu_layer = LegacyHSTULayer(hstu_config).cuda()
+    debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
+    debug_hstu_layer = Float16Module(hstu_config, debug_hstu_layer)
+
+    hstu_config.hstu_layer_type = HSTULayerType.NATIVE
     tp_hstu_layer = HSTULayer(hstu_config).cuda()
-
-    legacy_hstu_layer = Float16Module(hstu_config, legacy_hstu_layer)
     tp_hstu_layer = Float16Module(hstu_config, tp_hstu_layer)
-    hstu_config.kernel_backend = KernelBackend.PYTORCH
-    fp32_legacy_hstu_layer = LegacyHSTULayer(hstu_config).cuda()
 
-    init_tpN_weights_from_native_legacy(legacy_hstu_layer.module, tp_hstu_layer.module)
+    hstu_config.hstu_layer_type = HSTULayerType.DEBUG
+    hstu_config.kernel_backend = KernelBackend.PYTORCH
+    fp32_debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
+
+    init_tpN_weights_from_debug(debug_hstu_layer.module, tp_hstu_layer.module)
     jd, ref_jd, fp32_ref_jd = generate_input()
 
-    out_legacy = legacy_hstu_layer(ref_jd).values
-    fp32_out_legacy = fp32_legacy_hstu_layer(fp32_ref_jd).values
+    out_legacy = debug_hstu_layer(ref_jd).values
+    fp32_out_legacy = fp32_debug_hstu_layer(fp32_ref_jd).values
     tp_out = tp_hstu_layer(jd).values
 
     assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
@@ -332,13 +262,13 @@ def test_fused_hstu_layer(
         is_causal=causal,
         kernel_backend=attn_backend,  # attn_backend
         target_group_size=target_group_size,
-        hstu_layer_type=HSTULayerType.NATIVE,
+        hstu_layer_type=HSTULayerType.DEBUG,
         learnable_input_layernorm=learnable_ln,
         residual=residual,
         async_wgrad=async_wgrad,
     )
     # hstu_config.kernel_backend = KernelBackend.PYTORCH
-    ref_hstu_layer = LegacyHSTULayer(hstu_config)
+    ref_hstu_layer = DebugHSTULayer(hstu_config)
     # to create fused hstu layer
     hstu_config.hstu_layer_type = HSTULayerType.FUSED
 
@@ -348,14 +278,14 @@ def test_fused_hstu_layer(
 
     hstu_config.kernel_backend = KernelBackend.PYTORCH
     hstu_config.dtype = torch.float32
-    hstu_config.hstu_layer_type = HSTULayerType.NATIVE
-    fp32_ref_hstu_layer = LegacyHSTULayer(hstu_config)
+    hstu_config.hstu_layer_type = HSTULayerType.DEBUG
+    fp32_ref_hstu_layer = DebugHSTULayer(hstu_config)
 
     fp32_ref_hstu_layer.cuda()
     fp32_ref_hstu_layer.load_state_dict(ref_hstu_layer.state_dict())
 
-    init_fused_weights_from_native_legacy(
-        native_module=ref_hstu_layer, fused_module=fused_hstu_layer
+    init_fused_weights_from_debug(
+        debug_module=ref_hstu_layer, fused_module=fused_hstu_layer
     )
     if dtype != torch.float32:
         ref_hstu_layer = Float16Module(hstu_config, ref_hstu_layer)
