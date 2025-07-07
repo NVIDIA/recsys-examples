@@ -196,7 +196,7 @@ class MovielensDataProcessor(DataProcessor):
                 9: 8,
                 10: 9,
             }
-        self._output_file: str = f"{data_path}{prefix}/processed_seqs.csv"
+        self._output_file: str = os.path.join(data_path, prefix, "processed_seqs.csv")
 
     def download(self) -> None:
         """
@@ -297,30 +297,31 @@ class DLRMKuaiRandProcessor(DataProcessor):
             "friend_user_num_range",
             "register_days_range",
         ]
+        base_path = os.path.join(data_path, prefix, "data")
         if prefix == "KuaiRand-Pure":
             self._log_files = [
-                f"{data_path}{prefix}/data/log_standard_4_08_to_4_21_pure.csv",
-                f"{data_path}{prefix}/data/log_standard_4_22_to_5_08_pure.csv",
+                os.path.join(base_path, "log_standard_4_08_to_4_21_pure.csv"),
+                os.path.join(base_path, "log_standard_4_22_to_5_08_pure.csv"),
             ]
             self._user_features_file = (
-                f"{data_path}{prefix}/data/user_features_pure.csv"
+                os.path.join(base_path, "user_features_pure.csv")
             )
 
         elif prefix == "KuaiRand-1K":
             self._log_files = [
-                f"{data_path}{prefix}/data/log_standard_4_08_to_4_21_1k.csv",
-                f"{data_path}{prefix}/data/log_standard_4_22_to_5_08_1k.csv",
+                os.path.join(base_path, "log_standard_4_08_to_4_21_1k.csv"),
+                os.path.join(base_path, "log_standard_4_22_to_5_08_1k.csv"),
             ]
-            self._user_features_file = f"{data_path}{prefix}/data/user_features_1k.csv"
+            self._user_features_file = os.path.join(base_path, "user_features_1k.csv")
         elif prefix == "KuaiRand-27K":
             self._log_files = [
-                f"{data_path}{prefix}/data/log_standard_4_08_to_4_21_27k_part1.csv",
-                f"{data_path}{prefix}/data/log_standard_4_08_to_4_21_27k_part2.csv",
-                f"{data_path}{prefix}/data/log_standard_4_22_to_5_08_27k_part1.csv",
-                f"{data_path}{prefix}/data/log_standard_4_22_to_5_08_27k_part2.csv",
+                os.path.join(base_path, "log_standard_4_08_to_4_21_27k_part1.csv"),
+                os.path.join(base_path, "log_standard_4_08_to_4_21_27k_part2.csv"),
+                os.path.join(base_path, "log_standard_4_22_to_5_08_27k_part1.csv"),
+                os.path.join(base_path, "log_standard_4_22_to_5_08_27k_part2.csv"),
             ]
-            self._user_features_file = f"{data_path}{prefix}/data/user_features_27k.csv"
-        self._output_file: str = f"{data_path}{prefix}/data/processed_seqs.csv"
+            self._user_features_file = os.path.join(base_path, "user_features_27k.csv")
+        self._output_file: str = os.path.join(base_path, "processed_seqs.csv")
         self._event_merge_weight: Dict[str, int] = {
             "is_click": 1,
             "is_like": 2,
@@ -408,7 +409,15 @@ class DLRMKuaiRandProcessor(DataProcessor):
         )
 
 
-def get_common_preprocessors():
+dataset_names = (
+    "ml-1m",
+    "ml-20m",
+    "kuairand-pure",
+    "kuairand-1k",
+    "kuairand-27k",
+)
+
+def get_common_preprocessors(dataset_path: str):
     """
     Get common data preprocessors.
 
@@ -416,54 +425,52 @@ def get_common_preprocessors():
         dict: Dictionary of common data preprocessors. The valid keys are
         "ml-1m", "ml-20m", "kuairand-pure", "kuairand-1k", "kuairand-27k".
     """
+    data_path = dataset_path if dataset_path else "tmp_data"
     ml_1m_dp = MovielensDataProcessor(
         "http://files.grouplens.org/datasets/movielens/ml-1m.zip",
-        data_path="tmp_data/",
+        data_path=data_path,
         file_name="movielens1m.zip",
         prefix="ml-1m",
     )
     ml_20m_dp = MovielensDataProcessor(
         "http://files.grouplens.org/datasets/movielens/ml-20m.zip",
-        data_path="tmp_data/",
+        data_path=data_path,
         file_name="movielens20m.zip",
         prefix="ml-20m",
     )
     kuairand_pure_dp = DLRMKuaiRandProcessor(
         download_url="https://zenodo.org/records/10439422/files/KuaiRand-Pure.tar.gz",
-        data_path="tmp_data/",
+        data_path=data_path,
         file_name="KuaiRand-Pure.tar.gz",
         prefix="KuaiRand-Pure",
     )
     kuairand_1k_dp = DLRMKuaiRandProcessor(
         download_url="https://zenodo.org/records/10439422/files/KuaiRand-1K.tar.gz",
-        data_path="tmp_data/",
+        data_path=data_path,
         file_name="KuaiRand-1K.tar.gz",
         prefix="KuaiRand-1K",
     )
     kuairand_27k_dp = DLRMKuaiRandProcessor(
         download_url="https://zenodo.org/records/10439422/files/KuaiRand-27K.tar.gz",
-        data_path="tmp_data/",
+        data_path=data_path,
         file_name="KuaiRand-27K.tar.gz",
         prefix="KuaiRand-27K",
     )
-    return {
-        "ml-1m": ml_1m_dp,
-        "ml-20m": ml_20m_dp,
-        "kuairand-pure": kuairand_pure_dp,
-        "kuairand-1k": kuairand_1k_dp,
-        "kuairand-27k": kuairand_27k_dp,
-    }
-
+    return {key: locals()[f"{key}_dp".replace('-', '_')] for key in dataset_names}
 
 if __name__ == "__main__":
-    common_preprocessors = get_common_preprocessors()
-
     parser = argparse.ArgumentParser(description="Preprocessor")
     parser.add_argument(
-        "--dataset_name", choices=list(common_preprocessors.keys()) + ["all"]
+        "--dataset_name", choices=list(dataset_names) + ["all"]
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
     )
     args = parser.parse_args()
 
+    common_preprocessors = get_common_preprocessors(args.dataset_path)
     if args.dataset_name == "all":
         for dataset_name in common_preprocessors.keys():
             dp = common_preprocessors[dataset_name]

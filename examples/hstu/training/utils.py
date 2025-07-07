@@ -149,6 +149,7 @@ def get_data_loader(
             test_dataset,
         ) = dataset.sequence_dataset.get_dataset(
             dataset_name=dataset_args.dataset_name,
+            dataset_path=dataset_args.dataset_path,
             max_sequence_length=dataset_args.max_sequence_length,
             max_num_candidates=dataset_args.max_num_candidates,
             num_tasks=num_tasks,
