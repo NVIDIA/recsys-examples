@@ -116,6 +116,8 @@ class RankingGR(BaseModel):
         """
         # DMP embedding
         embeddings: Dict[str, JaggedTensor] = self._embedding_collection(batch.features)
+        #
+        embeddings = self._embedding_collection._maybe_detach(embeddings)
         # For model-parallel embedding, torchrec does gradient division by (tp_size * dp_size). However, we only need to divide by dp size. In such case, we need to scale the gradient by tp_size.
         # For data-parallel embedding, torchrec does nothing on the gradient. It will be handed over to the DDP -- which will divide the gradient by dp_size (allreduce avg).
         # As a side effect, we scale the dp embedding gradient by tp_size unintentionally, so that we need to perform allreduce avg across tp ranks after/before the DDP allreduce avg.
@@ -125,12 +127,13 @@ class RankingGR(BaseModel):
         )
         batch = dmp_batch_to_tp(batch)
         # hidden_states is a JaggedData
-        hidden_states = self._hstu_block(
+        hidden_states_jagged = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
         )
-
-        return self._mlp(hidden_states.values), batch.labels
+        hidden_states = hidden_states_jagged.values
+        logits = self._mlp(hidden_states)
+        return logits, batch.labels
 
     def forward(  # type: ignore[override]
         self,
