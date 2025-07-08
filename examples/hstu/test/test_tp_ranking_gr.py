@@ -25,6 +25,7 @@ from megatron.core import parallel_state
 from pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from test_utils import (
     collective_assert_tensor,
+    compare_tpN_to_debug_weights,
     create_model,
     debug_module_path_to_tpN_module_path,
     init_tpN_weights_from_debug,
@@ -151,12 +152,12 @@ def test_gr_tp_ranking_initialization(tp_size: int):
 
 
 @pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"]])
-@pytest.mark.parametrize("max_num_candidates", [10])
+@pytest.mark.parametrize("max_num_candidates", [0])
 @pytest.mark.parametrize(
     "optimizer_type_str", ["sgd"]
 )  # adam does not work since torchrec does not save the optimizer state `step`.
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("tp_size", [1])
+@pytest.mark.parametrize("tp_size", [2, 1])
 def test_tp_gr_ranking_forward_backward(
     contextual_feature_names: List[str],
     max_num_candidates: int,
@@ -192,9 +193,9 @@ def test_tp_gr_ranking_forward_backward(
         pipeline_type="none",
         dtype=dtype,
         seed=1234,
-        hstu_layer_type=HSTULayerType.NATIVE,
+        hstu_layer_type=HSTULayerType.NATIVE,  # only native supports TP
     )
-    get_unwrapped_module(tp_model)
+    tp_ranking_gr = get_unwrapped_module(tp_model)
     debug_ranking_gr = get_unwrapped_module(debug_model)
     num_heads = debug_ranking_gr._hstu_config.num_attention_heads
     init_tpN_weights_from_debug(debug_model, tp_model, num_heads)
@@ -212,19 +213,14 @@ def test_tp_gr_ranking_forward_backward(
         tp_dense_optimizer,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
-    # debug_embedding_debug_tensor = debug_ranking_gr._embedding_collection._data_parallel_embedding_collection.embeddings.act_weights
-    # tp_embedding_debug_tensor = tp_ranking_gr._embedding_collection._data_parallel_embedding_collection.embeddings.act_weights
 
-    # debug_mlp_weight = debug_ranking_gr._hstu_block._attention_layers[0]._linear_uvqk.weight
-    # tp_mlp_weight = tp_ranking_gr._hstu_block._attention_layers[0]._linear_uvqk.weight
+    # tp_data_parallel_embedding_weights = tp_ranking_gr._embedding_collection._data_parallel_embedding_collection.embeddings.act_weights
+    # tp_mlp_weights = tp_ranking_gr._hstu_block._attention_layers[0]._linear_uvqk.weight
 
-    # tp_optimizer = tp_dense_optimizer.chained_optimizers[0] # Float16OptimizerWithFloat16Params
-    # debug_optimizer = debug_dense_optimizer.chained_optimizers[0]
-    # te_optimizer = tp_optimizer.optimizer
-    # params_group = tp_optimizer.param_groups
     iter_history_batches = iter(history_batches)
     debug_pipeline_batches = iter(history_batches)
     for i, batch in enumerate(history_batches):
+        compare_tpN_to_debug_weights(tp_ranking_gr, debug_ranking_gr)
         reporting_loss, (_, logits, _) = debug_pipeline.progress(debug_pipeline_batches)
         pipelined_reporting_loss, (_, pipelined_logits, _) = tp_pipeline.progress(
             iter_history_batches
@@ -237,15 +233,14 @@ def test_tp_gr_ranking_forward_backward(
             ),
             f"iter {i} loss per token mismatch: {tp_loss_per_token} vs {debug_loss_per_token}",
         )
+        # print(f'tp_mlp_weights main grad {tp_mlp_weights.main_grad}, grad {tp_mlp_weights.grad}')
         print(
-            f"[iter {i} loss] (tp vs debug) {tp_loss_per_token:.6f} vs {debug_loss_per_token:.6f}"
+            f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} loss] (tp vs debug) {tp_loss_per_token:.6f} vs {debug_loss_per_token:.6f}"
         )
         # collective_assert(
         #     torch.allclose(pipelined_reporting_loss, reporting_loss),
         #     f"iter {i} reporting loss mismatch",
         # )
-        # diff_index, diff_tensor = get_diff_tensor(pipelined_logits, logits)
-        # print(f'iter {i} logits diff index: {diff_index}, diff tensor: {diff_tensor}')
         # collective_assert(torch.allclose(pipelined_logits, logits, atol=1e-3, rtol=1e-3), f"iter {i} logits mismatch")
 
     init.destroy_global_state()
