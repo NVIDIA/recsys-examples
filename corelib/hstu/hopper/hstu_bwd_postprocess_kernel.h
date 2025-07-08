@@ -119,6 +119,7 @@ public:
         typename Seqlen_traits::LayoutT layout_dQ;
         const int total_q;
         const int seqlen_q;
+        const float alpha;
         const int* cu_seqlens_q;
         const int* num_targets;
         const int* num_contexts;
@@ -132,6 +133,7 @@ public:
         typename Seqlen_traits::LayoutT layout_dQ;
         const int total_q;
         const int seqlen_q;
+        const float alpha;
         const int* cu_seqlens_q;
         const int* num_targets;
         const int* num_contexts;
@@ -155,6 +157,7 @@ public:
             args.layout_dQ,
             args.total_q,
             args.seqlen_q,
+            args.alpha,
             args.cu_seqlens_q,
             args.num_targets,
             args.num_contexts
@@ -182,6 +185,7 @@ public:
         Seqlen_traits seqlen_traits_q(
             params.total_q, params.seqlen_q, params.cu_seqlens_q, params.num_targets, params.num_contexts);
         seqlen_traits_q.init(bidb);
+        int const max_seq_len_q = seqlen_traits_q.max_seq_len;
         int const seqlen = seqlen_traits_q.actual_seq_len;
         if (m_block * kBlockM >= seqlen) { return; }
 
@@ -217,6 +221,13 @@ public:
         CUTE_STATIC_ASSERT_V(size(taccdQrdQaccum) == size(tdQsdQaccum));
         Tensor tdQrdQaccum = s2r_thr_copy_dQaccum.retile_D(taccdQrdQaccum);
         cute::copy(s2r_tiled_copy_dQaccum, tdQsdQaccum, tdQrdQaccum);
+        if constexpr (!Ktraits::Has_drab) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tdQrdQaccum); ++i) {
+                tdQrdQaccum(i) /= max_seq_len_q;
+                tdQrdQaccum(i) *= params.alpha;
+            }
+        }
         // Convert tdQrdQ from fp32 to fp16
         Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum);
         flash::convert_type_safe(taccdQrdQaccum, rdQ);

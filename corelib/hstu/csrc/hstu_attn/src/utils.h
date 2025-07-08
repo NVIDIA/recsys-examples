@@ -40,8 +40,20 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define __debug_print \
-  if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && blockIdx.x == 0)
+#ifndef HSTU_DEBUG_ENABLED
+#define HSTU_DEBUG_ENABLED 0
+#endif
+
+#if HSTU_DEBUG_ENABLED
+#define HSTU_DEBUG_INFO(cond, ...)                 \
+ do {                                              \
+   if (cond) {                                     \
+     printf(__VA_ARGS__);                          \
+   }                                               \
+ } while (0)
+#else
+#define HSTU_DEBUG_INFO(cond, ...) do {} while (0)
+#endif
 
 namespace flash {
 
@@ -328,14 +340,10 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
 // {kBlockM, kBlockN, kNWarps}
 template <int kHeadDim, bool Has_rab>
 constexpr std::tuple<int, int, int> get_tile_size_bwd() {
-  if constexpr (Has_rab) {
-    return {64, 64, 8};
+  if constexpr (kHeadDim <= 128) {
+    return {128, 64, 8};
   } else {
-    if constexpr (kHeadDim <= 128) {
-      return {128, 64, 8};
-    } else {
-      return {64, 64, 8};
-    }
+    return {64, 64, 8};
   }
 }
 

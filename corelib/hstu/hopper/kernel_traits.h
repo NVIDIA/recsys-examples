@@ -48,6 +48,7 @@ struct SharedStorageQRabKVO {
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_rab;
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
+    int tile_count_semaphore;
   };
 };
 
@@ -71,6 +72,7 @@ struct SharedStorageQRabKVOVt {
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_rab;
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
     typename cutlass::PipelineAsync<kStages>::SharedStorage pipeline_vt;
+    int tile_count_semaphore;
   };
 };
 

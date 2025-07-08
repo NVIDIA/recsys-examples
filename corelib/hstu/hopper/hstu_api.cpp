@@ -121,6 +121,8 @@ void set_params_fprop(Hstu_fwd_params &params,
       bool(params.cu_seqlens_q) == bool(params.cu_seqlens_k),
       "cu_seqlens_q and cu_seqlens_k must be both null or non-null"
   );
+  // Set num SM
+  params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
   // Set the block scheduling
   // float coeff = 0.3;
@@ -487,6 +489,10 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                     is_delta_q,
                     window_size_left,
                     window_size_right);
+
+  auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
+  params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+
   params.total_q = total_q;
   params.total_k = total_k;
 

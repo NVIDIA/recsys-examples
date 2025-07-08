@@ -91,11 +91,13 @@ struct Hstu_fwd_params : public Qkv_params {
     bool is_delta_q;
     bool is_context;
 
+    int * __restrict__ tile_count_semaphore;
     float * __restrict__ descale_q_ptr;
     float * __restrict__ descale_k_ptr;
     float * __restrict__ descale_v_ptr;
 
     int arch;
+    int num_sm;
 
     bool is_balance_fwd;
     bool is_balance_bwd;

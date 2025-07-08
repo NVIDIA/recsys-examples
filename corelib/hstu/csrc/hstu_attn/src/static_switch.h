@@ -43,6 +43,20 @@
     }                                           \
   }()
 
+#define INT_SWITCH(COND, CONST_NAME, ...)      \
+  [&] {                                         \
+    if (COND == 32) {                                 \
+      constexpr static int CONST_NAME = 32;  \
+      return __VA_ARGS__();                     \
+    } else if (COND == 64) {                    \
+      constexpr static int CONST_NAME = 64; \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      constexpr static int CONST_NAME = 0; \
+      return __VA_ARGS__();                     \
+    }                                           \
+  }()
+
 #define TWO_BOOL_SWITCH(COND1, COND2, CONST_NAME1, CONST_NAME2, ...) \
   [&] {                                                              \
     if (COND1) {                                                     \
@@ -82,10 +96,10 @@
 #endif
 
 #ifdef HSTU_DISABLE_RAB
-  #define RAB_SWITCH(COND, CONST_NAME, ...)   \
-  [&] {                                       \
-    constexpr static bool CONST_NAME = false; \
-    return __VA_ARGS__();                     \
+  #define RAB_SWITCH(COND, CONST_NAME, ...)    \
+  [&] {                                        \
+    constexpr static bool CONST_NAME = false;  \
+    return __VA_ARGS__();                      \
   }()
 #else
   #define RAB_SWITCH BOOL_SWITCH
@@ -116,16 +130,24 @@
   #endif
 #endif
 
-#define ARCH_SWITCH(ARCH, ARCH_NAME, ...)   \
-[&] {                                       \
-  if (ARCH == 86 || ARCH == 89) {           \
-    constexpr static int ARCH_NAME = 89;    \
-    return __VA_ARGS__();                   \
-  } else {                                  \
-    constexpr static int ARCH_NAME = 80;    \
-    return __VA_ARGS__();                   \
-  }                                         \
-}()
+#ifdef HSTU_DISABLE_86OR89
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)   \
+  [&] {                                       \
+    constexpr static int ARCH_NAME = 80;      \
+    return __VA_ARGS__();                     \
+  }()
+#else
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)   \
+  [&] {                                       \
+    if (ARCH == 86 || ARCH == 89) {           \
+      constexpr static int ARCH_NAME = 89;    \
+      return __VA_ARGS__();                   \
+    } else {                                  \
+      constexpr static int ARCH_NAME = 80;    \
+      return __VA_ARGS__();                   \
+    }                                         \
+  }()
+#endif
 
 #ifdef HSTU_DISABLE_FP16
   #define FP16_BF16_SWITCH(BF16_COND, ...) \

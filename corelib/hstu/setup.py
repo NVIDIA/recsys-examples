@@ -58,6 +58,7 @@ DISABLE_TARGET = os.getenv("HSTU_DISABLE_TARGET", "FALSE") == "TRUE"
 DISABLE_DELTA_Q = os.getenv("HSTU_DISABLE_DELTA_Q", "FALSE") == "TRUE"
 DISABLE_RAB = os.getenv("HSTU_DISABLE_RAB", "FALSE") == "TRUE"
 DISABLE_DRAB = os.getenv("HSTU_DISABLE_DRAB", "FALSE") == "TRUE"
+DISABLE_86OR89 = os.getenv("HSTU_DISABLE_86OR89", "FALSE") == "TRUE"
 
 
 def get_platform():
@@ -104,6 +105,7 @@ def nvcc_threads_args():
 
 
 def generate_cuda_sources():
+    ARCH_SM = ["80"] + (["89"] if not DISABLE_86OR89 else [])
     DTYPE_FWD_SM80 = (["bf16"] if not DISABLE_BF16 else []) + (
         ["fp16"] if not DISABLE_FP16 else []
     )
@@ -138,6 +140,11 @@ def generate_cuda_sources():
             for c, x, t in itertools.product(CAUSAL_MASK, CONTEXT_MASK, TARGET_MASK)
         ]
         MASK += ["_causal_deltaq"] if not DISABLE_DELTA_Q else []
+        MASK += (
+            ["_causal_target_deltaq"]
+            if not DISABLE_DELTA_Q and not DISABLE_CAUSAL and not DISABLE_TARGET
+            else []
+        )
 
     dtype_to_str = {
         "bf16": "cutlass::bfloat16_t",
@@ -153,18 +160,19 @@ def generate_cuda_sources():
 
 #include "hstu_fwd.h"
 
-template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}>
+template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}>
                            (Hstu_fwd_params& params, cudaStream_t stream);
 
     """
-    for hdim, dtype, rab, mask in itertools.product(
-        HEAD_DIMENSIONS, DTYPE_FWD_SM80, RAB, MASK
+    for hdim, dtype, rab, mask, arch_sm in itertools.product(
+        HEAD_DIMENSIONS, DTYPE_FWD_SM80, RAB, MASK, ARCH_SM
     ):
-        file_name = f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm80.cu"
+        file_name = f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm{arch_sm}.cu"
         if not os.path.exists(file_name):
             with open(file_name, "w") as f:
                 f.write(
                     fwd_file_head.format(
+                        arch_sm,
                         dtype_to_str[dtype],
                         hdim,
                         "true" if "_rab" in rab else "false",
@@ -259,6 +267,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DHSTU_DISABLE_DELTA_Q"] if DISABLE_DELTA_Q else [])
         + (["-DHSTU_DISABLE_RAB"] if DISABLE_RAB else [])
         + (["-DHSTU_DISABLE_DRAB"] if DISABLE_DRAB else [])
+        + (["-DHSTU_DISABLE_86OR89"] if DISABLE_86OR89 else [])
     )
 
     if DISABLE_BF16 and DISABLE_FP16:
