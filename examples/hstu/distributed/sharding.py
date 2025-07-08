@@ -141,6 +141,7 @@ def apply_megatron_ddp(
         params_dtype=param_dtype,
         bf16=config.bf16,
         fp16=config.fp16,
+        weight_decay=dense_optimizer_param.weight_decay,
     )
     dense_optimizer = get_megatron_optimizer(
         dense_optimizer_config, [dmp._dmp_wrapped_module]
