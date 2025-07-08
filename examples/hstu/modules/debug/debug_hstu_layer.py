@@ -23,7 +23,7 @@ from megatron.core.transformer.module import MegatronModule
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.utils import init_mlp_weights_optional_bias
-from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
+from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 
 
 class HSTULayer(MegatronModule):
@@ -50,10 +50,10 @@ class HSTULayer(MegatronModule):
         self._num_heads: int = config.num_attention_heads
 
         self._split_arg_list = [
-            self._linear_dim_per_head * self._num_heads,
-            self._linear_dim_per_head * self._num_heads,
-            self._attention_dim_per_head * self._num_heads,
-            self._attention_dim_per_head * self._num_heads,
+            self._linear_dim_per_head,
+            self._linear_dim_per_head,
+            self._attention_dim_per_head,
+            self._attention_dim_per_head,
         ]
         self._residual = config.residual
         device = torch.cuda.current_device()
@@ -77,7 +77,7 @@ class HSTULayer(MegatronModule):
         # [embedding_dim, 4 * num_head * head_dim]
         self._linear_uvqk = torch.nn.Linear(
             self._embedding_dim,
-            sum(self._split_arg_list),
+            sum(self._split_arg_list) * self._num_heads,
             bias=True,
         ).apply(init_mlp_weights_optional_bias)
 
@@ -110,18 +110,18 @@ class HSTULayer(MegatronModule):
         """
         mixed_uvqk = self._linear_uvqk(hidden_states)
         # elevate to fp32 for higher precision
-        mixed_uvqk = F.silu(mixed_uvqk)
+        mixed_uvqk = F.silu(mixed_uvqk).view(
+            -1, self._num_heads, sum(self._split_arg_list)
+        )
         (user, value, query, key) = torch.split(
             mixed_uvqk,
             self._split_arg_list,
             dim=-1,
         )
-        value = value.view(-1, self._num_heads * self._linear_dim_per_head).contiguous()
-        query = query.view(
-            -1, self._num_heads * self._attention_dim_per_head
-        ).contiguous()
-        key = key.view(-1, self._num_heads * self._attention_dim_per_head).contiguous()
-        user = user.contiguous()
+        value = value.reshape(-1, self._num_heads * self._linear_dim_per_head)
+        query = query.reshape(-1, self._num_heads * self._attention_dim_per_head)
+        key = key.reshape(-1, self._num_heads * self._attention_dim_per_head)
+        user = user.reshape(-1, self._num_heads * self._linear_dim_per_head)
         del mixed_uvqk
         return user, value, query, key
 
@@ -160,7 +160,7 @@ class HSTULayer(MegatronModule):
                 target_group_size=self._target_group_size,
             )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
-            parallel_input = pytorch_norm_mul_dropout(
+            parallel_input = triton_norm_mul_dropout(
                 jagged_attn_output,
                 tu,
                 self._output_layernorm_weight,
