@@ -15,9 +15,9 @@ def _divide_with_exception(x, y):
 # TODO: to add customized TP autograd function where we can handle the tensor memory allocation and deallocation
 class TPLayerNorm(torch.nn.Module):
     """
-    This is a TP LayerNorm. Weights and bias are shared across TP ranks.
+    This is a TP LayerNorm. Weights and bias can be shared or sharded across TP ranks according to the shard_weight boolean argument.
 
-    In the forward stage: we need to allgather the activations across TP ranks to compute the mean and variance.
+    In the forward stage: we need to allgather the activations across TP ranks to compute the mean and variance (allgather weights/bias if shard_weight is True).
     In the backward stage: we need to allgather the gradients of the mean and variance to compute the gradients of the weights and bias.
 
     Note that we do not support the gradient of the weights and bias.
