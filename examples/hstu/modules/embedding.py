@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import os
 
 # pyre-strict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -323,12 +324,25 @@ class ShardedEmbedding(torch.nn.Module):
         else:
             self._data_parallel_embedding_collection = None
             self._side_stream = None
-
+        self.freeze_embedding = os.environ.get("FREEZE_EMBEDDING", "0")
         # for nvtx setting, we need to get the tensor from the output dict and set it back to the output dict
         register_setter_and_getter_for_nvtx(
             ShardedEmbedding.forward,
             key_or_attr_name=[embedding_configs[0].feature_names[0], "_values"],
         )
+
+    def _maybe_detach(self, embeddings):
+        """
+        Detach the embeddings if the freeze_embedding is 1. For debugging purpose.
+        Args:
+            embeddings (Dict[str, JaggedTensor]): The embeddings to be detached.
+        Returns:
+            Dict[str, JaggedTensor]: The detached embeddings.
+        """
+        if self.freeze_embedding == "1":
+            for key, embedding in embeddings.items():
+                embedding._values = embedding._values.detach()
+        return embeddings
 
     @output_nvtx_hook(nvtx_tag="ShardedEmbedding")
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:

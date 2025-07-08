@@ -18,12 +18,16 @@ from typing import Dict, List
 import commons.utils as init
 import pytest
 import torch
+from commons.checkpoint import get_unwrapped_module
+from commons.utils.distributed_utils import collective_assert
 from configs import HSTULayerType
 from megatron.core import parallel_state
+from pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from test_utils import (
     collective_assert_tensor,
     create_model,
     debug_module_path_to_tpN_module_path,
+    init_tpN_weights_from_debug,
 )
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
@@ -31,7 +35,7 @@ from torchrec.distributed.composable.table_batched_embedding_slice import (
 
 
 # @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-@pytest.mark.parametrize("tp_size", [2])
+@pytest.mark.parametrize("tp_size", [1])
 def test_gr_tp_ranking_initialization(tp_size: int):
     contextual_feature_names: List[str] = []
     max_num_candidates: int = 10
@@ -65,6 +69,11 @@ def test_gr_tp_ranking_initialization(tp_size: int):
         seed=1234,
         hstu_layer_type=HSTULayerType.NATIVE,
     )
+    # import pdb;pdb.set_trace()
+    tp_model.state_dict()[
+        "_embedding_collection._model_parallel_embedding_collection.embeddings.item.weight"
+    ].local_tensor()
+    # print(f'[tp{parallel_state.get_tensor_model_parallel_rank()},dp{parallel_state.get_data_parallel_rank()}] {local_shard.shape}')
     debug_tensor_shape_to_assert: Dict[str, torch.Size] = {}
     for name, param in debug_model.named_parameters():
         # The layernorm weights, mlp and data-parallel embedding should be initialized the same across whole world.
@@ -139,95 +148,104 @@ def test_gr_tp_ranking_initialization(tp_size: int):
 # )  # adam does not work since torchrec does not save the optimizer state `step`.
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-# def test_tp_gr_ranking_forward_backward(
-#     contextual_feature_names: List[str],
-#     max_num_candidates: int,
-#     optimizer_type_str: str,
-#     dtype: torch.dtype,
-#     tp_size: int,
-# ):
-#     # we must use static embedding for
-#     use_dynamic_emb = False
-#     pipeline_type = "none"
-#     init.initialize_distributed()
-#     init.initialize_model_parallel(tp_size)
-#     model, dense_optimizer, history_batches = create_model(
-#         task_type="ranking",
-#         contextual_feature_names=contextual_feature_names,
-#         max_num_candidates=max_num_candidates,
-#         optimizer_type_str=optimizer_type_str,
-#         use_dynamic_emb=use_dynamic_emb,
-#         pipeline_type="none",
-#         dtype=dtype,
-#         seed=1234,
-#     )
-#     pipelined_model, pipelined_dense_optimizer, _ = create_model(
-#         task_type="ranking",
-#         contextual_feature_names=contextual_feature_names,
-#         max_num_candidates=max_num_candidates,
-#         optimizer_type_str=optimizer_type_str,
-#         dtype=dtype,
-#         use_dynamic_emb=use_dynamic_emb,
-#         pipeline_type=pipeline_type,
-#         seed=1234,
-#     )
 
-#     # we will use ckpt to initialize the pipelined model
-#     # state_dict is not supported for dynamic embedding!
-#     for batch in history_batches:
-#         model.module.zero_grad_buffer()
-#         dense_optimizer.zero_grad()
-#         loss, _ = model(batch)
-#         collective_assert(not torch.isnan(loss).any(), f"loss has nan")
-#         loss.sum().backward()
-#         finalize_model_grads([model.module], None)
-#         dense_optimizer.step()
 
-#     save_path = "./gr_checkpoint"
-#     if dist.get_rank() == 0:
-#         if os.path.exists(save_path):
-#             shutil.rmtree(save_path)
-#     dist.barrier(device_ids=[torch.cuda.current_device()])
+@pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"]])
+@pytest.mark.parametrize("max_num_candidates", [10])
+@pytest.mark.parametrize(
+    "optimizer_type_str", ["sgd"]
+)  # adam does not work since torchrec does not save the optimizer state `step`.
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("tp_size", [1])
+def test_tp_gr_ranking_forward_backward(
+    contextual_feature_names: List[str],
+    max_num_candidates: int,
+    optimizer_type_str: str,
+    dtype: torch.dtype,
+    tp_size: int,
+):
+    # we must use static embedding for reproducibility
+    use_dynamic_emb = False
+    init.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+    if world_size < tp_size:
+        pytest.skip("TP size is larger than world size")
+    init.initialize_model_parallel(tp_size)
+    debug_model, debug_dense_optimizer, history_batches = create_model(
+        task_type="ranking",
+        contextual_feature_names=contextual_feature_names,
+        max_num_candidates=max_num_candidates,
+        optimizer_type_str=optimizer_type_str,
+        use_dynamic_emb=use_dynamic_emb,
+        pipeline_type="none",
+        dtype=dtype,
+        seed=1234,
+        hstu_layer_type=HSTULayerType.DEBUG,
+    )
+    # print(f'\n\n\n\n\n\n\n\n\n\n\n\n\n\ntp*************************\n')
+    tp_model, tp_dense_optimizer, _ = create_model(
+        task_type="ranking",
+        contextual_feature_names=contextual_feature_names,
+        max_num_candidates=max_num_candidates,
+        optimizer_type_str=optimizer_type_str,
+        use_dynamic_emb=use_dynamic_emb,
+        pipeline_type="none",
+        dtype=dtype,
+        seed=1234,
+        hstu_layer_type=HSTULayerType.NATIVE,
+    )
+    get_unwrapped_module(tp_model)
+    debug_ranking_gr = get_unwrapped_module(debug_model)
+    num_heads = debug_ranking_gr._hstu_config.num_attention_heads
+    init_tpN_weights_from_debug(debug_model, tp_model, num_heads)
+    # this is a must because the master weight needs to be updated as well
+    tp_dense_optimizer.reload_model_params()
 
-#     if dist.get_rank() == 0:
-#         os.makedirs(save_path, exist_ok=True)
-#     dist.barrier(device_ids=[torch.cuda.current_device()])
-#     checkpoint.save(save_path, model, dense_optimizer=dense_optimizer)
-#     checkpoint.load(
-#         save_path, pipelined_model, dense_optimizer=pipelined_dense_optimizer
-#     )
-#     dist.barrier(device_ids=[torch.cuda.current_device()])
-#     if dist.get_rank() == 0:
-#         shutil.rmtree(save_path)
+    debug_pipeline = JaggedMegatronTrainNonePipeline(
+        debug_model,
+        debug_dense_optimizer,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
 
-#     no_pipeline = JaggedMegatronTrainNonePipeline(
-#         model,
-#         dense_optimizer,
-#         device=torch.device("cuda", torch.cuda.current_device()),
-#     )
-#     if pipeline_type == "native":
-#         target_pipeline = JaggedMegatronTrainPipelineSparseDist(
-#             pipelined_model,
-#             pipelined_dense_optimizer,
-#             device=torch.device("cuda", torch.cuda.current_device()),
-#         )
-#     else:
-#         target_pipeline = JaggedMegatronPrefetchTrainPipelineSparseDist(
-#             pipelined_model,
-#             pipelined_dense_optimizer,
-#             device=torch.device("cuda", torch.cuda.current_device()),
-#         )
-#     iter_history_batches = iter(history_batches)
-#     no_pipeline_batches = iter(history_batches)
-#     for i, batch in enumerate(history_batches):
-#         reporting_loss, (_, logits, _) = no_pipeline.progress(no_pipeline_batches)
-#         pipelined_reporting_loss, (_, pipelined_logits, _) = target_pipeline.progress(
-#             iter_history_batches
-#         )
-#         collective_assert(
-#             torch.allclose(pipelined_reporting_loss, reporting_loss),
-#             f"reporting loss mismatch",
-#         )
-#         collective_assert(torch.allclose(pipelined_logits, logits), f"logits mismatch")
+    tp_pipeline = JaggedMegatronTrainNonePipeline(
+        tp_model,
+        tp_dense_optimizer,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    # debug_embedding_debug_tensor = debug_ranking_gr._embedding_collection._data_parallel_embedding_collection.embeddings.act_weights
+    # tp_embedding_debug_tensor = tp_ranking_gr._embedding_collection._data_parallel_embedding_collection.embeddings.act_weights
 
-#     init.destroy_global_state()
+    # debug_mlp_weight = debug_ranking_gr._hstu_block._attention_layers[0]._linear_uvqk.weight
+    # tp_mlp_weight = tp_ranking_gr._hstu_block._attention_layers[0]._linear_uvqk.weight
+
+    # tp_optimizer = tp_dense_optimizer.chained_optimizers[0] # Float16OptimizerWithFloat16Params
+    # debug_optimizer = debug_dense_optimizer.chained_optimizers[0]
+    # te_optimizer = tp_optimizer.optimizer
+    # params_group = tp_optimizer.param_groups
+    iter_history_batches = iter(history_batches)
+    debug_pipeline_batches = iter(history_batches)
+    for i, batch in enumerate(history_batches):
+        reporting_loss, (_, logits, _) = debug_pipeline.progress(debug_pipeline_batches)
+        pipelined_reporting_loss, (_, pipelined_logits, _) = tp_pipeline.progress(
+            iter_history_batches
+        )
+        tp_loss_per_token = pipelined_reporting_loss[0] / pipelined_reporting_loss[1]
+        debug_loss_per_token = reporting_loss[0] / reporting_loss[1]
+        collective_assert(
+            torch.allclose(
+                tp_loss_per_token, debug_loss_per_token, atol=1e-5, rtol=1e-5
+            ),
+            f"iter {i} loss per token mismatch: {tp_loss_per_token} vs {debug_loss_per_token}",
+        )
+        print(
+            f"[iter {i} loss] (tp vs debug) {tp_loss_per_token:.6f} vs {debug_loss_per_token:.6f}"
+        )
+        # collective_assert(
+        #     torch.allclose(pipelined_reporting_loss, reporting_loss),
+        #     f"iter {i} reporting loss mismatch",
+        # )
+        # diff_index, diff_tensor = get_diff_tensor(pipelined_logits, logits)
+        # print(f'iter {i} logits diff index: {diff_index}, diff tensor: {diff_tensor}')
+        # collective_assert(torch.allclose(pipelined_logits, logits, atol=1e-3, rtol=1e-3), f"iter {i} logits mismatch")
+
+    init.destroy_global_state()
