@@ -272,6 +272,9 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         cowclip_regularization: Optional[
             CowClipDefinition
         ] = None,  # used by Rowwise Adagrad
+        # Frequency masking parameters
+        frequency_threshold: int = 0,  # Frequency threshold for masking
+        mask_dims: int = 0,  # Number of dimensions to mask
         # TO align with FBGEMM TBE
         *args,
         **kwargs,
@@ -293,6 +296,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
+        self.frequency_threshold = frequency_threshold
+        self.mask_dims = mask_dims
 
         if device is not None:
             self.device_id = int(str(device)[-1])
@@ -602,6 +607,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self.frequency_threshold,
+                self.mask_dims,
                 self._empty_tensor,
             )
         else:
@@ -622,6 +629,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self.frequency_threshold,
+                self.mask_dims,
                 self._empty_tensor,
             )
 

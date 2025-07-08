@@ -434,6 +434,8 @@ def apply_dmp(model, args):
 
     fused_params = {}
     fused_params["output_dtype"] = SparseType.FP32
+    fused_params["frequency_threshold"] = 6
+    fused_params["mask_dims"] = 5
     fused_params.update(optimizer_kwargs)
 
     # precision of all-to-all
