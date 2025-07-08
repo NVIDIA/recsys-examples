@@ -183,7 +183,9 @@ def test_tp_hstu_layer(
     hstu_config.kernel_backend = KernelBackend.PYTORCH
     fp32_debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
 
-    init_tpN_weights_from_debug(debug_hstu_layer.module, tp_hstu_layer.module)
+    init_tpN_weights_from_debug(
+        debug_hstu_layer.module, tp_hstu_layer.module, num_heads
+    )
     jd, ref_jd, fp32_ref_jd = generate_input()
 
     out_legacy = debug_hstu_layer(ref_jd).values
@@ -285,7 +287,7 @@ def test_fused_hstu_layer(
     fp32_ref_hstu_layer.load_state_dict(ref_hstu_layer.state_dict())
 
     init_fused_weights_from_debug(
-        debug_module=ref_hstu_layer, fused_module=fused_hstu_layer
+        debug_module=ref_hstu_layer, fused_module=fused_hstu_layer, num_heads=num_heads
     )
     if dtype != torch.float32:
         ref_hstu_layer = Float16Module(hstu_config, ref_hstu_layer)
