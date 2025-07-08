@@ -8,6 +8,18 @@ The project includes:
 - HSTU (Hierarchical Sequential Transduction Unit) attention operator support
 - Dynamic Embeddings with GPU acceleration
 
+# What's New
+- **[2025/7/4]** 🎉v25.06 released! 
+  - Dynamicemb lookup module performance improvement and LFU eviction support. 
+  - Recompute support for HSTU layer
+  - Customized cuda ops for jagged tensor concat.
+  - Pipeline support for HSTU example.
+  - Stable dependency to torchrec v1.2.0 and fbgemm_gpu v1.2.0
+- **[2025/5/29]** 🎉v25.05 released! 
+  - Enhancements to the dynamicemb functionality, including support for EmbeddingBagCollection, truncated normal initialization, and initial_accumulator_value for Adagrad.
+  - Fusion of operations like layernorm and dropout in the HSTU layer, resulting in about 1.2x end-to-end speedup.
+  - Fix convergence issues on the Kuairand dataset.
+
 # Environment Setup
 ## Start from dockerfile
 
