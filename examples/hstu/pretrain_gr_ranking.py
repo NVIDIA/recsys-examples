@@ -42,7 +42,7 @@ from training import (
     TensorModelParallelArgs,
     TrainerArgs,
     create_dynamic_optitons_dict,
-    create_embedding_config,
+    create_embedding_configs,
     create_hstu_config,
     create_optimizer_params,
     get_data_loader,
@@ -89,10 +89,9 @@ def create_ranking_config() -> RankingConfig:
     ranking_args = RankingArgs()
 
     return RankingConfig(
-        embedding_configs=[
-            create_embedding_config(network_args.hidden_size, arg)
-            for arg in embedding_args
-        ],
+        embedding_configs=create_embedding_configs(
+            dataset_args, network_args, embedding_args
+        ),
         prediction_head_arch=ranking_args.prediction_head_arch,
         prediction_head_act_type=ranking_args.prediction_head_act_type,
         prediction_head_bias=ranking_args.prediction_head_bias,
