@@ -162,7 +162,7 @@ class RetrievalGR(BaseModel):
     def forward(  # type: ignore[override]
         self,
         batch: RetrievalBatch,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]:
         """
         Perform the forward pass of the model.
 
@@ -188,6 +188,7 @@ class RetrievalGR(BaseModel):
             losses.detach(),
             jagged_item_logit.detach(),
             supervision_item_ids.detach(),
+            sum(batch.feature_to_max_seqlen.values()),
         )
 
     # used for evaluation

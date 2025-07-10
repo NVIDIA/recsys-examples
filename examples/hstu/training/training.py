@@ -32,6 +32,7 @@ from pipeline.train_pipeline import (
     JaggedMegatronTrainPipelineSparseDist,
 )
 from training.gin_config_args import TrainerArgs
+from training.utils import cal_flops_per_sample
 
 
 def evaluate(
@@ -53,7 +54,7 @@ def evaluate(
     with torch.no_grad():
         for i in range(max_eval_iters):
             eval_iter += 1
-            reporting_loss, (_, logits, labels) = pipeline.progress(
+            reporting_loss, (_, logits, labels, _) = pipeline.progress(
                 iterated_eval_loader
             )
             # metric module forward
@@ -167,9 +168,12 @@ def train_with_pipeline(
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
                 torch.cuda.nvtx.range_push(f"step {train_iter}")
-                reporting_loss, (local_loss, logits, labels) = pipeline.progress(
-                    batched_iterator
-                )
+                reporting_loss, (
+                    local_loss,
+                    logits,
+                    labels,
+                    max_seqlen,
+                ) = pipeline.progress(batched_iterator)
                 tokens_logged += reporting_loss[1]
                 torch.cuda.nvtx.range_pop()
             except StopIteration:
@@ -180,8 +184,15 @@ def train_with_pipeline(
             if train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0:
                 gpu_timer.stop()
                 cur_td = gpu_timer.elapsed_time() - last_td
+                flops = (
+                    cal_flops_per_sample(
+                        get_unwrapped_module(pipeline._model)._hstu_config, max_seqlen
+                    )
+                    * trainer_args.log_interval
+                    * trainer_args.train_batch_size
+                )
                 print_rank_0(
-                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, FLOPS {flops / cur_td / 1e9:.2f} GFLOPS]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
                 )
                 last_td = cur_td + last_td
                 tokens_logged.zero_()
