@@ -102,6 +102,7 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
 class DatasetArgs:
     dataset_name: str
     max_sequence_length: int
+    dataset_path: str = None
     max_num_candidates: int = 0
     shuffle: bool = False
 

@@ -30,6 +30,7 @@ import json
 import math
 from collections import defaultdict
 from typing import Dict, Iterator, List, Optional, Tuple
+import os.path
 
 import numpy as np
 import pandas as pd
@@ -288,6 +289,7 @@ class SequenceDataset(IterableDataset[Batch]):
 
 def get_dataset(
     dataset_name: str,
+    dataset_path: str,
     max_sequence_length: int,
     max_num_candidates: int,
     num_tasks: int,
@@ -305,6 +307,7 @@ def get_dataset(
 
     Args:
         dataset_name (str): The name of the dataset to retrieve.
+        dataset_path (str): The path to the dataset.
         max_sequence_length (int): The maximum length of sequences in the dataset.
         max_num_candidates (int): The maximum number of candidate items.
         num_tasks (int): The number of tasks;
@@ -319,7 +322,7 @@ def get_dataset(
     Returns:
         Tuple[SequenceDataset, Optional[SequenceDataset]]: A tuple containing the training dataset and the evaluation dataset (if `eval_batch_size` is provided).
     """
-    common_preprocessors = get_common_preprocessors()
+    common_preprocessors = get_common_preprocessors(dataset_path)
     if dataset_name not in common_preprocessors:
         raise ValueError(f"{dataset_name} not in preprocessors")
     dp = common_preprocessors[dataset_name]
