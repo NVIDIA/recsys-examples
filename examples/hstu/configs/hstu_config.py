@@ -17,8 +17,15 @@ from enum import Enum, unique
 from typing import Optional
 
 import torch
-from megatron.core import parallel_state
-from megatron.core.transformer import TransformerConfig
+
+try:
+    from megatron.core import parallel_state
+    from megatron.core.transformer import TransformerConfig
+except:
+    parallel_state = None
+
+    class TransformerConfig:  # type: ignore
+        pass
 
 
 @unique
@@ -106,6 +113,8 @@ class HSTUConfig(TransformerConfig):
     # whether to recompute input layernorm
     recompute_input_layernorm: bool = False
     recompute_input_silu: bool = False
+    # whether is the inference mode
+    is_inference: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -129,6 +138,7 @@ def get_hstu_config(
     async_wgrad: bool = False,
     recompute_input_layernorm: bool = False,
     recompute_input_silu: bool = False,
+    is_inference: bool = False,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -151,6 +161,7 @@ def get_hstu_config(
         async_wgrad (bool, optional): Whether to use async wgrad. Defaults to False.
         recompute_input_layernorm (bool, optional): Whether to recompute input layernorm. Defaults to False.
         recompute_input_silu (bool, optional): Whether to recompute input silu. Defaults to False.
+        is_inference (bool, optional): Whether is the inference mode
     Returns:
         HSTUConfig: The HSTU configuration object.
     """
@@ -171,9 +182,15 @@ def get_hstu_config(
         layernorm_epsilon=norm_epsilon,
         num_layers=num_layers,
         bf16=is_bf16,
-        tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
-        pipeline_model_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
-        context_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
+        tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size()
+        if not is_inference
+        else 1,
+        pipeline_model_parallel_size=parallel_state.get_pipeline_model_parallel_world_size()
+        if not is_inference
+        else 1,
+        context_parallel_size=parallel_state.get_pipeline_model_parallel_world_size()
+        if not is_inference
+        else 1,
         fp16=is_fp16,
         is_causal=is_causal,
         kernel_backend=kernel_backend,
