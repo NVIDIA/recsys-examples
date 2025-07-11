@@ -300,4 +300,34 @@ void SegmentedUniqueDevice::operator()(
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void select_index_async(
+    int num_items,
+    bool const * d_flags,
+    int* d_output,
+    int* d_num_select,
+    at::Device const& device,
+    cudaStream_t const& stream
+) {
+
+  void* d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+  cub::CountingInputIterator<int> counting_iter(0);
+
+  // 1. get the size of temp storage.
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    counting_iter, d_flags, d_output,
+    d_num_select, num_items, stream);
+  
+  // 2. allocate the temp storage.
+  d_temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)}, 
+    at::TensorOptions().dtype(torch::kChar).device(device)).data_ptr();
+
+  // 3. select
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    counting_iter, d_flags, d_output,
+    d_num_select, num_items, stream);
+}
+
 } // namespace dyn_emb
