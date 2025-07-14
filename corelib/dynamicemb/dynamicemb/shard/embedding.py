@@ -156,7 +156,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 d_table_offset = self.get_buffer(
                     f"_nonfuse_table_feature_offsets_device_{i}"
                 )
-
+                input_feature._values = input_feature._values.contiguous()
                 # for debug
                 # hash_size_cumsum = self.get_buffer(
                 #    f"_hash_size_cumsum_tensor_{i}"
@@ -183,7 +183,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 offsets = input_feature.offsets()
                 lengths = input_feature.lengths()
                 dtype_convert = False
-                torch.int64
                 if indices.dtype != torch.int64:
                     indices.dtype
                     indices_input = indices.to(torch.int64)
