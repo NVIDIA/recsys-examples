@@ -40,8 +40,8 @@ from typing import (
 import nvtx
 import torch
 from commons.utils.distributed_utils import collective_assert
+from distributed.finalize_model_grads import finalize_model_grads
 from megatron.core import parallel_state
-from megatron.core.distributed import finalize_model_grads
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from pipeline.utils import (
     In,

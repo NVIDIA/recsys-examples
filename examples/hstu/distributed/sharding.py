@@ -20,6 +20,9 @@ import torch
 import torch.distributed as dist
 import torchrec
 from configs.task_config import OptimizerParam
+
+# import our own finalize model grads
+from distributed.finalize_model_grads import finalize_model_grads
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.planner import DynamicEmbeddingEnumerator
 from dynamicemb.planner import (
@@ -33,10 +36,7 @@ from dynamicemb.shard import (
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import (
-    DistributedDataParallelConfig,
-    finalize_model_grads,
-)
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module

@@ -21,7 +21,6 @@ import torch
 from commons.utils.hstu_assert_close import assert_hstu_close
 from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
-from megatron.core import parallel_state
 from megatron.core.transformer.module import Float16Module
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
@@ -29,26 +28,6 @@ from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from ops.length_to_offsets import length_to_complete_offsets
 from test_utils import init_fused_weights_from_debug, init_tpN_weights_from_debug
-
-
-def get_batch_on_this_tp_rank(batch: JaggedData):
-    def _broadcast(item):
-        if item is not None:
-            torch.distributed.broadcast(
-                item,
-                parallel_state.get_tensor_model_parallel_src_rank(),
-                group=parallel_state.get_tensor_model_parallel_group(),
-            )
-
-    _broadcast(batch.values)
-    _broadcast(batch.seqlen)
-    _broadcast(batch.seqlen_offsets)
-    _broadcast(batch.max_seqlen)
-    _broadcast(batch.num_candidates)
-    _broadcast(batch.num_candidates_offsets)
-    _broadcast(batch.contextual_seqlen)
-    _broadcast(batch.contextual_seqlen_offsets)
-    return batch
 
 
 @pytest.mark.parametrize(
@@ -76,6 +55,7 @@ def test_tp_hstu_layer(
     init.initialize_model_parallel(tp_size)
     init.set_random_seed(1234)
 
+    # The input are replicated across TP because they maintain the same seed across TP ranks. No need to broadcast.
     def generate_input():
         input_sparsity = 0.75
         max_history_seqlen = 5

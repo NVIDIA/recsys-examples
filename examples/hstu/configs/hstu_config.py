@@ -117,6 +117,7 @@ class HSTUConfig(TransformerConfig):
     recompute_input_silu: bool = False
     # whether is the inference mode
     is_inference: bool = False
+    add_uvqk_bias: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -141,6 +142,7 @@ def get_hstu_config(
     recompute_input_layernorm: bool = False,
     recompute_input_silu: bool = False,
     is_inference: bool = False,
+    add_uvqk_bias: bool = True,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -205,4 +207,6 @@ def get_hstu_config(
         async_wgrad_event=async_wgrad_event,
         recompute_input_layernorm=recompute_input_layernorm,
         recompute_input_silu=recompute_input_silu,
+        add_uvqk_bias=add_uvqk_bias,
+        is_inference=is_inference,
     )

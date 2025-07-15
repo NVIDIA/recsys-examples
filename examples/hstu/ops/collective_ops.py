@@ -505,4 +505,8 @@ def keyed_jagged_tensor_allgather(
     pg: Optional[dist.ProcessGroup] = None,
 ):
     # check dtype are all integers
-    raise NotImplementedError("KeyedJaggedTensor allgather is not implemented")
+    input_jt_dict = kjt.to_dict()
+    output_jt_dict = {}
+    for key, value in input_jt_dict.items():
+        output_jt_dict[key] = jagged_tensor_allgather(value, pg)
+    return KeyedJaggedTensor.from_jt_dict(output_jt_dict)

@@ -26,6 +26,7 @@ from modules.utils import init_mlp_weights_optional_bias
 from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 
 
+# TODO move this layer to test folder! And remove the layer type: DEBUG
 class HSTULayer(MegatronModule):
     """
     One basic unit of HSTUBlock. Input and output are all JaggedData.
@@ -78,7 +79,7 @@ class HSTULayer(MegatronModule):
         self._linear_uvqk = torch.nn.Linear(
             self._embedding_dim,
             sum(self._split_arg_list) * self._num_heads,
-            bias=True,
+            bias=config.add_uvqk_bias,
         ).apply(init_mlp_weights_optional_bias)
 
         self._linear_proj = torch.nn.Linear(
