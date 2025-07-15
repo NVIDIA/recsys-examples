@@ -257,7 +257,10 @@ def run(args):
         else None
     )
     # TODO: parse args.output_dtype
-    fused_params = {"output_dtype": SparseType.FP32}
+    fused_params = {}
+    fused_params["output_dtype"] = SparseType.FP32
+    fused_params["frequency_threshold"] = 0
+    fused_params["mask_dims"] = 0
     if not args.use_torch_opt:
         fused_params.update(optimizer_kwargs)
     sharder = DynamicEmbeddingCollectionSharder(
@@ -555,7 +558,7 @@ def main(argv: List[str]) -> None:
             f"INFO: args.embedding_dim = {args.embedding_dim} is not aligned with 4, which can't use TorchREC raw embedding table , so all embedding table is dynamic embedding table"
         )
         args.dynamicemb_num = args.num_embedding_table
-
+    args.dynamicemb_num = args.num_embedding_table
     if args.platform == "a100":
         args.intra_host_bw = 300e9
         args.inter_host_bw = 25e9

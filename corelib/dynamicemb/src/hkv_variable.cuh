@@ -609,11 +609,11 @@ void HKVVariable<KeyType, ValueType, Strategy>::accum_or_assign(
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
     const size_t n, const void *keys, void **value_ptrs, void *values,
-    bool *d_found, const cudaStream_t& stream) {
+    bool *d_found, void *output_scores, const cudaStream_t& stream) {
   if (n == 0)
     return;
   int dim = dim_;
-  this->find_pointers(n, keys, value_ptrs, d_found, nullptr, stream);
+  this->find_pointers(n, keys, value_ptrs, d_found, output_scores, stream);
   auto &device_prop = DeviceProp::getDeviceProp();
   int block_size = dim < device_prop.max_thread_per_block
                        ? dim
