@@ -20,7 +20,9 @@ import pytest
 import torch
 from commons.checkpoint import get_unwrapped_module
 from commons.utils.distributed_utils import collective_assert
-from configs import HSTULayerType
+from commons.utils.hstu_assert_close import hstu_close
+from configs import HSTULayerType, KernelBackend
+from distributed.dmp_to_tp import dmp_batch_to_tp
 from megatron.core import parallel_state
 from pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from test_utils import (
@@ -28,15 +30,16 @@ from test_utils import (
     compare_tpN_to_debug_weights,
     create_model,
     debug_module_path_to_tpN_module_path,
+    init_module_from,
     init_tpN_weights_from_debug,
+    zero_bias,
 )
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
 
 
-# @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-@pytest.mark.parametrize("tp_size", [1])
+@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 def test_gr_tp_ranking_initialization(tp_size: int):
     contextual_feature_names: List[str] = []
     max_num_candidates: int = 10
@@ -142,28 +145,25 @@ def test_gr_tp_ranking_initialization(tp_size: int):
             ), f"[tp{parallel_state.get_tensor_model_parallel_rank()},dp{parallel_state.get_data_parallel_rank()}] {name} shape mismatch"
 
 
-# @pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"], []])
-# @pytest.mark.parametrize("max_num_candidates", [10, 0])
-# @pytest.mark.parametrize(
-#     "optimizer_type_str", ["sgd", "none"]
-# )  # adam does not work since torchrec does not save the optimizer state `step`.
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-
-
 @pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"]])
 @pytest.mark.parametrize("max_num_candidates", [0])
-@pytest.mark.parametrize(
-    "optimizer_type_str", ["sgd"]
-)  # adam does not work since torchrec does not save the optimizer state `step`.
+@pytest.mark.parametrize("optimizer_type_str", ["sgd"])  # TODO: add adam
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("tp_size", [2, 1])
+@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
+@pytest.mark.parametrize(
+    "replicate_batches", [False, True]
+)  # same batch or various batches
+@pytest.mark.parametrize(
+    "kernel_backend", [KernelBackend.PYTORCH]
+)  # Note that only pytorch supports fp32
 def test_tp_gr_ranking_forward_backward(
     contextual_feature_names: List[str],
     max_num_candidates: int,
     optimizer_type_str: str,
     dtype: torch.dtype,
     tp_size: int,
+    replicate_batches: bool,
+    kernel_backend: KernelBackend,
 ):
     # we must use static embedding for reproducibility
     use_dynamic_emb = False
@@ -172,18 +172,6 @@ def test_tp_gr_ranking_forward_backward(
     if world_size < tp_size:
         pytest.skip("TP size is larger than world size")
     init.initialize_model_parallel(tp_size)
-    debug_model, debug_dense_optimizer, history_batches = create_model(
-        task_type="ranking",
-        contextual_feature_names=contextual_feature_names,
-        max_num_candidates=max_num_candidates,
-        optimizer_type_str=optimizer_type_str,
-        use_dynamic_emb=use_dynamic_emb,
-        pipeline_type="none",
-        dtype=dtype,
-        seed=1234,
-        hstu_layer_type=HSTULayerType.DEBUG,
-    )
-    # print(f'\n\n\n\n\n\n\n\n\n\n\n\n\n\ntp*************************\n')
     tp_model, tp_dense_optimizer, _ = create_model(
         task_type="ranking",
         contextual_feature_names=contextual_feature_names,
@@ -194,53 +182,106 @@ def test_tp_gr_ranking_forward_backward(
         dtype=dtype,
         seed=1234,
         hstu_layer_type=HSTULayerType.NATIVE,  # only native supports TP
+        kernel_backend=kernel_backend,  # only pytorch supports fp32
     )
+    (
+        debug_model,
+        debug_dense_optimizer,
+        history_batches,
+    ) = create_model(  # replicate all weights!
+        task_type="ranking",
+        contextual_feature_names=contextual_feature_names,
+        max_num_candidates=max_num_candidates,
+        optimizer_type_str=optimizer_type_str,
+        use_dynamic_emb=use_dynamic_emb,
+        pipeline_type="none",
+        dtype=dtype,
+        seed=1234,
+        hstu_layer_type=HSTULayerType.DEBUG,  # no TP, i.e. does not shard weights
+        num_batches=10,
+        replicate_batches=replicate_batches,
+        kernel_backend=kernel_backend,  # only pytorch supports fp32
+    )
+    debug_model_fp32, debug_dense_optimizer_fp32, _ = create_model(
+        task_type="ranking",
+        contextual_feature_names=contextual_feature_names,
+        max_num_candidates=max_num_candidates,
+        optimizer_type_str=optimizer_type_str,
+        use_dynamic_emb=use_dynamic_emb,
+        pipeline_type="none",
+        dtype=torch.float32,
+        seed=1234,
+        hstu_layer_type=HSTULayerType.DEBUG,
+        kernel_backend=KernelBackend.PYTORCH,  # only pytorch supports fp32
+    )
+
     tp_ranking_gr = get_unwrapped_module(tp_model)
     debug_ranking_gr = get_unwrapped_module(debug_model)
-    num_heads = debug_ranking_gr._hstu_config.num_attention_heads
-    init_tpN_weights_from_debug(debug_model, tp_model, num_heads)
+    debug_ranking_gr_fp32 = get_unwrapped_module(debug_model_fp32)
+
+    # set bias to zero for better debugging
+    zero_bias(debug_model_fp32)
+    # init debug from fp32
+    init_module_from(debug_model_fp32, debug_model)
+    # init tp from debug
+    init_tpN_weights_from_debug(debug_model, tp_model)
     # this is a must because the master weight needs to be updated as well
     tp_dense_optimizer.reload_model_params()
+    debug_dense_optimizer.reload_model_params()
+    debug_dense_optimizer_fp32.reload_model_params()
 
     debug_pipeline = JaggedMegatronTrainNonePipeline(
         debug_model,
         debug_dense_optimizer,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
-
+    debug_pipeline_fp32 = JaggedMegatronTrainNonePipeline(
+        debug_model_fp32,
+        debug_dense_optimizer_fp32,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
     tp_pipeline = JaggedMegatronTrainNonePipeline(
         tp_model,
         tp_dense_optimizer,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
-
-    # tp_data_parallel_embedding_weights = tp_ranking_gr._embedding_collection._data_parallel_embedding_collection.embeddings.act_weights
-    # tp_mlp_weights = tp_ranking_gr._hstu_block._attention_layers[0]._linear_uvqk.weight
-
+    # for debug model, the tp is fake, so we need to gather the batches across tp. The wgrad will be reduced across DP ranks.
+    gathered_batches_across_tp = [
+        dmp_batch_to_tp(batch, exclude_features=False) for batch in history_batches
+    ]
     iter_history_batches = iter(history_batches)
     debug_pipeline_batches = iter(history_batches)
-    for i, batch in enumerate(history_batches):
-        compare_tpN_to_debug_weights(tp_ranking_gr, debug_ranking_gr)
-        reporting_loss, (_, logits, _) = debug_pipeline.progress(debug_pipeline_batches)
-        pipelined_reporting_loss, (_, pipelined_logits, _) = tp_pipeline.progress(
-            iter_history_batches
+    debug_pipeline_batches_fp32 = iter(history_batches)
+    # initial state check
+    compare_tpN_to_debug_weights(tp_ranking_gr, debug_ranking_gr, debug_ranking_gr_fp32)
+
+    for i, batch in enumerate(history_batches[0:]):
+        _, (losses, logits, _) = debug_pipeline.progress(debug_pipeline_batches)
+        _, (losses_fp32, logits_fp32, _) = debug_pipeline_fp32.progress(
+            debug_pipeline_batches_fp32
         )
-        tp_loss_per_token = pipelined_reporting_loss[0] / pipelined_reporting_loss[1]
-        debug_loss_per_token = reporting_loss[0] / reporting_loss[1]
+        _, (tp_losses, tp_logits, _) = tp_pipeline.progress(iter_history_batches)
+        compare_tpN_to_debug_weights(
+            tp_ranking_gr, debug_ranking_gr, debug_ranking_gr_fp32
+        )
+
+        # we only assert loss & logits across tp when weights are fp32. They must be bit-wise the same.
+        # collective_assert_tensor(losses_fp32, compare_type="close", pg=parallel_state.get_tensor_model_parallel_group())
+        # collective_assert_tensor(logits_fp32, compare_type="close", pg=parallel_state.get_tensor_model_parallel_group())
+
+        # assert loss & logits element-wise
         collective_assert(
-            torch.allclose(
-                tp_loss_per_token, debug_loss_per_token, atol=1e-5, rtol=1e-5
-            ),
-            f"iter {i} loss per token mismatch: {tp_loss_per_token} vs {debug_loss_per_token}",
+            hstu_close(tp_losses, losses, losses_fp32),
+            f"losses mismatch at iter {i}, diff {(tp_losses - losses_fp32).abs().max()} vs {(losses - losses_fp32).abs().max()} vs hey {(tp_losses - losses).abs().max()}",
+            group=parallel_state.get_data_parallel_group(),
         )
-        # print(f'tp_mlp_weights main grad {tp_mlp_weights.main_grad}, grad {tp_mlp_weights.grad}')
+        collective_assert(
+            hstu_close(tp_logits, logits, logits_fp32),
+            f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
+            group=parallel_state.get_data_parallel_group(),
+        )
         print(
-            f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} loss] (tp vs debug) {tp_loss_per_token:.6f} vs {debug_loss_per_token:.6f}"
+            f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
         )
-        # collective_assert(
-        #     torch.allclose(pipelined_reporting_loss, reporting_loss),
-        #     f"iter {i} reporting loss mismatch",
-        # )
-        # collective_assert(torch.allclose(pipelined_logits, logits, atol=1e-3, rtol=1e-3), f"iter {i} logits mismatch")
 
     init.destroy_global_state()

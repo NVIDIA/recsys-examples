@@ -14,17 +14,20 @@
 # limitations under the License.
 
 
-from typing import Optional
+from typing import List, Optional, Union
 
 import commons.utils as init
 import configs
 import dataset
 import model
 import torch
-from configs import HSTULayerType, OptimizerParam
+from commons.utils.distributed_utils import collective_assert
+from commons.utils.hstu_assert_close import hstu_close
+from configs import HSTULayerType, KernelBackend, OptimizerParam
 from distributed.sharding import make_optimizer_and_shard
 from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state, tensor_parallel
+from modules.jagged_data import JaggedData
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
@@ -34,6 +37,26 @@ debug_module_path_to_tpN_module_path = {
     "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
     "_output_layernorm_bias": "_output_ln_dropout_mul.bias",
 }
+
+
+def get_batch_on_this_tp_rank(batch: JaggedData):
+    def _broadcast(item):
+        if item is not None:
+            torch.distributed.broadcast(
+                item,
+                parallel_state.get_tensor_model_parallel_src_rank(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            )
+
+    _broadcast(batch.values)
+    _broadcast(batch.seqlen)
+    _broadcast(batch.seqlen_offsets)
+    _broadcast(batch.max_seqlen)
+    _broadcast(batch.num_candidates)
+    _broadcast(batch.num_candidates_offsets)
+    _broadcast(batch.contextual_seqlen)
+    _broadcast(batch.contextual_seqlen_offsets)
+    return batch
 
 
 def get_diff_tensor(tensor1, tensor2, threshold=1e-5):
@@ -60,17 +83,32 @@ def collective_assert_tensor(
             continue
 
         if compare_type == "equal":
+            values, indices = torch.topk(
+                torch.abs(tensor - gathered_tensors[i]),
+                k=min(10, tensor.numel()),
+                dim=0,
+                largest=True,
+                sorted=True,
+            )
             assert torch.equal(
                 tensor, gathered_tensors[i]
-            ), f"rank {cur_rank} and rank {i} tensor are not equal"
+            ), f"rank {cur_rank} and rank {i} tensor are not equal, diff top 10 {values}"
         elif compare_type == "not_equal":
             assert not torch.equal(
                 tensor, gathered_tensors[i]
             ), f"rank {cur_rank} and rank {i} tensor are equal"
         elif compare_type == "close":
+            values, indices = torch.topk(
+                torch.abs(tensor - gathered_tensors[i]),
+                k=min(10, tensor.numel()),
+                dim=0,
+                largest=True,
+                sorted=True,
+            )
             assert torch.allclose(
-                tensor, gathered_tensors[i]
-            ), f"rank {cur_rank} and rank {i} tensor are not close"
+                tensor,
+                gathered_tensors[i],
+            ), f"rank {cur_rank} and rank {i} tensor are not close, diff top 10  {values}"
         elif compare_type == "not_close":
             assert not torch.allclose(
                 tensor, gathered_tensors[i]
@@ -125,59 +163,75 @@ def get_tp_slice(tensor: Optional[torch.Tensor], mode="row"):
         raise ValueError(f"mode {mode} is not supported")
 
 
-def compare_tpN_to_debug_weights(tpN_module, debug_module, compare_grad: bool = True):
+def compare_tpN_to_debug_weights(
+    tpN_module, debug_module, debug_fp32_module, include_grad: bool = True
+):
     import re
 
     tpN_module_params_map = dict(tpN_module.named_parameters())
-    tpN_module_state_dict = tpN_module.state_dict()
+    tpN_module.state_dict()
+
+    debug_module_params_map = dict(debug_module.named_parameters())
     debug_module_state_dict = debug_module.state_dict()
-    for name, param in debug_module.named_parameters():
-        src = (
-            param if not isinstance(param.data, ShardedTensor) else param.local_tensor()
+
+    debug_fp32_module_state_dict = debug_fp32_module.state_dict()
+    debug_fp32_module_params_map = dict(debug_fp32_module.named_parameters())
+    for name, param in debug_module_params_map.items():
+        src = param if not isinstance(param, ShardedTensor) else param.local_tensor()
+        src_fp32 = debug_fp32_module_params_map[name]
+        src_fp32 = (
+            src_fp32
+            if not isinstance(src_fp32, ShardedTensor)
+            else src_fp32.local_tensor()
         )
         src_grad = None
+        src_grad_fp32 = None
         # col parallel linear weight, weight is sliced along row
         if re.match(r".*_linear_uvqk.weight$", name):
             src_grad = get_tp_slice(getattr(src, "main_grad", None), "row")
             src = get_tp_slice(src, "row")
+            src_fp32 = get_tp_slice(src_fp32, "row")
+            src_grad_fp32 = get_tp_slice(getattr(src_fp32, "main_grad", None), "row")
         # row wise linear weight, weight is sliced along col
         elif re.match(r".*_linear_proj.weight$", name):
             src_grad = get_tp_slice(getattr(src, "main_grad", None), "col")
             src = get_tp_slice(src, "col")
+            src_fp32 = get_tp_slice(src_fp32, "col")
+            src_grad_fp32 = get_tp_slice(getattr(src_fp32, "main_grad", None), "col")
         # output layernorm weight and bias are TP split
         # colparallel linear bias is also TP split when config.use_cpu_initialization is True
         # see https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1104, https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1037
         elif re.match(r".*_linear_uvqk.bias$", name):
             src_grad = get_tp_slice(getattr(src, "main_grad", None), "row")
             src = get_tp_slice(src, "row")
+            src_fp32 = get_tp_slice(src_fp32, "row")
+            src_grad_fp32 = get_tp_slice(getattr(src_fp32, "main_grad", None), "row")
         elif re.match(r".*_output_layernorm.*$", name):
             child_name = name.split(".")[-1]
             name = name.replace(
                 child_name, debug_module_path_to_tpN_module_path[child_name]
             )
-            src_grad = getattr(src, "main_grad", None)
+        src_grad = getattr(src, "main_grad", None)
+        src_grad_fp32 = getattr(src_fp32, "main_grad", None)
+
         dst = tpN_module_params_map[name]
         dst_grad = None
         # model parallel embedding table weight is a TableBatchedEmbeddingSlice, which has no grad
         if isinstance(dst, TableBatchedEmbeddingSlice):
             src_grad = None
+            src_grad_fp32 = None
             dst_grad = None
             src = debug_module_state_dict[name].local_tensor()
-            dst = tpN_module_state_dict[name].local_tensor()
-        else:
+            src_fp32 = debug_fp32_module_state_dict[name].local_tensor()
             dst_grad = dst.main_grad if dst.main_grad is not None else None
             dst = dst.data
-        # check grad first
-        if compare_grad and dst_grad is not None and src_grad is not None:
-            diff_index_grad, diff_tensor_grad = get_diff_tensor(src_grad, dst_grad)
-            if diff_index_grad.numel() > 0:
-                print(
-                    f"{name} grad diff_index: {diff_index_grad}, diff_tensor: {diff_tensor_grad}"
-                )
-        # check updated weight
-        diff_index, diff_tensor = get_diff_tensor(src, dst)
-        if diff_index.numel() > 0:
-            print(f"{name} diff_index: {diff_index}, diff_tensor: {diff_tensor}")
+        if include_grad and all(
+            x is not None for x in [dst_grad, src_grad, src_grad_fp32]
+        ):
+            collective_assert(
+                hstu_close(src_grad, dst_grad, src_grad_fp32, multiplier=5)
+            )
+        collective_assert(hstu_close(src, dst, src_fp32, multiplier=5))  # weight
 
 
 # allgather weights from tp1 to tpN (slice tp1 to tpN)
@@ -185,7 +239,6 @@ def compare_tpN_to_debug_weights(tpN_module, debug_module, compare_grad: bool = 
 def init_tpN_weights_from_debug(
     debug_module,
     tpN_module,
-    num_heads,
 ):
     import re
 
@@ -215,6 +268,25 @@ def init_tpN_weights_from_debug(
             dst.local_tensor().data.copy_(src)
         else:
             dst.data.copy_(src)
+
+
+def init_module_from(src_module, dst_module):
+    for name, param in src_module.state_dict().items():
+        src = param if not isinstance(param, ShardedTensor) else param.local_tensor()
+        dst = dst_module.state_dict()[name]
+        if isinstance(dst, ShardedTensor):
+            dst.local_tensor().data.copy_(src)
+        else:
+            dst.data.copy_(src)
+
+
+def zero_bias(modules: Union[torch.nn.Module, List[torch.nn.Module]]):
+    if isinstance(modules, torch.nn.Module):
+        modules = [modules]
+    for module in modules:
+        for name, param in module.named_parameters():
+            if name.endswith("bias"):
+                param.data.zero_()
 
 
 def _flatten_state_dict(state_dict):
@@ -259,11 +331,16 @@ def create_model(
     *,
     seed: int,
     hstu_layer_type: HSTULayerType = HSTULayerType.DEBUG,
+    kernel_backend: KernelBackend = KernelBackend.CUTLASS,
+    num_batches: int = 10,
+    replicate_batches: bool = True,
 ):
     init.set_random_seed(seed)
     device = torch.device("cuda", torch.cuda.current_device())
     embdim = 128
     batch_size = 128
+    if dtype == torch.float32:
+        assert kernel_backend == KernelBackend.PYTORCH, "only pytorch supports float32"
     hstu_config = configs.get_hstu_config(
         hidden_size=embdim,
         kv_channels=32,
@@ -272,13 +349,15 @@ def create_model(
         hidden_dropout=0.0,  # disable dropout
         dtype=dtype,
         hstu_layer_type=hstu_layer_type,
+        kernel_backend=kernel_backend,
+        add_uvqk_bias=False,  # disable bias for better debugging
     )
 
     item_feature_name = "item_feat"
     action_feature_name = "action_feat"
     contextual_emb_size = 1000
     item_emb_size = 1024 * 1024
-    action_vocab_size = 2
+    action_vocab_size = 16
     emb_configs = [
         configs.ShardedEmbeddingConfig(
             feature_names=[action_feature_name],
@@ -340,17 +419,26 @@ def create_model(
         num_tasks = 1
         task_config = configs.RankingConfig(
             embedding_configs=emb_configs,
-            prediction_head_arch=[64, 10, num_tasks],
+            prediction_head_arch=[num_tasks],  # single Linear for better debugging
+            prediction_head_bias=False,  # disable bias for better debugging
         )
         model_train = model.RankingGR(hstu_config=hstu_config, task_config=task_config)
 
         history_batches = []
         with tensor_parallel.get_cuda_rng_tracker().fork():
-            batch = dataset.utils.RankingBatch.random(
-                num_tasks=num_tasks, **batch_kwargs
-            )
-            for i in range(10):
-                history_batches.append(batch)
+            if replicate_batches:
+                history_batches = [
+                    dataset.utils.RankingBatch.random(
+                        num_tasks=num_tasks, **batch_kwargs
+                    )
+                ] * num_batches
+            else:
+                history_batches = [
+                    dataset.utils.RankingBatch.random(
+                        num_tasks=num_tasks, **batch_kwargs
+                    )
+                    for _ in range(num_batches)
+                ]
     else:
         assert task_type == "retrieval"
         task_config = configs.RetrievalConfig(embedding_configs=emb_configs)
@@ -360,9 +448,15 @@ def create_model(
 
         history_batches = []
         with tensor_parallel.get_cuda_rng_tracker().fork():
-            batch = dataset.utils.RetrievalBatch.random(**batch_kwargs)
-            for i in range(10):
-                history_batches.append(batch)
+            if replicate_batches:
+                history_batches = [
+                    dataset.utils.RetrievalBatch.random(**batch_kwargs)
+                ] * num_batches
+            else:
+                history_batches = [
+                    dataset.utils.RetrievalBatch.random(**batch_kwargs)
+                    for _ in range(num_batches)
+                ]
     optimizer_param = OptimizerParam(
         optimizer_str=optimizer_type_str,
         learning_rate=1e-1,

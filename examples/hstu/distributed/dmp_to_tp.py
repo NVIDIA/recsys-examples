@@ -14,7 +14,9 @@ from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
 def jt_dict_grad_scaling_and_allgather(
-    jt: Dict[str, JaggedTensor], pg: Optional[dist.ProcessGroup] = None
+    jt: Dict[str, JaggedTensor],
+    scaling_factor: Union[int, float] = 1,
+    pg: Optional[dist.ProcessGroup] = None,
 ):
     if pg is None:
         pg = parallel_state.get_tensor_model_parallel_group()
@@ -24,9 +26,10 @@ def jt_dict_grad_scaling_and_allgather(
         return jt
 
     output_jt_dict = {}
+    # value is a JaggedTensor, value._values is a Tensor
     for key, value in jt.items():
-        value_scaled = grad_scaling(value, tp_size)
-        output_jt_dict[key] = jagged_tensor_allgather(value_scaled, pg)
+        value._values = grad_scaling(value._values, scaling_factor)
+        output_jt_dict[key] = jagged_tensor_allgather(value, pg)
     return output_jt_dict
 
 
@@ -42,7 +45,6 @@ def dmp_batch_to_tp(
         return output_batch
     output_batch.batch_size = output_batch.batch_size * tp_size
     if not exclude_features:
-        # Not support now
         output_batch.features = keyed_jagged_tensor_allgather(batch.features, tp_pg)
 
     if batch.num_candidates is not None:
