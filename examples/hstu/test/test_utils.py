@@ -190,32 +190,34 @@ def compare_tpN_to_debug_weights(
         if re.match(r".*_linear_uvqk.weight$", name):
             src_grad = get_tp_slice(getattr(src, "main_grad", None), "row")
             src = get_tp_slice(src, "row")
-            src_fp32 = get_tp_slice(src_fp32, "row")
             src_grad_fp32 = get_tp_slice(getattr(src_fp32, "main_grad", None), "row")
+            src_fp32 = get_tp_slice(src_fp32, "row")
         # row wise linear weight, weight is sliced along col
         elif re.match(r".*_linear_proj.weight$", name):
             src_grad = get_tp_slice(getattr(src, "main_grad", None), "col")
             src = get_tp_slice(src, "col")
-            src_fp32 = get_tp_slice(src_fp32, "col")
             src_grad_fp32 = get_tp_slice(getattr(src_fp32, "main_grad", None), "col")
+            src_fp32 = get_tp_slice(src_fp32, "col")
         # output layernorm weight and bias are TP split
         # colparallel linear bias is also TP split when config.use_cpu_initialization is True
         # see https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1104, https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/module/linear.py#L1037
         elif re.match(r".*_linear_uvqk.bias$", name):
             src_grad = get_tp_slice(getattr(src, "main_grad", None), "row")
             src = get_tp_slice(src, "row")
-            src_fp32 = get_tp_slice(src_fp32, "row")
             src_grad_fp32 = get_tp_slice(getattr(src_fp32, "main_grad", None), "row")
-        elif re.match(r".*_output_layernorm.*$", name):
+            src_fp32 = get_tp_slice(src_fp32, "row")
+        else:
+            src_grad = getattr(src, "main_grad", None)
+            src_grad_fp32 = getattr(src_fp32, "main_grad", None)
+
+        if re.match(r".*_output_layernorm.*$", name):
             child_name = name.split(".")[-1]
             name = name.replace(
                 child_name, debug_module_path_to_tpN_module_path[child_name]
             )
-        src_grad = getattr(src, "main_grad", None)
-        src_grad_fp32 = getattr(src_fp32, "main_grad", None)
 
         dst = tpN_module_params_map[name]
-        dst_grad = None
+        dst_grad = getattr(dst, "main_grad", None)
         # model parallel embedding table weight is a TableBatchedEmbeddingSlice, which has no grad
         if isinstance(dst, TableBatchedEmbeddingSlice):
             src_grad = None
@@ -223,7 +225,6 @@ def compare_tpN_to_debug_weights(
             dst_grad = None
             src = debug_module_state_dict[name].local_tensor()
             src_fp32 = debug_fp32_module_state_dict[name].local_tensor()
-            dst_grad = dst.main_grad if dst.main_grad is not None else None
             dst = dst.data
         if include_grad and all(
             x is not None for x in [dst_grad, src_grad, src_grad_fp32]
