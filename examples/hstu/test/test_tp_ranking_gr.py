@@ -156,7 +156,7 @@ def test_gr_tp_ranking_initialization(tp_size: int):
 @pytest.mark.parametrize(
     "kernel_backend", [KernelBackend.PYTORCH]
 )  # Note that only pytorch supports fp32
-def test_tp_gr_ranking_forward_backward(
+def test_tp_gr_ranking_forward_backward_update(
     contextual_feature_names: List[str],
     max_num_candidates: int,
     optimizer_type_str: str,
