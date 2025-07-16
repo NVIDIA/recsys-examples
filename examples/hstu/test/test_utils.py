@@ -167,25 +167,6 @@ def get_tp_slice(tensor: Optional[torch.Tensor], mode="row"):
 def compare_tpN_to_debug_optimizer_state(
     tpN_optimizer, debug_optimizer, debug_fp32_optimizer
 ):
-    # tp_optimizer_state = tpN_optimizer.chained_optimizers[0].state_dict()['optimizer']['state']
-    # debug_optimizer_state = debug_optimizer.chained_optimizers[0].state_dict()['optimizer']['state']
-    # debug_optimizer_fp32_state = debug_fp32_optimizer.chained_optimizers[0].state_dict()['state']
-
-    # for key in tp_optimizer_state.keys():
-    #     tp_exp_avg = tp_optimizer_state[key]['exp_avg']
-    #     debug_exp_avg = debug_optimizer_state[key]['exp_avg']
-    #     debug_exp_avg_fp32 = debug_optimizer_fp32_state[key]['exp_avg']
-
-    #     tp_exp_avg_sq = tp_optimizer_state[key]['exp_avg_sq']
-    #     debug_exp_avg_sq = debug_optimizer_state[key]['exp_avg_sq']
-    #     debug_exp_avg_sq_fp32 = debug_optimizer_fp32_state[key]['exp_avg_sq']
-
-    #     collective_assert(
-    #         hstu_close(tp_exp_avg, debug_exp_avg, debug_exp_avg_fp32, multiplier=5)
-    #     )
-    #     collective_assert(
-    #         hstu_close(tp_exp_avg_sq, debug_exp_avg_sq, debug_exp_avg_sq_fp32, multiplier=5)
-    #     )
     tp_param_groups = tpN_optimizer.chained_optimizers[0].state_dict()["optimizer"][
         "param_groups"
     ]
