@@ -1,0 +1,186 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import commons.utils.initialize as init
+import fbgemm_gpu  # pylint: disable-unused-import
+import pytest
+import torch
+from commons.utils.hstu_assert_close import assert_hstu_close
+from configs import get_hstu_config
+from configs.hstu_config import HSTULayerType, KernelBackend
+from megatron.core.transformer.module import Float16Module
+from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
+from modules.jagged_data import JaggedData
+from modules.native_hstu_layer import HSTULayer
+from ops.length_to_offsets import length_to_complete_offsets
+from test_utils import init_tpN_weights_from_debug
+
+
+@pytest.mark.parametrize(
+    "batchsize",
+    [
+        2,
+    ],
+)
+@pytest.mark.parametrize("num_heads", [4, 8, 1])
+@pytest.mark.parametrize("hidden_dim_per_head", [32, 64, 128])  #
+@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
+def test_tp_hstu_layer(
+    batchsize,
+    num_heads,
+    hidden_dim_per_head,
+    tp_size,
+):
+    init.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+
+    if world_size < tp_size:
+        pytest.skip("TP size is larger than world size")
+    if num_heads % tp_size != 0:
+        pytest.skip("num_heads should be divisible by tp_size")
+    init.initialize_model_parallel(tp_size)
+    init.set_random_seed(1234)
+
+    # The input are replicated across TP because they maintain the same seed across TP ranks. No need to broadcast.
+    def generate_input():
+        input_sparsity = 0.75
+        max_history_seqlen = 5
+        max_num_targets = 2
+        max_num_contextuals = 2
+        device = torch.cuda.current_device()
+        max_seqlen = max_history_seqlen + max_num_targets + max_num_contextuals
+        lengths = torch.randint(
+            low=1,
+            high=max_seqlen + 1,
+            size=(batchsize,),
+            device=device,
+            dtype=torch.int,
+        )
+        num_targets = torch.randint(
+            low=0,
+            high=max_num_targets + 1,
+            size=(batchsize,),
+            device=device,
+            dtype=torch.int32,
+        )
+        num_targets = torch.clamp(
+            num_targets, max=lengths - 1, min=torch.zeros_like(num_targets)
+        )  # at least 1 history
+
+        num_contextuals = torch.randint(
+            low=0,
+            high=max_num_contextuals + 1,
+            size=(batchsize,),
+            device=device,
+            dtype=torch.int32,
+        )
+        num_contextuals = torch.clamp(
+            num_contextuals,
+            max=lengths - 1 - num_targets if num_targets is not None else lengths - 1,
+            min=torch.zeros_like(num_contextuals),
+        )  # at least 1 history!!
+        lengths = torch.randint(
+            low=1,
+            high=max_seqlen + 1,
+            size=(batchsize,),
+            device=device,
+            dtype=torch.int,
+        )
+        seq_offsets = length_to_complete_offsets(lengths)
+        L = int(seq_offsets[-1].item())
+
+        input = torch.empty(
+            (L, hidden_dim_per_head * num_heads),
+            dtype=dtype,
+            device=device,
+        ).uniform_(-0.1, 0.1)
+        with torch.no_grad():
+            input = torch.nn.functional.dropout(input, p=input_sparsity, training=True)
+        input.requires_grad_()
+        ref_input = input.detach().clone().requires_grad_()
+        fp32_ref_input = input.float().detach().clone().requires_grad_()
+
+        ctor_nograd_dict = {
+            "seqlen": lengths,
+            "seqlen_offsets": seq_offsets,
+            "max_seqlen": max_seqlen,
+            "max_num_candidates": max_num_targets,
+            "num_candidates": num_targets,
+            "num_candidates_offsets": length_to_complete_offsets(num_targets),
+            "contextual_max_seqlen": max_num_contextuals,
+            "contextual_seqlen": num_contextuals,
+            "contextual_seqlen_offsets": length_to_complete_offsets(num_contextuals),
+        }
+        jd = JaggedData(values=input, **ctor_nograd_dict)
+        ref_jd = JaggedData(values=ref_input, **ctor_nograd_dict)
+        fp32_ref_jd = JaggedData(values=fp32_ref_input, **ctor_nograd_dict)
+        return jd, ref_jd, fp32_ref_jd
+
+    ln_eps = 1e-5
+    attn_backend = KernelBackend.CUTLASS
+    dropout_ratio = 0.0  # triton dropout is not consistent with torch.nn.dropout
+    dtype = torch.bfloat16
+    hidden_size = hidden_dim_per_head * num_heads
+    hstu_config = get_hstu_config(
+        hidden_size=hidden_size,
+        kv_channels=hidden_dim_per_head,
+        num_attention_heads=num_heads,
+        num_layers=1,
+        dtype=dtype,
+        hidden_dropout=dropout_ratio,
+        norm_epsilon=ln_eps,
+        is_causal=True,
+        kernel_backend=attn_backend,  # attn_backend
+        target_group_size=1,
+        hstu_layer_type=HSTULayerType.DEBUG,
+        learnable_input_layernorm=True,
+        residual=True,
+    )
+    torch.cuda.current_device()
+
+    debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
+    debug_hstu_layer = Float16Module(hstu_config, debug_hstu_layer)
+
+    hstu_config.hstu_layer_type = HSTULayerType.NATIVE
+    tp_hstu_layer = HSTULayer(hstu_config).cuda()
+    tp_hstu_layer = Float16Module(hstu_config, tp_hstu_layer)
+
+    hstu_config.hstu_layer_type = HSTULayerType.DEBUG
+    hstu_config.kernel_backend = KernelBackend.PYTORCH
+    fp32_debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
+
+    init_tpN_weights_from_debug(
+        debug_hstu_layer.module, tp_hstu_layer.module, num_heads
+    )
+    jd, ref_jd, fp32_ref_jd = generate_input()
+
+    out_legacy = debug_hstu_layer(ref_jd).values
+    fp32_out_legacy = fp32_debug_hstu_layer(fp32_ref_jd).values
+    tp_out = tp_hstu_layer(jd).values
+
+    assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
+
+    # make the grad_output sparse
+    with torch.no_grad():
+        dout = torch.ones_like(out_legacy) / (2**8)
+        dout = torch.nn.functional.dropout(dout, p=0.7, training=True)
+    out_legacy.backward(dout)
+    tp_out.backward(dout)
+    fp32_out_legacy.backward(dout.float())
+    grad_legacy = ref_jd.values.grad
+    grad_tp = jd.values.grad
+    grad_fp32_legacy = fp32_ref_jd.values.grad
+    assert_hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, fwd=False)
+    init.destroy_global_state()
