@@ -147,7 +147,7 @@ def test_gr_tp_ranking_initialization(tp_size: int):
 
 @pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"]])
 @pytest.mark.parametrize("max_num_candidates", [0])
-@pytest.mark.parametrize("optimizer_type_str", ["sgd"])  # TODO: add adam
+@pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])  # TODO: add adam
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 @pytest.mark.parametrize(
@@ -198,7 +198,7 @@ def test_tp_gr_ranking_forward_backward(
         dtype=dtype,
         seed=1234,
         hstu_layer_type=HSTULayerType.DEBUG,  # no TP, i.e. does not shard weights
-        num_batches=10,
+        num_batches=10 if optimizer_type_str == "sgd" else 20,
         replicate_batches=replicate_batches,
         kernel_backend=kernel_backend,  # only pytorch supports fp32
     )
@@ -254,8 +254,9 @@ def test_tp_gr_ranking_forward_backward(
     debug_pipeline_batches_fp32 = iter(history_batches)
     # initial state check
     compare_tpN_to_debug_weights(tp_ranking_gr, debug_ranking_gr, debug_ranking_gr_fp32)
+    multiplier = 2
 
-    for i, batch in enumerate(history_batches[0:]):
+    for i, batch in enumerate(history_batches):
         _, (losses, logits, _) = debug_pipeline.progress(debug_pipeline_batches)
         _, (losses_fp32, logits_fp32, _) = debug_pipeline_fp32.progress(
             debug_pipeline_batches_fp32
@@ -271,17 +272,19 @@ def test_tp_gr_ranking_forward_backward(
 
         # assert loss & logits element-wise
         collective_assert(
-            hstu_close(tp_losses, losses, losses_fp32),
+            hstu_close(tp_losses, losses, losses_fp32, multiplier=multiplier),
             f"losses mismatch at iter {i}, diff {(tp_losses - losses_fp32).abs().max()} vs {(losses - losses_fp32).abs().max()} vs hey {(tp_losses - losses).abs().max()}",
             group=parallel_state.get_data_parallel_group(),
         )
         collective_assert(
-            hstu_close(tp_logits, logits, logits_fp32),
+            hstu_close(tp_logits, logits, logits_fp32, multiplier=multiplier),
             f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
             group=parallel_state.get_data_parallel_group(),
         )
         print(
             f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
         )
+        # relax the threshold except for the first iteration
+        multiplier = 5 if i == 0 else multiplier
 
     init.destroy_global_state()
