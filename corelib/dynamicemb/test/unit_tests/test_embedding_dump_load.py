@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import argparse
-import os
 import random
 import shutil
 import sys
@@ -45,7 +44,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
-from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.comm import get_local_rank, get_local_size
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
     QCommsConfig,
@@ -148,8 +147,9 @@ def get_planner(args, device, eb_configs):
             )
         dict_const[table_idx_to_name(i)] = const
 
+    local_world_size = get_local_size()
     topology = Topology(
-        local_world_size=get_local_size(),
+        local_world_size=local_world_size,
         world_size=dist.get_world_size(),
         compute_device=device.type,
         hbm_cap=args.hbm_cap,
@@ -216,8 +216,8 @@ def run(args):
     backend = "nccl"
     dist.init_process_group(backend=backend)
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = get_local_rank()
+    world_size = dist.get_world_size()
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
@@ -339,7 +339,7 @@ def run(args):
             )
     set_score(model, {prefix_path: scores_to_set})
 
-    if local_rank == 0 and args.print_sharding_plan:
+    if dist.get_rank() == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
             print(collectionkey)
             for table_name, plan in plans.items():
@@ -402,10 +402,22 @@ def run(args):
 
     dist.barrier()
 
-    if local_rank == 0:
-        shutil.rmtree("debug_weight")
-        shutil.rmtree("debug_weight_t0")
-        shutil.rmtree("debug_weight_t1")
+    # Only global rank 0 should clean up, not local rank 0 on each node
+    if dist.get_rank() == 0:
+        try:
+            shutil.rmtree("debug_weight")
+        except Exception as e:
+            print(f"Warning: Failed to remove debug_weight: {e}")
+
+        try:
+            shutil.rmtree("debug_weight_t0")
+        except Exception as e:
+            print(f"Warning: Failed to remove debug_weight_t0: {e}")
+
+        try:
+            shutil.rmtree("debug_weight_t1")
+        except Exception as e:
+            print(f"Warning: Failed to remove debug_weight_t1: {e}")
 
     dist.barrier()
     dist.destroy_process_group()

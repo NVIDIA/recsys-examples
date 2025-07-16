@@ -58,6 +58,7 @@ DISABLE_TARGET = os.getenv("HSTU_DISABLE_TARGET", "FALSE") == "TRUE"
 DISABLE_DELTA_Q = os.getenv("HSTU_DISABLE_DELTA_Q", "FALSE") == "TRUE"
 DISABLE_RAB = os.getenv("HSTU_DISABLE_RAB", "FALSE") == "TRUE"
 DISABLE_DRAB = os.getenv("HSTU_DISABLE_DRAB", "FALSE") == "TRUE"
+DISABLE_86OR89 = os.getenv("HSTU_DISABLE_86OR89", "FALSE") == "TRUE"
 
 
 def get_platform():
@@ -104,6 +105,7 @@ def nvcc_threads_args():
 
 
 def generate_cuda_sources():
+    ARCH_SM = ["80"] + (["89"] if not DISABLE_86OR89 else [])
     DTYPE_FWD_SM80 = (["bf16"] if not DISABLE_BF16 else []) + (
         ["fp16"] if not DISABLE_FP16 else []
     )
@@ -138,6 +140,11 @@ def generate_cuda_sources():
             for c, x, t in itertools.product(CAUSAL_MASK, CONTEXT_MASK, TARGET_MASK)
         ]
         MASK += ["_causal_deltaq"] if not DISABLE_DELTA_Q else []
+        MASK += (
+            ["_causal_target_deltaq"]
+            if not DISABLE_DELTA_Q and not DISABLE_CAUSAL and not DISABLE_TARGET
+            else []
+        )
 
     dtype_to_str = {
         "bf16": "cutlass::bfloat16_t",
@@ -153,28 +160,28 @@ def generate_cuda_sources():
 
 #include "hstu_fwd.h"
 
-template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}>
+template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}>
                            (Hstu_fwd_params& params, cudaStream_t stream);
 
     """
-    for hdim, dtype, rab, mask in itertools.product(
-        HEAD_DIMENSIONS, DTYPE_FWD_SM80, RAB, MASK
+    for hdim, dtype, rab, mask, arch_sm in itertools.product(
+        HEAD_DIMENSIONS, DTYPE_FWD_SM80, RAB, MASK, ARCH_SM
     ):
-        file_name = f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm80.cu"
-        if not os.path.exists(file_name):
-            with open(file_name, "w") as f:
-                f.write(
-                    fwd_file_head.format(
-                        dtype_to_str[dtype],
-                        hdim,
-                        "true" if "_rab" in rab else "false",
-                        "true" if "local" in mask else "false",
-                        "true" if "causal" in mask else "false",
-                        "true" if "context" in mask else "false",
-                        "true" if "target" in mask else "false",
-                        "true" if "deltaq" in mask else "false",
-                    )
+        file_name = f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm{arch_sm}.cu"
+        with open(file_name, "w") as f:
+            f.write(
+                fwd_file_head.format(
+                    arch_sm,
+                    dtype_to_str[dtype],
+                    hdim,
+                    "true" if "_rab" in rab else "false",
+                    "true" if "local" in mask else "false",
+                    "true" if "causal" in mask else "false",
+                    "true" if "context" in mask else "false",
+                    "true" if "target" in mask else "false",
+                    "true" if "deltaq" in mask else "false",
                 )
+            )
         sources_fwd_sm80.append(file_name)
 
     sources_bwd_sm80 = []
@@ -194,21 +201,20 @@ template void run_hstu_bwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}>
             HEAD_DIMENSIONS, DTYPE_BWD_SM80, RAB_DRAB, MASK
         ):
             file_name = f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_sm80.cu"
-            if not os.path.exists(file_name):
-                with open(file_name, "w") as f:
-                    f.write(
-                        bwd_file_head.format(
-                            dtype_to_str[dtype],
-                            hdim,
-                            "true" if "_rab" in rab_drab else "false",
-                            "true" if "drab" in rab_drab else "false",
-                            "true" if "local" in mask else "false",
-                            "true" if "causal" in mask else "false",
-                            "true" if "context" in mask else "false",
-                            "true" if "target" in mask else "false",
-                            "true" if "deltaq" in mask else "false",
-                        )
+            with open(file_name, "w") as f:
+                f.write(
+                    bwd_file_head.format(
+                        dtype_to_str[dtype],
+                        hdim,
+                        "true" if "_rab" in rab_drab else "false",
+                        "true" if "drab" in rab_drab else "false",
+                        "true" if "local" in mask else "false",
+                        "true" if "causal" in mask else "false",
+                        "true" if "context" in mask else "false",
+                        "true" if "target" in mask else "false",
+                        "true" if "deltaq" in mask else "false",
                     )
+                )
             sources_bwd_sm80.append(file_name)
 
     return sources_fwd_sm80 + sources_bwd_sm80
@@ -259,6 +265,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DHSTU_DISABLE_DELTA_Q"] if DISABLE_DELTA_Q else [])
         + (["-DHSTU_DISABLE_RAB"] if DISABLE_RAB else [])
         + (["-DHSTU_DISABLE_DRAB"] if DISABLE_DRAB else [])
+        + (["-DHSTU_DISABLE_86OR89"] if DISABLE_86OR89 else [])
     )
 
     if DISABLE_BF16 and DISABLE_FP16:

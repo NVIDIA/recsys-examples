@@ -38,7 +38,18 @@ setup(
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
-        )
+        ),
+        CUDAExtension(
+            name="paged_kvcache_ops",
+            sources=[
+                "ops/cuda_ops/csrc/paged_kvcache_ops_cuda.cpp",
+                "ops/cuda_ops/csrc/paged_kvcache_ops_kernel.cu",
+            ],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++17"],
+                "nvcc": nvcc_threads_args() + nvcc_flags,
+            },
+        ),
     ],
     cmdclass={"build_ext": BuildExtension},
 )

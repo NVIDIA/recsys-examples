@@ -253,40 +253,38 @@ template void run_hstu_fwd_<90, {}, {}, {}, {}, {}, {}, {}, {}>
         HEAD_DIMENSIONS, DTYPE_16, RAB, MASK
     ):
         file_name = f"instantiations/hstu_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm90.cu"
-        if not os.path.exists(file_name):
-            with open(file_name, "w") as f:
-                f.write(
-                    fwd_file_head.format(
-                        dtype_to_str[dtype],
-                        hdim,
-                        "true" if "_rab" in rab else "false",
-                        "true" if "local" in mask else "false",
-                        "true" if "causal" in mask else "false",
-                        "true" if "context" in mask else "false",
-                        "true" if "target" in mask else "false",
-                        "true" if "deltaq" in mask else "false",
-                    )
+        with open(file_name, "w") as f:
+            f.write(
+                fwd_file_head.format(
+                    dtype_to_str[dtype],
+                    hdim,
+                    "true" if "_rab" in rab else "false",
+                    "true" if "local" in mask else "false",
+                    "true" if "causal" in mask else "false",
+                    "true" if "context" in mask else "false",
+                    "true" if "target" in mask else "false",
+                    "true" if "deltaq" in mask else "false",
                 )
+            )
         sources_fwd.append(file_name)
     if not DISABLE_FP8:
         for hdim, rab, mask in itertools.product(HEAD_DIMENSIONS, RAB, FP8_MASK):
             if hdim == 32:
                 continue
             file_name = f"instantiations/hstu_fwd_hdim{hdim}_e4m3{rab}{mask}_sm90.cu"
-            if not os.path.exists(file_name):
-                with open(file_name, "w") as f:
-                    f.write(
-                        fwd_file_head.format(
-                            "cutlass::float_e4m3_t",
-                            hdim,
-                            "true" if "_rab" in rab else "false",
-                            "true" if "local" in mask else "false",
-                            "true" if "causal" in mask else "false",
-                            "false",  # context
-                            "false",  # target
-                            "false",
-                        )
-                    )  # deltaq
+            with open(file_name, "w") as f:
+                f.write(
+                    fwd_file_head.format(
+                        "cutlass::float_e4m3_t",
+                        hdim,
+                        "true" if "_rab" in rab else "false",
+                        "true" if "local" in mask else "false",
+                        "true" if "causal" in mask else "false",
+                        "false",  # context
+                        "false",  # target
+                        "false",
+                    )
+                )  # deltaq
             sources_fwd.append(file_name)
 
     sources_bwd = []
@@ -308,21 +306,20 @@ template void run_hstu_bwd_<90, {}, {}, {}, {}, {}, {}, {}, {}, {}>
             file_name = (
                 f"instantiations/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_sm90.cu"
             )
-            if not os.path.exists(file_name):
-                with open(file_name, "w") as f:
-                    f.write(
-                        bwd_file_head.format(
-                            dtype_to_str[dtype],
-                            hdim,
-                            "true" if "_rab" in rab_drab else "false",
-                            "true" if "drab" in rab_drab else "false",
-                            "true" if "local" in mask else "false",
-                            "true" if "causal" in mask else "false",
-                            "true" if "context" in mask else "false",
-                            "true" if "target" in mask else "false",
-                            "true" if "deltaq" in mask else "false",
-                        )
+            with open(file_name, "w") as f:
+                f.write(
+                    bwd_file_head.format(
+                        dtype_to_str[dtype],
+                        hdim,
+                        "true" if "_rab" in rab_drab else "false",
+                        "true" if "drab" in rab_drab else "false",
+                        "true" if "local" in mask else "false",
+                        "true" if "causal" in mask else "false",
+                        "true" if "context" in mask else "false",
+                        "true" if "target" in mask else "false",
+                        "true" if "deltaq" in mask else "false",
                     )
+                )
             sources_bwd.append(file_name)
         # if not DISABLE_FP8:
         #     for hdim, rab_drab, mask in itertools.product(HEAD_DIMENSIONS, RAB_DRAB, FP8_MASK):

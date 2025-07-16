@@ -8,6 +8,17 @@ The project includes:
 - HSTU (Hierarchical Sequential Transduction Unit) attention operator support
 - Dynamic Embeddings with GPU acceleration
 
+# What's New
+- **[2025/7/4]** 🎉v25.06 released!
+  - Dynamicemb lookup module performance improvement and LFU eviction support. 
+  - Pipeline support for HSTU example, recompute support for HSTU layer and customized cuda ops for jagged tensor concat.
+- **[2025/5/29]** 🎉v25.05 released! 
+  - Enhancements to the dynamicemb functionality, including support for EmbeddingBagCollection, truncated normal initialization, and initial_accumulator_value for Adagrad.
+  - Fusion of operations like layernorm and dropout in the HSTU layer, resulting in about 1.2x end-to-end speedup.
+  - Fix convergence issues on the Kuairand dataset.
+
+For more detailed release notes, please refer our [releases](https://github.com/NVIDIA/recsys-examples/releases).
+
 # Environment Setup
 ## Start from dockerfile
 
@@ -52,6 +63,14 @@ The examples we supported:
 
 # Contribution Guidelines
 Please see our [contributing guidelines](./CONTRIBUTING.md) for details on how to contribute to this project.
+
+# Resources
+## Video
+- [RecSys Examples 中的训练与推理优化实践](https://www.bilibili.com/video/BV1msMwzpE5B?buvid=638d217658211387f0a20e730604a780&from_spmid=united.player-video-detail.drama-float.0&is_story_h5=false&mid=V%2FD40L0stVy%2BZTgWdpjtGA%3D%3D&plat_id=116&share_from=ugc&share_medium=iphone&share_plat=ios&share_session_id=2DD6CE30-B189-4EEC-9FD4-8BAD6AEFE720&share_source=WEIXIN&share_tag=s_i&spmid=united.player-video-detail.0.0&timestamp=1749773222&unique_k=Sjcfmgy&up_id=1320140761&vd_source=7372540fd02b24a46851135aa003577c)
+- [基于CUTLASS 3 的HSTU attention 算子开发与优化](https://www.bilibili.com/video/BV1TsMwzWEzS?buvid=638d217658211387f0a20e730604a780&from_spmid=united.player-video-detail.drama-float.0&is_story_h5=false&mid=V%2FD40L0stVy%2BZTgWdpjtGA%3D%3D&plat_id=116&share_from=ugc&share_medium=iphone&share_plat=ios&share_session_id=2DD6CE30-B189-4EEC-9FD4-8BAD6AEFE720&share_source=WEIXIN&share_tag=s_i&spmid=united.player-video-detail.0.0&timestamp=1749773222&unique_k=Sjcfmgy&up_id=1320140761&vd_source=7372540fd02b24a46851135aa003577c&spm_id_from=333.788.videopod.sections)
+
+## Blog
+- [NVIDIA recsys-examples: 生成式推荐系统大规模训练推理的高效实践（上篇）](https://mp.weixin.qq.com/s/K9xtYC3azAccShpJ3ZxKbg)
 
 # Community
 Join our community channels to ask questions, provide feedback, and interact with other users and developers:

@@ -311,7 +311,7 @@ def generate_input(
         .requires_grad_()
     ).to(dtype)
 
-    if is_delta_q is False:
+    if is_delta_q is False and dtype != torch.float8_e4m3fn:
         qkv = (
             torch.empty(
                 (L_q, 3, heads, attn_dim), dtype=dtype, device=torch.device("cuda")
@@ -386,7 +386,6 @@ def _hstu_attention_maybe_from_cache(
     invalid_attn_mask: torch.Tensor,
     alpha: float,
     upcast: bool = True,
-    reorder_op: bool = False,
     is_delta_q: bool = False,
 ):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -465,11 +464,11 @@ def _hstu_attention_maybe_from_cache(
         (111, 111, False),
         (256, 256, False),
         (1111, 1111, False),
-        # (27, 32, True),
-        # (8, 99, True),
-        # (51, 256, True),
-        # (1000, 1111, True),
-        # (160, 2000, True),
+        (27, 32, True),
+        (8, 99, True),
+        (51, 256, True),
+        (1000, 1111, True),
+        (160, 2000, True),
     ],
 )
 @pytest.mark.parametrize("max_context_len", [0, 11, 99, 160, 333])
@@ -651,7 +650,6 @@ def test_fused_attn(
                     else None,
                     alpha=alpha,
                     upcast=False,
-                    reorder_op=True,
                     is_delta_q=is_delta_q,
                 )
             output_datas.append(fwd_out)
@@ -791,7 +789,6 @@ def test_fused_attn(
         else None,
         alpha=alpha,
         upcast=False,
-        reorder_op=True,
         is_delta_q=is_delta_q,
     )
     if qkv is None:
@@ -838,6 +835,7 @@ def test_fused_attn(
     assert (hstu_out.view(L_q, -1) - out_ref).abs().max().item() <= 2 * (
         torch_out - out_ref
     ).abs().max().item()
+
     g = torch.rand_like(torch_out)
     if not has_drab:
         (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
@@ -914,7 +912,459 @@ def test_fused_attn(
             drab_torch - drab_ref
         ).abs().max().item()
     torch.cuda.synchronize()
-    # return 0, 0
+
+
+def generate_paged_kv_input(
+    batch_size: int,
+    heads: int,
+    max_seq_len_q: int,
+    max_seq_len_k: int,
+    max_target_len: int,
+    attn_dim: int,
+    hidden_dim: int,
+    page_size: int,
+    dtype: torch.dtype,
+    full_batch: bool,
+):
+    # Generate lengths for new history qkv
+    if full_batch:
+        lengths_q = (
+            torch.ones((batch_size,), device=torch.device("cuda"), dtype=torch.int32)
+            * max_seq_len_q
+        )
+    else:
+        lengths_q = torch.randint(
+            1, max_seq_len_q + 1, size=(batch_size,), device=torch.device("cuda")
+        )
+    seq_offsets_q = torch.zeros(
+        (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
+    )
+    seq_offsets_q[1:] = torch.cumsum(lengths_q, dim=0)
+
+    # Generate lengths for target qkv
+    if full_batch:
+        num_targets = (
+            torch.ones((batch_size,), device=torch.device("cuda"), dtype=torch.int32)
+            * max_target_len
+        )
+    else:
+        num_targets = torch.randint(
+            0,
+            max_target_len + 1,
+            size=(batch_size,),
+            dtype=torch.int32,
+            device=torch.device("cuda"),
+        )
+    seq_offsets_t = torch.zeros(
+        (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
+    )
+    seq_offsets_t[1:] = torch.cumsum(num_targets, dim=0)
+
+    # Lengths for new history + target qkv
+    seq_offsets_q_wt = seq_offsets_q + seq_offsets_t
+    L_q = int(seq_offsets_q_wt[-1].item())
+
+    # Generate q, k, v for new history + target
+    M_uvqk = torch.empty(
+        (L_q, 4, heads, attn_dim), dtype=dtype, device=torch.device("cuda")
+    ).uniform_(-1, 1)
+    q = M_uvqk[:, 2, :, :]
+    k = M_uvqk[:, 3, :, :]
+    v = M_uvqk[:, 1, :, :]
+
+    # Generate user feature + previous history
+    if full_batch:
+        lengths_k = (
+            torch.ones((batch_size,), device=torch.device("cuda"), dtype=torch.int32)
+            * max_seq_len_k
+        )
+    else:
+        lengths_k = torch.randint(
+            1, max_seq_len_k + 1, size=(batch_size,), device=torch.device("cuda")
+        )
+    seq_offsets_k = torch.zeros(
+        (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
+    )
+    seq_offsets_k[1:] = torch.cumsum(lengths_k, dim=0)
+
+    # Lengths for user feature + previous history + new history
+    lengths_k_cache = lengths_k + lengths_q
+    lengths_page = (lengths_k_cache + page_size - 1) // page_size
+    page_offsets = torch.zeros(
+        (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
+    )
+    page_offsets[1:] = torch.cumsum(lengths_page, dim=0)
+
+    total_page = int(page_offsets[-1].item())
+    page_ids = torch.randperm(
+        total_page, device=torch.device("cuda"), dtype=torch.int32
+    )
+    last_page_lens = ((lengths_k_cache - 1) % page_size + 1).to(torch.int32)
+    kv_cache = torch.empty(
+        (total_page, 2, page_size, heads, attn_dim),
+        dtype=dtype,
+        device=torch.device("cuda"),
+    ).uniform_(-1, 1)
+
+    mask = torch.zeros(
+        (
+            batch_size,
+            1,
+            max_seq_len_q + max_seq_len_k + max_target_len,
+            max_seq_len_q + max_seq_len_k + max_target_len,
+        ),
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+    )
+    for i in range(batch_size):
+        # new history part
+        for j in range(lengths_k_cache[i]):
+            mask[i, 0, j, : j + 1] = 1.0
+
+        # target part
+        mask[
+            i,
+            0,
+            lengths_k_cache[i] : lengths_k_cache[i] + num_targets[i],
+            : lengths_k_cache[i],
+        ] = 1.0
+        for j in range(num_targets[i]):
+            mask[i, 0, lengths_k_cache[i] + j, lengths_k_cache[i] + j] = 1.0
+
+    return (
+        L_q,
+        seq_offsets_q_wt,
+        seq_offsets_k + seq_offsets_q_wt,
+        seq_offsets_t,
+        num_targets,
+        page_offsets,
+        page_ids,
+        last_page_lens,
+        q,
+        k,
+        v,
+        kv_cache,
+        mask,
+    )
+
+
+# @torch.compile
+def _hstu_paged_kv_attention(
+    num_heads: int,
+    attention_dim: int,
+    linear_dim: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_offsets: torch.Tensor,
+    k_offsets: torch.Tensor,
+    num_targets: torch.Tensor,
+    invalid_attn_mask: torch.Tensor,
+    alpha: float,
+    upcast: bool = True,
+    kv_cache: torch.Tensor = None,
+    page_offsets: torch.Tensor = None,
+    page_ids: torch.Tensor = None,
+    last_page_lens: torch.Tensor = None,
+):
+    k_con = torch.empty((0, num_heads, attention_dim), device=k.device, dtype=k.dtype)
+    v_con = torch.empty((0, num_heads, attention_dim), device=v.device, dtype=v.dtype)
+
+    for i in range(len(last_page_lens)):
+        page_num = page_offsets[i + 1] - page_offsets[i]
+        new_history_len = q_offsets[i + 1] - q_offsets[i] - num_targets[i]
+        for j in range(page_num - 1):
+            k_con = torch.cat(
+                (k_con, kv_cache[page_ids[page_offsets[i] + j], 0, :, :, :]), dim=0
+            )
+            v_con = torch.cat(
+                (v_con, kv_cache[page_ids[page_offsets[i] + j], 1, :, :, :]), dim=0
+            )
+        k_con = torch.cat(
+            (
+                k_con,
+                kv_cache[
+                    page_ids[page_offsets[i + 1] - 1], 0, : last_page_lens[i], :, :
+                ],
+            ),
+            dim=0,
+        )
+        k_con = torch.cat(
+            (k_con, k[(q_offsets[i] + new_history_len) : q_offsets[i + 1], :, :]), dim=0
+        )
+        v_con = torch.cat(
+            (
+                v_con,
+                kv_cache[
+                    page_ids[page_offsets[i + 1] - 1], 1, : last_page_lens[i], :, :
+                ],
+            ),
+            dim=0,
+        )
+        v_con = torch.cat(
+            (v_con, v[(q_offsets[i] + new_history_len) : q_offsets[i + 1], :, :]), dim=0
+        )
+
+    return _hstu_attention_maybe_from_cache(
+        num_heads=num_heads,
+        attention_dim=attention_dim,
+        linear_dim=linear_dim,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        q=q,
+        k=k_con,
+        v=v_con,
+        q_offsets=q_offsets,
+        k_offsets=k_offsets,
+        rab=None,
+        invalid_attn_mask=invalid_attn_mask,
+        alpha=alpha,
+        upcast=upcast,
+        is_delta_q=True,
+    )
+
+
+@pytest.mark.skipif(
+    sm_major_version == 9, reason="paged_kv_attn is not supported on sm90"
+)
+@pytest.mark.parametrize("batch_size", [32])
+@pytest.mark.parametrize("heads", [2])
+@pytest.mark.parametrize("max_seq_len_q", [21, 53, 201, 302])
+@pytest.mark.parametrize("max_seq_len_k", [10, 99, 111, 256, 717])
+@pytest.mark.parametrize("max_target_len", [0, 32, 111, 501])
+@pytest.mark.parametrize(
+    "attn_dim, hidden_dim",
+    [
+        (32, 32),
+        (64, 64),
+        (128, 128),
+        (256, 256),
+    ],
+)
+@pytest.mark.parametrize("page_size", [32])
+@pytest.mark.parametrize("run_benchmark", [None])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])  # torch.float16
+@pytest.mark.parametrize("full_batch", [True, False])
+@pytest.mark.parametrize("alpha", [1.0, 1.0 / (100**0.5)])
+def test_paged_kv_attn(
+    batch_size: int,
+    heads: int,
+    max_seq_len_q: int,  # new history length
+    max_seq_len_k: int,  # user feature + previous history
+    max_target_len: int,
+    attn_dim: int,
+    hidden_dim: int,
+    page_size: int,
+    alpha: float,
+    run_benchmark: Optional[int],
+    dtype: torch.dtype,
+    full_batch: bool,
+) -> None:
+    if dtype == torch.float8_e4m3fn:
+        raise ValueError("float8_e4m3fn for paged_kv_attn is not supported")
+    if page_size != 32 and page_size != 64:
+        raise ValueError("page_size must be 32 or 64")
+
+    torch.cuda.synchronize()
+    if run_benchmark is not None:
+        assert run_benchmark in [
+            0,
+            1,
+        ]  # 0 is run hstu benchmark and 1 is run torch benchmark
+        iterations = 20
+        profiler_step_start = 10
+
+        input_datas = []
+        for i in range(2):
+            input_data = generate_paged_kv_input(
+                batch_size=batch_size,
+                heads=heads,
+                max_seq_len_q=max_seq_len_q,
+                max_seq_len_k=max_seq_len_k,
+                max_target_len=max_target_len,
+                attn_dim=attn_dim,
+                hidden_dim=hidden_dim,
+                page_size=page_size,
+                dtype=dtype,
+                full_batch=full_batch,
+            )
+            input_datas.append(input_data)
+
+        fwd_event_start = torch.cuda.Event(enable_timing=True)
+        fwd_event_stop = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        for i in range(iterations):
+            if i == profiler_step_start:
+                fwd_event_start.record()
+            (
+                L_q,
+                seq_offsets_q,
+                seq_offsets_k,
+                seq_offsets_t,
+                num_targets,
+                page_offsets,
+                page_ids,
+                last_page_lens,
+                q,
+                k,
+                v,
+                kv_cache,
+                mask,
+            ) = input_datas[i % 2]
+            if run_benchmark == 0:
+                fwd_out = hstu_attn_varlen_func(
+                    q=q,
+                    k=k,
+                    v=v,
+                    seq_offsets_q=seq_offsets_q,
+                    seq_offsets_k=seq_offsets_q,
+                    max_seqlen_q=max_seq_len_q + max_target_len,
+                    max_seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
+                    num_contexts=None,
+                    num_targets=num_targets,
+                    target_group_size=1,
+                    window_size=(-1, 0),
+                    alpha=alpha,
+                    rab=None,
+                    has_drab=False,
+                    is_delta_q=True,
+                    kv_cache=kv_cache,
+                    page_offsets=page_offsets,
+                    page_ids=page_ids,
+                    last_page_lens=last_page_lens,
+                )
+            else:
+                assert run_benchmark == 1
+                fwd_out = _hstu_paged_kv_attention(
+                    num_heads=heads,
+                    attention_dim=attn_dim,
+                    linear_dim=hidden_dim,
+                    seqlen_q=max_seq_len_q + max_target_len,
+                    seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
+                    q=q,
+                    k=k,
+                    v=v,
+                    q_offsets=seq_offsets_q,
+                    k_offsets=seq_offsets_k,
+                    num_targets=num_targets,
+                    invalid_attn_mask=mask,
+                    alpha=alpha,
+                    upcast=False,
+                    kv_cache=kv_cache,
+                    page_offsets=page_offsets,
+                    page_ids=page_ids,
+                    last_page_lens=last_page_lens,
+                )
+        fwd_event_stop.record()
+        torch.cuda.synchronize()
+        fwd_time = fwd_event_start.elapsed_time(fwd_event_stop) / (
+            iterations - profiler_step_start
+        )
+        return fwd_time, 0
+
+    (
+        L_q,
+        seq_offsets_q,
+        seq_offsets_k,
+        seq_offsets_t,
+        num_targets,
+        page_offsets,
+        page_ids,
+        last_page_lens,
+        q,
+        k,
+        v,
+        kv_cache,
+        mask,
+    ) = generate_paged_kv_input(
+        batch_size=batch_size,
+        heads=heads,
+        max_seq_len_q=max_seq_len_q,
+        max_seq_len_k=max_seq_len_k,
+        max_target_len=max_target_len,
+        attn_dim=attn_dim,
+        hidden_dim=hidden_dim,
+        page_size=page_size,
+        dtype=dtype,
+        full_batch=full_batch,
+    )
+    out_ref = _hstu_paged_kv_attention(
+        num_heads=heads,
+        attention_dim=attn_dim,
+        linear_dim=hidden_dim,
+        seqlen_q=max_seq_len_q + max_target_len,
+        seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
+        q=q,
+        k=k,
+        v=v,
+        q_offsets=seq_offsets_q,
+        k_offsets=seq_offsets_k,
+        num_targets=num_targets,
+        invalid_attn_mask=mask,
+        alpha=alpha,
+        upcast=True,
+        kv_cache=kv_cache,
+        page_offsets=page_offsets,
+        page_ids=page_ids,
+        last_page_lens=last_page_lens,
+    )
+
+    torch_out = _hstu_paged_kv_attention(
+        num_heads=heads,
+        attention_dim=attn_dim,
+        linear_dim=hidden_dim,
+        seqlen_q=max_seq_len_q + max_target_len,
+        seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
+        q=q,
+        k=k,
+        v=v,
+        q_offsets=seq_offsets_q,
+        k_offsets=seq_offsets_k,
+        num_targets=num_targets,
+        invalid_attn_mask=mask,
+        alpha=alpha,
+        upcast=False,
+        kv_cache=kv_cache,
+        page_offsets=page_offsets,
+        page_ids=page_ids,
+        last_page_lens=last_page_lens,
+    )
+
+    hstu_out = hstu_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets_q=seq_offsets_q,
+        seq_offsets_k=seq_offsets_k,
+        max_seqlen_q=max_seq_len_q + max_target_len,
+        max_seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
+        num_contexts=None,
+        num_targets=num_targets,
+        target_group_size=1,
+        window_size=(-1, 0),
+        alpha=alpha,
+        rab=None,
+        has_drab=False,
+        is_delta_q=True,
+        kv_cache=kv_cache,
+        page_offsets=page_offsets,
+        page_ids=page_ids,
+        last_page_lens=last_page_lens,
+        seq_offsets_t=seq_offsets_t,
+    )
+
+    print(f"Output max diff: {(hstu_out.view(L_q, -1) - out_ref).abs().max().item()}")
+    print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
+
+    print(f"Output mean diff: {(hstu_out.view(L_q, -1) - out_ref).abs().mean().item()}")
+    print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+
+    assert (hstu_out.view(L_q, -1) - out_ref).abs().max().item() <= 2 * (
+        torch_out - out_ref
+    ).abs().max().item()
+    torch.cuda.synchronize()
 
 
 # @torch.compile
@@ -1520,6 +1970,7 @@ def test_fused_attn_fp8(
         seq_offsets_q,
         seq_offsets_k,
         _,
+        _,
         q,
         k,
         v,
@@ -1671,26 +2122,41 @@ def test_fused_attn_fp8(
 
 
 if __name__ == "__main__":
-    test_fused_attn(
-        batch_size=128,
-        heads=3,
-        heads_rab=1,
-        max_seq_len_q=1024,
-        max_seq_len_k=1024,
-        max_context_len=0,
-        max_target_len=0,
-        target_group_size=1,
-        attn_dim=256,
-        hidden_dim=256,
-        alpha=1.0,
-        has_rab=False,
-        has_drab=False,
-        window_size=(-1, 0),
-        dtype=torch.bfloat16,
-        run_benchmark=None,
-        full_batch=False,
-        is_delta_q=False,
-    )
+    # test_paged_kv_attn(
+    #     batch_size=1,
+    #     heads=1,
+    #     max_seq_len_q=32, # q is new history
+    #     max_seq_len_k=32, # k is user feature + previous history  # kv cache = user feature + previous history + new history
+    #     max_target_len=32, # target is target length
+    #     attn_dim=32,
+    #     hidden_dim=32,
+    #     page_size=32,
+    #     alpha=1.0,
+    #     run_benchmark=None,
+    #     dtype=torch.bfloat16,
+    #     full_batch=False,
+    # )
+
+    # test_fused_attn(
+    #     batch_size=128,
+    #     heads=1,
+    #     heads_rab=1,
+    #     max_seq_len_q=1024,
+    #     max_seq_len_k=1024,
+    #     max_context_len=0,
+    #     max_target_len=0,
+    #     target_group_size=1,
+    #     attn_dim=256,
+    #     hidden_dim=256,
+    #     alpha=1.0,
+    #     has_rab=True,
+    #     has_drab=True,
+    #     window_size=(-1, 0),
+    #     dtype=torch.bfloat16,
+    #     run_benchmark=None,
+    #     full_batch=False,
+    #     is_delta_q=False,
+    # )
 
     # test_fused_attn_fp8(
     #     batch_size=1,
@@ -1711,14 +2177,14 @@ if __name__ == "__main__":
     #     is_delta_q=False,
     # )
 
-    bs = [1, 2, 4, 8]
-    dim = [128, 256]
+    bs = [8]
+    dim = [32, 64, 128, 256]
     num_heads = 4
 
-    has_rabs = [True]
-    seq_lens = [8192]
-    seq_lens_t = [0]
-    has_drabs = [True]
+    has_rabs = [False]
+    seq_lens = [8192, 4096]
+    seq_lens_t = [0, 4096]
+    has_drabs = [False]
     dytpes = [torch.bfloat16]
     for run_benchmark in [0]:
         for h in [num_heads]:
@@ -1728,26 +2194,41 @@ if __name__ == "__main__":
                         for dtype in dytpes:
                             for has_rab in has_rabs:
                                 for has_drab in has_drabs:
-                                    fwd_time, bwd_time = test_fused_attn(
+                                    fwd_time, bwd_time = test_paged_kv_attn(
                                         batch_size=b,
                                         heads=h,
-                                        heads_rab=h,
-                                        max_seq_len_q=seq_len,
-                                        max_seq_len_k=seq_len,
-                                        max_context_len=0,
-                                        max_target_len=seq_len_t,
-                                        target_group_size=1,
+                                        max_seq_len_q=seq_len // 2,  # q is new history
+                                        max_seq_len_k=seq_len
+                                        // 2,  # k is user feature + previous history  # kv cache = user feature + previous history + new history
+                                        max_target_len=seq_len_t,  # target is target length
                                         attn_dim=d,
                                         hidden_dim=d,
+                                        page_size=32,
                                         alpha=1.0,
-                                        has_rab=has_rab,
-                                        has_drab=has_drab,
-                                        window_size=(-1, 0),
                                         run_benchmark=run_benchmark,
-                                        dtype=dtype,
+                                        dtype=torch.bfloat16,
                                         full_batch=True,
-                                        is_delta_q=False,
                                     )
+                                    # fwd_time, bwd_time = test_fused_attn(
+                                    #     batch_size=b,
+                                    #     heads=h,
+                                    #     heads_rab=h,
+                                    #     max_seq_len_q=seq_len,
+                                    #     max_seq_len_k=seq_len,
+                                    #     max_context_len=0,
+                                    #     max_target_len=seq_len_t,
+                                    #     target_group_size=1,
+                                    #     attn_dim=d,
+                                    #     hidden_dim=d,
+                                    #     alpha=1.0,
+                                    #     has_rab=has_rab,
+                                    #     has_drab=has_drab,
+                                    #     window_size=(-1, 0),
+                                    #     run_benchmark=run_benchmark,
+                                    #     dtype=dtype,
+                                    #     full_batch=True,
+                                    #     is_delta_q=False,
+                                    # )
                                     info = [
                                         "hstu" if run_benchmark == 0 else "torch",
                                         b,

@@ -14,6 +14,7 @@ install:
 		export HSTU_DISABLE_HDIM64=FALSE; \
 		export HSTU_DISABLE_HDIM128=FALSE; \
 		export HSTU_DISABLE_HDIM256=FALSE; \
+		export HSTU_DISABLE_86OR89=TRUE; \
 		python setup.py install \
 	)
 

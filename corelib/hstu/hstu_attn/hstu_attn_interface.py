@@ -39,6 +39,11 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         rab=None,  # need grad
         has_drab=False,
         is_delta_q=False,
+        kv_cache=None,
+        page_offsets=None,
+        page_ids=None,
+        last_page_lens=None,
+        seq_offsets_t=None,
     ):
         assert q.dim() == 3, "q shape should be (L, num_heads, head_dim)"
         assert k.dim() == 3, "k shape should be (L, num_heads, head_dim)"
@@ -62,6 +67,11 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 alpha,
                 rab,
                 is_delta_q,
+                kv_cache,
+                page_offsets,
+                page_ids,
+                last_page_lens,
+                seq_offsets_t,
             )
         P = out[:, :, :head_dim].reshape(-1, num_heads * head_dim)
 
@@ -158,6 +168,11 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             dRab if ctx.has_drab else None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -177,6 +192,11 @@ def hstu_attn_varlen_func(
     rab=None,
     has_drab=False,
     is_delta_q=False,
+    kv_cache=None,
+    page_offsets=None,
+    page_ids=None,
+    last_page_lens=None,
+    seq_offsets_t=None,
 ):
     """
     Arguments:
@@ -197,6 +217,10 @@ def hstu_attn_varlen_func(
         rab: (batch_size, max_seqlen_k, max_seqlen_k). Random access bias for the key.
         has_drab: bool. Whether to apply random access bias for the key.
         is_delta_q: bool. Whether to apply delta query.
+        kv_cache: (page_num, 2, page_size, nheads, headdim). Key and value paged cache.
+        page_offsets: (batch_size + 1,). The cumulative sequence lengths of the page_ptr in the batch, used to index into kv_cache.
+        page_ids: (page_offsets[-1],). The ids of the pages in the batch.
+        last_page_lens: (batch_size,). The lengths of the last pages in the batch.
     Return:
         out: (total, nheads, headdim).
     """
@@ -212,12 +236,8 @@ def hstu_attn_varlen_func(
         raise ValueError(
             "AssertError: target is True and causal is not True, this is undefined behavior"
         )
-    if (num_contexts != None and is_delta_q is True) or (
-        num_targets != None and is_delta_q is True
-    ):
-        raise ValueError(
-            "AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior"
-        )
+    # if (num_contexts != None and is_delta_q is True) or (num_targets != None and is_delta_q is True):
+    #     raise ValueError("AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior")
     if num_targets is None and target_group_size < 1:
         raise ValueError(
             "AssertError: target_group_size should be greater than 0 when target is True"
@@ -247,6 +267,11 @@ def hstu_attn_varlen_func(
         rab,
         has_drab,
         is_delta_q,
+        kv_cache,
+        page_offsets,
+        page_ids,
+        last_page_lens,
+        seq_offsets_t,
     )
 
 
@@ -288,6 +313,11 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 alpha,
                 rab,
                 is_delta_q,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
         num_heads = q.size(1)
         head_dim = q.size(2)

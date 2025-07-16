@@ -86,7 +86,7 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
       make_layout(make_shape(Is_delta_q ? params.seqlen_k : params.seqlen_q, params.seqlen_k, params.h_rab, params.b),
                   make_stride((int64_t)params.drab_row_stride, _1{}, (int64_t)params.drab_head_stride, (int64_t)params.drab_batch_stride)),  // layout_dRab
       params.b, params.window_size_left, params.window_size_right,
-      params.target_group_size, params.alpha, params.dq_semaphore
+      params.target_group_size, 1.0f / params.target_group_size, params.alpha, params.dq_semaphore
   });
 
   typename CollectiveEpilogue::Params epilogue_params = CollectiveEpilogue::to_underlying_arguments({
@@ -136,6 +136,7 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
       ),  // layout_dQ
       params.total_q,
       params.seqlen_q,
+      params.alpha,
       params.cu_seqlens_q,
       params.num_targets,
       params.num_contexts
