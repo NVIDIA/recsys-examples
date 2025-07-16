@@ -1,4 +1,4 @@
-TrainerArgs.train_batch_size = 8
+TrainerArgs.train_batch_size = 4
 TrainerArgs.eval_batch_size = 8
 TrainerArgs.log_interval = 10
 TrainerArgs.eval_interval = 10
