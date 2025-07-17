@@ -104,11 +104,13 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
         self._opt_args: OptimizerArgs = copy.deepcopy(opt_args)
         self._table_options: List[DynamicEmbTableOptions] = copy.deepcopy(table_options)
 
         self._hashtables: List[DynamicEmbTable] = hashtables
+        self._host_tables: List[DynamicEmbTable] = host_tables
         self._num_tables: int = len(self._hashtables)
 
         self._state_dict: Dict[str, List[DynamicEmbTable]] = {}
@@ -175,8 +177,9 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
     def update(
         self,
@@ -197,6 +200,8 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
 
+            host_table = self._host_tables[state_idx]
+
             grad = grads[i]
             indice = indices[i]
             num_indice = indice.shape[0]
@@ -213,6 +218,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                     weight_dtype,
                     score,
                     emb,
+                    host_table,
                 )
             else:
                 dynamic_emb_sgd_with_table(
@@ -223,6 +229,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                     lr,
                     weight_dtype,
                     score,
+                    host_table=host_table,
                 )
 
     def get_opt_args(self):
@@ -240,8 +247,9 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
         self._iterations: int = 0
         self._state_dict["m"] = []
@@ -270,6 +278,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
+            host_table = self._host_tables[state_idx]
 
             indice = indices[i]
             grad = grads[i]
@@ -293,6 +302,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                     weight_dtype,
                     score,
                     emb,
+                    host_table,
                 )
             else:
                 dynamic_emb_adam_with_table(
@@ -308,6 +318,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                     self._iterations,
                     weight_dtype,
                     score,
+                    host_table=host_table,
                 )
 
     def get_opt_args(self):
@@ -337,8 +348,9 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
         self._state_dict["Gt"] = hashtables
 
@@ -364,6 +376,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
+            host_table = self._host_tables[state_idx]
 
             indice = indices[i]
             grad = grads[i]
@@ -384,10 +397,19 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                     weight_dtype,
                     score,
                     emb,
+                    host_table,
                 )
             else:
                 dynamic_emb_adagrad_with_table(
-                    ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                    ht,
+                    num_indice,
+                    indice,
+                    grad,
+                    lr,
+                    eps,
+                    weight_dtype,
+                    score,
+                    host_table=host_table,
                 )
 
     def get_opt_args(self):
@@ -414,8 +436,9 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
         self._state_dict["Gt"] = hashtables
 
@@ -440,6 +463,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         for i, ht in enumerate(hashtables):
             state_idx = self._table_state_map[ht]
             table_option = self._table_options[state_idx]
+            host_table = self._host_tables[state_idx]
 
             indice = indices[i]
             grad = grads[i]
@@ -460,10 +484,19 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                     weight_dtype,
                     score,
                     emb,
+                    host_table,
                 )
             else:
                 dynamic_emb_rowwise_adagrad_with_table(
-                    ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                    ht,
+                    num_indice,
+                    indice,
+                    grad,
+                    lr,
+                    eps,
+                    weight_dtype,
+                    score,
+                    host_table=host_table,
                 )
 
     def get_opt_args(self):

@@ -44,8 +44,9 @@ class TorchSGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
     def update(
         self,
@@ -93,8 +94,9 @@ class TorchAdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
         self._iterations: int = 0
 
@@ -194,8 +196,9 @@ class TorchAdagradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
         for table_option in self._table_options:
             table_option.initializer_args = DynamicEmbInitializerArgs(
@@ -270,8 +273,9 @@ class TorchRowWiseAdagradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer
         opt_args: OptimizerArgs,
         table_options: List[DynamicEmbTableOptions],
         hashtables: List[DynamicEmbTable],
+        host_tables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args, table_options, hashtables, host_tables)
 
         for table_option in self._table_options:
             old_dim = table_option.dim
@@ -481,6 +485,7 @@ def test_optimizer(
             local_hbm_for_values=4 * 1024**3,
             bucket_capacity=1024,
             device_id=-1,
+            caching=True,
         )
         for i in range(num_tables)
     ]
@@ -489,7 +494,9 @@ def test_optimizer(
     torch_optimizer_class = optimizer_class[1]
     # Initialize hash tables and optimizer states
     hashtables_for_torch = initialize_hashtables(num_tables, table_options)
-    opt_for_torch = torch_optimizer_class(opt_args, table_options, hashtables_for_torch)
+    opt_for_torch = torch_optimizer_class(
+        opt_args, table_options, hashtables_for_torch, []
+    )
 
     batched_dynamicemb_tables = []
     for i, table_option in enumerate(table_options):
