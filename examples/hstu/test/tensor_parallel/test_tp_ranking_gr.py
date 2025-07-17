@@ -15,12 +15,11 @@
 import re
 from typing import Dict, List
 
-import collective_assert_tensor
 import commons.utils as init
 import pytest
 import torch
 from commons.checkpoint import get_unwrapped_module
-from commons.utils.distributed_utils import collective_assert
+from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend
 from distributed.dmp_to_tp import dmp_batch_to_tp
