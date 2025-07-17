@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Union
 
+import torch
 import torch.distributed as dist
 from dataset.utils import RankingBatch, RetrievalBatch
 from megatron.core import parallel_state
@@ -43,6 +44,7 @@ def dmp_batch_to_tp(
     output_batch = batch_cls(**batch.__dict__)
     if tp_size == 1:
         return output_batch
+    # batch size is the number of items in the batch
     output_batch.batch_size = output_batch.batch_size * tp_size
     if not exclude_features:
         output_batch.features = keyed_jagged_tensor_allgather(batch.features, tp_pg)
@@ -54,5 +56,18 @@ def dmp_batch_to_tp(
 
     if hasattr(batch, "labels") and batch.labels is not None:
         output_batch.labels = gatherv_along_first_dim(batch.labels, tp_pg)
+    # reduce max seqlen
+    feat_to_seqlen_tensor = torch.tensor(
+        list(batch.feature_to_max_seqlen.values()),
+        dtype=torch.int32,
+        device=torch.device("cuda"),
+    )
+    torch.distributed.all_reduce(
+        feat_to_seqlen_tensor, op=torch.distributed.ReduceOp.MAX, group=tp_pg
+    )
+    feat_max_seqlen_list = feat_to_seqlen_tensor.tolist()
+    output_batch.feature_to_max_seqlen = {
+        k: v for k, v in zip(batch.feature_to_max_seqlen.keys(), feat_max_seqlen_list)
+    }
 
     return output_batch
