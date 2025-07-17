@@ -15,6 +15,7 @@
 import re
 from typing import Dict, List
 
+import collective_assert_tensor
 import commons.utils as init
 import pytest
 import torch
@@ -26,7 +27,6 @@ from distributed.dmp_to_tp import dmp_batch_to_tp
 from megatron.core import parallel_state
 from pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from test_utils import (
-    collective_assert_tensor,
     compare_tpN_to_debug_weights,
     create_model,
     debug_module_path_to_tpN_module_path,

@@ -66,57 +66,6 @@ def get_diff_tensor(tensor1, tensor2, threshold=1e-5):
     return diff_index, diff_tensor
 
 
-def collective_assert_tensor(
-    tensor: torch.Tensor,
-    compare_type: str = "equal",
-    pg: Optional[torch.distributed.ProcessGroup] = None,
-):
-    cur_rank = torch.distributed.get_rank(group=pg)
-    world_size = torch.distributed.get_world_size(group=pg)
-
-    gathered_tensors = [torch.empty_like(tensor) for _ in range(world_size)]
-    torch.distributed.all_gather(gathered_tensors, tensor.contiguous(), group=pg)
-    torch.distributed.barrier(group=pg)
-
-    for i in range(world_size):
-        if i == cur_rank:
-            continue
-
-        if compare_type == "equal":
-            values, indices = torch.topk(
-                torch.abs(tensor - gathered_tensors[i]),
-                k=min(10, tensor.numel()),
-                dim=0,
-                largest=True,
-                sorted=True,
-            )
-            assert torch.equal(
-                tensor, gathered_tensors[i]
-            ), f"rank {cur_rank} and rank {i} tensor are not equal, diff top 10 {values}"
-        elif compare_type == "not_equal":
-            assert not torch.equal(
-                tensor, gathered_tensors[i]
-            ), f"rank {cur_rank} and rank {i} tensor are equal"
-        elif compare_type == "close":
-            values, indices = torch.topk(
-                torch.abs(tensor - gathered_tensors[i]),
-                k=min(10, tensor.numel()),
-                dim=0,
-                largest=True,
-                sorted=True,
-            )
-            assert torch.allclose(
-                tensor,
-                gathered_tensors[i],
-            ), f"rank {cur_rank} and rank {i} tensor are not close, diff top 10  {values}"
-        elif compare_type == "not_close":
-            assert not torch.allclose(
-                tensor, gathered_tensors[i]
-            ), f"rank {cur_rank} and rank {i} tensor are close"
-        else:
-            raise ValueError(f"compare_type {compare_type} is not supported")
-
-
 def init_fused_weights_from_debug(
     debug_module,
     fused_module,

@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import torch
 
 
@@ -23,3 +25,41 @@ def collective_assert(
         flag_tensor, op=torch.distributed.ReduceOp.MIN, group=group
     )
     assert flag_tensor.item(), err_msg
+
+
+def collective_assert_tensor(
+    tensor: torch.Tensor,
+    compare_type: str = "equal",
+    pg: Optional[torch.distributed.ProcessGroup] = None,
+    msg: str = "",
+):
+    cur_rank = torch.distributed.get_rank(group=pg)
+    world_size = torch.distributed.get_world_size(group=pg)
+
+    gathered_tensors = [torch.empty_like(tensor) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_tensors, tensor.contiguous(), group=pg)
+    torch.distributed.barrier(group=pg)
+
+    for i in range(world_size):
+        if i == cur_rank:
+            continue
+
+        if compare_type == "equal":
+            assert torch.equal(
+                tensor, gathered_tensors[i]
+            ), f"{msg} rank {cur_rank} and rank {i} tensor are not equal"
+        elif compare_type == "not_equal":
+            assert not torch.equal(
+                tensor, gathered_tensors[i]
+            ), f"{msg}rank {cur_rank} and rank {i} tensor are equal"
+        elif compare_type == "close":
+            assert torch.allclose(
+                tensor,
+                gathered_tensors[i],
+            ), f"{msg} rank {cur_rank} and rank {i} tensor are not close"
+        elif compare_type == "not_close":
+            assert not torch.allclose(
+                tensor, gathered_tensors[i]
+            ), f"{msg} rank {cur_rank} and rank {i} tensor are close"
+        else:
+            raise ValueError(f"compare_type {compare_type} is not supported")
