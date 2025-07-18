@@ -161,9 +161,7 @@ def test_tp_hstu_layer(
     hstu_config.kernel_backend = KernelBackend.PYTORCH
     fp32_debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
 
-    init_tpN_weights_from_debug(
-        debug_hstu_layer.module, tp_hstu_layer.module, num_heads
-    )
+    init_tpN_weights_from_debug(debug_hstu_layer.module, tp_hstu_layer.module)
     jd, ref_jd, fp32_ref_jd = generate_input()
 
     out_legacy = debug_hstu_layer(ref_jd).values
