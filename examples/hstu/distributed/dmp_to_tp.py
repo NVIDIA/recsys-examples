@@ -18,7 +18,7 @@ def jt_dict_grad_scaling_and_allgather(
     jt: Dict[str, JaggedTensor],
     scaling_factor: Union[int, float] = 1,
     pg: Optional[dist.ProcessGroup] = None,
-):
+) -> Dict[str, JaggedTensor]:
     if pg is None:
         pg = parallel_state.get_tensor_model_parallel_group()
     tp_size = dist.get_world_size(group=pg)
@@ -37,7 +37,7 @@ def jt_dict_grad_scaling_and_allgather(
 # The features is a kjt, input to embedding module.
 def dmp_batch_to_tp(
     batch: Union[RetrievalBatch, RankingBatch], exclude_features: bool = True
-):
+) -> Union[RetrievalBatch, RankingBatch]:
     tp_pg = parallel_state.get_tensor_model_parallel_group()
     tp_size = dist.get_world_size(group=tp_pg)
     batch_cls = type(batch)
