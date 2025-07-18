@@ -146,6 +146,7 @@ class TPLayerNormMulDropout(torch.nn.Module):
         full_x = gather_along_last_dim(x, self._tp_pg)
         full_u = gather_along_last_dim(u, self._tp_pg)
         # we use triton layer norm such that full_x can be of different dtype from weight/bias
+        # TODO: The activation is allgathered, we should ensure the dropout behavior is consistent across TP ranks.
         normed_x = triton_norm_mul_dropout(
             full_x,
             full_u,
