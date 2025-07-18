@@ -119,9 +119,8 @@ class RankingGR(BaseModel):
         # maybe freeze embedding for debugging
         embeddings = self._embedding_collection._maybe_detach(embeddings)
         # For model-parallel embedding, torchrec does gradient division by (tp_size * dp_size). However, we only need to divide by dp size. In such case, we need to scale the gradient by tp_size.
-        # For data-parallel embedding, torchrec does nothing on the gradient. It will be handed over to the DDP -- which will divide the gradient by dp_size (allreduce avg).
-        # As a side effect, we scale the dp embedding gradient by tp_size unintentionally, so that we need to perform allreduce avg across tp ranks after/before the DDP allreduce avg.
-        # Beaware that, this scaling is not related to the uneven jagged size issues.
+        # But simultaneously, the DP embedding might be scaled by tp_size unintentionally. On the other hand, the DDP will divide the DP embedding gradient by dp_size (allreduce avg).
+        # We need to perform allreduce sum across tp ranks after/before the DDP allreduce avg.
         grad_scaling_factor = self._tp_size
         embeddings = jt_dict_grad_scaling_and_allgather(
             embeddings,
