@@ -63,3 +63,13 @@ def collective_assert_tensor(
             ), f"{msg} rank {cur_rank} and rank {i} tensor are close"
         else:
             raise ValueError(f"compare_type {compare_type} is not supported")
+
+
+def grad_collective_equal_assert_hook(
+    grad, pg: Optional[torch.distributed.ProcessGroup] = None, msg: str = ""
+):
+    grad = grad.detach()
+    collective_assert_tensor(
+        grad, compare_type="equal", msg=msg + f" {grad.dtype}", pg=pg
+    )
+    return grad
