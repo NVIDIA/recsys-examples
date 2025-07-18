@@ -42,9 +42,10 @@ from configs.hstu_config import (
     KernelBackend,
     get_hstu_config,
 )
+from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
-from modules.native_hstu_layer import HSTULayer
+from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
 from ops.length_to_offsets import length_to_complete_offsets
 
 _backend_str_to_type = {
@@ -53,7 +54,11 @@ _backend_str_to_type = {
     "pytorch": KernelBackend.PYTORCH,
 }
 
-_layer_type_str_to_type = {"native": HSTULayerType.NATIVE, "fused": HSTULayerType.FUSED}
+_layer_type_str_to_type = {
+    "native": HSTULayerType.NATIVE,
+    "fused": HSTULayerType.FUSED,
+    "debug": HSTULayerType.DEBUG,
+}
 
 _dtype_str_to_type = {
     "float16": torch.float16,
@@ -69,9 +74,11 @@ def cli() -> None:
 def create_hstu_layer(
     hstu_config: HSTUConfig,
     dtype: torch.dtype = torch.bfloat16,
-) -> Union[HSTULayer, FusedHSTULayer]:
-    if hstu_config.hstu_layer_type == HSTULayerType.NATIVE:
-        module = HSTULayer(hstu_config).to(dtype).cuda()
+) -> Union[DebugHSTULayer, NativeHSTULayer, FusedHSTULayer]:
+    if hstu_config.hstu_layer_type == HSTULayerType.DEBUG:
+        module = DebugHSTULayer(hstu_config).to(dtype).cuda()
+    elif hstu_config.hstu_layer_type == HSTULayerType.NATIVE:
+        module = NativeHSTULayer(hstu_config).to(dtype).cuda()
     else:
         module = FusedHSTULayer(hstu_config).to(dtype).cuda()
 

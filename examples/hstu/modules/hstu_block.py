@@ -7,9 +7,10 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
 from dataset.utils import RankingBatch, RetrievalBatch
 from megatron.core.transformer.module import MegatronModule
+from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
-from modules.native_hstu_layer import HSTULayer
+from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
 from modules.position_encoder import HSTUPositionalEncoder
 from modules.utils import hstu_postprocess_embeddings, hstu_preprocess_embeddings
 from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
@@ -51,7 +52,9 @@ class HSTUBlock(MegatronModule):
         HSTULayerImpl = (
             FusedHSTULayer
             if config.hstu_layer_type == HSTULayerType.FUSED
-            else HSTULayer
+            else DebugHSTULayer
+            if config.hstu_layer_type == HSTULayerType.DEBUG
+            else NativeHSTULayer
         )
         self._attention_layers = torch.nn.ModuleList(
             [HSTULayerImpl(config) for l in range(self.config.num_layers)]

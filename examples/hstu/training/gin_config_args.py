@@ -22,6 +22,7 @@ import gin
 @dataclass
 class TrainerArgs:
     # below batchsize is batchsize_per_gpu
+    # when TP is enabled, the theoratical batchsize is (train_batch_size * tp_size)
     train_batch_size: int
     eval_batch_size: int
 
@@ -102,7 +103,7 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
 class DatasetArgs:
     dataset_name: str
     max_sequence_length: int
-    dataset_path: str = None
+    dataset_path: Optional[str] = None
     max_num_candidates: int = 0
     shuffle: bool = False
 

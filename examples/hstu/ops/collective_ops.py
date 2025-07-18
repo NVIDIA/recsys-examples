@@ -17,6 +17,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 from ops.length_to_offsets import length_to_complete_offsets
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 def _split_along_first_dim(input_, pg: Optional[dist.ProcessGroup] = None):
@@ -46,6 +47,36 @@ def _split_along_first_dim(input_, pg: Optional[dist.ProcessGroup] = None):
     dim_offset = rank * local_dim_size
 
     output = input_[dim_offset : dim_offset + local_dim_size].contiguous()
+
+    return output
+
+
+def _split_along_last_dim(input_, pg: Optional[dist.ProcessGroup] = None):
+    """
+    Split the tensor along its last dimension and keep the corresponding slice.
+
+    Args:
+        input_ (torch.Tensor): Input tensor to be split.
+        pg (Optional[dist.ProcessGroup]): Process group for distributed operations.
+
+    Returns:
+        torch.Tensor: Sliced tensor.
+    """
+
+    world_size = dist.get_world_size(pg)
+    rank = dist.get_rank(pg)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    # Split along last dimension.
+    dim_size = input_.size()[-1]
+    assert (
+        dim_size % world_size == 0
+    ), "First dimension of the tensor should be divisible by tensor parallel size"
+    local_dim_size = dim_size // world_size
+    dim_offset = rank * local_dim_size
+    output = input_[..., dim_offset : dim_offset + local_dim_size].contiguous()
 
     return output
 
@@ -112,6 +143,20 @@ def _gather_along_first_dim(input_, pg: Optional[dist.ProcessGroup] = None):
         dim_size, dtype=input_.dtype, device=torch.cuda.current_device()
     )
     torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=pg)
+    return output
+
+
+def _gather_along_last_dim(input_, pg: Optional[dist.ProcessGroup] = None):
+    """
+    Gather tensors and concatenate along the last dimension.
+    """
+    world_size = dist.get_world_size(pg)
+    if world_size == 1:
+        return input_
+    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+    # allgather along the first dim and then concatenate along the last dim
+    torch.distributed.all_gather(tensor_list, input_.contiguous(), group=pg)
+    output = torch.cat(tensor_list, dim=-1)
     return output
 
 
@@ -194,6 +239,42 @@ class AllGatherFirstDimFromRegion(torch.autograd.Function):
         return _split_along_first_dim(grad_output, pg), None
 
 
+class AllGatherLastDimFromRegion(torch.autograd.Function):
+    """
+    All gather tensor from given process group and concatenate along the last dimension.
+
+    Args:
+        input_ (torch.Tensor): Input tensor. The last dim of tensors on different ranks must be the same.
+        pg (torch.distributed.ProcessGroup): Process group for distributed operations.
+
+    Example:
+        >>> import torch
+        >>> import torch.distributed as dist
+        >>> dist.init_process_group(backend='nccl', world_size=2)
+        >>> input_tensor = torch.rand(3, 4).cuda()
+        >>> gathered_tensor = AllGatherLastDimFromRegion.apply(input_tensor)
+        >>> print(gathered_tensor.size())
+        torch.Size([3, 8])
+    """
+
+    @staticmethod
+    def symbolic(graph, input_, pg: torch.distributed.ProcessGroup):
+        """"""
+        return _gather_along_last_dim(input_, pg)
+
+    @staticmethod
+    def forward(ctx, input_, pg: torch.distributed.ProcessGroup):
+        """"""
+        ctx.pg = pg
+        return _gather_along_last_dim(input_, pg)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """"""
+        pg = ctx.pg
+        return _split_along_last_dim(grad_output, pg), None
+
+
 class AllGathervFirstDimFromRegion(torch.autograd.Function):
     """
     All gatherv tensor from given process group and concatenate along the first dimension.
@@ -238,8 +319,42 @@ class AllGathervFirstDimFromRegion(torch.autograd.Function):
         return ret_values, None
 
 
+class SplitAlongFirstDimFromRegion(torch.autograd.Function):
+    @staticmethod
+    def symbolic(graph, input_, pg: torch.distributed.ProcessGroup):
+        return _split_along_first_dim(input_, pg)
+
+    @staticmethod
+    def forward(ctx, input_, pg: torch.distributed.ProcessGroup):
+        ctx.pg = pg
+        return _split_along_first_dim(input_, pg)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pg = ctx.pg
+        return _gather_along_first_dim(grad_output, pg), None
+
+
+class SplitAlongLastDimFromRegion(torch.autograd.Function):
+    @staticmethod
+    def symbolic(graph, input_, pg: torch.distributed.ProcessGroup):
+        return _split_along_last_dim(input_, pg)
+
+    @staticmethod
+    def forward(ctx, input_, pg: torch.distributed.ProcessGroup):
+        ctx.pg = pg
+        return _split_along_last_dim(input_, pg)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pg = ctx.pg
+        return _gather_along_last_dim(grad_output, pg), None
+
+
+split_along_last_dim = SplitAlongLastDimFromRegion.apply
 gather_along_first_dim = AllGatherFirstDimFromRegion.apply
 gatherv_along_first_dim = AllGathervFirstDimFromRegion.apply
+gather_along_last_dim = AllGatherLastDimFromRegion.apply
 
 
 class ViewAsDtype(torch.autograd.Function):
@@ -279,17 +394,15 @@ view_as_dtype = ViewAsDtype.apply
 
 def grouped_allgatherv_tensor_list(
     value_list: List[torch.Tensor],
-    seqlen: torch.Tensor,
     pg: Optional[dist.ProcessGroup] = None,
 ):
     """
     A differentiable allgatherv function. To reduce the collective calls, all tensors in `value_list`
     will be viewed as bfloat16 and then concatenated as single tensor. The input tensors on one rank must share
-    the same seqlen.
+    the same seqlen_sum.
 
     Args:
         value_list (List[torch.Tensor]): List of tensors to be gathered.
-        seqlen (torch.Tensor): Sequence length tensor.
         pg (Optional[dist.ProcessGroup]): Process group for distributed operations.
 
     Returns:
@@ -305,12 +418,9 @@ def grouped_allgatherv_tensor_list(
       >>> seqlen = torch.tensor([2, 2]) if rank == 0 else torch.tensor([1, 1])
       >>> T = seqlen.sum().item()
       >>> value_list = [torch.arange(0,T).cuda(), torch.arange(0,T).cuda() + 1]
-      >>> gathered_tensors, output_seqlen = grouped_allgatherv_tensor_list(value_list, seqlen)
+      >>> gathered_tensors = grouped_allgatherv_tensor_list(value_list)
       >>> print(gathered_tensors)
       [tensor([0., 1. ,2. ,3., 0., 1.]), tensor([1., 2., 3., 4., 1., 2.])]
-      >>> print(output_seqlen)
-      tensor([2, 2, 1, 1])
-
     """
     # 1. make sure all input tensors share the same dim0
     T0 = value_list[0].size(0)
@@ -357,7 +467,6 @@ def grouped_allgatherv_tensor_list(
     untyped_tensor = pack_as_2byte_and_concat(value_list)
     # 4. allgatherv
     gathered_tensor = gatherv_along_first_dim(untyped_tensor, pg)
-    output_seqlen = gather_along_first_dim(seqlen, pg).detach()
 
     # 5. unpack
     ret_value_list = split_and_unpack_dtype(
@@ -367,4 +476,37 @@ def grouped_allgatherv_tensor_list(
         value.squeeze(-1) if dim == 1 else value
         for dim, value in zip(input_dims, ret_value_list)
     ]
-    return ret_value_list, output_seqlen
+    return ret_value_list
+
+
+def grouped_allgather_tensor_list(
+    value_list: List[torch.Tensor],
+    pg: Optional[dist.ProcessGroup] = None,
+):
+    # allgather
+    output_value_list = []
+    for value in value_list:
+        output_value_list.append(gather_along_first_dim(value, pg))
+    return output_value_list
+
+
+def jagged_tensor_allgather(
+    jt: JaggedTensor,
+    pg: Optional[dist.ProcessGroup] = None,
+):
+    values, lengths = jt.values(), jt.lengths()
+    values = gatherv_along_first_dim(values, pg)
+    lengths = gather_along_first_dim(lengths, pg)
+    return JaggedTensor(values=values, lengths=lengths)
+
+
+def keyed_jagged_tensor_allgather(
+    kjt: KeyedJaggedTensor,
+    pg: Optional[dist.ProcessGroup] = None,
+):
+    # check dtype are all integers
+    input_jt_dict = kjt.to_dict()
+    output_jt_dict = {}
+    for key, value in input_jt_dict.items():
+        output_jt_dict[key] = jagged_tensor_allgather(value, pg)
+    return KeyedJaggedTensor.from_jt_dict(output_jt_dict)
