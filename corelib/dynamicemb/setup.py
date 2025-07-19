@@ -35,7 +35,8 @@ def check_torchrec_version():
 
         version = re.match(r"^\d+\.\d+\.\d+", torchrec.__version__).group()
         if version >= compatible_versions:
-            raise RuntimeError(f"torchrec version {version} is installed.")
+            print(f"torchrec version {version} is installed.")
+            return
         else:
             raise RuntimeError(
                 f"torchrec version {version} is installed, but version >= {compatible_versions} is required."
