@@ -16,7 +16,6 @@
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -34,7 +33,7 @@ def check_torchrec_version():
     try:
         import torchrec
 
-        version = re.match(r'^\d+\.\d+\.\d+', torchrec.__version__).group()
+        version = re.match(r"^\d+\.\d+\.\d+", torchrec.__version__).group()
         if version >= compatible_versions:
             raise RuntimeError(f"torchrec version {version} is installed.")
         else:
@@ -43,6 +42,7 @@ def check_torchrec_version():
             )
     except ImportError:
         raise RuntimeError("torchrec is not installed.")
+
 
 def find_source_files(directory, extension_pattern, exclude_dirs=[]):
     source_files = []

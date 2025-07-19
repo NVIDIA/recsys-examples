@@ -303,9 +303,7 @@ class DLRMKuaiRandProcessor(DataProcessor):
                 os.path.join(base_path, "log_standard_4_08_to_4_21_pure.csv"),
                 os.path.join(base_path, "log_standard_4_22_to_5_08_pure.csv"),
             ]
-            self._user_features_file = (
-                os.path.join(base_path, "user_features_pure.csv")
-            )
+            self._user_features_file = os.path.join(base_path, "user_features_pure.csv")
 
         elif prefix == "KuaiRand-1K":
             self._log_files = [
@@ -417,6 +415,7 @@ dataset_names = (
     "kuairand-27k",
 )
 
+
 def get_common_preprocessors(dataset_path: str):
     """
     Get common data preprocessors.
@@ -456,13 +455,12 @@ def get_common_preprocessors(dataset_path: str):
         file_name="KuaiRand-27K.tar.gz",
         prefix="KuaiRand-27K",
     )
-    return {key: locals()[f"{key}_dp".replace('-', '_')] for key in dataset_names}
+    return {key: locals()[f"{key}_dp".replace("-", "_")] for key in dataset_names}
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocessor")
-    parser.add_argument(
-        "--dataset_name", choices=list(dataset_names) + ["all"]
-    )
+    parser.add_argument("--dataset_name", choices=list(dataset_names) + ["all"])
     parser.add_argument(
         "--dataset_path",
         type=str,
