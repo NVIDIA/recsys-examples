@@ -126,7 +126,7 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
 ```bash
 ~$ cd recsys-examples/examples/hstu
 ~$ export PYTHONPATH=${PYTHONPATH}:$(realpath ../)
-~$ python3 ./benchmark/inference_showcase.py
+~$ python3 ./benchmark/inference_benchmark.py
 ~$ python3 ./benchmark/paged_hstu_with_kvcache_benchmark.py
 ``` 
 
