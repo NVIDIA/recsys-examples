@@ -327,6 +327,7 @@ def create_model(
         hstu_layer_type=hstu_layer_type,
         kernel_backend=kernel_backend,
         add_uvqk_bias=False,  # disable bias for better debugging
+        fuse_norm_mul_dropout=False,  # disable fusion for better debugging
     )
 
     item_feature_name = "item_feat"

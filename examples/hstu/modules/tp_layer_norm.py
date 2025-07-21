@@ -1,6 +1,7 @@
 import megatron.core.parallel_state as parallel_state
 import torch
 from ops.collective_ops import gather_along_last_dim, split_along_last_dim
+from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
 from ops.triton_ops.triton_layer_norm import triton_layer_norm
 from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 
@@ -96,6 +97,7 @@ class TPLayerNormMulDropout(torch.nn.Module):
         trainable=True,
         shard_weight=False,
         gather_output=False,
+        fusion=True,
     ):
         super().__init__()
 
@@ -107,6 +109,9 @@ class TPLayerNormMulDropout(torch.nn.Module):
         self._hidden_size = hidden_size
         self._shard_weight = shard_weight
         self._dropout_ratio = dropout_ratio
+        self._norm_mul_dropout_func = (
+            pytorch_norm_mul_dropout if not fusion else triton_norm_mul_dropout
+        )
         if shard_weight:
             hidden_size_per_partition = _divide_with_exception(hidden_size, tp_size)
             self.weight = (
@@ -147,7 +152,7 @@ class TPLayerNormMulDropout(torch.nn.Module):
         full_u = gather_along_last_dim(u, self._tp_pg)
         # we use triton layer norm such that full_x can be of different dtype from weight/bias
         # TODO: The activation is allgathered, we should ensure the dropout behavior is consistent across TP ranks.
-        normed_x = triton_norm_mul_dropout(
+        normed_x = self._norm_mul_dropout_func(
             full_x,
             full_u,
             weight,

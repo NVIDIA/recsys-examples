@@ -13,17 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from functools import partial
+
 import nvtx
 import torch
 import torch.nn.functional as F
+from commons.utils.distributed_utils import (
+    collective_assert_tensor,
+    grad_collective_equal_assert_hook,
+)
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
+from megatron.core import parallel_state
 from megatron.core.transformer.module import MegatronModule
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.utils import init_mlp_weights_optional_bias
+from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
 from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
+
+DEBUG_CHECK_TP_EQUAL = False
 
 
 # TODO move this layer to test folder! And remove the layer type: DEBUG
@@ -98,6 +109,14 @@ class HSTULayer(MegatronModule):
             linear_dim=self._linear_dim_per_head,
             is_causal=config.is_causal,
         )
+        self._fuse_norm_mul_dropout = config.fuse_norm_mul_dropout
+        self._norm_mul_dropout_func = (
+            pytorch_norm_mul_dropout
+            if not self._fuse_norm_mul_dropout
+            else triton_norm_mul_dropout
+        )
+        global DEBUG_CHECK_TP_EQUAL
+        DEBUG_CHECK_TP_EQUAL = os.environ.get("DEBUG_CHECK_TP_EQUAL", "0") == "1"
 
     def get_user_value_query_key_tensors(self, hidden_states: torch.Tensor):
         """
@@ -110,6 +129,18 @@ class HSTULayer(MegatronModule):
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: The user, value, query, and key tensors.
         """
         mixed_uvqk = self._linear_uvqk(hidden_states)
+        if DEBUG_CHECK_TP_EQUAL:
+            # fwd
+            collective_assert_tensor(
+                mixed_uvqk,
+                compare_type="equal",
+                msg="linear uvqk fwd",
+                pg=parallel_state.get_tensor_model_parallel_group(),
+            )
+            # bwd
+            hidden_states.register_hook(
+                partial(grad_collective_equal_assert_hook, msg="linear uvqk dgrad")
+            )
         # elevate to fp32 for higher precision
         mixed_uvqk = F.silu(mixed_uvqk).view(
             -1, self._num_heads, sum(self._split_arg_list)
@@ -147,6 +178,18 @@ class HSTULayer(MegatronModule):
                 bias=self._input_layernorm_bias,
                 eps=self._eps,
             )
+            if DEBUG_CHECK_TP_EQUAL:
+                # fwd
+                collective_assert_tensor(
+                    normed_x,
+                    compare_type="equal",
+                    msg="ln fwd",
+                    pg=parallel_state.get_tensor_model_parallel_group(),
+                )
+                # bwd
+                x.register_hook(
+                    partial(grad_collective_equal_assert_hook, msg="ln dgrad")
+                )
             tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
         # TODO: remove contiguous once cutlass backend is ready
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
@@ -160,8 +203,29 @@ class HSTULayer(MegatronModule):
                 max_seqlen=jd.max_seqlen,
                 target_group_size=self._target_group_size,
             )
+            if DEBUG_CHECK_TP_EQUAL:
+                # fwd
+                collective_assert_tensor(
+                    jagged_attn_output,
+                    compare_type="equal",
+                    msg="attn fwd",
+                    pg=parallel_state.get_tensor_model_parallel_group(),
+                )
+                # bwd
+                tq.register_hook(
+                    partial(grad_collective_equal_assert_hook, msg="tq dgrad")
+                )
+                tk.register_hook(
+                    partial(grad_collective_equal_assert_hook, msg="tk dgrad")
+                )
+                tv.register_hook(
+                    partial(grad_collective_equal_assert_hook, msg="tv dgrad")
+                )
+                tu.register_hook(
+                    partial(grad_collective_equal_assert_hook, msg="tu dgrad")
+                )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
-            parallel_input = triton_norm_mul_dropout(
+            parallel_input = self._norm_mul_dropout_func(
                 jagged_attn_output,
                 tu,
                 self._output_layernorm_weight,
@@ -170,8 +234,34 @@ class HSTULayer(MegatronModule):
                 self._dropout_ratio,
                 self.training,
             )
+            if DEBUG_CHECK_TP_EQUAL:
+                # fwd
+                collective_assert_tensor(
+                    parallel_input,
+                    compare_type="equal",
+                    msg="ln mul dropout fwd",
+                    pg=parallel_state.get_tensor_model_parallel_group(),
+                )
+                # bwd
+                jagged_attn_output.register_hook(
+                    partial(
+                        grad_collective_equal_assert_hook, msg="ln mul dropout dgrad"
+                    )
+                )
         with nvtx.annotate("hstu linear_residual fwd", color="YELLOW"):
             output = self._linear_proj(parallel_input)
+            if DEBUG_CHECK_TP_EQUAL:
+                # fwd
+                collective_assert_tensor(
+                    output,
+                    compare_type="equal",
+                    msg="proj linear fwd",
+                    pg=parallel_state.get_tensor_model_parallel_group(),
+                )
+                # bwd
+                parallel_input.register_hook(
+                    partial(grad_collective_equal_assert_hook, msg="proj linear dgrad")
+                )
             if self._residual:
                 output = output + x
         return JaggedData(

@@ -102,6 +102,7 @@ class HSTUConfig(TransformerConfig):
     enable_relative_attention_bias: bool = False
 
     kernel_backend: KernelBackend = KernelBackend.CUTLASS
+    # TODO deprecate FUSED
     hstu_layer_type: HSTULayerType = HSTULayerType.FUSED
 
     target_group_size: int = 1
@@ -118,6 +119,7 @@ class HSTUConfig(TransformerConfig):
     # whether is the inference mode
     is_inference: bool = False
     add_uvqk_bias: bool = True
+    fuse_norm_mul_dropout: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -143,6 +145,7 @@ def get_hstu_config(
     recompute_input_silu: bool = False,
     is_inference: bool = False,
     add_uvqk_bias: bool = True,
+    fuse_norm_mul_dropout: bool = True,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -209,4 +212,5 @@ def get_hstu_config(
         recompute_input_silu=recompute_input_silu,
         add_uvqk_bias=add_uvqk_bias,
         is_inference=is_inference,
+        fuse_norm_mul_dropout=fuse_norm_mul_dropout,
     )
