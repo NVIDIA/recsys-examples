@@ -21,6 +21,7 @@ import dataset
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from configs import (
+    HSTUConfig,
     HSTULayerType,
     KernelBackend,
     OptimizerParam,
@@ -38,6 +39,27 @@ from training.gin_config_args import (
     OptimizerArgs,
     TrainerArgs,
 )
+
+
+def cal_flops_per_sample(hstu_config: HSTUConfig, max_seqlen: int) -> int:
+    num_layers = hstu_config.num_layers
+    hidden_size = hstu_config.hidden_size
+    num_heads = hstu_config.num_attention_heads
+    dim_per_head = hstu_config.kv_channels
+
+    total_flops_per_layer = 0
+    total_flops_per_layer += (
+        2 * max_seqlen * 4 * num_heads * dim_per_head * hidden_size
+    )  # qkvu proj fwd
+    total_flops_per_layer += (
+        2 * num_heads * 2 * max_seqlen * max_seqlen * dim_per_head
+    )  # attn fwd
+    total_flops_per_layer += max_seqlen * num_heads * dim_per_head  # mul fwd
+    total_flops_per_layer += 2 * max_seqlen * num_heads * hidden_size  # proj fwd
+    if hstu_config.residual:
+        total_flops_per_layer += max_seqlen * num_heads * hidden_size  # add fwd
+
+    return total_flops_per_layer * num_layers * 3  # fwd + bwd
 
 
 def create_hstu_config(network_args: NetworkArgs):
