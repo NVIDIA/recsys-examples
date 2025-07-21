@@ -85,6 +85,7 @@ class HSTULayer(MegatronModule):
             trainable=True,
             shard_weight=False,
             dropout_ratio=self._dropout_ratio,
+            fusion=config.fuse_norm_mul_dropout,
         )
         # [embedding_dim, 4 * num_head * head_dim]
         self._linear_uvqk = TEColumnParallelLinear(

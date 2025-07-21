@@ -150,7 +150,7 @@ def test_gr_tp_ranking_initialization(tp_size: int):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 @pytest.mark.parametrize(
-    "replicate_batches", [False, True]
+    "replicate_batches", [True, False]
 )  # same batch or various batches
 @pytest.mark.parametrize(
     "kernel_backend", [KernelBackend.PYTORCH]
@@ -197,7 +197,7 @@ def test_tp_gr_ranking_forward_backward_update(
         dtype=dtype,
         seed=1234,
         hstu_layer_type=HSTULayerType.DEBUG,  # no TP, i.e. does not shard weights
-        num_batches=10 if optimizer_type_str == "sgd" else 20,
+        num_batches=40 if optimizer_type_str == "sgd" else 80,
         replicate_batches=replicate_batches,
         kernel_backend=kernel_backend,  # only pytorch supports fp32
     )
@@ -265,9 +265,22 @@ def test_tp_gr_ranking_forward_backward_update(
             tp_ranking_gr, debug_ranking_gr, debug_ranking_gr_fp32
         )
 
-        # we only assert loss & logits across tp when weights are fp32. They must be bit-wise the same.
-        # collective_assert_tensor(losses_fp32, compare_type="close", pg=parallel_state.get_tensor_model_parallel_group())
-        # collective_assert_tensor(logits_fp32, compare_type="close", pg=parallel_state.get_tensor_model_parallel_group())
+        # the logits must be bit-wise aligned
+        collective_assert_tensor(
+            logits_fp32,
+            compare_type="close",
+            pg=parallel_state.get_tensor_model_parallel_group(),
+        )
+        collective_assert_tensor(
+            logits,
+            compare_type="close",
+            pg=parallel_state.get_tensor_model_parallel_group(),
+        )
+        collective_assert_tensor(
+            tp_logits,
+            compare_type="close",
+            pg=parallel_state.get_tensor_model_parallel_group(),
+        )
 
         # assert loss & logits element-wise
         collective_assert(

@@ -43,11 +43,20 @@ def collective_assert_tensor(
     for i in range(world_size):
         if i == cur_rank:
             continue
-
+        original_diff = torch.abs(tensor.reshape(-1) - gathered_tensors[i].reshape(-1))
+        original_diff_val, original_diff_idx = torch.sort(
+            original_diff, dim=0, descending=True
+        )
         if compare_type == "equal":
-            assert torch.equal(
-                tensor, gathered_tensors[i]
-            ), f"{msg} rank {cur_rank} and rank {i} tensor are not equal"
+            if not torch.equal(tensor, gathered_tensors[i]):
+                left_bits = tensor.reshape(-1).view(torch.int32)
+                right_bits = gathered_tensors[i].reshape(-1).view(torch.int32)
+                diff = torch.bitwise_xor(left_bits, right_bits)
+                diff_val, diff_idx = torch.sort(diff, dim=0, descending=True)
+
+                assert torch.equal(
+                    tensor, gathered_tensors[i]
+                ), f"{msg} rank {cur_rank} and rank {i} tensor are not equal, selected diff bits {diff_val[0:10]}; \nmost numerically diff {original_diff_val[0:10]}"
         elif compare_type == "not_equal":
             assert not torch.equal(
                 tensor, gathered_tensors[i]
@@ -56,7 +65,7 @@ def collective_assert_tensor(
             assert torch.allclose(
                 tensor,
                 gathered_tensors[i],
-            ), f"{msg} rank {cur_rank} and rank {i} tensor are not close"
+            ), f"{msg} rank {cur_rank} and rank {i} tensor are not close, diff top10 {original_diff_val[0:10]}"
         elif compare_type == "not_close":
             assert not torch.allclose(
                 tensor, gathered_tensors[i]
