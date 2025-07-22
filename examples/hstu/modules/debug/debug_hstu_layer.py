@@ -117,6 +117,17 @@ class HSTULayer(MegatronModule):
         )
         global DEBUG_CHECK_TP_EQUAL
         DEBUG_CHECK_TP_EQUAL = os.environ.get("DEBUG_CHECK_TP_EQUAL", "0") == "1"
+        # register hook to check if the param is bit-wise equal across tp ranks
+        if DEBUG_CHECK_TP_EQUAL:
+            for name, param in self.named_parameters():
+                if isinstance(param.data, torch.Tensor):
+                    param.register_hook(
+                        partial(
+                            grad_collective_equal_assert_hook,
+                            pg=parallel_state.get_tensor_model_parallel_group(),
+                            msg=f"param {name}",
+                        )
+                    )
 
     def get_user_value_query_key_tensors(self, hidden_states: torch.Tensor):
         """
@@ -139,7 +150,11 @@ class HSTULayer(MegatronModule):
             )
             # bwd
             hidden_states.register_hook(
-                partial(grad_collective_equal_assert_hook, msg="linear uvqk dgrad")
+                partial(
+                    grad_collective_equal_assert_hook,
+                    pg=parallel_state.get_tensor_model_parallel_group(),
+                    msg="linear uvqk dgrad",
+                )
             )
         # elevate to fp32 for higher precision
         mixed_uvqk = F.silu(mixed_uvqk).view(
@@ -188,7 +203,11 @@ class HSTULayer(MegatronModule):
                 )
                 # bwd
                 x.register_hook(
-                    partial(grad_collective_equal_assert_hook, msg="ln dgrad")
+                    partial(
+                        grad_collective_equal_assert_hook,
+                        pg=parallel_state.get_tensor_model_parallel_group(),
+                        msg="ln dgrad",
+                    )
                 )
             tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
         # TODO: remove contiguous once cutlass backend is ready
@@ -213,16 +232,32 @@ class HSTULayer(MegatronModule):
                 )
                 # bwd
                 tq.register_hook(
-                    partial(grad_collective_equal_assert_hook, msg="tq dgrad")
+                    partial(
+                        grad_collective_equal_assert_hook,
+                        pg=parallel_state.get_tensor_model_parallel_group(),
+                        msg="tq dgrad",
+                    )
                 )
                 tk.register_hook(
-                    partial(grad_collective_equal_assert_hook, msg="tk dgrad")
+                    partial(
+                        grad_collective_equal_assert_hook,
+                        pg=parallel_state.get_tensor_model_parallel_group(),
+                        msg="tk dgrad",
+                    )
                 )
                 tv.register_hook(
-                    partial(grad_collective_equal_assert_hook, msg="tv dgrad")
+                    partial(
+                        grad_collective_equal_assert_hook,
+                        pg=parallel_state.get_tensor_model_parallel_group(),
+                        msg="tv dgrad",
+                    )
                 )
                 tu.register_hook(
-                    partial(grad_collective_equal_assert_hook, msg="tu dgrad")
+                    partial(
+                        grad_collective_equal_assert_hook,
+                        pg=parallel_state.get_tensor_model_parallel_group(),
+                        msg="tu dgrad",
+                    )
                 )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             parallel_input = self._norm_mul_dropout_func(
@@ -245,7 +280,9 @@ class HSTULayer(MegatronModule):
                 # bwd
                 jagged_attn_output.register_hook(
                     partial(
-                        grad_collective_equal_assert_hook, msg="ln mul dropout dgrad"
+                        grad_collective_equal_assert_hook,
+                        pg=parallel_state.get_tensor_model_parallel_group(),
+                        msg="ln mul dropout dgrad",
                     )
                 )
         with nvtx.annotate("hstu linear_residual fwd", color="YELLOW"):
@@ -260,7 +297,11 @@ class HSTULayer(MegatronModule):
                 )
                 # bwd
                 parallel_input.register_hook(
-                    partial(grad_collective_equal_assert_hook, msg="proj linear dgrad")
+                    partial(
+                        grad_collective_equal_assert_hook,
+                        pg=parallel_state.get_tensor_model_parallel_group(),
+                        msg="proj linear dgrad",
+                    )
                 )
             if self._residual:
                 output = output + x

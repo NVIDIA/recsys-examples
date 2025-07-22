@@ -21,7 +21,7 @@ import configs
 import dataset
 import model
 import torch
-from commons.utils.distributed_utils import collective_assert
+from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend, OptimizerParam
 from distributed.sharding import make_optimizer_and_shard
@@ -154,6 +154,14 @@ def compare_tpN_to_debug_weights(
     for name, param in debug_module_params_map.items():
         src = param if not isinstance(param, ShardedTensor) else param.local_tensor()
         src_fp32 = debug_fp32_module_params_map[name]
+        # weight should be bit-wise equal across all ranks for src and src_fp32. Other wise, there is some bugs
+        if not isinstance(src, TableBatchedEmbeddingSlice):
+            collective_assert_tensor(
+                src, compare_type="equal", pg=None, msg=f"param {name}"
+            )
+            collective_assert_tensor(
+                src_fp32, compare_type="equal", pg=None, msg=f"fp32 param {name}"
+            )
         src_fp32 = (
             src_fp32
             if not isinstance(src_fp32, ShardedTensor)

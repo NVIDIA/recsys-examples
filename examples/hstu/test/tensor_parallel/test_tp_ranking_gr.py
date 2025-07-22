@@ -265,20 +265,20 @@ def test_tp_gr_ranking_forward_backward_update(
             tp_ranking_gr, debug_ranking_gr, debug_ranking_gr_fp32
         )
 
-        # the logits must be bit-wise aligned
+        # # the logits must be bit-wise aligned across tp ranks
         collective_assert_tensor(
             logits_fp32,
-            compare_type="close",
+            compare_type="equal",
             pg=parallel_state.get_tensor_model_parallel_group(),
         )
         collective_assert_tensor(
             logits,
-            compare_type="close",
+            compare_type="equal",
             pg=parallel_state.get_tensor_model_parallel_group(),
         )
         collective_assert_tensor(
             tp_logits,
-            compare_type="close",
+            compare_type="equal",
             pg=parallel_state.get_tensor_model_parallel_group(),
         )
 
