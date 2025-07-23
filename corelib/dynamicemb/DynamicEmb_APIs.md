@@ -112,6 +112,7 @@ Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic em
         topology : Optional[Topology], optional
             The topology of GPU and Host memory. If None, a default topology will be created. Defaults to None.
             The creation and usage are consistent with the same types in TorchREC.
+            Note: The memory budget does not include the consumption of dynamicemb.
         batch_size : Optional[int], optional
             The batch size for training. Defaults to None, will set 512 in Planner.
         enumerator : Optional[Enumerator], optional

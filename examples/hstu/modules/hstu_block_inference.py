@@ -227,6 +227,7 @@ class HSTUBlockInference(torch.nn.Module):
         static_hidden_states,
         static_jagged_metadata,
         static_kvcache_metadata,
+        cudagraph_configs=None,
     ):
         print("Setting up cuda graphs ...")
         if self._hstu_graph is None:
@@ -247,16 +248,23 @@ class HSTUBlockInference(torch.nn.Module):
             self._hstu_graph[max_batch_size][max_num_tokens] = graph_max
 
             bs_list = [2**i for i in range(math.ceil(math.log2(max_batch_size)) + 1)]
-            num_tokens_list = [
-                2**i for i in range(5, math.ceil(math.log2(max_num_tokens)) + 1)
+            seqlen_list = [
+                2**i for i in range(5, math.ceil(math.log2(max_seq_len)) + 1)
             ]
+            if cudagraph_configs is not None:
+                bs_list = cudagraph_configs["batch_size"]
+                seqlen_list = cudagraph_configs["length_per_sequence"]
+            print("Cudagraph setup configs:")
+            print("  Batch size:", bs_list)
+            print("  Length per sequence", seqlen_list)
 
             for batch_size in bs_list:
                 if batch_size not in self._hstu_graph:
                     self._hstu_graph[batch_size] = dict()
-                for num_tokens in num_tokens_list:
-                    if num_tokens // batch_size > max_seq_len:
+                for seq_len in seqlen_list:
+                    if seq_len > max_seq_len:
                         break
+                    num_tokens = seq_len * batch_size
                     if num_tokens in self._hstu_graph[batch_size]:
                         continue
                     self._hstu_graph[batch_size][num_tokens] = self.capture_graph(

@@ -16,7 +16,6 @@
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -27,32 +26,23 @@ subprocess.run(
 )
 
 # TODO: update when torchrec release compatible commit.
-compatible_versions = "1.1.0"
+compatible_versions = "1.2.0"
 
 
 def check_torchrec_version():
     try:
         import torchrec
 
-        version = torchrec.__version__
+        version = re.match(r"^\d+\.\d+\.\d+", torchrec.__version__).group()
         if version >= compatible_versions:
             print(f"torchrec version {version} is installed.")
-            return True
+            return
         else:
-            print(
+            raise RuntimeError(
                 f"torchrec version {version} is installed, but version >= {compatible_versions} is required."
             )
-            return False
     except ImportError:
-        print("torchrec is not installed.")
-        return False
-
-
-def install_torchrec():
-    print(f"Installing torchrec version {compatible_versions}...")
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", f"torchrec=={compatible_versions}"]
-    )
+        raise RuntimeError("torchrec is not installed.")
 
 
 def find_source_files(directory, extension_pattern, exclude_dirs=[]):
@@ -69,8 +59,7 @@ def find_source_files(directory, extension_pattern, exclude_dirs=[]):
     return source_files
 
 
-if not check_torchrec_version():
-    install_torchrec()
+check_torchrec_version()
 
 library_name = "dynamicemb"
 

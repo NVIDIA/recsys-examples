@@ -43,7 +43,7 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
-from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, BaseEmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
 from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbedding,
@@ -196,22 +196,6 @@ def _validate_configs(
         # num_embeddings_per_rank = _get_safe_local_capacity(num_embeddings_per_rank, tmp_constraint.dynamicemb_options.bucket_capacity)
         num_embeddings_new = int(num_embeddings_per_rank * world_size)
         tmp_config.num_embeddings = num_embeddings_new
-        embedding_dim = tmp_config.embedding_dim
-        type_bits = DATA_TYPE_NUM_BITS[tmp_config.data_type]
-
-        embedding_table_memory_in_bytes = (
-            type_bits * embedding_dim * num_embeddings_new / 8
-        )
-        hbm_memory_size_in_bytes = (
-            tmp_constraint.dynamicemb_options.global_hbm_for_values
-        )
-
-        if embedding_table_memory_in_bytes < hbm_memory_size_in_bytes:
-            hbm_memory_size_in_bytes = embedding_table_memory_in_bytes
-
-        tmp_constraint.dynamicemb_options.global_hbm_for_values = (
-            hbm_memory_size_in_bytes
-        )
 
 
 def _dyn_emb_table_size_per_rank(
@@ -244,37 +228,18 @@ def _reserve_storage_for_dyn_emb(
     world_size = dist.get_world_size()
     for name, constraint in dyn_emb_table_const.items():
         tmp_table_config = dyn_emb_table_configs[name]
-        type_bits = DATA_TYPE_NUM_BITS[tmp_table_config.data_type]
 
         embedding_dim, num_embeddings_per_rank = _dyn_emb_table_size_per_rank(
             tmp_table_config, world_size
-        )
-        embedding_table_memory_in_bytes_per_rank = (
-            type_bits * embedding_dim * num_embeddings_per_rank / 8
         )
         # TODO: should HBM align with the power of 2
         HBM_memory_in_bytes_per_rank = _dyn_emb_table_hbm_size_per_rank(
             constraint, world_size
         )
-        if embedding_table_memory_in_bytes_per_rank < HBM_memory_in_bytes_per_rank:
-            HBM_memory_in_bytes_per_rank = embedding_table_memory_in_bytes_per_rank
 
         constraint.dynamicemb_options.local_hbm_for_values = (
             HBM_memory_in_bytes_per_rank
         )
-        # TODO: only estimate DynamicEmb table's memory , not include meta data , and kjt data memory
-        DDR_memory_in_bytes_per_rank = (
-            embedding_table_memory_in_bytes_per_rank - HBM_memory_in_bytes_per_rank
-        )
-        for device in topology.devices:
-            device.storage.hbm = device.storage.hbm - HBM_memory_in_bytes_per_rank
-            device.storage.ddr = device.storage.ddr - DDR_memory_in_bytes_per_rank
-
-            # Check if hbm or ddr is less than 0 and raise an error if so
-            if device.storage.hbm < 0 or device.storage.ddr < 0:
-                raise ValueError(
-                    "Please configure a smaller DynamicEmb table or configure the topology correctly."
-                )
 
 
 class DynamicEmbeddingShardingPlanner:
@@ -306,6 +271,7 @@ class DynamicEmbeddingShardingPlanner:
         topology : Optional[Topology], optional
             The topology of GPU and Host memory. If None, a default topology will be created. Defaults to None.
             The creation and usage are consistent with the same types in TorchREC.
+            Note: The memory budget does not include the consumption of dynamicemb.
         batch_size : Optional[int], optional
             The batch size for training. Defaults to None, will set 512 in Planner.
         enumerator : Optional[Enumerator], optional

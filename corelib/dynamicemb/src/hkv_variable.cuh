@@ -511,10 +511,10 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   set_curand_states(&curand_states_, stream);
   hkv_table_option_.init_capacity = init_capacity;
   hkv_table_option_.max_capacity = max_capacity;
-  hkv_table_option_.max_hbm_for_vectors =
-      max_hbm_for_vectors; // nv::merlin::GB(max_hbm_for_vectors);
-  hkv_table_option_.max_bucket_size = max_bucket_size;
   hkv_table_option_.dim = dim + get_optimizer_state_dim<ValueType>(optimizer_type, dim);
+  int64_t max_hbm_needed = hkv_table_option_.max_capacity * hkv_table_option_.dim * sizeof (ValueType);
+  hkv_table_option_.max_hbm_for_vectors = max_hbm_needed < max_hbm_for_vectors ? max_hbm_needed : max_hbm_for_vectors;
+  hkv_table_option_.max_bucket_size = max_bucket_size;
   hkv_table_option_.max_load_factor = max_load_factor;
   hkv_table_option_.block_size = block_size;
   hkv_table_option_.io_block_size = io_block_size;

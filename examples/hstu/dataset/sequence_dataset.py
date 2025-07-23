@@ -30,7 +30,6 @@ import json
 import math
 from collections import defaultdict
 from typing import Dict, Iterator, List, Optional, Tuple
-import os.path
 
 import numpy as np
 import pandas as pd
