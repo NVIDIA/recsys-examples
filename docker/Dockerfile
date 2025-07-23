@@ -48,6 +48,9 @@ RUN pip install --no-cache pre-commit
 FROM ${DEVEL_IMAGE} AS build
 
 WORKDIR /workspace/recsys-examples
+# to remove the pre-installed hstu packages of the previous build
+RUN rm -rf /workspace/recsys-examples/*
+# COPY the new cloned repo into workdir
 COPY . .
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
