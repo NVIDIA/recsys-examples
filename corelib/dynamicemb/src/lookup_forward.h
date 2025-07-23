@@ -52,5 +52,12 @@ void batched_vector_copy_device(void *src_ptr, void *dst_ptr, int batch_size,
                                 DataType dst_type, int num_sms,
                                 cudaStream_t stream);
 
+// Frequency masking functions
+void mask_embeddings_by_frequency(void *embeddings_ptr, void *scores_ptr,
+                                  int num_embeddings, int embedding_dim,
+                                  int frequency_threshold, int mask_dims,
+                                  DataType emb_type, DataType score_type,
+                                  int device_num_sms, cudaStream_t stream);
+
 } // namespace dyn_emb
 #endif // LOOKUP_FORWARD_H

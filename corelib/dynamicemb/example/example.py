@@ -391,7 +391,8 @@ def get_planner(device, eb_configs, batch_size):
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
-                score_strategy=DynamicEmbScoreStrategy.STEP,
+                # score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+                score_strategy=DynamicEmbScoreStrategy.LFU, #if you want set frequency_threshold and mask_dims
             ),
         )
 
@@ -446,6 +447,8 @@ def apply_dmp(model, args):
 
     fused_params = {}
     fused_params["output_dtype"] = SparseType.FP32
+    fused_params["frequency_threshold"] = 6
+    fused_params["mask_dims"] = 5
     fused_params.update(optimizer_kwargs)
 
     # precision of all-to-all
