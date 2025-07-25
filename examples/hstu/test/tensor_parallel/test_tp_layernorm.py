@@ -14,6 +14,7 @@
 # limitations under the License.
 import pytest
 import torch
+import torch.nn.functional as F
 from commons.utils import initialize as init
 from megatron.core import parallel_state
 from modules.tp_layer_norm import (
@@ -22,6 +23,21 @@ from modules.tp_layer_norm import (
     _divide_with_exception,
 )
 from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
+
+
+def ref_layernorm(x, weight, bias, eps, swish=False):
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    y = F.layer_norm(
+        x,
+        normalized_shape=(x.shape[-1],),
+        weight=weight,
+        bias=bias,
+        eps=eps,
+    )
+    if swish:
+        y = x * F.sigmoid(y)
+    return y.to(dtype)
 
 
 @pytest.mark.parametrize("hidden_dim", [32, 128, 256])
