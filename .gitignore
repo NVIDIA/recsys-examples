@@ -30,3 +30,4 @@ embedding_checkpoint/
 .DS_Store
 *.pickle
 *.xlsx
+pcie_lookup_poc/*

@@ -57,7 +57,7 @@ def run_ranking_gr_inference():
     inference_dtype = torch.bfloat16
     hstu_cudagraph_configs = {
         "batch_size": [1, 2, 4, 8],
-        "length_per_sequence": [i * 256 in range(2, 18)],
+        "length_per_sequence": [i * 256 for i in range(2, 18)],
     }
 
     hstu_config = get_inference_hstu_config(
