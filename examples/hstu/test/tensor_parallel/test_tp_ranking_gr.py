@@ -49,6 +49,9 @@ def test_gr_tp_ranking_initialization(tp_size: int):
     dtype: torch.dtype = torch.bfloat16
 
     init.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+    if world_size < tp_size:
+        pytest.skip("TP size is larger than world size")
     init.initialize_model_parallel(tp_size)
     debug_model, dense_optimizer, history_batches = create_model(
         task_type="ranking",
