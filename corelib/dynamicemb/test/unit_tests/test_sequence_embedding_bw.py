@@ -112,6 +112,7 @@ def test(args):
             initializer_args=DynamicEmbInitializerArgs(
                 mode=DynamicEmbInitializerMode.DEBUG,
             ),
+            caching=args.caching,
         )
         for num_emb in args.num_embeddings_per_feature
     ]
@@ -254,6 +255,7 @@ def main(argv: List[str]) -> None:
         default=True,
         help="Use index deduplication (default: True).",
     )
+    parser.add_argument("--caching", action="store_true")
 
     args = parser.parse_args()
     args.num_embeddings_per_feature = [
