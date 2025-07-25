@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from commons.utils.distributed_utils import collective_assert
-from megatron.core.distributed import finalize_model_grads
+from distributed.finalize_model_grads import finalize_model_grads
 from test_utils import assert_equal_two_state_dict, create_model
 
 
@@ -87,6 +87,51 @@ def test_checkpoint_model(
 
     model.eval()
     new_model.eval()
+    from commons.checkpoint import get_unwrapped_module
+
+    mp_ec = get_unwrapped_module(
+        model
+    )._embedding_collection  # ._model_parallel_embedding_collection
+    new_model_unwrapped = get_unwrapped_module(new_model)._embedding_collection
+    # check item embedding export
+    item_keys_before, item_values_before = mp_ec.export_local_embedding("item")
+    item_keys_after, item_values_after = new_model_unwrapped.export_local_embedding(
+        "item"
+    )
+    item_keys_before = torch.from_numpy(item_keys_before).cuda()
+    item_values_before = torch.from_numpy(item_values_before).cuda()
+    item_keys_after = torch.from_numpy(item_keys_after).cuda()
+    item_values_after = torch.from_numpy(item_values_after).cuda()
+
+    sorted_item_keys_values_before, sorted_item_keys_indices_before = torch.sort(
+        item_keys_before, dim=0
+    )
+    sorted_item_keys_values_after, sorted_item_keys_indices_after = torch.sort(
+        item_keys_after, dim=0
+    )
+
+    all_emb_before, all_emb_after = (
+        item_values_before[sorted_item_keys_indices_before],
+        item_values_after[sorted_item_keys_indices_after],
+    )
+    assert torch.allclose(
+        all_emb_before, all_emb_after
+    ), f"[rank{dist.get_rank()}] item values should be the same"
+    assert torch.allclose(
+        sorted_item_keys_values_before, sorted_item_keys_values_after
+    ), f"[rank{dist.get_rank()}] item keys should be the same"
+    # batches are replicated
+    batch = history_batches[0]
+    kjt = batch.features
+    output_before = mp_ec._model_parallel_embedding_collection(kjt).wait()["item_feat"]
+    output_after = new_model_unwrapped._model_parallel_embedding_collection(kjt).wait()[
+        "item_feat"
+    ]
+
+    assert torch.allclose(
+        output_before.values(), output_after.values()
+    ), f"[rank{dist.get_rank()}] output should be the same"
+
     for batch in history_batches:
         with torch.random.fork_rng():  # randomness negative sampling
             loss, _ = model(batch)

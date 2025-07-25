@@ -23,9 +23,9 @@ from commons.utils.hstu_assert_close import assert_hstu_close
 from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
 from megatron.core.transformer.module import Float16Module
+from modules.debug.debug_hstu_layer import HSTULayer
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
-from modules.native_hstu_layer import HSTULayer
 from ops.fused_hstu_op import fused_hstu_op
 from ops.length_to_offsets import length_to_complete_offsets
 
@@ -129,9 +129,15 @@ def generate_or_copy_parameters(
                 .to(dtype)
                 .requires_grad_()
             )
+            src_linear_uvqk_weight = input_module._linear_uvqk.weight.data
+            input_size = src_linear_uvqk_weight.size(1)
+            output_size = src_linear_uvqk_weight.size(0)
             linear_uvqk_weight = (
-                torch.empty_like(input_module._linear_uvqk.weight.data)
-                .copy_(input_module._linear_uvqk.weight.data)
+                torch.empty_like(src_linear_uvqk_weight)
+                .copy_(src_linear_uvqk_weight)
+                .reshape(num_heads, 4, -1, input_size)
+                .transpose(0, 1)
+                .reshape(output_size, input_size)
                 .t()
                 .to(dtype)
                 .requires_grad_()
@@ -394,7 +400,7 @@ def test_hstu_attn(
 @pytest.mark.parametrize("max_history_seqlen", [32, 200])
 @pytest.mark.parametrize("max_num_targets", [4, 0])
 @pytest.mark.parametrize("max_num_contextuals", [0, 4, 6])
-@pytest.mark.parametrize("num_heads", [1, 2, 8])
+@pytest.mark.parametrize("num_heads", [2, 8, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [128])
 @pytest.mark.parametrize("dropout_ratio", [0.0])
 @pytest.mark.parametrize("training", [True])
@@ -447,7 +453,7 @@ def test_fused_hstu_op(
         is_causal=causal,
         kernel_backend=attn_backend,  # attn_backend
         target_group_size=target_group_size,
-        hstu_layer_type=HSTULayerType.NATIVE,
+        hstu_layer_type=HSTULayerType.DEBUG,
         learnable_input_layernorm=learnable_ln,
         residual=residual,
         async_wgrad=async_wgrad,
@@ -610,6 +616,9 @@ def test_fused_hstu_op(
     fp32_ref_out.backward(dout.detach().clone().float())
     with torch.no_grad():
         out.backward(dout.detach().clone())
+    # dst
+    input_size = linear_uvqk_weight.size(0)
+    output_size = linear_uvqk_weight.size(1)
     grad_to_compared = OrderedDict(
         {
             "input_norm_weight": (
@@ -624,15 +633,30 @@ def test_fused_hstu_op(
                 input_module._input_layernorm_bias.grad if learnable_ln else None,
                 fp32_input_module._input_layernorm_bias.grad if learnable_ln else None,
             ),
+            # uvqk weight and bias layout is different from debug.
             "linear_uvqk_weight": (
                 linear_uvqk_weight.grad,
-                input_module._linear_uvqk.weight.grad.t(),
-                fp32_input_module._linear_uvqk.weight.grad.t(),
+                input_module._linear_uvqk.weight.grad.reshape(
+                    num_heads, 4, -1, input_size
+                )
+                .transpose(0, 1)
+                .reshape(output_size, input_size)
+                .t(),
+                fp32_input_module._linear_uvqk.weight.grad.reshape(
+                    num_heads, 4, -1, input_size
+                )
+                .transpose(0, 1)
+                .reshape(output_size, input_size)
+                .t(),
             ),
             "linear_uvqk_bias": (
                 linear_uvqk_bias.grad,
-                input_module._linear_uvqk.bias.grad,
-                fp32_input_module._linear_uvqk.bias.grad,
+                input_module._linear_uvqk.bias.grad.reshape(num_heads, 4, -1)
+                .transpose(0, 1)
+                .reshape(output_size, -1),
+                fp32_input_module._linear_uvqk.bias.grad.reshape(num_heads, 4, -1)
+                .transpose(0, 1)
+                .reshape(output_size, -1),
             ),
             "output_norm_weight": (
                 output_norm_weight.grad if learnable_ln else None,

@@ -34,12 +34,14 @@ class HSTULayerType(Enum):
     Enum class representing different HSTU layer types.
 
     Attributes:
-      FUSED: Represents the fused type. The fused layer is scheduleable and pipelineable
-      NATIVE: Represents the non-fused type.
+      FUSED: Represents the fused type. The fused layer is scheduleable and pipelineable. Does not support TP. This will be deprecated in the future.
+      NATIVE: Represents the non-fused type. Support TP.
+      DEBUG: Represents the debug type. This does not support TP and is used for debugging.
     """
 
     FUSED = "FUSED"
     NATIVE = "NATIVE"
+    DEBUG = "DEBUG"
 
 
 @unique
@@ -100,6 +102,7 @@ class HSTUConfig(TransformerConfig):
     enable_relative_attention_bias: bool = False
 
     kernel_backend: KernelBackend = KernelBackend.CUTLASS
+    # TODO deprecate FUSED
     hstu_layer_type: HSTULayerType = HSTULayerType.FUSED
 
     target_group_size: int = 1
@@ -115,6 +118,8 @@ class HSTUConfig(TransformerConfig):
     recompute_input_silu: bool = False
     # whether is the inference mode
     is_inference: bool = False
+    add_uvqk_bias: bool = True
+    fuse_norm_mul_dropout: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -139,6 +144,8 @@ def get_hstu_config(
     recompute_input_layernorm: bool = False,
     recompute_input_silu: bool = False,
     is_inference: bool = False,
+    add_uvqk_bias: bool = True,
+    fuse_norm_mul_dropout: bool = True,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -203,4 +210,7 @@ def get_hstu_config(
         async_wgrad_event=async_wgrad_event,
         recompute_input_layernorm=recompute_input_layernorm,
         recompute_input_silu=recompute_input_silu,
+        add_uvqk_bias=add_uvqk_bias,
+        is_inference=is_inference,
+        fuse_norm_mul_dropout=fuse_norm_mul_dropout,
     )

@@ -22,6 +22,7 @@ import gin
 @dataclass
 class TrainerArgs:
     # below batchsize is batchsize_per_gpu
+    # when TP is enabled, the theoratical batchsize is (train_batch_size * tp_size)
     train_batch_size: int
     eval_batch_size: int
 

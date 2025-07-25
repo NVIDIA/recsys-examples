@@ -1,4 +1,4 @@
-TrainerArgs.train_batch_size = 8
+TrainerArgs.train_batch_size = 4
 TrainerArgs.eval_batch_size = 8
 TrainerArgs.log_interval = 10
 TrainerArgs.eval_interval = 10
@@ -15,6 +15,8 @@ NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 512
 NetworkArgs.kv_channels = 128
 
+NetworkArgs.layer_type = 'native' # only native supports tp!
+
 RankingArgs.prediction_head_arch = [
     512, 8
 ]
@@ -23,3 +25,5 @@ RankingArgs.num_tasks = 8
 
 OptimizerArgs.optimizer_str = 'adam'
 OptimizerArgs.learning_rate = 1e-3
+
+TensorModelParallelArgs.tensor_model_parallel_size = 2

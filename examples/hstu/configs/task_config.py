@@ -34,6 +34,7 @@ class OptimizerParam:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-08
+    weight_decay: float = 0.01
 
 
 @dataclass

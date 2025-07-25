@@ -45,7 +45,7 @@ def test_layernorm_swish(input_dtype, swish, hidden_dim):
     init.set_random_seed(1234)
     world_size = torch.distributed.get_world_size()
     if world_size > 1:
-        return
+        pytest.skip("Skip test in distributed mode")
     device = torch.cuda.current_device()
     eps = 1e-5
     batchsize = 128
@@ -74,6 +74,5 @@ def test_layernorm_swish(input_dtype, swish, hidden_dim):
 
     y.backward(dout)
     ref_y.backward(dout)
-    # import pdb; pdb.set_trace()
     torch.testing.assert_close(ln_weight.grad, ref_weight.grad)
     torch.testing.assert_close(ln_bias.grad, ref_bias.grad)

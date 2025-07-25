@@ -40,8 +40,8 @@ from typing import (
 import nvtx
 import torch
 from commons.utils.distributed_utils import collective_assert
+from distributed.finalize_model_grads import finalize_model_grads
 from megatron.core import parallel_state
-from megatron.core.distributed import finalize_model_grads
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from pipeline.utils import (
     In,
@@ -814,6 +814,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             # backward
             with nvtx.annotate("## backward ##"):
                 dp_size = parallel_state.get_data_parallel_world_size()
+                # in case of uneven jagged size across dp ranks.
                 local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
                 local_loss_average.backward()
 
@@ -887,6 +888,9 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             # backward
             with nvtx.annotate("## backward ##"):
                 dp_size = parallel_state.get_data_parallel_world_size()
+                # in case of uneven jagged size across dp ranks.
+                # this cannot solve the issue completely because of the allreduce avg across DP ranks. To solve it completely, we need to perform sum reduce.
+                # see https://github.com/NVIDIA/Megatron-LM/blob/v0.12.0rc3/megatron/core/distributed/distributed_data_parallel.py#L237-L240
                 local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
                 local_loss_average.backward()
 

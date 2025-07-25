@@ -22,25 +22,11 @@ from commons.utils.hstu_assert_close import assert_hstu_close
 from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
 from megatron.core.transformer.module import Float16Module
+from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
-from modules.native_hstu_layer import HSTULayer
 from ops.length_to_offsets import length_to_complete_offsets
-
-
-def init_weights_from_native(native_module: HSTULayer, fused_module: FusedHSTULayer):
-    import re
-
-    for name, param in native_module.named_parameters():
-        # linear layer weight is transposed in the fused module
-        fused_accessor = name.replace(".weight", "_weight").replace(".bias", "_bias")
-        src_data = (
-            param.data.t()
-            if re.match(r".*linear\w*_weight$", fused_accessor)
-            else param.data
-        )
-        if param.requires_grad:
-            fused_module.state_dict()[fused_accessor].data.copy_(src_data)
+from test_utils import init_fused_weights_from_debug
 
 
 @pytest.mark.parametrize(
@@ -54,7 +40,7 @@ def init_weights_from_native(native_module: HSTULayer, fused_module: FusedHSTULa
 @pytest.mark.parametrize("max_history_seqlen", [128, 200])
 @pytest.mark.parametrize("max_num_targets", [16])
 @pytest.mark.parametrize("max_num_contextuals", [2, 0])
-@pytest.mark.parametrize("num_heads", [1, 8])
+@pytest.mark.parametrize("num_heads", [8, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [64, 128])
 @pytest.mark.parametrize("dropout_ratio", [0.0])
 @pytest.mark.parametrize("attn_backend", [KernelBackend.CUTLASS])
@@ -99,13 +85,13 @@ def test_fused_hstu_layer(
         is_causal=causal,
         kernel_backend=attn_backend,  # attn_backend
         target_group_size=target_group_size,
-        hstu_layer_type=HSTULayerType.NATIVE,
+        hstu_layer_type=HSTULayerType.DEBUG,
         learnable_input_layernorm=learnable_ln,
         residual=residual,
         async_wgrad=async_wgrad,
     )
     # hstu_config.kernel_backend = KernelBackend.PYTORCH
-    ref_hstu_layer = HSTULayer(hstu_config)
+    ref_hstu_layer = DebugHSTULayer(hstu_config)
     # to create fused hstu layer
     hstu_config.hstu_layer_type = HSTULayerType.FUSED
 
@@ -115,14 +101,14 @@ def test_fused_hstu_layer(
 
     hstu_config.kernel_backend = KernelBackend.PYTORCH
     hstu_config.dtype = torch.float32
-    hstu_config.hstu_layer_type = HSTULayerType.NATIVE
-    fp32_ref_hstu_layer = HSTULayer(hstu_config)
+    hstu_config.hstu_layer_type = HSTULayerType.DEBUG
+    fp32_ref_hstu_layer = DebugHSTULayer(hstu_config)
 
     fp32_ref_hstu_layer.cuda()
     fp32_ref_hstu_layer.load_state_dict(ref_hstu_layer.state_dict())
 
-    init_weights_from_native(
-        native_module=ref_hstu_layer, fused_module=fused_hstu_layer
+    init_fused_weights_from_debug(
+        debug_module=ref_hstu_layer, fused_module=fused_hstu_layer, num_heads=num_heads
     )
     if dtype != torch.float32:
         ref_hstu_layer = Float16Module(hstu_config, ref_hstu_layer)

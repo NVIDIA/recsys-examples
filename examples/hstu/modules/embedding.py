@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import os
 
 # pyre-strict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -51,7 +52,6 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-from torchrec.types import ModuleNoCopyMixin
 
 
 def create_data_parallel_sharding_infos_by_sharding(
@@ -129,7 +129,8 @@ def create_data_parallel_sharding_infos_by_sharding(
     return sharding_type_to_sharding_infos
 
 
-class DataParallelEmbeddingCollection(torch.nn.Module, ModuleNoCopyMixin):
+# TODO add wgrad allreduce sum across tp ranks in finalize model grads!
+class DataParallelEmbeddingCollection(torch.nn.Module):
     """
     Sharded implementation of `EmbeddingCollection`.
     This is part of the public API to allow for manual data dist pipelining.
@@ -193,11 +194,16 @@ class DataParallelEmbeddingCollection(torch.nn.Module, ModuleNoCopyMixin):
         """
         self.embeddings: nn.ModuleDict = nn.Module()
         assert len(self._dp_lookups[0]._emb_modules) == 1
+        param_name = f"{'/'.join(self._table_names)}_weights"
         self.embeddings.register_parameter(
-            f"{'/'.join(self._table_names)}_weights",
+            param_name,
             self._dp_lookups[0]._emb_modules[0].emb_module.weights,
         )
-
+        setattr(
+            self._dp_lookups[0]._emb_modules[0].emb_module.weights,
+            "need_tp_allreduce",
+            True,
+        )
         self.embedding_weights: Dict[str, torch.Tensor] = {}
 
         for (
@@ -318,12 +324,25 @@ class ShardedEmbedding(torch.nn.Module):
         else:
             self._data_parallel_embedding_collection = None
             self._side_stream = None
-
+        self.freeze_embedding = os.environ.get("FREEZE_EMBEDDING", "0")
         # for nvtx setting, we need to get the tensor from the output dict and set it back to the output dict
         register_setter_and_getter_for_nvtx(
             ShardedEmbedding.forward,
             key_or_attr_name=[embedding_configs[0].feature_names[0], "_values"],
         )
+
+    def _maybe_detach(self, embeddings):
+        """
+        Detach the embeddings if the freeze_embedding is 1. For debugging purpose.
+        Args:
+            embeddings (Dict[str, JaggedTensor]): The embeddings to be detached.
+        Returns:
+            Dict[str, JaggedTensor]: The detached embeddings.
+        """
+        if self.freeze_embedding == "1":
+            for key, embedding in embeddings.items():
+                embedding._values = embedding._values.detach()
+        return embeddings
 
     @output_nvtx_hook(nvtx_tag="ShardedEmbedding")
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:

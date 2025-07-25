@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Tuple
+from typing import Dict, Tuple
 
 import torch
 from configs import HSTUConfig, RankingConfig
 from dataset.utils import RankingBatch
+from distributed.dmp_to_tp import dmp_batch_to_tp, jt_dict_grad_scaling_and_allgather
 from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.embedding import ShardedEmbedding
@@ -24,6 +25,7 @@ from modules.hstu_block import HSTUBlock
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP
 from modules.multi_task_loss_module import MultiTaskLossModule
+from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
 class RankingGR(BaseModel):
@@ -44,9 +46,6 @@ class RankingGR(BaseModel):
     ):
         super().__init__()
         self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        assert (
-            self._tp_size == 1
-        ), "RankingGR does not support tensor model parallel for now"
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._hstu_config = hstu_config
         self._task_config = task_config
@@ -115,13 +114,28 @@ class RankingGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The logits and labels.
         """
-        embeddings = self._embedding_collection(batch.features)
-        hidden_states = self._hstu_block(
+        # DMP embedding
+        embeddings: Dict[str, JaggedTensor] = self._embedding_collection(batch.features)
+        # maybe freeze embedding for debugging
+        embeddings = self._embedding_collection._maybe_detach(embeddings)
+        # For model-parallel embedding, torchrec does gradient division by (tp_size * dp_size). However, we only need to divide by dp size. In such case, we need to scale the gradient by tp_size.
+        # But simultaneously, the DP embedding might be scaled by tp_size unintentionally. On the other hand, the DDP will divide the DP embedding gradient by dp_size (allreduce avg).
+        # We need to perform allreduce sum across tp ranks after/before the DDP allreduce avg.
+        grad_scaling_factor = self._tp_size
+        embeddings = jt_dict_grad_scaling_and_allgather(
+            embeddings,
+            grad_scaling_factor,
+            parallel_state.get_tensor_model_parallel_group(),
+        )
+        batch = dmp_batch_to_tp(batch)
+        # hidden_states is a JaggedData
+        hidden_states_jagged = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
         )
-
-        return self._mlp(hidden_states.values), batch.labels
+        hidden_states = hidden_states_jagged.values
+        logits = self._mlp(hidden_states)
+        return logits, batch.labels
 
     def forward(  # type: ignore[override]
         self,
