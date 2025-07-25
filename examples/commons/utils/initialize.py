@@ -16,7 +16,13 @@ import gc
 import os
 
 import torch
-from megatron.core import parallel_state, tensor_parallel
+
+try:
+    from megatron.core import parallel_state, tensor_parallel
+except ImportError:
+    print("megatron.core is not installed, training is not supported.")
+    parallel_state = None
+    tensor_parallel = None
 
 
 def initialize_single_rank():
