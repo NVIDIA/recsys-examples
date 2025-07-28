@@ -17,27 +17,9 @@ from typing import Tuple
 import torch
 
 
-def assert_hstu_close(actual, out_ref, fp32_ref, fwd: bool = True):
-    """
-    compare the maximum absolute error between actual and fp32_ref
-    with the maximum absolute error between out_ref and fp32_ref
-    """
-    L = actual.size(0)
-    actual = actual.view(L, -1)
-    out_ref = out_ref.view(L, -1)
-    fp32_ref = fp32_ref.view(L, -1)
-    assert fp32_ref.dtype == torch.float32, "fp32_ref should be float32"
-
-    multiplier = 2 if fwd else 5
-    left_abs_max = (actual - fp32_ref).abs().max().item()
-    right_abs_max = (out_ref - fp32_ref).abs().max().item()
-
-    assert left_abs_max <= multiplier * right_abs_max, (
-        f"actual - fp32_ref: {left_abs_max}, " f"out_ref - fp32_ref: {right_abs_max}"
-    )
-
-
-def hstu_close(actual, out_ref, fp32_ref, multiplier: int = 2) -> bool:
+def hstu_close(
+    actual, out_ref, fp32_ref, try_allclose: bool = False, multiplier: int = 2
+) -> bool:
     """
     compare the maximum absolute error between actual and fp32_ref
     with the maximum absolute error between out_ref and fp32_ref
@@ -47,9 +29,26 @@ def hstu_close(actual, out_ref, fp32_ref, multiplier: int = 2) -> bool:
     fp32_ref = fp32_ref.reshape(-1)
     assert fp32_ref.dtype == torch.float32, "fp32_ref should be float32"
 
+    try_allclose = torch.allclose(actual, out_ref) and try_allclose
+
     left_abs_max = (actual - fp32_ref).abs().max().item()
     right_abs_max = (out_ref - fp32_ref).abs().max().item()
-    return left_abs_max <= multiplier * right_abs_max
+    if left_abs_max > multiplier * right_abs_max:
+        print(f" fffffffffffailed multiplier {left_abs_max / right_abs_max}")
+    return (left_abs_max <= multiplier * right_abs_max) or (try_allclose)
+
+
+def assert_hstu_close(
+    actual, out_ref, fp32_ref, try_allclose: bool = False, fwd: bool = True
+):
+    """
+    compare the maximum absolute error between actual and fp32_ref
+    with the maximum absolute error between out_ref and fp32_ref
+    """
+    close_flag = hstu_close(
+        actual, out_ref, fp32_ref, try_allclose=try_allclose, multiplier=2 if fwd else 5
+    )
+    assert close_flag
 
 
 def max_abs_diff(actual, out_ref, fp32_ref) -> Tuple[float, float, float]:

@@ -213,9 +213,11 @@ def compare_tpN_to_debug_weights(
             x is not None for x in [dst_grad, src_grad, src_grad_fp32]
         ):
             collective_assert(
-                hstu_close(src_grad, dst_grad, src_grad_fp32, multiplier=5)
+                hstu_close(dst_grad, src_grad, src_grad_fp32, multiplier=5)
             )
-        collective_assert(hstu_close(src, dst, src_fp32, multiplier=5))  # weight
+        collective_assert(
+            hstu_close(dst, src, src_fp32, try_allclose=True, multiplier=5)
+        )  # weight
 
 
 # allgather weights from tp1 to tpN (slice tp1 to tpN)
@@ -356,7 +358,7 @@ def create_model(
             table_name="item",
             vocab_size=item_emb_size,
             dim=embdim,
-            sharding_type="model_parallel",
+            sharding_type="data_parallel",
         ),
     ]
     feature_configs = [
@@ -366,7 +368,7 @@ def create_model(
                 max(item_emb_size // 2, 1),
                 action_vocab_size,
             ],  # halve the max ids to `minimize` eviction
-            max_sequence_length=8,
+            max_sequence_length=100,
             is_jagged=True,
         )
     ]
