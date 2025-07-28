@@ -32,7 +32,7 @@ from pipeline.train_pipeline import (
     JaggedMegatronTrainPipelineSparseDist,
 )
 from training.gin_config_args import TrainerArgs
-from training.utils import cal_flops_per_sample
+from training.utils import cal_flops
 
 
 def evaluate(
@@ -139,6 +139,8 @@ def train_with_pipeline(
     max_train_iters = trainer_args.max_train_iters or len(train_loader)
     gpu_timer.start()
     last_td = 0
+    # used to compute achieved flops/s
+    ddp_seqlens = []
     # using a tensor on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
     # limit the number of iters to max_train_iters
@@ -172,8 +174,9 @@ def train_with_pipeline(
                     local_loss,
                     logits,
                     labels,
-                    max_seqlen,
+                    ddp_seqlen,
                 ) = pipeline.progress(batched_iterator)
+                ddp_seqlens.append(ddp_seqlen.view(-1))
                 tokens_logged += reporting_loss[1]
                 torch.cuda.nvtx.range_pop()
             except StopIteration:
@@ -184,18 +187,15 @@ def train_with_pipeline(
             if train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0:
                 gpu_timer.stop()
                 cur_td = gpu_timer.elapsed_time() - last_td
-                flops = (
-                    cal_flops_per_sample(
-                        get_unwrapped_module(pipeline._model)._hstu_config, max_seqlen
-                    )
-                    * trainer_args.log_interval
-                    * trainer_args.train_batch_size
+                flops = cal_flops(
+                    get_unwrapped_module(pipeline._model)._hstu_config, ddp_seqlens
                 )
                 print_rank_0(
-                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, FLOPS {flops / cur_td / 1e9:.2f} GFLOPS]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, FLOPS {flops / cur_td / 1e9:.2f} GFLOPS/GPU]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
                 )
                 last_td = cur_td + last_td
                 tokens_logged.zero_()
+                ddp_seqlens = []
         # TODO CHECK if train pipeline is flushed
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
             pipeline._model.eval()
