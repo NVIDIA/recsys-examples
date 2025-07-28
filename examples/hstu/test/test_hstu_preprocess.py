@@ -98,7 +98,7 @@ def test_hstu_preprocess(
     if action_feature_name is not None:
         action_embedding = embedding_dict[action_feature_name].values()
 
-    jd = hstu_block.hstu_preprocess(embeddings=embeddings, batch=batch)
+    jd = hstu_block._preprocessor(embeddings=embeddings, batch=batch)
     for sample_id in range(batch_size):
         start, end = jd.seqlen_offsets[sample_id], jd.seqlen_offsets[sample_id + 1]
         cur_sequence_embedding = jd.values[start:end, :]
@@ -133,7 +133,7 @@ def test_hstu_preprocess(
                 ), "action embedding not match"
                 idx += 1
 
-    result_jd = hstu_block.hstu_postprocess(jd)
+    result_jd = hstu_block._postprocessor(jd)
     for sample_id in range(batch_size):
         start, end = (
             result_jd.seqlen_offsets[sample_id],

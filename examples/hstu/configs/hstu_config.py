@@ -78,11 +78,18 @@ class PositionEncodingConfig:
 
 
 @dataclass
+class HSTUPreprocessingConfig:
+    item_embedding_dim: int
+    contextual_embedding_dim: int
+
+
+@dataclass
 class HSTUConfig(TransformerConfig):
     """
     HSTUConfig is a configuration data class for the HSTU model, inheriting from TransformerConfig.
 
     Args:
+      hstu_preprocessing_config (HSTUPreprocessingConfig): HSTU preprocessing config. Defaults to None.
       position_encoding_config (PositionEncodingConfig): Position embedding config. Defaults to None.
       is_causal (bool): Indicates if the model is causal. Defaults to True.
       enable_relative_attention_bias (bool): Flag to enable relative attention bias. Defaults to False.
@@ -97,6 +104,7 @@ class HSTUConfig(TransformerConfig):
       recompute_input_silu (bool): Flag to enable recompute input silu. Defaults to False.
     """
 
+    hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None
     position_encoding_config: Optional[PositionEncodingConfig] = None
     is_causal: bool = True
     enable_relative_attention_bias: bool = False
@@ -131,6 +139,7 @@ def get_hstu_config(
     num_attention_heads,
     num_layers,
     dtype,
+    hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None,
     position_encoding_config: Optional[PositionEncodingConfig] = None,
     hidden_dropout=0.2,
     norm_epsilon=1e-5,
@@ -156,6 +165,7 @@ def get_hstu_config(
         num_attention_heads (int): Number of attention heads.
         num_layers (int): Number of attention layers.
         dtype (torch.dtype): Data type (e.g., torch.float16).
+        hstu_preprocessing_config (Optional[HSTUPreprocessingConfig], optional): HSTU preprocessing config. Defaults to None.
         position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.
         hidden_dropout (float, optional): Dropout rate for hidden layers. Defaults to 0.2.
         norm_epsilon (float, optional): Epsilon value for normalization. Defaults to 1e-5.
@@ -181,6 +191,7 @@ def get_hstu_config(
         async_wgrad_stream = None
         async_wgrad_event = None
     return HSTUConfig(  # type: ignore
+        hstu_preprocessing_config=hstu_preprocessing_config,
         position_encoding_config=position_encoding_config,
         hidden_size=hidden_size,
         kv_channels=kv_channels,

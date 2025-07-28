@@ -358,7 +358,7 @@ class InferenceRankingGR(torch.nn.Module):
     ):
         with torch.inference_mode():
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
-            jagged_data = self._hstu_block.hstu_preprocess(
+            jagged_data = self._hstu_block._preprocessor(
                 embeddings=self._embedding_collection(batch.features),
                 batch=batch,
             )
@@ -400,7 +400,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.current_stream()
             )
 
-            jagged_data = self._hstu_block.hstu_postprocess(jagged_data)
+            jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._dense_module(jagged_data.values)
             self._offload_states = self.offload_kv_cache_async(
                 user_ids, kvcache_metadata

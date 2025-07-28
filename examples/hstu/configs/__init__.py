@@ -2,6 +2,7 @@ from . import hstu_config, inference_config, task_config
 from .hstu_config import (
     HSTUConfig,
     HSTULayerType,
+    HSTUPreprocessingConfig,
     KernelBackend,
     PositionEncodingConfig,
     get_hstu_config,
@@ -29,6 +30,7 @@ __all__ = [
     "task_config",
     "ConfigType",
     "PositionEncodingConfig",
+    "HSTUPreprocessingConfig",
     "HSTUConfig",
     "get_hstu_config",
     "RankingConfig",

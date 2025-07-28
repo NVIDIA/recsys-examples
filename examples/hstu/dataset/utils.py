@@ -77,6 +77,32 @@ class Batch:
         )
         assert isinstance(self.max_num_candidates, int)
 
+    def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":  # type: ignore
+        """
+        Move the batch to the specified device.
+
+        Args:
+            device (torch.device): The device to move the batch to.
+            non_blocking (bool, optional): Whether to perform the move asynchronously. Defaults to False.
+
+        Returns:
+            RankingBatch: The batch on the specified device.
+        """
+        return Batch(
+            features=self.features.to(device=device, non_blocking=non_blocking),
+            batch_size=self.batch_size,
+            feature_to_max_seqlen=self.feature_to_max_seqlen,
+            contextual_feature_names=self.contextual_feature_names,
+            item_feature_name=self.item_feature_name,
+            action_feature_name=self.action_feature_name,
+            max_num_candidates=self.max_num_candidates,
+            num_candidates=self.num_candidates.to(
+                device=device, non_blocking=non_blocking
+            )
+            if self.num_candidates is not None
+            else None,
+        )
+
     @staticmethod
     def random(
         batch_size: int,

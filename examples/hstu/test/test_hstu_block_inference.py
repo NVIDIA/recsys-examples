@@ -142,7 +142,7 @@ def test_hstu_process_inference():
 
             embs = model_predict._embedding_collection(batch.features)
 
-            jd = model_predict._hstu_block.hstu_preprocess(embs, batch)
+            jd = model_predict._hstu_block._preprocessor(embs, batch)
 
             history_lens = [
                 (jd.seqlen[i].item() - jd.num_candidates[i].item()) // 2
@@ -207,7 +207,7 @@ def test_hstu_process_inference():
             )
 
             # post process
-            post_jd = model_predict._hstu_block.hstu_postprocess(jd)
+            post_jd = model_predict._hstu_block._postprocessor(jd)
             original_candidates = torch.tensor(
                 [
                     embs["item_feat"].offsets()[i].item() + history_lens[i] + token_idx

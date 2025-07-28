@@ -150,6 +150,9 @@ class NetworkArgs:
     recompute_input_layernorm: bool = False
     recompute_input_silu: bool = False
 
+    item_embedding_dim: int = -1
+    contextual_embedding_dim: int = -1
+
     def __post_init__(self):
         assert self.dtype_str in [
             "bfloat16",
