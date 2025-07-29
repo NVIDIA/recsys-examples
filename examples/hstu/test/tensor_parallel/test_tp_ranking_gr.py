@@ -22,7 +22,6 @@ from commons.checkpoint import get_unwrapped_module
 from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend
-from distributed.dmp_to_tp import dmp_batch_to_tp
 from megatron.core import parallel_state
 from pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from test_utils import (
@@ -247,10 +246,6 @@ def test_tp_gr_ranking_forward_backward_update(
         tp_dense_optimizer,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
-    # for debug model, the tp is fake, so we need to gather the batches across tp. The wgrad will be reduced across DP ranks.
-    gathered_batches_across_tp = [
-        dmp_batch_to_tp(batch, exclude_features=False) for batch in history_batches
-    ]
     iter_history_batches = iter(history_batches)
     debug_pipeline_batches = iter(history_batches)
     debug_pipeline_batches_fp32 = iter(history_batches)
