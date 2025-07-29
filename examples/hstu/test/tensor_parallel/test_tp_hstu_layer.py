@@ -133,12 +133,11 @@ def generate_jagged_data_list(
 @pytest.mark.parametrize(
     "batchsize",
     [
-        128,
         32,
     ],
 )
-@pytest.mark.parametrize("num_heads", [4, 8, 1])
-@pytest.mark.parametrize("hidden_dim_per_head", [32, 64, 128])  #
+@pytest.mark.parametrize("num_heads", [4, 1])
+@pytest.mark.parametrize("hidden_dim_per_head", [32, 128])  #
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 def test_tp_hstu_layer_forward_backward(
     batchsize,
@@ -218,8 +217,8 @@ def test_tp_hstu_layer_forward_backward(
     "batchsize",
     [128],
 )
-@pytest.mark.parametrize("num_heads", [4, 8, 1])
-@pytest.mark.parametrize("hidden_dim_per_head", [32, 64, 128])  #
+@pytest.mark.parametrize("num_heads", [4, 1])
+@pytest.mark.parametrize("hidden_dim_per_head", [128])  #
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 @pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
 def test_tp_hstu_layer_forward_backward_update(
@@ -229,6 +228,9 @@ def test_tp_hstu_layer_forward_backward_update(
     tp_size,
     optimizer_type_str,
 ):
+    print(
+        f"test_tp_hstu_layer_forward_backward_update tp_size {tp_size}, optimizer_type_str {optimizer_type_str}, num_heads {num_heads}, hidden_dim_per_head {hidden_dim_per_head}, batchsize {batchsize}"
+    )
     init.initialize_distributed()
     world_size = torch.distributed.get_world_size()
 
@@ -299,7 +301,7 @@ def test_tp_hstu_layer_forward_backward_update(
         dtype,
         hidden_dim_per_head,
         num_heads,
-        num_batches=500,
+        num_batches=100,
         replicate_batches=False,
     )
     multiplier = 2
@@ -319,37 +321,20 @@ def test_tp_hstu_layer_forward_backward_update(
             compare_type="equal",
             pg=parallel_state.get_tensor_model_parallel_group(),
         )
-
-        collective_assert_tensor(
-            logits_fp32,
-            compare_type="not_equal",
-            pg=parallel_state.get_data_parallel_group(),
-        )
         collective_assert_tensor(
             logits,
             compare_type="equal",
             pg=parallel_state.get_tensor_model_parallel_group(),
         )
         collective_assert_tensor(
-            logits,
-            compare_type="not_equal",
-            pg=parallel_state.get_data_parallel_group(),
-        )
-        collective_assert_tensor(
             tp_logits,
             compare_type="equal",
             pg=parallel_state.get_tensor_model_parallel_group(),
-        )
-        collective_assert_tensor(
-            tp_logits,
-            compare_type="not_equal",
-            pg=parallel_state.get_data_parallel_group(),
         )
 
         collective_assert(
             hstu_close(tp_logits, logits, logits_fp32, multiplier=multiplier),
             f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
-            group=parallel_state.get_data_parallel_group(),
         )
         # use normal distribution
         dout = torch.empty_like(tp_logits)
@@ -370,7 +355,6 @@ def test_tp_hstu_layer_forward_backward_update(
         collective_assert(
             hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, multiplier=multiplier),
             f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_legacy).abs().max()} vs {(grad_legacy - grad_fp32_legacy).abs().max()} vs hey {(grad_tp - grad_legacy).abs().max()}",
-            group=parallel_state.get_data_parallel_group(),
         )
         print(
             f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"

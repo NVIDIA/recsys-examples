@@ -288,12 +288,10 @@ def test_tp_gr_ranking_forward_backward_update(
         collective_assert(
             hstu_close(tp_losses, losses, losses_fp32, multiplier=multiplier),
             f"losses mismatch at iter {i}, diff {(tp_losses - losses_fp32).abs().max()} vs {(losses - losses_fp32).abs().max()} vs hey {(tp_losses - losses).abs().max()}",
-            group=parallel_state.get_data_parallel_group(),
         )
         collective_assert(
             hstu_close(tp_logits, logits, logits_fp32, multiplier=multiplier),
             f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
-            group=parallel_state.get_data_parallel_group(),
         )
         print(
             f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
