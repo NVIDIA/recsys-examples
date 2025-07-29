@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import re
 from typing import Dict, List
 
@@ -166,6 +167,9 @@ def test_tp_gr_ranking_forward_backward_update(
     replicate_batches: bool,
     kernel_backend: KernelBackend,
 ):
+    # we use mock debug tp layer to test the correctness.
+    os.environ["DEBUG_MOCK_TP"] = "1"
+
     # we must use static embedding for reproducibility
     use_dynamic_emb = False
     init.initialize_distributed()
