@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import nvtx
 import torch
 import torch.nn.functional as F
@@ -30,6 +32,7 @@ from megatron.core.utils import divide
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.tp_layer_norm import TPLayerNormMulDropout
+from ops.collective_ops import gather_along_last_dim
 
 
 class HSTULayer(MegatronModule):
@@ -98,6 +101,17 @@ class HSTULayer(MegatronModule):
             skip_bias_add=False,  # note: TEColumnParallelLinear does not support bias fusion!
             is_expert=False,
         )
+        self._debug_shortcut_proj_linear = (
+            os.environ.get("DEBUG_SHORTCUT_PROJ_LINEAR", "0") == "1"
+        )
+        self._debug_shortcut_output_ln_mul_dropout = (
+            os.environ.get("DEBUG_SHORTCUT_OUTPUT_LN_MUL_DROPOUT", "0") == "1"
+        )
+        if self._debug_shortcut_proj_linear:
+            assert (
+                self._embedding_dim == self._linear_dim_per_head * self._num_heads
+            ), "when shortcut proj linear is on, embedding dim must be equal to linear dim per head * num heads"
+
         self._linear_proj = TERowParallelLinear(
             input_size=self._linear_dim_per_head * self._num_heads,
             output_size=self._embedding_dim,
@@ -187,10 +201,18 @@ class HSTULayer(MegatronModule):
                 target_group_size=self._target_group_size,
             )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
-            parallel_input = self._output_ln_dropout_mul(jagged_attn_output, tu)
+            if self._debug_shortcut_output_ln_mul_dropout:
+                parallel_input = jagged_attn_output
+            else:
+                parallel_input = self._output_ln_dropout_mul(jagged_attn_output, tu)
         with nvtx.annotate("hstu linear_residual fwd", color="YELLOW"):
-            # Note that output is a pair of (output, bias)
-            output, _ = self._linear_proj(parallel_input)
+            # shortcut for debug
+            if self._debug_shortcut_proj_linear:
+                output = gather_along_last_dim(
+                    parallel_input, parallel_state.get_tensor_model_parallel_group()
+                )
+            else:
+                output, _ = self._linear_proj(parallel_input)
             if self._residual:
                 output = output + x
         return JaggedData(

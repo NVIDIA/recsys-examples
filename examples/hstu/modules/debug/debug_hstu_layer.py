@@ -15,6 +15,7 @@
 
 import os
 from functools import partial
+from typing import Callable
 
 import nvtx
 import torch
@@ -27,14 +28,47 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig
 from configs.hstu_config import HSTULayerType
 from megatron.core import parallel_state
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_tensor_model_parallel_region,
+)
 from megatron.core.transformer.module import MegatronModule
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.utils import init_mlp_weights_optional_bias
+from ops.collective_ops import gather_along_last_dim, split_along_last_dim
 from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
 from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 
-DEBUG_CHECK_TP_EQUAL = False
+
+def _mock_tp_output_ln_mul_dropout(
+    jagged_attn_output: torch.Tensor,
+    tu: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    dropout_ratio: float,
+    training: bool,
+    norm_mul_dropout_func: Callable,
+) -> torch.Tensor:
+    jagged_attn_output = gather_along_last_dim(
+        jagged_attn_output, parallel_state.get_tensor_model_parallel_group()
+    )
+    tu = gather_along_last_dim(
+        tu.contiguous(), parallel_state.get_tensor_model_parallel_group()
+    )
+    full_output = norm_mul_dropout_func(
+        jagged_attn_output,
+        tu,
+        weight,
+        bias,
+        eps,
+        dropout_ratio,
+        training,
+    )
+    this_rank_output = split_along_last_dim(
+        full_output, parallel_state.get_tensor_model_parallel_group()
+    )
+    return this_rank_output
 
 
 # TODO move this layer to test folder! And remove the layer type: DEBUG
@@ -47,7 +81,10 @@ class HSTULayer(MegatronModule):
         config (HSTUConfig): Configuration for the HSTU layer.
     """
 
-    def __init__(self, config: HSTUConfig):
+    def __init__(
+        self,
+        config: HSTUConfig,
+    ):
         assert (
             config.hstu_layer_type == HSTULayerType.DEBUG
         ), "HSTULayer expects native hstu layer type"
@@ -60,6 +97,26 @@ class HSTULayer(MegatronModule):
         self._dropout_ratio: float = config.hidden_dropout
         # dropout on QK; not used now
         self._num_heads: int = config.num_attention_heads
+
+        self._debug_mock_tp = os.environ.get("DEBUG_MOCK_TP", "0") == "1"
+        self._debug_check_tp_equal = os.environ.get("DEBUG_CHECK_TP_EQUAL", "0") == "1"
+        if self._debug_mock_tp:
+            assert (
+                not self._debug_check_tp_equal
+            ), "when mock tp is on, tp equality check is not available"
+        self._debug_shortcut_proj_linear = (
+            os.environ.get("DEBUG_SHORTCUT_PROJ_LINEAR", "0") == "1"
+        )
+        self._debug_shortcut_output_ln_mul_dropout = (
+            os.environ.get("DEBUG_SHORTCUT_OUTPUT_LN_MUL_DROPOUT", "0") == "1"
+        )
+        if self._debug_shortcut_proj_linear:
+            assert (
+                self._embedding_dim == self._linear_dim_per_head * self._num_heads
+            ), "when shortcut proj linear is on, embedding dim must be equal to linear dim per head * num heads"
+
+        self._tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
 
         self._split_arg_list = [
             self._linear_dim_per_head,
@@ -104,7 +161,9 @@ class HSTULayer(MegatronModule):
 
         self._attn_func = create_hstu_attention(
             kernel_backend=config.kernel_backend,
-            num_heads=self._num_heads,
+            num_heads=self._num_heads
+            if not self._debug_mock_tp
+            else self._num_heads // self._tp_size,
             attention_dim=self._attention_dim_per_head,
             linear_dim=self._linear_dim_per_head,
             is_causal=config.is_causal,
@@ -115,10 +174,9 @@ class HSTULayer(MegatronModule):
             if not self._fuse_norm_mul_dropout
             else triton_norm_mul_dropout
         )
-        global DEBUG_CHECK_TP_EQUAL
-        DEBUG_CHECK_TP_EQUAL = os.environ.get("DEBUG_CHECK_TP_EQUAL", "0") == "1"
+
         # register hook to check if the param is bit-wise equal across tp ranks
-        if DEBUG_CHECK_TP_EQUAL:
+        if self._debug_check_tp_equal:
             for name, param in self.named_parameters():
                 if isinstance(param.data, torch.Tensor):
                     param.register_hook(
@@ -139,8 +197,39 @@ class HSTULayer(MegatronModule):
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: The user, value, query, and key tensors.
         """
-        mixed_uvqk = self._linear_uvqk(hidden_states)
-        if DEBUG_CHECK_TP_EQUAL:
+
+        if self._debug_mock_tp:
+            slice_size_per_rank = self._linear_uvqk.weight.shape[0] // self._tp_size
+            this_rank_weight_slice_start = self._tp_rank * slice_size_per_rank
+            this_rank_weight_slice_end = (self._tp_rank + 1) * slice_size_per_rank
+            current_tp_weight = self._linear_uvqk.weight[
+                this_rank_weight_slice_start:this_rank_weight_slice_end, ...
+            ]
+            current_tp_bias = (
+                self._linear_uvqk.bias[
+                    this_rank_weight_slice_start:this_rank_weight_slice_end
+                ]
+                if self._linear_uvqk.bias is not None
+                else None
+            )
+            if current_tp_bias is not None:
+                mixed_uvqk = torch.addmm(
+                    current_tp_bias, hidden_states, current_tp_weight.t()
+                )
+                # we need to reduce the grad from tp ranks
+            else:
+                mixed_uvqk = torch.matmul(hidden_states, current_tp_weight.t())
+            hidden_states.register_hook(
+                lambda grad: reduce_from_tensor_model_parallel_region(grad)
+                if grad is not None
+                else None
+            )
+            num_heads_compute = self._num_heads // self._tp_size
+        else:
+            mixed_uvqk = self._linear_uvqk(hidden_states)
+            num_heads_compute = self._num_heads
+
+        if self._debug_check_tp_equal:
             # fwd
             collective_assert_tensor(
                 mixed_uvqk,
@@ -156,19 +245,19 @@ class HSTULayer(MegatronModule):
                     msg="linear uvqk dgrad",
                 )
             )
-        # elevate to fp32 for higher precision
+        # maybe elevate to fp32 for higher precision
         mixed_uvqk = F.silu(mixed_uvqk).view(
-            -1, self._num_heads, sum(self._split_arg_list)
+            -1, num_heads_compute, sum(self._split_arg_list)
         )
         (user, value, query, key) = torch.split(
             mixed_uvqk,
             self._split_arg_list,
             dim=-1,
         )
-        value = value.reshape(-1, self._num_heads * self._linear_dim_per_head)
-        query = query.reshape(-1, self._num_heads * self._attention_dim_per_head)
-        key = key.reshape(-1, self._num_heads * self._attention_dim_per_head)
-        user = user.reshape(-1, self._num_heads * self._linear_dim_per_head)
+        value = value.reshape(-1, num_heads_compute * self._linear_dim_per_head)
+        query = query.reshape(-1, num_heads_compute * self._attention_dim_per_head)
+        key = key.reshape(-1, num_heads_compute * self._attention_dim_per_head)
+        user = user.reshape(-1, num_heads_compute * self._linear_dim_per_head)
         del mixed_uvqk
         return user, value, query, key
 
@@ -193,7 +282,7 @@ class HSTULayer(MegatronModule):
                 bias=self._input_layernorm_bias,
                 eps=self._eps,
             )
-            if DEBUG_CHECK_TP_EQUAL:
+            if self._debug_check_tp_equal:
                 # fwd
                 collective_assert_tensor(
                     normed_x,
@@ -222,7 +311,7 @@ class HSTULayer(MegatronModule):
                 max_seqlen=jd.max_seqlen,
                 target_group_size=self._target_group_size,
             )
-            if DEBUG_CHECK_TP_EQUAL:
+            if self._debug_check_tp_equal:
                 # fwd
                 collective_assert_tensor(
                     jagged_attn_output,
@@ -260,16 +349,30 @@ class HSTULayer(MegatronModule):
                     )
                 )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
-            parallel_input = self._norm_mul_dropout_func(
-                jagged_attn_output,
-                tu,
-                self._output_layernorm_weight,
-                self._output_layernorm_bias,
-                self._eps,
-                self._dropout_ratio,
-                self.training,
-            )
-            if DEBUG_CHECK_TP_EQUAL:
+            if self._debug_shortcut_output_ln_mul_dropout:
+                parallel_input = jagged_attn_output
+            elif self._debug_mock_tp:
+                parallel_input = _mock_tp_output_ln_mul_dropout(
+                    jagged_attn_output,
+                    tu,
+                    self._output_layernorm_weight,
+                    self._output_layernorm_bias,
+                    self._eps,
+                    self._dropout_ratio,
+                    self.training,
+                    self._norm_mul_dropout_func,
+                )
+            else:
+                parallel_input = self._norm_mul_dropout_func(
+                    jagged_attn_output,
+                    tu,
+                    self._output_layernorm_weight,
+                    self._output_layernorm_bias,
+                    self._eps,
+                    self._dropout_ratio,
+                    self.training,
+                )
+            if self._debug_check_tp_equal:
                 # fwd
                 collective_assert_tensor(
                     parallel_input,
@@ -286,8 +389,26 @@ class HSTULayer(MegatronModule):
                     )
                 )
         with nvtx.annotate("hstu linear_residual fwd", color="YELLOW"):
-            output = self._linear_proj(parallel_input)
-            if DEBUG_CHECK_TP_EQUAL:
+            if self._debug_mock_tp and not self._debug_shortcut_proj_linear:
+                slice_size_per_rank = self._linear_proj.weight.shape[1] // self._tp_size
+                this_rank_weight_slice_start = self._tp_rank * slice_size_per_rank
+                this_rank_weight_slice_end = (self._tp_rank + 1) * slice_size_per_rank
+                this_rank_weight = self._linear_proj.weight[
+                    ..., this_rank_weight_slice_start:this_rank_weight_slice_end
+                ]
+                output = torch.matmul(parallel_input, this_rank_weight.t())
+                output = reduce_from_tensor_model_parallel_region(output)
+            if self._debug_mock_tp and self._debug_shortcut_proj_linear:
+                output = gather_along_last_dim(
+                    parallel_input, parallel_state.get_tensor_model_parallel_group()
+                )
+
+            # this is the regular/default behavior
+            if not self._debug_mock_tp and not self._debug_shortcut_proj_linear:
+                output = self._linear_proj(parallel_input)
+            if not self._debug_mock_tp and self._debug_shortcut_proj_linear:
+                output = parallel_input
+            if self._debug_check_tp_equal:
                 # fwd
                 collective_assert_tensor(
                     output,
