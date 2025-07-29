@@ -135,7 +135,7 @@ def hstu_preprocess_embeddings(
             batch.feature_to_max_seqlen[name] for name in batch.contextual_feature_names
         ]
         contextual_jts = [embeddings[name] for name in batch.contextual_feature_names]
-        contextual_jts_values = [jt.values() for jt in contextual_jts]
+        contextual_jts_values = [jt.values().to(dtype) for jt in contextual_jts]
         contextual_jts_offsets = [jt.offsets() for jt in contextual_jts]
 
         (contextual_sequence_embeddings, contextual_seqlen) = jagged_2D_tensor_concat(
@@ -153,7 +153,6 @@ def hstu_preprocess_embeddings(
         contextual_max_seqlen = max(
             len(batch.contextual_feature_names), sum(contextual_max_seqlens)
         )
-
         (
             sequence_embeddings,
             sequence_embeddings_lengths,
