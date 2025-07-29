@@ -33,8 +33,6 @@ def hstu_close(
 
     left_abs_max = (actual - fp32_ref).abs().max().item()
     right_abs_max = (out_ref - fp32_ref).abs().max().item()
-    if left_abs_max > multiplier * right_abs_max:
-        print(f" fffffffffffailed multiplier {left_abs_max / right_abs_max}")
     return (left_abs_max <= multiplier * right_abs_max) or (try_allclose)
 
 

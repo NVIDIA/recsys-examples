@@ -86,12 +86,23 @@ from megatron.core import parallel_state
 
 
 def apply_megatron_ddp(
-    dmp: DistributedModelParallel,
+    model: Union[DistributedModelParallel, torch.nn.Module],
     config: TransformerConfig,
     dense_optimizer_param: OptimizerParam,
     device: torch.device,
 ):
-    model = dmp._dmp_wrapped_module
+    """
+    Apply megatron DDP to the model.
+    If the original model is a DistributedModelParallel, the model._dmp_wrapped_module will be wrapped by DDP.
+    Otherwise the original model will be wrapped by DDP.
+
+    The original model is returned.
+    """
+    original_model = model
+    if isinstance(model, DistributedModelParallel):
+        model = original_model._dmp_wrapped_module
+    else:
+        model = original_model
     model = model.to(device)
     if config.fp16 or config.bf16:
         model = Float16Module(config, model)
@@ -104,18 +115,25 @@ def apply_megatron_ddp(
         bucket_size=True,
     )
     # MCORE DDP does not broadcast parameters implicitly
-    dmp._dmp_wrapped_module = DDP(
-        config,
-        ddp_config,
-        model,
-    )
+    if isinstance(original_model, DistributedModelParallel):
+        original_model._dmp_wrapped_module = DDP(
+            config,
+            ddp_config,
+            model,
+        )
+    else:
+        original_model = DDP(
+            config,
+            ddp_config,
+            model,
+        )
 
     # only broadcast parameters within DataParallel group, TP group weights are initialized with the same rng states!
     def broadcast_params_for_non_model_parallel_embedding_modules():
         data_parallel_group = parallel_state.get_data_parallel_group(
             with_context_parallel=True
         )
-        for p in dmp._dmp_wrapped_module.parameters():
+        for p in model.parameters():
             if not isinstance(p, TableBatchedEmbeddingSlice):
                 dist.broadcast(
                     p.data,
@@ -144,9 +162,14 @@ def apply_megatron_ddp(
         weight_decay=dense_optimizer_param.weight_decay,
     )
     dense_optimizer = get_megatron_optimizer(
-        dense_optimizer_config, [dmp._dmp_wrapped_module]
+        dense_optimizer_config,
+        [
+            original_model._dmp_wrapped_module
+            if isinstance(original_model, DistributedModelParallel)
+            else original_model
+        ],
     )
-    return dmp, dense_optimizer
+    return original_model, dense_optimizer
 
 
 # refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91

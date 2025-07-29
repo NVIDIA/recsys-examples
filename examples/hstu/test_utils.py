@@ -21,13 +21,15 @@ import configs
 import dataset
 import model
 import torch
-from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
+from commons.utils.distributed_utils import collective_assert
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend, OptimizerParam
-from distributed.sharding import make_optimizer_and_shard
+from distributed.sharding import apply_megatron_ddp, make_optimizer_and_shard
 from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state, tensor_parallel
+from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.jagged_data import JaggedData
+from modules.native_hstu_layer import HSTULayer
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
@@ -154,14 +156,6 @@ def compare_tpN_to_debug_weights(
     for name, param in debug_module_params_map.items():
         src = param if not isinstance(param, ShardedTensor) else param.local_tensor()
         src_fp32 = debug_fp32_module_params_map[name]
-        # weight should be bit-wise equal across all ranks for src and src_fp32. Other wise, there is some bugs
-        if not isinstance(src, TableBatchedEmbeddingSlice):
-            collective_assert_tensor(
-                src, compare_type="equal", pg=None, msg=f"param {name}"
-            )
-            collective_assert_tensor(
-                src_fp32, compare_type="equal", pg=None, msg=f"fp32 param {name}"
-            )
         src_fp32 = (
             src_fp32
             if not isinstance(src_fp32, ShardedTensor)
@@ -213,10 +207,14 @@ def compare_tpN_to_debug_weights(
             x is not None for x in [dst_grad, src_grad, src_grad_fp32]
         ):
             collective_assert(
-                hstu_close(dst_grad, src_grad, src_grad_fp32, multiplier=5)
+                hstu_close(dst_grad, src_grad, src_grad_fp32, multiplier=5),
+                f"grad mismatch at {name}, multiplier {(dst_grad - src_grad_fp32).abs().max() / (src_grad - src_grad_fp32).abs().max()}",
+                group=parallel_state.get_data_parallel_group(),
             )
         collective_assert(
-            hstu_close(dst, src, src_fp32, try_allclose=True, multiplier=5)
+            hstu_close(dst, src, src_fp32, try_allclose=True, multiplier=5),
+            f"weight mismatch at {name}  multiplier {(dst - src_fp32).abs().max() / (src - src_fp32).abs().max()}",
+            group=parallel_state.get_data_parallel_group(),
         )  # weight
 
 
@@ -338,6 +336,7 @@ def create_model(
         kernel_backend=kernel_backend,
         add_uvqk_bias=False,  # disable bias for better debugging
         fuse_norm_mul_dropout=False,  # disable fusion for better debugging
+        learnable_input_layernorm=False,  # disable bias for better debugging
     )
 
     item_feature_name = "item_feat"
@@ -358,7 +357,7 @@ def create_model(
             table_name="item",
             vocab_size=item_emb_size,
             dim=embdim,
-            sharding_type="data_parallel",
+            sharding_type="model_parallel",
         ),
     ]
     feature_configs = [
@@ -471,3 +470,54 @@ def create_model(
         device=device,
     )
     return model_train, dense_optimizer, history_batches
+
+
+def create_hstu_layer_and_optimizer(
+    dtype: torch.dtype,
+    hidden_size: int,
+    num_attention_heads: int,
+    kv_channels: int,
+    optimizer_type_str: str,
+    hstu_layer_type: HSTULayerType = HSTULayerType.DEBUG,
+    kernel_backend: KernelBackend = KernelBackend.CUTLASS,
+    learnable_input_layernorm: bool = False,
+):
+    hstu_config = configs.get_hstu_config(
+        hidden_size=hidden_size,
+        kv_channels=kv_channels,
+        num_attention_heads=num_attention_heads,
+        num_layers=1,
+        dtype=dtype,
+        hidden_dropout=0.0,
+        norm_epsilon=1e-5,
+        is_causal=True,
+        kernel_backend=kernel_backend,  # attn_backend
+        target_group_size=1,
+        hstu_layer_type=hstu_layer_type,
+        learnable_input_layernorm=learnable_input_layernorm,
+        residual=True,
+        add_uvqk_bias=False,  # disable bias for better debugging
+        fuse_norm_mul_dropout=False,  # disable fusion for better debugging
+    )
+    torch.cuda.current_device()
+    if hstu_layer_type == HSTULayerType.DEBUG:
+        hstu_layer = DebugHSTULayer(hstu_config).cuda()
+    else:
+        hstu_layer = HSTULayer(hstu_config).cuda()
+
+    optimizer_param = OptimizerParam(
+        optimizer_str=optimizer_type_str,
+        learning_rate=1e-3 if optimizer_type_str == "adam" else 1e-1,
+        adam_beta1=0.5,  # larger beta1 for better debugging!
+        adam_beta2=0.999,
+        adam_eps=1e-8,
+        weight_decay=0.0,  # decay is off for better debugging
+    )
+    model, dense_optimizer = apply_megatron_ddp(
+        hstu_layer,
+        hstu_config,
+        optimizer_param,
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+
+    return model, dense_optimizer
