@@ -82,4 +82,76 @@ struct SegmentedUniqueDevice {
       cudaStream_t &stream);
 };
 
+template <typename T>
+void select_async(
+    int num_items,
+    bool const * d_flags,
+    T const * d_input,
+    T* d_output,
+    int* d_num_select,
+    at::Device const& device,
+    cudaStream_t const& stream
+) {
+
+  void* d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+
+  // 1. get the size of temp storage.
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    d_input, d_flags, d_output,
+    d_num_select, num_items, stream);
+  
+  // 2. allocate the temp storage.
+  d_temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)}, 
+    at::TensorOptions().dtype(torch::kChar).device(device)).data_ptr();
+
+  // 3. select
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    d_input, d_flags, d_output,
+    d_num_select, num_items, stream);
+}
+
+template <typename T>
+void sort_async(
+    int num_items,
+    T const * d_input,
+    T* d_output,
+    int* d_indices_out,
+    at::Device const& device,
+    cudaStream_t const& stream
+) {
+
+  void* d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+  // cub::CountingInputIterator<int> counting_iter(0);
+  auto src_idx = at::arange(0, num_items, at::TensorOptions().dtype(at::kInt).device(device));
+
+  // 1. get the size of temp storage.
+  cub::DeviceRadixSort::SortPairs(
+    d_temp_storage, temp_storage_bytes,
+    d_input, d_output, src_idx.data_ptr<int>(),
+    d_indices_out, num_items, 0, sizeof(T) * 8, stream);
+  
+  // 2. allocate the temp storage.
+  d_temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)}, 
+    at::TensorOptions().dtype(torch::kChar).device(device)).data_ptr();
+
+  // 3. sort
+  cub::DeviceRadixSort::SortPairs(
+    d_temp_storage, temp_storage_bytes,
+    d_input, d_output, src_idx.data_ptr<int>(),
+    d_indices_out, num_items, 0, sizeof(T) * 8, stream);
+}
+
+void select_index_async(
+    int num_items,
+    bool const * d_flags,
+    int* d_output,
+    int* d_num_select,
+    at::Device const& device,
+    cudaStream_t const& stream
+);
+
 } // namespace dyn_emb

@@ -21,9 +21,9 @@ from pathlib import Path
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-subprocess.run(
-    ["git", "submodule", "update", "--init", "../../third_party/HierarchicalKV"]
-)
+# subprocess.run(
+#     ["git", "submodule", "update", "--init", "../../third_party/HierarchicalKV"]
+# )
 
 # TODO: update when torchrec release compatible commit.
 compatible_versions = "1.2.0"

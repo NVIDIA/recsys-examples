@@ -280,6 +280,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         unique_op: UniqueOp,
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
+        host_tables: List[DynamicEmbTable],
+        cache_metrics: torch.Tensor,
         *args
     ):
         # TODO:need check dimension is right
@@ -321,28 +323,54 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         unique_idx = torch.empty_like(indices, dtype=indices.dtype, device=device)
         h_unique_nums = torch.empty(table_num, dtype=torch.uint64, device="cpu")
         d_unique_nums = torch.empty(table_num, dtype=torch.uint64, device=device)
-        lookup_forward_dense(
-            tables,
-            indices,
-            offsets,
-            scores,
-            table_offsets_in_feature,
-            table_offsets,
-            table_num,
-            batch_size,
-            dim,
-            use_index_dedup,
-            unique_idx,
-            reverse_idx,
-            h_unique_nums,
-            d_unique_nums,
-            h_unique_offsets,
-            d_unique_offsets,
-            unique_embs,
-            output_embs,
-            device_num_sms,
-            unique_op,
-        )
+        if host_tables is not None:
+            lookup_forward_dense(
+                tables,
+                indices,
+                offsets,
+                scores,
+                table_offsets_in_feature,
+                table_offsets,
+                table_num,
+                batch_size,
+                dim,
+                use_index_dedup,
+                unique_idx,
+                reverse_idx,
+                h_unique_nums,
+                d_unique_nums,
+                h_unique_offsets,
+                d_unique_offsets,
+                unique_embs,
+                output_embs,
+                device_num_sms,
+                unique_op,
+                cache_metrics,
+                host_tables,
+            )
+        else:
+            lookup_forward_dense(
+                tables,
+                indices,
+                offsets,
+                scores,
+                table_offsets_in_feature,
+                table_offsets,
+                table_num,
+                batch_size,
+                dim,
+                use_index_dedup,
+                unique_idx,
+                reverse_idx,
+                h_unique_nums,
+                d_unique_nums,
+                h_unique_offsets,
+                d_unique_offsets,
+                unique_embs,
+                output_embs,
+                device_num_sms,
+                unique_op,
+            )
         if use_index_dedup:
             unique_idx_forback = torch.empty(
                 h_unique_offsets[-1], dtype=indices.dtype, device=device
@@ -415,9 +443,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 unique_grads_list.append(
                     unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
                 )
-                unique_embs_list.append(
-                    unique_emb_forback[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
-                )
+                # unique_embs_list.append(
+                #     unique_emb_forback[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
+                # )
         else:
             # backward: reduce the grad.
             unique_indices = torch.empty(
@@ -447,4 +475,4 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         optimizer.update(
             tables, unique_indices_list, unique_grads_list, unique_embs_list, scores
         )
-        return (None,) * 17
+        return (None,) * 19

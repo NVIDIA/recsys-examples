@@ -524,11 +524,13 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   hkv_table_option_.reserved_key_start_bit = reserved_key_start_bit;
   hkv_table_option_.num_of_buckets_per_alloc = num_of_buckets_per_alloc;
 
-  /// TODO: make HKV's init async.
-  hkv_table_->init(hkv_table_option_);
-  // HKV itself has cuda check, however, it invokes exit() rather than throw
-  // error, so we need to disable the HKV check
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  if (max_capacity != 0) {
+    /// TODO: make HKV's init async.
+    hkv_table_->init(hkv_table_option_);
+    // HKV itself has cuda check, however, it invokes exit() rather than throw
+    // error, so we need to disable the HKV check
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
@@ -875,6 +877,39 @@ void HKVVariable<KeyType, ValueType,Strategy >::export_batch_matched(
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::lock(
+    const size_t n,
+    const void* keys,            // (n)
+    void** locked_keys_ptr,      // (n)
+    bool* flags,                 // (n)
+    void* scores,
+    cudaStream_t stream
+)  {
+  hkv_table_->lock_keys(
+    n,
+    reinterpret_cast<const KeyType*>(keys),
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    flags, stream, (uint64_t*)scores);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::unlock(
+    const size_t n,
+    void** locked_keys_ptr,      // (n)
+    const void* keys,            // (n)
+    bool* flags,                 // (n)
+    cudaStream_t stream
+) {
+  hkv_table_->unlock_keys(
+    n,
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    reinterpret_cast<const KeyType*>(keys),
+    flags, stream);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 curandState* HKVVariable<KeyType, ValueType, Strategy>::get_curand_states() const {
   return curand_states_;
 }
@@ -899,4 +934,60 @@ const float HKVVariable<KeyType, ValueType, Strategy>::get_initial_optstate() co
   return this->initial_optstate_;
 }
 
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+const bool HKVVariable<KeyType, ValueType, Strategy>::need_score() const {
+  return Strategy == EvictStrategy::kCustomized || Strategy == EvictStrategy::kLfu;
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+const float  HKVVariable<KeyType, ValueType, Strategy>::load_factor() const {
+  return hkv_table_->load_factor();
+}
+
+
+template <typename K, typename S, typename V>
+struct EvictedObjectProcessor {
+  __forceinline__ __device__ void operator()(const K& key, const S& score, V* value) {
+    int offset = atomicAdd(evict_counter, 1);
+    evicted_keys[offset] = key;
+    if (evicted_scores) evicted_scores[offset] = score;
+    evicted_values_ptr[offset] = value;
+  }
+  int* evict_counter = nullptr;
+  K* evicted_keys = nullptr;
+  S* evicted_scores = nullptr;
+  V** evicted_values_ptr = nullptr;
+};
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert_ptr_with_evict(
+    const size_t n, 
+    const void *keys, // (n)
+    void **value_ptrs,  // (n * ptrs)
+    void *scores, // (n)
+    bool *d_found,          // (n * 1)
+    void* evicted_keys,        // (n)
+    void** evicted_values,    // (n, DIM)
+    void* evicted_scores,    // (n)
+    int* evicted_counter,  // (1)
+    cudaStream_t stream
+) {
+
+  using Processor = EvictedObjectProcessor<KeyType, uint64_t ,ValueType>;
+  Processor processor;
+  processor.evict_counter = reinterpret_cast<int*>(evicted_counter);
+  processor.evicted_keys = reinterpret_cast<KeyType*>(evicted_keys);
+  if (evicted_scores != nullptr) {
+    processor.evicted_scores = reinterpret_cast<uint64_t*>(evicted_scores);
+  }
+  processor.evicted_values_ptr = reinterpret_cast<ValueType**>(evicted_values);
+  
+  hkv_table_->template find_or_insert_v2<Processor>(
+    processor, n, 
+    reinterpret_cast<const KeyType*>(keys),
+    reinterpret_cast<ValueType**>(value_ptrs),
+    d_found, (uint64_t*)scores, stream);
+
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
 } // namespace dyn_emb

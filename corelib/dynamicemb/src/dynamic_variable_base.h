@@ -131,6 +131,18 @@ public:
                                        bool unique_key = true,
                                        bool ignore_evict_strategy = false) = 0;
 
+  virtual void find_or_insert_ptr_with_evict(
+      const size_t n, 
+      const void *keys, // (n)
+      void **value_ptrs,  // (n * ptrs)
+      void *scores, // (n)
+      bool *d_found,          // (n * 1)
+      void* evicted_keys,        // (n)
+      void** evicted_values,    // (n, DIM)
+      void* evicted_scores,    // (n)
+      int* evicted_counter,  // (1)
+      cudaStream_t stream = 0) = 0;
+
   virtual void find_and_initialize(
     const size_t n, const void *keys, void **value_ptrs, void *values,
     bool *founds, const cudaStream_t& stream) = 0;
@@ -183,11 +195,26 @@ public:
       uint64_t threshold, 
       uint64_t* d_counter, 
       cudaStream_t stream = 0) const = 0;
+  virtual void lock(const size_t n,
+                    const void* keys,            // (n)
+                    void** locked_keys_ptr,      // (n)
+                    bool* flags = nullptr,       // (n)
+                    void* scores = nullptr, // (n)
+                    cudaStream_t stream = 0) = 0;
+
+  virtual void unlock(const size_t n,
+                      void** locked_keys_ptr,      // (n)
+                      const void* keys,            // (n)
+                      bool* flags = nullptr,       // (n)
+                      cudaStream_t stream = 0) = 0;
+  
   virtual curandState* get_curand_states() const = 0;
   virtual const InitializerArgs& get_initializer_args() const = 0;
   virtual const int optstate_dim() const = 0;
   virtual void set_initial_optstate(const float value) = 0;
   virtual const float get_initial_optstate() const = 0;
+  virtual const bool need_score() const = 0;
+  virtual const float load_factor() const = 0;
 };
 
 class VariableFactory {
