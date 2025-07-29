@@ -312,6 +312,7 @@ def create_model(
     dtype: torch.dtype,
     pipeline_type: str = "none",
     use_dynamic_emb: bool = True,
+    num_heads: int = 4,
     *,
     seed: int,
     hstu_layer_type: HSTULayerType = HSTULayerType.DEBUG,
@@ -328,7 +329,7 @@ def create_model(
     hstu_config = configs.get_hstu_config(
         hidden_size=embdim,
         kv_channels=32,
-        num_attention_heads=4,
+        num_attention_heads=num_heads,
         num_layers=1,
         hidden_dropout=0.0,  # disable dropout
         dtype=dtype,

@@ -228,9 +228,6 @@ def test_tp_hstu_layer_forward_backward_update(
     tp_size,
     optimizer_type_str,
 ):
-    print(
-        f"test_tp_hstu_layer_forward_backward_update tp_size {tp_size}, optimizer_type_str {optimizer_type_str}, num_heads {num_heads}, hidden_dim_per_head {hidden_dim_per_head}, batchsize {batchsize}"
-    )
     init.initialize_distributed()
     world_size = torch.distributed.get_world_size()
 

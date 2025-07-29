@@ -174,8 +174,11 @@ def test_tp_gr_ranking_forward_backward_update(
     use_dynamic_emb = False
     init.initialize_distributed()
     world_size = torch.distributed.get_world_size()
+    num_heads = 8
     if world_size < tp_size:
         pytest.skip("TP size is larger than world size")
+    if num_heads % tp_size != 0:
+        pytest.skip("num_heads should be divisible by tp_size")
     init.initialize_model_parallel(tp_size)
     tp_model, tp_dense_optimizer, _ = create_model(
         task_type="ranking",
@@ -188,6 +191,7 @@ def test_tp_gr_ranking_forward_backward_update(
         seed=1234,
         hstu_layer_type=HSTULayerType.NATIVE,  # only native supports TP
         kernel_backend=kernel_backend,  # only pytorch supports fp32
+        num_heads=num_heads,
     )
     (
         debug_model,
@@ -206,6 +210,7 @@ def test_tp_gr_ranking_forward_backward_update(
         num_batches=40 if optimizer_type_str == "sgd" else 80,
         replicate_batches=replicate_batches,
         kernel_backend=kernel_backend,  # only pytorch supports fp32
+        num_heads=num_heads,
     )
     debug_model_fp32, debug_dense_optimizer_fp32, _ = create_model(
         task_type="ranking",
@@ -218,6 +223,7 @@ def test_tp_gr_ranking_forward_backward_update(
         seed=1234,
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,  # only pytorch supports fp32
+        num_heads=num_heads,
     )
 
     tp_ranking_gr = get_unwrapped_module(tp_model)

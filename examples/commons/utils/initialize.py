@@ -57,12 +57,13 @@ def destroy_global_state():
 
     # TODO, find the reason why destroying pg hit nccl error when tpsize > 1
     if parallel_state.model_parallel_is_initialized():
-        # torch.distributed.destroy_process_group(
-        #     group=parallel_state.get_tensor_model_parallel_group()
-        # )
-        # torch.distributed.destroy_process_group(
-        #     group=parallel_state.get_data_parallel_group(with_context_parallel=True)
-        # )
+        if parallel_state.get_tensor_model_parallel_world_size() == 1:
+            torch.distributed.destroy_process_group(
+                group=parallel_state.get_tensor_model_parallel_group()
+            )
+            torch.distributed.destroy_process_group(
+                group=parallel_state.get_data_parallel_group(with_context_parallel=True)
+            )
         parallel_state.destroy_model_parallel()
     torch.cuda.empty_cache()
     gc.collect()
