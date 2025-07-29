@@ -26,6 +26,7 @@ from modules.negatives_sampler import InBatchNegativesSampler
 from modules.output_postprocessors import L2NormEmbeddingPostprocessor
 from modules.sampled_softmax_loss import SampledSoftmaxLoss
 from modules.similarity.dot_product import DotProductSimilarity
+from ops.length_to_offsets import length_to_complete_offsets
 from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
     triton_split_2D_jagged,
 )
@@ -112,6 +113,10 @@ class RetrievalGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The logits, supervision item IDs, and supervision embeddings.
         """
+        assert (
+            batch.max_num_candidates == 0
+        ), "num candidates is not supported for retrieval"
+
         embeddings = self._embedding_collection(batch.features)
         jagged_data = self._hstu_block(
             embeddings=embeddings,
@@ -120,31 +125,13 @@ class RetrievalGR(BaseModel):
         pred_item_embeddings = jagged_data.values
         pred_item_max_seqlen = jagged_data.max_seqlen
         pred_item_seqlen_offsets = jagged_data.seqlen_offsets
+        pred_item_seqlen = jagged_data.seqlen
 
         supervision_item_embeddings = embeddings[batch.item_feature_name].values()
         supervision_item_ids = batch.features[batch.item_feature_name].values()
-        if batch.max_num_candidates > 0:
-            supervision_item_max_seqlen = batch.feature_to_max_seqlen[
-                batch.item_feature_name
-            ]
-            supervision_item_seqlen_offsets = batch.features[
-                batch.item_feature_name
-            ].offsets()
-            _, supervision_item_embeddings = triton_split_2D_jagged(
-                supervision_item_embeddings,
-                supervision_item_max_seqlen,
-                offsets_a=supervision_item_seqlen_offsets - pred_item_seqlen_offsets,
-                offsets_b=pred_item_seqlen_offsets,
-            )
-            _, supervision_item_ids = triton_split_2D_jagged(
-                supervision_item_ids.view(-1, 1),
-                supervision_item_max_seqlen,
-                offsets_a=supervision_item_seqlen_offsets - pred_item_seqlen_offsets,
-                offsets_b=pred_item_seqlen_offsets,
-            )
 
-        shift_pred_item_seqlen_offsets = torch.clamp(
-            pred_item_seqlen_offsets - 1, min=0
+        shift_pred_item_seqlen_offsets = length_to_complete_offsets(
+            torch.clamp(pred_item_seqlen - 1, min=0)
         )
         first_n_pred_item_embeddings, _ = triton_split_2D_jagged(
             pred_item_embeddings,
