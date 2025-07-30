@@ -191,7 +191,7 @@ def train_with_pipeline(
                     get_unwrapped_module(pipeline._model)._hstu_config, ddp_seqlens
                 )
                 print_rank_0(
-                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, FLOPS {flops / cur_td / 1e9:.2f} GFLOPS/GPU]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
                 )
                 last_td = cur_td + last_td
                 tokens_logged.zero_()

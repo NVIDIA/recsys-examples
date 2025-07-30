@@ -80,7 +80,6 @@ def cal_flops(hstu_config: HSTUConfig, seqlens: List[torch.Tensor]) -> int:
     if torch.distributed.get_rank() == 0:
         flops = (
             cal_flops_single_rank(hstu_config, torch.cat(gathered_seqlens)).cpu().item()
-            / world_size
         )
     else:
         flops = 0
