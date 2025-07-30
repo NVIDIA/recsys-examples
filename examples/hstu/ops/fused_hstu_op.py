@@ -192,10 +192,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm = torch.cuda.get_device_properties(0).major
             if sm == 8:
                 addmm_silu_fwd_impl = triton_addmm_silu_fwd
-            elif sm == 9:
-                addmm_silu_fwd_impl = torch_addmm_silu_fwd
             else:
-                raise ValueError(f"Unsupported SM major version: {sm}")
+                addmm_silu_fwd_impl = torch_addmm_silu_fwd
             # 2. linear & silu
             # bias is 1D
             linear_uvqk, silu_linear_uvqk = addmm_silu_fwd_impl(
@@ -276,18 +274,19 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             alpha,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
+            sm_minor_version = torch.cuda.get_device_properties(0).minor
             extension_args = ()
-            if sm_major_version == 8:
-                cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
-                ampere_paged_kv_args = (None, None, None, None, None)
-                extension_args = ampere_paged_kv_args
-            elif sm_major_version == 9:
+            if sm_major_version == 9:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
                 hopper_fp8_args = (None, None, None)
                 extension_args = hopper_fp8_args
-
             else:
-                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
+                assert sm_major_version >= 8, "Ampere or Ampere next GPU is required."
+                if sm_major_version == 8:
+                    assert sm_minor_version == 0, "For Ampere, only A100 is supported."
+                cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
+                ampere_paged_kv_args = (None, None, None, None, None)
+                extension_args = ampere_paged_kv_args
             assert q.dim() == 3, "q shape should be (L, num_heads, head_dim)"
             assert k.dim() == 3, "k shape should be (L, num_heads, head_dim)"
             assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
@@ -602,12 +601,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             dv: Optional[torch.Tensor] = None,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
-            if sm_major_version == 8:
-                cutlass_hstu_varlen_bwd = flash_attn_cuda_ampere.varlen_bwd
-            elif sm_major_version == 9:
+            sm_minor_version = torch.cuda.get_device_properties(0).minor
+            if sm_major_version == 9:
                 cutlass_hstu_varlen_bwd = flash_attn_cuda_hopper.varlen_bwd
             else:
-                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
+                assert sm_major_version >= 8, "Ampere or Ampere next GPU is required."
+                if sm_major_version == 8:
+                    assert sm_minor_version == 0, "For Ampere, only A100 is supported."
+                cutlass_hstu_varlen_bwd = flash_attn_cuda_ampere.varlen_bwd
             assert dout.dim() == 3
             dq, dk, dv, _ = cutlass_hstu_varlen_bwd(
                 dout,

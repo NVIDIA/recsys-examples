@@ -83,6 +83,8 @@ def get_extensions():
             "arch=compute_80,code=sm_80",
             "-gencode",
             "arch=compute_90,code=sm_90",
+            "-gencode",
+            "arch=compute_100,code=sm_100",
             "-w",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
