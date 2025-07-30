@@ -37,25 +37,7 @@ Before running examples, build and install libs under corelib following instruct
 - [HSTU attention documentation](./corelib/hstu/README.md)
 - [Dynamic Embeddings documentation](./corelib/dynamicemb/README.md)
 
-On top of those two core libs, Megatron-Core along with other libs are required. You can install them via pypi package:
-
-```bash
-pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath megatron-core==0.9.0
-```
-
-If you fail to install the megatron-core package, usually due to the python version incompatibility, please try to clone and then install the source code. 
-
-```bash
-git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
-pip install -e ./megatron-lm
-```
-
-We provide our custom HSTU CUDA operators for enhanced performance. You need to install these operators using the following command:
-
-```bash
-cd /workspace/recsys-examples/examples/hstu && \
-python setup.py install
-```
+On top of those two core libs, Megatron-Core along with other libs and custom HSTU CUDA operators are required. You can refer to the [dockerfile](./docker/Dockerfile) for detailed install instruction. 
 
 # Get Started
 The examples we supported:
