@@ -25,6 +25,7 @@ from dynamicemb.batched_dynamicemb_function import *
 from dynamicemb.dynamicemb_config import *
 from dynamicemb.optimizer import *
 from dynamicemb.unique_op import UniqueOp
+from dynamicemb.utils import tabulate
 from dynamicemb_extensions import (
     DynamicEmbTable,
     OptimizerType,
@@ -355,6 +356,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         self._optimizer_type = optimizer
         self._tables: List[DynamicEmbTable] = []
         self._create_tables()
+        self._print_memory_consume()
         # add placeholder require_grad param tensor to enable autograd with int8 weights
         # self.placeholder_autograd_tensor = nn.Parameter(
         #     torch.zeros(0, device=torch.device(self.device_id), dtype=torch.float)
@@ -485,6 +487,79 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                         f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
                     )
             self._tables.append(create_dynamicemb_table(option))
+
+    def _print_memory_consume(self) -> None:
+        title = [
+            "table name",
+            "",
+            "memory(MB)",
+            "",
+            "",
+            f"hbm(MB)/cuda:{self.device_id}",
+            "",
+            "",
+            "dram(MB)",
+            "",
+        ]
+        subtitle = [
+            "",
+            "total",
+            "embedding",
+            "optim_state",
+            "total",
+            "embedding",
+            "optim_state",
+            "total",
+            "embedding",
+            "optim_state",
+        ]
+        table_consume = []
+        table_consume.append(subtitle)
+
+        def _get_optimizer_state_dim(optimizer_type, dim, element_size):
+            if optimizer_type == OptimizerType.RowWiseAdaGrad:
+                return 16 // element_size
+            elif optimizer_type == OptimizerType.Adam:
+                return dim * 2
+            elif optimizer_type == OptimizerType.AdaGrad:
+                return dim
+            else:
+                return 0
+
+        DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+            torch.float32: 4,
+            torch.float16: 2,
+            torch.bfloat16: 2,
+        }
+
+        for table_name, table_option in zip(
+            self._table_names, self._dynamicemb_options
+        ):
+            element_size = DTYPE_NUM_BYTES[table_option.embedding_dtype]
+            emb_dim = table_option.dim
+            optim_state_dim = _get_optimizer_state_dim(
+                table_option.optimizer_type, emb_dim, element_size
+            )
+            total_dim = emb_dim + optim_state_dim
+            total_memory = table_option.max_capacity * element_size * total_dim
+            local_hbm_for_values = min(table_option.local_hbm_for_values, total_memory)
+            local_dram_for_values = total_memory - local_hbm_for_values
+            table_consume.append(
+                [
+                    table_name,
+                    total_memory // 1024,
+                    table_option.max_capacity * element_size * emb_dim // 1024,
+                    table_option.max_capacity * element_size * optim_state_dim // 1024,
+                    local_hbm_for_values // 1024,
+                    int(local_hbm_for_values * emb_dim // total_dim) // 1024,
+                    int(local_hbm_for_values * optim_state_dim // total_dim) // 1024,
+                    local_dram_for_values // 1024,
+                    int(local_dram_for_values * emb_dim // total_dim) // 1024,
+                    int(local_dram_for_values * optim_state_dim // total_dim) // 1024,
+                ]
+            )
+        output = "\n\n" + tabulate(table_consume, title, sub_headers=True)
+        print(output)
 
     def _create_optimizer(
         self,
