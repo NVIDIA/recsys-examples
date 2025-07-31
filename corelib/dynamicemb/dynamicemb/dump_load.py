@@ -654,134 +654,6 @@ def export_keys_values(dynamic_table, offset, device, batch_size=65536, optim=Fa
     return keys, values, scores, d_counter
 
 
-def gather_and_export(
-    dynamic_table,
-    root_path,
-    name,
-    batch_size=65536,
-    pg: Optional[dist.ProcessGroup] = None,
-    optim: bool = False,
-):
-    rank = dist.get_rank(group=pg)
-    world_size = dist.get_world_size(group=pg)
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-    need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
-
-    key_name = name + "_keys"
-    value_name = name + "_values"
-
-    key_path = os.path.join(root_path, key_name)
-    value_path = os.path.join(root_path, value_name)
-
-    if rank == 0:
-        fkey = open(key_path, "wb")
-        fvalue = open(value_path, "wb")
-
-    if need_dump_score:
-        score_name = name + "_scores"
-        score_path = os.path.join(root_path, score_name)
-        if rank == 0:
-            fscore = open(score_path, "wb")
-
-    local_max_rows = dyn_emb_rows(dynamic_table)
-    dim = dyn_emb_cols(dynamic_table)
-    optstate_dim = dynamic_table.optstate_dim()
-    if optim:
-        dim += optstate_dim
-
-    search_capacity = dyn_emb_capacity(dynamic_table)
-
-    max_rows_tensor = torch.tensor(local_max_rows, dtype=torch.int64, device=device)
-    gathered_local_max_rows = (
-        [torch.tensor(0, dtype=torch.int64, device=device) for _ in range(world_size)]
-        if rank == 0
-        else None
-    )
-    dist.gather(max_rows_tensor, gather_list=gathered_local_max_rows, dst=0, group=pg)
-
-    if rank == 0:
-        gathered_local_max_rows = [t.item() for t in gathered_local_max_rows]
-
-    accumulated_counts = [0] * world_size if rank == 0 else None
-
-    max_rows_tensor.item()
-    offset = 0
-
-    while offset < search_capacity:
-        keys, values, scores, d_counter = export_keys_values(
-            dynamic_table, offset, device, batch_size, optim=optim
-        )
-        d_counter = d_counter.to(dtype=torch.int64)
-
-        # Gather keys and values at the root process (rank 0)
-        gathered_keys = (
-            [torch.empty_like(keys) for _ in range(world_size)] if rank == 0 else None
-        )
-        gathered_values = (
-            [torch.empty_like(values) for _ in range(world_size)] if rank == 0 else None
-        )
-        gathered_counts = (
-            [torch.empty_like(d_counter) for _ in range(world_size)]
-            if rank == 0
-            else None
-        )
-
-        if need_dump_score:
-            scores = scores.contiguous()
-            scores_bytes = scores.view(torch.uint8)
-            gathered_scores_bytes = (
-                [torch.empty_like(scores_bytes) for _ in range(world_size)]
-                if rank == 0
-                else None
-            )
-
-        dist.gather(keys, gather_list=gathered_keys, dst=0, group=pg)
-        dist.gather(values, gather_list=gathered_values, dst=0, group=pg)
-        dist.gather(d_counter, gather_list=gathered_counts, dst=0, group=pg)
-
-        if need_dump_score:
-            dist.gather(
-                scores_bytes, gather_list=gathered_scores_bytes, dst=0, group=pg
-            )
-
-        if rank == 0:
-            if need_dump_score:
-                gathered_scores = [
-                    tensor.view(torch.uint64) for tensor in gathered_scores_bytes
-                ]
-            for i in range(world_size):
-                actual_length = gathered_counts[i].item()
-                if actual_length > 0:
-                    tmp_gathered_keys = (
-                        gathered_keys[i][:actual_length].to(torch.int64).cpu()
-                    )
-                    fkey.write(tmp_gathered_keys.numpy().tobytes())
-                    tmp_gathered_values = (
-                        gathered_values[i][: actual_length * dim].to(torch.float).cpu()
-                    )
-                    fvalue.write(tmp_gathered_values.numpy().tobytes())
-                    if need_dump_score:
-                        tmp_gathered_scores = (
-                            gathered_scores[i][:actual_length].to(torch.uint64).cpu()
-                        )
-                        fscore.write(tmp_gathered_scores.numpy().tobytes())
-                    accumulated_counts[i] += actual_length
-        offset += batch_size
-    if rank == 0:
-        fkey.close()
-        fvalue.close()
-        if need_dump_score:
-            fscore.close()
-        for i in range(world_size):
-            assert accumulated_counts[i] == gathered_local_max_rows[i], (
-                f"Rank {i} has accumulated count {accumulated_counts[i]} which is different from expected {gathered_local_max_rows[i]}, "
-                f"difference: {accumulated_counts[i] - gathered_local_max_rows[i]}"
-            )
-
-    return
-
-
 def distributed_export(
     dynamic_table,
     root_path,
@@ -872,143 +744,6 @@ def distributed_export(
     if rank == 0:
         print(f"DynamicEmb distributed dump table {name} success! Generated {world_size} rank files.")
 
-    return
-
-
-
-
-def load_table(
-    dynamic_table,
-    root_path,
-    name,
-    batch_size=65536,
-    pg: Optional[dist.ProcessGroup] = None,
-    debug_mode: Optional[bool] = False,
-    optim: bool = False,
-):
-    rank = dist.get_rank(group=pg)
-    world_size = dist.get_world_size(group=pg)
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
-
-    key_name = name + "_keys"
-    value_name = name + "_values"
-
-    key_path = os.path.join(root_path, key_name)
-    value_path = os.path.join(root_path, value_name)
-
-    if not os.path.exists(key_path):
-        raise Exception("can't find path to load, path:", key_path)
-
-    if not os.path.exists(value_path):
-        raise Exception("can't find path to load, path:", value_path)
-
-    key_file_size = os.path.getsize(key_path)
-    value_file_size = os.path.getsize(value_path)
-
-    key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-    value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-
-    key_bytes = dtype_to_bytes(key_dtype)
-    value_bytes = dtype_to_bytes(value_dtype)
-
-    total_keys = key_file_size // key_bytes
-    total_dim = value_file_size // (total_keys * value_bytes)
-
-    dim = dyn_emb_cols(dynamic_table)
-    optstate_dim = dynamic_table.optstate_dim()
-    if total_dim < dim or ((total_dim != dim + optstate_dim) and optim):
-        raise Exception(
-            "Can't load as mismatch of embedding dtype, dim or optimizer type"
-        )
-
-    keys_read_bytes = batch_size * 8  # key in file always int64 ,so is 8
-    values_read_bytes = (
-        batch_size * total_dim * 4
-    )  # value in file always float , so is 4
-
-    if debug_mode:
-        debug_check_dynamic_table_is_zero(dynamic_table)
-    if need_dump_score:
-        score_name = name + "_scores"
-        score_path = os.path.join(root_path, score_name)
-        if not os.path.exists(score_path):
-            raise Exception("can't find path to load, path:", score_path)
-        score_dtype = torch.uint64
-        scores_read_bytes = batch_size * 8  # score in file always uint64, so is 8
-        score_file_size = os.path.getsize(score_path)
-
-    with open(key_path, "rb") as fkey, open(value_path, "rb") as fvalue:
-        if need_dump_score:
-            fscore = open(score_path, "rb")
-        while True:
-            remaining_key_bytes = key_file_size - fkey.tell()
-            remaining_value_bytes = value_file_size - fvalue.tell()
-
-            if remaining_key_bytes <= 0 or remaining_value_bytes <= 0:
-                break
-
-            key_bytes_to_read = min(keys_read_bytes, remaining_key_bytes)
-            value_bytes_to_read = min(values_read_bytes, remaining_value_bytes)
-
-            key_bytes = fkey.read(key_bytes_to_read)
-            value_bytes = fvalue.read(value_bytes_to_read)
-
-            num_keys = len(key_bytes) // 8  # key in file always int64 ,so is 8
-
-            key_array = np.frombuffer(key_bytes, dtype=np.int64)
-            value_array = np.frombuffer(value_bytes, dtype=np.float32).reshape(
-                -1, total_dim
-            )
-
-            if need_dump_score:
-                remaining_score_bytes = score_file_size - fscore.tell()
-                score_bytes_to_read = min(scores_read_bytes, remaining_score_bytes)
-                score_bytes = fscore.read(score_bytes_to_read)
-                score_array = np.frombuffer(score_bytes, dtype=np.uint64)
-
-            # Masking keys and values based on rank
-            mask = key_array % world_size == rank
-            masked_keys = key_array[mask]
-            masked_values = value_array[mask, :]
-            if need_dump_score:
-                masked_scores = score_array[mask]
-            if masked_keys.shape[0] > 0:
-                keys_tensor = torch.tensor(masked_keys, dtype=key_dtype, device=device)
-                values_tensor = torch.tensor(
-                    masked_values, dtype=value_dtype, device=device
-                )
-                if not optim:
-                    optstate = (
-                        torch.ones(
-                            values_tensor.size(0),
-                            optstate_dim,
-                            dtype=value_dtype,
-                            device=device,
-                        )
-                        * dynamic_table.get_initial_optstate()
-                    )
-                    values_tensor = torch.cat(
-                        (values_tensor[:, :dim], optstate), dim=1
-                    ).contiguous()
-                if need_dump_score:
-                    scores_tensor = torch.tensor(
-                        masked_scores, dtype=score_dtype, device=device
-                    )
-                    insert_or_assign(
-                        dynamic_table,
-                        masked_keys.shape[0],
-                        keys_tensor,
-                        values_tensor,
-                        scores_tensor,
-                    )
-                else:
-                    insert_or_assign(
-                        dynamic_table, masked_keys.shape[0], keys_tensor, values_tensor
-                    )
-
-        if need_dump_score:
-            fscore.close()
     return
 
 
@@ -1211,15 +946,10 @@ def DynamicEmbDump(
 
             for k, dump_name in enumerate(ordered_keys):
                 dynamic_table = tmp_tables_dict[dump_name]
-                distributed_dump = True # whether to use distributed dump
-                if(distributed_dump):
-                    distributed_export(
-                        dynamic_table, full_collection_path, dump_name, pg=pg, optim=optim
-                    )
-                else:   
-                    gather_and_export(
-                        dynamic_table, full_collection_path, dump_name, pg=pg, optim=optim
-                    )
+
+                distributed_export(
+                    dynamic_table, full_collection_path, dump_name, pg=pg, optim=optim
+                )
 
                 if optim:
                     args_filename = dump_name + "_opt_args.json"
@@ -1480,24 +1210,6 @@ def parse_distributed_files(root_path: str, table_name: str) -> Dict[str, Any]:
     return file_info
 
 
-def load_separated_files(
-    dynamic_table,
-    root_path,
-    name,
-    file_info,
-    current_rank,
-    current_world_size,
-    optim,
-    device,
-):
-    dump_world_size = file_info["world_size"]
-    has_optimizer = file_info["has_optimizer"]
-    #todo: function structure is not good, need to combine them
-    if dump_world_size == current_world_size:
-        return load_direct_separated_files(dynamic_table, root_path, name, file_info, current_rank, optim, device)
-    if current_rank == 0:
-        return load_resharded_separated_files(dynamic_table, root_path, name, file_info, current_world_size, current_rank, optim, device)
-
 
 def load_direct_separated_files(
     dynamic_table,
@@ -1701,11 +1413,17 @@ def load_distributed_table_by_files(
     optim: bool = False,
 ):
     file_info = parse_distributed_files(root_path, name)
-    if file_info is not None:
-        rank = dist.get_rank(group=pg)
-        world_size = dist.get_world_size(group=pg)
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        
-        load_separated_files(dynamic_table, root_path, name, file_info, rank, world_size, optim, device)
+    rank = dist.get_rank(group=pg)
+    world_size = dist.get_world_size(group=pg)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    
+    # load_separated_files(dynamic_table, root_path, name, file_info, rank, world_size, optim, device)
+
+    dump_world_size = file_info["world_size"]
+    has_optimizer = file_info["has_optimizer"]
+    #todo: function structure is not good, need to combine them
+    if dump_world_size == world_size:
+        return load_direct_separated_files(dynamic_table, root_path, name, file_info, rank, optim, device)
     else:
-        load_table(dynamic_table, root_path, name, batch_size, pg, debug_mode, optim)
+        return load_resharded_separated_files(dynamic_table, root_path, name, file_info, world_size, rank, optim, device)
+
