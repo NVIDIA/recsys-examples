@@ -43,7 +43,8 @@ def test_checkpoint_model(
 ):
     init.initialize_distributed()
     init.initialize_model_parallel(1)
-
+    if task_type == "retrieval" and max_num_candidates > 0:
+        pytest.skip("skipping retrieval with no candidates")
     model, dense_optimizer, history_batches = create_model(
         task_type=task_type,
         contextual_feature_names=contextual_feature_names,
