@@ -424,7 +424,8 @@ def get_common_preprocessors(dataset_path: str):
         dict: Dictionary of common data preprocessors. The valid keys are
         "ml-1m", "ml-20m", "kuairand-pure", "kuairand-1k", "kuairand-27k".
     """
-    data_path = dataset_path if dataset_path else "tmp_data"
+    data_path = dataset_path if dataset_path else "tmp_data/"
+    data_path += "/"
     ml_1m_dp = MovielensDataProcessor(
         "http://files.grouplens.org/datasets/movielens/ml-1m.zip",
         data_path=data_path,
