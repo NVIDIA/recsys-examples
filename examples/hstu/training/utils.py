@@ -21,6 +21,7 @@ import dataset
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from configs import (
+    HSTUConfig,
     HSTULayerType,
     HSTUPreprocessingConfig,
     KernelBackend,
@@ -39,6 +40,51 @@ from training.gin_config_args import (
     OptimizerArgs,
     TrainerArgs,
 )
+
+
+@torch.compile
+def cal_flops_single_rank(
+    hstu_config: HSTUConfig, seqlens: torch.Tensor
+) -> torch.Tensor:
+    num_layers = hstu_config.num_layers
+    hidden_size = hstu_config.hidden_size
+    num_heads = hstu_config.num_attention_heads
+    dim_per_head = hstu_config.kv_channels
+    with torch.inference_mode():
+        total_flops_per_layer = 0
+        total_flops_per_layer += (
+            2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
+        )  # qkvu proj fwd
+        total_flops_per_layer += (
+            2 * num_heads * 2 * seqlens * seqlens * dim_per_head
+        )  # attn fwd
+        total_flops_per_layer += seqlens * num_heads * dim_per_head  # mul fwd
+        total_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
+        total_flops_per_layer *= 3  # bwd
+        if hstu_config.residual:
+            total_flops_per_layer += (
+                seqlens * num_heads * hidden_size
+            )  # add fwd, bwd is no-op
+
+        return torch.sum(total_flops_per_layer) * num_layers
+
+
+def cal_flops(hstu_config: HSTUConfig, seqlens: List[torch.Tensor]) -> int:
+    seqlens_tensor = torch.cat(seqlens)
+    world_size = torch.distributed.get_world_size()
+    gathered_seqlens = (
+        [torch.empty_like(seqlens_tensor) for _ in range(world_size)]
+        if torch.distributed.get_rank() == 0
+        else None
+    )
+    torch.distributed.gather(seqlens_tensor, gathered_seqlens, dst=0)
+    if torch.distributed.get_rank() == 0:
+        flops = (
+            cal_flops_single_rank(hstu_config, torch.cat(gathered_seqlens)).cpu().item()
+        )
+    else:
+        flops = 0
+    return flops
 
 
 def create_hstu_config(network_args: NetworkArgs):

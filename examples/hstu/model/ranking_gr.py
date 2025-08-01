@@ -134,7 +134,9 @@ class RankingGR(BaseModel):
     def forward(  # type: ignore[override]
         self,
         batch: RankingBatch,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]:
         """
         Perform the forward pass of the model.
 
@@ -150,4 +152,5 @@ class RankingGR(BaseModel):
             losses.detach(),
             jagged_item_logit.detach(),
             labels.detach(),
+            batch.features.lengths().detach(),  # used to compute achieved flops/s
         )
