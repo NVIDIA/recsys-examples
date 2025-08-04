@@ -33,6 +33,7 @@ from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.tp_layer_norm import TPLayerNormMulDropout
 from ops.collective_ops import gather_along_last_dim
+from ops.triton_ops.triton_layer_norm import triton_layer_norm
 
 
 class HSTULayer(MegatronModule):
@@ -96,7 +97,7 @@ class HSTULayer(MegatronModule):
             output_size=sum(self._split_arg_list) * self._num_heads,
             init_method=config.init_method,
             config=config,
-            bias=config.add_uvqk_bias,
+            bias=False,  # config.add_uvqk_bias,
             gather_output=False,
             skip_bias_add=False,  # note: TEColumnParallelLinear does not support bias fusion!
             is_expert=False,
@@ -148,21 +149,25 @@ class HSTULayer(MegatronModule):
         """
 
         # TODO: fuse linear, bias, and silu?
-        mixed_uvqk, _ = self._linear_uvqk(hidden_states)
-        # silu will upcast to fp32 in register
-        mixed_uvqk = F.silu(mixed_uvqk).view(
-            -1, self._num_heads_per_partition, sum(self._split_arg_list)
-        )
-        (user, value, query, key) = torch.split(
-            mixed_uvqk,
-            self._split_arg_list,
-            dim=-1,
-        )
+        with nvtx.annotate("hstu linear_uvqk fwd", color="RED"):
+            mixed_uvqk, _ = self._linear_uvqk(hidden_states)
+        with nvtx.annotate("hstu silu fwd", color="BLUE"):
+            # silu will upcast to fp32 in register
+            mixed_uvqk = F.silu(mixed_uvqk).view(
+                -1, self._num_heads_per_partition, sum(self._split_arg_list)
+            )
+        with nvtx.annotate("hstu split fwd", color="BLUE"):
+            (user, value, query, key) = torch.split(
+                mixed_uvqk,
+                self._split_arg_list,
+                dim=-1,
+            )
 
-        # this contiguous is inevitable, because output layout is (T, head_dim * 4, num_heads)
-        user = user.reshape(
-            -1, self._num_heads_per_partition * self._linear_dim_per_head
-        )
+        with nvtx.annotate("u.contiguous", color="BLUE"):
+            # this contiguous is inevitable, because output layout is (T, head_dim * 4, num_heads)
+            user = user.reshape(
+                -1, self._num_heads_per_partition * self._linear_dim_per_head
+            )
         clear_tensor_data(mixed_uvqk)
         return user, value, query, key
 
@@ -180,9 +185,8 @@ class HSTULayer(MegatronModule):
         # input is [*, h]
         x = jd.values
         with nvtx.annotate("hstu ln+linear_bias+silu fwd", color="RED"):
-            normed_x = F.layer_norm(
+            normed_x = triton_layer_norm(
                 x,
-                normalized_shape=[self._embedding_dim],
                 weight=self._input_layernorm_weight,
                 bias=self._input_layernorm_bias,
                 eps=self._eps,
