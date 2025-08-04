@@ -97,7 +97,7 @@ class HSTULayer(MegatronModule):
             output_size=sum(self._split_arg_list) * self._num_heads,
             init_method=config.init_method,
             config=config,
-            bias=False,  # config.add_uvqk_bias,
+            bias=config.add_uvqk_bias,
             gather_output=False,
             skip_bias_add=False,  # note: TEColumnParallelLinear does not support bias fusion!
             is_expert=False,
@@ -163,11 +163,6 @@ class HSTULayer(MegatronModule):
                 dim=-1,
             )
 
-        with nvtx.annotate("u.contiguous", color="BLUE"):
-            # this contiguous is inevitable, because output layout is (T, head_dim * 4, num_heads)
-            user = user.reshape(
-                -1, self._num_heads_per_partition * self._linear_dim_per_head
-            )
         clear_tensor_data(mixed_uvqk)
         return user, value, query, key
 
