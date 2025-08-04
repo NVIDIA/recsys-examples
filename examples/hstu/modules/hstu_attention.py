@@ -428,7 +428,7 @@ def create_hstu_attention(
             )
         assert sm_major_version >= 8, "Ampere or Ampere next GPU is required."
         if sm_major_version == 8:
-            assert sm_minor_version == 0, "For Ampere, only A100 is supported." 
+            assert sm_minor_version == 0, "For Ampere, only A100 is supported."
         return FusedHSTUAttention(
             num_heads,
             attention_dim,

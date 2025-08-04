@@ -391,10 +391,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm = torch.cuda.get_device_properties(0).major
             if sm == 8:
                 addmm_silu_fwd_impl = triton_addmm_silu_fwd
-            elif sm == 9:
-                addmm_silu_fwd_impl = torch_addmm_silu_fwd
             else:
-                raise ValueError(f"Unsupported SM major version: {sm}")
+                addmm_silu_fwd_impl = torch_addmm_silu_fwd
             y, _ = addmm_silu_fwd_impl(
                 x=x,
                 w=w,
