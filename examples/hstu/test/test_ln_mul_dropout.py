@@ -30,8 +30,9 @@ from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 @pytest.mark.parametrize("hidden_dim", [128, 512])
 @pytest.mark.parametrize("seed", [1234])
 @pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("u_is_3d", [True, False])
 def test_ln_mul_dropout(
-    input_dtype, training, concat_ux, dropout_ratio, hidden_dim, seed
+    input_dtype, training, concat_ux, dropout_ratio, hidden_dim, seed, u_is_3d
 ):
     torch.backends.cuda.matmul.allow_tf32 = False
     init.initialize_distributed()
@@ -54,14 +55,25 @@ def test_ln_mul_dropout(
         .uniform_(-0.1, 0.1)
         .requires_grad_(True)
     )
-    u = (
-        torch.empty(batchsize, hidden_dim, device=device, dtype=input_dtype)
-        .fill_(0.5)
-        .requires_grad_(True)
-    )
+    nheads = 4
+    head_dim = hidden_dim // nheads
+    if u_is_3d:
+        u = (
+            torch.empty(
+                batchsize, nheads, head_dim * 4, device=device, dtype=input_dtype
+            )  # (bs, heads, combined_uvqk_dim )
+            .fill_(0.5)
+            .requires_grad_(True)
+        )[:, :, :head_dim]
+    else:
+        u = (
+            torch.empty(batchsize, hidden_dim, device=device, dtype=input_dtype)
+            .fill_(0.5)
+            .requires_grad_(True)
+        )
 
     ref_x = x.detach().clone().requires_grad_(True)
-    ref_u = u.detach().clone().requires_grad_(True)
+    ref_u = u.detach().clone().requires_grad_(True).contiguous().view(batchsize, -1)
 
     y = triton_norm_mul_dropout(
         x, u, ln_weight, ln_bias, eps, dropout_ratio, training, concat_ux, seed=seed
