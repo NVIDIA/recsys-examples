@@ -242,6 +242,8 @@ if not SKIP_CUDA_BUILD:
     cc_flag = []
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_80,code=sm_80")
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_100,code=sm_100")
     # cc_flag.append("arch=compute_86,code=sm_86")
 
     if FORCE_CXX11_ABI:
