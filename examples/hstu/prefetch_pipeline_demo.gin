@@ -45,7 +45,6 @@ NetworkArgs.hidden_size = 1024
 # per head dim
 NetworkArgs.kv_channels = 256
 NetworkArgs.kernel_backend = 'cutlass'
-NetworkArgs.layer_type = 'fused'
 
 # recompute can incurs perf regression, but save memory
 NetworkArgs.recompute_input_layernorm = True

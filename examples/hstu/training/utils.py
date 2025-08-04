@@ -107,14 +107,11 @@ def create_hstu_config(network_args: NetworkArgs):
             f"Kernel backend {network_args.kernel_backend} is not supported."
         )
     layer_type = None
-    if network_args.layer_type == "fused":
+    if network_args.enable_hstu_as_op:
         layer_type = HSTULayerType.FUSED
-    elif network_args.layer_type == "debug":
-        layer_type = HSTULayerType.DEBUG
-    elif network_args.layer_type == "native":
-        layer_type = HSTULayerType.NATIVE
     else:
-        raise ValueError(f"Layer type {network_args.layer_type} is not supported.")
+        layer_type = HSTULayerType.NATIVE
+
     position_encoding_config = PositionEncodingConfig(
         num_position_buckets=network_args.num_position_buckets,
         num_time_buckets=2048,

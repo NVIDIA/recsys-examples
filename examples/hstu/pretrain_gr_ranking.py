@@ -49,6 +49,7 @@ from training import (
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
     train_with_pipeline,
+    validate_and_update_args,
 )
 
 
@@ -101,6 +102,14 @@ def create_ranking_config() -> RankingConfig:
 
 
 def main():
+    validate_and_update_args(
+        network_args,
+        trainer_args,
+        tp_args,
+        embedding_args,
+        dataset_args,
+        optimizer_args,
+    )
     init.initialize_distributed()
     init.initialize_model_parallel(
         tensor_model_parallel_size=tp_args.tensor_model_parallel_size

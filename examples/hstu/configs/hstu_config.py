@@ -110,8 +110,7 @@ class HSTUConfig(TransformerConfig):
     enable_relative_attention_bias: bool = False
 
     kernel_backend: KernelBackend = KernelBackend.CUTLASS
-    # TODO deprecate FUSED
-    hstu_layer_type: HSTULayerType = HSTULayerType.FUSED
+    hstu_layer_type: HSTULayerType = HSTULayerType.FUSED  # DEBUG|NATIVE|FUSED
 
     target_group_size: int = 1
     learnable_input_layernorm: bool = True
