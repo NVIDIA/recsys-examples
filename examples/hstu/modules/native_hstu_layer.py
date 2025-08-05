@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+from functools import partial
 
 import nvtx
 import torch
@@ -27,6 +28,7 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TERowParallelLinear,
 )
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import divide
 from modules.hstu_attention import create_hstu_attention
@@ -70,6 +72,12 @@ class HSTULayer(MegatronModule):
             self._attention_dim_per_head,
             self._attention_dim_per_head,
         ]
+        self._recompute_input_layernorm = config.recompute_input_layernorm
+        if self._recompute_input_layernorm:
+            self.input_layernorm_checkpoint = CheckpointWithoutOutput()
+        self._recompute_input_silu = config.recompute_input_silu
+        if self._recompute_input_silu:
+            self.silu_checkpoint = CheckpointWithoutOutput()
         self._residual = config.residual
         device = torch.cuda.current_device()
         # input layernorm
@@ -151,19 +159,33 @@ class HSTULayer(MegatronModule):
         # TODO: fuse linear, bias, and silu?
         with nvtx.annotate("hstu linear_uvqk fwd", color="RED"):
             mixed_uvqk, _ = self._linear_uvqk(hidden_states)
+
         with nvtx.annotate("hstu silu fwd", color="BLUE"):
+            if self._recompute_input_silu:
+                silu_uvqk = self.silu_checkpoint.checkpoint(
+                    F.silu,
+                    mixed_uvqk,
+                )
+            else:
+                silu_uvqk = F.silu(mixed_uvqk)
             # silu will upcast to fp32 in register
-            mixed_uvqk = F.silu(mixed_uvqk).view(
+            silu_uvqk = silu_uvqk.view(
                 -1, self._num_heads_per_partition, sum(self._split_arg_list)
             )
+        if self._recompute_input_layernorm:
+            # when mixed_uvqk grad(silu) is computed, trigger the recompute of the input layernorm
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                mixed_uvqk
+            )
+
         with nvtx.annotate("hstu split fwd", color="BLUE"):
             (user, value, query, key) = torch.split(
-                mixed_uvqk,
+                silu_uvqk,
                 self._split_arg_list,
                 dim=-1,
             )
 
-        clear_tensor_data(mixed_uvqk)
+        clear_tensor_data(silu_uvqk)
         return user, value, query, key
 
     @output_nvtx_hook(nvtx_tag="HSTULayer")
@@ -179,13 +201,22 @@ class HSTULayer(MegatronModule):
         """
         # input is [*, h]
         x = jd.values
-        with nvtx.annotate("hstu ln+linear_bias+silu fwd", color="RED"):
-            normed_x = triton_layer_norm(
-                x,
-                weight=self._input_layernorm_weight,
-                bias=self._input_layernorm_bias,
-                eps=self._eps,
-            )
+        with nvtx.annotate("hstu input layernorm fwd", color="RED"):
+            if self._recompute_input_layernorm:
+                normed_x = self.input_layernorm_checkpoint.checkpoint(
+                    partial(triton_layer_norm, eps=self._eps),
+                    x,
+                    self._input_layernorm_weight,
+                    self._input_layernorm_bias,
+                )
+            else:
+                normed_x = triton_layer_norm(
+                    x,
+                    weight=self._input_layernorm_weight,
+                    bias=self._input_layernorm_bias,
+                    eps=self._eps,
+                )
+        with nvtx.annotate("hstu uvqk linear_silu fwd", color="BLUE"):
             tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
         # TODO: remove contiguous once cutlass backend is ready
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
@@ -199,11 +230,18 @@ class HSTULayer(MegatronModule):
                 max_seqlen=jd.max_seqlen,
                 target_group_size=self._target_group_size,
             )
+
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             if self._debug_shortcut_output_ln_mul_dropout:
                 parallel_input = jagged_attn_output
             else:
                 parallel_input = self._output_ln_dropout_mul(jagged_attn_output, tu)
+
+        if self._recompute_input_silu:
+            # when output grad (gemm dgrad) is computed, trigger the recompute of the silu
+            # we discard here after tu is used
+            self.silu_checkpoint.discard_output_and_register_recompute(parallel_input)
+
         with nvtx.annotate("hstu linear_residual fwd", color="YELLOW"):
             # shortcut for debug
             if self._debug_shortcut_proj_linear:
@@ -212,8 +250,10 @@ class HSTULayer(MegatronModule):
                 )
             else:
                 output, _ = self._linear_proj(parallel_input)
+
             if self._residual:
                 output = output + x
+
         return JaggedData(
             values=output,
             seqlen=jd.seqlen,
