@@ -33,6 +33,7 @@ from dynamicemb_extensions import (
     dyn_emb_cols,
     dyn_emb_rows,
     export_batch,
+    find,
     insert_or_assign,
 )
 from torch import nn
@@ -136,6 +137,8 @@ def debug_dump(embedding_collections_list, path, table_names, optim, pg):
         else:
             export_batch(dynamic_table, search_capacity, 0, d_counter, keys, values)
 
+        print(f"keys in debug_export: {keys}")
+        print(f"values in debug_export: {values}")
         cap = dynamic_table.capacity()
         assert cap == search_capacity
         d_num_matched = torch.zeros(1, dtype=torch.uint64, device=device)
@@ -326,6 +329,7 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
         keys_in_dynemb = torch.empty(
             local_max_rows, dtype=key_dtype_in_table, device=device
         )
+        # value_dim = dim if not optim else dim + optstate_dim
         values_in_dynemb = torch.empty(
             local_max_rows * (dim + optstate_dim),
             dtype=value_dtype_in_table,
@@ -342,7 +346,18 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
 
         keys_device = keys.to(device)
         values_device = values.to(device)
+        print(f"values_device in debug_load: {values_device}")
 
+        test_keys = torch.empty(total_keys, dtype=keys.dtype, device=device)
+        test_values = torch.empty(total_keys, dim + optstate_dim, dtype=torch.float32, device=device)
+        test_founds = torch.empty(total_keys, dtype=torch.bool, device=device)
+        test_scores = torch.zeros(total_keys, dtype=torch.uint64, device=device)
+        test_d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
+        # find(dynamic_table, total_keys, keys_device, test_values, test_founds, test_scores) 
+        export_batch(dynamic_table, dyn_emb_capacity(dynamic_table), 0, test_d_counter, test_keys, test_values, test_scores) 
+        print(f"keys_device in debug_load: {keys_device}")
+        print(f"test_values in debug_load: {test_values}")
+        # print(f"test_founds in debug_load: {test_founds}")
         if need_dump_score:
             score_dtype_in_table = torch.uint64
             scores_in_dynemb = torch.empty(
@@ -373,6 +388,7 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
                 keys_in_dynemb,
                 values_in_dynemb,
             )
+        print(f"values_in_dynemb: {values_in_dynemb}")
         if not optim:
             values_in_dynemb = (
                 values_in_dynemb.reshape(-1, dim + optstate_dim)[:, :dim]
@@ -409,6 +425,8 @@ def debug_load(embedding_collections_list, path, table_names, optim, pg):
             raise ValueError(
                 f"DynamicEmb Debug: Mismatch in keys for table {dump_name} at positions {diff_keys.tolist()}"
             )
+        print(f"sorted_values_device: {sorted_values_device}")
+        print(f"sorted_values_in_dynemb_float: {sorted_values_in_dynemb_float}")
         if not torch.equal(sorted_values_device, sorted_values_in_dynemb_float):
             diff_values = torch.nonzero(
                 sorted_values_device != sorted_values_in_dynemb_float
@@ -631,18 +649,13 @@ def broadcast_string(
     result_str = "".join(chr(value.item()) for value in broadcasted_tensor[0]).rstrip()
     return result_str
 
-
 def export_keys_values(dynamic_table, offset, device, batch_size=65536, optim=False):
     key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
     value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
     score_dtype = torch.uint64
     dim = dyn_emb_cols(dynamic_table)
     optstate_dim = dynamic_table.optstate_dim()
-    
-    if not optim:
-        total_dim = dim
-    else:
-        total_dim = dim + optstate_dim
+    total_dim = dim + optstate_dim
 
     keys = torch.empty(batch_size, dtype=key_dtype, device=device)
     values = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
@@ -650,6 +663,9 @@ def export_keys_values(dynamic_table, offset, device, batch_size=65536, optim=Fa
     d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
 
     export_batch(dynamic_table, batch_size, offset, d_counter, keys, values, scores)
+
+    if not optim:
+        values = values.reshape(batch_size, total_dim)[:, :dim].contiguous().reshape(-1)
 
     return keys, values, scores, d_counter
 
@@ -712,19 +728,23 @@ def distributed_export(
             tmp_keys = keys[:actual_length].to(torch.int64).cpu()
             fkey.write(tmp_keys.numpy().tobytes())
             
-            tmp_emb_values = values[:actual_length * emb_dim].to(torch.float).cpu()
-            fvalue.write(tmp_emb_values.numpy().tobytes())
+            if optim:
+                # When optim=True, values is 1D with shape [actual_length * (emb_dim + optstate_dim)]
+                values_2d = values[:actual_length * (emb_dim + optstate_dim)].reshape(actual_length, emb_dim + optstate_dim)
+                tmp_emb_values = values_2d[:, :emb_dim].to(torch.float).cpu()
+                tmp_opt_values = values_2d[:, emb_dim:emb_dim + optstate_dim].to(torch.float).cpu()
+                print(f"tmp_opt_values: {tmp_opt_values}")
+                fopt_value.write(tmp_opt_values.numpy().tobytes())
+            else:
+                # When optim=False, values is 1D with shape [actual_length * emb_dim]
+                tmp_emb_values = values[:actual_length * emb_dim].reshape(actual_length, emb_dim).to(torch.float).cpu()
             
+            fvalue.write(tmp_emb_values.numpy().tobytes()) 
+            print(f"values: {values}")
+            print(f"tmp_emb_values: {tmp_emb_values}")
             if need_dump_score:
                 tmp_scores = scores[:actual_length].to(torch.uint64).cpu()
                 fscore.write(tmp_scores.numpy().tobytes())
-            
-            if optim:
-                # optimizer keys same as embedding keys
-                # fopt_key.write(tmp_keys.numpy().tobytes())
-                
-                tmp_opt_values = values[actual_length * emb_dim:actual_length * (emb_dim + optstate_dim)].to(torch.float).cpu()
-                fopt_value.write(tmp_opt_values.numpy().tobytes())
             
             total_written += actual_length
 
@@ -1257,7 +1277,7 @@ def load_direct_separated_files(
     total_keys = len(keys)
     emb_dim = len(values) // total_keys
     values = values.reshape(total_keys, emb_dim)
-    
+    print(f"values in direct_separated_files: {values}")
     if optim and file_info["has_optimizer"]:
         opt_value_file = file_info["opt_files"].get(f"opt_value_rank{rank}")
         
@@ -1275,6 +1295,7 @@ def load_direct_separated_files(
                 
                 combined_values = torch.cat([values, opt_values], dim=1)
                 
+                print(f"combined_values: {combined_values}")
                 if need_dump_score and scores is not None:
                     insert_or_assign(dynamic_table, total_keys, keys, combined_values, scores)
                 else:
@@ -1283,11 +1304,35 @@ def load_direct_separated_files(
                 print(f"Rank {rank}: Loaded {total_keys} embeddings + optimizer states from {emb_key_file}")
                 return
     
+    opt_values = (
+        torch.ones(
+            total_keys,
+            dynamic_table.optstate_dim(),
+            dtype=dyn_emb_to_torch(dynamic_table.value_type()),      # 数据类型
+            device=device,          # GPU设备
+        )
+        * dynamic_table.get_initial_optstate()  # 乘以初始优化器状态值
+    )
+    values = torch.cat(
+        (values[:, :emb_dim], opt_values), dim=1  # 在维度1上拼接
+    ).contiguous()  # 确保内存连续
+    test_keys = torch.empty(total_keys, dtype=keys.dtype, device=device)
+    test_founds = torch.empty(total_keys, dtype=torch.bool, device=device)
+    test_values = torch.empty((total_keys, emb_dim+dynamic_table.optstate_dim()), dtype=torch.float32, device=device)
+    test_scores = torch.zeros(total_keys, dtype=torch.uint64, device=device)
+    test_d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
+    print(f"load value dim: {emb_dim}")
+    print(f"load value shape: {values.shape}")
     if need_dump_score and scores is not None:
         insert_or_assign(dynamic_table, total_keys, keys, values, scores)
+        #find(dynamic_table, total_keys, keys, test_values, test_founds, test_scores) 
+        export_batch(dynamic_table, dyn_emb_capacity(dynamic_table), 0, test_d_counter, test_keys, test_values, test_scores) 
     else:
         insert_or_assign(dynamic_table, total_keys, keys, values)
-    
+        #find(dynamic_table, total_keys, keys, test_values, test_founds) 
+        export_batch(dynamic_table, dyn_emb_capacity(dynamic_table), 0, test_d_counter, test_keys, test_values) 
+    print("keys: ", keys)
+    print(f"test_values: {test_values}")
     print(f"Rank {rank}: Loaded {total_keys} embeddings from {emb_key_file}")
 
 
