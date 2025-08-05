@@ -22,11 +22,14 @@ from typing import Any, Dict, List, Optional, Union
 import torch  # usort:skip
 from dynamicemb.dynamicemb_config import *
 from dynamicemb_extensions import (
-    DynamicEmbTable,
-    dynamic_emb_adagrad_with_table,
-    dynamic_emb_adam_with_table,
-    dynamic_emb_rowwise_adagrad_with_table,
-    dynamic_emb_sgd_with_table,
+    dynamic_emb_sgd,
+    dynamic_emb_sgd_with_pointer,
+    dynamic_emb_adam,
+    dynamic_emb_adam_with_pointer,
+    dynamic_emb_adagrad,
+    dynamic_emb_adagrad_with_pointer,
+    dynamic_emb_rowwise_adagrad,
+    dynamic_emb_rowwise_adagrad_with_pointer,
 )
 
 
@@ -102,61 +105,23 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
     def __init__(
         self,
         opt_args: OptimizerArgs,
-        table_options: List[DynamicEmbTableOptions],
-        hashtables: List[DynamicEmbTable],
     ) -> None:
         self._opt_args: OptimizerArgs = copy.deepcopy(opt_args)
-        self._table_options: List[DynamicEmbTableOptions] = copy.deepcopy(table_options)
-
-        self._hashtables: List[DynamicEmbTable] = hashtables
-        self._num_tables: int = len(self._hashtables)
-
-        self._state_dict: Dict[str, List[DynamicEmbTable]] = {}
-        self._table_state_map: Dict[DynamicEmbTable, int] = {}
-
-        for i, ht in enumerate(self._hashtables):
-            self._table_state_map[ht] = i
-
-    def get_state_by_name(self, state_name: str) -> Union[List[DynamicEmbTable], None]:
-        """
-        Get the state from the state dictionary.
-        """
-        return self._state_dict.get(state_name, None)
-
-    def get_state(self) -> Union[Dict[str, List[DynamicEmbTable]], None]:
-        """
-        Get the state from the state dictionary.
-        """
-        return self._state_dict
-
-    def state_names(self) -> List[str]:
-        """
-        Get a list of all state names in the state dictionary.
-        """
-        return list(self._state_dict.keys())
-
-    def table_state_map(self) -> Dict[DynamicEmbTable, int]:
-        """
-        Get a list of all state names in the state dictionary.
-        """
-        return self._table_state_map
-
-    def set_learning_rate(self, new_lr) -> None:
-        self._opt_args.learning_rate = new_lr
-        return
-
-    def _create_tables(self, states: List[DynamicEmbTable]) -> None:
-        for i, table_option in enumerate(self._table_options):
-            states.append(create_dynamicemb_table(table_option))
 
     @abc.abstractmethod
     def update(
         self,
-        hashtables: List[DynamicEmbTable],
-        indices: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        ...
+
+    @abc.abstractmethod
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
     ) -> None:
         ...
 
@@ -168,62 +133,58 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
     def set_opt_args(self, args: Dict[str, Any]) -> None:
         ...
 
+    @abc.abstractmethod
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        pass
+
+    def set_learning_rate(self, new_lr) -> None:
+        self._opt_args.learning_rate = new_lr
+        return
+
+    def get_initial_optim_states(self) -> float:
+        return self._opt_args.initial_accumulator_value
+
+    def set_initial_optim_states(self, value: float) -> None:
+        self._opt_args.initial_accumulator_value = value
+        return
+
 
 class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,
-        table_options: List[DynamicEmbTableOptions],
-        hashtables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args)
 
     def update(
         self,
-        hashtables: List[DynamicEmbTable],
-        indices: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
     ) -> None:
-        for ht in hashtables:
-            if ht not in self._hashtables:
-                raise ValueError(
-                    f"DynamicEmb ERROR: Hashtable {ht} not found in hashtables in class {self.__class__.__name__}."
-                )
-
         lr = self._opt_args.learning_rate
-        for i, ht in enumerate(hashtables):
-            state_idx = self._table_state_map[ht]
-            table_option = self._table_options[state_idx]
+        dynamic_emb_sgd(
+            grads.size(0),
+            grads,
+            embs,
+            lr,
+        )
 
-            grad = grads[i]
-            indice = indices[i]
-            num_indice = indice.shape[0]
-            weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
-            if embs is not None and len(embs) != 0:
-                emb = embs[i]
-                dynamic_emb_sgd_with_table(
-                    ht,
-                    num_indice,
-                    indice,
-                    grad,
-                    lr,
-                    weight_dtype,
-                    score,
-                    emb,
-                )
-            else:
-                dynamic_emb_sgd_with_table(
-                    ht,
-                    num_indice,
-                    indice,
-                    grad,
-                    lr,
-                    weight_dtype,
-                    score,
-                )
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        dynamic_emb_sgd_with_pointer(
+            grads.size(0),
+            grads,
+            value_ptr,
+            lr,
+        )
 
     def get_opt_args(self):
         ret_args = {"lr": self._opt_args.learning_rate}
@@ -233,82 +194,80 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         self._opt_args.learning_rate = get_required_arg(args, "lr")
         return
 
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return 0
 
 class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,
-        table_options: List[DynamicEmbTableOptions],
-        hashtables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
-
+        super().__init__(opt_args)
         self._iterations: int = 0
-        self._state_dict["m"] = []
-        self._state_dict["v"] = []
+    
+    def _step(self):
+        self._iterations += 1
 
     def update(
         self,
-        hashtables: List[DynamicEmbTable],
-        indices: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
     ) -> None:
-        for ht in hashtables:
-            if ht not in self._table_state_map.keys():
-                raise ValueError(
-                    f"DynamicEmb ERROR: Hashtable {ht} not found in _table_state_map in class {self.__class__.__name__}."
-                )
-        self._iterations += 1
+        assert states is not None
+        self._step()
+
         lr = self._opt_args.learning_rate
         beta1 = self._opt_args.beta1
         beta2 = self._opt_args.beta2
         weight_decay = self._opt_args.weight_decay
         eps = self._opt_args.eps
 
-        for i, ht in enumerate(hashtables):
-            state_idx = self._table_state_map[ht]
-            table_option = self._table_options[state_idx]
+        dynamic_emb_adam(
+            grads.size(0),
+            grads,
+            embs,
+            states,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            self._iterations,
+        )
 
-            indice = indices[i]
-            grad = grads[i]
-            num_indice = indice.shape[0]
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+    ) -> None:
 
-            weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
-            if embs is not None and len(embs) != 0:
-                emb = embs[i]
-                dynamic_emb_adam_with_table(
-                    ht,
-                    num_indice,
-                    indice,
-                    grad,
-                    lr,
-                    beta1,
-                    beta2,
-                    eps,
-                    weight_decay,
-                    self._iterations,
-                    weight_dtype,
-                    score,
-                    emb,
-                )
-            else:
-                dynamic_emb_adam_with_table(
-                    ht,
-                    num_indice,
-                    indice,
-                    grad,
-                    lr,
-                    beta1,
-                    beta2,
-                    eps,
-                    weight_decay,
-                    self._iterations,
-                    weight_dtype,
-                    score,
-                )
+        self._step()
+
+        lr = self._opt_args.learning_rate
+        beta1 = self._opt_args.beta1
+        beta2 = self._opt_args.beta2
+        weight_decay = self._opt_args.weight_decay
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        dynamic_emb_adam_with_pointer(
+            grads.size(0),
+            grads,
+            value_ptr,
+            state_dim,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            self._iterations,
+        )
 
     def get_opt_args(self):
         ret_args = {
@@ -330,65 +289,59 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         self._opt_args.weight_decay = get_required_arg(args, "weight_decay")
         return
 
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return emb_dim * 2
+
 
 class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,
-        table_options: List[DynamicEmbTableOptions],
-        hashtables: List[DynamicEmbTable],
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
-
-        self._state_dict["Gt"] = hashtables
-
-        for table in hashtables:
-            table.set_initial_optstate(self._opt_args.initial_accumulator_value)
+        super().__init__(opt_args)
 
     def update(
         self,
-        hashtables: List[DynamicEmbTable],
-        indices: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
     ) -> None:
-        for ht in hashtables:
-            if ht not in self._table_state_map.keys():
-                raise ValueError(
-                    f"DynamicEmb ERROR: Hashtable {ht} not found in _table_state_map in class {self.__class__.__name__}."
-                )
+  
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
 
-        for i, ht in enumerate(hashtables):
-            state_idx = self._table_state_map[ht]
-            table_option = self._table_options[state_idx]
+        dynamic_emb_adagrad(
+            grads.size(0),
+            grads,
+            embs,
+            states,
+            lr,
+            eps,
+        )
 
-            indice = indices[i]
-            grad = grads[i]
-            num_indice = indice.shape[0]
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+    ) -> None:
 
-            weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
 
-            if embs is not None and len(embs) != 0:
-                emb = embs[i]
-                dynamic_emb_adagrad_with_table(
-                    ht,
-                    num_indice,
-                    indice,
-                    grad,
-                    lr,
-                    eps,
-                    weight_dtype,
-                    score,
-                    emb,
-                )
-            else:
-                dynamic_emb_adagrad_with_table(
-                    ht, num_indice, indice, grad, lr, eps, weight_dtype, score
-                )
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        dynamic_emb_adagrad(
+            grads.size(0),
+            grads,
+            value_ptr,
+            state_dim,
+            lr,
+            eps,
+        )
 
     def get_opt_args(self):
         ret_args = {
@@ -403,68 +356,69 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         self._opt_args.eps = get_required_arg(args, "eps")
         initial_value = get_required_arg(args, "initial_accumulator_value")
         self._opt_args.initial_accumulator_value = initial_value
-        for table in self._state_dict["Gt"]:
-            table.set_initial_optstate(initial_value)
         return
+
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return emb_dim
 
 
 class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,
-        table_options: List[DynamicEmbTableOptions],
-        hashtables: List[DynamicEmbTable],
+        emb_dtype: torch.dtype,
     ) -> None:
-        super().__init__(opt_args, table_options, hashtables)
+        super().__init__(opt_args)
 
-        self._state_dict["Gt"] = hashtables
-
-        for table in hashtables:
-            table.set_initial_optstate(self._opt_args.initial_accumulator_value)
+        DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+            torch.float32: 4,
+            torch.float16: 2,
+            torch.bfloat16: 2,
+        }
+        self._optim_state_dim = 16 // DTYPE_NUM_BYTES[emb_dtype]
 
     def update(
         self,
-        hashtables: List[DynamicEmbTable],
-        indices: List[torch.Tensor],
-        grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
     ) -> None:
-        for ht in hashtables:
-            if ht not in self._table_state_map.keys():
-                raise ValueError(
-                    f"DynamicEmb ERROR: Hashtable {ht} not found in _table_state_map in class {self.__class__.__name__}."
-                )
+  
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
-        for i, ht in enumerate(hashtables):
-            state_idx = self._table_state_map[ht]
-            table_option = self._table_options[state_idx]
 
-            indice = indices[i]
-            grad = grads[i]
-            num_indice = indice.shape[0]
+        dynamic_emb_rowwise_adagrad(
+            grads.size(0),
+            grads,
+            embs,
+            states,
+            lr,
+            eps,
+        )
 
-            weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+    ) -> None:
 
-            if embs is not None and len(embs) != 0:
-                emb = embs[i]
-                dynamic_emb_rowwise_adagrad_with_table(
-                    ht,
-                    num_indice,
-                    indice,
-                    grad,
-                    lr,
-                    eps,
-                    weight_dtype,
-                    score,
-                    emb,
-                )
-            else:
-                dynamic_emb_rowwise_adagrad_with_table(
-                    ht, num_indice, indice, grad, lr, eps, weight_dtype, score
-                )
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        dynamic_emb_rowwise_adagrad_with_pointer(
+            grads.size(0),
+            grads,
+            value_ptr,
+            state_dim,
+            lr,
+            eps,
+        )
 
     def get_opt_args(self):
         ret_args = {
@@ -479,6 +433,10 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         self._opt_args.eps = get_required_arg(args, "eps")
         initial_value = get_required_arg(args, "initial_accumulator_value")
         self._opt_args.initial_accumulator_value = initial_value
-        for table in self._state_dict["Gt"]:
-            table.set_initial_optstate(initial_value)
         return
+
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return self._optim_state_dim

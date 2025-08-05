@@ -1,0 +1,481 @@
+# 1. 外接 ps
+# 2. 兼容 prefetch
+# 3. 兼容不同的 score: cache LRU, storage LFU.
+# 4. remove API lock
+
+# 1. interface mock
+# 2. export 
+# 3. test 
+
+# 1. find: forward
+# 2. migrate/prefetch: migrate embeddings between cache and storage
+# 3. update: backward
+# 4. initialize
+
+import abc
+import torch
+from typing import Tuple, Optional, Callable
+
+from dynamicemb.dynamicemb_config import (
+    DynamicEmbTableOptions,
+    create_dynamicemb_table,
+)
+from dynamicemb.initializer import BaseDynamicEmbInitializer
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb_extensions import (
+    find_pointers,
+    load_from_pointers,
+    select,
+    select_index,
+    insert_and_evict,
+    insert_or_assign,
+    clear,
+    export_batch,
+)
+
+class Storage(abc.ABC):
+    @abc.abstractmethod
+    def find(
+        self, 
+        unique_keys: torch.Tensor,
+        unique_embs: torch.Tensor,
+        founds: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_missing: torch.Tensor
+        missing_keys: torch.Tensor
+        missing_indices: torch.Tensor
+        return num_missing, missing_keys, missing_indices
+
+    @abc.abstractmethod
+    def insert(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        scores: Optional[torch.Tensor]
+    ) -> None:
+        pass
+    
+    @abc.abstractmethod
+    def update(
+        self, 
+        keys: torch.Tensor, 
+        grads: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_missing: torch.Tensor
+        missing_keys: torch.Tensor
+        missing_indices: torch.Tensor
+        return num_missing, missing_keys, missing_indices
+
+    @abc.abstractmethod
+    def enable_update(self) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def dump(
+        self,
+        start: int,
+        end: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_dumped: torch.Tensor
+        dumped_keys: torch.Tensor
+        dumped_values: torch.Tensor
+        dumped_scores: torch.Tensor
+        return num_dumped, dumped_keys, dumped_values, dumped_scores
+
+    @abc.abstractmethod
+    def embedding_dtype(self,) -> torch.dtype:
+        pass
+
+    @abc.abstractmethod
+    def value_dim(self,) -> int:
+        pass
+
+    @abc.abstractmethod
+    def embedding_dim(self,) -> int:
+        pass
+    
+    @abc.abstractmethod
+    def init_optimizer_state(self,) -> float:
+        pass
+
+class Cache(abc.ABC):
+    @abc.abstractmethod
+    def find(
+        self, 
+        unique_keys: torch.Tensor,
+        unique_embs: torch.Tensor,
+        founds: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_missing: torch.Tensor
+        missing_keys: torch.Tensor
+        missing_indices: torch.Tensor
+        return num_missing, missing_keys, missing_indices
+
+    @abc.abstractmethod
+    def insert_and_evict(
+        self,
+        keys: torch.Tensor, 
+        values: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_evicted: torch.Tensor
+        evicted_keys: torch.Tensor
+        evicted_values: torch.Tensor
+        evicted_scores: torch.Tensor
+        return num_evicted, evicted_keys, evicted_values, evicted_scores
+    
+    @abc.abstractmethod
+    def update(
+        self, 
+        keys: torch.Tensor, 
+        grads: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_missing: torch.Tensor
+        missing_keys: torch.Tensor
+        missing_indices: torch.Tensor
+        return num_missing, missing_keys, missing_indices
+
+    @abc.abstractmethod
+    def flush(
+        self,
+        storage: Storage
+    ) -> None:
+        pass
+
+    @abc.abstractmethod
+    def reset(
+        self,
+    ) -> None:
+        pass
+
+class KeyValueTable(Cache, Storage):
+    def __init__(
+        self,
+        options: DynamicEmbTableOptions,
+        optimizer: BaseDynamicEmbeddingOptimizer,
+    ):
+        self.options = options
+        self.table = create_dynamicemb_table(options)
+        self.capacity = options.max_capacity
+        self.optimizer = optimizer
+        self.score: int = None
+        self._is_farward = False
+        self._emb_dim = self.options.dim
+        self._emb_dtype = self.options.embedding_dtype
+        self._value_dim = self._emb_dim + optimizer.get_state_dim(self._emb_dim)
+        self._initial_optim_state = optimizer.get_initial_optim_states()
+
+        self.device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(self.device.index)
+        self._threads_in_wave = props.multi_processor_count * props.max_threads_per_multi_processor
+
+    def find(
+        self, 
+        unique_keys: torch.Tensor,
+        unique_embs: torch.Tensor,
+        founds: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        batch = unique_keys.size(0)
+        assert unique_embs.dim() == 2
+        assert unique_embs.size(0) == batch
+        
+        load_dim = unique_embs.size(1)
+    
+        device = unique_keys.device
+        if founds is None:
+            founds = torch.empty(batch, dtype=torch.bool, device=device)
+        pointers = torch.empty(batch, dtype=torch.long, device=device)
+        
+        if self._is_farward:
+            find_pointers(self.table, batch, unique_keys, pointers, founds, self.score)
+        else:
+            find_pointers(self.table, batch, unique_keys, pointers, founds)
+        
+        val_dim = self.value_dim()
+        
+        if load_dim != 0:
+            load_from_pointers(batch, pointers, val_dim, unique_embs, load_dim)
+
+        missing = torch.logical_not(founds)
+        num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
+        num_missing_1: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
+        missing_keys: torch.Tensor = torch.empty_like(unique_keys)
+        missing_indices: torch.Tensor = torch.empty(batch, dtype=torch.long, device=device)
+        select(batch, missing, unique_keys, missing_keys, num_missing_0)
+        select_index(batch, missing, missing_indices, num_missing_1)
+        
+        return num_missing_0, missing_keys, missing_indices
+
+    def insert(
+        self,
+        unique_keys: torch.Tensor,
+        unique_values: torch.Tensor,
+        scores: Optional[torch.Tensor]
+    ) -> None:
+        h_num_unique_keys = unique_keys.size(0)
+        if scores is None:
+            insert_or_assign(self.table, h_num_unique_keys, unique_keys, unique_values, self.score)
+        else:
+            insert_or_assign(self.table, h_num_unique_keys, unique_keys, unique_values, scores)
+
+    def update(
+        self, 
+        keys: torch.Tensor, 
+        grads: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        assert self._is_farward == False, "update is called only in backward."
+        
+        batch = keys.size(0)
+
+        device = keys.device
+        founds = torch.empty(batch, dtype=torch.bool, device=device)
+        pointers = torch.empty(batch, dtype=torch.long, device=device)
+        find_pointers(self.table, batch, keys, pointers, founds)
+        
+        self.optimizer.fused_update_with_pointer(grads, pointers)
+
+        missing = torch.logical_not(founds)
+        num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
+        num_missing_1: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
+        missing_keys: torch.Tensor = torch.empty_like(keys)
+        missing_indices: torch.Tensor = torch.empty(batch, dtype=torch.long, device=device)
+        select(batch, missing, keys, missing_keys, num_missing_0)
+        select_index(batch, missing, missing_indices, num_missing_1)
+        return num_missing_0, missing_keys, missing_indices
+
+    def enable_update(self) -> bool:
+        return True
+    
+    def set_score(
+        self,
+        score: int,
+    ) -> None:
+        self.score = score
+    
+    @property
+    def is_farward(self,) -> None:
+        return self._is_farward
+
+    @is_farward.setter
+    def is_farward(self, value: bool):
+        self._is_farward = value
+
+    def dump(
+        self,
+        start: int,
+        end: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch = end - start
+        device = self.device
+        key_dtype = self.options.index_type
+        value_dtype = self._emb_dtype
+        dim: int = self._value_dim
+        
+        num_dumped: torch.Tensor = torch.zeros(1, dtype=torch.uint64, device=device)
+        dumped_keys: torch.Tensor = torch.empty(batch, dtype=key_dtype, device=device)
+        dumped_values: torch.Tensor = torch.empty(batch, dim, dtype=value_dtype, device=device)
+        dumped_scores: torch.Tensor = torch.empty(batch, dtype=torch.uint64, device=device)
+
+        export_batch(self.table, start, end, dumped_keys, dumped_values, dumped_scores)
+
+        return num_dumped, dumped_keys, dumped_values, dumped_scores
+
+    def embedding_dtype(self,) -> torch.dtype:
+        return self._emb_dtype
+
+    def value_dim(self,) -> int:
+        return self._value_dim
+
+    def embedding_dim(self,) -> int:
+        return self._emb_dim
+
+    def init_optimizer_state(self,) -> float:
+        return self._initial_optim_state
+
+    def insert_and_evict(
+        self,
+        keys: torch.Tensor, 
+        values: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        batch = keys.numel()
+        num_evicted: torch.Tensor = torch.empty(1, dtype=torch.long, device=keys.device)
+        evicted_keys: torch.Tensor = torch.empty_like(keys)
+        evicted_values: torch.Tensor = torch.empty_like(values)
+        evicted_scores: torch.Tensor = torch.empty(batch, dtype=torch.uint64, device=keys.device)
+        insert_and_evict(self.table, batch, keys, values, num_evicted, evicted_keys, evicted_values, evicted_scores, self.score)
+        return num_evicted, evicted_keys, evicted_values, evicted_scores
+
+    def flush(
+        self,
+        storage: Storage
+    ) -> None:
+        batch_size = self._threads_in_wave
+        for start in range(0, self.capacity, batch_size):
+            end = min(start + batch_size, self.capacity)
+            num_dumped, dumped_keys, dumped_values, dumped_scores = self.dump(start, end)
+            h_num_dumped = num_dumped.cpu().item()
+            dumped_keys = dumped_keys[:h_num_dumped]
+            dumped_values = dumped_values[:h_num_dumped, :]
+            dumped_scores = dumped_scores[:h_num_dumped]
+            storage.insert(dumped_keys, dumped_values, dumped_scores)
+
+    def reset(
+        self,
+    ) -> None:
+        clear(self.table)
+
+
+def update_cache(
+    cache: Cache, 
+    storage: Storage, 
+    missing_keys: torch.Tensor, 
+    missing_values: torch.Tensor
+):
+    # need to update score.
+    num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(missing_keys, missing_values)
+    h_num_evicted = num_evicted.cpu().item()
+    if h_num_evicted != 0:
+        storage.insert(evicted_keys[:h_num_evicted], evicted_values[:h_num_evicted, :], evicted_scores[:h_num_evicted])
+
+def unique(keys) -> Tuple[int, torch.Tensor, torch.Tensor]:
+    unique_keys, inverse_indices = torch.unique(keys, sort=False, return_inverse=True)
+    h_num_unique_keys = unique_keys.numel()
+    return h_num_unique_keys, unique_keys, inverse_indices
+    # h_num_unique, unique_keys, inverse_indices = unique(keys)
+
+
+class KeyValueTableFunction:
+    @staticmethod
+    def lookup(
+        cache: Optional[Cache], 
+        storage: Storage, 
+        unique_keys: torch.Tensor, 
+        unique_embs: torch.Tensor,
+        initializer: Callable, 
+        enable_prefetch: bool
+    ) -> None:
+
+        assert unique_keys.dim() == 1
+        h_num_toatl = unique_keys.numel()
+        emb_dim = storage.embedding_dim()
+        emb_dtype = storage.embedding_dtype()
+
+        # 1. find in cache
+        if cache is not None:
+            num_missing, missing_keys, missing_indices = cache.find(unique_keys, unique_embs)
+            h_num_keys_for_storage = num_missing.cpu().item()
+            keys_for_storage = missing_keys[:h_num_keys_for_storage]
+            missing_indices = missing_indices[:h_num_keys_for_storage]
+        else:
+            h_num_keys_for_storage = h_num_toatl
+            keys_for_storage = unique_keys
+            missing_indices = slice(None)
+        if h_num_keys_for_storage == 0:
+            return
+        
+        # 2. find in storage
+        val_dim = storage.value_dim()
+        values_for_storage = torch.empty(h_num_keys_for_storage, val_dim, device=unique_keys.device, dtype=emb_dtype)
+        num_missing_in_storage, missing_keys_in_storage, missing_indices_in_storage = storage.find(keys_for_storage, values_for_storage)
+        
+        # 3. initialize missing embeddings
+        h_num_missing_in_storage = num_missing_in_storage.cpu().item()
+        missing_indices_in_storage = missing_indices_in_storage[:h_num_missing_in_storage]
+        missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
+
+        if h_num_missing_in_storage != 0:
+            initializer(values_for_storage[:, :emb_dim], missing_indices_in_storage)
+            
+
+        # 4. d2d
+        unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
+        
+        if h_num_missing_in_storage == 0:
+            return
+    
+        if cache is None:
+            # insert missing values
+            missing_values_in_storage = values_for_storage[missing_indices_in_storage, :].contiguous()
+            missing_values_in_storage[:, emb_dim-val_dim:] = storage.init_optimizer_state()
+            storage.insert(missing_keys_in_storage, missing_values_in_storage)
+
+        if cache is not None and not enable_prefetch:
+            values_for_storage[missing_indices_in_storage, emb_dim-val_dim:] = storage.init_optimizer_state()
+            update_cache(cache, storage, keys_for_storage, values_for_storage)
+
+
+    @staticmethod
+    def update(
+        cache: Optional[Cache], 
+        storage: Storage, 
+        unique_keys: torch.Tensor, 
+        unique_grads: torch.Tensor,
+        optimizer: BaseDynamicEmbeddingOptimizer,
+    ):
+
+        if cache is not None:
+            num_missing, missing_keys, missing_indices = cache.update(unique_keys, unique_grads)
+            h_num_keys_for_storage = num_missing.cpu().item()
+            keys_for_storage = missing_keys[:h_num_keys_for_storage]
+            missing_indices = missing_indices[:h_num_keys_for_storage]
+            grads_for_storage = unique_grads[missing_indices, :].contiguous()
+        else:
+            keys_for_storage = unique_keys
+            grads_for_storage = grads_for_storage
+
+        if storage.enable_update():
+            storage.update(keys_for_storage, grads_for_storage)
+            return
+
+        emb_dtype = storage.embedding_dtype()
+        val_dim = storage.value_dim()
+        emb_dim = storage.embedding_dim()
+        values_for_storage = torch.empty(h_num_keys_for_storage, val_dim, device=unique_keys.device, dtype=emb_dtype)
+        founds = torch.empty(h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool)
+        _, _, _ = storage.find(keys_for_storage, values_for_storage, founds=founds)
+        
+        keys_for_storage = keys_for_storage[founds]
+        values_for_storage = values_for_storage[founds, :]
+        grads_for_storage = grads_for_storage[founds, :]
+        optimizer.update(grads_for_storage, values_for_storage[:emb_dim, :], values_for_storage[emb_dim-val_dim:, :])
+        
+        storage.insert(keys_for_storage, values_for_storage)
+        
+        return
+
+    @staticmethod
+    def prefetch(
+        cache: Cache,
+        storage: Storage,
+        unique_keys: torch.Tensor,
+        initializer: BaseDynamicEmbInitializer,
+        forward_stream: Optional[torch.cuda.Stream] = None
+    ) -> None:
+        #TODO: forward_stream constraint
+
+        assert cache is not None
+        emb_dtype = storage.embedding_dtype()
+        # dummy tensor
+        unique_embs = torch.empty(unique_keys.numel(), 0, device=unique_keys.device, dtype=emb_dtype)
+        num_missing, missing_keys, _ = cache.find(unique_keys, unique_embs)
+        
+        h_num_keys_for_storage = num_missing.cpu().item()
+        missing_keys = missing_keys[:h_num_keys_for_storage]
+        if h_num_keys_for_storage == 0:
+            return
+
+        val_dim = storage.value_dim()
+        emb_dim = storage.embedding_dim()
+        values_for_storage = torch.empty(h_num_keys_for_storage, val_dim, device=unique_keys.device, dtype=emb_dtype)
+        num_missing_in_storage, _, missing_indices_in_storage = storage.find(missing_keys, values_for_storage)
+
+        h_num_missing_in_storage = num_missing_in_storage.cpu().item()
+        missing_indices_in_storage = missing_indices_in_storage[:,h_num_missing_in_storage]
+        if h_num_missing_in_storage != 0:
+            embs_for_storage = values_for_storage[:, :emb_dim]
+            initializer(embs_for_storage, missing_indices_in_storage)
+            values_for_storage[missing_indices_in_storage, emb_dim-val_dim:] = storage.init_optimizer_state()
+        
+        update_cache(cache, storage, missing_keys, values_for_storage)
