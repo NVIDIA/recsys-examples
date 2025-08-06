@@ -47,7 +47,6 @@ from training import (
     get_dataset_and_embedding_args,
     maybe_load_ckpts,
     train_with_pipeline,
-    validate_and_update_args,
 )
 
 
@@ -90,21 +89,13 @@ def create_retrieval_config() -> RetrievalConfig:
 
 
 def main():
-    validate_and_update_args(
-        network_args,
-        trainer_args,
-        tp_args,
-        embedding_args,
-        dataset_args,
-        optimizer_args,
-    )
     init.initialize_distributed()
     init.initialize_model_parallel(
         tensor_model_parallel_size=tp_args.tensor_model_parallel_size
     )
     init.set_random_seed(trainer_args.seed)
 
-    hstu_config = create_hstu_config(network_args)
+    hstu_config = create_hstu_config(network_args, tp_args)
     task_config = create_retrieval_config()
     model = get_retrieval_model(hstu_config=hstu_config, task_config=task_config)
 

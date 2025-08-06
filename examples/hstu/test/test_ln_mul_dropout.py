@@ -73,7 +73,7 @@ def test_ln_mul_dropout(
         )
 
     ref_x = x.detach().clone().requires_grad_(True)
-    ref_u = u.detach().clone().requires_grad_(True).contiguous().view(batchsize, -1)
+    ref_u = u.detach().clone().contiguous().view(batchsize, -1).requires_grad_(True)
 
     y = triton_norm_mul_dropout(
         x, u, ln_weight, ln_bias, eps, dropout_ratio, training, concat_ux, seed=seed

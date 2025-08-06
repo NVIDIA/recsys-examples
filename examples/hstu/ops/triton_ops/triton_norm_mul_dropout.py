@@ -44,9 +44,8 @@ def _ln_mul_dropout_fwd(
     stride_u0,
     stride_u1,
     stride_y,
-    U_IS_3D: tl.constexpr,
     NUM_U_SLICES: tl.constexpr,  # num of heads
-    UD: tl.constexpr,  # valid only when U_IS_3D is True
+    UD: tl.constexpr,  # valid only when NUM_U_SLICES>1
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_UX: tl.constexpr,
@@ -77,7 +76,7 @@ def _ln_mul_dropout_fwd(
     b = tl.load(B + cols, mask=mask).to(tl.float32)
     y = y * w + b
 
-    if U_IS_3D:
+    if NUM_U_SLICES > 1:
         u_tile_offsets = tl.arange(0, NUM_U_SLICES)
         u_inner_offsets = tl.arange(0, UD)
         offsets_2d = u_tile_offsets[:, None] * stride_u1 + u_inner_offsets[None, :]
@@ -149,9 +148,8 @@ def _ln_mul_dropout_bwd_dx_du(
     seed,
     dropout_ratio,
     N,
-    U_IS_3D: tl.constexpr,
     NUM_U_SLICES: tl.constexpr,
-    UD: tl.constexpr,  # valid only when U_IS_3D is True
+    UD: tl.constexpr,  # valid only when NUM_U_SLICES>1
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_UX: tl.constexpr,
@@ -222,7 +220,7 @@ def _ln_mul_dropout_bwd_dx_du(
         du += dy * ln
 
         # 2D write-back du
-        if U_IS_3D:
+        if NUM_U_SLICES > 1:
             du = du.reshape(NUM_U_SLICES, UD)
             u_tile_offsets = tl.arange(0, NUM_U_SLICES)
             u_inner_offsets = tl.arange(0, UD)
@@ -235,7 +233,7 @@ def _ln_mul_dropout_bwd_dx_du(
             tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
 
         # load u
-        if U_IS_3D:
+        if NUM_U_SLICES > 1:
             u_tile_offsets = tl.arange(0, NUM_U_SLICES)
             u_inner_offsets = tl.arange(0, UD)
             offsets_2d = u_tile_offsets[:, None] * stride_u1 + u_inner_offsets[None, :]
@@ -409,7 +407,6 @@ def triton_layer_norm_mul_dropout_fwd(
         u.stride(0),
         u.stride(1) if U_IS_3D else 1,
         y.stride(0),
-        U_IS_3D=U_IS_3D,
         NUM_U_SLICES=u.size(1) if U_IS_3D else 1,
         UD=u.size(-1) if U_IS_3D else D,
         BLOCK_D=BLOCK_D,
@@ -495,7 +492,6 @@ def triton_layer_norm_mul_dropout_bwd(
         seed,
         dropout_ratio,
         N=N,
-        U_IS_3D=U_IS_3D,
         NUM_U_SLICES=u.size(1) if U_IS_3D else 1,
         UD=u.size(-1) if U_IS_3D else D,
         BLOCK_D=BLOCK_D,

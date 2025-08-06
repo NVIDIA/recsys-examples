@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -143,7 +142,6 @@ class NetworkArgs:
     dtype_str: str = "bfloat16"
 
     kernel_backend: str = "cutlass"
-    enable_hstu_as_op: bool = False
     target_group_size: int = 1
 
     num_position_buckets: int = 8192
@@ -177,23 +175,3 @@ class OptimizerArgs:
 @dataclass
 class TensorModelParallelArgs:
     tensor_model_parallel_size: int = 1
-
-
-def validate_and_update_args(
-    network_args: NetworkArgs,
-    trainer_args: TrainerArgs,
-    tensor_model_parallel_args: TensorModelParallelArgs,
-    embedding_args: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]],
-    dataset_args: Union[DatasetArgs, BenchmarkDatasetArgs],
-    optimizer_args: OptimizerArgs,
-):
-    if (
-        tensor_model_parallel_args.tensor_model_parallel_size > 1
-        and network_args.enable_hstu_as_op
-    ):
-        logging.warning(
-            "hstu as op is not supported when tensor_model_parallel_size > 1, setting to False"
-        )
-        network_args.enable_hstu_as_op = False
-    else:
-        network_args.enable_hstu_as_op = True
