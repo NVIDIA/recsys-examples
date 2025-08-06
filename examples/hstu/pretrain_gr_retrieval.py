@@ -95,7 +95,7 @@ def main():
     )
     init.set_random_seed(trainer_args.seed)
 
-    hstu_config = create_hstu_config(network_args)
+    hstu_config = create_hstu_config(network_args, tp_args)
     task_config = create_retrieval_config()
     model = get_retrieval_model(hstu_config=hstu_config, task_config=task_config)
 

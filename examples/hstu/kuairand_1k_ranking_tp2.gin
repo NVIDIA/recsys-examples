@@ -15,8 +15,6 @@ NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 512
 NetworkArgs.kv_channels = 128
 
-NetworkArgs.layer_type = 'native' # only native supports tp!
-
 RankingArgs.prediction_head_arch = [
     512, 8
 ]

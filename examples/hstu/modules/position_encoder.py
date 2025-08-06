@@ -34,6 +34,7 @@ from math import sqrt
 from typing import Optional
 
 import torch
+from commons.utils.nvtx_op import output_nvtx_hook
 from ops.triton_ops.triton_position import (  # type: ignore[attr-defined]
     triton_add_position_embeddings,
     triton_add_timestamp_positional_embeddings,
@@ -87,6 +88,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
                 ),
             )
 
+    @output_nvtx_hook(nvtx_tag="HSTUPositionalEncoder")
     def forward(
         self,
         max_seq_len: int,

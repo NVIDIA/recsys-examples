@@ -38,6 +38,7 @@ from training.gin_config_args import (
     EmbeddingArgs,
     NetworkArgs,
     OptimizerArgs,
+    TensorModelParallelArgs,
     TrainerArgs,
 )
 
@@ -87,7 +88,9 @@ def cal_flops(hstu_config: HSTUConfig, seqlens: List[torch.Tensor]) -> int:
     return flops
 
 
-def create_hstu_config(network_args: NetworkArgs):
+def create_hstu_config(
+    network_args: NetworkArgs, tensor_model_parallel_args: TensorModelParallelArgs
+):
     dtype = None
     if network_args.dtype_str == "bfloat16":
         dtype = torch.bfloat16
@@ -107,14 +110,11 @@ def create_hstu_config(network_args: NetworkArgs):
             f"Kernel backend {network_args.kernel_backend} is not supported."
         )
     layer_type = None
-    if network_args.layer_type == "fused":
+    if tensor_model_parallel_args.tensor_model_parallel_size == 1:
         layer_type = HSTULayerType.FUSED
-    elif network_args.layer_type == "debug":
-        layer_type = HSTULayerType.DEBUG
-    elif network_args.layer_type == "native":
-        layer_type = HSTULayerType.NATIVE
     else:
-        raise ValueError(f"Layer type {network_args.layer_type} is not supported.")
+        layer_type = HSTULayerType.NATIVE
+
     position_encoding_config = PositionEncodingConfig(
         num_position_buckets=network_args.num_position_buckets,
         num_time_buckets=2048,

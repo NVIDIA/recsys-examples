@@ -142,7 +142,6 @@ class NetworkArgs:
     dtype_str: str = "bfloat16"
 
     kernel_backend: str = "cutlass"
-    layer_type: str = "fused"
     target_group_size: int = 1
 
     num_position_buckets: int = 8192
@@ -160,7 +159,6 @@ class NetworkArgs:
         ], "Only support bfloat16 and float16 precision for Network."
 
         assert self.kernel_backend.lower() in ["cutlass", "triton", "pytorch"]
-        assert self.layer_type.lower() in ["fused", "native"]
 
 
 @gin.configurable

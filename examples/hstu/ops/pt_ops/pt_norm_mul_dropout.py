@@ -34,7 +34,7 @@ def pytorch_norm_mul_dropout(
     """
     dtype = x.dtype
     x = x.to(torch.float32)
-    u = u.to(torch.float32)
+    u = u.reshape(u.size(0), -1).to(torch.float32)
     if group_norm:
         y = u * F.group_norm(
             x.view(-1, num_heads, linear_dim),
