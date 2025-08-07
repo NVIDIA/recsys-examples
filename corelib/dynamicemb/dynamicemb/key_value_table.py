@@ -87,11 +87,11 @@ class Storage(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def value_dim(self,) -> int:
+    def embedding_dim(self,) -> int:
         pass
 
     @abc.abstractmethod
-    def embedding_dim(self,) -> int:
+    def value_dim(self,) -> int:
         pass
     
     @abc.abstractmethod
@@ -147,6 +147,12 @@ class Cache(abc.ABC):
     ) -> None:
         pass
 
+    @property
+    @abc.abstractmethod
+    def modification_event(self) -> torch.cuda.Event:
+        pass
+
+
 class KeyValueTable(Cache, Storage):
     def __init__(
         self,
@@ -158,7 +164,7 @@ class KeyValueTable(Cache, Storage):
         self.capacity = options.max_capacity
         self.optimizer = optimizer
         self.score: int = None
-        self._is_farward = False
+        self._is_forward = False
         self._emb_dim = self.options.dim
         self._emb_dtype = self.options.embedding_dtype
         self._value_dim = self._emb_dim + optimizer.get_state_dim(self._emb_dim)
@@ -167,6 +173,8 @@ class KeyValueTable(Cache, Storage):
         self.device = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(self.device.index)
         self._threads_in_wave = props.multi_processor_count * props.max_threads_per_multi_processor
+        
+        self._modify_event = torch.cuda.Event()
 
     def find(
         self, 
@@ -186,7 +194,7 @@ class KeyValueTable(Cache, Storage):
             founds = torch.empty(batch, dtype=torch.bool, device=device)
         pointers = torch.empty(batch, dtype=torch.long, device=device)
         
-        if self._is_farward:
+        if self._is_forward:
             find_pointers(self.table, batch, unique_keys, pointers, founds, self.score)
         else:
             find_pointers(self.table, batch, unique_keys, pointers, founds)
@@ -224,7 +232,7 @@ class KeyValueTable(Cache, Storage):
         grads: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
-        assert self._is_farward == False, "update is called only in backward."
+        assert self._is_forward == False, "update is called only in backward."
         
         batch = keys.size(0)
 
@@ -254,12 +262,12 @@ class KeyValueTable(Cache, Storage):
         self.score = score
     
     @property
-    def is_farward(self,) -> None:
-        return self._is_farward
+    def is_forward(self,) -> None:
+        return self._is_forward
 
-    @is_farward.setter
-    def is_farward(self, value: bool):
-        self._is_farward = value
+    @is_forward.setter
+    def is_forward(self, value: bool):
+        self._is_forward = value
 
     def dump(
         self,
@@ -325,16 +333,23 @@ class KeyValueTable(Cache, Storage):
         self,
     ) -> None:
         clear(self.table)
+    
+    @property
+    def modification_event(self) -> torch.cuda.Event:
+        self._modify_event
 
 
 def update_cache(
     cache: Cache, 
     storage: Storage, 
     missing_keys: torch.Tensor, 
-    missing_values: torch.Tensor
+    missing_values: torch.Tensor,
+    record: bool = False
 ):
     # need to update score.
     num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(missing_keys, missing_values)
+    if record:
+        cache.modification_event.record()
     h_num_evicted = num_evicted.cpu().item()
     if h_num_evicted != 0:
         storage.insert(evicted_keys[:h_num_evicted], evicted_values[:h_num_evicted, :], evicted_scores[:h_num_evicted])
@@ -413,8 +428,11 @@ class KeyValueTableFunction:
         unique_keys: torch.Tensor, 
         unique_grads: torch.Tensor,
         optimizer: BaseDynamicEmbeddingOptimizer,
+        enable_prefetch: bool,
     ):
 
+        if enable_prefetch:
+            torch.cuda.current_stream().wait(cache.modification_event)
         if cache is not None:
             num_missing, missing_keys, missing_indices = cache.update(unique_keys, unique_grads)
             h_num_keys_for_storage = num_missing.cpu().item()
@@ -453,7 +471,6 @@ class KeyValueTableFunction:
         initializer: BaseDynamicEmbInitializer,
         forward_stream: Optional[torch.cuda.Stream] = None
     ) -> None:
-        #TODO: forward_stream constraint
 
         assert cache is not None
         emb_dtype = storage.embedding_dtype()
@@ -478,4 +495,4 @@ class KeyValueTableFunction:
             initializer(embs_for_storage, missing_indices_in_storage)
             values_for_storage[missing_indices_in_storage, emb_dim-val_dim:] = storage.init_optimizer_state()
         
-        update_cache(cache, storage, missing_keys, values_for_storage)
+        update_cache(cache, storage, missing_keys, values_for_storage, forward_stream is not None)

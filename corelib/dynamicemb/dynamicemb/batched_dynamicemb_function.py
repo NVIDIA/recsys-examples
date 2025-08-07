@@ -545,6 +545,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         ctx.caches = caches
         ctx.storages = storages
         ctx.optimizer = optimizer
+        ctx.enable_prefetch = enable_prefetch
 
         return output_embs
 
@@ -557,6 +558,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
+        enable_prefetch = ctx.enable_prefetch
   
         input_dist_dedup = ctx.input_dist_dedup
         if input_dist_dedup:
@@ -579,6 +581,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 unique_indices_per_table,
                 unique_embs_per_table,
                 optimizer,
+                enable_prefetch,
             )
 
         return (None,) * 10
