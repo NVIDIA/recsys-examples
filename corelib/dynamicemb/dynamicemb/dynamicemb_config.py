@@ -17,7 +17,7 @@ import enum
 import os
 from dataclasses import dataclass, field, fields
 from math import sqrt
-from typing import Optional
+from typing import Optional, Dict
 
 import torch
 from dynamicemb_extensions import (
@@ -505,3 +505,31 @@ def validate_initializer_args(
             initializer_args.lower = default_lower
         if initializer_args.upper is None:
             initializer_args.upper = default_upper
+
+def get_optimizer_state_dim(optimizer_type, dim, dtype):
+    DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+        torch.float32: 4,
+        torch.float16: 2,
+        torch.bfloat16: 2,
+    }
+    if optimizer_type == OptimizerType.RowWiseAdaGrad:
+        return 16 // DTYPE_NUM_BYTES[dtype]
+    elif optimizer_type == OptimizerType.Adam:
+        return dim * 2
+    elif optimizer_type == OptimizerType.AdaGrad:
+        return dim
+    else:
+        return 0
+            
+def get_constraint_capacity(
+    memory_bytes,
+    dtype,
+    dim,
+    optimizer_type,
+    bucket_capacity,
+) -> int:
+    byte_consume = (
+        dim + get_optimizer_state_dim(optimizer_type, dim, dtype)
+    ) * dtype_to_bytes(dtype)
+    capacity = memory_bytes // byte_consume
+    return (capacity // bucket_capacity) * bucket_capacity
