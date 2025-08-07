@@ -34,6 +34,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdlib>
 #include <cstdint>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <torch/torch.h>
 #include <cooperative_groups.h>
@@ -184,7 +186,8 @@ void find_and_initialize(
     std::shared_ptr<dyn_emb::DynamicVariableBase> table,
     const size_t n,
     const at::Tensor keys,
-    const at::Tensor values) {
+    const at::Tensor values,
+    const c10::optional<at::Tensor> &output_scores = c10::nullopt) {
 
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -195,7 +198,13 @@ void find_and_initialize(
      at::TensorOptions().dtype(at::kBool).device(keys.device()));
   auto founds = founds_tensor.data_ptr<bool>();
 
-  table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, stream);
+  // table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, output_scores.data_ptr(), stream);
+  if (output_scores.has_value()) {
+    at::Tensor output_scores_ = output_scores.value();
+    table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, output_scores_.data_ptr(), stream);
+  } else {
+    table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, nullptr, stream);
+  }
 }
 
 void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
@@ -375,20 +384,31 @@ void export_batch_matched(
 
 void lookup_forward_dense(
     std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>> tables,
-    const at::Tensor indices, const at::Tensor offsets, const py::list scores,
-    const std::vector<int> &table_offsets_in_feature, at::Tensor table_offsets,
-    int table_num, int batch_size, int dim, bool use_index_dedup,
-    const at::Tensor unique_idx, const at::Tensor reverse_idx,
-    const at::Tensor h_unique_nums, const at::Tensor d_unique_nums,
-    const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
-    const at::Tensor unique_embs, const at::Tensor output_embs,
-    int device_num_sms, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
+    const at::Tensor indices,
+    const at::Tensor offsets,
+    const py::list scores,
+    const std::vector<int> &table_offsets_in_feature,
+    at::Tensor table_offsets,
+    int table_num,
+    int batch_size,
+    int dim,
+    bool use_index_dedup,
+    const at::Tensor unique_idx,
+    const at::Tensor reverse_idx,
+    const at::Tensor h_unique_nums,
+    const at::Tensor d_unique_nums,
+    const at::Tensor h_unique_offsets,
+    const at::Tensor d_unique_offsets,
+    const at::Tensor unique_embs,
+    const at::Tensor output_embs,
+    int device_num_sms,
+    std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
+    int frequency_threshold = 0, int mask_dims = 0) {
 
   if (!offsets.is_cuda() || !indices.is_cuda()) {
     throw std::runtime_error(
         "offsets or indices tensor must be on CUDA device");
   }
-
   // Check dtype of h_unique_nums and d_unique_nums
   if (h_unique_nums.scalar_type() != at::kUInt64 ||
       d_unique_nums.scalar_type() != at::kUInt64) {
@@ -398,6 +418,7 @@ void lookup_forward_dense(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   int64_t indices_shape = indices.size(0);
+  
   auto unique_num_type = scalartype_to_datatype(
       convertTypeMetaToScalarType(d_unique_nums.dtype()));
   auto unique_offset_type = scalartype_to_datatype(
@@ -428,9 +449,11 @@ void lookup_forward_dense(
   AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
   h_table_offsets[0] = 0;
+
   for (int i = 0; i < table_num; ++i) {
     int table_offset_begin = table_offsets_in_feature[i];
     int table_offset_end = table_offsets_in_feature[i + 1];
+    
     int offset_begin = table_offset_begin * batch_size;
     int offset_end = table_offset_end * batch_size;
 
@@ -450,8 +473,8 @@ void lookup_forward_dense(
       at::Tensor tmp_reverse_idx =
           create_sub_tensor(reverse_idx, indices_begin);
       at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
-
       at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
+      
       unique_op->unique(tmp_indices, indices_length, tmp_reverse_idx,
                         tmp_unique_indices[i], tmp_d_unique_num, stream,
                         previous_d_unique_num);
@@ -474,14 +497,27 @@ void lookup_forward_dense(
                       table_offsets.numel() * table_offsets.element_size(),
                       cudaMemcpyHostToDevice, stream));
 
+  at::Tensor unique_output_scores;
+  int64_t total_unique_embs = 0;
+  for (int i = 0; i < table_num; ++i) {
+    total_unique_embs += h_unique_nums[i].item<int64_t>();
+  }
+  unique_output_scores = at::zeros({total_unique_embs}, 
+      at::TensorOptions().dtype(at::kUInt64).device(indices.device()));
+
   int64_t unique_embs_offset = 0;
+  int64_t scores_offset = 0;
+
   for (int i = 0; i < table_num; ++i) {
     int64_t tmp_unique_num = h_unique_nums[i].item<int64_t>();
     if (tmp_unique_num != 0) {
       at::Tensor tmp_unique_embs =
           create_sub_tensor(unique_embs, unique_embs_offset * dim);
+      at::Tensor tmp_unique_scores = create_sub_tensor(unique_output_scores, scores_offset);
+    
       if (use_index_dedup) {
-        find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+        find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs, tmp_unique_scores);
+        
         void *dst_ptr = reinterpret_cast<char *>(unique_idx.data_ptr()) +
                         unique_embs_offset * unique_idx.element_size();
         void *src_ptr = tmp_unique_indices[i].data_ptr();
@@ -492,20 +528,106 @@ void lookup_forward_dense(
         auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
         find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
                       tmp_unique_embs, score);
-      }
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        at::Tensor vals_ptr_tensor = at::empty({static_cast<int64_t>(tmp_unique_num)}, 
+          at::TensorOptions().dtype(at::kLong).device(tmp_unique_embs.device()));
+        auto vals_ptr = reinterpret_cast<void**>(vals_ptr_tensor.data_ptr<int64_t>());
+        at::Tensor founds_tensor = at::empty({static_cast<int64_t>(tmp_unique_num)},
+          at::TensorOptions().dtype(at::kBool).device(tmp_unique_indices[i].device()));
+        auto founds = founds_tensor.data_ptr<bool>(); 
+          tables[i]->find_pointers(tmp_unique_num, tmp_unique_indices[i].data_ptr(), vals_ptr, founds, 
+            tmp_unique_scores.data_ptr(), stream);
+          }
     }
+    scores_offset += tmp_unique_num;
     unique_embs_offset += tmp_unique_num;
   }
+  
+at::Tensor unique_embeddings_for_scatter;
+if (tables[0]->evict_strategy() == EvictStrategy::kLfu && frequency_threshold > 0 && mask_dims > 0) {
+  unique_embeddings_for_scatter = unique_embs.clone();
+  auto score_type = scalartype_to_datatype(convertTypeMetaToScalarType(unique_output_scores.dtype()));
+  
+  auto emb_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(unique_embeddings_for_scatter.dtype()));
+  dyn_emb::mask_embeddings_by_frequency(
+    unique_embeddings_for_scatter.data_ptr(), unique_output_scores.data_ptr(),
+    total_unique_embs, dim, frequency_threshold, mask_dims,
+    emb_type, score_type, device_num_sms, stream);
+} else {
+  unique_embeddings_for_scatter = unique_embs;
+}
+
   auto src_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(unique_embs.dtype()));
+      scalartype_to_datatype(convertTypeMetaToScalarType(unique_embeddings_for_scatter.dtype()));
   auto dst_type =
       scalartype_to_datatype(convertTypeMetaToScalarType(output_embs.dtype()));
   auto offset_type =
       scalartype_to_datatype(convertTypeMetaToScalarType(reverse_idx.dtype()));
+#ifdef DEBUG
 
-  dyn_emb::scatter_fused(unique_embs.data_ptr(), output_embs.data_ptr(),
-                         reverse_idx.data_ptr(), indices_shape, dim, src_type,
-                         dst_type, offset_type, device_num_sms, stream);
+    if (frequency_threshold > 0 && mask_dims > 0) {
+      // printf("Masking enabled\n");
+      at::Tensor h_unique_embs = unique_embs.cpu();
+      at::Tensor h_unique_embeddings_for_scatter = unique_embeddings_for_scatter.cpu();
+      at::Tensor h_unique_output_scores = unique_output_scores.cpu();
+      int masked_embeddings = 0;
+      float* data_ptr = h_unique_embs.data_ptr<float>();
+      uint64_t* score_ptr = h_unique_output_scores.data_ptr<uint64_t>();
+      for(int j = 0; j < total_unique_embs; j++) {
+        uint64_t score = score_ptr[j];
+        if(score >= frequency_threshold) continue;
+        for(int i = dim - mask_dims; i < dim; i++) {
+          data_ptr[j * dim + i] = 0.0;
+        }
+      }
+      int count = 0;
+      float* data_ptr_for_scatter = h_unique_embeddings_for_scatter.data_ptr<float>();
+              bool masking_correct = true;
+        for(int j = 0; j < total_unique_embs; j++) {
+         for(int i = dim - mask_dims; i < dim; i++) {
+           if(data_ptr_for_scatter[j * dim + i] != data_ptr[j * dim + i]) {
+             printf("Masking error at embedding %d, dim %d: expected %.6f, got %.6f\n", 
+                    j, i, data_ptr[j * dim + i], data_ptr_for_scatter[j * dim + i]);
+             masking_correct = false; 
+           }
+         }
+        }
+        
+        if (!masking_correct) {
+          std::stringstream error_msg;
+          error_msg << "Frequency masking validation failed:\n"
+                   << "  Frequency threshold: " << frequency_threshold 
+                   << ", Mask dims: " << mask_dims << "\n"
+                   << "  Total unique embeddings: " << total_unique_embs 
+                   << ", Embedding dim: " << dim << "\n";
+          
+          bool same_storage = unique_embeddings_for_scatter.data_ptr() == unique_embs.data_ptr();
+          error_msg << "  Memory layout: " << (same_storage ? "same tensor" : "different tensors") << "\n";
+          
+          if (!same_storage) {
+            error_msg << "  Note: Different tensors detected - masking may have been applied\n";
+          } else {
+            error_msg << "  Note: Same tensor detected - no masking applied\n";
+          }
+          
+          std::cerr << error_msg.str() << std::endl;
+          
+          throw std::runtime_error(error_msg.str());
+        }
+    }
+#endif // NDEBUG
+
+  dyn_emb::scatter_fused(unique_embeddings_for_scatter.data_ptr(),    
+                         output_embs.data_ptr(),    
+                         reverse_idx.data_ptr(),    
+                         indices_shape,             
+                         dim,                       
+                         src_type,                  
+                         dst_type,                  
+                         offset_type,               
+                         device_num_sms,            
+                         stream);                  
 }
 
 void lookup_forward_dense(
@@ -989,7 +1111,7 @@ void bind_dyn_emb_op(py::module &m) {
                   const at::Tensor, const at::Tensor, const at::Tensor,
                   const at::Tensor, const at::Tensor, const at::Tensor,
                   const at::Tensor, int,
-                  std::shared_ptr<dyn_emb::UniqueOpBase>)) &
+                  std::shared_ptr<dyn_emb::UniqueOpBase>, int, int)) &
             lookup_forward_dense,
         "lookup forward dense for duplicated keys", py::arg("tables"),
         py::arg("indices"), py::arg("offsets"), py::arg("scores"),
@@ -1000,7 +1122,8 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("d_unique_nums"), py::arg("h_unique_offsets"),
         py::arg("d_unique_offsets"), py::arg("unique_embs"),
         py::arg("output_embs"), py::arg("device_num_sms"),
-        py::arg("unique_op"));
+        py::arg("unique_op"), py::arg("frequency_threshold"), 
+        py::arg("mask_dims"));
 
   m.def("lookup_forward_dense",
         (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,

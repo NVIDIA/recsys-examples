@@ -51,6 +51,8 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         unique_op: UniqueOp,
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
+        frequency_threshold: int = 0,
+        mask_dims: int = 0,
         *args
     ):
         # TODO: remove unnecessary params.
@@ -257,7 +259,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
             tables, unique_indices_list, unique_grads_per_table, [], scores
         )
 
-        return (None,) * 17
+        return (None,) * 19
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
@@ -280,6 +282,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         unique_op: UniqueOp,
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
+        frequency_threshold: int = 0,
+        mask_dims: int = 0,
         *args
     ):
         # TODO:need check dimension is right
@@ -342,6 +346,8 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             output_embs,
             device_num_sms,
             unique_op,
+            frequency_threshold,
+            mask_dims,
         )
         if use_index_dedup:
             unique_idx_forback = torch.empty(
@@ -447,4 +453,4 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         optimizer.update(
             tables, unique_indices_list, unique_grads_list, unique_embs_list, scores
         )
-        return (None,) * 17
+        return (None,) * 19
