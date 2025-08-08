@@ -83,10 +83,9 @@ def test_embedding_optimizer(opt_type, opt_params):
 
     loss.backward()
 
+
 def test_train_eval(opt_type, opt_params):
-    print(
-        f"step in test_train_eval , opt_type = {opt_type} opt_params = {opt_params}"
-    )
+    print(f"step in test_train_eval , opt_type = {opt_type} opt_params = {opt_params}")
     assert torch.cuda.is_available()
     device_id = 0
     device = torch.device(f"cuda:{device_id}")
@@ -129,8 +128,12 @@ def test_train_eval(opt_type, opt_params):
     f2  [15, 2],    [7,105],
     f3  [],         [0]
     """
-    indices = torch.tensor([0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device)
-    offsets = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], dtype=key_type, device=device)
+    indices = torch.tensor(
+        [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device
+    )
+    offsets = torch.tensor(
+        [0, 2, 3, 5, 6, 8, 10, 10, 11], dtype=key_type, device=device
+    )
 
     embs_train = bdebt(indices, offsets)
     torch.cuda.synchronize()
@@ -139,9 +142,13 @@ def test_train_eval(opt_type, opt_params):
         bdebt.eval()
         embs_eval = bdebt(indices, offsets)
     torch.cuda.synchronize()
+    print('embs_train', embs_train)
+    print('embs_eval', embs_eval)
 
     # non-exist key
-    indices = torch.tensor([777, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(key_type)
+    indices = torch.tensor([777, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(
+        key_type
+    )
     offsets = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], device=device).to(key_type)
     embs_non_exist = bdebt(indices, offsets)
     torch.cuda.synchronize()
@@ -158,6 +165,7 @@ def test_train_eval(opt_type, opt_params):
     assert torch.equal(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
 
     print("all check passed")
+
 
 if __name__ == "__main__":
     optimizer_params = [

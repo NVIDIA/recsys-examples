@@ -184,7 +184,8 @@ void find_and_initialize(
     std::shared_ptr<dyn_emb::DynamicVariableBase> table,
     const size_t n,
     const at::Tensor keys,
-    const at::Tensor values) {
+    const at::Tensor values,
+    std::optional<InitializerArgs> initializer_args) {
 
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -195,7 +196,7 @@ void find_and_initialize(
      at::TensorOptions().dtype(at::kBool).device(keys.device()));
   auto founds = founds_tensor.data_ptr<bool>();
 
-  table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, stream);
+  table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, initializer_args, stream);
 }
 
 void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
@@ -388,7 +389,8 @@ std::vector<at::Tensor> lookup_forward_dense(
     int device_num_sms,
     std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
     const at::Device& device,
-    bool training) {
+    bool training,
+    const std::vector<InitializerArgs> &eval_initializers) {
 
   if (!offsets.is_cuda() || !indices.is_cuda()) {
     throw std::runtime_error(
@@ -401,25 +403,23 @@ std::vector<at::Tensor> lookup_forward_dense(
   auto embedding_type = scalartype_to_datatype(embedding_dtype);
   auto output_type = scalartype_to_datatype(output_dtype);
 
-  at::Tensor h_unique_offsets, table_offsets, unique_idx, unique_embs, founds;
+  at::Tensor h_unique_offsets, table_offsets, unique_idx, unique_embs;
   at::Tensor d_unique_offsets = at::zeros({table_num + 1}, at::TensorOptions().dtype(at::kUInt64).device(device));
   // TODO:in our case , maybe uint32 is enough for reverse_idx
   at::Tensor reverse_idx = at::empty_like(indices, indices.options().dtype(at::kUInt64));
   // output' dtype
   at::Tensor output_embs = at::empty({indices_shape, dim}, at::TensorOptions().dtype(output_dtype).device(device));
 
+  unique_embs = at::empty_like(output_embs, output_embs.options().dtype(embedding_dtype));
+
   if (training) {
     h_unique_offsets = at::empty({table_num + 1}, at::TensorOptions().dtype(at::kUInt64).device(at::kCPU));
     table_offsets = at::empty({table_num + 1}, at::TensorOptions().dtype(offsets.dtype()).device(device));
     unique_idx = at::empty_like(indices);
-    unique_embs = at::empty_like(output_embs, output_embs.options().dtype(embedding_dtype));
   } else {
     h_unique_offsets = at::empty({0}, at::TensorOptions().dtype(at::kUInt64).device(at::kCPU));
     table_offsets = at::empty({0}, at::TensorOptions().dtype(offsets.dtype()).device(device));
     unique_idx = at::empty({0}, indices.options());
-    // TODO. support other default value than zero
-    unique_embs = at::zeros_like(output_embs, output_embs.options().dtype(embedding_dtype));
-    founds = at::empty({indices_shape}, at::TensorOptions().dtype(at::kBool).device(device));
   }
 
   at::Tensor h_offset = at::empty_like(offsets, offsets.options().device(at::kCPU));
@@ -513,7 +513,7 @@ std::vector<at::Tensor> lookup_forward_dense(
 
       if (training) {
         if (use_index_dedup) {
-          find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
+          find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs, std::nullopt);
           void *dst_ptr = reinterpret_cast<char *>(unique_idx.data_ptr()) +
                           unique_embs_offset * unique_idx.element_size();
           void *src_ptr = tmp_unique_indices[i].data_ptr();
@@ -526,8 +526,8 @@ std::vector<at::Tensor> lookup_forward_dense(
                         tmp_unique_embs, score);
         }
       } else {
-        at::Tensor tmp_founds = create_sub_tensor(founds, unique_embs_offset);
-        find(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs, tmp_founds);
+	std::cout << "tmp_unique_indices[i]" << tmp_unique_indices[i] << std::endl;
+        find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs, eval_initializers[i]);
       }
 
     }
@@ -923,6 +923,11 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("n"), py::arg("keys"), py::arg("value_or_deltas"),
         py::arg("accum_or_assigns"), py::arg("score") = c10::nullopt,
         py::arg("ignore_evict_strategy") = false);
+  
+  m.def("find_and_initialize", &find_and_initialize,
+        "Find and initialize a key-value pair in the table", py::arg("table"),
+        py::arg("n"), py::arg("keys"), py::arg("values"), 
+        py::arg("initializer_args") = py::none());
 
   m.def("find_or_insert", &find_or_insert,
         "Find or insert a key-value pair in the table", py::arg("table"),
@@ -1031,7 +1036,7 @@ void bind_dyn_emb_op(py::module &m) {
                   const at::Tensor, const at::Tensor, const py::list,
                   const std::vector<int> &, at::ScalarType, at::ScalarType,
                   int, int, int, bool, int, std::shared_ptr<dyn_emb::UniqueOpBase>,
-                  const at::Device&, bool)) &
+                  const at::Device&, bool, const std::vector<InitializerArgs> &)) &
             lookup_forward_dense,
         "lookup forward dense for duplicated keys", py::arg("tables"),
         py::arg("indices"), py::arg("offsets"), py::arg("scores"),
@@ -1039,7 +1044,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("embedding_dtype"), py::arg("output_dtype"),
         py::arg("table_num"), py::arg("batch_size"), py::arg("dim"),
         py::arg("use_index_dedup"), py::arg("device_num_sms"),
-        py::arg("unique_op"), py::arg("device"), py::arg("training"));
+        py::arg("unique_op"), py::arg("device"), py::arg("training"), py::arg("eval_initializers"));
 
   m.def("lookup_forward_dense",
         (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,

@@ -575,7 +575,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs
 def test_one_epoch(model, test_loader, loss_fn, epoch, total_epochs):
     model.eval()
     test_loss = 0
-    with torch.no_grad():
+    with torch.inference_mode():
         for features, labels in test_loader:
             features = features.to(device)
             labels = labels.to(device)
