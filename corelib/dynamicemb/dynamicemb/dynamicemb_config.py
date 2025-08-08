@@ -511,6 +511,8 @@ def get_optimizer_state_dim(optimizer_type, dim, dtype):
 
 
 def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmbTable:
+    if not table_options.training:
+        table_options.optimizer_type = OptimizerType.Null
     return DynamicEmbTable(
         torch_to_dyn_emb(table_options.index_type),
         torch_to_dyn_emb(table_options.embedding_dtype),
