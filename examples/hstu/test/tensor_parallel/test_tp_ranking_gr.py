@@ -264,11 +264,11 @@ def test_tp_gr_ranking_forward_backward_update(
     multiplier = 2
 
     for i, batch in enumerate(history_batches):
-        _, (losses, logits, _) = debug_pipeline.progress(debug_pipeline_batches)
-        _, (losses_fp32, logits_fp32, _) = debug_pipeline_fp32.progress(
+        _, (losses, logits, _, _) = debug_pipeline.progress(debug_pipeline_batches)
+        _, (losses_fp32, logits_fp32, _, _) = debug_pipeline_fp32.progress(
             debug_pipeline_batches_fp32
         )
-        _, (tp_losses, tp_logits, _) = tp_pipeline.progress(iter_history_batches)
+        _, (tp_losses, tp_logits, _, _) = tp_pipeline.progress(iter_history_batches)
         compare_tpN_to_debug_weights(
             tp_ranking_gr, debug_ranking_gr, debug_ranking_gr_fp32
         )
