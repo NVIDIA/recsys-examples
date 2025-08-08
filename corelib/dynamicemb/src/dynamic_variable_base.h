@@ -23,6 +23,7 @@
 #include <curand_kernel.h>
 #include <memory>
 #include <string>
+#include <optional>
 
 namespace dyn_emb {
 
@@ -133,7 +134,7 @@ public:
 
   virtual void find_and_initialize(
     const size_t n, const void *keys, void **value_ptrs, void *values,
-    bool *founds, const cudaStream_t& stream) = 0;
+    bool *founds, std::optional<InitializerArgs> initializer_args, const cudaStream_t& stream) = 0;
 
   virtual void assign(const size_t n,
                       const void *keys,             // (n)

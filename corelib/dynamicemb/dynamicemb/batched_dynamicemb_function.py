@@ -16,12 +16,16 @@
 from typing import List
 
 import torch
-from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, dyn_emb_to_torch
+from dynamicemb.dynamicemb_config import (
+    DynamicEmbInitializerArgs,
+    DynamicEmbPoolingMode,
+    dyn_emb_to_torch,
+)
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
-    find,
+    find_and_initialize,
     find_or_insert,
     lookup_backward,
     lookup_backward_dense,
@@ -53,7 +57,8 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
         training: bool,
-        *args
+        eval_initializers: List[DynamicEmbInitializerArgs],
+        *args,
     ):
         # TODO: remove unnecessary params.
         # TODO:need check dimension is right
@@ -125,13 +130,16 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
                     scores[i],
                 )
             else:
-                tmp_founds = torch.empty(num_unique_indices, dtype=torch.bool, device=device)
-                find(
+                tmp_founds = torch.empty(
+                    num_unique_indices, dtype=torch.bool, device=device
+                )
+                find_and_initialize(
                     tables[i],
                     num_unique_indices,
                     unique_indices,
                     tmp_unique_embs,
                     tmp_founds,
+                    eval_initializers[i].as_ctype(),
                 )
 
             unique_embedding_list.append(tmp_unique_embs)
@@ -270,7 +278,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
             tables, unique_indices_list, unique_grads_per_table, [], scores
         )
 
-        return (None,) * 18
+        return (None,) * 19
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
@@ -294,6 +302,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
         training: bool,
+        eval_initializers: List[DynamicEmbInitializerArgs],
         *args,
     ):
         # TODO:need check dimension is right
@@ -321,8 +330,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         # TODO:in our case , maybe uint32 is enough for reverse_idx
         # reverse_idx = torch.empty_like(indices, dtype=torch.uint64, device=device)
         # unique_idx = torch.empty_like(indices, dtype=indices.dtype, device=device)
-        output_embs, table_offsets, unique_idx, reverse_idx, h_unique_offsets = \
-            lookup_forward_dense(
+        (
+            output_embs,
+            table_offsets,
+            unique_idx,
+            reverse_idx,
+            h_unique_offsets,
+        ) = lookup_forward_dense(
             tables,
             indices,
             offsets,
@@ -338,8 +352,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             unique_op,
             device,
             training,
+            [initializer.as_ctype() for initializer in eval_initializers],
         )
-        
+
         if training:
             if use_index_dedup:
                 unique_idx_forback = torch.empty(
@@ -440,5 +455,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
         scores = ctx.scores
         # optimizer: update tables.
-        optimizer.update(tables, unique_indices_list, unique_grads_list, unique_embs_list, scores)
-        return (None,) * 18
+        optimizer.update(
+            tables, unique_indices_list, unique_grads_list, unique_embs_list, scores
+        )
+        return (None,) * 19
