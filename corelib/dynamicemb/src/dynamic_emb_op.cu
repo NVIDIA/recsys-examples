@@ -184,7 +184,8 @@ void find_and_initialize(
     std::shared_ptr<dyn_emb::DynamicVariableBase> table,
     const size_t n,
     const at::Tensor keys,
-    const at::Tensor values) {
+    const at::Tensor values,
+    std::optional<InitializerArgs> initializer_args) {
 
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -195,7 +196,7 @@ void find_and_initialize(
      at::TensorOptions().dtype(at::kBool).device(keys.device()));
   auto founds = founds_tensor.data_ptr<bool>();
 
-  table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, stream);
+  table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(), founds, initializer_args, stream);
 }
 
 void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
@@ -373,6 +374,45 @@ void export_batch_matched(
     keys.data_ptr(), values.data_ptr(), nullptr, stream);
 }
 
+template <typename scalar_t>
+__global__ void compact_offsets(
+  const scalar_t *offsets,
+  scalar_t *features_offsets,
+  const int64_t num_features,
+  const int64_t batch_size
+) { 
+  for (int tid = threadIdx.x + blockIdx.x * blockDim.x; tid < num_features; tid += blockDim.x * gridDim.x) {
+    features_offsets[tid] = offsets[tid * batch_size];
+  }
+  if (threadIdx.x == 0) {
+    features_offsets[num_features] = offsets[num_features * batch_size];
+  }
+}
+
+std::vector<int64_t> offsets_to_table_features_offsets(const at::Tensor &offsets, const std::vector<int> &table_offsets_in_feature, const int64_t batch_size, cudaStream_t stream) {
+  int64_t table_num = table_offsets_in_feature.size() - 1;
+  int64_t num_features = (offsets.numel() - 1) / batch_size;
+  at::Tensor h_features_offsets =
+      at::empty({num_features + 1}, offsets.options().device(at::kCPU).pinned_memory(true));
+  if (num_features == 0) {
+    return {0, 0};
+  }
+  AT_DISPATCH_INTEGRAL_TYPES(offsets.scalar_type(), "compact_offsets", [&] {
+    compact_offsets<<<num_features / 1024 + 1, 1024, 0, stream>>>(
+      offsets.data_ptr<scalar_t>(),
+      h_features_offsets.data_ptr<scalar_t>(),
+      num_features,
+      batch_size
+    );
+  });
+  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+  std::vector<int64_t> table_features_offsets(table_offsets_in_feature.size(), 0);
+  for (int i = 0; i < table_offsets_in_feature.size(); ++i) {
+    table_features_offsets[i] = h_features_offsets[table_offsets_in_feature[i]].item<int64_t>();
+  }
+  return table_features_offsets;
+}
+
 void lookup_forward_dense(
     std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>> tables,
     const at::Tensor indices, const at::Tensor offsets, const py::list scores,
@@ -397,18 +437,14 @@ void lookup_forward_dense(
   }
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t indices_shape = indices.size(0);
+  int64_t indices_shape = indices.numel();
   auto unique_num_type = scalartype_to_datatype(
       convertTypeMetaToScalarType(d_unique_nums.dtype()));
   auto unique_offset_type = scalartype_to_datatype(
       convertTypeMetaToScalarType(d_unique_offsets.dtype()));
 
-  at::Tensor h_offset =
-      at::empty_like(offsets, offsets.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaMemcpyAsync(h_offset.data_ptr(), offsets.data_ptr(),
-                                offsets.numel() * offsets.element_size(),
-                                cudaMemcpyDeviceToHost, stream));
-
+  auto h_table_offsets = offsets_to_table_features_offsets(offsets, table_offsets_in_feature, batch_size, stream);
+  
   size_t unique_op_capacity = unique_op->get_capacity();
   if (indices_shape * 2 > unique_op_capacity) {
     at::Tensor new_keys = at::empty({indices_shape * 2}, indices.options());
@@ -423,21 +459,10 @@ void lookup_forward_dense(
     tmp_unique_indices[i] = at::empty_like(indices);
   }
 
-  at::Tensor h_table_offsets =
-      at::empty({table_num + 1}, table_offsets.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  h_table_offsets[0] = 0;
   for (int i = 0; i < table_num; ++i) {
-    int table_offset_begin = table_offsets_in_feature[i];
-    int table_offset_end = table_offsets_in_feature[i + 1];
-    int offset_begin = table_offset_begin * batch_size;
-    int offset_end = table_offset_end * batch_size;
-
-    int64_t indices_begin = h_offset[offset_begin].item<int64_t>();
-    int64_t indices_end = h_offset[offset_end].item<int64_t>();
+    int64_t indices_begin = h_table_offsets[i];
+    int64_t indices_end = h_table_offsets[i + 1];
     int64_t indices_length = indices_end - indices_begin;
-    h_table_offsets[i + 1] = indices_end;
 
     if (indices_length == 0) {
       DEMB_CUDA_CHECK(cudaMemsetAsync(
@@ -470,7 +495,7 @@ void lookup_forward_dense(
       cudaMemcpyDeviceToHost, stream));
   AT_CUDA_CHECK(cudaStreamSynchronize(stream));
   AT_CUDA_CHECK(
-      cudaMemcpyAsync(table_offsets.data_ptr(), h_table_offsets.data_ptr(),
+      cudaMemcpyAsync(table_offsets.data_ptr(), h_table_offsets.data(),
                       table_offsets.numel() * table_offsets.element_size(),
                       cudaMemcpyHostToDevice, stream));
 
@@ -480,18 +505,16 @@ void lookup_forward_dense(
     if (tmp_unique_num != 0) {
       at::Tensor tmp_unique_embs =
           create_sub_tensor(unique_embs, unique_embs_offset * dim);
+      auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
+      find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
+                    tmp_unique_embs, score);
       if (use_index_dedup) {
-        find_and_initialize(tables[i], tmp_unique_num, tmp_unique_indices[i], tmp_unique_embs);
         void *dst_ptr = reinterpret_cast<char *>(unique_idx.data_ptr()) +
                         unique_embs_offset * unique_idx.element_size();
         void *src_ptr = tmp_unique_indices[i].data_ptr();
         size_t copy_size = tmp_unique_num * unique_idx.element_size();
         AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                       cudaMemcpyDeviceToDevice, stream));
-      } else {
-        auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
-        find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
-                      tmp_unique_embs, score);
       }
     }
     unique_embs_offset += tmp_unique_num;
@@ -508,54 +531,41 @@ void lookup_forward_dense(
                          dst_type, offset_type, device_num_sms, stream);
 }
 
-void lookup_forward_dense(
+at::Tensor lookup_forward_dense_eval(
     std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>> tables,
-    const at::Tensor indices, const at::Tensor offsets,
-    const std::vector<int> &table_offsets_in_feature, int table_num,
-    int batch_size, int dim, const at::Tensor h_unique_offsets,
-    const at::Tensor unique_embs, const at::Tensor output_embs) {
+    const at::Tensor &indices,
+    const at::Tensor &offsets,
+    const std::vector<int> &table_offsets_in_feature,
+    at::ScalarType embedding_dtype,
+    int table_num,
+    int batch_size,
+    int dim,
+    const at::Device& device,
+    const std::vector<InitializerArgs> &eval_initializers) {
 
-  if (!offsets.is_cuda() || !indices.is_cuda()) {
+  if (!indices.is_cuda() || !offsets.is_cuda()) {
     throw std::runtime_error(
         "offsets or indices tensor must be on CUDA device");
   }
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t indices_shape = indices.size(0);
-  auto scalar_type = unique_embs.dtype().toScalarType();
-  auto emb_dtype = scalartype_to_datatype(scalar_type);
-  scalar_type = output_embs.dtype().toScalarType();
-  auto output_dtype = scalartype_to_datatype(scalar_type);
-  auto &device_prop = DeviceProp::getDeviceProp(indices.device().index());
+  int64_t num_indices = indices.numel();
 
-  at::Tensor h_offset =
-      at::empty_like(offsets, offsets.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaMemcpyAsync(h_offset.data_ptr(), offsets.data_ptr(),
-                                offsets.numel() * offsets.element_size(),
-                                cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+  at::Tensor output_embs = at::empty({num_indices, dim}, at::TensorOptions().dtype(embedding_dtype).device(device));
 
-  h_unique_offsets[0] = 0;
+  auto table_features_offsets = offsets_to_table_features_offsets(offsets, table_offsets_in_feature, batch_size, stream);
+  
   for (int i = 0; i < table_num; ++i) {
-    int table_offset_begin = table_offsets_in_feature[i];
-    int table_offset_end = table_offsets_in_feature[i + 1];
-    int offset_begin = table_offset_begin * batch_size;
-    int offset_end = table_offset_end * batch_size;
-
-    int64_t indices_begin = h_offset[offset_begin].item<int64_t>();
-    int64_t indices_end = h_offset[offset_end].item<int64_t>();
-    int64_t indices_length = indices_end - indices_begin;
-    h_unique_offsets[i + 1] = indices_end;
-    at::Tensor tmp_indices = create_sub_tensor(indices, indices_begin);
-    at::Tensor tmp_unique_embs =
-        create_sub_tensor(unique_embs, indices_begin * dim);
-    find_or_insert(tables[i], indices_length, tmp_indices, tmp_unique_embs);
-    at::Tensor tmp_output_embs =
-        create_sub_tensor(output_embs, indices_begin * dim);
-    dyn_emb::batched_vector_copy_device(
-        tmp_unique_embs.data_ptr(), output_embs.data_ptr(), indices_length, dim,
-        emb_dtype, output_dtype, device_prop.num_sms, stream);
+    int64_t table_offset_begin = table_features_offsets[i];
+    int64_t table_offset_end = table_features_offsets[i + 1];
+    int64_t table_offset_length = table_offset_end - table_offset_begin;
+    at::Tensor current_indices = create_sub_tensor(indices, table_offset_begin);
+    at::Tensor current_output_embs = create_sub_tensor(output_embs, table_offset_begin * dim);
+    
+    find_and_initialize(tables[i], static_cast<size_t>(table_offset_length), current_indices, current_output_embs, eval_initializers[i]);
   }
+
+  return output_embs;
 }
 
 void lookup_backward_dense(const at::Tensor indices, const at::Tensor grads,
@@ -879,6 +889,11 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("n"), py::arg("keys"), py::arg("value_or_deltas"),
         py::arg("accum_or_assigns"), py::arg("score") = c10::nullopt,
         py::arg("ignore_evict_strategy") = false);
+  
+  m.def("find_and_initialize", &find_and_initialize,
+        "Find and initialize a key-value pair in the table", py::arg("table"),
+        py::arg("n"), py::arg("keys"), py::arg("values"), 
+        py::arg("initializer_args") = py::none());
 
   m.def("find_or_insert", &find_or_insert,
         "Find or insert a key-value pair in the table", py::arg("table"),
@@ -981,16 +996,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("tables_num"), py::arg("batch_size"), py::arg("num_feature"),
         py::arg("num_key"));
 
-  m.def("lookup_forward_dense",
-        (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,
-                  const at::Tensor, const at::Tensor, const py::list, 
-                  const std::vector<int> &,
-                  at::Tensor, int, int, int, bool, const at::Tensor,
-                  const at::Tensor, const at::Tensor, const at::Tensor,
-                  const at::Tensor, const at::Tensor, const at::Tensor,
-                  const at::Tensor, int,
-                  std::shared_ptr<dyn_emb::UniqueOpBase>)) &
-            lookup_forward_dense,
+  m.def("lookup_forward_dense", &lookup_forward_dense,
         "lookup forward dense for duplicated keys", py::arg("tables"),
         py::arg("indices"), py::arg("offsets"), py::arg("scores"),
         py::arg("table_offsets_in_feature"), py::arg("table_offsets"),
@@ -1002,23 +1008,16 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("output_embs"), py::arg("device_num_sms"),
         py::arg("unique_op"));
 
-  m.def("lookup_forward_dense",
-        (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,
-                  const at::Tensor, const at::Tensor, const std::vector<int> &,
-                  int, int, int, const at::Tensor, const at::Tensor,
-                  const at::Tensor)) &
-            lookup_forward_dense,
-        "lookup forward dense for globally deduplicated keys",
-        py::arg("tables"), py::arg("indices"), py::arg("offsets"),
-        py::arg("table_offsets_in_feature"), py::arg("table_num"),
-        py::arg("batch_size"), py::arg("dim"), py::arg("h_unique_offsets"),
-        py::arg("unique_embs"), py::arg("output_embs"));
+  m.def("lookup_forward_dense_eval", &lookup_forward_dense_eval,
+        "lookup forward dense eval for globally deduplicated keys", py::arg("tables"),
+        py::arg("indices"), py::arg("offsets"), py::arg("table_offsets_in_feature"),
+        py::arg("embedding_dtype"), py::arg("table_num"), py::arg("batch_size"),
+        py::arg("dim"), py::arg("device"), py::arg("eval_initializers"));
 
   m.def("lookup_backward_dense", &lookup_backward_dense,
         "lookup backward for dense/sequence", py::arg("indices"),
         py::arg("grads"), py::arg("dim"), py::arg("table_offsets"),
         py::arg("unique_indices"), py::arg("unique_grads"));
-
 
   m.def("lookup_backward_dense_dedup", &lookup_backward_dense_dedup,
         "lookup backward for dedup dense/sequence", py::arg("grads"),

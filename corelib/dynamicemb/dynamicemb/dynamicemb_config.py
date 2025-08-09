@@ -310,6 +310,9 @@ class DynamicEmbTableOptions(HKVConfig):
     initializer_args : DynamicEmbInitializerArgs
         Arguments for initializing dynamic embedding vector values.
         Default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / eb_config.num_embeddings).
+    eval_initializer_args: DynamicEmbInitializerArgs
+        The initializer args for evaluation mode.
+        Default is constant initialization with value 0.0.
     score_strategy(DynamicEmbScoreStrategy):
         The strategy to set the score for each indices in forward and backward per table.
         Default to DynamicEmbScoreStrategy.TIMESTAMP.
@@ -330,8 +333,19 @@ class DynamicEmbTableOptions(HKVConfig):
     initializer_args: DynamicEmbInitializerArgs = field(
         default_factory=DynamicEmbInitializerArgs
     )
+    eval_initializer_args: DynamicEmbInitializerArgs = field(
+        default_factory=lambda: DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT,
+            value=0.0,
+        )
+    )
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
     training: bool = True
+
+    def __post_init__(self):
+        assert (
+            self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
+        ), "eval_initializer_args must be constant initialization"
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
