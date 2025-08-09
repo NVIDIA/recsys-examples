@@ -342,6 +342,11 @@ class DynamicEmbTableOptions(HKVConfig):
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
     training: bool = True
 
+    def __post_init__(self):
+        assert (
+            self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
+        ), "eval_initializer_args must be constant initialization"
+
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
             return NotImplementedError

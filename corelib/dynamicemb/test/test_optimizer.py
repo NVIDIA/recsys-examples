@@ -52,8 +52,6 @@ class TorchSGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._hashtables:
@@ -113,8 +111,6 @@ class TorchAdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._table_state_map.keys():
@@ -209,8 +205,6 @@ class TorchAdagradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._table_state_map.keys():
@@ -298,8 +292,6 @@ class TorchRowWiseAdagradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        embs: List[torch.Tensor] = None,
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._table_state_map.keys():
@@ -608,7 +600,6 @@ def test_optimizer(
                 [hashtables_for_dynamicemb[i]],
                 [indices[i]],
                 [grads[i]],
-                [result_tensors_for_dynamicemb[i][:, : embedding_dim[i]].contiguous()],
             )
 
         found_weights_for_torch = [
