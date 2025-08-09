@@ -682,10 +682,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 torch.device(self.device_id),
                 self._optimizer,
                 self.training,
-                [
-                    option.eval_initializer_args
-                    for option in self._dynamicemb_options
-                ],
+                [option.eval_initializer_args for option in self._dynamicemb_options],
                 self._empty_tensor,
             )
         else:
@@ -707,10 +704,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 torch.device(self.device_id),
                 self._optimizer,
                 self.training,
-                [
-                    option.eval_initializer_args
-                    for option in self._dynamicemb_options
-                ],
+                [option.eval_initializer_args for option in self._dynamicemb_options],
                 self._empty_tensor,
             )
 

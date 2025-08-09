@@ -32,6 +32,7 @@ from dynamicemb_extensions import (
     lookup_backward_dense_dedup,
     lookup_forward,
     lookup_forward_dense,
+    lookup_forward_dense_eval,
 )
 
 
@@ -130,15 +131,11 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
                     scores[i],
                 )
             else:
-                tmp_founds = torch.empty(
-                    num_unique_indices, dtype=torch.bool, device=device
-                )
                 find_and_initialize(
                     tables[i],
                     num_unique_indices,
                     unique_indices,
                     tmp_unique_embs,
-                    tmp_founds,
                     eval_initializers[i].as_ctype(),
                 )
 
@@ -272,11 +269,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         for i, unique_grad in enumerate(unique_backward_grads_per_table):
             unique_grads_per_table.append(unique_grad.reshape(-1, dims[i]))
 
-        scores = ctx.scores
-
-        optimizer.update(
-            tables, unique_indices_list, unique_grads_per_table, [], scores
-        )
+        optimizer.update(tables, unique_indices_list, unique_grads_per_table)
 
         return (None,) * 19
 
@@ -313,49 +306,66 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         batch_size = feature_batch_size // feature_num
         assert feature_batch_size % feature_num == 0
 
-        # #TODO: if global dedup is done:
-        # if use_index_dedup:
-        #     lookup_forward_dense(
-        #         tables,
-        #         indices,
-        #         offsets,
-        #         table_offsets_in_feature,
-        #         table_num,
-        #         batch_size,
-        #         dim,
-        #         h_unique_offsets, # used in backward, actually plays a role as table_offsets.
-        #         unique_embs, # serve as a tmp buffer.
-        #         output_embs)
-        # else:
-        # TODO:in our case , maybe uint32 is enough for reverse_idx
-        # reverse_idx = torch.empty_like(indices, dtype=torch.uint64, device=device)
-        # unique_idx = torch.empty_like(indices, dtype=indices.dtype, device=device)
-        (
-            output_embs,
-            table_offsets,
-            unique_idx,
-            reverse_idx,
-            h_unique_offsets,
-        ) = lookup_forward_dense(
-            tables,
-            indices,
-            offsets,
-            scores if training else [],
-            table_offsets_in_feature,
-            embedding_dtype,
-            output_dtype,
-            table_num,
-            batch_size,
-            dim,
-            use_index_dedup,
-            device_num_sms,
-            unique_op,
-            device,
-            training,
-            [initializer.as_ctype() for initializer in eval_initializers],
-        )
-
         if training:
+            d_unique_offsets = torch.zeros(
+                table_num + 1, dtype=torch.uint64, device=device
+            )
+            h_unique_offsets = torch.empty(
+                table_num + 1, dtype=torch.uint64, device="cpu"
+            )
+            table_offsets = torch.empty(
+                table_num + 1, dtype=offsets.dtype, device=device
+            )
+            # table' dtype
+            unique_embs = torch.empty(
+                indices.shape[0], dim, dtype=embedding_dtype, device=device
+            )
+            # output' dtype
+            output_embs = torch.empty(
+                indices.shape[0], dim, dtype=output_dtype, device=device
+            )
+
+            # #TODO: if global dedup is done:
+            # if use_index_dedup:
+            #     lookup_forward_dense(
+            #         tables,
+            #         indices,
+            #         offsets,
+            #         table_offsets_in_feature,
+            #         table_num,
+            #         batch_size,
+            #         dim,
+            #         h_unique_offsets, # used in backward, actually plays a role as table_offsets.
+            #         unique_embs, # serve as a tmp buffer.
+            #         output_embs)
+            # else:
+            # TODO:in our case , maybe uint32 is enough for reverse_idx
+            reverse_idx = torch.empty_like(indices, dtype=torch.uint64, device=device)
+            unique_idx = torch.empty_like(indices, dtype=indices.dtype, device=device)
+            h_unique_nums = torch.empty(table_num, dtype=torch.uint64, device="cpu")
+            d_unique_nums = torch.empty(table_num, dtype=torch.uint64, device=device)
+            lookup_forward_dense(
+                tables,
+                indices,
+                offsets,
+                scores,
+                table_offsets_in_feature,
+                table_offsets,
+                table_num,
+                batch_size,
+                dim,
+                use_index_dedup,
+                unique_idx,
+                reverse_idx,
+                h_unique_nums,
+                d_unique_nums,
+                h_unique_offsets,
+                d_unique_offsets,
+                unique_embs,
+                output_embs,
+                device_num_sms,
+                unique_op,
+            )
             if use_index_dedup:
                 unique_idx_forback = torch.empty(
                     h_unique_offsets[-1], dtype=indices.dtype, device=device
@@ -363,6 +373,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 unique_idx_forback.copy_(
                     unique_idx[: h_unique_offsets[-1]], non_blocking=True
                 )
+                unique_emb_forback = unique_embs[: h_unique_offsets[-1], :]
 
             backward_tensors = [indices, offsets]
             ctx.save_for_backward(*backward_tensors)
@@ -379,9 +390,23 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             if use_index_dedup:
                 ctx.reverse_idx = reverse_idx
                 ctx.unique_idx_forback = unique_idx_forback
+                ctx.unique_emb_forback = unique_emb_forback
             ctx.scores = scores
 
-        return output_embs
+            return output_embs
+        else:
+            return lookup_forward_dense_eval(
+                tables,
+                indices,
+                offsets,
+                table_offsets_in_feature,
+                embedding_dtype,
+                table_num,
+                batch_size,
+                dim,
+                device,
+                [initializer.as_ctype() for initializer in eval_initializers],
+            ).to(output_dtype)
 
     @staticmethod
     def backward(ctx, grads):
@@ -394,19 +419,15 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         device = ctx.device
         tables = ctx.tables
         optimizer = ctx.optimizer
-        use_index_dedup = ctx.use_index_dedup
-        device_num_sms = ctx.device_num_sms
-        if use_index_dedup:
-            reverse_idx = ctx.reverse_idx
-            unique_idx_forback = ctx.unique_idx_forback
-            unique_emb_forback = ctx.unique_emb_forback
 
         table_num = len(tables)
         unique_indices_list = []
         unique_grads_list = []
-        unique_embs_list = []
-
-        if use_index_dedup:
+        if ctx.use_index_dedup:
+            device_num_sms = ctx.device_num_sms
+            reverse_idx = ctx.reverse_idx
+            unique_idx_forback = ctx.unique_idx_forback
+            ctx.unique_emb_forback
             unique_grads = torch.zeros(
                 h_unique_offsets[-1], dim, dtype=grads.dtype, device=device
             )
@@ -425,9 +446,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 )
                 unique_grads_list.append(
                     unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
-                )
-                unique_embs_list.append(
-                    unique_emb_forback[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
                 )
         else:
             # backward: reduce the grad.
@@ -453,9 +471,29 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
                 )
 
-        scores = ctx.scores
-        # optimizer: update tables.
-        optimizer.update(
-            tables, unique_indices_list, unique_grads_list, unique_embs_list, scores
+        # backward: reduce the grad.
+        unique_indices = torch.empty(
+            h_unique_offsets[-1], dtype=indices.dtype, device=device
         )
+        unique_grads = torch.empty(
+            h_unique_offsets[-1], dim, dtype=grads.dtype, device=device
+        )
+        lookup_backward_dense(
+            indices,
+            grads,
+            dim,
+            table_offsets,
+            unique_indices,
+            unique_grads,
+        )
+        for i in range(table_num):
+            unique_indices_list.append(
+                unique_indices[h_unique_offsets[i] : h_unique_offsets[i + 1]]
+            )
+            unique_grads_list.append(
+                unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
+            )
+
+        # optimizer: update tables.
+        optimizer.update(tables, unique_indices_list, unique_grads_list)
         return (None,) * 19

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 from dynamicemb import (
     DynamicEmbEvictStrategy,
@@ -23,6 +24,22 @@ from dynamicemb import (
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
 
 
+@pytest.mark.parametrize(
+    "opt_type,opt_params",
+    [
+        (EmbOptimType.SGD, {"learning_rate": 0.3}),
+        (
+            EmbOptimType.ADAM,
+            {
+                "learning_rate": 0.3,
+                "weight_decay": 0.06,
+                "eps": 3e-5,
+                "beta1": 0.8,
+                "beta2": 0.888,
+            },
+        ),
+    ],
+)
 def test_embedding_optimizer(opt_type, opt_params):
     print(
         f"step in test_embedding_optimizer , opt_type = {opt_type} opt_params = {opt_params}"
@@ -84,6 +101,22 @@ def test_embedding_optimizer(opt_type, opt_params):
     loss.backward()
 
 
+@pytest.mark.parametrize(
+    "opt_type,opt_params",
+    [
+        (EmbOptimType.SGD, {"learning_rate": 0.3}),
+        (
+            EmbOptimType.ADAM,
+            {
+                "learning_rate": 0.3,
+                "weight_decay": 0.06,
+                "eps": 3e-5,
+                "beta1": 0.8,
+                "beta2": 0.888,
+            },
+        ),
+    ],
+)
 def test_train_eval(opt_type, opt_params):
     print(f"step in test_train_eval , opt_type = {opt_type} opt_params = {opt_params}")
     assert torch.cuda.is_available()
@@ -142,8 +175,6 @@ def test_train_eval(opt_type, opt_params):
         bdebt.eval()
         embs_eval = bdebt(indices, offsets)
     torch.cuda.synchronize()
-    print('embs_train', embs_train)
-    print('embs_eval', embs_eval)
 
     # non-exist key
     indices = torch.tensor([777, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(
@@ -165,24 +196,3 @@ def test_train_eval(opt_type, opt_params):
     assert torch.equal(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
 
     print("all check passed")
-
-
-if __name__ == "__main__":
-    optimizer_params = [
-        {
-            "learning_rate": 0.3,
-        },
-        {
-            "learning_rate": 0.3,
-            "weight_decay": 0.06,
-            "eps": 3e-5,
-            "beta1": 0.8,
-            "beta2": 0.888,
-        },
-    ]
-
-    opt_types = [EmbOptimType.SGD, EmbOptimType.ADAM]
-    for i in range(len(opt_types)):
-        test_embedding_optimizer(opt_types[i], optimizer_params[i])
-
-    test_train_eval(EmbOptimType.ADAM, optimizer_params[0])
