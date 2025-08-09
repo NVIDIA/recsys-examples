@@ -34,6 +34,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from commons.utils.logger import print_rank_0
 from dataset.utils import Batch, RankingBatch, RetrievalBatch
 from preprocessor import get_common_preprocessors
 from torch.utils.data.dataset import IterableDataset
@@ -107,6 +108,7 @@ class SequenceDataset(IterableDataset[Batch]):
             self._seq_logs_frame = pd.read_csv(
                 seq_logs_file, delimiter=",", nrows=nrows
             )
+        self._filter_short_sequences(item_feature_name, max_num_candidates)
         num_total_samples = len(self._seq_logs_frame)
         train_samples = int(num_total_samples * 0.7)
         test_samples = num_total_samples - train_samples
@@ -139,6 +141,43 @@ class SequenceDataset(IterableDataset[Batch]):
 
         self._sample_ids = np.arange(self._num_samples)
         self._shuffle_batch()
+
+    def _filter_short_sequences(
+        self, item_feature_name: str, max_num_candidates: int
+    ) -> None:
+        """
+        Filter out samples where the user's historical interaction sequence
+        (approximated using the given item feature) is shorter than `max_num_candidates`.
+
+        Args:
+            item_feature_name (str): Column name containing the item sequence.
+            max_num_candidates (int): The minimum number of historical interactions required.
+
+        Note:
+            - This check only uses the sequence in `item_feature_name`.
+              Please ensure that item, action, and time sequences are aligned,
+              as this assumption is not validated here.
+            - The goal is to ensure that each sample has enough history to allow
+              `max_num_candidates` candidates to be extracted safely.
+        """
+        if max_num_candidates <= 0:
+            return
+
+        def is_valid(row):
+            item_seq = load_seq(row[item_feature_name])
+            return len(item_seq) > max_num_candidates
+
+        before_count = len(self._seq_logs_frame)
+        self._seq_logs_frame = self._seq_logs_frame[
+            self._seq_logs_frame.apply(is_valid, axis=1)
+        ]
+        self._seq_logs_frame.reset_index(drop=True, inplace=True)
+        after_count = len(self._seq_logs_frame)
+
+        print_rank_0(
+            f"[SequenceDataset] Removed {before_count - after_count} samples with sequence length < max_num_candidates "
+            f"({after_count} samples remaining)."
+        )
 
     # We do batching in our own
     def __len__(self) -> int:
@@ -173,6 +212,10 @@ class SequenceDataset(IterableDataset[Batch]):
                     contextual_features_seqlen[contextual_feature_name].append(1)
 
                 item_seq = load_seq(data[self._item_feature_name])
+                if self._max_num_candidates > len(item_seq):
+                    raise ValueError(
+                        f"max_num_candidates: {self._max_num_candidates} > len(item_seq): {len(item_seq)}, please check data or decrease max_num_candidates"
+                    )
                 candidate_seq = item_seq[-self._max_num_candidates :]
                 item_seq = item_seq[: -self._max_num_candidates]
 
