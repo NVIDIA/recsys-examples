@@ -471,29 +471,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
                 )
 
-        # backward: reduce the grad.
-        unique_indices = torch.empty(
-            h_unique_offsets[-1], dtype=indices.dtype, device=device
-        )
-        unique_grads = torch.empty(
-            h_unique_offsets[-1], dim, dtype=grads.dtype, device=device
-        )
-        lookup_backward_dense(
-            indices,
-            grads,
-            dim,
-            table_offsets,
-            unique_indices,
-            unique_grads,
-        )
-        for i in range(table_num):
-            unique_indices_list.append(
-                unique_indices[h_unique_offsets[i] : h_unique_offsets[i + 1]]
-            )
-            unique_grads_list.append(
-                unique_grads[h_unique_offsets[i] : h_unique_offsets[i + 1], :]
-            )
-
         # optimizer: update tables.
         optimizer.update(tables, unique_indices_list, unique_grads_list)
         return (None,) * 19
