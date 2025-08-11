@@ -523,6 +523,7 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   hkv_table_option_.use_constant_memory = use_constant_memory;
   hkv_table_option_.reserved_key_start_bit = reserved_key_start_bit;
   hkv_table_option_.num_of_buckets_per_alloc = num_of_buckets_per_alloc;
+  hkv_table_option_.api_lock = false;
 
   /// TODO: make HKV's init async.
   hkv_table_->init(hkv_table_option_);
