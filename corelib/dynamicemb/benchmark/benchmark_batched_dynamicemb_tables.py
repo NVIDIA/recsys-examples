@@ -21,56 +21,35 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torchrec
+from benchmark_utils import GPUTimer
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbPoolingMode,
+    DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EmbOptimType,
-    DynamicEmbScoreStrategy
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
-from torch.distributed.elastic.multiprocessing.errors import record
-from benchmark_utils import GPUTimer
-
+from dynamicemb_extensions import clear, insert_or_assign
+from fbgemm_gpu.runtime_monitor import StdLogStatsReporterConfig
+from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
     CacheAlgorithm,
     EmbeddingLocation,
     PoolingMode,
     RecordCacheMetrics,
-)
-from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
-    IntNBitTableBatchedEmbeddingBagsCodegen,
-    rounded_row_size_in_bytes,
 )
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     ComputeDevice,
-    DenseTableBatchedEmbeddingBagsCodegen,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType, SparseType
-from fbgemm_gpu.runtime_monitor import (
-    AsyncSeriesTimer,
-    TBEStatsReporter,
-    TBEStatsReporterConfig,
-    StdLogStatsReporterConfig,
-)
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
-    BoundsCheckMode,
-    CacheAlgorithm,
-    CacheState,
-    construct_cache_state,
-    EmbeddingLocation,
-    MAX_PREFETCH_DEPTH,
-    PoolingMode,
-    RecordCacheMetrics,
-    SplitState,
-)
-from dynamicemb_extensions import insert_or_assign, clear
+from torch.distributed.elastic.multiprocessing.errors import record
 
 report_interval = 10
-warmup_repeat=100
+warmup_repeat = 100
 
 
 def str2bool(v):
@@ -83,6 +62,7 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError("Boolean value expected.")
 
+
 def get_emb_precision(precision_str):
     if precision_str == "fp32":
         return torch.float32
@@ -93,6 +73,7 @@ def get_emb_precision(precision_str):
     else:
         raise ValueError("unknown embedding precision type")
 
+
 def get_fbgemm_precision(precision_str):
     if precision_str == "fp32":
         return SparseType.FP32
@@ -102,6 +83,7 @@ def get_fbgemm_precision(precision_str):
         return SparseType.BF16
     else:
         raise ValueError("unknown embedding precision type")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -227,6 +209,7 @@ def get_dynamicemb_optimizer(optimizer_type):
     else:
         raise ValueError("unknown optimizer type")
 
+
 def get_fbgemm_optimizer(optimizer_type):
     if optimizer_type == "sgd":
         return OptimType.EXACT_SGD
@@ -241,41 +224,6 @@ def get_fbgemm_optimizer(optimizer_type):
     else:
         raise ValueError("unknown optimizer type")
 
-#TODO: collect input distribution theory hit_rate
-# if existed gap, then improve hit rate.
-# if low theory hit_rate is low, then change alpha.
-def zipf(min_val, max_val, exponent, size, device):
-    """
-    Generates Zipf-like random variables in the inclusive range [min_val, max_val).
-
-    Args:
-        min_val (int): Minimum value (inclusive, must be ≥0).
-        max_val (int): Maximum value (exclusive).
-        exponent (float): Exponent parameter (a > 0).
-        size (int): Output shape.
-
-    Returns:
-        torch.Tensor: Sampled values of specified size.
-    """
-
-    # Generate integer values and probabilities
-    values = torch.arange(min_val + 1, max_val + 1, dtype=torch.long, device=device)
-    probs = 1.0 / (values.float() ** exponent)
-    probs_normalized = probs / probs.sum()
-
-    # k = np.arange(min_val, max_val)
-    # np.random.shuffle(k)
-
-    k = torch.arange(min_val, max_val, dtype=torch.long, device=device)
-    perm = torch.randperm(k.size(0), device=device)
-    k_shuffled = k[perm]
-    
-    probs_np = probs_normalized.cpu().numpy()
-    samples = np.random.choice(k_shuffled.cpu().numpy(), size=size, replace=True, p=probs_np)
-    samples = torch.tensor(samples, device=probs_normalized.device)
-
-    return samples
-
 
 def generate_sequence_sparse_feature(args, device):
     feature_names = [
@@ -289,7 +237,7 @@ def generate_sequence_sparse_feature(args, device):
             lengths_list = []
             for i in range(args.num_embedding_table):
                 indices_list.append(
-                    torch.randint(low=0, high=(2**63)-1, size=(args.batch_size,))
+                    torch.randint(low=0, high=(2**63) - 1, size=(args.batch_size,))
                 )
             indices = torch.cat(indices_list, dim=0)
             indices = indices.to(dtype=torch.int64, device="cuda")
@@ -307,17 +255,23 @@ def generate_sequence_sparse_feature(args, device):
     elif args.feature_distribution == "pow-law":
         assert args.num_embedding_table == 1
         from dataset_generator import gen_jagged_key
+
         res = [
             gen_jagged_key(
                 args.batch_size,
-                1, 
+                1,
                 args.alpha,
                 args.num_embeddings_per_feature[0],
                 device,
-                feature_names) for i in range(args.num_iterations)]
+                feature_names,
+            )
+            for i in range(args.num_iterations)
+        ]
         return res
     elif args.feature_distribution == "zipf":
         assert args.num_embedding_table == 1
+        from dataset_generator import zipf
+
         total_indices = zipf(
             min_val=0,
             max_val=args.num_embeddings_per_feature[0],
@@ -327,8 +281,8 @@ def generate_sequence_sparse_feature(args, device):
         )
         total_indices = total_indices.to(dtype=torch.int64, device="cuda")
         res = []
-        for x in range(args.num_iterations):  
-            indices = total_indices[x * args.batch_size: (x + 1) * args.batch_size]
+        for x in range(args.num_iterations):
+            indices = total_indices[x * args.batch_size : (x + 1) * args.batch_size]
             lengths_list = []
             lengths_list.extend([1] * args.batch_size * args.num_embedding_table)
             lengths = torch.tensor(lengths_list, dtype=torch.int64).cuda()
@@ -350,6 +304,7 @@ def generate_sequence_sparse_feature(args, device):
             f"Not support distribution {args.feature_distribution} of sparse features."
         )
 
+
 def create_dynamic_embedding_tables(args, device):
     table_options = []
     table_num = args.num_embedding_table
@@ -365,7 +320,9 @@ def create_dynamic_embedding_tables(args, device):
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL,
                 ),
-                score_strategy=DynamicEmbScoreStrategy.LFU if args.cache_algorithm == "lfu" else DynamicEmbScoreStrategy.TIMESTAMP,
+                score_strategy=DynamicEmbScoreStrategy.LFU
+                if args.cache_algorithm == "lfu"
+                else DynamicEmbScoreStrategy.TIMESTAMP,
             )
         )
 
@@ -388,14 +345,19 @@ def create_dynamic_embedding_tables(args, device):
         cur_hkv_table = var.tables[table_id]
 
         num_embeddings = args.num_embeddings_per_feature[table_id]
-        fill_batch = 1024*1024
+        fill_batch = 1024 * 1024
         i = 0
         while i < num_embeddings:
             start = i
             end = min(i + fill_batch, num_embeddings)
             i += fill_batch
             unique_indices = torch.arange(start, end, device=device, dtype=torch.int64)
-            unique_values = torch.rand(unique_indices.numel(), args.embedding_dim, device=device, dtype=torch.float32)
+            unique_values = torch.rand(
+                unique_indices.numel(),
+                args.embedding_dim,
+                device=device,
+                dtype=torch.float32,
+            )
 
             optstate_dim = cur_hkv_table.optstate_dim()
             initial_accumulator = cur_hkv_table.get_initial_optstate()
@@ -414,17 +376,22 @@ def create_dynamic_embedding_tables(args, device):
             n = unique_indices.shape[0]
             if args.cache_algorithm == "lfu":
                 scores = torch.ones(n, dtype=torch.uint64, device=unique_indices.device)
-                insert_or_assign(cur_hkv_table, n, unique_indices, unique_values, scores)
+                insert_or_assign(
+                    cur_hkv_table, n, unique_indices, unique_values, scores
+                )
             else:
                 insert_or_assign(cur_hkv_table, n, unique_indices, unique_values)
     return var
 
-def create_split_table_batched_embeddings(args, device):    
+
+def create_split_table_batched_embeddings(args, device):
     optimizer = get_fbgemm_optimizer(args.optimizer_type)
     D = args.embedding_dim
     Es = args.num_embeddings_per_feature
-    cache_alg = CacheAlgorithm.LRU if args.cache_algorithm == "lru" else CacheAlgorithm.LFU
-    
+    cache_alg = (
+        CacheAlgorithm.LRU if args.cache_algorithm == "lru" else CacheAlgorithm.LFU
+    )
+
     if args.caching:
         emb = SplitTableBatchedEmbeddingBagsCodegen(
             [
@@ -485,7 +452,7 @@ def warmup_gpu(device="cuda"):
     a = torch.randn(10, 16384, 2048, device=device)
     b = torch.randn(10, 2048, 16384, device=device)
     for _ in range(5):
-        c = torch.matmul(a, b)
+        torch.matmul(a, b)
         torch.cuda.synchronize()
 
     # 2. copy engine
@@ -498,6 +465,7 @@ def warmup_gpu(device="cuda"):
         # GPU -> CPU
         d_cpu.copy_(d_gpu, non_blocking=True)
         torch.cuda.synchronize()
+
 
 def benchmark_one_iteration(model, sparse_feature):
     start_event = torch.cuda.Event(enable_timing=True)
@@ -517,8 +485,8 @@ def benchmark_one_iteration(model, sparse_feature):
     iteration_latency = start_event.elapsed_time(end_event)
     return forward_latency, backward_latency, iteration_latency
 
+
 def benchmark_train_eval(model, sparse_features, timer, args):
-    
     model.train()
 
     timer.start()
@@ -536,9 +504,9 @@ def benchmark_train_eval(model, sparse_features, timer, args):
         output = model(sparse_feature.values(), sparse_feature.offsets())
     timer.stop()
     train_forward_latency = timer.elapsed_time() / args.num_iterations
-    
+
     train_backward_latency = train_latency - train_forward_latency
-    
+
     model.eval()
     timer.start()
     for i in range(args.num_iterations):
@@ -546,8 +514,9 @@ def benchmark_train_eval(model, sparse_features, timer, args):
         output = model(sparse_feature.values(), sparse_feature.offsets())
     timer.stop()
     eval_latency = timer.elapsed_time() / args.num_iterations
-    
+
     return train_latency, train_forward_latency, train_backward_latency, eval_latency
+
 
 def append_to_json(file_path, data):
     try:
@@ -565,9 +534,14 @@ def append_to_json(file_path, data):
     with open(file_path, "w") as f:
         json.dump(exist_data, f, indent=4)
 
+
 def input_distribution(tensor_list, n, max_val, batch_size):
-    counts = torch.zeros(max_val + 1, dtype=torch.long, device=tensor_list[0].values().device)
-    counts_res = torch.zeros(max_val + 1, dtype=torch.long, device=tensor_list[0].values().device)
+    counts = torch.zeros(
+        max_val + 1, dtype=torch.long, device=tensor_list[0].values().device
+    )
+    counts_res = torch.zeros(
+        max_val + 1, dtype=torch.long, device=tensor_list[0].values().device
+    )
     for i in range(n):
         tensor_ = tensor_list[i]
         indices = tensor_.values()
@@ -579,19 +553,22 @@ def input_distribution(tensor_list, n, max_val, batch_size):
     unique_vals, cnts = torch.unique(indices, return_counts=True)
     counts_res[unique_vals] = 1
     print(unique_vals.size(0))
-    equal_mask = (counts == 1) & (counts_res == 1) 
+    equal_mask = (counts == 1) & (counts_res == 1)
     num_equal = equal_mask.sum().item()
     return num_equal, (num_equal / unique_vals.size(0)) * 100
 
+
 def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb):
-    counts = torch.zeros(max_val + 1, dtype=torch.long, device=tensor_list[0].values().device)
+    counts = torch.zeros(
+        max_val + 1, dtype=torch.long, device=tensor_list[0].values().device
+    )
     for tensor in tensor_list:
         indices = tensor.values()
         unique_vals, cnts = torch.unique(indices, return_counts=True)
         counts[unique_vals] += cnts
     top_counts, top_indices = torch.topk(counts, n)
     total_unique_num = (counts != 0).sum().item()
-    print("Totol unique input number:", total_unique_num)
+    print("Total unique input number:", total_unique_num)
     length = torch.ones(batch_size, dtype=torch.int64, device=top_indices.device)
     batches = torch.split(top_indices, batch_size, dim=0)
     for i, batch in enumerate(reversed(batches)):
@@ -604,13 +581,15 @@ def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb
             dynamic_emb(features.values(), features.offsets())
             torchrec_emb(features.values(), features.offsets())
 
+
 def clear_cache(args, dynamic_emb, torchrec_emb):
     table_num = args.num_embedding_table
     if args.caching:
         for table_id in range(table_num):
             clear(dynamic_emb.tables[table_id])
     torchrec_emb.reset_cache_states()
-    
+
+
 @record
 def main():
     args = parse_args()
@@ -636,12 +615,12 @@ def main():
     num_embs = [f"{num}" for num in args.num_embeddings_per_feature]
     features_file = f"{args.num_iterations}-{args.feature_distribution}-{num_embs}-{args.batch_size}-{args.alpha}.pt"
     try:
-        with open(features_file, 'rb') as f:
+        with open(features_file, "rb") as f:
             sparse_features = torch.load(f, map_location=f"cuda:{local_rank}")
     except FileNotFoundError:
         sparse_features = []
         for i in range(args.num_iterations):
-            sparse_features= generate_sequence_sparse_feature(args, device)
+            sparse_features = generate_sequence_sparse_feature(args, device)
         torch.save(sparse_features, features_file)
     timer.stop()
     print(f"Generate sparse features done in {timer.elapsed_time() / 1000:.3f} s.")
@@ -650,19 +629,23 @@ def main():
     warmup_gpu(device)
 
     for i in range(0, args.num_iterations, report_interval):
-        for j in range(report_interval):   
-            forward_latency, backward_latency, iteration_latency = benchmark_one_iteration(
-                var, sparse_features[i + j]
-            )
+        for j in range(report_interval):
+            (
+                forward_latency,
+                backward_latency,
+                iteration_latency,
+            ) = benchmark_one_iteration(var, sparse_features[i + j])
             print(
                 f"dynamicemb: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
                 f"total: {iteration_latency:.3f} ms"
             )
 
-        for j in range(report_interval):   
-            forward_latency, backward_latency, iteration_latency = benchmark_one_iteration(
-                torchrec_emb, sparse_features[i + j]
-            )
+        for j in range(report_interval):
+            (
+                forward_latency,
+                backward_latency,
+                iteration_latency,
+            ) = benchmark_one_iteration(torchrec_emb, sparse_features[i + j])
             print(
                 f"torchrec: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
                 f"total: {iteration_latency:.3f} ms"
@@ -672,7 +655,6 @@ def main():
     dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
     torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, timer, args)
     torch.cuda.profiler.stop()
-    
 
     test_result = {
         "use_index_dedup": args.use_index_dedup,

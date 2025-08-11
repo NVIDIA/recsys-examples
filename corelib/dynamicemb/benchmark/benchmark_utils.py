@@ -15,6 +15,7 @@
 
 import torch
 
+
 class GPUTimer:
     def __init__(self):
         self.start_event = torch.cuda.Event(enable_timing=True)
