@@ -98,7 +98,7 @@ class RankingGR(BaseModel):
 
     def get_logit_and_labels(
         self, batch: RankingBatch
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get the logits and labels for the batch.
 
@@ -123,13 +123,13 @@ class RankingGR(BaseModel):
         )
         batch = dmp_batch_to_tp(batch)
         # hidden_states is a JaggedData
-        hidden_states_jagged = self._hstu_block(
+        hidden_states_jagged, seqlen_after_preprocessor = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
         )
         hidden_states = hidden_states_jagged.values
         logits = self._mlp(hidden_states)
-        return logits, batch.labels
+        return logits, seqlen_after_preprocessor, batch.labels
 
     def forward(  # type: ignore[override]
         self,
@@ -146,11 +146,15 @@ class RankingGR(BaseModel):
         Returns:
             Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]: The losses and a tuple of losses, logits, and labels.
         """
-        jagged_item_logit, labels = self.get_logit_and_labels(batch)
+        (
+            jagged_item_logit,
+            seqlen_after_preprocessor,
+            labels,
+        ) = self.get_logit_and_labels(batch)
         losses = self._loss_module(jagged_item_logit.float(), labels)
         return losses, (
             losses.detach(),
             jagged_item_logit.detach(),
             labels.detach(),
-            batch.features.lengths().detach(),  # used to compute achieved flops/s
+            seqlen_after_preprocessor.detach(),  # used to compute achieved flops/s
         )

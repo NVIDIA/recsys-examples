@@ -44,14 +44,15 @@ from training.gin_config_args import (
 
 @torch.compile
 def cal_flops_single_rank(
-    hstu_config: HSTUConfig, seqlens: torch.Tensor
+    hstu_config: HSTUConfig, seqlens: torch.Tensor, has_bwd: bool = True
 ) -> torch.Tensor:
     num_layers = hstu_config.num_layers
     hidden_size = hstu_config.hidden_size
     num_heads = hstu_config.num_attention_heads
     dim_per_head = hstu_config.kv_channels
     with torch.inference_mode():
-        total_flops_per_layer = 0
+        seqlens = seqlens.to(torch.int64)
+        total_flops_per_layer = torch.zeros_like(seqlens).to(torch.int64)
         total_flops_per_layer += (
             2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
         )  # qkvu proj fwd
@@ -60,7 +61,8 @@ def cal_flops_single_rank(
         )  # attn fwd
         total_flops_per_layer += seqlens * num_heads * dim_per_head  # mul fwd
         total_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
-        total_flops_per_layer *= 3  # bwd
+        if has_bwd:
+            total_flops_per_layer *= 3  # bwd
         if hstu_config.residual:
             total_flops_per_layer += (
                 seqlens * num_heads * hidden_size
