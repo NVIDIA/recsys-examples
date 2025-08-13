@@ -72,6 +72,8 @@ def test_ln_mul_dropout(
             .requires_grad_(True)
         )
 
+    u.retain_grad()
+    
     ref_x = x.detach().clone().requires_grad_(True)
     ref_u = u.detach().clone().contiguous().view(batchsize, -1).requires_grad_(True)
 
@@ -85,15 +87,13 @@ def test_ln_mul_dropout(
         torch.testing.assert_close(y, ref_y)
 
     dout = torch.empty_like(y).uniform_(-0.1, 0.1)
-
     y.backward(dout)
     ref_y.backward(dout)
-
     if dropout_ratio == 0.0:
         torch.testing.assert_close(ln_weight.grad, ref_weight.grad)
         torch.testing.assert_close(ln_bias.grad, ref_bias.grad)
         torch.testing.assert_close(x.grad, ref_x.grad)
-        torch.testing.assert_close(u.grad, ref_u.grad)
+        torch.testing.assert_close(u.grad.contiguous().view(batchsize, -1), ref_u.grad)
 
 
 @pytest.mark.parametrize(
