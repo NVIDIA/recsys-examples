@@ -41,18 +41,20 @@ def _ln_mul_dropout_fwd(
     seed,
     dropout_ratio,
     stride_x,
-    stride_u,
+    stride_u0,
+    stride_u1,
     stride_y,
+    NUM_U_SLICES: tl.constexpr,  # num of heads
+    UD: tl.constexpr,  # valid only when NUM_U_SLICES>1
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_UX: tl.constexpr,
 ):
     row = tl.program_id(0)
     X += row.to(tl.int64) * stride_x
-    U += row.to(tl.int64) * stride_u
+    U += row.to(tl.int64) * stride_u0  # next rows
     Y += row.to(tl.int64) * stride_y
     cols = tl.arange(0, BLOCK_D)
-
     # Compute mean
     mean = 0.0
     x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
@@ -73,7 +75,20 @@ def _ln_mul_dropout_fwd(
     w = tl.load(W + cols, mask=mask).to(tl.float32)
     b = tl.load(B + cols, mask=mask).to(tl.float32)
     y = y * w + b
-    u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
+
+    if NUM_U_SLICES > 1:
+        u_tile_offsets = tl.arange(0, NUM_U_SLICES)
+        u_inner_offsets = tl.arange(0, UD)
+        offsets_2d = u_tile_offsets[:, None] * stride_u1 + u_inner_offsets[None, :]
+        u_mask = (u_tile_offsets[:, None] < NUM_U_SLICES) & (
+            u_inner_offsets[None, :] < UD
+        )
+        u = tl.load(U + offsets_2d, mask=u_mask, other=0.0).to(tl.float32)
+        u = u.reshape(NUM_U_SLICES * UD)
+    else:
+        u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
+
+    # u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
     y = y * u
 
     if TRAINING:
@@ -121,16 +136,20 @@ def _ln_mul_dropout_bwd_dx_du(
     Mean,
     Rstd,
     stride_dx,
-    stride_du,
+    stride_du0,
+    stride_du1,  # do we need this?
     stride_dy,
     stride_x,
-    stride_u,
+    stride_u0,
+    stride_u1,
     stride_y,
     D,
     eps,
     seed,
     dropout_ratio,
     N,
+    NUM_U_SLICES: tl.constexpr,
+    UD: tl.constexpr,  # valid only when NUM_U_SLICES>1
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_UX: tl.constexpr,
@@ -144,18 +163,17 @@ def _ln_mul_dropout_bwd_dx_du(
 
     if rows_per_tile == 0:
         return
-
     cols = tl.arange(0, BLOCK_D)
     mask = cols < D
 
     row = pid
     X += row.to(tl.int64) * stride_x
-    U += row.to(tl.int64) * stride_u
+    U += row.to(tl.int64) * stride_u0
     if COMPUTE_Y:
         Y += row.to(tl.int64) * stride_y
     DY += row.to(tl.int64) * stride_dy
     DX += row.to(tl.int64) * stride_dx
-    DU += row.to(tl.int64) * stride_du
+    DU += row.to(tl.int64) * stride_du0
     DW = DW + pid * D + cols
     DB = DB + pid * D + cols
 
@@ -200,8 +218,33 @@ def _ln_mul_dropout_bwd_dx_du(
         b = tl.load(B + cols, mask=mask).to(tl.float32)
         ln = xhat * w + b
         du += dy * ln
-        tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
-        u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
+
+        # 2D write-back du
+        if NUM_U_SLICES > 1:
+            du = du.reshape(NUM_U_SLICES, UD)
+            u_tile_offsets = tl.arange(0, NUM_U_SLICES)
+            u_inner_offsets = tl.arange(0, UD)
+            offsets_2d = u_tile_offsets[:, None] * stride_du1 + u_inner_offsets[None, :]
+            u_mask = (u_tile_offsets[:, None] < NUM_U_SLICES) & (
+                u_inner_offsets[None, :] < UD
+            )
+            tl.store(DU + offsets_2d, du, mask=u_mask)
+        else:
+            tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
+
+        # load u
+        if NUM_U_SLICES > 1:
+            u_tile_offsets = tl.arange(0, NUM_U_SLICES)
+            u_inner_offsets = tl.arange(0, UD)
+            offsets_2d = u_tile_offsets[:, None] * stride_u1 + u_inner_offsets[None, :]
+            u_mask = (u_tile_offsets[:, None] < NUM_U_SLICES) & (
+                u_inner_offsets[None, :] < UD
+            )
+            u = tl.load(U + offsets_2d, mask=u_mask, other=0.0).to(tl.float32)
+            u = u.reshape(NUM_U_SLICES * UD)
+        else:
+            u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
+
         dy = dy * u
         wdy = w * dy
         if COMPUTE_Y:
@@ -255,10 +298,10 @@ def _ln_mul_dropout_bwd_dx_du(
         tl.store(DW, partial_dw, mask=mask)
         tl.store(DB, partial_db, mask=mask)
         X += tile_num.to(tl.int64) * stride_x
-        U += tile_num.to(tl.int64) * stride_u
+        U += tile_num.to(tl.int64) * stride_u0
         DY += tile_num.to(tl.int64) * stride_dy
         DX += tile_num.to(tl.int64) * stride_dx
-        DU += tile_num.to(tl.int64) * stride_du
+        DU += tile_num.to(tl.int64) * stride_du0
         row += tile_num
 
 
@@ -329,7 +372,7 @@ def triton_layer_norm_mul_dropout_fwd(
     assert bias.dim() == 1
     assert weight.numel() == D
     assert bias.numel() == D
-
+    U_IS_3D = u.dim() == 3
     if concat_ux:
         y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
     else:
@@ -362,7 +405,10 @@ def triton_layer_norm_mul_dropout_fwd(
         dropout_ratio,
         x.stride(0),
         u.stride(0),
+        u.stride(1) if U_IS_3D else 1,
         y.stride(0),
+        NUM_U_SLICES=u.size(1) if U_IS_3D else 1,
+        UD=u.size(-1) if U_IS_3D else D,
         BLOCK_D=BLOCK_D,
         TRAINING=training,
         CONCAT_UX=concat_ux,
@@ -408,6 +454,7 @@ def triton_layer_norm_mul_dropout_bwd(
             y,
         )
     dx = torch.empty_like(x)
+    U_IS_3D = u.dim() == 3
     if du is None:
         du = torch.empty_like(u)
     sms = torch.cuda.get_device_properties(x.device).multi_processor_count
@@ -434,15 +481,19 @@ def triton_layer_norm_mul_dropout_bwd(
         rstd,
         dx.stride(0),
         du.stride(0),
+        du.stride(1) if U_IS_3D else 1,
         dy.stride(0),
         x.stride(0),
         u.stride(0),
+        u.stride(1) if U_IS_3D else 1,
         y.stride(0) if compute_y else 0,  # pyre-ignore [16]
         D,
         eps,
         seed,
         dropout_ratio,
         N=N,
+        NUM_U_SLICES=u.size(1) if U_IS_3D else 1,
+        UD=u.size(-1) if U_IS_3D else D,
         BLOCK_D=BLOCK_D,
         TRAINING=training,
         CONCAT_UX=concat_ux,
@@ -555,7 +606,7 @@ def _group_norm_mul_dropout_fwd(
     seed,
     dropout_ratio,
     stride_x,
-    stride_u,
+    stride_u0,
     stride_y,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -564,7 +615,7 @@ def _group_norm_mul_dropout_fwd(
 ):  # type: ignore
     row = tl.program_id(0)
     X += row.to(tl.int64) * stride_x
-    U += row.to(tl.int64) * stride_u
+    U += row.to(tl.int64) * stride_u0
     Y += row.to(tl.int64) * stride_y
     cols = tl.arange(0, BLOCK_D)
     heads = tl.arange(0, BLOCK_H)
@@ -643,10 +694,10 @@ def _group_norm_mul_dropout_bwd_dx_du(
     Mean,
     Rstd,
     stride_dx,
-    stride_du,
+    stride_du0,
     stride_dy,
     stride_x,
-    stride_u,
+    stride_u0,
     stride_y,
     D,
     Heads,
@@ -667,10 +718,10 @@ def _group_norm_mul_dropout_bwd_dx_du(
     mask_h = off_heads < Heads
     mask = mask_c[None, :] & mask_h[:, None]
     X += row.to(tl.int64) * stride_x
-    U += row.to(tl.int64) * stride_u
+    U += row.to(tl.int64) * stride_u0
     DY += row.to(tl.int64) * stride_dy
     DX += row.to(tl.int64) * stride_dx
-    DU += row.to(tl.int64) * stride_du
+    DU += row.to(tl.int64) * stride_du0
     offsets = off_heads[:, None] * D + cols[None, :]
 
     # Load data to SRAM

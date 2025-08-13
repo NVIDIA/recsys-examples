@@ -445,7 +445,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 `self._execute_all_batches=True`, then returns None.
         """
         context = self._create_context()
-        with record_function(f"## copy_batch_to_gpu {self._next_index} ##"):
+        with nvtx.annotate(f"## copy_batch_to_gpu {self._next_index} ##"):
             with self._stream_context(self._memcpy_stream):
                 batch = self._next_batch(dataloader_iter)
                 if batch is not None:
@@ -808,7 +808,8 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             )
         if len(self.batches) >= 2:
             # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
-            self.wait_sparse_data_dist(self.contexts[1])
+            with nvtx.annotate("## wait_sparse_data_dist ##"):
+                self.wait_sparse_data_dist(self.contexts[1])
 
         if self._model.training:
             # backward
