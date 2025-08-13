@@ -272,7 +272,9 @@ void find_pointers(
   const size_t n,
   const at::Tensor keys,
   at::Tensor values,
-  at::Tensor founds) {
+  at::Tensor founds,
+  const std::optional<uint64_t> score = std::nullopt
+) {
 
   if (n == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -281,6 +283,25 @@ void find_pointers(
 
   table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, 
       nullptr, stream);
+  
+  // update score.
+  if (score.has_value()) {
+    at::Tensor locked_ptr = at::empty({n}, keys.options().dtype(at::kLong));
+    at::Tensor success = at::empty({n}, keys.options().dtype(at::kBool));
+    if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
+      auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
+      // broadcast scores
+      at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
+      bc_scores.fill_(score.value());
+      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
+                  success.data_ptr<bool>(), bc_scores.data_ptr(), stream);
+    } else {
+      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
+                  success.data_ptr<bool>(), nullptr, stream);
+    }
+    AT_CUDA_CHECK(cudaGetLastError());
+    table->unlock(num_total, reinterpret_cast<void**>(locked_ptr.data_ptr()), keys.data_ptr(), success.data_ptr<bool>(), stream);
+  }
 }
 
 void assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
@@ -609,6 +630,18 @@ void lookup_backward_dense(const at::Tensor indices, const at::Tensor grads,
                              unique_key_ids, stream);
 }
 
+std::tuple<at::Tensor, at::Tensor>
+reduce_grads(at::Tensor indices, at::Tensor grads, at::Tensor segment_range, at::Tensor h_segment_range) {
+  int64_t num_total = indices.size(0);
+  int64_t dim = grads.size(0);
+  int64_t num_segment = h_segment_range.size(0) - 1;
+  int64_t num_unique_total = h_segment_range[num_segment].item<int64_t>();
+  at::Tensor unique_indices = at::empty(num_unique_total, indices.options());
+  at::Tensor unique_grads = at::empty({num_unique_total, dim}, grads.options());
+  lookup_backward_dense(indices, grads, dim, segment_range, unique_indices, unique_grads);
+  return std::make_tuple(unique_indices, unique_grads);
+}
+
 void lookup_backward_dense_dedup(const at::Tensor grads,
                                  at::Tensor unique_indices,
                                  at::Tensor reverse_idx, int32_t dim,
@@ -786,6 +819,102 @@ void lookup_backward(const at::Tensor grad, const at::Tensor unique_buffer,
                     num_key, key_type, value_type, stream);
 }
 
+template <typename T>
+__global__ void load_from_pointers_kernel() {
+
+}
+
+template <typename T>
+__global__ void load_from_pointers_kernel_vec4(
+    int batch,
+    int emb_dim,
+    T* __restrict__ outputs,
+    T* const * __restrict__ src_ptrs) {
+  
+  constexpr int kWarpSize = 32;
+  constexpr int VecSize = 4;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+
+  Vec4T<T> emb;
+  for (int emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+      emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
+    T* const src_ptr = src_ptrs[emb_id];
+    T* dst_ptr = outputs + emb_id * emb_dim;
+    if (src_ptr != nullptr) {
+      for (int i = 0; VecSize * (kWarpSize * i + lane_id) < emb_dim; ++i) {
+        int idx4 = VecSize * (kWarpSize * i + lane_id);
+        emb.load(src_ptr + idx4);
+        emb.store(dst_ptr + idx4);
+      }
+    }
+  }
+}
+
+template <typename T>
+__global__ void load_from_pointers_kernel(
+    int batch,
+    int emb_dim,
+    T* __restrict__ outputs,
+    T* const * __restrict__ src_ptrs) {
+
+  for (int emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
+    T* const src_ptr = src_ptrs[emb_id];
+    T* dst_ptr = outputs + emb_id * emb_dim;
+    if (src_ptr != nullptr) {
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        dst_ptr[i] = src_ptr[i];
+      }
+    }
+  }
+}
+
+void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
+  int64_t num_total = pointers.size(0);
+  int64_t dim = dst.size(0);
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  auto &device_prop = DeviceProp::getDeviceProp();
+  const int max_grid_size =
+      device_prop.num_sms *
+      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+  
+  int grid_size = 0;
+  if (num_total / WARP_PER_BLOCK < max_grid_size) {
+    grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
+  } else if (num_total / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size = max_grid_size;
+  }
+
+  auto scalar_type = dst.dtype().toScalarType();
+  auto value_type = scalartype_to_datatype(scalar_type);
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+    if (dim % 4 == 0) {
+      load_from_pointers_kernel_vec4<ValueType>
+        <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
+        num_total, dim, reinterpret_cast<ValueType*>(dst.data_ptr()), 
+        reinterpret_cast<ValueType**>(pointers.data_ptr()));
+    } else {
+      int block_size = dim < device_prop.max_thread_per_block
+                          ? dim
+                          : device_prop.max_thread_per_block;
+      int grid_size = num_total;
+      load_from_pointers_kernel<ValueType>
+        <<<grid_size, block_size, 0, stream>>>(
+        num_total, dim, reinterpret_cast<ValueType*>(dst.data_ptr()), 
+        reinterpret_cast<ValueType**>(pointers.data_ptr()));
+    }
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // PYTHON WARP
 void bind_dyn_emb_op(py::module &m) {
   py::class_<dyn_emb::InitializerArgs>(m, "InitializerArgs")
@@ -892,6 +1021,12 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"), py::arg("founds"),
         py::arg("score") = py::none(), py::arg("unique_key") = true, 
         py::arg("ignore_evict_strategy") = false);
+
+  m.def("find_pointers", &find_pointers,
+        "Find a key-value pair in the table , and return every "
+        "value's ptr",
+        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"), py::arg("founds"),
+        py::arg("score") = py::none());
 
   m.def("assign", &assign, "Assign values to the table based on keys",
         py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
@@ -1035,4 +1170,8 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("h_unique_offsets"), py::arg("d_unique_offsets"),
         py::arg("unique_idx"), py::arg("new_offsets"), py::arg("new_lengths"),
         py::arg("device_num_sms"), py::arg("unique_op"));
+
+  m.def("reduce_grads", &reduce_grads,
+    "reduce grads", py::arg("indices"), py::arg("grads"), py::arg("segment_range"), py::arg("h_segment_range")
+  );
 }

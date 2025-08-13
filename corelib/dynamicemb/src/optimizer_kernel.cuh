@@ -409,10 +409,10 @@ __global__ void update4_kernel(const uint32_t num_keys, const uint32_t dim, cons
 
   for (uint32_t ev_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
        ev_id < num_keys; ev_id += gridDim.x * warp_num_per_block) {
-    bool mask = masks[ev_id];
+    bool mask = masks ? masks[ev_id] : true;
     weight_t *weight_ptr = weight_evs[ev_id];
     const wgrad_t *grad_ptr = grad_evs + ev_id * dim;
-    if (!mask) {
+    if ((!mask) or (weight_ptr == nullptr)) {
       continue;
     }
     OptimizierInput<wgrad_t, weight_t> input {grad_ptr, weight_ptr, dim};
@@ -426,10 +426,10 @@ __global__ void update_kernel(const uint32_t num_keys, const uint32_t dim, const
   constexpr int kWarpSize = 32;
 
   for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
-    bool mask = masks[ev_id];
+    bool mask = masks ? masks[ev_id] : true;
     weight_t *weight_ptr = weight_evs[ev_id];
     const wgrad_t *grad_ptr = grad_evs + ev_id * dim;
-    if (!mask) {
+    if ((!mask) or (weight_ptr == nullptr)) {
       continue;
     }
     OptimizierInput<wgrad_t, weight_t> input {grad_ptr, weight_ptr, dim};

@@ -22,13 +22,13 @@ from typing import Any, Dict, List, Optional, Union
 import torch  # usort:skip
 from dynamicemb.dynamicemb_config import *
 from dynamicemb_extensions import (
-    dynamic_emb_sgd,
+    # dynamic_emb_sgd,
     dynamic_emb_sgd_with_pointer,
-    dynamic_emb_adam,
+    # dynamic_emb_adam,
     dynamic_emb_adam_with_pointer,
-    dynamic_emb_adagrad,
+    # dynamic_emb_adagrad,
     dynamic_emb_adagrad_with_pointer,
-    dynamic_emb_rowwise_adagrad,
+    # dynamic_emb_rowwise_adagrad,
     dynamic_emb_rowwise_adagrad_with_pointer,
 )
 
@@ -101,7 +101,7 @@ def get_required_arg(args: Dict[str, Any], key: str) -> Any:
     return args[key]
 
 
-class BaseDynamicEmbeddingOptimizer(abc.ABC):
+class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -152,7 +152,7 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         return
 
 
-class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
+class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -165,24 +165,26 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         embs: torch.Tensor,
         states: Optional[torch.Tensor],
     ) -> None:
-        lr = self._opt_args.learning_rate
-        dynamic_emb_sgd(
-            grads.size(0),
-            grads,
-            embs,
-            lr,
-        )
+        pass
+        # lr = self._opt_args.learning_rate
+        # dynamic_emb_sgd(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     lr,
+        # )
 
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
         value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_type,
     ) -> None:
         lr = self._opt_args.learning_rate
         dynamic_emb_sgd_with_pointer(
-            grads.size(0),
             grads,
             value_ptr,
+            value_type,
             lr,
         )
 
@@ -200,7 +202,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         """
         return 0
 
-class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
+class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -217,32 +219,34 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         embs: torch.Tensor,
         states: Optional[torch.Tensor],
     ) -> None:
-        assert states is not None
-        self._step()
+        pass
+        # assert states is not None
+        # self._step()
 
-        lr = self._opt_args.learning_rate
-        beta1 = self._opt_args.beta1
-        beta2 = self._opt_args.beta2
-        weight_decay = self._opt_args.weight_decay
-        eps = self._opt_args.eps
+        # lr = self._opt_args.learning_rate
+        # beta1 = self._opt_args.beta1
+        # beta2 = self._opt_args.beta2
+        # weight_decay = self._opt_args.weight_decay
+        # eps = self._opt_args.eps
 
-        dynamic_emb_adam(
-            grads.size(0),
-            grads,
-            embs,
-            states,
-            lr,
-            beta1,
-            beta2,
-            eps,
-            weight_decay,
-            self._iterations,
-        )
+        # dynamic_emb_adam(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     states,
+        #     lr,
+        #     beta1,
+        #     beta2,
+        #     eps,
+        #     weight_decay,
+        #     self._iterations,
+        # )
 
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
         value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_type,
     ) -> None:
 
         self._step()
@@ -257,9 +261,9 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         state_dim = self.get_state_dim(emb_dim)
 
         dynamic_emb_adam_with_pointer(
-            grads.size(0),
             grads,
             value_ptr,
+            value_type,
             state_dim,
             lr,
             beta1,
@@ -296,7 +300,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return emb_dim * 2
 
 
-class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
+class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -309,23 +313,24 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         embs: torch.Tensor,
         states: Optional[torch.Tensor],
     ) -> None:
-  
-        lr = self._opt_args.learning_rate
-        eps = self._opt_args.eps
+        pass
+        # lr = self._opt_args.learning_rate
+        # eps = self._opt_args.eps
 
-        dynamic_emb_adagrad(
-            grads.size(0),
-            grads,
-            embs,
-            states,
-            lr,
-            eps,
-        )
+        # dynamic_emb_adagrad(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     states,
+        #     lr,
+        #     eps,
+        # )
 
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
         value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_type,
     ) -> None:
 
         lr = self._opt_args.learning_rate
@@ -334,10 +339,10 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim = grads.size(1)
         state_dim = self.get_state_dim(emb_dim)
 
-        dynamic_emb_adagrad(
-            grads.size(0),
+        dynamic_emb_adagrad_with_pointer(
             grads,
             value_ptr,
+            value_type,
             state_dim,
             lr,
             eps,
@@ -365,7 +370,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return emb_dim
 
 
-class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
+class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -386,23 +391,24 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         embs: torch.Tensor,
         states: Optional[torch.Tensor],
     ) -> None:
-  
-        lr = self._opt_args.learning_rate
-        eps = self._opt_args.eps
+        pass
+        # lr = self._opt_args.learning_rate
+        # eps = self._opt_args.eps
 
-        dynamic_emb_rowwise_adagrad(
-            grads.size(0),
-            grads,
-            embs,
-            states,
-            lr,
-            eps,
-        )
+        # dynamic_emb_rowwise_adagrad(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     states,
+        #     lr,
+        #     eps,
+        # )
 
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
         value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_type,
     ) -> None:
 
         lr = self._opt_args.learning_rate
@@ -415,6 +421,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             grads.size(0),
             grads,
             value_ptr,
+            value_type,
             state_dim,
             lr,
             eps,

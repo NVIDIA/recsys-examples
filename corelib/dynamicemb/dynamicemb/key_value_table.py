@@ -19,6 +19,7 @@ from typing import Tuple, Optional, Callable
 from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     create_dynamicemb_table,
+    torch_to_dyn_emb,
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
@@ -167,6 +168,7 @@ class KeyValueTable(Cache, Storage):
         self._is_forward = False
         self._emb_dim = self.options.dim
         self._emb_dtype = self.options.embedding_dtype
+        self._de_emb_dtype = torch_to_dyn_emb(self._emb_dtype)
         self._value_dim = self._emb_dim + optimizer.get_state_dim(self._emb_dim)
         self._initial_optim_state = optimizer.get_initial_optim_states()
 
@@ -195,6 +197,7 @@ class KeyValueTable(Cache, Storage):
         pointers = torch.empty(batch, dtype=torch.long, device=device)
         
         if self._is_forward:
+            #TODO: support score
             find_pointers(self.table, batch, unique_keys, pointers, founds, self.score)
         else:
             find_pointers(self.table, batch, unique_keys, pointers, founds)
@@ -202,15 +205,15 @@ class KeyValueTable(Cache, Storage):
         val_dim = self.value_dim()
         
         if load_dim != 0:
-            load_from_pointers(batch, pointers, val_dim, unique_embs, load_dim)
+            load_from_pointers(pointers, unique_embs)
 
         missing = torch.logical_not(founds)
         num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
         num_missing_1: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
         missing_keys: torch.Tensor = torch.empty_like(unique_keys)
         missing_indices: torch.Tensor = torch.empty(batch, dtype=torch.long, device=device)
-        select(batch, missing, unique_keys, missing_keys, num_missing_0)
-        select_index(batch, missing, missing_indices, num_missing_1)
+        select(missing, unique_keys, missing_keys, num_missing_0)
+        select_index(missing, missing_indices, num_missing_1)
         
         return num_missing_0, missing_keys, missing_indices
 
@@ -241,7 +244,7 @@ class KeyValueTable(Cache, Storage):
         pointers = torch.empty(batch, dtype=torch.long, device=device)
         find_pointers(self.table, batch, keys, pointers, founds)
         
-        self.optimizer.fused_update_with_pointer(grads, pointers)
+        self.optimizer.fused_update_with_pointer(grads, pointers, self._de_emb_dtype)
 
         missing = torch.logical_not(founds)
         num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
@@ -401,7 +404,7 @@ class KeyValueTableFunction:
         missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
 
         if h_num_missing_in_storage != 0:
-            initializer(values_for_storage[:, :emb_dim], missing_indices_in_storage)
+            initializer(values_for_storage[:, :emb_dim], missing_indices_in_storage, missing_keys_in_storage)
             
 
         # 4. d2d
@@ -486,13 +489,14 @@ class KeyValueTableFunction:
         val_dim = storage.value_dim()
         emb_dim = storage.embedding_dim()
         values_for_storage = torch.empty(h_num_keys_for_storage, val_dim, device=unique_keys.device, dtype=emb_dtype)
-        num_missing_in_storage, _, missing_indices_in_storage = storage.find(missing_keys, values_for_storage)
+        num_missing_in_storage, missing_keys_in_storage, missing_indices_in_storage = storage.find(missing_keys, values_for_storage)
 
         h_num_missing_in_storage = num_missing_in_storage.cpu().item()
-        missing_indices_in_storage = missing_indices_in_storage[:,h_num_missing_in_storage]
+        missing_indices_in_storage = missing_indices_in_storage[:h_num_missing_in_storage]
+        missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
         if h_num_missing_in_storage != 0:
             embs_for_storage = values_for_storage[:, :emb_dim]
-            initializer(embs_for_storage, missing_indices_in_storage)
+            initializer(embs_for_storage, missing_indices_in_storage, missing_keys_in_storage)
             values_for_storage[missing_indices_in_storage, emb_dim-val_dim:] = storage.init_optimizer_state()
         
         update_cache(cache, storage, missing_keys, values_for_storage, forward_stream is not None)

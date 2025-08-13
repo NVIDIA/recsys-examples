@@ -29,9 +29,10 @@ from dynamicemb_extensions import (
     lookup_forward,
     lookup_forward_dense,
     reduce_grads,
+    get_table_range,
+    segmented_unique
 )
 from dynamicemb.key_value_table import KeyValueTableFunction, Cache, Storage
-from dynamicemb.index_calculation import get_table_range, segmented_unique
 
 
 # TODO: BatchedDynamicEmbeddingFunction is more concrete.
@@ -495,6 +496,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         output_dtype: torch.dtype,
         initializers: List[BaseDynamicEmbInitializer],
         optimizer: BaseDynamicEmbeddingOptimizer,
+        unique_op,
         enable_prefetch: bool=False,
         input_dist_dedup: bool=False,
         *args
@@ -505,12 +507,13 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         emb_dim = storages[0].embedding_dim()
 
         indices_table_range = get_table_range(offsets, feature_offsets)
-        unique_indices, inverse, unique_indices_table_range = segmented_unique(indices, indices_table_range)
+        #TODO: only return device unique_indices_table_range
+        unique_indices, inverse, unique_indices_table_range, h_unique_indices_table_range = segmented_unique(indices, indices_table_range, unique_op)
 
         unique_embs = torch.empty(
             unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
         )
-        h_unique_indices_table_range = unique_indices_table_range.cpu()
+        # h_unique_indices_table_range = unique_indices_table_range.cpu()
         for i in range(table_num):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
@@ -566,7 +569,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             unique_embs = ctx.unique_embs
             inverse = ctx.inverse
     
-        unique_indices, unique_embs = reduce_grads(indices, grads, unique_indices_table_range)
+        unique_indices, unique_embs = reduce_grads(indices, grads, unique_indices_table_range, h_unique_indices_table_range)
         
         table_num = len(storages)
         for i in range (table_num):
@@ -584,4 +587,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 enable_prefetch,
             )
 
-        return (None,) * 10
+        return (None,) * 11
