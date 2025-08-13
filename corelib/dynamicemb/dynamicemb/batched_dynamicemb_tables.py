@@ -650,6 +650,10 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         # Jost forward it to DynamicEmbeddingFunction
         # return DynamicEmbeddingFunction.apply(indices, offsets, self.table_offsets_in_feature, self.tables, self.total_D,
         #                                       self.dims,self.feature_table_map, self.embedding_dtype, self.pooling_mode, torch.device(self.device_id), 1, self._empty_tensor)
+        if any([not o.training for o in self._dynamicemb_options]) and self.training:
+            raise RuntimeError(
+                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
+            )
 
         scores = []
         for table_name in self._table_names:
@@ -677,6 +681,8 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self.training,
+                [option.eval_initializer_args for option in self._dynamicemb_options],
                 self._empty_tensor,
             )
         else:
@@ -697,10 +703,13 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self.training,
+                [option.eval_initializer_args for option in self._dynamicemb_options],
                 self._empty_tensor,
             )
 
-        self._update_score()
+        if self.training:
+            self._update_score()
         return res
 
     def set_score(

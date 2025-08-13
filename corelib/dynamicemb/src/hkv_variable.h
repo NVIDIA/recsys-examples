@@ -86,7 +86,7 @@ public:
 
   void find_and_initialize(
     const size_t n, const void *keys, void **value_ptrs, void *values,
-    bool *founds, const cudaStream_t& stream) override;
+    bool *founds, std::optional<InitializerArgs> initializer_args, const cudaStream_t& stream) override;
 
   void find_or_insert_pointers(const size_t n, const void *keys, // (n)
                                void **value_ptrs,                // (n * ptrs)

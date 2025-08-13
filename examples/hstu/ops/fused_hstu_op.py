@@ -17,7 +17,11 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
 import hstu_attn_2_cuda as flash_attn_cuda_ampere
-import hstu_hopper_cuda as flash_attn_cuda_hopper
+
+try:
+    import hstu_hopper_cuda as flash_attn_cuda_hopper
+except ImportError:
+    pass
 import nvtx
 import torch
 from commons.utils.clear_tensor_data import clear_tensor_data
