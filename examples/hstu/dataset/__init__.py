@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 def get_data_loader(
     dataset: torch.utils.data.Dataset,
-    pin_memory: bool = True,
+    pin_memory: bool = False,
 ) -> DataLoader:
     loader = DataLoader(
         dataset,

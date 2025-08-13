@@ -21,7 +21,9 @@ import dataset
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from configs import (
+    HSTUConfig,
     HSTULayerType,
+    HSTUPreprocessingConfig,
     KernelBackend,
     OptimizerParam,
     PositionEncodingConfig,
@@ -38,6 +40,51 @@ from training.gin_config_args import (
     OptimizerArgs,
     TrainerArgs,
 )
+
+
+@torch.compile
+def cal_flops_single_rank(
+    hstu_config: HSTUConfig, seqlens: torch.Tensor
+) -> torch.Tensor:
+    num_layers = hstu_config.num_layers
+    hidden_size = hstu_config.hidden_size
+    num_heads = hstu_config.num_attention_heads
+    dim_per_head = hstu_config.kv_channels
+    with torch.inference_mode():
+        total_flops_per_layer = 0
+        total_flops_per_layer += (
+            2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
+        )  # qkvu proj fwd
+        total_flops_per_layer += (
+            2 * num_heads * 2 * seqlens * seqlens * dim_per_head
+        )  # attn fwd
+        total_flops_per_layer += seqlens * num_heads * dim_per_head  # mul fwd
+        total_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
+        total_flops_per_layer *= 3  # bwd
+        if hstu_config.residual:
+            total_flops_per_layer += (
+                seqlens * num_heads * hidden_size
+            )  # add fwd, bwd is no-op
+
+        return torch.sum(total_flops_per_layer) * num_layers
+
+
+def cal_flops(hstu_config: HSTUConfig, seqlens: List[torch.Tensor]) -> int:
+    seqlens_tensor = torch.cat(seqlens)
+    world_size = torch.distributed.get_world_size()
+    gathered_seqlens = (
+        [torch.empty_like(seqlens_tensor) for _ in range(world_size)]
+        if torch.distributed.get_rank() == 0
+        else None
+    )
+    torch.distributed.gather(seqlens_tensor, gathered_seqlens, dst=0)
+    if torch.distributed.get_rank() == 0:
+        flops = (
+            cal_flops_single_rank(hstu_config, torch.cat(gathered_seqlens)).cpu().item()
+        )
+    else:
+        flops = 0
+    return flops
 
 
 def create_hstu_config(network_args: NetworkArgs):
@@ -73,6 +120,13 @@ def create_hstu_config(network_args: NetworkArgs):
         num_time_buckets=2048,
         use_time_encoding=False,
     )
+    if network_args.item_embedding_dim > 0 or network_args.contextual_embedding_dim > 0:
+        hstu_preprocessing_config = HSTUPreprocessingConfig(
+            item_embedding_dim=network_args.item_embedding_dim,
+            contextual_embedding_dim=network_args.contextual_embedding_dim,
+        )
+    else:
+        hstu_preprocessing_config = None
     return get_hstu_config(
         hidden_size=network_args.hidden_size,
         kv_channels=network_args.kv_channels,
@@ -83,6 +137,7 @@ def create_hstu_config(network_args: NetworkArgs):
         is_causal=network_args.is_causal,
         dtype=dtype,
         kernel_backend=kernel_backend,
+        hstu_preprocessing_config=hstu_preprocessing_config,
         position_encoding_config=position_encoding_config,
         target_group_size=network_args.target_group_size,
         hstu_layer_type=layer_type,
@@ -193,6 +248,55 @@ def create_embedding_config(
         dim=hidden_size,
         sharding_type=embedding_args.sharding_type,
     )
+
+
+def create_embedding_configs(
+    dataset_args: Union[DatasetArgs, BenchmarkDatasetArgs],
+    network_args: NetworkArgs,
+    embedding_args: List[EmbeddingArgs],
+) -> List[ShardedEmbeddingConfig]:
+    if (
+        network_args.item_embedding_dim <= 0
+        or network_args.contextual_embedding_dim <= 0
+    ):
+        return [
+            create_embedding_config(network_args.hidden_size, arg)
+            for arg in embedding_args
+        ]
+    if isinstance(dataset_args, DatasetArgs):
+        from preprocessor import get_common_preprocessors
+
+        common_preprocessors = get_common_preprocessors()
+        dp = common_preprocessors[dataset_args.dataset_name]
+        item_feature_name = dp._item_feature_name
+        contextual_feature_names = dp._contextual_feature_names
+        action_feature_name = dp._action_feature_name
+    elif isinstance(dataset_args, BenchmarkDatasetArgs):
+        item_feature_name = dataset_args.item_feature_name
+        contextual_feature_names = dataset_args.contextual_feature_names
+        action_feature_name = dataset_args.action_feature_name
+    else:
+        raise ValueError(f"Dataset args type {type(dataset_args)} not supported")
+
+    embedding_configs = []
+    for arg in embedding_args:
+        if (
+            item_feature_name in arg.feature_names
+            or action_feature_name in arg.feature_names
+        ):
+            emb_config = create_embedding_config(network_args.item_embedding_dim, arg)
+        else:
+            if len(set(arg.feature_names) & set(contextual_feature_names)) != len(
+                arg.feature_names
+            ):
+                raise ValueError(
+                    f"feature name {arg.feature_name} not match with contextual feature names {contextual_feature_names}"
+                )
+            emb_config = create_embedding_config(
+                network_args.contextual_embedding_dim, arg
+            )
+        embedding_configs.append(emb_config)
+    return embedding_configs
 
 
 def create_dynamic_optitons_dict(

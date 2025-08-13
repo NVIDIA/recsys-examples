@@ -369,6 +369,7 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   hkv_table_option_.use_constant_memory = use_constant_memory;
   hkv_table_option_.reserved_key_start_bit = reserved_key_start_bit;
   hkv_table_option_.num_of_buckets_per_alloc = num_of_buckets_per_alloc;
+  hkv_table_option_.api_lock = false;
 
   /// TODO: make HKV's init async.
   hkv_table_->init(hkv_table_option_);
@@ -455,7 +456,7 @@ void HKVVariable<KeyType, ValueType, Strategy>::accum_or_assign(
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
     const size_t n, const void *keys, void **value_ptrs, void *values,
-    bool *d_found, const cudaStream_t& stream) {
+    bool *d_found, std::optional<InitializerArgs> initializer_args_, const cudaStream_t& stream) {
   if (n == 0)
     return;
   int dim = dim_;
@@ -465,23 +466,24 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
                        ? dim
                        : device_prop.max_thread_per_block;
   int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
-
-  auto &initializer_ = initializer_args.mode;
+  
+  auto &init_args = initializer_args_.has_value() ? initializer_args_.value() : initializer_args;
+  auto &initializer_ = init_args.mode;
   if (initializer_ == "normal") {
     using Generator = NormalEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+    auto generator_args = typename Generator::Args {curand_states_, init_args.mean, init_args.std_dev};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
       <<<grid_size, block_size, 0, stream>>>(
       n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
   } else if (initializer_ == "truncated_normal") {
     using Generator = TruncatedNormalEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+    auto generator_args = typename Generator::Args {curand_states_, init_args.mean, init_args.std_dev, init_args.lower, init_args.upper};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
       <<<grid_size, block_size, 0, stream>>>(
       n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
   } else if (initializer_ == "uniform") {
     using Generator = UniformEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
+    auto generator_args = typename Generator::Args {curand_states_, init_args.lower, init_args.upper};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
       <<<grid_size, block_size, 0, stream>>>(
       n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
@@ -493,7 +495,7 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
       n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
   } else if (initializer_ == "constant") {
     using Generator = ConstEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {initializer_args.value};
+    auto generator_args = typename Generator::Args {init_args.value};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
       <<<grid_size, block_size, 0, stream>>>(
       n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);

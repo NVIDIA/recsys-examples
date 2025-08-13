@@ -50,17 +50,11 @@ class RankingGR(BaseModel):
         self._hstu_config = hstu_config
         self._task_config = task_config
 
-        self._embedding_dim = hstu_config.hidden_size
-        for ebc_config in task_config.embedding_configs:
-            assert (
-                ebc_config.dim == self._embedding_dim
-            ), "hstu layer hidden size should equal to embedding dim"
-
         self._embedding_collection = ShardedEmbedding(task_config.embedding_configs)
 
         self._hstu_block = HSTUBlock(hstu_config)
         self._mlp = MLP(
-            self._embedding_dim,
+            hstu_config.hidden_size,
             task_config.prediction_head_arch,
             task_config.prediction_head_act_type,
             task_config.prediction_head_bias,
@@ -140,7 +134,9 @@ class RankingGR(BaseModel):
     def forward(  # type: ignore[override]
         self,
         batch: RankingBatch,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]:
         """
         Perform the forward pass of the model.
 
@@ -156,4 +152,5 @@ class RankingGR(BaseModel):
             losses.detach(),
             jagged_item_logit.detach(),
             labels.detach(),
+            batch.features.lengths().detach(),  # used to compute achieved flops/s
         )

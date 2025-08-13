@@ -26,7 +26,7 @@ RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers
 
-RUN pip install --no-cache setuptools==69.5.1 setuptools-git-versioning scikit-build && \
+RUN pip install --no-cache-dir setuptools==69.5.1 setuptools-git-versioning scikit-build && \
   git clone --recursive -b v1.2.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
   cd fbgemm/fbgemm_gpu && \
   python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 9.0"

@@ -6,14 +6,9 @@ from typing import Any, Dict, Optional
 import torch
 from configs import InferenceHSTUConfig, KVCacheConfig
 from dataset.utils import Batch
+from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
-from modules.position_encoder import HSTUPositionalEncoder
-from modules.utils import hstu_postprocess_embeddings, hstu_preprocess_embeddings
-from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
-    triton_concat_2D_jagged,
-    triton_split_2D_jagged,
-)
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
@@ -32,21 +27,10 @@ class HSTUBlockInference(torch.nn.Module):
     ):
         super().__init__()
         self.config = config
-        if self.config.bf16:
-            self._dtype = torch.bfloat16
-        if self.config.fp16:
-            self._dtype = torch.float16
 
-        self._positional_encoder: Optional[HSTUPositionalEncoder] = None
-        if config.position_encoding_config is not None:
-            self._positional_encoder = HSTUPositionalEncoder(
-                num_position_buckets=config.position_encoding_config.num_position_buckets,
-                num_time_buckets=config.position_encoding_config.num_time_buckets,
-                embedding_dim=config.hidden_size,
-                is_inference=True,
-                use_time_encoding=config.position_encoding_config.use_time_encoding,
-                training_dtype=self._dtype,
-            )
+        self._preprocessor = HSTUBlockPreprocessor(config, is_inference=True)
+        self._postprocessor = HSTUBlockPostprocessor(is_inference=True)
+
         self._attention_layers = torch.nn.ModuleList(
             [
                 PagedHSTUInferLayer(config, kvcache_config, layer_idx)
@@ -54,61 +38,6 @@ class HSTUBlockInference(torch.nn.Module):
             ]
         )
         self._hstu_graph: Optional[Dict[int, Any]] = None  # type: ignore
-
-    def hstu_preprocess(
-        self, embeddings: Dict[str, JaggedTensor], batch: Batch
-    ) -> JaggedData:
-        """
-        Preprocesses the embeddings for use in the HSTU architecture.
-
-        This method performs the following steps:
-        1. **Interleaving**: If action embeddings are present, interleaves them with item embeddings (candidates excluded).
-        2. **Concatenation**: Concatenates contextual, item, and action embeddings for each sample, following the order specified in the batch.
-        3. **Position Encoding**: Applies position encoding to the concatenated embeddings.
-
-        Args:
-            embeddings (Dict[str, JaggedTensor]): A dictionary of embeddings where each key corresponds to a feature name and the value is a jagged tensor.
-            batch (Batch): The batch of ranking data.
-
-        Returns:
-            JaggedData: The preprocessed jagged data, ready for further processing in the HSTU architecture.
-        """
-
-        # Interleaving & Concatenation
-        jd = hstu_preprocess_embeddings(
-            embeddings, batch, is_inference=True, dtype=self._dtype
-        )
-        device = jd.seqlen_offsets.device
-        jd.num_candidates = jd.num_candidates.to(device=device)
-        jd.num_candidates_offsets = jd.num_candidates_offsets.to(device=device)
-
-        # Position Encoding
-        if self._positional_encoder is not None:
-            jd.values = self._positional_encoder(
-                max_seq_len=jd.max_seqlen,
-                seq_lengths=jd.seqlen,
-                seq_offsets=jd.seqlen_offsets,
-                seq_timestamps=None,
-                seq_embeddings=jd.values,
-                num_targets=jd.num_candidates,
-            )
-
-        return jd
-
-    def hstu_postprocess(self, jd: JaggedData) -> JaggedData:
-        """
-        Postprocess the output from the HSTU architecture.
-        1. If max_num_candidates > 0, split and only keep last ``num_candidates`` embeddings as candidates embedding for further processing.
-        2. Remove action embeddings if present. Only use item embedding for further processing.
-
-        Args:
-            jd (JaggedData): The jagged data output from the HSTU architecture that needs further processing.
-
-        Returns:
-            JaggedData: The postprocessed jagged data.
-        """
-
-        return hstu_postprocess_embeddings(jd, is_inference=True)
 
     def forward(
         self,
@@ -125,10 +54,11 @@ class HSTUBlockInference(torch.nn.Module):
         Returns:
             JaggedData: The output jagged data.
         """
-        jd = self.hstu_preprocess(embeddings, batch)
-        for hstu_layer in self._attention_layers:
-            jd = hstu_layer(jd)
-        return self.hstu_postprocess(jd)
+        with torch.inference_mode():
+            jd = self._preprocessor(embeddings, batch)
+            for hstu_layer in self._attention_layers:
+                jd = hstu_layer(jd)
+            return self._postprocessor(jd)
 
     def predict(
         self,

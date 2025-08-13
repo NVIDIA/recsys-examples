@@ -17,7 +17,7 @@ from typing import List, Optional
 
 import torch
 
-from .hstu_config import PositionEncodingConfig
+from .hstu_config import HSTUPreprocessingConfig, PositionEncodingConfig
 
 
 @dataclass
@@ -156,6 +156,7 @@ class InferenceHSTUConfig:
     is_causal: bool = True
     target_group_size: int = 1
     position_encoding_config: Optional[PositionEncodingConfig] = None
+    hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None
 
     def __post_init__(self):
         assert self.is_causal

@@ -38,6 +38,8 @@ BenchmarkDatasetArgs.contextual_feature_names=[]
 BenchmarkDatasetArgs.action_feature_name='action'
 BenchmarkDatasetArgs.max_num_candidates=0
 
+NetworkArgs.item_embedding_dim = 128
+NetworkArgs.contextual_embedding_dim = 256
 NetworkArgs.num_layers = 8
 NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 1024

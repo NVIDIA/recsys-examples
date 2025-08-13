@@ -16,17 +16,24 @@
 import torch
 
 
-def init_mlp_weights_optional_bias(
-    m: torch.nn.Module,
-) -> None:
-    """
-    Initialize the weights of a linear layer and optionally the bias.
+class GPUTimer:
+    def __init__(self):
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
 
-    Args:
-        m: The module to initialize.
-    """
-    if isinstance(m, torch.nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight)
-        # Always initialize bias to zero.
-        if m.bias is not None:
-            m.bias.data.fill_(0.0)
+    def start(self):
+        self.start_event.record()
+
+    def stop(self):
+        self.end_event.record()
+
+    def elapsed_time(self):
+        """
+        return in ms
+        """
+        self.dist_sync()
+        torch.cuda.synchronize()
+        return self.start_event.elapsed_time(self.end_event)
+
+    def dist_sync(self):
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
