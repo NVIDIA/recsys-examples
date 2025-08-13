@@ -22,10 +22,13 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cooperative_groups.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <pybind11/pybind11.h>
-#include "util.h"
+#include "utils.h"
 #include "check.h"
+#include "lookup_kernel.cuh"
+#include "torch_utils.h"
 
 namespace dyn_emb {
 

@@ -37,12 +37,12 @@ public:
     auto &deviceProp = DeviceProp::getDeviceProp();
     num_worker_ = deviceProp.total_threads;
     CUDACHECK(cudaMallocAsync(
-      states_, sizeof(curandState) * num_worker_, stream));
+      &states_, sizeof(curandState) * num_worker_, stream));
     std::random_device rd;
     auto seed = rd();
     int block_size = deviceProp.max_thread_per_block;
     int grid_size = num_worker_ / block_size;
-    init_curand_state_kernel<<<grid_size, block_size, 0, stream>>>(seed, *states_);
+    init_curand_state_kernel<<<grid_size, block_size, 0, stream>>>(seed, states_);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
@@ -81,8 +81,8 @@ __global__ void initialize_with_index_addressor_kernel(
     int64_t emb_id = task_id / dim;
     int64_t index = indices[emb_id];
     ValueT * dst = buffer + index * stide;
-    auto tmp = emb.generate(index);
-    dst[task_id % dim] = TypeConvertFunc<T, float>::convert(tmp);
+    auto tmp = gen.generate(index);
+    dst[task_id % dim] = TypeConvertFunc<ValueT, float>::convert(tmp);
   }
   gen.destroy();
 }
@@ -91,7 +91,8 @@ template <typename GeneratorT>
 void initialize_with_generator(
   at::Tensor buffer, 
   at::Tensor indices, 
-  typename GeneratorT::Args generator_args
+  typename GeneratorT::Args generator_args,
+  int num_worker = -1
 ) {
   int num_dims = buffer.dim();
   if (num_dims != 2) {
@@ -108,8 +109,10 @@ void initialize_with_generator(
   auto &deviceProp = DeviceProp::getDeviceProp();
 
   int block_size = deviceProp.max_thread_per_block;
-  int num_worker = curand_state_context.num_worker();
   int num_need = num_total * dim;
+  if (num_worker == -1) {
+    num_worker = deviceProp.total_threads;
+  }
   if (num_worker > num_need) {
     num_worker = num_need;
   }
@@ -121,7 +124,7 @@ void initialize_with_generator(
       scalartype_to_datatype(convertTypeMetaToScalarType(indices.dtype()));
   DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
     DISPATCH_INTEGER_DATATYPE_FUNCTION(index_type, IndexType, [&] {
-      initialize_with_index_addressor_kernel<ValueType, IndexType, Generator>
+      initialize_with_index_addressor_kernel<ValueType, IndexType, GeneratorT>
         <<<grid_size, block_size, 0, stream>>>(
         num_total, dim, stride, reinterpret_cast<ValueType *>(buffer.data_ptr()), 
         reinterpret_cast<IndexType *>(indices.data_ptr()), generator_args);
@@ -140,7 +143,8 @@ void normal_init(
 
   using GeneratorT = NormalEmbeddingGenerator;
   auto generator_args = typename GeneratorT::Args {curand_state_context.ptr(), mean, std_dev};
-  initialize_with_generator<GeneratorT>(buffer, indices, generator_args);
+  int num_worker = curand_state_context.num_worker();
+  initialize_with_generator<GeneratorT>(buffer, indices, generator_args, num_worker);
 }
 
 void truncated_normal_init(
@@ -154,7 +158,8 @@ void truncated_normal_init(
 ) {
   using GeneratorT = TruncatedNormalEmbeddingGenerator;
   auto generator_args = typename GeneratorT::Args {curand_state_context.ptr(), mean, std_dev, lower, upper};
-  initialize_with_generator<GeneratorT>(buffer, indices, generator_args);
+  int num_worker = curand_state_context.num_worker();
+  initialize_with_generator<GeneratorT>(buffer, indices, generator_args, num_worker);
 }
 
 void uniform_init(
@@ -166,7 +171,8 @@ void uniform_init(
 ) {
   using GeneratorT = UniformEmbeddingGenerator;
   auto generator_args = typename GeneratorT::Args {curand_state_context.ptr(), lower, upper};
-  initialize_with_generator<GeneratorT>(buffer, indices, generator_args);
+  int num_worker = curand_state_context.num_worker();
+  initialize_with_generator<GeneratorT>(buffer, indices, generator_args, num_worker);
 }
 
 void const_init(
@@ -198,9 +204,9 @@ void debug_init(
 
 void bind_initializer_op(py::module &m) {
 
-  py::class_<CurandStateContext>(m, "CurandStateContext")
+  py::class_<dyn_emb::CurandStateContext>(m, "CurandStateContext")
     .def(py::init<>())
-    .def("ptr", &CurandStateContext::ptr,
+    .def("ptr", &dyn_emb::CurandStateContext::ptr,
           py::return_value_policy::reference);
 
   m.def("normal_init", &dyn_emb::normal_init,

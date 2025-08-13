@@ -28,6 +28,7 @@
 #include "index_calculation.h"
 #include "lookup_backward.h"
 #include "lookup_forward.h"
+#include "lookup_kernel.cuh"
 #include "torch_utils.h"
 #include "unique_op.h"
 #include "utils.h"
@@ -286,8 +287,8 @@ void find_pointers(
   
   // update score.
   if (score.has_value()) {
-    at::Tensor locked_ptr = at::empty({n}, keys.options().dtype(at::kLong));
-    at::Tensor success = at::empty({n}, keys.options().dtype(at::kBool));
+    at::Tensor locked_ptr = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kLong));
+    at::Tensor success = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kBool));
     if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
       auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
       // broadcast scores
@@ -300,7 +301,7 @@ void find_pointers(
                   success.data_ptr<bool>(), nullptr, stream);
     }
     AT_CUDA_CHECK(cudaGetLastError());
-    table->unlock(num_total, reinterpret_cast<void**>(locked_ptr.data_ptr()), keys.data_ptr(), success.data_ptr<bool>(), stream);
+    table->unlock(n, reinterpret_cast<void**>(locked_ptr.data_ptr()), keys.data_ptr(), success.data_ptr<bool>(), stream);
   }
 }
 

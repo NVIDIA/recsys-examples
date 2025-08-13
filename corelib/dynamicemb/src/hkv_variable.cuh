@@ -721,6 +721,39 @@ void HKVVariable<KeyType, ValueType,Strategy >::export_batch_matched(
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::lock(
+    const size_t n,
+    const void* keys,            // (n)
+    void** locked_keys_ptr,      // (n)
+    bool* flags,                 // (n)
+    void* scores,
+    cudaStream_t stream
+)  {
+  hkv_table_->lock_keys(
+    n,
+    reinterpret_cast<const KeyType*>(keys),
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    flags, stream, (uint64_t*)scores);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::unlock(
+    const size_t n,
+    void** locked_keys_ptr,      // (n)
+    const void* keys,            // (n)
+    bool* flags,                 // (n)
+    cudaStream_t stream
+) {
+  hkv_table_->unlock_keys(
+    n,
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    reinterpret_cast<const KeyType*>(keys),
+    flags, stream);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 curandState* HKVVariable<KeyType, ValueType, Strategy>::get_curand_states() const {
   return curand_states_;
 }

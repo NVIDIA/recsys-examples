@@ -342,14 +342,14 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
     get_table_range_kernel<offset_t><<<grid_size, block_size, 0, stream>>>(
       num_table, feature_x_batch, reinterpret_cast<offset_t*>(offsets.data_ptr()),
       reinterpret_cast<offset_t*>(feature_offsets.data_ptr()),
-      reinterpret_cast<offset_t*>(table_range.data_ptr()),
+      reinterpret_cast<offset_t*>(table_range.data_ptr())
     );
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   return table_range;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique(at::Tensor keys, at::Tensor segment_range, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -396,12 +396,11 @@ segmented_unique(at::Tensor keys, at::Tensor segment_range, std::shared_ptr<dyn_
       dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_indices_table_range.data_ptr(),
                           i, unique_num_type, unique_offset_type, stream);
     } else {
-      at::Tensor tmp_indices = create_sub_tensor(keys, indices_begin);
-      at::Tensor tmp_inverse_idx =
-          create_sub_tensor(inverse_idx, indices_begin);
-      at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
+      at::Tensor tmp_indices = keys.slice(0, indices_begin, num_total);
+      at::Tensor tmp_inverse_idx = inverse_idx.slice(0, indices_begin, num_total);
+      at::Tensor tmp_d_unique_num = d_unique_nums.slice(0, i, table_num);
 
-      at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_indices_table_range, i);
+      at::Tensor previous_d_unique_num = d_unique_indices_table_range.slice(0, i, table_num + 1);
       unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
                         tmp_unique_indices[i], tmp_d_unique_num, stream,
                         previous_d_unique_num);
@@ -419,7 +418,7 @@ segmented_unique(at::Tensor keys, at::Tensor segment_range, std::shared_ptr<dyn_
 
   int64_t unique_embs_offset = 0;
   int64_t num_unique_total = h_unique_indices_table_range[table_num].item<int64_t>();
-  at::Tensor unique_keys = torch.empty(num_unique_total, keys.options());
+  at::Tensor unique_keys = at::empty(num_unique_total, keys.options());
   for (int i = 0; i < table_num; ++i) {
     int64_t tmp_unique_num = h_unique_indices_table_range[i+1].item<int64_t>() - h_unique_indices_table_range[i].item<int64_t>();
     if (tmp_unique_num != 0) {
@@ -475,8 +474,7 @@ void bind_index_calculation_op(py::module &m) {
     py::arg("offsets"), py::arg("feature_offsets"));
 
   m.def("segmented_unique", &dyn_emb::segmented_unique,
-    "Dose segmented unique operation on keys with segment_range, 
-    return tuple<unique_keys, inverse, unique_keys_table_range, h_unique_keys_table_range>",
+    "Dose segmented unique operation on keys with segment_range, return tuple<unique_keys, inverse, unique_keys_table_range, h_unique_keys_table_range>",
     py::arg("keys"), py::arg("segment_range"), py::arg("unique_op"));
   
   m.def(

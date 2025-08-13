@@ -144,6 +144,21 @@ public:
     uint64_t threshold,
     uint64_t* d_counter, 
     cudaStream_t stream = 0) const override;
+
+  void lock(
+    const size_t n,
+    const void* keys,            // (n)
+    void** locked_keys_ptr,      // (n)
+    bool* flags = nullptr,       // (n)
+    void* scores = nullptr,     // (n)
+    cudaStream_t stream = 0) override;
+
+  void unlock(
+    const size_t n,
+    void** locked_keys_ptr,      // (n)
+    const void* keys,            // (n)
+    bool* flags = nullptr,       // (n)
+    cudaStream_t stream = 0) override;
   
   curandState* get_curand_states() const override;
   const InitializerArgs& get_initializer_args() const override;

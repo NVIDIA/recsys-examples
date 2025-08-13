@@ -17,6 +17,8 @@
 
 #pragma once
 #include "torch_utils.h"
+#include "unique_op.h"
+#include "lookup_forward.h"
 #include "utils.h"
 #include <cstdint>
 #include <cub/cub.cuh>
