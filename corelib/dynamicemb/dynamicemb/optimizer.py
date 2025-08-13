@@ -17,7 +17,7 @@ import abc
 import copy
 import enum
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 import torch  # usort:skip
 from dynamicemb.dynamicemb_config import *
@@ -162,7 +162,6 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        scores: Optional[List[int]] = None,
     ) -> None:
         ...
 
@@ -197,7 +196,6 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._hashtables:
@@ -214,9 +212,14 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             indice = indices[i]
             num_indice = indice.shape[0]
             weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
+
             dynamic_emb_sgd_with_table(
-                ht, num_indice, indice, grad, lr, weight_dtype, score
+                ht,
+                num_indice,
+                indice,
+                grad,
+                lr,
+                weight_dtype,
             )
 
     def get_opt_args(self):
@@ -246,7 +249,6 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._table_state_map.keys():
@@ -269,7 +271,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             num_indice = indice.shape[0]
 
             weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
+
             dynamic_emb_adam_with_table(
                 ht,
                 num_indice,
@@ -282,7 +284,6 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 weight_decay,
                 self._iterations,
                 weight_dtype,
-                score,
             )
 
     def get_opt_args(self):
@@ -325,7 +326,6 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._table_state_map.keys():
@@ -344,10 +344,9 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             num_indice = indice.shape[0]
 
             weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
 
             dynamic_emb_adagrad_with_table(
-                ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                ht, num_indice, indice, grad, lr, eps, weight_dtype
             )
 
     def get_opt_args(self):
@@ -387,7 +386,6 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         hashtables: List[DynamicEmbTable],
         indices: List[torch.Tensor],
         grads: List[torch.Tensor],
-        scores: Optional[List[int]] = None,
     ) -> None:
         for ht in hashtables:
             if ht not in self._table_state_map.keys():
@@ -405,10 +403,9 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             num_indice = indice.shape[0]
 
             weight_dtype = torch_to_dyn_emb(table_option.embedding_dtype)
-            score = scores[i] if scores is not None else None
 
             dynamic_emb_rowwise_adagrad_with_table(
-                ht, num_indice, indice, grad, lr, eps, weight_dtype, score
+                ht, num_indice, indice, grad, lr, eps, weight_dtype
             )
 
     def get_opt_args(self):

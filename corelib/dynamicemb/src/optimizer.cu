@@ -26,9 +26,7 @@ void find_pointers(
   const size_t n,
   const at::Tensor keys,
   at::Tensor values,
-  at::Tensor founds,
-  const std::optional<uint64_t> score = std::nullopt
-) ;
+  at::Tensor founds);
 
 namespace dyn_emb {
 
@@ -39,8 +37,7 @@ constexpr int OPTIMIZER_BLOCKSIZE = 1024;
 
 void dynamic_emb_sgd_with_table(
     std::shared_ptr<dyn_emb::DynamicVariableBase> table, const uint64_t n, 
-    const at::Tensor indices, const at::Tensor grads, const float lr, DataType weight_type, 
-    const std::optional<uint64_t> score) {
+    const at::Tensor indices, const at::Tensor grads, const float lr, DataType weight_type) {
 
   if (n == 0) return;
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
@@ -106,8 +103,7 @@ void dynamic_emb_adam_with_table(
   const uint64_t n, const at::Tensor indices, const at::Tensor grads, 
   const float lr, const float beta1, const float beta2, const float eps,
   const float weight_decay,
-  const uint32_t iter_num, DataType weight_type, 
-  const std::optional<uint64_t> score) {
+  const uint32_t iter_num, DataType weight_type) {
 
   if (n == 0) return;
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
@@ -120,7 +116,7 @@ void dynamic_emb_adam_with_table(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   find_pointers(ht, n, indices, vector_ptrs, founds);
-
+  
   auto &device_prop = DeviceProp::getDeviceProp(grads.device().index());
 
   int64_t dim = grads.size(1);
@@ -178,7 +174,7 @@ void dynamic_emb_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  DataType weight_type,const std::optional<uint64_t> score){
+  DataType weight_type){
   if (n == 0) return;
 
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
@@ -246,7 +242,7 @@ void dynamic_emb_rowwise_adagrad_with_table(
   const at::Tensor grads,
   const float lr,
   const float eps,
-  DataType weight_type,const std::optional<uint64_t> score) {
+  DataType weight_type){
   if (n == 0) return;
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
@@ -660,54 +656,24 @@ void bind_optimizer_kernel_op(py::module &m) {
   m.def("dynamic_emb_sgd_with_table", &dyn_emb::dynamic_emb_sgd_with_table,
         "SGD optimizer for Dynamic Emb", py::arg("table"),
         py::arg("n"), py::arg("indices"), py::arg("grads"),
-        py::arg("lr"), py::arg("weight_type"), py::arg("score") = py::none());
+        py::arg("lr"), py::arg("weight_type"));
 
   m.def("dynamic_emb_adam_with_table", &dyn_emb::dynamic_emb_adam_with_table,
         "Adam optimizer for Dynamic Emb", py::arg("ht"),
         py::arg("n"), py::arg("indices"), py::arg("grads"),
         py::arg("lr"), py::arg("beta1"),
         py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"), py::arg("iter_num"),
-        py::arg("weight_type"), py::arg("score") = py::none());
+        py::arg("weight_type"));
 
   m.def("dynamic_emb_adagrad_with_table", &dyn_emb::dynamic_emb_adagrad_with_table,
         "Adagrad optimizer for Dynamic Emb", py::arg("ht"),
         py::arg("n"), py::arg("indices"), py::arg("grads"),py::arg("lr"),
         py::arg("eps"),
-        py::arg("weight_type"), py::arg("score") = py::none());
+        py::arg("weight_type"));
 
   m.def("dynamic_emb_rowwise_adagrad_with_table", &dyn_emb::dynamic_emb_rowwise_adagrad_with_table,
         "Row Wise Adagrad optimizer for Dynamic Emb", py::arg("ht"),
         py::arg("n"), py::arg("indices"), py::arg("grads"),py::arg("lr"),
         py::arg("eps"),
         py::arg("weight_type"));
-
-  m.def("dynamic_emb_sgd_with_pointer", &dyn_emb::dynamic_emb_sgd_with_pointer,
-        "SGD optimizer for Dynamic Emb", py::arg("grads"), py::arg("val_pointers"), py::arg("val_dtype"), py::arg("lr"));
-
-  m.def("dynamic_emb_adam_with_pointer", &dyn_emb::dynamic_emb_adam_with_pointer,
-        "Adam optimizer for Dynamic Emb", py::arg("grads"), py::arg("val_pointers"), py::arg("val_dtype"), py::arg("state_dim"),
-        py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"), py::arg("iter_num"));
-
-  m.def("dynamic_emb_adagrad_with_pointer", &dyn_emb::dynamic_emb_adagrad_with_pointer,
-        "Adagrad optimizer for Dynamic Emb", py::arg("grads"), py::arg("val_pointers"), py::arg("val_dtype"), py::arg("state_dim"),
-        py::arg("lr"), py::arg("eps"));
-
-  m.def("dynamic_emb_rowwise_adagrad_with_pointer", &dyn_emb::dynamic_emb_rowwise_adagrad_with_pointer,
-        "Row Wise Adagrad optimizer for Dynamic Emb",  py::arg("grads"), py::arg("val_pointers"), py::arg("val_dtype"), py::arg("state_dim"),
-        py::arg("lr"), py::arg("eps"));
-
-  m.def("dynamic_emb_sgd_fused", &dyn_emb::dynamic_emb_sgd_fused,
-        "SGD optimizer for Dynamic Emb", py::arg("grads"), py::arg("values"), py::arg("lr"));
-
-  m.def("dynamic_emb_adam_fused", &dyn_emb::dynamic_emb_adam_fused,
-        "Adam optimizer for Dynamic Emb", py::arg("grads"), py::arg("values"),
-        py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"), py::arg("iter_num"));
-
-  m.def("dynamic_emb_adagrad_fused", &dyn_emb::dynamic_emb_adagrad_fused,
-        "Adagrad optimizer for Dynamic Emb", py::arg("grads"), py::arg("values"),
-        py::arg("lr"), py::arg("eps"));
-
-  m.def("dynamic_emb_rowwise_adagrad_fused", &dyn_emb::dynamic_emb_rowwise_adagrad_fused,
-        "Row Wise Adagrad optimizer for Dynamic Emb",  py::arg("grads"), py::arg("values"),
-        py::arg("lr"), py::arg("eps"));
 }

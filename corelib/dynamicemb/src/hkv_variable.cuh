@@ -422,6 +422,58 @@ void HKVVariable<KeyType, ValueType, Strategy>::accum_or_assign(
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
+    const size_t n, const void *keys, void **value_ptrs, void *values,
+    bool *d_found, std::optional<InitializerArgs> initializer_args_, const cudaStream_t& stream) {
+  if (n == 0)
+    return;
+  int dim = dim_;
+  this->find_pointers(n, keys, value_ptrs, d_found, nullptr, stream);
+  auto &device_prop = DeviceProp::getDeviceProp();
+  int block_size = dim < device_prop.max_thread_per_block
+                       ? dim
+                       : device_prop.max_thread_per_block;
+  int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
+  
+  auto &init_args = initializer_args_.has_value() ? initializer_args_.value() : initializer_args;
+  auto &initializer_ = init_args.mode;
+  if (initializer_ == "normal") {
+    using Generator = NormalEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, init_args.mean, init_args.std_dev};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "truncated_normal") {
+    using Generator = TruncatedNormalEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, init_args.mean, init_args.std_dev, init_args.lower, init_args.upper};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "uniform") {
+    using Generator = UniformEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {curand_states_, init_args.lower, init_args.upper};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "debug") {
+    using Generator = MappingEmbeddingGenerator<KeyType>;
+    auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys), 100000};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else if (initializer_ == "constant") {
+    using Generator = ConstEmbeddingGenerator;
+    auto generator_args = typename Generator::Args {init_args.value};
+    load_or_initialize_embeddings_kernel<ValueType, Generator>
+      <<<grid_size, block_size, 0, stream>>>(
+      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+  } else {
+    throw std::runtime_error("Unrecognized initializer {" + initializer_ + "}");
+  }
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
     const size_t n, const void *keys, void **value_ptrs, void *values,
     bool *d_found, void *scores, cudaStream_t stream, bool unique_key,
