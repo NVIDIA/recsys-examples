@@ -21,15 +21,11 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch  # usort:skip
 from dynamicemb.dynamicemb_config import *
-from dynamicemb_extensions import (
-    # dynamic_emb_sgd,
-    dynamic_emb_sgd_with_pointer,
-    # dynamic_emb_adam,
-    dynamic_emb_adam_with_pointer,
-    # dynamic_emb_adagrad,
+from dynamicemb_extensions import (  # dynamic_emb_sgd,; dynamic_emb_adam,; dynamic_emb_adagrad,; dynamic_emb_rowwise_adagrad,
     dynamic_emb_adagrad_with_pointer,
-    # dynamic_emb_rowwise_adagrad,
+    dynamic_emb_adam_with_pointer,
     dynamic_emb_rowwise_adagrad_with_pointer,
+    dynamic_emb_sgd_with_pointer,
 )
 
 
@@ -99,6 +95,7 @@ def get_required_arg(args: Dict[str, Any], key: str) -> Any:
             f"Input args does not contain required optimizer argument: {key}"
         )
     return args[key]
+
 
 class BaseDynamicEmbeddingOptimizer(abc.ABC):
     def __init__(
@@ -485,6 +482,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             table.set_initial_optstate(initial_value)
         return
 
+
 class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
     def __init__(
         self,
@@ -505,7 +503,7 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
-        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
     ) -> None:
         ...
 
@@ -522,7 +520,6 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
         """
         Get the state dim.
         """
-        pass
 
     def set_learning_rate(self, new_lr) -> None:
         self._opt_args.learning_rate = new_lr
@@ -561,7 +558,7 @@ class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
-        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
         value_type,
     ) -> None:
         lr = self._opt_args.learning_rate
@@ -586,6 +583,7 @@ class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         """
         return 0
 
+
 class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
         self,
@@ -593,7 +591,7 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     ) -> None:
         super().__init__(opt_args)
         self._iterations: int = 0
-    
+
     def _step(self):
         self._iterations += 1
 
@@ -629,10 +627,9 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
-        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
         value_type,
     ) -> None:
-
         self._step()
 
         lr = self._opt_args.learning_rate
@@ -713,10 +710,9 @@ class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
-        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
         value_type,
     ) -> None:
-
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
 
@@ -791,10 +787,9 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
     def fused_update_with_pointer(
         self,
         grads: torch.Tensor,
-        value_ptr: torch.Tensor, # pointers to embeddng + optimizer states
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
         value_type,
     ) -> None:
-
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
 

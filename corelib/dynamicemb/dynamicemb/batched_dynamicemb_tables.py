@@ -15,16 +15,17 @@
 
 import enum
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import List, Optional, Tuple, cast
-from copy import deepcopy
 
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import *
 from dynamicemb.dynamicemb_config import *
 from dynamicemb.initializer import *
+from dynamicemb.key_value_table import Cache, KeyValueTable, Storage
 from dynamicemb.optimizer import *
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb.utils import tabulate
@@ -38,7 +39,6 @@ from dynamicemb_extensions import (
     export_batch_matched,
 )
 from torch import Tensor, nn  # usort:skip
-from dynamicemb.key_value_table import Storage, Cache, KeyValueTable
 
 
 @enum.unique
@@ -225,6 +225,7 @@ def _export_matched(
         d_count.fill_(0)
 
     return ret_keys, ret_vals
+
 
 class BatchedDynamicEmbeddingTables(nn.Module):
     """
@@ -796,6 +797,7 @@ class BatchedDynamicEmbeddingTables(nn.Module):
             ret_scores[table_name] = self._scores[table_name]
         return ret_tensors, ret_scores
 
+
 class BatchedDynamicEmbeddingTablesV2(nn.Module):
     """
     Dynamic Embedding is based on [HKV](https://github.com/NVIDIA-Merlin/HierarchicalKV/tree/master).
@@ -926,16 +928,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 old_table_id = table_id
         self.table_offsets_in_feature.append(self.feature_num)
         self.feature_offsets = torch.tensor(
-            self.table_offsets_in_feature, 
+            self.table_offsets_in_feature,
             device=torch.device(self.device_id),
-            dtype=torch.int64
+            dtype=torch.int64,
         )
 
         for option in self._dynamicemb_options:
             if option.init_capacity is None:
                 option.init_capacity = option.max_capacity
 
-        
         self._optimizer: BaseDynamicEmbeddingOptimizer = None
         self._create_optimizer(
             optimizer,
@@ -983,8 +984,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
         self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
 
-    def _create_tables(self, PS:Storage = None) -> None:
-
+    def _create_tables(self, PS: Storage = None) -> None:
         self._storages: List[Storage] = []
         self._caches: List[Cache] = []
         self._caching = self._dynamicemb_options[0].caching
@@ -1030,7 +1030,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 storage_option.local_hbm_for_values = 0
                 print(f"Storage capacity: {storage_option.max_capacity}")
                 self._storages.append(
-                    PS(storage_option) if PS else KeyValueTable(storage_option, self._optimizer)
+                    PS(storage_option)
+                    if PS
+                    else KeyValueTable(storage_option, self._optimizer)
                 )
             else:
                 print(f"Total capacity: {option.max_capacity}")
@@ -1099,7 +1101,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         output = "\n\n" + tabulate(table_consume, title, sub_headers=True)
         print(output)
-    
+
     def _create_initializers(self) -> None:
         for option in self._dynamicemb_options:
             mode = option.initializer_args.mode
@@ -1135,12 +1137,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         eta: float,
         momentum: float,
         weight_decay_mode: WeightDecayMode,
-        counter_based_regularization: Optional[
-            CounterBasedRegularizationDefinition
-        ],
-        cowclip_regularization: Optional[
-            CowClipDefinition
-        ],
+        counter_based_regularization: Optional[CounterBasedRegularizationDefinition],
+        cowclip_regularization: Optional[CowClipDefinition],
     ) -> None:
         self._optimizer_type = optimizer_type
         self.stochastic_rounding = stochastic_rounding
@@ -1284,7 +1282,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return
 
     @property
-    def enable_prefetch(self,) -> None:
+    def enable_prefetch(
+        self,
+    ) -> None:
         return self._enable_prefetch
 
     @enable_prefetch.setter
@@ -1303,10 +1303,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
     ) -> List[Tensor]:
-        
         if self._enable_prefetch:
             self.self.num_prefetch_ahead -= 1
-        
+
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
@@ -1317,7 +1316,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     f"Must set score for table '{table_name}' whose score_strategy is customized."
                 )
             scores.append(self._scores[table_name])
-    
+
         for i, cache in enumerate(self._caches):
             if isinstance(cache, KeyValueTable):
                 table = cast(KeyValueTable, cache)
@@ -1400,7 +1399,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if self._enable_prefetch:
             self.num_prefetch_ahead += 1
             assert self.num_prefetch_ahead >= 1, "Prefetch context mismatches."
-        
+
         prefetch_scores = self._get_prefetch_score()
 
         for i, cache in enumerate(self._caches):
@@ -1503,11 +1502,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
                 self._scores[table_name] = 1
 
-    def _get_prefetch_score(self,):
+    def _get_prefetch_score(
+        self,
+    ):
         ret_scores = []
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
             cur_score = self._scores[table_name]
-            if self.enable_prefetch and option.score_strategy == DynamicEmbScoreStrategy.STEP:
+            if (
+                self.enable_prefetch
+                and option.score_strategy == DynamicEmbScoreStrategy.STEP
+            ):
                 max_uint64 = (2**64) - 1
                 new_score = cur_score + self.num_prefetch_ahead - 1
                 if new_score > max_uint64:
@@ -1518,10 +1522,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     new_score = 0
             else:
                 new_score = cur_score
-            
+
             ret_scores.append(new_score)
         return ret_scores
-               
 
     def incremental_dump(
         self,

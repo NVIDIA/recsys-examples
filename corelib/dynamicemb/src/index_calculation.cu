@@ -475,7 +475,7 @@ void bind_index_calculation_op(py::module &m) {
     py::arg("offsets"), py::arg("feature_offsets"));
 
   m.def("segmented_unique", &dyn_emb::segmented_unique,
-    "Dose segemented unique operation on keys with segment_range, 
+    "Dose segmented unique operation on keys with segment_range, 
     return tuple<unique_keys, inverse, unique_keys_table_range, h_unique_keys_table_range>",
     py::arg("keys"), py::arg("segment_range"), py::arg("unique_op"));
   

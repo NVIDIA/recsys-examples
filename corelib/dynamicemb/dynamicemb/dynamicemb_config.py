@@ -17,7 +17,7 @@ import enum
 import os
 from dataclasses import dataclass, field, fields
 from math import sqrt
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 import torch
 from dynamicemb_extensions import (
@@ -506,6 +506,7 @@ def validate_initializer_args(
         if initializer_args.upper is None:
             initializer_args.upper = default_upper
 
+
 def get_optimizer_state_dim(optimizer_type, dim, dtype):
     DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
         torch.float32: 4,
@@ -520,7 +521,8 @@ def get_optimizer_state_dim(optimizer_type, dim, dtype):
         return dim
     else:
         return 0
-            
+
+
 def get_constraint_capacity(
     memory_bytes,
     dtype,

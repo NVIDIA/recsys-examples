@@ -820,11 +820,6 @@ void lookup_backward(const at::Tensor grad, const at::Tensor unique_buffer,
 }
 
 template <typename T>
-__global__ void load_from_pointers_kernel() {
-
-}
-
-template <typename T>
 __global__ void load_from_pointers_kernel_vec4(
     int batch,
     int emb_dim,

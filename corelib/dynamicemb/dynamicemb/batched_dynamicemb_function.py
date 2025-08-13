@@ -17,22 +17,22 @@ from typing import List, Optional
 
 import torch
 from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, dyn_emb_to_torch
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.initializer import BaseDynamicEmbInitializer
+from dynamicemb.key_value_table import Cache, KeyValueTableFunction, Storage
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
     find_or_insert,
+    get_table_range,
     lookup_backward,
     lookup_backward_dense,
     lookup_backward_dense_dedup,
     lookup_forward,
     lookup_forward_dense,
     reduce_grads,
-    get_table_range,
-    segmented_unique
+    segmented_unique,
 )
-from dynamicemb.key_value_table import KeyValueTableFunction, Cache, Storage
 
 
 # TODO: BatchedDynamicEmbeddingFunction is more concrete.
@@ -454,6 +454,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         )
         return (None,) * 17
 
+
 def dynamicemb_prefetch(
     indices: torch.Tensor,
     offsets: torch.Tensor,
@@ -461,13 +462,15 @@ def dynamicemb_prefetch(
     storages: List[Storage],
     feature_offsets: torch.Tensor,
     initializers: List[BaseDynamicEmbInitializer],
-    forward_stream: Optional[torch.cuda.Stream] = None
+    forward_stream: Optional[torch.cuda.Stream] = None,
 ):
     table_num = len(storages)
     assert table_num != 0
 
     indices_table_range = get_table_range(offsets, feature_offsets)
-    unique_indices, inverse, unique_indices_table_range = segmented_unique(indices, indices_table_range)
+    unique_indices, inverse, unique_indices_table_range = segmented_unique(
+        indices, indices_table_range
+    )
 
     h_unique_indices_table_range = unique_indices_table_range.cpu()
     for i in range(table_num):
@@ -476,13 +479,13 @@ def dynamicemb_prefetch(
         unique_indices_per_table = unique_indices[begin:end]
 
         KeyValueTableFunction.prefetch(
-            caches[i], 
+            caches[i],
             storages[i],
             unique_indices_per_table,
             initializers[i],
             forward_stream,
         )
-     
+
 
 class DynamicEmbeddingFunctionV2(torch.autograd.Function):
     @staticmethod
@@ -497,8 +500,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         initializers: List[BaseDynamicEmbInitializer],
         optimizer: BaseDynamicEmbeddingOptimizer,
         unique_op,
-        enable_prefetch: bool=False,
-        input_dist_dedup: bool=False,
+        enable_prefetch: bool = False,
+        input_dist_dedup: bool = False,
         *args
     ):
         table_num = len(storages)
@@ -507,8 +510,13 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         emb_dim = storages[0].embedding_dim()
 
         indices_table_range = get_table_range(offsets, feature_offsets)
-        #TODO: only return device unique_indices_table_range
-        unique_indices, inverse, unique_indices_table_range, h_unique_indices_table_range = segmented_unique(indices, indices_table_range, unique_op)
+        # TODO: only return device unique_indices_table_range
+        (
+            unique_indices,
+            inverse,
+            unique_indices_table_range,
+            h_unique_indices_table_range,
+        ) = segmented_unique(indices, indices_table_range, unique_op)
 
         unique_embs = torch.empty(
             unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
@@ -519,9 +527,9 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             end = h_unique_indices_table_range[i + 1]
             unique_indices_per_table = unique_indices[begin:end]
             unique_embs_per_table = unique_embs[begin:end, :]
-            
+
             KeyValueTableFunction.lookup(
-                caches[i], 
+                caches[i],
                 storages[i],
                 unique_indices_per_table,
                 unique_embs_per_table,
@@ -532,19 +540,21 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         output_embs = torch.empty(
             indices.shape[0], emb_dim, dtype=output_dtype, device=indices.device
         )
-        
+
         output_embs = unique_embs[inverse]
 
         # save context
-        backward_tensors = [indices,]
-        ctx.save_for_backward(*backward_tensors) 
+        backward_tensors = [
+            indices,
+        ]
+        ctx.save_for_backward(*backward_tensors)
         ctx.input_dist_dedup = input_dist_dedup
         if input_dist_dedup:
             ctx.unique_indices = unique_indices
             ctx.unique_embs = unique_embs
             ctx.inverse = inverse
         ctx.h_unique_indices_table_range = h_unique_indices_table_range
-        ctx.unique_indices_table_range = unique_indices_table_range  
+        ctx.unique_indices_table_range = unique_indices_table_range
         ctx.caches = caches
         ctx.storages = storages
         ctx.optimizer = optimizer
@@ -555,31 +565,33 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grads):
         # parse context
-        indices, = ctx.saved_tensors
+        (indices,) = ctx.saved_tensors
         h_unique_indices_table_range = ctx.h_unique_indices_table_range
         unique_indices_table_range = ctx.unique_indices_table_range
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
         enable_prefetch = ctx.enable_prefetch
-  
+
         input_dist_dedup = ctx.input_dist_dedup
         if input_dist_dedup:
             unique_indices = ctx.unique_indices
             unique_embs = ctx.unique_embs
-            inverse = ctx.inverse
-    
-        unique_indices, unique_embs = reduce_grads(indices, grads, unique_indices_table_range, h_unique_indices_table_range)
-        
+            ctx.inverse
+
+        unique_indices, unique_embs = reduce_grads(
+            indices, grads, unique_indices_table_range, h_unique_indices_table_range
+        )
+
         table_num = len(storages)
-        for i in range (table_num):
+        for i in range(table_num):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
-            unique_indices_per_table = unique_indices[begin: end]
+            unique_indices_per_table = unique_indices[begin:end]
             unique_embs_per_table = unique_embs[begin:end, :]
 
             KeyValueTableFunction.update(
-                caches[i], 
+                caches[i],
                 storages[i],
                 unique_indices_per_table,
                 unique_embs_per_table,

@@ -208,7 +208,7 @@ void bind_initializer_op(py::module &m) {
     py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"), py::arg("mean"), py::arg("std_dev"));
 
   m.def("truncated_normal_init", &dyn_emb::truncated_normal_init,
-    "Truncted normal initializer",
+    "Truncated normal initializer",
     py::arg("buffer"), py::arg("indices"), py::arg("curand_state_context"), 
     py::arg("mean"), py::arg("std_dev"), py::arg("lower"), py::arg("upper"));
   
@@ -225,6 +225,6 @@ void bind_initializer_op(py::module &m) {
 
   m.def(
     "debug_init", &dyn_emb::debug_init,
-    "Debug initilizer", 
+    "Debug initializer", 
     py::arg("buffer"), py::arg("indices"), py::arg("keys"));
 }
