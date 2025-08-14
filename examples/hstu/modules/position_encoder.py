@@ -97,6 +97,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
         seq_embeddings: torch.Tensor,
         num_targets: Optional[torch.Tensor],
         seq_timestamps: Optional[torch.Tensor] = None,
+        seq_start_position: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         alpha = self._embedding_dim**0.5
         if self._use_time_encoding:
@@ -114,7 +115,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
                 interleave_targets=False,
                 time_bucket_fn="sqrt",
             )
-        else:
+        elif not self._is_inference or seq_start_position is None:
             high_inds = _get_high_inds(
                 seq_lengths, self._position_embeddings_weight, num_targets, False
             )
@@ -134,5 +135,30 @@ class HSTUPositionalEncoder(torch.nn.Module):
                 max_seq_len=max_seq_len,
                 dense=self._position_embeddings_weight,
                 scale=alpha,
+            )
+        else:  # use position embeddings and inference
+            ind_offsets = seq_start_position
+            high_inds = _get_high_inds(
+                seq_lengths + seq_start_position,
+                self._position_embeddings_weight,
+                num_targets,
+                False,
+            )
+            if not is_fx_tracing():
+                _, D = seq_embeddings.shape
+                torch._assert(
+                    seq_offsets.size(0) - 1 == high_inds.size(0),
+                    "wrong jagged_offsets shape[0]",
+                )
+                _, D2 = self._position_embeddings_weight.shape
+                torch._assert(D2 == D, "wrong dense shape[1]")
+            seq_embeddings = triton_add_position_embeddings(
+                jagged=seq_embeddings,
+                jagged_offsets=seq_offsets,
+                high_inds=high_inds,
+                max_seq_len=max_seq_len,
+                dense=self._position_embeddings_weight,
+                scale=alpha,
+                ind_offsets=ind_offsets,
             )
         return seq_embeddings
