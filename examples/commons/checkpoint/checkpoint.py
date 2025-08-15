@@ -110,7 +110,7 @@ def load(
     save_path = os.path.join(
         path, "torch_module", "model.{}.pth".format(dist.get_rank())
     )
-    state_dict = torch.load(save_path)
+    state_dict = torch.load(save_path, weights_only=False)
     unwrapped_module.load_state_dict(state_dict["model_state_dict"])
     if dense_optimizer and state_dict["optimizer_state_dict"]:
         dense_optimizer.load_state_dict(state_dict["optimizer_state_dict"])
