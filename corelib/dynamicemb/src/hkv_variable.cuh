@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <cooperative_groups.h>
 #include "lookup_kernel.cuh"
+#include "initializer.cuh"
 
 namespace {
 
@@ -117,161 +118,6 @@ __global__ static void setup_kernel(unsigned long long seed,
   auto grid = cooperative_groups::this_grid();
   curand_init(seed, grid.thread_rank(), 0, &states[grid.thread_rank()]);
 }
-
-struct UniformEmbeddingGenerator {
-  struct Args {
-    curandState* state;
-    float lower;
-    float upper;
-  };
-
-  DEVICE_INLINE UniformEmbeddingGenerator(Args args): load_(false), state_(args.state), 
-    lower(args.lower), upper(args.upper) {}
-
-  DEVICE_INLINE float generate(int64_t vec_id) {
-    if (!load_) {
-      localState_ = state_[GlobalThreadId()];
-      load_ = true;
-    }
-    auto tmp = curand_uniform_double(&this->localState_);
-    return static_cast<float>((upper - lower) * tmp + lower);
-  }
-
-  DEVICE_INLINE void destroy() {
-    if (load_) {
-      state_[GlobalThreadId()] = localState_;
-    }
-  }
-
-  bool load_;
-  curandState localState_;
-  curandState* state_;
-  float lower;
-  float upper;
-};
-
-struct NormalEmbeddingGenerator {
-  struct Args {
-    curandState* state;
-    float mean;
-    float std_dev;
-  };
-
-  DEVICE_INLINE
-  NormalEmbeddingGenerator(Args args): load_(false), state_(args.state),
-    mean(args.mean), std_dev(args.std_dev) {}
-
-  DEVICE_INLINE
-  float generate(int64_t vec_id) {
-    if (!load_) {
-      localState_ = state_[GlobalThreadId()];
-      load_ = true;
-    }
-    auto tmp = curand_normal_double(&this->localState_);
-    return static_cast<float>(std_dev * tmp + mean);
-  }
-
-  DEVICE_INLINE void destroy() {
-    if (load_) {
-      state_[GlobalThreadId()] = localState_;
-    }
-  }
-
-  bool load_;
-  curandState localState_;
-  curandState* state_;
-  float mean;
-  float std_dev;
-};
-
-struct TruncatedNormalEmbeddingGenerator {
-  struct Args {
-    curandState* state;
-    float mean;
-    float std_dev;
-    float lower;
-    float upper;
-  };
-
-  DEVICE_INLINE
-  TruncatedNormalEmbeddingGenerator(Args args): load_(false), state_(args.state),
-    mean(args.mean), std_dev(args.std_dev), lower(args.lower), upper(args.upper) {}
-
-  DEVICE_INLINE
-  float generate(int64_t vec_id) {
-    if (!load_) {
-      localState_ = state_[GlobalThreadId()];
-      load_ = true;
-    }
-    auto l = normcdf((lower - mean) / std_dev);
-    auto u = normcdf((upper - mean) / std_dev);
-    u = 2 * u - 1;
-    l = 2 * l - 1;
-    float tmp = curand_uniform_double(&this->localState_);
-    tmp = tmp * (u - l) + l;
-    tmp = erfinv(tmp);
-    tmp *= scale * std_dev;
-    tmp += mean;
-    tmp = max(tmp, lower);
-    tmp = min(tmp, upper);
-    return tmp;
-  }
-
-  DEVICE_INLINE void destroy() {
-    if (load_) {
-      state_[GlobalThreadId()] = localState_;
-    }
-  }
-
-  bool load_;
-  curandState localState_;
-  curandState* state_;
-  float mean;
-  float std_dev;
-  float lower;
-  float upper;
-  double scale = sqrt(2.0f);
-};
-
-template <typename K>
-struct MappingEmbeddingGenerator {
-  struct Args {
-    const K* keys;
-    uint64_t mod;
-  };
-
-  DEVICE_INLINE
-  MappingEmbeddingGenerator(Args args): mod(args.mod), keys(args.keys) {}
-
-  DEVICE_INLINE
-  float generate(int64_t vec_id) {
-    K key = keys[vec_id];
-    return static_cast<float>(key % mod);
-  }
-
-  DEVICE_INLINE void destroy() {}
-
-  uint64_t mod;
-  const K* keys;
-};
-
-struct ConstEmbeddingGenerator {
-  struct Args {
-    float val;
-  };
-
-  DEVICE_INLINE
-  ConstEmbeddingGenerator(Args args): val(args.val) {}
-  
-  DEVICE_INLINE
-  float generate(int64_t vec_id) {
-    return val;
-  }
-
-  DEVICE_INLINE void destroy() {}
-
-  float val;
-};
 
 template <typename ElementType, typename SizeType>
 struct OptStateInitializer {
@@ -873,6 +719,39 @@ void HKVVariable<KeyType, ValueType,Strategy >::export_batch_matched(
     reinterpret_cast<KeyType*>(keys),
     reinterpret_cast<ValueType*>(values),
     reinterpret_cast<uint64_t*>(scores), stream);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::lock(
+    const size_t n,
+    const void* keys,            // (n)
+    void** locked_keys_ptr,      // (n)
+    bool* flags,                 // (n)
+    void* scores,
+    cudaStream_t stream
+)  {
+  hkv_table_->lock_keys(
+    n,
+    reinterpret_cast<const KeyType*>(keys),
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    flags, stream, (uint64_t*)scores);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::unlock(
+    const size_t n,
+    void** locked_keys_ptr,      // (n)
+    const void* keys,            // (n)
+    bool* flags,                 // (n)
+    cudaStream_t stream
+) {
+  hkv_table_->unlock_keys(
+    n,
+    reinterpret_cast<KeyType**>(locked_keys_ptr),
+    reinterpret_cast<const KeyType*>(keys),
+    flags, stream);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
