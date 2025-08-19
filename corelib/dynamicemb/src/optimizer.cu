@@ -529,6 +529,126 @@ void dynamic_emb_rowwise_adagrad_with_pointer(
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <
+typename opt_t,
+typename g_t,
+typename w_t
+>
+void fused_update(const opt_t& opt, at::Tensor grads, at::Tensor values) {
+
+  int64_t ev_nums = grads.size(0);
+  int64_t dim = grads.size(1);
+  int64_t val_dim = values.size(1);
+  if (ev_nums == 0) return;
+  TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto &device_prop = DeviceProp::getDeviceProp(grads.device().index());
+
+  if (dim % 4 == 0) {
+    const int max_grid_size =
+        device_prop.num_sms *
+        (device_prop.max_thread_per_sm / OPTIMIZER_BLOCKSIZE_VEC);
+    const int warp_per_block = OPTIMIZER_BLOCKSIZE_VEC / WARPSIZE;
+
+    int grid_size = 0;
+    if (ev_nums / warp_per_block < max_grid_size) {
+      grid_size = (ev_nums - 1) / warp_per_block + 1;
+    } else if (ev_nums / warp_per_block > max_grid_size * MULTIPLIER) {
+      grid_size = max_grid_size * MULTIPLIER;
+    } else {
+      grid_size = max_grid_size;
+    }
+
+    auto kernel = update4_kernel_fused<g_t, w_t, opt_t>;
+    kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
+      ev_nums, dim, val_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+      reinterpret_cast<w_t *>(values.data_ptr()), nullptr, opt);
+  } else {
+    int block_size = dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : dim;
+    int grid_size = ev_nums;
+
+    auto kernel = update_kernel_fused<g_t, w_t, opt_t>;
+    kernel<<<grid_size, block_size, 0, stream>>>(
+      ev_nums, dim, val_dim, reinterpret_cast<const g_t *>(grads.data_ptr()),
+      reinterpret_cast<w_t *>(values.data_ptr()), nullptr, opt);
+  }
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dynamic_emb_sgd_fused(at::Tensor grads, at::Tensor values, float const lr) {
+
+  auto grad_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(grads.dtype()));
+  auto val_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(values.dtype()));
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
+    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+      SgdVecOptimizer<g_t, w_t> opt{lr};
+      fused_update<decltype(opt), g_t, w_t>(opt, grads, values);
+    });
+  });
+}
+
+void dynamic_emb_adam_fused(
+  at::Tensor grads, at::Tensor values,
+  const float lr, const float beta1, const float beta2, const float eps,
+  const float weight_decay, const uint32_t iter_num
+) {
+  auto grad_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(grads.dtype()));
+  auto val_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(values.dtype()));
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
+    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+      AdamVecOptimizer<g_t, w_t> opt{lr,
+                                     beta1,
+                                     beta2,
+                                     eps,
+                                     weight_decay,
+                                     iter_num};
+      fused_update<decltype(opt), g_t, w_t>(opt, grads, values);
+    });
+  });
+}
+
+void  dynamic_emb_adagrad_fused(
+  at::Tensor grads, at::Tensor values,
+  const float lr, const float eps) {
+
+  auto grad_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(grads.dtype()));
+  auto val_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(values.dtype()));
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
+    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+      AdaGradVecOptimizer<g_t,w_t> opt{lr, eps};
+      fused_update<decltype(opt), g_t, w_t>(opt, grads, values);
+    });
+  });
+}
+
+void dynamic_emb_rowwise_adagrad_fused(
+  at::Tensor grads, at::Tensor values,
+  const float lr, const float eps) {
+
+  auto grad_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(grads.dtype()));
+  auto val_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(values.dtype()));
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
+    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+      RowWiseAdaGradVecOptimizer<g_t, w_t> opt {lr, eps};
+      fused_update<decltype(opt), g_t, w_t>(opt, grads, values);
+    });
+  });
+}
+
 } // namespace dyn_emb
 
 // PYTHON WRAP
@@ -570,5 +690,20 @@ void bind_optimizer_kernel_op(py::module &m) {
 
   m.def("dynamic_emb_rowwise_adagrad_with_pointer", &dyn_emb::dynamic_emb_rowwise_adagrad_with_pointer,
         "Row Wise Adagrad optimizer for Dynamic Emb",  py::arg("grads"), py::arg("val_pointers"), py::arg("val_dtype"), py::arg("state_dim"),
+        py::arg("lr"), py::arg("eps"));
+
+  m.def("dynamic_emb_sgd_fused", &dyn_emb::dynamic_emb_sgd_fused,
+        "SGD optimizer for Dynamic Emb", py::arg("grads"), py::arg("values"), py::arg("lr"));
+
+  m.def("dynamic_emb_adam_fused", &dyn_emb::dynamic_emb_adam_fused,
+        "Adam optimizer for Dynamic Emb", py::arg("grads"), py::arg("values"),
+        py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"), py::arg("iter_num"));
+
+  m.def("dynamic_emb_adagrad_fused", &dyn_emb::dynamic_emb_adagrad_fused,
+        "Adagrad optimizer for Dynamic Emb", py::arg("grads"), py::arg("values"),
+        py::arg("lr"), py::arg("eps"));
+
+  m.def("dynamic_emb_rowwise_adagrad_fused", &dyn_emb::dynamic_emb_rowwise_adagrad_fused,
+        "Row Wise Adagrad optimizer for Dynamic Emb",  py::arg("grads"), py::arg("values"),
         py::arg("lr"), py::arg("eps"));
 }

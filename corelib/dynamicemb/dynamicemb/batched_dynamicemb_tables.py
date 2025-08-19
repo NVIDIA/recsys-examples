@@ -968,6 +968,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         self._create_tables(ext_ps)
         self._initializers = []
+        self._eval_initializers = []
         self._create_initializers()
 
         # TODO:1->10
@@ -1112,23 +1113,29 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         print(output)
 
     def _create_initializers(self) -> None:
-        for option in self._dynamicemb_options:
-            mode = option.initializer_args.mode
+        def _get_initializer(initializer_args):
+            mode = initializer_args.mode
             if mode == DynamicEmbInitializerMode.NORMAL:
-                initializer = NormalInitializer(option.initializer_args)
+                initializer = NormalInitializer(initializer_args)
             elif mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-                initializer = TruncatedNormalInitializer(option.initializer_args)
+                initializer = TruncatedNormalInitializer(initializer_args)
             elif mode == DynamicEmbInitializerMode.UNIFORM:
-                initializer = UniformInitializer(option.initializer_args)
+                initializer = UniformInitializer(initializer_args)
             elif mode == DynamicEmbInitializerMode.CONSTANT:
-                initializer = ConstantInitializer(option.initializer_args)
+                initializer = ConstantInitializer(initializer_args)
             elif mode == DynamicEmbInitializerMode.DEBUG:
-                initializer = DebugInitializer(option.initializer_args)
+                initializer = DebugInitializer(initializer_args)
             else:
                 raise ValueError(
                     f"Not supported initializer type({mode}) {type(mode)} {mode.value}."
                 )
+            return initializer
+
+        for option in self._dynamicemb_options:
+            initializer = _get_initializer(option.initializer_args)
             self._initializers.append(initializer)
+            eval_initializer = _get_initializer(option.eval_initializer_args)
+            self._eval_initializers.append(eval_initializer)
 
     def _create_optimizer(
         self,
@@ -1318,24 +1325,30 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
-        scores = []
-        for table_name in self._table_names:
-            if table_name not in self._scores.keys():
-                raise RuntimeError(
-                    f"Must set score for table '{table_name}' whose score_strategy is customized."
-                )
-            scores.append(self._scores[table_name])
+        if any([not o.training for o in self._dynamicemb_options]) and self.training:
+            raise RuntimeError(
+                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
+            )
 
-        for i, cache in enumerate(self._caches):
-            if isinstance(cache, KeyValueTable):
-                table = cast(KeyValueTable, cache)
-                table.is_forward = True
-                table.set_score(self._scores[self.table_names[i]])
-        for i, storage in enumerate(self._storages):
-            if isinstance(storage, KeyValueTable):
-                table = cast(KeyValueTable, storage)
-                table.is_forward = True
-                table.set_score(self._scores[self.table_names[i]])
+        scores = []
+        if self.training:
+            for table_name in self._table_names:
+                if table_name not in self._scores.keys():
+                    raise RuntimeError(
+                        f"Must set score for table '{table_name}' whose score_strategy is customized."
+                    )
+                scores.append(self._scores[table_name])
+
+            for i, cache in enumerate(self._caches):
+                if isinstance(cache, KeyValueTable):
+                    table = cast(KeyValueTable, cache)
+                    table.score_update = True
+                    table.set_score(self._scores[self.table_names[i]])
+            for i, storage in enumerate(self._storages):
+                if isinstance(storage, KeyValueTable):
+                    table = cast(KeyValueTable, storage)
+                    table.score_update = True
+                    table.set_score(self._scores[self.table_names[i]])
 
         if self.pooling_mode == DynamicEmbPoolingMode.NONE:
             res = DynamicEmbeddingFunctionV2.apply(
@@ -1345,11 +1358,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._storages,
                 self.feature_offsets,
                 self.output_dtype,
-                self._initializers,
+                self._initializers if self.training else self._eval_initializers,
                 self._optimizer,
                 self._unique_op,
                 self._enable_prefetch,
                 self.use_index_dedup,
+                self.training,
                 self._empty_tensor,
             )
         else:
@@ -1370,19 +1384,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._unique_op,
                 torch.device(self.device_id),
                 self._optimizer,
+                self.training,
+                [option.eval_initializer_args for option in self._dynamicemb_options],
                 self._empty_tensor,
             )
 
-        self._update_score()
-
-        for cache in self._caches:
-            if isinstance(cache, KeyValueTable):
-                table = cast(KeyValueTable, cache)
-                table.is_forward = False
-        for storage in self._storages:
-            if isinstance(storage, KeyValueTable):
-                table = cast(KeyValueTable, storage)
-                table.is_forward = False
+        if self.training:
+            self._update_score()
+            for cache in self._caches:
+                if isinstance(cache, KeyValueTable):
+                    table = cast(KeyValueTable, cache)
+                    table.score_update = False
+            for storage in self._storages:
+                if isinstance(storage, KeyValueTable):
+                    table = cast(KeyValueTable, storage)
+                    table.score_update = False
 
         return res
 
@@ -1393,6 +1409,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         forward_stream: Optional[torch.cuda.Stream] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
     ) -> None:
+        assert (
+            self.pooling_mode == DynamicEmbPoolingMode.NONE
+        ), "only support prefetch for sequence embedding."
+
         if self.prefetch_stream is None and forward_stream is not None:
             # Set the prefetch stream to the current stream
             self.prefetch_stream = torch.cuda.current_stream()
@@ -1411,16 +1431,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         prefetch_scores = self._get_prefetch_score()
 
-        for i, cache in enumerate(self._caches):
-            if isinstance(cache, KeyValueTable):
-                table = cast(KeyValueTable, cache)
-                table.is_forward = True
-                table.set_score(prefetch_scores[i])
-        for i, storage in enumerate(self._storages):
-            if isinstance(storage, KeyValueTable):
-                table = cast(KeyValueTable, storage)
-                table.is_forward = True
-                table.set_score(prefetch_scores[i])
+        if self.training:
+            for i, cache in enumerate(self._caches):
+                if isinstance(cache, KeyValueTable):
+                    table = cast(KeyValueTable, cache)
+                    table.score_update = True
+                    table.set_score(prefetch_scores[i])
+            for i, storage in enumerate(self._storages):
+                if isinstance(storage, KeyValueTable):
+                    table = cast(KeyValueTable, storage)
+                    table.score_update = True
+                    table.set_score(prefetch_scores[i])
 
         dynamicemb_prefetch(
             indices,
@@ -1428,18 +1449,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._caches,
             self._storages,
             self.feature_offsets,
-            self._initializers,
+            self._initializers if self.training else self._eval_initializers,
+            self._unique_op,
+            self.training,
             forward_stream if self.num_prefetch_ahead == 1 else None,
         )
 
-        for cache in self._caches:
-            if isinstance(cache, KeyValueTable):
-                table = cast(KeyValueTable, cache)
-                table.is_forward = False
-        for storage in self._storages:
-            if isinstance(storage, KeyValueTable):
-                table = cast(KeyValueTable, storage)
-                table.is_forward = False
+        if self.training:
+            for cache in self._caches:
+                if isinstance(cache, KeyValueTable):
+                    table = cast(KeyValueTable, cache)
+                    table.score_update = False
+            for storage in self._storages:
+                if isinstance(storage, KeyValueTable):
+                    table = cast(KeyValueTable, storage)
+                    table.score_update = False
 
     def set_score(
         self,
