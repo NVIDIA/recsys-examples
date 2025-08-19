@@ -118,8 +118,6 @@ class InferenceRankingGR(torch.nn.Module):
             layer_sizes[-1] for layer_sizes in task_config.prediction_head_arch
         ]
         self._embedding_collection = InferenceEmbedding(task_config.embedding_configs)
-        # temporary using a non-sharing GPU embedding
-        self._embedding_collection.to_empty(device=torch.device("cpu"))
 
         self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(hstu_config, kvcache_config)
         self._host_kv_storage_manager = HSTUHostKVStorageManager(
