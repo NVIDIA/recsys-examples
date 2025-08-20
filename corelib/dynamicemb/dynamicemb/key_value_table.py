@@ -153,6 +153,16 @@ class Cache(abc.ABC):
     def modification_event(self) -> torch.cuda.Event:
         pass
 
+    @abc.abstractmethod
+    def cache_metrics(
+        self,
+    ) -> torch.Tensor:
+        pass
+
+    @abc.abstractmethod
+    def set_record_cache_metrics(self, record: bool) -> None:
+        pass
+
 
 class KeyValueTable(Cache, Storage):
     def __init__(
@@ -179,6 +189,8 @@ class KeyValueTable(Cache, Storage):
         )
 
         self._modify_event = torch.cuda.Event()
+        self._cache_metrics = torch.zeros(10, dtype=torch.int32, device="cpu")
+        self._record_cache_metrics = False
 
     def find(
         self,
@@ -217,6 +229,10 @@ class KeyValueTable(Cache, Storage):
         )
         select(missing, unique_keys, missing_keys, num_missing_0)
         select_index(missing, missing_indices, num_missing_1)
+
+        if self._record_cache_metrics:
+            self._cache_metrics[0] = batch
+            self._cache_metrics[1] = founds.sum().item()
 
         return num_missing_0, missing_keys, missing_indices
 
@@ -347,6 +363,9 @@ class KeyValueTable(Cache, Storage):
             evicted_scores,
             self.score,
         )
+        if self._record_cache_metrics:
+            self._cache_metrics[2] = batch
+            self._cache_metrics[3] = num_evicted.cpu().item()
         return num_evicted, evicted_keys, evicted_values, evicted_scores
 
     def flush(self, storage: Storage) -> None:
@@ -370,6 +389,14 @@ class KeyValueTable(Cache, Storage):
     @property
     def modification_event(self) -> torch.cuda.Event:
         self._modify_event
+
+    @property
+    def cache_metrics(self) -> Optional[torch.Tensor]:
+        return self._cache_metrics if self._record_cache_metrics else None
+
+    def set_record_cache_metrics(self, record: bool) -> None:
+        self._record_cache_metrics = record
+        return
 
 
 def update_cache(
