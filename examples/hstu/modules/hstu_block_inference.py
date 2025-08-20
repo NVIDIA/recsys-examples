@@ -287,7 +287,7 @@ class HSTUBlockInference(torch.nn.Module):
         static_kvcache_metadata,
         memory_pool=None,
     ):
-        torch.cuda.mem_get_info()[0]
+        before_gmem = torch.cuda.mem_get_info()[0]
 
         # Create CUDA stream
         graph_capture_warmup_stream = torch.cuda.Stream()
@@ -381,7 +381,7 @@ class HSTUBlockInference(torch.nn.Module):
                 static_kvcache_metadata,
             )
 
-        torch.cuda.mem_get_info()[0]
+        after_gmem = torch.cuda.mem_get_info()[0]
 
         static_kvcache_metadata.total_history_offsets -= (
             static_jagged_metadata.num_candidates_offsets
@@ -391,4 +391,5 @@ class HSTUBlockInference(torch.nn.Module):
                 batch_size, num_tokens
             )
         )
+        # print((before_gmem - after_gmem), (before_gmem - after_gmem) / 1024. / 1024. / 1024.)
         return graph

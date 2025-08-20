@@ -27,8 +27,12 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
-from megatron.core import parallel_state
 from ops.collective_ops import grouped_allgatherv_tensor_list
+
+try:
+    from megatron.core import parallel_state
+except ImportError:
+    print("megatron.core is not installed, training is not supported.")
 
 # from torchrec.distributed import ModuleShardingPlan
 from tqdm import tqdm

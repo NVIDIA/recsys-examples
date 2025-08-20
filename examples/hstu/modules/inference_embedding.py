@@ -154,14 +154,9 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         return num_input_features
 
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
-        num_input_features = self.get_input_dist(input_feature_names=features.keys())
         with torch.no_grad():
-            if self._features_order:
-                features = features.permute(
-                    self._features_order,
-                    self._features_order_tensor[: len(self._features_order)],
-                )
-            features = features.split([num_input_features])[0]
+            num_input_features = len(features.keys())
+            features = features.split([num_input_features-1, 1])[0]
             embeddings = self._embedding_tables(features.values(), features.offsets())
         embeddings_kjt = KeyedJaggedTensor(
             values=embeddings,
@@ -295,16 +290,10 @@ class InferenceEmbedding(torch.nn.Module):
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
 
-        kjt = kjt.to(device=torch.cuda.current_device())
-
         dynamic_embeddings = self._dynamic_embedding_collection(kjt)
         if self._static_embedding_collection is not None:
             with torch.cuda.stream(self._side_stream):
                 static_embeddings = self._static_embedding_collection(kjt)
-                for feat_key in static_embeddings:
-                    static_embeddings[feat_key] = static_embeddings[feat_key].to(
-                        device=torch.cuda.current_device(), non_blocking=True
-                    )
             torch.cuda.current_stream().wait_stream(self._side_stream)
             embeddings = {**dynamic_embeddings, **static_embeddings}
         else:

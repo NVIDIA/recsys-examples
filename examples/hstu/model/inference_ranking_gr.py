@@ -114,9 +114,6 @@ class InferenceRankingGR(torch.nn.Module):
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
 
-        self._logit_dim_list = [
-            layer_sizes[-1] for layer_sizes in task_config.prediction_head_arch
-        ]
         self._embedding_collection = InferenceEmbedding(task_config.embedding_configs)
 
         self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(hstu_config, kvcache_config)
@@ -127,7 +124,7 @@ class InferenceRankingGR(torch.nn.Module):
         self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
         self._dense_module = MLP(
             self._embedding_dim,
-            task_config.prediction_head_arch[0],
+            task_config.prediction_head_arch,
             task_config.prediction_head_act_type,
             task_config.prediction_head_bias,
             device=self._device,
@@ -313,6 +310,10 @@ class InferenceRankingGR(torch.nn.Module):
 
     def finalize_kv_cache(self, user_ids: torch.Tensor, **kwargs):
         pass
+    
+    def clear_kv_cache(self):
+        self._gpu_kv_cache_manager.evict_all()
+        self._host_kv_storage_manager.evict_all_kvdata()
 
     def offload_kv_cache(
         self, user_ids: torch.Tensor, kvcache_metadata: KVCacheMetadata

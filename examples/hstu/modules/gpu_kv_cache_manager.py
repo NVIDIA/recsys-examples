@@ -147,6 +147,9 @@ class HSTUGpuKVCacheManager:
     def evict(self, user_ids: torch.Tensor):
         for idx in range(len(user_ids)):
             self.impl.remove_sequence(user_ids[idx].item(), None)
+    
+    def evict_all(self):
+        self.impl.evict_all_sequences()
 
     def get_user_kvdata_info(self, user_id: int) -> Tuple[int, int]:
         cached_start_pos = self.impl.get_cached_start_position(
@@ -350,7 +353,7 @@ class HSTUGpuKVCacheManager:
     ) -> "KVCacheMetadata":
         batch_size = total_history_lengths.shape[0]
 
-        new_history_offsets = torch.zeros((batch_size + 1,), dtype=torch.int32)
+        new_history_offsets = torch.zeros((batch_size + 1,), dtype=torch.int32, device=new_history_lengths.device)
         torch.cumsum(new_history_lengths, 0, out=new_history_offsets[1:])
 
         new_history_token_nnz = new_history_offsets[-1].item()
