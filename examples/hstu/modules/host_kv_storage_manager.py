@@ -90,8 +90,10 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
             if data_chunk.shape[0] * self._page_size + current_length > length:
                 slice_length = (length - current_length) // self._page_size
                 kv_data_list.append(data_chunk[:slice_length, ...])
+                break
             else:
                 kv_data_list.append(data_chunk)
+            current_length += kv_data_list[-1].shape[0] * self._page_size
         return torch.cat(kv_data_list, dim=0, out=output_buffer)
     
     def evict_all_kvdata(self):

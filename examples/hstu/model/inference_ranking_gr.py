@@ -268,7 +268,7 @@ class InferenceRankingGR(torch.nn.Module):
         if onload_length > 0:
             kv_page_ids = triton_concat_2D_jagged(
                 max_seq_len=onload_kv_page_indptr[-1]
-                + kv_cache_metadata.kv_indices[-1],
+                + kv_cache_metadata.kv_indptr[-1],
                 values_a=onload_kv_page_ids.view(-1, 1),
                 values_b=kv_cache_metadata.kv_indices.view(-1, 1),
                 offsets_a=onload_kv_page_indptr.to(torch.int64),
