@@ -180,7 +180,6 @@ class InferenceDataset(IterableDataset[Batch]):
             date = dates[idx]
             end_pos = sequence_endptrs[idx]
             start_pos = sequence_startptrs[idx]
-            start_pos = start_pos + (end_pos - start_pos) // 2
 
             data = self._seq_logs_frame[(self._seq_logs_frame[self._userid_name] == uid) & (self._seq_logs_frame[self._date_name] == date)]
             data = data.iloc[0]
