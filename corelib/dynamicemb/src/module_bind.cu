@@ -24,6 +24,8 @@ void bind_unique_op(py::module& m);
 void bind_bucktiz_kernel_op(py::module& m);
 void bind_optimizer_kernel_op(py::module& m);
 void bind_utils(py::module& m);
+void bind_index_calculation_op(py::module& m);
+void bind_initializer_op(py::module &m);
 
 PYBIND11_MODULE(dynamicemb_extensions, m) {
   m.doc() = "DYNAMICEMB"; // Optional
@@ -32,5 +34,7 @@ PYBIND11_MODULE(dynamicemb_extensions, m) {
   bind_unique_op(m);
   bind_bucktiz_kernel_op(m);
   bind_optimizer_kernel_op(m);
+  bind_index_calculation_op(m);
+  bind_initializer_op(m);
   bind_utils(m);
 }

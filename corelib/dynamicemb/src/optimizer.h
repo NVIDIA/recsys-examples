@@ -62,5 +62,22 @@ void dynamic_emb_rowwise_adagrad_with_table(
   const float eps,
   DataType weight_type);
 
+void dynamic_emb_sgd_with_pointer(
+  at::Tensor grads, at::Tensor val_pointers, DataType val_type, float const lr);
+
+void dynamic_emb_adam_with_pointer(
+  at::Tensor grads, at::Tensor val_pointers, DataType val_type, int64_t state_dim,
+  const float lr, const float beta1, const float beta2, const float eps,
+  const float weight_decay, const uint32_t iter_num
+);
+
+void  dynamic_emb_adagrad_with_pointer(
+  at::Tensor grads, at::Tensor val_pointers, DataType val_type, int64_t state_dim,
+  const float lr, const float eps);
+
+void dynamic_emb_rowwise_adagrad_with_pointer(
+  at::Tensor grads, at::Tensor val_pointers, DataType val_type, int64_t state_dim,
+  const float lr, const float eps);
+
 } // namespace dyn_emb
 #endif // OPTIMIZER_H
