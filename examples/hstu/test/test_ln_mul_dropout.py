@@ -73,7 +73,7 @@ def test_ln_mul_dropout(
         )
 
     u.retain_grad()
-    
+
     ref_x = x.detach().clone().requires_grad_(True)
     ref_u = u.detach().clone().contiguous().view(batchsize, -1).requires_grad_(True)
 

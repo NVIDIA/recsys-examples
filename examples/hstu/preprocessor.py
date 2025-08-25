@@ -138,7 +138,10 @@ class DataProcessor:
         log.info(data)
 
     def file_exists(self, name: str) -> bool:
-        return os.path.isfile("%s/%s" % (os.getcwd(), name))
+        if os.path.isabs(name):
+            return os.path.isfile(name)
+        else:
+            return os.path.isfile("%s/%s" % (os.getcwd(), name))
 
 
 class MovielensDataProcessor(DataProcessor):
