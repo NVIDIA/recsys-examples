@@ -26,7 +26,9 @@ void find_pointers(
   const size_t n,
   const at::Tensor keys,
   at::Tensor values,
-  at::Tensor founds);
+  at::Tensor founds,
+  const std::optional<uint64_t> score = std::nullopt
+) ;
 
 namespace dyn_emb {
 

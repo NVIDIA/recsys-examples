@@ -323,6 +323,9 @@ class DynamicEmbTableOptions(HKVConfig):
         Please refer to the API documentation for DynamicEmbCheckMode for more information.
     training: bool
         Flag to indicate dynamic embedding tables is working on training mode or evaluation mode, default to `True`.
+    caching: bool
+        Flag to indicate dynamic embedding tables is working on caching mode, which will support to prefetch embeddings
+        from host memory to HBM if existed, default to `False`.
 
     Notes
     -----
@@ -341,6 +344,7 @@ class DynamicEmbTableOptions(HKVConfig):
     )
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
     training: bool = True
+    caching: bool = False
 
     def __post_init__(self):
         assert (
@@ -509,6 +513,7 @@ def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmb
     )
 
 
+# TODO: sync with table
 def validate_initializer_args(
     initializer_args: DynamicEmbInitializerArgs, eb_config: BaseEmbeddingConfig = None
 ) -> None:

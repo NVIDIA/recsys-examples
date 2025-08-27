@@ -475,6 +475,9 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
         self._opt_args.initial_accumulator_value = value
         return
 
+    def step(self) -> None:
+        pass
+
 
 class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
@@ -547,7 +550,7 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         super().__init__(opt_args)
         self._iterations: int = 0
 
-    def _step(self):
+    def step(self):
         self._iterations += 1
 
     def update(
@@ -558,7 +561,6 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     ) -> None:
         pass
         # assert states is not None
-        # self._step()
 
         # lr = self._opt_args.learning_rate
         # beta1 = self._opt_args.beta1
@@ -584,8 +586,6 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         grads: torch.Tensor,
         values: torch.Tensor,
     ) -> None:
-        self._step()
-
         lr = self._opt_args.learning_rate
         beta1 = self._opt_args.beta1
         beta2 = self._opt_args.beta2
@@ -609,8 +609,6 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
         value_type,
     ) -> None:
-        self._step()
-
         lr = self._opt_args.learning_rate
         beta1 = self._opt_args.beta1
         beta2 = self._opt_args.beta2

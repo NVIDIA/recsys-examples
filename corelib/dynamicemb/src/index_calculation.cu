@@ -359,7 +359,7 @@ segmented_unique(at::Tensor keys, at::Tensor segment_range, std::shared_ptr<dyn_
     at::Tensor new_keys = at::empty({num_total * 2}, keys.options());
     at::Tensor new_vals = at::empty(
         {num_total * 2},
-        at::TensorOptions().dtype(at::kUInt64).device(keys.device()));
+        at::TensorOptions().dtype(at::kLong).device(keys.device()));
     unique_op->reset_capacity(new_keys, new_vals, num_total * 2, stream);
   }
 
@@ -373,7 +373,7 @@ segmented_unique(at::Tensor keys, at::Tensor segment_range, std::shared_ptr<dyn_
   }
 
   at::Tensor d_unique_nums = at::empty(table_num, segment_range.options());
-  at::Tensor d_unique_indices_table_range = at::empty(table_num + 1, segment_range.options());
+  at::Tensor d_unique_indices_table_range = at::zeros(table_num + 1, segment_range.options());
 
   auto unique_num_type = scalartype_to_datatype(
       convertTypeMetaToScalarType(d_unique_nums.dtype()));

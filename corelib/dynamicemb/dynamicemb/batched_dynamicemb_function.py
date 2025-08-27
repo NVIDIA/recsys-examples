@@ -198,6 +198,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
             ctx.device = device
             ctx.optimizer = optimizer
             ctx.scores = scores
+            ctx.combiner = combiner
 
         return embs
 
@@ -216,6 +217,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         device = ctx.device
         optimizer = ctx.optimizer
         table_num = len(tables)
+        combiner = ctx.combiner
 
         offsets_list_per_table = []
         for i in range(table_num):
@@ -268,6 +270,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
                 batch_size,
                 feature_num_per_table[i],
                 offsets_list_per_table[i][-1].item(),
+                combiner,
             )
 
         unique_grads_per_table = []
@@ -602,6 +605,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 ctx.unique_indices = unique_indices
                 ctx.unique_embs = unique_embs
                 ctx.inverse = inverse
+            ctx.indices_table_range = indices_table_range
+            ctx.h_indices_table_range = indices_table_range.cpu()
             ctx.h_unique_indices_table_range = h_unique_indices_table_range
             ctx.unique_indices_table_range = unique_indices_table_range
             ctx.caches = caches
@@ -615,8 +620,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
     def backward(ctx, grads):
         # parse context
         (indices,) = ctx.saved_tensors
+        indices_table_range = ctx.indices_table_range
+        h_indices_table_range = ctx.h_indices_table_range
         h_unique_indices_table_range = ctx.h_unique_indices_table_range
-        unique_indices_table_range = ctx.unique_indices_table_range
+        ctx.unique_indices_table_range
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
@@ -627,11 +634,11 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             unique_indices = ctx.unique_indices
             unique_embs = ctx.unique_embs
             ctx.inverse
-
         unique_indices, unique_embs = reduce_grads(
-            indices, grads, unique_indices_table_range, h_unique_indices_table_range
+            indices, grads, indices_table_range, h_indices_table_range
         )
 
+        optimizer.step()
         table_num = len(storages)
         for i in range(table_num):
             begin = h_unique_indices_table_range[i]
@@ -648,4 +655,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 enable_prefetch,
             )
 
-        return (None,) * 11
+        return (None,) * 13

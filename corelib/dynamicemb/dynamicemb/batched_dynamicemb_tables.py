@@ -946,7 +946,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if option.init_capacity is None:
                 option.init_capacity = option.max_capacity
 
-        self._optimizer: BaseDynamicEmbeddingOptimizer = None
+        if self.pooling_mode != DynamicEmbPoolingMode.NONE:
+            self._optimizer_type = optimizer
+            self._create_tables()
+
+        self._optimizer: Union[
+            BaseDynamicEmbeddingOptimizer, BaseDynamicEmbeddingOptimizerV2
+        ] = None
         self._create_optimizer(
             optimizer,
             stochastic_rounding,
@@ -965,8 +971,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             counter_based_regularization,
             cowclip_regularization,
         )
-
-        self._create_tables(ext_ps)
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+            self._create_cache_storage(ext_ps)
         self._initializers = []
         self._eval_initializers = []
         self._create_initializers()
@@ -983,18 +989,43 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         # new a unique op
         # TODO: in our case maybe we can use torch.uint32
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+            count_dtype = torch.long
+        else:
+            count_dtype = torch.uint64
         reserve_keys = torch.tensor(
             2, dtype=self.index_type, device=torch.device(self.device_id)
         )
         reserve_vals = torch.tensor(
-            2, dtype=torch.uint64, device=torch.device(self.device_id)
+            2, dtype=count_dtype, device=torch.device(self.device_id)
         )
         counter = torch.tensor(
-            1, dtype=torch.uint64, device=torch.device(self.device_id)
+            1, dtype=count_dtype, device=torch.device(self.device_id)
         )
         self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
 
-    def _create_tables(self, PS: Storage = None) -> None:
+    def _create_tables(self) -> None:
+        self._tables: List[DynamicEmbTable] = []
+        for option in self._dynamicemb_options:
+            if option.training:
+                if self._optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+                    option.optimizer_type = OptimizerType.RowWiseAdaGrad
+                elif (
+                    self._optimizer_type == EmbOptimType.SGD
+                    or self._optimizer_type == EmbOptimType.EXACT_SGD
+                ):
+                    option.optimizer_type = OptimizerType.SGD
+                elif self._optimizer_type == EmbOptimType.ADAM:
+                    option.optimizer_type = OptimizerType.Adam
+                elif self._optimizer_type == EmbOptimType.EXACT_ADAGRAD:
+                    option.optimizer_type = OptimizerType.AdaGrad
+                else:
+                    raise ValueError(
+                        f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
+                    )
+            self._tables.append(create_dynamicemb_table(option))
+
+    def _create_cache_storage(self, PS: Storage = None) -> None:
         self._storages: List[Storage] = []
         self._caches: List[Cache] = []
         self._caching = self._dynamicemb_options[0].caching
@@ -1017,35 +1048,32 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
                     )
             if option.caching and option.training:
+                cache_option = deepcopy(option)
+                cache_option.bucket_capacity = 1024
                 capacity = get_constraint_capacity(
                     option.local_hbm_for_values,
                     option.embedding_dtype,
                     option.dim,
                     option.optimizer_type,
-                    option.bucket_capacity,
+                    cache_option.bucket_capacity,
                 )
-
                 if capacity == 0:
                     raise ValueError(
                         "Can't use caching mode as the reserved HBM size is too small."
                     )
-                cache_option = deepcopy(option)
+
                 cache_option.max_capacity = capacity
                 cache_option.init_capacity = capacity
-                cache_option.bucket_capacity = 1024
-                print(f"Cache capacity: {cache_option.max_capacity}")
                 self._caches.append(KeyValueTable(cache_option, self._optimizer))
 
                 storage_option = deepcopy(option)
                 storage_option.local_hbm_for_values = 0
-                print(f"Storage capacity: {storage_option.max_capacity}")
                 self._storages.append(
                     PS(storage_option)
                     if PS
                     else KeyValueTable(storage_option, self._optimizer)
                 )
             else:
-                print(f"Total capacity: {option.max_capacity}")
                 self._caches.append(None)
                 self._storages.append(KeyValueTable(option, self._optimizer))
 
@@ -1136,6 +1164,42 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._initializers.append(initializer)
             eval_initializer = _get_initializer(option.eval_initializer_args)
             self._eval_initializers.append(eval_initializer)
+
+    def _create_table_optimizer(
+        self,
+        optimizer_type: EmbOptimType,
+        optimizer_args: OptimizerArgs,
+    ) -> None:
+        if optimizer_type == EmbOptimType.SGD:
+            self._optimizer = SGDDynamicEmbeddingOptimizer(
+                optimizer_args,
+                self._dynamicemb_options,
+                self._tables,
+            )
+        elif optimizer_type == EmbOptimType.EXACT_SGD:
+            self._optimizer = SGDDynamicEmbeddingOptimizer(
+                optimizer_args,
+                self._dynamicemb_options,
+                self._tables,
+            )
+        elif optimizer_type == EmbOptimType.ADAM:
+            self._optimizer = AdamDynamicEmbeddingOptimizer(
+                optimizer_args,
+                self._dynamicemb_options,
+                self._tables,
+            )
+        elif optimizer_type == EmbOptimType.EXACT_ADAGRAD:
+            self._optimizer = AdaGradDynamicEmbeddingOptimizer(
+                optimizer_args, self._dynamicemb_options, self._tables
+            )
+        elif optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+            self._optimizer = RowWiseAdaGradDynamicEmbeddingOptimizer(
+                optimizer_args, self._dynamicemb_options, self._tables
+            )
+        else:
+            raise ValueError(
+                f"Not supported optimizer type ,optimizer type = {optimizer_type} {type(optimizer_type)} {optimizer_type.value}."
+            )
 
     def _create_optimizer(
         self,
@@ -1236,24 +1300,28 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             lower_bound=cowclip_regularization.lower_bound,
             regularization_mode=weight_decay_mode.value,
         )
+        if self.pooling_mode != DynamicEmbPoolingMode.NONE:
+            self._create_table_optimizer(optimizer_type, optimizer_args)
+            return
+
         if optimizer_type == EmbOptimType.SGD:
-            self._optimizer = SGDDynamicEmbeddingOptimizer(
+            self._optimizer = SGDDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_SGD:
-            self._optimizer = SGDDynamicEmbeddingOptimizer(
+            self._optimizer = SGDDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.ADAM:
-            self._optimizer = AdamDynamicEmbeddingOptimizer(
+            self._optimizer = AdamDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_ADAGRAD:
-            self._optimizer = AdaGradDynamicEmbeddingOptimizer(
+            self._optimizer = AdaGradDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-            self._optimizer = RowWiseAdaGradDynamicEmbeddingOptimizer(
+            self._optimizer = RowWiseAdaGradDynamicEmbeddingOptimizerV2(
                 optimizer_args,
                 self.embedding_dtype,
             )
@@ -1291,7 +1359,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     @property
     def tables(self) -> List[DynamicEmbTable]:
-        return self._tables
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+            return self._storages
+        else:
+            return self._tables
 
     def set_learning_rate(self, lr: float) -> None:
         self._optimizer.set_learning_rate(lr)
@@ -1331,14 +1402,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
         scores = []
-        if self.training:
-            for table_name in self._table_names:
-                if table_name not in self._scores.keys():
-                    raise RuntimeError(
-                        f"Must set score for table '{table_name}' whose score_strategy is customized."
-                    )
-                scores.append(self._scores[table_name])
+        # if self.training:
+        for table_name in self._table_names:
+            if table_name not in self._scores.keys():
+                raise RuntimeError(
+                    f"Must set score for table '{table_name}' whose score_strategy is customized."
+                )
+            scores.append(self._scores[table_name])
 
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
             for i, cache in enumerate(self._caches):
                 if isinstance(cache, KeyValueTable):
                     table = cast(KeyValueTable, cache)
@@ -1349,8 +1421,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     table = cast(KeyValueTable, storage)
                     table.score_update = True
                     table.set_score(self._scores[self.table_names[i]])
-
-        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
             res = DynamicEmbeddingFunctionV2.apply(
                 indices,
                 offsets,
@@ -1366,6 +1436,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.training,
                 self._empty_tensor,
             )
+            for cache in self._caches:
+                if isinstance(cache, KeyValueTable):
+                    table = cast(KeyValueTable, cache)
+                    table.score_update = False
+            for storage in self._storages:
+                if isinstance(storage, KeyValueTable):
+                    table = cast(KeyValueTable, storage)
+                    table.score_update = False
         else:
             res = DynamicEmbeddingBagFunction.apply(
                 indices,
@@ -1389,16 +1467,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._empty_tensor,
             )
 
-        if self.training:
+        # We have to update cache's core in eval mode.
+        if self.training or self._caching:
             self._update_score()
-            for cache in self._caches:
-                if isinstance(cache, KeyValueTable):
-                    table = cast(KeyValueTable, cache)
-                    table.score_update = False
-            for storage in self._storages:
-                if isinstance(storage, KeyValueTable):
-                    table = cast(KeyValueTable, storage)
-                    table.score_update = False
 
         return res
 

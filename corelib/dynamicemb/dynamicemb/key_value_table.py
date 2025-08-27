@@ -24,6 +24,7 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb_extensions import (
+    EvictStrategy,
     clear,
     export_batch,
     find_pointers,
@@ -41,7 +42,7 @@ class Storage(abc.ABC):
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor],
+        founds: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_missing: torch.Tensor
         missing_keys: torch.Tensor
@@ -50,7 +51,10 @@ class Storage(abc.ABC):
 
     @abc.abstractmethod
     def insert(
-        self, keys: torch.Tensor, values: torch.Tensor, scores: Optional[torch.Tensor]
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -110,7 +114,7 @@ class Cache(abc.ABC):
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor],
+        founds: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_missing: torch.Tensor
         missing_keys: torch.Tensor
@@ -182,8 +186,9 @@ class KeyValueTable(Cache, Storage):
         self._value_dim = self._emb_dim + optimizer.get_state_dim(self._emb_dim)
         self._initial_optim_state = optimizer.get_initial_optim_states()
 
-        self.device = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(self.device.index)
+        device_idx = torch.cuda.current_device()
+        self.device = torch.device(f"cuda:{device_idx}")
+        props = torch.cuda.get_device_properties(device_idx)
         self._threads_in_wave = (
             props.multi_processor_count * props.max_threads_per_multi_processor
         )
@@ -191,12 +196,13 @@ class KeyValueTable(Cache, Storage):
         self._modify_event = torch.cuda.Event()
         self._cache_metrics = torch.zeros(10, dtype=torch.int32, device="cpu")
         self._record_cache_metrics = False
+        self._use_score = self.table.evict_strategy() != EvictStrategy.KLru
 
     def find(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor],
+        founds: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = unique_keys.size(0)
         assert unique_embs.dim() == 2
@@ -240,17 +246,21 @@ class KeyValueTable(Cache, Storage):
         self,
         unique_keys: torch.Tensor,
         unique_values: torch.Tensor,
-        scores: Optional[torch.Tensor],
+        scores: Optional[torch.Tensor] = None,
     ) -> None:
         h_num_unique_keys = unique_keys.size(0)
-        if scores is None:
-            insert_or_assign(
-                self.table, h_num_unique_keys, unique_keys, unique_values, self.score
-            )
+        if self._use_score:
+            if scores is None:
+                scores = torch.empty(
+                    h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
+                )
+                scores.fill_(self.score)
         else:
-            insert_or_assign(
-                self.table, h_num_unique_keys, unique_keys, unique_values, scores
-            )
+            scores = None
+
+        insert_or_assign(
+            self.table, h_num_unique_keys, unique_keys, unique_values, scores
+        )
 
     def update(
         self, keys: torch.Tensor, grads: torch.Tensor
@@ -273,8 +283,8 @@ class KeyValueTable(Cache, Storage):
         missing_indices: torch.Tensor = torch.empty(
             batch, dtype=torch.long, device=device
         )
-        select(batch, missing, keys, missing_keys, num_missing_0)
-        select_index(batch, missing, missing_indices, num_missing_1)
+        select(missing, keys, missing_keys, num_missing_0)
+        select_index(missing, missing_indices, num_missing_1)
         return num_missing_0, missing_keys, missing_indices
 
     def enable_update(self) -> bool:
@@ -357,11 +367,11 @@ class KeyValueTable(Cache, Storage):
             batch,
             keys,
             values,
-            num_evicted,
+            self.score if self._use_score else None,
             evicted_keys,
             evicted_values,
             evicted_scores,
-            self.score,
+            num_evicted,
         )
         if self._record_cache_metrics:
             self._cache_metrics[2] = batch
@@ -497,9 +507,10 @@ class KeyValueTableFunction:
             if enable_prefetch:  # ignore the cache missed when enable prefetch.
                 return
             if training:
-                values_for_storage[
-                    missing_indices_in_storage, emb_dim - val_dim :
-                ] = storage.init_optimizer_state()
+                if emb_dim != val_dim:
+                    values_for_storage[
+                        missing_indices_in_storage, emb_dim - val_dim :
+                    ] = storage.init_optimizer_state()
                 update_cache(cache, storage, keys_for_storage, values_for_storage)
             else:
                 found_keys_in_storage = keys_for_storage[founds]
@@ -519,9 +530,10 @@ class KeyValueTableFunction:
                 missing_values_in_storage[:, :emb_dim] = values_for_storage[
                     missing_indices_in_storage, :emb_dim
                 ]
-                missing_values_in_storage[
-                    :, emb_dim - val_dim :
-                ] = storage.init_optimizer_state()
+                if val_dim != emb_dim:
+                    missing_values_in_storage[
+                        :, emb_dim - val_dim :
+                    ] = storage.init_optimizer_state()
                 storage.insert(missing_keys_in_storage, missing_values_in_storage)
             # ignore the storage missed in eval mode
 
@@ -546,7 +558,7 @@ class KeyValueTableFunction:
             grads_for_storage = unique_grads[missing_indices, :].contiguous()
         else:
             keys_for_storage = unique_keys
-            grads_for_storage = grads_for_storage
+            grads_for_storage = unique_grads
 
         if storage.enable_update():
             storage.update(keys_for_storage, grads_for_storage)

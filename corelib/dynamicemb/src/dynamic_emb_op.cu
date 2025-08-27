@@ -644,7 +644,7 @@ void lookup_backward_dense(const at::Tensor indices, const at::Tensor grads,
 std::tuple<at::Tensor, at::Tensor>
 reduce_grads(at::Tensor indices, at::Tensor grads, at::Tensor segment_range, at::Tensor h_segment_range) {
   int64_t num_total = indices.size(0);
-  int64_t dim = grads.size(0);
+  int64_t dim = grads.size(1);
   int64_t num_segment = h_segment_range.size(0) - 1;
   int64_t num_unique_total = h_segment_range[num_segment].item<int64_t>();
   at::Tensor unique_indices = at::empty(num_unique_total, indices.options());
@@ -817,7 +817,7 @@ void lookup_backward(const at::Tensor grad, const at::Tensor unique_buffer,
                      const at::Tensor inverse_indices,
                      const at::Tensor biased_offsets, const int dim,
                      const int table_num, int batch_size, int feature_num,
-                     int num_key) {
+                     int num_key, int combiner) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto value_type = scalartype_to_datatype(
@@ -827,7 +827,7 @@ void lookup_backward(const at::Tensor grad, const at::Tensor unique_buffer,
   dyn_emb::backward(grad.data_ptr(), unique_buffer.data_ptr(),
                     unique_indices.data_ptr(), inverse_indices.data_ptr(),
                     biased_offsets.data_ptr(), dim, batch_size, feature_num,
-                    num_key, key_type, value_type, stream);
+                    num_key, combiner, key_type, value_type, stream);
 }
 
 template <typename T>
@@ -878,7 +878,7 @@ __global__ void load_from_pointers_kernel(
 
 void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
   int64_t num_total = pointers.size(0);
-  int64_t dim = dst.size(0);
+  int64_t dim = dst.size(1);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   constexpr int kWarpSize = 32;
@@ -1125,7 +1125,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("unique_buffer"), py::arg("unique_indices"),
         py::arg("inverse_indices"), py::arg("biased_offsets"), py::arg("dim"),
         py::arg("tables_num"), py::arg("batch_size"), py::arg("num_feature"),
-        py::arg("num_key"));
+        py::arg("num_key"), py::arg("combiner"));
 
   m.def("lookup_forward_dense", &lookup_forward_dense,
         "lookup forward dense for duplicated keys", py::arg("tables"),
@@ -1168,5 +1168,9 @@ void bind_dyn_emb_op(py::module &m) {
 
   m.def("reduce_grads", &reduce_grads,
     "reduce grads", py::arg("indices"), py::arg("grads"), py::arg("segment_range"), py::arg("h_segment_range")
+  );
+
+  m.def("load_from_pointers", &load_from_pointers,
+    "load from pointers to dst.", py::arg("pointers"), py::arg("dst")
   );
 }
