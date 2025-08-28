@@ -36,6 +36,24 @@ from dynamicemb_extensions import (
 )
 
 
+class EventQueue:
+    def __init__(
+        self,
+    ):
+        self._events = []
+
+    def produce(self) -> torch.cuda.Event:
+        event = torch.cuda.Event()
+        self._events.append(event)
+        return event
+
+    def consume(self) -> torch.cuda.Event:
+        return self._events.pop(0)
+
+    def clear(self) -> None:
+        self._events = []
+
+
 class Storage(abc.ABC):
     @abc.abstractmethod
     def find(
@@ -154,7 +172,7 @@ class Cache(abc.ABC):
 
     @property
     @abc.abstractmethod
-    def modification_event(self) -> torch.cuda.Event:
+    def event_queue(self) -> EventQueue:
         pass
 
     @abc.abstractmethod
@@ -193,7 +211,7 @@ class KeyValueTable(Cache, Storage):
             props.multi_processor_count * props.max_threads_per_multi_processor
         )
 
-        self._modify_event = torch.cuda.Event()
+        self._event_queue = EventQueue()
         self._cache_metrics = torch.zeros(10, dtype=torch.int32, device="cpu")
         self._record_cache_metrics = False
         self._use_score = self.table.evict_strategy() != EvictStrategy.KLru
@@ -326,7 +344,15 @@ class KeyValueTable(Cache, Storage):
             batch, dtype=torch.uint64, device=device
         )
 
-        export_batch(self.table, start, end, dumped_keys, dumped_values, dumped_scores)
+        export_batch(
+            self.table,
+            batch,
+            start,
+            num_dumped,
+            dumped_keys,
+            dumped_values,
+            dumped_scores,
+        )
 
         return num_dumped, dumped_keys, dumped_values, dumped_scores
 
@@ -395,10 +421,11 @@ class KeyValueTable(Cache, Storage):
         self,
     ) -> None:
         clear(self.table)
+        self._event_queue.clear()
 
     @property
-    def modification_event(self) -> torch.cuda.Event:
-        self._modify_event
+    def event_queue(self) -> EventQueue:
+        return self._event_queue
 
     @property
     def cache_metrics(self) -> Optional[torch.Tensor]:
@@ -421,7 +448,7 @@ def update_cache(
         missing_keys, missing_values
     )
     if record:
-        cache.modification_event.record()
+        cache.event_queue.produce().record()
     h_num_evicted = num_evicted.cpu().item()
     if h_num_evicted != 0:
         storage.insert(
@@ -451,6 +478,8 @@ class KeyValueTableFunction:
 
         # 1. find in cache
         if caching:
+            if enable_prefetch:
+                torch.cuda.current_stream().wait_event(cache.event_queue.consume())
             num_missing, missing_keys, missing_indices = cache.find(
                 unique_keys, unique_embs
             )
@@ -546,8 +575,6 @@ class KeyValueTableFunction:
         optimizer: BaseDynamicEmbeddingOptimizer,
         enable_prefetch: bool,
     ):
-        if enable_prefetch:
-            torch.cuda.current_stream().wait(cache.modification_event)
         if cache is not None:
             num_missing, missing_keys, missing_indices = cache.update(
                 unique_keys, unique_grads
@@ -607,6 +634,8 @@ class KeyValueTableFunction:
         h_num_keys_for_storage = num_missing.cpu().item()
         missing_keys = missing_keys[:h_num_keys_for_storage]
         if h_num_keys_for_storage == 0:
+            if forward_stream is not None:
+                cache.event_queue.produce().record()
             return
 
         val_dim = storage.value_dim()

@@ -877,6 +877,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.pooling_mode = pooling_mode
         self.use_index_dedup = use_index_dedup
         self._enable_prefetch = enable_prefetch
+        self.prefetch_stream = None
         self.num_prefetch_ahead = 0
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
@@ -1344,10 +1345,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return splits
 
     def flush(self) -> None:
-        return
+        self.num_prefetch_ahead = 0
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+            for cache, storage in zip(self._caches, self._storages):
+                cache.flush(storage)
 
     def reset_cache_states(self) -> None:
-        return
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+            for cache in self._caches:
+                cache.reset()
 
     @property
     def table_names(self) -> List[str]:
@@ -1363,6 +1369,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             return self._storages
         else:
             return self._tables
+
+    @property
+    def caches(self) -> List[Cache]:
+        return self._caches
+
+    def set_record_cache_metrics(self, record: bool) -> None:
+        for cache in self._caches:
+            cache.set_record_cache_metrics(record)
 
     def set_learning_rate(self, lr: float) -> None:
         self._optimizer.set_learning_rate(lr)
@@ -1391,7 +1405,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         total_unique_indices: Optional[int] = None,
     ) -> List[Tensor]:
         if self._enable_prefetch:
-            self.self.num_prefetch_ahead -= 1
+            self.num_prefetch_ahead -= 1
 
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
@@ -1502,17 +1516,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         prefetch_scores = self._get_prefetch_score()
 
-        if self.training:
-            for i, cache in enumerate(self._caches):
-                if isinstance(cache, KeyValueTable):
-                    table = cast(KeyValueTable, cache)
-                    table.score_update = True
-                    table.set_score(prefetch_scores[i])
-            for i, storage in enumerate(self._storages):
-                if isinstance(storage, KeyValueTable):
-                    table = cast(KeyValueTable, storage)
-                    table.score_update = True
-                    table.set_score(prefetch_scores[i])
+        for i, cache in enumerate(self._caches):
+            if isinstance(cache, KeyValueTable):
+                table = cast(KeyValueTable, cache)
+                table.score_update = True
+                table.set_score(prefetch_scores[i])
+        for i, storage in enumerate(self._storages):
+            if isinstance(storage, KeyValueTable):
+                table = cast(KeyValueTable, storage)
+                table.score_update = True
+                table.set_score(prefetch_scores[i])
 
         dynamicemb_prefetch(
             indices,
@@ -1523,18 +1536,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._initializers if self.training else self._eval_initializers,
             self._unique_op,
             self.training,
-            forward_stream if self.num_prefetch_ahead == 1 else None,
+            forward_stream,
         )
 
-        if self.training:
-            for cache in self._caches:
-                if isinstance(cache, KeyValueTable):
-                    table = cast(KeyValueTable, cache)
-                    table.score_update = False
-            for storage in self._storages:
-                if isinstance(storage, KeyValueTable):
-                    table = cast(KeyValueTable, storage)
-                    table.score_update = False
+        for cache in self._caches:
+            if isinstance(cache, KeyValueTable):
+                table = cast(KeyValueTable, cache)
+                table.score_update = False
+        for storage in self._storages:
+            if isinstance(storage, KeyValueTable):
+                table = cast(KeyValueTable, storage)
+                table.score_update = False
 
     def set_score(
         self,
