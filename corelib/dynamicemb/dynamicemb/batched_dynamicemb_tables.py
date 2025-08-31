@@ -1070,7 +1070,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 storage_option = deepcopy(option)
                 storage_option.local_hbm_for_values = 0
                 self._storages.append(
-                    PS(storage_option)
+                    PS(storage_option, self._optimizer)
                     if PS
                     else KeyValueTable(storage_option, self._optimizer)
                 )

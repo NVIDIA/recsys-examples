@@ -22,7 +22,7 @@ from dynamicemb.dynamicemb_config import (
     torch_to_dyn_emb,
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb_extensions import (
     EvictStrategy,
     clear,
@@ -55,6 +55,14 @@ class EventQueue:
 
 
 class Storage(abc.ABC):
+    @abc.abstractmethod
+    def __init__(
+        self,
+        options: DynamicEmbTableOptions,
+        optimizer: BaseDynamicEmbeddingOptimizerV2,
+    ):
+        pass
+
     @abc.abstractmethod
     def find(
         self,
@@ -190,7 +198,7 @@ class KeyValueTable(Cache, Storage):
     def __init__(
         self,
         options: DynamicEmbTableOptions,
-        optimizer: BaseDynamicEmbeddingOptimizer,
+        optimizer: BaseDynamicEmbeddingOptimizerV2,
     ):
         self.options = options
         self.table = create_dynamicemb_table(options)
@@ -212,7 +220,7 @@ class KeyValueTable(Cache, Storage):
         )
 
         self._event_queue = EventQueue()
-        self._cache_metrics = torch.zeros(10, dtype=torch.int32, device="cpu")
+        self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
         self._use_score = self.table.evict_strategy() != EvictStrategy.KLru
 
@@ -382,7 +390,7 @@ class KeyValueTable(Cache, Storage):
         values: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = keys.numel()
-        num_evicted: torch.Tensor = torch.empty(1, dtype=torch.long, device=keys.device)
+        num_evicted: torch.Tensor = torch.zeros(1, dtype=torch.long, device=keys.device)
         evicted_keys: torch.Tensor = torch.empty_like(keys)
         evicted_values: torch.Tensor = torch.empty_like(values)
         evicted_scores: torch.Tensor = torch.empty(
@@ -572,7 +580,7 @@ class KeyValueTableFunction:
         storage: Storage,
         unique_keys: torch.Tensor,
         unique_grads: torch.Tensor,
-        optimizer: BaseDynamicEmbeddingOptimizer,
+        optimizer: BaseDynamicEmbeddingOptimizerV2,
         enable_prefetch: bool,
     ):
         if cache is not None:
