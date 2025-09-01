@@ -110,6 +110,15 @@ class Storage(abc.ABC):
         return num_dumped, dumped_keys, dumped_values, dumped_scores
 
     @abc.abstractmethod
+    def load(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> None:
+        pass
+
+    @abc.abstractmethod
     def embedding_dtype(
         self,
     ) -> torch.dtype:
@@ -363,6 +372,15 @@ class KeyValueTable(Cache, Storage):
         )
 
         return num_dumped, dumped_keys, dumped_values, dumped_scores
+
+    @abc.abstractmethod
+    def load(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> None:
+        self.insert(keys, values, scores)
 
     def embedding_dtype(
         self,

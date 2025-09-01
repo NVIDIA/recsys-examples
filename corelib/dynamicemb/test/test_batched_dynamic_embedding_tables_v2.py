@@ -145,6 +145,14 @@ class PyDictStorage(Storage):
         dumped_scores: torch.Tensor
         return num_dumped, dumped_keys, dumped_values, dumped_scores
 
+    def load(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> None:
+        raise NotImplementedError
+
     def embedding_dtype(
         self,
     ) -> torch.dtype:
