@@ -16,6 +16,7 @@
 import argparse
 import json
 import os
+from typing import cast
 
 import numpy as np
 import torch
@@ -30,8 +31,12 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     EmbOptimType,
 )
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
-from dynamicemb_extensions import clear, insert_or_assign
+from dynamicemb.batched_dynamicemb_tables import (
+    BatchedDynamicEmbeddingTables,
+    BatchedDynamicEmbeddingTablesV2,
+)
+from dynamicemb.key_value_table import KeyValueTable
+from dynamicemb_extensions import DynamicEmbTable, insert_or_assign
 from fbgemm_gpu.runtime_monitor import StdLogStatsReporterConfig
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -167,6 +172,12 @@ def parse_args():
         type=float,
         default=0.125,
         help="cache how many embeddings to HBM",
+    )
+    parser.add_argument(
+        "--table_version",
+        type=int,
+        default=1,
+        help="Table Version",
     )
 
     parser.add_argument("--learning_rate", type=float, default=0.1)
@@ -305,28 +316,86 @@ def generate_sequence_sparse_feature(args, device):
         )
 
 
+class TableShim:
+    def __init__(self, table):
+        if isinstance(table, DynamicEmbTable):
+            self.table = cast(DynamicEmbTable, table)
+        elif isinstance(table, KeyValueTable):
+            self.table = cast(KeyValueTable, table)
+        else:
+            raise ValueError("Not support table type")
+
+    def optim_states_dim(self) -> int:
+        if isinstance(self.table, DynamicEmbTable):
+            return self.table.optstate_dim()
+        else:
+            return self.table.value_dim() - self.table.embedding_dim()
+
+    def init_optim_state(self) -> float:
+        if isinstance(self.table, DynamicEmbTable):
+            return self.table.get_initial_optstate()
+        else:
+            return self.table.init_optimizer_state()
+
+    def insert(
+        self,
+        n,
+        unique_indices,
+        unique_values,
+        scores,
+    ) -> None:
+        if isinstance(self.table, DynamicEmbTable):
+            insert_or_assign(self.table, n, unique_indices, unique_values, scores)
+        else:
+            # self.table.set_score(scores[0].item())
+            self.table.insert(unique_indices, unique_values, scores)
+
+
 def create_dynamic_embedding_tables(args, device):
     table_options = []
     table_num = args.num_embedding_table
     for i in range(table_num):
-        table_options.append(
-            DynamicEmbTableOptions(
-                index_type=torch.int64,
-                embedding_dtype=get_emb_precision(args.emb_precision),
-                dim=args.embedding_dim,
-                max_capacity=args.num_embeddings_per_feature[i],
-                local_hbm_for_values=args.hbm_for_embeddings[i],
-                bucket_capacity=128,
-                initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.NORMAL,
-                ),
-                score_strategy=DynamicEmbScoreStrategy.LFU
-                if args.cache_algorithm == "lfu"
-                else DynamicEmbScoreStrategy.TIMESTAMP,
+        if args.table_version == 1:
+            TableModule = BatchedDynamicEmbeddingTables
+            table_options.append(
+                DynamicEmbTableOptions(
+                    index_type=torch.int64,
+                    embedding_dtype=get_emb_precision(args.emb_precision),
+                    dim=args.embedding_dim,
+                    max_capacity=args.num_embeddings_per_feature[i],
+                    local_hbm_for_values=args.hbm_for_embeddings[i],
+                    bucket_capacity=128,
+                    initializer_args=DynamicEmbInitializerArgs(
+                        mode=DynamicEmbInitializerMode.NORMAL,
+                    ),
+                    score_strategy=DynamicEmbScoreStrategy.LFU
+                    if args.cache_algorithm == "lfu"
+                    else DynamicEmbScoreStrategy.TIMESTAMP,
+                )
             )
-        )
+        elif args.table_version == 2:
+            TableModule = BatchedDynamicEmbeddingTablesV2
+            table_options.append(
+                DynamicEmbTableOptions(
+                    index_type=torch.int64,
+                    embedding_dtype=get_emb_precision(args.emb_precision),
+                    dim=args.embedding_dim,
+                    max_capacity=args.num_embeddings_per_feature[i],
+                    local_hbm_for_values=args.hbm_for_embeddings[i],
+                    bucket_capacity=128,
+                    initializer_args=DynamicEmbInitializerArgs(
+                        mode=DynamicEmbInitializerMode.NORMAL,
+                    ),
+                    score_strategy=DynamicEmbScoreStrategy.LFU
+                    if args.cache_algorithm == "lfu"
+                    else DynamicEmbScoreStrategy.TIMESTAMP,
+                    caching=args.caching,
+                )
+            )
+        else:
+            raise ValueError("Not support table version")
 
-    var = BatchedDynamicEmbeddingTables(
+    var = TableModule(
         table_options=table_options,
         table_names=[table_idx_to_name(i) for i in range(table_num)],
         use_index_dedup=args.use_index_dedup,
@@ -342,7 +411,7 @@ def create_dynamic_embedding_tables(args, device):
     )
 
     for table_id in range(table_num):
-        cur_hkv_table = var.tables[table_id]
+        cur_table = TableShim(var.tables[table_id])
 
         num_embeddings = args.num_embeddings_per_feature[table_id]
         fill_batch = 1024 * 1024
@@ -359,8 +428,8 @@ def create_dynamic_embedding_tables(args, device):
                 dtype=torch.float32,
             )
 
-            optstate_dim = cur_hkv_table.optstate_dim()
-            initial_accumulator = cur_hkv_table.get_initial_optstate()
+            optstate_dim = cur_table.optim_states_dim()
+            initial_accumulator = cur_table.init_optim_state()
             optstate = (
                 torch.rand(
                     unique_values.size(0),
@@ -374,13 +443,13 @@ def create_dynamic_embedding_tables(args, device):
             unique_values = unique_values.reshape(-1)
 
             n = unique_indices.shape[0]
-            if args.cache_algorithm == "lfu":
-                scores = torch.ones(n, dtype=torch.uint64, device=unique_indices.device)
-                insert_or_assign(
-                    cur_hkv_table, n, unique_indices, unique_values, scores
-                )
-            else:
-                insert_or_assign(cur_hkv_table, n, unique_indices, unique_values)
+            scores = (
+                torch.ones(n, dtype=torch.uint64, device=unique_indices.device)
+                if args.cache_algorithm == "lfu"
+                else None
+            )
+            cur_table.insert(n, unique_indices, unique_values, scores)
+
     return var
 
 
@@ -583,10 +652,8 @@ def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb
 
 
 def clear_cache(args, dynamic_emb, torchrec_emb):
-    table_num = args.num_embedding_table
-    if args.caching:
-        for table_id in range(table_num):
-            clear(dynamic_emb.tables[table_id])
+    assert args.caching
+    dynamic_emb.reset_cache_states()
     torchrec_emb.reset_cache_states()
 
 
@@ -626,8 +693,13 @@ def main():
     print(f"Generate sparse features done in {timer.elapsed_time() / 1000:.3f} s.")
 
     torchrec_emb = create_split_table_batched_embeddings(args, device)
-    warmup_gpu(device)
+    cache_miss_counter_torchrec = None
 
+    if args.caching:
+        var.set_record_cache_metrics(True)
+        clear_cache(args, var, torchrec_emb)
+
+    warmup_gpu(device)
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):
             (
@@ -635,9 +707,17 @@ def main():
                 backward_latency,
                 iteration_latency,
             ) = benchmark_one_iteration(var, sparse_features[i + j])
+            cache_info = ""
+            if args.caching:
+                cache_metrics = var.caches[0].cache_metrics
+                unique_num = cache_metrics[0].item()
+                cache_hit = cache_metrics[1].item()
+                cache_miss = unique_num - cache_hit
+                hit_rate = 1.0 * cache_hit / unique_num
+                cache_info = f"cache_miss:{cache_miss}, unique: {unique_num}, hit_rate: {hit_rate:.8f},"
             print(
                 f"dynamicemb: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-                f"total: {iteration_latency:.3f} ms"
+                f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
             )
 
         for j in range(report_interval):
@@ -646,10 +726,32 @@ def main():
                 backward_latency,
                 iteration_latency,
             ) = benchmark_one_iteration(torchrec_emb, sparse_features[i + j])
+            cache_info = ""
+            if args.caching:
+                cache_miss_counter_ = torchrec_emb.get_cache_miss_counter().clone()
+                # table_wise_cache_miss_ = torchrec_emb.get_table_wise_cache_miss().clone()
+                if cache_miss_counter_torchrec is not None:
+                    cache_miss_counter_incerment = (
+                        cache_miss_counter_ - cache_miss_counter_torchrec
+                    )
+                else:
+                    cache_miss_counter_incerment = torch.tensor([0, 0])
+                # if table_wise_cache_miss is not None:
+                #     table_wise_cache_miss_increment = table_wise_cache_miss_ - table_wise_cache_miss
+                # else:
+                #     table_wise_cache_miss_increment = torch.tensor([0])
+                cache_info = f"cache miss: {cache_miss_counter_incerment[1].item()}"
+                cache_miss_counter_torchrec = cache_miss_counter_
+
             print(
                 f"torchrec: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-                f"total: {iteration_latency:.3f} ms"
+                f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
             )
+
+    if args.caching:
+        var.set_record_cache_metrics(False)
+        torchrec_emb.record_cache_metrics = RecordCacheMetrics(False, False)
+        clear_cache(args, var, torchrec_emb)
 
     torch.cuda.profiler.start()
     dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
@@ -657,7 +759,8 @@ def main():
     torch.cuda.profiler.stop()
 
     test_result = {
-        "use_index_dedup": args.use_index_dedup,
+        "caching": args.caching,
+        "table_version": args.table_version,
         "batch_size": args.batch_size,
         "num_embeddings_per_feature": args.num_embeddings_per_feature,
         "hbm_for_embeddings": args.hbm_for_embeddings,
@@ -666,6 +769,7 @@ def main():
         "embedding_dim": args.embedding_dim,
         "num_iterations": args.num_iterations,
         "cache_algorithm": args.cache_algorithm,
+        "use_index_dedup": args.use_index_dedup,
         "eval(torchrec)": torchrec_res[3],
         "forward(torchrec)": torchrec_res[1],
         "backward(torchrec)": torchrec_res[2],
