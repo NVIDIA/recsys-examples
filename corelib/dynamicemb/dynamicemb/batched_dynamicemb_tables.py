@@ -1114,6 +1114,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             torch.bfloat16: 2,
         }
 
+        def MB_(x) -> int:
+            return x // (1024 * 1024)
+
         for table_name, table_option in zip(
             self._table_names, self._dynamicemb_options
         ):
@@ -1127,15 +1130,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             table_consume.append(
                 [
                     table_name,
-                    total_memory // 1024,
-                    table_option.max_capacity * element_size * emb_dim // 1024,
-                    table_option.max_capacity * element_size * optim_state_dim // 1024,
-                    local_hbm_for_values // 1024,
-                    int(local_hbm_for_values * emb_dim // total_dim) // 1024,
-                    int(local_hbm_for_values * optim_state_dim // total_dim) // 1024,
-                    local_dram_for_values // 1024,
-                    int(local_dram_for_values * emb_dim // total_dim) // 1024,
-                    int(local_dram_for_values * optim_state_dim // total_dim) // 1024,
+                    MB_(total_memory),
+                    MB_(table_option.max_capacity * element_size * emb_dim),
+                    MB_(table_option.max_capacity * element_size * optim_state_dim),
+                    MB_(local_hbm_for_values),
+                    MB_(int(local_hbm_for_values * emb_dim // total_dim)),
+                    MB_(int(local_hbm_for_values * optim_state_dim // total_dim)),
+                    MB_(local_dram_for_values),
+                    MB_(int(local_dram_for_values * emb_dim // total_dim)),
+                    MB_(int(local_dram_for_values * optim_state_dim // total_dim)),
                 ]
             )
         output = "\n\n" + tabulate(table_consume, title, sub_headers=True)
