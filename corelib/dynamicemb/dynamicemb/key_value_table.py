@@ -1,16 +1,17 @@
-# 1. 外接 ps
-# 2. 兼容 prefetch
-# 3. 兼容不同的 score: cache LRU, storage LFU.
-# 4. remove API lock
-
-# 1. interface mock
-# 2. export
-# 3. test
-
-# 1. find: forward
-# 2. migrate/prefetch: migrate embeddings between cache and storage
-# 3. update: backward
-# 4. initialize
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import abc
 from typing import Callable, Optional, Tuple
@@ -373,7 +374,6 @@ class KeyValueTable(Cache, Storage):
 
         return num_dumped, dumped_keys, dumped_values, dumped_scores
 
-    @abc.abstractmethod
     def load(
         self,
         keys: torch.Tensor,

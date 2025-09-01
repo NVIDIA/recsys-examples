@@ -227,6 +227,97 @@ def _export_matched(
     return ret_keys, ret_vals
 
 
+def _print_memory_consume(
+    table_names, dynamicemb_options, optimizer, device_id
+) -> None:
+    subtitle = [
+        "",
+        "total",
+        "embedding",
+        "optim_state",
+        "total",
+        "embedding",
+        "optim_state",
+        "total",
+        "embedding",
+        "optim_state",
+    ]
+    table_consume = []
+    table_consume.append(subtitle)
+
+    def _get_optimizer_state_dim(optimizer_type, dim, element_size):
+        if optimizer_type == OptimizerType.RowWiseAdaGrad:
+            return 16 // element_size
+        elif optimizer_type == OptimizerType.Adam:
+            return dim * 2
+        elif optimizer_type == OptimizerType.AdaGrad:
+            return dim
+        else:
+            return 0
+
+    DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+        torch.float32: 4,
+        torch.float16: 2,
+        torch.bfloat16: 2,
+    }
+
+    def MB_(x) -> int:
+        return x // (1024 * 1024)
+
+    def KB_(x) -> int:
+        return x // (1024)
+
+    F = None
+
+    for table_name, table_option in zip(table_names, dynamicemb_options):
+        element_size = DTYPE_NUM_BYTES[table_option.embedding_dtype]
+        emb_dim = table_option.dim
+        if optimizer is not None:
+            optim_state_dim = optimizer.get_state_dim(emb_dim)
+        else:
+            optim_state_dim = _get_optimizer_state_dim(
+                table_option.optimizer_type, emb_dim, element_size
+            )
+        total_dim = emb_dim + optim_state_dim
+        total_memory = table_option.max_capacity * element_size * total_dim
+        if F is None:
+            if total_memory // (1024 * 1024) != 0:
+                F = MB_
+            else:
+                F = KB_
+        local_hbm_for_values = min(table_option.local_hbm_for_values, total_memory)
+        local_dram_for_values = total_memory - local_hbm_for_values
+        table_consume.append(
+            [
+                table_name,
+                F(total_memory),
+                F(table_option.max_capacity * element_size * emb_dim),
+                F(table_option.max_capacity * element_size * optim_state_dim),
+                F(local_hbm_for_values),
+                F(int(local_hbm_for_values * emb_dim // total_dim)),
+                F(int(local_hbm_for_values * optim_state_dim // total_dim)),
+                F(local_dram_for_values),
+                F(int(local_dram_for_values * emb_dim // total_dim)),
+                F(int(local_dram_for_values * optim_state_dim // total_dim)),
+            ]
+        )
+    unit = "MB" if F == MB_ else "KB"
+    title = [
+        "table name",
+        "",
+        f"memory({unit})",
+        "",
+        "",
+        f"hbm({unit})/cuda:{device_id}",
+        "",
+        "",
+        f"dram({unit})",
+        "",
+    ]
+    output = "\n\n" + tabulate(table_consume, title, sub_headers=True)
+    print(output)
+
+
 class BatchedDynamicEmbeddingTables(nn.Module):
     """
     Dynamic Embedding is based on [HKV](https://github.com/NVIDIA-Merlin/HierarchicalKV/tree/master).
@@ -359,7 +450,9 @@ class BatchedDynamicEmbeddingTables(nn.Module):
         self._optimizer_type = optimizer
         self._tables: List[DynamicEmbTable] = []
         self._create_tables()
-        self._print_memory_consume()
+        _print_memory_consume(
+            self._table_names, self._dynamicemb_options, None, self.device_id
+        )
         # add placeholder require_grad param tensor to enable autograd with int8 weights
         # self.placeholder_autograd_tensor = nn.Parameter(
         #     torch.zeros(0, device=torch.device(self.device_id), dtype=torch.float)
@@ -490,79 +583,6 @@ class BatchedDynamicEmbeddingTables(nn.Module):
                         f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
                     )
             self._tables.append(create_dynamicemb_table(option))
-
-    def _print_memory_consume(self) -> None:
-        title = [
-            "table name",
-            "",
-            "memory(MB)",
-            "",
-            "",
-            f"hbm(MB)/cuda:{self.device_id}",
-            "",
-            "",
-            "dram(MB)",
-            "",
-        ]
-        subtitle = [
-            "",
-            "total",
-            "embedding",
-            "optim_state",
-            "total",
-            "embedding",
-            "optim_state",
-            "total",
-            "embedding",
-            "optim_state",
-        ]
-        table_consume = []
-        table_consume.append(subtitle)
-
-        def _get_optimizer_state_dim(optimizer_type, dim, element_size):
-            if optimizer_type == OptimizerType.RowWiseAdaGrad:
-                return 16 // element_size
-            elif optimizer_type == OptimizerType.Adam:
-                return dim * 2
-            elif optimizer_type == OptimizerType.AdaGrad:
-                return dim
-            else:
-                return 0
-
-        DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
-            torch.float32: 4,
-            torch.float16: 2,
-            torch.bfloat16: 2,
-        }
-
-        for table_name, table_option in zip(
-            self._table_names, self._dynamicemb_options
-        ):
-            element_size = DTYPE_NUM_BYTES[table_option.embedding_dtype]
-            emb_dim = table_option.dim
-            optim_state_dim = _get_optimizer_state_dim(
-                table_option.optimizer_type, emb_dim, element_size
-            )
-            total_dim = emb_dim + optim_state_dim
-            total_memory = table_option.max_capacity * element_size * total_dim
-            local_hbm_for_values = min(table_option.local_hbm_for_values, total_memory)
-            local_dram_for_values = total_memory - local_hbm_for_values
-            table_consume.append(
-                [
-                    table_name,
-                    total_memory // 1024,
-                    table_option.max_capacity * element_size * emb_dim // 1024,
-                    table_option.max_capacity * element_size * optim_state_dim // 1024,
-                    local_hbm_for_values // 1024,
-                    int(local_hbm_for_values * emb_dim // total_dim) // 1024,
-                    int(local_hbm_for_values * optim_state_dim // total_dim) // 1024,
-                    local_dram_for_values // 1024,
-                    int(local_dram_for_values * emb_dim // total_dim) // 1024,
-                    int(local_dram_for_values * optim_state_dim // total_dim) // 1024,
-                ]
-            )
-        output = "\n\n" + tabulate(table_consume, title, sub_headers=True)
-        print(output)
 
     def _create_optimizer(
         self,
@@ -1078,71 +1098,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._caches.append(None)
                 self._storages.append(KeyValueTable(option, self._optimizer))
 
-        self._print_memory_consume()
-
-    def _print_memory_consume(self) -> None:
-        title = [
-            "table name",
-            "",
-            "memory(MB)",
-            "",
-            "",
-            f"hbm(MB)/cuda:{self.device_id}",
-            "",
-            "",
-            "dram(MB)",
-            "",
-        ]
-        subtitle = [
-            "",
-            "total",
-            "embedding",
-            "optim_state",
-            "total",
-            "embedding",
-            "optim_state",
-            "total",
-            "embedding",
-            "optim_state",
-        ]
-        table_consume = []
-        table_consume.append(subtitle)
-
-        DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
-            torch.float32: 4,
-            torch.float16: 2,
-            torch.bfloat16: 2,
-        }
-
-        def MB_(x) -> int:
-            return x // (1024 * 1024)
-
-        for table_name, table_option in zip(
-            self._table_names, self._dynamicemb_options
-        ):
-            element_size = DTYPE_NUM_BYTES[table_option.embedding_dtype]
-            emb_dim = table_option.dim
-            optim_state_dim = self._optimizer.get_state_dim(emb_dim)
-            total_dim = emb_dim + optim_state_dim
-            total_memory = table_option.max_capacity * element_size * total_dim
-            local_hbm_for_values = min(table_option.local_hbm_for_values, total_memory)
-            local_dram_for_values = total_memory - local_hbm_for_values
-            table_consume.append(
-                [
-                    table_name,
-                    MB_(total_memory),
-                    MB_(table_option.max_capacity * element_size * emb_dim),
-                    MB_(table_option.max_capacity * element_size * optim_state_dim),
-                    MB_(local_hbm_for_values),
-                    MB_(int(local_hbm_for_values * emb_dim // total_dim)),
-                    MB_(int(local_hbm_for_values * optim_state_dim // total_dim)),
-                    MB_(local_dram_for_values),
-                    MB_(int(local_dram_for_values * emb_dim // total_dim)),
-                    MB_(int(local_dram_for_values * optim_state_dim // total_dim)),
-                ]
-            )
-        output = "\n\n" + tabulate(table_consume, title, sub_headers=True)
-        print(output)
+        _print_memory_consume(
+            self._table_names, self._dynamicemb_options, self._optimizer, self.device_id
+        )
 
     def _create_initializers(self) -> None:
         def _get_initializer(initializer_args):
