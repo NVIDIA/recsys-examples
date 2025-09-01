@@ -56,7 +56,6 @@ struct Hstu_params {
   // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k
   // could be different from nheads (query).
   int h_h_k_ratio;  // precompute h / h_k,
-  bool is_delta_q;
 
   bool is_balance_fwd;
   bool is_balance_bwd;
@@ -79,6 +78,12 @@ struct Hstu_fwd_params : public Hstu_params {
   int* __restrict__ num_targets;
   int* __restrict__ num_contexts;
 
+  void* __restrict__ func_ptr; // batch_size x heads x n_func x seqlen_q
+  index_t func_ids_stride;
+  index_t func_head_stride;
+  int func_batch;
+  int n_func;
+
   void* __restrict__ rab_ptr;
   index_t rab_seqlen_qk_stride;
   index_t rab_seqlen_q_stride;
@@ -91,7 +96,7 @@ struct Hstu_fwd_params : public Hstu_params {
   index_t kv_cache_page_stride;
   index_t kv_cache_kvtensor_stride;
   int page_size;
-  int total_pages; 
+  int total_pages;
 
   int*  __restrict__ page_offsets;
   int*  __restrict__ page_ids;
@@ -103,7 +108,6 @@ struct Hstu_fwd_params : public Hstu_params {
   float alpha;
 
   int target_group_size;
-  float target_group_size_inv;
 
   int window_size_left;
   int window_size_right;
@@ -115,6 +119,7 @@ struct Hstu_fwd_params : public Hstu_params {
   bool is_target;
   bool is_context;
   bool is_paged_kv;
+  bool is_arbitrary_mask;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -161,9 +166,9 @@ struct Hstu_bwd_params : public Hstu_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int Arch, typename T, int Headdim, bool Has_rab, bool Is_local,
-          bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+          bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_fwd_(Hstu_fwd_params& params, cudaStream_t stream);
 
 template <typename T, int Headdim, bool Has_rab, bool Has_drab, bool Is_local,
-          bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+          bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc, bool Is_deterministic>
 void run_hstu_bwd_(Hstu_bwd_params& params, cudaStream_t stream);

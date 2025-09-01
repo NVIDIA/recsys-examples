@@ -26,7 +26,11 @@ from pathlib import Path
 import torch
 from packaging.version import Version, parse
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import (
+    CUDA_HOME,
+    BuildExtension,
+    CUDAExtension,
+)
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -45,6 +49,7 @@ SKIP_CUDA_BUILD = os.getenv("HSTU_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 FORCE_CXX11_ABI = os.getenv("HSTU_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
 DISABLE_BACKWARD = os.getenv("HSTU_DISABLE_BACKWARD", "FALSE") == "TRUE"
+DISABLE_DETERMINISTIC = os.getenv("HSTU_DISABLE_DETERMINISTIC", "TRUE") == "TRUE"
 DISABLE_BF16 = os.getenv("HSTU_DISABLE_BF16", "FALSE") == "TRUE"
 DISABLE_FP16 = os.getenv("HSTU_DISABLE_FP16", "FALSE") == "TRUE"
 DISABLE_HDIM32 = os.getenv("HSTU_DISABLE_HDIM32", "FALSE") == "TRUE"
@@ -55,7 +60,8 @@ DISABLE_LOCAL = os.getenv("HSTU_DISABLE_LOCAL", "FALSE") == "TRUE"
 DISABLE_CAUSAL = os.getenv("HSTU_DISABLE_CAUSAL", "FALSE") == "TRUE"
 DISABLE_CONTEXT = os.getenv("HSTU_DISABLE_CONTEXT", "FALSE") == "TRUE"
 DISABLE_TARGET = os.getenv("HSTU_DISABLE_TARGET", "FALSE") == "TRUE"
-DISABLE_DELTA_Q = os.getenv("HSTU_DISABLE_DELTA_Q", "FALSE") == "TRUE"
+DISABLE_ARBITRARY = os.getenv("HSTU_DISABLE_ARBITRARY", "FALSE") == "TRUE"
+ARBITRARY_NFUNC = int(os.getenv("HSTU_ARBITRARY_NFUNC", "0"))
 DISABLE_RAB = os.getenv("HSTU_DISABLE_RAB", "FALSE") == "TRUE"
 DISABLE_DRAB = os.getenv("HSTU_DISABLE_DRAB", "FALSE") == "TRUE"
 DISABLE_86OR89 = os.getenv("HSTU_DISABLE_86OR89", "FALSE") == "TRUE"
@@ -130,7 +136,6 @@ def generate_cuda_sources():
     MASK = [""]
     if not DISABLE_LOCAL:
         MASK += ["_local"]
-        MASK += ["_local_deltaq"] if not DISABLE_DELTA_Q else []
     if not DISABLE_CAUSAL:
         CAUSAL_MASK = ["_causal"]
         CONTEXT_MASK = [""] + (["_context"] if not DISABLE_CONTEXT else [])
@@ -139,13 +144,9 @@ def generate_cuda_sources():
             f"{c}{x}{t}"
             for c, x, t in itertools.product(CAUSAL_MASK, CONTEXT_MASK, TARGET_MASK)
         ]
-        MASK += ["_causal_deltaq"] if not DISABLE_DELTA_Q else []
-        MASK += (
-            ["_causal_target_deltaq"]
-            if not DISABLE_DELTA_Q and not DISABLE_CAUSAL and not DISABLE_TARGET
-            else []
-        )
-
+    if not DISABLE_ARBITRARY:
+        MASK += ["_arbitrary"]
+    BWD_DETERMINISTIC = ["false"] + (["true"] if not DISABLE_DETERMINISTIC else [])
     dtype_to_str = {
         "bf16": "cutlass::bfloat16_t",
         "fp16": "cutlass::half_t",
@@ -160,28 +161,34 @@ def generate_cuda_sources():
 
 #include "hstu_fwd.h"
 
-template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}>
+template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
                            (Hstu_fwd_params& params, cudaStream_t stream);
 
     """
     for hdim, dtype, rab, mask, arch_sm in itertools.product(
         HEAD_DIMENSIONS, DTYPE_FWD_SM80, RAB, MASK, ARCH_SM
     ):
-        file_name = f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm{arch_sm}.cu"
-        with open(file_name, "w") as f:
-            f.write(
-                fwd_file_head.format(
-                    arch_sm,
-                    dtype_to_str[dtype],
-                    hdim,
-                    "true" if "_rab" in rab else "false",
-                    "true" if "local" in mask else "false",
-                    "true" if "causal" in mask else "false",
-                    "true" if "context" in mask else "false",
-                    "true" if "target" in mask else "false",
-                    "true" if "deltaq" in mask else "false",
+        file_name = (
+            f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_fn{ARBITRARY_NFUNC}_sm{arch_sm}.cu"
+            if "arbitrary" in mask
+            else f"csrc/hstu_attn/src/generated/flash_fwd_hdim{hdim}_{dtype}{rab}{mask}_sm{arch_sm}.cu"
+        )
+        if not os.path.exists(file_name):
+            with open(file_name, "w") as f:
+                f.write(
+                    fwd_file_head.format(
+                        arch_sm,
+                        dtype_to_str[dtype],
+                        hdim,
+                        "true" if "_rab" in rab else "false",
+                        "true" if "local" in mask else "false",
+                        "true" if "causal" in mask else "false",
+                        "true" if "context" in mask else "false",
+                        "true" if "target" in mask else "false",
+                        "true" if "arbitrary" in mask else "false",
+                        str(ARBITRARY_NFUNC) if "arbitrary" in mask else "0",
+                    )
                 )
-            )
         sources_fwd_sm80.append(file_name)
 
     sources_bwd_sm80 = []
@@ -192,29 +199,36 @@ template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}>
 
 #include "hstu_bwd.h"
 
-template void run_hstu_bwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}>
+template void run_hstu_bwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
                            (Hstu_bwd_params& params, cudaStream_t stream);
 
     """
     if not DISABLE_BACKWARD:
-        for hdim, dtype, rab_drab, mask in itertools.product(
-            HEAD_DIMENSIONS, DTYPE_BWD_SM80, RAB_DRAB, MASK
+        for hdim, dtype, rab_drab, mask, bwd_deterministic in itertools.product(
+            HEAD_DIMENSIONS, DTYPE_BWD_SM80, RAB_DRAB, MASK, BWD_DETERMINISTIC
         ):
-            file_name = f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_sm80.cu"
-            with open(file_name, "w") as f:
-                f.write(
-                    bwd_file_head.format(
-                        dtype_to_str[dtype],
-                        hdim,
-                        "true" if "_rab" in rab_drab else "false",
-                        "true" if "drab" in rab_drab else "false",
-                        "true" if "local" in mask else "false",
-                        "true" if "causal" in mask else "false",
-                        "true" if "context" in mask else "false",
-                        "true" if "target" in mask else "false",
-                        "true" if "deltaq" in mask else "false",
+            file_name = (
+                f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_fn{ARBITRARY_NFUNC}_{bwd_deterministic}_sm80.cu"
+                if "arbitrary" in mask
+                else f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_{bwd_deterministic}_sm80.cu"
+            )
+            if not os.path.exists(file_name):
+                with open(file_name, "w") as f:
+                    f.write(
+                        bwd_file_head.format(
+                            dtype_to_str[dtype],
+                            hdim,
+                            "true" if "_rab" in rab_drab else "false",
+                            "true" if "drab" in rab_drab else "false",
+                            "true" if "local" in mask else "false",
+                            "true" if "causal" in mask else "false",
+                            "true" if "context" in mask else "false",
+                            "true" if "target" in mask else "false",
+                            "true" if "arbitrary" in mask else "false",
+                            str(ARBITRARY_NFUNC) if "arbitrary" in mask else "0",
+                            bwd_deterministic,
+                        )
                     )
-                )
             sources_bwd_sm80.append(file_name)
 
     return sources_fwd_sm80 + sources_bwd_sm80
@@ -252,6 +266,7 @@ if not SKIP_CUDA_BUILD:
     feature_args = (
         []
         + (["-DHSTU_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
+        + (["-DHSTU_DISABLE_DETERMINISTIC"] if DISABLE_DETERMINISTIC else [])
         + (["-DHSTU_DISABLE_BF16"] if DISABLE_BF16 else [])
         + (["-DHSTU_DISABLE_FP16"] if DISABLE_FP16 else [])
         + (["-DHSTU_DISABLE_HDIM32"] if DISABLE_HDIM32 else [])
@@ -262,7 +277,8 @@ if not SKIP_CUDA_BUILD:
         + (["-DHSTU_DISABLE_CAUSAL"] if DISABLE_CAUSAL else [])
         + (["-DHSTU_DISABLE_CONTEXT"] if DISABLE_CONTEXT else [])
         + (["-DHSTU_DISABLE_TARGET"] if DISABLE_TARGET else [])
-        + (["-DHSTU_DISABLE_DELTA_Q"] if DISABLE_DELTA_Q else [])
+        + (["-DHSTU_DISABLE_ARBITRARY"] if DISABLE_ARBITRARY else [])
+        + (["-DHSTU_ARBITRARY_NFUNC=" + str(ARBITRARY_NFUNC)])
         + (["-DHSTU_DISABLE_RAB"] if DISABLE_RAB else [])
         + (["-DHSTU_DISABLE_DRAB"] if DISABLE_DRAB else [])
         + (["-DHSTU_DISABLE_86OR89"] if DISABLE_86OR89 else [])
@@ -278,6 +294,8 @@ if not SKIP_CUDA_BUILD:
         raise ValueError("Cannot support drab without rab")
     if DISABLE_CAUSAL and not DISABLE_TARGET:
         raise ValueError("Cannot support target without causal")
+    if not DISABLE_ARBITRARY and ARBITRARY_NFUNC % 2 == 0:
+        raise ValueError("ARBITRARY_NFUNC must be odd")
 
     torch_cpp_sources = ["csrc/hstu_attn/hstu_api.cpp"]
     cuda_sources = generate_cuda_sources()
@@ -295,7 +313,7 @@ if not SKIP_CUDA_BUILD:
         "--expt-extended-lambda",
         "--use_fast_math",
         # "--ptxas-options=-v",
-        # "-lineinfo",
+        "-lineinfo",
     ]
     include_dirs = [
         Path(this_dir) / "csrc" / "hstu_attn" / "src",

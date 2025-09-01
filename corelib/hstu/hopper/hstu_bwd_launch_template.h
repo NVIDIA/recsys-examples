@@ -41,7 +41,6 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
   using Element = typename Kernel_traits::Element;
   using ElementAccum = float;
   static constexpr int kBlockM = Kernel_traits::kBlockM;
-  static constexpr bool Is_delta_q = Kernel_traits::Is_delta_q;
   int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * kBlockM, kBlockM);
 
   using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
@@ -62,7 +61,7 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
           params.q_row_stride, params.q_head_stride
       ),  // layout_Q
       static_cast<Element const*>(params.rab_ptr),
-      make_layout(make_shape(Is_delta_q ? params.seqlen_k : params.seqlen_q, params.seqlen_k, params.h_rab, params.b),
+      make_layout(make_shape(params.seqlen_k, params.seqlen_k, params.h_rab, params.b),
                   make_stride(params.rab_row_stride, _1{},
                               params.rab_head_stride,
                               params.rab_batch_stride)), // layout_Rab
@@ -83,8 +82,9 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
       make_layout(make_shape(total_q_padded_rounded, params.d, params.h),
                   make_stride((int64_t)params.d, _1{}, (int64_t)params.d * total_q_padded_rounded)),  // layout_dQaccum
       static_cast<Element*>(params.drab_ptr),
-      make_layout(make_shape(Is_delta_q ? params.seqlen_k : params.seqlen_q, params.seqlen_k, params.h_rab, params.b),
+      make_layout(make_shape(params.seqlen_k, params.seqlen_k, params.h_rab, params.b),
                   make_stride((int64_t)params.drab_row_stride, _1{}, (int64_t)params.drab_head_stride, (int64_t)params.drab_batch_stride)),  // layout_dRab
+      static_cast<int const*>(params.func_ptr), params.func_ids_stride,
       params.b, params.window_size_left, params.window_size_right,
       params.target_group_size, 1.0f / params.target_group_size, params.alpha, params.dq_semaphore
   });
@@ -155,7 +155,7 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
 }
 
 template<int Arch, typename T, int Headdim, bool Has_rab, bool Has_drab, bool Is_local,
-         bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+         bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_bwd_(Hstu_bwd_params &params, cudaStream_t stream) {
   static constexpr auto tile_size = flash::get_tile_size_bwd<Headdim, Has_rab>();
   static constexpr int kBlockM = std::get<0>(tile_size);
@@ -165,13 +165,13 @@ void run_hstu_bwd_(Hstu_bwd_params &params, cudaStream_t stream) {
   // BOOL_SWITCH(params.is_balance_bwd, Is_balance_bwd, [&] {
   static constexpr bool Is_balance_bwd = false;
   if constexpr (Headdim == 32) {
-    run_hstu_bwd<Arch, Hstu_bwd_kernel_traits<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_delta_q, Is_local, Has_rab, Has_drab, false, 1, 2, true, false, false, kNWarpGroups, 1, 2, 1, Is_balance_bwd, T>
+    run_hstu_bwd<Arch, Hstu_bwd_kernel_traits<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, Has_drab, false, 1, 2, true, false, false, kNWarpGroups, 1, 2, 1, Is_balance_bwd, T>
                   >(params, stream);
   } else if constexpr (Headdim == 64) {
-    run_hstu_bwd<Arch, Hstu_bwd_kernel_traits<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_delta_q, Is_local, Has_rab, Has_drab, false, 1, 2, true, false, true, kNWarpGroups, 1, 2, 2, Is_balance_bwd, T>
+    run_hstu_bwd<Arch, Hstu_bwd_kernel_traits<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, Has_drab, false, 1, 2, true, false, true, kNWarpGroups, 1, 2, 2, Is_balance_bwd, T>
                   >(params, stream);
   } else {
-    run_hstu_bwd<Arch, Hstu_bwd_kernel_traits<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_delta_q, Is_local, Has_rab, Has_drab, false, 1, 2, false, true, true, kNWarpGroups, 1, 1, 1, Is_balance_bwd, T>
+    run_hstu_bwd<Arch, Hstu_bwd_kernel_traits<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, Has_drab, false, 1, 2, false, true, true, kNWarpGroups, 1, 1, 1, Is_balance_bwd, T>
                   >(params, stream);
   }
   // });

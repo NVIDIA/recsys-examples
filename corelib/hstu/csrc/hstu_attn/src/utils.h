@@ -128,6 +128,45 @@ inline __device__ void dsilu_bwd(Tensor0& dy, Tensor1& x) {
     dy(i) = static_cast<ValT>(dsilu_out);
   }
 }
+
+template<typename T>
+struct MaxOp {
+  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
+    return max(a, b);
+  }
+};
+
+template<typename T>
+struct MinOp {
+  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
+    return min(a, b);
+  }
+};
+
+template<typename T, typename Op>
+__inline__ __device__ void warpReduce(T& val, Op op) {
+  #pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    val = op(val, __shfl_xor_sync(0xffffffff, val, mask, 32));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Engine, typename Layout, typename EngineOut>
+CUTLASS_DEVICE void convert_type_safe(Tensor<Engine, Layout> const &tensor, Tensor<EngineOut, Layout> &out) {
+    // Somehow if we allocate out inside this function and return it, e2e is slower and the output can be wrong.
+    using From_type = typename Engine::value_type;
+    using To_type = typename EngineOut::value_type;
+    static constexpr int FragmentSize = std::max(sizeof(From_type) / sizeof(To_type), sizeof(To_type) / sizeof(From_type));
+    static_assert(CUTE_STATIC_V(size(tensor)) % FragmentSize == 0, "Fragment size does not vectorize properly");
+    Tensor frag = recast<cutlass::Array<From_type, FragmentSize> const>(tensor);
+    Tensor out_frg = recast<cutlass::Array<To_type, FragmentSize>>(out);
+    static_assert(size(frag) == size(out_frg));
+    cutlass::NumericArrayConverter<To_type, From_type, FragmentSize> convert_op;
+    #pragma unroll
+    for (int i = 0; i < size(frag); ++i) { out_frg[i] = convert_op(frag[i]); }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <bool A_in_regs = false,
@@ -234,22 +273,6 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
   }
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename Engine, typename Layout, typename EngineOut>
-CUTLASS_DEVICE void convert_type_safe(Tensor<Engine, Layout> const &tensor, Tensor<EngineOut, Layout> &out) {
-    // Somehow if we allocate out inside this function and return it, e2e is slower and the output can be wrong.
-    using From_type = typename Engine::value_type;
-    using To_type = typename EngineOut::value_type;
-    static constexpr int FragmentSize = std::max(sizeof(From_type) / sizeof(To_type), sizeof(To_type) / sizeof(From_type));
-    static_assert(CUTE_STATIC_V(size(tensor)) % FragmentSize == 0, "Fragment size does not vectorize properly");
-    Tensor frag = recast<cutlass::Array<From_type, FragmentSize> const>(tensor);
-    Tensor out_frg = recast<cutlass::Array<To_type, FragmentSize>>(out);
-    static_assert(size(frag) == size(out_frg));
-    cutlass::NumericArrayConverter<To_type, From_type, FragmentSize> convert_op;
-    #pragma unroll
-    for (int i = 0; i < size(frag); ++i) { out_frg[i] = convert_op(frag[i]); }
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -315,7 +338,7 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
       if constexpr (kHeadDim <= 64) {
         return {128, 96, 4};
       } else if constexpr (kHeadDim <= 128) {
-        return {128, 64, 4};
+        return {128, 96, 8};
       } else {
         return {128, 96, 8};
       }
@@ -341,7 +364,7 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
 template <int kHeadDim, bool Has_rab>
 constexpr std::tuple<int, int, int> get_tile_size_bwd() {
   if constexpr (kHeadDim <= 128) {
-    return {128, 64, 8};
+    return {64, 128, 8};
   } else {
     return {64, 64, 8};
   }

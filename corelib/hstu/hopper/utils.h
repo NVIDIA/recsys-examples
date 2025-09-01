@@ -128,6 +128,27 @@ CUTLASS_DEVICE void dsilu_bwd(Tensor0& dy, Tensor1& x) {
   }
 }
 
+template<typename T>
+struct MaxOp {
+  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
+    return max(a, b);
+  }
+};
+
+template<typename T>
+struct MinOp {
+  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
+    return min(a, b);
+  }
+};
+
+template<typename T, typename Op>
+__inline__ __device__ void warpReduce(T& val, Op op) {
+  #pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    val = op(val, __shfl_xor_sync(0xffffffff, val, mask, 32));
+}
+// 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // For SM90, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))

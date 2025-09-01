@@ -54,17 +54,16 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
 
   // Shared memory.
   extern __shared__ char smem_[];
-
   // The thread index.
   const int tidx = threadIdx.x;
   constexpr bool Is_causal = Kernel_traits::Is_causal;
   constexpr bool Is_target = Kernel_traits::Is_target;
   constexpr bool Is_context = Kernel_traits::Is_context;
-
-  constexpr bool Is_even_rab = Kernel_traits::Is_even_rab;
+  constexpr bool Is_arbitrary = Kernel_traits::Is_arbitrary;
+  constexpr int  kNFunc = Kernel_traits::kNFunc;
   constexpr bool Is_local = Kernel_traits::Is_local;
-  constexpr bool Has_rab = Kernel_traits::Has_rab;
 
+  constexpr bool Has_rab = Kernel_traits::Has_rab;
   constexpr bool Paged_KV = Kernel_traits::Paged_KV;
 
   constexpr int kBlockM = Kernel_traits::kBlockM;
@@ -76,6 +75,13 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
   if (m_block * kBlockM >= binfo.actual_seqlen_q) {
     return;
   }
+
+  char *smem_q       = reinterpret_cast<char*>(smem_);
+  char *smem_func    = reinterpret_cast<char*>(smem_) + Kernel_traits::kSmemSizeQKVRabValidBlockIds;
+
+  int *sn_valid_block_max = reinterpret_cast<int*>(smem_func);
+  int *sf_min = reinterpret_cast<int*>(sn_valid_block_max) + 1;
+  int *sf_max = reinterpret_cast<int*>(sf_min) + (kNFunc/2 + 1);
 
   const int actual_seqlen_q = binfo.actual_seqlen_q;
   const int actual_seqlen_k = binfo.actual_seqlen_k;
@@ -99,7 +105,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
   const int last_page_offset = is_in_paged_target ? kBlockN - last_page_seqlen : 0;
 
   const int n_block_history = cute::ceil_div(actual_seqlen_h, kBlockN);
-  const int target_index = (m_block * kBlockM - actual_seqlen_h) * params.target_group_size_inv;
+  const int target_index = (m_block * kBlockM - actual_seqlen_h) / params.target_group_size;
   const int n_block_paged = Paged_KV ? n_block_history : 0;
   const int n_block_target = cute::ceil_div(actual_seqlen_t, kBlockN);
 
@@ -130,32 +136,20 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
   }
   const int n_masking_steps = (!Is_causal || is_in_context) ? 0 : n_masking_block_max - n_masking_block_min;
 
-  // We exit early and write 0 to gO. This also covers the case where
-  // actual_seqlen_k == 0. Otherwise we might read OOB elements from gK and gV.
-  if ((Is_causal || Is_local) && n_block_max <= n_block_min) {
-    Tensor mO = make_tensor(
-        make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) +
-                      binfo.q_offset(params.o_row_stride)),
-        make_shape(actual_seqlen_q, params.h, params.d),
-        make_stride(params.o_row_stride, params.o_head_stride, _1{}));
-    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                          make_coord(m_block, 0));
+  // arbitrary func
+  Tensor mMaxFunc = make_tensor(make_gmem_ptr(reinterpret_cast<int*>(params.func_ptr) + binfo.sum_s_q),
+        make_shape(/*params.h*/Int<1>{}, Int<kNFunc/2 + 1>{}, actual_seqlen_q),
+        make_stride(params.func_head_stride, 2 * params.func_ids_stride, _1{}));
+  Tensor mMinFunc = make_tensor(make_gmem_ptr(reinterpret_cast<int*>(params.func_ptr) + binfo.sum_s_q + params.func_ids_stride),
+      make_shape(/*params.h*/Int<1>{}, Int<kNFunc/2>{}, actual_seqlen_q),
+      make_stride(params.func_head_stride, 2 * params.func_ids_stride, _1{}));
 
-    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
-    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
-    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-    Tensor tOrO = make_tensor<Element>(shape(tOgO));
-    clear(tOrO);
-    // Construct identity layout for sO
-    Tensor cO = make_identity_tensor(make_shape(
-        size<0>(gO), size<1>(gO)));
-    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-    // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_O, tOrO, tOgO, tOcO, actual_seqlen_q - m_block * kBlockM);
-    return;
-  }
+  Tensor gMaxFunc = local_tile(mMaxFunc(Int<0>{}, _, _),
+                             make_shape(Int<kNFunc/2 + 1>{}, Int<kBlockM>{}),
+                             make_coord(Int<0>{}, m_block));
+  Tensor gMinFunc = local_tile(mMinFunc(Int<0>{}, _, _),
+                             make_shape(Int<kNFunc/2>{}, Int<kBlockM>{}),
+                             make_coord(Int<0>{}, m_block));
 
   // We iterate over the blocks in reverse order.
   Tensor mQ =
@@ -165,6 +159,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
                   make_stride(params.q_row_stride, params.q_head_stride, _1{}));
   Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                         make_coord(m_block, 0));
+
   Tensor mK =
       make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr) +
                                 (Paged_KV ? binfo.kv_cache_offset(params.k_row_stride) : binfo.k_offset(params.k_row_stride))),
@@ -204,7 +199,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
                         make_shape(Int<kBlockM>{}, Int<kBlockN>{}),
                         make_coord(m_block, _));
 
-  Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_)),
+  Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_q)),
                           typename Kernel_traits::SmemLayoutQ{});
   // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
   Tensor sK =
@@ -218,6 +213,111 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
       sV.data(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
   Tensor sRab = make_tensor(sV.data() + size(sV),
                             typename Kernel_traits::SmemLayoutRab{});
+
+  Tensor sValidBlockIds = make_tensor(make_smem_ptr(reinterpret_cast<int*>(smem_ + Kernel_traits::kSmemSizeQKVRab)), typename Kernel_traits::SmemLayoutValidBlockIds{});
+  Tensor sFunc_min      = make_tensor(make_smem_ptr(reinterpret_cast<int*>(sf_min)), typename Kernel_traits::SmemLayoutMinFunc{});
+  Tensor sFunc_max      = make_tensor(make_smem_ptr(reinterpret_cast<int*>(sf_max)), typename Kernel_traits::SmemLayoutMaxFunc{});
+
+
+  if constexpr (Is_arbitrary) {
+    const int lane_id = cutlass::canonical_lane_idx();
+    const int warp_id = cutlass::canonical_warp_idx_sync();
+    // only 1 warp
+    if (warp_id == 0)  {
+      // init smme
+      *sn_valid_block_max = 0;
+      sFunc_min[0] = 0;
+      __syncwarp();
+
+      int f_min = INT_MAX;
+      int f_max = INT_MIN;
+
+      const int base_row = m_block * kBlockM;
+      for (int i = 0; i < size<0>(gMinFunc); i++) {
+        for (int j = lane_id; j < size<1>(gMinFunc); j+=32) {
+          const int row = base_row + j;
+          if (row < actual_seqlen_q) {
+            if (f_min > gMinFunc(i, j)) {
+              f_min = gMinFunc(i, j);
+            }
+          }
+        }
+        warpReduce(f_min, MinOp<int>());
+
+        if (lane_id == 0) {
+          sFunc_min[i+1] = f_min;
+        }
+        f_min = INT_MAX;
+      }
+      for (int i = 0; i < size<0>(gMaxFunc); i++) {
+        for (int j = lane_id; j < size<1>(gMaxFunc); j+=32) {
+          const int row = base_row + j;
+          if (row < actual_seqlen_q) {
+            if (f_max < gMaxFunc(i, j)) {
+              f_max = gMaxFunc(i, j);
+            }
+          }
+        }
+        // warpReduceMax(f_max);
+        warpReduce(f_max, MaxOp<int>());
+        if (lane_id == 0) {
+          sFunc_max[i] = f_max;
+        }
+        f_max = INT_MIN;
+      }
+      if (lane_id == 0) {
+        for (int n_block = n_block_min; n_block < n_block_max; n_block++) {
+          int b_max = (n_block + 1) * kBlockN;
+          int b_min = n_block * kBlockN;
+          for (int i = 0; i < (kNFunc + 1)/2; i++) {
+            int f_min = sFunc_min[i];
+            int f_max = sFunc_max[i];
+            if (f_max <= f_min) { continue; }
+
+            bool case1 = (f_min <= b_min && f_max > b_min);
+            bool case2 = (f_min >= b_min && b_max > f_min);
+            bool case3 = (f_min >= b_min && f_max < b_max);
+
+            if (case1 || case2 || case3) {
+              sValidBlockIds[*sn_valid_block_max] = n_block;
+              (*sn_valid_block_max)++;
+              break;
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+    n_block_max = *sn_valid_block_max;
+    n_block_min = 0;
+  }
+
+  // We exit early and write 0 to gO. This also covers the case where
+  // actual_seqlen_k == 0. Otherwise we might read OOB elements from gK and gV.
+  if ((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) {
+    Tensor mO = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) +
+                      binfo.q_offset(params.o_row_stride)),
+        make_shape(actual_seqlen_q, params.h, params.d),
+        make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                          make_coord(m_block, 0));
+
+    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    clear(tOrO);
+    // Construct identity layout for sO
+    Tensor cO = make_identity_tensor(make_shape(
+        size<0>(gO), size<1>(gO)));
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+    // Clear_OOB_K must be false since we don't want to write zeros to gmem
+    flash::copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, actual_seqlen_q - m_block * kBlockM);
+    return;
+  }
 
   typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
   typename Kernel_traits::GmemTiledCopyRab gmem_tiled_copy_Rab;
@@ -286,7 +386,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
       if (get<0>(tQcRab(0, m, 0)) < (actual_seqlen_q - m_block * kBlockM)) {
         #pragma unroll
         for (int k = 0; k < size<2>(ctQgRab_view); ++k) {
-          if (Is_even_rab || get<1>(tQcRab(0, m, k)) < (actual_seqlen_k - n_block_id * kBlockN)) {
+          if (get<1>(tQcRab(0, m, k)) < (actual_seqlen_k - n_block_id * kBlockN)) {
             cute::copy(gmem_tiled_copy_Rab, ctQgRab_view(_, m, k), tQsRab(_, m, k, buffer_stage));
           }
         }
@@ -300,7 +400,7 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     for (int m = 0; m < size<1>(ctQgRab_view); ++m) {
       #pragma unroll
       for (int k = 0; k < size<2>(ctQgRab_view); ++k) {
-        if (Is_even_rab || get<0>(tQcRab(0, m, k)) < (actual_seqlen_q - m_block * kBlockM)) {
+        if (get<0>(tQcRab(0, m, k)) < (actual_seqlen_q - m_block * kBlockM)) {
           cute::copy(gmem_tiled_copy_Rab, ctQgRab_view(_, m, k), tQsRab(_, m, k, buffer_stage));
         }
       }
@@ -308,7 +408,8 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
   };
 
   // Prologue
-  int n_block = n_block_max - 1;
+  int n_valid_block_max = Is_arbitrary ? *sn_valid_block_max - 1 : 0;
+  int n_block = !Is_arbitrary ? n_block_max - 1 : sValidBlockIds[n_valid_block_max];
   int buffer_stage = 0;
 
   if constexpr (Has_rab) {
@@ -369,52 +470,99 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     );
   };
 
-  auto apply_mask = [&](auto& tensor, int n_block) {
+  auto apply_mask = [&](auto& tSrS, int n_block) {
     static constexpr int Row = 0, Col = 1;
     Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
     Tensor tScS = thr_mma.partition_C(cS);
     const int base_row = m_block * kBlockM + actual_seqlen_offset;
     const int base_col = n_block * kBlockN;
+
+    Tensor tSrS_view = make_tensor(tSrS.data(), group<1, 3>(group<0, 2>(select<1, 2, 0, 3>(flatten(tSrS.layout())))));
+    Tensor tScS_view = make_tensor(tScS.data(), group<1, 3>(group<0, 2>(select<1, 2, 0, 3>(flatten(tScS.layout())))));
+
     #pragma unroll
-    for (int i = 0; i < size(tensor); ++i) {
-      int row = int(get<Row>(tScS(i))) + base_row;
-      int col = int(get<Col>(tScS(i))) + base_col;
-      if (Paged_KV && row >= actual_seqlen_h) {
-        col -= last_page_offset;
-      }
-      if constexpr (!Is_causal && !Is_local) {
-        if (col >= actual_seqlen_k) {
-          tensor(i) = -INFINITY;
-        }
-      } else {
-        if constexpr (Is_context) {
-          if (row < actual_seqlen_c && col < actual_seqlen_h) {
-            continue;
+    for (int mma_row = 0; mma_row < size<0>(tSrS_view); mma_row++) {
+      const int block_row = int(get<Row>(tScS_view(mma_row, 0)));
+      const int row = block_row + base_row;
+
+      [[maybe_unused]] const int target_index = Is_target ? (row - actual_seqlen_h) / params.target_group_size : 0;
+      [[maybe_unused]] const int target_col_limit_left = Is_target ? actual_seqlen_h + target_index * params.target_group_size : 0;
+
+      Tensor col_min = make_tensor<int>(make_shape(size<0>(gMinFunc)));
+      Tensor col_max = make_tensor<int>(make_shape(size<0>(gMaxFunc)));
+      if constexpr (Is_arbitrary) {
+        // Below if code introduces BRA. For the forward pass, we don't need to apply a mask in the seq_q direction.
+        // The reason for adding the 'if' statement was to guard against gMin and gMax going out of bounds.
+        // However, our design ensures that the lengths of the gMin and gMax sequences are both max_seq_q, so there's no need to worry about this issue.
+        /*if (row >= actual_seqlen_q) {
+          #pragma unroll
+          for (int mma_col = 0; mma_col < size<1>(tSrS_view); mma_col++) {
+            tSrS_view(mma_row, mma_col) = -INFINITY;
           }
-        }
-        // causal mask
-        if (col >= col_limit_right(row)) {
-          tensor(i) = -INFINITY;
           continue;
-        }
-        if constexpr (Is_local) {
-          if (col < col_limit_left(row)) {
-            tensor(i) = -INFINITY;
-            continue;
-          }
-        }
-        if constexpr (Is_target) {
-          int target_index = (row - actual_seqlen_h) * params.target_group_size_inv;
-          int target_col_limit_left = actual_seqlen_h + target_index * params.target_group_size;
-          if (row >= actual_seqlen_h && (col + (Paged_KV ? last_page_offset : 0)) >= actual_seqlen_h && col < target_col_limit_left) {
-            tensor(i) = -INFINITY;
-          }
+        }*/
+        col_max(0) = gMaxFunc(0, block_row);
+        #pragma unroll
+        for (int j = 0; j < size<0>(gMinFunc); ++j) {
+          col_min(j)   = gMinFunc(j, block_row);
+          col_max(j+1) = gMaxFunc(j+1, block_row);
         }
       }
-    }
+
+      #pragma unroll
+      for (int mma_col = 0; mma_col < size<1>(tSrS_view); mma_col++) {
+        const int block_col = int(get<Col>(tScS_view(mma_row, mma_col)));
+        int col = block_col + base_col;
+        if (Paged_KV && row >= actual_seqlen_h) {
+          col -= last_page_offset;
+        }
+        if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
+          if (col >= actual_seqlen_k) {
+            tSrS_view(mma_row, mma_col) = -INFINITY;
+            continue;
+          }
+        } else {
+          if constexpr (Is_context) {
+            if (row < actual_seqlen_c && col < actual_seqlen_h) {
+                continue;
+            }
+          }
+          // causal mask
+          if (col >= col_limit_right(row)) {
+              tSrS_view(mma_row, mma_col) = -INFINITY;
+              continue;
+          }
+          if constexpr (Is_local) {
+            if (col < col_limit_left(row)) {
+              tSrS_view(mma_row, mma_col) = -INFINITY;
+              continue;
+            }
+          }
+          if constexpr (Is_target) {
+            if (row >= actual_seqlen_h && (col + (Paged_KV ? last_page_offset : 0)) >= actual_seqlen_h && col < target_col_limit_left) {
+              tSrS_view(mma_row, mma_col) = -INFINITY;
+            }
+          }
+        }
+        if constexpr (Is_arbitrary) {
+          bool non_mask = false;
+          non_mask = (/*col_min=*/0 <= col) && (col < col_max(0));
+          if (non_mask) continue;
+          #pragma unroll
+          for (int j = 0; j < size<0>(gMinFunc); ++j) {
+            non_mask = (col_min(j) <= col) && (col < col_max(j+1));
+            if (non_mask) break;
+          }
+          if (!non_mask) {
+            tSrS_view(mma_row, mma_col) = -INFINITY;
+          }
+        }
+      } // col loop
+    } // row loop
   };
 
-  for (int masking_step = 0; n_block >= n_block_min; ++masking_step, --n_block) {
+  auto fwd_step = [&](int n_valid_block, int masking_step) {
+    int n_block = !Is_arbitrary ? n_valid_block : sValidBlockIds[n_valid_block];
     // When jumps occur, it is necessary to apply a mask for the mixed situation
     const bool is_masking = masking_step < n_masking_steps || (n_block + 1) * kBlockN > actual_seqlen_h;
     Tensor acc_s = partition_fragment_C(
@@ -440,18 +588,18 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     cute::cp_async_fence();
 
     // compute q @ k + rab
-    int n_block_prev = n_block;
     if constexpr (Has_rab) {
       Tensor rRab = make_tensor<Element>(
           partition_shape_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}));
       auto tSrRab_view = smem_thr_copy_rab.retile_D(rRab);
       cute::copy(smem_tiled_copy_rab, tSsRab(_, _, _, buffer_stage), tSrRab_view(_, _, _));
       flash::convert_type_safe(rRab, acc_s);
-      if (n_block > n_block_min) {
+      if (n_valid_block > n_block_min) {
+        int n_block_next = !Is_arbitrary ? n_block - 1 : sValidBlockIds[n_valid_block - 1];
         if (is_jump && masking_step == n_masking_steps - 1) {
-          n_block = std::min(n_block, n_block_history);
+          n_block_next = std::min(n_block, n_block_history) - 1;
         }
-        copy_g2s_rab(n_block - 1, buffer_stage);
+        copy_g2s_rab(n_block_next, buffer_stage);
       }
     } else {
       clear(acc_s);
@@ -460,23 +608,23 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
         acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_Q,
         smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
 
-    if (Is_local || is_masking) {
-      apply_mask(acc_s, n_block_prev);
+    if (Is_arbitrary || Is_local || is_masking) {
+      apply_mask(acc_s, n_block);
     }
 
     flash::cp_async_wait<0>();
     __syncthreads();
-    if constexpr (!Has_rab) {
-      if (is_jump && masking_step == n_masking_steps - 1) {
-        n_block = std::min(n_block, n_block_history);
-      }
-    }
-    if (n_block > n_block_min) {
+
+    if (n_valid_block > n_block_min) {
       // async load(next(k))
-      bool is_paged_tile = (n_block - 1 < n_block_paged) && Paged_KV;
+      int n_block_next = !Is_arbitrary ? n_block - 1 : sValidBlockIds[n_valid_block - 1];
+      if (is_jump && masking_step == n_masking_steps - 1) {
+        n_block_next = std::min(n_block, n_block_history) - 1;
+      }
+      bool is_paged_tile = (n_block_next < n_block_paged) && Paged_KV;
       auto tKsK_stage_view_next = tKsK(_, _, _, buffer_stage);
       flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV,
-                                      is_paged_tile ? tKgK_page(_, _, _, params.page_ids[page_offset + n_block - 1]) : tKgK(_, _, _, n_block - 1 - n_block_paged),
+                                      is_paged_tile ? tKgK_page(_, _, _, params.page_ids[page_offset + n_block_next]) : tKgK(_, _, _, n_block_next - n_block_paged),
                                       tKsK_stage_view_next, tKVcKV);
       cute::cp_async_fence();
     }
@@ -498,6 +646,13 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
 
     // compute qk @ v
     flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+  };
+
+  for (int n_block = n_block_max - 1, masking_step = 0; n_block >= n_block_min; ++masking_step, --n_block) {
+    fwd_step(n_block, masking_step);
+    if (is_jump && masking_step == n_masking_steps - 1) {
+      n_block = std::min(n_block, n_block_history);
+    }
   }
 
   // scale acc_o
@@ -575,23 +730,27 @@ template <typename elem_type,
           int kBlockM,
           int kBlockN,
           int kNWarps,
-          bool Is_delta_q,
           bool Is_causal,
           bool Is_target,
           bool Is_context,
           bool Is_local,
+          bool Is_arbitrary,
+          int kNFunc,
           bool Has_rab,
           bool Paged_KV,
           bool Is_balance = false,
-          bool Is_even_rab = true,
           bool Is_Q_in_regs = false,
           bool Share_Q_K_smem = false>
 void run_hstu_fwd_impl(Hstu_fwd_params& params, cudaStream_t stream) {
   using Kernel_traits = Hstu_fwd_kernel_traits<
-      kHeadDim, kBlockM, kBlockN, kNWarps, Is_delta_q, Is_causal, Is_target, Is_context, Is_local,
-      Has_rab, Paged_KV, Is_balance, Is_even_rab, Is_Q_in_regs, Share_Q_K_smem, elem_type>;
+      kHeadDim, kBlockM, kBlockN, kNWarps, Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc,
+      Has_rab, Paged_KV, Is_balance, Is_Q_in_regs, Share_Q_K_smem, elem_type>;
 
-  constexpr size_t smem_size = Kernel_traits::kSmemSize;
+  size_t smem_size = Kernel_traits::kSmemSize;
+  #if DDEBUG
+    printf("smem_size: %zu\n", smem_size);
+    printf("((1 + (kNFunc + 1)/2*2) * sizeof(int) + 127) & ~127: %zu\n", (((1 + (kNFunc + 1)/2*2) * sizeof(int) + 127) & ~127));
+  #endif
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
   dim3 grid;
   if constexpr (Is_balance) {
@@ -601,7 +760,7 @@ void run_hstu_fwd_impl(Hstu_fwd_params& params, cudaStream_t stream) {
   }
   auto kernel = &flash::hstu_fwd_kernel<Kernel_traits, Hstu_fwd_params>;
 
-  if constexpr (smem_size >= 48 * 1024) {
+  if (smem_size >= 48 * 1024) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   }
@@ -611,7 +770,7 @@ void run_hstu_fwd_impl(Hstu_fwd_params& params, cudaStream_t stream) {
 }
 
 template <int Arch, typename elem_type, int kHeadDim, bool Has_rab, bool Is_local,
-          bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+          bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_fwd_(Hstu_fwd_params& params, cudaStream_t stream) {
   // BOOL_SWITCH(params.is_balance_fwd, Is_balance, [&] {
   static constexpr bool Is_balance = false;
@@ -623,11 +782,8 @@ void run_hstu_fwd_(Hstu_fwd_params& params, cudaStream_t stream) {
     static constexpr int kNWarps = std::get<2>(tile_size);
     static constexpr bool Is_Q_in_regs = kHeadDim <= 128;
     static constexpr bool Share_Q_K_smem = kHeadDim <= 128;
-    const bool even_rab = params.seqlen_q % kBlockM == 0 && params.seqlen_k % kBlockN == 0;
-    BOOL_SWITCH(even_rab, Is_even_rab, [&] {
-      run_hstu_fwd_impl<elem_type, kHeadDim, kBlockM, kBlockN, kNWarps, Is_delta_q, Is_causal, Is_target, Is_context, Is_local,
-                        Has_rab, Paged_KV, Is_balance, Is_even_rab, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
-    });
+      run_hstu_fwd_impl<elem_type, kHeadDim, kBlockM, kBlockN, kNWarps, Is_causal, Is_target, Is_context, Is_local, Is_arbitrary, kNFunc,
+                    Has_rab, Paged_KV, Is_balance, Is_Q_in_regs, Share_Q_K_smem>(params, stream);
   });
   // });
 }

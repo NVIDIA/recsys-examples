@@ -42,7 +42,7 @@ def _hstu_attn_varlen_forward(
     window_size=(-1, -1),
     alpha=1.0,
     rab=None,
-    is_delta_q=False,
+    func=None,
     descale_q=None,
     descale_k=None,
     descale_v=None,
@@ -66,7 +66,7 @@ def _hstu_attn_varlen_forward(
         window_size[1],
         alpha,
         rab,
-        is_delta_q,
+        func,
         descale_q,
         descale_k,
         descale_v,
@@ -93,7 +93,7 @@ def _hstu_attn_varlen_backward(
     alpha=1.0,
     rab=None,
     has_drab=False,
-    is_delta_q=False,
+    func=None,
     descale_q=None,
     descale_k=None,
     descale_v=None,
@@ -127,7 +127,7 @@ def _hstu_attn_varlen_backward(
         alpha,
         rab,
         has_drab,
-        is_delta_q,
+        func,
         # descale_q,
         # descale_k,
         # descale_v,
@@ -155,7 +155,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
         alpha=1.0,
         rab=None,
         has_drab=False,
-        is_delta_q=False,
+        func=None,
         descale_q=None,
         descale_k=None,
         descale_v=None,
@@ -176,7 +176,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
                 window_size,
                 alpha,
                 rab,
-                is_delta_q,
+                func,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -194,7 +194,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
         ctx.descale_do = descale_do
         ctx.has_drab = has_drab
         ctx.alpha = alpha
-        ctx.is_delta_q = is_delta_q
+        ctx.func = func
         return out
 
     @staticmethod
@@ -229,7 +229,7 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
                 ctx.alpha,
                 rab,
                 ctx.has_drab,
-                ctx.is_delta_q,
+                ctx.func,
                 ctx.descale_q,
                 ctx.descale_k,
                 ctx.descale_v,
@@ -278,7 +278,7 @@ def hstu_attn_varlen_func(
     alpha=1.0,
     rab=None,
     has_drab=False,
-    is_delta_q=False,
+    func=None,
     descale_q=None,
     descale_k=None,
     descale_v=None,
@@ -302,7 +302,7 @@ def hstu_attn_varlen_func(
         alpha: float. Scaling factor between add rab and silu.
         rab: (batch_size, max_seqlen_k, max_seqlen_k). Random access bias for the key.
         has_drab: bool. Whether to apply random access bias for the key.
-        is_delta_q: bool. Whether to apply delta query.
+        func: (nheads, total_q + 256). Function for describe the mask shape.
         descale_q: (1,). Descaling factor for the query.
         descale_k: (1,). Descaling factor for the key.
         descale_v: (1,). Descaling factor for the value.
@@ -322,19 +322,9 @@ def hstu_attn_varlen_func(
         raise ValueError(
             "AssertError: target is True and causal is not True, this is undefined behavior"
         )
-    if (num_contexts != None and is_delta_q is True) or (
-        num_targets != None and is_delta_q is True
-    ):
-        raise ValueError(
-            "AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior"
-        )
     if num_targets is None and target_group_size < 1:
         raise ValueError(
             "AssertError: target_group_size should be greater than 0 when target is True"
-        )
-    if max_seqlen_q < max_seqlen_k and window_size != (-1, -1) and is_delta_q is False:
-        raise ValueError(
-            "AssertError: seq_len_q < seq_len_k, is_delta_q should be True, as is_delta_q represents mask behavior under the case"
         )
     if max_seqlen_q > max_seqlen_k:
         raise ValueError(
@@ -356,7 +346,7 @@ def hstu_attn_varlen_func(
         alpha,
         rab,
         has_drab,
-        is_delta_q,
+        func,
         descale_q,
         descale_k,
         descale_v,
@@ -380,7 +370,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         alpha=1.0,
         rab=None,
         has_drab=False,
-        is_delta_q=False,
+        func=None,
         descale_q=None,
         descale_k=None,
         descale_v=None,
@@ -404,7 +394,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 window_size,
                 alpha,
                 rab,
-                is_delta_q,
+                func,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -422,7 +412,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         ctx.descale_do = descale_do
         ctx.has_drab = has_drab
         ctx.alpha = alpha
-        ctx.is_delta_q = is_delta_q
+        ctx.func = func
         return out
 
     @staticmethod
@@ -459,7 +449,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 ctx.alpha,
                 rab,
                 ctx.has_drab,
-                ctx.is_delta_q,
+                ctx.func,
                 ctx.descale_q,
                 ctx.descale_k,
                 ctx.descale_v,
@@ -501,7 +491,7 @@ def hstu_attn_qkvpacked_func(
     alpha=1.0,
     rab=None,
     has_drab=False,
-    is_delta_q=False,
+    func=None,
     descale_q=None,
     descale_k=None,
     descale_v=None,
@@ -523,7 +513,7 @@ def hstu_attn_qkvpacked_func(
         alpha: float. Scaling factor between add rab and silu.
         rab: (batch_size, max_seqlen_k, max_seqlen_k). Random access bias for the key.
         has_drab: bool. Whether to apply random access bias for the key.
-        is_delta_q: bool. Whether to apply delta query.
+        func: (nheads, total_q + 256). Function for describe the mask shape.
         descale_q: (1,). Descaling factor for the query.
         descale_k: (1,). Descaling factor for the key.
         descale_v: (1,). Descaling factor for the value.
@@ -543,19 +533,9 @@ def hstu_attn_qkvpacked_func(
         raise ValueError(
             "AssertError: target is True and causal is not True, this is undefined behavior"
         )
-    if (num_contexts != None and is_delta_q is True) or (
-        num_targets != None and is_delta_q is True
-    ):
-        raise ValueError(
-            "AssertError: delta_q is True, but num_contexts or num_targets is not None, this is undefined behavior"
-        )
     if num_targets is None and target_group_size < 1:
         raise ValueError(
             "AssertError: target_group_size should be greater than 0 when target is True"
-        )
-    if max_seqlen_q < max_seqlen_k and window_size != (-1, -1) and is_delta_q is False:
-        raise ValueError(
-            "AssertError: seq_len_q < seq_len_k, is_delta_q should be True, as is_delta_q represents mask behavior under the case"
         )
     if max_seqlen_q > max_seqlen_k:
         raise ValueError(
@@ -575,7 +555,7 @@ def hstu_attn_qkvpacked_func(
         alpha,
         rab,
         has_drab,
-        is_delta_q,
+        func,
         descale_q,
         descale_k,
         descale_v,

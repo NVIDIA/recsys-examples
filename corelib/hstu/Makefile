@@ -1,15 +1,17 @@
 install:
 	@(\
 		export HSTU_DISABLE_BACKWARD=FALSE; \
+		export HSTU_DISABLE_DETERMINISTIC=TRUE; \
 		export HSTU_DISABLE_LOCAL=FALSE; \
 		export HSTU_DISABLE_CAUSAL=FALSE; \
 		export HSTU_DISABLE_CONTEXT=FALSE; \
 		export HSTU_DISABLE_TARGET=FALSE; \
-		export HSTU_DISABLE_DELTA_Q=FALSE; \
+		export HSTU_DISABLE_ARBITRARY=FALSE; \
+		export HSTU_ARBITRARY_NFUNC=3; \
 		export HSTU_DISABLE_RAB=FALSE; \
 		export HSTU_DISABLE_DRAB=FALSE; \
 		export HSTU_DISABLE_BF16=FALSE; \
-		export HSTU_DISABLE_FP16=FALSE; \
+		export HSTU_DISABLE_FP16=TRUE; \
 		export HSTU_DISABLE_HDIM32=FALSE; \
 		export HSTU_DISABLE_HDIM64=FALSE; \
 		export HSTU_DISABLE_HDIM128=FALSE; \
@@ -22,6 +24,7 @@ clean:
 	rm -rf build/*
 	rm -rf dist/*
 	rm -rf hstu_attn.egg-info/*
+	rm -rf csrc/hstu_attn/src/generated/flash*
 
 clean_dist:
 	rm -rf dist/*
@@ -42,7 +45,10 @@ vt:
 	pytest -q -s test.py
 
 fm:
-	ncu --set full --import-source yes --nvtx --nvtx-include "triton/" --nvtx-include  "hstu_varlen_fwd_kernel/"  -f -o hstu.%p python3 test.py
+	ncu --set full --clock-control none --import-source yes --nvtx --nvtx-include "triton/" --nvtx-include  "hstu_varlen_fwd_kernel/"  -f -o hstu.%p python3 test.py
 
 bm:
-	ncu --set full --nvtx --nvtx-include "triton/" --nvtx-include "hstu_varlen_fwd_kernel/" --nvtx-include "hstu_varlen_bwd_kernel/"  -f -o hstu.%p python3 test.py
+	ncu --set full --clock-control none --import-source yes --nvtx --nvtx-include "triton/" --nvtx-include "hstu_varlen_bwd_kernel/" -k regex:hstu_bwd_compute_dq_dk_dv_ker  -f -o hstu.%p python3 test.py
+
+am:
+	ncu --set full --clock-control none --import-source yes --nvtx --nvtx-include "triton/" --nvtx-include "hstu_varlen_fwd_kernel/" --nvtx-include "hstu_varlen_bwd_kernel/"  -f -o hstu.%p python3 test.py

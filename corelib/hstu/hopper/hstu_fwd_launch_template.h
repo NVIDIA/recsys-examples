@@ -41,13 +41,12 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
   using OutputType = typename Kernel_traits::OutputType;
   using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
   using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
-  static constexpr bool Is_delta_q = Kernel_traits::Is_delta_q;
 
   using Seqlen_traits = flash::VarSeqLenTraits;
   using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Seqlen_traits>;
   using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
   using Scheduler = std::conditional_t<
-    cutlass::sizeof_bits_v<Element> == 8,
+    cutlass::sizeof_bits_v<Element> == 8 || Kernel_traits::Is_arbitrary,
     flash::SingleTileScheduler<Kernel_traits::Is_balance_fwd>,
     flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup, Kernel_traits::NumProducerThreads>
   >;
@@ -63,7 +62,7 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
               params.q_row_stride, params.q_head_stride
           ),  // layout_Q
           static_cast<OutputType const*>(params.rab_ptr),
-          make_layout(make_shape(Is_delta_q ? params.seqlen_k : params.seqlen_q, params.seqlen_k, params.h_rab, params.b),
+          make_layout(make_shape(params.seqlen_k, params.seqlen_k, params.h_rab, params.b),
                       make_stride(params.rab_row_stride, _1{},
                                   params.rab_head_stride,
                                   params.rab_batch_stride)), // layout_Rab
@@ -77,6 +76,8 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
               params.seqlen_k, params.d, params.h_k, params.b,
               params.v_row_stride, params.v_head_stride
           ),  // layout_V
+          static_cast<int const*>(params.func_ptr),
+          params.func_ids_stride,
           params.descale_q_ptr, params.descale_k_ptr, params.descale_v_ptr,
           params.window_size_left, params.window_size_right,
           params.target_group_size, 1.0f / params.target_group_size, params.alpha
@@ -118,7 +119,7 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
 }
 
 template<int Arch, typename T, int Headdim, bool Has_rab, bool Is_local,
-         bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+         bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_fwd_(Hstu_fwd_params &params, cudaStream_t stream) {
   constexpr static bool Is_fp8 = cutlass::sizeof_bits_v<T> == 8;
   // BOOL_SWITCH(params.is_balance_fwd, Is_balance_fwd, [&] {
@@ -128,11 +129,11 @@ void run_hstu_fwd_(Hstu_fwd_params &params, cudaStream_t stream) {
   static constexpr int kBlockN = std::get<1>(tile_size);
   static constexpr int kNWarps = std::get<2>(tile_size);
   if constexpr (Is_fp8) {
-    run_hstu_fwd<90, Hstu_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, 2, Is_causal, false, false, false, Is_local, Has_rab, 1, Is_balance_fwd>
-                >(params, stream);
+      run_hstu_fwd<90, Hstu_fwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, kNWarps, 2, Is_causal, false, false, Is_local, Is_arbitrary, kNFunc, Has_rab, 1, Is_balance_fwd>
+                  >(params, stream);
   } else {
-    run_hstu_fwd<Arch, Hstu_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, 2, Is_causal, Is_context, Is_target, Is_delta_q, Is_local, Has_rab, 1, Is_balance_fwd, T>
-                >(params, stream);
+      run_hstu_fwd<Arch, Hstu_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, 2, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, 1, Is_balance_fwd, T>
+                  >(params, stream);
   }
-  // });
+//   });
 }

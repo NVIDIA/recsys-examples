@@ -54,30 +54,30 @@ template <
     int kBlockM_,
     int kBlockN_,
     int kNWarps_,
-    bool Is_delta_q_,
     bool Is_causal_,
     bool Is_target_,
     bool Is_context_,
     bool Is_local_,
+    bool Is_arbitrary_,
+    int  kNFunc_,
     bool Has_rab_,
     bool Paged_KV_,
     bool Is_balance_,
-    bool Is_even_rab_,
     bool Is_Q_in_regs_ = false,
     bool Share_Q_K_smem_ = false,
     typename elem_type = cutlass::half_t,
     typename Base =
         Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type>>
 struct Hstu_fwd_kernel_traits : public Base {
-  static constexpr bool Is_delta_q = Is_delta_q_;
   static constexpr bool Is_causal = Is_causal_;
   static constexpr bool Is_target = Is_target_;
   static constexpr bool Is_context = Is_context_;
   static constexpr bool Is_local = Is_local_;
+  static constexpr bool Is_arbitrary = Is_arbitrary_;
+  static constexpr int  kNFunc = Is_arbitrary_ ? kNFunc_ : 0;
   static constexpr bool Has_rab = Has_rab_;
   static constexpr bool Paged_KV = Paged_KV_;
   static constexpr bool Is_balance = Is_balance_;
-  static constexpr bool Is_even_rab = Is_even_rab_;
 
   using Element = typename Base::Element;
   using ElementAccum = typename Base::ElementAccum;
@@ -145,13 +145,22 @@ struct Hstu_fwd_kernel_traits : public Base {
                              Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopy, Element>;
 
+  static constexpr int MaxSeqLenK = 64 * 1024; // 64K
+  static constexpr int MaxValidBlock = MaxSeqLenK / kBlockN; // 4KB
+
+  using SmemLayoutValidBlockIds = Layout<Shape<Int<MaxValidBlock>>, Stride<_1>>; // 0 refer to number of valid blocks
+  using SmemLayoutMaxFunc = Layout<Shape<Int<kNFunc/2 + 1>>, Stride<_1>>;
+  using SmemLayoutMinFunc = Layout<Shape<Int<kNFunc/2 + 1>>, Stride<_1>>;
+
   static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
   static constexpr int kSmemRabSize = Has_rab ? size(SmemLayoutRab{}) * sizeof(Element) : 0;
   static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
   static constexpr int kSmemSizeQKV = Share_Q_K_smem
                                           ? std::max(kSmemQSize, kSmemKVSize)
                                           : kSmemQSize + kSmemKVSize;
-  static constexpr int kSmemSize = kSmemSizeQKV + kSmemRabSize;
+  static constexpr int kSmemSizeQKVRab = kSmemSizeQKV + kSmemRabSize;
+  static constexpr int kSmemSizeQKVRabValidBlockIds = kSmemSizeQKVRab + (Is_arbitrary ? (size(SmemLayoutValidBlockIds{})) * sizeof(int) : 0);
+  static constexpr int kSmemSize = kSmemSizeQKVRabValidBlockIds + (Is_arbitrary ? (size(SmemLayoutMaxFunc{}) + size(SmemLayoutMinFunc{}) + 1) * sizeof(int) : 0);
 
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
   static_assert(kHeadDim % kGmemElemsPerLoad == 0,
@@ -205,13 +214,13 @@ template <
     bool Is_causal_,
     bool Is_target_,
     bool Is_context_,
-    bool Is_delta_q_,
     bool Is_local_,
+    bool Is_arbitrary_,
+    int kNFunc_,
     bool Is_deterministic_,
     bool Has_rab_,
     bool Has_drab_,
     bool Is_balance_,
-    bool Is_even_rab_,
     bool Rab_one_head_,
     int AtomLayoutMSdP_ = 2,
     int AtomLayoutNdKV_ = 4,
@@ -230,14 +239,14 @@ struct Hstu_bwd_kernel_traits : public Base {
   static constexpr bool Is_causal = Is_causal_;
   static constexpr bool Is_target = Is_target_;
   static constexpr bool Is_context = Is_context_;
-  static constexpr bool Is_delta_q = Is_delta_q_;
   static constexpr bool Is_local = Is_local_;
+  static constexpr bool Is_arbitrary = Is_arbitrary_;
+  static constexpr int  kNFunc = Is_arbitrary_ ? kNFunc_ : 0;
   static constexpr bool Is_deterministic = Is_deterministic_;
   static constexpr bool Has_rab = Has_rab_;
   static constexpr bool Paged_KV = false;
   static constexpr bool Has_drab = Has_drab_;
   static constexpr bool Is_balance = Is_balance_;
-  static constexpr bool Is_even_rab = Is_even_rab_;
   static constexpr bool Rab_one_head = Rab_one_head_;
   static constexpr bool Is_V_in_regs = Is_V_in_regs_;
 
@@ -350,6 +359,10 @@ struct Hstu_bwd_kernel_traits : public Base {
       decltype(tile_to_shape(SmemLayoutAtomdQ{},
                              make_shape(Int<kBlockM>{}, Int<kHeadDim>{})));
 
+  static constexpr int MaxSeqLenQ = 64 * 1024; // 64K
+  static constexpr int MaxValidBlock = MaxSeqLenQ / kBlockM; // 4KB
+  using SmemLayoutValidBlockIds = Layout<Shape<Int<MaxValidBlock>>, Stride<_1>>; // 0 refer to number of valid blocks
+
   // Double buffer for sQ
   static constexpr int kSmemdOSize = size(SmemLayoutdO{}) * sizeof(Element);
   static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
@@ -364,7 +377,8 @@ struct Hstu_bwd_kernel_traits : public Base {
       (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + kSmemPSize
            : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize));
-
+  static constexpr int kSmemSize1colblock_validblockids = kSmemSize1colblock + (Is_arbitrary ? (size(SmemLayoutValidBlockIds{})) * sizeof(int) : 0);
+  static constexpr int kSmemSize = kSmemSize1colblock_validblockids + (Is_arbitrary ? 128 : 0); // 128 for sm_valid_block_max, actually sizeof(int) is enough, TODO check sizeof(int)
   ////////////////////////////////////////////////////////////////////////////////////////////////////
 
   using SmemCopyAtomPdS = Copy_Atom<AutoVectorizingCopy, elem_type>;

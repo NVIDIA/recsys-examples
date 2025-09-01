@@ -55,8 +55,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
   static constexpr bool Is_causal = Ktraits::Is_causal;
   static constexpr bool Is_target = Ktraits::Is_target;
   static constexpr bool Is_context = Ktraits::Is_context;
-  static constexpr bool Is_delta_q = Ktraits::Is_delta_q;
   static constexpr bool Is_local = Ktraits::Is_local;
+  static constexpr bool Is_arbitrary = Ktraits::Is_arbitrary;
+  static constexpr int  kNFunc = Ktraits::kNFunc;
+
   static constexpr bool Has_drab = Ktraits::Has_drab;
 
   using CollectiveMainloop = CollectiveMainloopBwd<Ktraits, Seqlen_traits>;
@@ -157,7 +159,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
     const bool is_jump = Is_target && n_block * kBlockN >= actual_seqlen_h;
     const bool is_in_context = Is_context && actual_seqlen_c > 0 && n_block * kBlockN <= actual_seqlen_h;
 
-    const int actual_seqlen_offset = Is_delta_q ? actual_seqlen_k - actual_seqlen_q : 0;
+    const int actual_seqlen_offset = actual_seqlen_k - actual_seqlen_q;
     const int target_index = cute::ceil_div((n_block + 1) * kBlockN - actual_seqlen_h, mainloop_params.target_group_size);
 
     // calculate m_masking_block_min and m_masking_block_max
@@ -189,6 +191,101 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
     return std::make_tuple(m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context);
   };
 
+  auto get_valid_block_ids = [&](int n_block, int &m_block_min, int &m_block_max, auto is_calwarp) {
+    constexpr bool Is_calwarp = decltype(is_calwarp)::value;
+    // arbitrary func
+    if constexpr (!Is_arbitrary) {
+      return;
+    }
+    int *sm_valid_block_max = &shared_storage.sm_valid_block_max;
+    const int actual_seqlen_q = seqlen_traits_q.actual_seq_len;
+    // arbitrary func
+    Tensor mMaxFunc = make_tensor(make_gmem_ptr(mainloop_params.func_ptr + seqlen_traits_q.get_offset()),
+        make_shape(/*params.h*/Int<1>{}, Int<kNFunc/2 + 1>{}, actual_seqlen_q),
+        make_stride(/*mainloop_params.func_head_stride*/Int<0>{}, 2 * mainloop_params.func_ids_stride, _1{}));
+    Tensor mMinFunc = make_tensor(make_gmem_ptr(mainloop_params.func_ptr + seqlen_traits_q.get_offset() + mainloop_params.func_ids_stride),
+        make_shape(/*params.h*/Int<1>{}, Int<kNFunc/2>{}, actual_seqlen_q),
+        make_stride(/*mainloop_params.func_head_stride*/Int<0>{}, 2 * mainloop_params.func_ids_stride, _1{}));
+
+    Tensor gMaxFunc = local_tile(mMaxFunc(Int<0>{}, _, _),
+        make_shape(Int<kNFunc/2 + 1>{}, Int<kBlockM>{}), make_coord(Int<0>{}, _));
+    Tensor gMinFunc = local_tile(mMinFunc(Int<0>{}, _, _),
+        make_shape(Int<kNFunc/2>{}, Int<kBlockM>{}), make_coord(Int<0>{}, _));
+    
+    Tensor sValidBlockIds = make_tensor(make_smem_ptr(reinterpret_cast<int*>(shared_storage.smem_valid_block_ids.data())),  typename Ktraits::SmemLayoutValidBlockIds{});
+
+    const int lane_id = cutlass::canonical_lane_idx();
+    const int warp_id = cutlass::canonical_warp_idx_sync();
+    // only 1 warp
+    if (Is_calwarp && warp_id == 4)  {
+      *sm_valid_block_max = 0;
+      int b_min = n_block * kBlockN;
+      int b_max = (n_block + 1) * kBlockN;
+      #pragma unroll
+      for (int m_block = m_block_min; m_block < m_block_max; ++m_block) {
+        int base_row = m_block * kBlockM;
+        int f_min = 0;
+        int f_max = INT_MIN;
+        for (int j = lane_id; j < size<1>(gMaxFunc); j+=32) {
+          const int row = base_row + j;
+          if (row < actual_seqlen_q) {
+            if (f_max < gMaxFunc(0, j, m_block)) {
+              f_max = gMaxFunc(0, j, m_block);
+            }
+          }
+        }
+        warpReduce(f_max, MaxOp<int>());
+        bool case1 = (f_min <= b_min && f_max > b_min);
+        bool case2 = (f_min >= b_min && b_max > f_min);
+        bool case3 = (f_min >= b_min && f_max < b_max);
+        bool is_valid = __shfl_sync(0xffffffff, (case1 || case2 || case3) && (f_max > f_min), 0);
+
+        if (is_valid) {
+          sValidBlockIds[*sm_valid_block_max] = m_block;
+          if (lane_id == 0) {
+            (*sm_valid_block_max)++;
+          }
+          continue;
+        }
+        
+        #pragma unroll
+        for (int i = 0; i < size<0>(gMinFunc); i++) {
+          f_min = INT_MAX;
+          f_max = INT_MIN;
+          #pragma unroll
+          for (int j = lane_id; j < size<1>(gMinFunc); j+=32) {
+            const int row = base_row + j;
+            if (row < actual_seqlen_q) {
+              if (f_min > gMinFunc(i, j, m_block)) {
+                f_min = gMinFunc(i, j, m_block);
+              }
+              if (f_max < gMaxFunc(i+1, j, m_block)) {
+                f_max = gMaxFunc(i+1, j, m_block);
+              }
+            }
+          }
+          warpReduce(f_min, MinOp<int>());
+          warpReduce(f_max, MaxOp<int>());
+          bool case1 = (f_min <= b_min && f_max > b_min);
+          bool case2 = (f_min >= b_min && b_max > f_min);
+          bool case3 = (f_min >= b_min && f_max < b_max);
+          bool is_valid = __shfl_sync(0xffffffff, (case1 || case2 || case3) && (f_max > f_min), 0);
+          if (is_valid) {
+            sValidBlockIds[*sm_valid_block_max] = m_block;
+            if (lane_id == 0) { 
+              (*sm_valid_block_max)++;
+            }
+            break;
+          }
+        }
+      }
+    }
+    __syncthreads();
+    m_block_max = *sm_valid_block_max;
+    m_block_min = 0;
+  };
+
+
   if (warp_group_idx == 0) {  // Producer
     cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
@@ -205,7 +302,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
         auto [n_block, bidh, bidb] = block_coord;
 
         auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
-
+        get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<false>{});
         if (m_block_min >= m_block_max) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           continue;
@@ -227,7 +324,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
         auto [n_block, bidh, bidb] = block_coord;
 
         auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
-
+        get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<false>{});
         if (m_block_min >= m_block_max) { continue; }
         collective_mainloop.store_dq(mainloop_params, shared_storage, block_coord,
                                       m_block_min, m_block_max, is_in_context, m_block_context, seqlen_traits_q);
@@ -242,7 +339,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
         auto [n_block, bidh, bidb] = block_coord;
 
         auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
-
+        get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<true>{});
         if (m_block_min >= m_block_max) { continue; }
         collective_mainloop.store_drab(mainloop_params, pipeline_drab, smem_pipe_read_dRab, shared_storage, block_coord,
                                       m_block_min, m_block_max, is_in_context, m_block_context, seqlen_traits_q, seqlen_traits_k);
@@ -271,7 +368,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
       auto [n_block, bidh, bidb] = block_coord;
 
       auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
-
+      get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<true>{});
       if (m_block_min >= m_block_max) {  // We exit early and write 0 to dK and dV
         collective_epilogue.store_zero(epilogue_params, threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_k);
         continue;

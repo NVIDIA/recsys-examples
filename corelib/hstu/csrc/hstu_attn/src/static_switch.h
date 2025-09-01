@@ -175,3 +175,13 @@
   }()
 #endif
 #endif
+
+#ifdef HSTU_DISABLE_DETERMINISTIC
+  #define DETERMINISTIC_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;   \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define DETERMINISTIC_SWITCH BOOL_SWITCH
+#endif

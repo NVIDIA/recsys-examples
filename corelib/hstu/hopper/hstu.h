@@ -71,6 +71,12 @@ struct Hstu_fwd_params : public Qkv_params {
     int * __restrict__ num_contexts;
     int * __restrict__ num_targets;
 
+    void* __restrict__ func_ptr;
+    index_t func_head_stride;
+    index_t func_ids_stride;
+    int func_batch;
+    int n_func;
+
     void* __restrict__ rab_ptr;
     index_t rab_batch_stride;
     index_t rab_row_stride;
@@ -88,8 +94,8 @@ struct Hstu_fwd_params : public Qkv_params {
     bool is_causal;
     bool is_local;
     bool is_target;
-    bool is_delta_q;
     bool is_context;
+    bool is_arbitrary_mask;
 
     int * __restrict__ tile_count_semaphore;
     float * __restrict__ descale_q_ptr;
@@ -141,8 +147,8 @@ struct Hstu_bwd_params : public Hstu_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<int Arch, typename T, int Headdim, bool Has_rab, bool Is_local,
-         bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+         bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_fwd_(Hstu_fwd_params &params, cudaStream_t stream);
 template<int Arch, typename T, int Headdim, bool Has_rab, bool Has_drab, bool Is_local,
-         bool Is_causal, bool Is_context, bool Is_target, bool Is_delta_q>
+         bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_bwd_(Hstu_bwd_params &params, cudaStream_t stream);

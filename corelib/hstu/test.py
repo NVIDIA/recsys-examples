@@ -29,6 +29,8 @@ import pytest
 import torch.nn.functional as F
 from einops import rearrange
 
+debug = False
+
 
 def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
     indices = []
@@ -87,20 +89,45 @@ def unpad_input_delta_q(padded_input, cu_seqlen_q, cu_seqlen_k, batch, seqlen):
 
 
 def construct_mask(
+    batch_func,
     seqlen_c,
     seqlen,
     seqlen_t=0,
     target_group_size=1,
     window_size=(-1, -1),  # -1 means infinite window size
-    seq_offsets=None,
+    func=None,
+    seq_offsets_q=None,
+    seq_offsets_k=None,
     num_contexts=None,
-    device=None,
+    device=torch.device("cuda"),
 ):
     seqlen = seqlen_c + seqlen + seqlen_t
-    bs = seq_offsets.size(0) - 1
-
-    mask = torch.zeros((seqlen, seqlen), device=device, dtype=torch.bool)
-    if window_size[0] < 0 and window_size[1] == 0:
+    bs = seq_offsets_k.size(0) - 1
+    if debug:
+        print(func)
+    if func is not None:
+        mask = torch.zeros(
+            (batch_func, seqlen, seqlen), device=device, dtype=torch.bool
+        )
+    else:
+        mask = torch.zeros((seqlen, seqlen), device=device, dtype=torch.bool)
+    mask[:] = False
+    if func is not None:
+        for b in range(batch_func):
+            actual_seqlen_q = (seq_offsets_q[b + 1] - seq_offsets_q[b]).item()
+            actual_seqlen_k = (seq_offsets_k[b + 1] - seq_offsets_k[b]).item()
+            actual_offset = actual_seqlen_k - actual_seqlen_q
+            for i in range(actual_seqlen_q):
+                mask[b, actual_offset + i, 0 : func[b, 0, 0, i]] = True
+            n_pair_fun = func.size(2) // 2
+            for fun_idx in range(1, n_pair_fun + 1):
+                for i in range(actual_seqlen_q):
+                    mask[
+                        b,
+                        actual_offset + i,
+                        func[b, 0, 2 * fun_idx - 1, i] : func[b, 0, 2 * fun_idx, i],
+                    ] = True
+    elif window_size[0] < 0 and window_size[1] == 0:
         # causal mask
         for i in range(seqlen):
             mask[i, : i + 1] = True
@@ -110,7 +137,7 @@ def construct_mask(
             mask = mask.unsqueeze(0).unsqueeze(0).repeat(bs, 1, 1, 1)
             for i in range(bs):
                 target_start = (
-                    num_contexts[i] + seq_offsets[i + 1] - seq_offsets[i]
+                    num_contexts[i] + seq_offsets_k[i + 1] - seq_offsets_k[i]
                 ).item()
                 mask[i, 0, : num_contexts[i], :target_start] = True
 
@@ -123,7 +150,7 @@ def construct_mask(
             )
             for i in range(bs):
                 target_start = (
-                    num_contexts[i] + seq_offsets[i + 1] - seq_offsets[i]
+                    num_contexts[i] + seq_offsets_k[i + 1] - seq_offsets_k[i]
                 ).item()
                 # target group mask
                 if target_group_size > 1:
@@ -156,6 +183,35 @@ def construct_mask(
     return mask
 
 
+def make_heart_func(batch_func: int, L_q: int, L_k: int, device="cuda"):
+    n_func = 3
+    func = torch.zeros((batch_func, 1, n_func, L_q), dtype=torch.int32, device=device)
+
+    x = torch.linspace(-1.3, 1.3, L_k, device=device)
+    y = torch.linspace(-1.3, 1.3, L_q, device=device)
+    X, Y = torch.meshgrid(x, y, indexing="xy")
+    inside = ((X * X + Y * Y - 1) ** 3 - (X * X) * (Y**3)) <= 0
+    inside = inside.T  #
+
+    if inside.size(0) == inside.size(1):
+        inside = torch.rot90(inside, k=-1, dims=(0, 1))
+
+    inside = torch.rot90(inside, k=2, dims=(0, 1))
+
+    for i in range(L_q):
+        row = inside[i]  # (L_k,)
+        idx = torch.nonzero(row, as_tuple=False).flatten()
+        if idx.numel() == 0:
+            continue
+
+        start_col = idx.min().item()
+        end_col_exclusive = idx.max().item() + 1
+        func[:, :, 0, i] = 0
+        func[:, :, 1, i] = start_col
+        func[:, :, 2, i] = end_col_exclusive
+    return func
+
+
 def generate_input(
     batch_size: int,
     heads: int,
@@ -172,6 +228,7 @@ def generate_input(
     full_batch: bool,
     has_drab: bool,
     is_delta_q: bool,
+    is_arbitrary: bool,
 ):
     has_context = max_context_len > 0
     has_target = max_target_len > 0
@@ -335,25 +392,168 @@ def generate_input(
         dtype=dtype_init,
         device=torch.device("cuda"),
     ).uniform_(-1, 1)
+
+    head_func = 1
+    batch_func = batch_size
+    if is_arbitrary:
+        n_func = 3
+        max_seq_split = max_seq_len_k // n_func
+        coef = 0.3
+        func = torch.empty(
+            (batch_func, head_func, n_func, max_seq_len_q),
+            dtype=torch.int32,
+            device=torch.device("cuda"),
+        )
+        for i in range(n_func):
+            func[:, :, i, :] = torch.randint(
+                i * max_seq_split,
+                int((i + coef) * max_seq_split),
+                size=(batch_func, head_func, max_seq_len_q),
+                device=torch.device("cuda"),
+            )
+
+        example = True
+        if example:
+            # emulate casual mask
+            n_func = 1  # export HSTU_ARBITRARY_NFUNC=1;
+            func = torch.empty(
+                (batch_func, head_func, n_func, max_seq_len_q),
+                dtype=torch.int32,
+                device=torch.device("cuda"),
+            )
+            for token_id in range(max_seq_len_k):
+                func[:, :, 0, token_id] = token_id + 1
+
+            # emulate local mask（2, 12）
+            # [1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0]
+            # [1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0]
+            # [1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0]
+            # [0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]
+            # [0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1]
+            # [0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1]
+            # [0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1]
+            # [0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1]
+            # [0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1]
+            # [0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1]
+            # [0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1]
+            # [0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1]
+            # [0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1]
+            # [0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1]
+            # [0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1]
+            # [0 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1]
+            n_func = 3  # export HSTU_ARBITRARY_NFUNC=3;
+            func = torch.empty(
+                (batch_func, head_func, n_func, max_seq_len_q),
+                dtype=torch.int32,
+                device=torch.device("cuda"),
+            )
+            left_window_size = 2
+            right_window_size = 12
+            for token_id in range(max_seq_len_k):
+                func[:, :, 0, token_id] = 0
+                func[:, :, 1, token_id] = max(0, token_id - left_window_size)
+                func[:, :, 2, token_id] = min(
+                    max_seq_len_k, token_id + right_window_size + 1
+                )
+
+            # emulate casual + dynamic + target
+            # [1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+            # [1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+            # [1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0]
+            # [1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0]
+            # [1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0]
+            # [1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0]
+            # [1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0]
+            # [1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0]
+            # [0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0]
+            # [1 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0]
+            # [1 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0]
+            # [1 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0]
+            # [1 1 0 0 0 0 0 0 0 0 0 0 1 0 0 0]
+            # [1 1 1 1 0 0 0 0 0 0 0 0 0 1 0 0]
+            # [0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0]
+            # [1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 1]
+            n_func = 3  # export HSTU_ARBITRARY_NFUNC=3;
+            func = torch.empty(
+                (batch_func, head_func, n_func, max_seq_len_q),
+                dtype=torch.int32,
+                device=torch.device("cuda"),
+            )
+            left_window_size = 2
+            right_window_size = 12
+            casual_len = 8
+
+            for token_id in range(casual_len):
+                func[:, :, 0, token_id] = token_id + 1
+                func[:, :, 1, token_id] = casual_len
+                func[:, :, 2, token_id] = casual_len
+
+            for token_id in range(casual_len, max_seq_len_k):
+                func[:, :, 0, token_id] = torch.randint(
+                    0, casual_len + 1, (1,), device=torch.device("cuda")
+                )
+                func[:, :, 1, token_id] = token_id
+                func[:, :, 2, token_id] = token_id + 1
+
+            # heart example
+            func = make_heart_func(batch_func, L_q, L_k)
+        if example:
+            print("func", func)
+    else:
+        func = None
+        batch_func = 1
+
+    # kernel input is a variable-length function (var_fun). The following is copying the value of a fixed-length function(func) to a variable-length function(var_fun).
+    # the variable-length function (var_func) can also be directly initialized. The initialization of the fixed-length function(func) is just provided as an example.
+
+    # it is especially important to note that we need to do padding for the variable-length function.
+    # +256 is to avoid the boundary problem in kernel, it can reduce BRA instructions, which helps improve kernel performance.
+    # currently, we do not have a broadcasting mechanism, and each batch has its own mask shape.
+    L_func = L_q + 256
+    if is_arbitrary:
+        var_fun = torch.empty(
+            (head_func, n_func, L_func), dtype=torch.int32, device=torch.device("cuda")
+        )
+        for i in range(batch_func):
+            for j in range(head_func):
+                var_fun[j, :, seq_offsets_q_wt[i] : seq_offsets_q_wt[i + 1]] = func[
+                    i, j, :, 0 : seq_offsets_q_wt[i + 1] - seq_offsets_q_wt[i]
+                ]
+    else:
+        var_fun = None
+
+    # TODO: add broadcast mask
+    # # The mask shape will be broadcasted to each batch
+    # if batch_func == 1:
+    #     var_fun = func[0, 0, :, :]
+    # else:
+    #     # different batches use different mask shapes.
+    #     for i in range(batch_func):
+    #         for j in range(head_func):
+    #             var_fun[j, :, seq_offsets_q_wt[i]:seq_offsets_q_wt[i+1]] = func[i, j, :, 0:seq_offsets_q_wt[i+1]-seq_offsets_q_wt[i]]
     if has_drab:
         rab = rab.requires_grad_()
-    if window_size[0] == -1 and window_size[1] == -1:
+    if window_size[0] == -1 and window_size[1] == -1 and func is None:
         attn_mask = None
     else:
         attn_mask = (
             construct_mask(
+                batch_func=batch_func,
                 seqlen_c=max_context_len,
                 seqlen=max_seq_len_k,
                 seqlen_t=max_target_len,
                 target_group_size=target_group_size,
                 window_size=window_size,
+                func=func,
+                seq_offsets_q=seq_offsets_q,
+                seq_offsets_k=seq_offsets_k,
                 num_contexts=num_contexts,
-                seq_offsets=seq_offsets_k,
             )
             .cuda()
             .to(torch.float32)
         )
-
+    if example:
+        print(attn_mask.to(torch.int32).squeeze().cpu().numpy())
     return (
         L_q,
         L_k,
@@ -367,6 +567,7 @@ def generate_input(
         v,
         rab,
         attn_mask,
+        var_fun,
     )
 
 
@@ -432,9 +633,9 @@ def _hstu_attention_maybe_from_cache(
     if invalid_attn_mask is not None:
         if invalid_attn_mask.ndim == 2:
             invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-        masked_qk_attn = (
-            masked_qk_attn * invalid_attn_mask.type(masked_qk_attn.dtype)[:, :, :, :]
-        )
+        if invalid_attn_mask.ndim == 3:
+            invalid_attn_mask = invalid_attn_mask.unsqueeze(1)
+        masked_qk_attn = masked_qk_attn * invalid_attn_mask.type(masked_qk_attn.dtype)
 
     attn_output = torch.einsum(
         "bhnm,bmhd->bnhd",
@@ -457,34 +658,34 @@ def _hstu_attention_maybe_from_cache(
 @pytest.mark.parametrize("batch_size", [32])
 @pytest.mark.parametrize("heads", [2])
 @pytest.mark.parametrize(
-    "max_seq_len_q, max_seq_len_k, is_delta_q",
+    "max_seq_len_q, max_seq_len_k",
     [
-        (32, 32, False),
-        (99, 99, False),
-        (111, 111, False),
-        (256, 256, False),
-        (1111, 1111, False),
-        (27, 32, True),
-        (8, 99, True),
-        (51, 256, True),
-        (1000, 1111, True),
-        (160, 2000, True),
+        (32, 32),
+        (99, 99),
+        (111, 111),
+        (256, 256),
+        (1111, 1111),
+        (27, 32),
+        (8, 99),
+        (51, 256),
+        (160, 2000),
     ],
 )
 @pytest.mark.parametrize("max_context_len", [0, 11, 99, 160, 333])
 @pytest.mark.parametrize(
-    "max_target_len, window_size, target_group_size",
+    "max_target_len, window_size, target_group_size, is_arbitrary",
     [
-        (0, (-1, -1), 1),
-        (0, (11, 111), 1),
-        (0, (111, 11), 1),
-        (0, (111, 222), 1),
-        (0, (-1, 0), 1),
-        (32, (-1, 0), 1),
-        (257, (-1, 0), 1),
-        (1024, (-1, 0), 1),
-        (111, (-1, 0), 11),
-        (1111, (-1, 0), 222),
+        (0, (-1, -1), 1, False),
+        (0, (-1, -1), 1, True),
+        (0, (11, 111), 1, False),
+        (0, (111, 11), 1, False),
+        (0, (111, 222), 1, False),
+        (0, (-1, 0), 1, False),
+        (32, (-1, 0), 1, False),
+        (257, (-1, 0), 1, False),
+        (1024, (-1, 0), 1, False),
+        (111, (-1, 0), 11, False),
+        (1111, (-1, 0), 222, False),
     ],
 )
 @pytest.mark.parametrize(
@@ -528,12 +729,13 @@ def test_fused_attn(
     run_benchmark: Optional[int],
     dtype: torch.dtype,
     full_batch: bool,
-    is_delta_q: bool,
+    is_arbitrary: bool,
 ) -> None:
     has_context = max_context_len > 0
     has_target = max_target_len > 0
     group_target = target_group_size > 1
     is_causal = window_size[0] == -1 and window_size[1] == 0
+    is_delta_q = max_seq_len_q < max_seq_len_k
     if dtype == torch.float8_e4m3fn:
         raise ValueError(
             "float8_e4m3fn is not supported, please use test_fused_attn_fp8 instead"
@@ -546,13 +748,15 @@ def test_fused_attn(
         raise ValueError(
             "has_target is True but is_causal is False or window_size is not (-1, -1)"
         )
-    if (max_seq_len_q != max_seq_len_k) and not is_delta_q:
-        raise ValueError("max_seq_len_q != max_seq_len_k but is_delta_q is False")
-    if is_delta_q and max_seq_len_q > max_seq_len_k:
-        raise ValueError("is_delta_q is True but max_seq_len_q > max_seq_len_k")
+    if max_seq_len_q > max_seq_len_k:
+        raise ValueError("max_seq_len_q > max_seq_len_k is not supported")
     if group_target and not has_target:
         raise ValueError("group_target is True but has_target is False")
+    if is_arbitrary and (window_size[0] != -1 or window_size[1] != -1):
+        raise ValueError("is_arbitrary is True but window_size is not (-1, -1)")
     # TODO: find a better way to avoid these combinations
+    if is_arbitrary and has_context:
+        return
     if is_delta_q and has_target:
         return
     if is_delta_q and has_context:
@@ -589,6 +793,7 @@ def test_fused_attn(
                 full_batch=full_batch,
                 has_drab=has_drab,
                 is_delta_q=is_delta_q,
+                is_arbitrary=is_arbitrary,
             )
             input_datas.append(input_data)
 
@@ -612,6 +817,7 @@ def test_fused_attn(
                 v,
                 rab,
                 attn_mask,
+                func,
             ) = input_datas[i % 2]
             if run_benchmark == 0:
                 fwd_out = hstu_attn_varlen_func(
@@ -629,7 +835,6 @@ def test_fused_attn(
                     alpha=alpha,
                     rab=rab if has_rab else None,
                     has_drab=has_drab,
-                    is_delta_q=is_delta_q,
                 )
             else:
                 assert run_benchmark == 1
@@ -683,6 +888,7 @@ def test_fused_attn(
                 v,
                 rab,
                 attn_mask,
+                func,
             ) = input_datas[i % 2]
             g = grads[i]
             fwd_out = output_datas[i]
@@ -736,6 +942,7 @@ def test_fused_attn(
         v,
         rab,
         attn_mask,
+        func,
     ) = generate_input(
         batch_size=batch_size,
         heads=heads,
@@ -752,6 +959,7 @@ def test_fused_attn(
         full_batch=full_batch,
         has_drab=has_drab,
         is_delta_q=is_delta_q,
+        is_arbitrary=is_arbitrary,
     )
     out_ref = _hstu_attention_maybe_from_cache(
         num_heads=heads,
@@ -807,7 +1015,7 @@ def test_fused_attn(
             alpha=alpha,
             rab=rab if has_rab else None,
             has_drab=has_drab,
-            is_delta_q=is_delta_q,
+            func=func,
         )
     else:
         hstu_out = hstu_attn_qkvpacked_func(
@@ -823,7 +1031,7 @@ def test_fused_attn(
             alpha=alpha,
             rab=rab if has_rab else None,
             has_drab=has_drab,
-            is_delta_q=is_delta_q,
+            func=func,
         )
 
     print(f"Output max diff: {(hstu_out.view(L_q, -1) - out_ref).abs().max().item()}")
@@ -1347,12 +1555,12 @@ def test_paged_kv_attn(
         alpha=alpha,
         rab=None,
         has_drab=False,
-        is_delta_q=True,
         kv_cache=kv_cache,
         page_offsets=page_offsets,
         page_ids=page_ids,
         last_page_lens=last_page_lens,
         seq_offsets_t=seq_offsets_t,
+        func=None,  # func
     )
 
     print(f"Output max diff: {(hstu_out.view(L_q, -1) - out_ref).abs().max().item()}")
@@ -1738,13 +1946,13 @@ def _bwd_reference_fp8(
 @pytest.mark.parametrize("batch_size", [32])
 @pytest.mark.parametrize("heads", [2])
 @pytest.mark.parametrize(
-    "max_seq_len_q, max_seq_len_k, is_delta_q",
+    "max_seq_len_q, max_seq_len_k",
     [
-        (32, 32, False),
-        (99, 99, False),
-        (256, 256, False),
-        (1024, 1024, False),
-        (1111, 1111, False),
+        (32, 32),
+        (99, 99),
+        (256, 256),
+        (1024, 1024),
+        (1111, 1111),
     ],
 )
 @pytest.mark.parametrize(
@@ -1777,6 +1985,7 @@ def _bwd_reference_fp8(
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("full_batch", [True, False])
 @pytest.mark.parametrize("alpha", [1.0, 1.0 / (100**0.5)])
+@pytest.mark.parametrize("is_arbitrary", [False])
 def test_fused_attn_fp8(
     batch_size: int,
     heads: int,
@@ -1793,7 +2002,7 @@ def test_fused_attn_fp8(
     run_benchmark: Optional[int],
     dtype: torch.dtype,
     full_batch: bool,
-    is_delta_q: bool,
+    is_arbitrary: bool,
 ) -> None:
     if sm_major_version == 8:
         print("skipping fp8 test on sm8x")
@@ -1806,8 +2015,7 @@ def test_fused_attn_fp8(
         raise ValueError("for fp8, max_target_len must be 0")
     if max_seq_len_q != max_seq_len_k:
         raise ValueError("max_seq_len_q != max_seq_len_k")
-    if is_delta_q:
-        raise ValueError("fp8 does not support delta_q")
+    is_delta_q = max_seq_len_q < max_seq_len_k
 
     torch.cuda.synchronize()
     if run_benchmark is not None:
@@ -1836,6 +2044,7 @@ def test_fused_attn_fp8(
                 full_batch=full_batch,
                 has_drab=has_drab,
                 is_delta_q=is_delta_q,
+                is_arbitrary=is_arbitrary,
             )
             input_datas.append(input_data)
 
@@ -1876,7 +2085,6 @@ def test_fused_attn_fp8(
                     alpha=alpha,
                     rab=rab if has_rab else None,
                     has_drab=has_drab,
-                    is_delta_q=is_delta_q,
                     descale_q=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
                     descale_k=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
                     descale_v=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
@@ -1976,6 +2184,7 @@ def test_fused_attn_fp8(
         v,
         rab,
         attn_mask,
+        func,
     ) = generate_input(
         batch_size=batch_size,
         heads=heads,
@@ -1992,6 +2201,7 @@ def test_fused_attn_fp8(
         full_batch=full_batch,
         has_drab=has_drab,
         is_delta_q=is_delta_q,
+        is_arbitrary=is_arbitrary,
     )
     out_ref = _hstu_attention_maybe_from_cache(
         num_heads=heads,
@@ -2048,7 +2258,6 @@ def test_fused_attn_fp8(
         alpha=alpha,
         rab=rab if has_rab else None,
         has_drab=has_drab,
-        is_delta_q=is_delta_q,
         descale_q=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
         descale_k=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
         descale_v=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
@@ -2065,7 +2274,6 @@ def test_fused_attn_fp8(
         torch_out - out_ref
     ).abs().max().item()
     return
-
     # torch.set_printoptions(profile="full")
     g = torch.rand_like(torch_out)
     (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
@@ -2122,6 +2330,26 @@ def test_fused_attn_fp8(
 
 
 if __name__ == "__main__":
+    test_fused_attn(
+        batch_size=1,
+        heads=1,
+        heads_rab=1,
+        max_seq_len_q=16,
+        max_seq_len_k=16,
+        max_context_len=0,
+        max_target_len=0,
+        target_group_size=1,
+        attn_dim=32,
+        hidden_dim=32,
+        alpha=1.0,
+        has_rab=True,
+        has_drab=False,
+        window_size=(-1, -1),
+        dtype=torch.bfloat16,
+        run_benchmark=None,
+        full_batch=True,
+        is_arbitrary=True,
+    )
     # test_paged_kv_attn(
     #     batch_size=1,
     #     heads=1,
@@ -2135,27 +2363,6 @@ if __name__ == "__main__":
     #     run_benchmark=None,
     #     dtype=torch.bfloat16,
     #     full_batch=False,
-    # )
-
-    # test_fused_attn(
-    #     batch_size=128,
-    #     heads=1,
-    #     heads_rab=1,
-    #     max_seq_len_q=1024,
-    #     max_seq_len_k=1024,
-    #     max_context_len=0,
-    #     max_target_len=0,
-    #     target_group_size=1,
-    #     attn_dim=256,
-    #     hidden_dim=256,
-    #     alpha=1.0,
-    #     has_rab=True,
-    #     has_drab=True,
-    #     window_size=(-1, 0),
-    #     dtype=torch.bfloat16,
-    #     run_benchmark=None,
-    #     full_batch=False,
-    #     is_delta_q=False,
     # )
 
     # test_fused_attn_fp8(
@@ -2174,73 +2381,74 @@ if __name__ == "__main__":
     #     dtype=torch.float8_e4m3fn,
     #     run_benchmark=None,
     #     full_batch=True,
-    #     is_delta_q=False,
     # )
 
-    bs = [8]
-    dim = [32, 64, 128, 256]
-    num_heads = 4
+    # bs = [8]
+    # num_heads = 4
+    # num_heads_rab = 1
+    # # dim = [32, 64, 128, 256]
+    # dim = [256]
 
-    has_rabs = [False]
-    seq_lens = [8192, 4096]
-    seq_lens_t = [0, 4096]
-    has_drabs = [False]
-    dytpes = [torch.bfloat16]
-    for run_benchmark in [0]:
-        for h in [num_heads]:
-            for b in bs:
-                for d in dim:
-                    for seq_len, seq_len_t in zip(seq_lens, seq_lens_t):
-                        for dtype in dytpes:
-                            for has_rab in has_rabs:
-                                for has_drab in has_drabs:
-                                    fwd_time, bwd_time = test_paged_kv_attn(
-                                        batch_size=b,
-                                        heads=h,
-                                        max_seq_len_q=seq_len // 2,  # q is new history
-                                        max_seq_len_k=seq_len
-                                        // 2,  # k is user feature + previous history  # kv cache = user feature + previous history + new history
-                                        max_target_len=seq_len_t,  # target is target length
-                                        attn_dim=d,
-                                        hidden_dim=d,
-                                        page_size=32,
-                                        alpha=1.0,
-                                        run_benchmark=run_benchmark,
-                                        dtype=torch.bfloat16,
-                                        full_batch=True,
-                                    )
-                                    # fwd_time, bwd_time = test_fused_attn(
-                                    #     batch_size=b,
-                                    #     heads=h,
-                                    #     heads_rab=h,
-                                    #     max_seq_len_q=seq_len,
-                                    #     max_seq_len_k=seq_len,
-                                    #     max_context_len=0,
-                                    #     max_target_len=seq_len_t,
-                                    #     target_group_size=1,
-                                    #     attn_dim=d,
-                                    #     hidden_dim=d,
-                                    #     alpha=1.0,
-                                    #     has_rab=has_rab,
-                                    #     has_drab=has_drab,
-                                    #     window_size=(-1, 0),
-                                    #     run_benchmark=run_benchmark,
-                                    #     dtype=dtype,
-                                    #     full_batch=True,
-                                    #     is_delta_q=False,
-                                    # )
-                                    info = [
-                                        "hstu" if run_benchmark == 0 else "torch",
-                                        b,
-                                        seq_len,
-                                        seq_len_t,
-                                        d,
-                                        h,
-                                        has_rab,
-                                        has_drab,
-                                        (-1, 0),
-                                        dtype,
-                                        fwd_time,
-                                        bwd_time,
-                                    ]
-                                    print(",".join([str(v) for v in info]))
+    # has_rabs = [False]
+    # seq_lens = [8192]
+    # seq_lens_t = [0]
+    # has_drabs = [False]
+    # dytpes = [torch.bfloat16]
+    # for run_benchmark in [0]:
+    #     for h in [num_heads]:
+    #         for h_rab in [num_heads_rab]:
+    #             for b in bs:
+    #                 for d in dim:
+    #                     for seq_len, seq_len_t in zip(seq_lens, seq_lens_t):
+    #                         for dtype in dytpes:
+    #                             for has_rab in has_rabs:
+    #                                 for has_drab in has_drabs:
+    #                                     #   fwd_time, bwd_time = test_paged_kv_attn(
+    #                                     #       batch_size=b,
+    #                                     #       heads=h,
+    #                                     #       max_seq_len_q=seq_len//2, # q is new history
+    #                                     #       max_seq_len_k=seq_len//2, # k is user feature + previous history  # kv cache = user feature + previous history + new history
+    #                                     #       max_target_len=seq_len_t, # target is target length
+    #                                     #       attn_dim=d,
+    #                                     #       hidden_dim=d,
+    #                                     #       page_size=32,
+    #                                     #       alpha=1.0,
+    #                                     #       run_benchmark=run_benchmark,
+    #                                     #       dtype=torch.bfloat16,
+    #                                     #       full_batch=True,
+    #                                     #   )
+    #                                     fwd_time, bwd_time = test_fused_attn(
+    #                                         batch_size=b,
+    #                                         heads=h,
+    #                                         heads_rab=h_rab,
+    #                                         max_seq_len_q=seq_len,
+    #                                         max_seq_len_k=seq_len,
+    #                                         max_context_len=0,
+    #                                         max_target_len=seq_len_t,
+    #                                         target_group_size=1,
+    #                                         attn_dim=d,
+    #                                         hidden_dim=d,
+    #                                         alpha=1.0,
+    #                                         has_rab=has_rab,
+    #                                         has_drab=has_drab,
+    #                                         window_size=(-1, -1),
+    #                                         run_benchmark=run_benchmark,
+    #                                         dtype=dtype,
+    #                                         full_batch=True,
+    #                                         is_arbitrary=True,
+    #                                     )
+    #                                     info = [
+    #                                         "hstu" if run_benchmark == 0 else "torch",
+    #                                         b,
+    #                                         seq_len,
+    #                                         seq_len_t,
+    #                                         d,
+    #                                         h,
+    #                                         has_rab,
+    #                                         has_drab,
+    #                                         (-1, -1),
+    #                                         dtype,
+    #                                         fwd_time,
+    #                                         bwd_time,
+    #                                     ]
+    #                                     print(",".join([str(v) for v in info]))

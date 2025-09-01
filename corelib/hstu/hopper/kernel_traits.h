@@ -33,7 +33,8 @@
 using namespace cute;
 
 template <int kStages, class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
-          class SmemRabStorage, class SmemLayoutK, class SmemLayoutV, class SmemLayoutO>
+          class SmemRabStorage, class SmemLayoutK, class SmemLayoutV, class SmemLayoutO,
+          class SmemLayoutValidBlockIds, class SmemLayoutMaxFunc, class SmemLayoutMinFunc>
 struct SharedStorageQRabKVO {
   cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
   cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
@@ -42,6 +43,7 @@ struct SharedStorageQRabKVO {
     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
     cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
   };
+
   struct {
     cutlass::arch::ClusterTransactionBarrier barrier_Q;
     cutlass::arch::ClusterBarrier barrier_O;
@@ -49,6 +51,12 @@ struct SharedStorageQRabKVO {
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_rab;
     typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
     int tile_count_semaphore;
+  };
+  struct {
+    cute::array_aligned<int, cute::cosize_v<SmemLayoutMaxFunc>> smem_max_func;
+    cute::array_aligned<int, cute::cosize_v<SmemLayoutMinFunc>> smem_min_func;
+    cute::array_aligned<int, cute::cosize_v<SmemLayoutValidBlockIds>> smem_valid_block_ids;
+    int sn_valid_block_max;
   };
 };
 
@@ -76,9 +84,9 @@ struct SharedStorageQRabKVOVt {
   };
 };
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_,
-         bool Is_causal_, bool Is_context_, bool Is_target_, bool Is_delta_q_, bool Is_local_,
-         bool Has_rab_, int kClusterM_ = 1, bool Is_balance_fwd_ = false, typename elem_type=cutlass::half_t>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, 
+         bool Is_causal_, bool Is_context_, bool Is_target_, bool Is_local_,
+         bool Is_arbitrary_, int kNFunc_, bool Has_rab_, int kClusterM_ = 1, bool Is_balance_fwd_ = false, typename elem_type=cutlass::half_t>
 struct Hstu_fwd_kernel_traits {
   using Element = elem_type;
   using ElementAccum = float;
@@ -88,10 +96,11 @@ struct Hstu_fwd_kernel_traits {
   static constexpr bool Is_causal = Is_causal_;
   static constexpr bool Is_context = Is_context_;
   static constexpr bool Is_target = Is_target_;
-  static constexpr bool Is_delta_q = Is_delta_q_;
   static constexpr bool Is_local = Is_local_;
   static constexpr bool Has_rab = Has_rab_;
   static constexpr bool Is_balance_fwd = Is_balance_fwd_;
+  static constexpr bool Is_arbitrary = Is_arbitrary_;
+  static constexpr int kNFunc = Is_arbitrary ? kNFunc_ : 0;
 
   // The number of threads.
   static constexpr int kNWarps = kNWarps_;
@@ -157,8 +166,15 @@ struct Hstu_fwd_kernel_traits {
 
   using SmemCopyAtomRab = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
 
+  static constexpr int MaxSeqLenK = (kHeadDim == 256 && Has_rab) ? 32 * 1024 : 64 * 1024; // 48K and 64K
+  static constexpr int MaxValidBlock = Is_arbitrary ? MaxSeqLenK / kBlockN : 1; // 4KB
+
+  using SmemLayoutValidBlockIds = Layout<Shape<Int<MaxValidBlock>>, Stride<_1>>; // 0 refer to number of valid blocks
+  using SmemLayoutMaxFunc = Layout<Shape<Int<kNFunc/2 + 1>>, Stride<_1>>;
+  using SmemLayoutMinFunc = Layout<Shape<Int<kNFunc/2 + 1>>, Stride<_1>>;
+
   using SharedStorage = SharedStorageQRabKVO<kStages, Element, Element, Element, SmemLayoutQ,
-                          SmemRabStorage, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
+                          SmemRabStorage, SmemLayoutK, SmemLayoutV, SmemLayoutO, SmemLayoutValidBlockIds, SmemLayoutMaxFunc, SmemLayoutMinFunc>;
 
   using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
   using MainloopPipelineNoTMA = typename cutlass::PipelineAsync<kStages>;
@@ -167,8 +183,8 @@ struct Hstu_fwd_kernel_traits {
 
 // Traits struct for fp8 kernel with in-kernel transpose
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_,
-         bool Is_causal_, bool Is_context_, bool Is_target_, bool Is_delta_q_, bool Is_local_,
-         bool Has_rab_, int kClusterM_ = 1, bool Is_balance_fwd_ = false>
+         bool Is_causal_, bool Is_context_, bool Is_target_, bool Is_local_,
+         bool Is_arbitrary_, int kNFunc_, bool Has_rab_, int kClusterM_ = 1, bool Is_balance_fwd_ = false>
 struct Hstu_fwd_kernel_traits_fp8 {
   using Element = cutlass::float_e4m3_t;
   using ElementAccum = float;
@@ -178,11 +194,12 @@ struct Hstu_fwd_kernel_traits_fp8 {
   static constexpr bool Is_causal = Is_causal_;
   static constexpr bool Is_context = Is_context_;
   static constexpr bool Is_target = Is_target_;
-  static constexpr bool Is_delta_q = Is_delta_q_;
   static constexpr bool Is_local = Is_local_;
   static constexpr bool Has_rab = Has_rab_;
   static constexpr bool Is_balance_fwd = Is_balance_fwd_;
-
+  static constexpr bool Is_arbitrary = Is_arbitrary_;
+  static constexpr int  kNFunc = Is_arbitrary ? kNFunc_ : 0;
+  
   // The number of threads.
   static constexpr int kNWarps = kNWarps_;
   static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
@@ -287,7 +304,8 @@ struct Hstu_fwd_kernel_traits_fp8 {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<int kHeadDim_, int kBlockM_, int kBlockN_,
-         bool Is_causal_, bool Is_context_, bool Is_target_, bool Is_delta_q_, bool Is_local_,
+         bool Is_causal_, bool Is_context_, bool Is_target_, bool Is_local_,
+         bool Is_arbitrary_, int kNFunc_,
          bool Has_rab_, bool Has_drab_, bool Is_deterministic_,
          int kStages_dO_, int kStages_dS_, bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
          int NumWarpGroups_=3, int AtomLayoutMSdP_=1, int AtomLayoutNdKV_=2,
@@ -300,8 +318,9 @@ struct Hstu_bwd_kernel_traits {
   static constexpr bool Is_causal = Is_causal_;
   static constexpr bool Is_context = Is_context_;
   static constexpr bool Is_target = Is_target_;
-  static constexpr bool Is_delta_q = Is_delta_q_;
   static constexpr bool Is_local = Is_local_;
+  static constexpr bool Is_arbitrary = Is_arbitrary_;  
+  static constexpr int  kNFunc = Is_arbitrary ? kNFunc_ : 0;
   static constexpr bool Has_rab = Has_rab_;
   static constexpr bool Has_drab = Has_drab_;
   static constexpr bool Is_deterministic = Is_deterministic_;
@@ -505,6 +524,11 @@ struct Hstu_bwd_kernel_traits {
                             Stride<Int<kBlockKSmem>, _1>>{}));
   using SmemLayoutdKV = decltype(tile_to_shape(SmemLayoutAtomdKV{}, select<1, 2>(TileShape_MNK{})));
 
+  static constexpr int MaxSeqLenQ = 64 * 1024; // 64K
+  static constexpr int MaxValidBlock = Is_arbitrary ? MaxSeqLenQ / kBlockM : 1; // 4KB
+  using SmemLayoutValidBlockIds = Layout<Shape<Int<MaxValidBlock>>, Stride<_1>>; // 0 refer to number of valid blocks
+  
+
   static constexpr bool dQacc_use_TMA = kHeadDim < 256;
   // These are for the case where we don't use TMA to do atomicAdd on dQaccum, but just use direct atomicAdd.
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(ElementAccum);
@@ -552,6 +576,12 @@ struct Hstu_bwd_kernel_traits {
     cute::array_aligned<Element, Mma_dKV_is_RS ? 0 : cute::cosize_v<SmemLayoutPdS>, SmemAlignmentP> smem_p;
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdS>, SmemAlignmentdS> smem_ds;
     SmemRabStorage smem_rab;
+
+    // arbitrary mask
+    struct {
+      cute::array_aligned<int, cute::cosize_v<SmemLayoutValidBlockIds>> smem_valid_block_ids;
+      int sm_valid_block_max;
+    };
 
     struct {
       alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_KV;

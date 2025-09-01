@@ -58,7 +58,7 @@ void set_params_fprop(Hstu_fwd_params &params,
                       void* cu_seqlens_k_d,
                       void* num_targets_d,
                       bool has_rab,
-                      bool is_delta_q,
+                      const at::Tensor& func,
                       int window_size_left,
                       int window_size_right) {
   // Reset the parameters
@@ -164,19 +164,6 @@ void set_params_fprop(Hstu_fwd_params &params,
   #ifdef HSTU_DISABLE_CONTEXT
     TORCH_CHECK(!params.is_context, "This hstu attention build does not support context mask.");
   #endif
-  params.is_delta_q = is_delta_q;
-  #ifdef HSTU_DISABLE_DELTA_Q
-    TORCH_CHECK(!is_delta_q, "This hstu attention build does not support delta_q.");
-  #endif
-  if (is_delta_q) {
-    TORCH_CHECK(params.seqlen_q <= params.seqlen_k,
-                "For delta_q = True, seqlen_q must be less than or equal to seqlen_k.");
-    TORCH_CHECK(!params.is_target, "For delta_q = True, target mask must be False.");
-    TORCH_CHECK(!params.is_context, "For delta_q = True, context mask must be False.");
-  } else {
-    TORCH_CHECK(params.seqlen_q == params.seqlen_k,
-                "For delta_q = False, seqlen_q must be equal to seqlen_k.");
-  }
 
   if (window_size_left < 0 || window_size_left > (int)seqlen_k) { window_size_left = seqlen_k; }
   if (window_size_right < 0 || window_size_right > (int)seqlen_k) { window_size_right = seqlen_k; }
@@ -193,6 +180,21 @@ void set_params_fprop(Hstu_fwd_params &params,
   #ifdef HSTU_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This hstu attention build does not support local mask.");
   #endif
+
+  params.is_arbitrary_mask = func.defined();
+  #ifdef HSTU_DISABLE_ARBITRARY
+    TORCH_CHECK(!params.is_arbitrary_mask, "This hstu attention build does not support arbitrary mask.");
+  #endif
+  if (params.is_arbitrary_mask) {
+    TORCH_CHECK(func.dtype() == torch::kInt32, "func must have dtype int32");
+    CHECK_DEVICE(func); // batch_size x heads x n_func x seqlen_q
+
+    params.func_ptr = func.data_ptr();
+    params.func_ids_stride = func.stride(-2);
+    params.func_head_stride = func.stride(-3);
+    params.n_func = func.size(-2);
+    TORCH_CHECK(params.n_func == HSTU_ARBITRARY_NFUNC, "n_func must be equal to HSTU_ARBITRARY_NFUNC");
+  }
 }
 
 void set_params_dgrad(Hstu_bwd_params &params,
@@ -223,18 +225,18 @@ void set_params_dgrad(Hstu_bwd_params &params,
                       void *cu_seqlens_k_d,
                       void *num_targets_d,
                       void *dq_accum_d,
+                      const at::Tensor& func,
                       bool has_rab,
                       bool has_drab,
                       int window_size_left,
                       int window_size_right,
-                      bool deterministic,
-                      bool is_delta_q) {
+                      bool deterministic) {
 
   set_params_fprop(params, b, seqlen_q, seqlen_k, target_group_size, seqlen_q_rounded,
                     seqlen_k_rounded, h, h_k, h_rab, d, alpha, q, k, v, rab,
                     /*out=*/torch::Tensor(),
                     num_contexts_d, cu_seqlens_q_d, cu_seqlens_k_d, num_targets_d,
-                    has_rab, is_delta_q, window_size_left, window_size_right);
+                    has_rab, func, window_size_left, window_size_right);
 
   params.has_drab = has_drab;
   #ifdef HSTU_DISABLE_DRAB
@@ -273,23 +275,18 @@ void set_params_dgrad(Hstu_bwd_params &params,
 template <typename Dtype, int Headdim>
 void run_hstu_fwd_mask_16(Hstu_fwd_params &params, cudaStream_t stream) {
   RAB_SWITCH(params.has_rab, Has_rab, [&] {
-    #ifndef HSTU_DISABLE_DELTA_Q
-    if (params.is_delta_q) {
-      #ifndef HSTU_DISABLE_LOCAL
-      if (params.is_local) {run_hstu_fwd_<90, Dtype, Headdim, Has_rab, true, false, false, false, true>(params, stream); return; }
-      #endif
-      run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, true, false, false, true>(params, stream); return;
-    }
+    #ifndef HSTU_DISABLE_ARBITRARY
+    if (params.is_arbitrary_mask) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, true, HSTU_ARBITRARY_NFUNC>(params, stream); return; }
     #endif
     #ifndef HSTU_DISABLE_LOCAL
-    if (params.is_local) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, true, false, false, false, false>(params, stream); return; }
+    if (params.is_local) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, true, false, false, false, false, 0>(params, stream); return; }
     #endif
-    if (!params.is_causal) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false>(params, stream); return; }
+    if (!params.is_causal) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false, 0>(params, stream); return; }
     else {
       #ifndef HSTU_DISABLE_CAUSAL
       CONTEXT_SWITCH(params.is_context, Is_context, [&] {
         TARGET_SWITCH(params.is_target, Is_target, [&] {
-          run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, true, Is_context, Is_target, false>(params, stream);
+          run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, true, Is_context, Is_target, false, 0>(params, stream);
         });
       });
       #endif
@@ -301,12 +298,12 @@ template <typename Dtype, int Headdim>
 void run_hstu_fwd_mask_8(Hstu_fwd_params &params, cudaStream_t stream) {
   RAB_SWITCH(params.has_rab, Has_rab, [&] {
     #ifndef HSTU_DISABLE_LOCAL
-    if (params.is_local) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, true, false, false, false, false>(params, stream); return; }
+    if (params.is_local) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, true, false, false, false, false, 0>(params, stream); return; }
     #endif
     #ifndef HSTU_DISABLE_CAUSAL
-    if (params.is_causal) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, true, false, false, false>(params, stream); return; }
+    if (params.is_causal) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, true, false, false, false, 0>(params, stream); return; }
     #endif
-    run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false>(params, stream);
+    run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false, 0>(params, stream);
   });
 }
 
@@ -380,7 +377,7 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                int window_size_right,
                const float alpha,
                std::optional<at::Tensor> &rab,
-               const bool is_delta_q,
+               std::optional<const at::Tensor>& func,
                std::optional<const at::Tensor> &descale_q_,
                std::optional<const at::Tensor> &descale_k_,
                std::optional<const at::Tensor> &descale_v_) {
@@ -486,11 +483,11 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                     cu_seqlens_k.data_ptr(),
                     num_targets.has_value() ? num_targets.value().data_ptr() : nullptr,
                     has_rab,
-                    is_delta_q,
+                    func.has_value() ? func.value() : torch::Tensor(),
                     window_size_left,
                     window_size_right);
 
-  auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
+  auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32)); // TODO: if arbitrary mask, do not need zeros it, just empty
   params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
 
   params.total_q = total_q;
@@ -522,7 +519,7 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
     params.descale_v_ptr = nullptr;
   }
 
-  if (max_seqlen_k > 0) {
+  if (total_k > 0) {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     run_hstu_fwd(params, stream);
   } else {
@@ -536,23 +533,18 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
 template <typename Dtype, int Headdim>
 void run_hstu_bwd_mask_16(Hstu_bwd_params &params, cudaStream_t stream) {
   RAB_DRAB_SWITCH(params.has_rab, params.has_drab, Has_rab, Has_drab, [&] {
-    #ifndef HSTU_DISABLE_DELTA_Q
-    if (params.is_delta_q) {
-      #ifndef HSTU_DISABLE_LOCAL
-      if (params.is_local) {run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, true, false, false, false, true>(params, stream); return; }
-      #endif
-      run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, false, true, false, false, true>(params, stream); return;
-    }
+    #ifndef HSTU_DISABLE_ARBITRARY
+    if (params.is_arbitrary_mask) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, false, false, false, false, true, HSTU_ARBITRARY_NFUNC>(params, stream); return; }
     #endif
     #ifndef HSTU_DISABLE_LOCAL
-    if (params.is_local) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, true, false, false, false, false>(params, stream); return; }
+    if (params.is_local) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, true, false, false, false, false, 0>(params, stream); return; }
     #endif
-    if (!params.is_causal) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, false, false, false, false, false>(params, stream); return; }
+    if (!params.is_causal) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, false, false, false, false, false, 0>(params, stream); return; }
     else {
       #ifndef HSTU_DISABLE_CAUSAL
       CONTEXT_SWITCH(params.is_context, Is_context, [&] {
         TARGET_SWITCH(params.is_target, Is_target, [&] {
-            run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, false, true, Is_context, Is_target, false>(params, stream);
+            run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, false, true, Is_context, Is_target, false, 0>(params, stream);
         });
       });
       #endif
@@ -564,12 +556,12 @@ template <typename Dtype, int Headdim>
 void run_hstu_bwd_mask_8(Hstu_bwd_params &params, cudaStream_t stream) {
   RAB_SWITCH(params.has_rab, Has_rab, [&] {
     #ifndef HSTU_DISABLE_LOCAL
-    if (params.is_local) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, true, false, false, false, false>(params, stream); return; }
+    if (params.is_local) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, true, false, false, false, false, 0>(params, stream); return; }
     #endif
     #ifndef HSTU_DISABLE_CAUSAL
-    if (params.is_causal) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, false, true, false, false, false>(params, stream); return; }
+    if (params.is_causal) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, false, true, false, false, false, 0>(params, stream); return; }
     #endif
-    run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false, false>(params, stream);
+    run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false, false, 0>(params, stream);
   });
 }
 
@@ -650,7 +642,7 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     const float alpha,
     std::optional<at::Tensor> &rab,
     const bool has_drab,
-    const bool is_delta_q,
+    std::optional<const at::Tensor>& func,
     const bool deterministic) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
@@ -768,9 +760,10 @@ std::vector<at::Tensor> hstu_varlen_bwd(
                     cu_seqlens_q.data_ptr(), cu_seqlens_k.data_ptr(),
                     num_targets.has_value() ? num_targets.value().data_ptr() : nullptr,
                     dq_accum.data_ptr(),
+                    func.has_value() ? func.value() : torch::Tensor(),
                     has_rab, has_drab,
                     window_size_left, window_size_right,
-                    deterministic, is_delta_q);
+                    deterministic);
   params.total_q = total_q;
   params.total_k = total_k;
 
@@ -779,7 +772,7 @@ std::vector<at::Tensor> hstu_varlen_bwd(
   dq_semaphore.zero_();
   params.dq_semaphore = dq_semaphore.data_ptr<int>();
 
-  if (max_seqlen_q > 0) {
+  if (total_q > 0) {
       run_hstu_bwd(params, stream);
   } else {
       // If max_seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.

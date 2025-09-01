@@ -5,11 +5,12 @@ install:
 		export HSTU_DISABLE_CAUSAL=FALSE; \
 		export HSTU_DISABLE_TARGET=FALSE; \
 		export HSTU_DISABLE_CONTEXT=FALSE; \
-		export HSTU_DISABLE_DELTA_Q=FALSE; \
+		export HSTU_DISABLE_ARBITRARY=FALSE; \
+		export HSTU_ARBITRARY_NFUNC=3; \
 		export HSTU_DISABLE_RAB=FALSE; \
 		export HSTU_DISABLE_DRAB=FALSE; \
 		export HSTU_DISABLE_BF16=FALSE; \
-		export HSTU_DISABLE_FP16=FALSE; \
+		export HSTU_DISABLE_FP16=TRUE; \
 		export HSTU_DISABLE_FP8=FALSE; \
 		export HSTU_DISABLE_HDIM32=FALSE; \
 		export HSTU_DISABLE_HDIM64=FALSE; \
@@ -23,6 +24,7 @@ clean:
 	rm -rf build/*
 	rm -rf dist/*
 	rm -rf hstu_hopper.egg-info/*
+	rm -rf instantiations/hstu*
 
 tt:
 	export PYTHONPATH=${PWD}
