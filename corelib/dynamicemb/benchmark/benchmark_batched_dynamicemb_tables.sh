@@ -4,10 +4,8 @@ export CUDA_VISIBLE_DEVICES=0
 
 declare -A hbm=(["sgd"]=4 ["adam"]=12)
 use_index_dedups=("False")
-# batch_sizes=(65536 1048576)
-# capacities=("8" "64")
-batch_sizes=(1048576)
-capacities=("64")
+batch_sizes=(65536 1048576)
+capacities=("8" "64")
 optimizer_types=("sgd" "adam")
 embedding_dims=(128)
 alphas=(1.05)
