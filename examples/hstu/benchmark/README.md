@@ -159,6 +159,11 @@ Performance results:
 
 ![Local Image](inference_benchmark_l20.png)
 
+Note:
+1. The baseline performance is based on our implementation without KVCache support and CUDA Graph optimization.
+2. The end-to-end performance includes the embedding part, which utilizes both native `EmbeddingCollection` from TorchRec and `DynamicEmbedding`.
+3. The number of input sequences from the synthetic dataset increases according to the batch size.
+
 ### 2. HSTU block performance
 
 Performance Results:
@@ -166,4 +171,4 @@ Performance Results:
 ![Local Image](hstu_inference_l20_batch1.png)
 ![Local Image](hstu_inference_l20_batch8.png)
 
-When the input sequence has 2048 tokens in which 1920 tokens have KV data cached, we can achieve **5x ~ 10x** performance speedup on HSTU block (for batch size = 1 and 8 respectively).
+When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3x ~ 20x** without candidate items, and a speedup of **3x ~ 8x** with extra 256 candidates for each sequence. (for batch size = 1 and 8 respectively).

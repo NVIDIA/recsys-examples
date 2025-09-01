@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, Union
+from typing import Dict, Tuple, Union
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
@@ -53,7 +53,7 @@ class HSTUBlock(MegatronModule):
         self,
         embeddings: Dict[str, JaggedTensor],
         batch: Union[RankingBatch, RetrievalBatch],
-    ) -> JaggedData:
+    ) -> Tuple[JaggedData, torch.Tensor]:
         """
         Forward pass of the HSTUBlock.
 
@@ -65,6 +65,7 @@ class HSTUBlock(MegatronModule):
             JaggedData: The output jagged data.
         """
         jd = self._preprocessor(embeddings, batch)
+        seqlen_after_preprocessor = jd.seqlen
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
-        return self._postprocessor(jd)
+        return self._postprocessor(jd), seqlen_after_preprocessor

@@ -186,7 +186,9 @@ def test_input(
     )
     new_history_nnz = batch_size * new_history_length
     new_history_nnz_cuda = torch.tensor([new_history_nnz])
-    kv_seqlen_offsets = torch.arange(batch_size + 1) * seq_len
+    kv_seqlen_offsets = torch.arange(batch_size + 1) * (
+        total_history_length + num_targets
+    )
 
     num_input_sets = max(num_input_sets, 2)
     input_lists = []

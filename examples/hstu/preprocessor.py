@@ -138,7 +138,10 @@ class DataProcessor:
         log.info(data)
 
     def file_exists(self, name: str) -> bool:
-        return os.path.isfile("%s/%s" % (os.getcwd(), name))
+        if os.path.isabs(name):
+            return os.path.isfile(name)
+        else:
+            return os.path.isfile("%s/%s" % (os.getcwd(), name))
 
 
 class MovielensDataProcessor(DataProcessor):
@@ -250,6 +253,9 @@ class MovielensDataProcessor(DataProcessor):
 
         log_df["movie_id"] = log_df["movie_id"].astype(int)
         log_df["rating"] = log_df["rating"].map(self._rating_mapping).astype(int)
+        log_df = log_df.sort_values(
+            by=["unix_timestamp"], ascending=True, kind="mergesort"
+        )
         df_grouped_by_user = log_df.groupby("user_id").agg(list).reset_index()
 
         contextual_feature_names = self._contextual_feature_names.copy()
@@ -344,6 +350,39 @@ class DLRMKuaiRandProcessor(DataProcessor):
                 tar_ref.extractall(path=self._data_path)
                 log.info("Data files extracted")
 
+    def _reorder_per_user_by_time(
+        self,
+        df_seq: pd.DataFrame,
+        seq_cols: List[str],
+        time_col: str = "time_ms",
+    ) -> pd.DataFrame:
+        """
+        Reorder each user's sequences by `time_col` (non-decreasing, stable),
+        and reorder all columns in `seq_cols` with the same permutation.
+
+        Notes:
+          - No type casting is performed; timestamps are used as-is.
+          - If a column in `seq_cols` has a different length than `time_col`, a ValueError is raised.
+          - If `time_col` is included in `seq_cols`, it will be reordered too; otherwise it is left as-is.
+        """
+
+        def _row_fn(row: pd.Series) -> pd.Series:
+            t = row[time_col]  # use original values as-is
+            order = np.argsort(
+                np.asarray(t), kind="mergesort"
+            )  # stable, non-decreasing
+            L = len(t)
+            for c in seq_cols:
+                seq = row[c]
+                if len(seq) != L:
+                    raise ValueError(
+                        f"length mismatch: user={row.get('user_id')} col={c} len={len(seq)} vs time={L}"
+                    )
+                row[c] = [seq[i] for i in order]
+            return row
+
+        return df_seq.apply(_row_fn, axis=1)
+
     def preprocess(self) -> None:
         """
         Preprocess the raw data. The support dataset are "KuaiRand-Pure", "KuaiRand-1K", "KuaiRand-27K".
@@ -388,6 +427,7 @@ class DLRMKuaiRandProcessor(DataProcessor):
                     )
                     df = df.drop(columns=[col + "_x", col + "_y"])
 
+        df = self._reorder_per_user_by_time(df, seq_cols)
         log.info("Merging user features...")
         user_features_df = pd.read_csv(self._user_features_file, delimiter=",")
 

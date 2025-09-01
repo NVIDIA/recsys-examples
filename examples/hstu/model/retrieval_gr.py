@@ -103,7 +103,7 @@ class RetrievalGR(BaseModel):
 
     def get_logit_and_labels(
         self, batch: RetrievalBatch
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get the logits and labels for the batch.
 
@@ -118,7 +118,7 @@ class RetrievalGR(BaseModel):
         ), "num candidates is not supported for retrieval"
 
         embeddings = self._embedding_collection(batch.features)
-        jagged_data = self._hstu_block(
+        jagged_data, seqlen_after_preprocessor = self._hstu_block(
             embeddings=embeddings,
             batch=batch,
         )
@@ -154,6 +154,7 @@ class RetrievalGR(BaseModel):
         )
         return (
             first_n_pred_item_embeddings.view(-1, self._embedding_dim),
+            seqlen_after_preprocessor,
             last_n_supervision_item_ids.view(-1),
             last_n_supervision_item_embeddings.view(-1, self._embedding_dim),
         )
@@ -179,6 +180,7 @@ class RetrievalGR(BaseModel):
 
         (
             jagged_item_logit,
+            seqlen_after_preprocessor,
             supervision_item_ids,
             supervision_emb,
         ) = self.get_logit_and_labels(batch)
@@ -190,7 +192,7 @@ class RetrievalGR(BaseModel):
             losses.detach(),
             jagged_item_logit.detach(),
             supervision_item_ids.detach(),
-            batch.features.lengths().detach(),  # used to compute achieved flops/s
+            seqlen_after_preprocessor.detach(),  # used to compute achieved flops/s
         )
 
     # used for evaluation

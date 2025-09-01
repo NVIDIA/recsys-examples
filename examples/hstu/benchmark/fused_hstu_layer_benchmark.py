@@ -47,6 +47,7 @@ from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
 from ops.length_to_offsets import length_to_complete_offsets
+from training.utils import cal_flops_single_rank
 
 _backend_str_to_type = {
     "cutlass": KernelBackend.CUTLASS,
@@ -235,8 +236,9 @@ def run(
         igpu_timer.stop(iteration)
 
     fwd_median_time = igpu_timer.elapsed_time(reduction="median")
+    fwd_flops = cal_flops_single_rank(hstu_config, lengths, has_bwd=False)
     print(
-        f"[{log_layer_type}] [fwd] tokens {L};time (median): {fwd_median_time:.4f} ms."
+        f"[{log_layer_type}] [fwd] tokens {L};time (median): {fwd_median_time:.4f} ms;achieved flops: {fwd_flops / fwd_median_time * 1e-9:.4f} TFLOPS"
     )
     # bwd
     for iteration in range(iters):
@@ -248,11 +250,12 @@ def run(
         igpu_timer.stop(iteration)
 
     bwd_median_time = igpu_timer.elapsed_time(reduction="median")
+    bwd_flops = cal_flops_single_rank(hstu_config, lengths, has_bwd=True) - fwd_flops
     print(
-        f"[{log_layer_type}] [bwd] tokens {L};time (median): {bwd_median_time:.4f} ms."
+        f"[{log_layer_type}] [bwd] tokens {L};time (median): {bwd_median_time:.4f} ms;achieved flops: {bwd_flops / bwd_median_time * 1e-9:.4f} TFLOPS"
     )
     print(
-        f"[{log_layer_type}] [e2e] tokens {L};time: {fwd_median_time + bwd_median_time:.4f} ms."
+        f"[{log_layer_type}] [e2e] tokens {L};time: {fwd_median_time + bwd_median_time:.4f} ms;achieved flops: {(fwd_flops + bwd_flops) / (fwd_median_time + bwd_median_time) * 1e-9:.4f} TFLOPS"
     )
     # nsys
     for iteration in range(iters):
