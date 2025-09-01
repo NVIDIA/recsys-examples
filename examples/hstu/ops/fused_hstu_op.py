@@ -313,7 +313,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 0,  # window_size_right
                 alpha,
                 None,  # rab
-                False,  # is_delta_q
+                None,  # func
                 *extension_args,
             )
             # in case of padding
@@ -629,7 +629,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 alpha,
                 None,  # rab_padded
                 False,  # has_drab
-                False,  # is_delta_q
+                None,  # func
                 False,  # deterministic
             )
 

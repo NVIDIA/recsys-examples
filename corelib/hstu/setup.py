@@ -26,11 +26,7 @@ from pathlib import Path
 import torch
 from packaging.version import Version, parse
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import (
-    CUDA_HOME,
-    BuildExtension,
-    CUDAExtension,
-)
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
