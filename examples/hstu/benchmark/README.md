@@ -11,8 +11,8 @@ In hstu example, we have provided a set of performance optimization guidelines f
 2. Kernel fusions (with triton).
 3. Seletive forward recompute.
 
-You can run script `run.sh` to see the performance over native implementation. The baseline (native implementation) is 
-1. With triton-based hstu attention kernels
+You can run script `run.sh` to see the performance over native implementation. The baseline (native implementation) is from [Meta's open source HSTU implementation](https://github.com/meta-recsys/generative-recommenders/tree/bb389f9539b054e7268528efcd35457a6ad52439), which features in:
+1. Triton-based HSTU attention kernels with the remaining operations using PyTorch ops.
 2. No kernel fusions.
 3. No recompute.
 
