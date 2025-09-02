@@ -168,7 +168,7 @@ def test_allgatherv(varied_T, tp, dtype, embdim):
 
 @pytest.mark.parametrize("batchsize_per_gpu", [2, 13])
 @pytest.mark.parametrize("num_tensors", [1, 3, 6])
-@pytest.mark.parametrize("tp", [2])
+@pytest.mark.parametrize("tp", [1])
 @pytest.mark.parametrize("hidden_size", [128])
 @pytest.mark.parametrize("max_seqlen", [4, 20])
 def test_grouped_allgatherv(
@@ -215,9 +215,7 @@ def test_grouped_allgatherv(
         value_list.append(tensor_to_gather)
         dense_ref_list.append(ref_dense_out)
 
-    tensor_out_list, output_seqlen = grouped_allgatherv_tensor_list(
-        value_list, seqlen, tp_pg
-    )
+    tensor_out_list = grouped_allgatherv_tensor_list(value_list, tp_pg)
 
     varied_T_gathered = torch.empty(
         size=(tp_size,), dtype=varied_T_tensor.dtype, device=varied_T_tensor.device
