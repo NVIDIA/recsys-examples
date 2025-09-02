@@ -17,6 +17,7 @@
 
 #include "check.h"
 #include "index_calculation.h"
+#include <torch/extension.h>
 #include <cuda/std/tuple>
 #include <iostream>
 #include <type_traits>
@@ -300,4 +301,190 @@ void SegmentedUniqueDevice::operator()(
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename T>
+__global__ void get_table_range_kernel(
+  int64_t num_table,
+  int64_t feature_x_batch,
+  T const * __restrict__ offsets,
+  T const * __restrict__ feature_offsets,
+  T * __restrict__ table_range
+) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < num_table + 1) {
+    T num_feature = feature_offsets[num_table];
+    int64_t batch = feature_x_batch / num_feature;
+    T feature_offset = feature_offsets[tid];
+    T feature_x_batch_offset = feature_offset * batch;
+    table_range[tid] = offsets[feature_x_batch_offset];
+  }
+}
+
+at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
+  if (!offsets.is_cuda()) {
+    throw std::runtime_error("Tensor <offsets> must be on CUDA device.");
+  }
+  if (!feature_offsets.is_cuda()) {
+    throw std::runtime_error("Tensor <feature_offsets> must be on CUDA device.");
+  }
+  int64_t feature_x_batch = offsets.size(0) - 1;
+  int64_t num_table = feature_offsets.size(0) - 1;
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  at::Tensor table_range = at::empty_like(feature_offsets);
+
+  int block_size = 128;
+  if (num_table + 1 < block_size) {
+    block_size = num_table + 1;
+  }
+  int grid_size = (num_table + block_size) / block_size;
+  auto offset_type = scalartype_to_datatype(offsets.dtype().toScalarType());
+  DISPATCH_OFFSET_INT_TYPE(offset_type, offset_t, [&] {
+    get_table_range_kernel<offset_t><<<grid_size, block_size, 0, stream>>>(
+      num_table, feature_x_batch, reinterpret_cast<offset_t*>(offsets.data_ptr()),
+      reinterpret_cast<offset_t*>(feature_offsets.data_ptr()),
+      reinterpret_cast<offset_t*>(table_range.data_ptr())
+    );
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  return table_range;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+segmented_unique(at::Tensor keys, at::Tensor segment_range, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  int64_t num_total = keys.size(0);
+  size_t unique_op_capacity = unique_op->get_capacity();
+  if (num_total * 2 > unique_op_capacity) {
+    at::Tensor new_keys = at::empty({num_total * 2}, keys.options());
+    at::Tensor new_vals = at::empty(
+        {num_total * 2},
+        at::TensorOptions().dtype(at::kLong).device(keys.device()));
+    unique_op->reset_capacity(new_keys, new_vals, num_total * 2, stream);
+  }
+
+  at::Tensor h_segment_range = at::empty(segment_range.sizes(), segment_range.options().device(at::kCPU).pinned_memory(true));
+  h_segment_range.copy_(segment_range, /*non_blocking=*/true);
+
+  int table_num = segment_range.size(0) - 1;
+  std::vector<at::Tensor> tmp_unique_indices(table_num);
+  for (int i = 0; i < table_num; ++i) {
+    tmp_unique_indices[i] = at::empty_like(keys);
+  }
+
+  at::Tensor d_unique_nums = at::empty(table_num, segment_range.options());
+  at::Tensor d_unique_indices_table_range = at::zeros(table_num + 1, segment_range.options());
+
+  auto unique_num_type = scalartype_to_datatype(
+      convertTypeMetaToScalarType(d_unique_nums.dtype()));
+  auto unique_offset_type = scalartype_to_datatype(
+      convertTypeMetaToScalarType(d_unique_indices_table_range.dtype()));
+  auto inverse_idx = at::empty(num_total, segment_range.options());
+
+  // sync for h_segment_range
+  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  for (int i = 0; i < table_num; ++i) {
+    int64_t indices_begin = h_segment_range[i].item<int64_t>();
+    int64_t indices_end = h_segment_range[i+1].item<int64_t>();
+    int64_t indices_length = indices_end - indices_begin;
+
+    if (indices_length == 0) {
+      DEMB_CUDA_CHECK(cudaMemsetAsync(
+          reinterpret_cast<int64_t *>(d_unique_nums.data_ptr()) + i, 0,
+          sizeof(int64_t), stream));
+      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_indices_table_range.data_ptr(),
+                          i, unique_num_type, unique_offset_type, stream);
+    } else {
+      at::Tensor tmp_indices = keys.slice(0, indices_begin, num_total);
+      at::Tensor tmp_inverse_idx = inverse_idx.slice(0, indices_begin, num_total);
+      at::Tensor tmp_d_unique_num = d_unique_nums.slice(0, i, table_num);
+
+      at::Tensor previous_d_unique_num = d_unique_indices_table_range.slice(0, i, table_num + 1);
+      unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
+                        tmp_unique_indices[i], tmp_d_unique_num, stream,
+                        previous_d_unique_num);
+      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_indices_table_range.data_ptr(),
+                          i, unique_num_type, unique_offset_type, stream);
+    }
+  }
+  
+  at::Tensor h_unique_indices_table_range = at::empty(table_num + 1, segment_range.options().device(at::kCPU));
+  AT_CUDA_CHECK(cudaMemcpyAsync(
+      h_unique_indices_table_range.data_ptr(), d_unique_indices_table_range.data_ptr(),
+      (d_unique_indices_table_range.size(0)) * d_unique_indices_table_range.element_size(),
+      cudaMemcpyDeviceToHost, stream));
+  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  int64_t unique_embs_offset = 0;
+  int64_t num_unique_total = h_unique_indices_table_range[table_num].item<int64_t>();
+  at::Tensor unique_keys = at::empty(num_unique_total, keys.options());
+  for (int i = 0; i < table_num; ++i) {
+    int64_t tmp_unique_num = h_unique_indices_table_range[i+1].item<int64_t>() - h_unique_indices_table_range[i].item<int64_t>();
+    if (tmp_unique_num != 0) {
+      void *dst_ptr = reinterpret_cast<char *>(unique_keys.data_ptr()) +
+                      unique_embs_offset * unique_keys.element_size();
+      void *src_ptr = tmp_unique_indices[i].data_ptr();
+      size_t copy_size = tmp_unique_num * unique_keys.element_size();
+      AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
+                                    cudaMemcpyDeviceToDevice, stream));
+
+    }
+    unique_embs_offset += tmp_unique_num;
+  }
+  return std::make_tuple(unique_keys, inverse_idx, d_unique_indices_table_range, h_unique_indices_table_range);
+}
+
+void select(at::Tensor flags, at::Tensor inputs, at::Tensor outputs, at::Tensor num_selected) {
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  int64_t num_total = inputs.size(0);
+  auto scalar_type = inputs.dtype().toScalarType();
+  auto key_type = scalartype_to_datatype(scalar_type);
+  auto num_select_iter_type = scalartype_to_datatype(num_selected.dtype().toScalarType());
+
+  DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(num_select_iter_type, NumSelectedIteratorT, [&] {
+      select_async<KeyType, NumSelectedIteratorT>(num_total, flags.data_ptr<bool>(), reinterpret_cast<KeyType*>(inputs.data_ptr()),
+        reinterpret_cast<KeyType*>(outputs.data_ptr()), reinterpret_cast<NumSelectedIteratorT*>(num_selected.data_ptr()), inputs.device(), stream);
+    });
+  });
+}
+
+void select_index(at::Tensor flags, at::Tensor output_indices, at::Tensor num_selected) {
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  int64_t num_total = output_indices.size(0);
+  auto scalar_type = output_indices.dtype().toScalarType();
+  auto key_type = scalartype_to_datatype(scalar_type);
+  auto num_select_iter_type = scalartype_to_datatype(num_selected.dtype().toScalarType());
+
+  DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(num_select_iter_type, NumSelectedIteratorT, [&] {
+      select_index_async<KeyType, NumSelectedIteratorT>(num_total, flags.data_ptr<bool>(), reinterpret_cast<KeyType*>(output_indices.data_ptr()),
+        reinterpret_cast<NumSelectedIteratorT*>(num_selected.data_ptr()), output_indices.device(), stream);
+    });
+  });
+}
+
 } // namespace dyn_emb
+
+void bind_index_calculation_op(py::module &m) {
+  m.def("get_table_range", &dyn_emb::get_table_range,
+    "Make offsets from <feature, batch> scope into <table> scope",
+    py::arg("offsets"), py::arg("feature_offsets"));
+
+  m.def("segmented_unique", &dyn_emb::segmented_unique,
+    "Dose segmented unique operation on keys with segment_range, return tuple<unique_keys, inverse, unique_keys_table_range, h_unique_keys_table_range>",
+    py::arg("keys"), py::arg("segment_range"), py::arg("unique_op"));
+  
+  m.def(
+    "select", &dyn_emb::select,
+    "Select items in inputs which flags are true.", 
+    py::arg("flags"), py::arg("inputs"), py::arg("outputs"), py::arg("num_selected")
+  );
+  m.def(
+    "select_index", &dyn_emb::select_index,
+    "Select items' indices where flags are true.", 
+    py::arg("flags"), py::arg("output_indices"), py::arg("num_selected")
+  );
+}

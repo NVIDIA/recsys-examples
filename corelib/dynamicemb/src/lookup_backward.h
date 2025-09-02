@@ -47,7 +47,7 @@ public:
 
 void backward(void *grads, void *unique_buffer, void *unique_indices,
               void *inverse_indices, void *biased_offset, const int dim,
-              const int batch_size, const int feature_num, const int num_key,
+              const int batch_size, const int feature_num, const int num_key, int combiner,
               DataType key_type, DataType value_type, cudaStream_t stream);
 void one_to_one_atomic(void *grads, void *unique_indices, void *reverse_indices,
                        void *unique_grads, const int ev_size,
