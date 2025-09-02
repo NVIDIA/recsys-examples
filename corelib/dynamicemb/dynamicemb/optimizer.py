@@ -21,11 +21,18 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch  # usort:skip
 from dynamicemb.dynamicemb_config import *
-from dynamicemb_extensions import (
-    DynamicEmbTable,
+from dynamicemb_extensions import (  # dynamic_emb_sgd,; dynamic_emb_adam,; dynamic_emb_adagrad,; dynamic_emb_rowwise_adagrad,
+    dynamic_emb_adagrad_fused,
+    dynamic_emb_adagrad_with_pointer,
     dynamic_emb_adagrad_with_table,
+    dynamic_emb_adam_fused,
+    dynamic_emb_adam_with_pointer,
     dynamic_emb_adam_with_table,
+    dynamic_emb_rowwise_adagrad_fused,
+    dynamic_emb_rowwise_adagrad_with_pointer,
     dynamic_emb_rowwise_adagrad_with_table,
+    dynamic_emb_sgd_fused,
+    dynamic_emb_sgd_with_pointer,
     dynamic_emb_sgd_with_table,
 )
 
@@ -412,3 +419,424 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         for table in self._state_dict["Gt"]:
             table.set_initial_optstate(initial_value)
         return
+
+
+class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
+    def __init__(
+        self,
+        opt_args: OptimizerArgs,
+    ) -> None:
+        self._opt_args: OptimizerArgs = copy.deepcopy(opt_args)
+
+    @abc.abstractmethod
+    def update(
+        self,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        ...
+
+    @abc.abstractmethod
+    def fused_update(
+        self,
+        grads: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        ...
+
+    @abc.abstractmethod
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
+    ) -> None:
+        ...
+
+    @abc.abstractmethod
+    def get_opt_args(self) -> Dict[str, Any]:
+        ...
+
+    @abc.abstractmethod
+    def set_opt_args(self, args: Dict[str, Any]) -> None:
+        ...
+
+    @abc.abstractmethod
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+
+    def set_learning_rate(self, new_lr) -> None:
+        self._opt_args.learning_rate = new_lr
+        return
+
+    def get_initial_optim_states(self) -> float:
+        return self._opt_args.initial_accumulator_value
+
+    def set_initial_optim_states(self, value: float) -> None:
+        self._opt_args.initial_accumulator_value = value
+        return
+
+    def step(self) -> None:
+        pass
+
+
+class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+    def __init__(
+        self,
+        opt_args: OptimizerArgs,
+    ) -> None:
+        super().__init__(opt_args)
+
+    def update(
+        self,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        pass
+        # lr = self._opt_args.learning_rate
+        # dynamic_emb_sgd(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     lr,
+        # )
+
+    def fused_update(
+        self,
+        grads: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        dynamic_emb_sgd_fused(
+            grads,
+            values,
+            lr,
+        )
+
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
+        value_type,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        dynamic_emb_sgd_with_pointer(
+            grads,
+            value_ptr,
+            value_type,
+            lr,
+        )
+
+    def get_opt_args(self):
+        ret_args = {"lr": self._opt_args.learning_rate}
+        return ret_args
+
+    def set_opt_args(self, args: Dict[str, Any]):
+        self._opt_args.learning_rate = get_required_arg(args, "lr")
+        return
+
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return 0
+
+
+class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+    def __init__(
+        self,
+        opt_args: OptimizerArgs,
+    ) -> None:
+        super().__init__(opt_args)
+        self._iterations: int = 0
+
+    def step(self):
+        self._iterations += 1
+
+    def update(
+        self,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        pass
+        # assert states is not None
+
+        # lr = self._opt_args.learning_rate
+        # beta1 = self._opt_args.beta1
+        # beta2 = self._opt_args.beta2
+        # weight_decay = self._opt_args.weight_decay
+        # eps = self._opt_args.eps
+
+        # dynamic_emb_adam(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     states,
+        #     lr,
+        #     beta1,
+        #     beta2,
+        #     eps,
+        #     weight_decay,
+        #     self._iterations,
+        # )
+
+    def fused_update(
+        self,
+        grads: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        beta1 = self._opt_args.beta1
+        beta2 = self._opt_args.beta2
+        weight_decay = self._opt_args.weight_decay
+        eps = self._opt_args.eps
+
+        dynamic_emb_adam_fused(
+            grads,
+            values,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            self._iterations,
+        )
+
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
+        value_type,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        beta1 = self._opt_args.beta1
+        beta2 = self._opt_args.beta2
+        weight_decay = self._opt_args.weight_decay
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        dynamic_emb_adam_with_pointer(
+            grads,
+            value_ptr,
+            value_type,
+            state_dim,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            self._iterations,
+        )
+
+    def get_opt_args(self):
+        ret_args = {
+            "lr": self._opt_args.learning_rate,
+            "iters": self._iterations,
+            "beta1": self._opt_args.beta1,
+            "beta2": self._opt_args.beta2,
+            "eps": self._opt_args.eps,
+            "weight_decay": self._opt_args.weight_decay,
+        }
+        return ret_args
+
+    def set_opt_args(self, args: Dict[str, Any]):
+        self._opt_args.learning_rate = get_required_arg(args, "lr")
+        self._iterations = get_required_arg(args, "iters")
+        self._opt_args.beta1 = get_required_arg(args, "beta1")
+        self._opt_args.beta2 = get_required_arg(args, "beta2")
+        self._opt_args.eps = get_required_arg(args, "eps")
+        self._opt_args.weight_decay = get_required_arg(args, "weight_decay")
+        return
+
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return emb_dim * 2
+
+
+class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+    def __init__(
+        self,
+        opt_args: OptimizerArgs,
+    ) -> None:
+        super().__init__(opt_args)
+
+    def update(
+        self,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        pass
+        # lr = self._opt_args.learning_rate
+        # eps = self._opt_args.eps
+
+        # dynamic_emb_adagrad(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     states,
+        #     lr,
+        #     eps,
+        # )
+
+    def fused_update(
+        self,
+        grads: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
+
+        dynamic_emb_adagrad_fused(
+            grads,
+            values,
+            lr,
+            eps,
+        )
+
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
+        value_type,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        dynamic_emb_adagrad_with_pointer(
+            grads,
+            value_ptr,
+            value_type,
+            state_dim,
+            lr,
+            eps,
+        )
+
+    def get_opt_args(self):
+        ret_args = {
+            "lr": self._opt_args.learning_rate,
+            "eps": self._opt_args.eps,
+            "initial_accumulator_value": self._opt_args.initial_accumulator_value,
+        }
+        return ret_args
+
+    def set_opt_args(self, args: Dict[str, Any]):
+        self._opt_args.learning_rate = get_required_arg(args, "lr")
+        self._opt_args.eps = get_required_arg(args, "eps")
+        initial_value = get_required_arg(args, "initial_accumulator_value")
+        self._opt_args.initial_accumulator_value = initial_value
+        return
+
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return emb_dim
+
+
+class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+    def __init__(
+        self,
+        opt_args: OptimizerArgs,
+        emb_dtype: torch.dtype,
+    ) -> None:
+        super().__init__(opt_args)
+
+        DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+            torch.float32: 4,
+            torch.float16: 2,
+            torch.bfloat16: 2,
+        }
+        self._optim_state_dim = 16 // DTYPE_NUM_BYTES[emb_dtype]
+
+    def update(
+        self,
+        grads: torch.Tensor,
+        embs: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        pass
+        # lr = self._opt_args.learning_rate
+        # eps = self._opt_args.eps
+
+        # dynamic_emb_rowwise_adagrad(
+        #     grads.size(0),
+        #     grads,
+        #     embs,
+        #     states,
+        #     lr,
+        #     eps,
+        # )
+
+    def fused_update(
+        self,
+        grads: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        self.get_state_dim(emb_dim)
+
+        dynamic_emb_rowwise_adagrad_fused(
+            grads.size(0),
+            grads,
+            values,
+            lr,
+            eps,
+        )
+
+    def fused_update_with_pointer(
+        self,
+        grads: torch.Tensor,
+        value_ptr: torch.Tensor,  # pointers to embeddng + optimizer states
+        value_type,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        dynamic_emb_rowwise_adagrad_with_pointer(
+            grads.size(0),
+            grads,
+            value_ptr,
+            value_type,
+            state_dim,
+            lr,
+            eps,
+        )
+
+    def get_opt_args(self):
+        ret_args = {
+            "lr": self._opt_args.learning_rate,
+            "eps": self._opt_args.eps,
+            "initial_accumulator_value": self._opt_args.initial_accumulator_value,
+        }
+        return ret_args
+
+    def set_opt_args(self, args: Dict[str, Any]):
+        self._opt_args.learning_rate = get_required_arg(args, "lr")
+        self._opt_args.eps = get_required_arg(args, "eps")
+        initial_value = get_required_arg(args, "initial_accumulator_value")
+        self._opt_args.initial_accumulator_value = initial_value
+        return
+
+    def get_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the state dim.
+        """
+        return self._optim_state_dim

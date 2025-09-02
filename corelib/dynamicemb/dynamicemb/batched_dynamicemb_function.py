@@ -13,20 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+from typing import List, Optional
 
 import torch
-from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, dyn_emb_to_torch
+from dynamicemb.dynamicemb_config import (
+    DynamicEmbInitializerArgs,
+    DynamicEmbPoolingMode,
+    dyn_emb_to_torch,
+)
+from dynamicemb.initializer import BaseDynamicEmbInitializer
+from dynamicemb.key_value_table import Cache, KeyValueTableFunction, Storage
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
     find_or_insert,
+    get_table_range,
     lookup_backward,
     lookup_backward_dense,
     lookup_backward_dense_dedup,
     lookup_forward,
     lookup_forward_dense,
+    lookup_forward_dense_eval,
+    reduce_grads,
+    segmented_unique,
 )
 
 
@@ -162,19 +172,21 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
             accum_D += dims[i] * (num_embeddings // batch_size)
             assert num_embeddings % batch_size == 0
 
-        backward_tensors = [indices, offsets]
-        ctx.save_for_backward(*backward_tensors)
-        ctx.tables = tables
-        ctx.unique_indices_list = unique_indices_list
-        ctx.inverse_indices_list = inverse_indices_list
-        ctx.biased_offsets_list = biased_offsets_list
-        ctx.dims = dims
-        ctx.batch_size = batch_size
-        ctx.feature_num = feature_num
-        ctx.feature_table_map = feature_table_map
-        ctx.device = device
-        ctx.optimizer = optimizer
-        ctx.scores = scores
+        if training:
+            backward_tensors = [indices, offsets]
+            ctx.save_for_backward(*backward_tensors)
+            ctx.tables = tables
+            ctx.unique_indices_list = unique_indices_list
+            ctx.inverse_indices_list = inverse_indices_list
+            ctx.biased_offsets_list = biased_offsets_list
+            ctx.dims = dims
+            ctx.batch_size = batch_size
+            ctx.feature_num = feature_num
+            ctx.feature_table_map = feature_table_map
+            ctx.device = device
+            ctx.optimizer = optimizer
+            ctx.scores = scores
+            ctx.combiner = combiner
 
         return embs
 
@@ -193,6 +205,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         device = ctx.device
         optimizer = ctx.optimizer
         table_num = len(tables)
+        combiner = ctx.combiner
 
         offsets_list_per_table = []
         for i in range(table_num):
@@ -245,6 +258,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
                 batch_size,
                 feature_num_per_table[i],
                 offsets_list_per_table[i][-1].item(),
+                combiner,
             )
 
         unique_grads_per_table = []
@@ -435,5 +449,179 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
         scores = ctx.scores
         # optimizer: update tables.
-        optimizer.update(tables, unique_indices_list, unique_grads_list, scores)
-        return (None,) * 17
+        optimizer.update(tables, unique_indices_list, unique_grads_list)
+        return (None,) * 19
+
+
+def dynamicemb_prefetch(
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    caches: List[Optional[Cache]],
+    storages: List[Storage],
+    feature_offsets: torch.Tensor,
+    initializers: List[BaseDynamicEmbInitializer],
+    unique_op,
+    training: bool = True,
+    forward_stream: Optional[torch.cuda.Stream] = None,
+):
+    table_num = len(storages)
+    assert table_num != 0
+    caching = caches[0] is not None
+
+    indices_table_range = get_table_range(offsets, feature_offsets)
+    if training or caching:
+        (
+            unique_indices,
+            inverse,
+            unique_indices_table_range,
+            h_unique_indices_table_range,
+        ) = segmented_unique(indices, indices_table_range, unique_op)
+        # TODO: only return device unique_indices_table_range
+        # h_unique_indices_table_range = unique_indices_table_range.cpu()
+    else:
+        h_unique_indices_table_range = indices_table_range.cpu()
+        unique_indices = indices
+
+    for i in range(table_num):
+        begin = h_unique_indices_table_range[i]
+        end = h_unique_indices_table_range[i + 1]
+        unique_indices_per_table = unique_indices[begin:end]
+
+        KeyValueTableFunction.prefetch(
+            caches[i],
+            storages[i],
+            unique_indices_per_table,
+            initializers[i],
+            training,
+            forward_stream,
+        )
+
+
+class DynamicEmbeddingFunctionV2(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        indices: torch.Tensor,
+        offsets: torch.Tensor,
+        caches: List[Optional[Cache]],
+        storages: List[Storage],
+        feature_offsets: torch.Tensor,
+        output_dtype: torch.dtype,
+        initializers: List[BaseDynamicEmbInitializer],
+        optimizer: BaseDynamicEmbeddingOptimizer,
+        unique_op,
+        enable_prefetch: bool = False,
+        input_dist_dedup: bool = False,
+        training: bool = True,
+        *args,
+    ):
+        table_num = len(storages)
+        assert table_num != 0
+        emb_dtype = storages[0].embedding_dtype()
+        emb_dim = storages[0].embedding_dim()
+        caching = caches[0] is not None
+
+        indices_table_range = get_table_range(offsets, feature_offsets)
+        if training or caching:
+            (
+                unique_indices,
+                inverse,
+                unique_indices_table_range,
+                h_unique_indices_table_range,
+            ) = segmented_unique(indices, indices_table_range, unique_op)
+            # TODO: only return device unique_indices_table_range
+            # h_unique_indices_table_range = unique_indices_table_range.cpu()
+        else:
+            h_unique_indices_table_range = indices_table_range.cpu()
+            unique_indices = indices
+
+        unique_embs = torch.empty(
+            unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
+        )
+
+        for i in range(table_num):
+            begin = h_unique_indices_table_range[i]
+            end = h_unique_indices_table_range[i + 1]
+            unique_indices_per_table = unique_indices[begin:end]
+            unique_embs_per_table = unique_embs[begin:end, :]
+
+            KeyValueTableFunction.lookup(
+                caches[i],
+                storages[i],
+                unique_indices_per_table,
+                unique_embs_per_table,
+                initializers[i],
+                enable_prefetch,
+                training,
+            )
+
+        if training or caching:
+            output_embs = torch.empty(
+                indices.shape[0], emb_dim, dtype=output_dtype, device=indices.device
+            )
+            output_embs = unique_embs[inverse]
+        else:
+            output_embs = unique_embs
+
+        if training:
+            # save context
+            backward_tensors = [
+                indices,
+            ]
+            ctx.save_for_backward(*backward_tensors)
+            ctx.input_dist_dedup = input_dist_dedup
+            if input_dist_dedup:
+                ctx.unique_indices = unique_indices
+                ctx.unique_embs = unique_embs
+                ctx.inverse = inverse
+            ctx.indices_table_range = indices_table_range
+            ctx.h_indices_table_range = indices_table_range.cpu()
+            ctx.h_unique_indices_table_range = h_unique_indices_table_range
+            ctx.unique_indices_table_range = unique_indices_table_range
+            ctx.caches = caches
+            ctx.storages = storages
+            ctx.optimizer = optimizer
+            ctx.enable_prefetch = enable_prefetch
+
+        return output_embs
+
+    @staticmethod
+    def backward(ctx, grads):
+        # parse context
+        (indices,) = ctx.saved_tensors
+        indices_table_range = ctx.indices_table_range
+        h_indices_table_range = ctx.h_indices_table_range
+        h_unique_indices_table_range = ctx.h_unique_indices_table_range
+        ctx.unique_indices_table_range
+        caches = ctx.caches
+        storages = ctx.storages
+        optimizer = ctx.optimizer
+        enable_prefetch = ctx.enable_prefetch
+
+        input_dist_dedup = ctx.input_dist_dedup
+        if input_dist_dedup:
+            unique_indices = ctx.unique_indices
+            unique_embs = ctx.unique_embs
+            ctx.inverse
+        unique_indices, unique_embs = reduce_grads(
+            indices, grads, indices_table_range, h_indices_table_range
+        )
+
+        optimizer.step()
+        table_num = len(storages)
+        for i in range(table_num):
+            begin = h_unique_indices_table_range[i]
+            end = h_unique_indices_table_range[i + 1]
+            unique_indices_per_table = unique_indices[begin:end]
+            unique_embs_per_table = unique_embs[begin:end, :]
+
+            KeyValueTableFunction.update(
+                caches[i],
+                storages[i],
+                unique_indices_per_table,
+                unique_embs_per_table,
+                optimizer,
+                enable_prefetch,
+            )
+
+        return (None,) * 13

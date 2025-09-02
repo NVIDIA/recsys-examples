@@ -17,6 +17,8 @@
 
 #pragma once
 #include "torch_utils.h"
+#include "unique_op.h"
+#include "lookup_forward.h"
 #include "utils.h"
 #include <cstdint>
 #include <cub/cub.cuh>
@@ -82,4 +84,67 @@ struct SegmentedUniqueDevice {
       cudaStream_t &stream);
 };
 
+template <typename T, typename NumSelectedIteratorT>
+void select_async(
+    int64_t num_items,
+    bool const * d_flags,
+    T const * d_input,
+    T* d_output,
+    NumSelectedIteratorT* d_num_select,
+    at::Device const& device,
+    cudaStream_t const& stream
+) {
+
+  void* d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+
+  // 1. get the size of temp storage.
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    d_input, d_flags, d_output,
+    d_num_select, num_items, stream);
+  
+  // 2. allocate the temp storage.
+  d_temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)}, 
+    at::TensorOptions().dtype(torch::kChar).device(device)).data_ptr();
+
+  // 3. select
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    d_input, d_flags, d_output,
+    d_num_select, num_items, stream);
+}
+
+template <typename T, typename NumSelectedIteratorT>
+void select_index_async(
+    int64_t num_items,
+    bool const * d_flags,
+    T* d_output,
+    NumSelectedIteratorT* d_num_select,
+    at::Device const& device,
+    cudaStream_t const& stream
+) {
+  void* d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+  cub::CountingInputIterator<T> counting_iter(0);
+
+  // 1. get the size of temp storage.
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    counting_iter, d_flags, d_output,
+    d_num_select, num_items, stream);
+  
+  // 2. allocate the temp storage.
+  d_temp_storage = at::empty({static_cast<int64_t>(temp_storage_bytes)}, 
+    at::TensorOptions().dtype(torch::kChar).device(device)).data_ptr();
+
+  // 3. select
+  cub::DeviceSelect::Flagged(
+    d_temp_storage, temp_storage_bytes,
+    counting_iter, d_flags, d_output,
+    d_num_select, num_items, stream);
+}
+
 } // namespace dyn_emb
+
+void bind_index_calculation_op(py::module &m);

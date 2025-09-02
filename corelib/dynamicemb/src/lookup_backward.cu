@@ -561,7 +561,7 @@ __global__ void
 wgrad_reduction_kernel(const Key_t *unique_indices,
                        const Key_t *inverse_indices, const Key_t *biased_offset,
                        const Value_t *grads, Value_t *unique_buffer, int dim,
-                       int batch_size, int feature_num, int num_key) {
+                       int batch_size, int feature_num, int num_key, int combiner) {
   const int warpsize = 32;
   int tid = threadIdx.x;
 
@@ -570,19 +570,24 @@ wgrad_reduction_kernel(const Key_t *unique_indices,
 
     Key_t src_id = bs_upper_bound_sub_one(
         biased_offset, batch_size * feature_num + 1, (Key_t)i_ev);
+    Value_t pooling_factor = 1.0f;
+    if (combiner == 1) {
+      pooling_factor = Value_t(static_cast<float>(biased_offset[src_id + 1] - biased_offset[src_id]));
+    }
+
     const Value_t *src_ptr = grads + src_id * dim;
     Key_t dst_id = inverse_indices[i_ev];
     Value_t *dst_ptr = unique_buffer + dst_id * dim;
 
     for (int i = tid % warpSize; i < dim; i += warpsize) {
-      Value_t value = atomicAdd(dst_ptr + i, src_ptr[i]);
+      Value_t value = atomicAdd(dst_ptr + i, src_ptr[i] / pooling_factor);
     }
   }
 }
 
 void backward(void *grads, void *unique_buffer, void *unique_indices,
               void *inverse_indices, void *biased_offset, const int dim,
-              const int batch_size, const int feature_num, const int num_key,
+              const int batch_size, const int feature_num, const int num_key, int combiner,
               DataType key_type, DataType value_type, cudaStream_t stream) {
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, key_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, value_t, [&] {
@@ -591,7 +596,7 @@ void backward(void *grads, void *unique_buffer, void *unique_indices,
       wgrad_reduction_kernel<<<grid_size, block_size, 0, stream>>>(
           (key_t *)unique_indices, (key_t *)inverse_indices,
           (key_t *)biased_offset, (value_t *)grads, (value_t *)unique_buffer,
-          dim, batch_size, feature_num, num_key);
+          dim, batch_size, feature_num, num_key, combiner);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
