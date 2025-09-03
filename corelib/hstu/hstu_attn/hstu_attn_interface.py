@@ -235,7 +235,7 @@ def hstu_attn_varlen_func(
         raise ValueError(
             "AssertError: target is True and causal is not True, this is undefined behavior"
         )
-    if num_targets is None and target_group_size < 1:
+    if num_targets != None and target_group_size < 1:
         raise ValueError(
             "AssertError: target_group_size should be greater than 0 when target is True"
         )
