@@ -32,7 +32,7 @@ class HSTUAttention(torch.nn.Module):
         tq: torch.Tensor,  # (T, d)
         tk: torch.Tensor,  # (T, d)
         tv: torch.Tensor,  # (T, d)
-        offsets: torch.Tensor,  # (batch_size, 1)
+        offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
         target_group_size: int = 1,  # target <=> candidates
         num_candidates: Optional[torch.Tensor] = None,
@@ -84,7 +84,7 @@ class TorchHSTUAttention(HSTUAttention):
         tq: torch.Tensor,  # (T, d)
         tk: torch.Tensor,  # (T, d)
         tv: torch.Tensor,  # (T, d)
-        offsets: torch.Tensor,  # (batch_size, 1)
+        offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
@@ -162,7 +162,7 @@ class TritonHSTUAttention(HSTUAttention):
         tq: torch.Tensor,  # (T, d)
         tk: torch.Tensor,  # (T, d)
         tv: torch.Tensor,  # (T, d)
-        offsets: torch.Tensor,  # (batch_size, 1)
+        offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
@@ -175,7 +175,7 @@ class TritonHSTUAttention(HSTUAttention):
              tq (torch.Tensor): Query tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the query.
             tk (torch.Tensor): Key tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the key.
             tv (torch.Tensor): Value tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the value.
-            offsets (torch.Tensor): Offsets tensor of shape (batch_size, 1), indicating the start position of each sequence in the batch.
+            offsets (torch.Tensor): Offsets tensor of shape (batch_size + 1,), indicating the start position of each sequence in the batch, with a terminal offset at the end.
             max_seqlen (int): The maximum sequence length across all batches.
             target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
             num_candidates (torch.Tensor): Tensor containing the number of candidates for each sequence.
@@ -258,7 +258,7 @@ class FusedHSTUAttention(HSTUAttention):
             tq (torch.Tensor): Query tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the query.
             tk (torch.Tensor): Key tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the key.
             tv (torch.Tensor): Value tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the value.
-            offsets (torch.Tensor): Offsets tensor of shape (batch_size, 1), indicating the start position of each sequence in the batch.
+            offsets (torch.Tensor): Offsets tensor of shape (batch_size + 1,), indicating the start position of each sequence in the batch, with a terminal offset at the end.
             max_seqlen (int): The maximum sequence length across all batches.
             target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
             num_candidates (torch.Tensor): Tensor containing the number of candidates for each sequence.
@@ -338,7 +338,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         tq: torch.Tensor,  # (T, d)
         tk: torch.Tensor,  # (T, d)
         tv: torch.Tensor,  # (T, d)
-        offsets: torch.Tensor,  # (batch_size, 1)
+        offsets: torch.Tensor,  # (batch_size + 1,)
         max_seqlen: int,
         target_group_size: int = 1,  # target == candidates
         num_candidates: Optional[torch.Tensor] = None,
@@ -351,7 +351,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
             tq (torch.Tensor): Query tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the query.
             tk (torch.Tensor): Key tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the key.
             tv (torch.Tensor): Value tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the value.
-            offsets (torch.Tensor): Offsets tensor of shape (batch_size, 1), indicating the start position of each sequence in the batch.
+            offsets (torch.Tensor): Offsets tensor of shape (batch_size + 1,), indicating the start position of each sequence in the batch, with a terminal offset at the end.
             max_seqlen (int): The maximum sequence length across all batches.
             target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
             num_candidates (torch.Tensor): Tensor containing the number of candidates for each sequence.
