@@ -115,8 +115,110 @@ class CowClipDefinition:
     lower_bound: float = 0.0
 
 
+# TODO: TableShim is used when we have to interact with both DynamicEmb and KeyValueTable.
+class TableShim:
+    def __init__(self, table):
+        if isinstance(table, DynamicEmbTable):
+            self.table = cast(DynamicEmbTable, table)
+        elif isinstance(table, KeyValueTable):
+            self.table = cast(KeyValueTable, table)
+        else:
+            raise ValueError("Not support table type")
+
+    def optim_states_dim(self) -> int:
+        if isinstance(self.table, DynamicEmbTable):
+            return self.table.optstate_dim()
+        else:
+            return self.table.value_dim() - self.table.embedding_dim()
+
+    def init_optim_state(self) -> float:
+        if isinstance(self.table, DynamicEmbTable):
+            return self.table.get_initial_optstate()
+        else:
+            return self.table.init_optimizer_state()
+
+    def insert(
+        self,
+        n,
+        unique_indices,
+        unique_values,
+        scores,
+    ) -> None:
+        if isinstance(self.table, DynamicEmbTable):
+            insert_or_assign(self.table, n, unique_indices, unique_values, scores)
+        else:
+            # self.table.set_score(scores[0].item())
+            self.table.insert(unique_indices, unique_values, scores)
+
+    def count_matched(
+        self,
+        threshold: int,
+        num_matched: torch.Tensor,
+    ) -> None:
+        if isinstance(self.table, DynamicEmbTable):
+            count_matched(self.table, threshold, num_matched)
+        else:
+            count_matched(self.table.table, threshold, num_matched)
+
+    def key_type(
+        self,
+    ) -> torch.dtype:
+        if isinstance(self.table, DynamicEmbTable):
+            return dyn_emb_to_torch(self.table.key_type())
+        else:
+            return dyn_emb_to_torch(self.table.table.key_type())
+
+    def value_type(
+        self,
+    ) -> torch.dtype:
+        if isinstance(self.table, DynamicEmbTable):
+            return dyn_emb_to_torch(self.table.value_type())
+        else:
+            return dyn_emb_to_torch(self.table.table.value_type())
+
+    def embedding_dim(
+        self,
+    ) -> int:
+        if isinstance(self.table, DynamicEmbTable):
+            return dyn_emb_cols(self.table)
+        else:
+            return self.table.embedding_dim()
+
+    def capacity(
+        self,
+    ) -> int:
+        if isinstance(self.table, DynamicEmbTable):
+            return dyn_emb_capacity(self.table)
+        else:
+            return self.table.capacity
+
+    def export_batch_matched(
+        self, threshold, batch_size, search_offset, d_count, d_keys, d_vals
+    ) -> None:
+        if isinstance(self.table, DynamicEmbTable):
+            export_batch_matched(
+                self.table,
+                threshold,
+                batch_size,
+                search_offset,
+                d_count,
+                d_keys,
+                d_vals,
+            )
+        else:
+            export_batch_matched(
+                self.table.table,
+                threshold,
+                batch_size,
+                search_offset,
+                d_count,
+                d_keys,
+                d_vals,
+            )
+
+
 def _export_matched_and_gather(
-    dynamic_table: DynamicEmbTable,
+    dynamic_table: TableShim,
     threshold: int,
     pg: Optional[dist.ProcessGroup] = None,
     batch_size: int = BATCH_SIZE_PER_DUMP,
@@ -127,7 +229,7 @@ def _export_matched_and_gather(
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     d_num_matched = torch.zeros(1, dtype=torch.uint64, device=device)
-    count_matched(dynamic_table, threshold, d_num_matched)
+    dynamic_table.count_matched(threshold, d_num_matched)
 
     gathered_num_matched = [
         torch.tensor(0, dtype=torch.int64, device=device) for _ in range(world_size)
@@ -135,16 +237,16 @@ def _export_matched_and_gather(
     dist.all_gather(gathered_num_matched, d_num_matched.to(dtype=torch.int64), group=pg)
 
     total_matched = sum([t.item() for t in gathered_num_matched])  # t is on device.
-    key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-    value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-    dim: int = dyn_emb_cols(dynamic_table)
+    key_dtype = dynamic_table.key_type()
+    value_dtype = dynamic_table.value_type()
+    dim: int = dynamic_table.embedding_dim()
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
     ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
     ret_offset = 0
 
     search_offset = 0
-    search_capacity = dyn_emb_capacity(dynamic_table)
+    search_capacity = dynamic_table.capacity()
     batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
@@ -159,8 +261,8 @@ def _export_matched_and_gather(
     ]
 
     while search_offset < search_capacity:
-        export_batch_matched(
-            dynamic_table, threshold, batch_size, search_offset, d_count, d_keys, d_vals
+        dynamic_table.export_batch_matched(
+            threshold, batch_size, search_offset, d_count, d_keys, d_vals
         )
 
         dist.all_gather(gathered_keys, d_keys, group=pg)
@@ -184,25 +286,25 @@ def _export_matched_and_gather(
 
 
 def _export_matched(
-    dynamic_table: DynamicEmbTable,
+    dynamic_table: TableShim,
     threshold: int,
     batch_size: int = BATCH_SIZE_PER_DUMP,
 ) -> Tuple[Tensor, Tensor]:
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     d_num_matched = torch.zeros(1, dtype=torch.uint64, device=device)
-    count_matched(dynamic_table, threshold, d_num_matched)
+    dynamic_table.count_matched(threshold, d_num_matched)
 
     total_matched = d_num_matched.cpu().item()
-    key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-    value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-    dim: int = dyn_emb_cols(dynamic_table)
+    key_dtype = dynamic_table.key_type()
+    value_dtype = dynamic_table.value_type()
+    dim: int = dynamic_table.embedding_dim()
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
     ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
     ret_offset = 0
 
     search_offset = 0
-    search_capacity = dyn_emb_capacity(dynamic_table)
+    search_capacity = dynamic_table.capacity()
     batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
@@ -210,8 +312,8 @@ def _export_matched(
     d_count = torch.zeros(1, dtype=torch.uint64, device=device)
 
     while search_offset < search_capacity:
-        export_batch_matched(
-            dynamic_table, threshold, batch_size, search_offset, d_count, d_keys, d_vals
+        dynamic_table.export_batch_matched(
+            threshold, batch_size, search_offset, d_count, d_keys, d_vals
         )
 
         h_count = d_count.cpu().item()
@@ -1586,14 +1688,31 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_thresholds: List[int] = named_thresholds.values()
         ret_tensors: Dict[str, Tuple[Tensor, Tensor]] = {}
         ret_scores: Dict[str, int] = {}
+
+        def _export_matched_per_table(pg, table, threshold):
+            if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
+                key, value = _export_matched(table, threshold)
+            else:
+                key, value = _export_matched_and_gather(table, threshold, pg)
+            return key, value
+
         for table_name, threshold in zip(table_names, table_thresholds):
             index = self._table_names.index(table_name)
-            if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
-                key, value = _export_matched(self._tables[index], threshold)
+            if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+                storage = TableShim(self._storages[index])
+                key, value = _export_matched_per_table(pg, storage, threshold)
+                if self._caches[index] is not None:
+                    # flush will change the score(timestamp) in storage
+                    # self._caches[index].flush(self._storages[index])
+                    cache = TableShim(self._caches[index])
+                    key_c, value_c = _export_matched_per_table(pg, cache, threshold)
+
+                    key = torch.cat((key_c, key), dim=0).contiguous()
+                    value = torch.cat((value_c, value), dim=0).contiguous()
             else:
-                key, value = _export_matched_and_gather(
-                    self._tables[index], threshold, pg
-                )
+                table = TableShim(self._tables[index])
+                key, value = _export_matched_per_table(pg, table, threshold)
+
             ret_tensors[table_name] = (key, value)
             ret_scores[table_name] = self._scores[table_name]
         return ret_tensors, ret_scores
