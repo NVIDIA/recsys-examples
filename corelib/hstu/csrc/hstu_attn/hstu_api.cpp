@@ -556,7 +556,9 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     const bool deterministic) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
-  TORCH_CHECK(dprops->major == 8 && dprops->minor == 0, "HSTU backward does not support sm86 or sm89.");
+  if (dprops->major == 8) {
+    TORCH_CHECK(dprops->minor == 0, "For Ampere GPUs, HSTU backward does not support sm86 or sm89.");
+  }
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   auto q_dtype = q.dtype();
