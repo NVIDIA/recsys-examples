@@ -48,6 +48,8 @@ POOLING_MODE: Dict[DynamicEmbPoolingMode, PoolingMode] = {
 OPTIM_TYPE: Dict[EmbOptimType, OptimType] = {
     EmbOptimType.SGD: OptimType.EXACT_SGD,
     EmbOptimType.ADAM: OptimType.ADAM,
+    EmbOptimType.EXACT_ADAGRAD: OptimType.EXACT_ADAGRAD,
+    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimType.EXACT_ROWWISE_ADAGRAD,
 }
 
 
@@ -380,6 +382,20 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
                 "beta2": 0.888,
             },
         ),
+        (
+            EmbOptimType.EXACT_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -487,6 +503,20 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
                 "eps": 3e-5,
                 "beta1": 0.8,
                 "beta2": 0.888,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
             },
         ),
     ],
