@@ -25,7 +25,7 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 
 
 @pytest.fixture
@@ -103,6 +103,7 @@ def generate_sparse_feature(feature_num, batch, multi_hot_size):
 @pytest.mark.parametrize("num_iteration", [12])  # [1024])
 @pytest.mark.parametrize("dump_interval", [3])  # ][64])
 @pytest.mark.parametrize("fixed_hot_size", [1])
+@pytest.mark.parametrize("caching", [True, False])
 def test_without_eviction(
     request,
     current_device,
@@ -117,6 +118,7 @@ def test_without_eviction(
     num_iteration,
     dump_interval,
     fixed_hot_size,
+    caching,
 ):
     print(f"\n{request.node.name}")
     options_list = [
@@ -131,13 +133,14 @@ def test_without_eviction(
             local_hbm_for_values=1024**3,
             score_strategy=score_strategy,
             num_of_buckets_per_alloc=num_embeddings[i] // bucket_capacity,
+            caching=caching,
         )
         for i in range(table_num)
     ]
 
     table_names = [f"t_{i}" for i in range(table_num)]
 
-    model = BatchedDynamicEmbeddingTables(
+    model = BatchedDynamicEmbeddingTablesV2(
         table_options=options_list,
         output_dtype=torch.float32,
         table_names=table_names,

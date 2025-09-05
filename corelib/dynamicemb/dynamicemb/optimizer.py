@@ -788,7 +788,6 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
         self.get_state_dim(emb_dim)
 
         dynamic_emb_rowwise_adagrad_fused(
-            grads.size(0),
             grads,
             values,
             lr,
@@ -808,7 +807,6 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
         state_dim = self.get_state_dim(emb_dim)
 
         dynamic_emb_rowwise_adagrad_with_pointer(
-            grads.size(0),
             grads,
             value_ptr,
             value_type,
