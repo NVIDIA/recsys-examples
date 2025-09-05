@@ -244,6 +244,7 @@ class HKVConfig(GroupedHKVConfig):
     use_constant_memory: bool = False
     reserved_key_start_bit: int = 0
     num_of_buckets_per_alloc: int = 1
+    num_embedding_growth_per_rank: int = 0
 
 
 @dataclass
@@ -489,7 +490,37 @@ def string_to_evict_strategy(strategy_str: str) -> EvictStrategy:
         raise ValueError(f"Invalid EvictStrategy string: {strategy_str}")
 
 
+DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+}
+
+
+def get_optimizer_state_dim(optimizer_type, dim, dtype):
+    if optimizer_type == OptimizerType.RowWiseAdaGrad:
+        return 16 // DTYPE_NUM_BYTES[dtype]
+    elif optimizer_type == OptimizerType.Adam:
+        return dim * 2
+    elif optimizer_type == OptimizerType.AdaGrad:
+        return dim
+    else:
+        return 0
+
+
 def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmbTable:
+    table_options.local_hbm_for_values += (
+        table_options.num_embedding_growth_per_rank
+        * (
+            table_options.dim
+            + get_optimizer_state_dim(
+                table_options.optimizer_type,
+                table_options.dim,
+                table_options.embedding_dtype,
+            )
+        )
+        * DTYPE_NUM_BYTES[table_options.embedding_dtype]
+    )
     return DynamicEmbTable(
         torch_to_dyn_emb(table_options.index_type),
         torch_to_dyn_emb(table_options.embedding_dtype),
@@ -524,22 +555,6 @@ def validate_initializer_args(
             initializer_args.lower = default_lower
         if initializer_args.upper is None:
             initializer_args.upper = default_upper
-
-
-def get_optimizer_state_dim(optimizer_type, dim, dtype):
-    DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
-        torch.float32: 4,
-        torch.float16: 2,
-        torch.bfloat16: 2,
-    }
-    if optimizer_type == OptimizerType.RowWiseAdaGrad:
-        return 16 // DTYPE_NUM_BYTES[dtype]
-    elif optimizer_type == OptimizerType.Adam:
-        return dim * 2
-    elif optimizer_type == OptimizerType.AdaGrad:
-        return dim
-    else:
-        return 0
 
 
 def get_constraint_capacity(
