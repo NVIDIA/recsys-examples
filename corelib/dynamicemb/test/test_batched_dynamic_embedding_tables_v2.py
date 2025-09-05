@@ -625,6 +625,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
         assert list(bdeb.get_score().values()) == [1] * len(dims)
 
     with torch.cuda.stream(forward_stream):
+        torch.cuda.current_stream().wait_stream(pretch_stream)
         embs_bdeb_A = bdeb(indicesA, offsetsA)
         loss_bdet_A = embs_bdeb_A.mean()
         loss_bdet_A.backward()
@@ -656,6 +657,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
         assert list(bdeb.get_score().values()) == [2] * len(dims)
 
     with torch.cuda.stream(forward_stream):
+        torch.cuda.current_stream().wait_stream(pretch_stream)
         embs_bdeb_A = bdeb(indicesA, offsetsA)
         loss_bdet_A = embs_bdeb_A.mean()
         loss_bdet_A.backward()
