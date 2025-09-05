@@ -37,24 +37,6 @@ from dynamicemb_extensions import (
 )
 
 
-class EventQueue:
-    def __init__(
-        self,
-    ):
-        self._events = []
-
-    def produce(self) -> torch.cuda.Event:
-        event = torch.cuda.Event()
-        self._events.append(event)
-        return event
-
-    def consume(self) -> torch.cuda.Event:
-        return self._events.pop(0)
-
-    def clear(self) -> None:
-        self._events = []
-
-
 class Storage(abc.ABC):
     @abc.abstractmethod
     def __init__(
@@ -188,11 +170,6 @@ class Cache(abc.ABC):
     ) -> None:
         pass
 
-    @property
-    @abc.abstractmethod
-    def event_queue(self) -> EventQueue:
-        pass
-
     @abc.abstractmethod
     def cache_metrics(
         self,
@@ -229,7 +206,6 @@ class KeyValueTable(Cache, Storage):
             props.multi_processor_count * props.max_threads_per_multi_processor
         )
 
-        self._event_queue = EventQueue()
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
         self._use_score = self.table.evict_strategy() != EvictStrategy.KLru
@@ -447,11 +423,6 @@ class KeyValueTable(Cache, Storage):
         self,
     ) -> None:
         clear(self.table)
-        self._event_queue.clear()
-
-    @property
-    def event_queue(self) -> EventQueue:
-        return self._event_queue
 
     @property
     def cache_metrics(self) -> Optional[torch.Tensor]:
@@ -467,14 +438,11 @@ def update_cache(
     storage: Storage,
     missing_keys: torch.Tensor,
     missing_values: torch.Tensor,
-    record: bool = False,
 ):
     # need to update score.
     num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(
         missing_keys, missing_values
     )
-    if record:
-        cache.event_queue.produce().record()
     h_num_evicted = num_evicted.cpu().item()
     if h_num_evicted != 0:
         storage.insert(
@@ -504,8 +472,6 @@ class KeyValueTableFunction:
 
         # 1. find in cache
         if caching:
-            if enable_prefetch:
-                torch.cuda.current_stream().wait_event(cache.event_queue.consume())
             num_missing, missing_keys, missing_indices = cache.find(
                 unique_keys, unique_embs
             )
@@ -660,8 +626,6 @@ class KeyValueTableFunction:
         h_num_keys_for_storage = num_missing.cpu().item()
         missing_keys = missing_keys[:h_num_keys_for_storage]
         if h_num_keys_for_storage == 0:
-            if forward_stream is not None:
-                cache.event_queue.produce().record()
             return
 
         val_dim = storage.value_dim()
@@ -699,5 +663,8 @@ class KeyValueTableFunction:
                 values_for_storage = values_for_storage[founds, :]
 
         update_cache(
-            cache, storage, missing_keys, values_for_storage, forward_stream is not None
+            cache,
+            storage,
+            missing_keys,
+            values_for_storage,
         )
