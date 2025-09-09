@@ -44,26 +44,42 @@ torch_dtype_to_np_dtype = {
     torch.float32: np.float32,
 }
 
-KEY_TYPE = torch.uint64
+KEY_TYPE = torch.int64
 EMBEDDING_TYPE = torch.float32
-SCORE_TYPE = torch.uint64
+SCORE_TYPE = torch.int64
 OPT_STATE_TYPE = torch.float32
 
 
-def encode_key_file_name(table_name: str, rank: int, world_size: int) -> str:
-    return f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}"
+def encode_key_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}"
+    )
 
 
-def encode_value_file_name(table_name: str, rank: int, world_size: int) -> str:
-    return f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}"
+def encode_value_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}"
+    )
 
 
-def encode_score_file_name(table_name: str, rank: int, world_size: int) -> str:
-    return f"{table_name}_emb_scores.rank_{rank}.world_size_{world_size}"
+def encode_score_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_scores.rank_{rank}.world_size_{world_size}"
+    )
 
 
-def encode_opt_file_name(table_name: str, rank: int, world_size: int) -> str:
-    return f"{table_name}_opt_values.rank_{rank}.world_size_{world_size}"
+def encode_opt_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_opt_values.rank_{rank}.world_size_{world_size}"
+    )
 
 
 def save_to_json(data: Dict[str, Any], file_path: str) -> None:
@@ -101,9 +117,7 @@ def find_sharded_modules(
         else:
             for name, child in current_module.named_children():
                 child_path = current_path + ("." if current_path else "") + name
-
                 stack.append((child, child_path, name))
-
     return sharded_modules
 
 
@@ -213,7 +227,6 @@ def local_export(
     ):
         fkey.write(keys.cpu().numpy().tobytes())
         fembedding.write(embeddings.cpu().numpy().tobytes())
-
         if fopt_states:
             fopt_states.write(opt_states.cpu().numpy().tobytes())
         if fscore:
@@ -243,21 +256,16 @@ def distributed_export(
     world_size = dist.get_world_size(group=pg)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    emb_key_name = encode_key_file_name(name, rank, world_size)
-    emb_value_name = encode_value_file_name(name, rank, world_size)
-
-    emb_key_path = os.path.join(root_path, emb_key_name)
-    emb_value_path = os.path.join(root_path, emb_value_name)
+    emb_key_path = encode_key_file_path(root_path, name, rank, world_size)
+    emb_value_path = encode_value_file_path(root_path, name, rank, world_size)
 
     emb_score_path = None
     if dynamic_table.evict_strategy() != EvictStrategy.KLru:
-        emb_score_name = encode_score_file_name(name, rank, world_size)
-        emb_score_path = os.path.join(root_path, emb_score_name)
+        emb_score_path = encode_score_file_path(root_path, name, rank, world_size)
 
     opt_value_path = None
-    if optim:
-        opt_value_name = encode_opt_file_name(name, rank, world_size)
-        opt_value_path = os.path.join(root_path, opt_value_name)
+    if optim and dynamic_table.optstate_dim() > 0:
+        opt_value_path = encode_opt_file_path(root_path, name, rank, world_size)
 
     local_export(
         dynamic_table,
@@ -372,10 +380,6 @@ def DynamicEmbDump(
                 ):
                     continue
 
-                if optim:
-                    optimizer = dynamic_emb_module.optimizer
-                    opt_args = optimizer.get_opt_args()
-
                 distributed_export(
                     dynamic_table,
                     full_collection_path,
@@ -385,6 +389,8 @@ def DynamicEmbDump(
                 )
 
                 if optim and rank == 0:
+                    optimizer = dynamic_emb_module.optimizer
+                    opt_args = optimizer.get_opt_args()
                     args_filename = dynamic_table_name + "_opt_args.json"
                     args_path = os.path.join(full_collection_path, args_filename)
                     save_to_json(opt_args, args_path)
@@ -465,6 +471,7 @@ def local_load(
     device: Optional[torch.device] = None,
     rank: int = 0,
     world_size: int = 1,
+    checkpoint_version: int = 2,
 ):
     if device is None:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -480,9 +487,17 @@ def local_load(
     batch_size = 65536
 
     num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
-    num_embeddings = (
-        os.path.getsize(embedding_file_path) // EMBEDDING_TYPE.itemsize // dim
-    )
+
+    if checkpoint_version == 1:
+        num_embeddings = (
+            os.path.getsize(embedding_file_path)
+            // EMBEDDING_TYPE.itemsize
+            // (dim + optstate_dim)
+        )
+    else:
+        num_embeddings = (
+            os.path.getsize(embedding_file_path) // EMBEDDING_TYPE.itemsize // dim
+        )
 
     if num_keys != num_embeddings:
         raise ValueError(
@@ -496,7 +511,7 @@ def local_load(
                 f"The number of keys in {emb_key_path} does not match with number of scores in {score_file_path}."
             )
 
-    if opt_file_path:
+    if opt_file_path and checkpoint_version == 2:
         num_opt_states = (
             os.path.getsize(opt_file_path) // OPT_STATE_TYPE.itemsize // optstate_dim
         )
@@ -508,20 +523,51 @@ def local_load(
     for start in range(0, num_keys, batch_size):
         num_keys_to_read = min(num_keys - start, batch_size)
         keys_bytes = fkey.read(KEY_TYPE.itemsize * num_keys_to_read)
-        embedding_bytes = fembedding.read(
-            EMBEDDING_TYPE.itemsize * dim * num_keys_to_read
-        )
+        if checkpoint_version == 1:
+            value_bytes = fembedding.read(
+                EMBEDDING_TYPE.itemsize * (dim + optstate_dim) * num_keys_to_read
+            )
+            values = torch.tensor(
+                np.frombuffer(
+                    value_bytes, dtype=torch_dtype_to_np_dtype[EMBEDDING_TYPE]
+                ),
+                dtype=EMBEDDING_TYPE,
+                device=device,
+            ).view(-1, dim + optstate_dim)
+            embeddings = values[:, :dim]
+            opt_states = None
+            if fopt_states:
+                opt_states = values[:, dim:]
+        elif checkpoint_version == 2:
+            embedding_bytes = fembedding.read(
+                EMBEDDING_TYPE.itemsize * dim * num_keys_to_read
+            )
+            embeddings = torch.tensor(
+                np.frombuffer(
+                    embedding_bytes, dtype=torch_dtype_to_np_dtype[EMBEDDING_TYPE]
+                ),
+                dtype=EMBEDDING_TYPE,
+                device=device,
+            ).view(-1, dim)
+
+            opt_states = None
+            if fopt_states:
+                opt_state_bytes = fopt_states.read(
+                    OPT_STATE_TYPE.itemsize * optstate_dim * num_keys_to_read
+                )
+                opt_states = torch.tensor(
+                    np.frombuffer(
+                        opt_state_bytes, dtype=torch_dtype_to_np_dtype[OPT_STATE_TYPE]
+                    ),
+                    dtype=OPT_STATE_TYPE,
+                    device=device,
+                ).view(-1, optstate_dim)
+        else:
+            raise ValueError(f"Invalid checkpoint version: {checkpoint_version}")
 
         keys = torch.tensor(
             np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
             dtype=KEY_TYPE,
-            device=device,
-        )
-        embeddings = torch.tensor(
-            np.frombuffer(
-                embedding_bytes, dtype=torch_dtype_to_np_dtype[EMBEDDING_TYPE]
-            ),
-            dtype=EMBEDDING_TYPE,
             device=device,
         )
 
@@ -534,27 +580,14 @@ def local_load(
                 device=device,
             )
 
-        opt_states = None
-        if fopt_states:
-            opt_state_bytes = fopt_states.read(
-                OPT_STATE_TYPE.itemsize * optstate_dim * num_keys_to_read
-            )
-            opt_states = torch.tensor(
-                np.frombuffer(
-                    opt_state_bytes, dtype=torch_dtype_to_np_dtype[OPT_STATE_TYPE]
-                ),
-                dtype=OPT_STATE_TYPE,
-                device=device,
-            )
-
         if world_size > 1:
             masks = keys % world_size == rank
             keys = keys[masks]
-            embeddings = embeddings[masks]
+            embeddings = embeddings[masks, :]
             if scores is not None:
                 scores = scores[masks]
             if opt_states is not None:
-                opt_states = opt_states[masks]
+                opt_states = opt_states[masks, :]
         load_key_values(dynamic_table, keys, embeddings, scores, opt_states)
 
     fkey.close()
@@ -565,22 +598,38 @@ def local_load(
         fopt_states.close()
 
 
-def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str], int]:
-    suffix_to_encode_file_name_func = {
-        "emb_keys": encode_key_file_name,
-        "emb_values": encode_value_file_name,
-        "emb_scores": encode_score_file_name,
-        "opt_values": encode_opt_file_name,
+def find_files(
+    root_path: str, table_name: str, suffix: str
+) -> Tuple[List[str], int, int]:
+    suffix_to_encode_file_path_func = {
+        "emb_keys": encode_key_file_path,
+        "emb_values": encode_value_file_path,
+        "emb_scores": encode_score_file_path,
+        "opt_values": encode_opt_file_path,
     }
-    if suffix not in suffix_to_encode_file_name_func:
+    if suffix not in suffix_to_encode_file_path_func:
         raise RuntimeError(f"Invalid suffix: {suffix}")
-    encode_file_name_func = suffix_to_encode_file_name_func[suffix]
+    encode_file_path_func = suffix_to_encode_file_path_func[suffix]
 
     import glob
 
+    # v2 version
     files = glob.glob(
         os.path.join(root_path, f"{table_name}_{suffix}.rank_*.world_size_*")
     )
+    if len(files) == 0:
+        # v1 version
+        checkpoint_version = 1
+        suffix_to_v1_path = {
+            "emb_keys": os.path.join(root_path, table_name + "_keys"),
+            "emb_values": os.path.join(root_path, table_name + "_values"),
+            "emb_scores": os.path.join(root_path, table_name + "_scores"),
+            "opt_values": os.path.join(root_path, table_name + "_values"),
+        }
+        file = suffix_to_v1_path[suffix]
+        if not os.path.exists(file):
+            return [], 0, checkpoint_version
+        return [file], 1, checkpoint_version
     world_size = int(files[0].split(".")[-1].split("_")[-1])
     if len(files) != world_size:
         raise RuntimeError(
@@ -588,13 +637,14 @@ def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str],
         )
 
     for i in range(world_size):
-        expected_file_name = encode_file_name_func(table_name, i, world_size)
-        if os.path.join(root_path, expected_file_name) not in set(files):
+        expected_file_path = encode_file_path_func(root_path, table_name, i, world_size)
+        if expected_file_path not in set(files):
             raise RuntimeError(
-                f"Checkpoints is corrupted. Expected file {expected_file_name} under path {root_path} for table {table_name}, but it is not found."
+                f"Checkpoints is corrupted. Expected file path {expected_file_path} for table {table_name}, but it is not found."
             )
 
-    return files, len(files)
+    checkpoint_version = 2
+    return files, len(files), checkpoint_version
 
 
 def get_loading_files(
@@ -603,18 +653,23 @@ def get_loading_files(
     pg: Optional[dist.ProcessGroup] = None,
     need_dump_score: bool = False,
     optim: bool = False,
-) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
+) -> Tuple[List[str], List[str], List[str], List[str], int, int, int]:
+    checkpoint_version = 2
     world_size = dist.get_world_size(group=pg)
 
     if not os.path.exists(root_path):
         raise RuntimeError(f"can't find path to load, path:", root_path)
 
-    key_files, num_key_files = find_files(root_path, name, "emb_keys")
-    value_files, num_value_files = find_files(root_path, name, "emb_values")
-    score_files, num_score_files = (
-        find_files(root_path, name, "emb_scores") if need_dump_score else 0
+    key_files, num_key_files, checkpoint_version = find_files(
+        root_path, name, "emb_keys"
     )
-    opt_files, num_opt_files = find_files(root_path, name, "opt_values") if optim else 0
+    value_files, num_value_files, _ = find_files(root_path, name, "emb_values")
+    score_files, num_score_files, _ = (
+        find_files(root_path, name, "emb_scores") if need_dump_score else ([], 0, None)
+    )
+    opt_files, num_opt_files, _ = (
+        find_files(root_path, name, "opt_values") if optim else ([], 0, None)
+    )
 
     if num_key_files != num_value_files:
         raise RuntimeError(
@@ -631,17 +686,20 @@ def get_loading_files(
             f"The number of key files under path {root_path} for table {name} does not match the number of opt files."
         )
 
-    if world_size == num_key_files:
-        rank = dist.get_rank(group=pg)
+    rank = dist.get_rank(group=pg)
+    if world_size == num_key_files and checkpoint_version == 2:
         return (
-            [encode_key_file_name(name, rank, world_size)],
-            [encode_value_file_name(name, rank, world_size)],
-            [encode_score_file_name(name, rank, world_size)]
+            [encode_key_file_path(root_path, name, rank, world_size)],
+            [encode_value_file_path(root_path, name, rank, world_size)],
+            [encode_score_file_path(root_path, name, rank, world_size)]
             if need_dump_score
             else [None],
-            [encode_opt_file_name(name, rank, world_size)] if optim else [None],
+            [encode_opt_file_path(root_path, name, rank, world_size)]
+            if num_opt_files > 0
+            else [None],
             0,
             1,
+            checkpoint_version,
         )
     # TODO: support skipping files.
     return (
@@ -651,6 +709,7 @@ def get_loading_files(
         opt_files if optim else [None for _ in range(num_key_files)],
         rank,
         world_size,
+        checkpoint_version,
     )
 
 
@@ -659,6 +718,7 @@ def distributed_load(
     root_path: str,
     name: str,
     optim: bool = False,
+    pg: Optional[dist.ProcessGroup] = None,
 ):
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -671,7 +731,10 @@ def distributed_load(
         opt_value_files,
         rank,
         world_size,
-    ) = get_loading_files(root_path, name, need_dump_score, optim)
+        checkpoint_version,
+    ) = get_loading_files(
+        root_path, name, pg, need_dump_score, optim and dynamic_table.optstate_dim() > 0
+    )
 
     for emb_key_file, emb_value_file, score_file, opt_file in zip(
         emb_key_files, emb_value_files, emb_score_files, opt_value_files
@@ -685,6 +748,7 @@ def distributed_load(
             device,
             rank,
             world_size,
+            checkpoint_version,
         )
 
 
@@ -762,13 +826,12 @@ def DynamicEmbLoad(
                     table_names[current_collection_name]
                 ):
                     continue
-
                 distributed_load(
                     dynamic_table,
                     full_collection_path,
                     dynamic_table_name,
-                    pg=pg,
                     optim=optim,
+                    pg=pg,
                 )
 
     if torch.cuda.is_available():

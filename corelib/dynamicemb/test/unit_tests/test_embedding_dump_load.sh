@@ -1,61 +1,42 @@
 #!/bin/bash 
 set -e
 
-export PYHKV_DEBUG=1
-export PYHKV_DEBUG_ITER=10
-export DYNAMICEMB_DUMP_LOAD_DEBUG=1
+NUM_EMBEDDING_COLLECTIONS=4
+NUM_EMBEDDINGS=1000000,1000000,1000000,1000000,1000000,1000000
+MULTI_HOT_SIZES=10,10,10,10,10,10
+NUM_GPUS=(1 2 4 8)
+OPTIMIZER_TYPE=("adam" "sgd" "adagrad" "rowwise_adagrad")
 
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup True --batch_size 1024 || exit 1
+for num_gpus in ${NUM_GPUS[@]}; do
+  for optimizer_type in ${OPTIMIZER_TYPE[@]}; do  
+    torchrun \
+      --nnodes 1 \
+      --nproc_per_node $num_gpus \
+      ./test/unit_tests/test_embedding_dump_load.py \
+      --optimizer-type ${optimizer_type} \
+      --mode "dump" \
+      --save-path "debug_weight_${optimizer_type}_${num_gpus}" \
+      --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+      --num-embeddings $NUM_EMBEDDINGS \
+      --multi-hot-sizes $MULTI_HOT_SIZES \
+      --embedding-dim 16 || exit 1
+  done
+done
 
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup False --batch_size 1024 || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 129 --use_index_dedup True --batch_size 1024 || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 129 --use_index_dedup False --batch_size 1024 || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 15 --use_index_dedup True --batch_size 1023 --multi_hot_sizes=20,1,101,49 || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 15 --use_index_dedup False --batch_size 1023  --multi_hot_sizes=20,1,101,49 || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 15 --use_index_dedup True --batch_size 1023  --multi_hot_sizes=20,49,101,1 || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 15 --use_index_dedup False --batch_size 1023  --multi_hot_sizes=20,1,101,49 --score_type="step" || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 15 --use_index_dedup True --batch_size 1023  --multi_hot_sizes=20,49,101,1  --score_type="step" || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 15 --use_index_dedup False --batch_size 1023  --multi_hot_sizes=20,1,101,49 --score_type="custimized" || exit 1
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --nnodes 1 \
-  --nproc_per_node 2 \
-  ./test/unit_tests/test_embedding_dump_load.py --print_sharding_plan --optimizer_type "adam" --embedding_dim 15 --use_index_dedup True --batch_size 1023  --multi_hot_sizes=20,49,101,1  --score_type="custimized" || exit 1
+for num_load_gpus in ${NUM_GPUS[@]}; do
+  for num_dump_gpus in ${NUM_GPUS[@]}; do
+    for optimizer_type in ${OPTIMIZER_TYPE[@]}; do  
+      torchrun \
+        --nnodes 1 \
+        --nproc_per_node $num_load_gpus \
+        ./test/unit_tests/test_embedding_dump_load.py \
+        --optimizer-type ${optimizer_type} \
+        --mode "load" \
+        --save-path "debug_weight_${optimizer_type}_${num_dump_gpus}" \
+        --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+        --num-embeddings $NUM_EMBEDDINGS \
+        --multi-hot-sizes $MULTI_HOT_SIZES \
+        --embedding-dim 16 || exit 1
+    done
+  done
+done
