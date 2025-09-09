@@ -13,9 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Union, cast
+# pyre-strict
+from typing import List, Optional, Set, Type, Union, cast
 
 import torch
+
+# from torchrec.distributed import ModuleShardingPlan
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+
+TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = {
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+}
 
 
 def tabulate(
