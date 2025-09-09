@@ -40,6 +40,9 @@ from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_parallel import get_unwrapped_module
 
+_PAD_TO_LENGTH = 4096  # Pad strings to multiples of 4096 for broadcasting
+def _calculate_pad_length(original_str: str, base: int = _PAD_TO_LENGTH) -> int:
+    return ((len(original_str) + base - 1) // base) * base
 
 def debug_check_dynamic_table_is_zero(dynamic_table):
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -592,7 +595,7 @@ def get_dynamic_emb_module(model: nn.Module) -> List[nn.Module]:
 
 
 # TODO:will use in TW TWRW , to gather tablename , and do communication
-def pad_to_length(original_str: str, length: int = 4096, pad_char: str = " ") -> str:
+def pad_to_length(original_str: str, length: int, pad_char: str = " ") -> str:
     """
     Pad the input string to a specified length with a given character.
 
@@ -608,7 +611,7 @@ def pad_to_length(original_str: str, length: int = 4096, pad_char: str = " ") ->
 
 
 def broadcast_string(
-    original_str: str, rank: int = 0, pg: Optional[dist.ProcessGroup] = None
+    original_str: str, length: int, rank: int = 0, pg: Optional[dist.ProcessGroup] = None
 ) -> str:
     """
     Broadcasts a string from rank 0 to all other ranks.
@@ -621,7 +624,7 @@ def broadcast_string(
         str: The resulting string after broadcasting.
     """
 
-    padded_str = pad_to_length(original_str)
+    padded_str = pad_to_length(original_str, length)
     ascii_values = [ord(char) for char in padded_str]
     tensor = torch.tensor(ascii_values, dtype=torch.int32).cuda()
 
@@ -1102,14 +1105,16 @@ def DynamicEmbDump(
                 for name, table in zip(filtered_table_names, filtered_dynamic_tables)
             }
 
-            if rank == 0:
-                # Rank 0 determines the order of keys
-                ordered_keys = tmp_tables_dict.keys()
-                ordered_keys_str = ",".join(ordered_keys)
-            else:
+            ordered_keys = tmp_tables_dict.keys()
+            ordered_keys_str = ",".join(ordered_keys)
+            length = _calculate_pad_length(ordered_keys_str)
+
+            if rank != 0:
                 ordered_keys_str = ""
 
-            ordered_keys_str = broadcast_string(ordered_keys_str, rank=rank, pg=pg)
+            ordered_keys_str = broadcast_string(
+                ordered_keys_str, length=length, rank=rank, pg=pg
+            )
             ordered_keys = ordered_keys_str.split(",")
 
             for k, dump_name in enumerate(ordered_keys):
