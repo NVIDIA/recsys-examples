@@ -490,6 +490,8 @@ def string_to_evict_strategy(strategy_str: str) -> EvictStrategy:
 
 
 def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmbTable:
+    if not table_options.training:
+        table_options.optimizer_type = OptimizerType.Null
     return DynamicEmbTable(
         torch_to_dyn_emb(table_options.index_type),
         torch_to_dyn_emb(table_options.embedding_dtype),
