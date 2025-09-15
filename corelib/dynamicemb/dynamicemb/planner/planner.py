@@ -183,25 +183,24 @@ def _validate_configs(
             tmp_constraint.dynamicemb_options.initializer_args, tmp_config
         )
         # modify num_embeddings per rank to power of 2
-        num_embeddings_per_rank = int(
+        num_aligned_embedding_per_rank = int(
             _next_power_of_2(math.ceil(tmp_config.num_embeddings / world_size))
         )
         if (
-            num_embeddings_per_rank
+            num_aligned_embedding_per_rank
             < constraints[config_name].dynamicemb_options.bucket_capacity
         ):
-            num_embeddings_per_rank = constraints[
+            num_aligned_embedding_per_rank = constraints[
                 config_name
             ].dynamicemb_options.bucket_capacity
-        num_embeddings_growth_per_rank = (
-            num_embeddings_per_rank - tmp_config.num_embeddings // world_size
-        )
-        tmp_constraint.dynamicemb_options.num_embeddings_growth_per_rank = (
-            num_embeddings_growth_per_rank
-        )
-        # num_embeddings_per_rank = _get_safe_local_capacity(num_embeddings_per_rank, tmp_constraint.dynamicemb_options.bucket_capacity)
-        num_embeddings_new = int(num_embeddings_per_rank * world_size)
-        tmp_config.num_embeddings = num_embeddings_new
+
+        # num_aligned_embedding_per_rank = _get_safe_local_capacity(num_aligned_embedding_per_rank, tmp_constraint.dynamicemb_options.bucket_capacity)
+        if tmp_config.num_embeddings != int(
+            num_aligned_embedding_per_rank * world_size
+        ):
+            tmp_constraint.dynamicemb_options.num_aligned_embedding_per_rank = (
+                num_aligned_embedding_per_rank
+            )
 
 
 def _dyn_emb_table_size_per_rank(

@@ -566,22 +566,13 @@ class BatchedDynamicEmbeddingTables(nn.Module):
 
     def _create_tables(self) -> None:
         for option in self._dynamicemb_options:
-            if option.training:
-                if self._optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-                    option.optimizer_type = OptimizerType.RowWiseAdaGrad
-                elif (
-                    self._optimizer_type == EmbOptimType.SGD
-                    or self._optimizer_type == EmbOptimType.EXACT_SGD
-                ):
-                    option.optimizer_type = OptimizerType.SGD
-                elif self._optimizer_type == EmbOptimType.ADAM:
-                    option.optimizer_type = OptimizerType.Adam
-                elif self._optimizer_type == EmbOptimType.EXACT_ADAGRAD:
-                    option.optimizer_type = OptimizerType.AdaGrad
-                else:
-                    raise ValueError(
-                        f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
-                    )
+            if option.training and option.optimizer_type == OptimizerType.Null:
+                option.optimizer_type = convert_optimizer_type(self._optimizer_type)
+            elif not option.training and option.optimizer_type != OptimizerType.Null:
+                option.optimizer_type = OptimizerType.Null
+                warnings.warn(
+                    "Set OptimizerType to Null as not on training mode.", UserWarning
+                )
             self._tables.append(create_dynamicemb_table(option))
 
     def _create_optimizer(
@@ -1028,22 +1019,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def _create_tables(self) -> None:
         self._tables: List[DynamicEmbTable] = []
         for option in self._dynamicemb_options:
-            if option.training:
-                if self._optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-                    option.optimizer_type = OptimizerType.RowWiseAdaGrad
-                elif (
-                    self._optimizer_type == EmbOptimType.SGD
-                    or self._optimizer_type == EmbOptimType.EXACT_SGD
-                ):
-                    option.optimizer_type = OptimizerType.SGD
-                elif self._optimizer_type == EmbOptimType.ADAM:
-                    option.optimizer_type = OptimizerType.Adam
-                elif self._optimizer_type == EmbOptimType.EXACT_ADAGRAD:
-                    option.optimizer_type = OptimizerType.AdaGrad
-                else:
-                    raise ValueError(
-                        f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
-                    )
+            if option.training and option.optimizer_type == OptimizerType.Null:
+                option.optimizer_type = convert_optimizer_type(self._optimizer_type)
+            elif not option.training and option.optimizer_type != OptimizerType.Null:
+                option.optimizer_type = OptimizerType.Null
+                warnings.warn(
+                    "Set OptimizerType to Null as not on training mode.", UserWarning
+                )
             self._tables.append(create_dynamicemb_table(option))
 
     def _create_cache_storage(self, PS: Storage = None) -> None:
@@ -1052,22 +1034,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._caching = self._dynamicemb_options[0].caching
 
         for option in self._dynamicemb_options:
-            if option.training:
-                if self._optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-                    option.optimizer_type = OptimizerType.RowWiseAdaGrad
-                elif (
-                    self._optimizer_type == EmbOptimType.SGD
-                    or self._optimizer_type == EmbOptimType.EXACT_SGD
-                ):
-                    option.optimizer_type = OptimizerType.SGD
-                elif self._optimizer_type == EmbOptimType.ADAM:
-                    option.optimizer_type = OptimizerType.Adam
-                elif self._optimizer_type == EmbOptimType.EXACT_ADAGRAD:
-                    option.optimizer_type = OptimizerType.AdaGrad
-                else:
-                    raise ValueError(
-                        f"Not supported optimizer type ,optimizer type = {self._optimizer_type} {type(self._optimizer_type)} {self._optimizer_type.value}."
-                    )
+            if option.training and option.optimizer_type == OptimizerType.Null:
+                option.optimizer_type = convert_optimizer_type(self._optimizer_type)
+            elif not option.training and option.optimizer_type != OptimizerType.Null:
+                option.optimizer_type = OptimizerType.Null
+                warnings.warn(
+                    "Set OptimizerType to Null as not on training mode.", UserWarning
+                )
+
             if option.caching and option.training:
                 cache_option = deepcopy(option)
                 cache_option.bucket_capacity = 1024

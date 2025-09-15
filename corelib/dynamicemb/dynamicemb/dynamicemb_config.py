@@ -244,7 +244,6 @@ class HKVConfig(GroupedHKVConfig):
     use_constant_memory: bool = False
     reserved_key_start_bit: int = 0
     num_of_buckets_per_alloc: int = 1
-    num_embedding_growth_per_rank: int = 0
 
 
 @dataclass
@@ -327,6 +326,8 @@ class DynamicEmbTableOptions(HKVConfig):
     caching: bool
         Flag to indicate dynamic embedding tables is working on caching mode, which will support to prefetch embeddings
         from host memory to HBM if existed, default to `False`.
+    num_aligned_embedding_per_rank: int
+        Number of aligned embedding per rank when the `num_embeddings` does not meet our alignment requirements, default to None.
 
     Notes
     -----
@@ -346,6 +347,7 @@ class DynamicEmbTableOptions(HKVConfig):
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
     training: bool = True
     caching: bool = False
+    num_aligned_embedding_per_rank: int = None
 
     def __post_init__(self):
         assert (
@@ -509,18 +511,6 @@ def get_optimizer_state_dim(optimizer_type, dim, dtype):
 
 
 def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmbTable:
-    table_options.local_hbm_for_values += (
-        table_options.num_embedding_growth_per_rank
-        * (
-            table_options.dim
-            + get_optimizer_state_dim(
-                table_options.optimizer_type,
-                table_options.dim,
-                table_options.embedding_dtype,
-            )
-        )
-        * DTYPE_NUM_BYTES[table_options.embedding_dtype]
-    )
     return DynamicEmbTable(
         torch_to_dyn_emb(table_options.index_type),
         torch_to_dyn_emb(table_options.embedding_dtype),

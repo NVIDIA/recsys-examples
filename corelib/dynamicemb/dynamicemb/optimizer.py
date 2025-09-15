@@ -105,6 +105,21 @@ def get_required_arg(args: Dict[str, Any], key: str) -> Any:
     return args[key]
 
 
+def convert_optimizer_type(optimizer: EmbOptimType) -> OptimizerType:
+    if optimizer == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+        return OptimizerType.RowWiseAdaGrad
+    elif optimizer == EmbOptimType.SGD or optimizer == EmbOptimType.EXACT_SGD:
+        return OptimizerType.SGD
+    elif optimizer == EmbOptimType.ADAM:
+        return OptimizerType.Adam
+    elif optimizer == EmbOptimType.EXACT_ADAGRAD:
+        return OptimizerType.AdaGrad
+    else:
+        raise ValueError(
+            f"Not supported optimizer type ,optimizer type = {optimizer} {type(optimizer)} {optimizer.value}."
+        )
+
+
 class BaseDynamicEmbeddingOptimizer(abc.ABC):
     def __init__(
         self,
