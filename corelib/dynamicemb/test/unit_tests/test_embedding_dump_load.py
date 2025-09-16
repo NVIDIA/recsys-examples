@@ -88,7 +88,6 @@ def generate_sparse_feature(
                     hotness = random.randint(
                         0, multi_hot_sizes[embedding_collection_id]
                     )
-                    # indices = [int(0) for _ in range(hotness)]
                     indices = [random.randint(0, (1 << 63) - 1) for _ in range(hotness)]
                     if sample_id // batch_size_per_rank == rank:
                         cur_indices.extend(indices)
@@ -177,7 +176,7 @@ def apply_dmp(
 
     sharder = DynamicEmbeddingCollectionSharder(
         fused_params=fused_params,
-        use_index_dedup=True,
+        use_index_dedup=False,
     )
     plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
 
@@ -282,7 +281,10 @@ def test_model_load_dump(
 
     for kjt in kjts:
         ret = ref_model(kjt)
-        ret.sum().backward()
+        loss = (
+            ret.sum() * dist.get_world_size()
+        )  # scale the loss by world size to make the gradients consistent between different gpu settings
+        loss.backward()
 
     if mode == "dump":
         shutil.rmtree(save_path, ignore_errors=True)
@@ -297,6 +299,12 @@ def test_model_load_dump(
         )
 
         DynamicEmbLoad(save_path, model, optim=True)
+
+        for kjt in kjts:
+            ret = model(kjt)
+            ret.sum().backward()
+            ref_ret = ref_model(kjt)
+            ref_ret.sum().backward()
 
         ref_model = ref_model.eval()
         model = model.eval()

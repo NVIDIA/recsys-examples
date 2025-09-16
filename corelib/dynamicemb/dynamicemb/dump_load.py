@@ -341,6 +341,7 @@ def DynamicEmbDump(
                 )
         else:
             raise Exception(f"The path '{path}' exists and is not a directory.")
+    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
 
     # find embedding collections
     collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
@@ -400,6 +401,8 @@ def DynamicEmbDump(
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
 
     return
 
@@ -630,6 +633,7 @@ def find_files(
         if not os.path.exists(file):
             return [], 0, checkpoint_version
         return [file], 1, checkpoint_version
+    files = sorted(files)
     world_size = int(files[0].split(".")[-1].split("_")[-1])
     if len(files) != world_size:
         raise RuntimeError(
@@ -826,6 +830,13 @@ def DynamicEmbLoad(
                     table_names[current_collection_name]
                 ):
                     continue
+
+                if optim:
+                    args_filename = dynamic_table_name + "_opt_args.json"
+                    args_path = os.path.join(full_collection_path, args_filename)
+                    opt_args = load_from_json(args_path)
+                    dynamic_emb_module.optimizer.set_opt_args(opt_args)
+
                 distributed_load(
                     dynamic_table,
                     full_collection_path,
