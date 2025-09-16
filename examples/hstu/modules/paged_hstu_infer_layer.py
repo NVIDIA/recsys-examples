@@ -322,7 +322,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             self._max_seqlen,
             self._max_seqlen,
             num_contexts=jd.contextual_seqlen[:batch_size]
-            if jd.contextual_seqlen
+            if jd.contextual_seqlen is not None
             else None,
             num_targets=jd.num_candidates[:batch_size],
             target_group_size=1,

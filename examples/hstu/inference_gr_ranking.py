@@ -182,9 +182,9 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        "blocks_in_primary_pool": 512,
+        "blocks_in_primary_pool": 10240,
         "page_size": 32,
-        "offload_chunksize": 32,
+        "offload_chunksize": 1024,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -378,6 +378,18 @@ def run_ranking_gr_evaluate(
         batch.features = KeyedJaggedTensor.from_jt_dict(kjt_dict)
         return batch
 
+    def strip_padding_batch(batch, unpadded_batch_size):
+        batch.batch_size = unpadded_batch_size
+        kjt_dict = batch.features.to_dict()
+        for k in kjt_dict:
+            kjt_dict[k] = JaggedTensor.from_dense_lengths(
+                kjt_dict[k].to_padded_dense()[: batch.batch_size],
+                kjt_dict[k].lengths()[: batch.batch_size].long(),
+            )
+        batch.features = KeyedJaggedTensor.from_jt_dict(kjt_dict)
+        batch.num_candidates = batch.num_candidates[: batch.batch_size]
+        return batch
+
     with torch.inference_mode():
         model = get_inference_hstu_model(
             emb_configs,
@@ -422,6 +434,9 @@ def run_ranking_gr_evaluate(
                 d = batch.features.to_dict()
                 user_ids = d["user_id"].values().cpu().int()
                 seq_startpos = torch.zeros_like(user_ids)
+
+                if user_ids.shape[0] != batch.batch_size:
+                    batch = strip_padding_batch(batch, user_ids.shape[0])
 
                 logits = model.forward(batch, user_ids, seq_startpos)
                 eval_module(logits, batch.labels)
