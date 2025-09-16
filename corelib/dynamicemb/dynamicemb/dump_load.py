@@ -23,7 +23,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.batched_dynamicemb_tables import (
+    BatchedDynamicEmbeddingTables,
+    BatchedDynamicEmbeddingTablesV2,
+)
 from dynamicemb.dynamicemb_config import dtype_to_bytes, dyn_emb_to_torch
 from dynamicemb_extensions import (
     DynamicEmbTable,
@@ -562,7 +565,7 @@ def find_sharded_modules(
 
 
 def check_emb_collection_modules(module: nn.Module, ret_list: List[nn.Module]):
-    if isinstance(module, BatchedDynamicEmbeddingTables):
+    if isinstance(module, BatchedDynamicEmbeddingTablesV2):
         ret_list.append(module)
         return ret_list
 

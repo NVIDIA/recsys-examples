@@ -322,8 +322,8 @@ def run(args):
         )
         print(f"DynamicEmb iteration {i+1} Passed")
 
-    dict_ = model.state_dict()
-    model.load_state_dict(dict_)
+    # dict_ = model.state_dict()
+    # model.load_state_dict(dict_)
     dist.barrier()
     dist.destroy_process_group()
 

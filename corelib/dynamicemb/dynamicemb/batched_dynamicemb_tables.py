@@ -124,6 +124,14 @@ class TableShim:
             self.table = cast(KeyValueTable, table)
         else:
             raise ValueError("Not support table type")
+    
+    def get_underlying_table(self) -> DynamicEmbTable:
+        if isinstance(self.table, DynamicEmbTable):
+            return self.table
+        elif isinstance(self.table, KeyValueTable):
+            return self.table.table
+        else:
+            raise ValueError("Not support table type")
 
     def optim_states_dim(self) -> int:
         if isinstance(self.table, DynamicEmbTable):
