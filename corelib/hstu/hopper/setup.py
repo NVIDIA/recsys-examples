@@ -485,18 +485,10 @@ if not SKIP_CUDA_BUILD:
 
 setup(
     name=PACKAGE_NAME,
-    version="0.1.0" + "+cu" + str(bare_metal_version),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-        )
-    ),
+    version="0.1.1" + "+cu" + str(bare_metal_version),
+    packages=["hopper"],
+    package_dir={"hopper": "."},
+    package_data={"hopper": ["*.py"]},
     author="NVIDIA-DevTech",
     py_modules=["hstu_attn_interface"],
     description="HSTU Attention",
