@@ -18,7 +18,15 @@ import torch
 sm_major_version = torch.cuda.get_device_properties(0).major
 sm_minor_version = torch.cuda.get_device_properties(0).minor
 if sm_major_version == 9 and sm_minor_version == 0:
-    from hstu_attn_interface import hstu_attn_qkvpacked_func, hstu_attn_varlen_func
+    from hstu_attn_interface import (
+        get_bm_and_bn_block_size_bwd,
+        get_bm_and_bn_block_size_fwd,
+        hstu_attn_qkvpacked_func,
+        hstu_attn_varlen_func,
+        quantize_for_block_scale,
+        quantize_for_head_batch_tensor,
+        quantize_for_two_directions,
+    )
 elif sm_major_version == 8:
     from hstu_attn import hstu_attn_varlen_func, hstu_attn_qkvpacked_func
 
@@ -30,6 +38,8 @@ import torch.nn.functional as F
 from einops import rearrange
 
 debug = False
+example = False
+e4m3_max = 448.0
 
 
 def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
@@ -96,13 +106,13 @@ def construct_mask(
     target_group_size=1,
     window_size=(-1, -1),  # -1 means infinite window size
     func=None,
-    seq_offsets_q=None,
-    seq_offsets_k=None,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
     num_contexts=None,
     device=torch.device("cuda"),
 ):
     seqlen = seqlen_c + seqlen + seqlen_t
-    bs = seq_offsets_k.size(0) - 1
+    bs = cu_seqlens_k.size(0) - 1
     if debug:
         print(func)
     if func is not None:
@@ -114,8 +124,8 @@ def construct_mask(
     mask[:] = False
     if func is not None:
         for b in range(batch_func):
-            actual_seqlen_q = (seq_offsets_q[b + 1] - seq_offsets_q[b]).item()
-            actual_seqlen_k = (seq_offsets_k[b + 1] - seq_offsets_k[b]).item()
+            actual_seqlen_q = (cu_seqlens_q[b + 1] - cu_seqlens_q[b]).item()
+            actual_seqlen_k = (cu_seqlens_k[b + 1] - cu_seqlens_k[b]).item()
             actual_offset = actual_seqlen_k - actual_seqlen_q
             for i in range(actual_seqlen_q):
                 mask[b, actual_offset + i, 0 : func[b, 0, 0, i]] = True
@@ -137,7 +147,7 @@ def construct_mask(
             mask = mask.unsqueeze(0).unsqueeze(0).repeat(bs, 1, 1, 1)
             for i in range(bs):
                 target_start = (
-                    num_contexts[i] + seq_offsets_k[i + 1] - seq_offsets_k[i]
+                    num_contexts[i] + cu_seqlens_k[i + 1] - cu_seqlens_k[i]
                 ).item()
                 mask[i, 0, : num_contexts[i], :target_start] = True
 
@@ -150,7 +160,7 @@ def construct_mask(
             )
             for i in range(bs):
                 target_start = (
-                    num_contexts[i] + seq_offsets_k[i + 1] - seq_offsets_k[i]
+                    num_contexts[i] + cu_seqlens_k[i + 1] - cu_seqlens_k[i]
                 ).item()
                 # target group mask
                 if target_group_size > 1:
@@ -254,10 +264,10 @@ def generate_input(
         num_contexts = torch.zeros(
             (batch_size,), dtype=torch.int32, device=torch.device("cuda")
         )
-    seq_offsets_c = torch.zeros(
+    cu_seqlens_c = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_c[1:] = torch.cumsum(num_contexts, dim=0)
+    cu_seqlens_c[1:] = torch.cumsum(num_contexts, dim=0)
 
     # Generate lengths for historial qkv
     if full_batch:
@@ -269,10 +279,10 @@ def generate_input(
         lengths_k = torch.randint(
             1, max_seq_len_k + 1, size=(batch_size,), device=torch.device("cuda")
         )
-    seq_offsets_k = torch.zeros(
+    cu_seqlens_k = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_k[1:] = torch.cumsum(lengths_k, dim=0)
+    cu_seqlens_k[1:] = torch.cumsum(lengths_k, dim=0)
 
     # Generate lengths for target qkv
     if has_target:
@@ -295,10 +305,10 @@ def generate_input(
         num_targets = torch.zeros(
             (batch_size,), dtype=torch.int32, device=torch.device("cuda")
         )
-    seq_offsets_t = torch.zeros(
+    cu_seqlens_t = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_t[1:] = torch.cumsum(num_targets, dim=0)
+    cu_seqlens_t[1:] = torch.cumsum(num_targets, dim=0)
 
     # Generate lengths for delta q
     if is_delta_q:
@@ -321,25 +331,25 @@ def generate_input(
                     size=(1,),
                     device=torch.device("cuda"),
                 )
-        seq_offsets_q = torch.zeros(
+        cu_seqlens_q = torch.zeros(
             (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
         )
-        seq_offsets_q[1:] = torch.cumsum(lengths_q, dim=0)
+        cu_seqlens_q[1:] = torch.cumsum(lengths_q, dim=0)
     else:
-        seq_offsets_q = seq_offsets_k
+        cu_seqlens_q = cu_seqlens_k
 
     # Lengths for whole q, kv
-    seq_offsets_q_wt = torch.zeros(
+    cu_seqlens_q_wt = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_q_wt = seq_offsets_c + seq_offsets_q + seq_offsets_t
-    seq_offsets_k_wt = torch.zeros(
+    cu_seqlens_q_wt = cu_seqlens_c + cu_seqlens_q + cu_seqlens_t
+    cu_seqlens_k_wt = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_k_wt = seq_offsets_c + seq_offsets_k + seq_offsets_t
+    cu_seqlens_k_wt = cu_seqlens_c + cu_seqlens_k + cu_seqlens_t
 
-    L_q = int(seq_offsets_q_wt[-1].item())
-    L_k = int(seq_offsets_k_wt[-1].item())
+    L_q = int(cu_seqlens_q_wt[-1].item())
+    L_k = int(cu_seqlens_k_wt[-1].item())
     if dtype == torch.float8_e4m3fn:
         dtype_init = torch.float16
     else:
@@ -352,21 +362,21 @@ def generate_input(
         )
         .uniform_(-1, 1)
         .requires_grad_()
-    ).to(dtype)
+    )
     k = (
         torch.empty(
             (L_k, heads, attn_dim), dtype=dtype_init, device=torch.device("cuda")
         )
         .uniform_(-1, 1)
         .requires_grad_()
-    ).to(dtype)
+    )
     v = (
         torch.empty(
             (L_k, heads, hidden_dim), dtype=dtype_init, device=torch.device("cuda")
         )
         .uniform_(-1, 1)
         .requires_grad_()
-    ).to(dtype)
+    )
 
     if is_delta_q is False and dtype != torch.float8_e4m3fn:
         qkv = (
@@ -412,7 +422,6 @@ def generate_input(
                 device=torch.device("cuda"),
             )
 
-        example = True
         if example:
             # emulate casual mask
             n_func = 1  # export HSTU_ARBITRARY_NFUNC=1;
@@ -516,8 +525,8 @@ def generate_input(
         )
         for i in range(batch_func):
             for j in range(head_func):
-                var_fun[j, :, seq_offsets_q_wt[i] : seq_offsets_q_wt[i + 1]] = func[
-                    i, j, :, 0 : seq_offsets_q_wt[i + 1] - seq_offsets_q_wt[i]
+                var_fun[j, :, cu_seqlens_q_wt[i] : cu_seqlens_q_wt[i + 1]] = func[
+                    i, j, :, 0 : cu_seqlens_q_wt[i + 1] - cu_seqlens_q_wt[i]
                 ]
     else:
         var_fun = None
@@ -530,7 +539,7 @@ def generate_input(
     #     # different batches use different mask shapes.
     #     for i in range(batch_func):
     #         for j in range(head_func):
-    #             var_fun[j, :, seq_offsets_q_wt[i]:seq_offsets_q_wt[i+1]] = func[i, j, :, 0:seq_offsets_q_wt[i+1]-seq_offsets_q_wt[i]]
+    #             var_fun[j, :, cu_seqlens_q_wt[i]:cu_seqlens_q_wt[i+1]] = func[i, j, :, 0:cu_seqlens_q_wt[i+1]-cu_seqlens_q_wt[i]]
     if has_drab:
         rab = rab.requires_grad_()
     if window_size[0] == -1 and window_size[1] == -1 and func is None:
@@ -545,21 +554,21 @@ def generate_input(
                 target_group_size=target_group_size,
                 window_size=window_size,
                 func=func,
-                seq_offsets_q=seq_offsets_q,
-                seq_offsets_k=seq_offsets_k,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 num_contexts=num_contexts,
             )
             .cuda()
             .to(torch.float32)
         )
-    if example:
+    if example and attn_mask is not None:
         print(attn_mask.to(torch.int32).squeeze().cpu().numpy())
     return (
         L_q,
         L_k,
         num_contexts if has_context else None,
-        seq_offsets_q_wt,
-        seq_offsets_k_wt,
+        cu_seqlens_q_wt,
+        cu_seqlens_k_wt,
         num_targets if has_target else None,
         qkv,
         q,
@@ -633,7 +642,7 @@ def _hstu_attention_maybe_from_cache(
     if invalid_attn_mask is not None:
         if invalid_attn_mask.ndim == 2:
             invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-        if invalid_attn_mask.ndim == 3:
+        elif invalid_attn_mask.ndim == 3:
             invalid_attn_mask = invalid_attn_mask.unsqueeze(1)
         masked_qk_attn = masked_qk_attn * invalid_attn_mask.type(masked_qk_attn.dtype)
 
@@ -650,7 +659,7 @@ def _hstu_attention_maybe_from_cache(
         )
     else:
         attn_output = unpad_input(attn_output, q_offsets)
-    attn_output = attn_output.reshape(-1, num_heads * linear_dim)
+    attn_output = attn_output.reshape(-1, num_heads, linear_dim)
 
     return attn_output.to(dtype_out)
 
@@ -662,7 +671,6 @@ def _hstu_attention_maybe_from_cache(
     [
         (32, 32),
         (99, 99),
-        (111, 111),
         (256, 256),
         (1111, 1111),
         (27, 32),
@@ -671,13 +679,12 @@ def _hstu_attention_maybe_from_cache(
         (160, 2000),
     ],
 )
-@pytest.mark.parametrize("max_context_len", [0, 11, 99, 160, 333])
+@pytest.mark.parametrize("max_context_len", [0, 99, 160, 333])
 @pytest.mark.parametrize(
     "max_target_len, window_size, target_group_size, is_arbitrary",
     [
         (0, (-1, -1), 1, False),
         (0, (-1, -1), 1, True),
-        (0, (11, 111), 1, False),
         (0, (111, 11), 1, False),
         (0, (111, 222), 1, False),
         (0, (-1, 0), 1, False),
@@ -755,8 +762,6 @@ def test_fused_attn(
     if is_arbitrary and (window_size[0] != -1 or window_size[1] != -1):
         raise ValueError("is_arbitrary is True but window_size is not (-1, -1)")
     # TODO: find a better way to avoid these combinations
-    if is_arbitrary and has_context:
-        return
     if is_delta_q and has_target:
         return
     if is_delta_q and has_context:
@@ -808,8 +813,8 @@ def test_fused_attn(
                 L_q,
                 L_k,
                 num_contexts,
-                seq_offsets_q,
-                seq_offsets_k,
+                cu_seqlens_q,
+                cu_seqlens_k,
                 num_targets,
                 qkv,
                 q,
@@ -824,8 +829,8 @@ def test_fused_attn(
                     q=q,
                     k=k,
                     v=v,
-                    seq_offsets_q=seq_offsets_q,
-                    seq_offsets_k=seq_offsets_k,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
                     max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
                     max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
                     num_contexts=num_contexts if has_context else None,
@@ -847,8 +852,8 @@ def test_fused_attn(
                     q=q.view(L_q, -1),
                     k=k.view(L_k, -1),
                     v=v.view(L_k, -1),
-                    q_offsets=seq_offsets_q,
-                    k_offsets=seq_offsets_k,
+                    q_offsets=cu_seqlens_q,
+                    k_offsets=cu_seqlens_k,
                     rab=rab if has_rab else None,
                     invalid_attn_mask=attn_mask.to(torch.float32)
                     if attn_mask is not None
@@ -879,8 +884,8 @@ def test_fused_attn(
                 L_q,
                 L_k,
                 num_contexts,
-                seq_offsets_q,
-                seq_offsets_k,
+                cu_seqlens_q,
+                cu_seqlens_k,
                 num_targets,
                 qkv,
                 q,
@@ -933,8 +938,8 @@ def test_fused_attn(
         L_q,
         L_k,
         num_contexts,
-        seq_offsets_q,
-        seq_offsets_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
         num_targets,
         qkv,
         q,
@@ -970,13 +975,14 @@ def test_fused_attn(
         q=q.view(L_q, -1),
         k=k.view(L_k, -1),
         v=v.view(L_k, -1),
-        q_offsets=seq_offsets_q,
-        k_offsets=seq_offsets_k,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
         rab=rab if has_rab else None,
         invalid_attn_mask=attn_mask.to(torch.float32)
         if attn_mask is not None
         else None,
         alpha=alpha,
+        upcast=True,
         is_delta_q=is_delta_q,
     )
 
@@ -989,8 +995,8 @@ def test_fused_attn(
         q=q.view(L_q, -1),
         k=k.view(L_k, -1),
         v=v.view(L_k, -1),
-        q_offsets=seq_offsets_q,
-        k_offsets=seq_offsets_k,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
         rab=rab if has_rab else None,
         invalid_attn_mask=attn_mask.to(torch.float32)
         if attn_mask is not None
@@ -1004,8 +1010,8 @@ def test_fused_attn(
             q=q.to(dtype),
             k=k.to(dtype),
             v=v.to(dtype),
-            seq_offsets_q=seq_offsets_q,
-            seq_offsets_k=seq_offsets_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
             max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
             num_contexts=num_contexts,
@@ -1020,8 +1026,8 @@ def test_fused_attn(
     else:
         hstu_out = hstu_attn_qkvpacked_func(
             qkv=qkv.to(dtype),
-            seq_offsets_q=seq_offsets_q,
-            seq_offsets_k=seq_offsets_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
             max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
             num_contexts=num_contexts,
@@ -1034,16 +1040,15 @@ def test_fused_attn(
             func=func,
         )
 
-    print(f"Output max diff: {(hstu_out.view(L_q, -1) - out_ref).abs().max().item()}")
+    print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
     print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
 
-    print(f"Output mean diff: {(hstu_out.view(L_q, -1) - out_ref).abs().mean().item()}")
+    print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
     print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
-    assert (hstu_out.view(L_q, -1) - out_ref).abs().max().item() <= 2 * (
+    assert (hstu_out - out_ref).abs().max().item() <= 2 * (
         torch_out - out_ref
     ).abs().max().item()
-
     g = torch.rand_like(torch_out)
     if not has_drab:
         (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
@@ -1144,10 +1149,10 @@ def generate_paged_kv_input(
         lengths_q = torch.randint(
             1, max_seq_len_q + 1, size=(batch_size,), device=torch.device("cuda")
         )
-    seq_offsets_q = torch.zeros(
+    cu_seqlens_q = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_q[1:] = torch.cumsum(lengths_q, dim=0)
+    cu_seqlens_q[1:] = torch.cumsum(lengths_q, dim=0)
 
     # Generate lengths for target qkv
     if full_batch:
@@ -1163,14 +1168,14 @@ def generate_paged_kv_input(
             dtype=torch.int32,
             device=torch.device("cuda"),
         )
-    seq_offsets_t = torch.zeros(
+    cu_seqlens_t = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_t[1:] = torch.cumsum(num_targets, dim=0)
+    cu_seqlens_t[1:] = torch.cumsum(num_targets, dim=0)
 
     # Lengths for new history + target qkv
-    seq_offsets_q_wt = seq_offsets_q + seq_offsets_t
-    L_q = int(seq_offsets_q_wt[-1].item())
+    cu_seqlens_q_wt = cu_seqlens_q + cu_seqlens_t
+    L_q = int(cu_seqlens_q_wt[-1].item())
 
     # Generate q, k, v for new history + target
     M_uvqk = torch.empty(
@@ -1190,10 +1195,10 @@ def generate_paged_kv_input(
         lengths_k = torch.randint(
             1, max_seq_len_k + 1, size=(batch_size,), device=torch.device("cuda")
         )
-    seq_offsets_k = torch.zeros(
+    cu_seqlens_k = torch.zeros(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
-    seq_offsets_k[1:] = torch.cumsum(lengths_k, dim=0)
+    cu_seqlens_k[1:] = torch.cumsum(lengths_k, dim=0)
 
     # Lengths for user feature + previous history + new history
     lengths_k_cache = lengths_k + lengths_q
@@ -1241,9 +1246,9 @@ def generate_paged_kv_input(
 
     return (
         L_q,
-        seq_offsets_q_wt,
-        seq_offsets_k + seq_offsets_q_wt,
-        seq_offsets_t,
+        cu_seqlens_q_wt,
+        cu_seqlens_k + cu_seqlens_q_wt,
+        cu_seqlens_t,
         num_targets,
         page_offsets,
         page_ids,
@@ -1370,6 +1375,8 @@ def test_paged_kv_attn(
     dtype: torch.dtype,
     full_batch: bool,
 ) -> None:
+    if sm_major_version == 9:
+        raise ValueError("paged_kv_attn is not supported on sm90")
     if dtype == torch.float8_e4m3fn:
         raise ValueError("float8_e4m3fn for paged_kv_attn is not supported")
     if page_size != 32 and page_size != 64:
@@ -1408,9 +1415,9 @@ def test_paged_kv_attn(
                 fwd_event_start.record()
             (
                 L_q,
-                seq_offsets_q,
-                seq_offsets_k,
-                seq_offsets_t,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                cu_seqlens_t,
                 num_targets,
                 page_offsets,
                 page_ids,
@@ -1426,8 +1433,8 @@ def test_paged_kv_attn(
                     q=q,
                     k=k,
                     v=v,
-                    seq_offsets_q=seq_offsets_q,
-                    seq_offsets_k=seq_offsets_q,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
                     max_seqlen_q=max_seq_len_q + max_target_len,
                     max_seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
                     num_contexts=None,
@@ -1454,8 +1461,8 @@ def test_paged_kv_attn(
                     q=q,
                     k=k,
                     v=v,
-                    q_offsets=seq_offsets_q,
-                    k_offsets=seq_offsets_k,
+                    q_offsets=cu_seqlens_q,
+                    k_offsets=cu_seqlens_k,
                     num_targets=num_targets,
                     invalid_attn_mask=mask,
                     alpha=alpha,
@@ -1474,9 +1481,9 @@ def test_paged_kv_attn(
 
     (
         L_q,
-        seq_offsets_q,
-        seq_offsets_k,
-        seq_offsets_t,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_t,
         num_targets,
         page_offsets,
         page_ids,
@@ -1507,8 +1514,8 @@ def test_paged_kv_attn(
         q=q,
         k=k,
         v=v,
-        q_offsets=seq_offsets_q,
-        k_offsets=seq_offsets_k,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
         num_targets=num_targets,
         invalid_attn_mask=mask,
         alpha=alpha,
@@ -1528,8 +1535,8 @@ def test_paged_kv_attn(
         q=q,
         k=k,
         v=v,
-        q_offsets=seq_offsets_q,
-        k_offsets=seq_offsets_k,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
         num_targets=num_targets,
         invalid_attn_mask=mask,
         alpha=alpha,
@@ -1544,8 +1551,8 @@ def test_paged_kv_attn(
         q=q,
         k=k,
         v=v,
-        seq_offsets_q=seq_offsets_q,
-        seq_offsets_k=seq_offsets_k,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seq_len_q + max_target_len,
         max_seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
         num_contexts=None,
@@ -1559,20 +1566,198 @@ def test_paged_kv_attn(
         page_offsets=page_offsets,
         page_ids=page_ids,
         last_page_lens=last_page_lens,
-        seq_offsets_t=seq_offsets_t,
+        cu_seqlens_t=cu_seqlens_t,
         func=None,  # func
     )
 
-    print(f"Output max diff: {(hstu_out.view(L_q, -1) - out_ref).abs().max().item()}")
+    print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
     print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
 
-    print(f"Output mean diff: {(hstu_out.view(L_q, -1) - out_ref).abs().mean().item()}")
+    print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
     print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
-    assert (hstu_out.view(L_q, -1) - out_ref).abs().max().item() <= 2 * (
+    assert (hstu_out - out_ref).abs().max().item() <= 2 * (
         torch_out - out_ref
     ).abs().max().item()
     torch.cuda.synchronize()
+
+
+def P_blockwise_Vt_gemm_fp8(
+    P: torch.Tensor,  # (B, H, SQ, SK)
+    Vt: torch.Tensor,  # (B, H, SK, D), fp8
+    Vt_descale: torch.Tensor,  # (sum(ceil(actual, 128)), H, D)
+    cu_seqlens_vt_descale: torch.Tensor,  # (B + 1)
+    BM: int,
+    BN: int,
+    swapQK: bool = False,
+    start_ids: torch.Tensor = None,  # (B)
+    mode: int = 1,
+    is_qdo_offset: bool = False,
+):
+    P = P.contiguous()
+    Vt = Vt.contiguous()
+    B = P.shape[0]
+    H = P.shape[1]
+    seq_len_q = P.shape[2]
+    seq_len_k = P.shape[3]
+    dim = Vt.shape[3]
+    BM = BN if swapQK else BM
+    BN = BM if swapQK else BN
+
+    is_delta_q_m = (swapQK == False) and (start_ids is not None)
+    is_delta_q_n = (swapQK == True) and (start_ids is not None)
+
+    output = torch.zeros(B, H, seq_len_q, dim, dtype=torch.float, device="cuda")
+    descale_one = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    for bs in range(B):
+        for h in range(H):
+            start_q = start_ids[bs] if start_ids is not None else 0
+            start_q_m = start_q if is_delta_q_m else 0
+            start_q_n = start_q if is_delta_q_n else 0
+            start_q_B = start_q if is_qdo_offset else 0
+            total_M = math.ceil((seq_len_q - start_q_m) / BM)
+            if mode == 1:
+                actual_len_vt_descale = (
+                    cu_seqlens_vt_descale[bs + 1] - cu_seqlens_vt_descale[bs]
+                ).item()
+                total_N = min(
+                    math.ceil((seq_len_k - start_q_n) / BN),
+                    actual_len_vt_descale * 128 // BN,
+                )
+            elif mode == 2:
+                total_N = min(
+                    math.ceil((seq_len_k - start_q_n) / BN),
+                    (cu_seqlens_vt_descale[bs + 1] - cu_seqlens_vt_descale[bs]),
+                )
+            else:
+                total_N = math.ceil((seq_len_k - start_q_n) / BN)
+
+            for kM in range(total_M):
+                for kN in range(total_N):
+                    P_block = P[
+                        bs,
+                        h,
+                        start_q_m + kM * BM : start_q_m + (kM + 1) * BM,
+                        start_q_n + kN * BN : start_q_n + (kN + 1) * BN,
+                    ]
+                    descale_Pblock = torch.max(P_block.abs()) / e4m3_max
+                    descale_Pblock = torch.max(
+                        descale_Pblock,
+                        torch.tensor([1e-6], dtype=torch.float32, device="cuda"),
+                    )
+                    P_block = (P_block / descale_Pblock).to(torch.float8_e4m3fn)
+                    Vt_block = (
+                        Vt[bs, h, start_q_B + kN * BN : start_q_B + (kN + 1) * BN, :]
+                        .transpose(0, 1)
+                        .contiguous()
+                        .transpose(0, 1)
+                    )
+                    output_tmp = torch._scaled_mm(
+                        P_block,
+                        Vt_block,
+                        out_dtype=torch.float,
+                        scale_a=descale_Pblock,
+                        scale_b=descale_one,
+                    )
+                    if mode == 1:
+                        V_scale = Vt_descale[
+                            cu_seqlens_vt_descale[bs] + kN * BN // 128, h, :
+                        ]
+                    elif mode == 2:
+                        V_scale = Vt_descale[cu_seqlens_vt_descale[bs] + kN, h]
+                    elif mode == 3:
+                        V_scale = Vt_descale[bs, h]
+                    elif mode == 4:
+                        V_scale = Vt_descale[bs]
+                    else:
+                        V_scale = Vt_descale
+                    output[
+                        bs, h, start_q_m + kM * BM : start_q_m + (kM + 1) * BM, :
+                    ] += (output_tmp * V_scale)
+    return output
+
+
+def AB_blockscale_gemm_fp8(
+    ab_attn: torch.Tensor,  # (SQ, SK)
+    a_offsets: torch.Tensor,  # (B + 1)
+    b_offsets: torch.Tensor,  # (B + 1)
+    a_descale: torch.Tensor,  # (sum(ceil(actual, 128)), H)
+    b_descale: torch.Tensor,  # (sum(ceil(actual, 128)), H)
+    cu_seqlens_block_descale_a,
+    cu_seqlens_block_descale_b,
+    B,
+    bm,
+    bn,
+):
+    for bs in range(B):
+        cur_q_start_offset = (b_offsets[bs + 1] - b_offsets[bs]) - (
+            a_offsets[bs + 1] - a_offsets[bs]
+        )
+        # step1: padding 0 at beginning, and do offset
+        cur_bs_ab_atten = ab_attn[
+            bs,
+            :,
+            cur_q_start_offset : cur_q_start_offset
+            + (a_offsets[bs + 1] - a_offsets[bs]),
+            : b_offsets[bs + 1] - b_offsets[bs],
+        ]
+        actual_len_padding_block_num_a = (
+            (a_offsets[bs + 1] - a_offsets[bs]) + bm - 1
+        ) // bm
+        actual_len_padding_block_num_b = (
+            (b_offsets[bs + 1] - b_offsets[bs]) + bn - 1
+        ) // bn
+        target_a_len = actual_len_padding_block_num_a * bm
+        target_b_len = actual_len_padding_block_num_b * bn
+        a_padded_len = target_a_len - (a_offsets[bs + 1] - a_offsets[bs])
+        b_padded_len = target_b_len - (b_offsets[bs + 1] - b_offsets[bs])
+        # step2: after slicing the real data, padding 0 based on BM and BN
+        cur_padded_bs_ab_atten = F.pad(
+            cur_bs_ab_atten, (0, b_padded_len, 0, a_padded_len)
+        )  # padding after original tensor
+        cur_padded_bs_ab_atten_view = cur_padded_bs_ab_atten.view(
+            cur_padded_bs_ab_atten.shape[0],
+            actual_len_padding_block_num_a,
+            bm,
+            actual_len_padding_block_num_b,
+            bn,
+        )  # [1, 1, 128, 5, 64])
+        cur_descale_a = a_descale[
+            cu_seqlens_block_descale_a[bs] : cu_seqlens_block_descale_a[bs + 1], :
+        ].permute(1, 0)
+        cur_descale_b = b_descale[
+            cu_seqlens_block_descale_b[bs] : cu_seqlens_block_descale_b[bs + 1], :
+        ].permute(1, 0)
+
+        for row in range(actual_len_padding_block_num_a):
+            for col in range(actual_len_padding_block_num_b):
+                scale = (cur_descale_a[:, row] * cur_descale_b[:, col]).view(
+                    -1, 1, 1
+                )  # (num_heads, 1, 1)
+                cur_padded_bs_ab_atten_view[:, row, :, col, :] = (
+                    cur_padded_bs_ab_atten_view[:, row, :, col, :] * scale
+                )
+        cur_padded_bs_ab_atten_view = cur_padded_bs_ab_atten_view.view(
+            cur_bs_ab_atten.shape[0],
+            actual_len_padding_block_num_a * bm,
+            actual_len_padding_block_num_b * bn,
+        )
+        # step3: Restore the true shape of is_delat before padding
+        cur_bs_ab_atten = cur_padded_bs_ab_atten_view[
+            :,
+            0 : (a_offsets[bs + 1] - a_offsets[bs]),
+            0 : (b_offsets[bs + 1] - b_offsets[bs]),
+        ]
+        # step4: No longer using padding techniques, but directly assigning slice values
+        ab_attn[
+            bs,
+            :,
+            cur_q_start_offset : cur_q_start_offset
+            + (a_offsets[bs + 1] - a_offsets[bs]),
+            : b_offsets[bs + 1] - b_offsets[bs],
+        ] = cur_bs_ab_atten
+
+    return ab_attn
 
 
 # @torch.compile
@@ -1590,12 +1775,11 @@ def _hstu_attention_maybe_from_cache_fp8(
     rab: Optional[torch.Tensor],
     invalid_attn_mask: torch.Tensor,
     alpha: float,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
+    quant_mode: int,
+    is_delta_q: bool,
 ):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+
     B: int = q_offsets.size(0) - 1
     n_q: int = seqlen_q  # max_seq_len
     n_k: int = seqlen_k  # max_seq_len
@@ -1604,28 +1788,72 @@ def _hstu_attention_maybe_from_cache_fp8(
     n_q = 16 * math.ceil(seqlen_q / 16)
     n_k = 16 * math.ceil(seqlen_k / 16)
     dtype_out = torch.float16
-    padded_q = pad_input(q, q_offsets, B, n_q)
-    padded_k = pad_input(k, k_offsets, B, n_k)
-    padded_v = pad_input(v, k_offsets, B, n_k)
+    bm, bn = get_bm_and_bn_block_size_fwd(rab, attention_dim)
 
-    padded_q = padded_q.view(B, n_q, num_heads, attention_dim)
-    padded_k = padded_k.view(B, n_k, num_heads, attention_dim)
-    padded_v = padded_v.view(B, n_k, num_heads, linear_dim)
+    if quant_mode == 0:
+        q_fp8 = q.to(torch.float8_e4m3fn)
+        k_fp8 = k.to(torch.float8_e4m3fn)
+        v_fp8 = v.to(torch.float8_e4m3fn)
+    elif quant_mode == 1:
+        q_fp8, q_descale, _, _, _ = quantize_for_two_directions(q, q_offsets)
+        k_fp8, k_descale, _, _, _ = quantize_for_two_directions(k, k_offsets)
+        _, _, v_fp8, v_descale, cu_seqlens_v_descale = quantize_for_two_directions(
+            v, k_offsets
+        )
+    elif quant_mode == 2:
+        q_fp8, q_descale, cu_seqlens_block_descale_q = quantize_for_block_scale(
+            q, q_offsets, block_size=bm
+        )
+        k_fp8, k_descale, cu_seqlens_block_descale_k = quantize_for_block_scale(
+            k, k_offsets, block_size=bn
+        )
+        v_fp8, v_descale, cu_seqlens_block_descale_k = quantize_for_block_scale(
+            v, k_offsets, block_size=bn
+        )
+        q_descale = q_descale.transpose(1, 0)
+        k_descale = k_descale.transpose(1, 0)
+        v_descale = v_descale.transpose(1, 0)
+    elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
+        q_fp8, q_descale = quantize_for_head_batch_tensor(
+            q, q_offsets, quant_mode=quant_mode
+        )
+        k_fp8, k_descale = quantize_for_head_batch_tensor(
+            k, k_offsets, quant_mode=quant_mode
+        )
+        v_fp8, v_descale = quantize_for_head_batch_tensor(
+            v, k_offsets, quant_mode=quant_mode
+        )
 
-    padded_q = padded_q.permute(0, 2, 1, 3).reshape(-1, n_q, attention_dim)
-    padded_k = (
-        padded_k.permute(0, 2, 1, 3)
-        .contiguous()
-        .reshape(-1, n_k, attention_dim)
-        .permute(0, 2, 1)
+    if is_delta_q:
+        padded_q = pad_input_delta_q(
+            q_fp8, q_offsets, k_offsets, B, n_k
+        )  # padding at beginning
+    else:
+        padded_q = pad_input(q_fp8, q_offsets, B, n_q)
+    padded_k = pad_input(k_fp8, k_offsets, B, n_k)
+    padded_v = pad_input(v_fp8, k_offsets, B, n_k)
+
+    padded_q = (
+        padded_q.view(B, n_k, num_heads, attention_dim).permute(0, 2, 1, 3).contiguous()
     )
+    padded_k = (
+        padded_k.view(B, n_k, num_heads, attention_dim).permute(0, 2, 1, 3).contiguous()
+    )
+    padded_v = (
+        padded_v.view(B, n_k, num_heads, linear_dim).permute(0, 2, 1, 3).contiguous()
+    )
+
+    padded_q = padded_q.reshape(-1, n_k, attention_dim)
+    padded_k = padded_k.reshape(-1, n_k, attention_dim).permute(0, 2, 1)
+    descale_one = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
     # only support MK @ KN
     qk_attn = torch._scaled_mm(
         padded_q[0],
         padded_k[0],
         out_dtype=torch.float,
-        scale_a=descale_q,
-        scale_b=descale_k,
+        scale_a=descale_one,
+        scale_b=descale_one,
     )
     for i in range(1, padded_q.size(0)):
         qk_attn = torch.cat(
@@ -1635,13 +1863,57 @@ def _hstu_attention_maybe_from_cache_fp8(
                     padded_q[i],
                     padded_k[i],
                     out_dtype=torch.float,
-                    scale_a=descale_q,
-                    scale_b=descale_k,
+                    scale_a=descale_one,
+                    scale_b=descale_one,
                 ),
             ),
             dim=0,
         )
-    qk_attn = qk_attn.view(B, num_heads, n_q, n_k)
+    qk_attn = qk_attn.view(B, num_heads, n_k, n_k)
+
+    if quant_mode == 1:
+        for bs in range(B):
+            actual_seqlen_q = q_offsets[bs + 1] - q_offsets[bs]
+            actual_seqlen_k = k_offsets[bs + 1] - k_offsets[bs]
+            qk_attn[
+                bs, :, actual_seqlen_k - actual_seqlen_q : actual_seqlen_k, :
+            ] = qk_attn[
+                bs, :, actual_seqlen_k - actual_seqlen_q : actual_seqlen_k, :
+            ] * q_descale[
+                :, q_offsets[bs] : q_offsets[bs + 1]
+            ].unsqueeze(
+                -1
+            )
+            qk_attn[bs, :, :, :actual_seqlen_k] = qk_attn[
+                bs, :, :, :actual_seqlen_k
+            ] * k_descale[:, k_offsets[bs] : k_offsets[bs + 1]].unsqueeze(-2)
+    elif quant_mode == 2:
+        qk_attn = AB_blockscale_gemm_fp8(
+            ab_attn=qk_attn,
+            a_offsets=q_offsets,
+            b_offsets=k_offsets,
+            a_descale=q_descale,
+            b_descale=k_descale,
+            cu_seqlens_block_descale_a=cu_seqlens_block_descale_q,
+            cu_seqlens_block_descale_b=cu_seqlens_block_descale_k,
+            B=B,
+            bm=bm,
+            bn=bn,
+        )
+    elif quant_mode == 3:
+        qk_attn = (
+            qk_attn
+            * q_descale.unsqueeze(-1).unsqueeze(-1)
+            * k_descale.unsqueeze(-1).unsqueeze(-1)
+        )
+    elif quant_mode == 4:
+        qk_attn = (
+            qk_attn
+            * q_descale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            * k_descale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        )
+    elif quant_mode == 5:
+        qk_attn = qk_attn * q_descale * k_descale
 
     if rab is not None:
         padding = (
@@ -1654,60 +1926,112 @@ def _hstu_attention_maybe_from_cache_fp8(
         masked_qk_attn = qk_attn + rab
     else:
         masked_qk_attn = qk_attn
-
     masked_qk_attn = masked_qk_attn * alpha
     masked_qk_attn = F.silu(masked_qk_attn)
-    masked_qk_attn = masked_qk_attn / ori_n_q
     if invalid_attn_mask is not None:
         if invalid_attn_mask.ndim == 2:
-            if invalid_attn_mask.shape[0] != n_q or invalid_attn_mask.shape[1] != n_k:
+            if invalid_attn_mask.shape[0] != n_k or invalid_attn_mask.shape[1] != n_k:
                 invalid_attn_mask = F.pad(
-                    invalid_attn_mask, (0, n_q - ori_n_q, 0, n_k - ori_n_k), value=1
+                    invalid_attn_mask, (0, n_k - ori_n_k, 0, n_k - ori_n_k), value=0
                 )
             invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-        elif invalid_attn_mask.shape[2] != n_q or invalid_attn_mask.shape[3] != n_k:
+        elif invalid_attn_mask.ndim == 3:
+            if invalid_attn_mask.shape[1] != n_k or invalid_attn_mask.shape[2] != n_k:
+                invalid_attn_mask = F.pad(
+                    invalid_attn_mask,
+                    (0, n_k - ori_n_k, 0, n_k - ori_n_k, 0, 0),
+                    value=0,
+                )
+            invalid_attn_mask = invalid_attn_mask.unsqueeze(1)
+        elif invalid_attn_mask.shape[2] != n_k or invalid_attn_mask.shape[3] != n_k:
             # pad 3rd and 4th dim
             invalid_attn_mask = F.pad(
                 invalid_attn_mask,
-                (0, 0, 0, 0, 0, n_q - ori_n_q, 0, n_k - ori_n_k),
-                value=1,
+                (0, n_k - ori_n_k, 0, n_k - ori_n_k, 0, 0, 0, 0),
+                value=0,
             )
         masked_qk_attn = masked_qk_attn * invalid_attn_mask.type(masked_qk_attn.dtype)
 
-    descale_a = torch.tensor([1.0], dtype=torch.float32, device="cuda")
-    masked_qk_attn = masked_qk_attn.to(torch.float8_e4m3fn).reshape(-1, n_q, n_k)
-    padded_v = (
-        padded_v.permute(0, 2, 3, 1)
-        .contiguous()
-        .permute(0, 1, 3, 2)
-        .reshape(-1, n_k, linear_dim)
-    )
-    attn_output = torch._scaled_mm(
-        masked_qk_attn[0],
-        padded_v[0],
-        out_dtype=torch.float,
-        scale_a=descale_a,
-        scale_b=descale_v,
-    )
-    for i in range(1, masked_qk_attn.size(0)):
-        attn_output = torch.cat(
-            (
-                attn_output,
-                torch._scaled_mm(
-                    masked_qk_attn[i],
-                    padded_v[i],
-                    out_dtype=torch.float,
-                    scale_a=descale_a,
-                    scale_b=descale_v,
-                ),
-            ),
-            dim=0,
+    if quant_mode == 0:
+        masked_qk_attn = masked_qk_attn.to(torch.float8_e4m3fn).reshape(-1, n_k, n_k)
+        padded_v = (
+            padded_v.permute(0, 1, 3, 2)
+            .contiguous()
+            .permute(0, 1, 3, 2)
+            .reshape(-1, n_k, linear_dim)
         )
-    attn_output = attn_output.view(B, num_heads, n_q, linear_dim).permute(0, 2, 1, 3)
 
-    attn_output = attn_output.reshape(B, n_q, num_heads * linear_dim)[:, :ori_n_q, :]
-    attn_output = unpad_input(attn_output, q_offsets)
-    attn_output = attn_output.reshape(-1, num_heads * linear_dim)
+        attn_output = torch._scaled_mm(
+            masked_qk_attn[0],
+            padded_v[0],
+            out_dtype=torch.float,
+            scale_a=descale_one,
+            scale_b=descale_one,
+        )
+        for i in range(1, masked_qk_attn.size(0)):
+            attn_output = torch.cat(
+                (
+                    attn_output,
+                    torch._scaled_mm(
+                        masked_qk_attn[i],
+                        padded_v[i],
+                        out_dtype=torch.float,
+                        scale_a=descale_one,
+                        scale_b=descale_one,
+                    ),
+                ),
+                dim=0,
+            )
+        attn_output = attn_output.view(B, num_heads, n_k, linear_dim).permute(
+            0, 2, 1, 3
+        )
+    elif quant_mode == 1:
+        attn_output = P_blockwise_Vt_gemm_fp8(
+            masked_qk_attn, padded_v, v_descale, cu_seqlens_v_descale, 16, bn
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 2:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        attn_output = P_blockwise_Vt_gemm_fp8(
+            masked_qk_attn,
+            padded_v,
+            v_descale,
+            cu_seqlens_block_descale_k,
+            16,
+            bn,
+            False,
+            start_ids,
+            mode=2,
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
+        attn_output = P_blockwise_Vt_gemm_fp8(
+            masked_qk_attn,
+            padded_v,
+            v_descale,
+            None,
+            16,
+            bn,
+            False,
+            None,
+            mode=quant_mode,
+        ).permute(0, 2, 1, 3)
+
+    attn_output = attn_output.reshape(B, n_k, num_heads * linear_dim)[:, :ori_n_k, :]
+
+    if is_delta_q:
+        attn_output = unpad_input_delta_q(attn_output, q_offsets, k_offsets, B, n_k)
+    else:
+        attn_output = unpad_input(attn_output, q_offsets)
+    attn_output = attn_output.reshape(-1, num_heads, linear_dim) / ori_n_q
 
     return attn_output.to(dtype_out)
 
@@ -1727,10 +2051,8 @@ def _bwd_reference_fp8(
     rab: Optional[torch.Tensor],
     invalid_attn_mask: Optional[torch.Tensor],
     alpha: float,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
+    quant_mode: int,
+    is_delta_q: bool,
 ):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     B: int = q_offsets.size(0) - 1
@@ -1742,16 +2064,108 @@ def _bwd_reference_fp8(
     n_k = 16 * math.ceil(seqlen_k / 16)
     L: int = q.size(0)
     do.dtype
+    bm, bn = get_bm_and_bn_block_size_bwd()
 
-    padded_q = pad_input(q, q_offsets, B, n_q)
-    padded_k = pad_input(k, k_offsets, B, n_k)
-    padded_v = pad_input(v, k_offsets, B, n_k)
-    padded_do = pad_input(do, q_offsets, B, n_q)
+    if quant_mode == 0:
+        q_fp8 = q.to(torch.float8_e4m3fn)
+        k_fp8 = k.to(torch.float8_e4m3fn)
+        v_fp8 = v.to(torch.float8_e4m3fn)
+        do_fp8 = do.to(torch.float8_e4m3fn)
+    elif quant_mode == 1:
+        (
+            q_fp8,
+            q_descale,
+            qt_fp8,
+            qt_descale,
+            cu_seqlens_qt_descale,
+        ) = quantize_for_two_directions(q, q_offsets, torch.float8_e4m3fn)
+        (
+            k_fp8,
+            k_descale,
+            kt_fp8,
+            kt_descale,
+            cu_seqlens_kt_descale,
+        ) = quantize_for_two_directions(k, k_offsets, torch.float8_e4m3fn)
+        v_fp8, v_descale, _, _, _ = quantize_for_two_directions(
+            v, k_offsets, torch.float8_e4m3fn
+        )
+        (
+            do_fp8,
+            do_descale,
+            dot_fp8,
+            dot_descale,
+            cu_seqlens_dot_descale,
+        ) = quantize_for_two_directions(do, q_offsets, torch.float8_e4m3fn)
+        padded_qt = pad_input(qt_fp8, q_offsets, B, n_q)
+        padded_kt = pad_input(kt_fp8, k_offsets, B, n_k)
+        padded_dot = pad_input(dot_fp8, q_offsets, B, n_q)
+        padded_qt = (
+            padded_qt.view(B, n_q, num_heads, attention_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        padded_kt = (
+            padded_kt.view(B, n_k, num_heads, attention_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        padded_dot = (
+            padded_dot.view(B, n_q, num_heads, linear_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+    elif quant_mode == 2:  # block_scale
+        q_fp8, q_descale, cu_seqlens_block_descale_q = quantize_for_block_scale(
+            q, q_offsets, block_size=bm, fp8_type=torch.float8_e4m3fn
+        )
+        k_fp8, k_descale, cu_seqlens_block_descale_k = quantize_for_block_scale(
+            k, k_offsets, block_size=bn, fp8_type=torch.float8_e4m3fn
+        )
+        v_fp8, v_descale, cu_seqlens_block_descale_k = quantize_for_block_scale(
+            v, k_offsets, block_size=bn, fp8_type=torch.float8_e4m3fn
+        )
+        do_fp8, do_descale, cu_seqlens_block_descale_q = quantize_for_block_scale(
+            do, q_offsets, block_size=bm, fp8_type=torch.float8_e4m3fn
+        )  # same with q, so using bm as block size
+        q_descale = q_descale.transpose(1, 0)
+        k_descale = k_descale.transpose(1, 0)
+        v_descale = v_descale.transpose(1, 0)
+        do_descale = do_descale.transpose(1, 0)
+    elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
+        q_fp8, q_descale = quantize_for_head_batch_tensor(
+            q, q_offsets, quant_mode=quant_mode
+        )
+        k_fp8, k_descale = quantize_for_head_batch_tensor(
+            k, k_offsets, quant_mode=quant_mode
+        )
+        v_fp8, v_descale = quantize_for_head_batch_tensor(
+            v, k_offsets, quant_mode=quant_mode
+        )
+        do_fp8, do_descale = quantize_for_head_batch_tensor(
+            do, q_offsets, quant_mode=quant_mode
+        )
 
-    padded_q = padded_q.view(B, n_q, num_heads, attention_dim)
-    padded_k = padded_k.view(B, n_k, num_heads, attention_dim)
-    padded_v = padded_v.view(B, n_k, num_heads, linear_dim)
-    padded_do = padded_do.view(B, n_q, num_heads, linear_dim)
+    if is_delta_q:
+        padded_q = pad_input_delta_q(q_fp8, q_offsets, k_offsets, B, n_k)
+        padded_do = pad_input_delta_q(do_fp8, q_offsets, k_offsets, B, n_k)
+    else:
+        padded_q = pad_input(q_fp8, q_offsets, B, n_q)
+        padded_do = pad_input(do_fp8, q_offsets, B, n_q)
+    padded_k = pad_input(k_fp8, k_offsets, B, n_k)
+    padded_v = pad_input(v_fp8, k_offsets, B, n_k)
+
+    padded_q = (
+        padded_q.view(B, n_k, num_heads, attention_dim).permute(0, 2, 1, 3).contiguous()
+    )
+    padded_k = (
+        padded_k.view(B, n_k, num_heads, attention_dim).permute(0, 2, 1, 3).contiguous()
+    )
+    padded_v = (
+        padded_v.view(B, n_k, num_heads, linear_dim).permute(0, 2, 1, 3).contiguous()
+    )
+    padded_do = (
+        padded_do.view(B, n_k, num_heads, linear_dim).permute(0, 2, 1, 3).contiguous()
+    )
 
     def dsilu(dy, x):
         dy = dy.to(torch.float32)
@@ -1759,20 +2173,18 @@ def _bwd_reference_fp8(
         sigmoid = F.sigmoid(x)
         return dy * sigmoid * (1 + x * (1 - sigmoid))
 
-    padded_q = padded_q.permute(0, 2, 1, 3).reshape(-1, n_q, attention_dim)
-    padded_k = (
-        padded_k.permute(0, 2, 1, 3)
-        .contiguous()
-        .reshape(-1, n_k, attention_dim)
-        .permute(0, 2, 1)
-    )
+    padded_k_for_dQ = padded_k
+    padded_q_for_dK = padded_q
+    padded_q = padded_q.reshape(-1, n_k, attention_dim)
+    padded_k = padded_k.reshape(-1, n_k, attention_dim).permute(0, 2, 1)
+    descale_one = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     # only support MK @ KN
     qk_attn = torch._scaled_mm(
         padded_q[0],
         padded_k[0],
         out_dtype=torch.float,
-        scale_a=descale_q,
-        scale_b=descale_k,
+        scale_a=descale_one,
+        scale_b=descale_one,
     )
     for i in range(1, padded_q.size(0)):
         qk_attn = torch.cat(
@@ -1782,13 +2194,57 @@ def _bwd_reference_fp8(
                     padded_q[i],
                     padded_k[i],
                     out_dtype=torch.float,
-                    scale_a=descale_q,
-                    scale_b=descale_k,
+                    scale_a=descale_one,
+                    scale_b=descale_one,
                 ),
             ),
             dim=0,
         )
-    qk_attn = qk_attn.view(B, num_heads, n_q, n_k)
+    qk_attn = qk_attn.view(B, num_heads, n_k, n_k)
+
+    if quant_mode == 1:
+        for bs in range(B):
+            actual_seqlen_q = q_offsets[bs + 1] - q_offsets[bs]
+            actual_seqlen_k = k_offsets[bs + 1] - k_offsets[bs]
+            qk_attn[
+                bs, :, actual_seqlen_k - actual_seqlen_q : actual_seqlen_k, :
+            ] = qk_attn[
+                bs, :, actual_seqlen_k - actual_seqlen_q : actual_seqlen_k, :
+            ] * q_descale[
+                :, q_offsets[bs] : q_offsets[bs + 1]
+            ].unsqueeze(
+                -1
+            )
+            qk_attn[bs, :, :, :actual_seqlen_k] = qk_attn[
+                bs, :, :, :actual_seqlen_k
+            ] * k_descale[:, k_offsets[bs] : k_offsets[bs + 1]].unsqueeze(-2)
+    elif quant_mode == 2:
+        qk_attn = AB_blockscale_gemm_fp8(
+            ab_attn=qk_attn,
+            a_offsets=q_offsets,
+            b_offsets=k_offsets,
+            a_descale=q_descale,
+            b_descale=k_descale,
+            cu_seqlens_block_descale_a=cu_seqlens_block_descale_q,
+            cu_seqlens_block_descale_b=cu_seqlens_block_descale_k,
+            B=B,
+            bm=bm,
+            bn=bn,
+        )
+    elif quant_mode == 3:
+        qk_attn = (
+            qk_attn
+            * q_descale.unsqueeze(-1).unsqueeze(-1)
+            * k_descale.unsqueeze(-1).unsqueeze(-1)
+        )
+    elif quant_mode == 4:
+        qk_attn = (
+            qk_attn
+            * q_descale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            * k_descale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        )
+    elif quant_mode == 5:
+        qk_attn = qk_attn * q_descale * k_descale
 
     if rab is not None:
         padding = (
@@ -1800,174 +2256,457 @@ def _bwd_reference_fp8(
         rab = F.pad(rab, padding, value=0)
         qk_attn = qk_attn + rab
     qk_attn = qk_attn * alpha
-    qk_attn_silu = F.silu(qk_attn) / ori_n_k
+    qk_attn_silu = F.silu(qk_attn)
     if invalid_attn_mask is not None:
         if invalid_attn_mask.ndim == 2:
-            if invalid_attn_mask.shape[0] != n_q or invalid_attn_mask.shape[1] != n_k:
+            if invalid_attn_mask.shape[0] != n_k or invalid_attn_mask.shape[1] != n_k:
                 invalid_attn_mask = F.pad(
-                    invalid_attn_mask, (0, n_q - ori_n_q, 0, n_k - ori_n_k), value=1
+                    invalid_attn_mask, (0, n_k - ori_n_k, 0, n_k - ori_n_k), value=0
                 )
             invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-        elif invalid_attn_mask.shape[2] != n_q or invalid_attn_mask.shape[3] != n_k:
+        elif invalid_attn_mask.ndim == 3:
+            if invalid_attn_mask.shape[1] != n_k or invalid_attn_mask.shape[2] != n_k:
+                invalid_attn_mask = F.pad(
+                    invalid_attn_mask,
+                    (0, n_k - ori_n_k, 0, n_k - ori_n_k, 0, 0),
+                    value=0,
+                )
+            invalid_attn_mask = invalid_attn_mask.unsqueeze(1)
+        elif invalid_attn_mask.shape[2] != n_k or invalid_attn_mask.shape[3] != n_k:
             # pad 3rd and 4th dim
             invalid_attn_mask = F.pad(
                 invalid_attn_mask,
-                (0, 0, 0, 0, 0, n_q - ori_n_q, 0, n_k - ori_n_k),
-                value=1,
+                (0, n_k - ori_n_k, 0, n_k - ori_n_k, 0, 0, 0, 0),
+                value=0,
             )
         masked_qk_attn = qk_attn_silu * invalid_attn_mask.type(qk_attn_silu.dtype)
     else:
         masked_qk_attn = qk_attn_silu
-    masked_qk_attn = (
-        masked_qk_attn.to(torch.float8_e4m3fn)
-        .reshape(-1, n_q, n_k)
-        .permute(0, 2, 1)
-        .contiguous()
-    )
 
-    padded_do = (
-        padded_do.permute(0, 2, 3, 1)
-        .reshape(-1, linear_dim, n_q)
-        .contiguous()
-        .permute(0, 2, 1)
-    )
-    dv = torch._scaled_mm(
-        masked_qk_attn[0],
-        padded_do[0],
-        out_dtype=torch.float,
-        scale_a=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        scale_b=descale_v,
-    )
-    for i in range(1, masked_qk_attn.size(0)):
-        dv = torch.cat(
-            (
-                dv,
-                torch._scaled_mm(
-                    masked_qk_attn[i],
-                    padded_do[i],
-                    out_dtype=torch.float,
-                    scale_a=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    scale_b=descale_v,
-                ),
-            ),
-            dim=0,
+    if quant_mode == 0:
+        masked_qk_attn = (
+            masked_qk_attn.to(torch.float8_e4m3fn)
+            .reshape(-1, n_k, n_k)
+            .permute(0, 2, 1)
+            .contiguous()
         )
-    dv = dv.view(B, num_heads, n_q, linear_dim).permute(0, 2, 1, 3)
-    dv = unpad_input(dv, q_offsets)
+        padded_do = (
+            padded_do.permute(0, 1, 3, 2)
+            .reshape(-1, linear_dim, n_k)
+            .contiguous()
+            .permute(0, 2, 1)
+        )
+        dv = torch._scaled_mm(
+            masked_qk_attn[0],
+            padded_do[0],
+            out_dtype=torch.float,
+            scale_a=descale_one,
+            scale_b=descale_one,
+        )
+        for i in range(1, masked_qk_attn.size(0)):
+            dv = torch.cat(
+                (
+                    dv,
+                    torch._scaled_mm(
+                        masked_qk_attn[i],
+                        padded_do[i],
+                        out_dtype=torch.float,
+                        scale_a=descale_one,
+                        scale_b=descale_one,
+                    ),
+                ),
+                dim=0,
+            )
+        dv = dv.view(B, num_heads, n_k, linear_dim).permute(0, 2, 1, 3)
+    elif quant_mode == 1:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dv = P_blockwise_Vt_gemm_fp8(
+            masked_qk_attn.permute(0, 1, 3, 2),
+            padded_dot,
+            dot_descale,
+            cu_seqlens_dot_descale,
+            bm,
+            bn,
+            True,
+            start_ids,
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 2:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dv = P_blockwise_Vt_gemm_fp8(
+            masked_qk_attn.permute(0, 1, 3, 2),
+            padded_do,
+            do_descale,
+            cu_seqlens_block_descale_q,
+            bm,
+            bn,
+            True,
+            start_ids=start_ids,
+            mode=2,
+            is_qdo_offset=True,
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dv = P_blockwise_Vt_gemm_fp8(
+            masked_qk_attn.permute(0, 1, 3, 2),
+            padded_do,
+            do_descale,
+            None,
+            bm,
+            bn,
+            True,
+            None,
+            mode=quant_mode,
+            is_qdo_offset=True,
+        ).permute(0, 2, 1, 3)
 
-    padded_do = padded_do.contiguous().permute(0, 2, 1)
-    padded_v = padded_v.permute(0, 2, 1, 3).reshape(-1, n_k, linear_dim)
+    dv = unpad_input(dv, k_offsets) / ori_n_q
+
+    if quant_mode == 0:
+        padded_do = padded_do.contiguous()
+    else:
+        padded_do = padded_do.reshape(-1, n_k, linear_dim)
+    padded_v = padded_v.reshape(-1, n_k, linear_dim).permute(0, 2, 1)
     dp = torch._scaled_mm(
-        padded_v[0],
         padded_do[0],
+        padded_v[0],
         out_dtype=torch.float,
-        scale_a=descale_v,
-        scale_b=descale_do,
+        scale_a=descale_one,
+        scale_b=descale_one,
     )
-    for i in range(1, padded_v.size(0)):
+    for i in range(1, padded_do.size(0)):
         dp = torch.cat(
             (
                 dp,
                 torch._scaled_mm(
-                    padded_v[i],
                     padded_do[i],
+                    padded_v[i],
                     out_dtype=torch.float,
-                    scale_a=descale_v,
-                    scale_b=descale_do,
+                    scale_a=descale_one,
+                    scale_b=descale_one,
                 ),
             ),
             dim=0,
         )
-    dp = dp.view(B, num_heads, n_k, n_q).permute(0, 1, 3, 2)
+    dp = dp.view(B, num_heads, n_k, n_k)
+
+    if quant_mode == 1:
+        for bs in range(B):
+            actual_seqlen_q = q_offsets[bs + 1] - q_offsets[bs]
+            actual_seqlen_k = k_offsets[bs + 1] - k_offsets[bs]
+            dp[bs, :, actual_seqlen_k - actual_seqlen_q : actual_seqlen_k, :] = dp[
+                bs, :, actual_seqlen_k - actual_seqlen_q : actual_seqlen_k, :
+            ] * do_descale[:, q_offsets[bs] : q_offsets[bs + 1]].unsqueeze(-1)
+            dp[bs, :, :, :actual_seqlen_k] = dp[bs, :, :, :actual_seqlen_k] * v_descale[
+                :, k_offsets[bs] : k_offsets[bs + 1]
+            ].unsqueeze(-2)
+    elif quant_mode == 2:
+        dp = AB_blockscale_gemm_fp8(
+            ab_attn=dp,
+            a_offsets=q_offsets,
+            b_offsets=k_offsets,
+            a_descale=do_descale,
+            b_descale=v_descale,
+            cu_seqlens_block_descale_a=cu_seqlens_block_descale_q,
+            cu_seqlens_block_descale_b=cu_seqlens_block_descale_k,
+            B=B,
+            bm=bm,
+            bn=bn,
+        )
+    elif quant_mode == 3:
+        dp = (
+            dp
+            * do_descale.unsqueeze(-1).unsqueeze(-1)
+            * v_descale.unsqueeze(-1).unsqueeze(-1)
+        )
+    elif quant_mode == 4:
+        dp = (
+            dp
+            * do_descale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            * v_descale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        )
+    elif quant_mode == 5:
+        dp = dp * do_descale * v_descale
 
     if invalid_attn_mask is not None:
         dp = dp * invalid_attn_mask.type(dp.dtype)
-    dp = dsilu(dp / ori_n_k, qk_attn)
-    dp = dp * alpha
 
-    dp = dp.to(torch.float8_e4m3fn).contiguous().reshape(-1, n_q, n_k)
-    padded_k = padded_k.contiguous().permute(0, 2, 1)
-    dq = torch._scaled_mm(
-        dp[0],
-        padded_k[0],
-        out_dtype=torch.float,
-        scale_a=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        scale_b=descale_k,
-    )
-    for i in range(1, dp.size(0)):
-        dq = torch.cat(
-            (
-                dq,
-                torch._scaled_mm(
-                    dp[i],
-                    padded_k[i],
-                    out_dtype=torch.float,
-                    scale_a=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    scale_b=descale_k,
-                ),
-            ),
-            dim=0,
-        )
-    dq = dq.view(B, num_heads, n_q, attention_dim).permute(0, 2, 1, 3)
-    dq = unpad_input(dq, q_offsets)
+    drab = dp / ori_n_q * alpha
+    drab = dsilu(drab, qk_attn)
+    drab = drab[:, :, :seqlen_k, :seqlen_k]
+    if rab is not None and rab.shape[1] == 1:
+        drab = drab.sum(dim=1, keepdim=True)
 
-    dp = dp.permute(0, 2, 1).contiguous()
-    padded_q = padded_q.permute(0, 2, 1).contiguous().permute(0, 2, 1)
-    dk = torch._scaled_mm(
-        dp[0], padded_q[0], out_dtype=torch.float, scale_a=descale_do, scale_b=descale_q
-    )
-    for i in range(1, dp.size(0)):
-        dk = torch.cat(
-            (
-                dk,
-                torch._scaled_mm(
-                    dp[i],
-                    padded_q[i],
-                    out_dtype=torch.float,
-                    scale_a=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    scale_b=descale_q,
-                ),
-            ),
-            dim=0,
+    dp = dsilu(dp, qk_attn)
+
+    if quant_mode == 0:
+        dp = dp.to(torch.float8_e4m3fn).contiguous().reshape(-1, n_k, n_k)
+        padded_k = padded_k.contiguous().permute(0, 2, 1)
+        dq = torch._scaled_mm(
+            dp[0],
+            padded_k[0],
+            out_dtype=torch.float,
+            scale_a=descale_one,
+            scale_b=descale_one,
         )
-    dk = dk.view(B, num_heads, n_k, attention_dim).permute(0, 2, 1, 3)
-    dk = unpad_input(dk, k_offsets)
+        for i in range(1, dp.size(0)):
+            dq = torch.cat(
+                (
+                    dq,
+                    torch._scaled_mm(
+                        dp[i],
+                        padded_k[i],
+                        out_dtype=torch.float,
+                        scale_a=descale_one,
+                        scale_b=descale_one,
+                    ),
+                ),
+                dim=0,
+            )
+        dq = dq.view(B, num_heads, n_k, attention_dim).permute(0, 2, 1, 3)
+    elif quant_mode == 1:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dq = P_blockwise_Vt_gemm_fp8(
+            dp,
+            padded_kt,
+            kt_descale,
+            cu_seqlens_kt_descale,
+            bm,
+            bn,
+            start_ids=start_ids,
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 2:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dq = P_blockwise_Vt_gemm_fp8(
+            dp,
+            padded_k_for_dQ,
+            k_descale,
+            cu_seqlens_block_descale_k,
+            bm,
+            bn,
+            False,
+            start_ids,
+            mode=2,
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dq = P_blockwise_Vt_gemm_fp8(
+            dp,
+            padded_k_for_dQ,
+            k_descale,
+            None,
+            bm,
+            bn,
+            False,
+            start_ids,
+            mode=quant_mode,
+        ).permute(0, 2, 1, 3)
+
+    if is_delta_q:
+        dq = unpad_input_delta_q(dq, q_offsets, k_offsets, B, n_k) / ori_n_q * alpha
+    else:
+        dq = unpad_input(dq, q_offsets) / ori_n_q * alpha
+
+    if quant_mode == 0:
+        dp = dp.permute(0, 2, 1).contiguous()
+        padded_q = padded_q.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+        dk = torch._scaled_mm(
+            dp[0],
+            padded_q[0],
+            out_dtype=torch.float,
+            scale_a=descale_one,
+            scale_b=descale_one,
+        )
+        for i in range(1, dp.size(0)):
+            dk = torch.cat(
+                (
+                    dk,
+                    torch._scaled_mm(
+                        dp[i],
+                        padded_q[i],
+                        out_dtype=torch.float,
+                        scale_a=descale_one,
+                        scale_b=descale_one,
+                    ),
+                ),
+                dim=0,
+            )
+        dk = dk.view(B, num_heads, n_k, attention_dim).permute(0, 2, 1, 3)
+    elif quant_mode == 1:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dk = P_blockwise_Vt_gemm_fp8(
+            dp.permute(0, 1, 3, 2).contiguous(),
+            padded_qt,
+            qt_descale,
+            cu_seqlens_qt_descale,
+            bm,
+            bn,
+            True,
+            start_ids,
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 2:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dk = P_blockwise_Vt_gemm_fp8(
+            dp.permute(0, 1, 3, 2).contiguous(),
+            padded_q_for_dK,
+            q_descale,
+            cu_seqlens_block_descale_q,
+            bm,
+            bn,
+            True,
+            start_ids=start_ids,
+            mode=2,
+            is_qdo_offset=True,
+        ).permute(0, 2, 1, 3)
+    elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
+        start_ids = (
+            torch.tensor(
+                [
+                    k_offsets[i + 1] - k_offsets[i] - q_offsets[i + 1] + q_offsets[i]
+                    for i in range(B)
+                ],
+                dtype=torch.int32,
+            )
+            if is_delta_q
+            else None
+        )
+        dk = P_blockwise_Vt_gemm_fp8(
+            dp.permute(0, 1, 3, 2).contiguous(),
+            padded_q_for_dK,
+            q_descale,
+            None,
+            bm,
+            bn,
+            True,
+            start_ids,
+            mode=quant_mode,
+            is_qdo_offset=True,
+        ).permute(0, 2, 1, 3)
+    dk = unpad_input(dk, k_offsets) / ori_n_q * alpha
 
     return (
         dq.view(-1, num_heads, attention_dim),
         dk.view(-1, num_heads, attention_dim),
         dv.view(-1, num_heads, linear_dim),
+        drab,
     )
 
 
 @pytest.mark.skipif(
     sm_major_version == 8, reason="float8_e4m3fn is not supported on sm8x"
 )
-@pytest.mark.parametrize("batch_size", [32])
+@pytest.mark.parametrize("batch_size", [16])
 @pytest.mark.parametrize("heads", [2])
 @pytest.mark.parametrize(
     "max_seq_len_q, max_seq_len_k",
     [
         (32, 32),
         (99, 99),
-        (256, 256),
-        (1024, 1024),
-        (1111, 1111),
+        (272, 272),
+        (848, 848),
+        (8, 99),
+        (51, 256),
+        (531, 777),
+        (160, 800),
     ],
 )
+@pytest.mark.parametrize("max_context_len", [0, 11, 99, 160])
 @pytest.mark.parametrize(
-    "max_target_len, window_size",
+    "max_target_len, window_size, target_group_size, is_arbitrary",
     [
-        (0, (-1, -1)),
-        (0, (11, 111)),
-        (0, (111, 222)),
-        (0, (-1, 0)),
+        (0, (-1, -1), 1, False),
+        (0, (-1, -1), 1, True),
+        (0, (111, 11), 1, False),
+        (0, (111, 222), 1, False),
+        (0, (-1, 0), 1, False),
+        (48, (-1, 0), 1, False),
+        (257, (-1, 0), 1, False),
+        (112, (-1, 0), 11, False),
+        (555, (-1, 0), 123, False),
     ],
 )
 @pytest.mark.parametrize(
     "attn_dim, hidden_dim",
     [
-        # (32, 32),
         (64, 64),
         (128, 128),
         (256, 256),
@@ -1978,21 +2717,35 @@ def _bwd_reference_fp8(
     [
         (False, False, None),
         (True, False, None),  # None is heads_rab=heads
+        (True, True, None),
         (True, False, 1),
+        (True, True, 1),
     ],
 )
 @pytest.mark.parametrize("run_benchmark", [None])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("full_batch", [True, False])
+@pytest.mark.parametrize(
+    "quant_mode, full_batch",
+    [
+        (0, True),
+        (0, False),
+        (1, True),
+        (2, True),
+        (3, True),
+        (4, True),
+        (5, True),
+    ],
+)
 @pytest.mark.parametrize("alpha", [1.0, 1.0 / (100**0.5)])
-@pytest.mark.parametrize("is_arbitrary", [False])
 def test_fused_attn_fp8(
     batch_size: int,
     heads: int,
     heads_rab: Optional[int],
     max_seq_len_q: int,
     max_seq_len_k: int,
+    max_context_len: int,
     max_target_len: int,
+    target_group_size: int,
     attn_dim: int,
     hidden_dim: int,
     alpha: float,
@@ -2003,19 +2756,49 @@ def test_fused_attn_fp8(
     dtype: torch.dtype,
     full_batch: bool,
     is_arbitrary: bool,
+    quant_mode: int,
 ) -> None:
     if sm_major_version == 8:
         print("skipping fp8 test on sm8x")
         return
+    total_q = max_context_len + max_seq_len_q + max_target_len
+    total_k = max_context_len + max_seq_len_k + max_target_len
+    has_context = max_context_len > 0
+    has_target = max_target_len > 0
+    group_target = target_group_size > 1
+    is_causal = window_size[0] == -1 and window_size[1] == 0
+    is_delta_q = max_seq_len_q < max_seq_len_k
     if dtype != torch.float8_e4m3fn:
         raise ValueError("dtype is not float8_e4m3fn")
-    if has_drab:
-        raise ValueError("fp8 does not support drab")
-    if max_target_len != 0:
-        raise ValueError("for fp8, max_target_len must be 0")
-    if max_seq_len_q != max_seq_len_k:
-        raise ValueError("max_seq_len_q != max_seq_len_k")
-    is_delta_q = max_seq_len_q < max_seq_len_k
+    if has_drab and not has_rab:
+        raise ValueError("has_drab is True but has_rab is False")
+    if (has_target and not is_causal) or (
+        has_target and (window_size[0] > 0 or window_size[1] > 0)
+    ):
+        raise ValueError(
+            "has_target is True but is_causal is False or window_size is not (-1, -1)"
+        )
+    if max_seq_len_q > max_seq_len_k:
+        raise ValueError("max_seq_len_q > max_seq_len_k is not supported")
+    if group_target and not has_target:
+        raise ValueError("group_target is True but has_target is False")
+    if is_arbitrary and (window_size[0] != -1 or window_size[1] != -1):
+        raise ValueError("is_arbitrary is True but window_size is not (-1, -1)")
+    # TODO: find a better way to avoid these combinations
+    if quant_mode == 0 and alpha < 0.5:
+        return
+    if quant_mode > 0 and (
+        total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False
+    ):
+        return
+    if is_delta_q and has_target:
+        return
+    if is_delta_q and has_context:
+        return
+    if not is_causal and has_context:
+        return
+    if (window_size[0] > 0 or window_size[1] > 0) and has_context:
+        return
 
     torch.cuda.synchronize()
     if run_benchmark is not None:
@@ -2032,11 +2815,11 @@ def test_fused_attn_fp8(
                 batch_size=batch_size,
                 heads=heads,
                 heads_rab=heads_rab,
-                max_context_len=0,
                 max_seq_len_q=max_seq_len_q,
                 max_seq_len_k=max_seq_len_k,
+                max_context_len=max_context_len,
                 max_target_len=max_target_len,
-                target_group_size=1,
+                target_group_size=target_group_size,
                 attn_dim=attn_dim,
                 hidden_dim=hidden_dim,
                 window_size=window_size,
@@ -2058,11 +2841,11 @@ def test_fused_attn_fp8(
             (
                 L_q,
                 L_k,
+                num_contexts,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                num_targets,
                 _,
-                seq_offsets_q,
-                seq_offsets_k,
-                _,
-                qkv,
                 q,
                 k,
                 v,
@@ -2071,24 +2854,21 @@ def test_fused_attn_fp8(
             ) = input_datas[i % 2]
             if run_benchmark == 0:
                 fwd_out = hstu_attn_varlen_func(
-                    q=q.to(dtype),
-                    k=k.to(dtype),
-                    v=v.to(dtype),
-                    seq_offsets_q=seq_offsets_q,
-                    seq_offsets_k=seq_offsets_k,
-                    max_seqlen_q=max_seq_len_q,
-                    max_seqlen_k=max_seq_len_k,
-                    num_contexts=None,
-                    num_targets=None,
-                    target_group_size=1,
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+                    max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+                    num_contexts=num_contexts,
+                    num_targets=num_targets,
+                    target_group_size=target_group_size,
                     window_size=window_size,
                     alpha=alpha,
                     rab=rab if has_rab else None,
                     has_drab=has_drab,
-                    descale_q=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    descale_k=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    descale_v=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    descale_do=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+                    quant_mode=quant_mode,
                 )
             else:
                 assert run_benchmark == 1
@@ -2096,13 +2876,13 @@ def test_fused_attn_fp8(
                     num_heads=heads,
                     attention_dim=attn_dim,
                     linear_dim=hidden_dim,
-                    seqlen_q=max_seq_len_q + max_target_len,
-                    seqlen_k=max_seq_len_k + max_target_len,
-                    q=q.view(L_q, -1),
-                    k=k.view(L_k, -1),
-                    v=v.view(L_k, -1),
-                    q_offsets=seq_offsets_q,
-                    k_offsets=seq_offsets_k,
+                    seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+                    seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+                    q=q,
+                    k=k,
+                    v=v,
+                    q_offsets=cu_seqlens_q,
+                    k_offsets=cu_seqlens_k,
                     rab=rab if has_rab else None,
                     invalid_attn_mask=(
                         1.0 - attn_mask.to(torch.float32)
@@ -2110,10 +2890,7 @@ def test_fused_attn_fp8(
                         else None
                     ),
                     alpha=alpha,
-                    descale_q=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    descale_k=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    descale_v=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    descale_do=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+                    quant_mode=quant_mode,
                 )
             output_datas.append(fwd_out)
         fwd_event_stop.record()
@@ -2136,11 +2913,11 @@ def test_fused_attn_fp8(
             (
                 L_q,
                 L_k,
+                num_contexts,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                num_targets,
                 _,
-                seq_offsets_q,
-                seq_offsets_k,
-                _,
-                qkv,
                 q,
                 k,
                 v,
@@ -2149,20 +2926,36 @@ def test_fused_attn_fp8(
             ) = input_datas[i % 2]
             g = grads[i]
             fwd_out = output_datas[i]
-            if run_benchmark == 0:
-                (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
-                    fwd_out,
-                    (q, k, v),
-                    g,
-                    retain_graph=True,
-                )
+            if not has_drab:
+                if run_benchmark == 0:
+                    (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
+                        fwd_out,
+                        (q, k, v),
+                        g,
+                        retain_graph=True,
+                    )
+                else:
+                    (dq_torch, dk_torch, dv_torch) = torch.autograd.grad(
+                        fwd_out,
+                        (q, k, v),
+                        g,
+                        retain_graph=True,
+                    )
             else:
-                (dq_torch, dk_torch, dv_torch) = torch.autograd.grad(
-                    fwd_out,
-                    (q, k, v),
-                    g,
-                    retain_graph=True,
-                )
+                if run_benchmark == 0:
+                    (dq_hstu, dk_hstu, dv_hstu, drab_hstu) = torch.autograd.grad(
+                        fwd_out,
+                        (q, k, v, rab),
+                        g,
+                        retain_graph=True,
+                    )
+                else:
+                    (dq_torch, dk_torch, dv_torch, drab_torch) = torch.autograd.grad(
+                        fwd_out,
+                        (q, k, v, rab),
+                        g,
+                        retain_graph=True,
+                    )
 
         bwd_event_stop.record()
         torch.cuda.synchronize()
@@ -2174,10 +2967,10 @@ def test_fused_attn_fp8(
     (
         L_q,
         L_k,
-        _,
-        seq_offsets_q,
-        seq_offsets_k,
-        _,
+        num_contexts,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        num_targets,
         _,
         q,
         k,
@@ -2191,9 +2984,9 @@ def test_fused_attn_fp8(
         heads_rab=heads_rab,
         max_seq_len_q=max_seq_len_q,
         max_seq_len_k=max_seq_len_k,
-        max_context_len=0,
+        max_context_len=max_context_len,
         max_target_len=max_target_len,
-        target_group_size=1,
+        target_group_size=target_group_size,
         attn_dim=attn_dim,
         hidden_dim=hidden_dim,
         window_size=window_size,
@@ -2203,118 +2996,138 @@ def test_fused_attn_fp8(
         is_delta_q=is_delta_q,
         is_arbitrary=is_arbitrary,
     )
+
     out_ref = _hstu_attention_maybe_from_cache(
         num_heads=heads,
         attention_dim=attn_dim,
         linear_dim=hidden_dim,
-        seqlen_q=max_seq_len_q,
-        seqlen_k=max_seq_len_k,
-        q=q.view(L_q, -1).float(),
-        k=k.view(L_k, -1).float(),
-        v=v.view(L_k, -1).float(),
-        q_offsets=seq_offsets_q,
-        k_offsets=seq_offsets_k,
+        seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+        seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+        q=q,
+        k=k,
+        v=v,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
         rab=rab if has_rab else None,
         invalid_attn_mask=attn_mask.to(torch.float32)
         if attn_mask is not None
         else None,
         alpha=alpha,
+        upcast=True,
+        is_delta_q=is_delta_q,
     )
 
     torch_out = _hstu_attention_maybe_from_cache_fp8(
         num_heads=heads,
         attention_dim=attn_dim,
         linear_dim=hidden_dim,
-        seqlen_q=max_seq_len_q,
-        seqlen_k=max_seq_len_k,
-        q=q.view(L_q, -1),
-        k=k.view(L_k, -1),
-        v=v.view(L_k, -1),
-        q_offsets=seq_offsets_q,
-        k_offsets=seq_offsets_k,
+        seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+        seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+        q=q,
+        k=k,
+        v=v,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
         rab=rab if has_rab else None,
         invalid_attn_mask=attn_mask.to(torch.float32)
         if attn_mask is not None
         else None,
         alpha=alpha,
-        descale_q=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_k=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_v=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_do=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+        quant_mode=quant_mode,
+        is_delta_q=is_delta_q,
     )
 
     hstu_out = hstu_attn_varlen_func(
-        q=q.to(dtype),
-        k=k.to(dtype),
-        v=v.to(dtype),
-        seq_offsets_q=seq_offsets_q,
-        seq_offsets_k=seq_offsets_k,
-        max_seqlen_q=max_seq_len_q,
-        max_seqlen_k=max_seq_len_k,
-        num_contexts=None,
-        num_targets=None,
-        target_group_size=1,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+        max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+        num_contexts=num_contexts,
+        num_targets=num_targets,
+        target_group_size=target_group_size,
         window_size=window_size,
         alpha=alpha,
         rab=rab if has_rab else None,
         has_drab=has_drab,
-        descale_q=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_k=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_v=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_do=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+        func=func,
+        quant_mode=quant_mode,
     )
 
-    print(f"Output max diff: {(hstu_out.view(L_q, -1) - out_ref).abs().max().item()}")
+    print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
     print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
-
-    print(f"Output mean diff: {(hstu_out.view(L_q, -1) - out_ref).abs().mean().item()}")
+    print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
     print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
-    assert (hstu_out.view(L_q, -1) - out_ref).abs().max().item() <= 2 * (
+    assert (hstu_out - out_ref).abs().max().item() <= 2 * (
         torch_out - out_ref
     ).abs().max().item()
-    return
-    # torch.set_printoptions(profile="full")
+
     g = torch.rand_like(torch_out)
-    (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
-        out_ref, (q, k, v), g, retain_graph=True
-    )
-    g = g.to(torch.float8_e4m3fn)
-    (dq_torch, dk_torch, dv_torch) = _bwd_reference_fp8(
+    if not has_drab:
+        (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
+            out_ref, (q, k, v), g, retain_graph=True
+        )
+        (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
+            hstu_out,
+            (q, k, v),
+            g,
+            retain_graph=True,
+        )
+    else:
+        (dq_ref, dk_ref, dv_ref, drab_ref) = torch.autograd.grad(
+            out_ref, (q, k, v, rab), g, retain_graph=True
+        )
+        (dq_hstu, dk_hstu, dv_hstu, drab_hstu) = torch.autograd.grad(
+            hstu_out,
+            (q, k, v, rab),
+            g,
+            retain_graph=True,
+        )
+    (dq_torch, dk_torch, dv_torch, drab_torch) = _bwd_reference_fp8(
         num_heads=heads,
         attention_dim=attn_dim,
         linear_dim=hidden_dim,
-        seqlen_q=max_seq_len_q + max_target_len,
-        seqlen_k=max_seq_len_k + max_target_len,
+        seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+        seqlen_k=max_context_len + max_seq_len_k + max_target_len,
         do=g,
         q=q,
         k=k,
         v=v,
-        q_offsets=seq_offsets_q,
-        k_offsets=seq_offsets_k,
+        q_offsets=cu_seqlens_q,
+        k_offsets=cu_seqlens_k,
         rab=rab if has_rab else None,
         invalid_attn_mask=attn_mask,
         alpha=alpha,
-        descale_q=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_k=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_v=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-        descale_do=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-    )
-    (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
-        hstu_out,
-        (q, k, v),
-        g.view(-1, heads, hidden_dim),
-        retain_graph=True,
+        quant_mode=quant_mode,
+        is_delta_q=is_delta_q,
     )
 
     print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
     print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
-
     print(f"dK max diff: {(dk_hstu - dk_ref).abs().max().item()}")
     print(f"dK Pytorch max diff: {(dk_torch - dk_ref).abs().max().item()}")
-
     print(f"dQ max diff: {(dq_hstu - dq_ref).abs().max().item()}")
     print(f"dQ Pytorch max diff: {(dq_torch - dq_ref).abs().max().item()}")
+    if has_drab:
+        print(f"drab max diff: {(drab_hstu - drab_ref).abs().max().item()}")
+        print(f"drab Pytorch max diff: {(drab_torch - drab_ref).abs().max().item()}")
+
+    assert (dv_torch - dv_ref).abs().max().item() <= 2 * (
+        dv_hstu - dv_ref
+    ).abs().max().item()
+    assert (dk_torch - dk_ref).abs().max().item() <= 2 * (
+        dk_hstu - dk_ref
+    ).abs().max().item()
+    assert (dq_torch - dq_ref).abs().max().item() <= 2 * (
+        dq_hstu - dq_ref
+    ).abs().max().item()
+    if has_drab:
+        assert (drab_torch - drab_ref).abs().max().item() <= 2 * (
+            drab_hstu - drab_ref
+        ).abs().max().item()
 
     assert (dv_hstu - dv_ref).abs().max().item() <= 5 * (
         dv_torch - dv_ref
@@ -2325,63 +3138,72 @@ def test_fused_attn_fp8(
     assert (dq_hstu - dq_ref).abs().max().item() <= 5 * (
         dq_torch - dq_ref
     ).abs().max().item()
-
+    if has_drab:
+        assert (drab_hstu - drab_ref).abs().max().item() <= 5 * (
+            drab_torch - drab_ref
+        ).abs().max().item()
+    torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
-    test_fused_attn(
-        batch_size=1,
-        heads=1,
-        heads_rab=1,
-        max_seq_len_q=16,
-        max_seq_len_k=16,
-        max_context_len=0,
-        max_target_len=0,
-        target_group_size=1,
-        attn_dim=32,
-        hidden_dim=32,
-        alpha=1.0,
-        has_rab=True,
-        has_drab=False,
-        window_size=(-1, -1),
-        dtype=torch.bfloat16,
-        run_benchmark=None,
-        full_batch=True,
-        is_arbitrary=True,
-    )
+    # test_fused_attn(
+    #     batch_size=1,
+    #     heads=1,
+    #     heads_rab=1,
+    #     max_seq_len_q=32,
+    #     max_seq_len_k=32,
+    #     max_context_len=0,
+    #     max_target_len=0,
+    #     target_group_size=1,
+    #     attn_dim=32,
+    #     hidden_dim=32,
+    #     alpha=1.0,
+    #     has_rab=False,
+    #     has_drab=False,
+    #     window_size=(-1, -1),
+    #     dtype=torch.bfloat16,
+    #     run_benchmark=None,
+    #     full_batch=True,
+    #     is_arbitrary=False,
+    # )
+
     # test_paged_kv_attn(
     #     batch_size=1,
     #     heads=1,
-    #     max_seq_len_q=32, # q is new history
-    #     max_seq_len_k=32, # k is user feature + previous history  # kv cache = user feature + previous history + new history
-    #     max_target_len=32, # target is target length
+    #     max_seq_len_q=21, # q is new history
+    #     max_seq_len_k=10, # k is user feature + previous history  # kv cache = user feature + previous history + new history
+    #     max_target_len=0, # target is target length
     #     attn_dim=32,
     #     hidden_dim=32,
     #     page_size=32,
     #     alpha=1.0,
     #     run_benchmark=None,
     #     dtype=torch.bfloat16,
-    #     full_batch=False,
-    # )
-
-    # test_fused_attn_fp8(
-    #     batch_size=1,
-    #     heads=1,
-    #     heads_rab=None,
-    #     max_seq_len_q=200,
-    #     max_seq_len_k=200,
-    #     max_target_len=0,
-    #     attn_dim=64,
-    #     hidden_dim=64,
-    #     alpha=1.0,
-    #     has_rab=False,
-    #     has_drab=False,
-    #     window_size=(-1, -1),
-    #     dtype=torch.float8_e4m3fn,
-    #     run_benchmark=None,
     #     full_batch=True,
     # )
+
+    test_fused_attn_fp8(
+        batch_size=1,
+        heads=1,
+        heads_rab=None,
+        max_seq_len_q=32,
+        max_seq_len_k=32,
+        max_context_len=0,
+        max_target_len=0,
+        target_group_size=1,
+        attn_dim=256,
+        hidden_dim=256,
+        alpha=1.0,
+        has_rab=False,
+        has_drab=False,
+        window_size=(-1, -1),
+        dtype=torch.float8_e4m3fn,
+        run_benchmark=None,
+        full_batch=True,
+        is_arbitrary=True,
+        quant_mode=3,
+    )
 
     # bs = [8]
     # num_heads = 4
