@@ -23,10 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTables,
-    BatchedDynamicEmbeddingTablesV2,
-)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import dtype_to_bytes, dyn_emb_to_torch
 from dynamicemb_extensions import (
     DynamicEmbTable,
@@ -44,8 +41,11 @@ from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_parallel import get_unwrapped_module
 
 _PAD_TO_LENGTH = 4096  # Pad strings to multiples of 4096 for broadcasting
+
+
 def _calculate_pad_length(original_str: str, base: int = _PAD_TO_LENGTH) -> int:
     return ((len(original_str) + base - 1) // base) * base
+
 
 def debug_check_dynamic_table_is_zero(dynamic_table):
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -614,7 +614,10 @@ def pad_to_length(original_str: str, length: int, pad_char: str = " ") -> str:
 
 
 def broadcast_string(
-    original_str: str, length: int, rank: int = 0, pg: Optional[dist.ProcessGroup] = None
+    original_str: str,
+    length: int,
+    rank: int = 0,
+    pg: Optional[dist.ProcessGroup] = None,
 ) -> str:
     """
     Broadcasts a string from rank 0 to all other ranks.

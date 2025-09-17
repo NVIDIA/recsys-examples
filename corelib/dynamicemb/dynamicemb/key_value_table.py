@@ -499,7 +499,7 @@ class KeyValueTableFunction:
         founds = torch.empty(
             h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
         )
-        #TODO: PS , renaming find.
+        # TODO: PS , renaming find.
         (
             num_missing_in_storage,
             missing_keys_in_storage,
@@ -516,7 +516,7 @@ class KeyValueTableFunction:
             initializer(
                 values_for_storage[:, :emb_dim],
                 missing_indices_in_storage,
-                missing_keys_in_storage,
+                keys_for_storage,
             )
 
         # 4. copy embeddings only
