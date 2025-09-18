@@ -15,23 +15,21 @@
 
 import json
 import os
-import shutil
 import warnings
 from collections import deque
+from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.dynamicemb_config import dtype_to_bytes, dyn_emb_to_torch
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.dynamicemb_config import dyn_emb_to_torch
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
-    count_matched,
     dyn_emb_capacity,
     dyn_emb_cols,
-    dyn_emb_rows,
     export_batch,
     insert_or_assign,
 )
@@ -40,487 +38,48 @@ from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_parallel import get_unwrapped_module
 
-_PAD_TO_LENGTH = 4096  # Pad strings to multiples of 4096 for broadcasting
+torch_dtype_to_np_dtype = {
+    torch.uint64: np.uint64,
+    torch.int64: np.int64,
+    torch.float32: np.float32,
+}
+
+KEY_TYPE = torch.int64
+EMBEDDING_TYPE = torch.float32
+SCORE_TYPE = torch.int64
+OPT_STATE_TYPE = torch.float32
 
 
-def _calculate_pad_length(original_str: str, base: int = _PAD_TO_LENGTH) -> int:
-    return ((len(original_str) + base - 1) // base) * base
-
-
-def debug_check_dynamic_table_is_zero(dynamic_table):
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
-
-    key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-    value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-    dim = dyn_emb_cols(dynamic_table)
-    optstate_dim = dynamic_table.optstate_dim()
-
-    search_capacity = dyn_emb_capacity(dynamic_table)
-
-    local_max_rows = dyn_emb_rows(dynamic_table)
-
-    keys = torch.ones(local_max_rows, dtype=key_dtype, device=device)
-    values = torch.ones(
-        local_max_rows * (dim + optstate_dim), dtype=value_dtype, device=device
+def encode_key_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}"
     )
-    d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
 
-    if need_dump_score:
-        score_dtype = torch.uint64
-        scores = torch.zeros(local_max_rows, dtype=score_dtype, device=device)
 
-        export_batch(dynamic_table, search_capacity, 0, d_counter, keys, values, scores)
-    else:
-        export_batch(dynamic_table, search_capacity, 0, d_counter, keys, values)
+def encode_value_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}"
+    )
 
-    values = values.reshape(-1, dim + optstate_dim)[:, :dim].contiguous().reshape(-1)
 
-    value_is_zero = torch.all(values == 0)
-    score_is_one = True
-    if need_dump_score:
-        score_is_one = torch.all(
-            scores == 1
-        )  # HKV score have a placeholder value , the value is 0 ,so we use scores == 1
-    # Check if all values in the values tensor are zero
-    if value_is_zero and score_is_one:
-        print("DynamicEmb Debug:All values are zero.")
-    else:
-        non_zero_indices_for_value = torch.nonzero(values)
-        print(
-            f"DynamicEmb Debug:Not all values are zero. Non-zero values found at indices: {non_zero_indices_for_value.tolist()}"
-        )
-        if need_dump_score:
-            non_one_indices_for_score = torch.nonzero((scores.to(torch.int64) != 1))
-            print(
-                f"DynamicEmb Debug:Not all scores are one. Non-one scores found at indices = {non_one_indices_for_score} scores = {scores}"
-            )
-        raise ValueError(
-            f"DynamicEmb Debug:Not all values are zero and not all scores are one. Non-zero values found"
-        )
+def encode_score_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_scores.rank_{rank}.world_size_{world_size}"
+    )
 
 
-def debug_dump(embedding_collections_list, path, table_names, optim, pg):
-    def debug_export(dynamic_table, root_path, name, optim):
-        rank = dist.get_rank(group=pg)
-        world_size = dist.get_world_size(group=pg)
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
-
-        key_name = name + "_keys"
-        value_name = name + "_values"
-
-        key_path = os.path.join(root_path, key_name)
-        value_path = os.path.join(root_path, value_name)
-
-        fkey = open(key_path, "wb")
-        fvalue = open(value_path, "wb")
-        local_max_rows = dyn_emb_rows(dynamic_table)
-        dim = dyn_emb_cols(dynamic_table)
-        search_capacity = dyn_emb_capacity(dynamic_table)
-
-        key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-        value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-        optstate_dim = dynamic_table.optstate_dim()
-
-        keys = torch.empty(local_max_rows, dtype=key_dtype, device=device)
-        values = torch.empty(
-            local_max_rows * (dim + optstate_dim), dtype=value_dtype, device=device
-        )
-        d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
-
-        if need_dump_score:
-            score_name = name + "_scores"
-            score_path = os.path.join(root_path, score_name)
-            fscore = open(score_path, "wb")
-            score_dtype = torch.uint64
-            scores = torch.empty(local_max_rows, dtype=score_dtype, device=device)
-
-            export_batch(
-                dynamic_table, search_capacity, 0, d_counter, keys, values, scores
-            )
-        else:
-            export_batch(dynamic_table, search_capacity, 0, d_counter, keys, values)
-
-        cap = dynamic_table.capacity()
-        assert cap == search_capacity
-        d_num_matched = torch.zeros(1, dtype=torch.uint64, device=device)
-        count_matched(dynamic_table, 0, d_num_matched)
-        assert d_num_matched.item() == d_counter.item()
-        d_counter_cpu = d_counter.item()
-        if d_counter_cpu != local_max_rows:
-            raise ValueError(
-                f"DynamicEmb Debug: d_counter ({d_counter_cpu}) does not match local_max_rows ({local_max_rows})"
-            )
-
-        keys_int64 = keys.to(torch.int64)
-        values_float = values.reshape(-1, dim + optstate_dim)[
-            :, : dim + optstate_dim if optim else dim
-        ].to(torch.float)
-
-        fkey.write(keys_int64.cpu().numpy().tobytes())
-        fvalue.write(values_float.cpu().numpy().tobytes())
-        fkey.close()
-        fvalue.close()
-
-        if need_dump_score:
-            scores_uint64 = scores.to(torch.uint64)
-
-            fscore.write(scores_uint64.cpu().numpy().tobytes())
-            fscore.close()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        values[:] = 0
-        if need_dump_score:
-            scores[
-                :
-            ] = 1  # HKV score have a placeholder value , the value is 0 ,so we set scores = 1
-            insert_or_assign(dynamic_table, d_counter_cpu, keys, values, scores)
-        else:
-            insert_or_assign(dynamic_table, d_counter_cpu, keys, values)
-        d_num_matched = torch.zeros(1, dtype=torch.uint64, device=device)
-        count_matched(dynamic_table, 0, d_num_matched)
-        assert d_num_matched.item() == d_counter_cpu
-
-        return
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    rank = dist.get_rank(group=pg)
-    world_size = dist.get_world_size(group=pg)
-
-    debug_root_path = path + "_compare"
-    if rank == 0:
-        if os.path.exists(debug_root_path):
-            if os.path.isfile(debug_root_path):
-                os.remove(debug_root_path)
-            elif os.path.isdir(debug_root_path):
-                shutil.rmtree(debug_root_path)
-
-        os.makedirs(debug_root_path, exist_ok=True)
-
-    search_module_table = {}
-
-    for i, embedding_collection in enumerate(embedding_collections_list):
-        (
-            collection_path,
-            tmp_module_name,
-            embedding_collection_module,
-        ) = embedding_collection
-        tmp_dynamic_emb_module_list = get_dynamic_emb_module(
-            embedding_collection_module
-        )
-        search_module_table[tmp_module_name] = []
-
-        for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
-            tmp_table_names = dynamic_emb_module.table_names
-            for tmp_table_name in tmp_table_names:
-                search_module_table[tmp_module_name].append(tmp_table_name)
-
-    data_to_write = {
-        "rank": rank,
-        "world_size": world_size,
-        "data": table_names if table_names is not None else search_module_table,
-    }
-
-    if rank == 0:
-        with open(os.path.join(debug_root_path, "meta.json"), "w") as f:
-            json.dump(data_to_write, f, indent=4)
-
-    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
-
-    for i, embedding_collection in enumerate(embedding_collections_list):
-        (
-            collection_path,
-            tmp_module_name,
-            embedding_collection_module,
-        ) = embedding_collection
-        tmp_dynamic_emb_module_list = get_dynamic_emb_module(
-            embedding_collection_module
-        )
-
-        for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
-            tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
-
-            filtered_table_names: List[str] = []
-            filtered_dynamic_tables: List[DynamicEmbTable] = []
-
-            # TODO:need a warning
-            if table_names is not None:
-                tmp_input_names = table_names[tmp_module_name]
-                for name in tmp_input_names:
-                    if name in tmp_table_names:
-                        index = tmp_table_names.index(name)
-                        filtered_table_names.append(name)
-                        filtered_dynamic_tables.append(tmp_tables[index])
-            else:
-                filtered_table_names = tmp_table_names
-                filtered_dynamic_tables = tmp_tables
-
-            if len(filtered_table_names) == 0:
-                continue
-
-            if optim:
-                optimizer = dynamic_emb_module.optimizer
-                optimizer.get_opt_args()
-
-            tmp_tables_dict: Dict[str, DynamicEmbTable] = {
-                name: table
-                for name, table in zip(filtered_table_names, filtered_dynamic_tables)
-            }
-            # Get the rank of the current process
-
-            for k, dump_name in enumerate(filtered_table_names):
-                dynamic_table = filtered_dynamic_tables[k]
-                debug_export(
-                    dynamic_table,
-                    debug_root_path,
-                    dump_name + "_" + str(rank),
-                    optim=optim,
-                )
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    return
-
-
-def debug_load(embedding_collections_list, path, table_names, optim, pg):
-    def validate_dynamic_embedding(
-        debug_root_path, dump_name, rank, dynamic_table, optim
-    ):
-        need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
-
-        key_name = dump_name + "_" + str(rank) + "_keys"
-        value_name = dump_name + "_" + str(rank) + "_values"
-
-        key_path = os.path.join(debug_root_path, key_name)
-        value_path = os.path.join(debug_root_path, value_name)
-
-        key_file_size = os.path.getsize(key_path)
-        value_file_size = os.path.getsize(value_path)
-
-        key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-        value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-
-        key_bytes = dtype_to_bytes(key_dtype)
-        value_bytes = dtype_to_bytes(value_dtype)
-
-        total_keys = key_file_size // key_bytes
-        total_dim = value_file_size // (total_keys * value_bytes)
-
-        dim = dyn_emb_cols(dynamic_table)
-        optstate_dim = dynamic_table.optstate_dim()
-        exist_optstate: bool = total_dim > dim
-
-        if need_dump_score:
-            score_name = dump_name + "_" + str(rank) + "_scores"
-            score_path = os.path.join(debug_root_path, score_name)
-            os.path.getsize(score_path)
-
-        if key_file_size == 0:
-            return
-
-        local_max_rows = dyn_emb_rows(dynamic_table)
-
-        key_dtype_in_table = dyn_emb_to_torch(dynamic_table.key_type())
-        value_dtype_in_table = dyn_emb_to_torch(dynamic_table.value_type())
-
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-        keys_in_dynemb = torch.empty(
-            local_max_rows, dtype=key_dtype_in_table, device=device
-        )
-        values_in_dynemb = torch.empty(
-            local_max_rows * (dim + optstate_dim),
-            dtype=value_dtype_in_table,
-            device=device,
-        )
-
-        with open(key_path, "rb") as fkey:
-            keys = torch.frombuffer(fkey.read(), dtype=torch.int64).clone()
-
-        with open(value_path, "rb") as fvalue:
-            values = torch.frombuffer(fvalue.read(), dtype=torch.float).clone()
-
-        assert not torch.all(values == 0), "AssertionError: All values are zero."
-
-        keys_device = keys.to(device)
-        values_device = values.to(device)
-
-        if need_dump_score:
-            score_dtype_in_table = torch.uint64
-            scores_in_dynemb = torch.empty(
-                local_max_rows, dtype=score_dtype_in_table, device=device
-            )
-            with open(score_path, "rb") as fscore:
-                scores = torch.frombuffer(fscore.read(), dtype=torch.uint64).clone()
-            assert not torch.all(scores == 1), "AssertionError: All scores are one."
-            scores_device = scores.to(device)
-
-        d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
-        if need_dump_score:
-            export_batch(
-                dynamic_table,
-                dyn_emb_capacity(dynamic_table),
-                0,
-                d_counter,
-                keys_in_dynemb,
-                values_in_dynemb,
-                scores_in_dynemb,
-            )
-        else:
-            export_batch(
-                dynamic_table,
-                dyn_emb_capacity(dynamic_table),
-                0,
-                d_counter,
-                keys_in_dynemb,
-                values_in_dynemb,
-            )
-        if not optim:
-            values_in_dynemb = (
-                values_in_dynemb.reshape(-1, dim + optstate_dim)[:, :dim]
-                .contiguous()
-                .reshape(-1)
-            )
-
-        keys_in_dynemb_int64 = keys_in_dynemb.to(torch.int64)
-        values_in_dynemb_float = values_in_dynemb.to(torch.float)
-
-        sorted_keys_device, sorted_indices_device = torch.sort(keys_device)
-        sorted_keys_in_dynemb_int64, sorted_indices_in_dynemb_int64 = torch.sort(
-            keys_in_dynemb_int64
-        )
-
-        sorted_values_device = values_device.view(
-            local_max_rows, dim + optstate_dim if exist_optstate else dim
-        )[:, : dim + optstate_dim if optim else dim][sorted_indices_device].view(-1)
-        sorted_values_in_dynemb_float = values_in_dynemb_float.view(
-            local_max_rows, dim + optstate_dim if optim else dim
-        )[sorted_indices_in_dynemb_int64].view(-1)
-
-        if sorted_keys_device.shape != sorted_keys_in_dynemb_int64.shape:
-            raise ValueError(
-                f"DynamicEmb Debug: Shape mismatch for keys in table {dump_name}: {sorted_keys_device.shape} (dumped) != {sorted_keys_in_dynemb_int64.shape} (loaded)"
-            )
-        if sorted_values_device.shape != sorted_values_in_dynemb_float.shape:
-            raise ValueError(
-                f"DynamicEmb Debug: Shape mismatch for values in table {dump_name}: {sorted_values_device.shape} (dumped) != {sorted_values_in_dynemb_float.shape} (loaded)"
-            )
-
-        if not torch.equal(sorted_keys_device, sorted_keys_in_dynemb_int64):
-            diff_keys = torch.nonzero(sorted_keys_device != sorted_keys_in_dynemb_int64)
-            raise ValueError(
-                f"DynamicEmb Debug: Mismatch in keys for table {dump_name} at positions {diff_keys.tolist()}"
-            )
-        if not torch.equal(sorted_values_device, sorted_values_in_dynemb_float):
-            diff_values = torch.nonzero(
-                sorted_values_device != sorted_values_in_dynemb_float
-            )
-            raise ValueError(
-                f"DynamicEmb Debug: Mismatch in values for table {dump_name} at positions {diff_values.tolist()}"
-            )
-
-        if need_dump_score:
-            scores_in_dynemb_uint64 = scores_in_dynemb.to(torch.uint64)
-
-            scores_in_dynemb_int64 = scores_in_dynemb_uint64.view(torch.int64)
-            scores_device_int64 = scores_device.view(torch.int64)
-
-            sorted_scores_device = scores_device_int64[sorted_indices_device]
-            sorted_scores_in_dynemb_int64 = scores_in_dynemb_int64[
-                sorted_indices_in_dynemb_int64
-            ]
-
-            if sorted_scores_device.shape != sorted_scores_in_dynemb_int64.shape:
-                raise ValueError(
-                    f"DynamicEmb Debug: Shape mismatch for scores in table {dump_name}: {sorted_scores_device.shape} (dumped) != {sorted_scores_in_dynemb_uint64.shape} (loaded)"
-                )
-
-            if not torch.equal(sorted_scores_device, sorted_scores_in_dynemb_int64):
-                diff_values = torch.nonzero(
-                    sorted_scores_device != sorted_scores_in_dynemb_int64
-                )
-                raise ValueError(
-                    f"DynamicEmb Debug: Mismatch in scores for table {dump_name} at positions {diff_values.tolist()}"
-                )
-
-    debug_root_path = path + "_compare"
-    meta_path = os.path.join(debug_root_path, "meta.json")
-
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"DynamicEmb Debug: Meta file not found at {meta_path}")
-
-    with open(meta_path, "r") as f:
-        meta_data = json.load(f)
-
-    rank = dist.get_rank(group=pg)
-    world_size = dist.get_world_size(group=pg)
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-    expected_data = table_names if table_names is not None else {}
-    if table_names is None:
-        for (
-            collection_path,
-            tmp_module_name,
-            embedding_collection_module,
-        ) in embedding_collections_list:
-            tmp_dynamic_emb_module_list = get_dynamic_emb_module(
-                embedding_collection_module
-            )
-            expected_data[tmp_module_name] = []
-            for dynamic_emb_module in tmp_dynamic_emb_module_list:
-                tmp_table_names = dynamic_emb_module.table_names
-                expected_data[tmp_module_name].extend(tmp_table_names)
-
-    if meta_data["data"] != expected_data:
-        raise ValueError("Mismatch between expected data and meta data from debug dump")
-
-    for i, embedding_collection in enumerate(embedding_collections_list):
-        (
-            collection_path,
-            tmp_module_name,
-            embedding_collection_module,
-        ) = embedding_collection
-        tmp_dynamic_emb_module_list = get_dynamic_emb_module(
-            embedding_collection_module
-        )
-        for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
-            tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
-
-            filtered_table_names = []
-            filtered_dynamic_tables = []
-
-            if table_names is not None:
-                tmp_input_names = table_names[collection_path]
-                for name in tmp_input_names:
-                    if name in tmp_table_names:
-                        index = tmp_table_names.index(name)
-                        filtered_table_names.append(name)
-                        filtered_dynamic_tables.append(tmp_tables[index])
-            else:
-                filtered_table_names = tmp_table_names
-                filtered_dynamic_tables = tmp_tables
-
-            if len(filtered_table_names) == 0:
-                continue
-
-            tmp_tables_dict = {
-                name: table
-                for name, table in zip(filtered_table_names, filtered_dynamic_tables)
-            }
-
-            for k, dump_name in enumerate(filtered_table_names):
-                dynamic_table = tmp_tables_dict[dump_name]
-                validate_dynamic_embedding(
-                    debug_root_path, dump_name, rank, dynamic_table, optim=optim
-                )
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+def encode_opt_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_opt_values.rank_{rank}.world_size_{world_size}"
+    )
 
 
 def save_to_json(data: Dict[str, Any], file_path: str) -> None:
@@ -558,14 +117,12 @@ def find_sharded_modules(
         else:
             for name, child in current_module.named_children():
                 child_path = current_path + ("." if current_path else "") + name
-
                 stack.append((child, child_path, name))
-
     return sharded_modules
 
 
 def check_emb_collection_modules(module: nn.Module, ret_list: List[nn.Module]):
-    if isinstance(module, BatchedDynamicEmbeddingTablesV2):
+    if isinstance(module, BatchedDynamicEmbeddingTables):
         ret_list.append(module)
         return ret_list
 
@@ -597,331 +154,129 @@ def get_dynamic_emb_module(model: nn.Module) -> List[nn.Module]:
     return dynamic_emb_module_list
 
 
-# TODO:will use in TW TWRW , to gather tablename , and do communication
-def pad_to_length(original_str: str, length: int, pad_char: str = " ") -> str:
+def export_keys_values(
+    dynamic_table: DynamicEmbTable,
+    device: torch.device,
+    batch_size: int = 65536,
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
-    Pad the input string to a specified length with a given character.
-
-    Args:
-        original_str (str): The input string to be padded.
-        length (int): The desired length of the padded string.
-        pad_char (str): The character to use for padding. Default is space.
-
-    Returns:
-        str: The padded string.
+    export keys, embeddings, opt_states, scores
     """
-    return original_str.ljust(length, pad_char)
-
-
-def broadcast_string(
-    original_str: str,
-    length: int,
-    rank: int = 0,
-    pg: Optional[dist.ProcessGroup] = None,
-) -> str:
-    """
-    Broadcasts a string from rank 0 to all other ranks.
-
-    Args:
-        original_str (str): The input string to be broadcasted.
-        rank (int): The rank of the current process.
-
-    Returns:
-        str: The resulting string after broadcasting.
-    """
-
-    padded_str = pad_to_length(original_str, length)
-    ascii_values = [ord(char) for char in padded_str]
-    tensor = torch.tensor(ascii_values, dtype=torch.int32).cuda()
-
-    broadcasted_tensor = tensor.unsqueeze(0)
-    dist.broadcast(broadcasted_tensor, src=0, group=pg)
-    torch.cuda.synchronize()
-    result_str = "".join(chr(value.item()) for value in broadcasted_tensor[0]).rstrip()
-    return result_str
-
-
-def export_keys_values(dynamic_table, offset, device, batch_size=65536, optim=False):
-    key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-    value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-    score_dtype = torch.uint64
-    dim = dyn_emb_cols(dynamic_table)
-    optstate_dim = dynamic_table.optstate_dim()
-    total_dim = dim + optstate_dim
-
-    keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    values = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
-    scores = torch.zeros(batch_size, dtype=score_dtype, device=device)
-    d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
-
-    export_batch(dynamic_table, batch_size, offset, d_counter, keys, values, scores)
-
-    if not optim:
-        values = values.reshape(batch_size, total_dim)[:, :dim].contiguous().reshape(-1)
-
-    return keys, values, scores, d_counter
-
-
-def gather_and_export(
-    dynamic_table,
-    root_path,
-    name,
-    batch_size=65536,
-    pg: Optional[dist.ProcessGroup] = None,
-    optim: bool = False,
-):
-    rank = dist.get_rank(group=pg)
-    world_size = dist.get_world_size(group=pg)
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-    need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
-
-    key_name = name + "_keys"
-    value_name = name + "_values"
-
-    key_path = os.path.join(root_path, key_name)
-    value_path = os.path.join(root_path, value_name)
-
-    if rank == 0:
-        fkey = open(key_path, "wb")
-        fvalue = open(value_path, "wb")
-
-    if need_dump_score:
-        score_name = name + "_scores"
-        score_path = os.path.join(root_path, score_name)
-        if rank == 0:
-            fscore = open(score_path, "wb")
-
-    local_max_rows = dyn_emb_rows(dynamic_table)
-    dim = dyn_emb_cols(dynamic_table)
-    optstate_dim = dynamic_table.optstate_dim()
-    if optim:
-        dim += optstate_dim
 
     search_capacity = dyn_emb_capacity(dynamic_table)
 
-    max_rows_tensor = torch.tensor(local_max_rows, dtype=torch.int64, device=device)
-    gathered_local_max_rows = (
-        [torch.tensor(0, dtype=torch.int64, device=device) for _ in range(world_size)]
-        if rank == 0
-        else None
-    )
-    dist.gather(max_rows_tensor, gather_list=gathered_local_max_rows, dst=0, group=pg)
-
-    if rank == 0:
-        gathered_local_max_rows = [t.item() for t in gathered_local_max_rows]
-
-    accumulated_counts = [0] * world_size if rank == 0 else None
-
-    max_rows_tensor.item()
     offset = 0
 
     while offset < search_capacity:
-        keys, values, scores, d_counter = export_keys_values(
-            dynamic_table, offset, device, batch_size, optim=optim
-        )
+        key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
+        value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
+        dim = dyn_emb_cols(dynamic_table)
+        optstate_dim = dynamic_table.optstate_dim()
+        total_dim = dim + optstate_dim
+
+        keys = torch.empty(batch_size, dtype=key_dtype, device=device)
+        values = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
+        scores = torch.zeros(batch_size, dtype=SCORE_TYPE, device=device)
+        d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
+
+        export_batch(dynamic_table, batch_size, offset, d_counter, keys, values, scores)
+
+        values = values.reshape(batch_size, total_dim)
+
+        embeddings = values[:, :dim].contiguous()
+        opt_states = values[:, dim:].contiguous()
+
         d_counter = d_counter.to(dtype=torch.int64)
-
-        # Gather keys and values at the root process (rank 0)
-        gathered_keys = (
-            [torch.empty_like(keys) for _ in range(world_size)] if rank == 0 else None
-        )
-        gathered_values = (
-            [torch.empty_like(values) for _ in range(world_size)] if rank == 0 else None
-        )
-        gathered_counts = (
-            [torch.empty_like(d_counter) for _ in range(world_size)]
-            if rank == 0
-            else None
-        )
-
-        if need_dump_score:
-            scores = scores.contiguous()
-            scores_bytes = scores.view(torch.uint8)
-            gathered_scores_bytes = (
-                [torch.empty_like(scores_bytes) for _ in range(world_size)]
-                if rank == 0
-                else None
+        actual_length = d_counter.item()
+        if actual_length > 0:
+            yield (
+                keys[:actual_length].to(KEY_TYPE),
+                embeddings[:actual_length, :].to(EMBEDDING_TYPE),
+                opt_states[:actual_length, :].to(OPT_STATE_TYPE),
+                scores[:actual_length].to(SCORE_TYPE),
             )
-
-        dist.gather(keys, gather_list=gathered_keys, dst=0, group=pg)
-        dist.gather(values, gather_list=gathered_values, dst=0, group=pg)
-        dist.gather(d_counter, gather_list=gathered_counts, dst=0, group=pg)
-
-        if need_dump_score:
-            dist.gather(
-                scores_bytes, gather_list=gathered_scores_bytes, dst=0, group=pg
-            )
-
-        if rank == 0:
-            if need_dump_score:
-                gathered_scores = [
-                    tensor.view(torch.uint64) for tensor in gathered_scores_bytes
-                ]
-            for i in range(world_size):
-                actual_length = gathered_counts[i].item()
-                if actual_length > 0:
-                    tmp_gathered_keys = (
-                        gathered_keys[i][:actual_length].to(torch.int64).cpu()
-                    )
-                    fkey.write(tmp_gathered_keys.numpy().tobytes())
-                    tmp_gathered_values = (
-                        gathered_values[i][: actual_length * dim].to(torch.float).cpu()
-                    )
-                    fvalue.write(tmp_gathered_values.numpy().tobytes())
-                    if need_dump_score:
-                        tmp_gathered_scores = (
-                            gathered_scores[i][:actual_length].to(torch.uint64).cpu()
-                        )
-                        fscore.write(tmp_gathered_scores.numpy().tobytes())
-                    accumulated_counts[i] += actual_length
         offset += batch_size
-    if rank == 0:
-        fkey.close()
-        fvalue.close()
-        if need_dump_score:
-            fscore.close()
-        for i in range(world_size):
-            assert accumulated_counts[i] == gathered_local_max_rows[i], (
-                f"Rank {i} has accumulated count {accumulated_counts[i]} which is different from expected {gathered_local_max_rows[i]}, "
-                f"difference: {accumulated_counts[i] - gathered_local_max_rows[i]}"
-            )
+
+
+def local_export(
+    dynamic_table: DynamicEmbTable,
+    emb_key_path: str,
+    embedding_file_path: str,
+    score_file_path: Optional[str] = None,
+    opt_file_path: Optional[str] = None,
+    batch_size: int = 65536,
+    device: Optional[torch.device] = None,
+):
+    if device is None:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    if dynamic_table.evict_strategy() == EvictStrategy.KLru:
+        if score_file_path is not None:
+            raise RuntimeError("Scores are not supported for KLru evict strategy")
+    else:
+        if score_file_path is None:
+            raise RuntimeError("Scores are required for non-KLru evict strategy")
+
+    fkey = open(emb_key_path, "wb")
+    fembedding = open(embedding_file_path, "wb")
+    fscore = open(score_file_path, "wb") if score_file_path else None
+    fopt_states = open(opt_file_path, "wb") if opt_file_path else None
+
+    for keys, embeddings, opt_states, scores in export_keys_values(
+        dynamic_table, device, batch_size
+    ):
+        fkey.write(keys.cpu().numpy().tobytes())
+        fembedding.write(embeddings.cpu().numpy().tobytes())
+        if fopt_states:
+            fopt_states.write(opt_states.cpu().numpy().tobytes())
+        if fscore:
+            fscore.write(scores.cpu().numpy().tobytes())
+
+    fkey.close()
+    fembedding.close()
+
+    if fscore:
+        fscore.close()
+
+    if fopt_states:
+        fopt_states.close()
 
     return
 
 
-def load_table(
-    dynamic_table,
-    root_path,
-    name,
-    batch_size=65536,
+def distributed_export(
+    dynamic_table: DynamicEmbTable,
+    root_path: str,
+    name: str,
+    batch_size: int = 65536,
     pg: Optional[dist.ProcessGroup] = None,
-    debug_mode: Optional[bool] = False,
     optim: bool = False,
 ):
     rank = dist.get_rank(group=pg)
     world_size = dist.get_world_size(group=pg)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
 
-    key_name = name + "_keys"
-    value_name = name + "_values"
+    emb_key_path = encode_key_file_path(root_path, name, rank, world_size)
+    emb_value_path = encode_value_file_path(root_path, name, rank, world_size)
 
-    key_path = os.path.join(root_path, key_name)
-    value_path = os.path.join(root_path, value_name)
+    emb_score_path = None
+    if dynamic_table.evict_strategy() != EvictStrategy.KLru:
+        emb_score_path = encode_score_file_path(root_path, name, rank, world_size)
 
-    if not os.path.exists(key_path):
-        raise Exception("can't find path to load, path:", key_path)
+    opt_value_path = None
+    if optim and dynamic_table.optstate_dim() > 0:
+        opt_value_path = encode_opt_file_path(root_path, name, rank, world_size)
 
-    if not os.path.exists(value_path):
-        raise Exception("can't find path to load, path:", value_path)
+    local_export(
+        dynamic_table,
+        emb_key_path,
+        emb_value_path,
+        emb_score_path,
+        opt_value_path,
+        batch_size,
+        device,
+    )
 
-    key_file_size = os.path.getsize(key_path)
-    value_file_size = os.path.getsize(value_path)
-
-    key_dtype = dyn_emb_to_torch(dynamic_table.key_type())
-    value_dtype = dyn_emb_to_torch(dynamic_table.value_type())
-
-    key_bytes = dtype_to_bytes(key_dtype)
-    value_bytes = dtype_to_bytes(value_dtype)
-
-    total_keys = key_file_size // key_bytes
-    total_dim = value_file_size // (total_keys * value_bytes)
-
-    dim = dyn_emb_cols(dynamic_table)
-    optstate_dim = dynamic_table.optstate_dim()
-    if total_dim < dim or ((total_dim != dim + optstate_dim) and optim):
-        raise Exception(
-            "Can't load as mismatch of embedding dtype, dim or optimizer type"
-        )
-
-    keys_read_bytes = batch_size * 8  # key in file always int64 ,so is 8
-    values_read_bytes = (
-        batch_size * total_dim * 4
-    )  # value in file always float , so is 4
-
-    if debug_mode:
-        debug_check_dynamic_table_is_zero(dynamic_table)
-    if need_dump_score:
-        score_name = name + "_scores"
-        score_path = os.path.join(root_path, score_name)
-        if not os.path.exists(score_path):
-            raise Exception("can't find path to load, path:", score_path)
-        score_dtype = torch.uint64
-        scores_read_bytes = batch_size * 8  # score in file always uint64, so is 8
-        score_file_size = os.path.getsize(score_path)
-
-    with open(key_path, "rb") as fkey, open(value_path, "rb") as fvalue:
-        if need_dump_score:
-            fscore = open(score_path, "rb")
-        while True:
-            remaining_key_bytes = key_file_size - fkey.tell()
-            remaining_value_bytes = value_file_size - fvalue.tell()
-
-            if remaining_key_bytes <= 0 or remaining_value_bytes <= 0:
-                break
-
-            key_bytes_to_read = min(keys_read_bytes, remaining_key_bytes)
-            value_bytes_to_read = min(values_read_bytes, remaining_value_bytes)
-
-            key_bytes = fkey.read(key_bytes_to_read)
-            value_bytes = fvalue.read(value_bytes_to_read)
-
-            num_keys = len(key_bytes) // 8  # key in file always int64 ,so is 8
-
-            key_array = np.frombuffer(key_bytes, dtype=np.int64)
-            value_array = np.frombuffer(value_bytes, dtype=np.float32).reshape(
-                -1, total_dim
-            )
-
-            if need_dump_score:
-                remaining_score_bytes = score_file_size - fscore.tell()
-                score_bytes_to_read = min(scores_read_bytes, remaining_score_bytes)
-                score_bytes = fscore.read(score_bytes_to_read)
-                score_array = np.frombuffer(score_bytes, dtype=np.uint64)
-
-            # Masking keys and values based on rank
-            mask = key_array % world_size == rank
-            masked_keys = key_array[mask]
-            masked_values = value_array[mask, :]
-            if need_dump_score:
-                masked_scores = score_array[mask]
-            if masked_keys.shape[0] > 0:
-                keys_tensor = torch.tensor(masked_keys, dtype=key_dtype, device=device)
-                values_tensor = torch.tensor(
-                    masked_values, dtype=value_dtype, device=device
-                )
-                if not optim:
-                    optstate = (
-                        torch.ones(
-                            values_tensor.size(0),
-                            optstate_dim,
-                            dtype=value_dtype,
-                            device=device,
-                        )
-                        * dynamic_table.get_initial_optstate()
-                    )
-                    values_tensor = torch.cat(
-                        (values_tensor[:, :dim], optstate), dim=1
-                    ).contiguous()
-                if need_dump_score:
-                    scores_tensor = torch.tensor(
-                        masked_scores, dtype=score_dtype, device=device
-                    )
-                    insert_or_assign(
-                        dynamic_table,
-                        masked_keys.shape[0],
-                        keys_tensor,
-                        values_tensor,
-                        scores_tensor,
-                    )
-                else:
-                    insert_or_assign(
-                        dynamic_table, masked_keys.shape[0], keys_tensor, values_tensor
-                    )
-
-        if need_dump_score:
-            fscore.close()
     return
 
 
@@ -965,18 +320,6 @@ def DynamicEmbDump(
     None
     """
 
-    # Due to the difficulty of checking the HKV dump and load operations externally,
-    # debug_mode has been added to the code. This is controlled by the environment variable
-    # DYNAMICEMB_DUMP_LOAD_DEBUG. When DYNAMICEMB_DUMP_LOAD_DEBUG=1, debug mode is enabled.
-    # In debug mode, the state of dynamic emb will be saved before dumping to the file system,
-    # and a comparison will be performed after the load operation.
-    debug_env_var = os.getenv("DYNAMICEMB_DUMP_LOAD_DEBUG")
-    if debug_env_var == "1":
-        debug_mode = True
-        print("DynamicEmb's dump and load is in debug mode")
-    else:
-        debug_mode = False
-
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     # create path
@@ -1004,150 +347,413 @@ def DynamicEmbDump(
     collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
     if len(collections_list) == 0:
         warnings.warn(
-            "Input model don't have any TorchREC ShardedEmbeddingCollection or ShardedEmbeddingBagCollection module, don't dump any embedding tables to filesystem!",
+            "Input model don't have any TorchREC ShardedEmbeddingCollection or ShardedEmbeddingBagCollection module, will not dump any embedding tables to filesystem!",
             UserWarning,
         )
         return
-
-    # check if the model have dynamic embedding
-    check_dynamic_emb_modules_lists: List[List[nn.Module]] = []
-
-    for i, tmp_collection in enumerate(collections_list):
-        _, _, tmp_collection_module = tmp_collection
-        check_dynamic_emb_modules_lists.append(
-            get_dynamic_emb_module(tmp_collection_module)
-        )
-
-    has_dynamic_emb = False
-    for check_dynamic_emb_module_list in check_dynamic_emb_modules_lists:
-        if len(check_dynamic_emb_module_list) > 0:
-            has_dynamic_emb = True
-            break
-
-    if not has_dynamic_emb:
-        warnings.warn(
-            "Input model don't have any Dynamic embedding tables, don't dump any embedding tables to filesystem!",
-            UserWarning,
-        )
-        return
-
-    # filter the embedding collection
-    collection_names_in_module = set()
-    filtered_collections_list = []
-
-    for tmp_module_path, tmp_module_name, module in collections_list:
-        collection_names_in_module.add(tmp_module_name)
-        if table_names is None or tmp_module_name in table_names.keys():
-            filtered_collections_list.append((tmp_module_path, tmp_module_name, module))
-
-    collections_list = filtered_collections_list
-    # maybe user input shared module name wrong ,here raise a warning tell user that model don't have the module name
-    if table_names is not None:
-        for tmp_input_collection_name in table_names.keys():
-            if tmp_input_collection_name not in collection_names_in_module:
-                warnings.warn(
-                    f"sharded module '{tmp_input_collection_name}' specified in table_names not found in the model",
-                    UserWarning,
-                )
-
-    # create sub folder
-    latest_dir = ""
-    try:
-        for tmp_collection in collections_list:
-            collection_path, _, tmp_collection_module = tmp_collection
-            full_collection_path = os.path.join(path, collection_path)
-            latest_dir = full_collection_path
-            if not os.path.exists(full_collection_path):
-                os.makedirs(full_collection_path, exist_ok=True)
-                created_dirs.append(full_collection_path)
-    except Exception as e:
-        for dir_path in reversed(created_dirs):
-            try:
-                os.rmdir(dir_path)
-            except OSError:
-                pass
-        raise Exception(f"can't build path: {latest_dir}") from e
-
-    # start dump from different embedding_collection
-    # TODO:In practice, this approach is not ideal because the order of embedding collections
-    # might differ across each process, making it impossible to dump them together.
-    # We may need an alternative approach.
 
     # Get the rank of the current process
     rank = dist.get_rank(group=pg)
-    world_size = dist.get_world_size(group=pg)
 
-    for i, tmp_collection in enumerate(collections_list):
-        collection_path, tmp_collection_name, tmp_collection_module = tmp_collection
+    for _, current_collection in enumerate(collections_list):
+        (
+            collection_path,
+            current_collection_name,
+            current_collection_module,
+        ) = current_collection
         full_collection_path = os.path.join(path, collection_path)
-        tmp_dynamic_emb_module_list = get_dynamic_emb_module(tmp_collection_module)
+        current_dynamic_emb_module_list = get_dynamic_emb_module(
+            current_collection_module
+        )
 
-        for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
-            tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
+        if not os.path.exists(full_collection_path):
+            os.makedirs(full_collection_path, exist_ok=True)
 
-            filtered_table_names: List[str] = []
-            filtered_dynamic_tables: List[DynamicEmbTable] = []
-            # TODO:need a warning
-            if table_names is not None:
-                tmp_input_names = table_names[tmp_collection_name]
-                for name in tmp_input_names:
-                    if name in tmp_table_names:
-                        index = tmp_table_names.index(name)
-                        filtered_table_names.append(tmp_table_names[index])
-                        filtered_dynamic_tables.append(tmp_tables[index])
-            else:
-                filtered_table_names = tmp_table_names
-                filtered_dynamic_tables = tmp_tables
-            if len(filtered_table_names) == 0:
-                continue
+        for _, dynamic_emb_module in enumerate(current_dynamic_emb_module_list):
+            current_table_names = dynamic_emb_module.table_names
+            current_tables = dynamic_emb_module.tables
 
-            if optim:
-                optimizer = dynamic_emb_module.optimizer
-                opt_args = optimizer.get_opt_args()
+            for dynamic_table_name, dynamic_table in zip(
+                current_table_names, current_tables
+            ):
+                if table_names is not None and dynamic_table_name not in set(
+                    table_names[current_collection_name]
+                ):
+                    continue
 
-            tmp_tables_dict: Dict[str, DynamicEmbTable] = {
-                name: table
-                for name, table in zip(filtered_table_names, filtered_dynamic_tables)
-            }
-
-            ordered_keys = tmp_tables_dict.keys()
-            ordered_keys_str = ",".join(ordered_keys)
-            length = _calculate_pad_length(ordered_keys_str)
-
-            if rank != 0:
-                ordered_keys_str = ""
-
-            ordered_keys_str = broadcast_string(
-                ordered_keys_str, length=length, rank=rank, pg=pg
-            )
-            ordered_keys = ordered_keys_str.split(",")
-
-            for k, dump_name in enumerate(ordered_keys):
-                dynamic_table = tmp_tables_dict[dump_name]
-                gather_and_export(
-                    dynamic_table, full_collection_path, dump_name, pg=pg, optim=optim
+                distributed_export(
+                    dynamic_table,
+                    full_collection_path,
+                    dynamic_table_name,
+                    pg=pg,
+                    optim=optim,
                 )
 
-                if optim:
-                    args_filename = dump_name + "_opt_args.json"
+                if optim and rank == 0:
+                    optimizer = dynamic_emb_module.optimizer
+                    opt_args = optimizer.get_opt_args()
+                    args_filename = dynamic_table_name + "_opt_args.json"
                     args_path = os.path.join(full_collection_path, args_filename)
                     save_to_json(opt_args, args_path)
-                if rank == 0:
-                    print(
-                        f"DynamicEmb dump table {dump_name} from module {tmp_collection_name} success!"
-                    )
+                print(
+                    f"Rank {rank}DynamicEmb dump table {dynamic_table_name} from module {current_collection_name} success!"
+                )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    if debug_mode:
-        debug_dump(collections_list, path, table_names, optim, pg)
-
-    # add this barrier to guarantee they finish dump at the same time.
     dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
 
     return
+
+
+def load_key_values(
+    dynamic_table: DynamicEmbTable,
+    keys: torch.Tensor,
+    embeddings: torch.Tensor,
+    scores: Optional[torch.Tensor] = None,
+    opt_states: Optional[torch.Tensor] = None,
+):
+    dim = dyn_emb_cols(dynamic_table)
+    optstate_dim = dynamic_table.optstate_dim()
+    if not keys.is_cuda:
+        raise RuntimeError("Keys must be on GPU")
+    if not embeddings.is_cuda:
+        raise RuntimeError("Embeddings must be on GPU")
+    if scores is not None and not scores.is_cuda:
+        raise RuntimeError("Scores must be on GPU")
+    if opt_states is not None and not opt_states.is_cuda:
+        raise RuntimeError("Opt states must be on GPU")
+
+    if opt_states is None and optstate_dim > 0:
+        opt_states = (
+            torch.ones(
+                keys.numel(),
+                optstate_dim,
+                dtype=dyn_emb_to_torch(dynamic_table.value_type()),
+                device=embeddings.device,
+            )
+            * dynamic_table.get_initial_optstate()
+        )
+
+    values = (
+        torch.cat([embeddings.view(-1, dim), opt_states.view(-1, optstate_dim)], dim=-1)
+        if opt_states is not None
+        else embeddings
+    )
+
+    if dynamic_table.evict_strategy() == EvictStrategy.KLru:
+        if scores is not None:
+            raise RuntimeError("Scores are not supported for KLru evict strategy")
+    else:
+        if scores is None:
+            raise RuntimeError("Scores are required for non-KLru evict strategy")
+
+    key_type = dyn_emb_to_torch(dynamic_table.key_type())
+    value_type = dyn_emb_to_torch(dynamic_table.value_type())
+    if scores is not None:
+        insert_or_assign(
+            dynamic_table,
+            keys.numel(),
+            keys.to(key_type),
+            values.to(value_type),
+            scores.to(SCORE_TYPE),
+        )
+    else:
+        insert_or_assign(
+            dynamic_table, keys.numel(), keys.to(key_type), values.to(value_type)
+        )
+
+
+def local_load(
+    dynamic_table: DynamicEmbTable,
+    emb_key_path: str,
+    embedding_file_path: str,
+    score_file_path: Optional[str] = None,
+    opt_file_path: Optional[str] = None,
+    device: Optional[torch.device] = None,
+    rank: int = 0,
+    world_size: int = 1,
+    checkpoint_version: int = 2,
+):
+    if device is None:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    fkey = open(emb_key_path, "rb")
+    fembedding = open(embedding_file_path, "rb")
+    fscore = open(score_file_path, "rb") if score_file_path else None
+    fopt_states = open(opt_file_path, "rb") if opt_file_path else None
+
+    dim = dyn_emb_cols(dynamic_table)
+    optstate_dim = dynamic_table.optstate_dim()
+
+    batch_size = 65536
+
+    num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
+
+    if checkpoint_version == 1:
+        num_embeddings = (
+            os.path.getsize(embedding_file_path)
+            // EMBEDDING_TYPE.itemsize
+            // (dim + optstate_dim)
+        )
+    else:
+        num_embeddings = (
+            os.path.getsize(embedding_file_path) // EMBEDDING_TYPE.itemsize // dim
+        )
+
+    if num_keys != num_embeddings:
+        raise ValueError(
+            f"The number of keys in {emb_key_path} does not match with number of embeddings in {embedding_file_path}."
+        )
+
+    if score_file_path:
+        num_scores = os.path.getsize(score_file_path) // SCORE_TYPE.itemsize
+        if num_keys != num_scores:
+            raise ValueError(
+                f"The number of keys in {emb_key_path} does not match with number of scores in {score_file_path}."
+            )
+
+    if opt_file_path and checkpoint_version == 2:
+        num_opt_states = (
+            os.path.getsize(opt_file_path) // OPT_STATE_TYPE.itemsize // optstate_dim
+        )
+        if num_keys != num_opt_states:
+            raise ValueError(
+                f"The number of keys in {emb_key_path} does not match with number of opt_states in {opt_file_path}."
+            )
+
+    for start in range(0, num_keys, batch_size):
+        num_keys_to_read = min(num_keys - start, batch_size)
+        keys_bytes = fkey.read(KEY_TYPE.itemsize * num_keys_to_read)
+        if checkpoint_version == 1:
+            value_bytes = fembedding.read(
+                EMBEDDING_TYPE.itemsize * (dim + optstate_dim) * num_keys_to_read
+            )
+            values = torch.tensor(
+                np.frombuffer(
+                    value_bytes, dtype=torch_dtype_to_np_dtype[EMBEDDING_TYPE]
+                ),
+                dtype=EMBEDDING_TYPE,
+                device=device,
+            ).view(-1, dim + optstate_dim)
+            embeddings = values[:, :dim]
+            opt_states = None
+            if fopt_states:
+                opt_states = values[:, dim:]
+        elif checkpoint_version == 2:
+            embedding_bytes = fembedding.read(
+                EMBEDDING_TYPE.itemsize * dim * num_keys_to_read
+            )
+            embeddings = torch.tensor(
+                np.frombuffer(
+                    embedding_bytes, dtype=torch_dtype_to_np_dtype[EMBEDDING_TYPE]
+                ),
+                dtype=EMBEDDING_TYPE,
+                device=device,
+            ).view(-1, dim)
+
+            opt_states = None
+            if fopt_states:
+                opt_state_bytes = fopt_states.read(
+                    OPT_STATE_TYPE.itemsize * optstate_dim * num_keys_to_read
+                )
+                opt_states = torch.tensor(
+                    np.frombuffer(
+                        opt_state_bytes, dtype=torch_dtype_to_np_dtype[OPT_STATE_TYPE]
+                    ),
+                    dtype=OPT_STATE_TYPE,
+                    device=device,
+                ).view(-1, optstate_dim)
+        else:
+            raise ValueError(f"Invalid checkpoint version: {checkpoint_version}")
+
+        keys = torch.tensor(
+            np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
+            dtype=KEY_TYPE,
+            device=device,
+        )
+
+        scores = None
+        if fscore:
+            score_bytes = fscore.read(SCORE_TYPE.itemsize * num_keys_to_read)
+            scores = torch.tensor(
+                np.frombuffer(score_bytes, dtype=torch_dtype_to_np_dtype[SCORE_TYPE]),
+                dtype=SCORE_TYPE,
+                device=device,
+            )
+
+        if world_size > 1:
+            masks = keys % world_size == rank
+            keys = keys[masks]
+            embeddings = embeddings[masks, :]
+            if scores is not None:
+                scores = scores[masks]
+            if opt_states is not None:
+                opt_states = opt_states[masks, :]
+        load_key_values(dynamic_table, keys, embeddings, scores, opt_states)
+
+    fkey.close()
+    fembedding.close()
+    if fscore:
+        fscore.close()
+    if fopt_states:
+        fopt_states.close()
+
+
+def find_files(
+    root_path: str, table_name: str, suffix: str
+) -> Tuple[List[str], int, int]:
+    suffix_to_encode_file_path_func = {
+        "emb_keys": encode_key_file_path,
+        "emb_values": encode_value_file_path,
+        "emb_scores": encode_score_file_path,
+        "opt_values": encode_opt_file_path,
+    }
+    if suffix not in suffix_to_encode_file_path_func:
+        raise RuntimeError(f"Invalid suffix: {suffix}")
+    encode_file_path_func = suffix_to_encode_file_path_func[suffix]
+
+    import glob
+
+    # v2 version
+    files = glob.glob(
+        os.path.join(root_path, f"{table_name}_{suffix}.rank_*.world_size_*")
+    )
+    if len(files) == 0:
+        # v1 version
+        checkpoint_version = 1
+        suffix_to_v1_path = {
+            "emb_keys": os.path.join(root_path, table_name + "_keys"),
+            "emb_values": os.path.join(root_path, table_name + "_values"),
+            "emb_scores": os.path.join(root_path, table_name + "_scores"),
+            "opt_values": os.path.join(root_path, table_name + "_values"),
+        }
+        file = suffix_to_v1_path[suffix]
+        if not os.path.exists(file):
+            return [], 0, checkpoint_version
+        return [file], 1, checkpoint_version
+    files = sorted(files)
+    world_size = int(files[0].split(".")[-1].split("_")[-1])
+    if len(files) != world_size:
+        raise RuntimeError(
+            f"Checkpoints is corrupted. Found {len(files)} under path {root_path} for table {table_name}, but the number of checkpointed world size is {world_size}."
+        )
+
+    for i in range(world_size):
+        expected_file_path = encode_file_path_func(root_path, table_name, i, world_size)
+        if expected_file_path not in set(files):
+            raise RuntimeError(
+                f"Checkpoints is corrupted. Expected file path {expected_file_path} for table {table_name}, but it is not found."
+            )
+
+    checkpoint_version = 2
+    return files, len(files), checkpoint_version
+
+
+def get_loading_files(
+    root_path: str,
+    name: str,
+    pg: Optional[dist.ProcessGroup] = None,
+    need_dump_score: bool = False,
+    optim: bool = False,
+) -> Tuple[List[str], List[str], List[str], List[str], int, int, int]:
+    checkpoint_version = 2
+    world_size = dist.get_world_size(group=pg)
+
+    if not os.path.exists(root_path):
+        raise RuntimeError(f"can't find path to load, path:", root_path)
+
+    key_files, num_key_files, checkpoint_version = find_files(
+        root_path, name, "emb_keys"
+    )
+    value_files, num_value_files, _ = find_files(root_path, name, "emb_values")
+    score_files, num_score_files, _ = (
+        find_files(root_path, name, "emb_scores") if need_dump_score else ([], 0, None)
+    )
+    opt_files, num_opt_files, _ = (
+        find_files(root_path, name, "opt_values") if optim else ([], 0, None)
+    )
+
+    if num_key_files != num_value_files:
+        raise RuntimeError(
+            f"The number of key files under path {root_path} for table {name} does not match the number of value files."
+        )
+
+    if need_dump_score and num_key_files != num_score_files:
+        raise RuntimeError(
+            f"The number of key files under path {root_path} for table {name} does not match the number of score files."
+        )
+
+    if optim and num_key_files != num_opt_files:
+        raise RuntimeError(
+            f"The number of key files under path {root_path} for table {name} does not match the number of opt files."
+        )
+
+    rank = dist.get_rank(group=pg)
+    if world_size == num_key_files and checkpoint_version == 2:
+        return (
+            [encode_key_file_path(root_path, name, rank, world_size)],
+            [encode_value_file_path(root_path, name, rank, world_size)],
+            [encode_score_file_path(root_path, name, rank, world_size)]
+            if need_dump_score
+            else [None],
+            [encode_opt_file_path(root_path, name, rank, world_size)]
+            if num_opt_files > 0
+            else [None],
+            0,
+            1,
+            checkpoint_version,
+        )
+    # TODO: support skipping files.
+    return (
+        key_files,
+        value_files,
+        score_files if need_dump_score else [None for _ in range(num_key_files)],
+        opt_files if optim else [None for _ in range(num_key_files)],
+        rank,
+        world_size,
+        checkpoint_version,
+    )
+
+
+def distributed_load(
+    dynamic_table: DynamicEmbTable,
+    root_path: str,
+    name: str,
+    optim: bool = False,
+    pg: Optional[dist.ProcessGroup] = None,
+):
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    need_dump_score = dynamic_table.evict_strategy() != EvictStrategy.KLru
+
+    (
+        emb_key_files,
+        emb_value_files,
+        emb_score_files,
+        opt_value_files,
+        rank,
+        world_size,
+        checkpoint_version,
+    ) = get_loading_files(
+        root_path, name, pg, need_dump_score, optim and dynamic_table.optstate_dim() > 0
+    )
+
+    for emb_key_file, emb_value_file, score_file, opt_file in zip(
+        emb_key_files, emb_value_files, emb_score_files, opt_value_files
+    ):
+        local_load(
+            dynamic_table,
+            emb_key_file,
+            emb_value_file,
+            score_file,
+            opt_file,
+            device,
+            rank,
+            world_size,
+            checkpoint_version,
+        )
 
 
 # TODO: Now only support Row-Wise sharding, will support TW/TWRW in future.
@@ -1187,18 +793,6 @@ def DynamicEmbLoad(
     -------
     None
     """
-    # Due to the difficulty of checking the HKV dump and load operations externally,
-    # debug_mode has been added to the code. This is controlled by the environment variable
-    # DYNAMICEMB_DUMP_LOAD_DEBUG. When DYNAMICEMB_DUMP_LOAD_DEBUG=1, debug mode is enabled.
-    # In debug mode, the state of dynamic emb will be saved before dumping to the file system,
-    # and a comparison will be performed after the load operation.
-
-    debug_env_var = os.getenv("DYNAMICEMB_DUMP_LOAD_DEBUG")
-    if debug_env_var == "1":
-        debug_mode = True
-        print("DynamicEmb's dump and load is in debug mode")
-    else:
-        debug_mode = False
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1214,108 +808,44 @@ def DynamicEmbLoad(
         )
         return
 
-    check_dynamic_emb_modules_lists: List[List[nn.Module]] = []
-
-    for i, tmp_collection in enumerate(collections_list):
-        _, _, tmp_collection_module = tmp_collection
-        check_dynamic_emb_modules_lists.append(
-            get_dynamic_emb_module(tmp_collection_module)
-        )
-
-    has_dynamic_emb = False
-    for check_dynamic_emb_module_list in check_dynamic_emb_modules_lists:
-        if len(check_dynamic_emb_module_list) > 0:
-            has_dynamic_emb = True
-            break
-
-    if not has_dynamic_emb:
-        warnings.warn(
-            "Input model don't have any Dynamic embedding tables, can't load any embedding tables from filesystem!",
-            UserWarning,
-        )
-        return
-
-    collection_names_in_module = set()
-    filtered_collections_list = []
-
-    for tmp_shared_path, tmp_shared_name, module in collections_list:
-        collection_names_in_module.add(tmp_shared_name)
-        if table_names is None or tmp_shared_name in table_names:
-            filtered_collections_list.append((tmp_shared_path, tmp_shared_name, module))
-
-    collections_list = filtered_collections_list
-
-    if table_names is not None:
-        for tmp_input_collection_name in table_names.keys():
-            if tmp_input_collection_name not in collection_names_in_module:
-                warnings.warn(
-                    f"sharded module '{tmp_input_collection_name}' specified in table_names not found in the model",
-                    UserWarning,
-                )
-
-    rank = dist.get_rank(group=pg)
-
-    for i, tmp_collection in enumerate(collections_list):
-        # get collection mpdule
-        collection_path, tmp_collection_name, tmp_collection_module = tmp_collection
+    for _, current_collection in enumerate(collections_list):
+        (
+            collection_path,
+            current_collection_name,
+            current_collection_module,
+        ) = current_collection
         full_collection_path = os.path.join(path, collection_path)
-        tmp_dynamic_emb_module_list = get_dynamic_emb_module(tmp_collection_module)
+        current_dynamic_emb_module_list = get_dynamic_emb_module(
+            current_collection_module
+        )
 
-        for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
-            tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
+        for _, dynamic_emb_module in enumerate(current_dynamic_emb_module_list):
+            current_table_names = dynamic_emb_module.table_names
+            current_tables = dynamic_emb_module.tables
 
-            filtered_table_names: List[str] = []
-            filtered_dynamic_tables: List[DynamicEmbTable] = []
+            for dynamic_table_name, dynamic_table in zip(
+                current_table_names, current_tables
+            ):
+                if table_names is not None and dynamic_table_name not in set(
+                    table_names[current_collection_name]
+                ):
+                    continue
 
-            # TODO:need a warning
-            if table_names is not None:
-                tmp_input_names = table_names[tmp_collection_name]
-                for name in tmp_input_names:
-                    if name in tmp_table_names:
-                        index = tmp_table_names.index(name)
-                        filtered_table_names.append(tmp_table_names[index])
-                        filtered_dynamic_tables.append(tmp_tables[index])
-            else:
-                filtered_table_names = tmp_table_names
-                filtered_dynamic_tables = tmp_tables
-
-            if len(filtered_table_names) == 0:
-                continue
-
-            if optim:
-                optimizer = dynamic_emb_module.optimizer
-
-            tmp_tables_dict: Dict[str, DynamicEmbTable] = {
-                name: table
-                for name, table in zip(filtered_table_names, filtered_dynamic_tables)
-            }
-
-            for k, load_name in enumerate(filtered_table_names):
-                # load optimizer args firstly then can check if has already dumped the optimizer states.
                 if optim:
-                    args_filename = load_name + "_opt_args.json"
+                    args_filename = dynamic_table_name + "_opt_args.json"
                     args_path = os.path.join(full_collection_path, args_filename)
                     opt_args = load_from_json(args_path)
-                    # TODO: A single set of optimizer arguments is sufficient for a dynamic module set.
-                    optimizer.set_opt_args(opt_args)
+                    dynamic_emb_module.optimizer.set_opt_args(opt_args)
 
-                load_table(
-                    filtered_dynamic_tables[k],
+                distributed_load(
+                    dynamic_table,
                     full_collection_path,
-                    load_name,
-                    pg=pg,
-                    debug_mode=debug_mode,
+                    dynamic_table_name,
                     optim=optim,
+                    pg=pg,
                 )
 
-                if rank == 0:
-                    print(
-                        f"DynamicEmb load table {load_name} from module {tmp_collection_name} success!"
-                    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    if debug_mode:
-        debug_load(collections_list, path, table_names, optim, pg)
     return

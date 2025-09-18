@@ -43,6 +43,11 @@ class HSTUGpuKVCacheManager:
                 self.max_seq_len, kv_cache_config.max_attention_window
             )
 
+        assert self.page_size == 32 or self.page_size == 64, (
+            f"Unsupported GPU KV-cache page size: {self.page_size}. "
+            "Current paged HSTU attention kernel only support page size = 32 or 64."
+        )
+
         max_pages_per_batch = math.ceil(
             self.max_batch_size * self.max_seq_len / self.page_size
         )

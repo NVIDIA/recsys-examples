@@ -411,11 +411,7 @@ class ShardedEmbedding(torch.nn.Module):
         dynamic_table_names = set()
         if len(dynamicemb_modules) > 0:
             from dynamicemb.dump_load import export_keys_values
-            from dynamicemb_extensions import (
-                dyn_emb_capacity,
-                dyn_emb_cols,
-                dyn_emb_rows,
-            )
+            from dynamicemb_extensions import dyn_emb_rows
 
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -426,23 +422,15 @@ class ShardedEmbedding(torch.nn.Module):
                         continue
 
                     local_max_rows = dyn_emb_rows(dynamic_table)
-                    dim = dyn_emb_cols(dynamic_table)
-                    search_capacity = dyn_emb_capacity(dynamic_table)
-
-                    offset = 0
-                    batchsize = 65536
                     accumulated_counts = 0
-                    while offset < search_capacity:
-                        keys, values, _, d_counter = export_keys_values(
-                            dynamic_table, offset, device, batchsize
-                        )
-                        acutual_counts = d_counter.cpu().item()
-                        keys_list.append(keys.cpu().numpy()[:acutual_counts])
-                        values_list.append(
-                            values.cpu().numpy().reshape(-1, dim)[:acutual_counts, :]
-                        )
-                        offset += batchsize
-                        accumulated_counts += acutual_counts
+
+                    for keys, embeddings, _, _ in export_keys_values(
+                        dynamic_table, device
+                    ):
+                        keys_list.append(keys.cpu().numpy())
+                        values_list.append(embeddings.cpu().numpy())
+                        accumulated_counts += keys.numel()
+
                     if local_max_rows != accumulated_counts:
                         raise ValueError(
                             f"Rank {dist.get_rank()} has accumulated count {accumulated_counts} which is different from expected {local_max_rows}, "
