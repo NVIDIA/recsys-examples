@@ -29,7 +29,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     EmbOptimType,
 )
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from torch.distributed.elastic.multiprocessing.errors import record
 
 
@@ -116,7 +116,7 @@ def test(args):
         for num_emb in args.num_embeddings_per_feature
     ]
 
-    var = BatchedDynamicEmbeddingTables(
+    var = BatchedDynamicEmbeddingTablesV2(
         table_options=table_options,
         output_dtype=torch.float32,
         table_names=[table_idx_to_name(i) for i in range(table_num)],

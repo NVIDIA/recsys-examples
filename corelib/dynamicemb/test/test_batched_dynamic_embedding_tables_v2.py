@@ -48,6 +48,8 @@ POOLING_MODE: Dict[DynamicEmbPoolingMode, PoolingMode] = {
 OPTIM_TYPE: Dict[EmbOptimType, OptimType] = {
     EmbOptimType.SGD: OptimType.EXACT_SGD,
     EmbOptimType.ADAM: OptimType.ADAM,
+    EmbOptimType.EXACT_ADAGRAD: OptimType.EXACT_ADAGRAD,
+    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimType.EXACT_ROWWISE_ADAGRAD,
 }
 
 
@@ -380,6 +382,20 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
                 "beta2": 0.888,
             },
         ),
+        (
+            EmbOptimType.EXACT_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -489,6 +505,20 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
                 "beta2": 0.888,
             },
         ),
+        (
+            EmbOptimType.EXACT_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize("PS", [None, PyDictStorage])
@@ -595,6 +625,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
         assert list(bdeb.get_score().values()) == [1] * len(dims)
 
     with torch.cuda.stream(forward_stream):
+        torch.cuda.current_stream().wait_stream(pretch_stream)
         embs_bdeb_A = bdeb(indicesA, offsetsA)
         loss_bdet_A = embs_bdeb_A.mean()
         loss_bdet_A.backward()
@@ -626,6 +657,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
         assert list(bdeb.get_score().values()) == [2] * len(dims)
 
     with torch.cuda.stream(forward_stream):
+        torch.cuda.current_stream().wait_stream(pretch_stream)
         embs_bdeb_A = bdeb(indicesA, offsetsA)
         loss_bdet_A = embs_bdeb_A.mean()
         loss_bdet_A.backward()

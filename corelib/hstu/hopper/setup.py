@@ -26,7 +26,7 @@ import warnings
 from pathlib import Path
 
 from packaging.version import Version, parse
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
 with open("../README.md", "r", encoding="utf-8") as fh:
