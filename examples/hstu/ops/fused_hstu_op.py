@@ -16,7 +16,10 @@
 from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
-import hstu_attn_2_cuda as flash_attn_cuda_ampere
+try:
+    import hstu_attn_2_cuda as flash_attn_cuda_ampere
+except ImportError:
+    pass
 
 try:
     import hstu_hopper_cuda as flash_attn_cuda_hopper
@@ -283,7 +286,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 extension_args = ampere_paged_kv_args
             elif sm_major_version == 9:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
-                hopper_fp8_args = (None, None, None)
+                hopper_fp8_args = (-1, None, None, None, None, None, None, None, None)
                 extension_args = hopper_fp8_args
 
             else:
@@ -602,36 +605,63 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             dv: Optional[torch.Tensor] = None,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
+            assert dout.dim() == 3
             if sm_major_version == 8:
-                cutlass_hstu_varlen_bwd = flash_attn_cuda_ampere.varlen_bwd
+                dq, dk, dv, _ = flash_attn_cuda_ampere.varlen_bwd(
+                    dout,
+                    q,
+                    k,
+                    v,
+                    dq,
+                    dk,
+                    dv,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    window_size_left,
+                    window_size_right,
+                    alpha,
+                    None,  # rab_padded
+                    False,  # has_drab
+                    None,  # func
+                    False,  # deterministic
+                )
             elif sm_major_version == 9:
-                cutlass_hstu_varlen_bwd = flash_attn_cuda_hopper.varlen_bwd
+                fp8_args = (None,) * 11
+                dq, dk, dv, _ = flash_attn_cuda_hopper.varlen_bwd(
+                    dout,
+                    None,
+                    q,
+                    None,
+                    k,
+                    None,
+                    v,
+                    dq,
+                    dk,
+                    dv,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    window_size_left,
+                    window_size_right,
+                    alpha,
+                    -1,  # quant_mode
+                    None,  # rab_padded
+                    False,  # has_drab
+                    None,  # func
+                    *fp8_args,
+                    False,  # deterministic
+                )
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
-            assert dout.dim() == 3
-            dq, dk, dv, _ = cutlass_hstu_varlen_bwd(
-                dout,
-                q,
-                k,
-                v,
-                dq,
-                dk,
-                dv,
-                seq_offsets_q,
-                seq_offsets_q,
-                max_seqlen_q,
-                max_seqlen_q,
-                num_contexts,
-                num_targets,
-                target_group_size,
-                window_size_left,
-                window_size_right,
-                alpha,
-                None,  # rab_padded
-                False,  # has_drab
-                None,  # func
-                False,  # deterministic
-            )
 
             return dq, dk, dv
 
