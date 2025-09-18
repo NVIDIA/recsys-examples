@@ -31,12 +31,15 @@ from dynamicemb.unique_op import UniqueOp
 from dynamicemb.utils import tabulate
 from dynamicemb_extensions import (
     DynamicEmbTable,
+    EvictStrategy,
     OptimizerType,
     count_matched,
     device_timestamp,
     dyn_emb_capacity,
     dyn_emb_cols,
+    export_batch,
     export_batch_matched,
+    insert_or_assign,
 )
 from torch import Tensor, nn  # usort:skip
 
@@ -150,7 +153,7 @@ class TableShim:
         n,
         unique_indices,
         unique_values,
-        scores,
+        scores=None,
     ) -> None:
         if isinstance(self.table, DynamicEmbTable):
             insert_or_assign(self.table, n, unique_indices, unique_values, scores)
@@ -223,6 +226,36 @@ class TableShim:
                 d_keys,
                 d_vals,
             )
+
+    def export_batch(
+        self, batch_size, search_offset, d_count, d_keys, d_vals, d_scores
+    ) -> None:
+        if isinstance(self.table, DynamicEmbTable):
+            export_batch(
+                self.table,
+                batch_size,
+                search_offset,
+                d_count,
+                d_keys,
+                d_vals,
+                d_scores,
+            )
+        else:
+            export_batch(
+                self.table.table,
+                batch_size,
+                search_offset,
+                d_count,
+                d_keys,
+                d_vals,
+                d_scores,
+            )
+
+    def evict_strategy(self) -> EvictStrategy:
+        if isinstance(self.table, DynamicEmbTable):
+            return self.table.evict_strategy()
+        else:
+            return self.table.table.evict_strategy()
 
 
 def _export_matched_and_gather(

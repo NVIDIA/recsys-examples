@@ -19,19 +19,15 @@ import pytest
 import torch
 import torch.distributed as dist
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+from dynamicemb.batched_dynamicemb_tables import TableShim
 from dynamicemb.dump_load import (
     export_keys_values,
     load_key_values,
     local_export,
     local_load,
 )
-from dynamicemb.dynamicemb_config import (
-    DynamicEmbCheckMode,
-    DynamicEmbTable,
-    create_dynamicemb_table,
-    dyn_emb_to_torch,
-)
-from dynamicemb_extensions import EvictStrategy, OptimizerType, dyn_emb_cols, find
+from dynamicemb.dynamicemb_config import DynamicEmbCheckMode, create_dynamicemb_table
+from dynamicemb_extensions import EvictStrategy, OptimizerType, find
 from torchrec.distributed.comm import get_local_rank
 
 backend = "nccl"
@@ -45,7 +41,7 @@ device = torch.device(f"cuda:{local_rank}")
 
 
 def init_dynamicemb_table(
-    dynamicemb_table: DynamicEmbTable, num_embeddings: int, embedding_dim: int
+    dynamicemb_table: TableShim, num_embeddings: int, embedding_dim: int
 ):
     # Generate exactly num_embeddings unique random keys in range 0 to sys.maxsize
     # Use torch.randint to sample from the large range without creating a massive tensor
@@ -77,8 +73,8 @@ def init_dynamicemb_table(
     )
 
     opt_states = (
-        torch.randn(num_embeddings, dynamicemb_table.optstate_dim(), device=device)
-        if dynamicemb_table.optstate_dim() > 0
+        torch.randn(num_embeddings, dynamicemb_table.optim_states_dim(), device=device)
+        if dynamicemb_table.optim_states_dim() > 0
         else None
     )
 
@@ -93,16 +89,16 @@ def init_dynamicemb_table(
 
 
 def assert_two_dynamicemb_table_equal(
-    reference_table: DynamicEmbTable,
+    reference_table: TableShim,
     reference_table_optimizer_type: str,
-    table: DynamicEmbTable,
+    table: TableShim,
     table_optimizer_type: str,
 ):
     table_data_iterator = export_keys_values(table, device)
     for keys, embeddings, opt_states, scores in table_data_iterator:
-        dim = dyn_emb_cols(reference_table)
-        optstate_dim = reference_table.optstate_dim()
-        value_type = dyn_emb_to_torch(reference_table.value_type())
+        dim = reference_table.embedding_dim()
+        optstate_dim = reference_table.optim_states_dim()
+        value_type = reference_table.value_type()
         values = torch.empty(
             keys.numel() * (dim + optstate_dim),
             device=device,
@@ -111,7 +107,14 @@ def assert_two_dynamicemb_table_equal(
         founds = torch.empty(keys.numel(), device=device, dtype=torch.bool)
         scores = torch.empty(keys.numel(), device=device, dtype=torch.uint64)
 
-        find(reference_table, keys.numel(), keys, values, founds, scores)
+        find(
+            reference_table.get_underlying_table(),
+            keys.numel(),
+            keys,
+            values,
+            founds,
+            scores,
+        )
         assert torch.allclose(
             founds, torch.ones_like(founds)
         ), "missing keys in reference table"
@@ -122,7 +125,7 @@ def assert_two_dynamicemb_table_equal(
 
         if (
             reference_table_optimizer_type == table_optimizer_type
-            and table.optstate_dim() > 0
+            and table.optim_states_dim() > 0
             and optstate_dim > 0
         ):
             reference_opt_states = reference_values[:, dim:]
@@ -261,7 +264,7 @@ def test_dynamic_table_load_dump(
     print("num_embeddings", num_embeddings)
     print("embedding_dim", embedding_dim)
 
-    dynamicemb_table = create_dynamicemb_table(dump_table_options)
+    dynamicemb_table = TableShim(create_dynamicemb_table(dump_table_options))
     keys, embeddings, scores, opt_states = init_dynamicemb_table(
         dynamicemb_table, num_embeddings, embedding_dim
     )
@@ -274,7 +277,7 @@ def test_dynamic_table_load_dump(
         "opt_file_path" if opt_states is not None else None,
     )
 
-    new_dynamicemb_table = create_dynamicemb_table(load_table_options)
+    new_dynamicemb_table = TableShim(create_dynamicemb_table(load_table_options))
 
     need_load_optimizer = (
         opt_states is not None
