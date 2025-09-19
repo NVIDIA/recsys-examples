@@ -35,9 +35,6 @@ create_dist: clean_dist
 upload_package: create_dist
 	twine upload dist/*
 
-bb:
-	python3 setup.py develop --user
-
 tt:
 	python3 test.py
 

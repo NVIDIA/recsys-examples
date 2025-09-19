@@ -47,20 +47,29 @@ void set_params_fprop(Hstu_fwd_params &params,
                       const size_t h_rab,
                       const size_t d,
                       const float alpha,
+                      const int quant_mode,
                       // device pointers
                       const at::Tensor q,
                       const at::Tensor k,
                       const at::Tensor v,
+                      const at::Tensor q_descale,
+                      const at::Tensor k_descale,
+                      const at::Tensor v_descale,
                       const at::Tensor rab,
                       at::Tensor out,
                       void* num_contexts_d,
                       void* cu_seqlens_q_d,
                       void* cu_seqlens_k_d,
+                      void* cu_seqlens_vt_descale_d,
+                      void* cu_seqlens_q_block_descale,
+                      void* cu_seqlens_kv_block_descale,
                       void* num_targets_d,
                       bool has_rab,
                       const at::Tensor& func,
                       int window_size_left,
-                      int window_size_right) {
+                      int window_size_right,
+                      const at::Tensor vt,
+                      const at::Tensor vt_descale) {
   // Reset the parameters
   params = {};
 
@@ -81,6 +90,11 @@ void set_params_fprop(Hstu_fwd_params &params,
   params.q_ptr = q.data_ptr();
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
+  if (vt.numel() > 0) {
+    params.vt_ptr = vt.data_ptr();
+  } else {
+    params.vt_ptr = nullptr;
+  }
   // All stride are in elements, not bytes.
   params.q_row_stride = q.stride(-3);
   params.k_row_stride = k.stride(-3);
@@ -88,6 +102,11 @@ void set_params_fprop(Hstu_fwd_params &params,
   params.q_head_stride = q.stride(-2);
   params.k_head_stride = k.stride(-2);
   params.v_head_stride = v.stride(-2);
+  if (vt.numel() > 0) {
+    params.vt_row_stride = vt.stride(-1);
+    params.vt_head_stride = vt.stride(-2);
+  }
+
   if (out.numel() > 0) {
     params.o_ptr = out.data_ptr();
     params.o_row_stride = out.stride(-3);
@@ -112,34 +131,51 @@ void set_params_fprop(Hstu_fwd_params &params,
     params.h_rab = h;
   }
 
-  params.num_contexts = static_cast<int*>(num_contexts_d);
+  if (q_descale.numel() > 0) {
+    params.descale_q_ptr = q_descale.data_ptr<float>();
+    params.descale_q_head_stride = q_descale.stride(0);
+  } else {
+    params.descale_q_ptr = nullptr;
+    params.descale_q_head_stride = 0;
+  }
+  if (k_descale.numel() > 0) {
+    params.descale_k_ptr = k_descale.data_ptr<float>();
+    params.descale_k_head_stride = k_descale.stride(0);
+  } else {
+    params.descale_k_ptr = nullptr;
+    params.descale_k_head_stride = 0;
+  }
+  if (v_descale.numel() > 0) {
+    params.descale_v_ptr = v_descale.data_ptr<float>();
+    params.descale_v_head_stride = v_descale.stride(0);
+  } else {
+    params.descale_v_ptr = nullptr;
+    params.descale_v_head_stride = 0;
+  }
+  if (vt_descale.numel() > 0) {
+    params.descale_vt_ptr = vt_descale.data_ptr<float>();
+    params.descale_vt_row_stride = vt_descale.stride(-3);
+    params.descale_vt_head_stride = vt_descale.stride(-2);
+    params.cu_seqlens_vt_descale = static_cast<int*>(cu_seqlens_vt_descale_d);
+  } else {
+    params.descale_vt_ptr = nullptr;
+    params.descale_vt_row_stride = 0;
+    params.descale_vt_head_stride = 0;
+    params.cu_seqlens_vt_descale = nullptr;
+  }
+
+  if (quant_mode == 2) {
+    params.q_block_descale_head_stride = q_descale.stride(-2);
+    params.kv_block_descale_head_stride = k_descale.stride(-2);
+    params.cu_seqlens_q_block_descale = static_cast<int*>(cu_seqlens_q_block_descale);
+    params.cu_seqlens_kv_block_descale = static_cast<int*>(cu_seqlens_kv_block_descale);
+  }
+
   params.cu_seqlens_q = static_cast<int*>(cu_seqlens_q_d);
   params.cu_seqlens_k = static_cast<int*>(cu_seqlens_k_d);
-  params.num_targets = static_cast<int*>(num_targets_d);
 
-  TORCH_CHECK(
-      bool(params.cu_seqlens_q) == bool(params.cu_seqlens_k),
-      "cu_seqlens_q and cu_seqlens_k must be both null or non-null"
-  );
   // Set num SM
   params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-
-  // Set the block scheduling
-  // float coeff = 0.3;
-  params.is_balance_fwd = false;
-  params.is_balance_bwd = false;
-  // auto dprops = at::cuda::getCurrentDeviceProperties();
-  // int l2_size = dprops->l2CacheSize;
-  // int sm_count = dprops->multiProcessorCount;
-  // int num_KV = std::min(sm_count, int(b * h_k));
-  // int kv_cache_size = 2 * seqlen_k * num_KV * d * sizeof(k.dtype()) * coeff;
-  // int do_cache_size = seqlen_q * num_KV * d * sizeof(out.dtype()) * coeff;
-  // if (kv_cache_size < l2_size) {
-  //   params.is_balance_fwd = true;
-  // }
-  // if (kv_cache_size + do_cache_size < l2_size) {
-  //   params.is_balance_bwd = true;
-  // }
 
   // Set the dimensions.
   params.b = b;
@@ -151,8 +187,12 @@ void set_params_fprop(Hstu_fwd_params &params,
   params.seqlen_k_rounded = seqlen_k_rounded;
   params.d = d;
   params.alpha = alpha;
+  // 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization.
+  params.quant_mode = quant_mode;
+
   // Set the masks.
   params.is_target = num_targets_d != nullptr;
+  params.num_targets = static_cast<int*>(num_targets_d);
   #ifdef HSTU_DISABLE_TARGET
     TORCH_CHECK(!params.is_target, "This hstu attention build does not support target.");
   #endif
@@ -161,6 +201,7 @@ void set_params_fprop(Hstu_fwd_params &params,
     TORCH_CHECK(target_group_size > 0, "target_group_size must be greater than 0 when target is True");
   }
   params.is_context = num_contexts_d != nullptr;
+  params.num_contexts = static_cast<int*>(num_contexts_d);
   #ifdef HSTU_DISABLE_CONTEXT
     TORCH_CHECK(!params.is_context, "This hstu attention build does not support context mask.");
   #endif
@@ -210,12 +251,23 @@ void set_params_dgrad(Hstu_bwd_params &params,
                       const size_t h_rab,
                       const size_t d,
                       const float alpha,
+                      const int quant_mode,
                       // device pointers
                       const at::Tensor q,
+                      const at::Tensor qt,
                       const at::Tensor k,
+                      const at::Tensor kt,
                       const at::Tensor v,
                       const at::Tensor dout,
+                      const at::Tensor dout_t,
                       const at::Tensor rab,
+                      const at::Tensor do_descale,
+                      const at::Tensor q_descale,
+                      const at::Tensor k_descale,
+                      const at::Tensor v_descale,
+                      const at::Tensor dot_descale,
+                      const at::Tensor qt_descale,
+                      const at::Tensor kt_descale,
                       at::Tensor dq,
                       at::Tensor dk,
                       at::Tensor dv,
@@ -223,6 +275,10 @@ void set_params_dgrad(Hstu_bwd_params &params,
                       void *num_contexts_d,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
+                      void *cu_seqlens_qt_descale_d,
+                      void *cu_seqlens_kt_descale_d,
+                      void* cu_seqlens_q_block_descale,
+                      void* cu_seqlens_kv_block_descale,
                       void *num_targets_d,
                       void *dq_accum_d,
                       const at::Tensor& func,
@@ -233,11 +289,14 @@ void set_params_dgrad(Hstu_bwd_params &params,
                       bool deterministic) {
 
   set_params_fprop(params, b, seqlen_q, seqlen_k, target_group_size, seqlen_q_rounded,
-                    seqlen_k_rounded, h, h_k, h_rab, d, alpha, q, k, v, rab,
+                    seqlen_k_rounded, h, h_k, h_rab, d, alpha, quant_mode, q, k, v,
+                    q_descale, k_descale, v_descale, rab,
                     /*out=*/torch::Tensor(),
-                    num_contexts_d, cu_seqlens_q_d, cu_seqlens_k_d, num_targets_d,
-                    has_rab, func, window_size_left, window_size_right);
-
+                    num_contexts_d, cu_seqlens_q_d, cu_seqlens_k_d,
+                    /*cu_seqlens_vt_descale_d=*/nullptr, cu_seqlens_q_block_descale, cu_seqlens_kv_block_descale,
+                    num_targets_d, has_rab, func, window_size_left, window_size_right,
+                    /*vt=*/torch::Tensor(), /*vt_descale=*/torch::Tensor());
+  params.is_e5m2 = q.dtype() == torch::kFloat8_e5m2;
   params.has_drab = has_drab;
   #ifdef HSTU_DISABLE_DRAB
     TORCH_CHECK(!has_drab, "This hstu attention build does not support has_drab.");
@@ -266,6 +325,70 @@ void set_params_dgrad(Hstu_bwd_params &params,
   params.dq_head_stride = dq.stride(-2);
   params.dk_head_stride = dk.stride(-2);
   params.dv_head_stride = dv.stride(-2);
+  if (qt.numel() > 0) {
+    params.qt_ptr = qt.data_ptr();
+    params.qt_row_stride = qt.stride(-1);
+    params.qt_head_stride = qt.stride(-2);
+  } else {
+    params.qt_ptr = nullptr;
+    params.qt_row_stride = 0;
+    params.qt_head_stride = 0;
+  }
+  if (kt.numel() > 0) {
+    params.kt_ptr = kt.data_ptr();
+    params.kt_row_stride = kt.stride(-1);
+    params.kt_head_stride = kt.stride(-2);
+  } else {
+    params.kt_ptr = nullptr;
+    params.kt_row_stride = 0;
+    params.kt_head_stride = 0;
+  }
+  if (dout_t.numel() > 0) {
+    params.dot_ptr = dout_t.data_ptr();
+    params.dot_row_stride = dout_t.stride(-1);
+    params.dot_head_stride = dout_t.stride(-2);
+  } else {
+    params.dot_ptr = nullptr;
+    params.dot_row_stride = 0;
+    params.dot_head_stride = 0;
+  }
+  if (qt_descale.numel() > 0) {
+  params.descale_qt_ptr = qt_descale.data_ptr<float>();
+  params.descale_qt_head_stride = qt_descale.stride(-2);
+  params.descale_qt_row_stride = qt_descale.stride(-3);
+  } else {
+    params.descale_qt_ptr = nullptr;
+    params.descale_qt_head_stride = 0;
+    params.descale_qt_row_stride = 0;
+  }
+  if (kt_descale.numel() > 0) {
+    params.descale_kt_ptr = kt_descale.data_ptr<float>();
+    params.descale_kt_head_stride = kt_descale.stride(-2);
+    params.descale_kt_row_stride = kt_descale.stride(-3);
+  } else {
+    params.descale_kt_ptr = nullptr;
+    params.descale_kt_head_stride = 0;
+    params.descale_kt_row_stride = 0;
+  }
+  if (do_descale.numel() > 0) {
+    params.descale_do_ptr = do_descale.data_ptr<float>();
+    params.descale_do_head_stride = do_descale.stride(0);
+  } else {
+    params.descale_do_ptr = nullptr;
+    params.descale_do_head_stride = 0;
+  }
+  if (dot_descale.numel() > 0) {
+    params.descale_dot_ptr = dot_descale.data_ptr<float>();
+    params.descale_dot_head_stride = dot_descale.stride(-2);
+    params.descale_dot_row_stride = dot_descale.stride(-3);
+  } else {
+    params.descale_dot_ptr = nullptr;
+    params.descale_dot_head_stride = 0;
+    params.descale_dot_row_stride = 0;
+  }
+
+  params.cu_seqlens_descale_qt_ptr = static_cast<int*>(cu_seqlens_qt_descale_d);
+  params.cu_seqlens_descale_kt_ptr = static_cast<int*>(cu_seqlens_kt_descale_d);
 
   params.dq_accum_ptr = dq_accum_d;
 
@@ -273,7 +396,7 @@ void set_params_dgrad(Hstu_bwd_params &params,
 }
 
 template <typename Dtype, int Headdim>
-void run_hstu_fwd_mask_16(Hstu_fwd_params &params, cudaStream_t stream) {
+void run_hstu_fwd_mask(Hstu_fwd_params &params, cudaStream_t stream) {
   RAB_SWITCH(params.has_rab, Has_rab, [&] {
     #ifndef HSTU_DISABLE_ARBITRARY
     if (params.is_arbitrary_mask) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, true, HSTU_ARBITRARY_NFUNC>(params, stream); return; }
@@ -294,33 +417,20 @@ void run_hstu_fwd_mask_16(Hstu_fwd_params &params, cudaStream_t stream) {
   });
 }
 
-template <typename Dtype, int Headdim>
-void run_hstu_fwd_mask_8(Hstu_fwd_params &params, cudaStream_t stream) {
-  RAB_SWITCH(params.has_rab, Has_rab, [&] {
-    #ifndef HSTU_DISABLE_LOCAL
-    if (params.is_local) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, true, false, false, false, false, 0>(params, stream); return; }
-    #endif
-    #ifndef HSTU_DISABLE_CAUSAL
-    if (params.is_causal) { run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, true, false, false, false, 0>(params, stream); return; }
-    #endif
-    run_hstu_fwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false, 0>(params, stream);
-  });
-}
-
 void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
   if (params.is_bf16) {
     #ifndef HSTU_DISABLE_BF16
     #ifndef HSTU_DISABLE_HDIM32
-    if (params.d == 32) { run_hstu_fwd_mask_16<cutlass::bfloat16_t, 32>(params, stream); }
+    if (params.d == 32) { run_hstu_fwd_mask<cutlass::bfloat16_t, 32>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM64
-    if (params.d == 64) { run_hstu_fwd_mask_16<cutlass::bfloat16_t, 64>(params, stream); }
+    if (params.d == 64) { run_hstu_fwd_mask<cutlass::bfloat16_t, 64>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM128
-    if (params.d == 128) { run_hstu_fwd_mask_16<cutlass::bfloat16_t, 128>(params, stream); }
+    if (params.d == 128) { run_hstu_fwd_mask<cutlass::bfloat16_t, 128>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM256
-    if (params.d == 256) { run_hstu_fwd_mask_16<cutlass::bfloat16_t, 256>(params, stream); }
+    if (params.d == 256) { run_hstu_fwd_mask<cutlass::bfloat16_t, 256>(params, stream); }
     #endif
     #else
     TORCH_CHECK(false, "This flash attention build does not support BF16.");
@@ -331,13 +441,13 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
     if (params.d == 32) { std::cerr << "Not support dim = 32 and dtype = float_e4m3_t for now." << std::endl; }
     #endif
     #ifndef HSTU_DISABLE_HDIM64
-    if (params.d == 64) { run_hstu_fwd_mask_8<cutlass::float_e4m3_t, 64>(params, stream); }
+    if (params.d == 64) { run_hstu_fwd_mask<cutlass::float_e4m3_t, 64>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM128
-    if (params.d == 128) { run_hstu_fwd_mask_8<cutlass::float_e4m3_t, 128>(params, stream); }
+    if (params.d == 128) { run_hstu_fwd_mask<cutlass::float_e4m3_t, 128>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM256
-    if (params.d == 256) { run_hstu_fwd_mask_8<cutlass::float_e4m3_t, 256>(params, stream); }
+    if (params.d == 256) { run_hstu_fwd_mask<cutlass::float_e4m3_t, 256>(params, stream); }
     #endif
     #else
     TORCH_CHECK(false, "This flash attention build does not support FP8.");
@@ -345,16 +455,16 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
   } else {
     #ifndef HSTU_DISABLE_FP16
     #ifndef HSTU_DISABLE_HDIM32
-    if (params.d == 32) { run_hstu_fwd_mask_16<cutlass::half_t, 32>(params, stream); }
+    if (params.d == 32) { run_hstu_fwd_mask<cutlass::half_t, 32>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM64
-    if (params.d == 64) { run_hstu_fwd_mask_16<cutlass::half_t, 64>(params, stream); }
+    if (params.d == 64) { run_hstu_fwd_mask<cutlass::half_t, 64>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM128
-    if (params.d == 128) { run_hstu_fwd_mask_16<cutlass::half_t, 128>(params, stream); }
+    if (params.d == 128) { run_hstu_fwd_mask<cutlass::half_t, 128>(params, stream); }
     #endif
     #ifndef HSTU_DISABLE_HDIM256
-    if (params.d == 256) { run_hstu_fwd_mask_16<cutlass::half_t, 256>(params, stream); }
+    if (params.d == 256) { run_hstu_fwd_mask<cutlass::half_t, 256>(params, stream); }
     #endif
     #else
     TORCH_CHECK(false, "This flash attention build does not support FP16.");
@@ -378,15 +488,21 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                const float alpha,
                std::optional<at::Tensor> &rab,
                std::optional<const at::Tensor>& func,
-               std::optional<const at::Tensor> &descale_q_,
-               std::optional<const at::Tensor> &descale_k_,
-               std::optional<const at::Tensor> &descale_v_) {
+               const int quant_mode,
+               std::optional<const at::Tensor> &vt,
+               std::optional<const at::Tensor> &cu_seqlens_vt_descale, //b+1, Each element is round_up(actual_deq_1en/128)
+               std::optional<const at::Tensor> &q_descale,
+               std::optional<const at::Tensor> &k_descale,
+               std::optional<const at::Tensor> &v_descale, // num_heads x total_k x 1
+               std::optional<const at::Tensor> &vt_descale,
+               std::optional<const at::Tensor> &cu_seqlens_q_block_descale,
+               std::optional<const at::Tensor> &cu_seqlens_kv_block_descale) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
 
   auto q_type = q.scalar_type();
   TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn,
-              "HSTU only supports fp16, bf16, and fp8_e4m3 data type");
+              "HSTU fwd only supports fp16, bf16, and fp8_e4m3 data type");
   if (dprops->major < 9) {
     TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                 "HSTU on Ampere/Ada cards only supports fp16 and bf16 data type");
@@ -468,6 +584,52 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                             {0, seqlen_k_rounded - max_seqlen_k}));
     }
   }
+  bool is_fp8 = q_type == at::ScalarType::Float8_e4m3fn;
+  if (is_fp8) {
+    TORCH_CHECK(quant_mode >= 0 && quant_mode <= 5, "quant_mode must be 0, 1, 2, 3, 4, or 5 when dtype is float8_e4m3fn");
+    TORCH_CHECK(q_descale.has_value() && k_descale.has_value(),
+                "q_descale and k_descale must be provided when dtype is float8_e4m3fn");
+    CHECK_DEVICE(q_descale.value());
+    CHECK_DEVICE(k_descale.value());
+    if (quant_mode == 1) {
+      TORCH_CHECK(vt.has_value() && vt_descale.has_value() && cu_seqlens_vt_descale.has_value(),
+                  "vt, vt_descale and cu_seqlens_vt_descale must be provided when dtype is float8_e4m3fn and quant_mode is 1");
+      CHECK_DEVICE(vt.value());
+      CHECK_DEVICE(vt_descale.value());
+      CHECK_DEVICE(cu_seqlens_vt_descale.value());
+      CHECK_SHAPE(vt.value(), total_k, num_heads_k, head_size);
+      // Add 128 to the total_q and total_k to avoid out of bounds access
+      CHECK_SHAPE(q_descale.value(), num_heads, total_q + 128);
+      CHECK_SHAPE(k_descale.value(), num_heads, total_k + 128);
+      CHECK_SHAPE(cu_seqlens_vt_descale.value(), batch_size + 1);
+    } else if (quant_mode == 2) {
+      TORCH_CHECK(v_descale.has_value() && cu_seqlens_q_block_descale.has_value() && cu_seqlens_kv_block_descale.has_value(),
+                  "v_descale, cu_seqlens_q_block_descale and cu_seqlens_kv_block_descale must be provided when dtype is float8_e4m3fn and quant_mode is 2");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_DEVICE(cu_seqlens_q_block_descale.value());
+      CHECK_DEVICE(cu_seqlens_kv_block_descale.value());
+      CHECK_SHAPE(cu_seqlens_q_block_descale.value(), batch_size + 1);
+      CHECK_SHAPE(cu_seqlens_kv_block_descale.value(), batch_size + 1);
+    } else if (quant_mode == 3) {
+      TORCH_CHECK(v_descale.has_value(), "v_descale must be provided when dtype is float8_e4m3fn and quant_mode is 3");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_SHAPE(q_descale.value(), batch_size, num_heads);
+      CHECK_SHAPE(k_descale.value(), batch_size, num_heads_k);
+      CHECK_SHAPE(v_descale.value(), batch_size, num_heads_k);
+    } else if (quant_mode == 4) {
+      TORCH_CHECK(v_descale.has_value(), "v_descale must be provided when dtype is float8_e4m3fn and quant_mode is 4");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_SHAPE(q_descale.value(), batch_size);
+      CHECK_SHAPE(k_descale.value(), batch_size);
+      CHECK_SHAPE(v_descale.value(), batch_size);
+    } else if (quant_mode == 5) {
+      TORCH_CHECK(v_descale.has_value(), "v_descale must be provided when dtype is float8_e4m3fn and quant_mode is 5");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_SHAPE(q_descale.value(), 1);
+      CHECK_SHAPE(k_descale.value(), 1);
+      CHECK_SHAPE(v_descale.value(), 1);
+    }
+  }
 
   Hstu_fwd_params params;
   set_params_fprop(params,
@@ -475,49 +637,31 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
                     max_seqlen_q, max_seqlen_k, target_group_size,
                     seqlen_q_rounded, seqlen_k_rounded,
                     num_heads, num_heads_k, num_heads_rab,
-                    head_size, alpha,
+                    head_size, alpha, quant_mode,
                     q, k, v,
+                    is_fp8 ? q_descale.value() : torch::Tensor(),
+                    is_fp8 ? k_descale.value() : torch::Tensor(),
+                    is_fp8 ? v_descale.value() : torch::Tensor(),
                     has_rab ? rab.value() : torch::Tensor(), out,
                     num_contexts.has_value() ? num_contexts.value().data_ptr() : nullptr,
                     cu_seqlens_q.data_ptr(),
                     cu_seqlens_k.data_ptr(),
+                    cu_seqlens_vt_descale.has_value() ? cu_seqlens_vt_descale.value().data_ptr() : nullptr,
+                    cu_seqlens_q_block_descale.has_value() ? cu_seqlens_q_block_descale.value().data_ptr() : nullptr,
+                    cu_seqlens_kv_block_descale.has_value() ? cu_seqlens_kv_block_descale.value().data_ptr() : nullptr,
                     num_targets.has_value() ? num_targets.value().data_ptr() : nullptr,
                     has_rab,
                     func.has_value() ? func.value() : torch::Tensor(),
                     window_size_left,
-                    window_size_right);
+                    window_size_right,
+                    vt.has_value() ? vt.value() : torch::Tensor(),
+                    vt_descale.has_value() ? vt_descale.value() : torch::Tensor());
 
   auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32)); // TODO: if arbitrary mask, do not need zeros it, just empty
   params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
 
   params.total_q = total_q;
   params.total_k = total_k;
-
-  if(q_type == at::ScalarType::Float8_e4m3fn) {
-    at::Tensor descale_q, descale_k, descale_v;
-    if (descale_q_.has_value() && descale_k_.has_value() && descale_k_.has_value()) {
-      descale_q = descale_q_.value();
-      descale_k = descale_k_.value();
-      descale_v = descale_v_.value();
-      CHECK_DEVICE(descale_q);
-      CHECK_DEVICE(descale_k);
-      CHECK_DEVICE(descale_v);
-      CHECK_SHAPE(descale_q, 1);
-      CHECK_SHAPE(descale_k, 1);
-      CHECK_SHAPE(descale_v, 1);
-    } else {
-      descale_q = torch::ones({1}, opts.dtype(at::kFloat));
-      descale_k = torch::ones({1}, opts.dtype(at::kFloat));
-      descale_v = torch::ones({1}, opts.dtype(at::kFloat));
-    }
-    params.descale_q_ptr = descale_q.data_ptr<float>();
-    params.descale_k_ptr = descale_k.data_ptr<float>();
-    params.descale_v_ptr = descale_v.data_ptr<float>();
-  } else {
-    params.descale_q_ptr = nullptr;
-    params.descale_k_ptr = nullptr;
-    params.descale_v_ptr = nullptr;
-  }
 
   if (total_k > 0) {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -531,7 +675,7 @@ hstu_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_
 }
 
 template <typename Dtype, int Headdim>
-void run_hstu_bwd_mask_16(Hstu_bwd_params &params, cudaStream_t stream) {
+void run_hstu_bwd_mask(Hstu_bwd_params &params, cudaStream_t stream) {
   RAB_DRAB_SWITCH(params.has_rab, params.has_drab, Has_rab, Has_drab, [&] {
     #ifndef HSTU_DISABLE_ARBITRARY
     if (params.is_arbitrary_mask) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, Has_drab, false, false, false, false, true, HSTU_ARBITRARY_NFUNC>(params, stream); return; }
@@ -552,68 +696,80 @@ void run_hstu_bwd_mask_16(Hstu_bwd_params &params, cudaStream_t stream) {
   });
 }
 
-template <typename Dtype, int Headdim>
-void run_hstu_bwd_mask_8(Hstu_bwd_params &params, cudaStream_t stream) {
-  RAB_SWITCH(params.has_rab, Has_rab, [&] {
-    #ifndef HSTU_DISABLE_LOCAL
-    if (params.is_local) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, true, false, false, false, false, 0>(params, stream); return; }
-    #endif
-    #ifndef HSTU_DISABLE_CAUSAL
-    if (params.is_causal) { run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, false, true, false, false, false, 0>(params, stream); return; }
-    #endif
-    run_hstu_bwd_<90, Dtype, Headdim, Has_rab, false, false, false, false, false, false, 0>(params, stream);
-  });
-}
-
 void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
   #ifndef HSTU_DISABLE_BACKWARD
     if (params.is_bf16) {
       #ifndef HSTU_DISABLE_BF16
       #ifndef HSTU_DISABLE_HDIM32
-      if (params.d == 32) { run_hstu_bwd_mask_16<cutlass::bfloat16_t, 32>(params, stream); }
+      if (params.d == 32) { run_hstu_bwd_mask<cutlass::bfloat16_t, 32>(params, stream); }
       #endif
       #ifndef HSTU_DISABLE_HDIM64
-      if (params.d == 64) { run_hstu_bwd_mask_16<cutlass::bfloat16_t, 64>(params, stream); }
+      if (params.d == 64) { run_hstu_bwd_mask<cutlass::bfloat16_t, 64>(params, stream); }
       #endif
       #ifndef HSTU_DISABLE_HDIM128
-      if (params.d == 128) { run_hstu_bwd_mask_16<cutlass::bfloat16_t, 128>(params, stream); }
+      if (params.d == 128) { run_hstu_bwd_mask<cutlass::bfloat16_t, 128>(params, stream); }
       #endif
       #ifndef HSTU_DISABLE_HDIM256
-      if (params.d == 256) { run_hstu_bwd_mask_16<cutlass::bfloat16_t, 256>(params, stream); }
+      if (params.d == 256) { run_hstu_bwd_mask<cutlass::bfloat16_t, 256>(params, stream); }
       #endif
       #else
       TORCH_CHECK(false, "This flash attention build does not support BF16.");
       #endif
     } else if (params.is_e4m3) {
-      // #ifndef HSTU_DISABLE_FP8
-      // #ifndef HSTU_DISABLE_HDIM32
-      // if (params.d == 32) { std::cerr << "Not support dim = 32 and dtype = float_e4m3_t for now." << std::endl; }
-      // #endif
-      // #ifndef HSTU_DISABLE_HDIM64
-      // if (params.d == 64) { run_hstu_bwd_mask_8<cutlass::float_e4m3_t, 64>(params, stream); }
-      // #endif
-      // #ifndef HSTU_DISABLE_HDIM128
-      // if (params.d == 128) { run_hstu_bwd_mask_8<cutlass::float_e4m3_t, 128>(params, stream); }
-      // #endif
-      // #ifndef HSTU_DISABLE_HDIM256
-      // if (params.d == 256) { run_hstu_bwd_mask_8<cutlass::float_e4m3_t, 256>(params, stream); }
-      // #endif
-      // #else
-      // TORCH_CHECK(false, "This flash attention build does not support FP8.");
-      // #endif
+      #ifndef HSTU_DISABLE_FP8
+      #ifndef HSTU_USE_E5M2_BWD
+      #ifndef HSTU_DISABLE_HDIM32
+      if (params.d == 32) { std::cerr << "Not support dim = 32 and dtype = float_e4m3_t for now." << std::endl; }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM64
+      if (params.d == 64) { run_hstu_bwd_mask<cutlass::float_e4m3_t, 64>(params, stream); }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM128
+      if (params.d == 128) { run_hstu_bwd_mask<cutlass::float_e4m3_t, 128>(params, stream); }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM256
+      if (params.d == 256) { run_hstu_bwd_mask<cutlass::float_e4m3_t, 256>(params, stream); }
+      #endif
+      #else
+      TORCH_CHECK(false, "This flash attention build does not support e4m3 bwd.");
+      #endif
+      #else
+      TORCH_CHECK(false, "This flash attention build does not support FP8.");
+      #endif
+    } else if (params.is_e5m2) {
+      #ifndef HSTU_DISABLE_FP8
+      #ifdef HSTU_USE_E5M2_BWD
+      #ifndef HSTU_DISABLE_HDIM32
+      if (params.d == 32) { std::cerr << "Not support dim = 32 and dtype = float_e5m2_t for now." << std::endl; }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM64
+      if (params.d == 64) { run_hstu_bwd_mask<cutlass::float_e5m2_t, 64>(params, stream); }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM128
+      if (params.d == 128) { run_hstu_bwd_mask<cutlass::float_e5m2_t, 128>(params, stream); }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM256
+      if (params.d == 256) { run_hstu_bwd_mask<cutlass::float_e5m2_t, 256>(params, stream); }
+      #endif
+      #else
+      TORCH_CHECK(false, "This flash attention build does not support e5m2 bwd.");
+      #endif
+      #else
+      TORCH_CHECK(false, "This flash attention build does not support FP8.");
+      #endif
     } else {
       #ifndef HSTU_DISABLE_FP16
       #ifndef HSTU_DISABLE_HDIM32
-      if (params.d == 32) { run_hstu_bwd_mask_16<cutlass::half_t, 32>(params, stream); }
+      if (params.d == 32) { run_hstu_bwd_mask<cutlass::half_t, 32>(params, stream); }
       #endif
       #ifndef HSTU_DISABLE_HDIM64
-      if (params.d == 64) { run_hstu_bwd_mask_16<cutlass::half_t, 64>(params, stream); }
+      if (params.d == 64) { run_hstu_bwd_mask<cutlass::half_t, 64>(params, stream); }
       #endif
       #ifndef HSTU_DISABLE_HDIM128
-      if (params.d == 128) { run_hstu_bwd_mask_16<cutlass::half_t, 128>(params, stream); }
+      if (params.d == 128) { run_hstu_bwd_mask<cutlass::half_t, 128>(params, stream); }
       #endif
       #ifndef HSTU_DISABLE_HDIM256
-      if (params.d == 256) { run_hstu_bwd_mask_16<cutlass::half_t, 256>(params, stream); }
+      if (params.d == 256) { run_hstu_bwd_mask<cutlass::half_t, 256>(params, stream); }
       #endif
       #else
       TORCH_CHECK(false, "This flash attention build does not support FP16.");
@@ -624,8 +780,11 @@ void run_hstu_bwd(Hstu_bwd_params &params, cudaStream_t stream) {
 
 std::vector<at::Tensor> hstu_varlen_bwd(
     const at::Tensor &dout,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+    std::optional<const at::Tensor> &dout_t,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+    std::optional<const at::Tensor> &q_t,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const at::Tensor &k,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+    std::optional<const at::Tensor> &k_t,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor &v,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
     std::optional<const at::Tensor> &dq_,
     std::optional<const at::Tensor> &dk_,
@@ -640,18 +799,35 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     int window_size_left,
     int window_size_right,
     const float alpha,
+    const int quant_mode,
     std::optional<at::Tensor> &rab,
     const bool has_drab,
     std::optional<const at::Tensor>& func,
+    std::optional<const at::Tensor> &q_descale,
+    std::optional<const at::Tensor> &descale_qt_,
+    std::optional<const at::Tensor> &k_descale,
+    std::optional<const at::Tensor> &descale_kt_,
+    std::optional<const at::Tensor> &v_descale,
+    std::optional<const at::Tensor> &do_descale,
+    std::optional<const at::Tensor> &descale_dot_,
+    std::optional<const at::Tensor> &cu_seqlens_descale_qt_,
+    std::optional<const at::Tensor> &cu_seqlens_descale_kt_,
+    std::optional<const at::Tensor> &cu_seqlens_q_block_descale,
+    std::optional<const at::Tensor> &cu_seqlens_kv_block_descale,
     const bool deterministic) {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
+  auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   auto q_dtype = q.dtype();
-  TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-              "HSTU only support fp16 and bf16 data type");
+  TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 ||
+            q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e5m2,
+              "HSTU bwd only supports fp16, bf16, fp8_e4m3, and fp8_e5m2 data type");
+  if (dprops->major < 9) {
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "HSTU on Ampere/Ada cards only supports fp16 and bf16 data type");
+  }
   TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
   TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
   TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
@@ -729,6 +905,12 @@ std::vector<at::Tensor> hstu_varlen_bwd(
   at::Tensor dv = dv_.has_value() ? dv_.value() : torch::empty_like(v);
 
 
+  if (q_dtype == at::ScalarType::Float8_e4m3fn) {
+    dq = dq.to(torch::kFloat16);
+    dk = dk.to(torch::kFloat16);
+    dv = dv.to(torch::kFloat16);
+  }
+
   // Otherwise the kernel will be launched from cuda:0 device
   at::cuda::CUDAGuard device_guard{q.get_device()};
 
@@ -745,6 +927,63 @@ std::vector<at::Tensor> hstu_varlen_bwd(
       drab = torch::empty({seqlen_k_rounded}, opts);
   }
 
+  at::Tensor dot_value = dout_t.has_value() ? dout_t.value() : torch::Tensor();
+  at::Tensor qt_value = q_t.has_value() ? q_t.value() : torch::Tensor();
+  at::Tensor kt_value = k_t.has_value() ? k_t.value() : torch::Tensor();
+  if (q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e5m2) {
+    TORCH_CHECK(q_descale.has_value() && k_descale.has_value() && v_descale.has_value() && do_descale.has_value(),
+                "q_descale, k_descale, v_descale, and do_descale must be provided when dtype is float8");
+    CHECK_DEVICE(q_descale.value());
+    CHECK_DEVICE(k_descale.value());
+    CHECK_DEVICE(v_descale.value());
+    CHECK_DEVICE(do_descale.value());
+    if (quant_mode == 1) {
+      TORCH_CHECK(q_t.has_value() && k_t.has_value(),
+                  "q_t and k_t must be provided when dtype is float8 and dout_t is provided");
+      TORCH_CHECK(descale_qt_.has_value() && descale_kt_.has_value() && descale_dot_.has_value(),
+                  "descale_qt_, descale_kt_, and descale_dot_ must be provided when dtype is float8");
+      TORCH_CHECK(cu_seqlens_descale_qt_.has_value() && cu_seqlens_descale_kt_.has_value(),
+                  "cu_seqlens_descale_qt_ and cu_seqlens_descale_kt_ must be provided when dtype is float8");
+      CHECK_DEVICE(qt_value);
+      CHECK_DEVICE(kt_value);
+      CHECK_DEVICE(dot_value);
+      CHECK_DEVICE(descale_qt_.value());
+      CHECK_DEVICE(descale_kt_.value());
+      CHECK_DEVICE(descale_dot_.value());
+      CHECK_DEVICE(cu_seqlens_descale_qt_.value());
+      CHECK_DEVICE(cu_seqlens_descale_kt_.value());
+      CHECK_SHAPE(dot_value, total_q, num_heads, head_size);
+      CHECK_SHAPE(qt_value, total_q, num_heads, head_size);
+      CHECK_SHAPE(kt_value, total_k, num_heads_k, head_size);
+      CHECK_SHAPE(cu_seqlens_descale_qt_.value(), batch_size + 1);
+      CHECK_SHAPE(cu_seqlens_descale_kt_.value(), batch_size + 1);
+      // Add 128 to the total_q and total_k to avoid out of bounds access
+      CHECK_SHAPE(q_descale.value(), num_heads, total_q + 128);
+      CHECK_SHAPE(k_descale.value(), num_heads_k, total_k + 128);
+      CHECK_SHAPE(v_descale.value(), num_heads_k, total_k + 128);
+      CHECK_SHAPE(do_descale.value(), num_heads, total_q + 128);
+    } else if (quant_mode == 2) {
+      TORCH_CHECK(cu_seqlens_q_block_descale.has_value() && cu_seqlens_kv_block_descale.has_value(),
+                  "cu_seqlens_q_block_descale and cu_seqlens_kv_block_descale must be provided when dtype is float8 and quant_mode is 2");
+      CHECK_DEVICE(cu_seqlens_q_block_descale.value());
+      CHECK_DEVICE(cu_seqlens_kv_block_descale.value());
+      CHECK_SHAPE(cu_seqlens_q_block_descale.value(), batch_size + 1);
+      CHECK_SHAPE(cu_seqlens_kv_block_descale.value(), batch_size + 1);
+    } else if (quant_mode == 3) {
+      CHECK_SHAPE(q_descale.value(), batch_size, num_heads);
+      CHECK_SHAPE(k_descale.value(), batch_size, num_heads_k);
+      CHECK_SHAPE(v_descale.value(), batch_size, num_heads_k);
+    } else if (quant_mode == 4) {
+      CHECK_SHAPE(q_descale.value(), batch_size);
+      CHECK_SHAPE(k_descale.value(), batch_size);
+      CHECK_SHAPE(v_descale.value(), batch_size);
+    } else if (quant_mode == 5) {
+      CHECK_SHAPE(q_descale.value(), 1);
+      CHECK_SHAPE(k_descale.value(), 1);
+      CHECK_SHAPE(v_descale.value(), 1);
+    }
+  }
+
   Hstu_bwd_params params;
 
   set_params_dgrad(params,
@@ -752,12 +991,23 @@ std::vector<at::Tensor> hstu_varlen_bwd(
                     max_seqlen_q, max_seqlen_k, target_group_size,
                     seqlen_q_rounded, seqlen_k_rounded,
                     num_heads, num_heads_k, num_heads_rab,
-                    head_size, alpha,
-                    q, k, v, dout,
+                    head_size, alpha, quant_mode,
+                    q, qt_value, k, kt_value, v, dout, dot_value,
                     has_rab ? rab.value() : torch::Tensor(),
+                    do_descale.has_value() ? do_descale.value() : torch::Tensor(),
+                    q_descale.has_value() ? q_descale.value() : torch::Tensor(),
+                    k_descale.has_value() ? k_descale.value() : torch::Tensor(),
+                    v_descale.has_value() ? v_descale.value() : torch::Tensor(),
+                    descale_dot_.has_value() ? descale_dot_.value() : torch::Tensor(),
+                    descale_qt_.has_value() ? descale_qt_.value() : torch::Tensor(),
+                    descale_kt_.has_value() ? descale_kt_.value() : torch::Tensor(),
                     dq, dk, dv, drab,
                     num_contexts.has_value() ? num_contexts.value().data_ptr() : nullptr,
                     cu_seqlens_q.data_ptr(), cu_seqlens_k.data_ptr(),
+                    cu_seqlens_descale_qt_.has_value() ? cu_seqlens_descale_qt_.value().data_ptr() : cu_seqlens_q.data_ptr(),
+                    cu_seqlens_descale_kt_.has_value() ? cu_seqlens_descale_kt_.value().data_ptr() : cu_seqlens_k.data_ptr(),
+                    cu_seqlens_q_block_descale.has_value() ? cu_seqlens_q_block_descale.value().data_ptr() : nullptr,
+                    cu_seqlens_kv_block_descale.has_value() ? cu_seqlens_kv_block_descale.value().data_ptr() : nullptr,
                     num_targets.has_value() ? num_targets.value().data_ptr() : nullptr,
                     dq_accum.data_ptr(),
                     func.has_value() ? func.value() : torch::Tensor(),

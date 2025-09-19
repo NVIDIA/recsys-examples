@@ -30,7 +30,6 @@ namespace flash {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template <bool Is_balance_fwd = false>
 struct SingleTileScheduler {
 
 public:
@@ -46,36 +45,31 @@ public:
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        return {};
+      return {};
     }
 
     static dim3
     get_grid_dim(Arguments const& args, int num_sm) {
-        if constexpr (Is_balance_fwd) {
-            return {uint32_t(args.num_head), uint32_t(args.num_batch), uint32_t(args.num_blocks_m)};
-        } else {
-            return {uint32_t(args.num_blocks_m), uint32_t(args.num_head), uint32_t(args.num_batch)};
-        }
+      return {uint32_t(args.num_blocks_m), uint32_t(args.num_head), uint32_t(args.num_batch)};
     }
 
     struct WorkTileInfo {
-        int M_idx = 0;
-        int H_idx = 0;
-        int B_idx = 0;
-        bool is_valid_tile = false;
+      int M_idx = 0;
+      int H_idx = 0;
+      int B_idx = 0;
+      bool is_valid_tile = false;
 
-        CUTLASS_DEVICE
-        bool
-        is_valid(Params const& params) const {
-            return is_valid_tile;
-        }
+      CUTLASS_DEVICE
+      bool
+      is_valid(Params const& params) const {
+          return is_valid_tile;
+      }
 
-        CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t>
-        get_block_coord(Params const& params) const {
-            return {M_idx, H_idx, B_idx};
-        }
-
+      CUTLASS_DEVICE
+      cute::tuple<int32_t, int32_t, int32_t>
+      get_block_coord(Params const& params) const {
+          return {M_idx, H_idx, B_idx};
+      }
     };
 
     CUTLASS_DEVICE
@@ -84,11 +78,7 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work() const {
-        if constexpr (Is_balance_fwd) {
-            return {int(gridDim.z - 1 - blockIdx.z), int(blockIdx.x), int(blockIdx.y), true};
-        } else {
-            return {int(gridDim.x - 1 - blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
-        }
+      return {int(gridDim.x - 1 - blockIdx.x), int(blockIdx.y), int(blockIdx.z), true};
     }
 
     CUTLASS_DEVICE
@@ -99,15 +89,11 @@ public:
     void
     prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
 
-    CUTLASS_DEVICE
-    void
-    broadcast_next_work(WorkTileInfo& current_work) const {}
-
     template<bool IsProducer=false>
     CUTLASS_DEVICE
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
-        return {-1, -1, -1, false};
+      return {-1, -1, -1, false};
     }
 
 };
@@ -192,16 +178,6 @@ public:
         if (threadIdx.x % NumProducerThreads == 0) {
             current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
         }
-    }
-
-    CUTLASS_DEVICE
-    void
-    broadcast_next_work(WorkTileInfo& current_work) const {
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-        if (threadIdx.x % NumProducerThreads == 0) {
-            *tile_count_smem = current_work.tile_idx;
-        }
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<int>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
     }
 
     template<bool IsProducerWarp=false>
