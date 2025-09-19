@@ -219,7 +219,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_offsets=kv_cache_metadata.kv_indptr,
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
-            seq_offsets_t=jd.num_candidates_offsets,
+            cu_seqlens_t=jd.num_candidates_offsets,
         )
 
         jagged_attn_output = jagged_attn_output.view(
@@ -334,7 +334,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_offsets=kv_cache_metadata.kv_indptr,
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
-            seq_offsets_t=jd.num_candidates_offsets[: batch_size + 1],
+            cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1],
         )
 
         jagged_attn_output = jagged_attn_output.view(
