@@ -26,7 +26,7 @@ import warnings
 from pathlib import Path
 
 from packaging.version import Version, parse
-from setuptools import Extension, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 with open("../README.md", "r", encoding="utf-8") as fh:
@@ -531,9 +531,17 @@ class NinjaBuildExtension(BuildExtension):
 setup(
     name=PACKAGE_NAME,
     version="0.1.1" + "+cu" + str(bare_metal_version),
-    packages=["hopper"],
-    package_dir={"hopper": "."},
-    package_data={"hopper": ["*.py"]},
+    packages=find_packages(
+        exclude=(
+            "build",
+            "csrc",
+            "include",
+            "tests",
+            "dist",
+            "docs",
+            "benchmarks",
+        )
+    ),
     author="NVIDIA-DevTech",
     py_modules=["hstu_attn_interface"],
     description="HSTU Attention",
