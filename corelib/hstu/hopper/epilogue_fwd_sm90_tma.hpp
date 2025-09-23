@@ -211,7 +211,7 @@ struct CollectiveEpilogueFwd {
     // Repeat the partitioning with identity layouts
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-    #pragma unroll
+    CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(epilogue_params.layout_O.shape()); }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(

@@ -124,23 +124,6 @@ void set_params_fprop(Hstu_fwd_params* params,
     TORCH_CHECK(q.dtype() != torch::kFloat16, "This hstu attention build does not support fp16.");
   #endif
 
-  // Set the block scheduling
-  // float coeff = 0.3;
-  params->is_balance_fwd = false;
-  params->is_balance_bwd = false;
-  // auto dprops = at::cuda::getCurrentDeviceProperties();
-  // int l2_size = dprops->l2CacheSize;
-  // int sm_count = dprops->multiProcessorCount;
-  // int num_KV = std::min(sm_count, int(b * h_k));
-  // int kv_cache_size = 2 * seqlen_k * num_KV * d * sizeof(k.dtype()) * coeff;
-  // int do_cache_size = seqlen_q * num_KV * d * sizeof(out.dtype()) * coeff;
-  // if (kv_cache_size < l2_size) {
-  //   params->is_balance_fwd = true;
-  // }
-  // if (kv_cache_size + do_cache_size < l2_size) {
-  //   params->is_balance_bwd = true;
-  // }
-
   // Set the dimensions.
   params->b = b;
   params->h = h;

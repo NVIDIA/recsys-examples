@@ -42,18 +42,16 @@ make install
 
     ![Delta_q+causal mask](deltaq_causal.png)
 
+  * Arbitrary mask
+
 ### HSTU-3
 - **Source**: `hopper/`
-- **Interface**: `hopper/flash_attn_interface.py`
+- **Interface**: `hopper/hstu_attn_interface.py`
 - **Supported GPUs**: Hopper only (H100, H20)
-- **Data types**: FP16, BF16 (forward and backward), FP8 (forward only)
+- **Data types**: FP16, BF16, and FP8
 - **Head dimensions**: 32, 64, 128, 256 for FP16/BF16; 64, 128, 256 for FP8
-- **Attention masks**:
-  * For FP16/BF16, same as HSTU-2
-  * For FP8, only supports:
-    + No mask
-    + Causal mask
-    + Local mask
+- **Quantization for FP8**: Support 1xDIM and 128x1 quantization, per-block quantization, per-head quantization, per-batch quantization and per-tensor quantization.
+- **Attention masks**: Same as HSTU-2.
 - **Note**: Only undeterministic backward implementation
 
 ## Unified Interface
@@ -65,8 +63,8 @@ def hstu_attn_varlen_func(
     q,                      # (total_q, nheads, headdim)
     k,                      # (total_k, nheads_k, headdim), nheads should be equal to nhead_k
     v,                      # (total_k, nheads_k, headdim)
-    seq_offsets_q,          # (batch_size + 1,), cumulative sequence lengths for q
-    seq_offsets_k,          # (batch_size + 1,), cumulative sequence lengths for k/v
+    cu_seqlens_q,          # (batch_size + 1,), cumulative sequence lengths for q
+    cu_seqlens_k,          # (batch_size + 1,), cumulative sequence lengths for k/v
     max_seqlen_q,           # Maximum query sequence length
     max_seqlen_k,           # Maximum k/v sequence length
     num_contexts=None,      # (batch_size,), context tokens per batch
@@ -78,10 +76,7 @@ def hstu_attn_varlen_func(
                             # nheads should be divisible by nhead_rab
     has_drab=False,         # Whether to apply drab
     is_delta_q=False,       # Whether to apply delta_q
-    descale_q=None,         # (1,), descaling factor for query
-    descale_k=None,         # (1,), descaling factor for key
-    descale_v=None,         # (1,), descaling factor for value
-    descale_do=None,        # (1,), descaling factor for do
+    quantization_mode=-1,   # -1: no quantization, 0: cast to fp8, 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization.
 )
 ```
 

@@ -25,6 +25,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <tuple>
+#include <float.h>
+#include <optional>
 
 #include <cuda_fp16.h>
 
@@ -39,6 +41,13 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+
+#include <cub/cub.cuh>
+#define NO_FP8_COLUMN_PERMUTE
+
+#ifndef EPSILON
+#define EPSILON 1e-6
+#endif
 
 #define CHECK_CUDA(call)                                                                            \
   do {                                                                                              \
@@ -55,6 +64,17 @@
 namespace flash {
 
 using namespace cute;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+CUTLASS_DEVICE
+void warpReduceMax(T& val) {
+  CUTLASS_PRAGMA_UNROLL
+  for (int offset = 16; offset > 0; offset /= 2) {
+    val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -144,11 +164,11 @@ struct MinOp {
 
 template<typename T, typename Op>
 __inline__ __device__ void warpReduce(T& val, Op op) {
-  #pragma unroll
+  CUTLASS_PRAGMA_UNROLL
   for (int mask = 16; mask > 0; mask >>= 1)
     val = op(val, __shfl_xor_sync(0xffffffff, val, mask, 32));
 }
-// 
+//
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // For SM90, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
@@ -193,19 +213,33 @@ CUTLASS_DEVICE auto convert_layout_acc_Aregs_fp8(Layout acc_layout) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Byte permute for fp8 kernel
-template <typename Fragment>
-CUTLASS_DEVICE void permute_regs_A_to_C(Fragment &accum) {
-  auto data = accum.data();
+template <bool Transpose = false, typename Fragment>
+CUTLASS_DEVICE void permute_regs_C_to_A(Fragment &accum) {
+    static constexpr int upper_map[4] = {0, 3, 1, 2};
+    static constexpr int lower_map[4] = {1, 2, 0, 3};
 
-  CUTLASS_PRAGMA_UNROLL
-  for (int n = 0; n < size(accum); n += 8) {
-    uint32_t *data_32bit = reinterpret_cast<uint32_t *>(&data[n]);
-    auto upper = data_32bit[0];
-    auto lower = data_32bit[1];
-    data_32bit[0] = __byte_perm(upper, lower, 0x5410);
-    data_32bit[1] = __byte_perm(upper, lower, 0x7632);
-  }
+    int quad_idx = threadIdx.x % 4;
+    bool lane_03 = quad_idx == 0 || quad_idx == 3;
+
+    Tensor frag_64b = recast<uint2>(accum);
+    uint32_t upper, lower;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(frag_64b); ++i) {
+        upper = frag_64b[i].x;
+        lower = frag_64b[i].y;
+        if constexpr (!Transpose) {
+          uint32_t upper0 = lane_03 ? upper : lower;
+          uint32_t lower0 = lane_03 ? lower : upper;
+          upper0 = __shfl_sync(uint32_t(-1), upper0, upper_map[quad_idx], 4);
+          lower0 = __shfl_sync(uint32_t(-1), lower0, lower_map[quad_idx], 4);
+          upper = lane_03 ? upper0 : lower0;
+          lower = lane_03 ? lower0 : upper0;
+        }
+        frag_64b[i].x = __byte_perm(upper, lower, 0x5410);
+        frag_64b[i].y = __byte_perm(upper, lower, 0x7632);
+    }
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -376,13 +410,13 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
   if constexpr (Is_fp8) {
     if constexpr (Has_rab) {
       if constexpr (Headdim == 64) {
-        return {192, 128, 16};
+        return {128, 128, 12};
       } else {
         return {128, 64, 12};
       }
     } else {
       if constexpr (Headdim == 64) {
-        return {192, 128, 16};
+        return {128, 128, 12};
       } else if constexpr (Headdim == 128) {
         return {128, 128, 12};
       } else {
@@ -411,21 +445,25 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
 }
 
 // {kBlockM, kBlockN, kNWarpGroups}
-template <int Headdim, bool Has_rab>
+template <int Headdim, bool Has_rab, bool Is_fp8>
 constexpr std::tuple<int, int, int> get_tile_size_bwd() {
-  if constexpr (Has_rab) {
-    if constexpr (Headdim <= 64) {
-      return {64, 128, 3};
-    } else {
-      return {64, 64, 3};
-    }
+  if constexpr (Is_fp8) {
+    return {64, 128, 3};
   } else {
-    if constexpr (Headdim <= 64) {
-      return {128, 128, 3};
-    } else if constexpr (Headdim <= 128) {
-      return {64, 128, 3};
+    if constexpr (Has_rab) {
+      if constexpr (Headdim <= 64) {
+        return {64, 128, 3};
+      } else {
+        return {64, 64, 3};
+      }
     } else {
-      return {64, 64, 3};
+      if constexpr (Headdim <= 64) {
+        return {128, 128, 3};
+      } else if constexpr (Headdim <= 128) {
+        return {64, 128, 3};
+      } else {
+        return {64, 64, 3};
+      }
     }
   }
 }
