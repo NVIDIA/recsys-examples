@@ -114,6 +114,13 @@ public:
     void* scores = nullptr,                   // (n)
     cudaStream_t stream = 0) const override;
 
+  void find_pointers(
+    const size_t n, const void* keys,         // (n)
+    void** values,                            // (n)
+    bool* founds,                             // (n)
+    void* scores = nullptr,                   // (n)
+    cudaStream_t stream = 0) override;
+
   void erase(const size_t n, const void* keys,
            cudaStream_t stream = 0) override;
   

@@ -283,26 +283,20 @@ void find_pointers(
   auto values_data_ptr = reinterpret_cast<void**>(values.data_ptr<int64_t>());
   auto found_tensor_data_ptr = founds.data_ptr<bool>();
 
-  table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, 
-      nullptr, stream);
-  
   // update score.
   if (score.has_value()) {
-    at::Tensor locked_ptr = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kLong));
-    at::Tensor success = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kBool));
+    void * score_ptr = nullptr;
     if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
       auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
       // broadcast scores
       at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
       bc_scores.fill_(score.value());
-      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                  success.data_ptr<bool>(), bc_scores.data_ptr(), stream);
-    } else {
-      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                  success.data_ptr<bool>(), nullptr, stream);
-    }
-    AT_CUDA_CHECK(cudaGetLastError());
-    table->unlock(n, reinterpret_cast<void**>(locked_ptr.data_ptr()), keys.data_ptr(), success.data_ptr<bool>(), stream);
+      score_ptr = bc_scores.data_ptr();
+    } 
+    table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, score_ptr, stream);
+  } else {
+    std::shared_ptr<const dyn_emb::DynamicVariableBase> const_table = table;
+    const_table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, nullptr, stream);
   }
 }
 
