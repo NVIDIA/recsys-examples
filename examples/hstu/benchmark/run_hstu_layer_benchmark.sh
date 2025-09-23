@@ -26,17 +26,20 @@ for dim_per_head in "${dim_per_heads[@]}"; do
                 echo "==== dim_per_head: $dim_per_head, num_heads: $num_head, max_seqlen: $max_seqlen, batchsize: $batchsize, full_sequence: $full_sequence, num_layers: $num_layers ==== "
                 native_output_profile_name="${gpu_arch}_native_bs${batchsize}_dim${dim_per_head}_heads${num_head}_seqlen${max_seqlen}_async${ASYNC_WGRAD}"
                 fused_output_profile_name="${gpu_arch}_fused_bs${batchsize}_dim${dim_per_head}_heads${num_head}_seqlen${max_seqlen}_async${ASYNC_WGRAD}"
+                debug_output_profile_name="${gpu_arch}_debug_bs${batchsize}_dim${dim_per_head}_heads${num_head}_seqlen${max_seqlen}_async${ASYNC_WGRAD}"
 
                 if [ "$PROFILE" -eq 1 ]; then
                     fused_nsys_cmd="nsys profile -o ./profile/${fused_output_profile_name} ${nsys_profile_args}"
                     native_nsys_cmd="nsys profile -o ./profile/${native_output_profile_name} ${nsys_profile_args}"
+                    debug_nsys_cmd="nsys profile -o ./profile/${debug_output_profile_name} ${nsys_profile_args}"
                 else
                     fused_nsys_cmd=""
                     native_nsys_cmd=""
+                    debug_nsys_cmd=""
                 fi
-
+                echo -e "\n\033[32mfused layer\033[0m:"
                 ${fused_nsys_cmd} \
-                    python ./benchmark/fused_hstu_layer_benchmark.py run \
+                    python ./benchmark/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --layer-type fused \
@@ -53,10 +56,11 @@ for dim_per_head in "${dim_per_heads[@]}"; do
                     --profiler-end "$profiler_end" \
                     --recompute-input-silu "$RECOMPUTE_INPUT_SILU" \
                     --recompute-input-layernorm "$RECOMPUTE_INPUT_LAYERNORM" | tee "./profile/${gpu_arch}_${fused_output_profile_name}.log"
-
-                sleep 1
-                ${native_nsys_cmd} \
-                    python ./benchmark/fused_hstu_layer_benchmark.py run \
+                
+                # debug does not support recompute
+                echo -e "\n\033[32mdebug layer\033[0m:"
+                ${debug_nsys_cmd} \
+                    python ./benchmark/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --layer-type debug \
@@ -70,8 +74,27 @@ for dim_per_head in "${dim_per_heads[@]}"; do
                     --batchsize "$batchsize" \
                     --async-wgrad "$ASYNC_WGRAD" \
                     --profiler-start "$profiler_start" \
-                    --profiler-end "$profiler_end" | tee "./profile/${gpu_arch}_${native_output_profile_name}.log"
-                sleep 1
+                    --profiler-end "$profiler_end" \
+
+                echo -e "\n\033[32mnative layer\033[0m:"
+                ${native_nsys_cmd} \
+                    python ./benchmark/hstu_layer_benchmark.py run \
+                    --iters 100 \
+                    --warmup-iters 50 \
+                    --layer-type native \
+                    --kernel-backend cutlass \
+                    --full-sequence "$full_sequence" \
+                    --dim-per-head "$dim_per_head" \
+                    --num-heads "$num_head" \
+                    --num-layers "$num_layers" \
+                    --dtype bfloat16 \
+                    --max-seqlen "$max_seqlen" \
+                    --batchsize "$batchsize" \
+                    --async-wgrad "$ASYNC_WGRAD" \
+                    --profiler-start "$profiler_start" \
+                    --profiler-end "$profiler_end" \
+                    --recompute-input-silu "$RECOMPUTE_INPUT_SILU" \
+                    --recompute-input-layernorm "$RECOMPUTE_INPUT_LAYERNORM" | tee "./profile/${gpu_arch}_${native_output_profile_name}.log"
             done
         done
     done
