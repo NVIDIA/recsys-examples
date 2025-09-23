@@ -1424,12 +1424,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def flush(self) -> None:
         self.num_prefetch_ahead = 0
-        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE and self._caching:
             for cache, storage in zip(self._caches, self._storages):
                 cache.flush(storage)
 
     def reset_cache_states(self) -> None:
-        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+        if self.pooling_mode == DynamicEmbPoolingMode.NONE and self._caching:
             for cache in self._caches:
                 cache.reset()
 

@@ -72,7 +72,7 @@ class PyDictStorage(Storage):
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
 
-    def find(
+    def find_impl(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
@@ -111,6 +111,22 @@ class PyDictStorage(Storage):
             missing_indices, dtype=torch.long, device=self.device
         )
         return num_missing, missing_keys, missing_indices
+
+    def find_embeddings(
+        self,
+        unique_keys: torch.Tensor,
+        unique_embs: torch.Tensor,
+        founds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.find_impl(unique_keys, unique_embs, founds)
+
+    def find(
+        self,
+        unique_keys: torch.Tensor,
+        unique_vals: torch.Tensor,
+        founds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.find_impl(unique_keys, unique_vals, founds)
 
     def insert(
         self,

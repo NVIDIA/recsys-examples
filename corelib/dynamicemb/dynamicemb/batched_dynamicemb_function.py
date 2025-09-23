@@ -22,7 +22,12 @@ from dynamicemb.dynamicemb_config import (
     dyn_emb_to_torch,
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
-from dynamicemb.key_value_table import Cache, KeyValueTableFunction, Storage
+from dynamicemb.key_value_table import (
+    Cache,
+    KeyValueTableCachingFunction,
+    KeyValueTableFunction,
+    Storage,
+)
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
@@ -518,7 +523,7 @@ def dynamicemb_prefetch(
         end = h_unique_indices_table_range[i + 1]
         unique_indices_per_table = unique_indices[begin:end]
 
-        KeyValueTableFunction.prefetch(
+        KeyValueTableCachingFunction.prefetch(
             caches[i],
             storages[i],
             unique_indices_per_table,
@@ -576,15 +581,24 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             unique_indices_per_table = unique_indices[begin:end]
             unique_embs_per_table = unique_embs[begin:end, :]
 
-            KeyValueTableFunction.lookup(
-                caches[i],
-                storages[i],
-                unique_indices_per_table,
-                unique_embs_per_table,
-                initializers[i],
-                enable_prefetch,
-                training,
-            )
+            if caching:
+                KeyValueTableCachingFunction.lookup(
+                    caches[i],
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    initializers[i],
+                    enable_prefetch,
+                    training,
+                )
+            else:
+                KeyValueTableFunction.lookup(
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    initializers[i],
+                    training,
+                )
 
         if training or caching:
             output_embs = torch.empty(
@@ -627,7 +641,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
-        enable_prefetch = ctx.enable_prefetch
+        ctx.enable_prefetch
+        caching = caches[0] is not None
 
         input_dist_dedup = ctx.input_dist_dedup
         if input_dist_dedup:
@@ -646,13 +661,20 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             unique_indices_per_table = unique_indices[begin:end]
             unique_embs_per_table = unique_embs[begin:end, :]
 
-            KeyValueTableFunction.update(
-                caches[i],
-                storages[i],
-                unique_indices_per_table,
-                unique_embs_per_table,
-                optimizer,
-                enable_prefetch,
-            )
+            if caching:
+                KeyValueTableCachingFunction.update(
+                    caches[i],
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    optimizer,
+                )
+            else:
+                KeyValueTableFunction.update(
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    optimizer,
+                )
 
         return (None,) * 13
