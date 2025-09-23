@@ -1511,7 +1511,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             for i, storage in enumerate(self._storages):
                 if isinstance(storage, KeyValueTable):
                     table = cast(KeyValueTable, storage)
-                    table.score_update = True
+                    # if not training and not caching, we don't need to update score.
+                    table.score_update = self.training or self._caching
                     table.set_score(self._scores[self.table_names[i]])
             res = DynamicEmbeddingFunctionV2.apply(
                 indices,
