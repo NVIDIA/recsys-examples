@@ -34,6 +34,7 @@ from dynamicemb_extensions import (
     DynamicEmbTable,
     find_and_initialize,
     find_or_insert,
+    gather_embedding,
     get_table_range,
     lookup_backward,
     lookup_backward_dense,
@@ -604,7 +605,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             output_embs = torch.empty(
                 indices.shape[0], emb_dim, dtype=output_dtype, device=indices.device
             )
-            output_embs = unique_embs[inverse]
+            # output_embs = unique_embs[inverse]
+            gather_embedding(unique_embs, output_embs, inverse)
         else:
             output_embs = unique_embs
 

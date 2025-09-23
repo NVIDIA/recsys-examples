@@ -367,7 +367,7 @@ def test_forward_train_eval(opt_type, opt_params, caching, PS):
     bdebt.train()
     embs_train_non_exist = bdebt(indices, offsets)
     torch.cuda.synchronize()
-    
+
     torch.testing.assert_close(embs_train, embs_eval)
     torch.testing.assert_close(embs_train[1:, :], embs_non_exist[1:, :])
     assert torch.all(embs_non_exist[0, :] == 0)
