@@ -21,7 +21,7 @@ RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x8
 
 RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
       git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
-      pip install -e ./megatron-lm; \
+      pip install --no-deps -e ./megatron-lm; \
     fi
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers
