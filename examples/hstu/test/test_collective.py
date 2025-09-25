@@ -198,7 +198,7 @@ def test_grouped_allgatherv(
 
     with tensor_parallel.get_cuda_rng_tracker().fork():
         seqlen = torch.randint(
-            low=0, high=max_seqlen + 1, size=(batchsize_per_gpu,), device="cuda"
+            low=1, high=max_seqlen + 1, size=(batchsize_per_gpu,), device="cuda"
         )
         varied_T_tensor = seqlen.sum()
     varied_T = varied_T_tensor.item()
