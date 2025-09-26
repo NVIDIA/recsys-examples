@@ -411,7 +411,7 @@ def create_dynamic_embedding_tables(args, device):
     )
 
     for table_id in range(table_num):
-        cur_table = TableShim(var.tables[table_id])
+        cur_table = var.tables[table_id]
 
         num_embeddings = args.num_embeddings_per_feature[table_id]
         fill_batch = 1024 * 1024
@@ -428,8 +428,8 @@ def create_dynamic_embedding_tables(args, device):
                 dtype=torch.float32,
             )
 
-            optstate_dim = cur_table.optim_states_dim()
-            initial_accumulator = cur_table.init_optim_state()
+            optstate_dim = cur_table.optim_state_dim()
+            initial_accumulator = cur_table.init_optimizer_state()
             optstate = (
                 torch.rand(
                     unique_values.size(0),
@@ -448,7 +448,7 @@ def create_dynamic_embedding_tables(args, device):
                 if args.cache_algorithm == "lfu"
                 else None
             )
-            cur_table.insert(n, unique_indices, unique_values, scores)
+            cur_table.insert(unique_indices, unique_values, scores)
 
     return var
 

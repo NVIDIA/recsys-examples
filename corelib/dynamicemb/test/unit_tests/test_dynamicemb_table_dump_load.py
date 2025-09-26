@@ -19,14 +19,15 @@ import pytest
 import torch
 import torch.distributed as dist
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
-from dynamicemb.batched_dynamicemb_tables import TableShim
 from dynamicemb.dump_load import (
     export_keys_values,
     load_key_values,
     local_export,
     local_load,
 )
-from dynamicemb.dynamicemb_config import DynamicEmbCheckMode, create_dynamicemb_table
+from dynamicemb.dynamicemb_config import DynamicEmbCheckMode
+from dynamicemb.key_value_table import KeyValueTable
+from dynamicemb.optimizer import *
 from dynamicemb_extensions import EvictStrategy, OptimizerType, find
 from torchrec.distributed.comm import get_local_rank
 
@@ -41,7 +42,7 @@ device = torch.device(f"cuda:{local_rank}")
 
 
 def init_dynamicemb_table(
-    dynamicemb_table: TableShim, num_embeddings: int, embedding_dim: int
+    dynamicemb_table: KeyValueTable, num_embeddings: int, embedding_dim: int
 ):
     # Generate exactly num_embeddings unique random keys in range 0 to sys.maxsize
     # Use torch.randint to sample from the large range without creating a massive tensor
@@ -73,8 +74,8 @@ def init_dynamicemb_table(
     )
 
     opt_states = (
-        torch.randn(num_embeddings, dynamicemb_table.optim_states_dim(), device=device)
-        if dynamicemb_table.optim_states_dim() > 0
+        torch.randn(num_embeddings, dynamicemb_table.optim_state_dim(), device=device)
+        if dynamicemb_table.optim_state_dim() > 0
         else None
     )
 
@@ -89,15 +90,15 @@ def init_dynamicemb_table(
 
 
 def assert_two_dynamicemb_table_equal(
-    reference_table: TableShim,
+    reference_table: KeyValueTable,
     reference_table_optimizer_type: str,
-    table: TableShim,
+    table: KeyValueTable,
     table_optimizer_type: str,
 ):
     table_data_iterator = export_keys_values(table, device)
     for keys, embeddings, opt_states, scores in table_data_iterator:
         dim = reference_table.embedding_dim()
-        optstate_dim = reference_table.optim_states_dim()
+        optstate_dim = reference_table.optim_state_dim()
         value_type = reference_table.value_type()
         values = torch.empty(
             keys.numel() * (dim + optstate_dim),
@@ -108,7 +109,7 @@ def assert_two_dynamicemb_table_equal(
         scores = torch.empty(keys.numel(), device=device, dtype=torch.uint64)
 
         find(
-            reference_table.get_underlying_table(),
+            reference_table.table,
             keys.numel(),
             keys,
             values,
@@ -125,11 +126,41 @@ def assert_two_dynamicemb_table_equal(
 
         if (
             reference_table_optimizer_type == table_optimizer_type
-            and table.optim_states_dim() > 0
+            and table.optim_state_dim() > 0
             and optstate_dim > 0
         ):
             reference_opt_states = reference_values[:, dim:]
             torch.testing.assert_close(opt_states, reference_opt_states)
+
+
+def create_dummy_optimizer(optimizer_type, embedding_dtype):
+    optimizer_args = OptimizerArgs(
+        learning_rate=0.3,
+        weight_decay=0.06,
+        eps=3e-5,
+        beta1=0.8,
+        beta2=0.888,
+        initial_accumulator_value=0.0,
+    )
+    if optimizer_type == "sgd":
+        return SGDDynamicEmbeddingOptimizerV2(
+            optimizer_args,
+        )
+    elif optimizer_type == "adam":
+        return AdamDynamicEmbeddingOptimizerV2(
+            optimizer_args,
+        )
+    elif optimizer_type == "adagrad":
+        return AdaGradDynamicEmbeddingOptimizerV2(
+            optimizer_args,
+        )
+    elif optimizer_type == "rowwise_adagrad":
+        return RowWiseAdaGradDynamicEmbeddingOptimizerV2(
+            optimizer_args,
+            embedding_dtype,
+        )
+    else:
+        raise ValueError(f"Not supported optimizer type.")
 
 
 def create_table_options(
@@ -264,7 +295,11 @@ def test_dynamic_table_load_dump(
     print("num_embeddings", num_embeddings)
     print("embedding_dim", embedding_dim)
 
-    dynamicemb_table = TableShim(create_dynamicemb_table(dump_table_options))
+    dump_dummy_optimizer = create_dummy_optimizer(
+        dump_optimizer_type if dump_mode == "training" else "sgd",
+        dump_table_options.embedding_dtype,
+    )
+    dynamicemb_table = KeyValueTable(dump_table_options, dump_dummy_optimizer)
     keys, embeddings, scores, opt_states = init_dynamicemb_table(
         dynamicemb_table, num_embeddings, embedding_dim
     )
@@ -277,7 +312,11 @@ def test_dynamic_table_load_dump(
         "opt_file_path" if opt_states is not None else None,
     )
 
-    new_dynamicemb_table = TableShim(create_dynamicemb_table(load_table_options))
+    load_dummy_optimizer = create_dummy_optimizer(
+        load_optimizer_type if load_mode == "training" else "sgd",
+        load_table_options.embedding_dtype,
+    )
+    new_dynamicemb_table = KeyValueTable(load_table_options, load_dummy_optimizer)
 
     need_load_optimizer = (
         opt_states is not None

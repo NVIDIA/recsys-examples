@@ -20,6 +20,7 @@ import torch
 from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     create_dynamicemb_table,
+    dyn_emb_to_torch,
     torch_to_dyn_emb,
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
@@ -27,7 +28,10 @@ from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb_extensions import (
     EvictStrategy,
     clear,
+    count_matched,
+    dyn_emb_rows,
     export_batch,
+    export_batch_matched,
     find_pointers,
     insert_and_evict,
     insert_or_assign,
@@ -224,7 +228,7 @@ class KeyValueTable(Cache, Storage):
     ):
         self.options = options
         self.table = create_dynamicemb_table(options)
-        self.capacity = options.max_capacity
+        self._capacity = options.max_capacity
         self.optimizer = optimizer
         self.score: int = None
         self._score_update = False
@@ -480,8 +484,8 @@ class KeyValueTable(Cache, Storage):
 
     def flush(self, storage: Storage) -> None:
         batch_size = self._threads_in_wave
-        for start in range(0, self.capacity, batch_size):
-            end = min(start + batch_size, self.capacity)
+        for start in range(0, self._capacity, batch_size):
+            end = min(start + batch_size, self._capacity)
             num_dumped, dumped_keys, dumped_values, dumped_scores = self.dump(
                 start, end
             )
@@ -503,6 +507,63 @@ class KeyValueTable(Cache, Storage):
     def set_record_cache_metrics(self, record: bool) -> None:
         self._record_cache_metrics = record
         return
+
+    def count_matched(
+        self,
+        threshold: int,
+        num_matched: torch.Tensor,
+    ) -> None:
+        count_matched(self.table, threshold, num_matched)
+
+    def key_type(
+        self,
+    ) -> torch.dtype:
+        return dyn_emb_to_torch(self.table.key_type())
+
+    def value_type(
+        self,
+    ) -> torch.dtype:
+        return dyn_emb_to_torch(self.table.value_type())
+
+    def capacity(
+        self,
+    ) -> int:
+        return self._capacity
+
+    def export_batch_matched(
+        self, threshold, batch_size, search_offset, d_count, d_keys, d_vals
+    ) -> None:
+        export_batch_matched(
+            self.table,
+            threshold,
+            batch_size,
+            search_offset,
+            d_count,
+            d_keys,
+            d_vals,
+        )
+
+    def export_batch(
+        self, batch_size, search_offset, d_count, d_keys, d_vals, d_scores
+    ) -> None:
+        export_batch(
+            self.table,
+            batch_size,
+            search_offset,
+            d_count,
+            d_keys,
+            d_vals,
+            d_scores,
+        )
+
+    def evict_strategy(self) -> EvictStrategy:
+        return self.table.evict_strategy()
+
+    def optim_state_dim(self) -> int:
+        return self.value_dim() - self.embedding_dim()
+
+    def size(self) -> int:
+        return dyn_emb_rows(self.table)
 
 
 def update_cache(

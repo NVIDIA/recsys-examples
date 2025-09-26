@@ -411,7 +411,6 @@ class ShardedEmbedding(torch.nn.Module):
         dynamic_table_names = set()
         if len(dynamicemb_modules) > 0:
             from dynamicemb.dump_load import export_keys_values
-            from dynamicemb_extensions import dyn_emb_rows
 
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -421,7 +420,7 @@ class ShardedEmbedding(torch.nn.Module):
                     if table_name != dynamic_table_name:
                         continue
 
-                    local_max_rows = dyn_emb_rows(dynamic_table)
+                    local_max_rows = dynamic_table.size()
                     accumulated_counts = 0
 
                     for keys, embeddings, _, _ in export_keys_values(

@@ -23,10 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTablesV2,
-    TableShim,
-)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.key_value_table import KeyValueTable
 from dynamicemb_extensions import EvictStrategy
 from torch import nn
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
@@ -150,7 +148,7 @@ def get_dynamic_emb_module(model: nn.Module) -> List[nn.Module]:
 
 
 def export_keys_values(
-    dynamic_table: TableShim,
+    dynamic_table: KeyValueTable,
     device: torch.device,
     batch_size: int = 65536,
 ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -166,7 +164,7 @@ def export_keys_values(
         key_dtype = dynamic_table.key_type()
         value_dtype = dynamic_table.value_type()
         dim = dynamic_table.embedding_dim()
-        optstate_dim = dynamic_table.optim_states_dim()
+        optstate_dim = dynamic_table.optim_state_dim()
         total_dim = dim + optstate_dim
 
         keys = torch.empty(batch_size, dtype=key_dtype, device=device)
@@ -194,7 +192,7 @@ def export_keys_values(
 
 
 def local_export(
-    dynamic_table: TableShim,
+    dynamic_table: KeyValueTable,
     emb_key_path: str,
     embedding_file_path: str,
     score_file_path: Optional[str] = None,
@@ -240,7 +238,7 @@ def local_export(
 
 
 def distributed_export(
-    dynamic_table: TableShim,
+    dynamic_table: KeyValueTable,
     root_path: str,
     name: str,
     batch_size: int = 65536,
@@ -259,7 +257,7 @@ def distributed_export(
         emb_score_path = encode_score_file_path(root_path, name, rank, world_size)
 
     opt_value_path = None
-    if optim and dynamic_table.optim_states_dim() > 0:
+    if optim and dynamic_table.optim_state_dim() > 0:
         opt_value_path = encode_opt_file_path(root_path, name, rank, world_size)
 
     local_export(
@@ -377,7 +375,7 @@ def DynamicEmbDump(
                     continue
 
                 distributed_export(
-                    TableShim(dynamic_table),
+                    dynamic_table,
                     full_collection_path,
                     dynamic_table_name,
                     pg=pg,
@@ -403,14 +401,14 @@ def DynamicEmbDump(
 
 
 def load_key_values(
-    dynamic_table: TableShim,
+    dynamic_table: KeyValueTable,
     keys: torch.Tensor,
     embeddings: torch.Tensor,
     scores: Optional[torch.Tensor] = None,
     opt_states: Optional[torch.Tensor] = None,
 ):
     dim = dynamic_table.embedding_dim()
-    optstate_dim = dynamic_table.optim_states_dim()
+    optstate_dim = dynamic_table.optim_state_dim()
     if not keys.is_cuda:
         raise RuntimeError("Keys must be on GPU")
     if not embeddings.is_cuda:
@@ -428,7 +426,7 @@ def load_key_values(
                 dtype=dynamic_table.value_type(),
                 device=embeddings.device,
             )
-            * dynamic_table.init_optim_state()
+            * dynamic_table.init_optimizer_state()
         )
 
     values = (
@@ -448,17 +446,16 @@ def load_key_values(
     value_type = dynamic_table.value_type()
     if scores is not None:
         dynamic_table.insert(
-            keys.numel(),
             keys.to(key_type),
             values.to(value_type),
             scores.to(SCORE_TYPE),
         )
     else:
-        dynamic_table.insert(keys.numel(), keys.to(key_type), values.to(value_type))
+        dynamic_table.insert(keys.to(key_type), values.to(value_type))
 
 
 def local_load(
-    dynamic_table: TableShim,
+    dynamic_table: KeyValueTable,
     emb_key_path: str,
     embedding_file_path: str,
     score_file_path: Optional[str] = None,
@@ -477,7 +474,7 @@ def local_load(
     fopt_states = open(opt_file_path, "rb") if opt_file_path else None
 
     dim = dynamic_table.embedding_dim()
-    optstate_dim = dynamic_table.optim_states_dim()
+    optstate_dim = dynamic_table.optim_state_dim()
 
     batch_size = 65536
 
@@ -710,7 +707,7 @@ def get_loading_files(
 
 
 def distributed_load(
-    dynamic_table: TableShim,
+    dynamic_table: KeyValueTable,
     root_path: str,
     name: str,
     optim: bool = False,
@@ -733,7 +730,7 @@ def distributed_load(
         name,
         pg,
         need_dump_score,
-        optim and dynamic_table.optim_states_dim() > 0,
+        optim and dynamic_table.optim_state_dim() > 0,
     )
 
     for emb_key_file, emb_value_file, score_file, opt_file in zip(
@@ -834,7 +831,7 @@ def DynamicEmbLoad(
                     dynamic_emb_module.optimizer.set_opt_args(opt_args)
 
                 distributed_load(
-                    TableShim(dynamic_table),
+                    dynamic_table,
                     full_collection_path,
                     dynamic_table_name,
                     optim=optim,
