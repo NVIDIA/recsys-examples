@@ -1,29 +1,36 @@
 # Benchmark
 
 We provide two sets of benchmarks:
-* [Fused HSTU layer benchmarks](#fused-hstu-layer-benchmark)
+
+* [HSTU layer benchmarks](#hstu-layer-benchmark)
 * [Inference benchmarks](#hstu-inference-benchmark) on end-to-end inference and paged HSTU inference layer 
 
-# Fused HSTU layer benchmark
+# HSTU layer benchmark
 
 In hstu example, we have provided a set of performance optimization guidelines for single HSTU layer, including
 1. Fast and memory-efficient hstu attention integration.
-2. Kernel fusions (with triton).
+2. Kernel fusions: layer norm + multiplication + dropout 
 3. Seletive forward recompute.
 
-You can run script `run.sh` to see the performance over native implementation. The baseline (native implementation) is from [Meta's open source HSTU implementation](https://github.com/meta-recsys/generative-recommenders/tree/bb389f9539b054e7268528efcd35457a6ad52439), which features in:
+You can run script `run_hstu_benchmark.sh` to see the performance over the base implementation. The baseline is from [Meta's open source HSTU implementation](https://github.com/meta-recsys/generative-recommenders/tree/bb389f9539b054e7268528efcd35457a6ad52439), which features in:
+
 1. Triton-based HSTU attention kernels with the remaining operations using PyTorch ops.
 2. No kernel fusions.
 3. No recompute.
 
 ## How to run
-The test entry is `python ./benchmark/fused_hstu_layer_benchmark.py run`, you can type `python ./benchmark/fused_hstu_layer_benchmark.py run --help` to get the input arguments. 2 important arguments are :
-1. --layer-type: whether to enable fusions. Could be `fused` or `native`.
-2. --kernel-backend: select the hstu mha backend. Could be `triton` or `cutlass`.
+
+The test entry is `python ./benchmark/hstu_layer_benchmark.py run`, you can type `python ./benchmark/hstu_layer_benchmark.py run --help` to get the input arguments. 4 important arguments are :
+
+1. --kernel-backend: select the hstu mha backend. Could be `triton` or `cutlass`.
+2. --fuse-norm-mul-dropout: knob of  `layer norm + multiplication + dropout ` fusion. Could be `False` or `True`
+3. --recompute-input-silu: knob of silu recompute. Could be `False` or `True`
+4. --recompute-input-layernorm: knob of input layer norm recompute. Could be `False` or `True`
 
 Our baseline cmd example (1K): 
+
 ```bash
-python ./benchmark/fused_hstu_layer_benchmark.py run \
+python ./benchmark/hstu_layer_benchmark.py run \
   --iters 100 \
   --warmup-iters 50 \
   --layer-type native \
@@ -38,10 +45,10 @@ python ./benchmark/fused_hstu_layer_benchmark.py run \
 ```
 
 You can also run a set of arguments with run.sh:
+
 ```bash
-RECOMPUTE_INPUT_SILU=True RECOMPUTE_INPUT_LAYERNORM=True bash run.sh <num_layers>
+bash run_hstu_layer_benchmark.sh <num_layers>
 ```
-Since recompute helps reduce activation memory usage but incurs latency increase, you can use env `RECOMPUTE_INPUT_SILU, RECOMPUTE_INPUT_SILU` to decide whether to enable the input layernorm and the first silu following uvqk linear.
 
 After one run is done, a memory snapshot file in current working directory is generated, you can trace the memory usage with the file. Please refer to [PyTorch docs](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html) on how to visualize the memory trace.
 
@@ -56,19 +63,16 @@ We cover sequence from 1k~8k, other hyper-params are as followed:
 | embedding dim | 1024  |
 
 All results are conducted on single H100-SXM5-80G
-### Latency
 
-| seqlen | Baseline (ms) | + cutlass kernel | +fusion | +layer norm recompute (ms) | +silu recompute (ms) |
-| ------ | ------------- | ---------------- | ------- | -------------------------- | -------------------- |
-| 1K     | 6.6515        | 5.8640           | 3.8854  | 3.9271                     | 4.1149               |
-| 2K     | 16.0452       | 12.9900          | 9.1797  | 9.2780                     | 9.7622               |
-| 4K     | 44.3293       | 31.7074          | 24.5428 | 24.7954                    | 25.5000              |
-| 8K     | 137.9320      | 88.3084          | 74.7734 | 74.8163                    | 76.3875              |
+### Throughput
+
+![hstu_layer_perf](./hstu_layer_perf.png)
 
 The columns other than the first column are incrementally tested based on the previous column.
 
 ### Peak memory
-We trace the peak memory with the help of torch memory snapshot. To better identify the boundary forward and backward process, we have run 2 HSTU layers.
+
+We trace the peak memory with the help of torch memory snapshot. To better identify the boundary forward and backward process, we have run 3 HSTU layers.
 Below are the memory usage for seqlen=4K:
 
 ![image](./memory_snapshot.png)
@@ -100,6 +104,7 @@ We utilize the graph capture and replay support in Torch for convenient CUDA gra
 
 The HSTU inference utilize customized KV cache manager from TensorRT-LLM.
 The current version is based on the HSTU specialized implementation based on TensorRT-LLM v0.19.0.
+
 ```bash
 ~$ cd ${WORKING_DIR}
 ~$ git clone -b hstu-kvcache-recsys-examples https://github.com/geoffreyQiu/TensorRT-LLM.git tensorrt-llm-kvcache && cd tensorrt-llm-kvcache
@@ -111,6 +116,7 @@ The current version is based on the HSTU specialized implementation based on Ten
 2. Install the dependencies for Recsys-Examples.
 
 Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not required for inference.
+
 ```bash
 ~$ cd ${WORKING_DIR}
 ~$ git clone --recursive -b ${TEST_BRANCH} ${TEST_REPO} recsys-examples && cd recsys-examples
@@ -119,7 +125,7 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
     --build-arg INFERENCEBUILD=1 \
     -t recsys-examples:inference \
     -f docker/Dockerfile .
-``` 
+```
 
 3. Run the benchmark.
 
@@ -128,7 +134,7 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
 ~$ export PYTHONPATH=${PYTHONPATH}:$(realpath ../)
 ~$ python3 ./benchmark/inference_benchmark.py
 ~$ python3 ./benchmark/paged_hstu_with_kvcache_benchmark.py
-``` 
+```
 
 ## Benchmark results
 
@@ -136,19 +142,20 @@ Here we present the benchmark results of the HSTU layers with KV cache on single
 
 HSTU Setup for benchmark:
 
-| Parameter | Value |
-|-----------|-------|
-| Number of HSTU layers | 8 |
-| Hidden Dim Size | 1024 |
-| Number of Heads | 4 |
-| Head Dim Size | 256 |
-| Max Batchsize| 16 |
-| Max Per Sequence Length | 4096 |
-| Per Sequence Targets Number | 256 |
+| Parameter                   | Value |
+| --------------------------- | ----- |
+| Number of HSTU layers       | 8     |
+| Hidden Dim Size             | 1024  |
+| Number of Heads             | 4     |
+| Head Dim Size               | 256   |
+| Max Batchsize               | 16    |
+| Max Per Sequence Length     | 4096  |
+| Per Sequence Targets Number | 256   |
 
 ### 1. End-to-end inference performance
 
 Here we benchmarked with a synthetic input dataset:
+
 * Each user's input sequence starts from 256 tokens to 4096 in increments of 256.
 * Each input request has 256 item candidates for ranking.
 * Generate data for 1, 2, 4 and 8 users to benchmark with different batch size. 
@@ -160,6 +167,7 @@ Performance results:
 ![Local Image](inference_benchmark_l20.png)
 
 Note:
+
 1. The baseline performance is based on our implementation without KVCache support and CUDA Graph optimization.
 2. The end-to-end performance includes the embedding part, which utilizes both native `EmbeddingCollection` from TorchRec and `DynamicEmbedding`.
 3. The number of input sequences from the synthetic dataset increases according to the batch size.

@@ -92,13 +92,19 @@ def create_hstu_layer(
 @click.option(
     "--layer-type",
     type=click.Choice(_layer_type_str_to_type.keys()),
-    default="fused",
+    default="native",
     required=False,
 )
 @click.option(
     "--async-wgrad",
     type=bool,
     default=True,
+    required=False,
+)
+@click.option(
+    "--fuse-norm-mul-dropout",
+    type=bool,
+    default=False,
     required=False,
 )
 @click.option(
@@ -154,6 +160,7 @@ def run(
     num_layers,
     recompute_input_layernorm,
     recompute_input_silu,
+    fuse_norm_mul_dropout,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -173,6 +180,7 @@ def run(
         async_wgrad=async_wgrad,
         recompute_input_layernorm=recompute_input_layernorm,
         recompute_input_silu=recompute_input_silu,
+        fuse_norm_mul_dropout=fuse_norm_mul_dropout,
     )
     hstu_blocks = [
         create_hstu_layer(
