@@ -6,9 +6,10 @@ TEST_FILES=(
     "test/test_unique_op.py"
     "test/unit_tests/test_sequence_embedding.sh"
     "test/unit_tests/test_pooled_embedding.sh"
+    "test/unit_tests/test_dynamicemb_table_dump_load.sh"
     "test/unit_tests/test_embedding_dump_load.sh"
-    "test/unit_tests/incremental_dump/test_incremental_dump.sh"
     "test/unit_tests/test_twin_module.sh"
+    "test/unit_tests/incremental_dump/test_incremental_dump.sh"
 )
 export DYNAMICEMB_DUMP_LOAD_DEBUG=1
 # Run each test file using the appropriate command

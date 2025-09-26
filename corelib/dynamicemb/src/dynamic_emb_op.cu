@@ -283,26 +283,20 @@ void find_pointers(
   auto values_data_ptr = reinterpret_cast<void**>(values.data_ptr<int64_t>());
   auto found_tensor_data_ptr = founds.data_ptr<bool>();
 
-  table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, 
-      nullptr, stream);
-  
   // update score.
   if (score.has_value()) {
-    at::Tensor locked_ptr = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kLong));
-    at::Tensor success = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kBool));
+    void * score_ptr = nullptr;
     if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
       auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
       // broadcast scores
       at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
       bc_scores.fill_(score.value());
-      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                  success.data_ptr<bool>(), bc_scores.data_ptr(), stream);
-    } else {
-      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                  success.data_ptr<bool>(), nullptr, stream);
-    }
-    AT_CUDA_CHECK(cudaGetLastError());
-    table->unlock(n, reinterpret_cast<void**>(locked_ptr.data_ptr()), keys.data_ptr(), success.data_ptr<bool>(), stream);
+      score_ptr = bc_scores.data_ptr();
+    } 
+    table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, score_ptr, stream);
+  } else {
+    std::shared_ptr<const dyn_emb::DynamicVariableBase> const_table = table;
+    const_table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, nullptr, stream);
   }
 }
 
@@ -551,6 +545,31 @@ void lookup_forward_dense(
   dyn_emb::scatter_fused(unique_embs.data_ptr(), output_embs.data_ptr(),
                          reverse_idx.data_ptr(), indices_shape, dim, src_type,
                          dst_type, offset_type, device_num_sms, stream);
+}
+
+void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto &device_prop = DeviceProp::getDeviceProp(index.device().index());
+  int num_sms = device_prop.num_sms;
+  auto src_type =
+    scalartype_to_datatype(convertTypeMetaToScalarType(input.dtype()));
+  auto dst_type =
+    scalartype_to_datatype(convertTypeMetaToScalarType(output.dtype()));
+  auto index_type =
+    scalartype_to_datatype(convertTypeMetaToScalarType(index.dtype()));
+
+  int64_t num_total = output.size(0);
+  int64_t dim = output.size(1);
+  if (num_total != index.numel()) {
+    throw std::runtime_error("Number rows of `output` must match with `index`.");
+  }
+  if (dim != input.size(1)) {
+    throw std::runtime_error("Number cols of `output` must match with `input`.");
+  }
+  dyn_emb::scatter_fused(input.data_ptr(), output.data_ptr(),
+                         index.data_ptr(), num_total, dim, src_type,
+                         dst_type, index_type, num_sms, stream);
+
 }
 
 at::Tensor lookup_forward_dense_eval(
@@ -1172,5 +1191,9 @@ void bind_dyn_emb_op(py::module &m) {
 
   m.def("load_from_pointers", &load_from_pointers,
     "load from pointers to dst.", py::arg("pointers"), py::arg("dst")
+  );
+
+  m.def("gather_embedding", &gather_embedding,
+    "Gather embedding based on index.", py::arg("input"), py::arg("output"), py::arg("index")
   );
 }

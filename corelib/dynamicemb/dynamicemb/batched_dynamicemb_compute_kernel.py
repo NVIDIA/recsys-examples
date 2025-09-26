@@ -19,7 +19,10 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.batched_dynamicemb_tables import (
+    BatchedDynamicEmbeddingTables,
+    BatchedDynamicEmbeddingTablesV2,
+)
 from dynamicemb.dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DTYPE_NUM_BYTES,
@@ -320,13 +323,15 @@ class BatchedDynamicEmbeddingBag(
 
         fused_params = config.fused_params or {}
 
-        self._emb_module: BatchedDynamicEmbeddingTables = BatchedDynamicEmbeddingTables(
-            table_options=dynamicemb_options_list,
-            pooling_mode=pooling_mode_to_dynamicemb(self._pooling),
-            feature_table_map=self._feature_table_map,
-            table_names=[t.name for t in config.embedding_tables],
-            device=device,
-            **fused_params,
+        self._emb_module: BatchedDynamicEmbeddingTables = (
+            BatchedDynamicEmbeddingTablesV2(
+                table_options=dynamicemb_options_list,
+                pooling_mode=pooling_mode_to_dynamicemb(self._pooling),
+                feature_table_map=self._feature_table_map,
+                table_names=[t.name for t in config.embedding_tables],
+                device=device,
+                **fused_params,
+            )
         )
 
         if "learning_rate" in fused_params:
@@ -431,13 +436,15 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
 
         fused_params = config.fused_params or {}
 
-        self._emb_module: BatchedDynamicEmbeddingTables = BatchedDynamicEmbeddingTables(
-            table_options=dynamicemb_options_list,
-            pooling_mode=DynamicEmbPoolingMode.NONE,
-            feature_table_map=self._feature_table_map,
-            table_names=[t.name for t in config.embedding_tables],
-            device=device,
-            **fused_params,
+        self._emb_module: BatchedDynamicEmbeddingTables = (
+            BatchedDynamicEmbeddingTablesV2(
+                table_options=dynamicemb_options_list,
+                pooling_mode=DynamicEmbPoolingMode.NONE,
+                feature_table_map=self._feature_table_map,
+                table_names=[t.name for t in config.embedding_tables],
+                device=device,
+                **fused_params,
+            )
         )
 
         if "learning_rate" in fused_params:

@@ -156,6 +156,13 @@ public:
     void* scores = nullptr,                   // (n)
     cudaStream_t stream = 0) const = 0;
 
+  virtual void find_pointers(
+    const size_t n, const void* keys,         // (n)
+    void** values,                            // (n)
+    bool* founds,                             // (n)
+    void* scores = nullptr,                   // (n)
+    cudaStream_t stream = 0) = 0;
+
   virtual void erase(const size_t n, const void *keys,
                      cudaStream_t stream = 0) = 0;
     virtual void clear(cudaStream_t stream = 0) = 0;

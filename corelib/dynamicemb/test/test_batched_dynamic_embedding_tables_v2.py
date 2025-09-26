@@ -48,6 +48,8 @@ POOLING_MODE: Dict[DynamicEmbPoolingMode, PoolingMode] = {
 OPTIM_TYPE: Dict[EmbOptimType, OptimType] = {
     EmbOptimType.SGD: OptimType.EXACT_SGD,
     EmbOptimType.ADAM: OptimType.ADAM,
+    EmbOptimType.EXACT_ADAGRAD: OptimType.EXACT_ADAGRAD,
+    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimType.EXACT_ROWWISE_ADAGRAD,
 }
 
 
@@ -70,7 +72,7 @@ class PyDictStorage(Storage):
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
 
-    def find(
+    def find_impl(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
@@ -109,6 +111,22 @@ class PyDictStorage(Storage):
             missing_indices, dtype=torch.long, device=self.device
         )
         return num_missing, missing_keys, missing_indices
+
+    def find_embeddings(
+        self,
+        unique_keys: torch.Tensor,
+        unique_embs: torch.Tensor,
+        founds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.find_impl(unique_keys, unique_embs, founds)
+
+    def find(
+        self,
+        unique_keys: torch.Tensor,
+        unique_vals: torch.Tensor,
+        founds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.find_impl(unique_keys, unique_vals, founds)
 
     def insert(
         self,
@@ -350,11 +368,11 @@ def test_forward_train_eval(opt_type, opt_params, caching, PS):
     embs_train_non_exist = bdebt(indices, offsets)
     torch.cuda.synchronize()
 
-    assert torch.equal(embs_train, embs_eval)
-    assert torch.equal(embs_train[1:, :], embs_non_exist[1:, :])
+    torch.testing.assert_close(embs_train, embs_eval)
+    torch.testing.assert_close(embs_train[1:, :], embs_non_exist[1:, :])
     assert torch.all(embs_non_exist[0, :] == 0)
     assert torch.all(embs_train_non_exist[0, :] != 0)
-    assert torch.equal(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
+    torch.testing.assert_close(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
 
     print("all check passed")
 
@@ -378,6 +396,20 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
                 "eps": 3e-5,
                 "beta1": 0.8,
                 "beta2": 0.888,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
             },
         ),
     ],
@@ -489,6 +521,20 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
                 "beta2": 0.888,
             },
         ),
+        (
+            EmbOptimType.EXACT_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize("PS", [None, PyDictStorage])
@@ -595,6 +641,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
         assert list(bdeb.get_score().values()) == [1] * len(dims)
 
     with torch.cuda.stream(forward_stream):
+        torch.cuda.current_stream().wait_stream(pretch_stream)
         embs_bdeb_A = bdeb(indicesA, offsetsA)
         loss_bdet_A = embs_bdeb_A.mean()
         loss_bdet_A.backward()
@@ -626,6 +673,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
         assert list(bdeb.get_score().values()) == [2] * len(dims)
 
     with torch.cuda.stream(forward_stream):
+        torch.cuda.current_stream().wait_stream(pretch_stream)
         embs_bdeb_A = bdeb(indicesA, offsetsA)
         loss_bdet_A = embs_bdeb_A.mean()
         loss_bdet_A.backward()

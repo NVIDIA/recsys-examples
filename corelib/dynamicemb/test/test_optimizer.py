@@ -501,7 +501,7 @@ def test_optimizer(
             )
         )
     hashtables_for_dynamicemb = [
-        module.tables[0] for module in batched_dynamicemb_tables
+        module.tables[0].table for module in batched_dynamicemb_tables
     ]
     opt_for_dynamicemb = [module.optimizer for module in batched_dynamicemb_tables]
 

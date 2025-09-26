@@ -460,7 +460,7 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
   if (n == 0)
     return;
   int dim = dim_;
-  this->find_pointers(n, keys, value_ptrs, d_found, nullptr, stream);
+  const_cast<const HKVVariable<KeyType, ValueType, Strategy>*>(this)->find_pointers(n, keys, value_ptrs, d_found, nullptr, stream);
   auto &device_prop = DeviceProp::getDeviceProp();
   int block_size = dim < device_prop.max_thread_per_block
                        ? dim
@@ -635,6 +635,18 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_pointers(
     return;
   hkv_table_->find(n, (KeyType *)keys, (ValueType **)value_ptrs,
                    founds, (uint64_t *)scores, stream);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename KeyType, typename ValueType, EvictStrategy Strategy>
+void HKVVariable<KeyType, ValueType, Strategy>::find_pointers(
+    const size_t n, const void *keys, void **value_ptrs, bool *founds,
+    void *scores, cudaStream_t stream) {
+  if (n == 0)
+    return;
+  hkv_table_->find_and_update(
+    n, (KeyType *)keys, (ValueType **)value_ptrs,
+    founds, (uint64_t *)scores, stream);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
