@@ -41,6 +41,16 @@ from training.gin_config_args import (
     TrainerArgs,
 )
 
+_OPTIMIZER_TYPE_TO_STORAGE_MULTIPLIER = {
+    "sgd": 1,
+    "adam": 3,
+}
+
+
+def get_embedding_vector_storage_multiplier(optimizer_type: str) -> int:
+    global _OPTIMIZER_TYPE_TO_STORAGE_MULTIPLIER
+    return _OPTIMIZER_TYPE_TO_STORAGE_MULTIPLIER.get(optimizer_type, 1)
+
 
 def cal_flops_single_rank(
     hstu_config: HSTUConfig,
@@ -359,13 +369,17 @@ def create_embedding_configs(
 def create_dynamic_optitons_dict(
     embedding_args_list: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]],
     hidden_size: int,
+    training: bool = True,
+    embedding_dim_multiplier: int = 1,  # for training, we store the optimizer states together with original embedding vectors.
 ) -> Dict[str, DynamicEmbTableOptions]:
     dynamic_options_dict: Dict[str, DynamicEmbTableOptions] = {}
     for embedding_args in embedding_args_list:
         if isinstance(embedding_args, DynamicEmbeddingArgs):
             from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
 
-            embedding_args.calculate_and_reset_global_hbm_for_values(hidden_size)
+            embedding_args.calculate_and_reset_global_hbm_for_values(
+                hidden_size, embedding_dim_multiplier
+            )
             dynamic_options_dict[embedding_args.table_name] = DynamicEmbTableOptions(
                 global_hbm_for_values=embedding_args.global_hbm_for_values,
                 evict_strategy=DynamicEmbEvictStrategy.LRU
@@ -373,6 +387,8 @@ def create_dynamic_optitons_dict(
                 else DynamicEmbEvictStrategy.LFU,
                 safe_check_mode=DynamicEmbCheckMode.IGNORE,
                 bucket_capacity=128,
+                training=training,
+                caching=embedding_args.caching,
             )
     return dynamic_options_dict
 

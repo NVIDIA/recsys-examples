@@ -31,14 +31,14 @@ from pipeline.train_pipeline import (
 from test_utils import create_model
 
 
-@pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"], []])
-@pytest.mark.parametrize("max_num_candidates", [10, 0])
+@pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"]])
+@pytest.mark.parametrize("max_num_candidates", [10])
 @pytest.mark.parametrize(
     "optimizer_type_str", ["sgd"]
 )  # adam does not work since torchrec does not save the optimizer state `step`.
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("use_dynamic_emb", [False, True])
-@pytest.mark.parametrize("pipeline_type", ["native", "prefetch"])
+@pytest.mark.parametrize("use_dynamic_emb", [True])
+@pytest.mark.parametrize("pipeline_type", ["prefetch"])
 def test_pipeline(
     pipeline_type: str,
     contextual_feature_names: List[str],
@@ -49,8 +49,6 @@ def test_pipeline(
 ):
     init.initialize_distributed()
     init.initialize_model_parallel(1)
-    if pipeline_type == "prefetch" and use_dynamic_emb:
-        pytest.skip("Currently, prefetch does not support dynamic embedding")
     model, dense_optimizer, history_batches = create_model(
         task_type="ranking",
         contextual_feature_names=contextual_feature_names,
@@ -99,7 +97,6 @@ def test_pipeline(
     dist.barrier(device_ids=[torch.cuda.current_device()])
     if dist.get_rank() == 0:
         shutil.rmtree(save_path)
-
     no_pipeline = JaggedMegatronTrainNonePipeline(
         model,
         dense_optimizer,

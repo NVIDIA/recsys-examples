@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import logging
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -420,7 +421,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_names: Optional[List[str]] = None,
         feature_table_map: Optional[List[int]] = None,  # [T]
         use_index_dedup: bool = False,
-        enable_prefetch: bool = False,
+        prefetch_pipeline: bool = False,  #  we set the arg name same as FBGEMM TBE to align with it
         pooling_mode: DynamicEmbPoolingMode = DynamicEmbPoolingMode.SUM,
         output_dtype: torch.dtype = torch.float32,
         device: torch.device = None,
@@ -473,7 +474,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.output_dtype = output_dtype
         self.pooling_mode = pooling_mode
         self.use_index_dedup = use_index_dedup
-        self._enable_prefetch = enable_prefetch
+        self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
         self.num_prefetch_ahead = 0
         self._table_names = table_names
@@ -1027,7 +1028,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         assert (
             self.pooling_mode == DynamicEmbPoolingMode.NONE
         ), "only support prefetch for sequence embedding."
-
+        assert self._enable_prefetch, "Prefetch is not enabled."
+        if not self._caching:
+            logging.warning("Caching is not enabled, prefetch will do nothing.")
         if self.prefetch_stream is None and forward_stream is not None:
             # Set the prefetch stream to the current stream
             self.prefetch_stream = torch.cuda.current_stream()

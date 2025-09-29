@@ -47,6 +47,7 @@ from training import (
     create_optimizer_params,
     get_data_loader,
     get_dataset_and_embedding_args,
+    get_embedding_vector_storage_multiplier,
     maybe_load_ckpts,
     train_with_pipeline,
 )
@@ -115,7 +116,12 @@ def main():
     model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
 
     dynamic_options_dict = create_dynamic_optitons_dict(
-        embedding_args, network_args.hidden_size
+        embedding_args,
+        network_args.hidden_size,
+        training=True,
+        embedding_dim_multiplier=get_embedding_vector_storage_multiplier(
+            optimizer_args.optimizer_type
+        ),
     )
 
     optimizer_param = create_optimizer_params(optimizer_args)
