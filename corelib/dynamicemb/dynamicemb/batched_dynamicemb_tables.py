@@ -24,7 +24,11 @@ from typing import List, Optional, Tuple, cast
 
 import torch  # usort:skip
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_function import *
+from dynamicemb.batched_dynamicemb_function import (
+    DynamicEmbeddingBagFunction,
+    DynamicEmbeddingFunctionV2,
+    dynamicemb_prefetch,
+)
 from dynamicemb.dynamicemb_config import *
 from dynamicemb.initializer import *
 from dynamicemb.key_value_table import Cache, KeyValueTable, Storage

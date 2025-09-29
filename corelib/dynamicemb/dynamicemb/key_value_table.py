@@ -186,8 +186,8 @@ class Cache(abc.ABC):
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         return num_missing, missing_keys, missing_indices
@@ -198,8 +198,8 @@ class Cache(abc.ABC):
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         return num_missing, missing_keys, missing_indices
@@ -209,8 +209,8 @@ class Cache(abc.ABC):
         self,
         unique_keys: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         return num_missing, missing_keys, missing_indices
@@ -230,8 +230,8 @@ class Cache(abc.ABC):
     @abc.abstractmethod
     def update(
         self, keys: torch.Tensor, grads: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         return num_missing, missing_keys, missing_indices
@@ -443,21 +443,26 @@ class KeyValueTable(Cache, Storage):
             self._cache_metrics[0] = batch
             self._cache_metrics[1] = founds.sum().item()
 
-        return num_missing_0, missing_keys, missing_indices
+        h_num_missing = num_missing_0.cpu().item()
+        return (
+            h_num_missing,
+            missing_keys[:h_num_missing],
+            missing_indices[:h_num_missing],
+        )
 
     def find_embeddings(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
         return self.find_impl(unique_keys, unique_embs, founds)
 
     def find_missed_keys(
         self,
         unique_keys: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
         # dummy tensor
         unique_embs = torch.empty(
             unique_keys.numel(), 0, device=unique_keys.device, dtype=self._emb_dtype
@@ -469,7 +474,7 @@ class KeyValueTable(Cache, Storage):
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
         return self.find_impl(unique_keys, unique_vals, founds)
 
     def insert(
@@ -501,7 +506,7 @@ class KeyValueTable(Cache, Storage):
         keys: torch.Tensor,
         grads: torch.Tensor,
         return_missing: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
         assert self._score_update == False, "update is called only in backward."
 
         batch = keys.size(0)
@@ -529,9 +534,13 @@ class KeyValueTable(Cache, Storage):
             )
             select(missing, keys, missing_keys, num_missing_0)
             select_index(missing, missing_indices, num_missing_1)
-            return num_missing_0, missing_keys, missing_indices
-        else:
-            return None, None, None
+            h_num_missing = num_missing_0.cpu().item()
+            return (
+                h_num_missing,
+                missing_keys[:h_num_missing],
+                missing_indices[:h_num_missing],
+            )
+        return None, None, None
 
     def enable_update(self) -> bool:
         return True
@@ -975,17 +984,17 @@ class KeyValueTableCachingFunction:
         unique_keys.numel()
         emb_dim = storage.embedding_dim()
         emb_dtype = storage.embedding_dtype()
-        val_dim = storage.value_dim()
+        val_dim = (
+            storage.value_dim()
+        )  # value is generally composed of embedding and optimizer state
 
         # 1. find in cache
-        num_missing, missing_keys, missing_indices = cache.find_embeddings(
+        h_num_keys_for_storage, missing_keys, missing_indices = cache.find_embeddings(
             unique_keys, unique_embs
         )
-        h_num_keys_for_storage = num_missing.cpu().item()
         if h_num_keys_for_storage == 0:
             return
-        keys_for_storage = missing_keys[:h_num_keys_for_storage]
-        missing_indices = missing_indices[:h_num_keys_for_storage]
+        keys_for_storage = missing_keys
 
         founds = torch.empty(
             h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
@@ -1040,14 +1049,12 @@ class KeyValueTableCachingFunction:
         unique_grads: torch.Tensor,
         optimizer: BaseDynamicEmbeddingOptimizerV2,
     ):
-        num_missing, missing_keys, missing_indices = cache.update(
+        h_num_keys_for_storage, missing_keys, missing_indices = cache.update(
             unique_keys, unique_grads
         )
-        h_num_keys_for_storage = num_missing.cpu().item()
         if h_num_keys_for_storage == 0:
             return
-        keys_for_storage = missing_keys[:h_num_keys_for_storage]
-        # missing_indices = missing_indices[:h_num_keys_for_storage]
+        keys_for_storage = missing_keys
         grads_for_storage = unique_grads[missing_indices, :].contiguous()
 
         if storage.enable_update():
@@ -1087,12 +1094,11 @@ class KeyValueTableCachingFunction:
     ) -> None:
         assert cache is not None
         emb_dtype = storage.embedding_dtype()
-        num_missing, missing_keys, _ = cache.find_missed_keys(unique_keys)
+        h_num_keys_for_storage, missing_keys, _ = cache.find_missed_keys(unique_keys)
 
-        h_num_keys_for_storage = num_missing.cpu().item()
         if h_num_keys_for_storage == 0:
             return
-        keys_for_storage = missing_keys[:h_num_keys_for_storage]
+        keys_for_storage = missing_keys
 
         val_dim = storage.value_dim()
         emb_dim = storage.embedding_dim()
@@ -1108,13 +1114,7 @@ class KeyValueTableCachingFunction:
             missing_indices_in_storage,
         ) = storage.find(keys_for_storage, values_for_storage, founds=founds)
 
-        h_num_missing_in_storage = num_missing_in_storage.cpu().item()
-        if h_num_missing_in_storage != 0:
-            missing_indices_in_storage = missing_indices_in_storage[
-                :h_num_missing_in_storage
-            ]
-            missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
-
+        if num_missing_in_storage != 0:
             if training:
                 embs_for_storage = values_for_storage[:, :emb_dim]
                 initializer(
