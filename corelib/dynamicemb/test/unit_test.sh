@@ -1,8 +1,6 @@
 set -e
 TEST_FILES=(
-    "test/test_batched_dynamic_embedding_tables.py"
     "test/test_batched_dynamic_embedding_tables_v2.py"
-    "test/test_optimizer.py"
     "test/test_unique_op.py"
     "test/unit_tests/test_sequence_embedding.sh"
     "test/unit_tests/test_pooled_embedding.sh"

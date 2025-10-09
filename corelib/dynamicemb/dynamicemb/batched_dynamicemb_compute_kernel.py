@@ -19,10 +19,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTables,
-    BatchedDynamicEmbeddingTablesV2,
-)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DTYPE_NUM_BYTES,
@@ -155,7 +152,7 @@ def get_state_dict(
 
 
 def _gen_named_parameters_by_table_fused(
-    emb_module: BatchedDynamicEmbeddingTables,
+    emb_module: BatchedDynamicEmbeddingTablesV2,
     table_name_to_count: Dict[str, int],
     config: GroupedEmbeddingConfig,
     pg: Optional[dist.ProcessGroup] = None,
@@ -193,7 +190,7 @@ def _gen_named_parameters_by_table_fused(
 class DynamicEmbeddingFusedOptimizer(FusedOptimizer):
     def __init__(  # noqa C901
         self,
-        emb_module: BatchedDynamicEmbeddingTables,
+        emb_module: BatchedDynamicEmbeddingTablesV2,
         lr: float,
     ) -> None:
         state: Dict[Any, Any] = {}
@@ -323,7 +320,7 @@ class BatchedDynamicEmbeddingBag(
 
         fused_params = config.fused_params or {}
 
-        self._emb_module: BatchedDynamicEmbeddingTables = (
+        self._emb_module: BatchedDynamicEmbeddingTablesV2 = (
             BatchedDynamicEmbeddingTablesV2(
                 table_options=dynamicemb_options_list,
                 pooling_mode=pooling_mode_to_dynamicemb(self._pooling),
@@ -353,7 +350,7 @@ class BatchedDynamicEmbeddingBag(
     @property
     def emb_module(
         self,
-    ) -> BatchedDynamicEmbeddingTables:
+    ) -> BatchedDynamicEmbeddingTablesV2:
         return self._emb_module
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
@@ -436,7 +433,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
 
         fused_params = config.fused_params or {}
 
-        self._emb_module: BatchedDynamicEmbeddingTables = (
+        self._emb_module: BatchedDynamicEmbeddingTablesV2 = (
             BatchedDynamicEmbeddingTablesV2(
                 table_options=dynamicemb_options_list,
                 pooling_mode=DynamicEmbPoolingMode.NONE,
@@ -465,7 +462,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
     @property
     def emb_module(
         self,
-    ) -> BatchedDynamicEmbeddingTables:
+    ) -> BatchedDynamicEmbeddingTablesV2:
         return self._emb_module
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.

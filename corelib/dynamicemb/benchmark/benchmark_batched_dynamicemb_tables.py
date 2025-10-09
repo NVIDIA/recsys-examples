@@ -31,10 +31,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     EmbOptimType,
 )
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTables,
-    BatchedDynamicEmbeddingTablesV2,
-)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import KeyValueTable
 from dynamicemb_extensions import DynamicEmbTable, insert_or_assign
 from fbgemm_gpu.runtime_monitor import StdLogStatsReporterConfig
@@ -355,45 +352,24 @@ def create_dynamic_embedding_tables(args, device):
     table_options = []
     table_num = args.num_embedding_table
     for i in range(table_num):
-        if args.table_version == 1:
-            TableModule = BatchedDynamicEmbeddingTables
-            table_options.append(
-                DynamicEmbTableOptions(
-                    index_type=torch.int64,
-                    embedding_dtype=get_emb_precision(args.emb_precision),
-                    dim=args.embedding_dim,
-                    max_capacity=args.num_embeddings_per_feature[i],
-                    local_hbm_for_values=args.hbm_for_embeddings[i],
-                    bucket_capacity=128,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.NORMAL,
-                    ),
-                    score_strategy=DynamicEmbScoreStrategy.LFU
-                    if args.cache_algorithm == "lfu"
-                    else DynamicEmbScoreStrategy.TIMESTAMP,
-                )
+        TableModule = BatchedDynamicEmbeddingTablesV2
+        table_options.append(
+            DynamicEmbTableOptions(
+                index_type=torch.int64,
+                embedding_dtype=get_emb_precision(args.emb_precision),
+                dim=args.embedding_dim,
+                max_capacity=args.num_embeddings_per_feature[i],
+                local_hbm_for_values=args.hbm_for_embeddings[i],
+                bucket_capacity=128,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.NORMAL,
+                ),
+                score_strategy=DynamicEmbScoreStrategy.LFU
+                if args.cache_algorithm == "lfu"
+                else DynamicEmbScoreStrategy.TIMESTAMP,
+                caching=args.caching,
             )
-        elif args.table_version == 2:
-            TableModule = BatchedDynamicEmbeddingTablesV2
-            table_options.append(
-                DynamicEmbTableOptions(
-                    index_type=torch.int64,
-                    embedding_dtype=get_emb_precision(args.emb_precision),
-                    dim=args.embedding_dim,
-                    max_capacity=args.num_embeddings_per_feature[i],
-                    local_hbm_for_values=args.hbm_for_embeddings[i],
-                    bucket_capacity=128,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.NORMAL,
-                    ),
-                    score_strategy=DynamicEmbScoreStrategy.LFU
-                    if args.cache_algorithm == "lfu"
-                    else DynamicEmbScoreStrategy.TIMESTAMP,
-                    caching=args.caching,
-                )
-            )
-        else:
-            raise ValueError("Not support table version")
+        )
 
     var = TableModule(
         table_options=table_options,

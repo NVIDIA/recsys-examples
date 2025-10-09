@@ -429,124 +429,6 @@ std::vector<int64_t> offsets_to_table_features_offsets(const at::Tensor &offsets
   return table_features_offsets;
 }
 
-void lookup_forward_dense(
-    std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>> tables,
-    const at::Tensor indices, const at::Tensor offsets, const py::list scores,
-    const std::vector<int> &table_offsets_in_feature, at::Tensor table_offsets,
-    int table_num, int batch_size, int dim, bool use_index_dedup,
-    const at::Tensor unique_idx, const at::Tensor reverse_idx,
-    const at::Tensor h_unique_nums, const at::Tensor d_unique_nums,
-    const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
-    const at::Tensor unique_embs, const at::Tensor output_embs,
-    int device_num_sms, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
-
-  if (!offsets.is_cuda() || !indices.is_cuda()) {
-    throw std::runtime_error(
-        "offsets or indices tensor must be on CUDA device");
-  }
-
-  // Check dtype of h_unique_nums and d_unique_nums
-  if (h_unique_nums.scalar_type() != at::kUInt64 ||
-      d_unique_nums.scalar_type() != at::kUInt64) {
-    throw std::runtime_error(
-        "h_unique_nums and d_unique_nums must have dtype uint64_t");
-  }
-
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t indices_shape = indices.numel();
-  auto unique_num_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_nums.dtype()));
-  auto unique_offset_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_offsets.dtype()));
-
-  auto h_table_offsets = offsets_to_table_features_offsets(offsets, table_offsets_in_feature, batch_size, stream);
-  
-  size_t unique_op_capacity = unique_op->get_capacity();
-  if (indices_shape * 2 > unique_op_capacity) {
-    at::Tensor new_keys = at::empty({indices_shape * 2}, indices.options());
-    at::Tensor new_vals = at::empty(
-        {indices_shape * 2},
-        at::TensorOptions().dtype(at::kUInt64).device(indices.device()));
-    unique_op->reset_capacity(new_keys, new_vals, indices_shape * 2, stream);
-  }
-
-  std::vector<at::Tensor> tmp_unique_indices(table_num);
-  for (int i = 0; i < table_num; ++i) {
-    tmp_unique_indices[i] = at::empty_like(indices);
-  }
-
-  for (int i = 0; i < table_num; ++i) {
-    int64_t indices_begin = h_table_offsets[i];
-    int64_t indices_end = h_table_offsets[i + 1];
-    int64_t indices_length = indices_end - indices_begin;
-
-    if (indices_length == 0) {
-      DEMB_CUDA_CHECK(cudaMemsetAsync(
-          reinterpret_cast<uint64_t *>(d_unique_nums.data_ptr()) + i, 0,
-          sizeof(uint64_t), stream));
-      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
-                          i, unique_num_type, unique_offset_type, stream);
-    } else {
-      at::Tensor tmp_indices = create_sub_tensor(indices, indices_begin);
-      at::Tensor tmp_reverse_idx =
-          create_sub_tensor(reverse_idx, indices_begin);
-      at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
-
-      at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
-      unique_op->unique(tmp_indices, indices_length, tmp_reverse_idx,
-                        tmp_unique_indices[i], tmp_d_unique_num, stream,
-                        previous_d_unique_num);
-      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
-                          i, unique_num_type, unique_offset_type, stream);
-    }
-  }
-
-  AT_CUDA_CHECK(
-      cudaMemcpyAsync(h_unique_nums.data_ptr(), d_unique_nums.data_ptr(),
-                      d_unique_nums.numel() * d_unique_nums.element_size(),
-                      cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaMemcpyAsync(
-      h_unique_offsets.data_ptr(), d_unique_offsets.data_ptr(),
-      (d_unique_nums.numel() + 1) * d_unique_nums.element_size(),
-      cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-  AT_CUDA_CHECK(
-      cudaMemcpyAsync(table_offsets.data_ptr(), h_table_offsets.data(),
-                      table_offsets.numel() * table_offsets.element_size(),
-                      cudaMemcpyHostToDevice, stream));
-
-  int64_t unique_embs_offset = 0;
-  for (int i = 0; i < table_num; ++i) {
-    int64_t tmp_unique_num = h_unique_nums[i].item<int64_t>();
-    if (tmp_unique_num != 0) {
-      at::Tensor tmp_unique_embs =
-          create_sub_tensor(unique_embs, unique_embs_offset * dim);
-      auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
-      find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
-                    tmp_unique_embs, score);
-      if (use_index_dedup) {
-        void *dst_ptr = reinterpret_cast<char *>(unique_idx.data_ptr()) +
-                        unique_embs_offset * unique_idx.element_size();
-        void *src_ptr = tmp_unique_indices[i].data_ptr();
-        size_t copy_size = tmp_unique_num * unique_idx.element_size();
-        AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
-                                      cudaMemcpyDeviceToDevice, stream));
-      }
-    }
-    unique_embs_offset += tmp_unique_num;
-  }
-  auto src_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(unique_embs.dtype()));
-  auto dst_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(output_embs.dtype()));
-  auto offset_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(reverse_idx.dtype()));
-
-  dyn_emb::scatter_fused(unique_embs.data_ptr(), output_embs.data_ptr(),
-                         reverse_idx.data_ptr(), indices_shape, dim, src_type,
-                         dst_type, offset_type, device_num_sms, stream);
-}
-
 void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(index.device().index());
@@ -570,43 +452,6 @@ void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
                          index.data_ptr(), num_total, dim, src_type,
                          dst_type, index_type, num_sms, stream);
 
-}
-
-at::Tensor lookup_forward_dense_eval(
-    std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>> tables,
-    const at::Tensor &indices,
-    const at::Tensor &offsets,
-    const std::vector<int> &table_offsets_in_feature,
-    at::ScalarType embedding_dtype,
-    int table_num,
-    int batch_size,
-    int dim,
-    const at::Device& device,
-    const std::vector<InitializerArgs> &eval_initializers) {
-
-  if (!indices.is_cuda() || !offsets.is_cuda()) {
-    throw std::runtime_error(
-        "offsets or indices tensor must be on CUDA device");
-  }
-
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t num_indices = indices.numel();
-
-  at::Tensor output_embs = at::empty({num_indices, dim}, at::TensorOptions().dtype(embedding_dtype).device(device));
-
-  auto table_features_offsets = offsets_to_table_features_offsets(offsets, table_offsets_in_feature, batch_size, stream);
-  
-  for (int i = 0; i < table_num; ++i) {
-    int64_t table_offset_begin = table_features_offsets[i];
-    int64_t table_offset_end = table_features_offsets[i + 1];
-    int64_t table_offset_length = table_offset_end - table_offset_begin;
-    at::Tensor current_indices = create_sub_tensor(indices, table_offset_begin);
-    at::Tensor current_output_embs = create_sub_tensor(output_embs, table_offset_begin * dim);
-    
-    find_and_initialize(tables[i], static_cast<size_t>(table_offset_length), current_indices, current_output_embs, eval_initializers[i]);
-  }
-
-  return output_embs;
 }
 
 void lookup_backward_dense(const at::Tensor indices, const at::Tensor grads,
@@ -670,33 +515,6 @@ reduce_grads(at::Tensor indices, at::Tensor grads, at::Tensor segment_range, at:
   at::Tensor unique_grads = at::empty({num_unique_total, dim}, grads.options());
   lookup_backward_dense(indices, grads, dim, segment_range, unique_indices, unique_grads);
   return std::make_tuple(unique_indices, unique_grads);
-}
-
-void lookup_backward_dense_dedup(const at::Tensor grads,
-                                 at::Tensor unique_indices,
-                                 at::Tensor reverse_idx, int32_t dim,
-                                 at::Tensor unique_grads,
-                                 int32_t device_num_sms) {
-  // Initialization
-  if (!grads.is_cuda() || !unique_indices.is_cuda() || !reverse_idx.is_cuda() ||
-      !unique_grads.is_cuda()) {
-    throw std::runtime_error("All argument tensors should on device");
-  }
-  auto device_ = unique_indices.device();
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  auto rev_idx_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(reverse_idx.dtype()));
-  auto grad_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(grads.dtype()));
-  auto idx_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(unique_indices.dtype()));
-  auto key_num = reverse_idx.size(0);
-  auto unique_key_num = unique_indices.size(0);
-
-  dyn_emb::one_to_one_atomic(grads.data_ptr(), unique_indices.data_ptr(),
-                             reverse_idx.data_ptr(), unique_grads.data_ptr(),
-                             dim, key_num, unique_key_num, rev_idx_type,
-                             grad_type, idx_type, device_num_sms, stream);
 }
 
 void dedup_input_indices(
@@ -1145,34 +963,6 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("inverse_indices"), py::arg("biased_offsets"), py::arg("dim"),
         py::arg("tables_num"), py::arg("batch_size"), py::arg("num_feature"),
         py::arg("num_key"), py::arg("combiner"));
-
-  m.def("lookup_forward_dense", &lookup_forward_dense,
-        "lookup forward dense for duplicated keys", py::arg("tables"),
-        py::arg("indices"), py::arg("offsets"), py::arg("scores"),
-        py::arg("table_offsets_in_feature"), py::arg("table_offsets"),
-        py::arg("table_num"), py::arg("batch_size"), py::arg("dim"),
-        py::arg("use_index_dedup"), py::arg("unique_idx"),
-        py::arg("reverse_idx"), py::arg("h_unique_nums"),
-        py::arg("d_unique_nums"), py::arg("h_unique_offsets"),
-        py::arg("d_unique_offsets"), py::arg("unique_embs"),
-        py::arg("output_embs"), py::arg("device_num_sms"),
-        py::arg("unique_op"));
-
-  m.def("lookup_forward_dense_eval", &lookup_forward_dense_eval,
-        "lookup forward dense eval for globally deduplicated keys", py::arg("tables"),
-        py::arg("indices"), py::arg("offsets"), py::arg("table_offsets_in_feature"),
-        py::arg("embedding_dtype"), py::arg("table_num"), py::arg("batch_size"),
-        py::arg("dim"), py::arg("device"), py::arg("eval_initializers"));
-
-  m.def("lookup_backward_dense", &lookup_backward_dense,
-        "lookup backward for dense/sequence", py::arg("indices"),
-        py::arg("grads"), py::arg("dim"), py::arg("table_offsets"),
-        py::arg("unique_indices"), py::arg("unique_grads"));
-
-  m.def("lookup_backward_dense_dedup", &lookup_backward_dense_dedup,
-        "lookup backward for dedup dense/sequence", py::arg("grads"),
-        py::arg("unique_indices"), py::arg("reverse_idx"), py::arg("dim"),
-        py::arg("unique_grads"), py::arg("device_num_sms"));
 
   m.def("dedup_input_indices", &dedup_input_indices,
         "duplicate indices from a given list or array of indices",
