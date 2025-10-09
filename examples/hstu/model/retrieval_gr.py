@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
@@ -163,9 +163,7 @@ class RetrievalGR(BaseModel):
     def forward(  # type: ignore[override]
         self,
         batch: RetrievalBatch,
-    ) -> Tuple[
-        torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]:
         """
         Perform the forward pass of the model.
 
@@ -173,7 +171,7 @@ class RetrievalGR(BaseModel):
             batch (RetrievalBatch): The batch of retrieval data.
 
         Returns:
-            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]: The losses and a tuple of losses, logits, and supervision embeddings.
+            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]: The losses and a tuple of losses, logits, and supervision embeddings.
         """
         if self._item_feature_name is None:
             self._item_feature_name = batch.item_feature_name
@@ -192,7 +190,7 @@ class RetrievalGR(BaseModel):
             losses.detach(),
             jagged_item_logit.detach(),
             supervision_item_ids.detach(),
-            seqlen_after_preprocessor.detach(),  # used to compute achieved flops/s
+            seqlen_after_preprocessor,  # used to compute achieved flops/s
         )
 
     # used for evaluation

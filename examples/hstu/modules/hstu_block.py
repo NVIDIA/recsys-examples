@@ -53,7 +53,7 @@ class HSTUBlock(MegatronModule):
         self,
         embeddings: Dict[str, JaggedTensor],
         batch: Union[RankingBatch, RetrievalBatch],
-    ) -> Tuple[JaggedData, torch.Tensor]:
+    ) -> Tuple[JaggedData, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass of the HSTUBlock.
 
@@ -66,6 +66,16 @@ class HSTUBlock(MegatronModule):
         """
         jd = self._preprocessor(embeddings, batch)
         seqlen_after_preprocessor = jd.seqlen
+        num_contextuals_after_preprocessor = jd.contextual_seqlen
+        num_candidates_after_preprocessor = jd.num_candidates
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
-        return self._postprocessor(jd), seqlen_after_preprocessor
+        return self._postprocessor(jd), (
+            seqlen_after_preprocessor.detach(),
+            num_contextuals_after_preprocessor.detach()
+            if num_contextuals_after_preprocessor is not None
+            else torch.zeros_like(seqlen_after_preprocessor),
+            num_candidates_after_preprocessor.detach()
+            if num_candidates_after_preprocessor is not None
+            else torch.zeros_like(seqlen_after_preprocessor),
+        )

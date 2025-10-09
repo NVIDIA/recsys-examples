@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 from configs import HSTUConfig, RankingConfig
@@ -134,9 +134,7 @@ class RankingGR(BaseModel):
     def forward(  # type: ignore[override]
         self,
         batch: RankingBatch,
-    ) -> Tuple[
-        torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]:
         """
         Perform the forward pass of the model.
 
@@ -144,7 +142,7 @@ class RankingGR(BaseModel):
             batch (RankingBatch): The batch of ranking data.
 
         Returns:
-            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]: The losses and a tuple of losses, logits, and labels.
+            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]: The losses and a tuple of losses, logits, and labels.
         """
         (
             jagged_item_logit,
@@ -156,5 +154,5 @@ class RankingGR(BaseModel):
             losses.detach(),
             jagged_item_logit.detach(),
             labels.detach(),
-            seqlen_after_preprocessor.detach(),  # used to compute achieved flops/s
+            seqlen_after_preprocessor,  # used to compute achieved flops/s
         )

@@ -141,6 +141,8 @@ def train_with_pipeline(
     last_td = 0
     # used to compute achieved flops/s
     ddp_seqlens = []
+    ddp_num_contextuals = []
+    ddp_num_candidates = []
     # using a tensor on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
     # limit the number of iters to max_train_iters
@@ -174,9 +176,11 @@ def train_with_pipeline(
                     local_loss,
                     logits,
                     labels,
-                    ddp_seqlen,
+                    (ddp_seqlen, ddp_num_contextual, ddp_num_candidate),
                 ) = pipeline.progress(batched_iterator)
                 ddp_seqlens.append(ddp_seqlen.view(-1))
+                ddp_num_contextuals.append(ddp_num_contextual.view(-1))
+                ddp_num_candidates.append(ddp_num_candidate.view(-1))
                 tokens_logged += reporting_loss[1]
                 torch.cuda.nvtx.range_pop()
             except StopIteration:
@@ -188,7 +192,10 @@ def train_with_pipeline(
                 gpu_timer.stop()
                 cur_td = gpu_timer.elapsed_time() - last_td
                 flops = cal_flops(
-                    get_unwrapped_module(pipeline._model)._hstu_config, ddp_seqlens
+                    get_unwrapped_module(pipeline._model)._hstu_config,
+                    ddp_seqlens,
+                    ddp_num_contextuals,
+                    ddp_num_candidates,
                 )
                 print_rank_0(
                     f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"

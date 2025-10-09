@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
-from functools import partial  # pylint: disable-unused-import
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import configs
 import dataset
@@ -45,21 +44,42 @@ from training.gin_config_args import (
 
 @torch.compile
 def cal_flops_single_rank(
-    hstu_config: HSTUConfig, seqlens: torch.Tensor, has_bwd: bool = True
+    hstu_config: HSTUConfig,
+    seqlens: torch.Tensor,
+    num_contextuals: Optional[torch.Tensor],
+    num_candidates: Optional[torch.Tensor],
+    has_bwd: bool = True,
 ) -> torch.Tensor:
     num_layers = hstu_config.num_layers
     hidden_size = hstu_config.hidden_size
     num_heads = hstu_config.num_attention_heads
     dim_per_head = hstu_config.kv_channels
+    if num_contextuals is None:
+        num_contextuals = torch.zeros_like(seqlens)
+    if num_candidates is None:
+        num_candidates = torch.zeros_like(seqlens)
     with torch.inference_mode():
         seqlens = seqlens.to(torch.int64)
+        num_contextuals = num_contextuals.to(torch.int64)
+        num_candidates = num_candidates.to(torch.int64)
+        num_history = seqlens - num_contextuals - num_candidates
         total_flops_per_layer = torch.zeros_like(seqlens).to(torch.int64)
         total_flops_per_layer += (
             2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
         )  # qkvu proj fwd
+
+        # flops between seq and contextual + history
         total_flops_per_layer += (
-            2 * num_heads * 2 * seqlens * seqlens * dim_per_head
-        )  # attn fwd
+            2 * num_heads * 2 * seqlens * (num_contextuals + num_history) * dim_per_head
+        )
+        if hstu_config.is_causal:
+            # remove upper triangular flops between history and history
+            total_flops_per_layer -= (
+                2 * num_heads * num_history * num_history * dim_per_head
+            )
+        # flops between candidates
+        total_flops_per_layer += 2 * num_heads * 2 * num_candidates * dim_per_head
+
         total_flops_per_layer += seqlens * num_heads * dim_per_head  # mul fwd
         total_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
         if has_bwd:
@@ -72,7 +92,12 @@ def cal_flops_single_rank(
         return torch.sum(total_flops_per_layer) * num_layers
 
 
-def cal_flops(hstu_config: HSTUConfig, seqlens: List[torch.Tensor]) -> int:
+def cal_flops(
+    hstu_config: HSTUConfig,
+    seqlens: List[torch.Tensor],
+    num_contextuals: List[torch.Tensor],
+    num_candidates: List[torch.Tensor],
+) -> int:
     seqlens_tensor = torch.cat(seqlens)
     world_size = torch.distributed.get_world_size()
     gathered_seqlens = (
@@ -80,10 +105,32 @@ def cal_flops(hstu_config: HSTUConfig, seqlens: List[torch.Tensor]) -> int:
         if torch.distributed.get_rank() == 0
         else None
     )
+    num_contextuals_tensor = torch.cat(num_contextuals)
+    num_candidates_tensor = torch.cat(num_candidates)
+
+    gathered_num_contextuals = (
+        [torch.empty_like(seqlens_tensor) for _ in range(world_size)]
+        if torch.distributed.get_rank() == 0
+        else None
+    )
+    gathered_num_candidates = (
+        [torch.empty_like(seqlens_tensor) for _ in range(world_size)]
+        if torch.distributed.get_rank() == 0
+        else None
+    )
     torch.distributed.gather(seqlens_tensor, gathered_seqlens, dst=0)
+    torch.distributed.gather(num_contextuals_tensor, gathered_num_contextuals, dst=0)
+    torch.distributed.gather(num_candidates_tensor, gathered_num_candidates, dst=0)
     if torch.distributed.get_rank() == 0:
         flops = (
-            cal_flops_single_rank(hstu_config, torch.cat(gathered_seqlens)).cpu().item()
+            cal_flops_single_rank(
+                hstu_config,
+                torch.cat(gathered_seqlens),
+                torch.cat(gathered_num_contextuals),
+                torch.cat(gathered_num_candidates),
+            )
+            .cpu()
+            .item()
         )
     else:
         flops = 0
