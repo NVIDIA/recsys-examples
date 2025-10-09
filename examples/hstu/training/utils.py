@@ -109,12 +109,12 @@ def cal_flops(
     num_candidates_tensor = torch.cat(num_candidates)
 
     gathered_num_contextuals = (
-        [torch.empty_like(seqlens_tensor) for _ in range(world_size)]
+        [torch.empty_like(num_contextuals_tensor) for _ in range(world_size)]
         if torch.distributed.get_rank() == 0
         else None
     )
     gathered_num_candidates = (
-        [torch.empty_like(seqlens_tensor) for _ in range(world_size)]
+        [torch.empty_like(num_candidates_tensor) for _ in range(world_size)]
         if torch.distributed.get_rank() == 0
         else None
     )

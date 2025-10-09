@@ -193,9 +193,9 @@ def train_with_pipeline(
                 cur_td = gpu_timer.elapsed_time() - last_td
                 flops = cal_flops(
                     get_unwrapped_module(pipeline._model)._hstu_config,
-                    ddp_seqlens,
-                    ddp_num_contextuals,
-                    ddp_num_candidates,
+                    seqlens=ddp_seqlens,
+                    num_contextuals=ddp_num_contextuals,
+                    num_candidates=ddp_num_candidates,
                 )
                 print_rank_0(
                     f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
@@ -203,6 +203,8 @@ def train_with_pipeline(
                 last_td = cur_td + last_td
                 tokens_logged.zero_()
                 ddp_seqlens = []
+                ddp_num_contextuals = []
+                ddp_num_candidates = []
         # TODO CHECK if train pipeline is flushed
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
             pipeline._model.eval()

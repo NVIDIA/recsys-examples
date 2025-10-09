@@ -66,16 +66,20 @@ class HSTUBlock(MegatronModule):
         """
         jd = self._preprocessor(embeddings, batch)
         seqlen_after_preprocessor = jd.seqlen
-        num_contextuals_after_preprocessor = jd.contextual_seqlen
-        num_candidates_after_preprocessor = jd.num_candidates
+        num_contextuals_after_preprocessor = (
+            jd.contextual_seqlen
+            if jd.contextual_seqlen is not None
+            else torch.zeros_like(seqlen_after_preprocessor)
+        )
+        num_candidates_after_preprocessor = (
+            jd.num_candidates
+            if jd.num_candidates is not None
+            else torch.zeros_like(seqlen_after_preprocessor)
+        )
         for hstu_layer in self._attention_layers:
             jd = hstu_layer(jd)
         return self._postprocessor(jd), (
             seqlen_after_preprocessor.detach(),
-            num_contextuals_after_preprocessor.detach()
-            if num_contextuals_after_preprocessor is not None
-            else torch.zeros_like(seqlen_after_preprocessor),
-            num_candidates_after_preprocessor.detach()
-            if num_candidates_after_preprocessor is not None
-            else torch.zeros_like(seqlen_after_preprocessor),
+            num_contextuals_after_preprocessor.detach(),
+            num_candidates_after_preprocessor.detach(),
         )
