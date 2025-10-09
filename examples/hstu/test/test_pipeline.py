@@ -31,14 +31,14 @@ from pipeline.train_pipeline import (
 from test_utils import create_model
 
 
-@pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"]])
-@pytest.mark.parametrize("max_num_candidates", [10])
+@pytest.mark.parametrize("contextual_feature_names", [["user0", "user1"], []])
+@pytest.mark.parametrize("max_num_candidates", [10, 0])
 @pytest.mark.parametrize(
     "optimizer_type_str", ["sgd"]
 )  # adam does not work since torchrec does not save the optimizer state `step`.
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("use_dynamic_emb", [True])
-@pytest.mark.parametrize("pipeline_type", ["prefetch"])
+@pytest.mark.parametrize("use_dynamic_emb", [True, False])
+@pytest.mark.parametrize("pipeline_type", ["prefetch", "native"])
 def test_pipeline(
     pipeline_type: str,
     contextual_feature_names: List[str],
