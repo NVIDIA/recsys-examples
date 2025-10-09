@@ -105,7 +105,7 @@ def main():
         network_args.hidden_size,
         training=True,
         embedding_dim_multiplier=get_embedding_vector_storage_multiplier(
-            optimizer_args.optimizer_type
+            optimizer_args.optimizer_str
         ),
     )
     optimizer_param = create_optimizer_params(optimizer_args)
