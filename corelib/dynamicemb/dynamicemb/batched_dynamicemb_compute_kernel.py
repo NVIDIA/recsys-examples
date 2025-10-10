@@ -27,11 +27,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     get_optimizer_state_dim,
 )
-from dynamicemb.optimizer import (
-    EmbOptimType,
-    convert_optimizer_type,
-    string_to_opt_type,
-)
+from dynamicemb.optimizer import convert_optimizer_type, string_to_opt_type
 from dynamicemb_extensions import OptimizerType
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn
@@ -245,7 +241,7 @@ def _get_dynamicemb_options_per_table(
     local_row,
     local_col,
     data_type: DataType,
-    optimizer: EmbOptimType,
+    optimizer: OptimizerType,
     table: ShardedEmbeddingTable,
 ) -> DynamicEmbTableOptions:
     # User-configured
@@ -257,7 +253,7 @@ def _get_dynamicemb_options_per_table(
     if dynamicemb_options.embedding_dtype is None:
         dynamicemb_options.embedding_dtype = data_type_to_dtype(data_type)
     if dynamicemb_options.training:
-        dynamicemb_options.optimizer_type = convert_optimizer_type(optimizer)
+        dynamicemb_options.optimizer_type = optimizer
     else:
         dynamicemb_options.optimizer_type = OptimizerType.Null
     dynamicemb_options.dim = local_col
@@ -318,7 +314,9 @@ class BatchedDynamicEmbeddingBag(
                     local_row,
                     local_col,
                     config.data_type,
-                    config.fused_params["optimizer"],
+                    convert_optimizer_type(config.fused_params["optimizer"])
+                    if "optimizer" in config.fused_params
+                    else OptimizerType.Null,
                     table,
                 )
             )
@@ -431,7 +429,9 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
                     local_row,
                     local_col,
                     config.data_type,
-                    config.fused_params["optimizer"],
+                    convert_optimizer_type(config.fused_params["optimizer"])
+                    if "optimizer" in config.fused_params
+                    else OptimizerType.Null,
                     table,
                 )
             )
