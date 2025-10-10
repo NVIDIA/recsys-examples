@@ -42,7 +42,6 @@ from training.gin_config_args import (
 )
 
 
-@torch.compile
 def cal_flops_single_rank(
     hstu_config: HSTUConfig,
     seqlens: torch.Tensor,
@@ -59,37 +58,46 @@ def cal_flops_single_rank(
     if num_candidates is None:
         num_candidates = torch.zeros_like(seqlens)
     with torch.inference_mode():
-        seqlens = seqlens.to(torch.int64)
-        num_contextuals = num_contextuals.to(torch.int64)
-        num_candidates = num_candidates.to(torch.int64)
+        seqlens = seqlens.to(torch.float)
+        num_contextuals = num_contextuals.to(torch.float)
+        num_candidates = num_candidates.to(torch.float)
         num_history = seqlens - num_contextuals - num_candidates
-        total_flops_per_layer = torch.zeros_like(seqlens).to(torch.int64)
-        total_flops_per_layer += (
-            2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
-        )  # qkvu proj fwd
-
+        # reference: https://github.com/Dao-AILab/flash-attention/blob/9c0e9ee86d0e0022b60deddb405c20ab77481582/benchmarks/benchmark_flash_attention.py#L27-L30
         # flops between seq and contextual + history
-        total_flops_per_layer += (
-            2 * num_heads * 2 * seqlens * (num_contextuals + num_history) * dim_per_head
+        attn_flops_per_layer = (
+            4 * num_heads * seqlens * (num_contextuals + num_history) * dim_per_head
         )
         if hstu_config.is_causal:
             # remove upper triangular flops between history and history
-            total_flops_per_layer -= (
+            attn_flops_per_layer -= (
                 2 * num_heads * num_history * num_history * dim_per_head
             )
         # flops between candidates
-        total_flops_per_layer += 2 * num_heads * 2 * num_candidates * dim_per_head
-
-        total_flops_per_layer += seqlens * num_heads * dim_per_head  # mul fwd
-        total_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
+        attn_flops_per_layer += 4 * num_heads * num_candidates * dim_per_head
         if has_bwd:
-            total_flops_per_layer *= 3  # bwd
+            attn_flops_per_layer *= 3.5
+
+        gemm_flops_per_layer = (
+            2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
+        )  # qkvu proj fwd
+        gemm_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
+        if has_bwd:
+            gemm_flops_per_layer *= 3
+
+        other_ops_flops_per_layer = seqlens * num_heads * dim_per_head  # mul fwd
+        if has_bwd:
+            other_ops_flops_per_layer *= 2  # bwd
         if hstu_config.residual:
-            total_flops_per_layer += (
+            other_ops_flops_per_layer += (
                 seqlens * num_heads * hidden_size
             )  # add fwd, bwd is no-op
 
-        return torch.sum(total_flops_per_layer) * num_layers
+        return (
+            torch.sum(
+                gemm_flops_per_layer + attn_flops_per_layer + other_ops_flops_per_layer
+            )
+            * num_layers
+        )
 
 
 def cal_flops(
