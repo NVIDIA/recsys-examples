@@ -159,9 +159,11 @@ def train_with_pipeline(
         # for one slice(every eval interval)
         for train_iter in count(start_iter):
             if trainer_args.profile and train_iter == trainer_args.profile_step_start:
+                dist.barrier(device_ids=[torch.cuda.current_device()])
                 torch.cuda.profiler.start()
             if trainer_args.profile and train_iter == trainer_args.profile_step_end:
                 torch.cuda.profiler.stop()
+                dist.barrier(device_ids=[torch.cuda.current_device()])
             if (
                 train_iter * trainer_args.ckpt_save_interval > 0
                 and train_iter % trainer_args.ckpt_save_interval == 0

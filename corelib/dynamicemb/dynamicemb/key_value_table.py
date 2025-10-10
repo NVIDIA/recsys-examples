@@ -220,8 +220,8 @@ class Cache(abc.ABC):
         self,
         keys: torch.Tensor,
         values: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_evicted: torch.Tensor
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_evicted: int
         evicted_keys: torch.Tensor
         evicted_values: torch.Tensor
         evicted_scores: torch.Tensor
@@ -766,7 +766,7 @@ class KeyValueTable(Cache, Storage):
         self,
         keys: torch.Tensor,
         values: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = keys.numel()
         num_evicted: torch.Tensor = torch.zeros(1, dtype=torch.long, device=keys.device)
         evicted_keys: torch.Tensor = torch.empty_like(keys)
@@ -788,7 +788,13 @@ class KeyValueTable(Cache, Storage):
         if self._record_cache_metrics:
             self._cache_metrics[2] = batch
             self._cache_metrics[3] = num_evicted.cpu().item()
-        return num_evicted, evicted_keys, evicted_values, evicted_scores
+        h_num_evict = num_evicted.cpu().item()
+        return (
+            h_num_evict,
+            evicted_keys[:h_num_evict],
+            evicted_values[:h_num_evict, :],
+            evicted_scores[:h_num_evict],
+        )
 
     def flush(self, storage: Storage) -> None:
         batch_size = self._threads_in_wave
@@ -867,12 +873,11 @@ def update_cache(
     num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(
         missing_keys, missing_values
     )
-    h_num_evicted = num_evicted.cpu().item()
-    if h_num_evicted != 0:
+    if num_evicted != 0:
         storage.insert(
-            evicted_keys[:h_num_evicted],
-            evicted_values[:h_num_evicted, :],
-            evicted_scores[:h_num_evicted],
+            evicted_keys,
+            evicted_values,
+            evicted_scores,
         )
 
 
@@ -897,17 +902,12 @@ class KeyValueTableFunction:
         # 1. find in storage
         founds = torch.empty(h_num_toatl, device=unique_keys.device, dtype=torch.bool)
         (
-            num_missing_in_storage,
+            h_num_missing_in_storage,
             missing_keys_in_storage,
             missing_indices_in_storage,
         ) = storage.find_embeddings(unique_keys, unique_embs, founds=founds)
 
         # 2. initialize missing embeddings
-        h_num_missing_in_storage = num_missing_in_storage.cpu().item()
-        missing_indices_in_storage = missing_indices_in_storage[
-            :h_num_missing_in_storage
-        ]
-        missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
         if h_num_missing_in_storage != 0:
             initializer(
                 unique_embs,
@@ -972,10 +972,10 @@ class KeyValueTableFunction:
 class KeyValueTableCachingFunction:
     @staticmethod
     def lookup(
-        cache: Cache,
-        storage: Storage,
-        unique_keys: torch.Tensor,
-        unique_embs: torch.Tensor,
+        cache: Cache,  # partial emb + optimizer state
+        storage: Storage,  # full emb + optimizer state
+        unique_keys: torch.Tensor,  # input
+        unique_embs: torch.Tensor,  # output
         initializer: Callable,
         enable_prefetch: bool,
         training: bool,
@@ -1008,17 +1008,12 @@ class KeyValueTableCachingFunction:
             dtype=emb_dtype,
         )
         (
-            num_missing_in_storage,
+            h_num_missing_in_storage,
             missing_keys_in_storage,
             missing_indices_in_storage,
         ) = storage.find(keys_for_storage, values_for_storage, founds=founds)
 
         # 3. initialize missing embeddings
-        h_num_missing_in_storage = num_missing_in_storage.cpu().item()
-        missing_indices_in_storage = missing_indices_in_storage[
-            :h_num_missing_in_storage
-        ]
-        missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
         if h_num_missing_in_storage != 0:
             initializer(
                 values_for_storage[:, :emb_dim],
@@ -1092,7 +1087,7 @@ class KeyValueTableCachingFunction:
         training: bool = True,
         forward_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        assert cache is not None
+        assert cache is not None, "prefetch is available only when caching is enabled."
         emb_dtype = storage.embedding_dtype()
         h_num_keys_for_storage, missing_keys, _ = cache.find_missed_keys(unique_keys)
 

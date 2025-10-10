@@ -448,13 +448,13 @@ def get_dataset_and_embedding_args() -> (
                 feature_names=["video_id"],
                 table_name="video_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
             ),
         ]
     elif dataset_args.dataset_name == "kuairand-1k":
@@ -550,13 +550,13 @@ def get_dataset_and_embedding_args() -> (
                 feature_names=["video_id"],
                 table_name="video_id",
                 item_vocab_size_or_capacity=32038725,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
             ),
         ]
     elif dataset_args.dataset_name == "ml-1m":
@@ -595,13 +595,13 @@ def get_dataset_and_embedding_args() -> (
                 feature_names=["movie_id"],
                 table_name="movie_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
             ),
         ]
     elif dataset_args.dataset_name == "ml-20m":
@@ -616,13 +616,15 @@ def get_dataset_and_embedding_args() -> (
                 feature_names=["movie_id"],
                 table_name="movie_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
+                caching=True,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=1.0,
+                item_vocab_gpu_capacity_ratio=0.5,
+                caching=True,
             ),
         ]
     else:

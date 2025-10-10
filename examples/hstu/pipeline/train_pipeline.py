@@ -884,8 +884,12 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             )
         with nvtx.annotate("## prefetch ##"):
             self._prefetch(self._batch_ip1)
-
         if self._model.training:
+            # prefetch => Load to cache & might invalidate cache & flush to host
+            # bwd => read & write to cache/host
+            # the cache might be in a dangling state that a key is either not in cache or not in host.
+            # thererfore we enforce a sync: prefetch should be finished to avoid race condition.
+            torch.cuda.current_stream().wait_stream(self._prefetch_stream)
             # backward
             with nvtx.annotate("## backward ##"):
                 dp_size = parallel_state.get_data_parallel_world_size()
