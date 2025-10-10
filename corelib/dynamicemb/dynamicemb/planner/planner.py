@@ -52,6 +52,7 @@ from ..batched_dynamicemb_compute_kernel import (
 from ..dynamicemb_config import (
     DynamicEmbKernel,
     DynamicEmbTableOptions,
+    _next_power_of_2,
     validate_initializer_args,
 )
 
@@ -103,47 +104,6 @@ class DynamicEmbParameterSharding(ParameterSharding):
         return {
             k: v for k, v in all_fields.items() if k not in parameter_sharding_fields
         }
-
-
-def _next_power_of_2(n):
-    # Handle the case where n is 0
-    if n == 0:
-        return 1
-
-    # If n is already a power of 2, return n
-    if (n & (n - 1)) == 0:
-        return n
-
-    # Find the next power of 2
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32  # This line is necessary for 64-bit integers
-    return n + 1
-
-
-# def _get_safe_local_capacity(local_capacity, bucket_capacity):
-#     LOCAL_BATCH_SIZE: int = 8192
-#     factor: int = -1
-#     if bucket_capacity == local_capacity:
-#         factor = 1
-#     elif bucket_capacity >= 128:
-#         factor = 2
-#     elif bucket_capacity == 64:
-#         factor = 4
-#     elif bucket_capacity == 32:
-#         factor = 8
-#     elif bucket_capacity == 16:
-#         factor = 16
-#     else:
-#         raise ValueError("Bucket capacity is too small!")
-#     hkv_cap_min = LOCAL_BATCH_SIZE * factor
-#     if local_capacity < hkv_cap_min:
-#         local_capacity = hkv_cap_min
-#     return local_capacity
 
 
 def _validate_configs(

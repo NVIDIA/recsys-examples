@@ -15,6 +15,7 @@
 
 import enum
 import os
+import warnings
 from dataclasses import dataclass, field, fields
 from math import sqrt
 from typing import Dict, Optional
@@ -282,8 +283,12 @@ class DynamicEmbTableOptions(HKVConfig):
         The dimensionality of the value vectors. Default is -1, indicating it should be set explicitly.
     max_capacity : Optional[int], optional
         The maximum capacity of the embedding table. Automatically set in the shared planner.
+        It will be automatically inferred from EmbeddingConfig.num_embeddings and the world size, rounded up to a power of 2.
+        If init_capacity is set, max_capacity will not be smaller than init_capacity.
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
+        If set, it will be rounded up to the power of 2.
+        Note: This is the setting for a single table at each rank.
     max_load_factor : float
         The maximum load factor before rehashing occurs. Default is 0.5.
     global_hbm_for_values : int
@@ -353,6 +358,14 @@ class DynamicEmbTableOptions(HKVConfig):
         assert (
             self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
         ), "eval_initializer_args must be constant initialization"
+
+        if self.init_capacity is not None:
+            target_init_capacity = _next_power_of_2(self.init_capacity)
+            if self.init_capacity != target_init_capacity:
+                warnings.warn(
+                    f"init_capacity is changed to {target_init_capacity} from {self.init_capacity}"
+                )
+                self.init_capacity = target_init_capacity
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
@@ -561,3 +574,23 @@ def get_constraint_capacity(
     ) * dtype_to_bytes(dtype)
     capacity = memory_bytes // byte_consume
     return (capacity // bucket_capacity) * bucket_capacity
+
+
+def _next_power_of_2(n):
+    # Handle the case where n is 0
+    if n == 0:
+        return 1
+
+    # If n is already a power of 2, return n
+    if (n & (n - 1)) == 0:
+        return n
+
+    # Find the next power of 2
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32  # This line is necessary for 64-bit integers
+    return n + 1

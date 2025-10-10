@@ -281,6 +281,11 @@ def _get_dynamicemb_options_per_table(
     else:
         dynamicemb_options.max_capacity = local_row
 
+    if dynamicemb_options.init_capacity is not None:
+        dynamicemb_options.max_capacity = max(
+            dynamicemb_options.max_capacity, dynamicemb_options.init_capacity
+        )
+
     return dynamicemb_options
 
 
