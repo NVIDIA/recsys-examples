@@ -66,6 +66,26 @@ library_name = "dynamicemb"
 root_path: Path = Path(__file__).resolve().parent
 
 
+def get_version():
+    try:
+        cmd = ["git", "rev-parse", "HEAD"]
+        sha = subprocess.check_output(cmd, cwd=str(root_path)).decode("ascii").strip()
+    except Exception:
+        sha = None
+
+    if "BUILD_VERSION" in os.environ:
+        version = os.environ["BUILD_VERSION"]
+    else:
+        with open(os.path.join(root_path, "version.txt"), "r") as f:
+            version = f.readline().strip()
+        if sha is not None and "OFFICIAL_RELEASE" not in os.environ:
+            version += "+" + sha[:7]
+
+    if sha is None:
+        sha = "Unknown"
+    return version, sha
+
+
 def get_extensions():
     extra_link_args = []
     extra_compile_args = {
@@ -156,9 +176,11 @@ class NinjaBuildExtension(BuildExtension):
         print(f"compilation_time: {compilation_time}")
 
 
+version, sha = get_version()
+
 setup(
     name=library_name,
-    version="0.0.1",
+    version=version,
     author="NVIDIA Corporation.",
     maintainer="zehuanw",
     maintainer_email="zehuanw@nvidia.com",
