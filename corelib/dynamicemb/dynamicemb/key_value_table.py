@@ -708,82 +708,47 @@ class KeyValueTableCachingFunction:
         founds = torch.empty(
             h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
         )
-        if enable_prefetch:  # not prefetch in the lookup.
-            # 2. find in storage
-            embs_for_storage = torch.empty(
-                h_num_keys_for_storage,
-                emb_dim,
-                device=unique_keys.device,
-                dtype=emb_dtype,
-            )
-            (
-                num_missing_in_storage,
-                missing_keys_in_storage,
+
+        # 2. find in storage
+        values_for_storage = torch.empty(
+            h_num_keys_for_storage,
+            val_dim,
+            device=unique_keys.device,
+            dtype=emb_dtype,
+        )
+        (
+            num_missing_in_storage,
+            missing_keys_in_storage,
+            missing_indices_in_storage,
+        ) = storage.find(keys_for_storage, values_for_storage, founds=founds)
+
+        # 3. initialize missing embeddings
+        h_num_missing_in_storage = num_missing_in_storage.cpu().item()
+        missing_indices_in_storage = missing_indices_in_storage[
+            :h_num_missing_in_storage
+        ]
+        missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
+        if h_num_missing_in_storage != 0:
+            initializer(
+                values_for_storage[:, :emb_dim],
                 missing_indices_in_storage,
-            ) = storage.find_embeddings(
-                keys_for_storage, embs_for_storage, founds=founds
+                keys_for_storage,
             )
 
-            # 3. initialize missing embeddings
-            h_num_missing_in_storage = num_missing_in_storage.cpu().item()
-            missing_indices_in_storage = missing_indices_in_storage[
-                :h_num_missing_in_storage
-            ]
-            missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
-            if h_num_missing_in_storage != 0:
-                initializer(
-                    embs_for_storage,
-                    missing_indices_in_storage,
-                    keys_for_storage,
-                )
+        # 4. copy embeddings to unique_embs
+        unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
 
-            # 4. copy embeddings to unique_embs
-            unique_embs[missing_indices, :] = embs_for_storage[:, :]
-
-            # ignore the cache missed and storage missed when enable prefetch
-            return
-        else:
-            values_for_storage = torch.empty(
-                h_num_keys_for_storage,
-                val_dim,
-                device=unique_keys.device,
-                dtype=emb_dtype,
-            )
-            (
-                num_missing_in_storage,
-                missing_keys_in_storage,
-                missing_indices_in_storage,
-            ) = storage.find(keys_for_storage, values_for_storage, founds=founds)
-
-            # 3. initialize missing embeddings
-            h_num_missing_in_storage = num_missing_in_storage.cpu().item()
-            missing_indices_in_storage = missing_indices_in_storage[
-                :h_num_missing_in_storage
-            ]
-            missing_keys_in_storage = missing_keys_in_storage[:h_num_missing_in_storage]
-            if h_num_missing_in_storage != 0:
-                initializer(
-                    values_for_storage[:, :emb_dim],
-                    missing_indices_in_storage,
-                    keys_for_storage,
-                )
-
-            # 4. copy embeddings to unique_embs
-            unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
-
-            if training:
-                if emb_dim != val_dim:
-                    values_for_storage[
-                        missing_indices_in_storage, emb_dim - val_dim :
-                    ] = storage.init_optimizer_state()
-                update_cache(cache, storage, keys_for_storage, values_for_storage)
-            else:  # only update those found in the storage to cache.
-                found_keys_in_storage = keys_for_storage[founds].contiguous()
-                found_values_in_storage = values_for_storage[founds, :].contiguous()
-                update_cache(
-                    cache, storage, found_keys_in_storage, found_values_in_storage
-                )
-            return
+        if training:
+            if emb_dim != val_dim:
+                values_for_storage[
+                    missing_indices_in_storage, emb_dim - val_dim :
+                ] = storage.init_optimizer_state()
+            update_cache(cache, storage, keys_for_storage, values_for_storage)
+        else:  # only update those found in the storage to cache.
+            found_keys_in_storage = keys_for_storage[founds].contiguous()
+            found_values_in_storage = values_for_storage[founds, :].contiguous()
+            update_cache(cache, storage, found_keys_in_storage, found_values_in_storage)
+        return
 
     @staticmethod
     def update(

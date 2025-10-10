@@ -436,7 +436,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
-        ctx.enable_prefetch
         caching = caches[0] is not None
 
         input_dist_dedup = ctx.input_dist_dedup
