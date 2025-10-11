@@ -599,7 +599,9 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
         if (is_jump && masking_step == n_masking_steps - 1) {
           n_block_next = std::min(n_block, n_block_history) - 1;
         }
-        copy_g2s_rab(n_block_next, buffer_stage);
+        if (n_block_next >= n_block_min) {
+          copy_g2s_rab(n_block_next, buffer_stage);
+        }
       }
     } else {
       clear(acc_s);
@@ -623,9 +625,11 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
       }
       bool is_paged_tile = (n_block_next < n_block_paged) && Paged_KV;
       auto tKsK_stage_view_next = tKsK(_, _, _, buffer_stage);
-      flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV,
-                                      is_paged_tile ? tKgK_page(_, _, _, params.page_ids[page_offset + n_block_next]) : tKgK(_, _, _, n_block_next - n_block_paged),
-                                      tKsK_stage_view_next, tKVcKV);
+      if (n_block_next >= n_block_min) {
+        flash::copy</*Is_even_MN=*/true>(gmem_tiled_copy_QKV,
+                                        is_paged_tile ? tKgK_page(_, _, _, params.page_ids[page_offset + n_block_next]) : tKgK(_, _, _, n_block_next - n_block_paged),
+                                        tKsK_stage_view_next, tKVcKV);
+      }
       cute::cp_async_fence();
     }
 

@@ -756,7 +756,7 @@ struct Hstu_bwd_kernel_traits_fp8 {
 
   using TiledMmadQdescale = decltype(make_tiled_mma(
       UniversalFMA<ElementAccum, ElementAccum, ElementAccum>(),
-      Layout<Shape<Int<NumMmaThreads/8>, Shape<_4, _2>, _1>, Stride<_4, Stride<_1, _32>, _0>>{},
+      Layout<Shape<Int<NumMmaThreads/8>, Shape<_4, _2>, _1>, Stride<_4, Stride<_1, _128>, _0>>{},
       Tile<Layout<Shape<_8, Int<kBlockM/16>, _2>, Stride<_1, _16, _8>>, Layout<Shape<_4, _2, _2, Int<kHeadDim/16>>, Stride<_2, Int<kHeadDim/2>, _1, _8>>, _1>{})
   );
 

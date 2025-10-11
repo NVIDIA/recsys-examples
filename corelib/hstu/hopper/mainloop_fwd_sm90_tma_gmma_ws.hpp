@@ -435,12 +435,14 @@ struct CollectiveMainloopFwd {
         auto load_step = [&](int n_valid_block, int n_valid_block_prev, int masking_step) {
           int n_block_prev = !Is_arbitrary ? n_valid_block_prev : sValidBlockIds[n_valid_block];
           int n_block_next = !Is_arbitrary ? n_valid_block - 1  : sValidBlockIds[n_valid_block - 1];
-          pipeline_k.producer_acquire(smem_pipe_write_k);
-          copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
-                tKgK(_, n_block_next), tKsK(_, smem_pipe_write_k.index()));
-          ++smem_pipe_write_k;
+          if (n_block_next >= n_block_min) {
+            pipeline_k.producer_acquire(smem_pipe_write_k);
+            copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
+                  tKgK(_, n_block_next), tKsK(_, smem_pipe_write_k.index()));
+            ++smem_pipe_write_k;
+          }
 
-          if (Has_rab) {
+          if (Has_rab && n_block_next >= n_block_min) {
             pipeline_rab.producer_acquire(smem_pipe_write_rab);
             copy(mainloop_params.tma_load_Rab.with(*pipeline_rab.producer_get_barrier(smem_pipe_write_rab), 0),
                   tRabgRab(_, n_block_next), tRabsRab(_, smem_pipe_write_rab.index()));
