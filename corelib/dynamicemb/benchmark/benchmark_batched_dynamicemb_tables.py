@@ -189,7 +189,7 @@ def parse_args():
     ]
     args.num_embedding_table = len(args.num_embeddings_per_feature)
     args.hbm_for_embeddings = [
-        int(v) * (1024**3) for v in args.hbm_for_embeddings.split(",")
+        int(float(v) * (1024**3)) for v in args.hbm_for_embeddings.split(",")
     ]
 
     return args
