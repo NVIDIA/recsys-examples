@@ -116,7 +116,7 @@ void initialize_with_generator(
   if (num_worker > num_need) {
     num_worker = num_need;
   }
-  int grid_size = (num_worker - 1) / block_size + 1;
+  int grid_size = num_worker / block_size;
 
   auto value_type =
       scalartype_to_datatype(convertTypeMetaToScalarType(buffer.dtype()));
