@@ -17,7 +17,6 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 from configs import (
     InferenceHSTUConfig,
     KVCacheConfig,
@@ -27,7 +26,6 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from dataset.utils import Batch
-from dynamicemb.dump_load import distributed_load
 from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
 from modules.host_kv_storage_manager import HSTUHostKVStorageManager
 from modules.hstu_block_inference import HSTUBlockInference
@@ -226,20 +224,13 @@ class InferenceRankingGR(torch.nn.Module):
             "dynamicemb_module",
             "model._embedding_collection._model_parallel_embedding_collection",
         )
-        # FIXME: remove dist init in the future.
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "0000"
-        dist.init_process_group(world_size=1, rank=0)
         dynamic_tables = (
             self._embedding_collection._dynamic_embedding_collection._embedding_tables
         )
         for idx, table_name in enumerate(dynamic_tables.table_names):
-            distributed_load(
-                dynamic_tables.tables[idx], embedding_table_dir, table_name
+            dynamic_tables.load(
+                embedding_table_dir, optim=False, table_names=[table_name]
             )
-        dist.destroy_process_group()
-        os.environ.pop("MASTER_ADDR")
-        os.environ.pop("MASTER_PORT")
 
         model_state_dict_path = os.path.join(
             checkpoint_dir, "torch_module", "model.0.pth"

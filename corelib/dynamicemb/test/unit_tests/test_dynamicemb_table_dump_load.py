@@ -19,16 +19,10 @@ import pytest
 import torch
 import torch.distributed as dist
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
-from dynamicemb.dump_load import (
-    export_keys_values,
-    load_key_values,
-    local_export,
-    local_load,
-)
 from dynamicemb.dynamicemb_config import DynamicEmbCheckMode
-from dynamicemb.key_value_table import KeyValueTable
+from dynamicemb.key_value_table import KeyValueTable, export_keys_values
 from dynamicemb.optimizer import *
-from dynamicemb_extensions import EvictStrategy, OptimizerType, find
+from dynamicemb_extensions import OptimizerType, find
 from torchrec.distributed.comm import get_local_rank
 
 backend = "nccl"
@@ -63,30 +57,20 @@ def init_dynamicemb_table(
         keys = torch.unique(keys)
     keys = keys[:num_embeddings]  # Take exactly num_embeddings keys
 
-    embeddings = torch.randn(num_embeddings, embedding_dim, device=device)
-
-    scores = (
-        torch.randint(
-            0, sys.maxsize, (num_embeddings,), dtype=torch.uint64, device=device
-        )
-        if dynamicemb_table.evict_strategy() != EvictStrategy.KLru
-        else None
+    scores = torch.randint(
+        0, sys.maxsize, (num_embeddings,), dtype=torch.uint64, device=device
     )
 
-    opt_states = (
-        torch.randn(num_embeddings, dynamicemb_table.optim_state_dim(), device=device)
-        if dynamicemb_table.optim_state_dim() > 0
-        else None
+    values = torch.randn(
+        num_embeddings,
+        embedding_dim + dynamicemb_table.optim_state_dim(),
+        device=device,
     )
-
-    load_key_values(
-        dynamicemb_table,
-        keys=keys,
-        embeddings=embeddings,
-        scores=scores,
-        opt_states=opt_states,
+    dynamicemb_table.insert(
+        keys,
+        values.to(dynamicemb_table.value_type()),
+        scores,
     )
-    return keys, embeddings, scores, opt_states
 
 
 def assert_two_dynamicemb_table_equal(
@@ -94,8 +78,10 @@ def assert_two_dynamicemb_table_equal(
     reference_table_optimizer_type: str,
     table: KeyValueTable,
     table_optimizer_type: str,
+    dump_optim: bool,
+    load_optim: bool,
 ):
-    table_data_iterator = export_keys_values(table, device)
+    table_data_iterator = export_keys_values(table.table, device)
     for keys, embeddings, opt_states, scores in table_data_iterator:
         dim = reference_table.embedding_dim()
         optstate_dim = reference_table.optim_state_dim()
@@ -122,12 +108,16 @@ def assert_two_dynamicemb_table_equal(
 
         reference_values = values.reshape(-1, dim + optstate_dim).to(embeddings.dtype)
         reference_embeddings = reference_values[:, :dim]
+        # for i in range(keys.numel()):
+        #     print(f'key: {keys[i]}, embedding: {embeddings[i, :]}, reference_embedding: {reference_embeddings[i, :]}')
         torch.testing.assert_close(embeddings, reference_embeddings)
 
         if (
             reference_table_optimizer_type == table_optimizer_type
             and table.optim_state_dim() > 0
             and optstate_dim > 0
+            and dump_optim
+            and load_optim
         ):
             reference_opt_states = reference_values[:, dim:]
             torch.testing.assert_close(opt_states, reference_opt_states)
@@ -255,6 +245,8 @@ def create_table_options(
 )
 @pytest.mark.parametrize("dump_mode", ["training", "evaluation"])
 @pytest.mark.parametrize("load_mode", ["training", "evaluation"])
+@pytest.mark.parametrize("dump_include_optim", [True, False])
+@pytest.mark.parametrize("load_include_optim", [True, False])
 @pytest.mark.parametrize("num_embeddings", [10])
 @pytest.mark.parametrize("embedding_dim", [16])
 def test_dynamic_table_load_dump(
@@ -264,6 +256,8 @@ def test_dynamic_table_load_dump(
     score_strategy: str,
     dump_optimizer_type: str,
     load_optimizer_type: str,
+    dump_include_optim: bool,
+    load_include_optim: bool,
     dump_mode: str,
     load_mode: str,
     num_embeddings: int,
@@ -300,16 +294,16 @@ def test_dynamic_table_load_dump(
         dump_table_options.embedding_dtype,
     )
     dynamicemb_table = KeyValueTable(dump_table_options, dump_dummy_optimizer)
-    keys, embeddings, scores, opt_states = init_dynamicemb_table(
-        dynamicemb_table, num_embeddings, embedding_dim
-    )
+    init_dynamicemb_table(dynamicemb_table, num_embeddings, embedding_dim)
 
-    local_export(
-        dynamicemb_table,
-        "emb_key_path",
-        "embedding_file_path",
-        "score_file_path" if scores is not None else None,
-        "opt_file_path" if opt_states is not None else None,
+    dynamicemb_table.dump(
+        "metadata.json",
+        "key.data",
+        "embedding.data",
+        "score.data",
+        "opt.data",
+        include_optim=dump_include_optim,
+        include_meta=True,
     )
 
     load_dummy_optimizer = create_dummy_optimizer(
@@ -318,23 +312,31 @@ def test_dynamic_table_load_dump(
     )
     new_dynamicemb_table = KeyValueTable(load_table_options, load_dummy_optimizer)
 
-    need_load_optimizer = (
-        opt_states is not None
-        and dump_optimizer_type == load_optimizer_type
-        and load_mode == "training"
-    )
-
-    local_load(
-        new_dynamicemb_table,
-        "emb_key_path",
-        "embedding_file_path",
-        "score_file_path" if scores is not None else None,
-        "opt_file_path" if need_load_optimizer else None,
+    new_dynamicemb_table.load(
+        "metadata.json",
+        "key.data",
+        "embedding.data",
+        "score.data",
+        "opt.data",
+        include_optim=load_include_optim,
     )
 
     assert_two_dynamicemb_table_equal(
-        dynamicemb_table, dump_optimizer_type, new_dynamicemb_table, load_optimizer_type
+        dynamicemb_table,
+        dump_optimizer_type,
+        new_dynamicemb_table,
+        load_optimizer_type,
+        dump_include_optim,
+        load_include_optim,
     )
+
+    os.remove("metadata.json")
+    os.remove("key.data")
+    os.remove("embedding.data")
+    if os.path.exists("score.data"):
+        os.remove("score.data")
+    if os.path.exists("opt.data"):
+        os.remove("opt.data")
 
 
 dist.destroy_process_group()

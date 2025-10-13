@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import List, Optional, Tuple, cast
 
+import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import *
@@ -105,6 +106,118 @@ class CowClipDefinition:
     counter_halflife: int = -1
     weight_norm_coefficient: float = 0.0
     lower_bound: float = 0.0
+
+
+def encode_meta_json_file_path(root_path: str, table_name: str) -> str:
+    return os.path.join(root_path, f"{table_name}_opt_args.json")
+
+
+def encode_key_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}"
+    )
+
+
+def encode_value_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}"
+    )
+
+
+def encode_score_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_emb_scores.rank_{rank}.world_size_{world_size}"
+    )
+
+
+def encode_opt_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int
+) -> str:
+    return os.path.join(
+        root_path, f"{table_name}_opt_values.rank_{rank}.world_size_{world_size}"
+    )
+
+
+def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str], int]:
+    suffix_to_encode_file_path_func = {
+        "emb_keys": encode_key_file_path,
+        "emb_values": encode_value_file_path,
+        "emb_scores": encode_score_file_path,
+        "opt_values": encode_opt_file_path,
+    }
+    if suffix not in suffix_to_encode_file_path_func:
+        raise RuntimeError(f"Invalid suffix: {suffix}")
+    encode_file_path_func = suffix_to_encode_file_path_func[suffix]
+
+    import glob
+
+    # v2 version
+    files = glob.glob(encode_file_path_func(root_path, table_name, "*", "*"))
+    if len(files) == 0:
+        return [], 0
+    files = sorted(files)
+    world_size = int(files[0].split(".")[-1].split("_")[-1])
+    if len(files) != world_size:
+        raise RuntimeError(
+            f"Checkpoints is corrupted. Found {len(files)} under path {root_path} for table {table_name}, but the number of checkpointed world size is {world_size}."
+        )
+
+    for i in range(world_size):
+        expected_file_path = encode_file_path_func(root_path, table_name, i, world_size)
+        if expected_file_path not in set(files):
+            raise RuntimeError(
+                f"Checkpoints is corrupted. Expected file path {expected_file_path} for table {table_name}, but it is not found."
+            )
+
+    return files, len(files)
+
+
+def get_loading_files(
+    root_path: str,
+    name: str,
+    rank: int,
+    world_size: int,
+) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
+    if not os.path.exists(root_path):
+        raise RuntimeError(f"can't find path to load, path:", root_path)
+
+    key_files, num_key_files = find_files(root_path, name, "emb_keys")
+    value_files, num_value_files = find_files(root_path, name, "emb_values")
+    score_files, num_score_files = find_files(root_path, name, "emb_scores")
+    opt_files, num_opt_files = find_files(root_path, name, "opt_values")
+
+    if num_key_files != num_value_files:
+        assert (
+            num_key_files > 0
+        ), "No key files found under path {root_path} for table {name}"
+        raise RuntimeError(
+            f"The number of key files under path {root_path} for table {name} does not match the number of value files."
+        )
+
+    if world_size == num_key_files:
+        return (
+            [encode_key_file_path(root_path, name, rank, world_size)],
+            [encode_value_file_path(root_path, name, rank, world_size)],
+            [encode_score_file_path(root_path, name, rank, world_size)]
+            if num_score_files == num_key_files
+            else [],
+            [encode_opt_file_path(root_path, name, rank, world_size)]
+            if num_opt_files == num_key_files
+            else [],
+        )
+    # TODO: support skipping files.
+    return (
+        key_files,
+        value_files,
+        score_files,
+        opt_files,
+    )
 
 
 def _export_matched_and_gather(
@@ -1078,6 +1191,121 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ret_scores.append(new_score)
         return ret_scores
 
+    def dump(
+        self,
+        save_dir: str,
+        optim: bool = False,
+        table_names: Optional[List[str]] = None,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> None:
+        if table_names is None:
+            table_names = self._table_names
+
+        if pg is None:
+            assert dist.is_initialized(), "Distributed is not initialized."
+            pg = dist.group.WORLD
+        rank = dist.get_rank(group=pg)
+        world_size = dist.get_world_size(group=pg)
+
+        self.flush()
+        for table_name, storage in zip(self._table_names, self._storages):
+            if table_name not in set(table_names):
+                continue
+
+            meta_file_path = encode_meta_json_file_path(save_dir, table_name)
+            emb_key_path = encode_key_file_path(save_dir, table_name, rank, world_size)
+            emb_value_path = encode_value_file_path(
+                save_dir, table_name, rank, world_size
+            )
+            emb_score_path = encode_score_file_path(
+                save_dir, table_name, rank, world_size
+            )
+            opt_value_path = encode_opt_file_path(
+                save_dir, table_name, rank, world_size
+            )
+
+            storage.dump(
+                meta_file_path,
+                emb_key_path,
+                emb_value_path,
+                emb_score_path,
+                opt_value_path,
+                include_optim=optim,
+                include_meta=(rank == 0),
+            )
+
+    def load(
+        self,
+        save_dir: str,
+        optim: bool = False,
+        table_names: Optional[List[str]] = None,
+        pg: Optional[dist.ProcessGroup] = None,
+    ):
+        if table_names is None:
+            table_names = self._table_names
+
+        if pg is None and not dist.is_initialized():  # for inference load
+            rank = 0
+            world_size = 1
+        else:
+            rank = dist.get_rank(group=pg)
+            world_size = dist.get_world_size(group=pg)
+
+        for table_name, storage in zip(self._table_names, self._storages):
+            if table_name not in set(table_names):
+                continue
+            (
+                emb_key_files,
+                emb_value_files,
+                emb_score_files,
+                opt_value_files,
+            ) = get_loading_files(
+                save_dir,
+                table_name,
+                rank=rank,
+                world_size=world_size,
+            )
+            meta_json_file = encode_meta_json_file_path(save_dir, table_name)
+
+            num_key_files = len(emb_key_files)
+            for i in range(num_key_files):
+                storage.load(
+                    meta_json_file,
+                    emb_key_files[i],
+                    emb_value_files[i],
+                    emb_score_files[i] if len(emb_score_files) > 0 else None,
+                    opt_value_files[i] if len(opt_value_files) > 0 else None,
+                    include_optim=optim,
+                )
+
+    def export_keys_values(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
+        from dynamicemb.key_value_table import export_keys_values
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        keys_list = []
+        values_list = []
+        self.flush()
+        for dynamic_table_name, dynamic_table in zip(self.table_names, self.tables):
+            if table_name != dynamic_table_name:
+                continue
+
+            local_max_rows = dynamic_table.size()
+            accumulated_counts = 0
+
+            for keys, embeddings, _, _ in export_keys_values(
+                dynamic_table.table, device
+            ):
+                keys_list.append(keys.cpu().numpy())
+                values_list.append(embeddings.cpu().numpy())
+                accumulated_counts += keys.numel()
+
+            if local_max_rows != accumulated_counts:
+                raise ValueError(
+                    f"Rank {dist.get_rank()} has accumulated count {accumulated_counts} which is different from expected {local_max_rows}, "
+                    f"difference: {accumulated_counts - local_max_rows}"
+                )
+        return np.concatenate(keys_list), np.concatenate(values_list, axis=0)
+
     def incremental_dump(
         self,
         named_thresholds: Dict[str, int] = None,
@@ -1099,6 +1327,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             index = self._table_names.index(table_name)
 
             storage = self._storages[index]
+            if not isinstance(storage, KeyValueTable):
+                raise RuntimeError(
+                    "Only KeyValueTable is supported for incremental dump"
+                )
             key, value = _export_matched_per_table(pg, storage, threshold)
             if self._caches[index] is not None:
                 # flush will change the score(timestamp) in storage

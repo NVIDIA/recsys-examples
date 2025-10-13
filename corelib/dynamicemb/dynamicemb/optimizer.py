@@ -230,7 +230,10 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             )
 
     def get_opt_args(self):
-        ret_args = {"lr": self._opt_args.learning_rate}
+        ret_args = {
+            "lr": self._opt_args.learning_rate,
+            "opt_type": "exact_sgd",
+        }
         return ret_args
 
     def set_opt_args(self, args: Dict[str, Any]):
@@ -295,6 +298,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def get_opt_args(self):
         ret_args = {
+            "opt_type": "adam",
             "lr": self._opt_args.learning_rate,
             "iters": self._iterations,
             "beta1": self._opt_args.beta1,
@@ -358,6 +362,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def get_opt_args(self):
         ret_args = {
+            "opt_type": "exact_adagrad",
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
             "initial_accumulator_value": self._opt_args.initial_accumulator_value,
@@ -417,6 +422,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def get_opt_args(self):
         ret_args = {
+            "opt_type": "exact_row_wise_adagrad",
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
             "initial_accumulator_value": self._opt_args.initial_accumulator_value,
@@ -543,7 +549,10 @@ class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         )
 
     def get_opt_args(self):
-        ret_args = {"lr": self._opt_args.learning_rate}
+        ret_args = {
+            "opt_type": "sgd",
+            "lr": self._opt_args.learning_rate,
+        }
         return ret_args
 
     def set_opt_args(self, args: Dict[str, Any]):
@@ -648,6 +657,7 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
 
     def get_opt_args(self):
         ret_args = {
+            "opt_type": "adam",
             "lr": self._opt_args.learning_rate,
             "iters": self._iterations,
             "beta1": self._opt_args.beta1,
@@ -737,6 +747,7 @@ class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
 
     def get_opt_args(self):
         ret_args = {
+            "opt_type": "exact_adagrad",
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
             "initial_accumulator_value": self._opt_args.initial_accumulator_value,
@@ -832,6 +843,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
 
     def get_opt_args(self):
         ret_args = {
+            "opt_type": "exact_row_wise_adagrad",
             "lr": self._opt_args.learning_rate,
             "eps": self._opt_args.eps,
             "initial_accumulator_value": self._opt_args.initial_accumulator_value,

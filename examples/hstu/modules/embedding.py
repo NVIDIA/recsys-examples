@@ -20,7 +20,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.fx
 import torch.nn as nn
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
@@ -28,7 +27,6 @@ from configs.task_config import ShardedEmbeddingConfig
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
-from torch import distributed as dist
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.sharding.dp_sequence_sharding import (
@@ -401,58 +399,36 @@ class ShardedEmbedding(torch.nn.Module):
             rank 0: keys: (50,), values: (50, 32)
             rank 1: keys: (50,), values: (50, 32)
         """
-        keys_list = []
-        values_list = []
         from dynamicemb.dump_load import get_dynamic_emb_module
 
         dynamicemb_modules = get_dynamic_emb_module(
             self._model_parallel_embedding_collection
         )
-        dynamic_table_names = set()
         if len(dynamicemb_modules) > 0:
-            from dynamicemb.dump_load import export_keys_values
-
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
             for m in dynamicemb_modules:
-                for dynamic_table_name, dynamic_table in zip(m.table_names, m.tables):
-                    dynamic_table_names.add(dynamic_table_name)
-                    if table_name != dynamic_table_name:
-                        continue
-
-                    local_max_rows = dynamic_table.size()
-                    accumulated_counts = 0
-
-                    for keys, embeddings, _, _ in export_keys_values(
-                        dynamic_table, device
-                    ):
-                        keys_list.append(keys.cpu().numpy())
-                        values_list.append(embeddings.cpu().numpy())
-                        accumulated_counts += keys.numel()
-
-                    if local_max_rows != accumulated_counts:
-                        raise ValueError(
-                            f"Rank {dist.get_rank()} has accumulated count {accumulated_counts} which is different from expected {local_max_rows}, "
-                            f"difference: {accumulated_counts - local_max_rows}"
-                        )
-        if table_name not in dynamic_table_names:
-            for (
-                name,
-                t,
-            ) in self._model_parallel_embedding_collection.state_dict().items():
-                if table_name not in name:
+                if table_name not in set(m.table_names):
                     continue
-                if not hasattr(t, "local_shards"):
-                    raise ValueError(
-                        "export_local_embedding is not compatible with a data_parallel sharding table"
-                    )
-                for shard in t.local_shards():
-                    # [row_start, col_start]
-                    offsets = shard.metadata.shard_offsets
-                    # [row_length, col_length]
-                    lengths = shard.metadata.shard_sizes
-                    keys_list.append(np.arange(offsets[0], offsets[0] + lengths[0]))
-                    values_list.append(shard.tensor.cpu().numpy())
+                return m.export_keys_values(table_name)
+
+        keys_list = []
+        values_list = []
+        for (
+            name,
+            t,
+        ) in self._model_parallel_embedding_collection.state_dict().items():
+            if table_name not in name:
+                continue
+            if not hasattr(t, "local_shards"):
+                raise ValueError(
+                    "export_local_embedding is not compatible with a data_parallel sharding table"
+                )
+            for shard in t.local_shards():
+                # [row_start, col_start]
+                offsets = shard.metadata.shard_offsets
+                # [row_length, col_length]
+                lengths = shard.metadata.shard_sizes
+                keys_list.append(np.arange(offsets[0], offsets[0] + lengths[0]))
+                values_list.append(shard.tensor.cpu().numpy())
         return np.concatenate(keys_list), np.concatenate(values_list)
 
 

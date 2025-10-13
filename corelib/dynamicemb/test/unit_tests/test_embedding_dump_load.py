@@ -241,6 +241,7 @@ def create_model(
     required=True,
 )
 @click.option("--mode", type=click.Choice(["load", "dump"]), required=True)
+@click.option("--optim", type=bool, required=True)
 def test_model_load_dump(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -249,6 +250,7 @@ def test_model_load_dump(
     optimizer_type: str,
     mode: str,
     save_path: str,
+    optim: bool,
     batch_size: int = 128,
     num_iterations: int = 10,
 ):
@@ -288,7 +290,7 @@ def test_model_load_dump(
 
     if mode == "dump":
         shutil.rmtree(save_path, ignore_errors=True)
-        DynamicEmbDump(save_path, ref_model, optim=True)
+        DynamicEmbDump(save_path, ref_model, optim=optim)
 
     if mode == "load":
         model = create_model(
@@ -298,13 +300,14 @@ def test_model_load_dump(
             optimizer_kwargs=optimizer_kwargs,
         )
 
-        DynamicEmbLoad(save_path, model, optim=True)
+        DynamicEmbLoad(save_path, model, optim=optim)
 
-        for kjt in kjts:
-            ret = model(kjt)
-            ret.sum().backward()
-            ref_ret = ref_model(kjt)
-            ref_ret.sum().backward()
+        if optim:
+            for kjt in kjts:
+                ret = model(kjt)
+                ret.sum().backward()
+                ref_ret = ref_model(kjt)
+                ref_ret.sum().backward()
 
         ref_model = ref_model.eval()
         model = model.eval()
