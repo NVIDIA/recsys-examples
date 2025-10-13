@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import urllib.request
+import warnings
 import zipfile
 from typing import Dict, List
 
@@ -20,14 +21,16 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
+from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim
 from dynamicemb.incremental_dump import get_score, incremental_dump
+from dynamicemb.optimizer import EmbOptimType, convert_optimizer_type
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
+from fbgemm_gpu.split_embedding_configs import SparseType
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -48,6 +51,11 @@ from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+# Filter FBGEMM warning, make notebook clean
+warnings.filterwarnings(
+    "ignore", message=".*torch.library.impl_abstract.*", category=FutureWarning
+)
+
 backend = "nccl"
 dist.init_process_group(backend=backend)
 
@@ -63,7 +71,7 @@ if "LOCAL_RANK" not in os.environ:
 if "RANK" not in os.environ:
     os.environ["RANK"] = str(dist.get_rank())
 
-local_rank = get_local_rank()
+local_rank = dist.get_rank()  # for one node
 world_size = dist.get_world_size()
 torch.cuda.set_device(local_rank)
 device = torch.device(f"cuda:{local_rank}")
@@ -76,6 +84,7 @@ def rank_print(*args, **kwargs):
 
 
 builtins.print = rank_print
+cache_ratio = 0.5  # assume we will use 50% of the HBM for cache
 
 
 def download_movielens(data_dir="./ml-1m"):
@@ -111,9 +120,13 @@ def download_movielens(data_dir="./ml-1m"):
 def parse_args():
     parser = argparse.ArgumentParser(description="TorchRec MovieLens with dynamicemb")
     parser.add_argument("--train", action="store_true")
+    parser.add_argument("--eval", action="store_true")
     parser.add_argument("--load", action="store_true")
     parser.add_argument("--dump", action="store_true")
     parser.add_argument("--incremental_dump", action="store_true")
+    parser.add_argument("--caching", action="store_true")
+    parser.add_argument("--prefetch_pipeline", action="store_true")
+    parser.add_argument("--external_storage", action="store_true")
 
     parser.add_argument(
         "--data_path",
@@ -354,7 +367,7 @@ class MovieLensModel(nn.Module):
 
 
 # use a function warp all the Planner code
-def get_planner(device, eb_configs, batch_size):
+def get_planner(device, eb_configs, batch_size, optimizer_type, training, caching):
     DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
         DataType.FP32: 32,
         DataType.FP16: 16,
@@ -365,6 +378,7 @@ def get_planner(device, eb_configs, batch_size):
     ddr_cap = 512 * 1024 * 1024 * 1024  # Assume a Node have 512GB memory
     intra_host_bw = 450e9  # Nvlink bandwidth
     inter_host_bw = 25e9  # NIC bandwidth
+    bucket_capacity = 1024 if caching else 128
 
     dict_const = {}
 
@@ -379,7 +393,20 @@ def get_planner(device, eb_configs, batch_size):
         emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
             math.log2(emb_num_embeddings)
         )  # HKV need embedding vector num is power of 2
-        total_hbm_need = embedding_type_bytes * dim * emb_num_embeddings_next_power_of_2
+        threshold = (bucket_capacity * world_size) / cache_ratio
+        threshold_int = math.ceil(threshold)
+        if emb_num_embeddings_next_power_of_2 < threshold_int:
+            emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
+                math.log2(threshold_int)
+            )
+
+        # e.g. for adam, its `x`` embedding + `2x`` optimizer states
+        total_dim = dim + get_optimizer_state_dim(
+            convert_optimizer_type(optimizer_type), dim, data_type_to_dtype(tmp_type)
+        )
+        total_hbm_need = (
+            embedding_type_bytes * total_dim * emb_num_embeddings_next_power_of_2
+        )
 
         const = DynamicEmbParameterConstraints(
             sharding_types=[
@@ -387,11 +414,15 @@ def get_planner(device, eb_configs, batch_size):
             ],
             use_dynamicemb=True,  # from here , is all the HKV options , default use_dynamicemb is False , if it is False , it will fallback to raw TorchREC ParameterConstraints
             dynamicemb_options=DynamicEmbTableOptions(
-                global_hbm_for_values=total_hbm_need,
+                global_hbm_for_values=total_hbm_need * cache_ratio
+                if caching
+                else total_hbm_need,
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
                 score_strategy=DynamicEmbScoreStrategy.STEP,
+                caching=caching,
+                training=training,
             ),
         )
 
@@ -425,7 +456,7 @@ def get_planner(device, eb_configs, batch_size):
     )
 
 
-def apply_dmp(model, args):
+def apply_dmp(model, args, training):
     eb_configs = model.embedding_module.embedding_configs()
     # set optimizer args
     learning_rate = args.lr
@@ -434,9 +465,11 @@ def apply_dmp(model, args):
     weight_decay = 0
     eps = 0.001
 
+    optimizer_type = EmbOptimType.ADAM
+
     # Put args into a optimizer kwargs , which is same usage of TorchREC
     optimizer_kwargs = {
-        "optimizer": EmbOptimType.ADAM,
+        "optimizer": optimizer_type,
         "learning_rate": learning_rate,
         "beta1": beta1,
         "beta2": beta2,
@@ -447,6 +480,7 @@ def apply_dmp(model, args):
     fused_params = {}
     fused_params["output_dtype"] = SparseType.FP32
     fused_params.update(optimizer_kwargs)
+    fused_params["prefetch_pipeline"] = args.prefetch_pipeline  # enable prefetch
 
     # precision of all-to-all
     qcomm_codecs_registry = (
@@ -471,7 +505,14 @@ def apply_dmp(model, args):
         use_index_dedup=True,
     )
 
-    planner = get_planner(device, eb_configs, args.batch_size)
+    planner = get_planner(
+        device,
+        eb_configs,
+        args.batch_size,
+        optimizer_type=optimizer_type,
+        training=training,
+        caching=args.caching,
+    )
     # Same usage of TorchREC
     plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
 
@@ -486,7 +527,9 @@ def apply_dmp(model, args):
     return dmp
 
 
-def create_model(args):
+def create_model(args, training=True):
+    # Define the configuration parameters for the embedding table,
+    # including its name, embedding dimension, total number of embeddings, and feature name.
     eb_configs = [
         EmbeddingConfig(
             name="user_id",
@@ -541,7 +584,7 @@ def create_model(args):
         over_arch_layer_sizes=mlp_dims,
     )
 
-    model = apply_dmp(model, args)
+    model = apply_dmp(model, args, training)
 
     return model
 
@@ -665,7 +708,6 @@ def dump(args):
                 args.save_dir, f"model_epoch_{epoch+1}_rank{dist.get_rank()}.pt"
             ),
         )
-    # rank0 will gether embedding from other ranks, so no need to identify rank info.
     DynamicEmbDump(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
 
 
@@ -703,7 +745,6 @@ def load(args):
     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-    # all rank will load from the same files.
     DynamicEmbLoad(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
 
     test_one_epoch(model, test_loader, criterion, 0, 1)

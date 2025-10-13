@@ -28,6 +28,7 @@ from dynamicemb_extensions import (
     InitializerArgs,
     OptimizerType,
 )
+from key_value_table import Storage
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 
@@ -353,6 +354,7 @@ class DynamicEmbTableOptions(HKVConfig):
     training: bool = True
     caching: bool = False
     num_aligned_embedding_per_rank: int = None
+    external_storage: Storage = None
 
     def __post_init__(self):
         assert (
