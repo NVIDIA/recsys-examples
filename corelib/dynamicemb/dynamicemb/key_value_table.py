@@ -783,16 +783,12 @@ class KeyValueTable(Cache, Storage):
 
     def flush(self, storage: Storage) -> None:
         batch_size = self._threads_in_wave
-        for start in range(0, self._capacity, batch_size):
-            end = min(start + batch_size, self._capacity)
-            num_dumped, dumped_keys, dumped_values, dumped_scores = self.dump(
-                start, end
-            )
-            h_num_dumped = num_dumped.cpu().item()
-            dumped_keys = dumped_keys[:h_num_dumped]
-            dumped_values = dumped_values[:h_num_dumped, :]
-            dumped_scores = dumped_scores[:h_num_dumped]
-            storage.insert(dumped_keys, dumped_values, dumped_scores)
+        for keys, embeddings, opt_states, scores in batched_export_keys_values(
+            self.table, self.device, batch_size
+        ):
+            if keys.numel() != 0:
+                values = torch.cat((embeddings, opt_states), dim=1).contiguous()
+                storage.insert(keys, values, scores)
 
     def reset(
         self,

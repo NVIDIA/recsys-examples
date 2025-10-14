@@ -153,21 +153,22 @@ class PyDictStorage(Storage):
 
     def dump(
         self,
-        start: int,
-        end: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        meta_file_path: str,
+        emb_key_path: str,
+        embedding_file_path: str,
+        score_file_path: Optional[str],
+        opt_file_path: Optional[str],
+    ) -> None:
         raise NotImplementedError
-        num_dumped: torch.Tensor
-        dumped_keys: torch.Tensor
-        dumped_values: torch.Tensor
-        dumped_scores: torch.Tensor
-        return num_dumped, dumped_keys, dumped_values, dumped_scores
 
     def load(
         self,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        scores: torch.Tensor,
+        meta_file_path: str,
+        emb_file_path: str,
+        embedding_file_path: str,
+        score_file_path: Optional[str],
+        opt_file_path: Optional[str],
+        include_optim: bool,
     ) -> None:
         raise NotImplementedError
 
