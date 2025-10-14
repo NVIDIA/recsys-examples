@@ -37,10 +37,12 @@ from dynamicemb_extensions import (
     dyn_emb_capacity,
     dyn_emb_cols,
     dyn_emb_rows,
+    erase,
     export_batch,
     export_batch_matched,
     find_pointers,
-    insert_and_evict,
+    find_pointers_with_scores,
+    insert_and_evict_with_scores,
     insert_or_assign,
     load_from_pointers,
     select,
@@ -217,6 +219,7 @@ class KeyValueTable(
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
+        input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if unique_keys.dtype != self.key_type():
             unique_keys = unique_keys.to(self.key_type())
@@ -239,9 +242,12 @@ class KeyValueTable(
             founds = torch.empty(batch, dtype=torch.bool, device=device)
         pointers = torch.empty(batch, dtype=torch.long, device=device)
 
+        scores = self.create_scores(batch, device, input_scores)
+        
         if self._score_update:
-            # TODO: support score
-            find_pointers(self.table, batch, unique_keys, pointers, founds, self.score)
+            find_pointers_with_scores(
+                self.table, batch, unique_keys, pointers, founds, scores
+            )
         else:
             find_pointers(self.table, batch, unique_keys, pointers, founds)
 
@@ -269,6 +275,7 @@ class KeyValueTable(
             h_num_missing,
             missing_keys[:h_num_missing],
             missing_indices[:h_num_missing],
+            scores[missing_indices[:h_num_missing]],
         )
 
     def find_embeddings(
@@ -276,27 +283,49 @@ class KeyValueTable(
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        return self.find_impl(unique_keys, unique_embs, founds)
+        input_scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.find_impl(unique_keys, unique_embs, founds, input_scores)
 
     def find_missed_keys(
         self,
         unique_keys: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         # dummy tensor
         unique_embs = torch.empty(
             unique_keys.numel(), 0, device=unique_keys.device, dtype=self._emb_dtype
         )
-        return self.find_impl(unique_keys, unique_embs, founds)
+        return self.find_impl(unique_keys, unique_embs, founds, None)
 
     def find(
         self,
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        return self.find_impl(unique_keys, unique_vals, founds)
+        input_scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.find_impl(unique_keys, unique_vals, founds, input_scores)
+
+    def create_scores(
+        self,
+        h_num_total: int,
+        device: torch.device,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Create scores tensor for lookup operation based on eviction strategy.
+        """
+        if lfu_accumulated_frequency is not None:
+            return lfu_accumulated_frequency
+        elif self.evict_strategy() == EvictStrategy.kLFU:
+            scores = torch.zeros(h_num_total, device=device, dtype=torch.uint64)
+            return scores
+        elif self.evict_strategy() == EvictStrategy.KCustomized:
+            scores = torch.empty(h_num_total, device=device, dtype=torch.uint64)
+            scores.fill_(self.score)
+            return scores
+        else:
+            return None
 
     def insert(
         self,
@@ -313,6 +342,9 @@ class KeyValueTable(
                 scores.fill_(self.score)
         else:
             scores = None
+
+        if self.evict_strategy() == EvictStrategy.KLfu:
+            erase(self.table, h_num_unique_keys, unique_keys)
 
         insert_or_assign(
             self.table,
@@ -587,7 +619,8 @@ class KeyValueTable(
         self,
         keys: torch.Tensor,
         values: torch.Tensor,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = keys.numel()
         num_evicted: torch.Tensor = torch.zeros(1, dtype=torch.long, device=keys.device)
         evicted_keys: torch.Tensor = torch.empty_like(keys)
@@ -595,16 +628,16 @@ class KeyValueTable(
         evicted_scores: torch.Tensor = torch.empty(
             batch, dtype=torch.uint64, device=keys.device
         )
-        insert_and_evict(
+        insert_and_evict_with_scores(
             self.table,
             batch,
             keys,
             values,
-            self.score if self._use_score else None,
             evicted_keys,
             evicted_values,
             evicted_scores,
             num_evicted,
+            scores=scores,  # scores as keyword argument
         )
         if self._record_cache_metrics:
             self._cache_metrics[2] = batch
@@ -689,12 +722,25 @@ def update_cache(
     storage: Storage,
     missing_keys: torch.Tensor,
     missing_values: torch.Tensor,
+    missing_scores: Optional[torch.Tensor] = None,
 ):
     # need to update score.
+    num_keys_to_insert = missing_keys.numel()
+    cache_size_before = cache.size()
+    cache_capacity = cache.capacity()
+
     num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(
-        missing_keys, missing_values
+        missing_keys,
+        missing_values,
+        missing_scores,
     )
+
+    print(
+        f"[DEBUG update_cache] inserting {num_keys_to_insert} keys, cache_size: {cache_size_before}/{cache_capacity}, num_evicted: {num_evicted}"
+    )
+
     if num_evicted != 0:
+        print(f"evicted {num_evicted} keys from cache to storage")
         storage.insert(
             evicted_keys,
             evicted_values,
@@ -710,6 +756,7 @@ class KeyValueTableFunction:
         unique_embs: torch.Tensor,
         initializer: Callable,
         training: bool,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         h_num_toatl = unique_keys.numel()
@@ -726,7 +773,10 @@ class KeyValueTableFunction:
             h_num_missing_in_storage,
             missing_keys_in_storage,
             missing_indices_in_storage,
-        ) = storage.find_embeddings(unique_keys, unique_embs, founds=founds)
+            missing_scores_in_storage,
+        ) = storage.find_embeddings(
+            unique_keys, unique_embs, founds=founds, input_scores=lfu_accumulated_frequency
+        )
 
         # 2. initialize missing embeddings
         if h_num_missing_in_storage != 0:
@@ -754,7 +804,9 @@ class KeyValueTableFunction:
                 missing_values_in_storage[
                     :, emb_dim - val_dim :
                 ] = storage.init_optimizer_state()
-            storage.insert(missing_keys_in_storage, missing_values_in_storage)
+            storage.insert(
+                missing_keys_in_storage, missing_values_in_storage, missing_scores_in_storage
+            )
         # ignore the storage missed in eval mode
 
     @staticmethod
@@ -775,7 +827,7 @@ class KeyValueTableFunction:
             h_num_toatl, val_dim, device=unique_keys.device, dtype=emb_dtype
         )
         founds = torch.empty(h_num_toatl, device=unique_keys.device, dtype=torch.bool)
-        _, _, _ = storage.find(unique_keys, unique_values, founds=founds)
+        _, _, _, _ = storage.find(unique_keys, unique_values, founds=founds)
 
         keys_for_storage = unique_keys[founds].contiguous()
         values_for_storage = unique_values[founds, :].contiguous()
@@ -800,22 +852,25 @@ class KeyValueTableCachingFunction:
         initializer: Callable,
         enable_prefetch: bool,
         training: bool,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> None:
         assert unique_keys.dim() == 1
-        unique_keys.numel()
+        h_num_toatl = unique_keys.numel()
         emb_dim = storage.embedding_dim()
         emb_dtype = storage.embedding_dtype()
         val_dim = (
             storage.value_dim()
         )  # value is generally composed of embedding and optimizer state
 
-        # 1. find in cache
-        h_num_keys_for_storage, missing_keys, missing_indices = cache.find_embeddings(
-            unique_keys, unique_embs
+
+        h_num_keys_for_storage, missing_keys, missing_indices, missing_scores = cache.find_embeddings(
+            unique_keys, unique_embs, input_scores=lfu_accumulated_frequency
         )
         if h_num_keys_for_storage == 0:
             return
         keys_for_storage = missing_keys
+
+        scores_for_storage = missing_scores 
 
         founds = torch.empty(
             h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
@@ -832,7 +887,13 @@ class KeyValueTableCachingFunction:
             h_num_missing_in_storage,
             missing_keys_in_storage,
             missing_indices_in_storage,
-        ) = storage.find(keys_for_storage, values_for_storage, founds=founds)
+            missing_scores_in_storage,
+        ) = storage.find(
+            keys_for_storage,
+            values_for_storage,
+            founds=founds,
+            input_scores=scores_for_storage,
+        )
 
         # 3. initialize missing embeddings
         if h_num_missing_in_storage != 0:
@@ -850,11 +911,24 @@ class KeyValueTableCachingFunction:
                 values_for_storage[
                     missing_indices_in_storage, emb_dim - val_dim :
                 ] = storage.init_optimizer_state()
-            update_cache(cache, storage, keys_for_storage, values_for_storage)
+            update_cache(
+                cache, storage, keys_for_storage, values_for_storage, scores_for_storage
+            )
         else:  # only update those found in the storage to cache.
             found_keys_in_storage = keys_for_storage[founds].contiguous()
             found_values_in_storage = values_for_storage[founds, :].contiguous()
-            update_cache(cache, storage, found_keys_in_storage, found_values_in_storage)
+            found_scores_in_storage = (
+                scores_for_storage[founds].contiguous()
+                if scores_for_storage is not None
+                else None
+            )
+            update_cache(
+                cache,
+                storage,
+                found_keys_in_storage,
+                found_values_in_storage,
+                found_scores_in_storage,
+            )
         return
 
     @staticmethod
@@ -885,8 +959,7 @@ class KeyValueTableCachingFunction:
         founds = torch.empty(
             h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
         )
-        _, _, _ = storage.find(keys_for_storage, values_for_storage, founds=founds)
-
+        _, _, _, _ = storage.find(keys_for_storage, values_for_storage, founds=founds)
         keys_for_storage = keys_for_storage[founds].contiguous()
         values_for_storage = values_for_storage[founds, :].contiguous()
         grads_for_storage = grads_for_storage[founds, :].contiguous()
@@ -896,7 +969,6 @@ class KeyValueTableCachingFunction:
         )
 
         storage.insert(keys_for_storage, values_for_storage)
-
         return
 
     @staticmethod
@@ -910,7 +982,7 @@ class KeyValueTableCachingFunction:
     ) -> None:
         assert cache is not None, "prefetch is available only when caching is enabled."
         emb_dtype = storage.embedding_dtype()
-        h_num_keys_for_storage, missing_keys, _ = cache.find_missed_keys(unique_keys)
+        h_num_keys_for_storage, missing_keys, _, _= cache.find_missed_keys(unique_keys)
 
         if h_num_keys_for_storage == 0:
             return
@@ -928,6 +1000,7 @@ class KeyValueTableCachingFunction:
             num_missing_in_storage,
             missing_keys_in_storage,
             missing_indices_in_storage,
+            _,
         ) = storage.find(keys_for_storage, values_for_storage, founds=founds)
 
         if num_missing_in_storage != 0:
@@ -951,4 +1024,5 @@ class KeyValueTableCachingFunction:
             storage,
             keys_for_storage,
             values_for_storage,
+            None,  # prefetch does not update scores
         )

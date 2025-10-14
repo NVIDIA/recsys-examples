@@ -159,7 +159,36 @@ void insert_and_evict(
       reinterpret_cast<uint64_t*>(d_evicted_counter.data_ptr()), stream, unique_key, ignore_evict_strategy);
   }
 }
+void insert_and_evict_with_scores(
+  std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+  const size_t n,
+  const at::Tensor keys,
+  const at::Tensor values,
+  at::Tensor evicted_keys,
+  at::Tensor evicted_values,
+  at::Tensor evicted_score,
+  at::Tensor d_evicted_counter,
+  bool unique_key = true,
+  bool ignore_evict_strategy = false,
+  const std::optional<at::Tensor> scores = std::nullopt
+) {
 
+if (not scores.has_value() and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
+  throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
+}
+auto stream = at::cuda::getCurrentCUDAStream().stream();
+if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
+  table->insert_and_evict(
+    n, keys.data_ptr(), values.data_ptr(), scores.value().data_ptr(),
+    evicted_keys.data_ptr(), evicted_values.data_ptr(), evicted_score.data_ptr(),
+    reinterpret_cast<uint64_t*>(d_evicted_counter.data_ptr()), stream, unique_key, ignore_evict_strategy);
+} else {
+  table->insert_and_evict(
+    n, keys.data_ptr(), values.data_ptr(), nullptr, 
+    evicted_keys.data_ptr(), evicted_values.data_ptr(), evicted_score.data_ptr(),
+    reinterpret_cast<uint64_t*>(d_evicted_counter.data_ptr()), stream, unique_key, ignore_evict_strategy);
+}
+}
 void accum_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                      const size_t n, const at::Tensor keys,
                      const at::Tensor value_or_deltas,
@@ -294,6 +323,34 @@ void find_pointers(
       score_ptr = bc_scores.data_ptr();
     } 
     table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, score_ptr, stream);
+  } else {
+    std::shared_ptr<const dyn_emb::DynamicVariableBase> const_table = table;
+    const_table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, nullptr, stream);
+  }
+}
+
+void find_pointers_with_scores(
+  std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+  const size_t n,
+  const at::Tensor keys,
+  at::Tensor values,
+  at::Tensor founds,
+  const std::optional<at::Tensor> &scores = std::nullopt
+) {
+
+  if (n == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto values_data_ptr = reinterpret_cast<void**>(values.data_ptr<int64_t>());
+  auto found_tensor_data_ptr = founds.data_ptr<bool>();
+
+  // update score.
+  if (scores.has_value()) {
+    if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
+      table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, scores.value().data_ptr(), stream);
+    } 
+    else {
+      table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, nullptr, stream);
+    }
   } else {
     std::shared_ptr<const dyn_emb::DynamicVariableBase> const_table = table;
     const_table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, nullptr, stream);
@@ -518,110 +575,117 @@ reduce_grads(at::Tensor indices, at::Tensor grads, at::Tensor segment_range, at:
 }
 
 void dedup_input_indices(
-    const at::Tensor indices, const at::Tensor offsets,
-    const at::Tensor h_table_offsets_in_feature,
-    const at::Tensor d_table_offsets_in_feature, int table_num,
-    int local_batch_size, const at::Tensor reverse_idx,
-    const at::Tensor h_unique_nums, const at::Tensor d_unique_nums,
-    const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
-    std::vector<at::Tensor> unique_idx, const at::Tensor new_offsets,
-    const at::Tensor new_lengths, int device_num_sms,
-    std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
+  const at::Tensor indices, const at::Tensor offsets,
+  const at::Tensor h_table_offsets_in_feature,
+  const at::Tensor d_table_offsets_in_feature, int table_num,
+  int local_batch_size, const at::Tensor reverse_idx,
+  const at::Tensor h_unique_nums, const at::Tensor d_unique_nums,
+  const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
+  std::vector<at::Tensor> unique_idx, const at::Tensor new_offsets,
+  const at::Tensor new_lengths, int device_num_sms,
+  std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
+  const c10::optional< std::vector<at::Tensor> > &frequency_counters = c10::nullopt,
+  const c10::optional<at::Tensor> &input_frequencies = c10::nullopt
+  ) {
+    
 
-  if (!offsets.is_cuda() || !indices.is_cuda()) {
-    throw std::runtime_error(
-        "offsets or indices tensor must be on CUDA device");
+if (!offsets.is_cuda() || !indices.is_cuda()) {
+  throw std::runtime_error(
+      "offsets or indices tensor must be on CUDA device");
+}
+
+// Check dtype of h_unique_nums and d_unique_nums
+if (h_unique_nums.scalar_type() != at::kUInt64 ||
+    d_unique_nums.scalar_type() != at::kUInt64) {
+  throw std::runtime_error(
+      "h_unique_nums and d_unique_nums must have dtype uint64_t");
+}
+
+auto stream = at::cuda::getCurrentCUDAStream().stream();
+int64_t indices_shape = indices.size(0);
+auto unique_num_type = scalartype_to_datatype(
+    convertTypeMetaToScalarType(d_unique_nums.dtype()));
+auto unique_offset_type = scalartype_to_datatype(
+    convertTypeMetaToScalarType(d_unique_offsets.dtype()));
+int64_t new_lengths_size = new_lengths.size(0);
+
+at::Tensor h_offset =
+    at::empty_like(offsets, offsets.options().device(at::kCPU));
+AT_CUDA_CHECK(cudaMemcpyAsync(h_offset.data_ptr(), offsets.data_ptr(),
+                              offsets.numel() * offsets.element_size(),
+                              cudaMemcpyDeviceToHost, stream));
+
+size_t unique_op_capacity = unique_op->get_capacity();
+if (indices_shape * 2 > unique_op_capacity) {
+  at::Tensor new_keys = at::empty({indices_shape * 2}, indices.options());
+  at::Tensor new_vals = at::empty(
+      {indices_shape * 2},
+      at::TensorOptions().dtype(at::kUInt64).device(indices.device()));
+  unique_op->reset_capacity(new_keys, new_vals, indices_shape * 2, stream);
+}
+
+std::vector<at::Tensor> tmp_unique_indices(table_num);
+for (int i = 0; i < table_num; ++i) {
+  tmp_unique_indices[i] = at::empty_like(indices);
+}
+
+AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+for (int i = 0; i < table_num; ++i) {
+  int table_offset_begin = h_table_offsets_in_feature[i].item<int64_t>();
+  int table_offset_end = h_table_offsets_in_feature[i + 1].item<int64_t>();
+  int offset_begin = table_offset_begin * local_batch_size;
+  int offset_end = table_offset_end * local_batch_size;
+
+  int64_t indices_begin = h_offset[offset_begin].item<int64_t>();
+  int64_t indices_end = h_offset[offset_end].item<int64_t>();
+  int64_t indices_length = indices_end - indices_begin;
+
+  if (indices_length == 0) {
+    DEMB_CUDA_CHECK(cudaMemsetAsync(
+        reinterpret_cast<uint64_t *>(d_unique_nums.data_ptr()) + i, 0,
+        sizeof(uint64_t), stream));
+    dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
+                        i, unique_num_type, unique_offset_type, stream);
+  } else {
+    at::Tensor tmp_indices = create_sub_tensor(indices, indices_begin);
+    at::Tensor tmp_reverse_idx =
+        create_sub_tensor(reverse_idx, indices_begin);
+    at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
+    at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
+
+    // For first stage deduplication, we don't have input frequencies (set to empty tensor)
+    // The unique operation will default each key's frequency to 1
+    at::Tensor freq_counter = frequency_counters.has_value() ? frequency_counters.value()[i] : at::Tensor();
+    unique_op->unique(tmp_indices, indices_length, tmp_reverse_idx,
+                      unique_idx[i], tmp_d_unique_num, stream,
+                      previous_d_unique_num, freq_counter);
+    dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
+                        i, unique_num_type, unique_offset_type, stream);
   }
+}
 
-  // Check dtype of h_unique_nums and d_unique_nums
-  if (h_unique_nums.scalar_type() != at::kUInt64 ||
-      d_unique_nums.scalar_type() != at::kUInt64) {
-    throw std::runtime_error(
-        "h_unique_nums and d_unique_nums must have dtype uint64_t");
-  }
+AT_CUDA_CHECK(
+    cudaMemcpyAsync(h_unique_nums.data_ptr(), d_unique_nums.data_ptr(),
+                    d_unique_nums.numel() * d_unique_nums.element_size(),
+                    cudaMemcpyDeviceToHost, stream));
+AT_CUDA_CHECK(cudaMemcpyAsync(
+    h_unique_offsets.data_ptr(), d_unique_offsets.data_ptr(),
+    d_unique_offsets.numel() * d_unique_offsets.element_size(),
+    cudaMemcpyDeviceToHost, stream));
 
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t indices_shape = indices.size(0);
-  auto unique_num_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_nums.dtype()));
-  auto unique_offset_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_offsets.dtype()));
-  int64_t new_lengths_size = new_lengths.size(0);
+AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  at::Tensor h_offset =
-      at::empty_like(offsets, offsets.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaMemcpyAsync(h_offset.data_ptr(), offsets.data_ptr(),
-                                offsets.numel() * offsets.element_size(),
-                                cudaMemcpyDeviceToHost, stream));
+auto offset_type =
+    scalartype_to_datatype(convertTypeMetaToScalarType(new_offsets.dtype()));
+auto lengths_type =
+    scalartype_to_datatype(convertTypeMetaToScalarType(new_lengths.dtype()));
 
-  size_t unique_op_capacity = unique_op->get_capacity();
-  if (indices_shape * 2 > unique_op_capacity) {
-    at::Tensor new_keys = at::empty({indices_shape * 2}, indices.options());
-    at::Tensor new_vals = at::empty(
-        {indices_shape * 2},
-        at::TensorOptions().dtype(at::kUInt64).device(indices.device()));
-    unique_op->reset_capacity(new_keys, new_vals, indices_shape * 2, stream);
-  }
-
-  std::vector<at::Tensor> tmp_unique_indices(table_num);
-  for (int i = 0; i < table_num; ++i) {
-    tmp_unique_indices[i] = at::empty_like(indices);
-  }
-
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  for (int i = 0; i < table_num; ++i) {
-    int table_offset_begin = h_table_offsets_in_feature[i].item<int64_t>();
-    int table_offset_end = h_table_offsets_in_feature[i + 1].item<int64_t>();
-    int offset_begin = table_offset_begin * local_batch_size;
-    int offset_end = table_offset_end * local_batch_size;
-
-    int64_t indices_begin = h_offset[offset_begin].item<int64_t>();
-    int64_t indices_end = h_offset[offset_end].item<int64_t>();
-    int64_t indices_length = indices_end - indices_begin;
-
-    if (indices_length == 0) {
-      DEMB_CUDA_CHECK(cudaMemsetAsync(
-          reinterpret_cast<uint64_t *>(d_unique_nums.data_ptr()) + i, 0,
-          sizeof(uint64_t), stream));
-      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
-                          i, unique_num_type, unique_offset_type, stream);
-    } else {
-      at::Tensor tmp_indices = create_sub_tensor(indices, indices_begin);
-      at::Tensor tmp_reverse_idx =
-          create_sub_tensor(reverse_idx, indices_begin);
-      at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
-      at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
-
-      unique_op->unique(tmp_indices, indices_length, tmp_reverse_idx,
-                        unique_idx[i], tmp_d_unique_num, stream,
-                        previous_d_unique_num);
-      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
-                          i, unique_num_type, unique_offset_type, stream);
-    }
-  }
-
-  AT_CUDA_CHECK(
-      cudaMemcpyAsync(h_unique_nums.data_ptr(), d_unique_nums.data_ptr(),
-                      d_unique_nums.numel() * d_unique_nums.element_size(),
-                      cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaMemcpyAsync(
-      h_unique_offsets.data_ptr(), d_unique_offsets.data_ptr(),
-      d_unique_offsets.numel() * d_unique_offsets.element_size(),
-      cudaMemcpyDeviceToHost, stream));
-
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  auto offset_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(new_offsets.dtype()));
-  auto lengths_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(new_lengths.dtype()));
-
-  get_new_length_and_offsets(
-      reinterpret_cast<uint64_t *>(d_unique_offsets.data_ptr()),
-      d_table_offsets_in_feature.data_ptr<int64_t>(), table_num,
-      new_lengths_size, local_batch_size, lengths_type, offset_type,
-      new_offsets.data_ptr(), new_lengths.data_ptr(), stream);
+get_new_length_and_offsets(
+    reinterpret_cast<uint64_t *>(d_unique_offsets.data_ptr()),
+    d_table_offsets_in_feature.data_ptr<int64_t>(), table_num,
+    new_lengths_size, local_batch_size, lengths_type, offset_type,
+    new_offsets.data_ptr(), new_lengths.data_ptr(), stream);
 }
 
 void lookup_forward(const at::Tensor src, const at::Tensor dst,
@@ -845,7 +909,13 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("evicted_keys"), py::arg("evicted_values"),
         py::arg("evicted_score"), py::arg("d_evicted_counter"),
         py::arg("unique_key") = true, py::arg("ignore_evict_strategy") = false);
-
+  m.def("insert_and_evict_with_scores", &insert_and_evict_with_scores,
+          "Insert keys and values, evicting if necessary", py::arg("table"),
+          py::arg("n"), py::arg("keys"), py::arg("values"), 
+          py::arg("evicted_keys"), py::arg("evicted_values"),
+          py::arg("evicted_score"), py::arg("d_evicted_counter"),
+          py::arg("unique_key") = true, py::arg("ignore_evict_strategy") = false,
+          py::arg("scores") = py::none());
   m.def("accum_or_assign", &accum_or_assign,
         "Accumulate or assign values to the table", py::arg("table"),
         py::arg("n"), py::arg("keys"), py::arg("value_or_deltas"),
@@ -876,6 +946,11 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"), py::arg("founds"),
         py::arg("score") = py::none());
 
+  m.def("find_pointers_with_scores", &find_pointers_with_scores,
+        "Find a key-value pair in the table , and return every "
+        "value's ptr",
+        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"), py::arg("founds"),
+        py::arg("scores") = py::none());
   m.def("assign", &assign, "Assign values to the table based on keys",
         py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
         py::arg("score") = c10::nullopt, py::arg("unique_key") = true);
@@ -964,16 +1039,19 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("tables_num"), py::arg("batch_size"), py::arg("num_feature"),
         py::arg("num_key"), py::arg("combiner"));
 
+
   m.def("dedup_input_indices", &dedup_input_indices,
-        "duplicate indices from a given list or array of indices",
-        py::arg("indices"), py::arg("offset"),
-        py::arg("h_table_offsets_in_feature"),
-        py::arg("d_table_offsets_in_feature"), py::arg("table_num"),
-        py::arg("local_batch_size"), py::arg("reverse_idx"),
-        py::arg("h_unique_nums"), py::arg("d_unique_nums"),
-        py::arg("h_unique_offsets"), py::arg("d_unique_offsets"),
-        py::arg("unique_idx"), py::arg("new_offsets"), py::arg("new_lengths"),
-        py::arg("device_num_sms"), py::arg("unique_op"));
+    "duplicate indices from a given list or array of indices",
+    py::arg("indices"), py::arg("offset"),
+    py::arg("h_table_offsets_in_feature"),
+    py::arg("d_table_offsets_in_feature"), py::arg("table_num"),
+    py::arg("local_batch_size"), py::arg("reverse_idx"),
+    py::arg("h_unique_nums"), py::arg("d_unique_nums"),
+    py::arg("h_unique_offsets"), py::arg("d_unique_offsets"),
+    py::arg("unique_idx"), py::arg("new_offsets"), py::arg("new_lengths"),
+    py::arg("device_num_sms"), py::arg("unique_op"),
+    py::arg("frequency_counters") = c10::nullopt,
+    py::arg("input_frequencies") = c10::nullopt);
 
   m.def("reduce_grads", &reduce_grads,
     "reduce grads", py::arg("indices"), py::arg("grads"), py::arg("segment_range"), py::arg("h_segment_range")

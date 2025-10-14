@@ -125,13 +125,21 @@ __global__ void get_insert_kernel(
     const KeyType *d_key, KeyType *d_unique_key, CounterType *d_val,
     const size_t len, KeyType *keys, CounterType *vals, const size_t capacity,
     CounterType *d_global_counter, const KeyType empty_key,
-    const CounterType empty_val, CounterType *offset_ptr = nullptr) {
+    const CounterType empty_val, 
+    CounterType *d_frequency_counters, 
+    const CounterType *d_input_frequencies,  
+    CounterType *offset_ptr = nullptr) {
   const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < len) {
     CounterType offset = 0;
     if (offset_ptr != nullptr) {
       offset = offset_ptr[0];
     }
+    
+    // if d_input_frequencies is nullptr, set input_freq to 1
+    CounterType input_freq = (d_input_frequencies != nullptr) ? 
+                            d_input_frequencies[idx] : static_cast<CounterType>(1);
+    
     KeyType target_key = d_key[idx];
     size_t hash_index = hasher::hash(target_key) % capacity;
     size_t counter = 0;
@@ -155,17 +163,31 @@ __global__ void get_insert_kernel(
           d_unique_key[result_val] = target_key;
           d_val[idx] = result_val + offset;
           target_val_pos = result_val;
+          
+          if (d_frequency_counters != nullptr) {
+            atomicCAS(&d_frequency_counters[result_val], 0, input_freq);
+          }
           break;
         } else if (target_key == old_key) {
           while (target_val_pos == empty_val) {
           };
           d_val[idx] = target_val_pos + offset;
+          
+          // accumulate frequency
+          if (d_frequency_counters != nullptr) {
+            atomicAdd(&d_frequency_counters[target_val_pos], input_freq);
+          }
           break;
         }
       } else if (target_key == existing_key) {
         while (target_val_pos == empty_val) {
         };
         d_val[idx] = target_val_pos + offset;
+        
+        // accumulate frequency
+        if (d_frequency_counters != nullptr) {
+          atomicAdd(&d_frequency_counters[target_val_pos], input_freq);
+        }
         break;
       }
       counter++;
@@ -213,7 +235,8 @@ template <typename KeyType, typename CounterType, KeyType empty_key,
 void unique_op<KeyType, CounterType, empty_key, empty_val, hasher>::unique(
     const KeyType *d_key, const uint64_t len, CounterType *d_output_index,
     KeyType *d_unique_key, CounterType *d_output_counter, cudaStream_t stream,
-    CounterType *offset_ptr) {
+    CounterType *offset_ptr, CounterType *d_frequency_counters,
+    const CounterType *d_input_frequencies) {
 
   if (len == 0) {
     // Set the d_output_counter to 0
@@ -225,7 +248,7 @@ void unique_op<KeyType, CounterType, empty_key, empty_val, hasher>::unique(
   get_insert_kernel<KeyType, CounterType, hasher>
       <<<(len - 1) / BLOCK_SIZE_ + 1, BLOCK_SIZE_, 0, stream>>>(
           d_key, d_unique_key, d_output_index, len, keys_, vals_, capacity_,
-          counter_, empty_key, empty_val, offset_ptr);
+          counter_, empty_key, empty_val, d_frequency_counters, d_input_frequencies, offset_ptr);
   // replace counter_ with input d_output_counter
   cudaMemcpyAsync(d_output_counter, counter_, sizeof(CounterType),
                   cudaMemcpyDeviceToDevice, stream);

@@ -520,3 +520,10 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
 
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
+
+    def forward(self, features) -> torch.Tensor:
+        return self._emb_module(
+            features.values(),
+            features.offsets(),
+            per_sample_weights=features.weights_or_none(),
+        )

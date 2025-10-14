@@ -24,6 +24,7 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.key_value_table import (
     Cache,
+    KeyValueTable,
     KeyValueTableCachingFunction,
     KeyValueTableFunction,
     Storage,
@@ -32,6 +33,7 @@ from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
+    EvictStrategy,
     find_and_initialize,
     find_or_insert,
     gather_embedding,
@@ -306,6 +308,7 @@ def dynamicemb_prefetch(
             inverse,
             unique_indices_table_range,
             h_unique_indices_table_range,
+            _,
         ) = segmented_unique(indices, indices_table_range, unique_op)
         # TODO: only return device unique_indices_table_range
         # h_unique_indices_table_range = unique_indices_table_range.cpu()
@@ -344,6 +347,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         enable_prefetch: bool = False,
         input_dist_dedup: bool = False,
         training: bool = True,
+        frequency_counters: Optional[torch.Tensor] = None,
         *args,
     ):
         table_num = len(storages)
@@ -352,6 +356,17 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         emb_dim = storages[0].embedding_dim()
         caching = caches[0] is not None
 
+        is_lfu_enabled = False
+        if isinstance(storages[0], KeyValueTable):
+            is_lfu_enabled = storages[0].evict_strategy() == EvictStrategy.KLfu
+
+        frequency_counts_uint64 = None
+        if frequency_counters is not None:
+            frequency_counts_uint64 = frequency_counters.long()
+
+        # TODO: Use frequency_counts_uint64 for LFU strategy in pooled embeddings
+
+        lfu_accumulated_frequency = None
         indices_table_range = get_table_range(offsets, feature_offsets)
         if training or caching:
             (
@@ -359,12 +374,29 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 inverse,
                 unique_indices_table_range,
                 h_unique_indices_table_range,
-            ) = segmented_unique(indices, indices_table_range, unique_op)
+                lfu_accumulated_frequency,
+            ) = segmented_unique(
+                indices,
+                indices_table_range,
+                unique_op,
+                is_lfu_enabled,
+                frequency_counts_uint64,
+            )
             # TODO: only return device unique_indices_table_range
             # h_unique_indices_table_range = unique_indices_table_range.cpu()
         else:
             h_unique_indices_table_range = indices_table_range.cpu()
             unique_indices = indices
+
+        # Debug: check lfu_accumulated_frequency structure
+        if is_lfu_enabled and lfu_accumulated_frequency is not None:
+            print(
+                f"[DEBUG] table_num={table_num}, unique_indices.shape={unique_indices.shape}, lfu_accumulated_frequency.shape={lfu_accumulated_frequency.shape}"
+            )
+            if lfu_accumulated_frequency.numel() > 0:
+                print(
+                    f"[DEBUG] lfu_accumulated_frequency[:min(20, numel)]={lfu_accumulated_frequency[:min(20, lfu_accumulated_frequency.numel())].tolist()}"
+                )
 
         unique_embs = torch.empty(
             unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
@@ -375,6 +407,13 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             end = h_unique_indices_table_range[i + 1]
             unique_indices_per_table = unique_indices[begin:end]
             unique_embs_per_table = unique_embs[begin:end, :]
+            # Slice lfu_accumulated_frequency to match the table
+            lfu_accumulated_frequency_per_table = (
+                lfu_accumulated_frequency[begin:end]
+                if lfu_accumulated_frequency is not None
+                and lfu_accumulated_frequency.numel() > 0
+                else None
+            )
 
             if caching:
                 KeyValueTableCachingFunction.lookup(
@@ -385,6 +424,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     initializers[i],
                     enable_prefetch,
                     training,
+                    lfu_accumulated_frequency_per_table,
                 )
             else:
                 KeyValueTableFunction.lookup(
@@ -393,6 +433,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     unique_embs_per_table,
                     initializers[i],
                     training,
+                    lfu_accumulated_frequency_per_table,
                 )
 
         if training or caching:
@@ -446,7 +487,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         unique_indices, unique_embs = reduce_grads(
             indices, grads, indices_table_range, h_indices_table_range
         )
-
         optimizer.step()
         table_num = len(storages)
         for i in range(table_num):
@@ -471,4 +511,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     optimizer,
                 )
 
-        return (None,) * 13
+        return (None,) * 14

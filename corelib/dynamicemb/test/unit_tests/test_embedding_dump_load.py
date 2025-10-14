@@ -144,7 +144,10 @@ def apply_dmp(
     model: torch.nn.Module,
     optimizer_kwargs: Dict[str, Any],
     device: torch.device,
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    use_index_dedup: bool = False,
+    caching: bool = False,
+    cache_capacity_ratio: float = 0.5,
 ):
     eb_configs = []
     dynamicemb_options_dict = {}
@@ -156,12 +159,47 @@ def apply_dmp(
                 tmp_type = eb_config.data_type
 
                 embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-                emb_num_embeddings = eb_config.num_embeddings
+                emb_num_embeddings = (
+                    eb_config.num_embeddings * cache_capacity_ratio
+                    if caching
+                    else eb_config.num_embeddings
+                )
                 emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
                     math.log2(emb_num_embeddings)
                 )  # HKV need embedding vector num is power of 2
+
+                # Calculate optimizer state dimension
+                from dynamicemb.dynamicemb_config import (
+                    data_type_to_dtype,
+                    get_optimizer_state_dim,
+                )
+                from dynamicemb_extensions import OptimizerType
+
+                # Map fbgemm EmbOptimType to dynamicemb OptimizerType
+                emb_opt_type = (
+                    optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
+                )
+                opt_type_map = {
+                    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimizerType.RowWiseAdaGrad,
+                    EmbOptimType.SGD: OptimizerType.SGD,
+                    EmbOptimType.EXACT_SGD: OptimizerType.SGD,
+                    EmbOptimType.ADAM: OptimizerType.Adam,
+                    EmbOptimType.EXACT_ADAGRAD: OptimizerType.AdaGrad,
+                }
+                opt_type = opt_type_map.get(emb_opt_type) if emb_opt_type else None
+                # Convert torchrec DataType to torch.dtype
+                torch_dtype = data_type_to_dtype(tmp_type)
+                optimizer_state_dim = (
+                    get_optimizer_state_dim(opt_type, dim, torch_dtype)
+                    if opt_type
+                    else 0
+                )
+
+                # Include optimizer state in HBM calculation
                 total_hbm_need = (
-                    embedding_type_bytes * dim * emb_num_embeddings_next_power_of_2
+                    embedding_type_bytes
+                    * (dim + optimizer_state_dim)
+                    * emb_num_embeddings_next_power_of_2
                 )
 
                 dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
@@ -171,8 +209,11 @@ def apply_dmp(
                         mode=DynamicEmbInitializerMode.CONSTANT,
                         value=1e-1,
                     ),
-                    bucket_capacity=emb_num_embeddings_next_power_of_2,
+                    # bucket_capacity=emb_num_embeddings_next_power_of_2,
                     max_capacity=emb_num_embeddings_next_power_of_2,
+                    caching=caching,
+                    local_hbm_for_values=1024**3,
+                    # local_hbm_for_values=local_hbm if caching else 0,
                 )
     planner = get_planner(
         eb_configs,
@@ -187,7 +228,7 @@ def apply_dmp(
 
     sharder = DynamicEmbeddingCollectionSharder(
         fused_params=fused_params,
-        use_index_dedup=False,
+        use_index_dedup=use_index_dedup,
     )
     plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
 
@@ -207,7 +248,10 @@ def create_model(
     num_embeddings: List[int],
     embedding_dim: int,
     optimizer_kwargs: Dict[str, Any],
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    use_index_dedup: bool = False,
+    caching: bool = False,
+    cache_capacity_ratio: float = 0.5,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -239,7 +283,10 @@ def create_model(
         model,
         optimizer_kwargs,
         torch.device(f"cuda:{torch.cuda.current_device()}"),
-        score_strategy,
+        score_strategy=score_strategy,
+        use_index_dedup=use_index_dedup,
+        caching=caching,
+        cache_capacity_ratio=cache_capacity_ratio,
     )
     return model
 
