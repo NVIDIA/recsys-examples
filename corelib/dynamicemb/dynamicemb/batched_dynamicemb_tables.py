@@ -17,10 +17,10 @@ import enum
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import accumulate
 from typing import List, Optional, Tuple, cast
 
-import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import *
@@ -112,44 +112,21 @@ def encode_meta_json_file_path(root_path: str, table_name: str) -> str:
     return os.path.join(root_path, f"{table_name}_opt_args.json")
 
 
-def encode_key_file_path(
-    root_path: str, table_name: str, rank: int, world_size: int
+def encode_checkpoint_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int, item: str
 ) -> str:
+    assert item in ["keys", "values", "scores", "opt_values"]
     return os.path.join(
-        root_path, f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}"
-    )
-
-
-def encode_value_file_path(
-    root_path: str, table_name: str, rank: int, world_size: int
-) -> str:
-    return os.path.join(
-        root_path, f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}"
-    )
-
-
-def encode_score_file_path(
-    root_path: str, table_name: str, rank: int, world_size: int
-) -> str:
-    return os.path.join(
-        root_path, f"{table_name}_emb_scores.rank_{rank}.world_size_{world_size}"
-    )
-
-
-def encode_opt_file_path(
-    root_path: str, table_name: str, rank: int, world_size: int
-) -> str:
-    return os.path.join(
-        root_path, f"{table_name}_opt_values.rank_{rank}.world_size_{world_size}"
+        root_path, f"{table_name}_emb_{item}.rank_{rank}.world_size_{world_size}"
     )
 
 
 def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str], int]:
     suffix_to_encode_file_path_func = {
-        "emb_keys": encode_key_file_path,
-        "emb_values": encode_value_file_path,
-        "emb_scores": encode_score_file_path,
-        "opt_values": encode_opt_file_path,
+        "emb_keys": partial(encode_checkpoint_file_path, item="keys"),
+        "emb_values": partial(encode_checkpoint_file_path, item="values"),
+        "emb_scores": partial(encode_checkpoint_file_path, item="scores"),
+        "opt_values": partial(encode_checkpoint_file_path, item="opt_values"),
     }
     if suffix not in suffix_to_encode_file_path_func:
         raise RuntimeError(f"Invalid suffix: {suffix}")
@@ -202,12 +179,16 @@ def get_loading_files(
 
     if world_size == num_key_files:
         return (
-            [encode_key_file_path(root_path, name, rank, world_size)],
-            [encode_value_file_path(root_path, name, rank, world_size)],
-            [encode_score_file_path(root_path, name, rank, world_size)]
+            [encode_checkpoint_file_path(root_path, name, rank, world_size, "keys")],
+            [encode_checkpoint_file_path(root_path, name, rank, world_size, "values")],
+            [encode_checkpoint_file_path(root_path, name, rank, world_size, "scores")]
             if num_score_files == num_key_files
             else [],
-            [encode_opt_file_path(root_path, name, rank, world_size)]
+            [
+                encode_checkpoint_file_path(
+                    root_path, name, rank, world_size, "opt_values"
+                )
+            ]
             if num_opt_files == num_key_files
             else [],
         )
@@ -1213,15 +1194,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
 
             meta_file_path = encode_meta_json_file_path(save_dir, table_name)
-            emb_key_path = encode_key_file_path(save_dir, table_name, rank, world_size)
-            emb_value_path = encode_value_file_path(
-                save_dir, table_name, rank, world_size
+            emb_key_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "keys"
             )
-            emb_score_path = encode_score_file_path(
-                save_dir, table_name, rank, world_size
+            emb_value_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "values"
             )
-            opt_value_path = encode_opt_file_path(
-                save_dir, table_name, rank, world_size
+            emb_score_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "scores"
+            )
+            opt_value_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "opt_values"
             )
 
             storage.dump(
@@ -1278,25 +1261,29 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     include_optim=optim,
                 )
 
-    def export_keys_values(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
-        from dynamicemb.key_value_table import export_keys_values
+    def export_keys_values(
+        self, table_name: str, device: torch.device, batch_size: int = 65536
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from dynamicemb.key_value_table import batched_export_keys_values
 
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
         keys_list = []
         values_list = []
         self.flush()
         for dynamic_table_name, dynamic_table in zip(self.table_names, self.tables):
+            assert isinstance(
+                dynamic_table, KeyValueTable
+            ), "Only KeyValueTable is supported for batched export keys and values"
             if table_name != dynamic_table_name:
                 continue
 
             local_max_rows = dynamic_table.size()
             accumulated_counts = 0
 
-            for keys, embeddings, _, _ in export_keys_values(
-                dynamic_table.table, device
+            for keys, embeddings, _, _ in batched_export_keys_values(
+                dynamic_table.table, device, batch_size
             ):
-                keys_list.append(keys.cpu().numpy())
-                values_list.append(embeddings.cpu().numpy())
+                keys_list.append(keys)
+                values_list.append(embeddings)
                 accumulated_counts += keys.numel()
 
             if local_max_rows != accumulated_counts:
@@ -1304,7 +1291,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     f"Rank {dist.get_rank()} has accumulated count {accumulated_counts} which is different from expected {local_max_rows}, "
                     f"difference: {accumulated_counts - local_max_rows}"
                 )
-        return np.concatenate(keys_list), np.concatenate(values_list, axis=0)
+        return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
     def incremental_dump(
         self,

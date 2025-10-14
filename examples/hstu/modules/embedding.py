@@ -408,7 +408,10 @@ class ShardedEmbedding(torch.nn.Module):
             for m in dynamicemb_modules:
                 if table_name not in set(m.table_names):
                     continue
-                return m.export_keys_values(table_name)
+                keys_tensor, values_tensor = m.export_keys_values(
+                    table_name, device=torch.device(f"cpu")
+                )
+                return keys_tensor.numpy(), values_tensor.numpy()
 
         keys_list = []
         values_list = []

@@ -257,7 +257,7 @@ class Cache(abc.ABC):
         pass
 
 
-def export_keys_values(
+def batched_export_keys_values(
     dynamic_table: DynamicEmbTable,
     device: torch.device,
     batch_size: int = 65536,
@@ -277,10 +277,13 @@ def export_keys_values(
         optstate_dim = dynamic_table.optstate_dim()
         total_dim = dim + optstate_dim
 
-        keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-        values = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
-        scores = torch.zeros(batch_size, dtype=SCORE_TYPE, device=device)
-        d_counter = torch.zeros(1, dtype=torch.uint64, device=device)
+        cuda_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        keys = torch.empty(batch_size, dtype=key_dtype, device=cuda_device)
+        values = torch.empty(
+            batch_size * total_dim, dtype=value_dtype, device=cuda_device
+        )
+        scores = torch.zeros(batch_size, dtype=SCORE_TYPE, device=cuda_device)
+        d_counter = torch.zeros(1, dtype=torch.uint64, device=cuda_device)
 
         export_batch(dynamic_table, batch_size, offset, d_counter, keys, values, scores)
 
@@ -293,10 +296,10 @@ def export_keys_values(
         actual_length = d_counter.item()
         if actual_length > 0:
             yield (
-                keys[:actual_length].to(KEY_TYPE),
-                embeddings[:actual_length, :].to(EMBEDDING_TYPE),
-                opt_states[:actual_length, :].to(OPT_STATE_TYPE),
-                scores[:actual_length].to(SCORE_TYPE),
+                keys[:actual_length].to(KEY_TYPE).to(device),
+                embeddings[:actual_length, :].to(EMBEDDING_TYPE).to(device),
+                opt_states[:actual_length, :].to(OPT_STATE_TYPE).to(device),
+                scores[:actual_length].to(SCORE_TYPE).to(device),
             )
         offset += batch_size
 
@@ -570,7 +573,7 @@ class KeyValueTable(Cache, Storage):
         fscore = open(score_file_path, "wb") if self._use_score else None
         fopt_states = open(opt_file_path, "wb") if include_optim else None
 
-        for keys, embeddings, opt_states, scores in export_keys_values(
+        for keys, embeddings, opt_states, scores in batched_export_keys_values(
             self.table, device
         ):
             fkey.write(keys.cpu().numpy().tobytes())
