@@ -113,10 +113,14 @@ void initialize_with_generator(
   if (num_worker == -1) {
     num_worker = deviceProp.total_threads;
   }
+  int max_grid_size = num_worker / block_size;
   if (num_worker > num_need) {
     num_worker = num_need;
   }
-  int grid_size = num_worker / block_size;
+  int grid_size = (num_worker - 1) / block_size + 1;
+  if (grid_size > max_grid_size) {
+    grid_size = max_grid_size;
+  }
 
   auto value_type =
       scalartype_to_datatype(convertTypeMetaToScalarType(buffer.dtype()));
