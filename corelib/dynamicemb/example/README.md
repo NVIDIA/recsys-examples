@@ -131,7 +131,7 @@ Refer to demo `PyDictStorage` in [uint test](../test/test_batched_dynamic_embedd
 
 ## DynamicEmbParameterSharding
 
-The final step of preparation is to generate a `ParameterSharding` for each table, describe (configure) the sharding of a parameter. For dynamic embedding table, `DynamicEmbParameterSharding` will be generated, which includes the parameters required for our embedding lookup module.
+The final step of preparation is to generate a `ParameterSharding` for each table, describe (configure) the sharding of a parameter. For dynamic embedding table, `DynamicEmbParameterSharding` will be generated, which includes the parameters required from our embedding lookup module.
 
 *We will not expand `DynamicEmbParameterSharding` here. The following steps demonstrate how to obtain `DynamicEmbParameterSharding` by `DynamicEmbeddingShardingPlanner`.*
 

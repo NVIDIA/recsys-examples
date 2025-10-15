@@ -53,7 +53,7 @@ OPTIM_TYPE: Dict[EmbOptimType, OptimType] = {
 }
 
 
-class PyDictStorage(Storage):
+class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizerV2]):
     def __init__(
         self,
         options: DynamicEmbTableOptions,
@@ -320,6 +320,7 @@ def test_forward_train_eval(opt_type, opt_params, caching, PS):
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
             caching=caching,
             local_hbm_for_values=1024**3,
+            external_storage=PS,
         )
         dyn_emb_table_options_list.append(dyn_emb_table_options)
 
@@ -330,7 +331,6 @@ def test_forward_train_eval(opt_type, opt_params, caching, PS):
         pooling_mode=DynamicEmbPoolingMode.NONE,
         optimizer=opt_type,
         use_index_dedup=True,
-        ext_ps=PS,
         **opt_params,
     )
     """
@@ -449,6 +449,7 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
             caching=caching,
             local_hbm_for_values=1024**3,
+            external_storage=PS,
         )
         dyn_emb_table_options_list.append(dyn_emb_table_options)
 
@@ -459,7 +460,6 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
         feature_table_map=feature_table_map,
         pooling_mode=pooling_mode,
         optimizer=opt_type,
-        ext_ps=PS,
         **opt_params,
     )
     num_embs = [max_capacity // 2 for d in dims]
@@ -566,6 +566,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
             score_strategy=DynamicEmbScoreStrategy.STEP,
             caching=True,
             local_hbm_for_values=1024**3,
+            external_storage=PS,
         )
         dyn_emb_table_options_list.append(dyn_emb_table_options)
 
@@ -577,7 +578,6 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
         pooling_mode=DynamicEmbPoolingMode.NONE,
         optimizer=opt_type,
         enable_prefetch=False,
-        ext_ps=PS,
         **opt_params,
     )
     bdeb.enable_prefetch = True

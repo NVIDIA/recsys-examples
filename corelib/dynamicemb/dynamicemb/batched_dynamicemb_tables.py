@@ -429,7 +429,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         pooling_mode: DynamicEmbPoolingMode = DynamicEmbPoolingMode.SUM,
         output_dtype: torch.dtype = torch.float32,
         device: torch.device = None,
-        ext_ps: Optional[Storage] = None,
         enforce_hbm: bool = False,  # place all weights/momentums in HBM when using cache
         bounds_check_mode: BoundsCheckMode = BoundsCheckMode.WARNING,
         optimizer: EmbOptimType = EmbOptimType.SGD,
@@ -570,8 +569,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             counter_based_regularization,
             cowclip_regularization,
         )
-        self._storage_externel = ext_ps is not None
-        self._create_cache_storage(ext_ps)
+        self._storage_externel = table_option.external_storage is not None
+        self._create_cache_storage()
         if self.pooling_mode != DynamicEmbPoolingMode.NONE:
             self._tables = []
             for storage in self._storages:
@@ -614,7 +613,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
         self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
 
-    def _create_cache_storage(self, PS: Storage = None) -> None:
+    def _create_cache_storage(self) -> None:
         self._storages: List[Storage] = []
         self._caches: List[Cache] = []
         self._caching = self._dynamicemb_options[0].caching
@@ -649,6 +648,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
                 storage_option = deepcopy(option)
                 storage_option.local_hbm_for_values = 0
+                PS = storage_option.external_storage
                 self._storages.append(
                     PS(storage_option, self._optimizer)
                     if PS

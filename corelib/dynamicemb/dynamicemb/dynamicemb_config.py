@@ -21,6 +21,7 @@ from math import sqrt
 from typing import Dict, Optional
 
 import torch
+from dynamicemb.types import Storage
 from dynamicemb_extensions import (
     DynamicEmbDataType,
     DynamicEmbTable,
@@ -28,7 +29,6 @@ from dynamicemb_extensions import (
     InitializerArgs,
     OptimizerType,
 )
-from key_value_table import Storage
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 
@@ -334,6 +334,9 @@ class DynamicEmbTableOptions(HKVConfig):
         from host memory to HBM if existed, default to `False`.
     num_aligned_embedding_per_rank: int
         Number of aligned embedding per rank when the `num_embeddings` does not meet our alignment requirements, default to None.
+    external_storage: Storage
+        The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
+        If not provided, will using KeyValueTable as the Storage.
 
     Notes
     -----
@@ -384,6 +387,8 @@ class DynamicEmbTableOptions(HKVConfig):
     def get_grouped_key(self):
         grouped_key = {f.name: getattr(self, f.name) for f in fields(GroupedHKVConfig)}
         grouped_key["training"] = self.training
+        grouped_key["caching"] = self.caching
+        grouped_key["external_storage"] = self.external_storage
         return grouped_key
 
     def __hash__(self):

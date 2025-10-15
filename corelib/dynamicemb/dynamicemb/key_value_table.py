@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import abc
 import json
 import os
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
@@ -29,6 +28,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
+from dynamicemb.types import Cache, Storage
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
@@ -74,187 +74,6 @@ def load_from_json(file_path: str) -> Dict[str, Any]:
         return data
     except Exception as e:
         raise RuntimeError(f"Error loading data from JSON file: {e}")
-
-
-class Storage(abc.ABC):
-    @abc.abstractmethod
-    def __init__(
-        self,
-        options: DynamicEmbTableOptions,
-        optimizer: BaseDynamicEmbeddingOptimizerV2,
-    ):
-        pass
-
-    @abc.abstractmethod
-    def find(
-        self,
-        unique_keys: torch.Tensor,
-        unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def find_embeddings(
-        self,
-        unique_keys: torch.Tensor,
-        unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def insert(
-        self,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        scores: Optional[torch.Tensor] = None,
-    ) -> None:
-        pass
-
-    @abc.abstractmethod
-    def update(
-        self, keys: torch.Tensor, grads: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def enable_update(self) -> bool:
-        ...
-
-    @abc.abstractmethod
-    def dump(
-        self,
-        meta_file_path: str,
-        emb_key_path: str,
-        embedding_file_path: str,
-        score_file_path: Optional[str],
-        opt_file_path: Optional[str],
-    ) -> None:
-        pass
-
-    @abc.abstractmethod
-    def load(
-        self,
-        meta_file_path: str,
-        emb_file_path: str,
-        embedding_file_path: str,
-        score_file_path: Optional[str],
-        opt_file_path: Optional[str],
-        include_optim: bool,
-    ) -> None:
-        pass
-
-    @abc.abstractmethod
-    def embedding_dtype(
-        self,
-    ) -> torch.dtype:
-        pass
-
-    @abc.abstractmethod
-    def embedding_dim(
-        self,
-    ) -> int:
-        pass
-
-    @abc.abstractmethod
-    def value_dim(
-        self,
-    ) -> int:
-        pass
-
-    @abc.abstractmethod
-    def init_optimizer_state(
-        self,
-    ) -> float:
-        pass
-
-
-class Cache(abc.ABC):
-    @abc.abstractmethod
-    def find(
-        self,
-        unique_keys: torch.Tensor,
-        unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def find_embeddings(
-        self,
-        unique_keys: torch.Tensor,
-        unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def find_missed_keys(
-        self,
-        unique_keys: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def insert_and_evict(
-        self,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_evicted: int
-        evicted_keys: torch.Tensor
-        evicted_values: torch.Tensor
-        evicted_scores: torch.Tensor
-        return num_evicted, evicted_keys, evicted_values, evicted_scores
-
-    @abc.abstractmethod
-    def update(
-        self, keys: torch.Tensor, grads: torch.Tensor
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def flush(self, storage: Storage) -> None:
-        pass
-
-    @abc.abstractmethod
-    def reset(
-        self,
-    ) -> None:
-        pass
-
-    @abc.abstractmethod
-    def cache_metrics(
-        self,
-    ) -> torch.Tensor:
-        pass
-
-    @abc.abstractmethod
-    def set_record_cache_metrics(self, record: bool) -> None:
-        pass
 
 
 def batched_export_keys_values(
@@ -362,7 +181,9 @@ def load_key_values(
         )
 
 
-class KeyValueTable(Cache, Storage):
+class KeyValueTable(
+    Cache, Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizerV2]
+):
     def __init__(
         self,
         options: DynamicEmbTableOptions,
