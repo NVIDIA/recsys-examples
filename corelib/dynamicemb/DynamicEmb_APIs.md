@@ -1,3 +1,6 @@
+# Introduction
+This document consists of two parts, one is the introduction to the API, which can be used as a reference, and the other part prompts specific functions from a functional perspective and which interfaces are related to them.
+
 # DynamicEmb APIs
 
 ## APIs
@@ -316,88 +319,108 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
 
     #API arguments
     @dataclass
-    class DynamicEmbTableOptions(HKVConfig):
+    class DynamicEmbTableOptions(InternalConfigs):
         """
-        Encapsulates the configuration options for dynamic embedding tables.
+        Encapsulates the configuration options for dynamic embedding table.
 
-        This class extends HKVConfig to include parameters that control the behavior and performance of
-        hierarchical key-value storage systems, specifically tailored for dynamic embeddings in
-        recommender systems. The options provided here allow users to customize their embedding tables
-        according to their specific requirements.
-
-        Including options:
-            1. HKVConfig: explicitly defined by users.
-                - Common configs for tables can be fused into a group.
-                - Uncommon configs for each table in a group.
-                - Some of HKVConfig can be inferred by context (index_type, embedding_dtype, dim, max_capacity, device_id, etc.)
-            2. Initializer args.
+        This class include parameters that control the behavior and performance of embedding lookup module, specifically tailored for dynamic embeddings.
+        `get_grouped_key` will return fields used to group dynamic embedding tables.
 
         Parameters
         ----------
-        index_type : Optional[torch.dtype], optional
-            The index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
-        embedding_dtype : Optional[torch.dtype], optional
-            Data (weight) type of dynamic embedding table.
-        score_type : torch.dtype
-            The score represents how important an embedding item is. This specifies the type of the score.
-        device_id : Optional[int], optional
-            CUDA device index.
+        training: bool
+            Flag to indicate dynamic embedding tables is working on training mode or evaluation mode, default to `True`.
+            If in training mode. **dyanmicemb** store embeddings and optimizer states together in the underlying key-value table. e.g.
+                key:torch.int64
+                value = torch.concat(embedding, opt_states, dim=1)
 
-        dim : Optional[int], optional
-            The dimensionality of the value vectors. Default is -1, indicating it should be set explicitly.
-        max_capacity : Optional[int], optional
-            The maximum capacity of the embedding table. Automatically set in the shared planner.
+            Therefore, if `training=True` dynamicemb will allocate memory for optimizer states whose consumption is decided by the `optimizer_type` which got from `fused_params`. 
+        initializer_args : DynamicEmbInitializerArgs
+            Arguments for initializing dynamic embedding vector values when training, and default using uniform distribution.
+            For `UNIFORM` and `TRUNCATED_NORMAL`, the `lower` and `upper` will set to $\pm {1 \over \sqrt{EmbeddingConfig.num\_embeddings}}$.
+        eval_initializer_args: DynamicEmbInitializerArgs
+            The initializer args for evaluation mode, and will return torch.zeros(...) as embedding by default if index/sparse feature is missing.
+        caching: bool
+            Flag to indicate dynamic embedding tables is working on caching mode, default to `False`.
+            When the device memory on a single GPU is insufficient to accommodate a single shard of the dynamic embedding table, 
+                HKV supports the mixed use of device memory and host memory(pinned memory).
+            But by default, the values of the entire table are concatenated with device memory and host memory.
+            This means that the storage location of one embeddng is determined by `hash_function(key)`, and mapping to device memory will bring better lookup performance.
+            However, sparse features in training are often with temporal locality.
+            In order to store hot keys in device memory, dynamicemb creates two HKV instances, 
+                whose values are stored in device memory and memory respectively, and store hot keys on the GPU table priorily. 
+            If the GPU table is full, the evicted keys will be inserted into the CPU table.
+            If the CPU table is also full, the key granularity will be evicted(all the eviction is based on the score per key). 
+            The original intention of eviction is based on this insight: features that only appear once should not occupy memory(even host memory) for a long time.
+            In short:
+                set **`caching=True`** will create a GPU table and a CPU table, and make GPU table serves as a cache;
+                set **`caching=False`** will create a hybrid table which use GPU and CPU memory in a concated way to store value.
+                All keys and other meta data are always stored on GPU for both cases.
         init_capacity : Optional[int], optional
             The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
+            If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
+            If set, it will be rounded up to the power of 2.
+            As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
+            Rehash will be done implicitly.
+            Note: This is the setting for a single table at each rank.
         max_load_factor : float
-            The maximum load factor before rehashing occurs. The default is 0.5.
-        global_hbm_for_values : int
-            Total high-bandwidth memory allocated for entire embedding values, in bytes. The default is 0.
-        local_hbm_for_values : int
-            High-bandwidth memory allocated for local values, in bytes. The default is 0.
-        evict_strategy : DynamicEmbEvictStrategy
-            Strategy used for evicting entries when the table exceeds its capacity. The default is DynamicEmbEvictStrategy.LRU.
-            At present, only DynamicEmbEvictStrategy.LRU and DynamicEmbEvictStrategy.LFU are available.
-        bucket_capacity : int
-            The number of entries each bucket can hold. The default is 128.
-        block_size : int
-            The size of blocks used during operations. The default is 128.
-        io_block_size : int
-            The size of input/output blocks during data transfer operations. The default is 1024.
-        io_by_cpu : bool
-            Flag indicating whether to use CPU for handling IO operations. The default is False.
-        use_constant_memory : bool
-            Flag to indicate if constant memory should be utilized. The default is False.
-        reserved_key_start_bit : int
-            Bit offset for reserved keys in the key space. The default is 0.
-        num_of_buckets_per_alloc : int
-            Number of buckets allocated per memory allocation request. Default is 1.
-        initializer_args : DynamicEmbInitializerArgs
-            Arguments for initializing dynamic embedding vector values.
-            Default is uniform distribution, and absolute values of upper and lower bound are sqrt(1 / eb_config.num_embeddings).
+            The maximum load factor before rehashing occurs. Default is 0.5.
         score_strategy(DynamicEmbScoreStrategy):
-            The strategy to set the score for each indices in forward and backward per table.
+            dynamicemb gives each key-value pair a score to represent its importance.
+            Once there is insufficient space, the key-value pair will be evicted based on the score.
+            The `score_strategy` is used to configure how to set the scores for keys in each batch.
             Default to DynamicEmbScoreStrategy.TIMESTAMP.
             For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
                 as they are the same table, but stored on different ranks.
+        bucket_capacity : int
+            Capacity of each bucket in HKV, and default is 128(using 1024 when HKV serves as cache).
+            A key will only be mapped to one bucket. 
+            When the bucket is full, the key with the smallest score in the bucket will be evicted, and its slot will be used to store a new key. 
+            The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
         safe_check_mode : DynamicEmbCheckMode
+            Used to check if all keys in the current batch have been successfully inserted into the table.
             Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
             Please refer to the API documentation for DynamicEmbCheckMode for more information.
-
+        global_hbm_for_values : int
+            Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
+            It has different meanings under `caching=True` and  `caching=False`.
+                When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
+                When `caching=True`, it decides the table capacity of the GPU table.
+        external_storage: Storage
+            The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
+            If not provided, will using KeyValueTable as the Storage.
+        index_type : Optional[torch.dtype], optional
+            Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.    
+        
         Notes
         -----
         For detailed descriptions and additional context on each parameter, please refer to the documentation at
         https://github.com/NVIDIA-Merlin/HierarchicalKV.
         """
 
+        training: bool = True
         initializer_args: DynamicEmbInitializerArgs = field(
             default_factory=DynamicEmbInitializerArgs
         )
+        eval_initializer_args: DynamicEmbInitializerArgs = field(
+            default_factory=lambda: DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT,
+                value=0.0,
+            )
+        )
+        caching: bool = False
+        init_capacity: Optional[
+            int
+        ] = None  # if not set then set to max_capcacity after sharded
+        max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
         score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
+        bucket_capacity: int = 128
+        safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
+        global_hbm_for_values: int = 0  # in bytes
+        external_storage: Storage = None
+        index_type: Optional[torch.dtype] = None
 
     ```
-If using `DynamicEmbInitializerMode.UNIFORM`, `DynamicEmbeddingShardingPlanner` will set the `initializer_args.upper` and `initializer_args.lower` to +/- sqrt(1 / eb_config.num_embeddings)
-by default(except users provide them explicitly).
 
 ## DynamicEmbDump
 
@@ -584,3 +607,40 @@ Setting the environment variable DYNAMICEMB_CSTM_SCORE_CHECK to 0 will not throw
             None.
         """
     ```
+
+# Functionality and User interface
+
+## Distributed embedding training and evaluation
+
+Once the model containing `EmbeddingCollection` is built and initialized through `DistributedModelParallel`, it can be trained and evaluated on each GPU like a single GPU, with torchrec completing communication between different GPUs.
+
+The switching between training and evaluation modes should be consistent with `nn.Module`, while `training` in [DynamicEmbTableOptions](../dynamicemb/dynamicemb_config.py) is used to guide whether to allocate memory to optimizer states when builds the table.
+
+Due to limited resources, the dynamic embedding table does not pre allocate memory for all keys. If a key appears for the first time during training, it will be initialized immediately during the training process. Please see `initializer_args` and `eval_initializer_args` in `DynamicEmbTableOptions` for more information.
+
+## Automatic eviction
+
+The size of the table is finite, but the set of keys during training may be infinite. dynamicemb provides the function of automatic eviction, which constrains the size of tables reasonably when there is no available space. See `score_strategy` and `bucket_capacity` for more information.
+
+## Caching and prefetch
+
+dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch keys from host to device like torchrec(document and example is waiting to append, and now please see `test_prefetch_flush_in_cache` in [test prefetch](./test/test_batched_dynamic_embedding_tables_v2.py)).
+
+## External storage
+
+dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](../dynamicemb/types.py). 
+Refer to demo `PyDictStorage` in [uint test](../test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
+
+
+## Table expansion
+
+Users can specify the initial capacity of a table on a single GPU. When the specified load factor is reached, the capacity of the table will double until the limit is reached. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions` for more information.
+
+
+## Dump/Load and Incremental dump
+
+Dump/Load and incremental dump is different from general module in PyTorch, because dynamicemb's underlying implementation is a hash table instead of a dense `torch.Tensor`.
+
+So dynamicemb provides dedicated interface to load/save models' states, and provide conditional dump to support online training.
+
+Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](../DynamicEmb_APIs.md) for more information.

@@ -23,6 +23,7 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 - **Dynamic Embedding Table Support**: DynamicEmb supports embedding tables backed by hash tables, allowing for optimal utilization of both GPU memory and host memory within the system. Hash tables can accept any specified `indices` type values, unlike static tables which only support index values.
 
 - **Seamless Integration with TorchREC**: DynamicEmb inherits the API from TorchREC, ensuring that its usage is largely consistent with TorchREC. Users can easily modify their existing code to run recommendation system models with dynamic embedding tables alongside TorchREC.
+**dynamicemb** provides a high-performance **hash table** to support dynamic embedding and leverages **torchrec** to implement sharding logic on multiple GPUs. This explains why dynamicemb largely reuses the user interface of torchrec while adding some new configuration options related to dynamic embedding.
 
 - **Embedded in DistributedGR Repository Supporting Generative-Recommenders(GR) Models**: Currently, DynamicEmb is integrated into the DistributedGR repository, serving as an embedding backend for GR models.
 
@@ -56,6 +57,10 @@ Once above processing is done, please execute `python -c 'import fbgemm_gpu'` to
 
 2. **TorchRec**
 
+> torchrec >= v1.2.0
+
+Thanks to the torchrec team for their [support](https://github.com/meta-pytorch/torchrec/commit/6aaf1fa72e884642f39c49ef232162fa3772055e), torchrec v1.2.0 added support for custom embedding lookup module.
+
 After fbgemm_gpu is installed, you can install TorchRec with below commands.
 
 ```bash
@@ -79,7 +84,7 @@ python setup.py install
 
 ## DynamicEmb APIs
 
-Regarding how to use the DynamicEmb APIs and their parameters, please refer to the `DynamicEmb_APIs.md` file in the same folder as this document.
+Regarding how to use the DynamicEmb APIs and their parameters, please refer to the [DynamicEmb_APIs.md](./DynamicEmb_APIs.md) file in the same folder as this document.
 
 ## Usage Notes
 
@@ -116,16 +121,14 @@ table_options = DynamicEmbTableOptions(
 
 We provide benchmark and unit test code to demonstrate how to use DynamicEmb. Please visit the benchmark and test folders. Below is a pseudocode example demonstrating how to convert TorchREC code to use DynamicEmb.
 
-To get started with DynamicEmb, we highly recommend checking out the notebook in `example/DynamicEmb_Quick_Start.ipynb`. It walks you through the entire process of modifying your code and setting up a training script with model parallelism.
-
-This notebook is designed as an interactive guide, so you can quickly experiment with DynamicEmb and see its benefits in a practical setting.
+To get started with DynamicEmb, we highly recommend checking out the [example.py](./example/example.py). It walks you through the entire process of modifying your code and setting up a training script with model parallelism. You can quickly experiment with DynamicEmb and see its benefits in a practical setting.
 
 ## Future Plans
 
 1. Support the latest version of TorchREC and continuously follow TorchREC's version updates.
 2. Continuously optimize the performance of embedding lookup and embedding bag lookup.
 3. Support multiple optimizer types, aligning with the optimizer types supported by TorchREC.
-4. Support more configurations for dynamic embedding table eviction mechanisms and incremental dump.
+4. Support more configurations for dynamic embedding table eviction mechanisms.
 5. Support the separation of backward and optimizer update (required by certain large language model frameworks like Megatron), to better support large-scale GR training.
 6. Add more shard types for dynamic embedding tables, including `table-wise`, `table-row-wise` and `column-wise`.
 
