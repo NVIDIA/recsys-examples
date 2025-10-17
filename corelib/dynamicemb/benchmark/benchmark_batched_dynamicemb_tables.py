@@ -633,31 +633,61 @@ def clear_cache(args, dynamic_emb, torchrec_emb):
     torchrec_emb.reset_cache_states()
 
 
-def occupy_gpu_memory(remain=4):
+def find_max_tensor(remain_GB, dtype=torch.float32):
+    safe_margin = 0.95
+    device = torch.cuda.current_device()
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    reserved_mem = torch.cuda.memory_reserved(device)
+    current_free = total_mem - reserved_mem
+
+    target_free_bytes = remain_GB * 1024**3
+    alloc_bytes = int(current_free * safe_margin - target_free_bytes)
+    if alloc_bytes <= 0:
+        print(f"No enough memory to remain {remain_GB} GB")
+        return 0
+
+    bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+    max_elements = alloc_bytes // bytes_per_element
+
+    # binary search to get max safe allocate size, avoid fragment and OOM
+    left, right, result = 0, max_elements, 0
+    while left <= right:
+        mid = (left + right) // 2
+        try:
+            t = torch.empty(mid, dtype=dtype, device="cuda")
+            del t
+            result = mid
+            left = mid + 1
+        except RuntimeError:
+            right = mid - 1
+    print(
+        f"Max tensor size can be allocated：{result * bytes_per_element/1024**3:.2f} GB，total {result} elements."
+    )
+    return result
+
+
+def occupy_gpu_memory(remain=20):
     target_free_GB = remain
     if not torch.cuda.is_available():
         print("CUDA is not available.")
-        return
+        return None
 
     device = torch.cuda.current_device()
-
     total_mem = torch.cuda.get_device_properties(device).total_memory
     reserved_mem = torch.cuda.memory_reserved(device)
-    torch.cuda.memory_allocated(device)
     current_free = total_mem - reserved_mem
-
     current_free_GB = current_free / (1024**3)
     print(f"GPU memory remain: {current_free_GB:.2f} GB")
 
     if current_free_GB > target_free_GB:
-        required_GB = current_free_GB - target_free_GB
-        required_bytes = int(required_GB * 1024**3)
-        # dtype=fp32
-        num_elements = required_bytes // 4
-
-        t = torch.empty(num_elements, dtype=torch.float32, device="cuda")
-        print(f"Occupy {required_GB:.2f} remain {target_free_GB} GB gpu memory.")
-        return t
+        max_elements = find_max_tensor(remain_GB=target_free_GB, dtype=torch.float32)
+        if max_elements > 0:
+            t = torch.empty(max_elements, dtype=torch.float32, device="cuda")
+            allocated_GB = max_elements * t.element_size() / 1024**3
+            print(
+                f"Occupy gpu memory: {allocated_GB:.2f} GB，remain around {target_free_GB} GB"
+            )
+            return t
 
     print(f"The remained gpu memory less than {target_free_GB} GB")
     return None
@@ -714,7 +744,7 @@ def main():
         )
 
     warmup_gpu(device)
-    occupy_gpu_memory()
+    placeholder = occupy_gpu_memory()
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):
             (
@@ -780,6 +810,8 @@ def main():
     dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
     torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, timer, args)
     torch.cuda.profiler.stop()
+
+    print(placeholder.numel())
 
     test_result = {
         "caching": args.caching,
