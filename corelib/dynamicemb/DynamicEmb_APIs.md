@@ -319,7 +319,7 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
 
     #API arguments
     @dataclass
-    class DynamicEmbTableOptions(InternalConfigs):
+    class DynamicEmbTableOptions(_ContextOptions):
         """
         Encapsulates the configuration options for dynamic embedding table.
 
