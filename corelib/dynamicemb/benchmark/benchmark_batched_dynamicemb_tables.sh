@@ -2,14 +2,14 @@
 
 export CUDA_VISIBLE_DEVICES=0
 
-declare -A hbm=(["sgd"]=12.8 ["adam"]=38.4)
+declare -A hbm=(["sgd"]=8 ["adam"]=24)
 use_index_dedups=("False")
 batch_sizes=(65536 1048576)
-capacities=("64")
+capacities=("128")
 optimizer_types=("sgd" "adam")
-embedding_dims=(512)
+embedding_dims=(128)
 alphas=(1.05)
-gpu_ratio=0.1
+gpu_ratio=0.125
 
 rm benchmark_results.json
 for batch_size in "${batch_sizes[@]}"; do

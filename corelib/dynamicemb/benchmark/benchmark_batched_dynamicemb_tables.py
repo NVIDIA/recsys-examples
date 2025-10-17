@@ -633,6 +633,36 @@ def clear_cache(args, dynamic_emb, torchrec_emb):
     torchrec_emb.reset_cache_states()
 
 
+def occupy_gpu_memory(remain=4):
+    target_free_GB = remain
+    if not torch.cuda.is_available():
+        print("CUDA is not available.")
+        return
+
+    device = torch.cuda.current_device()
+
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    reserved_mem = torch.cuda.memory_reserved(device)
+    torch.cuda.memory_allocated(device)
+    current_free = total_mem - reserved_mem
+
+    current_free_GB = current_free / (1024**3)
+    print(f"GPU memory remain: {current_free_GB:.2f} GB")
+
+    if current_free_GB > target_free_GB:
+        required_GB = current_free_GB - target_free_GB
+        required_bytes = int(required_GB * 1024**3)
+        # dtype=fp32
+        num_elements = required_bytes // 4
+
+        t = torch.empty(num_elements, dtype=torch.float32, device="cuda")
+        print(f"Occupy {required_GB:.2f} remain {target_free_GB} GB gpu memory.")
+        return t
+
+    print(f"The remained gpu memory less than {target_free_GB} GB")
+    return None
+
+
 @record
 def main():
     args = parse_args()
@@ -674,8 +704,17 @@ def main():
     if args.caching:
         var.set_record_cache_metrics(True)
         clear_cache(args, var, torchrec_emb)
+        warmup_tables(
+            sparse_features,
+            int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
+            args.num_embeddings_per_feature[0],
+            args.batch_size,
+            var,
+            torchrec_emb,
+        )
 
     warmup_gpu(device)
+    occupy_gpu_memory()
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):
             (
@@ -728,6 +767,14 @@ def main():
         var.set_record_cache_metrics(False)
         torchrec_emb.record_cache_metrics = RecordCacheMetrics(False, False)
         clear_cache(args, var, torchrec_emb)
+        warmup_tables(
+            sparse_features,
+            int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
+            args.num_embeddings_per_feature[0],
+            args.batch_size,
+            var,
+            torchrec_emb,
+        )
 
     torch.cuda.profiler.start()
     dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
