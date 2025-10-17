@@ -44,7 +44,7 @@ During the embedding lookup process, dynamic embedding incurs some performance o
 
 ## 2.Benchmark BatchedDynamicEmbeddingTables
 
-In this benchmark, we test the forward and backward overhead of `BatchedDynamicEmbeddingTables` (torch.nn.Module contains batched embedding tables) on a single GPU.
+In this benchmark, we test the forward and backward and evaluation overhead of `BatchedDynamicEmbeddingTablesV2` (torch.nn.Module contains batched embedding tables) on a single GPU.
 
 ### How to run
 
@@ -54,13 +54,13 @@ bash ./benchmark/benchmark_batched_dynamicemb_tables.sh
 
 ### Test Results
 
-We test the `BatchedDynamicEmbeddingTables` under different capacities with the same HBM consumption for embeddings, leading to different HBM proportion.
+We test the `BatchedDynamicEmbeddingTablesV2` under `capacity=128x1024x1024`.
 
 The overhead(ms) on H100 80GB HBM3, used pow-law(alpha=1.05) as input.
 - embedding_dtype: float32
 - embedding_dim: 128
 - cache_algorithm: lru
+- cache_ratio: 0.125
 - num_iterations: 100
-- num_embeddings: 8M for hbm_ration=1, 64M for hbm_ratio=0.125
 
 ![benchmark result of BatchedDynamicEmbeddingTables with torchrec](./benchmark_bdet_results.png)
