@@ -170,12 +170,6 @@ def parse_args():
         default=0.125,
         help="cache how many embeddings to HBM",
     )
-    parser.add_argument(
-        "--table_version",
-        type=int,
-        default=1,
-        help="Table Version",
-    )
 
     parser.add_argument("--learning_rate", type=float, default=0.1)
     parser.add_argument("--eps", type=float, default=1e-3, help="Learning rate.")
@@ -185,7 +179,7 @@ def parse_args():
 
     args = parser.parse_args()
     args.num_embeddings_per_feature = [
-        int(v) * 1024 * 1024 for v in args.num_embeddings_per_feature.split(",")
+        int(float(v) * 1024 * 1024) for v in args.num_embeddings_per_feature.split(",")
     ]
     args.num_embedding_table = len(args.num_embeddings_per_feature)
     args.hbm_for_embeddings = [
@@ -603,6 +597,7 @@ def input_distribution(tensor_list, n, max_val, batch_size):
     return num_equal, (num_equal / unique_vals.size(0)) * 100
 
 
+# there is a illegal memory access issue when capacity=256M or embedding_dim=256(capacity=128M) when warmup
 def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb):
     counts = torch.zeros(
         max_val + 1, dtype=torch.long, device=tensor_list[0].values().device
@@ -734,17 +729,19 @@ def main():
     if args.caching:
         var.set_record_cache_metrics(True)
         clear_cache(args, var, torchrec_emb)
-        warmup_tables(
-            sparse_features,
-            int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
-            args.num_embeddings_per_feature[0],
-            args.batch_size,
-            var,
-            torchrec_emb,
-        )
+        # warmup_tables(
+        #     sparse_features,
+        #     int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
+        #     args.num_embeddings_per_feature[0],
+        #     args.batch_size,
+        #     var,
+        #     torchrec_emb,
+        # )
 
     warmup_gpu(device)
-    placeholder = occupy_gpu_memory()
+    # torch.cuda.empty_cache()
+
+    # placeholder = occupy_gpu_memory()
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):
             (
@@ -797,25 +794,24 @@ def main():
         var.set_record_cache_metrics(False)
         torchrec_emb.record_cache_metrics = RecordCacheMetrics(False, False)
         clear_cache(args, var, torchrec_emb)
-        warmup_tables(
-            sparse_features,
-            int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
-            args.num_embeddings_per_feature[0],
-            args.batch_size,
-            var,
-            torchrec_emb,
-        )
+        # warmup_tables(
+        #     sparse_features,
+        #     int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
+        #     args.num_embeddings_per_feature[0],
+        #     args.batch_size,
+        #     var,
+        #     torchrec_emb,
+        # )
 
     torch.cuda.profiler.start()
     dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
     torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, timer, args)
     torch.cuda.profiler.stop()
 
-    print(placeholder.numel())
+    # print(placeholder.numel())
 
     test_result = {
         "caching": args.caching,
-        "table_version": args.table_version,
         "batch_size": args.batch_size,
         "num_embeddings_per_feature": args.num_embeddings_per_feature,
         "hbm_for_embeddings": args.hbm_for_embeddings,
