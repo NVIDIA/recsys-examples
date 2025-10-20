@@ -50,8 +50,6 @@ for batch_size in "${batch_sizes[@]}"; do
                 --num_iterations 100 \
                 --cache_algorithm "lru" \
 
-          # ncu -f --target-processes all --export de_and_tr-$batch_size-$capacity-$optimizer_type-rep.report --section SchedulerStats --section WarpStateStats --import-source=yes --page raw --set full --profile-from-start no -k regex:"load_or_initialize_" \
-          # nsys profile  -s none -t cuda,nvtx,osrt,mpi,ucx -f true -o de_and_tr-$batch_size-$capacity-$optimizer_type.qdrep -c cudaProfilerApi  --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node \
         done
       done
     done
@@ -84,9 +82,7 @@ for batch_size in "${batch_sizes[@]}"; do
                 --alpha $alpha \
                 --num_iterations 100 \
                 --cache_algorithm "lru" \
-
-          # ncu -f --target-processes all --export de_and_tr-$batch_size-$capacity-$optimizer_type-rep.report --section SchedulerStats --section WarpStateStats --import-source=yes --page raw --set full --profile-from-start no -k regex:"load_or_initialize_" \
-          # nsys profile  -s none -t cuda,nvtx,osrt,mpi,ucx -f true -o de_and_tr-$batch_size-$capacity-$optimizer_type.qdrep -c cudaProfilerApi  --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node \
+                --gpu_ratio $gpu_ratio
         done
       done
     done

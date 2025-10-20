@@ -465,7 +465,9 @@ def create_split_table_batched_embeddings(args, device):
                 (
                     e,
                     D,
-                    EmbeddingLocation.MANAGED,
+                    EmbeddingLocation.MANAGED
+                    if abs(args.gpu_ratio - 1.0) > 1e-3
+                    else EmbeddingLocation.DEVICE,
                     ComputeDevice.CUDA,
                 )
                 for e in Es
@@ -483,6 +485,7 @@ def create_split_table_batched_embeddings(args, device):
             beta2=args.beta2,
             bounds_check_mode=BoundsCheckMode.NONE,
         ).cuda()
+        print(f"torchrec table 's specs={emb.embedding_specs[0]}")
     return emb
 
 
@@ -738,7 +741,7 @@ def main():
         #     torchrec_emb,
         # )
 
-    warmup_gpu(device)
+    # warmup_gpu(device)
     # torch.cuda.empty_cache()
 
     # placeholder = occupy_gpu_memory()
