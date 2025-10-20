@@ -60,7 +60,8 @@ The overhead(ms) on H100 80GB HBM3, used pow-law(alpha=1.05) as input.
 - embedding_dtype: float32
 - embedding_dim: 128
 - cache_algorithm: lru
-- cache_ratio: 0.125
+- cache_ratio: 1.0 and 0.1
+- capacity: 24M when cache_ratio=1.0, 256M when cache_ratio=0.1 
 - num_iterations: 100
 
 ![benchmark result of BatchedDynamicEmbeddingTables with torchrec](./benchmark_bdet_results.png)
