@@ -115,14 +115,14 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         missing_indices = torch.tensor(
             missing_indices, dtype=torch.long, device=self.device
         )
-        
+
         if input_scores is not None and len(missing_scores_list) > 0:
             missing_scores = torch.tensor(
                 missing_scores_list, dtype=input_scores.dtype, device=self.device
             )
         else:
             missing_scores = torch.empty(0, dtype=torch.uint64, device=self.device)
-            
+
         return num_missing, missing_keys, missing_indices, missing_scores
 
     def find_embeddings(

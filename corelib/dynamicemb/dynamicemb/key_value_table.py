@@ -243,7 +243,7 @@ class KeyValueTable(
         pointers = torch.empty(batch, dtype=torch.long, device=device)
 
         scores = self.create_scores(batch, device, input_scores)
-        
+
         if self._score_update:
             find_pointers_with_scores(
                 self.table, batch, unique_keys, pointers, founds, scores
@@ -323,8 +323,7 @@ class KeyValueTable(
         device: torch.device,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Create scores tensor for lookup operation based on eviction strategy.
-        """
+        """Create scores tensor for lookup operation based on eviction strategy."""
         if lfu_accumulated_frequency is not None:
             return lfu_accumulated_frequency
         elif self.evict_strategy() == EvictStrategy.KLfu:
@@ -785,7 +784,10 @@ class KeyValueTableFunction:
             missing_indices_in_storage,
             missing_scores_in_storage,
         ) = storage.find_embeddings(
-            unique_keys, unique_embs, founds=founds, input_scores=lfu_accumulated_frequency
+            unique_keys,
+            unique_embs,
+            founds=founds,
+            input_scores=lfu_accumulated_frequency,
         )
 
         # 2. initialize missing embeddings
@@ -815,7 +817,9 @@ class KeyValueTableFunction:
                     :, emb_dim - val_dim :
                 ] = storage.init_optimizer_state()
             storage.insert(
-                missing_keys_in_storage, missing_values_in_storage, missing_scores_in_storage
+                missing_keys_in_storage,
+                missing_values_in_storage,
+                missing_scores_in_storage,
             )
         # ignore the storage missed in eval mode
 
@@ -865,22 +869,26 @@ class KeyValueTableCachingFunction:
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> None:
         assert unique_keys.dim() == 1
-        h_num_toatl = unique_keys.numel()
+        unique_keys.numel()
         emb_dim = storage.embedding_dim()
         emb_dtype = storage.embedding_dtype()
         val_dim = (
             storage.value_dim()
         )  # value is generally composed of embedding and optimizer state
 
-
-        h_num_keys_for_storage, missing_keys, missing_indices, missing_scores = cache.find_embeddings(
+        (
+            h_num_keys_for_storage,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+        ) = cache.find_embeddings(
             unique_keys, unique_embs, input_scores=lfu_accumulated_frequency
         )
         if h_num_keys_for_storage == 0:
             return
         keys_for_storage = missing_keys
 
-        scores_for_storage = missing_scores 
+        scores_for_storage = missing_scores
 
         founds = torch.empty(
             h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
@@ -992,7 +1000,7 @@ class KeyValueTableCachingFunction:
     ) -> None:
         assert cache is not None, "prefetch is available only when caching is enabled."
         emb_dtype = storage.embedding_dtype()
-        h_num_keys_for_storage, missing_keys, _, _= cache.find_missed_keys(unique_keys)
+        h_num_keys_for_storage, missing_keys, _, _ = cache.find_missed_keys(unique_keys)
 
         if h_num_keys_for_storage == 0:
             return
