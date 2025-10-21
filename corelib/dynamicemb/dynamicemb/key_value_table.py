@@ -285,6 +285,11 @@ class KeyValueTable(
         founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Check shape to prevent misuse of find_embeddings and find
+        if unique_embs.dim() == 2 and unique_embs.size(1) != self.embedding_dim():
+            raise ValueError(
+                f"find_embeddings expects dim={self.embedding_dim()}, got {unique_embs.size(1)}. "
+            )
         return self.find_impl(unique_keys, unique_embs, founds, input_scores)
 
     def find_missed_keys(
@@ -305,6 +310,11 @@ class KeyValueTable(
         founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Check shape to prevent misuse of find_embeddings and find
+        if unique_vals.dim() == 2 and unique_vals.size(1) != self.value_dim():
+            raise ValueError(
+                f"find expects dim={self.value_dim()}, got {unique_vals.size(1)}. "
+            )
         return self.find_impl(unique_keys, unique_vals, founds, input_scores)
 
     def create_scores(
@@ -317,7 +327,7 @@ class KeyValueTable(
         """
         if lfu_accumulated_frequency is not None:
             return lfu_accumulated_frequency
-        elif self.evict_strategy() == EvictStrategy.kLFU:
+        elif self.evict_strategy() == EvictStrategy.KLfu:
             scores = torch.zeros(h_num_total, device=device, dtype=torch.uint64)
             return scores
         elif self.evict_strategy() == EvictStrategy.KCustomized:

@@ -23,11 +23,13 @@ class Storage(abc.ABC, Generic[TableOptionType, OptimizerInterface]):
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         num_missing: torch.Tensor
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
+        missing_scores: torch.Tensor
+        return num_missing, missing_keys, missing_indices, missing_scores
 
     @abc.abstractmethod
     def find_embeddings(
@@ -35,11 +37,13 @@ class Storage(abc.ABC, Generic[TableOptionType, OptimizerInterface]):
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
+        input_scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
+        missing_scores: torch.Tensor
+        return num_missing, missing_keys, missing_indices, missing_scores
 
     @abc.abstractmethod
     def insert(
@@ -118,11 +122,13 @@ class Cache(abc.ABC):
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        input_scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
+        missing_scores: torch.Tensor
+        return num_missing, missing_keys, missing_indices, missing_scores
 
     @abc.abstractmethod
     def find_embeddings(
@@ -130,22 +136,25 @@ class Cache(abc.ABC):
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        input_scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
+        missing_scores: torch.Tensor
+        return num_missing, missing_keys, missing_indices, missing_scores
 
     @abc.abstractmethod
     def find_missed_keys(
         self,
         unique_keys: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
+        missing_scores: torch.Tensor
+        return num_missing, missing_keys, missing_indices, missing_scores
 
     @abc.abstractmethod
     def insert_and_evict(
