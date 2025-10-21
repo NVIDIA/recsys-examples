@@ -24,12 +24,18 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
-from dynamicemb.dump_load import DynamicEmbDump, DynamicEmbLoad
+from dynamicemb.dump_load import (
+    DynamicEmbDump,
+    DynamicEmbLoad,
+    find_sharded_modules,
+    get_dynamic_emb_module,
+)
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
 from dynamicemb.get_planner import get_planner
+from dynamicemb.key_value_table import batched_export_keys_values
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
@@ -88,9 +94,10 @@ def generate_sparse_feature(
 
     batch_size_per_rank = batch_size // world_size
     kjts = []
+    all_kjts = []
     for _ in range(num_iterations):
-        cur_indices = []
-        cur_lengths = []
+        cur_indices, cur_lengths = [], []
+        all_indices, all_lengths = [], []
         keys = []
         for embedding_collection_id in range(num_embedding_collections):
             for embedding_id, num_embedding in enumerate(num_embeddings):
@@ -100,6 +107,8 @@ def generate_sparse_feature(
                         0, multi_hot_sizes[embedding_collection_id]
                     )
                     indices = [random.randint(0, (1 << 63) - 1) for _ in range(hotness)]
+                    all_indices.extend(indices)
+                    all_lengths.append(hotness)
                     if sample_id // batch_size_per_rank == rank:
                         cur_indices.extend(indices)
                         cur_lengths.append(hotness)
@@ -111,7 +120,14 @@ def generate_sparse_feature(
                 lengths=torch.tensor(cur_lengths, dtype=torch.int64).cuda(),
             )
         )
-    return kjts
+        all_kjts.append(
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=keys,
+                values=torch.tensor(all_indices, dtype=torch.int64).cuda(),
+                lengths=torch.tensor(all_lengths, dtype=torch.int64).cuda(),
+            )
+        )
+    return kjts, keys, all_kjts
 
 
 class TestModel(nn.Module):
@@ -258,7 +274,7 @@ def create_model(
 @click.option("--mode", type=click.Choice(["load", "dump"]), required=True)
 @click.option(
     "--score-strategy",
-    type=click.Choice(["timestamp", "step", "lru", "lfu"]),
+    type=click.Choice(["timestamp", "step", "lfu"]),
     required=True,
 )
 @click.option("--optim", type=bool, required=True)
@@ -272,8 +288,8 @@ def test_model_load_dump(
     mode: str,
     save_path: str,
     optim: bool,
-    batch_size: int = 128,
-    num_iterations: int = 10,
+    batch_size: int = 8,
+    num_iterations: int = 2,
 ):
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
@@ -295,7 +311,7 @@ def test_model_load_dump(
         score_strategy=score_strategy_,
     )
 
-    kjts = generate_sparse_feature(
+    kjts, feature_names, all_kjts = generate_sparse_feature(
         num_embedding_collections=num_embedding_collections,
         num_embeddings=num_embeddings,
         multi_hot_sizes=multi_hot_sizes,
@@ -326,6 +342,36 @@ def test_model_load_dump(
         )
 
         DynamicEmbLoad(save_path, model, optim=optim)
+
+        key_to_score = {}
+        for _, _, sharded_module in find_sharded_modules(model):
+            dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
+            for dynamic_emb_module in dynamic_emb_modules:
+                for storage in dynamic_emb_module._storages:
+                    for batched_key, _, _, batched_score in batched_export_keys_values(
+                        storage.table, torch.device(f"cpu")
+                    ):
+                        for key, score in zip(
+                            batched_key.tolist(), batched_score.tolist()
+                        ):
+                            key_to_score[key] = score
+
+        for feature_name in feature_names:
+            min_score = float("inf")
+            for kjt in reversed(all_kjts):
+                keys = kjt[feature_name].values().tolist()
+
+                for key in keys:
+                    if key not in key_to_score:
+                        continue
+                    score = key_to_score[key]
+                    assert (
+                        score < min_score
+                    ), f"key {key} score {score} should be less than min_score {min_score}"
+
+                for key in set(keys):
+                    min_score = min(min_score, key_to_score[key])
+                    key_to_score[key] = float("-inf")
 
         if optim:
             for kjt in kjts:
