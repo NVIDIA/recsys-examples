@@ -400,7 +400,10 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
     def create_context(self) -> DynamicEmbeddingCollectionContext:
         # pre-allocate frequency_counters list, ensure all ranks have the same structure
         frequency_counters = [] if not self._is_lfu_enabled else None
-        return DynamicEmbeddingCollectionContext(sharding_contexts=[], frequency_counters=frequency_counters)
+        return DynamicEmbeddingCollectionContext(
+            sharding_contexts=[], frequency_counters=frequency_counters
+        )
+
 
 class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
     """
