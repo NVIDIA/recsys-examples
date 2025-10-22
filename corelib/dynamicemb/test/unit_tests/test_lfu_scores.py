@@ -337,18 +337,19 @@ def test_lfu_score_validation(
     # Extract actual scores
     actual_scores = local_DynamicEmbDump(model, optim=True)
 
-    print(f"\nExpected frequencies:")
-    for table_name, freqs in expected_frequencies.items():
-        print(
-            f"  {table_name}: {len(freqs)} unique keys, total frequency: {sum(freqs.values())}"
-        )
-        print(f"    Sample: {dict(list(freqs.items())[:20])}")
+    # debug print
+    # print(f"\nExpected frequencies:")
+    # for table_name, freqs in expected_frequencies.items():
+    #     print(
+    #         f"  {table_name}: {len(freqs)} unique keys, total frequency: {sum(freqs.values())}"
+    #     )
+    #     print(f"    Sample: {dict(list(freqs.items())[:20])}")
 
-    print(f"\nActual scores{' (from storage after flush)' if caching else ''}:")
-    for table_name, scores in actual_scores.items():
-        print(f"  {table_name}: {len(scores)} keys")
-        if len(scores) > 0:
-            print(f"    Sample: {dict(list(scores.items())[:20])}")
+    # print(f"\nActual scores{' (from storage after flush)' if caching else ''}:")
+    # for table_name, scores in actual_scores.items():
+    #     print(f"  {table_name}: {len(scores)} keys")
+    #     if len(scores) > 0:
+    #         print(f"    Sample: {dict(list(scores.items())[:20])}")
 
     torch.cuda.synchronize()
 

@@ -331,7 +331,6 @@ class KeyValueTable(
         device: torch.device,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        # print(f"lfu_accumulated_frequency dtype: {lfu_accumulated_frequency.dtype}")
         """Create scores tensor for lookup operation based on eviction strategy."""
         if lfu_accumulated_frequency is not None:
             return lfu_accumulated_frequency
@@ -757,22 +756,13 @@ def update_cache(
     missing_scores: Optional[torch.Tensor] = None,
 ):
     # need to update score.
-    num_keys_to_insert = missing_keys.numel()
-    cache_size_before = cache.size()
-    cache_capacity = cache.capacity()
-
     num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(
         missing_keys,
         missing_values,
         missing_scores,
     )
 
-    print(
-        f"[DEBUG update_cache] inserting {num_keys_to_insert} keys, cache_size: {cache_size_before}/{cache_capacity}, num_evicted: {num_evicted}"
-    )
-
     if num_evicted != 0:
-        print(f"evicted {num_evicted} keys from cache to storage")
         storage.insert(
             evicted_keys,
             evicted_values,

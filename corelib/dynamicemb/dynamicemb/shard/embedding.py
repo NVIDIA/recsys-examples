@@ -333,10 +333,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 ctx.reverse_indices.append(reverse_idx)
                 # Only store frequency_counters if LFU is enabled
                 if self._is_lfu_enabled:
-                    print(f"unique_idx_out: {unique_idx_out[:20]}")
-                    print(f"reverse_idx: {reverse_idx[:20]}")
                     ctx.frequency_counters.append(frequency_counters)
-                    print(f"frequency_counters: {frequency_counters[:20]}")
                     assert frequency_counters.size(0) == unique_idx_out.size(
                         0
                     ), f"Frequency counters size {frequency_counters.size(0)} doesn't match unique indices size {unique_idx_out.size(0)}"

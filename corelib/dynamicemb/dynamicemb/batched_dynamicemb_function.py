@@ -388,16 +388,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             h_unique_indices_table_range = indices_table_range.cpu()
             unique_indices = indices
 
-        # Debug: check lfu_accumulated_frequency structure
-        if is_lfu_enabled and lfu_accumulated_frequency is not None:
-            print(
-                f"[DEBUG] table_num={table_num}, unique_indices.shape={unique_indices.shape}, lfu_accumulated_frequency.shape={lfu_accumulated_frequency.shape}"
-            )
-            if lfu_accumulated_frequency.numel() > 0:
-                print(
-                    f"[DEBUG] lfu_accumulated_frequency[:min(20, numel)]={lfu_accumulated_frequency[:min(20, lfu_accumulated_frequency.numel())].tolist()}"
-                )
-
         unique_embs = torch.empty(
             unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
         )
