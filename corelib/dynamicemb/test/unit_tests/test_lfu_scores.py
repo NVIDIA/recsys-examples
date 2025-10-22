@@ -370,8 +370,6 @@ if __name__ == "__main__":
     torch.cuda.set_device(LOCAL_RANK)
 
     dist.init_process_group(backend="nccl")
-
-    try:
-        test_lfu_score_validation()
-    finally:
-        dist.destroy_process_group()
+    test_lfu_score_validation()
+    dist.barrier()
+    dist.destroy_process_group()

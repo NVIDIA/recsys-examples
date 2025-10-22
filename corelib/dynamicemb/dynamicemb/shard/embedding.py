@@ -394,9 +394,13 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 self._compute_sequence_vbe_context(ctx, unpadded_features)
         return KJTListSplitsAwaitable(awaitables, ctx)
 
-    def create_context(self) -> DynamicEmbeddingCollectionContext:
-        return DynamicEmbeddingCollectionContext(sharding_contexts=[])
+    # def create_context(self) -> DynamicEmbeddingCollectionContext:
+    #     return DynamicEmbeddingCollectionContext(sharding_contexts=[])
 
+    def create_context(self) -> DynamicEmbeddingCollectionContext:
+        # pre-allocate frequency_counters list, ensure all ranks have the same structure
+        frequency_counters = [] if not self._is_lfu_enabled else None
+        return DynamicEmbeddingCollectionContext(sharding_contexts=[], frequency_counters=frequency_counters)
 
 class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
     """
