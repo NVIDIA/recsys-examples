@@ -42,6 +42,7 @@ from dynamicemb_extensions import (
     export_batch_matched,
     find_pointers,
     find_pointers_with_scores,
+    insert_and_evict,
     insert_and_evict_with_scores,
     insert_or_assign,
     load_from_pointers,
@@ -271,11 +272,18 @@ class KeyValueTable(
             self._cache_metrics[1] = founds.sum().item()
 
         h_num_missing = num_missing_0.cpu().item()
+
+        # Handle missing scores: return empty tensor if scores is None
+        if scores is not None:
+            missing_scores = scores[missing_indices[:h_num_missing]]
+        else:
+            missing_scores = torch.empty(0, dtype=torch.long, device=device)
+
         return (
             h_num_missing,
             missing_keys[:h_num_missing],
             missing_indices[:h_num_missing],
-            scores[missing_indices[:h_num_missing]],
+            missing_scores,
         )
 
     def find_embeddings(
@@ -323,14 +331,15 @@ class KeyValueTable(
         device: torch.device,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
+        # print(f"lfu_accumulated_frequency dtype: {lfu_accumulated_frequency.dtype}")
         """Create scores tensor for lookup operation based on eviction strategy."""
         if lfu_accumulated_frequency is not None:
             return lfu_accumulated_frequency
         elif self.evict_strategy() == EvictStrategy.KLfu:
-            scores = torch.zeros(h_num_total, device=device, dtype=torch.uint64)
+            scores = torch.zeros(h_num_total, device=device, dtype=torch.long)
             return scores
         elif self.evict_strategy() == EvictStrategy.KCustomized:
-            scores = torch.empty(h_num_total, device=device, dtype=torch.uint64)
+            scores = torch.empty(h_num_total, device=device, dtype=torch.long)
             scores.fill_(self.score)
             return scores
         else:
@@ -637,17 +646,31 @@ class KeyValueTable(
         evicted_scores: torch.Tensor = torch.empty(
             batch, dtype=torch.uint64, device=keys.device
         )
-        insert_and_evict_with_scores(
-            self.table,
-            batch,
-            keys,
-            values,
-            evicted_keys,
-            evicted_values,
-            evicted_scores,
-            num_evicted,
-            scores=scores,  # scores as keyword argument
-        )
+        if scores is not None:
+            insert_and_evict_with_scores(
+                self.table,
+                batch,
+                keys,
+                values,
+                evicted_keys,
+                evicted_values,
+                evicted_scores,
+                num_evicted,
+                scores=scores,  # scores as keyword argument
+            )
+        else:
+            # TODO: Fix prefetch issue when scores is not provided
+            insert_and_evict(
+                self.table,
+                batch,
+                keys,
+                values,
+                self.score if self._use_score else None,
+                evicted_keys,
+                evicted_values,
+                evicted_scores,
+                num_evicted,
+            )
         if self._record_cache_metrics:
             self._cache_metrics[2] = batch
             self._cache_metrics[3] = num_evicted.cpu().item()

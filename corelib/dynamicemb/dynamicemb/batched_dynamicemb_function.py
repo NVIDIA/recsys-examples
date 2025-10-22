@@ -360,9 +360,9 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         if isinstance(storages[0], KeyValueTable):
             is_lfu_enabled = storages[0].evict_strategy() == EvictStrategy.KLfu
 
-        frequency_counts_uint64 = None
+        frequency_counts_int64 = None
         if frequency_counters is not None:
-            frequency_counts_uint64 = frequency_counters.long()
+            frequency_counts_int64 = frequency_counters.long()
 
         # TODO: Use frequency_counts_uint64 for LFU strategy in pooled embeddings
 
@@ -380,7 +380,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 indices_table_range,
                 unique_op,
                 is_lfu_enabled,
-                frequency_counts_uint64,
+                frequency_counts_int64,
             )
             # TODO: only return device unique_indices_table_range
             # h_unique_indices_table_range = unique_indices_table_range.cpu()
