@@ -92,3 +92,51 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
 ~$ # Run the inference example
 ~$ python3 ./inference_gr_ranking.py --gin_config_file ./kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT} --mode eval
 ```
+
+## Consistency Check for Inference
+
+Currently, we use the evaluation metrics results (e.g. AUC) to check the consistency between training and inference.
+
+1. Evaluation metrics from training
+
+* Add evaluation output in training configs. Make sure `max_train_iters` is a multiple of `max_train_iters`.
+
+```
+# File: examples/hstu/training/configs/
+...
+TrainerArgs.eval_interval = 50
+TrainerArgs.max_train_iters = 550
+TrainerArgs.ckpt_save_interval = 550
+...
+```
+
+* Get eval metrics from training
+```
+/workspace/recsys-examples$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 ./training/pretrain_gr_ranking.py --gin-config-file ./training/configs/kuairand_1k_ranking.gin
+... [training output] ...
+[eval] [eval 296 users]:
+    Metrics.task0.AUC:0.557266
+    Metrics.task1.AUC:0.801949
+    Metrics.task2.AUC:0.599034
+    Metrics.task3.AUC:0.666739
+    Metrics.task4.AUC:0.555904
+    Metrics.task5.AUC:0.582272
+    Metrics.task6.AUC:0.620481
+    Metrics.task7.AUC:0.556170
+... [training output] ...
+```
+
+2. Evaluation metrics from inference
+```
+/workspace/recsys-examples$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT} --mode eval
+... [inference output] ...
+[eval]:
+    Metrics.task0.AUC:0.556894
+    Metrics.task1.AUC:0.802019
+    Metrics.task2.AUC:0.599779
+    Metrics.task3.AUC:0.666891
+    Metrics.task4.AUC:0.559471
+    Metrics.task5.AUC:0.580227
+    Metrics.task6.AUC:0.620498
+    Metrics.task7.AUC:0.556064
+... [inference output] ...
