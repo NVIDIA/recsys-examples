@@ -453,9 +453,8 @@ segmented_unique(at::Tensor keys, at::Tensor segment_range, std::shared_ptr<dyn_
   int64_t num_unique_total = h_unique_indices_table_range[table_num].item<int64_t>();
   at::Tensor unique_keys = at::empty(num_unique_total, keys.options());
   at::Tensor output_scores;
-  if (num_unique_total == 0) {
-    output_scores = at::Tensor();
-  } else {
+  output_scores = at::Tensor();
+  if(is_lfu_enabled.value()) {
     output_scores = at::empty(num_unique_total, keys.options());
   }
   for (int i = 0; i < table_num; ++i) {
