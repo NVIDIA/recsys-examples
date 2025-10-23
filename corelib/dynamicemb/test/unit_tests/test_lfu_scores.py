@@ -79,8 +79,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
                 for sample_id in range(batch_size):
                     hotness = random.randint(
                         1, multi_hot_sizes[embedding_collection_id]
-                    )  # At least 1
-                    # Generate indices with smaller range to ensure duplicates
+                    )
                     if caching:
                         # In caching mode, use wider range to trigger eviction
                         # Use 80% of num_embedding to generate enough unique keys
@@ -131,56 +130,36 @@ def local_DynamicEmbDump(
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-
     dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    # find embedding collections
-    collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
-
-    rank = dist.get_rank(group=pg)
-    device = (
-        torch.device(f"cuda:{torch.cuda.current_device()}")
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
     batch_size = 65536
+
     all_table_scores = {}
 
-    for _, current_collection in enumerate(collections_list):
-        (
-            current_collection_path,
-            current_collection_name,
-            current_collection_module,
-        ) = current_collection
-        current_dynamic_emb_module_list = get_dynamic_emb_module(
-            current_collection_module
-        )
+    for _, collection_name, sharded_module in find_sharded_modules(model, ""):
+        dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
 
-        for _, dynamic_emb_module in enumerate(current_dynamic_emb_module_list):
+        for dynamic_emb_module in dynamic_emb_modules:
             dynamic_emb_module.flush()
-            current_table_names = dynamic_emb_module.table_names
 
-            # In cache mode, read from storage instead of cache
-            # Check if this module has separate cache and storage
-            current_tables = dynamic_emb_module.tables
-
-            for dynamic_table_name, dynamic_table in zip(
-                current_table_names, current_tables
+            for table_name, table in zip(
+                dynamic_emb_module.table_names, dynamic_emb_module.tables
             ):
-                if table_names is not None and dynamic_table_name not in set(
-                    table_names[current_collection_name]
+                if table_names is not None and table_name not in set(
+                    table_names[collection_name]
                 ):
                     continue
 
                 table_key_scores = {}
 
-                for keys, embeddings, opt_states, scores in batched_export_keys_values(
-                    dynamic_table.table, device, batch_size
+                for keys, _, _, scores in batched_export_keys_values(
+                    table.table, device, batch_size
                 ):
                     for key, score in zip(keys, scores):
                         table_key_scores[int(key)] = int(score)
 
-                all_table_scores[dynamic_table_name] = table_key_scores
+                all_table_scores[table_name] = table_key_scores
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -201,12 +180,11 @@ def validate_lfu_scores(
     Returns:
         (is_valid, error_message)
     """
-    all_errors = []
-
     for table_name in expected_frequencies:
         if table_name not in actual_scores:
-            all_errors.append(f"Table {table_name} missing from actual scores")
-            continue
+            assert (
+                table_name in actual_scores
+            ), f"Table {table_name} missing from actual scores"
 
         expected = expected_frequencies[table_name]
         actual = actual_scores[table_name]
@@ -270,13 +248,6 @@ def test_lfu_score_validation(
                     "this may lead to eviction of dynamicemb and cause test fail"
                 )
 
-    # Print test header
-    print(f"\n{'='*60}")
-    if caching:
-        print(f"LFU SCORE VALIDATION TEST WITH CACHE")
-    else:
-        print(f"LFU SCORE VALIDATION TEST (STORAGE ONLY)")
-    print(f"{'='*60}")
     print(f"Configuration:")
     print(f"  - Embedding collections: {num_embedding_collections}")
     print(f"  - Num embeddings: {num_embeddings}")
@@ -337,32 +308,10 @@ def test_lfu_score_validation(
     # Extract actual scores
     actual_scores = local_DynamicEmbDump(model, optim=True)
 
-    # debug print
-    # print(f"\nExpected frequencies:")
-    # for table_name, freqs in expected_frequencies.items():
-    #     print(
-    #         f"  {table_name}: {len(freqs)} unique keys, total frequency: {sum(freqs.values())}"
-    #     )
-    #     print(f"    Sample: {dict(list(freqs.items())[:20])}")
-
-    # print(f"\nActual scores{' (from storage after flush)' if caching else ''}:")
-    # for table_name, scores in actual_scores.items():
-    #     print(f"  {table_name}: {len(scores)} keys")
-    #     if len(scores) > 0:
-    #         print(f"    Sample: {dict(list(scores.items())[:20])}")
-
     torch.cuda.synchronize()
 
     # Validate scores
     validate_lfu_scores(expected_frequencies, actual_scores, tolerance)
-
-    # Report results
-    print(f"\n{'='*60}")
-    if caching:
-        print(f"VALIDATION RESULT (WITH CACHE): PASS")
-    else:
-        print(f"VALIDATION RESULT: PASS")
-    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

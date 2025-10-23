@@ -209,11 +209,10 @@ def apply_dmp(
                         mode=DynamicEmbInitializerMode.CONSTANT,
                         value=1e-1,
                     ),
-                    # bucket_capacity=emb_num_embeddings_next_power_of_2,
+                    bucket_capacity=emb_num_embeddings_next_power_of_2,
                     max_capacity=emb_num_embeddings_next_power_of_2,
                     caching=caching,
                     local_hbm_for_values=1024**3,
-                    # local_hbm_for_values=local_hbm if caching else 0,
                 )
     planner = get_planner(
         eb_configs,
