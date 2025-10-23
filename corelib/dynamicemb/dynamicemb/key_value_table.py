@@ -332,7 +332,10 @@ class KeyValueTable(
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Create scores tensor for lookup operation based on eviction strategy."""
-        if lfu_accumulated_frequency is not None and self.evict_strategy() == EvictStrategy.KLfu:
+        if (
+            lfu_accumulated_frequency is not None
+            and self.evict_strategy() == EvictStrategy.KLfu
+        ):
             return lfu_accumulated_frequency
         elif self.evict_strategy() == EvictStrategy.KLfu:
             scores = torch.zeros(h_num_total, device=device, dtype=torch.long)
