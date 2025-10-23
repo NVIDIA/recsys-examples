@@ -273,11 +273,11 @@ class KeyValueTable(
 
         h_num_missing = num_missing_0.cpu().item()
 
-        # Handle missing scores: return empty tensor if scores is None
+        # Handle missing scores: return None if scores is None
         if scores is not None:
             missing_scores = scores[missing_indices[:h_num_missing]]
         else:
-            missing_scores = torch.empty(0, dtype=torch.long, device=device)
+            missing_scores = None
 
         return (
             h_num_missing,
