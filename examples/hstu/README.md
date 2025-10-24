@@ -1,4 +1,4 @@
-# Examples: to demonstrate how to train generative recommendation models
+# Examples: to demonstrate how to do training and inference generative recommendation models
 
 ## Generative Recommender Introduction
 Meta's paper ["Actions Speak Louder Than Words"](https://arxiv.org/abs/2402.17152) introduces a novel paradigm for recommendation systems called **Generative Recommenders(GRs)**, which reformulates recommendation tasks as generative modeling problems. The work introduced Hierarchical Sequential Transduction Units (HSTU), a novel architecture designed to handle high-cardinality, non-stationary data streams in large-scale recommendation systems. HSTU enables both retrieval and ranking tasks. As noted in the paper, “HSTU-based GRs, with 1.5 trillion parameters, improve metrics in online A/B tests by 12.4% and have been deployed on multiple surfaces of a large internet platform with billions of users.”
@@ -40,60 +40,11 @@ However, achieving efficient scaling for GRs presents unique challenges. Existin
 
 To address these limitations, a hybrid approach combining sparse and dense parallelism is introduced as the pic shows.
 **TorchRec** is employed to shard large embedding tables effectively.
-**Megatron-Core** is used to support data and context parallelism for the dense components of the model. Please note that context parallelism is planned as part of future development.
+**Megatron-Core** is used to support DP,TP for the dense components of the model. Please note that CP is planned as part of future development.
 This integration ensures efficient training by coordinating sparse (embedding) and dense (context/data) parallelisms within a single model.
 ![parallelism](./figs/parallelism.png)
 
-
-## Dataset Introduction
-
-We have supported several datasets as listed in the following sections:
-
-### Dataset Information
-#### **MovieLens**
-refer to [MovieLens 1M](https://grouplens.org/datasets/movielens/1m/) and [MovieLens 20M](https://www.kaggle.com/datasets/grouplens/movielens-20m-dataset) for details.
-#### **KuaiRand**
-
-| dataset       | # users | seqlen max | seqlen min | seqlen mean | seqlen median | # items    |
-|---------------|---------|------------|------------|-------------|---------------|------------|
-| kuairand_pure | 27285   | 910        | 1          | 1           | 39            | 7551       |
-| kuairand_1k   | 1000    | 49332      | 10         | 5038        | 3379          | 4369953    |
-| kuairand_27k  | 27285   | 228000     | 100        | 11796       | 8591          | 32038725   |
- 
-refer to [KuaiRand](https://kuairand.com/) for details.
-
-## Running the examples
-
-Before getting started, please make sure that all pre-requisites are fulfilled. You can refer to [Get Started][../../README] section in the root directory of the repo to set up the environment.
-
-### Dataset Preprocessing
-We provides preprocessor scripts to assist in downloading raw data if it is not already present. It processes the raw data into csv files.
-```bash
-mkdir -p ./tmp_data && python3 preprocessor.py --dataset_name <dataset-name>
-```
-The following dataset-name is supported:
-* ml-1m
-* ml-20m
-* kuairand-pure
-* kuairand-1k
-* kuairand-27k
-* all: preprocess all above datasets
-
-
-### Start training
-The entrypoint for training are `pretrain_gr_retrieval.py` or `pretrain_gr_ranking.py`. We use gin-config to specify the model structure, training arguments, hyper-params etc.
-To run retrieval task with `MovieLens 20m` dataset:
-
-```bash
-# Before running the `pretrain_gr_retrieval.py`, make sure that current working directory is `hstu`
-PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000  pretrain_gr_retrieval.py --gin-config-file movielen_retrieval.gin
-```
-
-To run ranking task with `MovieLens 20m` dataset:
-```bash
-# Before running the `pretrain_gr_ranking.py`, make sure that current working directory is `hstu`
-PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000  pretrain_gr_ranking.py --gin-config-file movielen_ranking.gin
-```
+To get started on training, please refer to [training example](./training/README.md). And [inference example](./inference/README.md) for inference.
 
 # Acknowledgements
 

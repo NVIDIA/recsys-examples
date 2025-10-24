@@ -34,11 +34,11 @@ def stringify_dict(input_dict, prefix="", sep=","):
             value.float()
             assert value.dim() == 0
             value = value.cpu().item()
-            output += key + ":" + f"{value:6f}{sep}"
+            output += key + ": " + f"{value:6f}{sep}"
         elif isinstance(value, float):
-            output += key + ":" + f"{value:6f}{sep}"
+            output += key + ": " + f"{value:6f}{sep}"
         elif isinstance(value, int):
-            output += key + ":" + f"{value}{sep}"
+            output += key + ": " + f"{value}{sep}"
         else:
             assert RuntimeError(f"stringify dict not supports type {type(value)}")
     # remove the ending sep
