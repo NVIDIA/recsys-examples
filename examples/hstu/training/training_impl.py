@@ -31,8 +31,8 @@ from pipeline.train_pipeline import (
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
 )
-from training.gin_config_args import TrainerArgs
-from training.utils import cal_flops
+from training.training_utils import cal_flops
+from utils import TrainerArgs
 
 
 def evaluate(

@@ -30,7 +30,7 @@ from configs import (
 )
 from dynamicemb import DynamicEmbTableOptions
 from modules.embedding import ShardedEmbeddingConfig
-from training.gin_config_args import (
+from utils import (
     BenchmarkDatasetArgs,
     DatasetArgs,
     DynamicEmbeddingArgs,

@@ -18,29 +18,25 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 import argparse
-from dataclasses import dataclass
 from functools import partial  # pylint: disable-unused-import
-from typing import Tuple
 
 import commons.utils.initialize as init
 import gin
 import torch  # pylint: disable-unused-import
-from configs import RetrievalConfig
+from commons.utils.logger import print_rank_0
+from configs import RankingConfig
 from distributed.sharding import make_optimizer_and_shard
-from model import get_retrieval_model
-from modules.metrics import RetrievalTaskMetricWithSampling
+from megatron.core import parallel_state
+from model import get_ranking_model
+from modules.metrics import get_multi_event_metric_module
 from pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
 )
 from training import (
-    NetworkArgs,
-    OptimizerArgs,
-    TensorModelParallelArgs,
-    TrainerArgs,
     create_dynamic_optitons_dict,
-    create_embedding_config,
+    create_embedding_configs,
     create_hstu_config,
     create_optimizer_params,
     get_data_loader,
@@ -49,17 +45,13 @@ from training import (
     maybe_load_ckpts,
     train_with_pipeline,
 )
-
-
-@gin.configurable
-@dataclass
-class RetrievalArgs:
-    ### retrieval
-    num_negatives: int = -1
-    temperature = 0.05
-    l2_norm_eps = 1e-6
-    eval_metrics: Tuple[str, ...] = ("HR@10", "NDCG@10")
-
+from utils import (
+    NetworkArgs,
+    OptimizerArgs,
+    RankingArgs,
+    TensorModelParallelArgs,
+    TrainerArgs,
+)
 
 parser = argparse.ArgumentParser(
     description="Distributed GR Arguments", allow_abbrev=False
@@ -74,18 +66,18 @@ optimizer_args = OptimizerArgs()
 tp_args = TensorModelParallelArgs()
 
 
-def create_retrieval_config() -> RetrievalConfig:
-    retrieval_args = RetrievalArgs()
+def create_ranking_config() -> RankingConfig:
+    ranking_args = RankingArgs()
 
-    return RetrievalConfig(
-        embedding_configs=[
-            create_embedding_config(network_args.hidden_size, arg)
-            for arg in embedding_args
-        ],
-        temperature=retrieval_args.temperature,
-        l2_norm_eps=retrieval_args.l2_norm_eps,
-        num_negatives=retrieval_args.num_negatives,
-        eval_metrics=retrieval_args.eval_metrics,
+    return RankingConfig(
+        embedding_configs=create_embedding_configs(
+            dataset_args, network_args, embedding_args
+        ),
+        prediction_head_arch=ranking_args.prediction_head_arch,
+        prediction_head_act_type=ranking_args.prediction_head_act_type,
+        prediction_head_bias=ranking_args.prediction_head_bias,
+        num_tasks=ranking_args.num_tasks,
+        eval_metrics=ranking_args.eval_metrics,
     )
 
 
@@ -95,10 +87,13 @@ def main():
         tensor_model_parallel_size=tp_args.tensor_model_parallel_size
     )
     init.set_random_seed(trainer_args.seed)
-
+    free_memory, total_memory = torch.cuda.mem_get_info()
+    print_rank_0(
+        f"distributed env initialization done. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
+    )
     hstu_config = create_hstu_config(network_args, tp_args)
-    task_config = create_retrieval_config()
-    model = get_retrieval_model(hstu_config=hstu_config, task_config=task_config)
+    task_config = create_ranking_config()
+    model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
 
     dynamic_options_dict = create_dynamic_optitons_dict(
         embedding_args,
@@ -108,6 +103,7 @@ def main():
             optimizer_args.optimizer_str
         ),
     )
+
     optimizer_param = create_optimizer_params(optimizer_args)
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
@@ -117,12 +113,24 @@ def main():
         dynamicemb_options_dict=dynamic_options_dict,
         pipeline_type=trainer_args.pipeline_type,
     )
-    stateful_metric_module = RetrievalTaskMetricWithSampling(
-        metric_types=task_config.eval_metrics, MAX_K=500
+
+    stateful_metric_module = get_multi_event_metric_module(
+        num_classes=task_config.prediction_head_arch[-1],
+        num_tasks=task_config.num_tasks,
+        metric_types=task_config.eval_metrics,
+        comm_pg=parallel_state.get_data_parallel_group(
+            with_context_parallel=True
+        ),  # ranks in the same TP group do the same compute
     )
+
     train_dataloader, test_dataloader = get_data_loader(
-        "retrieval", dataset_args, trainer_args, 0
+        "ranking", dataset_args, trainer_args, task_config.num_tasks
     )
+    free_memory, total_memory = torch.cuda.mem_get_info()
+    print_rank_0(
+        f"model initialization done, start training. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
+    )
+
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
     if trainer_args.pipeline_type in ["prefetch", "native"]:
         pipeline_factory = (

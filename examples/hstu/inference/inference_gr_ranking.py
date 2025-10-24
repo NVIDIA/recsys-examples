@@ -17,8 +17,6 @@ import enum
 import math
 import sys
 import time
-from dataclasses import dataclass
-from typing import List, Tuple, cast
 
 import gin
 import torch
@@ -36,12 +34,10 @@ from dataset.sequence_dataset import get_dataset
 from modules.metrics import get_multi_event_metric_module
 from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from utils import DatasetArgs, NetworkArgs, RankingArgs
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
-
-sys.path.append("./training/")
-from gin_config_args import DatasetArgs, NetworkArgs
 
 
 class RunningMode(enum.Enum):
@@ -50,27 +46,6 @@ class RunningMode(enum.Enum):
 
     def __str__(self):
         return self.value
-
-
-# duplicate
-@gin.configurable
-@dataclass
-class RankingArgs:
-    prediction_head_arch: List[int] = cast(List[int], None)
-    prediction_head_act_type: str = "relu"
-    prediction_head_bias: bool = True
-    num_tasks: int = 1
-    eval_metrics: Tuple[str, ...] = ("AUC",)
-
-    def __post_init__(self):
-        assert (
-            self.prediction_head_arch is not None
-        ), "Please provide prediction head arch for ranking model"
-        if isinstance(self.prediction_head_act_type, str):
-            assert self.prediction_head_act_type.lower() in [
-                "relu",
-                "gelu",
-            ], "prediction_head_act_type should be in ['relu', 'gelu']"
 
 
 def get_inference_dataset_and_embedding_configs(

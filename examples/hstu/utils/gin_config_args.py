@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union, cast
 
 import gin
 
@@ -181,3 +181,33 @@ class OptimizerArgs:
 @dataclass
 class TensorModelParallelArgs:
     tensor_model_parallel_size: int = 1
+
+
+@gin.configurable
+@dataclass
+class RankingArgs:
+    prediction_head_arch: List[int] = cast(List[int], None)
+    prediction_head_act_type: str = "relu"
+    prediction_head_bias: bool = True
+    num_tasks: int = 1
+    eval_metrics: Tuple[str, ...] = ("AUC",)
+
+    def __post_init__(self):
+        assert (
+            self.prediction_head_arch is not None
+        ), "Please provide prediction head arch for ranking model"
+        if isinstance(self.prediction_head_act_type, str):
+            assert self.prediction_head_act_type.lower() in [
+                "relu",
+                "gelu",
+            ], "prediction_head_act_type should be in ['relu', 'gelu']"
+
+
+@gin.configurable
+@dataclass
+class RetrievalArgs:
+    ### retrieval
+    num_negatives: int = -1
+    temperature = 0.05
+    l2_norm_eps = 1e-6
+    eval_metrics: Tuple[str, ...] = ("HR@10", "NDCG@10")
