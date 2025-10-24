@@ -452,7 +452,13 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
         has_drab=False,
         func=None,
         quant_mode=-1,
-    ):
+      ):
+        # Debug: Log to file to avoid stdout buffering issues
+        import sys
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            sys.stderr.write(f"[HSTU Attn Forward] quant_mode: {quant_mode}, q.dtype: {q.dtype}, k.dtype: {k.dtype}, v.dtype: {v.dtype}\n")
+            sys.stderr.flush()
         vt = None
         descale_q = None
         descale_k = None
@@ -512,6 +518,12 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
             )
 
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
+            # Debug: Check dtypes before kernel
+            import sys
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                sys.stderr.write(f"[Before CUDA kernel] quant_mode={quant_mode}, q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}\n")
+                sys.stderr.flush()
             out, rab = _hstu_attn_varlen_forward(
                 q,
                 k,
@@ -537,6 +549,25 @@ class HSTUAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_block_descale_q,
                 cu_seqlens_block_descale_k,
             )
+        
+        # Debug: Check dtypes after kernel
+        import sys
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            sys.stderr.write(f"[After CUDA kernel] out.dtype={out.dtype}, original_q.dtype={ctx.q_fp16.dtype}\n")
+            sys.stderr.flush()
+        
+        # Restore original dtype: CUDA kernel outputs FP16, but input may be BF16
+        # This ensures dtype consistency with the rest of the model
+        # TODO: Replace dtype conversion when kernel outputs consistent dtype
+        if quant_mode >= 0 and out.dtype != ctx.q_fp16.dtype:
+            import sys
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                sys.stderr.write(f"[Dtype Cast] Converting {out.dtype} -> {ctx.q_fp16.dtype}\n")
+                sys.stderr.flush()
+            out = out.to(ctx.q_fp16.dtype)
+        
         ctx.save_for_backward(
             q, k, v, rab, cu_seqlens_q, cu_seqlens_k, num_contexts, num_targets
         )

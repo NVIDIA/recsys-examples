@@ -29,7 +29,7 @@ from configs import (
     get_hstu_config,
 )
 from dynamicemb import DynamicEmbTableOptions
-from modules.embedding import ShardedEmbeddingConfig
+from modules.embedding import ShardedEmbeddingConfig, ShardedEmbedding
 from training.gin_config_args import (
     BenchmarkDatasetArgs,
     DatasetArgs,
@@ -38,8 +38,10 @@ from training.gin_config_args import (
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
+    MixedPrecisionArgs,
     TrainerArgs,
 )
+from commons.utils.logger import print_rank_0
 
 _OPTIMIZER_TYPE_TO_STORAGE_MULTIPLIER = {
     "sgd": 1,
@@ -156,7 +158,7 @@ def cal_flops(
 
 
 def create_hstu_config(
-    network_args: NetworkArgs, tensor_model_parallel_args: TensorModelParallelArgs
+    network_args: NetworkArgs, tensor_model_parallel_args: TensorModelParallelArgs, mp_args: MixedPrecisionArgs
 ):
     dtype = None
     if network_args.dtype_str == "bfloat16":
@@ -194,6 +196,20 @@ def create_hstu_config(
         )
     else:
         hstu_preprocessing_config = None
+
+    # Define HSTU attn quantization separate from TE FP8
+    hstu_attn_quantization_mode = mp_args.hstu_attn_quantization_map[mp_args.hstu_attn_quantization_mode]
+
+    if mp_args.enabled:
+        # Matching Megatron FP8 arguments
+        fp8 = mp_args.linear_scaling_precision  # Flag to set both te linear and precision https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/transformer_config.py
+        fp8_recipe = mp_args.linear_recipe
+        fp8_alignment_mode = mp_args.fp8_alignment_mode
+    else:
+        fp8 = None
+        fp8_recipe = None
+        fp8_alignment_mode = None
+
     return get_hstu_config(
         hidden_size=network_args.hidden_size,
         kv_channels=network_args.kv_channels,
@@ -204,12 +220,16 @@ def create_hstu_config(
         is_causal=network_args.is_causal,
         dtype=dtype,
         kernel_backend=kernel_backend,
+        hstu_attn_quantization_mode=hstu_attn_quantization_mode,
+        fp8_alignment_mode=fp8_alignment_mode,
         hstu_preprocessing_config=hstu_preprocessing_config,
         position_encoding_config=position_encoding_config,
         target_group_size=network_args.target_group_size,
         hstu_layer_type=layer_type,
         recompute_input_layernorm=network_args.recompute_input_layernorm,
         recompute_input_silu=network_args.recompute_input_silu,
+        fp8 = fp8,
+        fp8_recipe = fp8_recipe,
     )
 
 
@@ -629,3 +649,195 @@ def get_dataset_and_embedding_args() -> (
         ]
     else:
         raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
+
+def inspect_sharded_embedding_tables(embedding_collection: ShardedEmbedding, table_name_filter: str = None, tracking_state: dict = None) -> dict:
+    """
+    Helper function to inspect all embedding tables in a ShardedEmbedding collection.
+    Works with both regular embeddings and dynamic embeddings.
+    
+    Args:
+        embedding_collection: The ShardedEmbedding instance to inspect
+        table_name_filter: Optional filter to only show tables containing this string
+        tracking_state: Optional dict to track IDs across iterations {table_name: {'all_ids': set(), 'nan_ids': set()}}
+    
+    Returns:
+        Updated tracking_state dict
+    """
+    if tracking_state is None:
+        tracking_state = {}
+    print_rank_0("=" * 80)
+    print_rank_0("EMBEDDING COLLECTION INSPECTION")
+    print_rank_0("=" * 80)
+    
+    # Check model-parallel embeddings
+    if embedding_collection._model_parallel_embedding_collection is not None:
+        print_rank_0("\n[MODEL-PARALLEL EMBEDDINGS]")
+        mp_collection = embedding_collection._model_parallel_embedding_collection
+        
+        # Try to get dynamic embedding modules
+        try:
+            from dynamicemb.dump_load import get_dynamic_emb_module
+            dynamic_modules = get_dynamic_emb_module(mp_collection)
+            
+            if len(dynamic_modules) > 0:
+                print_rank_0(f"Found {len(dynamic_modules)} dynamic embedding module(s)")
+                for module_idx, dyn_module in enumerate(dynamic_modules):
+                    print_rank_0(f"\n  Dynamic Module {module_idx}:")
+                    for table_idx, (table_name, table) in enumerate(zip(dyn_module.table_names, dyn_module.tables)):
+                        if table_name_filter and table_name_filter not in table_name:
+                            continue
+                        print_rank_0(f"    Table '{table_name}':")
+                        print_rank_0(f"      Type: Dynamic Embedding (KeyValueTable)")
+                        capacity = table.capacity()
+                        used_size = table.size()
+                        emb_dim = table.embedding_dim()
+                        opt_dim = table.optim_state_dim()
+                        
+                        print_rank_0(f"      Capacity: {capacity}")
+                        print_rank_0(f"      Size (used): {used_size}")
+                        print_rank_0(f"      Embedding dim: {emb_dim}")
+                        print_rank_0(f"      Optimizer state dim: {opt_dim}")
+                        print_rank_0(f"      Effective shape: [{used_size}, {emb_dim}] (sparse)")
+                        
+                        # Check ALL embeddings for NaNs (sparse hash table requires full scan)
+                        if used_size > 0:
+                            from dynamicemb.dump_load import export_keys_values
+                            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                            
+                            try:
+                                total_checked = 0
+                                total_nan_count = 0
+                                all_embedding_ids = []
+                                ids_with_nan = []
+                                emb_min = float('inf')
+                                emb_max = float('-inf')
+                                has_any_nan = False
+                                
+                                # Scan through entire hash table to find all stored embeddings
+                                for keys, embeddings, opt_states, scores in export_keys_values(table, device, batch_size=65536):
+                                    batch_size_actual = embeddings.shape[0]
+                                    total_checked += batch_size_actual
+                                    
+                                    # Track all embedding IDs
+                                    all_embedding_ids.extend(keys.tolist())
+                                    
+                                    # Check for NaNs and get the actual movie IDs with NaN
+                                    if torch.isnan(embeddings).any():
+                                        has_any_nan = True
+                                        nan_mask = embeddings.isnan().any(dim=1)  # Which embeddings have NaN
+                                        nan_per_embedding = embeddings.isnan().sum(dim=1)  # Count NaNs per embedding
+                                        total_nan_count += torch.isnan(embeddings).sum().item()
+                                        ids_with_nan_in_batch = keys[nan_mask].tolist()  # Get actual movie IDs
+                                        ids_with_nan.extend(ids_with_nan_in_batch)
+                                        
+                                        # Store NaN pattern for detailed analysis
+                                        if 'nan_patterns' not in tracking_state:
+                                            tracking_state['nan_patterns'] = {}
+                                        if table_name not in tracking_state['nan_patterns']:
+                                            # For each ID with NaN, store how many dimensions have NaN
+                                            nan_pattern = {
+                                                int(keys[i].item()): int(nan_per_embedding[i].item()) 
+                                                for i in range(len(keys)) if nan_mask[i]
+                                            }
+                                            tracking_state['nan_patterns'][table_name] = nan_pattern
+                                    else:
+                                        emb_min = min(emb_min, embeddings.min().item())
+                                        emb_max = max(emb_max, embeddings.max().item())
+                                
+                                print_rank_0(f"      Scanned {total_checked}/{used_size} embeddings")
+                                print_rank_0(f"      Has NaN: {has_any_nan}")
+                                if has_any_nan:
+                                    print_rank_0(f"      Total NaN count: {total_nan_count}")
+                                    total_elements = total_checked * emb_dim
+                                    print_rank_0(f"      NaN percentage: {100.0 * total_nan_count / total_elements:.2f}%")
+                                    print_rank_0(f"      Number of embeddings with NaN: {len(ids_with_nan)}")
+                                    print_rank_0(f"      IDs with NaN: {ids_with_nan}")
+                                    
+                                    # Print NaN pattern analysis
+                                    if 'nan_patterns' in tracking_state and table_name in tracking_state['nan_patterns']:
+                                        nan_pattern = tracking_state['nan_patterns'][table_name]
+                                        fully_nan = sum(1 for count in nan_pattern.values() if count == emb_dim)
+                                        partially_nan = len(nan_pattern) - fully_nan
+                                        print_rank_0(f"      NaN Pattern:")
+                                        print_rank_0(f"        Fully NaN embeddings: {fully_nan}/{len(nan_pattern)} (all {emb_dim} dims)")
+                                        print_rank_0(f"        Partially NaN embeddings: {partially_nan}/{len(nan_pattern)}")
+                                        if partially_nan > 0:
+                                            # Show examples of partial NaN
+                                            partial_examples = [(id_, count) for id_, count in list(nan_pattern.items())[:5] if count < emb_dim]
+                                            if partial_examples:
+                                                print_rank_0(f"        Partial NaN examples (ID: NaN_count): {partial_examples}")
+                                    
+                                    # Store for comparison across iterations
+                                    if table_name not in tracking_state:
+                                        tracking_state[table_name] = {'all_ids': set(), 'nan_ids': set()}
+                                    
+                                    prev_all_ids = tracking_state[table_name]['all_ids']
+                                    prev_nan_ids = tracking_state[table_name]['nan_ids']
+                                    current_all_ids = set(all_embedding_ids)
+                                    current_nan_ids = set(ids_with_nan)
+                                    
+                                    new_ids = current_all_ids - prev_all_ids
+                                    new_ids_with_nan = current_nan_ids & new_ids
+                                    old_ids_with_nan = current_nan_ids - new_ids
+                                    
+                                    print_rank_0(f"      New embeddings this iteration: {len(new_ids)}")
+                                    print_rank_0(f"      New embeddings with NaN: {len(new_ids_with_nan)} (IDs: {list(new_ids_with_nan)[:10]})")
+                                    print_rank_0(f"      Old embeddings corrupted: {len(old_ids_with_nan)} (IDs: {list(old_ids_with_nan)[:10]})")
+                                    
+                                    # Update tracking
+                                    tracking_state[table_name]['all_ids'] = current_all_ids
+                                    tracking_state[table_name]['nan_ids'] = current_nan_ids
+                                else:
+                                    print_rank_0(f"      Min/Max: {emb_min:.4f} / {emb_max:.4f}")
+                                    
+                                    # Track IDs even when no NaN for future comparison
+                                    if table_name not in tracking_state:
+                                        tracking_state[table_name] = {'all_ids': set(), 'nan_ids': set()}
+                                    tracking_state[table_name]['all_ids'] = set(all_embedding_ids)
+                            except Exception as e:
+                                print_rank_0(f"      Error scanning embeddings: {e}")
+        except ImportError:
+            print_rank_0("  Dynamic embeddings module not available")
+        
+        # Check regular (non-dynamic) embeddings via state_dict
+        print_rank_0("\n  Regular embeddings in state_dict:")
+        for name, tensor in mp_collection.state_dict().items():
+            if table_name_filter and table_name_filter not in name:
+                continue
+            print_rank_0(f"    '{name}':")
+            
+            if hasattr(tensor, "local_shards"):
+                print_rank_0(f"      Type: ShardedTensor (model-parallel)")
+                for shard_idx, shard in enumerate(tensor.local_shards()):
+                    shard_tensor = shard.tensor
+                    print_rank_0(f"      Shard {shard_idx}:")
+                    print_rank_0(f"        Shape: {shard_tensor.shape}")
+                    print_rank_0(f"        Offsets: {shard.metadata.shard_offsets}")
+                    print_rank_0(f"        Sizes: {shard.metadata.shard_sizes}")
+                    print_rank_0(f"        Has NaN: {torch.isnan(shard_tensor).any()}")
+                    if torch.isnan(shard_tensor).any():
+                        print_rank_0(f"        NaN count: {torch.isnan(shard_tensor).sum()}")
+            else:
+                print_rank_0(f"      Type: Regular Tensor")
+                print_rank_0(f"      Shape: {tensor.shape}")
+                print_rank_0(f"      Has NaN: {torch.isnan(tensor).any()}")
+                if torch.isnan(tensor).any():
+                    print_rank_0(f"      NaN count: {torch.isnan(tensor).sum()}")
+    
+    # Check data-parallel embeddings
+    if embedding_collection._data_parallel_embedding_collection is not None:
+        print_rank_0("\n[DATA-PARALLEL EMBEDDINGS]")
+        dp_collection = embedding_collection._data_parallel_embedding_collection
+        
+        if hasattr(dp_collection, 'embedding_weights'):
+            for table_name, weight_tensor in dp_collection.embedding_weights.items():
+                if table_name_filter and table_name_filter not in table_name:
+                    continue
+                print_rank_0(f"  Table '{table_name}':")
+                print_rank_0(f"    Shape: {weight_tensor.shape}")
+                print_rank_0(f"    Has NaN: {torch.isnan(weight_tensor).any()}")
+                if torch.isnan(weight_tensor).any():
+                    print_rank_0(f"    NaN count: {torch.isnan(weight_tensor).sum()}")
+    
+    print_rank_0("=" * 80)
+    return tracking_state

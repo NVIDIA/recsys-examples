@@ -23,6 +23,7 @@
 
 import abc
 import logging
+import warnings
 from collections import deque
 from typing import (
     Any,
@@ -65,6 +66,15 @@ from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.types import Awaitable
 from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format, DelayedScaling, Float8CurrentScaling, Float8BlockScaling
+    use_te = True
+    recipe_map = {'delayed': DelayedScaling, 'tensorwise': Float8CurrentScaling, 'blockwise': Float8BlockScaling}
+except:
+    warnings.warn("transformer_engine.pytorch is not installed, FP8 mixed precision will not be supported")
+    use_te = False
 
 logger: logging.Logger = logging.getLogger(__name__)
 # This is required to support older torch package export for older models
@@ -126,12 +136,26 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        te_mixed_precision: bool = False,
+        **fp8_mp_kwargs
     ) -> None:
         self._model = model
         self._optimizer = optimizer
         self._device = device
         self._execute_all_batches = execute_all_batches
         self._apply_jit = apply_jit
+        self._te_mixed_precision = te_mixed_precision
+        self._fp8_mp_kwargs = fp8_mp_kwargs
+        
+        # Define recipe for FP8 mixed precision training based on kwargs
+        if self._te_mixed_precision and not use_te:
+            assert False, "transformer_engine.pytorch is not installed, but te_mixed_precision = True"
+        elif self._te_mixed_precision and len(fp8_mp_kwargs) == 0:
+            assert False, "fp8_mp_kwargs is empty, but te_mixed_precision = True"
+        elif self._te_mixed_precision and use_te:
+            self.recipe = recipe_map[fp8_mp_kwargs.pop('recipe')](**fp8_mp_kwargs)
+        else:
+            self.recipe = None
 
         if device.type == "cuda":
             # use two data streams to support two concurrent batches
@@ -365,7 +389,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         # forward
         with record_function("## forward ##"):
-            losses, output = self._model_fwd(self.batches[0])
+            if use_te:
+                with te.fp8_autocast(enabled=self._te_mixed_precision, fp8_recipe=self.recipe):
+                    losses, output = self._model_fwd(self.batches[0])
+            else:
+                losses, output = self._model_fwd(self.batches[0])
 
         if len(self.batches) >= 2:
             # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
@@ -609,6 +637,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        **kwargs,
     ) -> None:
         super().__init__(
             model=model,
@@ -619,6 +648,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             context_type=PrefetchTrainPipelineContext,
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
+            **kwargs,
         )
         self._context = PrefetchTrainPipelineContext(version=0)
         self._prefetch_stream: Optional[torch.Stream] = (
@@ -675,7 +705,11 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         self._wait_sparse_data_dist()
         # forward
         with record_function("## forward ##"):
-            losses, output = self._model_fwd(self._batch_i)
+            if use_te:
+                with te.fp8_autocast(enabled=self._te_mixed_precision, fp8_recipe=self.recipe):
+                        losses, output = self._model_fwd(self._batch_i)
+            else:
+                losses, output = self._model_fwd(self._batch_i)
 
         self._prefetch(self._batch_ip1)
 
@@ -740,6 +774,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        **kwargs,
     ) -> None:
         super().__init__(
             model,
@@ -750,6 +785,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             TrainPipelineContext,
             pipeline_postproc,
             custom_model_fwd,
+            **kwargs,
         )
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
@@ -797,7 +833,11 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
         # forward
         with nvtx.annotate("## forward ##"):
-            losses, output = self._model_fwd(self.batches[0])
+            if use_te:
+                with te.fp8_autocast(enabled=self._te_mixed_precision, fp8_recipe=self.recipe):
+                    losses, output = self._model_fwd(self.batches[0])
+            else:
+                losses, output = self._model_fwd(self.batches[0])
         with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
@@ -843,6 +883,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        **kwargs,
     ) -> None:
         super().__init__(
             model,
@@ -852,6 +893,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             apply_jit,
             pipeline_postproc,
             custom_model_fwd,
+            **kwargs,
         )
 
     def progress(self, dataloader_iter: Iterator[In]) -> Tuple[torch.Tensor, Out]:

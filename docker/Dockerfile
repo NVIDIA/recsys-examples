@@ -45,6 +45,8 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
+RUN pip install --no-cache --upgrade --no-build-isolation transformer_engine[pytorch]
+
 FROM ${DEVEL_IMAGE} AS build
 
 WORKDIR /workspace/recsys-examples
