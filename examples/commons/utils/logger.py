@@ -12,16 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from datetime import datetime
+import logging
 
 import torch
+from rich.console import Console
+from rich.logging import RichHandler
+
+# Set up logger with RichHandler if not already configured
+
+console = Console()
+_LOGGER = logging.getLogger("rich_rank0")
+
+if not _LOGGER.hasHandlers():
+    handler = RichHandler(
+        console=console, show_time=True, show_path=False, rich_tracebacks=True
+    )
+    _LOGGER.addHandler(handler)
+    _LOGGER.propagate = False
+    _LOGGER.setLevel(logging.INFO)
 
 
 def print_rank_0(message):
     """If distributed is initialized, print only on rank 0."""
     if torch.distributed.is_initialized():
-        now = datetime.now()
         if torch.distributed.get_rank() == 0:
-            print(f"[{now}] " + message, flush=True)
+            _LOGGER.info(message)
     else:
         print(message, flush=True)

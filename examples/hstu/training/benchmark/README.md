@@ -13,7 +13,7 @@ You can run script `run_hstu_benchmark.sh` to see the performance over the base 
 
 ## How to run
 
-The test entry is `python ./benchmark/hstu_layer_benchmark.py run`, you can type `python ./benchmark/hstu_layer_benchmark.py run --help` to get the input arguments. 4 important arguments are :
+The test entry is `python ./training/benchmark/hstu_layer_benchmark.py run`, you can type `python ./training/benchmark/hstu_layer_benchmark.py run --help` to get the input arguments. 4 important arguments are :
 
 1. --kernel-backend: select the hstu mha backend. Could be `triton` or `cutlass`.
 2. --fuse-norm-mul-dropout: knob of  `layer norm + multiplication + dropout ` fusion. Could be `False` or `True`
@@ -23,7 +23,9 @@ The test entry is `python ./benchmark/hstu_layer_benchmark.py run`, you can type
 Our baseline cmd example (1K): 
 
 ```bash
-python ./benchmark/hstu_layer_benchmark.py run \
+
+cd recsys-examples/examples/hstu
+python ./training/benchmark/hstu_layer_benchmark.py run \
   --iters 100 \
   --warmup-iters 50 \
   --layer-type native \
@@ -40,7 +42,8 @@ python ./benchmark/hstu_layer_benchmark.py run \
 You can also run a set of arguments with run.sh:
 
 ```bash
-bash run_hstu_layer_benchmark.sh <num_layers>
+cd recsys-examples/examples/hstu
+bash ./training/benchmark/run_hstu_layer_benchmark.sh <num_layers>
 ```
 
 After one run is done, a memory snapshot file in current working directory is generated, you can trace the memory usage with the file. Please refer to [PyTorch docs](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html) on how to visualize the memory trace.
