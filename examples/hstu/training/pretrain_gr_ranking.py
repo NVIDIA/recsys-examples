@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 import argparse
-from functools import partial  # pylint: disable-unused-import
+from typing import List, Union
 
 import commons.utils.initialize as init
 import gin
@@ -34,7 +34,8 @@ from pipeline.train_pipeline import (
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
 )
-from training import (
+from trainer.training import maybe_load_ckpts, train_with_pipeline
+from trainer.utils import (
     create_dynamic_optitons_dict,
     create_embedding_configs,
     create_hstu_config,
@@ -42,10 +43,11 @@ from training import (
     get_data_loader,
     get_dataset_and_embedding_args,
     get_embedding_vector_storage_multiplier,
-    maybe_load_ckpts,
-    train_with_pipeline,
 )
-from utils import (
+from utils import (  # from hstu.utils
+    BenchmarkDatasetArgs,
+    DatasetArgs,
+    EmbeddingArgs,
     NetworkArgs,
     OptimizerArgs,
     RankingArgs,
@@ -53,20 +55,12 @@ from utils import (
     TrainerArgs,
 )
 
-parser = argparse.ArgumentParser(
-    description="Distributed GR Arguments", allow_abbrev=False
-)
-parser.add_argument("--gin-config-file", type=str)
-args = parser.parse_args()
-gin.parse_config_file(args.gin_config_file)
-trainer_args = TrainerArgs()
-dataset_args, embedding_args = get_dataset_and_embedding_args()
-network_args = NetworkArgs()
-optimizer_args = OptimizerArgs()
-tp_args = TensorModelParallelArgs()
 
-
-def create_ranking_config() -> RankingConfig:
+def create_ranking_config(
+    dataset_args: Union[DatasetArgs, BenchmarkDatasetArgs],
+    network_args: NetworkArgs,
+    embedding_args: List[EmbeddingArgs],
+) -> RankingConfig:
     ranking_args = RankingArgs()
 
     return RankingConfig(
@@ -82,6 +76,18 @@ def create_ranking_config() -> RankingConfig:
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="HSTU Example Arguments", allow_abbrev=False
+    )
+    parser.add_argument("--gin-config-file", type=str)
+    args = parser.parse_args()
+    gin.parse_config_file(args.gin_config_file)
+    trainer_args = TrainerArgs()
+    dataset_args, embedding_args = get_dataset_and_embedding_args()
+    network_args = NetworkArgs()
+    optimizer_args = OptimizerArgs()
+    tp_args = TensorModelParallelArgs()
+
     init.initialize_distributed()
     init.initialize_model_parallel(
         tensor_model_parallel_size=tp_args.tensor_model_parallel_size
@@ -92,7 +98,7 @@ def main():
         f"distributed env initialization done. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
     )
     hstu_config = create_hstu_config(network_args, tp_args)
-    task_config = create_ranking_config()
+    task_config = create_ranking_config(dataset_args, network_args, embedding_args)
     model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
 
     dynamic_options_dict = create_dynamic_optitons_dict(

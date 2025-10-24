@@ -47,7 +47,7 @@ from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
 from ops.length_to_offsets import length_to_complete_offsets
-from training.utils import cal_flops_single_rank
+from training.trainer.utils import cal_flops_single_rank
 
 _backend_str_to_type = {
     "cutlass": KernelBackend.CUTLASS,
