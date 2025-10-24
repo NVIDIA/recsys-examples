@@ -40,7 +40,9 @@ public:
   virtual void unique(const at::Tensor d_key, const uint64_t len,
                       at::Tensor d_output_index, at::Tensor d_unique_key,
                       at::Tensor d_output_counter, cudaStream_t stream = 0,
-                      at::Tensor offset = at::Tensor()) = 0;
+                      at::Tensor offset = at::Tensor(),
+                      at::Tensor d_frequency_counters = at::Tensor(),
+                      at::Tensor d_input_frequencies = at::Tensor()) = 0;
 
   virtual void reset_capacity(at::Tensor keys, at::Tensor vals,
                               const size_t capacity,
@@ -66,8 +68,9 @@ public:
   void unique(const at::Tensor d_key, const uint64_t len,
               at::Tensor d_output_index, at::Tensor d_unique_key,
               at::Tensor d_output_counter, cudaStream_t stream = 0,
-              at::Tensor offset =
-                  at::Tensor()) override { /// TODO: dtype check in runtime.
+              at::Tensor offset = at::Tensor(),
+              at::Tensor d_frequency_counters = at::Tensor(),
+              at::Tensor d_input_frequencies = at::Tensor()) override { /// TODO: dtype check in runtime.
     if (stream == 0) {
       stream = at::cuda::getCurrentCUDAStream().stream();
     }
@@ -82,12 +85,32 @@ public:
       offset_ptr = offset.data_ptr<CounterType>();
     }
 
+    CounterType *frequency_counters_ptr = nullptr;
+    if (d_frequency_counters.defined() && d_frequency_counters.numel() > 0) {
+      // Check if frequency counters is of the same type as CounterType
+      if (d_frequency_counters.scalar_type() != at::CppTypeToScalarType<CounterType>::value) {
+        throw std::runtime_error(
+            "Frequency counters tensor must have the same type as CounterType.");
+      }
+      frequency_counters_ptr = d_frequency_counters.data_ptr<CounterType>();
+    }
+
+    const CounterType *input_frequencies_ptr = nullptr;
+    if (d_input_frequencies.defined() && d_input_frequencies.numel() > 0) {
+      // Check if input frequencies is of the same type as CounterType
+      if (d_input_frequencies.scalar_type() != at::CppTypeToScalarType<CounterType>::value) {
+        throw std::runtime_error(
+            "Input frequencies tensor must have the same type as CounterType.");
+      }
+      input_frequencies_ptr = d_input_frequencies.data_ptr<CounterType>();
+    }
+
     this->unique_op_->unique(
         reinterpret_cast<KeyType *>(d_key.data_ptr()), len,
         reinterpret_cast<CounterType *>(d_output_index.data_ptr()),
         reinterpret_cast<KeyType *>(d_unique_key.data_ptr()),
         reinterpret_cast<CounterType *>(d_output_counter.data_ptr()), stream,
-        offset_ptr);
+        offset_ptr, frequency_counters_ptr, input_frequencies_ptr);
     this->unique_op_->clear(stream);
   }
 

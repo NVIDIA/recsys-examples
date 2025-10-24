@@ -21,10 +21,19 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbPoolingMode,
     dyn_emb_to_torch,
 )
+from dynamicemb.initializer import BaseDynamicEmbInitializer
+from dynamicemb.key_value_table import (
+    Cache,
+    KeyValueTable,
+    KeyValueTableCachingFunction,
+    KeyValueTableFunction,
+    Storage,
+)
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
+    EvictStrategy,
     find_and_initialize,
     find_or_insert,
     get_table_range,
@@ -477,3 +486,214 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         # optimizer: update tables.
         optimizer.update(tables, unique_indices_list, unique_grads_list)
         return (None,) * 19
+
+
+def dynamicemb_prefetch(
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    caches: List[Optional[Cache]],
+    storages: List[Storage],
+    feature_offsets: torch.Tensor,
+    initializers: List[BaseDynamicEmbInitializer],
+    unique_op,
+    training: bool = True,
+    forward_stream: Optional[torch.cuda.Stream] = None,
+):
+    table_num = len(storages)
+    assert table_num != 0
+    caching = caches[0] is not None
+
+    indices_table_range = get_table_range(offsets, feature_offsets)
+    if training or caching:
+        (
+            unique_indices,
+            inverse,
+            unique_indices_table_range,
+            h_unique_indices_table_range,
+            _,
+        ) = segmented_unique(indices, indices_table_range, unique_op)
+        # TODO: only return device unique_indices_table_range
+        # h_unique_indices_table_range = unique_indices_table_range.cpu()
+    else:
+        h_unique_indices_table_range = indices_table_range.cpu()
+        unique_indices = indices
+
+    for i in range(table_num):
+        begin = h_unique_indices_table_range[i]
+        end = h_unique_indices_table_range[i + 1]
+        unique_indices_per_table = unique_indices[begin:end]
+
+        KeyValueTableFunction.prefetch(
+            caches[i],
+            storages[i],
+            unique_indices_per_table,
+            initializers[i],
+            training,
+            forward_stream,
+        )
+
+
+class DynamicEmbeddingFunctionV2(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        indices: torch.Tensor,
+        offsets: torch.Tensor,
+        caches: List[Optional[Cache]],
+        storages: List[Storage],
+        feature_offsets: torch.Tensor,
+        output_dtype: torch.dtype,
+        initializers: List[BaseDynamicEmbInitializer],
+        optimizer: BaseDynamicEmbeddingOptimizer,
+        unique_op,
+        enable_prefetch: bool = False,
+        input_dist_dedup: bool = False,
+        training: bool = True,
+        frequency_counters: Optional[torch.Tensor] = None,
+        *args,
+    ):
+        table_num = len(storages)
+        assert table_num != 0
+        emb_dtype = storages[0].embedding_dtype()
+        emb_dim = storages[0].embedding_dim()
+        caching = caches[0] is not None
+
+        is_lfu_enabled = False
+        if isinstance(storages[0], KeyValueTable):
+            is_lfu_enabled = storages[0].evict_strategy() == EvictStrategy.KLfu
+
+        frequency_counts_int64 = None
+        if frequency_counters is not None:
+            frequency_counts_int64 = frequency_counters.long()
+
+        # TODO: Use frequency_counts_uint64 for LFU strategy in pooled embeddings
+
+        lfu_accumulated_frequency = None
+        indices_table_range = get_table_range(offsets, feature_offsets)
+        if training or caching:
+            (
+                unique_indices,
+                inverse,
+                unique_indices_table_range,
+                h_unique_indices_table_range,
+                lfu_accumulated_frequency,
+            ) = segmented_unique(
+                indices,
+                indices_table_range,
+                unique_op,
+                is_lfu_enabled,
+                frequency_counts_int64,
+            )
+            # TODO: only return device unique_indices_table_range
+            # h_unique_indices_table_range = unique_indices_table_range.cpu()
+        else:
+            h_unique_indices_table_range = indices_table_range.cpu()
+            unique_indices = indices
+
+        unique_embs = torch.empty(
+            unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
+        )
+
+        for i in range(table_num):
+            begin = h_unique_indices_table_range[i]
+            end = h_unique_indices_table_range[i + 1]
+            unique_indices_per_table = unique_indices[begin:end]
+            unique_embs_per_table = unique_embs[begin:end, :]
+            # Slice lfu_accumulated_frequency to match the table
+            lfu_accumulated_frequency_per_table = (
+                lfu_accumulated_frequency[begin:end]
+                if lfu_accumulated_frequency is not None
+                and lfu_accumulated_frequency.numel() > 0
+                else None
+            )
+
+            if caching:
+                KeyValueTableCachingFunction.lookup(
+                    caches[i],
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    initializers[i],
+                    enable_prefetch,
+                    training,
+                    lfu_accumulated_frequency_per_table,
+                )
+            else:
+                KeyValueTableFunction.lookup(
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    initializers[i],
+                    training,
+                    lfu_accumulated_frequency_per_table,
+                )
+
+        if training or caching:
+            output_embs = torch.empty(
+                indices.shape[0], emb_dim, dtype=output_dtype, device=indices.device
+            )
+            output_embs = unique_embs[inverse]
+        else:
+            output_embs = unique_embs
+
+        if training:
+            # save context
+            backward_tensors = [
+                indices,
+            ]
+            ctx.save_for_backward(*backward_tensors)
+            ctx.input_dist_dedup = input_dist_dedup
+            if input_dist_dedup:
+                ctx.unique_indices = unique_indices
+                ctx.unique_embs = unique_embs
+                ctx.inverse = inverse
+            ctx.indices_table_range = indices_table_range
+            ctx.h_indices_table_range = indices_table_range.cpu()
+            ctx.h_unique_indices_table_range = h_unique_indices_table_range
+            ctx.unique_indices_table_range = unique_indices_table_range
+            ctx.caches = caches
+            ctx.storages = storages
+            ctx.optimizer = optimizer
+            ctx.enable_prefetch = enable_prefetch
+
+        return output_embs
+
+    @staticmethod
+    def backward(ctx, grads):
+        # parse context
+        (indices,) = ctx.saved_tensors
+        indices_table_range = ctx.indices_table_range
+        h_indices_table_range = ctx.h_indices_table_range
+        h_unique_indices_table_range = ctx.h_unique_indices_table_range
+        ctx.unique_indices_table_range
+        caches = ctx.caches
+        storages = ctx.storages
+        optimizer = ctx.optimizer
+        enable_prefetch = ctx.enable_prefetch
+
+        input_dist_dedup = ctx.input_dist_dedup
+        if input_dist_dedup:
+            unique_indices = ctx.unique_indices
+            unique_embs = ctx.unique_embs
+            ctx.inverse
+        unique_indices, unique_embs = reduce_grads(
+            indices, grads, indices_table_range, h_indices_table_range
+        )
+        optimizer.step()
+        table_num = len(storages)
+        for i in range(table_num):
+            begin = h_unique_indices_table_range[i]
+            end = h_unique_indices_table_range[i + 1]
+            unique_indices_per_table = unique_indices[begin:end]
+            unique_embs_per_table = unique_embs[begin:end, :]
+
+            KeyValueTableFunction.update(
+                caches[i],
+                storages[i],
+                unique_indices_per_table,
+                unique_embs_per_table,
+                optimizer,
+                enable_prefetch,
+            )
+
+        return (None,) * 14

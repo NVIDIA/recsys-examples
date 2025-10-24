@@ -285,8 +285,114 @@ def run(args):
                 backward_precision=qcomm_backward_precision,
             )
         )
-        if backend == "nccl"
-        else None
+    return kjts
+
+
+class TestModel(nn.Module):
+    def __init__(
+        self,
+        embedding_modules: List[EmbeddingCollection],
+    ):
+        super().__init__()
+        self.embedding_modules = nn.ModuleList(embedding_modules)
+
+    def forward(self, kjt: KeyedJaggedTensor) -> torch.Tensor:
+        embeddings_dict = [
+            embedding_module(kjt).wait() for embedding_module in self.embedding_modules
+        ]
+        embeddings = []
+        for embedding_dict in embeddings_dict:
+            for embedding in embedding_dict.values():
+                embeddings.append(embedding.values())
+        return torch.cat(embeddings, dim=0)
+
+
+DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
+    DataType.FP32: 32,
+    DataType.FP16: 16,
+    DataType.BF16: 16,
+}
+
+
+def apply_dmp(
+    model: torch.nn.Module,
+    optimizer_kwargs: Dict[str, Any],
+    device: torch.device,
+    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    use_index_dedup: bool = False,
+    caching: bool = False,
+    cache_capacity_ratio: float = 0.5,
+):
+    eb_configs = []
+    dynamicemb_options_dict = {}
+    for n, m in model.named_modules():
+        if type(m) in TORCHREC_TYPES:
+            eb_configs.extend(m.embedding_configs())
+            for eb_config in eb_configs:
+                dim = eb_config.embedding_dim
+                tmp_type = eb_config.data_type
+
+                embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
+                emb_num_embeddings = (
+                    eb_config.num_embeddings * cache_capacity_ratio
+                    if caching
+                    else eb_config.num_embeddings
+                )
+                emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
+                    math.log2(emb_num_embeddings)
+                )  # HKV need embedding vector num is power of 2
+
+                # Calculate optimizer state dimension
+                from dynamicemb.dynamicemb_config import (
+                    data_type_to_dtype,
+                    get_optimizer_state_dim,
+                )
+                from dynamicemb_extensions import OptimizerType
+
+                # Map fbgemm EmbOptimType to dynamicemb OptimizerType
+                emb_opt_type = (
+                    optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
+                )
+                opt_type_map = {
+                    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimizerType.RowWiseAdaGrad,
+                    EmbOptimType.SGD: OptimizerType.SGD,
+                    EmbOptimType.EXACT_SGD: OptimizerType.SGD,
+                    EmbOptimType.ADAM: OptimizerType.Adam,
+                    EmbOptimType.EXACT_ADAGRAD: OptimizerType.AdaGrad,
+                }
+                opt_type = opt_type_map.get(emb_opt_type) if emb_opt_type else None
+                # Convert torchrec DataType to torch.dtype
+                torch_dtype = data_type_to_dtype(tmp_type)
+                optimizer_state_dim = (
+                    get_optimizer_state_dim(opt_type, dim, torch_dtype)
+                    if opt_type
+                    else 0
+                )
+
+                # Include optimizer state in HBM calculation
+                total_hbm_need = (
+                    embedding_type_bytes
+                    * (dim + optimizer_state_dim)
+                    * emb_num_embeddings_next_power_of_2
+                )
+
+                dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+                    global_hbm_for_values=total_hbm_need,
+                    score_strategy=score_strategy,
+                    initializer_args=DynamicEmbInitializerArgs(
+                        mode=DynamicEmbInitializerMode.CONSTANT,
+                        value=1e-1,
+                    ),
+                    bucket_capacity=emb_num_embeddings_next_power_of_2,
+                    max_capacity=emb_num_embeddings_next_power_of_2,
+                    caching=caching,
+                    local_hbm_for_values=1024**3,
+                )
+    planner = get_planner(
+        eb_configs,
+        {},
+        dynamicemb_options_dict,
+        device,
     )
 
     if not args.use_torch_opt:
@@ -301,17 +407,9 @@ def run(args):
             use_index_dedup=args.use_index_dedup,
         )
 
-    plan = planner.collective_plan(ebc, [sharder], dist.GroupMember.WORLD)
-
-    if args.use_torch_opt:
-        apply_optimizer_in_backward(
-            embedding_optimizer,
-            ebc.parameters(),
-            optimizer_kwargs,
-        )
-
-    data_parallel_wrapper = DefaultDataParallelWrapper(
-        allreduce_comm_precision=args.allreduce_precision
+    sharder = DynamicEmbeddingCollectionSharder(
+        fused_params=fused_params,
+        use_index_dedup=use_index_dedup,
     )
     model = DistributedModelParallel(
         module=ebc,
@@ -326,16 +424,22 @@ def run(args):
     ret: Dict[str, Dict[str, int]] = get_score(model)
     prefix_path = "model"
 
-    if ret is None:
-        return
-    else:
-        assert len(ret) == 1 and prefix_path in ret
-
-    scores_to_set: Dict[str, int] = {}
-    for i in range(args.num_embedding_table):
-        if args.score_strategies == DynamicEmbScoreStrategy.CUSTOMIZED:
-            scores_to_set[all_table_names[i]] = customized_scores.get(
-                all_table_names[i]
+def create_model(
+    num_embedding_collections: int,
+    num_embeddings: List[int],
+    embedding_dim: int,
+    optimizer_kwargs: Dict[str, Any],
+    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    use_index_dedup: bool = False,
+    caching: bool = False,
+    cache_capacity_ratio: float = 0.5,
+):
+    ebc_list = []
+    for embedding_collection_id in range(num_embedding_collections):
+        eb_configs = []
+        for embedding_id, num_embedding in enumerate(num_embeddings):
+            feature_name, embedding_name = idx_to_name(
+                embedding_collection_id, embedding_id
             )
     set_score(model, {prefix_path: scores_to_set})
 
@@ -638,18 +742,16 @@ def main(argv: List[str]) -> None:
         )
         args.dynamicemb_num = args.num_embedding_table
 
-    if args.platform == "a100":
-        args.intra_host_bw = 300e9
-        args.inter_host_bw = 25e9
-        args.hbm_cap = 80 * 1024 * 1024 * 1024
-    elif args.platform == "h100":
-        args.intra_host_bw = 450e9
-        args.inter_host_bw = 25e9  # TODO: need check
-        args.hbm_cap = 80 * 1024 * 1024 * 1024
-    elif args.platform == "h200":
-        args.intra_host_bw = 450e9
-        args.inter_host_bw = 450e9
-        args.hbm_cap = 140 * 1024 * 1024 * 1024
+    model = apply_dmp(
+        model,
+        optimizer_kwargs,
+        torch.device(f"cuda:{torch.cuda.current_device()}"),
+        score_strategy=score_strategy,
+        use_index_dedup=use_index_dedup,
+        caching=caching,
+        cache_capacity_ratio=cache_capacity_ratio,
+    )
+    return model
 
     if args.score_type == "timestamp":
         args.score_strategies = DynamicEmbScoreStrategy.TIMESTAMP

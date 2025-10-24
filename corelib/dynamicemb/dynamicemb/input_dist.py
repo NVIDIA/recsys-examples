@@ -154,7 +154,9 @@ def bucketize_kjt_before_all2all(
             # duplicate keys will be resolved by AllToAll
             keys=_fx_wrap_gen_list_n_times(kjt.keys(), num_buckets),
             values=bucketized_indices,
-            weights=pos if bucketize_pos else bucketized_weights,
+            weights=_determine_output_weights(
+                kjt, pos, bucketize_pos, bucketized_weights
+            ),
             lengths=bucketized_lengths.view(-1),
             offsets=None,
             stride=_fx_wrap_stride(kjt),
@@ -165,6 +167,31 @@ def bucketize_kjt_before_all2all(
         ),
         unbucketize_permute,
     )
+
+
+def _determine_output_weights(kjt, pos, bucketize_pos, bucketized_weights):
+    """
+    Determine which weights to return: pos or bucketized_weights.
+
+    If the input weights appear to be frequency counters (float values that were
+    converted from uint64), preserve them instead of overriding with pos.
+    """
+
+    if not bucketize_pos:
+        return bucketized_weights
+
+    if kjt.weights_or_none() is not None and bucketized_weights is not None:
+        # weights_as_int = bucketized_weights.long()
+        # weights_back_to_float = weights_as_int.float()
+
+        # if torch.allclose(
+        #     bucketized_weights, weights_back_to_float, atol=1e-6
+        # ) and torch.all(bucketized_weights >= 0):
+        return bucketized_weights
+
+    result = pos if bucketize_pos else bucketized_weights
+
+    return result
 
 
 class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
