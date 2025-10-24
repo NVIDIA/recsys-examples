@@ -338,7 +338,7 @@ class KeyValueTable(
         ):
             return lfu_accumulated_frequency
         elif self.evict_strategy() == EvictStrategy.KLfu:
-            scores = torch.zeros(h_num_total, device=device, dtype=torch.long)
+            scores = torch.ones(h_num_total, device=device, dtype=torch.long)
             return scores
         elif self.evict_strategy() == EvictStrategy.KCustomized:
             scores = torch.empty(h_num_total, device=device, dtype=torch.long)
@@ -640,7 +640,7 @@ class KeyValueTable(
         keys: torch.Tensor,
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = keys.numel()
         num_evicted: torch.Tensor = torch.zeros(1, dtype=torch.long, device=keys.device)
         evicted_keys: torch.Tensor = torch.empty_like(keys)
