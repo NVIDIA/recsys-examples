@@ -395,6 +395,11 @@ def benchmark():
         torch.cuda.synchronize()
         triton_time = (time.time() - start) / num_iters * 1000
         
+        # Warmup cuda
+        if CUDA_AVAILABLE:
+            for _ in range(10):
+                _ = embedding_pooling_cuda_wrapper(embeddings, offsets, "mean")
+            torch.cuda.synchronize()
         # Benchmark CUDA kernel (if available)
         if CUDA_AVAILABLE:
             start = time.time()
@@ -405,6 +410,11 @@ def benchmark():
         else:
             cuda_time = None
         
+        # Warmup pytorch
+        for _ in range(10):
+            _ = embedding_pooling_torch(embeddings, offsets, "mean")
+        torch.cuda.synchronize()
+        
         # Benchmark PyTorch explicitly
         start = time.time()
         for _ in range(num_iters):
@@ -412,6 +422,11 @@ def benchmark():
         torch.cuda.synchronize()
         torch_time = (time.time() - start) / num_iters * 1000
         
+        # Warmup reference
+        if batch <= 10000:
+            for _ in range(10):
+                _ = embedding_pooling_reference(embeddings, offsets, "mean")
+            torch.cuda.synchronize()
         # Benchmark Reference (leadership's version) - skip for huge batches
         if batch <= 10000:
             start = time.time()
