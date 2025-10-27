@@ -7,8 +7,44 @@ To facilitate large embedding tables and scaling-laws of HSTU dense, we have int
 This integration ensures efficient training by coordinating sparse (embedding) and dense (context/data) parallelisms within a single model.
 ![parallelism](../figs/parallelism.png)
 
+## Environment Setup
+### Start from dockerfile
 
-## Dataset Introduction
+We provide [dockerfile](./docker/Dockerfile) for users to build environment. 
+```
+docker build -f docker/Dockerfile --platform linux/amd64 -t recsys-examples:latest .
+```
+If you want to build image for Grace, you can use 
+```
+docker build -f docker/Dockerfile --platform linux/arm64 -t recsys-examples:latest .
+```
+You can also set your own base image with args `--build-arg <BASE_IMAGE>`.
+
+### Start from source file
+Before running examples, build and install libs under corelib following instruction in documentation:
+- [HSTU attention documentation](./corelib/hstu/README.md)
+- [Dynamic Embeddings documentation](./corelib/dynamicemb/README.md)
+
+On top of those two core libs, Megatron-Core along with other libs are required. You can install them via pypi package:
+
+```bash
+pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath megatron-core==0.9.0
+```
+
+If you fail to install the megatron-core package, usually due to the python version incompatibility, please try to clone and then install the source code. 
+
+```bash
+git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+pip install -e ./megatron-lm
+```
+
+We provide our custom HSTU CUDA operators for enhanced performance. You need to install these operators using the following command:
+
+```bash
+cd /workspace/recsys-examples/examples/hstu && \
+python setup.py install
+```
+### Dataset Introduction
 
 We have supported several datasets as listed in the following sections:
 
@@ -27,8 +63,18 @@ refer to [KuaiRand](https://kuairand.com/) for details.
 
 ## Running the examples
 
-Before getting started, please make sure that all pre-requisites are fulfilled. You can refer to [Get Started][../../../README] section in the root directory of the repo to set up the environment.****
+Before getting started, please make sure that all pre-requisites are fulfilled. You can refer to [Get Started](../../../README) section in the root directory of the repo to set up the environment.
 
+
+### Dataset preprocessing
+
+In order to prepare the dataset for training, you can use our `preprocessor.py` under the hstu example folder of the project.
+
+```bash
+cd <root-to-repo>/examples/hstu && 
+mkdir -p ./tmp_data && python3 ./preprocessor.py --dataset_name <"ml-1m"|"ml-20m"|"kuairand-pure"|"kuairand-1k"|"kuairand-27k">
+
+```
 
 ### Start training
 The entrypoint for training are `pretrain_gr_retrieval.py` or `pretrain_gr_ranking.py`. We use gin-config to specify the model structure, training arguments, hyper-params etc.
