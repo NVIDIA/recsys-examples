@@ -391,6 +391,8 @@ def get_sharder(args, optimizer_type):
     ] = (
         SparseType.FP32
     )  # data type of the output after lookup, and can differ from the stored.
+    fused_params["frequency_threshold"] = 10
+    fused_params["mask_dims"] = 10
     fused_params.update(optimizer_kwargs)
     fused_params[
         "prefetch_pipeline"
@@ -486,7 +488,7 @@ def get_planner(device, eb_configs, batch_size, optimizer_type, training, cachin
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
-                score_strategy=DynamicEmbScoreStrategy.STEP,
+                score_strategy=DynamicEmbScoreStrategy.LFU,
                 caching=caching,
                 training=training,
             ),
