@@ -40,6 +40,7 @@ from training import (
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
+    MixedPrecisionArgs,
     TrainerArgs,
     create_dynamic_optitons_dict,
     create_embedding_configs,
@@ -51,6 +52,15 @@ from training import (
     maybe_load_ckpts,
     train_with_pipeline,
 )
+
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format, DelayedScaling, Float8CurrentScaling, Float8BlockScaling
+    use_te = True
+    format_map = {'e4m3': Format.E4M3, 'e5m2': Format.E5M2, 'hybrid': Format.HYBRID}
+except:
+    warnings.warn("transformer_engine.pytorch is not installed, FP8 mixed precision will not be supported")
+    use_te = False
 
 
 @gin.configurable
@@ -84,7 +94,18 @@ dataset_args, embedding_args = get_dataset_and_embedding_args()
 network_args = NetworkArgs()
 optimizer_args = OptimizerArgs()
 tp_args = TensorModelParallelArgs()
+mp_args = MixedPrecisionArgs()
 
+if mp_args.enabled and not use_te:
+    assert False, "FP8 mixed precision only supported with Transformer Engine"
+
+if mp_args.enabled:
+    fp8_mp_kwargs = {
+        "recipe": mp_args.linear_recipe,
+        "fp8_format": format_map[mp_args.linear_scaling_precision],
+    }
+else:
+    fp8_mp_kwargs = {}
 
 def create_ranking_config() -> RankingConfig:
     ranking_args = RankingArgs()
@@ -111,7 +132,7 @@ def main():
     print_rank_0(
         f"distributed env initialization done. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
     )
-    hstu_config = create_hstu_config(network_args, tp_args)
+    hstu_config = create_hstu_config(network_args, tp_args, mp_args)
     task_config = create_ranking_config()
     model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
 
@@ -162,6 +183,8 @@ def main():
             model_train,
             dense_optimizer,
             device=torch.device("cuda", torch.cuda.current_device()),
+            te_mixed_precision=mp_args.enabled,
+            **fp8_mp_kwargs
         )
     else:
         pipeline = JaggedMegatronTrainNonePipeline(

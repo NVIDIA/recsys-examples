@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from configs import HSTUConfig
@@ -59,7 +60,7 @@ class FusedHSTULayer(MegatronModule):
         self._alpha = 1.0 / (self._attention_dim_per_head**0.5)
         self._residual = config.residual
         self._attn_backend = config.kernel_backend
-
+        self._quantization_mode = config.hstu_attn_quantization_mode
         # stream and event are shared across all layers
         self._wgrad_stream = config.async_wgrad_stream
         self._wgrad_event = config.async_wgrad_event
@@ -155,6 +156,7 @@ class FusedHSTULayer(MegatronModule):
             wgrad_event=self._wgrad_event,
             recompute_input_layernorm=self._recompute_input_layernorm,
             recompute_input_silu=self._recompute_input_silu,
+            quant_mode = -1,  # FusedHSTULayer using C++ API for HSTU attn, passthrough quant_mode when python API is used
         )
         return JaggedData(
             values=output,

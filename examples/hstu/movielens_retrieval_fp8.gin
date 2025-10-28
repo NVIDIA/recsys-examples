@@ -1,0 +1,32 @@
+TrainerArgs.train_batch_size = 128
+TrainerArgs.eval_batch_size = 128
+TrainerArgs.eval_interval = 100
+TrainerArgs.log_interval = 100
+TrainerArgs.ckpt_save_interval = -1
+TrainerArgs.seed = 1234
+
+DatasetArgs.dataset_name = 'ml-20m'
+DatasetArgs.max_sequence_length = 200
+DatasetArgs.shuffle = True
+
+NetworkArgs.dtype_str = "bfloat16"
+NetworkArgs.num_layers = 4
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 256
+NetworkArgs.kv_channels = 64
+NetworkArgs.hidden_dropout = 0
+NetworkArgs.norm_epsilon = 1e-6
+NetworkArgs.is_causal = True
+
+OptimizerArgs.optimizer_str = 'adam'
+OptimizerArgs.learning_rate = 1e-3
+OptimizerArgs.adam_beta1 = 0.9
+OptimizerArgs.adam_beta2 = 0.98
+
+RetrievalArgs.num_negatives = 128
+RetrievalArgs.eval_metrics = ("NDCG@10", "NDCG@20", "HR@10")
+
+# MixedPrecisionArgs.mixed_precision_dtype = "fp8"
+MixedPrecisionArgs.linear_recipe = "tensorwise"
+MixedPrecisionArgs.linear_scaling_precision = "hybrid"
+MixedPrecisionArgs.hstu_attn_quantization_mode = "fp8"

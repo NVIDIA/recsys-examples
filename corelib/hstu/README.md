@@ -76,7 +76,7 @@ def hstu_attn_varlen_func(
                             # nheads should be divisible by nhead_rab
     has_drab=False,         # Whether to apply drab
     is_delta_q=False,       # Whether to apply delta_q
-    quantization_mode=-1,   # -1: no quantization, 0: cast to fp8, 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization.
+    quant_mode=-1,   # -1: no quantization, 0: cast to fp8, 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization.
 )
 ```
 

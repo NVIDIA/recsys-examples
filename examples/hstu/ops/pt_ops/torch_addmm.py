@@ -16,6 +16,13 @@
 
 import torch
 
+try:
+    import transformer_engine.pytorch as te
+    use_te = True
+except:
+    warnings.warn("transformer_engine.pytorch is not installed, FP8 mixed precision will not be supported")
+    use_te = False
+
 
 def torch_addmm_silu_fwd(
     x: torch.Tensor,
@@ -27,6 +34,28 @@ def torch_addmm_silu_fwd(
     compute z = silu(y + x @ w); silu is optional
     """
     z = torch.addmm(y, x, w)
+    if silu:
+        silu_z = torch.nn.functional.silu(z)
+    else:
+        silu_z = None
+    return z, silu_z
+
+# TODO: Validate correctness 
+def te_addmm_silu_fwd(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    silu: bool = False,
+) -> torch.Tensor:
+    """
+    compute z = silu(y + x @ w); silu is optional
+    Use transformer engine pytorch for potential OOB fp8 support 
+    """
+    linear = te.linear(x.shape[-1], w.shape[-2], bias=True)
+    with torch.no_grad():
+        linear.weight.copy_(w)
+        linear.bias.copy_(y)
+    z = linear(x)
     if silu:
         silu_z = torch.nn.functional.silu(z)
     else:

@@ -319,6 +319,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         attention_dim: int,
         linear_dim: int,
         is_causal: bool,
+        quant_mode: int = -1,
     ):
         super().__init__()
         from hopper.hstu_attn_interface import hstu_attn_varlen_func
@@ -331,7 +332,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         assert (
             self.linear_dim == self.attention_dim
         ), "only support linear_dim and attention_dim"
-
+        self.quant_mode = quant_mode
     @output_nvtx_hook(nvtx_tag="FusedHSTUAttnHopper")
     def forward(
         self,
@@ -390,6 +391,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
             window_size=(-1, 0) if self.is_causal else (-1, -1),
             rab=None,
             alpha=1.0 / (self.attention_dim**0.5),
+            quant_mode=self.quant_mode,
         ).view(-1, self.num_heads * self.linear_dim)
 
 
@@ -399,6 +401,7 @@ def create_hstu_attention(
     attention_dim: int,
     linear_dim: int,
     is_causal: bool,
+    quant_mode: int = -1,
 ) -> HSTUAttention:
     """
     Factory function to create an HSTUAttention module based on the kernel backend.
@@ -425,6 +428,7 @@ def create_hstu_attention(
                 attention_dim,
                 linear_dim,
                 is_causal,
+                quant_mode,
             )
         elif sm_major_version == 8 and sm_minor_version == 0:
             return FusedHSTUAttention(

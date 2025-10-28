@@ -38,6 +38,8 @@ RUN pip install --no-deps tensordict orjson && \
   cd torchrec && \
   pip install --no-deps .
 
+RUN pip install --no-cache --upgrade --no-build-isolation transformer_engine[pytorch]
+
 RUN test -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 || ln -s ${CUDA_HOME}/targets/x86_64-linux/lib/stubs/libnvidia-ml.so  /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
 
 # Debugging - build w/DOCKER_BUILDKIT=1 to see output

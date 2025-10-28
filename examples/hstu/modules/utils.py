@@ -14,7 +14,14 @@
 # limitations under the License.
 
 import torch
+import warnings
 
+try:
+    import transformer_engine.pytorch as te
+    use_te = True
+except:
+    warnings.warn("transformer_engine.pytorch is not installed, FP8 mixed precision will not be supported")
+    use_te = False
 
 def init_mlp_weights_optional_bias(
     m: torch.nn.Module,
@@ -30,3 +37,38 @@ def init_mlp_weights_optional_bias(
         # Always initialize bias to zero.
         if m.bias is not None:
             m.bias.data.fill_(0.0)
+
+def convert_te_linear_to_torch_linear(m: torch.nn.Module) -> torch.nn.Module:
+    """
+    Convert a Transformer Engine Linear layer to a PyTorch Linear layer.
+    Copies weights and biases from the TE layer to the new PyTorch layer.
+
+    Args:
+        m: The module to convert. If not a TE Linear layer, returns unchanged.
+    
+    Returns:
+        torch.nn.Linear if m is a TE Linear layer, otherwise returns m unchanged.
+    """
+    if not use_te:
+        return m
+    
+    # Check if this is a Transformer Engine Linear layer
+    if not isinstance(m, te.Linear):
+        return m
+    
+    # Create new PyTorch Linear layer with same dimensions
+    new_layer = torch.nn.Linear(
+        m.in_features, 
+        m.out_features, 
+        bias=m.bias is not None, 
+        device=m.weight.device, 
+        dtype=m.weight.dtype
+    )
+    
+    # Copy weights and bias
+    with torch.no_grad():
+        new_layer.weight.copy_(m.weight)
+        if m.bias is not None and new_layer.bias is not None:
+            new_layer.bias.copy_(m.bias)
+    
+    return new_layer

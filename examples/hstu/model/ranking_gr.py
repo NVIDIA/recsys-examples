@@ -27,12 +27,11 @@ from modules.mlp import MLP
 from modules.multi_task_loss_module import MultiTaskLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
-
 class RankingGR(BaseModel):
     """
     A class representing the ranking model. Inherits from BaseModel. A ranking model consists of
     a sparse architecture and a dense architecture. A ranking model is able to process multiple labels
-    and thus has multiple logit dimensions. Each label is associated with a loss functoin (e.g. BCE, CE).
+    and thus has multiple logit dimensions. Each label is associated with a loss function (e.g. BCE, CE).
 
     Args:
         hstu_config (HSTUConfig): The HSTU configuration.
@@ -110,6 +109,7 @@ class RankingGR(BaseModel):
         """
         # DMP embedding
         embeddings: Dict[str, JaggedTensor] = self._embedding_collection(batch.features)
+        
         # maybe freeze embedding for debugging
         embeddings = self._embedding_collection._maybe_detach(embeddings)
         # For model-parallel embedding, torchrec does gradient division by (tp_size * dp_size). However, we only need to divide by dp size. In such case, we need to scale the gradient by tp_size.

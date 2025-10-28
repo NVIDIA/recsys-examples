@@ -15,6 +15,7 @@
 
 import os
 from functools import partial
+import warnings
 
 import nvtx
 import torch
@@ -140,6 +141,7 @@ class HSTULayer(MegatronModule):
             attention_dim=self._attention_dim_per_head,
             linear_dim=self._linear_dim_per_head,
             is_causal=config.is_causal,
+            quant_mode=config.hstu_attn_quantization_mode,
         )
         register_setter_and_getter_for_nvtx(
             HSTULayer.forward, key_or_attr_name="values"
@@ -216,8 +218,10 @@ class HSTULayer(MegatronModule):
                     bias=self._input_layernorm_bias,
                     eps=self._eps,
                 )
+
         with nvtx.annotate("hstu uvqk linear_silu fwd", color="BLUE"):
             tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
+
         # TODO: remove contiguous once cutlass backend is ready
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
             jagged_attn_output = self._attn_func(
@@ -230,6 +234,12 @@ class HSTULayer(MegatronModule):
                 max_seqlen=jd.max_seqlen,
                 target_group_size=self._target_group_size,
             )
+            
+            # TODO: Remove this once the attention kernel outputs consistent dtype
+            expected_dtype = torch.bfloat16 if self.config.bf16 else torch.float16
+            if jagged_attn_output.dtype != expected_dtype:
+                warnings.warn(f"Jagged attn output dtype mismatch: {jagged_attn_output.dtype} != {expected_dtype}. Casting to {expected_dtype}.")
+                jagged_attn_output = jagged_attn_output.to(expected_dtype, non_blocking=True)
 
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             if self._debug_shortcut_output_ln_mul_dropout:

@@ -94,6 +94,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         wgrad_event: Optional[torch.cuda.Event] = None,
         recompute_input_layernorm: bool = False,
         recompute_input_silu: bool = False,
+        quant_mode: int = -1,
     ) -> torch.Tensor:
         """Forward pass of the fused HSTU layer.
         Args:
@@ -125,6 +126,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             wgrad_event (Optional[torch.cuda.Event]): CUDA event for weight gradient computation. Defaults to None.
             recompute_input_layernorm (bool): Whether to recompute the input layer norm. Defaults to False.
             recompute_input_silu (bool): Whether to recompute the input silu. Defaults to False.
+            quant_mode (int): Quantization mode for fp8. Defaults to -1.
         Returns:
             torch.Tensor: Output tensor of shape [T, hidden_size]
         """
@@ -144,6 +146,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.wgrad_event = wgrad_event
         ctx.recompute_input_layernorm = recompute_input_layernorm
         ctx.recompute_input_silu = recompute_input_silu
+        ctx.quant_mode = quant_mode
         saved_tensor_map = OrderedDict()
         if num_contextuals is None and attn_backend == KernelBackend.TRITON:
             num_contextuals = 0
@@ -277,6 +280,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             num_targets,
             target_group_size,
             alpha,
+            quant_mode = -1,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
             extension_args = ()
@@ -286,7 +290,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 extension_args = ampere_paged_kv_args
             elif sm_major_version == 9:
                 cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
-                hopper_fp8_args = (-1, None, None, None, None, None, None, None, None)
+                hopper_fp8_args = (quant_mode, None, None, None, None, None, None, None, None)  # Replace -1 hardcode with quantization_mode
                 extension_args = hopper_fp8_args
 
             else:
@@ -340,6 +344,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             ctx.window_size_right = 0
             ctx.has_drab = False
             ctx.is_delta_q = False
+            ctx.quant_mode = quant_mode
 
             return P
 
@@ -444,6 +449,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     num_targets=num_targets,
                     target_group_size=target_group_size,
                     alpha=ctx.alpha,
+                    quant_mode=quant_mode,
                 )
             else:
                 assert isinstance(
@@ -528,6 +534,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         None,
         None,
         None,
+        None,  # gradient for quant_mode
     ]:
         def _linear_residual_bwd(
             grad_output,
@@ -603,6 +610,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             dq: Optional[torch.Tensor] = None,
             dk: Optional[torch.Tensor] = None,
             dv: Optional[torch.Tensor] = None,
+            quant_mode: int = -1,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
             assert dout.dim() == 3
@@ -653,7 +661,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     window_size_left,
                     window_size_right,
                     alpha,
-                    -1,  # quant_mode
+                    quant_mode,  # previously hardcoded -1, added quant mode from config
                     None,  # rab_padded
                     False,  # has_drab
                     None,  # func
@@ -838,6 +846,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     dq=pre_dq.view(-1, ctx.num_heads, ctx.attention_dim_per_head),
                     dk=pre_dk.view(-1, ctx.num_heads, ctx.attention_dim_per_head),
                     dv=pre_dv.view(-1, ctx.num_heads, ctx.attention_dim_per_head),
+                    quant_mode=ctx.quant_mode,
                 )
                 grad_output = duvqk
             else:
@@ -934,6 +943,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # gradient for quant_mode
         )
 
 
@@ -970,6 +980,7 @@ def fused_hstu_op(
     wgrad_event: Optional[torch.cuda.Event] = None,
     recompute_input_layernorm: bool = False,
     recompute_input_silu: bool = False,
+    quant_mode: int = -1,
 ):
     out = FusedHSTULayerFunction.apply(
         input,
@@ -1000,6 +1011,7 @@ def fused_hstu_op(
         wgrad_event,
         recompute_input_layernorm,
         recompute_input_silu,
+        quant_mode,
     )
 
     return out
