@@ -94,6 +94,7 @@ def DynamicEmbDump(
     table_names: Optional[Dict[str, List[str]]] = None,
     optim: Optional[bool] = False,
     pg: dist.ProcessGroup = dist.group.WORLD,
+    allow_overwrite: bool = False,
 ) -> None:
     """
     Dump the distributed weights and corresponding optimizer states of dynamic embedding tables from the model to the filesystem.
@@ -136,11 +137,13 @@ def DynamicEmbDump(
         if os.path.isdir(path):
             if not os.listdir(path):
                 pass
-            else:
+            elif not allow_overwrite:
                 raise Exception(
                     f"DynamicEmb Cannot dump to {path} because it already contains files, "
                     "as it may cause overwriting of existing files with the same name."
                 )
+            else:
+                logging.warning(f"DynamicEmb Overwriting existing files in {path}")
         else:
             raise Exception(f"The path '{path}' exists and is not a directory.")
     dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
