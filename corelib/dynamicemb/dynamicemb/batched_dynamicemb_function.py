@@ -93,11 +93,6 @@ def _mask_embeddings_by_frequency(
     if low_freq_mask.any():
         unique_embs[low_freq_mask, -mask_dims:] = 0.0
 
-    for i in range(unique_embs.size(0)):
-        print(
-            f"Row {i}: score = {scores[i].item()}, last {mask_dims} dims = {unique_embs[i, -mask_dims:].tolist()}"
-        )
-
 
 # TODO: BatchedDynamicEmbeddingFunction is more concrete.
 class DynamicEmbeddingBagFunction(torch.autograd.Function):
