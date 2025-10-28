@@ -386,6 +386,9 @@ class DynamicEmbTableOptions(_ContextOptions):
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
+    # Frequency-based masking parameters
+    frequency_threshold: int = 0  # frequency threshold for masking (0 = disabled)
+    mask_dims: int = 0  # number of dimensions to mask (0 = disabled)
 
     def __post_init__(self):
         assert (

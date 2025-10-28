@@ -70,7 +70,9 @@ def _mask_embeddings_by_frequency(
     batch = unique_keys.size(0)
     if batch == 0:
         return
-
+    assert hasattr(
+        storage, "query_scores"
+    ), "If you want to use frequency masking, storage must implement the query_scores method"
     # Query scores from cache and storage
     if cache is not None:
         # 1. Query cache first
@@ -92,6 +94,10 @@ def _mask_embeddings_by_frequency(
     low_freq_mask = scores < frequency_threshold
     if low_freq_mask.any():
         unique_embs[low_freq_mask, -mask_dims:] = 0.0
+    for i in range(unique_embs.size(0)):
+        print(
+            f"Row {i}: score = {scores[i].item()}, last {mask_dims} dims = {unique_embs[i, -mask_dims:].tolist()}"
+        )
 
 
 # TODO: BatchedDynamicEmbeddingFunction is more concrete.
