@@ -1,5 +1,6 @@
 [tool.mypy]
 exclude = [
+  "examples/hstu/tmp_data",
   "examples/hstu/ops/triton_ops/*",
   "examples/hstu/ops/fused_hstu_op.py",
   "corelib/*",
