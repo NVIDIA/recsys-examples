@@ -157,20 +157,17 @@ def DynamicEmbDump(
         )
         return
 
-    for _, current_collection in enumerate(collections_list):
-        (
-            collection_path,
-            _,
-            current_collection_module,
-        ) = current_collection
+    for collection_path, _, _ in collections_list:
+        full_collection_path = os.path.join(path, collection_path)
+        if not os.path.exists(full_collection_path):
+            os.makedirs(full_collection_path, exist_ok=True)
+    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
+
+    for collection_path, _, current_collection_module in collections_list:
         full_collection_path = os.path.join(path, collection_path)
         current_dynamic_emb_module_list = get_dynamic_emb_module(
             current_collection_module
         )
-
-        if not os.path.exists(full_collection_path):
-            os.makedirs(full_collection_path, exist_ok=True)
-
         table_names_to_dump = (
             table_names.get(collection_path, None) if table_names else None
         )
