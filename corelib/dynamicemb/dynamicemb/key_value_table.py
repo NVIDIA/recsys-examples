@@ -34,6 +34,7 @@ from dynamicemb_extensions import (
     EvictStrategy,
     clear,
     count_matched,
+    device_timestamp,
     dyn_emb_capacity,
     dyn_emb_cols,
     dyn_emb_rows,
@@ -161,27 +162,27 @@ def load_key_values(
         else embeddings
     )
 
-    if dynamic_table.evict_strategy() == EvictStrategy.KLru:
-        if scores is not None:
-            raise RuntimeError("Scores are not supported for KLru evict strategy")
-    else:
-        if scores is None:
-            raise RuntimeError("Scores are required for non-KLru evict strategy")
-
     key_type = dyn_emb_to_torch(dynamic_table.key_type())
     value_type = dyn_emb_to_torch(dynamic_table.value_type())
-    if scores is not None:
-        insert_or_assign(
-            dynamic_table,
-            keys.numel(),
-            keys.to(key_type),
-            values.to(value_type),
-            scores.to(SCORE_TYPE),
-        )
-    else:
+
+    if scores is None:
+        assert (
+            dynamic_table.evict_strategy() == EvictStrategy.KLru
+        ), "scores is None for KLru evict strategy is allowed but will be deprecated in future."
         insert_or_assign(
             dynamic_table, keys.numel(), keys.to(key_type), values.to(value_type)
         )
+        return
+
+    insert_or_assign(
+        dynamic_table,
+        keys.numel(),
+        keys.to(key_type),
+        values.to(value_type),
+        scores.to(SCORE_TYPE),
+        unique_key=True,
+        ignore_evict_strategy=True,
+    )
 
 
 class KeyValueTable(
@@ -214,6 +215,7 @@ class KeyValueTable(
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
         self._use_score = self.table.evict_strategy() != EvictStrategy.KLru
+        self._timestamp = device_timestamp()
 
     def find_impl(
         self,
@@ -434,6 +436,9 @@ class KeyValueTable(
     def score_update(self, value: bool):
         self._score_update = value
 
+    def update_timestamp(self) -> None:
+        self._timestamp = device_timestamp()
+
     def dump(
         self,
         meta_json_file_path: str,
@@ -448,11 +453,12 @@ class KeyValueTable(
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
+            meta_data["evict_strategy"] = str(self.table.evict_strategy())
             save_to_json(meta_data, meta_json_file_path)
 
         fkey = open(emb_key_path, "wb")
         fembedding = open(embedding_file_path, "wb")
-        fscore = open(score_file_path, "wb") if self._use_score else None
+        fscore = open(score_file_path, "wb")
         fopt_states = open(opt_file_path, "wb") if include_optim else None
 
         for keys, embeddings, opt_states, scores in batched_export_keys_values(
@@ -460,10 +466,12 @@ class KeyValueTable(
         ):
             fkey.write(keys.cpu().numpy().tobytes())
             fembedding.write(embeddings.cpu().numpy().tobytes())
+            if self.table.evict_strategy() == EvictStrategy.KLru:
+                scores = self._timestamp - scores
+            fscore.write(scores.cpu().numpy().tobytes())
             if fopt_states:
                 fopt_states.write(opt_states.cpu().numpy().tobytes())
-            if fscore:
-                fscore.write(scores.cpu().numpy().tobytes())
+
         fkey.close()
         fembedding.close()
 
@@ -494,16 +502,22 @@ class KeyValueTable(
                 f"Optimizer type mismatch: {opt_type} != {self.optimizer.get_opt_args().get('opt_type')}. Will not load optimizer states."
             )
 
+        evict_strategy = meta_data.get("evict_strategy", None)
+        if evict_strategy and str(self.table.evict_strategy()) != evict_strategy:
+            raise ValueError(
+                f"Evict strategy mismatch: {evict_strategy} != {self.table.evict_strategy()}"
+            )
+
+        if score_file_path is None:
+            print(
+                f"Score file {score_file_path} does not exist. Will not load score states."
+            )
+
         if not opt_file_path or not os.path.exists(opt_file_path):
             include_optim = False
             print(
                 f"Optimizer file {opt_file_path} does not exist. Will not load optimizer states."
             )
-
-        if self._use_score:
-            assert score_file_path and os.path.exists(
-                score_file_path
-            ), f"Score file {score_file_path} not found."
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -518,9 +532,12 @@ class KeyValueTable(
 
         fkey = open(emb_key_path, "rb")
         fembedding = open(embedding_file_path, "rb")
-        fscore = open(score_file_path, "rb") if self._use_score else None
+        fscore = (
+            open(score_file_path, "rb")
+            if score_file_path and os.path.exists(score_file_path)
+            else None
+        )
         fopt_states = open(opt_file_path, "rb") if include_optim else None
-
         num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
 
         num_embeddings = (
@@ -598,6 +615,8 @@ class KeyValueTable(
                     dtype=SCORE_TYPE,
                     device=device,
                 )
+                if self.table.evict_strategy() == EvictStrategy.KLru:
+                    scores = torch.clamp(self._timestamp - scores, min=0)
 
             masks = keys % world_size == rank
             keys = keys[masks]
