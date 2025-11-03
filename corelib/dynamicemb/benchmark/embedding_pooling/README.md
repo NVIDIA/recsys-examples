@@ -1,3 +1,55 @@
+## Result(new)
+### Benchmark with autotune
+```
+Small segs: 1000 segs, dim=128, avg_len=10, total=10074
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.0413 ms
+    CUDA kernel:   0.0057 ms  (vs Triton:  7.22x)
+    PyTorch:       0.1481 ms  (vs Triton:  3.59x)
+
+Medium segs: 1000 segs, dim=256, avg_len=50, total=49247
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.0413 ms
+    CUDA kernel:   0.0372 ms  (vs Triton:  1.11x)
+    PyTorch:       0.2058 ms  (vs Triton:  4.98x)
+
+Large segs: 500 segs, dim=256, avg_len=150, total=74682
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.0498 ms
+    CUDA kernel:   0.0529 ms  (vs Triton:  0.94x)
+    PyTorch:       0.1807 ms  (vs Triton:  3.63x)
+
+Very large: 100 segs, dim=512, avg_len=600, total=60021
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.1169 ms
+    CUDA kernel:   0.1251 ms  (vs Triton:  0.93x)
+    PyTorch:       0.3132 ms  (vs Triton:  2.68x)
+
+Many small: 10000 segs, dim=128, avg_len=20, total=196420
+  → Strategy: PyTorch
+
+  Results:
+    Triton:        0.2119 ms
+    CUDA kernel:   0.0676 ms  (vs Triton:  3.13x)
+    PyTorch:       0.2125 ms  (vs Triton:  1.00x)
+
+Huge batch: 20000 segs, dim=128, avg_len=15, total=289247
+  → Strategy: PyTorch
+
+  Results:
+    Triton:        0.2738 ms
+    CUDA kernel:   0.0989 ms  (vs Triton:  2.77x)
+    PyTorch:       0.2758 ms  (vs Triton:  1.01x)
+```
+
 ## Result
 ### Correctness
 ```

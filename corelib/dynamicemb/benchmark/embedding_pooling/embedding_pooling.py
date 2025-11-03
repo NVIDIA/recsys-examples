@@ -18,7 +18,29 @@ except ImportError:
 # ============================================================================
 # Triton Kernel: Parallel Reduction (Core Implementation)
 # ============================================================================
-
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 16}, num_warps=2),
+        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 32}, num_warps=4),
+        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 64}, num_warps=4),
+        
+        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 16}, num_warps=2),
+        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 32}, num_warps=4),
+        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 64}, num_warps=8),
+        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 16}, num_warps=4),
+        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 32}, num_warps=4),
+        
+        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 32}, num_warps=8),
+        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 16}, num_warps=4),
+        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 32}, num_warps=8),
+        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 64}, num_warps=8),
+    ],
+    key=['embedding_dim', 'num_segments'],
+    # 可选：prune_configs_by 可以剪枝明显不合理的配置
+    # prune_configs_by={
+    #     'early_config_prune': early_config_prune,
+    # }
+)
 @triton.jit
 def pooling_parallel_reduce_kernel(
     embeddings_ptr,
@@ -130,17 +152,17 @@ def embedding_pooling(
     mode = 0 if pooling_mode == "sum" else 1
     
     # Adaptive block sizes based on embedding dimension
-    if emb_dim <= 64:
-        BLOCK_D = 64
-    elif emb_dim <= 128:
-        BLOCK_D = 128
-    elif emb_dim <= 256:
-        BLOCK_D = 256
-    else:
-        BLOCK_D = 512
+    # if emb_dim <= 64:
+    #     BLOCK_D = 64
+    # elif emb_dim <= 128:
+    #     BLOCK_D = 128
+    # elif emb_dim <= 256:
+    #     BLOCK_D = 256
+    # else:
+    #     BLOCK_D = 512
     
-    # BLOCK_N: number of embeddings to process in parallel
-    BLOCK_N = 32
+    # # BLOCK_N: number of embeddings to process in parallel
+    # BLOCK_N = 32
     
     grid = (num_segs,)
     
@@ -151,8 +173,8 @@ def embedding_pooling(
         embedding_dim=emb_dim,
         num_segments=num_segs,
         pooling_mode=mode,
-        BLOCK_D=BLOCK_D,
-        BLOCK_N=BLOCK_N,
+        # BLOCK_D=BLOCK_D,
+        # BLOCK_N=BLOCK_N,
     )
     
     return output
@@ -381,10 +403,25 @@ def benchmark():
         print(f"\n{name}: {batch} segs, dim={dim}, avg_len={avg_len:.0f}, total={total}")
         print(f"  → Strategy: {strategy}")
         
-        # Warmup
-        for _ in range(10):
-            _ = embedding_pooling(embeddings, offsets, "mean")
-        torch.cuda.synchronize()
+        # Warmup triton autotune
+        # for _ in range(10):
+        #     _ = embedding_pooling(embeddings, offsets, "mean")
+
+        for name, batch, dim, avg_len in configs:
+            warmup_lengths = torch.randint(
+                max(1, avg_len - 10),
+                avg_len + 10,
+                (batch,),
+                device='cuda'
+            )
+            warmup_total = warmup_lengths.sum().item()
+            
+            warmup_embeddings = torch.randn(warmup_total, dim, device='cuda', dtype=torch.float32)
+            warmup_offsets = torch.cat([torch.tensor([0], device='cuda'), warmup_lengths.cumsum(0)])
+            for _ in range(20):
+                _ = embedding_pooling(warmup_embeddings, warmup_offsets, "mean")
+            torch.cuda.synchronize()
+
         
         num_iters = 100 if batch <= 10000 else 50
         
@@ -397,7 +434,7 @@ def benchmark():
         
         # Warmup cuda
         if CUDA_AVAILABLE:
-            for _ in range(10):
+            for _ in range(20):
                 _ = embedding_pooling_cuda_wrapper(embeddings, offsets, "mean")
             torch.cuda.synchronize()
         # Benchmark CUDA kernel (if available)
@@ -411,7 +448,7 @@ def benchmark():
             cuda_time = None
         
         # Warmup pytorch
-        for _ in range(10):
+        for _ in range(20):
             _ = embedding_pooling_torch(embeddings, offsets, "mean")
         torch.cuda.synchronize()
         
@@ -424,7 +461,7 @@ def benchmark():
         
         # Warmup reference
         if batch <= 10000:
-            for _ in range(10):
+            for _ in range(20):
                 _ = embedding_pooling_reference(embeddings, offsets, "mean")
             torch.cuda.synchronize()
         # Benchmark Reference (leadership's version) - skip for huge batches
