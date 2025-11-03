@@ -335,8 +335,8 @@ def test_model_load_dump(
     mode: str,
     save_path: str,
     optim: bool,
-    batch_size: int = 8,
-    num_iterations: int = 2,
+    batch_size: int = 128,
+    num_iterations: int = 10,
 ):
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
@@ -420,7 +420,7 @@ def test_model_load_dump(
             for kjt in reversed(all_kjts):
                 keys = kjt[feature_name].values().tolist()
                 for key in keys:
-                    if key not in key_to_score_dict and dist.world_size() > 1:
+                    if key not in key_to_score_dict and dist.get_world_size() > 1:
                         continue
                     score = key_to_score_dict[key]
                     assert (
@@ -428,7 +428,7 @@ def test_model_load_dump(
                     ), f"key {key} score {score} should be <= min_score {min_score}"
 
                 for key in set(keys):
-                    if key not in key_to_score_dict and dist.world_size() > 1:
+                    if key not in key_to_score_dict and dist.get_world_size() > 1:
                         continue
                     min_score = min(min_score, key_to_score_dict[key])
                     key_to_score_dict[key] = float("-inf")

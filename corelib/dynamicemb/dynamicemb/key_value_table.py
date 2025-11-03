@@ -618,13 +618,14 @@ class KeyValueTable(
                 if self.table.evict_strategy() == EvictStrategy.KLru:
                     scores = torch.clamp(self._timestamp - scores, min=0)
 
-            masks = keys % world_size == rank
-            keys = keys[masks]
-            embeddings = embeddings[masks, :]
-            if scores is not None:
-                scores = scores[masks]
-            if opt_states is not None:
-                opt_states = opt_states[masks, :]
+            if world_size > 1:
+                masks = keys % world_size == rank
+                keys = keys[masks]
+                embeddings = embeddings[masks, :]
+                if scores is not None:
+                    scores = scores[masks]
+                if opt_states is not None:
+                    opt_states = opt_states[masks, :]
             load_key_values(self.table, keys, embeddings, scores, opt_states)
 
         fkey.close()

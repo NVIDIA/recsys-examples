@@ -1215,7 +1215,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 save_dir, table_name, rank, world_size, "opt_values"
             )
 
-            if isinstance(storage, KeyValueTable) and storage._use_score:
+            if isinstance(storage, KeyValueTable) and not storage._use_score:
+                dist.barrier()  # sync global timestamp
                 cast(KeyValueTable, storage).update_timestamp()
             storage.dump(
                 meta_file_path,
@@ -1260,7 +1261,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
             meta_json_file = encode_meta_json_file_path(save_dir, table_name)
 
-            if isinstance(storage, KeyValueTable) and storage._use_score:
+            if isinstance(storage, KeyValueTable) and not storage._use_score:
                 cast(KeyValueTable, storage).update_timestamp()
             num_key_files = len(emb_key_files)
             for i in range(num_key_files):
