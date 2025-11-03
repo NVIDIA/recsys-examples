@@ -146,7 +146,12 @@ class TPLayerNormMulDropout(torch.nn.Module):
         if self._shard_weight:
             weight = gather_along_last_dim(self.weight, self._tp_pg)
             bias = gather_along_last_dim(self.bias, self._tp_pg)
-
+        # we actually need to allgather along the head dimension
+        # but we only support ag along the first and last dimension
+        # and thus we need to reshape u to a 2D tensor, which might introduce
+        # data copy
+        if u.dim() == 3 and self._tp_size > 1:
+            u = u.reshape(u.size(0), -1).contiguous()
         # allgather the activations
         full_x = gather_along_last_dim(x, self._tp_pg)
         full_u = gather_along_last_dim(u, self._tp_pg)

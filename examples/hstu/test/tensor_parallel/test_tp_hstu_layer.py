@@ -188,6 +188,7 @@ def test_tp_hstu_layer_forward_backward(
     hstu_config.kernel_backend = KernelBackend.PYTORCH
     fp32_debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
 
+    init_module_from(fp32_debug_hstu_layer, debug_hstu_layer)
     init_tpN_weights_from_debug(debug_hstu_layer.module, tp_hstu_layer.module)
     jd_list, ref_jd_list, fp32_ref_jd_list = generate_jagged_data_list(
         batchsize, dtype, hidden_dim_per_head, num_heads, 100, False
