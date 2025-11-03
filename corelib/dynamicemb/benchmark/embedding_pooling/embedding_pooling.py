@@ -23,17 +23,21 @@ except ImportError:
         triton.Config({'BLOCK_D': 64, 'BLOCK_N': 16}, num_warps=2),
         triton.Config({'BLOCK_D': 64, 'BLOCK_N': 32}, num_warps=4),
         triton.Config({'BLOCK_D': 64, 'BLOCK_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 128}, num_warps=4),
         
         triton.Config({'BLOCK_D': 128, 'BLOCK_N': 16}, num_warps=2),
         triton.Config({'BLOCK_D': 128, 'BLOCK_N': 32}, num_warps=4),
         triton.Config({'BLOCK_D': 128, 'BLOCK_N': 64}, num_warps=8),
+        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 128}, num_warps=8),
         triton.Config({'BLOCK_D': 256, 'BLOCK_N': 16}, num_warps=4),
         triton.Config({'BLOCK_D': 256, 'BLOCK_N': 32}, num_warps=4),
+        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 128}, num_warps=8),
         
         triton.Config({'BLOCK_D': 256, 'BLOCK_N': 32}, num_warps=8),
         triton.Config({'BLOCK_D': 512, 'BLOCK_N': 16}, num_warps=4),
         triton.Config({'BLOCK_D': 512, 'BLOCK_N': 32}, num_warps=8),
         triton.Config({'BLOCK_D': 512, 'BLOCK_N': 64}, num_warps=8),
+        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 128}, num_warps=8),
     ],
     key=['embedding_dim', 'num_segments'],
     # 可选：prune_configs_by 可以剪枝明显不合理的配置

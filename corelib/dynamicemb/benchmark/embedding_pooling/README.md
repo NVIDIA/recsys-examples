@@ -5,49 +5,49 @@ Small segs: 1000 segs, dim=128, avg_len=10, total=10074
   → Strategy: Triton
 
   Results:
-    Triton:        0.0391 ms
-    CUDA kernel:   0.0057 ms  (vs Triton:  6.83x)
-    PyTorch:       0.1499 ms  (vs Triton:  3.83x)
+    Triton:        0.0398 ms
+    CUDA kernel:   0.0057 ms  (vs Triton:  6.98x)
+    PyTorch:       0.1487 ms  (vs Triton:  3.73x)
 
 Medium segs: 1000 segs, dim=256, avg_len=50, total=49247
   → Strategy: Triton
 
   Results:
-    Triton:        0.0389 ms
-    CUDA kernel:   0.0371 ms  (vs Triton:  1.05x)
-    PyTorch:       0.1530 ms  (vs Triton:  3.94x)
+    Triton:        0.0395 ms
+    CUDA kernel:   0.0371 ms  (vs Triton:  1.06x)
+    PyTorch:       0.1538 ms  (vs Triton:  3.90x)
 
 Large segs: 500 segs, dim=256, avg_len=150, total=74682
   → Strategy: Triton
 
   Results:
-    Triton:        0.0496 ms
-    CUDA kernel:   0.0530 ms  (vs Triton:  0.94x)
-    PyTorch:       0.1787 ms  (vs Triton:  3.60x)
+    Triton:        0.0498 ms
+    CUDA kernel:   0.0529 ms  (vs Triton:  0.94x)
+    PyTorch:       0.1836 ms  (vs Triton:  3.69x)
 
 Very large: 100 segs, dim=512, avg_len=600, total=60021
   → Strategy: Triton
 
   Results:
-    Triton:        0.1167 ms
-    CUDA kernel:   0.1255 ms  (vs Triton:  0.93x)
-    PyTorch:       0.3127 ms  (vs Triton:  2.68x)
-  
+    Triton:        0.0736 ms
+    CUDA kernel:   0.1256 ms  (vs Triton:  0.59x)
+    PyTorch:       0.3117 ms  (vs Triton:  4.24x)
+
 Many small: 10000 segs, dim=128, avg_len=20, total=196420
   → Strategy: PyTorch
 
   Results:
-    Triton:        0.0657 ms
-    CUDA kernel:   0.0676 ms  (vs Triton:  0.97x)
-    PyTorch:       0.2164 ms  (vs Triton:  3.29x)
+    Triton:        0.0659 ms
+    CUDA kernel:   0.0678 ms  (vs Triton:  0.97x)
+    PyTorch:       0.2135 ms  (vs Triton:  3.24x)
 
 Huge batch: 20000 segs, dim=128, avg_len=15, total=289247
   → Strategy: PyTorch
 
   Results:
-    Triton:        0.0949 ms
-    CUDA kernel:   0.0991 ms  (vs Triton:  0.96x)
-    PyTorch:       0.2778 ms  (vs Triton:  2.93x)
+    Triton:        0.0950 ms
+    CUDA kernel:   0.0989 ms  (vs Triton:  0.96x)
+    PyTorch:       0.2777 ms  (vs Triton:  2.92x)
 ```
 
 ## Result
