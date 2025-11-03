@@ -172,8 +172,10 @@ def test_tp_hstu_layer_forward_backward(
         kernel_backend=attn_backend,  # attn_backend
         target_group_size=1,
         hstu_layer_type=HSTULayerType.DEBUG,
-        learnable_input_layernorm=True,
+        learnable_input_layernorm=False,
         residual=True,
+        add_uvqk_bias=True,  # can disable bias for better debugging
+        fuse_norm_mul_dropout=True,  # can disable triton for better debugging
     )
     torch.cuda.current_device()
 
@@ -188,31 +190,38 @@ def test_tp_hstu_layer_forward_backward(
     hstu_config.kernel_backend = KernelBackend.PYTORCH
     fp32_debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
 
+    init_module_from(fp32_debug_hstu_layer, debug_hstu_layer)
     init_tpN_weights_from_debug(debug_hstu_layer.module, tp_hstu_layer.module)
+
     jd_list, ref_jd_list, fp32_ref_jd_list = generate_jagged_data_list(
         batchsize, dtype, hidden_dim_per_head, num_heads, 100, False
     )
-    for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
-        zip(jd_list, ref_jd_list, fp32_ref_jd_list)
-    ):
-        out_legacy = debug_hstu_layer(ref_jd).values
-        fp32_out_legacy = fp32_debug_hstu_layer(fp32_ref_jd).values
-        tp_out = tp_hstu_layer(jd).values
+    with init.auto_destroy_global_state():
+        for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
+            zip(jd_list, ref_jd_list, fp32_ref_jd_list)
+        ):
+            out_legacy = debug_hstu_layer(ref_jd).values
+            fp32_out_legacy = fp32_debug_hstu_layer(fp32_ref_jd).values
+            tp_out = tp_hstu_layer(jd).values
 
-        assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
-        # use normal distribution
-        dout = torch.empty_like(out_legacy)
-        dout.normal_() / 2**2
-        out_legacy.backward(dout)
-        tp_out.backward(dout)
-        fp32_out_legacy.backward(dout.float())
-        grad_legacy = ref_jd.values.grad
-        grad_tp = jd.values.grad
-        grad_fp32_legacy = fp32_ref_jd.values.grad
-        assert_hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, fwd=False)
-    init.destroy_global_state()
+            assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
+            collective_assert(
+                hstu_close(tp_out, out_legacy, fp32_out_legacy, multiplier=2),
+                f"logits mismatch at iter {i}, diff {(tp_out - out_legacy).abs().max()} vs {(out_legacy - fp32_out_legacy).abs().max()} vs hey {(tp_out - out_legacy).abs().max()}",
+            )
+            # use normal distribution
+            dout = torch.empty_like(out_legacy)
+            dout.normal_() / 2**2
+            out_legacy.backward(dout)
+            tp_out.backward(dout)
+            fp32_out_legacy.backward(dout.float())
+            grad_legacy = ref_jd.values.grad
+            grad_tp = jd.values.grad
+            grad_fp32_legacy = fp32_ref_jd.values.grad
+            assert_hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, fwd=False)
 
 
+# set backend as PYTORCH
 @pytest.mark.parametrize(
     "batchsize",
     [128],
@@ -302,59 +311,62 @@ def test_tp_hstu_layer_forward_backward_update(
         replicate_batches=False,
     )
     multiplier = 2
-    for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
-        zip(jd_list, ref_jd_list, fp32_ref_jd_list)
-    ):
-        zero_grad(debug_dense_optimizer, debug_hstu_layer)
-        zero_grad(tp_dense_optimizer, tp_hstu_layer)
-        zero_grad(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
 
-        logits = debug_hstu_layer(ref_jd).values
-        logits_fp32 = fp32_debug_hstu_layer(fp32_ref_jd).values
-        tp_logits = tp_hstu_layer(jd).values
+    with init.auto_destroy_global_state():
+        for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
+            zip(jd_list, ref_jd_list, fp32_ref_jd_list)
+        ):
+            zero_grad(debug_dense_optimizer, debug_hstu_layer)
+            zero_grad(tp_dense_optimizer, tp_hstu_layer)
+            zero_grad(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
 
-        collective_assert_tensor(
-            logits_fp32,
-            compare_type="equal",
-            pg=parallel_state.get_tensor_model_parallel_group(),
-        )
-        collective_assert_tensor(
-            logits,
-            compare_type="equal",
-            pg=parallel_state.get_tensor_model_parallel_group(),
-        )
-        collective_assert_tensor(
-            tp_logits,
-            compare_type="equal",
-            pg=parallel_state.get_tensor_model_parallel_group(),
-        )
+            logits = debug_hstu_layer(ref_jd).values
+            logits_fp32 = fp32_debug_hstu_layer(fp32_ref_jd).values
+            tp_logits = tp_hstu_layer(jd).values
 
-        collective_assert(
-            hstu_close(tp_logits, logits, logits_fp32, multiplier=multiplier),
-            f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
-        )
-        # use normal distribution
-        dout = torch.empty_like(tp_logits)
-        dout.normal_() / 2**2
-        logits.backward(dout)
-        tp_logits.backward(dout)
-        logits_fp32.backward(dout.float())
+            collective_assert_tensor(
+                logits_fp32,
+                compare_type="equal",
+                pg=parallel_state.get_tensor_model_parallel_group(),
+            )
+            collective_assert_tensor(
+                logits,
+                compare_type="equal",
+                pg=parallel_state.get_tensor_model_parallel_group(),
+            )
+            collective_assert_tensor(
+                tp_logits,
+                compare_type="equal",
+                pg=parallel_state.get_tensor_model_parallel_group(),
+            )
 
-        # optimizer step
-        optimizer_step(tp_dense_optimizer, tp_hstu_layer)
-        optimizer_step(debug_dense_optimizer, debug_hstu_layer)
-        optimizer_step(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
-        compare_tpN_to_debug_weights(tp_model, debug_model, debug_model_fp32)
+            collective_assert(
+                hstu_close(tp_logits, logits, logits_fp32, multiplier=multiplier),
+                f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
+            )
+            # use normal distribution
+            dout = torch.empty_like(tp_logits)
+            dout.normal_() / 2**2
+            logits.backward(dout)
+            tp_logits.backward(dout)
+            logits_fp32.backward(dout.float())
 
-        grad_legacy = ref_jd.values.grad
-        grad_tp = jd.values.grad
-        grad_fp32_legacy = fp32_ref_jd.values.grad
-        collective_assert(
-            hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, multiplier=multiplier),
-            f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_legacy).abs().max()} vs {(grad_legacy - grad_fp32_legacy).abs().max()} vs hey {(grad_tp - grad_legacy).abs().max()}",
-        )
-        print(
-            f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
-        )
-        multiplier = 2 if i == 0 else multiplier
-    init.destroy_global_state()
+            # optimizer step
+            optimizer_step(tp_dense_optimizer, tp_hstu_layer)
+            optimizer_step(debug_dense_optimizer, debug_hstu_layer)
+            optimizer_step(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
+            compare_tpN_to_debug_weights(tp_model, debug_model, debug_model_fp32)
+
+            grad_legacy = ref_jd.values.grad
+            grad_tp = jd.values.grad
+            grad_fp32_legacy = fp32_ref_jd.values.grad
+            collective_assert(
+                hstu_close(
+                    grad_tp, grad_legacy, grad_fp32_legacy, multiplier=multiplier
+                ),
+                f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_legacy).abs().max()} vs {(grad_legacy - grad_fp32_legacy).abs().max()} vs hey {(grad_tp - grad_legacy).abs().max()}",
+            )
+            print(
+                f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
+            )
+            multiplier = 2 if i == 0 else multiplier

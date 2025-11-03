@@ -25,6 +25,9 @@ except ImportError:
     tensor_parallel = None
 
 
+from contextlib import contextmanager
+
+
 def initialize_single_rank():
     if torch.distributed.is_initialized():
         return
@@ -47,11 +50,13 @@ def initialize_distributed():
     backend = "nccl"
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend=backend)
+    # print(f'[global rank {torch.distributed.get_rank()}] process group initialized')
 
 
 def initialize_model_parallel(tensor_model_parallel_size=1):
     if parallel_state.model_parallel_is_initialized():
         return
+    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size,
     )
@@ -73,6 +78,14 @@ def destroy_global_state():
         parallel_state.destroy_model_parallel()
     torch.cuda.empty_cache()
     gc.collect()
+
+
+@contextmanager
+def auto_destroy_global_state():
+    try:
+        yield
+    finally:
+        destroy_global_state()
 
 
 def set_random_seed(seed_):
