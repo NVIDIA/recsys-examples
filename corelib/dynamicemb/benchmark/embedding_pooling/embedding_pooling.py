@@ -137,11 +137,6 @@ def embedding_pooling(
     num_segs = offsets.shape[0] - 1
     emb_dim = embeddings.shape[1]
     
-    # For very large number of segments, PyTorch native is better
-    # (avoids compilation overhead and benefits from single kernel launch)
-    if num_segs > 5000:
-        return embedding_pooling_torch(embeddings, offsets, pooling_mode)
-    
     # Use Triton parallel reduction
     output = torch.empty(
         (num_segs, emb_dim),
@@ -150,19 +145,6 @@ def embedding_pooling(
     )
     
     mode = 0 if pooling_mode == "sum" else 1
-    
-    # Adaptive block sizes based on embedding dimension
-    # if emb_dim <= 64:
-    #     BLOCK_D = 64
-    # elif emb_dim <= 128:
-    #     BLOCK_D = 128
-    # elif emb_dim <= 256:
-    #     BLOCK_D = 256
-    # else:
-    #     BLOCK_D = 512
-    
-    # # BLOCK_N: number of embeddings to process in parallel
-    # BLOCK_N = 32
     
     grid = (num_segs,)
     
@@ -173,8 +155,6 @@ def embedding_pooling(
         embedding_dim=emb_dim,
         num_segments=num_segs,
         pooling_mode=mode,
-        # BLOCK_D=BLOCK_D,
-        # BLOCK_N=BLOCK_N,
     )
     
     return output
