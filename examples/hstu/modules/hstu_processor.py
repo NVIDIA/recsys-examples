@@ -20,13 +20,20 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig
 from configs.inference_config import InferenceHSTUConfig
 from dataset.utils import RankingBatch
-from modules.jagged_data import JaggedData
+from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from ops.length_to_offsets import length_to_complete_offsets
 from ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from torchrec.sparse.jagged_tensor import JaggedTensor
+
+try:
+    from megatron.core import parallel_state
+
+    SUPPORT_TRAINING = True
+except ImportError:
+    SUPPORT_TRAINING = False
 
 
 def hstu_preprocess_embeddings(
@@ -216,6 +223,12 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             self._training_dtype = torch.bfloat16
         if config.fp16:
             self._training_dtype = torch.float16
+        self._sequence_parallel = config.sequence_parallel
+        self._tp_size = 1
+        if is_inference:
+            self._sequence_parallel = False
+        if not is_inference and SUPPORT_TRAINING:
+            self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
 
         self._item_mlp = None
         self._contextual_mlp = None
@@ -268,7 +281,8 @@ class HSTUBlockPreprocessor(torch.nn.Module):
         This method performs the following steps:
         1. **Interleaving**: If action embeddings are present, interleaves them with item embeddings.
         2. **Concatenation**: Concatenates contextual, item, and action embeddings for each sample, following the order specified in the batch.
-        3. **Position Encoding**: Applies position encoding to the concatenated embeddings.
+        3. **Padding**: Pads the jagged length of JaggedData to the TP size if sequence parallel is enabled.
+        4. **Position Encoding**: Applies position encoding to the concatenated embeddings.
 
         Args:
             embeddings (Dict[str, JaggedTensor]): A dictionary of embeddings where each key corresponds to a feature name and the value is a jagged tensor.
@@ -289,7 +303,8 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             dtype=self._training_dtype,
             scaling_seqlen=self._scaling_seqlen,
         )
-
+        if self._sequence_parallel:
+            jd = pad_jd_values(jd, self._tp_size)
         if self._positional_encoder is not None:
             jd.values = self._positional_encoder(
                 max_seq_len=jd.max_seqlen,
@@ -341,6 +356,9 @@ class HSTUBlockPostprocessor(torch.nn.Module):
         sequence_embeddings: torch.Tensor
         seqlen_offsets: torch.Tensor
         max_seqlen: int
+
+        # we need to remove the padding
+        jd = unpad_jd_values(jd)
         if jd.max_num_candidates > 0:
             seqlen_offsets = jd.num_candidates_offsets
             max_seqlen = jd.max_num_candidates

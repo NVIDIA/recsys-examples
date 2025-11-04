@@ -149,6 +149,7 @@ def get_hstu_config(
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     target_group_size: int = 1,
     hstu_layer_type: HSTULayerType = HSTULayerType.FUSED,
+    sequence_parallel: bool = False,
     learnable_input_layernorm: bool = True,
     residual: bool = True,
     async_wgrad: bool = False,
@@ -212,6 +213,7 @@ def get_hstu_config(
         context_parallel_size=parallel_state.get_pipeline_model_parallel_world_size()
         if not is_inference
         else 1,
+        sequence_parallel=sequence_parallel,
         fp16=is_fp16,
         is_causal=is_causal,
         kernel_backend=kernel_backend,

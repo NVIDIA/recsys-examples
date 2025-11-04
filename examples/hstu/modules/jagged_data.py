@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import dataclasses
 import pprint
 from typing import Optional
@@ -43,6 +44,7 @@ class JaggedData:
     values: torch.Tensor
     seqlen: torch.Tensor  # (batch_size, )
     seqlen_offsets: torch.Tensor  # (batch_size + 1)
+
     max_seqlen: int
 
     max_num_candidates: int = 0
@@ -55,6 +57,27 @@ class JaggedData:
 
     has_interleaved_action: bool = False
     scaling_seqlen: int = -1
+    padding_length: int = (
+        0  # the padded length of the values tensor, this is used when SP is on
+    )
+
+    def copy_others_but_set_values(self, values: Optional[torch.Tensor] = None):
+        """
+        copy all other fields but set values to the given tensor
+        """
+        new_instance = self.__class__.__new__(self.__class__)
+        for key, value in self.__dict__.items():
+            if key == "values":
+                new_instance.values = (
+                    values
+                    if values is not None
+                    else torch.tensor(
+                        [], device=self.values.device, dtype=self.values.dtype
+                    )
+                )
+            else:
+                setattr(new_instance, key, copy.deepcopy(value))
+        return new_instance
 
     def __post_init__(self):
         if self.max_num_candidates == 0:
@@ -242,3 +265,46 @@ class JaggedData:
             has_interleaved_action=self.has_interleaved_action,
             scaling_seqlen=self.scaling_seqlen,
         )
+
+
+def pad_jd_values(jd: JaggedData, pad_base: int, dim=0) -> JaggedData:
+    """
+    With sequence parallel, there will be Allgather & ReduceScatter communication among TP ranks during training.
+    We need to pad the jagged length of JaggedData to the TP size.
+
+    To make it differentiable, we need to return a new JaggedData instance.
+    """
+    # assert jd.padding_length == 0, "JaggedData must not be padded"
+    assert dim == 0, "Only padding along the first dimension is supported"
+    length = jd.seqlen_offsets[-1]
+    # Check if already aligned
+    if length % pad_base == 0:
+        return jd
+
+    aligned_size = ((length + pad_base - 1) // pad_base) * pad_base
+    values = jd.values
+    assert values.dim() == 2, "Values must be a 2D tensor"
+    assert values.size(0) == length, "Values shape & jagged length mismatch"
+    output_jd = jd.copy_others_but_set_values(
+        values=torch.nn.functional.pad(
+            values, (0, 0, 0, aligned_size - length), "constant", 0
+        )
+    )
+    output_jd.padding_length = aligned_size - length
+    return output_jd
+
+
+def unpad_jd_values(jd: JaggedData, dim=0) -> JaggedData:
+    """
+    Unpad the jagged length of JaggedData when SP is disabled.
+    To make it differentiable, we need to return a new JaggedData instance.
+    """
+    assert dim == 0, "Only unpadding along the first dimension is supported"
+    padding_length = jd.padding_length
+    if padding_length == 0:
+        return jd
+    output_jd = jd.copy_others_but_set_values(
+        values=jd.values[0 : jd.seqlen_offsets[-1], ...]
+    )
+    output_jd.padding_length = 0
+    return output_jd

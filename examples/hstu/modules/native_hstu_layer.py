@@ -80,6 +80,7 @@ class HSTULayer(MegatronModule):
             self.silu_checkpoint = CheckpointWithoutOutput()
         self._residual = config.residual
         device = torch.cuda.current_device()
+        self._sequence_parallel = config.sequence_parallel
         # input layernorm
         if config.learnable_input_layernorm:
             self._input_layernorm_weight = torch.nn.Parameter(
@@ -88,28 +89,35 @@ class HSTULayer(MegatronModule):
             self._input_layernorm_bias = torch.nn.Parameter(
                 torch.zeros(self._embedding_dim, device=device)
             )
+            # this flag will be used in finalize_model_grads!
+            # see https://github.com/NVIDIA/Megatron-LM/blob/core_v0.13.0/megatron/core/distributed/finalize_model_grads.py#L286-L288
+            self._input_layernorm_weight.sequence_parallel = self._sequence_parallel
+            self._input_layernorm_bias.sequence_parallel = self._sequence_parallel
         else:
             self._input_layernorm_weight = None
             self._input_layernorm_bias = None
+
         self._output_ln_dropout_mul = TPLayerNormMulDropout(
             hidden_size=self._num_heads * self._linear_dim_per_head,
             eps=self._eps,
             trainable=True,
-            shard_weight=False,
             dropout_ratio=self._dropout_ratio,
             fusion=config.fuse_norm_mul_dropout,
+            sequence_parallel=True,
         )
         # [embedding_dim, 4 * num_head * head_dim]
+        # config.sequence_parallel=False
         self._linear_uvqk = TEColumnParallelLinear(
             input_size=self._embedding_dim,
             output_size=sum(self._split_arg_list) * self._num_heads,
             init_method=config.init_method,
-            config=config,
+            config=config,  # sequence_parallel is handled in TEColumnParallelLinear
             bias=config.add_uvqk_bias,
             gather_output=False,
             skip_bias_add=False,  # note: TEColumnParallelLinear does not support bias fusion!
             is_expert=False,
         )
+        # config.sequence_parallel=True
         self._debug_shortcut_proj_linear = (
             os.environ.get("DEBUG_SHORTCUT_PROJ_LINEAR", "0") == "1"
         )
@@ -125,7 +133,7 @@ class HSTULayer(MegatronModule):
             input_size=self._linear_dim_per_head * self._num_heads,
             output_size=self._embedding_dim,
             init_method=config.init_method,
-            config=config,
+            config=config,  # sequence_parallel is handled in TEColumnParallelLinear
             input_is_parallel=True,
             bias=False,
             skip_bias_add=False,
@@ -199,6 +207,10 @@ class HSTULayer(MegatronModule):
         Returns:
             Tensor: The output embeddings [\*, D]
         """
+        if self._sequence_parallel:
+            assert (
+                jd.values.shape[0] % self._tp_size == 0
+            ), "sequence parallel is on, but sequence length is not divisible by tp size"
         # input is [*, h]
         x = jd.values
         with nvtx.annotate("hstu input layernorm fwd", color="RED"):
@@ -250,7 +262,9 @@ class HSTULayer(MegatronModule):
                     parallel_input, parallel_state.get_tensor_model_parallel_group()
                 )
             else:
-                output, _ = self._linear_proj(parallel_input)
+                output, _ = self._linear_proj(
+                    parallel_input
+                )  # when sequence parallel is on, the output is scattered
 
             if self._residual:
                 output = output + x
@@ -259,6 +273,7 @@ class HSTULayer(MegatronModule):
             values=output,
             seqlen=jd.seqlen,
             seqlen_offsets=jd.seqlen_offsets,
+            padding_length=jd.padding_length,  # inherit from the input jagged data
             max_seqlen=jd.max_seqlen,
             max_num_candidates=jd.max_num_candidates,
             num_candidates=jd.num_candidates,
