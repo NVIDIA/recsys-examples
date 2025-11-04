@@ -119,11 +119,7 @@ def embedding_pooling(
     pooling_mode: str = "mean"
 ) -> torch.Tensor:
     """
-    High-performance embedding pooling with automatic strategy selection.
-    
-    Strategy:
-    - For many small segments (>5000): Use PyTorch native (single kernel launch)
-    - Otherwise: Use Triton parallel reduction (optimized for medium/long segments)
+    High-performance embedding pooling.
     
     Args:
         embeddings: [total_embeddings, embedding_dim]
