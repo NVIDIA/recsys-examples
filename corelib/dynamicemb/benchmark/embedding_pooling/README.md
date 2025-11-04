@@ -1,4 +1,55 @@
-## Result(new)
+## Backward result
+### Benchmark(1D grid)
+```
+Small segs: 1000 segs, dim=128, avg_len=10, total=10096
+  Results:
+    Triton:    0.8943 ms
+    PyTorch:   1.6809 ms  (ratio:  1.88x)
+    Diff: 1.19e-07 ✓
+
+Medium segs: 1000 segs, dim=256, avg_len=50, total=49767
+  Results:
+    Triton:    1.0001 ms
+    PyTorch:   1.6645 ms  (ratio:  1.66x)
+    Diff: 7.45e-09 ✓
+
+Large segs: 500 segs, dim=256, avg_len=150, total=74505
+  Results:
+    Triton:    0.8936 ms
+    PyTorch:   1.6230 ms  (ratio:  1.82x)
+    Diff: 1.86e-09 ✓
+
+Very large: 100 segs, dim=512, avg_len=600, total=59989
+  Results:
+    Triton:    0.8731 ms
+    PyTorch:   1.6304 ms  (ratio:  1.87x)
+    Diff: 4.66e-10 ✓
+
+Many small: 10000 segs, dim=128, avg_len=20, total=195425
+  Results:
+    Triton:    0.8999 ms
+    PyTorch:   1.6412 ms  (ratio:  1.82x)
+    Diff: 2.98e-08 ✓
+
+
+================================================================================
+Complete Forward + Backward Benchmarking
+================================================================================
+
+Medium: 1000 segs, dim=256, total=49514
+  Forward:   0.8331 ms
+  Backward:  3.7943 ms
+  Total:     4.6274 ms
+  Backward/Forward ratio: 4.55x
+
+Large: 500 segs, dim=512, total=49500
+  Forward:   0.8525 ms
+  Backward:  3.8495 ms
+  Total:     4.7020 ms
+  Backward/Forward ratio: 4.52x
+```
+
+## Forward result(new)
 ### Benchmark with autotune
 ```
 Small segs: 1000 segs, dim=128, avg_len=10, total=10074
