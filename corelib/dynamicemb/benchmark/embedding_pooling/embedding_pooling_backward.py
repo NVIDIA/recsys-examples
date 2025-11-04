@@ -7,163 +7,7 @@ import triton
 import triton.language as tl
 
 
-# ============================================================================
-# Triton Kernel: Pooling Backward (Optimized)
-# ============================================================================
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 16}, num_warps=2),
-        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 32}, num_warps=4),
-        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 64}, num_warps=4),
-        triton.Config({'BLOCK_D': 64, 'BLOCK_N': 128}, num_warps=4),
-        
-        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 16}, num_warps=2),
-        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 32}, num_warps=4),
-        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 64}, num_warps=8),
-        triton.Config({'BLOCK_D': 128, 'BLOCK_N': 128}, num_warps=8),
-        
-        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 16}, num_warps=4),
-        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 32}, num_warps=4),
-        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 64}, num_warps=8),
-        triton.Config({'BLOCK_D': 256, 'BLOCK_N': 128}, num_warps=8),
-        
-        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 16}, num_warps=4),
-        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 32}, num_warps=8),
-        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 64}, num_warps=8),
-        triton.Config({'BLOCK_D': 512, 'BLOCK_N': 128}, num_warps=8),
-    ],
-    key=['embedding_dim', 'num_segments'],
-)
-@triton.jit
-def pooling_backward_kernel(
-    grad_output_ptr,    # [num_segments, embedding_dim]
-    offsets_ptr,        # [num_segments + 1]
-    grad_input_ptr,     # [total_embeddings, embedding_dim]
-    embedding_dim: tl.constexpr,
-    num_segments: tl.constexpr,
-    pooling_mode: tl.constexpr,  # 0=sum, 1=mean
-    BLOCK_D: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """
-    Segment-parallel backward kernel for pooling (scatter operation).
-    
-    Each program processes one segment and scatters gradient to all embeddings in that segment.
-    This mirrors the forward kernel structure - no binary search needed!
-    
-    For mean pooling: grad_embedding = grad_pooled / length
-    For sum pooling:  grad_embedding = grad_pooled
-    """
-    # Each program handles one segment (same as forward!)
-    seg_id = tl.program_id(0)
-    
-    if seg_id >= num_segments:
-        return
-    
-    # Directly read segment boundaries from offsets (no search needed!)
-    start = tl.load(offsets_ptr + seg_id)
-    end = tl.load(offsets_ptr + seg_id + 1)
-    length = end - start
-    
-    # Handle empty segments
-    if length == 0:
-        return
-    
-    # Calculate scale for mean pooling
-    if pooling_mode == 1:
-        scale = 1.0 / length.to(tl.float32)
-    else:
-        scale = 1.0
-    
-    # Process each dimension block
-    for d_off in range(0, embedding_dim, BLOCK_D):
-        d_idx = d_off + tl.arange(0, BLOCK_D)
-        d_mask = d_idx < embedding_dim
-        
-        # Load gradient from pooled output (once per dimension block)
-        grad_offset = seg_id * embedding_dim + d_idx
-        grad = tl.load(grad_output_ptr + grad_offset, mask=d_mask, other=0.0)
-        
-        # Apply scaling for mean pooling
-        if pooling_mode == 1:
-            grad = grad * scale
-        
-        # Parallel scatter: write to all embeddings in this segment
-        # Process BLOCK_N embeddings at once
-        for n_off in range(0, length, BLOCK_N):
-            n_idx = n_off + tl.arange(0, BLOCK_N)
-            n_mask = n_idx < length
-            
-            # 2D store: [BLOCK_N, BLOCK_D]
-            row_idx = start + n_idx
-            indices = row_idx[:, None] * embedding_dim + d_idx[None, :]
-            
-            # Broadcast grad to all embeddings in segment
-            grad_broadcasted = grad[None, :]  # [1, BLOCK_D] -> broadcast to [BLOCK_N, BLOCK_D]
-            
-            tl.store(
-                grad_input_ptr + indices,
-                grad_broadcasted,
-                mask=n_mask[:, None] & d_mask[None, :]
-            )
-
-
-# ============================================================================
-# Python Interface
-# ============================================================================
-
-def embedding_pooling_backward_triton(
-    grad_output: torch.Tensor,  # [num_segments, embedding_dim]
-    offsets: torch.Tensor,      # [num_segments + 1]
-    pooling_mode: str = "mean"
-) -> torch.Tensor:
-    """
-    Triton implementation of pooling backward using segment-parallel scatter.
-    
-    Key optimization: Mirrors forward kernel structure - each program handles one segment.
-    No binary search needed! Direct scatter operation is faster than searching.
-    
-    Args:
-        grad_output: Gradient w.r.t. pooled output [num_segments, embedding_dim]
-        offsets: Segment boundaries [num_segments + 1]
-        pooling_mode: "sum" or "mean"
-    
-    Returns:
-        grad_input: Gradient w.r.t. input embeddings [total_embeddings, embedding_dim]
-    """
-    assert grad_output.dim() == 2 and offsets.dim() == 1
-    assert pooling_mode in ["sum", "mean"]
-    assert grad_output.is_contiguous() and offsets.is_contiguous()
-    assert grad_output.is_cuda and offsets.is_cuda
-    
-    num_segs = offsets.shape[0] - 1
-    emb_dim = grad_output.shape[1]
-    total_embs = offsets[-1].item()
-    
-    # Create output tensor
-    grad_input = torch.empty(
-        (total_embs, emb_dim),
-        dtype=grad_output.dtype,
-        device=grad_output.device
-    )
-    
-    mode = 0 if pooling_mode == "sum" else 1
-    
-    # Grid size = num_segments (same as forward!)
-    grid = (num_segs,)
-    
-    # Launch kernel - segment-parallel scatter, no search needed!
-    pooling_backward_kernel[grid](
-        grad_output_ptr=grad_output,
-        offsets_ptr=offsets,
-        grad_input_ptr=grad_input,
-        embedding_dim=emb_dim,
-        num_segments=num_segs,
-        pooling_mode=mode,
-    )
-    
-    return grad_input
+from embedding_pooling_kernel import embedding_pooling_backward_triton
 
 
 def embedding_pooling_backward_torch(
@@ -373,15 +217,20 @@ def benchmark_forward_backward():
     configs = [
         ("Medium", 1000, 256, 50),
         ("Large", 500, 512, 100),
+        ("Many segments", 10000, 128, 20),
+        ("Mixed lengths", 1000, 128, None),
     ]
     
     for name, batch, dim, avg_len in configs:
-        lengths = torch.randint(
-            max(1, avg_len - 10),
-            avg_len + 10,
-            (batch,),
-            device='cuda'
-        )
+        if avg_len is None:
+            lengths = torch.randint(1, 100, (batch,), device='cuda')
+        else:
+            lengths = torch.randint(
+                max(1, avg_len - 10),
+                avg_len + 10,
+                (batch,),
+                device='cuda'
+            )
         total = lengths.sum().item()
         offsets = torch.cat([torch.tensor([0], device='cuda'), lengths.cumsum(0)])
         
