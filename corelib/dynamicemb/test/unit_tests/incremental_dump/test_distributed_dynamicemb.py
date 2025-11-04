@@ -23,6 +23,8 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import (
     BATCH_SIZE_PER_DUMP,
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
@@ -118,6 +120,9 @@ def get_planner(
             dynamicemb_options=DynamicEmbTableOptions(
                 global_hbm_for_values=1024**3,
                 score_strategy=score_strategies[i],
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.DEBUG,
+                ),
             ),
         )
         dict_const[table_names[i]] = const
@@ -410,5 +415,14 @@ def test_incremental_dump_api(
         undump_score = ret_scores[prefix_path]
         for i, (table_name, indices) in enumerate(zip(table_names, unique_indices)):
             if use_dynamicembs[i]:
-                dumped_indices = set(ret_tensors[prefix_path][table_name][0].tolist())
+                dump_keys = ret_tensors[prefix_path][table_name][0]
+                dump_vals = ret_tensors[prefix_path][table_name][1]
+                dumped_indices = set(dump_keys.tolist())
                 assert indices.issubset(dumped_indices)
+
+                ############### Test the dumped embeddings ###############
+                dump_keys = dump_keys % 100000
+                dump_vals = dump_vals.to(dump_keys.dtype)
+                assert torch.all(
+                    dump_keys.unsqueeze(1).expand(-1, dim).reshape(-1) == dump_vals
+                )

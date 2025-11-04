@@ -229,6 +229,7 @@ def _export_matched_and_gather(
     key_dtype = dynamic_table.key_type()
     value_dtype = dynamic_table.value_type()
     dim: int = dynamic_table.embedding_dim()
+    total_dim = dynamic_table.value_dim()
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
     ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
@@ -239,12 +240,13 @@ def _export_matched_and_gather(
     batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_vals = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_embs = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
     d_count = torch.zeros(1, dtype=torch.uint64, device=device)
 
     # Gather keys and values for all ranks
     gathered_keys = [torch.empty_like(d_keys) for _ in range(world_size)]
-    gathered_vals = [torch.empty_like(d_vals) for _ in range(world_size)]
+    gathered_vals = [torch.empty_like(d_embs) for _ in range(world_size)]
     gathered_counts = [
         torch.empty_like(d_count, dtype=torch.int64) for _ in range(world_size)
     ]
@@ -254,8 +256,9 @@ def _export_matched_and_gather(
             threshold, batch_size, search_offset, d_count, d_keys, d_vals
         )
 
+        d_embs = d_vals.view(batch_size, total_dim)[:, :dim].reshape(-1)
         dist.all_gather(gathered_keys, d_keys, group=pg)
-        dist.all_gather(gathered_vals, d_vals, group=pg)
+        dist.all_gather(gathered_vals, d_embs, group=pg)
         dist.all_gather(gathered_counts, d_count.to(dtype=torch.int64), group=pg)
 
         for d_keys_, d_vals_, d_count_ in zip(
@@ -287,6 +290,7 @@ def _export_matched(
     key_dtype = dynamic_table.key_type()
     value_dtype = dynamic_table.value_type()
     dim: int = dynamic_table.embedding_dim()
+    total_dim = dynamic_table.value_dim()
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
     ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
@@ -297,7 +301,7 @@ def _export_matched(
     batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_vals = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
     d_count = torch.zeros(1, dtype=torch.uint64, device=device)
 
     while search_offset < search_capacity:
@@ -307,9 +311,9 @@ def _export_matched(
 
         h_count = d_count.cpu().item()
         ret_keys[ret_offset : ret_offset + h_count] = d_keys[0:h_count].cpu()
-        ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = d_vals[
-            0 : h_count * dim
-        ].cpu()
+        ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = (
+            d_vals.view(batch_size, total_dim)[:h_count, :dim].reshape(-1).cpu()
+        )
         ret_offset += h_count
 
         search_offset += batch_size
