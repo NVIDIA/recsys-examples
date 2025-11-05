@@ -20,10 +20,7 @@ class PoolingFunction(torch.autograd.Function):
             output[0] = mean([e0, e1, e2])
             output[1] = mean([e3, e4])
         """
-        assert embeddings.dim() == 2 and offsets.dim() == 1
-        assert pooling_mode in ["sum", "mean"]
-        assert embeddings.is_cuda and offsets.is_cuda
-        
+
         if not embeddings.is_contiguous():
             embeddings = embeddings.contiguous()
         if not offsets.is_contiguous():
@@ -108,7 +105,7 @@ class PoolingFunction(torch.autograd.Function):
         return grad_embeddings, None, None
 
 
-def embedding_pooling_with_grad(
+def embedding_pooling(
     embeddings: torch.Tensor,
     offsets: torch.Tensor,
     pooling_mode: str = "mean"
@@ -121,6 +118,10 @@ def embedding_pooling_with_grad(
     Returns:
         pooled: [num_segments, embedding_dim] - Pooled embeddings
     """
+    assert pooling_mode in ['mean', 'sum']
+    assert embeddings.dim() == 2 and offsets.dim() == 1
+    assert embeddings.is_cuda and offsets.is_cuda
+
     return PoolingFunction.apply(embeddings, offsets, pooling_mode)
 
 

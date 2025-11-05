@@ -357,8 +357,6 @@ def benchmark_forward():
     print("Forward Performance Benchmarking")
     print("=" * 80)
     
-    import time
-    
     configs = [
         ("Small segs", 1000, 128, 10),
         ("Medium segs", 1000, 256, 50),
@@ -382,76 +380,71 @@ def benchmark_forward():
         
         # Determine which implementation will be used
         strategy = "PyTorch" if batch > 5000 else "Triton"
-        # strategy = "Triton"
         
         print(f"\n{name}: {batch} segs, dim={dim}, avg_len={avg_len:.0f}, total={total}")
         print(f"  → Strategy: {strategy}")
         
-
-        for name, batch, dim, avg_len in configs:
-            warmup_lengths = torch.randint(
-                max(1, avg_len - 10),
-                avg_len + 10,
-                (batch,),
-                device='cuda'
-            )
-            warmup_total = warmup_lengths.sum().item()
-            
-            warmup_embeddings = torch.randn(warmup_total, dim, device='cuda', dtype=torch.float32)
-            warmup_offsets = torch.cat([torch.tensor([0], device='cuda'), warmup_lengths.cumsum(0)])
-            for _ in range(20):
-                _ = embedding_pooling(warmup_embeddings, warmup_offsets, "mean")
-            torch.cuda.synchronize()
-
+        # Warmup
+        for _ in range(20):
+            _ = embedding_pooling(embeddings, offsets, "mean")
+        torch.cuda.synchronize()
         
         num_iters = 100 if batch <= 10000 else 50
         
-        # Benchmark Triton (auto-selects strategy)
-        start = time.time()
+        # Create CUDA events
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        # Benchmark Triton
+        start_event.record()
         for _ in range(num_iters):
             _ = embedding_pooling(embeddings, offsets, "mean")
+        end_event.record()
         torch.cuda.synchronize()
-        triton_time = (time.time() - start) / num_iters * 1000
+        triton_time = start_event.elapsed_time(end_event) / num_iters
         
-        # Warmup cuda
+        # Benchmark CUDA kernel (if available)
         if CUDA_AVAILABLE:
+            # Warmup
             for _ in range(20):
                 _ = embedding_pooling_cuda_wrapper(embeddings, offsets, "mean")
             torch.cuda.synchronize()
-        # Benchmark CUDA kernel (if available)
-        if CUDA_AVAILABLE:
-            start = time.time()
+            
+            start_event.record()
             for _ in range(num_iters):
                 _ = embedding_pooling_cuda_wrapper(embeddings, offsets, "mean")
+            end_event.record()
             torch.cuda.synchronize()
-            cuda_time = (time.time() - start) / num_iters * 1000
+            cuda_time = start_event.elapsed_time(end_event) / num_iters
         else:
             cuda_time = None
         
-        # Warmup pytorch
+        # Benchmark PyTorch
+        # Warmup
         for _ in range(20):
             _ = embedding_pooling_torch(embeddings, offsets, "mean")
         torch.cuda.synchronize()
         
-        # Benchmark PyTorch explicitly
-        start = time.time()
+        start_event.record()
         for _ in range(num_iters):
             _ = embedding_pooling_torch(embeddings, offsets, "mean")
+        end_event.record()
         torch.cuda.synchronize()
-        torch_time = (time.time() - start) / num_iters * 1000
+        torch_time = start_event.elapsed_time(end_event) / num_iters
         
-        # Warmup reference
+        # Benchmark Reference (skip for huge batches)
         if batch <= 10000:
+            # Warmup
             for _ in range(20):
                 _ = embedding_pooling_reference(embeddings, offsets, "mean")
             torch.cuda.synchronize()
-        # Benchmark Reference (leadership's version) - skip for huge batches
-        if batch <= 10000:
-            start = time.time()
+            
+            start_event.record()
             for _ in range(num_iters):
                 _ = embedding_pooling_reference(embeddings, offsets, "mean")
+            end_event.record()
             torch.cuda.synchronize()
-            ref_time = (time.time() - start) / num_iters * 1000
+            ref_time = start_event.elapsed_time(end_event) / num_iters
         else:
             ref_time = None
         
@@ -473,8 +466,6 @@ def benchmark_backward():
     print("\n" + "=" * 80)
     print("Backward Performance Benchmarking")
     print("=" * 80)
-    
-    import time
     
     configs = [
         ("Small segs", 1000, 128, 10),
@@ -505,12 +496,17 @@ def benchmark_backward():
         
         num_iters = 100 if batch <= 10000 else 50
         
+        # Create CUDA events
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
         # Benchmark Triton
-        start = time.time()
+        start_event.record()
         for _ in range(num_iters):
             grad_triton = embedding_pooling_backward_triton(grad_output, offsets, "mean")
+        end_event.record()
         torch.cuda.synchronize()
-        triton_time = (time.time() - start) / num_iters * 1000
+        triton_time = start_event.elapsed_time(end_event) / num_iters
         
         # Warmup PyTorch
         for _ in range(20):
@@ -518,11 +514,12 @@ def benchmark_backward():
         torch.cuda.synchronize()
         
         # Benchmark PyTorch
-        start = time.time()
+        start_event.record()
         for _ in range(num_iters):
             grad_torch = embedding_pooling_backward_torch(grad_output, offsets, "mean")
+        end_event.record()
         torch.cuda.synchronize()
-        torch_time = (time.time() - start) / num_iters * 1000
+        torch_time = start_event.elapsed_time(end_event) / num_iters
         
         print(f"  Results:")
         print(f"    Triton:   {triton_time:7.4f} ms")
@@ -539,7 +536,6 @@ def benchmark_forward_backward():
     print("Complete Forward + Backward Benchmarking")
     print("=" * 80)
     
-    import time
     from embedding_pooling_autograd import PoolingFunction
     
     configs = [
@@ -564,9 +560,11 @@ def benchmark_forward_backward():
         
         print(f"\n{name}: {batch} segs, dim={dim}, total={total}")
         
+        embeddings = torch.randn(total, dim, device='cuda', requires_grad=True)
+        
         # Warmup
         for _ in range(10):
-            embeddings = torch.randn(total, dim, device='cuda', requires_grad=True)
+            embeddings.grad = None
             pooled = PoolingFunction.apply(embeddings, offsets, "mean")
             loss = pooled.sum()
             loss.backward()
@@ -574,23 +572,35 @@ def benchmark_forward_backward():
         
         num_iters = 50
         
-        # Benchmark with autograd
-        start = time.time()
+        # Create CUDA events
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        # Benchmark with autograd (forward + backward)
+        start_event.record()
         for _ in range(num_iters):
-            embeddings = torch.randn(total, dim, device='cuda', requires_grad=True)
+            embeddings.grad = None
             pooled = PoolingFunction.apply(embeddings, offsets, "mean")
             loss = pooled.sum()
             loss.backward()
+        end_event.record()
         torch.cuda.synchronize()
-        total_time = (time.time() - start) / num_iters * 1000
+        total_time = start_event.elapsed_time(end_event) / num_iters
         
         # Measure forward only
-        start = time.time()
-        for _ in range(num_iters):
-            embeddings = torch.randn(total, dim, device='cuda')
-            pooled = embedding_pooling(embeddings, offsets, "mean")
+        embeddings_no_grad = torch.randn(total, dim, device='cuda')
+        
+        # Warmup forward
+        for _ in range(10):
+            _ = embedding_pooling(embeddings_no_grad, offsets, "mean")
         torch.cuda.synchronize()
-        forward_time = (time.time() - start) / num_iters * 1000
+        
+        start_event.record()
+        for _ in range(num_iters):
+            pooled = embedding_pooling(embeddings_no_grad, offsets, "mean")
+        end_event.record()
+        torch.cuda.synchronize()
+        forward_time = start_event.elapsed_time(end_event) / num_iters
         
         backward_time = total_time - forward_time
         

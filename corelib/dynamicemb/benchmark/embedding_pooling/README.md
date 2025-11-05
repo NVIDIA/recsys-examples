@@ -1,4 +1,125 @@
 ## Backward result
+### Benchmark(cuda event)
+```
+================================================================================
+Forward Performance Benchmarking
+================================================================================
+
+Small segs: 1000 segs, dim=128, avg_len=10, total=9699
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.0613 ms
+    CUDA kernel:   0.0088 ms  (vs Triton:  6.98x)
+    PyTorch:       0.1925 ms  (vs Triton:  3.14x)
+    Reference:    52.3397 ms  (speedup: 853.5x)
+
+Medium segs: 1000 segs, dim=256, avg_len=50, total=49637
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.0484 ms
+    CUDA kernel:   0.0280 ms  (vs Triton:  1.73x)
+    PyTorch:       0.1294 ms  (vs Triton:  2.68x)
+    Reference:    46.3950 ms  (speedup: 959.4x)
+
+Large segs: 500 segs, dim=256, avg_len=150, total=74799
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.0404 ms
+    CUDA kernel:   0.0391 ms  (vs Triton:  1.03x)
+    PyTorch:       0.1480 ms  (vs Triton:  3.67x)
+    Reference:    23.1728 ms  (speedup: 573.8x)
+Very large: 100 segs, dim=512, avg_len=600, total=59940
+  → Strategy: Triton
+
+  Results:
+    Triton:        0.0524 ms
+    CUDA kernel:   0.1097 ms  (vs Triton:  0.48x)
+    PyTorch:       0.2631 ms  (vs Triton:  5.02x)
+    Reference:     5.4698 ms  (speedup: 104.4x)
+
+Many small: 10000 segs, dim=128, avg_len=20, total=195248
+  → Strategy: PyTorch
+
+  Results:
+    Triton:        0.0456 ms
+    CUDA kernel:   0.0451 ms  (vs Triton:  1.01x)
+    PyTorch:       0.1713 ms  (vs Triton:  3.76x)
+    Reference:    461.8171 ms  (speedup: 10137.6x)
+
+Huge batch: 20000 segs, dim=128, avg_len=15, total=290518
+  → Strategy: PyTorch
+
+  Results:
+    Triton:        0.0589 ms
+    CUDA kernel:   0.0667 ms  (vs Triton:  0.88x)
+    PyTorch:       0.2192 ms  (vs Triton:  3.72x)
+
+================================================================================
+Backward Performance Benchmarking
+================================================================================
+
+Small segs: 1000 segs, dim=128, avg_len=10, total=10096
+  Results:
+    Triton:    0.0824 ms
+    PyTorch:   0.1888 ms  (ratio:  2.29x)
+    Diff: 1.19e-07 ✓
+
+Medium segs: 1000 segs, dim=256, avg_len=50, total=49767
+  Results:
+    Triton:    0.0936 ms
+    PyTorch:   0.1969 ms  (ratio:  2.10x)
+    Diff: 7.45e-09 ✓
+
+Large segs: 500 segs, dim=256, avg_len=150, total=74505
+  Results:
+    Triton:    0.0965 ms
+    PyTorch:   0.2413 ms  (ratio:  2.50x)
+    Diff: 1.86e-09 ✓
+
+Very large: 100 segs, dim=512, avg_len=600, total=59989
+  Results:
+    Triton:    0.1137 ms
+    PyTorch:   0.3314 ms  (ratio:  2.92x)
+    Diff: 4.66e-10 ✓
+
+Many small: 10000 segs, dim=128, avg_len=20, total=195425
+  Results:
+    Triton:    0.1100 ms
+    PyTorch:   0.2832 ms  (ratio:  2.57x)
+    Diff: 2.98e-08 ✓
+
+================================================================================
+Complete Forward + Backward Benchmarking
+================================================================================
+
+Medium: 1000 segs, dim=256, total=49514
+  Forward:   0.1678 ms
+  Backward:  1.4103 ms
+  Total:     1.5781 ms
+  Backward/Forward ratio: 8.41x
+
+Large: 500 segs, dim=512, total=49838
+  Forward:   0.1704 ms
+  Backward:  1.3918 ms
+  Total:     1.5622 ms
+  Backward/Forward ratio: 8.17x
+
+Many segments: 10000 segs, dim=128, total=194798
+  Forward:   0.1708 ms
+  Backward:  1.3953 ms
+  Total:     1.5661 ms
+  Backward/Forward ratio: 8.17x
+
+Mixed lengths: 1000 segs, dim=128, total=49352
+  Forward:   0.1572 ms
+  Backward:  1.3798 ms
+  Total:     1.5370 ms
+  Backward/Forward ratio: 8.78x
+```
+
 ### Benchmark(forward+backward)
 ```
 ================================================================================
