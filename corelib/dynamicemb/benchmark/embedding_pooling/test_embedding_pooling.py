@@ -387,9 +387,6 @@ def benchmark_forward():
         print(f"\n{name}: {batch} segs, dim={dim}, avg_len={avg_len:.0f}, total={total}")
         print(f"  → Strategy: {strategy}")
         
-        # Warmup triton autotune
-        # for _ in range(10):
-        #     _ = embedding_pooling(embeddings, offsets, "mean")
 
         for name, batch, dim, avg_len in configs:
             warmup_lengths = torch.randint(
