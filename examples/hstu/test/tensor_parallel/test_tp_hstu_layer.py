@@ -273,12 +273,14 @@ def test_tp_hstu_layer_forward_backward(
 @pytest.mark.parametrize("hidden_dim_per_head", [128])  #
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 @pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
+@pytest.mark.parametrize("sequence_parallel", [True, False])
 def test_tp_hstu_layer_forward_backward_update(
     batchsize,
     num_heads,
     hidden_dim_per_head,
     tp_size,
     optimizer_type_str,
+    sequence_parallel: bool,
 ):
     init.initialize_distributed()
     world_size = torch.distributed.get_world_size()
@@ -307,6 +309,7 @@ def test_tp_hstu_layer_forward_backward_update(
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
         learnable_input_layernorm=learnable_input_layernorm,
+        sequence_parallel=False,  # debug hstu layer does not support sequence parallel
     )
 
     tp_hstu_layer, tp_dense_optimizer = create_hstu_layer_and_optimizer(
@@ -318,6 +321,7 @@ def test_tp_hstu_layer_forward_backward_update(
         hstu_layer_type=HSTULayerType.NATIVE,  # use native hstu layer for tp
         kernel_backend=KernelBackend.PYTORCH,
         learnable_input_layernorm=learnable_input_layernorm,
+        sequence_parallel=sequence_parallel,
     )
 
     fp32_debug_hstu_layer, fp32_debug_dense_optimizer = create_hstu_layer_and_optimizer(
@@ -329,6 +333,7 @@ def test_tp_hstu_layer_forward_backward_update(
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
         learnable_input_layernorm=learnable_input_layernorm,
+        sequence_parallel=False,  # debug hstu layer does not support sequence parallel
     )
 
     init_module_from(fp32_debug_hstu_layer, debug_hstu_layer)
@@ -368,11 +373,23 @@ def test_tp_hstu_layer_forward_backward_update(
             zero_grad(debug_dense_optimizer, debug_hstu_layer)
             zero_grad(tp_dense_optimizer, tp_hstu_layer)
             zero_grad(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
+            padded_jd = jd
+            # when sequence parallel is on, we need to pad the jagged data to the tp size
+            # and scatter the values to the sequence parallel region
+            if sequence_parallel:
+                padded_jd = pad_jd_values(jd, pad_base=tp_size)
+                padded_jd.values = scatter_to_sequence_parallel_region(padded_jd.values)
+            jagged_tp_out = tp_hstu_layer(padded_jd)
+            # when sequence parallel is on, outputs are scatter among TP ranks, so we need to gather the outputs back for check
+            if sequence_parallel:
+                jagged_tp_out.values = gather_from_sequence_parallel_region(
+                    jagged_tp_out.values, False
+                )  # False -> output grad not RS but S
+                jagged_tp_out = unpad_jd_values(jagged_tp_out)
 
             logits = debug_hstu_layer(ref_jd).values
             logits_fp32 = fp32_debug_hstu_layer(fp32_ref_jd).values
-            tp_logits = tp_hstu_layer(jd).values
-
+            tp_logits = jagged_tp_out.values
             collective_assert_tensor(
                 logits_fp32,
                 compare_type="equal",
