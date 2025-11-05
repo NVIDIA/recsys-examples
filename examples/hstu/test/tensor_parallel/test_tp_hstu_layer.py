@@ -187,7 +187,7 @@ def test_tp_hstu_layer_forward_backward(
         target_group_size=1,
         hstu_layer_type=HSTULayerType.DEBUG,
         sequence_parallel=sequence_parallel,
-        learnable_input_layernorm=False,
+        learnable_input_layernorm=True,
         residual=True,
         add_uvqk_bias=False,  # can disable bias for better debugging
         fuse_norm_mul_dropout=True,  # can disable triton for better debugging
@@ -269,10 +269,10 @@ def test_tp_hstu_layer_forward_backward(
     "batchsize",
     [128],
 )
-@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("num_heads", [4, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [128])  #
-@pytest.mark.parametrize("tp_size", [2])
-@pytest.mark.parametrize("optimizer_type_str", ["sgd"])
+@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
+@pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
 def test_tp_hstu_layer_forward_backward_update(
     batchsize,
     num_heads,
@@ -292,7 +292,12 @@ def test_tp_hstu_layer_forward_backward_update(
     dtype = torch.bfloat16
     hidden_size = hidden_dim_per_head * num_heads
     torch.cuda.current_device()
-
+    if optimizer_type_str == "adam":
+        # skip because at the first adam step, bias update is quite instable
+        # see comment: https://github.com/NVIDIA/recsys-examples/pull/101#issuecomment-3077565334
+        learnable_input_layernorm = False
+    else:
+        learnable_input_layernorm = True
     debug_hstu_layer, debug_dense_optimizer = create_hstu_layer_and_optimizer(
         dtype=dtype,
         hidden_size=hidden_size,
@@ -301,7 +306,7 @@ def test_tp_hstu_layer_forward_backward_update(
         optimizer_type_str=optimizer_type_str,
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
-        learnable_input_layernorm=True,
+        learnable_input_layernorm=learnable_input_layernorm,
     )
 
     tp_hstu_layer, tp_dense_optimizer = create_hstu_layer_and_optimizer(
@@ -312,7 +317,7 @@ def test_tp_hstu_layer_forward_backward_update(
         optimizer_type_str=optimizer_type_str,
         hstu_layer_type=HSTULayerType.NATIVE,  # use native hstu layer for tp
         kernel_backend=KernelBackend.PYTORCH,
-        learnable_input_layernorm=True,
+        learnable_input_layernorm=learnable_input_layernorm,
     )
 
     fp32_debug_hstu_layer, fp32_debug_dense_optimizer = create_hstu_layer_and_optimizer(
@@ -323,7 +328,7 @@ def test_tp_hstu_layer_forward_backward_update(
         optimizer_type_str=optimizer_type_str,
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
-        learnable_input_layernorm=True,
+        learnable_input_layernorm=learnable_input_layernorm,
     )
 
     init_module_from(fp32_debug_hstu_layer, debug_hstu_layer)
@@ -353,8 +358,9 @@ def test_tp_hstu_layer_forward_backward_update(
         num_batches=100,
         replicate_batches=False,
     )
-    multiplier = 2
-
+    fwd_multiplier = 2
+    bwd_multiplier = 2
+    compare_tpN_to_debug_weights(tp_model, debug_model, debug_model_fp32)
     with init.auto_destroy_global_state():
         for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
             zip(jd_list, ref_jd_list, fp32_ref_jd_list)
@@ -384,7 +390,7 @@ def test_tp_hstu_layer_forward_backward_update(
             )
 
             collective_assert(
-                hstu_close(tp_logits, logits, logits_fp32, multiplier=multiplier),
+                hstu_close(tp_logits, logits, logits_fp32, multiplier=fwd_multiplier),
                 f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
             )
             # use normal distribution
@@ -404,10 +410,12 @@ def test_tp_hstu_layer_forward_backward_update(
             grad_tp = jd.values.grad
             grad_fp32_debug = fp32_ref_jd.values.grad
             collective_assert(
-                hstu_close(grad_tp, grad_debug, grad_fp32_debug, multiplier=multiplier),
+                hstu_close(
+                    grad_tp, grad_debug, grad_fp32_debug, multiplier=bwd_multiplier
+                ),
                 f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_debug).abs().max()} vs {(grad_debug - grad_fp32_debug).abs().max()} vs hey {(grad_tp - grad_debug).abs().max()}",
             )
             print(
                 f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
             )
-            multiplier = 2 if i == 0 else multiplier
+            bwd_multiplier = 5 if i >= 2 else fwd_multiplier

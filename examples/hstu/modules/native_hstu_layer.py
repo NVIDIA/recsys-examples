@@ -134,7 +134,7 @@ class HSTULayer(MegatronModule):
             init_method=config.init_method,
             config=config,  # sequence_parallel is handled in TEColumnParallelLinear
             input_is_parallel=True,
-            bias=False,
+            bias=False,  # there is no bias
             skip_bias_add=False,
             is_expert=False,
         )
@@ -217,8 +217,9 @@ class HSTULayer(MegatronModule):
                     self._input_layernorm_bias,
                 )
             else:
-                normed_x = triton_layer_norm(
+                normed_x = F.layer_norm(
                     x,
+                    normalized_shape=[self._embedding_dim],
                     weight=self._input_layernorm_weight,
                     bias=self._input_layernorm_bias,
                     eps=self._eps,

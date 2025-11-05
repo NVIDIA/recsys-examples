@@ -50,7 +50,6 @@ def initialize_distributed():
     backend = "nccl"
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend=backend)
-    # print(f'[global rank {torch.distributed.get_rank()}] process group initialized')
 
 
 def initialize_model_parallel(tensor_model_parallel_size=1):
