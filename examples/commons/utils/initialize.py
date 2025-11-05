@@ -44,7 +44,7 @@ def initialize_single_rank():
 def initialize_distributed():
     if torch.distributed.is_initialized():
         return
-    torch.set_printoptions(precision=6, sci_mode=False)
+    torch.set_printoptions(precision=8, sci_mode=False)
     rank = int(os.environ["LOCAL_RANK"])
     device: torch.device = torch.device(f"cuda:{rank}")
     backend = "nccl"

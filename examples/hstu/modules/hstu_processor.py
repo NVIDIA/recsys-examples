@@ -20,6 +20,10 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig
 from configs.inference_config import InferenceHSTUConfig
 from dataset.utils import RankingBatch
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
@@ -321,7 +325,11 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             p=self._dropout_ratio,
             training=self.training,
         ).to(self._training_dtype)
-
+        # when sequence parallel is on, we need to scatter the values to the sequence parallel region
+        # mcore performs the scatter in embedding: https://github.com/NVIDIA/Megatron-LM/blob/a32ff750191d04713ea1c15dcc65308324681016/megatron/core/tensor_parallel/layers.py#L286-L291
+        # but we have to perform interleave and concatenation here.
+        if self._sequence_parallel:
+            jd.values = scatter_to_sequence_parallel_region(jd.values)
         return jd
 
 
@@ -333,19 +341,21 @@ class HSTUBlockPostprocessor(torch.nn.Module):
         config (HSTUConfig): Configuration for the HSTU block.
     """
 
-    def __init__(
-        self,
-        is_inference: bool,
-    ):
+    def __init__(self, is_inference: bool, sequence_parallel: bool = False):
         super().__init__()
         self._is_inference = is_inference
+        self._sequence_parallel = sequence_parallel
+
+        if self._is_inference:
+            self._sequence_parallel = False
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock postprocess", hook_key_or_attr_name="values")
     def forward(self, jd: JaggedData) -> JaggedData:
         """
         Postprocess the output from the HSTU architecture.
         1. If max_num_candidates > 0, split and only keep last ``num_candidates`` embeddings as candidates embedding for further processing.
-        2. Remove action embeddings if present. Only use item embedding for further processing.
+        2, If sequence parallel is on, we need to gather the values back and remove the padding.
+        3. Remove action embeddings if present. Only use item embedding for further processing.
 
         Args:
             jd (JaggedData): The jagged data output from the HSTU architecture that needs further processing.
@@ -356,9 +366,13 @@ class HSTUBlockPostprocessor(torch.nn.Module):
         sequence_embeddings: torch.Tensor
         seqlen_offsets: torch.Tensor
         max_seqlen: int
-
-        # we need to remove the padding
-        jd = unpad_jd_values(jd)
+        # the following compute is duplicated among TP ranks, we need to AG and remove the padding,
+        # during backward, the gradients are scattered among TP ranks
+        if self._sequence_parallel:
+            jd.values = gather_from_sequence_parallel_region(
+                jd.values, False
+            )  # False -> output grad not RS but S
+            jd = unpad_jd_values(jd)
         if jd.max_num_candidates > 0:
             seqlen_offsets = jd.num_candidates_offsets
             max_seqlen = jd.max_num_candidates

@@ -281,7 +281,6 @@ def pad_jd_values(jd: JaggedData, pad_base: int, dim=0) -> JaggedData:
     if length % pad_base == 0:
         output_jd = jd.copy_others_but_set_values(values=jd.values.clone())
         return output_jd
-
     aligned_size = ((length + pad_base - 1) // pad_base) * pad_base
     values = jd.values
     assert values.dim() == 2, "Values must be a 2D tensor"

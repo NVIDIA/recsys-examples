@@ -24,6 +24,7 @@ def collective_assert(
     torch.distributed.all_reduce(
         flag_tensor, op=torch.distributed.ReduceOp.MIN, group=group
     )
+    torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
     assert flag_tensor.item(), err_msg
 
 

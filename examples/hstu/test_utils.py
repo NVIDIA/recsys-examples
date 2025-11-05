@@ -207,14 +207,14 @@ def compare_tpN_to_debug_weights(
             x is not None for x in [dst_grad, src_grad, src_grad_fp32]
         ):
             collective_assert(
-                hstu_close(dst_grad, src_grad, src_grad_fp32, multiplier=5),
-                f"grad mismatch at {name}, multiplier {(dst_grad - src_grad_fp32).abs().max() / (src_grad - src_grad_fp32).abs().max()}",
-                group=parallel_state.get_data_parallel_group(),
+                hstu_close(
+                    dst_grad, src_grad, src_grad_fp32, try_allclose=True, multiplier=5
+                ),
+                f"[rank{torch.distributed.get_rank()}] grad mismatch at {name}, multiplier {(dst_grad - src_grad_fp32).abs().max() / (src_grad - src_grad_fp32).abs().max()}",
             )
         collective_assert(
             hstu_close(dst, src, src_fp32, try_allclose=True, multiplier=5),
-            f"weight mismatch at {name}  multiplier {(dst - src_fp32).abs().max() / (src - src_fp32).abs().max()}",
-            group=parallel_state.get_data_parallel_group(),
+            f"[rank{torch.distributed.get_rank()}] weight mismatch at {name}  multiplier {(dst - src_fp32).abs().max() / (src - src_fp32).abs().max()}",
         )  # weight
 
 
@@ -319,6 +319,7 @@ def create_model(
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     num_batches: int = 10,
     replicate_batches: bool = True,
+    sequence_parallel: bool = False,
 ):
     init.set_random_seed(seed)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -338,6 +339,7 @@ def create_model(
         add_uvqk_bias=False,  # disable bias for better debugging
         fuse_norm_mul_dropout=False,  # disable fusion for better debugging
         learnable_input_layernorm=False,  # disable bias for better debugging
+        sequence_parallel=sequence_parallel,
     )
 
     item_feature_name = "item_feat"

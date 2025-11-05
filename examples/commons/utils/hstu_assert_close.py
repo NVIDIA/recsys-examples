@@ -28,11 +28,12 @@ def hstu_close(
     out_ref = out_ref.reshape(-1)
     fp32_ref = fp32_ref.reshape(-1)
     assert fp32_ref.dtype == torch.float32, "fp32_ref should be float32"
-
-    try_allclose = torch.allclose(actual, out_ref) and try_allclose
+    if try_allclose:
+        try_allclose = torch.allclose(actual, out_ref)
 
     left_abs_max = (actual - fp32_ref).abs().max().item()
     right_abs_max = (out_ref - fp32_ref).abs().max().item()
+    # either allclose or meet the abs threshold
     return (left_abs_max <= multiplier * right_abs_max) or (try_allclose)
 
 

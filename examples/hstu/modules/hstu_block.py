@@ -34,8 +34,12 @@ class HSTUBlock(MegatronModule):
         if self.config.fp16:
             self._training_dtype = torch.float16
 
-        self._preprocessor = HSTUBlockPreprocessor(config, is_inference=False)
-        self._postprocessor = HSTUBlockPostprocessor(is_inference=False)
+        self._preprocessor = HSTUBlockPreprocessor(
+            config, is_inference=False
+        )  # sequence parallel is from config
+        self._postprocessor = HSTUBlockPostprocessor(
+            is_inference=False, sequence_parallel=config.sequence_parallel
+        )
 
         HSTULayerImpl = (
             FusedHSTULayer
