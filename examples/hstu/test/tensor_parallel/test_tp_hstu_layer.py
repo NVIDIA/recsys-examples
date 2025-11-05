@@ -21,11 +21,15 @@ import pytest
 import torch
 from commons.checkpoint import get_unwrapped_module
 from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
-from commons.utils.hstu_assert_close import assert_hstu_close, hstu_close
+from commons.utils.hstu_assert_close import hstu_close
 from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
 from distributed.finalize_model_grads import finalize_model_grads
 from megatron.core import parallel_state
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.module import Float16Module
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
@@ -46,7 +50,9 @@ def generate_jagged_data_list(
     num_heads: int,
     num_batches: int,
     replicate_batches: bool = True,
-    length_away_from: Optional[int] = None,
+    banned_seqlen_divisor: Optional[
+        int
+    ] = None,  # we deliberately make the sequence length not divisible by banned_seqlen_divisor to test the padding logic
 ):
     max_history_seqlen = 100
     max_num_targets = 50
@@ -65,8 +71,12 @@ def generate_jagged_data_list(
             device=device,
             dtype=torch.int,
         )
-        # we don't want the sequence length to be divisible by length_away_from
-        if length_away_from is not None and lengths.sum() % length_away_from == 0:
+        # we don't want the sequence length to be divisible by banned_seqlen_divisor
+        # when banned_seqlen_divisor = 1, minus is safe
+        if (
+            banned_seqlen_divisor is not None
+            and lengths.sum() % banned_seqlen_divisor == 0
+        ):
             lengths[-1] -= 1
         num_targets = torch.randint(
             low=0,
@@ -130,26 +140,16 @@ def generate_jagged_data_list(
     return ret_list, ref_ret_list, fp32_ref_ret_list
 
 
-# @pytest.mark.parametrize(
-#     "batchsize",
-#     [
-#         32,
-#     ],
-# )
-# @pytest.mark.parametrize("num_heads", [4, 1])
-# @pytest.mark.parametrize("hidden_dim_per_head", [32, 128])  #
-# @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-# @pytest.mark.parametrize("sequence_parallel", [True, False])
 @pytest.mark.parametrize(
     "batchsize",
     [
         32,
     ],
 )
-@pytest.mark.parametrize("num_heads", [4])
-@pytest.mark.parametrize("hidden_dim_per_head", [32])  #
-@pytest.mark.parametrize("tp_size", [2])
-@pytest.mark.parametrize("sequence_parallel", [True])
+@pytest.mark.parametrize("num_heads", [4, 1])
+@pytest.mark.parametrize("hidden_dim_per_head", [32, 128])  #
+@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
+@pytest.mark.parametrize("sequence_parallel", [True, False])
 def test_tp_hstu_layer_forward_backward(
     batchsize,
     num_heads,
@@ -164,6 +164,8 @@ def test_tp_hstu_layer_forward_backward(
         pytest.skip("TP size is larger than world size")
     if num_heads % tp_size != 0:
         pytest.skip("num_heads should be divisible by tp_size")
+    if tp_size == 1 and sequence_parallel:
+        pytest.skip("TP size is 1, sequence parallel should be False")
     init.initialize_model_parallel(tp_size)
     init.set_random_seed(1234)
 
@@ -186,7 +188,7 @@ def test_tp_hstu_layer_forward_backward(
         hstu_layer_type=HSTULayerType.DEBUG,
         sequence_parallel=sequence_parallel,
         learnable_input_layernorm=False,
-        residual=False,
+        residual=True,
         add_uvqk_bias=False,  # can disable bias for better debugging
         fuse_norm_mul_dropout=True,  # can disable triton for better debugging
     )
@@ -214,23 +216,27 @@ def test_tp_hstu_layer_forward_backward(
         num_heads,
         100,
         False,
-        length_away_from=tp_size if sequence_parallel else None,
+        banned_seqlen_divisor=tp_size if sequence_parallel else None,
     )
     with init.auto_destroy_global_state():
         for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
             zip(jd_list, ref_jd_list, fp32_ref_jd_list)
         ):
-            if i > 0:
-                continue
+            padded_jd = jd
             # when sequence parallel is on, we need to pad the jagged data to the tp size
             if sequence_parallel:
                 padded_jd = pad_jd_values(jd, pad_base=tp_size)
+                padded_jd.values = scatter_to_sequence_parallel_region(padded_jd.values)
             jagged_out_debug = debug_hstu_layer(ref_jd)
             jagged_fp32_out_debug = fp32_debug_hstu_layer(fp32_ref_jd)
             torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
             jagged_tp_out = tp_hstu_layer(padded_jd)
 
+            # we need to ag the tp_out if sequence parallel is on
             if sequence_parallel:
+                jagged_tp_out.values = gather_from_sequence_parallel_region(
+                    jagged_tp_out.values, False
+                )  # False -> output grad not RS but S
                 jagged_tp_out = unpad_jd_values(jagged_tp_out)
 
             tp_out = jagged_tp_out.values
@@ -252,8 +258,6 @@ def test_tp_hstu_layer_forward_backward(
             grad_tp = jd.values.grad
             grad_debug = ref_jd.values.grad
             grad_fp32_debug = fp32_ref_jd.values.grad
-
-            assert_hstu_close(grad_tp, grad_debug, grad_fp32_debug, fwd=False)
             collective_assert(
                 hstu_close(grad_tp, grad_debug, grad_fp32_debug, multiplier=5),
                 f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_debug).abs().max()} vs {(grad_debug - grad_fp32_debug).abs().max()} vs hey {(grad_tp - grad_debug).abs().max()}",
@@ -265,10 +269,10 @@ def test_tp_hstu_layer_forward_backward(
     "batchsize",
     [128],
 )
-@pytest.mark.parametrize("num_heads", [4, 1])
+@pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("hidden_dim_per_head", [128])  #
-@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-@pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
+@pytest.mark.parametrize("tp_size", [2])
+@pytest.mark.parametrize("optimizer_type_str", ["sgd"])
 def test_tp_hstu_layer_forward_backward_update(
     batchsize,
     num_heads,

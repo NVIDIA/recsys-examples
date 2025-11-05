@@ -153,15 +153,17 @@ class TPLayerNormMulDropout(torch.nn.Module):
             self._dropout_ratio,
             training=self.training,
         )  # [ T or T / tp_size, hidden_size]
+        normed_x_this_rank = normed_x
         if not self.gather_output and not self._sequence_parallel:
-            normed_x = split_along_last_dim(
+            normed_x_this_rank = split_along_last_dim(
                 normed_x, self._tp_pg
             )  # [ T, hidden_size_per_partition]
         if not self.gather_output and self._sequence_parallel:
-            normed_x = all_to_all_sp2hp(normed_x)  # [ T, hidden_size_per_partition]
+            normed_x_this_rank = all_to_all_sp2hp(
+                normed_x
+            )  # [ T, hidden_size_per_partition]
         if self.gather_output and self._sequence_parallel:
-            normed_x = gather_along_first_dim(
+            normed_x_this_rank = gather_along_first_dim(
                 normed_x, self._tp_pg
             )  # [ T, hidden_size]
-
-        return normed_x
+        return normed_x_this_rank

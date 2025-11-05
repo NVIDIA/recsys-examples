@@ -279,7 +279,8 @@ def pad_jd_values(jd: JaggedData, pad_base: int, dim=0) -> JaggedData:
     length = jd.seqlen_offsets[-1]
     # Check if already aligned
     if length % pad_base == 0:
-        return jd
+        output_jd = jd.copy_others_but_set_values(values=jd.values.clone())
+        return output_jd
 
     aligned_size = ((length + pad_base - 1) // pad_base) * pad_base
     values = jd.values
@@ -302,7 +303,8 @@ def unpad_jd_values(jd: JaggedData, dim=0) -> JaggedData:
     assert dim == 0, "Only unpadding along the first dimension is supported"
     padding_length = jd.padding_length
     if padding_length == 0:
-        return jd
+        output_jd = jd.copy_others_but_set_values(values=jd.values.clone())
+        return output_jd
     output_jd = jd.copy_others_but_set_values(
         values=jd.values[0 : jd.seqlen_offsets[-1], ...]
     )

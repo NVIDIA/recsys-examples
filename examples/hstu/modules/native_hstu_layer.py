@@ -103,21 +103,20 @@ class HSTULayer(MegatronModule):
             trainable=True,
             dropout_ratio=self._dropout_ratio,
             fusion=config.fuse_norm_mul_dropout,
-            sequence_parallel=True,
+            sequence_parallel=config.sequence_parallel,
         )
         # [embedding_dim, 4 * num_head * head_dim]
-        # config.sequence_parallel=False
         self._linear_uvqk = TEColumnParallelLinear(
             input_size=self._embedding_dim,
             output_size=sum(self._split_arg_list) * self._num_heads,
             init_method=config.init_method,
-            config=config,  # sequence_parallel is handled in TEColumnParallelLinear
+            config=config,  # sequence_parallel is handled in TEColumnParallelLinear, it will help ag along seq dim.
             bias=config.add_uvqk_bias,
             gather_output=False,
             skip_bias_add=False,  # note: TEColumnParallelLinear does not support bias fusion!
             is_expert=False,
         )
-        # config.sequence_parallel=True
+
         self._debug_shortcut_proj_linear = (
             os.environ.get("DEBUG_SHORTCUT_PROJ_LINEAR", "0") == "1"
         )
@@ -207,10 +206,6 @@ class HSTULayer(MegatronModule):
         Returns:
             Tensor: The output embeddings [\*, D]
         """
-        if self._sequence_parallel:
-            assert (
-                jd.values.shape[0] % self._tp_size == 0
-            ), "sequence parallel is on, but sequence length is not divisible by tp size"
         # input is [*, h]
         x = jd.values
         with nvtx.annotate("hstu input layernorm fwd", color="RED"):
