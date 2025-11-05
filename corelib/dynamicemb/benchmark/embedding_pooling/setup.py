@@ -7,8 +7,8 @@ setup(
         CUDAExtension(
             name='embedding_pooling_cuda',
             sources=[
-                'embedding_pooling_cuda.cpp',
-                'embedding_pooling_kernel.cu',
+                'csrc/embedding_pooling_cuda.cpp',
+                'csrc/embedding_pooling_kernel.cu',
             ],
             extra_compile_args={
                 'cxx': ['-O3'],
