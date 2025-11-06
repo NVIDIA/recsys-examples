@@ -1,10 +1,9 @@
-import torch
 import triton
 import triton.language as tl
 
 
 # ============================================================================
-# Triton Kernel: Parallel Reduction (Core Implementation)
+# Forward Kernel
 # ============================================================================
 @triton.autotune(
     configs=[
@@ -96,7 +95,7 @@ def pooling_parallel_reduce_kernel(
 
 
 # ============================================================================
-# Triton Kernel: Pooling Backward
+# Backward Kernel
 # ============================================================================
 
 
@@ -189,7 +188,7 @@ def pooling_backward_kernel(
 
 
 # ============================================================================
-# 2D Grid Version (Higher Parallelism)
+# Backward Kernel 2D Grid Version
 # ============================================================================
 
 
@@ -273,74 +272,3 @@ def pooling_backward_kernel_2d(
             grad_broadcasted,
             mask=n_mask[:, None] & d_mask[None, :],
         )
-
-
-# ============================================================================
-# Python Interface
-# ============================================================================
-
-
-def embedding_pooling_backward_triton(
-    grad_output: torch.Tensor,  # [num_segments, embedding_dim]
-    offsets: torch.Tensor,  # [num_segments + 1]
-    pooling_mode: str = "mean",
-) -> torch.Tensor:
-    """
-    Triton implementation of pooling backward using segment-parallel scatter.
-
-    Key optimization: Mirrors forward kernel structure - each program handles one segment.
-    No binary search needed! Direct scatter operation is faster than searching.
-
-    Args:
-        grad_output: Gradient w.r.t. pooled output [num_segments, embedding_dim]
-        offsets: Segment boundaries [num_segments + 1]
-        pooling_mode: "sum" or "mean"
-
-    Returns:
-        grad_input: Gradient w.r.t. input embeddings [total_embeddings, embedding_dim]
-    """
-
-    num_segs = offsets.shape[0] - 1
-    emb_dim = grad_output.shape[1]
-    total_embs = offsets[-1].item()
-
-    # Create output tensor
-    grad_input = torch.empty(
-        (total_embs, emb_dim), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-    mode = 0 if pooling_mode == "sum" else 1
-
-    # ========================================================================
-    # Option 1: 1D Grid (Original) - One program per segment
-    # ========================================================================
-    # grid = (num_segs,)
-    # pooling_backward_kernel[grid](
-    #     grad_output_ptr=grad_output,
-    #     offsets_ptr=offsets,
-    #     grad_input_ptr=grad_input,
-    #     embedding_dim=emb_dim,
-    #     num_segments=num_segs,
-    #     pooling_mode=mode,
-    # )
-
-    # ========================================================================
-    # Option 2: 2D Grid (Higher Parallelism) - One program per (segment, dim_block)
-    # ========================================================================
-    # CRITICAL: Use the MINIMUM BLOCK_D from autotune configs to calculate grid
-    # This ensures we launch enough blocks to cover all dimensions
-    # even if autotune selects a smaller BLOCK_D than estimated
-    MIN_BLOCK_D = 64  # Minimum BLOCK_D across all autotune configs
-    num_d_blocks = triton.cdiv(emb_dim, MIN_BLOCK_D)
-    grid = (num_segs, num_d_blocks)
-
-    pooling_backward_kernel_2d[grid](
-        grad_output_ptr=grad_output,
-        offsets_ptr=offsets,
-        grad_input_ptr=grad_input,
-        embedding_dim=emb_dim,
-        num_segments=num_segs,
-        pooling_mode=mode,
-    )
-
-    return grad_input

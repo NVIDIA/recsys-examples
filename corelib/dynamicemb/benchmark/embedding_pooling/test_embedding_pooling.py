@@ -1,20 +1,16 @@
-"""
-Combined testing suite for embedding pooling (forward and backward)
-Merged from embedding_pooling.py and embedding_pooling_backward.py
-"""
-
 import torch
+import triton
 from embedding_pooling_kernel import (
-    embedding_pooling_backward_triton,
+    pooling_backward_kernel_2d,
     pooling_parallel_reduce_kernel,
 )
 
 # ============================================================================
-# Forward: Main Interface
+# Forward and backward: Only for testing
 # ============================================================================
 
 
-def embedding_pooling(
+def embedding_pooling_forward_triton(
     embeddings: torch.Tensor, offsets: torch.Tensor, pooling_mode: str = "mean"
 ) -> torch.Tensor:
     """
@@ -57,8 +53,74 @@ def embedding_pooling(
     return output
 
 
+def embedding_pooling_backward_triton(
+    grad_output: torch.Tensor,  # [num_segments, embedding_dim]
+    offsets: torch.Tensor,  # [num_segments + 1]
+    pooling_mode: str = "mean",
+) -> torch.Tensor:
+    """
+    Triton implementation of pooling backward using segment-parallel scatter.
+
+    Key optimization: Mirrors forward kernel structure - each program handles one segment.
+    No binary search needed! Direct scatter operation is faster than searching.
+
+    Args:
+        grad_output: Gradient w.r.t. pooled output [num_segments, embedding_dim]
+        offsets: Segment boundaries [num_segments + 1]
+        pooling_mode: "sum" or "mean"
+
+    Returns:
+        grad_input: Gradient w.r.t. input embeddings [total_embeddings, embedding_dim]
+    """
+
+    num_segs = offsets.shape[0] - 1
+    emb_dim = grad_output.shape[1]
+    total_embs = offsets[-1].item()
+
+    # Create output tensor
+    grad_input = torch.empty(
+        (total_embs, emb_dim), dtype=grad_output.dtype, device=grad_output.device
+    )
+
+    mode = 0 if pooling_mode == "sum" else 1
+
+    # ========================================================================
+    # Option 1: 1D Grid (Original) - One program per segment
+    # ========================================================================
+    # grid = (num_segs,)
+    # pooling_backward_kernel[grid](
+    #     grad_output_ptr=grad_output,
+    #     offsets_ptr=offsets,
+    #     grad_input_ptr=grad_input,
+    #     embedding_dim=emb_dim,
+    #     num_segments=num_segs,
+    #     pooling_mode=mode,
+    # )
+
+    # ========================================================================
+    # Option 2: 2D Grid (Higher Parallelism) - One program per (segment, dim_block)
+    # ========================================================================
+    # CRITICAL: Use the MINIMUM BLOCK_D from autotune configs to calculate grid
+    # This ensures we launch enough blocks to cover all dimensions
+    # even if autotune selects a smaller BLOCK_D than estimated
+    MIN_BLOCK_D = 64  # Minimum BLOCK_D across all autotune configs
+    num_d_blocks = triton.cdiv(emb_dim, MIN_BLOCK_D)
+    grid = (num_segs, num_d_blocks)
+
+    pooling_backward_kernel_2d[grid](
+        grad_output_ptr=grad_output,
+        offsets_ptr=offsets,
+        grad_input_ptr=grad_input,
+        embedding_dim=emb_dim,
+        num_segments=num_segs,
+        pooling_mode=mode,
+    )
+
+    return grad_input
+
+
 # ============================================================================
-# Forward: Reference Implementations (for testing and comparison)
+# Forward and backward: Reference Implementations (for testing and comparison)
 # ============================================================================
 
 
@@ -66,8 +128,7 @@ def embedding_pooling_reference(
     embeddings: torch.Tensor, offsets: torch.Tensor, pooling_mode: str
 ) -> torch.Tensor:
     """
-    Reference implementation (from leadership).
-    Pure Python loop - easy to understand but slow.
+    Reference implementation.
     """
     assert pooling_mode in ["sum", "mean"]
     assert embeddings.dim() == 2, "embeddings must be a 2D tensor"
@@ -98,7 +159,7 @@ def embedding_pooling_reference(
 def embedding_pooling_torch(
     embeddings: torch.Tensor, offsets: torch.Tensor, pooling_mode: str = "mean"
 ) -> torch.Tensor:
-    """PyTorch native implementation using scatter."""
+    """PyTorch reference implementation using scatter."""
     num_segs = offsets.shape[0] - 1
     dim = embeddings.shape[1]
 
@@ -120,11 +181,6 @@ def embedding_pooling_torch(
         output = output / lengths.unsqueeze(1).clamp(min=1)
 
     return output
-
-
-# ============================================================================
-# Backward: Reference Implementation
-# ============================================================================
 
 
 def embedding_pooling_backward_torch(
@@ -195,7 +251,7 @@ def test_forward_correctness():
             ref = embedding_pooling_reference(embeddings, offsets, mode)
 
             # Triton (our implementation)
-            triton_out = embedding_pooling(embeddings, offsets, mode)
+            triton_out = embedding_pooling_forward_triton(embeddings, offsets, mode)
 
             # PyTorch
             torch_out = embedding_pooling_torch(embeddings, offsets, mode)
@@ -215,7 +271,7 @@ def test_forward_correctness():
     offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
 
     ref = embedding_pooling_reference(embeddings, offsets, "mean")
-    triton_out = embedding_pooling(embeddings, offsets, "mean")
+    triton_out = embedding_pooling_forward_triton(embeddings, offsets, "mean")
 
     diff_triton = (triton_out - ref).abs().max().item()
     print(f"  Triton: diff={diff_triton:.2e} {'✓' if diff_triton < 1e-4 else '✗'}")
@@ -311,29 +367,24 @@ def benchmark_forward():
         embeddings = torch.randn(total, dim, device="cuda", dtype=torch.float32)
         offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
 
-        # Determine which implementation will be used
-        strategy = "PyTorch" if batch > 5000 else "Triton"
-
         print(
             f"\n{name}: {batch} segs, dim={dim}, avg_len={avg_len:.0f}, total={total}"
         )
-        print(f"  → Strategy: {strategy}")
 
         # Warmup
         for _ in range(20):
-            _ = embedding_pooling(embeddings, offsets, "mean")
+            _ = embedding_pooling_forward_triton(embeddings, offsets, "mean")
         torch.cuda.synchronize()
 
         num_iters = 100 if batch <= 10000 else 50
 
-        # Create CUDA events
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
         # Benchmark Triton
         start_event.record()
         for _ in range(num_iters):
-            _ = embedding_pooling(embeddings, offsets, "mean")
+            _ = embedding_pooling_forward_triton(embeddings, offsets, "mean")
         end_event.record()
         torch.cuda.synchronize()
         triton_time = start_event.elapsed_time(end_event) / num_iters
@@ -461,7 +512,7 @@ def benchmark_forward_backward():
     print("Complete Forward + Backward Benchmarking")
     print("=" * 80)
 
-    from embedding_pooling_autograd import PoolingFunction
+    from embedding_pooling import PoolingFunction
 
     configs = [
         ("Medium", 1000, 256, 50),
@@ -514,12 +565,14 @@ def benchmark_forward_backward():
 
         # Warmup forward
         for _ in range(10):
-            _ = embedding_pooling(embeddings_no_grad, offsets, "mean")
+            _ = embedding_pooling_forward_triton(embeddings_no_grad, offsets, "mean")
         torch.cuda.synchronize()
 
         start_event.record()
         for _ in range(num_iters):
-            pooled = embedding_pooling(embeddings_no_grad, offsets, "mean")
+            pooled = embedding_pooling_forward_triton(
+                embeddings_no_grad, offsets, "mean"
+            )
         end_event.record()
         torch.cuda.synchronize()
         forward_time = start_event.elapsed_time(end_event) / num_iters
@@ -531,10 +584,6 @@ def benchmark_forward_backward():
         print(f"  Total:    {total_time:7.4f} ms")
         print(f"  Backward/Forward ratio: {backward_time/forward_time:.2f}x")
 
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
 
 if __name__ == "__main__":
     print("\n🚀 Embedding Pooling - Combined Forward and Backward Testing\n")
