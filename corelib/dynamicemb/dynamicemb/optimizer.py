@@ -499,6 +499,14 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
     def step(self) -> None:
         pass
 
+    def need_gradient_clipping(self) -> bool:
+        return self._opt_args.gradient_clipping
+
+    def clip_gradient(self, grads) -> None:
+        grads.clamp_(
+            min=-1 * self._opt_args.max_gradient, max=self._opt_args.max_gradient
+        )
+
 
 class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
