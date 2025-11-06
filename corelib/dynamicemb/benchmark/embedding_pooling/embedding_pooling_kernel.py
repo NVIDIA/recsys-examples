@@ -24,7 +24,7 @@ import triton.language as tl
         triton.Config({"BLOCK_D": 512, "BLOCK_N": 64}, num_warps=8),
         triton.Config({"BLOCK_D": 512, "BLOCK_N": 128}, num_warps=8),
     ],
-    key=["embedding_dim", "num_segments"],
+    key=["embedding_dim", "autotune_num_segments"],
     # TODO: add prune_configs_by to prune obviously unreasonable configs
     # prune_configs_by={
     #     'early_config_prune': early_config_prune,
@@ -37,6 +37,7 @@ def pooling_parallel_reduce_kernel(
     output_ptr,
     embedding_dim: tl.constexpr,
     num_segments: tl.constexpr,
+    autotune_num_segments: tl.constexpr,
     pooling_mode: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -118,7 +119,7 @@ def pooling_parallel_reduce_kernel(
         triton.Config({"BLOCK_D": 512, "BLOCK_N": 64}, num_warps=8),
         triton.Config({"BLOCK_D": 512, "BLOCK_N": 128}, num_warps=8),
     ],
-    key=["embedding_dim", "num_segments"],
+    key=["embedding_dim", "autotune_num_segments"],
 )
 @triton.jit
 def pooling_backward_kernel(
@@ -127,6 +128,7 @@ def pooling_backward_kernel(
     grad_input_ptr,  # [total_embeddings, embedding_dim]
     embedding_dim: tl.constexpr,
     num_segments: tl.constexpr,
+    autotune_num_segments: tl.constexpr,
     pooling_mode: tl.constexpr,  # 0=sum, 1=mean
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -211,7 +213,7 @@ def pooling_backward_kernel(
         triton.Config({"BLOCK_D": 512, "BLOCK_N": 64}, num_warps=8),
         triton.Config({"BLOCK_D": 512, "BLOCK_N": 128}, num_warps=8),
     ],
-    key=["embedding_dim", "num_segments"],
+    key=["embedding_dim", "autotune_num_segments"],
 )
 @triton.jit
 def pooling_backward_kernel_2d(
@@ -220,6 +222,7 @@ def pooling_backward_kernel_2d(
     grad_input_ptr,  # [total_embeddings, embedding_dim]
     embedding_dim: tl.constexpr,
     num_segments: tl.constexpr,
+    autotune_num_segments: tl.constexpr,
     pooling_mode: tl.constexpr,  # 0=sum, 1=mean
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,

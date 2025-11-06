@@ -6,6 +6,19 @@ from embedding_pooling_kernel import (
 )
 
 
+@torch.fx.wrap
+def prev_power_of_2(x: int) -> int:
+    if torch.compiler.is_compiling():
+        # Re-write to make Dynamo happy
+        x_tensor = torch.scalar_tensor(x, dtype=torch.int64)  # type: ignore[arg-type]
+        x_tensor_orig = x_tensor.clone()
+        out = triton.next_power_of_2(x_tensor)  # type: ignore[arg-type]
+        return int(torch.where(torch.lt(x_tensor_orig, out), out // 2, out).item())  # type: ignore[return-value]
+    else:
+        out = triton.next_power_of_2(x)
+        return out // 2 if out > x else out
+
+
 class PoolingFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, embeddings, offsets, pooling_mode):
@@ -40,6 +53,8 @@ class PoolingFunction(torch.autograd.Function):
         mode = 0 if pooling_mode == "sum" else 1
         grid = (num_segs,)
 
+        autotune_num_segments = prev_power_of_2(num_segs)
+
         pooling_parallel_reduce_kernel[grid](
             embeddings_ptr=embeddings,
             offsets_ptr=offsets,
@@ -47,6 +62,7 @@ class PoolingFunction(torch.autograd.Function):
             embedding_dim=emb_dim,
             num_segments=num_segs,
             pooling_mode=mode,
+            autotune_num_segments=autotune_num_segments,
         )
 
         ctx.save_for_backward(offsets)
@@ -102,6 +118,8 @@ class PoolingFunction(torch.autograd.Function):
         num_d_blocks = triton.cdiv(emb_dim, MIN_BLOCK_D)
         grid = (num_segs, num_d_blocks)
 
+        autotune_num_segments = prev_power_of_2(num_segs)
+
         pooling_backward_kernel_2d[grid](
             grad_output_ptr=grad_output,
             offsets_ptr=offsets,
@@ -109,6 +127,7 @@ class PoolingFunction(torch.autograd.Function):
             embedding_dim=emb_dim,
             num_segments=num_segs,
             pooling_mode=mode,
+            autotune_num_segments=autotune_num_segments,
         )
         # ========================================================================
         # Option 2: 1D Grid (Original) - One program per segment

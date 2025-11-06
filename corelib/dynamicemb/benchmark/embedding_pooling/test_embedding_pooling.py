@@ -1,9 +1,21 @@
 import torch
 import triton
 from embedding_pooling import embedding_pooling
-from embedding_pooling_kernel import (
-    pooling_backward_kernel_2d,
-)
+from embedding_pooling_kernel import pooling_backward_kernel_2d
+
+
+@torch.fx.wrap
+def prev_power_of_2(x: int) -> int:
+    if torch.compiler.is_compiling():
+        # Re-write to make Dynamo happy
+        x_tensor = torch.scalar_tensor(x, dtype=torch.int64)  # type: ignore[arg-type]
+        x_tensor_orig = x_tensor.clone()
+        out = triton.next_power_of_2(x_tensor)  # type: ignore[arg-type]
+        return int(torch.where(torch.lt(x_tensor_orig, out), out // 2, out).item())  # type: ignore[return-value]
+    else:
+        out = triton.next_power_of_2(x)
+        return out // 2 if out > x else out
+
 
 # ============================================================================
 # Backward: Only for testing
@@ -63,7 +75,7 @@ def embedding_pooling_backward_triton(
     MIN_BLOCK_D = 64  # Minimum BLOCK_D across all autotune configs
     num_d_blocks = triton.cdiv(emb_dim, MIN_BLOCK_D)
     grid = (num_segs, num_d_blocks)
-
+    autotune_num_segments = prev_power_of_2(num_segs)
     pooling_backward_kernel_2d[grid](
         grad_output_ptr=grad_output,
         offsets_ptr=offsets,
@@ -71,6 +83,7 @@ def embedding_pooling_backward_triton(
         embedding_dim=emb_dim,
         num_segments=num_segs,
         pooling_mode=mode,
+        autotune_num_segments=autotune_num_segments,
     )
 
     return grad_input
