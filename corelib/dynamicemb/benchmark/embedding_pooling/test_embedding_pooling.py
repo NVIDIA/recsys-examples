@@ -5,52 +5,10 @@ from embedding_pooling_kernel import (
     pooling_parallel_reduce_kernel,
 )
 
+from embedding_pooling import embedding_pooling
 # ============================================================================
-# Forward and backward: Only for testing
+# Backward: Only for testing
 # ============================================================================
-
-
-def embedding_pooling_forward_triton(
-    embeddings: torch.Tensor, offsets: torch.Tensor, pooling_mode: str = "mean"
-) -> torch.Tensor:
-    """
-    High-performance embedding pooling.
-
-    Args:
-        embeddings: [total_embeddings, embedding_dim]
-        offsets: [num_segments + 1]
-        pooling_mode: "sum" or "mean"
-
-    Returns:
-        pooled: [num_segments, embedding_dim]
-    """
-    assert embeddings.dim() == 2 and offsets.dim() == 1
-    assert pooling_mode in ["sum", "mean"]
-    assert embeddings.is_contiguous() and offsets.is_contiguous()
-    assert embeddings.is_cuda and offsets.is_cuda
-
-    num_segs = offsets.shape[0] - 1
-    emb_dim = embeddings.shape[1]
-
-    # Use Triton parallel reduction
-    output = torch.empty(
-        (num_segs, emb_dim), dtype=embeddings.dtype, device=embeddings.device
-    )
-
-    mode = 0 if pooling_mode == "sum" else 1
-
-    grid = (num_segs,)
-
-    pooling_parallel_reduce_kernel[grid](
-        embeddings_ptr=embeddings,
-        offsets_ptr=offsets,
-        output_ptr=output,
-        embedding_dim=emb_dim,
-        num_segments=num_segs,
-        pooling_mode=mode,
-    )
-
-    return output
 
 
 def embedding_pooling_backward_triton(
@@ -250,8 +208,8 @@ def test_forward_correctness():
             # Reference (leadership's version)
             ref = embedding_pooling_reference(embeddings, offsets, mode)
 
-            # Triton (our implementation)
-            triton_out = embedding_pooling_forward_triton(embeddings, offsets, mode)
+            # Triton (our implementation - official interface)
+            triton_out = embedding_pooling(embeddings, offsets, mode)
 
             # PyTorch
             torch_out = embedding_pooling_torch(embeddings, offsets, mode)
@@ -271,7 +229,7 @@ def test_forward_correctness():
     offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
 
     ref = embedding_pooling_reference(embeddings, offsets, "mean")
-    triton_out = embedding_pooling_forward_triton(embeddings, offsets, "mean")
+    triton_out = embedding_pooling(embeddings, offsets, "mean")
 
     diff_triton = (triton_out - ref).abs().max().item()
     print(f"  Triton: diff={diff_triton:.2e} {'✓' if diff_triton < 1e-4 else '✗'}")
@@ -373,7 +331,7 @@ def benchmark_forward():
 
         # Warmup
         for _ in range(20):
-            _ = embedding_pooling_forward_triton(embeddings, offsets, "mean")
+            _ = embedding_pooling(embeddings, offsets, "mean")
         torch.cuda.synchronize()
 
         num_iters = 100 if batch <= 10000 else 50
@@ -381,10 +339,10 @@ def benchmark_forward():
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
-        # Benchmark Triton
+        # Benchmark Triton (official interface)
         start_event.record()
         for _ in range(num_iters):
-            _ = embedding_pooling_forward_triton(embeddings, offsets, "mean")
+            _ = embedding_pooling(embeddings, offsets, "mean")
         end_event.record()
         torch.cuda.synchronize()
         triton_time = start_event.elapsed_time(end_event) / num_iters
@@ -565,14 +523,12 @@ def benchmark_forward_backward():
 
         # Warmup forward
         for _ in range(10):
-            _ = embedding_pooling_forward_triton(embeddings_no_grad, offsets, "mean")
+            _ = embedding_pooling(embeddings_no_grad, offsets, "mean")
         torch.cuda.synchronize()
 
         start_event.record()
         for _ in range(num_iters):
-            pooled = embedding_pooling_forward_triton(
-                embeddings_no_grad, offsets, "mean"
-            )
+            pooled = embedding_pooling(embeddings_no_grad, offsets, "mean")
         end_event.record()
         torch.cuda.synchronize()
         forward_time = start_event.elapsed_time(end_event) / num_iters
