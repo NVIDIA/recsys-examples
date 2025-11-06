@@ -1106,20 +1106,23 @@ void run_hstu_bwd_impl_(Hstu_bwd_params& params, cudaStream_t stream) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename elem_type, int kHeadDim, bool Has_rab, bool Has_drab, bool Is_local,
+template <int Arch, typename elem_type, int kHeadDim, bool Has_rab, bool Has_drab, bool Is_local,
           bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc, bool Is_deterministic>
 void run_hstu_bwd_(Hstu_bwd_params& params, cudaStream_t stream) {
   const bool rab_one_head = (params.h_rab != params.h) && (params.h_rab == 1);
   // BOOL_SWITCH(params.is_balance_bwd, Is_balance, [&] {
   static constexpr bool Is_balance = false;
   BOOL_SWITCH(rab_one_head, Rab_one_head, [&] {
-    static constexpr auto tile_size = flash::get_tile_size_bwd<kHeadDim, Has_rab>();
+    static constexpr auto tile_size = flash::get_tile_size_bwd<Arch, kHeadDim, Has_rab>();
     static constexpr int kBlockM = std::get<0>(tile_size);
     static constexpr int kBlockN = std::get<1>(tile_size);
     static constexpr int kNWarps = std::get<2>(tile_size);
+    static constexpr int AtomLayoutMSdP = (Arch == 89) ? (kHeadDim <= 128 ? 2 : 1) : 4;
+    static constexpr int AtomLayoutNdKV = (Arch == 89) ? (kHeadDim <= 128 ? 4 : 1) : (kHeadDim <= 64 ? 4: 2);
+    static constexpr int AtomLayoutMdQ = (Arch == 89) ? (kHeadDim <= 128 ? 4 : 1) : (kHeadDim <= 64 ? 4: 2); // split DIM for 256
     run_hstu_bwd_impl_<elem_type, kHeadDim, kBlockM, kBlockN, Is_causal, Is_target, Is_context,
                       Is_local, Is_arbitrary, kNFunc, Is_deterministic, Has_rab, Has_drab, Is_balance,
-                      Rab_one_head, kNWarps, 4, kHeadDim <= 64 ? 4: 2, kHeadDim <= 64 ? 4: 2, false>(params, stream);
+                      Rab_one_head, kNWarps, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, false>(params, stream);
   });
   // });
 }

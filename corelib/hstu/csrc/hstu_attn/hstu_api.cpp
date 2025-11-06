@@ -478,18 +478,20 @@ template <typename Dtype, bool Has_rab, bool Has_drab, bool Is_local, bool Is_ca
           bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_bwd_headdim(Hstu_bwd_params &params, cudaStream_t stream) {
   DETERMINISTIC_SWITCH(params.deterministic, Is_deterministic, [&] {
-    #ifndef HSTU_DISABLE_HDIM32
-    if (params.d == 32) { run_hstu_bwd_<Dtype, 32, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
-    #endif
-    #ifndef HSTU_DISABLE_HDIM64
-    if (params.d == 64) { run_hstu_bwd_<Dtype, 64, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
-    #endif
-    #ifndef HSTU_DISABLE_HDIM128
-    if (params.d == 128) { run_hstu_bwd_<Dtype, 128, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
-    #endif
-    #ifndef HSTU_DISABLE_HDIM256
-    if (params.d == 256) { run_hstu_bwd_<Dtype, 256, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
-    #endif
+    ARCH_SWITCH(params.arch, Arch, [&] { // sm80 or sm86/sm89
+      #ifndef HSTU_DISABLE_HDIM32
+      if (params.d == 32) { run_hstu_bwd_<Arch, Dtype, 32, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM64
+      if (params.d == 64) { run_hstu_bwd_<Arch, Dtype, 64, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM128
+      if (params.d == 128) { run_hstu_bwd_<Arch, Dtype, 128, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
+      #endif
+      #ifndef HSTU_DISABLE_HDIM256
+      if (params.d == 256) { run_hstu_bwd_<Arch, Dtype, 256, Has_rab, Has_drab, Is_local, Is_causal, Is_context, Is_target, Is_arbitrary, kNFunc, Is_deterministic>(params, stream); }
+      #endif
+    });
   });
 }
 
@@ -545,7 +547,6 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     const bool deterministic) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
-  TORCH_CHECK(dprops->major == 8 && dprops->minor == 0, "HSTU backward does not support sm86 or sm89.");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   auto q_dtype = q.dtype();

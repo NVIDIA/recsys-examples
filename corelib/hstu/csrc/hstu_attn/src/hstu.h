@@ -170,6 +170,6 @@ template <int Arch, typename T, int Headdim, bool Has_rab, bool Is_local,
           bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc>
 void run_hstu_fwd_(Hstu_fwd_params& params, cudaStream_t stream);
 
-template <typename T, int Headdim, bool Has_rab, bool Has_drab, bool Is_local,
+template <int Arch, typename T, int Headdim, bool Has_rab, bool Has_drab, bool Is_local,
           bool Is_causal, bool Is_context, bool Is_target, bool Is_arbitrary, int kNFunc, bool Is_deterministic>
 void run_hstu_bwd_(Hstu_bwd_params& params, cudaStream_t stream);
