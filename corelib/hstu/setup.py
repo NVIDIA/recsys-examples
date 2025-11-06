@@ -34,8 +34,24 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
+root_path: Path = Path(__file__).resolve().parent
+
+cmd = ["git", "rev-parse", "HEAD"]
+sha = subprocess.check_output(cmd, cwd=str(root_path)).decode("ascii").strip()
 
 PACKAGE_NAME = "hstu_attn"
+
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "uninstall",
+        "-y",
+        PACKAGE_NAME,
+        "--break-system-packages",
+    ]
+)
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
@@ -365,7 +381,7 @@ class NinjaBuildExtension(BuildExtension):
 
 setup(
     name=PACKAGE_NAME,
-    version="0.1.0" + "+cu" + str(get_cuda_bare_metal_version(CUDA_HOME)[1]),
+    version="0.1.0" + "+" + sha[:7] + ".cu" + str(bare_metal_version),
     packages=find_packages(
         exclude=(
             "build",
