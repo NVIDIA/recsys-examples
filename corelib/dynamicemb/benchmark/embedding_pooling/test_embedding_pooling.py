@@ -586,7 +586,7 @@ def benchmark_forward_backward():
 
 
 if __name__ == "__main__":
-    print("\n🚀 Embedding Pooling - Combined Forward and Backward Testing\n")
+    print("\n Embedding Pooling - Forward and Backward Testing\n")
 
     # Forward tests
     test_forward_correctness()

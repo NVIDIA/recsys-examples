@@ -1,7 +1,6 @@
 import torch
 import triton
 from embedding_pooling_kernel import (
-    pooling_backward_kernel,
     pooling_backward_kernel_2d,
     pooling_parallel_reduce_kernel,
 )
@@ -91,7 +90,6 @@ class PoolingFunction(torch.autograd.Function):
         )
 
         mode = 0 if pooling_mode == "sum" else 1
-
 
         # When backward performance is not good, change this option
         # ========================================================================
