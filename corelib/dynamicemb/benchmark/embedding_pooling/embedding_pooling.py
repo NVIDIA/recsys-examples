@@ -1,7 +1,7 @@
 import torch
 import triton
 from embedding_pooling_kernel import (
-    pooling_backward_kernel_2d,
+    pooling_backward_kernel,
     pooling_parallel_reduce_kernel,
 )
 
@@ -107,20 +107,13 @@ class PoolingFunction(torch.autograd.Function):
 
         mode = 0 if pooling_mode == "sum" else 1
 
-        # When backward performance is not good, change this option
-        # ========================================================================
-        # Option 1: 2D Grid (Higher Parallelism) - One program per (segment, dim_block)
-        # ========================================================================
-        # CRITICAL: Use the MINIMUM BLOCK_D from autotune configs to calculate grid
-        # This ensures we launch enough blocks to cover all dimensions
-        # even if autotune selects a smaller BLOCK_D than estimated
         MIN_BLOCK_D = 64  # Minimum BLOCK_D across all autotune configs
         num_d_blocks = triton.cdiv(emb_dim, MIN_BLOCK_D)
         grid = (num_segs, num_d_blocks)
 
         autotune_num_segments = prev_power_of_2(num_segs)
 
-        pooling_backward_kernel_2d[grid](
+        pooling_backward_kernel[grid](
             grad_output_ptr=grad_output,
             offsets_ptr=offsets,
             grad_input_ptr=grad_embeddings,
@@ -129,19 +122,6 @@ class PoolingFunction(torch.autograd.Function):
             pooling_mode=mode,
             autotune_num_segments=autotune_num_segments,
         )
-        # ========================================================================
-        # Option 2: 1D Grid (Original) - One program per segment
-        # ========================================================================
-        # grid = (num_segs,)
-
-        # pooling_backward_kernel[grid](
-        #     grad_output_ptr=grad_output,
-        #     offsets_ptr=offsets,
-        #     grad_input_ptr=grad_embeddings,
-        #     embedding_dim=emb_dim,
-        #     num_segments=num_segs,
-        #     pooling_mode=mode,
-        # )
 
         return grad_embeddings, None, None
 
