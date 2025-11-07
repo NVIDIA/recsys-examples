@@ -92,9 +92,9 @@ void initialize_with_generator(
   at::Tensor buffer, 
   at::Tensor indices, 
   typename GeneratorT::Args generator_args,
-  int num_worker = -1
+  int64_t num_worker = -1
 ) {
-  int num_dims = buffer.dim();
+  int64_t num_dims = buffer.dim();
   if (num_dims != 2) {
     throw std::runtime_error("Initializer'input buffer's dim have to be 2.");
   }
@@ -108,16 +108,16 @@ void initialize_with_generator(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &deviceProp = DeviceProp::getDeviceProp();
 
-  int block_size = deviceProp.max_thread_per_block;
-  int num_need = num_total * dim;
+  int64_t block_size = deviceProp.max_thread_per_block;
+  int64_t num_need = num_total * dim;
   if (num_worker == -1) {
     num_worker = deviceProp.total_threads;
   }
-  int max_grid_size = num_worker / block_size;
+  int64_t max_grid_size = num_worker / block_size;
   if (num_worker > num_need) {
     num_worker = num_need;
   }
-  int grid_size = (num_worker - 1) / block_size + 1;
+  int64_t grid_size = (num_worker - 1) / block_size + 1;
   if (grid_size > max_grid_size) {
     grid_size = max_grid_size;
   }
