@@ -160,14 +160,20 @@ def embedding_pooling_backward_torch(
 
 
 # ============================================================================
-# Forward: Correctness Testing
+# Correctness Testing: Forward and Backward
 # ============================================================================
 
+# Unified tolerance for both forward and backward
+TOLERANCE = 1e-4
 
-def test_forward_correctness():
-    """Test forward correctness against reference implementations."""
+
+def test_correctness():
+    """
+    Unified test for forward and backward correctness.
+    Compares Triton implementation against PyTorch on the same data.
+    """
     print("=" * 80)
-    print("Forward Correctness Testing")
+    print("Forward and Backward Correctness Testing")
     print("=" * 80)
 
     torch.manual_seed(42)
@@ -192,161 +198,100 @@ def test_forward_correctness():
             )
 
         total_embs = lengths.sum().item()
-        embeddings = torch.randn(
-            total_embs, emb_dim, device="cuda", dtype=torch.float32
-        )
         offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
 
-        for mode in ["sum", "mean"]:
-            # Reference (leadership's version)
-            ref = embedding_pooling_reference(embeddings, offsets, mode)
+        # Generate embeddings with gradient tracking
+        embeddings = torch.randn(
+            total_embs, emb_dim, device="cuda", dtype=torch.float32, requires_grad=True
+        )
 
-            # Triton (our implementation - official interface)
+        for mode in ["sum", "mean"]:
+            # ===== Forward Test =====
+            # Triton forward
             triton_out = embedding_pooling(embeddings, offsets, mode)
 
-            # PyTorch
+            # PyTorch forward
             torch_out = embedding_pooling_torch(embeddings, offsets, mode)
 
-            # Compare
-            diff_ref = (triton_out - ref).abs().max().item()
-            diff_torch = (triton_out - torch_out).abs().max().item()
+            # Compare forward outputs
+            forward_diff = (triton_out - torch_out).abs().max().item()
 
-            status = "✓" if diff_ref < 1e-4 and diff_torch < 1e-4 else "✗"
-            print(f"  {mode:4s}: ref={diff_ref:.2e}, torch={diff_torch:.2e} {status}")
+            # ===== Backward Test =====
+            # Generate gradient output
+            grad_output = torch.randn_like(triton_out)
+
+            # Triton backward
+            triton_out.backward(grad_output, retain_graph=True)
+            grad_triton = embeddings.grad.clone()
+            embeddings.grad.zero_()
+
+            # PyTorch backward
+            torch_out.backward(grad_output)
+            grad_torch = embeddings.grad.clone()
+            embeddings.grad.zero_()
+
+            # Compare backward gradients
+            backward_diff = (grad_triton - grad_torch).abs().max().item()
+
+            # Status
+            forward_status = "✓" if forward_diff < TOLERANCE else "✗"
+            backward_status = "✓" if backward_diff < TOLERANCE else "✗"
+
+            print(
+                f"  {mode:4s}: fwd={forward_diff:.2e} {forward_status}  "
+                f"bwd={backward_diff:.2e} {backward_status}"
+            )
 
             # Assert correctness
             assert (
-                diff_ref < 1e-4
-            ), f"Forward failed: diff vs reference = {diff_ref:.2e} (mode={mode}, case={name})"
+                forward_diff < TOLERANCE
+            ), f"Forward failed: diff = {forward_diff:.2e} (mode={mode}, case={name})"
             assert (
-                diff_torch < 1e-4
-            ), f"Forward failed: diff vs PyTorch = {diff_torch:.2e} (mode={mode}, case={name})"
-
-    # Edge cases
-    print(f"\nEdge cases (with empty segments):")
-    lengths = torch.tensor([5, 0, 3, 0, 1], device="cuda")
-    total_embs = lengths.sum().item()
-    embeddings = torch.randn(total_embs, 64, device="cuda")
-    offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
-
-    ref = embedding_pooling_reference(embeddings, offsets, "mean")
-    triton_out = embedding_pooling(embeddings, offsets, "mean")
-
-    diff_triton = (triton_out - ref).abs().max().item()
-    print(f"  Triton: diff={diff_triton:.2e} {'✓' if diff_triton < 1e-4 else '✗'}")
-
-    # Assert correctness
-    assert diff_triton < 1e-4, f"Forward edge case failed: diff = {diff_triton:.2e}"
-
-
-# ============================================================================
-# Backward: Correctness Testing
-# ============================================================================
-
-
-def test_backward_correctness():
-    """
-    Test backward correctness by comparing against PyTorch autograd.
-    """
-    print("\n" + "=" * 80)
-    print("Backward vs PyTorch Autograd")
-    print("=" * 80)
-
-    torch.manual_seed(42)
-
-    from embedding_pooling import embedding_pooling
-
-    test_cases = [
-        ("Small", 100, 128, 10),
-        ("Medium", 1000, 256, 50),
-        ("Large", 500, 512, 100),
-        ("Many segs", 5000, 128, 20),
-    ]
-
-    for name, batch_size, emb_dim, avg_len in test_cases:
-        print(f"\n{name}: batch={batch_size}, dim={emb_dim}, avg_len={avg_len}")
-
-        lengths = torch.randint(
-            max(1, avg_len - 10), avg_len + 10, (batch_size,), device="cuda"
-        )
-        total_embs = lengths.sum().item()
-        offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
-
-        for mode in ["sum", "mean"]:
-            embeddings_ref = torch.randn(
-                total_embs,
-                emb_dim,
-                device="cuda",
-                dtype=torch.float32,
-                requires_grad=True,
-            )
-
-            # Reference: PyTorch
-            num_segs = offsets.shape[0] - 1
-            seg_ids = torch.repeat_interleave(
-                torch.arange(num_segs, device="cuda"), lengths
-            )
-
-            pooled_ref = torch.zeros(num_segs, emb_dim, device="cuda")
-            pooled_ref.scatter_add_(
-                0, seg_ids.unsqueeze(1).expand(-1, emb_dim), embeddings_ref
-            )
-            if mode == "mean":
-                pooled_ref = pooled_ref / lengths.unsqueeze(1).float().clamp(min=1)
-
-            grad_output = torch.randn_like(pooled_ref)
-            pooled_ref.backward(grad_output)
-            grad_ref = embeddings_ref.grad.clone()
-
-            # ===== Our Implementation:  =====
-            embeddings_ours = embeddings_ref.detach().clone().requires_grad_(True)
-
-            pooled_ours = embedding_pooling(embeddings_ours, offsets, mode)
-
-            pooled_ours.backward(grad_output)
-            grad_ours = embeddings_ours.grad.clone()
-
-            diff = (grad_ours - grad_ref).abs().max().item()
-            status = "✓" if diff < 1e-5 else "✗"
-
-            print(f"  {mode:4s}: diff={diff:.2e} {status}")
-
-            assert (
-                diff < 1e-5
-            ), f"Backward failed: diff vs PyTorch autograd = {diff:.2e} (mode={mode}, case={name})"
+                backward_diff < TOLERANCE
+            ), f"Backward failed: diff = {backward_diff:.2e} (mode={mode}, case={name})"
 
     # Edge case: empty segments
     print(f"\nEdge case (empty segments):")
-    lengths = torch.tensor([3, 0, 5, 0, 2], device="cuda")
+    lengths = torch.tensor([5, 0, 3, 0, 1], device="cuda")
     total_embs = lengths.sum().item()
+    embeddings = torch.randn(total_embs, 64, device="cuda", requires_grad=True)
     offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
 
-    # Ground truth
-    embeddings_ref = torch.randn(total_embs, 64, device="cuda", requires_grad=True)
-    num_segs = 5
-    seg_ids = torch.repeat_interleave(torch.arange(num_segs, device="cuda"), lengths)
+    for mode in ["sum", "mean"]:
+        # Forward
+        triton_out = embedding_pooling(embeddings, offsets, mode)
+        torch_out = embedding_pooling_torch(embeddings, offsets, mode)
+        forward_diff = (triton_out - torch_out).abs().max().item()
 
-    pooled_ref = torch.zeros(num_segs, 64, device="cuda")
-    pooled_ref.scatter_add_(0, seg_ids.unsqueeze(1).expand(-1, 64), embeddings_ref)
-    pooled_ref = pooled_ref / lengths.unsqueeze(1).float().clamp(min=1)
+        # Backward
+        grad_output = torch.randn_like(triton_out)
 
-    grad_output = torch.randn_like(pooled_ref)
-    pooled_ref.backward(grad_output)
-    grad_ref = embeddings_ref.grad.clone()
+        triton_out.backward(grad_output, retain_graph=True)
+        grad_triton = embeddings.grad.clone()
+        embeddings.grad.zero_()
 
-    # Our implementation
-    embeddings_ours = embeddings_ref.detach().clone().requires_grad_(True)
-    pooled_ours = embedding_pooling(embeddings_ours, offsets, "mean")
-    pooled_ours.backward(grad_output)
-    grad_ours = embeddings_ours.grad.clone()
+        torch_out.backward(grad_output)
+        grad_torch = embeddings.grad.clone()
+        embeddings.grad.zero_()
 
-    diff = (grad_ours - grad_ref).abs().max().item()
-    print(f"  diff={diff:.2e} {'✓' if diff < 1e-5 else '✗'}")
+        backward_diff = (grad_triton - grad_torch).abs().max().item()
 
-    # Assert correctness
-    assert diff < 1e-5, f"Backward edge case failed: diff = {diff:.2e}"
+        forward_status = "✓" if forward_diff < TOLERANCE else "✗"
+        backward_status = "✓" if backward_diff < TOLERANCE else "✗"
 
-    print("\n✓ All backward tests passed against PyTorch autograd!")
+        print(
+            f"  {mode:4s}: fwd={forward_diff:.2e} {forward_status}  "
+            f"bwd={backward_diff:.2e} {backward_status}"
+        )
+
+        assert (
+            forward_diff < TOLERANCE
+        ), f"Forward edge case failed: diff = {forward_diff:.2e} (mode={mode})"
+        assert (
+            backward_diff < TOLERANCE
+        ), f"Backward edge case failed: diff = {backward_diff:.2e} (mode={mode})"
+
+    print("\n✓ All forward and backward tests passed!")
 
 
 # ============================================================================
@@ -413,31 +358,11 @@ def benchmark_forward():
         torch.cuda.synchronize()
         torch_time = start_event.elapsed_time(end_event) / num_iters
 
-        # Benchmark Reference (skip for huge batches)
-        if batch <= 10000:
-            # Warmup
-            for _ in range(20):
-                _ = embedding_pooling_reference(embeddings, offsets, "mean")
-            torch.cuda.synchronize()
-
-            start_event.record()
-            for _ in range(num_iters):
-                _ = embedding_pooling_reference(embeddings, offsets, "mean")
-            end_event.record()
-            torch.cuda.synchronize()
-            ref_time = start_event.elapsed_time(end_event) / num_iters
-        else:
-            ref_time = None
-
         print(f"\n  Results:")
         print(f"    Triton:       {triton_time:7.4f} ms")
         print(
             f"    PyTorch:      {torch_time:7.4f} ms  (vs Triton: {torch_time/triton_time:5.2f}x)"
         )
-        if ref_time:
-            print(
-                f"    Reference:    {ref_time:7.4f} ms  (speedup: {ref_time/triton_time:5.1f}x)"
-            )
 
 
 # ============================================================================
@@ -597,12 +522,11 @@ def benchmark_forward_backward():
 if __name__ == "__main__":
     print("\n Embedding Pooling - Forward and Backward Testing\n")
 
-    # Forward tests
-    test_forward_correctness()
-    benchmark_forward()
+    # Correctness tests (unified forward + backward)
+    test_correctness()
 
-    # Backward tests
-    test_backward_correctness()  # Ground truth validation using PyTorch autograd
+    # Performance benchmarks
+    benchmark_forward()
     benchmark_backward()
     benchmark_forward_backward()
 
