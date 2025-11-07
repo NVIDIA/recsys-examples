@@ -34,7 +34,7 @@ from megatron.core.utils import divide
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.tp_layer_norm import TPLayerNormMulDropout
-from ops.collective_ops import gather_along_last_dim
+from ops.collective_ops import gather_along_last_dim, split_along_first_dim
 from ops.triton_ops.triton_layer_norm import triton_layer_norm
 
 
@@ -228,6 +228,7 @@ class HSTULayer(MegatronModule):
             tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
         # TODO: remove contiguous once cutlass backend is ready
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
+            # [ T, hidden_size_per_partition]
             jagged_attn_output = self._attn_func(
                 tq,
                 tk,
@@ -239,13 +240,20 @@ class HSTULayer(MegatronModule):
                 scaling_seqlen=jd.scaling_seqlen,
                 target_group_size=self._target_group_size,
             )
-
+            # TODO handle the padding in HSTU kernel
+            padding_length = jd.padding_length
+            last_valid_index = jd.seqlen_offsets[-1]
+            jagged_attn_output = jagged_attn_output.clone()
+            jagged_attn_output[
+                last_valid_index : last_valid_index + padding_length, ...
+            ] = 0.0
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             if self._debug_shortcut_output_ln_mul_dropout:
-                parallel_input = jagged_attn_output
+                parallel_input = jagged_attn_output.clone()
             else:
-                parallel_input = self._output_ln_dropout_mul(jagged_attn_output, tu)
-
+                parallel_input = self._output_ln_dropout_mul(
+                    jagged_attn_output, tu
+                )  # [ T, hidden_size_per_partition]
         if self._recompute_input_silu:
             # when output grad (gemm dgrad) is computed, trigger the recompute of the silu
             # we discard here after tu is used
@@ -256,7 +264,12 @@ class HSTULayer(MegatronModule):
             if self._debug_shortcut_proj_linear:
                 output = gather_along_last_dim(
                     parallel_input, parallel_state.get_tensor_model_parallel_group()
-                )
+                )  # [ T , hidden_size]
+                if self._sequence_parallel:
+                    # scatter
+                    output = split_along_first_dim(
+                        output, parallel_state.get_tensor_model_parallel_group()
+                    )  # [ T / tp_size, hidden_size]
             else:
                 output, _ = self._linear_proj(
                     parallel_input
@@ -264,7 +277,6 @@ class HSTULayer(MegatronModule):
 
             if self._residual:
                 output = output + x
-
         return JaggedData(
             values=output,
             seqlen=jd.seqlen,

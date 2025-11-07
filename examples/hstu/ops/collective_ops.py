@@ -352,6 +352,7 @@ class SplitAlongLastDimFromRegion(torch.autograd.Function):
 
 
 split_along_last_dim = SplitAlongLastDimFromRegion.apply
+split_along_first_dim = SplitAlongFirstDimFromRegion.apply
 gather_along_first_dim = AllGatherFirstDimFromRegion.apply
 gatherv_along_first_dim = AllGathervFirstDimFromRegion.apply
 gather_along_last_dim = AllGatherLastDimFromRegion.apply

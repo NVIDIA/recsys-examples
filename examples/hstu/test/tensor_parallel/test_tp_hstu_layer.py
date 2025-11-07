@@ -218,7 +218,7 @@ def test_tp_hstu_layer_forward_backward(
         False,
         banned_seqlen_divisor=tp_size if sequence_parallel else None,
     )
-    with init.auto_destroy_global_state():
+    with init.auto_destroy_global_state(), torch.autograd.set_detect_anomaly(True):
         for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
             zip(jd_list, ref_jd_list, fp32_ref_jd_list)
         ):
@@ -262,12 +262,13 @@ def test_tp_hstu_layer_forward_backward(
                 hstu_close(grad_tp, grad_debug, grad_fp32_debug, multiplier=5),
                 f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_debug).abs().max()} vs {(grad_debug - grad_fp32_debug).abs().max()} vs hey {(grad_tp - grad_debug).abs().max()}",
             )
+            print(f"[rank {torch.distributed.get_rank()}] [iter {i}] good")
 
 
 # set backend as PYTORCH
 @pytest.mark.parametrize(
     "batchsize",
-    [128],
+    [32],
 )
 @pytest.mark.parametrize("num_heads", [4, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [128])  #
@@ -366,7 +367,7 @@ def test_tp_hstu_layer_forward_backward_update(
     fwd_multiplier = 2
     bwd_multiplier = 2
     compare_tpN_to_debug_weights(tp_model, debug_model, debug_model_fp32)
-    with init.auto_destroy_global_state():
+    with init.auto_destroy_global_state(), torch.autograd.set_detect_anomaly(True):
         for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
             zip(jd_list, ref_jd_list, fp32_ref_jd_list)
         ):

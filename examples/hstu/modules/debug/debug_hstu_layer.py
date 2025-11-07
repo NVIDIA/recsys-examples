@@ -351,7 +351,7 @@ class HSTULayer(MegatronModule):
                 )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             if self._debug_shortcut_output_ln_mul_dropout:
-                parallel_input = jagged_attn_output
+                parallel_input = jagged_attn_output.clone()
             elif self._debug_mock_tp:
                 parallel_input = _mock_tp_output_ln_mul_dropout(
                     jagged_attn_output,
@@ -408,7 +408,7 @@ class HSTULayer(MegatronModule):
             if not self._debug_mock_tp and not self._debug_shortcut_proj_linear:
                 output = self._linear_proj(parallel_input)
             if not self._debug_mock_tp and self._debug_shortcut_proj_linear:
-                output = parallel_input
+                output = parallel_input.clone()
             if self._debug_check_tp_equal:
                 # fwd
                 collective_assert_tensor(
