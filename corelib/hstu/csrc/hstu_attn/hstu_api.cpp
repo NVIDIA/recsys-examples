@@ -662,7 +662,7 @@ std::vector<at::Tensor> hstu_varlen_bwd(
     it is directly defined here as the size of (max_seqlen_k, seqlen_k_rounded) to be compatible with both equal and unequal lengths of q and kv.
     Some tiles will not write back so we give zeros.
     */
-    dRab = torch::zeros({batch_size, num_heads, max_seqlen_k, seqlen_k_rounded}, opts);
+    dRab = torch::zeros({batch_size, num_heads_rab, max_seqlen_k, seqlen_k_rounded}, opts);
   }
 
   set_params_dgrad(&params,
