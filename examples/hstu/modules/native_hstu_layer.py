@@ -242,14 +242,25 @@ class HSTULayer(MegatronModule):
             )
             # TODO handle the padding in HSTU kernel
             padding_length = jd.padding_length
-            last_valid_index = jd.seqlen_offsets[-1]
-            jagged_attn_output = jagged_attn_output.clone()
-            jagged_attn_output[
-                last_valid_index : last_valid_index + padding_length, ...
-            ] = 0.0
+            if padding_length > 0:
+                last_valid_index = jd.seqlen_offsets[-1]
+                jagged_attn_output = (
+                    jagged_attn_output.clone()
+                )  # we need this clone otherwise it will be inplace operation
+                jagged_attn_output[
+                    last_valid_index : last_valid_index + padding_length, ...
+                ] = 0.0
+
+                def reset_padding_grad_hook(grad):
+                    grad[
+                        last_valid_index : last_valid_index + padding_length, ...
+                    ] = 0.0
+                    return grad
+
+                jagged_attn_output.register_hook(reset_padding_grad_hook)
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             if self._debug_shortcut_output_ln_mul_dropout:
-                parallel_input = jagged_attn_output.clone()
+                parallel_input = jagged_attn_output
             else:
                 parallel_input = self._output_ln_dropout_mul(
                     jagged_attn_output, tu

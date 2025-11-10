@@ -218,7 +218,7 @@ def test_tp_hstu_layer_forward_backward(
         False,
         banned_seqlen_divisor=tp_size if sequence_parallel else None,
     )
-    with init.auto_destroy_global_state(), torch.autograd.set_detect_anomaly(True):
+    with init.auto_destroy_global_state():
         for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
             zip(jd_list, ref_jd_list, fp32_ref_jd_list)
         ):
@@ -367,7 +367,7 @@ def test_tp_hstu_layer_forward_backward_update(
     fwd_multiplier = 2
     bwd_multiplier = 2
     compare_tpN_to_debug_weights(tp_model, debug_model, debug_model_fp32)
-    with init.auto_destroy_global_state(), torch.autograd.set_detect_anomaly(True):
+    with init.auto_destroy_global_state():
         for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
             zip(jd_list, ref_jd_list, fp32_ref_jd_list)
         ):

@@ -437,7 +437,7 @@ def create_hstu_attention(
                 linear_dim,
                 is_causal,
             )
-        elif sm_major_version == 8 and (sm_minor_version == 6 or sm_minor_version == 9):
+        elif sm_major_version == 8:
             return FusedHSTUAttention(
                 num_heads,
                 attention_dim,

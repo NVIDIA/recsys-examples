@@ -227,7 +227,10 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             self._training_dtype = torch.bfloat16
         if config.fp16:
             self._training_dtype = torch.float16
-        self._sequence_parallel = config.sequence_parallel
+        if isinstance(config, HSTUConfig):
+            self._sequence_parallel = config.sequence_parallel
+        else:
+            self._sequence_parallel = False
         self._tp_size = 1
         if is_inference:
             self._sequence_parallel = False
