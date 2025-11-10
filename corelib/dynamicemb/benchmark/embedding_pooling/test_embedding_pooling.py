@@ -204,13 +204,33 @@ def test_correctness():
         embeddings = torch.randn(
             total_embs, emb_dim, device="cuda", dtype=torch.float32, requires_grad=True
         )
+        embeddings_clone = embeddings.clone()
+
+        for i in range(20):
+            triton_out = embedding_pooling(embeddings, offsets, "mean")
+            torch_out = embedding_pooling_torch(embeddings_clone, offsets, "mean")
+            grad_out_triton = torch.randn_like(triton_out)
+            grad_out_torch = torch.randn_like(torch_out)
+
+            _ = torch.autograd.grad(
+                triton_out, embeddings, grad_out_triton, retain_graph=True
+            )
+            _ = torch.autograd.grad(
+                torch_out, embeddings, grad_out_torch, retain_graph=True
+            )
+
+        torch.cuda.synchronize()
 
         for mode in ["sum", "mean"]:
             # Triton forward
-            triton_out = embedding_pooling(embeddings, offsets, mode)
+            with torch.cuda.nvtx.range("triton_forward"):
+                triton_out = embedding_pooling(embeddings, offsets, mode)
+            torch.cuda.synchronize()
 
             # PyTorch forward
-            torch_out = embedding_pooling_torch(embeddings, offsets, mode)
+            with torch.cuda.nvtx.range("torch_forward"):
+                torch_out = embedding_pooling_torch(embeddings_clone, offsets, mode)
+            torch.cuda.synchronize()
 
             # Compare forward outputs
             forward_diff = (triton_out - torch_out).abs().max().item()
@@ -218,16 +238,21 @@ def test_correctness():
             # ===== Backward Test =====
             # Generate gradient output
             grad_output = torch.randn_like(triton_out)
+            torch.cuda.synchronize()
 
             # Triton backward
-            triton_out.backward(grad_output, retain_graph=True)
+            with torch.cuda.nvtx.range("triton_backward"):
+                triton_out.backward(grad_output, retain_graph=True)
             grad_triton = embeddings.grad.clone()
             embeddings.grad.zero_()
+            torch.cuda.synchronize()
 
             # PyTorch backward
-            torch_out.backward(grad_output)
+            with torch.cuda.nvtx.range("torch_backward"):
+                torch_out.backward(grad_output)
             grad_torch = embeddings.grad.clone()
             embeddings.grad.zero_()
+            torch.cuda.synchronize()
 
             # Compare backward gradients
             backward_diff = (grad_triton - grad_torch).abs().max().item()
@@ -293,302 +318,7 @@ def test_correctness():
     print("\n✓ All forward and backward tests passed!")
 
 
-# ============================================================================
-# Forward: Benchmarking
-# ============================================================================
-
-
-def benchmark_forward():
-    """Benchmark forward with alternating data (realistic usage)."""
-    print("\n" + "=" * 80)
-    print("Forward Performance Benchmarking (with alternating data)")
-    print("=" * 80)
-
-    configs = [
-        ("Small segs", 1000, 128, 10),
-        ("Medium segs", 1000, 256, 50),
-        ("Large segs", 500, 256, 150),
-        ("Very large", 100, 512, 600),
-        ("Many small", 10000, 128, 20),
-        ("Huge batch", 20000, 128, 15),
-    ]
-
-    for name, batch, dim, avg_len in configs:
-        lengths = torch.randint(
-            max(1, avg_len - 10), avg_len + 10, (batch,), device="cuda"
-        )
-        total = lengths.sum().item()
-        offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
-
-        print(
-            f"\n{name}: {batch} segs, dim={dim}, avg_len={avg_len:.0f}, total={total}"
-        )
-
-        data_pairs = []
-        for _ in range(2):
-            embeddings = torch.randn(total, dim, device="cuda", dtype=torch.float32)
-            data_pairs.append({"embeddings": embeddings, "offsets": offsets})
-
-        # ===== Warmup =====
-        for i in range(20):
-            data = data_pairs[i % 2]
-            embeddings = data["embeddings"]
-            _ = embedding_pooling(embeddings, offsets, "mean")
-            _ = embedding_pooling_torch(embeddings, offsets, "mean")
-        torch.cuda.synchronize()
-
-        num_iters = 100 if batch <= 10000 else 50
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        times_triton = []
-        times_torch = []
-
-        for i in range(num_iters):
-            data = data_pairs[i % 2]
-            embeddings = data["embeddings"]
-
-            start_event.record()
-            _ = embedding_pooling(embeddings, offsets, "mean")
-            end_event.record()
-            torch.cuda.synchronize()
-            times_triton.append(start_event.elapsed_time(end_event))
-
-            start_event.record()
-            _ = embedding_pooling_torch(embeddings, offsets, "mean")
-            end_event.record()
-            torch.cuda.synchronize()
-            times_torch.append(start_event.elapsed_time(end_event))
-
-        triton_time = sum(times_triton) / len(times_triton)
-        torch_time = sum(times_torch) / len(times_torch)
-
-        print(f"\n  Results:")
-        print(f"    Triton:       {triton_time:7.4f} ms")
-        print(
-            f"    PyTorch:      {torch_time:7.4f} ms  (vs Triton: {torch_time/triton_time:5.2f}x)"
-        )
-
-
-# ============================================================================
-# Backward: Benchmarking
-# ============================================================================
-
-
-def benchmark_backward():
-    """Benchmark backward performance through autograd (realistic usage)."""
-    print("\n" + "=" * 80)
-    print("Backward Performance Benchmarking (via autograd)")
-    print("=" * 80)
-
-    configs = [
-        ("Small segs", 1000, 128, 10),
-        ("Medium segs", 1000, 256, 50),
-        ("Large segs", 500, 256, 150),
-        ("Very large", 100, 512, 600),
-        ("Many small", 10000, 128, 20),
-    ]
-
-    for name, batch, dim, avg_len in configs:
-        lengths = torch.randint(
-            max(1, avg_len - 10), avg_len + 10, (batch,), device="cuda"
-        )
-        total = lengths.sum().item()
-        offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
-
-        print(
-            f"\n{name}: {batch} segs, dim={dim}, avg_len={avg_len:.0f}, total={total}"
-        )
-
-        data_pairs = []
-        for _ in range(2):
-            embeddings_triton = torch.randn(
-                total, dim, device="cuda", dtype=torch.float32, requires_grad=True
-            )
-            triton_out = embedding_pooling(embeddings_triton, offsets, "mean")
-            grad_output_triton = torch.randn_like(triton_out)
-
-            embeddings_torch = torch.randn(
-                total, dim, device="cuda", dtype=torch.float32, requires_grad=True
-            )
-            torch_out = embedding_pooling_torch(embeddings_torch, offsets, "mean")
-            grad_output_torch = torch.randn_like(torch_out)
-
-            data_pairs.append(
-                {
-                    "triton": (embeddings_triton, triton_out, grad_output_triton),
-                    "torch": (embeddings_torch, torch_out, grad_output_torch),
-                }
-            )
-
-        # ===== Warmup =====
-        for i in range(20):
-            data = data_pairs[i % 2]
-            embeddings_triton, triton_out, grad_output_triton = data["triton"]
-            embeddings_torch, torch_out, grad_output_torch = data["torch"]
-
-            _ = torch.autograd.grad(
-                outputs=triton_out,
-                inputs=embeddings_triton,
-                grad_outputs=grad_output_triton,
-                retain_graph=True,
-            )
-            _ = torch.autograd.grad(
-                outputs=torch_out,
-                inputs=embeddings_torch,
-                grad_outputs=grad_output_torch,
-                retain_graph=True,
-            )
-        torch.cuda.synchronize()
-
-        num_iters = 100 if batch <= 10000 else 50
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        times_triton = []
-        times_torch = []
-
-        for i in range(num_iters):
-            data = data_pairs[i % 2]
-            embeddings_triton, triton_out, grad_output_triton = data["triton"]
-            embeddings_torch, torch_out, grad_output_torch = data["torch"]
-
-            start_event.record()
-            grad_triton = torch.autograd.grad(
-                outputs=triton_out,
-                inputs=embeddings_triton,
-                grad_outputs=grad_output_triton,
-                retain_graph=True,
-            )
-            end_event.record()
-            torch.cuda.synchronize()
-            times_triton.append(start_event.elapsed_time(end_event))
-
-            start_event.record()
-            grad_torch = torch.autograd.grad(
-                outputs=torch_out,
-                inputs=embeddings_torch,
-                grad_outputs=grad_output_torch,
-                retain_graph=True,
-            )
-            end_event.record()
-            torch.cuda.synchronize()
-            times_torch.append(start_event.elapsed_time(end_event))
-
-        triton_time = sum(times_triton) / len(times_triton)
-        torch_time = sum(times_torch) / len(times_torch)
-
-        print(f"  Results:")
-        print(f"    Triton:   {triton_time:7.4f} ms")
-        print(
-            f"    PyTorch:  {torch_time:7.4f} ms  (ratio: {torch_time/triton_time:5.2f}x)"
-        )
-
-        data = data_pairs[0]
-        embeddings_triton, triton_out, grad_output_triton = data["triton"]
-        embeddings_torch, torch_out, grad_output_torch = data["torch"]
-
-        grad_triton = torch.autograd.grad(
-            triton_out, embeddings_triton, grad_output_triton, retain_graph=True
-        )
-        grad_torch = torch.autograd.grad(
-            torch_out, embeddings_torch, grad_output_torch, retain_graph=True
-        )
-
-        diff = (grad_triton[0] - grad_torch[0]).abs().max().item()
-        print(f"    Diff: {diff:.2e} {'✓' if diff < TOLERANCE else '✗'}")
-
-
-def benchmark_forward_backward():
-    """Benchmark complete forward + backward pass."""
-    print("\n" + "=" * 80)
-    print("Complete Forward + Backward Benchmarking")
-    print("=" * 80)
-
-    from embedding_pooling import PoolingFunction
-
-    configs = [
-        ("Medium", 1000, 256, 50),
-        ("Large", 500, 512, 100),
-        ("Many segments", 10000, 128, 20),
-        ("Mixed lengths", 1000, 128, None),
-    ]
-
-    for name, batch, dim, avg_len in configs:
-        if avg_len is None:
-            lengths = torch.randint(1, 100, (batch,), device="cuda")
-        else:
-            lengths = torch.randint(
-                max(1, avg_len - 10), avg_len + 10, (batch,), device="cuda"
-            )
-        total = lengths.sum().item()
-        offsets = torch.cat([torch.tensor([0], device="cuda"), lengths.cumsum(0)])
-
-        print(f"\n{name}: {batch} segs, dim={dim}, total={total}")
-
-        embeddings = torch.randn(total, dim, device="cuda", requires_grad=True)
-
-        # Warmup
-        for _ in range(10):
-            embeddings.grad = None
-            pooled = PoolingFunction.apply(embeddings, offsets, "mean")
-            loss = pooled.sum()
-            loss.backward()
-        torch.cuda.synchronize()
-
-        num_iters = 50
-
-        # Create CUDA events
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        # Benchmark with autograd (forward + backward)
-        start_event.record()
-        for _ in range(num_iters):
-            embeddings.grad = None
-            pooled = PoolingFunction.apply(embeddings, offsets, "mean")
-            loss = pooled.sum()
-            loss.backward()
-        end_event.record()
-        torch.cuda.synchronize()
-        total_time = start_event.elapsed_time(end_event) / num_iters
-
-        # Measure forward only
-        embeddings_no_grad = torch.randn(total, dim, device="cuda")
-
-        # Warmup forward
-        for _ in range(10):
-            _ = embedding_pooling(embeddings_no_grad, offsets, "mean")
-        torch.cuda.synchronize()
-
-        start_event.record()
-        for _ in range(num_iters):
-            pooled = embedding_pooling(embeddings_no_grad, offsets, "mean")
-        end_event.record()
-        torch.cuda.synchronize()
-        forward_time = start_event.elapsed_time(end_event) / num_iters
-
-        backward_time = total_time - forward_time
-
-        print(f"  Forward:  {forward_time:7.4f} ms")
-        print(f"  Backward: {backward_time:7.4f} ms")
-        print(f"  Total:    {total_time:7.4f} ms")
-        print(f"  Backward/Forward ratio: {backward_time/forward_time:.2f}x")
-
-
 if __name__ == "__main__":
     print("\n Embedding Pooling - Forward and Backward Testing\n")
 
-    # Correctness tests (unified forward + backward)
     test_correctness()
-
-    # Performance benchmarks
-    benchmark_forward()
-    benchmark_backward()
-    benchmark_forward_backward()
-
-    print("\n" + "=" * 80)
-    print("✓ All forward and backward tests completed")
-    print("=" * 80 + "\n")

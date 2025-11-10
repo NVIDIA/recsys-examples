@@ -68,6 +68,7 @@ class PoolingFunction(torch.autograd.Function):
         ctx.save_for_backward(offsets)
         ctx.pooling_mode = pooling_mode
         ctx.emb_dim = emb_dim
+        ctx.total_embs = embeddings.size(0)
 
         return output
 
@@ -87,6 +88,7 @@ class PoolingFunction(torch.autograd.Function):
         (offsets,) = ctx.saved_tensors
         pooling_mode = ctx.pooling_mode
         emb_dim = ctx.emb_dim
+        total_embs = ctx.total_embs
 
         assert grad_output.dim() == 2 and offsets.dim() == 1
         assert pooling_mode in ["sum", "mean"]
@@ -99,7 +101,6 @@ class PoolingFunction(torch.autograd.Function):
 
         num_segs = offsets.shape[0] - 1
         emb_dim = grad_output.shape[1]
-        total_embs = offsets[-1].item()
 
         grad_embeddings = torch.empty(
             (total_embs, emb_dim), dtype=grad_output.dtype, device=grad_output.device
@@ -107,11 +108,9 @@ class PoolingFunction(torch.autograd.Function):
 
         mode = 0 if pooling_mode == "sum" else 1
 
-        MIN_BLOCK_D = 64  # Minimum BLOCK_D across all autotune configs
-        num_d_blocks = triton.cdiv(emb_dim, MIN_BLOCK_D)
-        grid = (num_segs, num_d_blocks)
-
         autotune_num_segments = prev_power_of_2(num_segs)
+
+        grid = (num_segs,)
 
         pooling_backward_kernel[grid](
             grad_output_ptr=grad_output,
@@ -122,7 +121,6 @@ class PoolingFunction(torch.autograd.Function):
             pooling_mode=mode,
             autotune_num_segments=autotune_num_segments,
         )
-
         return grad_embeddings, None, None
 
 

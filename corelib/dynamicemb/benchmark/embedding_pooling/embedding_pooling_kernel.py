@@ -134,15 +134,13 @@ def pooling_backward_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """
-    2D grid backward kernel with increased parallelism.
-
-    Each program processes one (segment, dimension_block) pair.
-    This maximizes parallelism for the scatter operation.
-
-    Grid: (num_segments, cdiv(embedding_dim, BLOCK_D))
+    Segment-parallel backward kernel for pooling (scatter operation).
+    Each program processes one segment and scatters gradient to all embeddings in that segment.
+    This mirrors the forward kernel structure - no binary search needed!
+    For mean pooling: grad_embedding = grad_pooled / length
+    For sum pooling:  grad_embedding = grad_pooled
     """
     seg_id = tl.program_id(0)
-    d_block_id = tl.program_id(1)
 
     if seg_id >= num_segments:
         return
@@ -154,30 +152,36 @@ def pooling_backward_kernel(
     if length == 0:
         return
 
-    d_off = d_block_id * BLOCK_D
-    d_idx = d_off + tl.arange(0, BLOCK_D)
-    d_mask = d_idx < embedding_dim
-
-    grad_offset = seg_id * embedding_dim + d_idx
-    grad = tl.load(grad_output_ptr + grad_offset, mask=d_mask, other=0.0)
-
     if pooling_mode == 1:
         scale = 1.0 / length.to(tl.float32)
-        grad = grad * scale
+    else:
+        scale = 1.0
 
+    # Process embeddings in outer loop, dimensions in inner loop, for memory coalescing
     for n_off in range(0, length, BLOCK_N):
         n_idx = n_off + tl.arange(0, BLOCK_N)
         n_mask = n_idx < length
 
-        # Calculate indices for 2D store
-        row_idx = start + n_idx
-        indices = row_idx[:, None] * embedding_dim + d_idx[None, :]
+        row_idx = start + n_idx  # [BLOCK_N]
 
-        # Broadcast gradient
-        grad_broadcasted = grad[None, :]
+        # Process each dimension block
+        for d_off in range(0, embedding_dim, BLOCK_D):
+            d_idx = d_off + tl.arange(0, BLOCK_D)
+            d_mask = d_idx < embedding_dim
 
-        tl.store(
-            grad_input_ptr + indices,
-            grad_broadcasted,
-            mask=n_mask[:, None] & d_mask[None, :],
-        )
+            # Load gradient from pooled output
+            grad_offset = seg_id * embedding_dim + d_idx
+            grad = tl.load(grad_output_ptr + grad_offset, mask=d_mask, other=0.0)
+
+            if pooling_mode == 1:
+                grad = grad * scale
+
+            # 2D store: [BLOCK_N, BLOCK_D]
+            indices = row_idx[:, None] * embedding_dim + d_idx[None, :]
+            grad_broadcasted = grad[None, :]  # [1, BLOCK_D] -> [BLOCK_N, BLOCK_D]
+
+            tl.store(
+                grad_input_ptr + indices,
+                grad_broadcasted,
+                mask=n_mask[:, None] & d_mask[None, :],
+            )
