@@ -1,7 +1,6 @@
 import torch
 import triton
 from embedding_pooling import embedding_pooling
-from embedding_pooling_kernel import pooling_backward_kernel
 
 
 @torch.fx.wrap
@@ -15,59 +14,6 @@ def prev_power_of_2(x: int) -> int:
     else:
         out = triton.next_power_of_2(x)
         return out // 2 if out > x else out
-
-
-# ============================================================================
-# Backward: Only for testing
-# ============================================================================
-
-
-def embedding_pooling_backward_triton(
-    grad_output: torch.Tensor,  # [num_segments, embedding_dim]
-    offsets: torch.Tensor,  # [num_segments + 1]
-    pooling_mode: str = "mean",
-) -> torch.Tensor:
-    """
-    Triton implementation of pooling backward using segment-parallel scatter.
-
-    Key optimization: Mirrors forward kernel structure - each program handles one segment.
-    No binary search needed! Direct scatter operation is faster than searching.
-
-    Args:
-        grad_output: Gradient w.r.t. pooled output [num_segments, embedding_dim]
-        offsets: Segment boundaries [num_segments + 1]
-        pooling_mode: "sum" or "mean"
-
-    Returns:
-        grad_input: Gradient w.r.t. input embeddings [total_embeddings, embedding_dim]
-    """
-
-    num_segs = offsets.shape[0] - 1
-    emb_dim = grad_output.shape[1]
-    total_embs = offsets[-1].item()
-
-    # Create output tensor
-    grad_input = torch.empty(
-        (total_embs, emb_dim), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-    mode = 0 if pooling_mode == "sum" else 1
-
-    MIN_BLOCK_D = 64  # Minimum BLOCK_D across all autotune configs
-    num_d_blocks = triton.cdiv(emb_dim, MIN_BLOCK_D)
-    grid = (num_segs, num_d_blocks)
-    autotune_num_segments = prev_power_of_2(num_segs)
-    pooling_backward_kernel[grid](
-        grad_output_ptr=grad_output,
-        offsets_ptr=offsets,
-        grad_input_ptr=grad_input,
-        embedding_dim=emb_dim,
-        num_segments=num_segs,
-        pooling_mode=mode,
-        autotune_num_segments=autotune_num_segments,
-    )
-
-    return grad_input
 
 
 # ============================================================================
@@ -134,31 +80,6 @@ def embedding_pooling_torch(
     return output
 
 
-def embedding_pooling_backward_torch(
-    grad_output: torch.Tensor, offsets: torch.Tensor, pooling_mode: str = "mean"
-) -> torch.Tensor:
-    """
-    PyTorch reference implementation of pooling backward.
-    """
-    num_segs = offsets.shape[0] - 1
-    grad_output.shape[1]
-
-    lengths = offsets[1:] - offsets[:-1]
-    segment_ids = torch.repeat_interleave(
-        torch.arange(num_segs, device=offsets.device), lengths
-    )
-
-    # Scatter: each embedding gets gradient from its segment
-    grad_input = grad_output[segment_ids]
-
-    # For mean pooling, divide by length
-    if pooling_mode == "mean":
-        lengths_expanded = lengths[segment_ids].unsqueeze(1).float()
-        grad_input = grad_input / lengths_expanded
-
-    return grad_input
-
-
 # ============================================================================
 # Correctness Testing: Forward and Backward
 # ============================================================================
@@ -205,7 +126,6 @@ def test_correctness():
             total_embs, emb_dim, device="cuda", dtype=torch.float32, requires_grad=True
         )
         embeddings_clone = embeddings.clone()
-
 
         for mode in ["sum", "mean"]:
             # warmup
