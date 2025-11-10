@@ -97,10 +97,11 @@ class HSTULayer(MegatronModule):
             self._input_layernorm_weight = None
             self._input_layernorm_bias = None
 
+        self._learnable_output_layernorm = config.learnable_output_layernorm
         self._output_ln_dropout_mul = TPLayerNormMulDropout(
             hidden_size=self._num_heads * self._linear_dim_per_head,
             eps=self._eps,
-            trainable=True,
+            trainable=self._learnable_output_layernorm,
             dropout_ratio=self._dropout_ratio,
             fusion=config.fuse_norm_mul_dropout,
             sequence_parallel=config.sequence_parallel,
@@ -127,7 +128,6 @@ class HSTULayer(MegatronModule):
             assert (
                 self._embedding_dim == self._linear_dim_per_head * self._num_heads
             ), "when shortcut proj linear is on, embedding dim must be equal to linear dim per head * num heads"
-
         self._linear_proj = TERowParallelLinear(
             input_size=self._linear_dim_per_head * self._num_heads,
             output_size=self._embedding_dim,

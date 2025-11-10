@@ -136,12 +136,21 @@ class HSTULayer(MegatronModule):
         else:
             self._input_layernorm_weight = None
             self._input_layernorm_bias = None
-        # output norm weight and bias are mandatory
-        self._output_layernorm_weight = torch.nn.Parameter(
-            torch.ones(self._num_heads * self._linear_dim_per_head, device=device)
+
+        self._output_layernorm_weight = (
+            torch.nn.Parameter(
+                torch.ones(self._num_heads * self._linear_dim_per_head, device=device)
+            )
+            if config.learnable_output_layernorm
+            else None
         )
-        self._output_layernorm_bias = torch.nn.Parameter(
-            torch.zeros(self._num_heads * self._linear_dim_per_head, device=device)
+
+        self._output_layernorm_bias = (
+            torch.nn.Parameter(
+                torch.zeros(self._num_heads * self._linear_dim_per_head, device=device)
+            )
+            if config.learnable_output_layernorm
+            else None
         )
         # [embedding_dim, 4 * num_head * head_dim]
         self._linear_uvqk = torch.nn.Linear(
@@ -350,14 +359,16 @@ class HSTULayer(MegatronModule):
                     )
                 )
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
+            output_layernorm_weight = self._output_layernorm_weight
+            output_layernorm_bias = self._output_layernorm_bias
             if self._debug_shortcut_output_ln_mul_dropout:
                 parallel_input = jagged_attn_output
             elif self._debug_mock_tp:
                 parallel_input = _mock_tp_output_ln_mul_dropout(
                     jagged_attn_output,
                     tu,
-                    self._output_layernorm_weight,
-                    self._output_layernorm_bias,
+                    output_layernorm_weight,
+                    output_layernorm_bias,
                     self._eps,
                     self._dropout_ratio,
                     self.training,
@@ -367,8 +378,8 @@ class HSTULayer(MegatronModule):
                 parallel_input = self._norm_mul_dropout_func(
                     jagged_attn_output,
                     tu,
-                    self._output_layernorm_weight,
-                    self._output_layernorm_bias,
+                    output_layernorm_weight,
+                    output_layernorm_bias,
                     self._eps,
                     self._dropout_ratio,
                     self.training,

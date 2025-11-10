@@ -112,7 +112,7 @@ class TPLayerNormMulDropout(torch.nn.Module):
             torch.nn.Parameter(torch.zeros(self._hidden_size)) if trainable else None
         )
         self._sequence_parallel = sequence_parallel
-        if self._sequence_parallel:
+        if self._sequence_parallel and trainable:
             self.weight.sequence_parallel = sequence_parallel
             self.bias.sequence_parallel = sequence_parallel
         self.eps = eps

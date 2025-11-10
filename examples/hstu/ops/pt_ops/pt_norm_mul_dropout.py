@@ -39,16 +39,16 @@ def pytorch_norm_mul_dropout(
         y = u * F.group_norm(
             x.view(-1, num_heads, linear_dim),
             num_groups=num_heads,
-            weight=weight.to(torch.float32),
-            bias=bias.to(torch.float32),
+            weight=weight.to(torch.float32) if weight is not None else None,
+            bias=bias.to(torch.float32) if bias is not None else None,
             eps=eps,
         ).view(-1, num_heads * linear_dim)
     else:
         y = u * F.layer_norm(
             x,
             normalized_shape=(x.shape[-1],),
-            weight=weight.to(torch.float32),
-            bias=bias.to(torch.float32),
+            weight=weight.to(torch.float32) if weight is not None else None,
+            bias=bias.to(torch.float32) if bias is not None else None,
             eps=eps,
         )
     if concat_ux:

@@ -117,6 +117,7 @@ class HSTUConfig(TransformerConfig):
 
     target_group_size: int = 1
     learnable_input_layernorm: bool = True
+    learnable_output_layernorm: bool = True
     # whether to add residual connection
     residual: bool = True
     # whether to use async wgrad
@@ -152,6 +153,7 @@ def get_hstu_config(
     hstu_layer_type: HSTULayerType = HSTULayerType.FUSED,
     sequence_parallel: bool = False,
     learnable_input_layernorm: bool = True,
+    learnable_output_layernorm: bool = True,
     residual: bool = True,
     async_wgrad: bool = False,
     recompute_input_layernorm: bool = False,
@@ -223,6 +225,7 @@ def get_hstu_config(
         target_group_size=target_group_size,
         hstu_layer_type=hstu_layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
         residual=residual,
         async_wgrad=async_wgrad,
         async_wgrad_stream=async_wgrad_stream,

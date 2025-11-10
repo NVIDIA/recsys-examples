@@ -486,6 +486,7 @@ def create_hstu_layer_and_optimizer(
     hstu_layer_type: HSTULayerType = HSTULayerType.DEBUG,
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     learnable_input_layernorm: bool = False,
+    learnable_output_layernorm: bool = False,
     sequence_parallel: bool = False,
 ):
     hstu_config = configs.get_hstu_config(
@@ -501,12 +502,12 @@ def create_hstu_layer_and_optimizer(
         target_group_size=1,
         hstu_layer_type=hstu_layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
         residual=True,
         add_uvqk_bias=False,  # disable bias for better debugging
         fuse_norm_mul_dropout=False,  # disable fusion for better debugging
         sequence_parallel=sequence_parallel,
     )
-    torch.cuda.current_device()
     if hstu_layer_type == HSTULayerType.DEBUG:
         hstu_layer = DebugHSTULayer(hstu_config).cuda()
     else:

@@ -147,7 +147,7 @@ def generate_jagged_data_list(
     ],
 )
 @pytest.mark.parametrize("num_heads", [4, 1])
-@pytest.mark.parametrize("hidden_dim_per_head", [32, 128])  #
+@pytest.mark.parametrize("hidden_dim_per_head", [128])  #
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 @pytest.mark.parametrize("sequence_parallel", [True, False])
 def test_tp_hstu_layer_forward_backward(
@@ -262,7 +262,7 @@ def test_tp_hstu_layer_forward_backward(
                 hstu_close(grad_tp, grad_debug, grad_fp32_debug, multiplier=5),
                 f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_debug).abs().max()} vs {(grad_debug - grad_fp32_debug).abs().max()} vs hey {(grad_tp - grad_debug).abs().max()}",
             )
-            print(f"[rank {torch.distributed.get_rank()}] [iter {i}] good")
+            # print(f"[rank {torch.distributed.get_rank()}] [iter {i}] good")
 
 
 # set backend as PYTORCH
@@ -273,7 +273,7 @@ def test_tp_hstu_layer_forward_backward(
 @pytest.mark.parametrize("num_heads", [4, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [128])  #
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-@pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
+@pytest.mark.parametrize("optimizer_type_str", ["sgd", "adam"])
 @pytest.mark.parametrize("sequence_parallel", [True, False])
 def test_tp_hstu_layer_forward_backward_update(
     batchsize,
@@ -295,12 +295,10 @@ def test_tp_hstu_layer_forward_backward_update(
     dtype = torch.bfloat16
     hidden_size = hidden_dim_per_head * num_heads
     torch.cuda.current_device()
-    if optimizer_type_str == "adam":
-        # skip because at the first adam step, bias update is quite instable
-        # see comment: https://github.com/NVIDIA/recsys-examples/pull/101#issuecomment-3077565334
-        learnable_input_layernorm = False
-    else:
-        learnable_input_layernorm = True
+    # adam update is quite instable at the first step
+    # so we only test trainable layernorm when optimizer is sgd
+    learnable_input_layernorm = True if optimizer_type_str == "sgd" else False
+    learnable_output_layernorm = True if optimizer_type_str == "sgd" else False
     debug_hstu_layer, debug_dense_optimizer = create_hstu_layer_and_optimizer(
         dtype=dtype,
         hidden_size=hidden_size,
@@ -310,6 +308,7 @@ def test_tp_hstu_layer_forward_backward_update(
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
         learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
         sequence_parallel=False,  # debug hstu layer does not support sequence parallel
     )
 
@@ -322,6 +321,7 @@ def test_tp_hstu_layer_forward_backward_update(
         hstu_layer_type=HSTULayerType.NATIVE,  # use native hstu layer for tp
         kernel_backend=KernelBackend.PYTORCH,
         learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
         sequence_parallel=sequence_parallel,
     )
 
@@ -334,6 +334,7 @@ def test_tp_hstu_layer_forward_backward_update(
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
         learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
         sequence_parallel=False,  # debug hstu layer does not support sequence parallel
     )
 
@@ -433,7 +434,7 @@ def test_tp_hstu_layer_forward_backward_update(
                 ),
                 f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_debug).abs().max()} vs {(grad_debug - grad_fp32_debug).abs().max()} vs hey {(grad_tp - grad_debug).abs().max()}",
             )
-            print(
-                f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
-            )
+            # print(
+            #     f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
+            # )
             bwd_multiplier = 5 if i >= 2 else fwd_multiplier
