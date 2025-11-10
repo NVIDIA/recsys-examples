@@ -437,7 +437,7 @@ def create_hstu_attention(
                 linear_dim,
                 is_causal,
             )
-        elif sm_major_version == 8 and sm_minor_version == 0:
+        elif sm_major_version == 8 and (sm_minor_version == 6 or sm_minor_version == 9):
             return FusedHSTUAttention(
                 num_heads,
                 attention_dim,
@@ -445,7 +445,7 @@ def create_hstu_attention(
                 is_causal,
             )
         print(
-            "CUTLASS backend only support H100, H20 and A100, fallback to PyTorch backend"
+            "CUTLASS backend only support H100, H20 and A100/Ada series, fallback to PyTorch backend"
         )
     elif kernel_backend == KernelBackend.TRITON:
         if is_causal:

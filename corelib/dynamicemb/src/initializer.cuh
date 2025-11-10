@@ -32,6 +32,11 @@
 
 namespace dyn_emb {
 
+DEVICE_INLINE unsigned int worker_id() {
+  auto grid = cooperative_groups::this_grid();
+  return grid.thread_rank();
+}
+
 struct UniformEmbeddingGenerator {
   struct Args {
     curandState* state;
@@ -44,7 +49,7 @@ struct UniformEmbeddingGenerator {
 
   DEVICE_INLINE float generate(int64_t vec_id) {
     if (!load_) {
-      localState_ = state_[GlobalThreadId()];
+      localState_ = state_[worker_id()];
       load_ = true;
     }
     auto tmp = curand_uniform_double(&this->localState_);
@@ -53,7 +58,7 @@ struct UniformEmbeddingGenerator {
 
   DEVICE_INLINE void destroy() {
     if (load_) {
-      state_[GlobalThreadId()] = localState_;
+      state_[worker_id()] = localState_;
     }
   }
 
@@ -78,7 +83,7 @@ struct NormalEmbeddingGenerator {
   DEVICE_INLINE
   float generate(int64_t vec_id) {
     if (!load_) {
-      localState_ = state_[GlobalThreadId()];
+      localState_ = state_[worker_id()];
       load_ = true;
     }
     auto tmp = curand_normal_double(&this->localState_);
@@ -87,7 +92,7 @@ struct NormalEmbeddingGenerator {
 
   DEVICE_INLINE void destroy() {
     if (load_) {
-      state_[GlobalThreadId()] = localState_;
+      state_[worker_id()] = localState_;
     }
   }
 
@@ -114,7 +119,7 @@ struct TruncatedNormalEmbeddingGenerator {
   DEVICE_INLINE
   float generate(int64_t vec_id) {
     if (!load_) {
-      localState_ = state_[GlobalThreadId()];
+      localState_ = state_[worker_id()];
       load_ = true;
     }
     auto l = normcdf((lower - mean) / std_dev);
@@ -133,7 +138,7 @@ struct TruncatedNormalEmbeddingGenerator {
 
   DEVICE_INLINE void destroy() {
     if (load_) {
-      state_[GlobalThreadId()] = localState_;
+      state_[worker_id()] = localState_;
     }
   }
 
