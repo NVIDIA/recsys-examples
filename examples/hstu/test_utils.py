@@ -141,7 +141,7 @@ def compare_tpN_to_debug_optimizer_state(
 
 
 def compare_tpN_to_debug_weights(
-    tpN_module, debug_module, debug_fp32_module, include_grad: bool = True
+    tpN_module, debug_module, debug_fp32_module, include_grad: bool = True, msg=""
 ):
     import re
 
@@ -210,11 +210,11 @@ def compare_tpN_to_debug_weights(
                 hstu_close(
                     dst_grad, src_grad, src_grad_fp32, try_allclose=True, multiplier=5
                 ),
-                f"[rank{torch.distributed.get_rank()}] grad mismatch at {name}, multiplier {(dst_grad - src_grad_fp32).abs().max() / (src_grad - src_grad_fp32).abs().max()}",
+                f"[rank{torch.distributed.get_rank()}, {msg}] grad mismatch at {name}, multiplier {(dst_grad - src_grad_fp32).abs().max() / (src_grad - src_grad_fp32).abs().max()}",
             )
         collective_assert(
             hstu_close(dst, src, src_fp32, try_allclose=True, multiplier=5),
-            f"[rank{torch.distributed.get_rank()}] weight mismatch at {name}  multiplier {(dst - src_fp32).abs().max() / (src - src_fp32).abs().max()}",
+            f"[rank{torch.distributed.get_rank()}, {msg}] weight mismatch at {name}  multiplier {(dst - src_fp32).abs().max() / (src - src_fp32).abs().max()}",
         )  # weight
 
 
