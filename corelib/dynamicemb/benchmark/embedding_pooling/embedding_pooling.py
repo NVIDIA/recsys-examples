@@ -38,10 +38,8 @@ class PoolingFunction(torch.autograd.Function):
             output[1] = mean([e3, e4])
         """
 
-        if not embeddings.is_contiguous():
-            embeddings = embeddings.contiguous()
-        if not offsets.is_contiguous():
-            offsets = offsets.contiguous()
+        embeddings = embeddings.contiguous()
+        offsets = offsets.contiguous()
 
         num_segs = offsets.shape[0] - 1
         emb_dim = embeddings.shape[1]
@@ -69,6 +67,7 @@ class PoolingFunction(torch.autograd.Function):
         ctx.pooling_mode = pooling_mode
         ctx.emb_dim = emb_dim
         ctx.total_embs = embeddings.size(0)
+        ctx.num_segs = num_segs
 
         return output
 
@@ -89,18 +88,10 @@ class PoolingFunction(torch.autograd.Function):
         pooling_mode = ctx.pooling_mode
         emb_dim = ctx.emb_dim
         total_embs = ctx.total_embs
+        num_segs = ctx.num_segs
 
-        assert grad_output.dim() == 2 and offsets.dim() == 1
-        assert pooling_mode in ["sum", "mean"]
-        assert grad_output.is_cuda and offsets.is_cuda
-
-        if not grad_output.is_contiguous():
-            grad_output = grad_output.contiguous()
-        if not offsets.is_contiguous():
-            offsets = offsets.contiguous()
-
-        num_segs = offsets.shape[0] - 1
-        emb_dim = grad_output.shape[1]
+        grad_output = grad_output.contiguous()
+        offsets = offsets.contiguous()
 
         grad_embeddings = torch.empty(
             (total_embs, emb_dim), dtype=grad_output.dtype, device=grad_output.device

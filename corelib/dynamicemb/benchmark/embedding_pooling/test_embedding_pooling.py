@@ -206,22 +206,22 @@ def test_correctness():
         )
         embeddings_clone = embeddings.clone()
 
-        for i in range(20):
-            triton_out = embedding_pooling(embeddings, offsets, "mean")
-            torch_out = embedding_pooling_torch(embeddings_clone, offsets, "mean")
-            grad_out_triton = torch.randn_like(triton_out)
-            grad_out_torch = torch.randn_like(torch_out)
-
-            _ = torch.autograd.grad(
-                triton_out, embeddings, grad_out_triton, retain_graph=True
-            )
-            _ = torch.autograd.grad(
-                torch_out, embeddings, grad_out_torch, retain_graph=True
-            )
-
-        torch.cuda.synchronize()
 
         for mode in ["sum", "mean"]:
+            # warmup
+            for i in range(10):
+                triton_out = embedding_pooling(embeddings, offsets, mode)
+                torch_out = embedding_pooling_torch(embeddings_clone, offsets, mode)
+                grad_out_triton = torch.randn_like(triton_out)
+                grad_out_torch = torch.randn_like(torch_out)
+
+                _ = torch.autograd.grad(
+                    triton_out, embeddings, grad_out_triton, retain_graph=True
+                )
+                _ = torch.autograd.grad(
+                    torch_out, embeddings, grad_out_torch, retain_graph=True
+                )
+            torch.cuda.synchronize()
             # Triton forward
             with torch.cuda.nvtx.range("triton_forward"):
                 triton_out = embedding_pooling(embeddings, offsets, mode)
