@@ -20,10 +20,6 @@ from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig
 from configs.inference_config import InferenceHSTUConfig
 from dataset.utils import RankingBatch
-from megatron.core.tensor_parallel.mappings import (
-    gather_from_sequence_parallel_region,
-    scatter_to_sequence_parallel_region,
-)
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
@@ -34,6 +30,10 @@ from torchrec.sparse.jagged_tensor import JaggedTensor
 
 try:
     from megatron.core import parallel_state
+    from megatron.core.tensor_parallel.mappings import (
+        gather_from_sequence_parallel_region,
+        scatter_to_sequence_parallel_region,
+    )
 
     SUPPORT_TRAINING = True
 except ImportError:
