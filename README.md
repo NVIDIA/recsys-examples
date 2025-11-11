@@ -9,6 +9,10 @@ The project includes:
 - Dynamic Embeddings with GPU acceleration
 
 # What's New
+- **[2025/11/11]** 🎉v25.10 released!
+  - HSTU training example supports sequence parallelism.
+  - DynamicEmb supports LRU score checkpointing, gradient clipping.
+  - Decouple scaling sequence length from the maximum sequence length limit in HSTU attention and extend HSTU support to the SM89 GPU architecture for training.
 - **[2025/10/20]** 🎉v25.09 released!
   - Integrated prefetching and caching into the HSTU training example.
   - DynamicEmb now supports distributed embedding dumping and memory scaling.
@@ -18,12 +22,14 @@ The project includes:
   - Added cache support for dynamicemb, enabling seamless hot embedding migration between cache and storage.
   - Released an end-to-end HSTU inference example, demonstrating precision aligned with training.
   - Enabled evaluation mode support for dynamicemb.
+
+<details>
+<summary>More</summary>
+
 - **[2025/8/1]** 🎉v25.07 released!
   - Released HSTU inference benchmark, including paged kvcache HSTU kernel, kvcache manager based on trt-llm, CUDA graph, and other optimizations.
   - Added support for Tensor Parallelism in the HSTU layer.
 
-<details>
-<summary>More</summary>
 - **[2025/7/4]** 🎉v25.06 released!
   - Dynamicemb lookup module performance improvement and LFU eviction support. 
   - Pipeline support for HSTU example, recompute support for HSTU layer and customized cuda ops for jagged tensor concat.
