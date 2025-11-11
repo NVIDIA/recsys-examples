@@ -598,6 +598,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         optimizer = ctx.optimizer
         enable_prefetch = ctx.enable_prefetch
 
+        # clip the gradient before reduction
+        if optimizer.need_gradient_clipping():
+            optimizer.clip_gradient(grads)
+
         input_dist_dedup = ctx.input_dist_dedup
         if input_dist_dedup:
             unique_indices = ctx.unique_indices

@@ -143,8 +143,7 @@ def _export_matched_and_gather(
     ret_offset = 0
 
     search_offset = 0
-    search_capacity = dyn_emb_capacity(dynamic_table)
-    batch_size = batch_size if batch_size < search_capacity else search_capacity
+    search_capacity = dynamic_table.capacity()
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
     d_vals = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
