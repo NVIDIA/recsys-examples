@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,7 @@
 
 namespace {
 
-template <class S>
-__global__ void device_nano_kernel(S* d_clk) {
+template <class S> __global__ void device_nano_kernel(S *d_clk) {
   S mclk;
   asm volatile("mov.u64 %0,%%globaltimer;" : "=l"(mclk));
   *d_clk = mclk;
@@ -29,28 +28,26 @@ __global__ void device_nano_kernel(S* d_clk) {
 class DeviceTimestamp {
 public:
   DeviceTimestamp() {
-    CUDACHECK(cudaMalloc((void**)&d_timestamp, sizeof(uint64_t)));
+    CUDACHECK(cudaMalloc((void **)&d_timestamp, sizeof(uint64_t)));
   }
 
-  ~DeviceTimestamp() {
-    CUDACHECK(cudaFree(d_timestamp));
-  }
+  ~DeviceTimestamp() { CUDACHECK(cudaFree(d_timestamp)); }
 
-  uint64_t get(const cudaStream_t& stream) {
+  uint64_t get(const cudaStream_t &stream) {
     device_nano_kernel<uint64_t><<<1, 1, 0, stream>>>(d_timestamp);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-    CUDACHECK(cudaMemcpyAsync(&h_timestamp, d_timestamp, sizeof(uint64_t), 
-      cudaMemcpyDeviceToHost, stream));
+    CUDACHECK(cudaMemcpyAsync(&h_timestamp, d_timestamp, sizeof(uint64_t),
+                              cudaMemcpyDeviceToHost, stream));
     CUDACHECK(cudaStreamSynchronize(stream));
     return h_timestamp;
   }
 
 private:
-  uint64_t* d_timestamp {nullptr};
-  uint64_t h_timestamp {0};
+  uint64_t *d_timestamp{nullptr};
+  uint64_t h_timestamp{0};
 };
 
-}
+} // namespace
 
 namespace dyn_emb {
 
@@ -125,7 +122,8 @@ at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta &typeMeta) {
 }
 } // namespace dyn_emb
 
-//PYTHON WRAP
-void bind_utils(py::module& m) {
-  m.def("device_timestamp", &dyn_emb::device_timestamp, "Get device timestamp.");
+// PYTHON WRAP
+void bind_utils(py::module &m) {
+  m.def("device_timestamp", &dyn_emb::device_timestamp,
+        "Get device timestamp.");
 }

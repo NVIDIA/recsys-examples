@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,8 +47,9 @@ public:
 
 void backward(void *grads, void *unique_buffer, void *unique_indices,
               void *inverse_indices, void *biased_offset, const int dim,
-              const int batch_size, const int feature_num, const int num_key, int combiner,
-              DataType key_type, DataType value_type, cudaStream_t stream);
+              const int batch_size, const int feature_num, const int num_key,
+              int combiner, DataType key_type, DataType value_type,
+              cudaStream_t stream);
 void one_to_one_atomic(void *grads, void *unique_indices, void *reverse_indices,
                        void *unique_grads, const int ev_size,
                        const int64_t key_num, const int64_t unique_key_num,

@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -77,16 +77,17 @@ public:
                        bool ignore_evict_strategy = false) override;
 
   void find_or_insert(const size_t n, const void *keys, // (n)
-                         void **value_ptrs,                // (n * ptrs)
-                         void *values,                     // (n * DIM)
-                         bool *d_found,                    // (n * 1)
-                         void *scores = nullptr,           // (n)
-                         cudaStream_t stream = 0, bool unique_key = true,
-                         bool ignore_evict_strategy = false) override;
+                      void **value_ptrs,                // (n * ptrs)
+                      void *values,                     // (n * DIM)
+                      bool *d_found,                    // (n * 1)
+                      void *scores = nullptr,           // (n)
+                      cudaStream_t stream = 0, bool unique_key = true,
+                      bool ignore_evict_strategy = false) override;
 
-  void find_and_initialize(
-    const size_t n, const void *keys, void **value_ptrs, void *values,
-    bool *founds, std::optional<InitializerArgs> initializer_args, const cudaStream_t& stream) override;
+  void find_and_initialize(const size_t n, const void *keys, void **value_ptrs,
+                           void *values, bool *founds,
+                           std::optional<InitializerArgs> initializer_args,
+                           const cudaStream_t &stream) override;
 
   void find_or_insert_pointers(const size_t n, const void *keys, // (n)
                                void **value_ptrs,                // (n * ptrs)
@@ -107,23 +108,21 @@ public:
             void *scores = nullptr,           // (n)
             cudaStream_t stream = 0) const override;
 
-  void find_pointers(
-    const size_t n, const void* keys,         // (n)
-    void** values,                            // (n)
-    bool* founds,                             // (n)
-    void* scores = nullptr,                   // (n)
-    cudaStream_t stream = 0) const override;
+  void find_pointers(const size_t n, const void *keys, // (n)
+                     void **values,                    // (n)
+                     bool *founds,                     // (n)
+                     void *scores = nullptr,           // (n)
+                     cudaStream_t stream = 0) const override;
 
-  void find_pointers(
-    const size_t n, const void* keys,         // (n)
-    void** values,                            // (n)
-    bool* founds,                             // (n)
-    void* scores = nullptr,                   // (n)
-    cudaStream_t stream = 0) override;
+  void find_pointers(const size_t n, const void *keys, // (n)
+                     void **values,                    // (n)
+                     bool *founds,                     // (n)
+                     void *scores = nullptr,           // (n)
+                     cudaStream_t stream = 0) override;
 
-  void erase(const size_t n, const void* keys,
-           cudaStream_t stream = 0) override;
-  
+  void erase(const size_t n, const void *keys,
+             cudaStream_t stream = 0) override;
+
   void clear(cudaStream_t stream = 0) override;
 
   void reserve(const size_t new_capacity, cudaStream_t stream = 0) override;
@@ -137,42 +136,34 @@ public:
 
   EvictStrategy evict_strategy() const override;
 
-  void export_batch_matched(
-    uint64_t threshold,
-    const uint64_t n,
-    const uint64_t offset,
-    uint64_t* d_counter,
-    void* keys,              // (n)
-    void* values,            // (n, DIM)
-    void* scores = nullptr,  // (n)
-    cudaStream_t stream = 0) const override;
+  void export_batch_matched(uint64_t threshold, const uint64_t n,
+                            const uint64_t offset, uint64_t *d_counter,
+                            void *keys,             // (n)
+                            void *values,           // (n, DIM)
+                            void *scores = nullptr, // (n)
+                            cudaStream_t stream = 0) const override;
 
-  void count_matched(
-    uint64_t threshold,
-    uint64_t* d_counter, 
-    cudaStream_t stream = 0) const override;
+  void count_matched(uint64_t threshold, uint64_t *d_counter,
+                     cudaStream_t stream = 0) const override;
 
-  void lock(
-    const size_t n,
-    const void* keys,            // (n)
-    void** locked_keys_ptr,      // (n)
-    bool* flags = nullptr,       // (n)
-    void* scores = nullptr,     // (n)
-    cudaStream_t stream = 0) override;
+  void lock(const size_t n,
+            const void *keys,       // (n)
+            void **locked_keys_ptr, // (n)
+            bool *flags = nullptr,  // (n)
+            void *scores = nullptr, // (n)
+            cudaStream_t stream = 0) override;
 
-  void unlock(
-    const size_t n,
-    void** locked_keys_ptr,      // (n)
-    const void* keys,            // (n)
-    bool* flags = nullptr,       // (n)
-    cudaStream_t stream = 0) override;
-  
-  curandState* get_curand_states() const override;
-  const InitializerArgs& get_initializer_args() const override;
+  void unlock(const size_t n,
+              void **locked_keys_ptr, // (n)
+              const void *keys,       // (n)
+              bool *flags = nullptr,  // (n)
+              cudaStream_t stream = 0) override;
+
+  curandState *get_curand_states() const override;
+  const InitializerArgs &get_initializer_args() const override;
   const int optstate_dim() const override;
   void set_initial_optstate(const float value) override;
   const float get_initial_optstate() const override;
-
 
 private:
   using HKVTable =
@@ -188,8 +179,7 @@ private:
   DataType value_type_;
   SafeCheckMode safe_check_mode_;
   OptimizerType optimizer_type_;
-  float initial_optstate_ {0.};
-
+  float initial_optstate_{0.};
 };
 
 } // namespace dyn_emb

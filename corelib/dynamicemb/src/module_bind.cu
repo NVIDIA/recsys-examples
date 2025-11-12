@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,17 +19,17 @@
 
 namespace py = pybind11;
 
-void bind_dyn_emb_op(py::module& m);
-void bind_unique_op(py::module& m);
-void bind_bucktiz_kernel_op(py::module& m);
-void bind_optimizer_kernel_op(py::module& m);
-void bind_utils(py::module& m);
-void bind_index_calculation_op(py::module& m);
+void bind_dyn_emb_op(py::module &m);
+void bind_unique_op(py::module &m);
+void bind_bucktiz_kernel_op(py::module &m);
+void bind_optimizer_kernel_op(py::module &m);
+void bind_utils(py::module &m);
+void bind_index_calculation_op(py::module &m);
 void bind_initializer_op(py::module &m);
 
 PYBIND11_MODULE(dynamicemb_extensions, m) {
   m.doc() = "DYNAMICEMB"; // Optional
- 
+
   bind_dyn_emb_op(m);
   bind_unique_op(m);
   bind_bucktiz_kernel_op(m);

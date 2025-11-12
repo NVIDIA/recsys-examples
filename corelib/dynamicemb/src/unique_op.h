@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,7 +70,8 @@ public:
               at::Tensor d_output_counter, cudaStream_t stream = 0,
               at::Tensor offset = at::Tensor(),
               at::Tensor d_frequency_counters = at::Tensor(),
-              at::Tensor d_input_frequencies = at::Tensor()) override { /// TODO: dtype check in runtime.
+              at::Tensor d_input_frequencies =
+                  at::Tensor()) override { /// TODO: dtype check in runtime.
     if (stream == 0) {
       stream = at::cuda::getCurrentCUDAStream().stream();
     }
@@ -88,9 +89,10 @@ public:
     CounterType *frequency_counters_ptr = nullptr;
     if (d_frequency_counters.defined() && d_frequency_counters.numel() > 0) {
       // Check if frequency counters is of the same type as CounterType
-      if (d_frequency_counters.scalar_type() != at::CppTypeToScalarType<CounterType>::value) {
-        throw std::runtime_error(
-            "Frequency counters tensor must have the same type as CounterType.");
+      if (d_frequency_counters.scalar_type() !=
+          at::CppTypeToScalarType<CounterType>::value) {
+        throw std::runtime_error("Frequency counters tensor must have the same "
+                                 "type as CounterType.");
       }
       frequency_counters_ptr = d_frequency_counters.data_ptr<CounterType>();
     }
@@ -98,7 +100,8 @@ public:
     const CounterType *input_frequencies_ptr = nullptr;
     if (d_input_frequencies.defined() && d_input_frequencies.numel() > 0) {
       // Check if input frequencies is of the same type as CounterType
-      if (d_input_frequencies.scalar_type() != at::CppTypeToScalarType<CounterType>::value) {
+      if (d_input_frequencies.scalar_type() !=
+          at::CppTypeToScalarType<CounterType>::value) {
         throw std::runtime_error(
             "Input frequencies tensor must have the same type as CounterType.");
       }

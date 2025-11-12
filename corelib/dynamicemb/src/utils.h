@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,17 +17,13 @@
 
 #ifndef UTILS_H
 #define UTILS_H
+#include "check.h"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <cstdint>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include "check.h"
 
 namespace dyn_emb {
 
@@ -42,14 +38,16 @@ enum class DataType : uint32_t {
   Size_t,
 };
 
-// The EvictStrategy is consistent with HKV's EvictStrategy. If modifications are needed, please refer to the HKV documentation. 
-// TODO: need be changed to the form static_cast<uint32_t>(nv::merlin::EvictStrategy::EvictStrategyEnum::kLru)
+// The EvictStrategy is consistent with HKV's EvictStrategy. If modifications
+// are needed, please refer to the HKV documentation.
+// TODO: need be changed to the form
+// static_cast<uint32_t>(nv::merlin::EvictStrategy::EvictStrategyEnum::kLru)
 enum class EvictStrategy : uint32_t {
-    kLru = 0,
-    kLfu = 1, // dynamicemb don't use
-    kEpochLru = 2, // dynamicemb don't use
-    kEpochLfu = 3, // dynamicemb don't use
-    kCustomized = 4,
+  kLru = 0,
+  kLfu = 1,      // dynamicemb don't use
+  kEpochLru = 2, // dynamicemb don't use
+  kEpochLfu = 3, // dynamicemb don't use
+  kCustomized = 4,
 };
 
 #define CASE_TYPE_USING_HINT(enum_type, type, HINT, ...)                       \
@@ -100,13 +98,13 @@ enum class EvictStrategy : uint32_t {
     exit(EXIT_FAILURE);                                                        \
   }
 
-#define DISPATCH_EVICTYPE_FUNCTION(EVICT_TYPE, HINT, ...)               \
-  switch (EVICT_TYPE) {                                                 \
-    CASE_ENUM_USING_HINT(EvictStrategy::kLru, HINT, __VA_ARGS__)        \
-    CASE_ENUM_USING_HINT(EvictStrategy::kCustomized, HINT, __VA_ARGS__) \
-    CASE_ENUM_USING_HINT(EvictStrategy::kLfu, HINT, __VA_ARGS__) \
-    default:                                                            \
-      exit(EXIT_FAILURE);                                               \
+#define DISPATCH_EVICTYPE_FUNCTION(EVICT_TYPE, HINT, ...)                      \
+  switch (EVICT_TYPE) {                                                        \
+    CASE_ENUM_USING_HINT(EvictStrategy::kLru, HINT, __VA_ARGS__)               \
+    CASE_ENUM_USING_HINT(EvictStrategy::kCustomized, HINT, __VA_ARGS__)        \
+    CASE_ENUM_USING_HINT(EvictStrategy::kLfu, HINT, __VA_ARGS__)               \
+  default:                                                                     \
+    exit(EXIT_FAILURE);                                                        \
   }
 
 #define HOST_INLINE __host__ __forceinline__
@@ -217,39 +215,33 @@ template <> struct TypeConvertFunc<int, unsigned int> {
 class DeviceCounter {
 public:
   DeviceCounter() {
-    CUDACHECK(cudaMalloc((void**)&d_counter, sizeof(uint64_t)));
+    CUDACHECK(cudaMalloc((void **)&d_counter, sizeof(uint64_t)));
   }
 
-  ~DeviceCounter() {
-    CUDACHECK(cudaFree(d_counter));
-  }
+  ~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }
 
-  DeviceCounter& reset(const cudaStream_t& stream) {
+  DeviceCounter &reset(const cudaStream_t &stream) {
     CUDACHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
     return *this;
   }
 
-  uint64_t* get() {
-    return d_counter;
-  }
+  uint64_t *get() { return d_counter; }
 
-  DeviceCounter& sync(const cudaStream_t& stream) {
+  DeviceCounter &sync(const cudaStream_t &stream) {
     CUDACHECK(cudaMemcpyAsync(&h_counter, d_counter, sizeof(uint64_t),
-      cudaMemcpyDeviceToHost, stream));
+                              cudaMemcpyDeviceToHost, stream));
     CUDACHECK(cudaStreamSynchronize(stream));
     CUDACHECK(cudaGetLastError());
     return *this;
   }
 
-  uint64_t result() {
-    return h_counter;
-  }
+  uint64_t result() { return h_counter; }
 
 private:
-  uint64_t* d_counter {nullptr};
-  uint64_t h_counter {0};
+  uint64_t *d_counter{nullptr};
+  uint64_t h_counter{0};
 };
 
-}  // namespace dyn_emb
+} // namespace dyn_emb
 
-#endif  // UTILS_H 
+#endif // UTILS_H

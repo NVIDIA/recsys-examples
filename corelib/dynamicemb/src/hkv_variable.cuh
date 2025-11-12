@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,18 +17,18 @@
 
 #include "check.h"
 #include "hkv_variable.h"
+#include "initializer.cuh"
+#include "lookup_kernel.cuh"
 #include "utils.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
-#include <cooperative_groups.h>
-#include "lookup_kernel.cuh"
-#include "initializer.cuh"
 
 namespace {
 
@@ -36,37 +36,35 @@ using namespace cooperative_groups;
 namespace cg = cooperative_groups;
 
 // Increment the counter when matched
-template <class K, class V, class S>
-struct EvalAndInc {
+template <class K, class V, class S> struct EvalAndInc {
   S threshold;
-  uint64_t* d_counter;
-  EvalAndInc(S threshold, uint64_t* d_counter)
-    : threshold(threshold), d_counter(d_counter) {}
+  uint64_t *d_counter;
+  EvalAndInc(S threshold, uint64_t *d_counter)
+      : threshold(threshold), d_counter(d_counter) {}
   template <int GroupSize>
-  __forceinline__ __device__ void operator()(
-      const K& key, V* value, S* score, cg::thread_block_tile<GroupSize>& g) {
+  __forceinline__ __device__ void
+  operator()(const K &key, V *value, S *score,
+             cg::thread_block_tile<GroupSize> &g) {
     S score_val = *score;
-    bool match = (not nv::merlin::IS_RESERVED_KEY<K>(key)) && 
-                 score_val >= threshold;
+    bool match =
+        (not nv::merlin::IS_RESERVED_KEY<K>(key)) && score_val >= threshold;
     uint32_t vote = g.ballot(match);
     int group_cnt = __popc(vote);
     if (g.thread_rank() == 0) {
-      atomicAdd(reinterpret_cast<unsigned long long int*>(d_counter), 
+      atomicAdd(reinterpret_cast<unsigned long long int *>(d_counter),
                 static_cast<unsigned long long int>(group_cnt));
     }
   }
 };
 
-template <class K, class V, class S>
-struct ExportIfPredFunctor {
+template <class K, class V, class S> struct ExportIfPredFunctor {
   S threshold;
-  ExportIfPredFunctor(S threshold): threshold(threshold) {}
+  ExportIfPredFunctor(S threshold) : threshold(threshold) {}
   template <int GroupSize>
-  __forceinline__ __device__ bool operator()(
-      const K& key, const V* value, const S& score,
-      cg::thread_block_tile<GroupSize>& g) {
-    return (not nv::merlin::IS_RESERVED_KEY<K>(key)) && 
-           score >= threshold;
+  __forceinline__ __device__ bool
+  operator()(const K &key, const V *value, const S &score,
+             cg::thread_block_tile<GroupSize> &g) {
+    return (not nv::merlin::IS_RESERVED_KEY<K>(key)) && score >= threshold;
   }
 };
 
@@ -93,7 +91,7 @@ void check_safe_pointers_sync(const uint64_t n, const T **ptrs,
   if (n == 0)
     return;
   static DeviceCounter counter;
-  check_safe_pointers_kernel<<< (n + 1023) / 1024, 1024, 0, stream>>>(
+  check_safe_pointers_kernel<<<(n + 1023) / 1024, 1024, 0, stream>>>(
       n, ptrs, counter.reset(stream).get());
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   auto result = counter.sync(stream).result();
@@ -119,18 +117,19 @@ __global__ static void setup_kernel(unsigned long long seed,
   curand_init(seed, grid.thread_rank(), 0, &states[grid.thread_rank()]);
 }
 
-template <typename ElementType, typename SizeType>
-struct OptStateInitializer {
+template <typename ElementType, typename SizeType> struct OptStateInitializer {
   SizeType dim;
   ElementType initial_optstate;
-  DEVICE_INLINE void init(ElementType* vec_ptr) {
-    if (vec_ptr == nullptr) return;
-    for (SizeType i = threadIdx.x; i < dim; i ++) {
+  DEVICE_INLINE void init(ElementType *vec_ptr) {
+    if (vec_ptr == nullptr)
+      return;
+    for (SizeType i = threadIdx.x; i < dim; i++) {
       vec_ptr[i] = initial_optstate;
     }
   }
-  DEVICE_INLINE void init4(ElementType* vec_ptr) {
-    if (vec_ptr == nullptr) return;
+  DEVICE_INLINE void init4(ElementType *vec_ptr) {
+    if (vec_ptr == nullptr)
+      return;
     Vec4T<ElementType> state;
     state.reset(initial_optstate);
 
@@ -144,16 +143,16 @@ struct OptStateInitializer {
   }
 };
 
-template <typename ElementType>
-struct TableVector {
+template <typename ElementType> struct TableVector {
 
   struct Args {
-    ElementType** vec_ptrs {nullptr};
-    bool* founds {nullptr};
+    ElementType **vec_ptrs{nullptr};
+    bool *founds{nullptr};
   };
 
-  DEVICE_INLINE TableVector(Args args) : vec_ptrs_(args.vec_ptrs), 
-    founds_(args.founds), vec_id_(-1), vec_ptr_(nullptr),  found_(false) {}
+  DEVICE_INLINE TableVector(Args args)
+      : vec_ptrs_(args.vec_ptrs), founds_(args.founds), vec_id_(-1),
+        vec_ptr_(nullptr), found_(false) {}
 
   DEVICE_INLINE bool isInitialized(int64_t vec_id) {
     if (vec_id != vec_id_) {
@@ -169,7 +168,7 @@ struct TableVector {
     return vec_ptr_ != nullptr;
   }
 
-  DEVICE_INLINE ElementType* data_ptr(int64_t vec_id, int i = 0) {
+  DEVICE_INLINE ElementType *data_ptr(int64_t vec_id, int i = 0) {
     if (vec_id != vec_id_) {
       load(vec_id);
     }
@@ -187,33 +186,29 @@ private:
     vec_ptr_ = vec_ptrs_[vec_id];
   }
 
-  ElementType** vec_ptrs_;
-  bool* founds_;
+  ElementType **vec_ptrs_;
+  bool *founds_;
   int64_t vec_id_;
-  ElementType* vec_ptr_;
+  ElementType *vec_ptr_;
   bool found_;
 };
 
-template <
-  typename T, 
-  typename EmbeddingGenerator,
-  typename TableVector>
+template <typename T, typename EmbeddingGenerator, typename TableVector>
 __global__ void fill_output_with_table_vectors_kernel(
-    uint64_t n,
-    int emb_dim,
-    T* outputs, 
-    typename TableVector::Args vector_args,
+    uint64_t n, int emb_dim, T *outputs, typename TableVector::Args vector_args,
     typename EmbeddingGenerator::Args generator_args) {
-  
+
   TableVector vectors(vector_args);
   EmbeddingGenerator emb_gen(generator_args);
 
   for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
-    if (vectors.isInitialized(emb_id)) { // copy embedding from table to outputs.
+    if (vectors.isInitialized(
+            emb_id)) { // copy embedding from table to outputs.
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         outputs[emb_id * emb_dim + i] = *vectors.data_ptr(emb_id, i);
       }
-    } else if (vectors.isValid(emb_id)) { // initialize the embedding as well as outputs.
+    } else if (vectors.isValid(
+                   emb_id)) { // initialize the embedding as well as outputs.
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         auto tmp = emb_gen.generate(emb_id);
         outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(tmp);
@@ -221,7 +216,8 @@ __global__ void fill_output_with_table_vectors_kernel(
       }
     } else { // vector not exists in table, set the output to 0.
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
-        outputs[emb_id * emb_dim + i] = TypeConvertFunc<T, float>::convert(0.0f);
+        outputs[emb_id * emb_dim + i] =
+            TypeConvertFunc<T, float>::convert(0.0f);
       }
     }
   }
@@ -229,21 +225,15 @@ __global__ void fill_output_with_table_vectors_kernel(
   emb_gen.destroy();
 }
 
-template <
-  typename T, 
-  typename EmbeddingGenerator>
+template <typename T, typename EmbeddingGenerator>
 __global__ void load_or_initialize_embeddings_kernel(
-    uint64_t n,
-    int emb_dim,
-    T* outputs, 
-    T** inputs_ptr,
-    bool* masks,
+    uint64_t n, int emb_dim, T *outputs, T **inputs_ptr, bool *masks,
     typename EmbeddingGenerator::Args generator_args) {
 
   EmbeddingGenerator emb_gen(generator_args);
 
   for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
-    T* input_ptr = inputs_ptr[emb_id];
+    T *input_ptr = inputs_ptr[emb_id];
     bool mask = masks[emb_id];
     if (mask) { // copy embedding from inputs to outputs.
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
@@ -260,16 +250,11 @@ __global__ void load_or_initialize_embeddings_kernel(
   emb_gen.destroy();
 }
 
-template <
-  typename T,
-  typename OptStateInitializer,
-  typename TableVector>
+template <typename T, typename OptStateInitializer, typename TableVector>
 __global__ void initialize_optimizer_state_kernel_vec4(
-    uint64_t n,
-    int emb_dim,
-    typename TableVector::Args vector_args,
+    uint64_t n, int emb_dim, typename TableVector::Args vector_args,
     OptStateInitializer optstate_initailizer) {
-  
+
   TableVector vectors(vector_args);
 
   constexpr int kWarpSize = 32;
@@ -277,23 +262,19 @@ __global__ void initialize_optimizer_state_kernel_vec4(
   const int warp_id_in_block = threadIdx.x / kWarpSize;
 
   for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
-      emb_id < n; emb_id += gridDim.x * warp_num_per_block) {
+       emb_id < n; emb_id += gridDim.x * warp_num_per_block) {
     if ((!vectors.isInitialized(emb_id)) and vectors.isValid(emb_id)) {
       optstate_initailizer.init4(vectors.data_ptr(emb_id, emb_dim));
     }
   }
 }
 
-template <
-  typename T,
-  typename OptStateInitializer,
-  typename TableVector>
-__global__ void initialize_optimizer_state_kernel(
-    uint64_t n,
-    int emb_dim,
-    typename TableVector::Args vector_args,
-    OptStateInitializer optstate_initailizer) {
-  
+template <typename T, typename OptStateInitializer, typename TableVector>
+__global__ void
+initialize_optimizer_state_kernel(uint64_t n, int emb_dim,
+                                  typename TableVector::Args vector_args,
+                                  OptStateInitializer optstate_initailizer) {
+
   TableVector vectors(vector_args);
 
   for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
@@ -357,9 +338,13 @@ HKVVariable<KeyType, ValueType, Strategy>::HKVVariable(
   set_curand_states(&curand_states_, stream);
   hkv_table_option_.init_capacity = init_capacity;
   hkv_table_option_.max_capacity = max_capacity;
-  hkv_table_option_.dim = dim + get_optimizer_state_dim<ValueType>(optimizer_type, dim);
-  int64_t max_hbm_needed = hkv_table_option_.max_capacity * hkv_table_option_.dim * sizeof (ValueType);
-  hkv_table_option_.max_hbm_for_vectors = max_hbm_needed < max_hbm_for_vectors ? max_hbm_needed : max_hbm_for_vectors;
+  hkv_table_option_.dim =
+      dim + get_optimizer_state_dim<ValueType>(optimizer_type, dim);
+  int64_t max_hbm_needed = hkv_table_option_.max_capacity *
+                           hkv_table_option_.dim * sizeof(ValueType);
+  hkv_table_option_.max_hbm_for_vectors = max_hbm_needed < max_hbm_for_vectors
+                                              ? max_hbm_needed
+                                              : max_hbm_for_vectors;
   hkv_table_option_.max_bucket_size = max_bucket_size;
   hkv_table_option_.max_load_factor = max_load_factor;
   hkv_table_option_.block_size = block_size;
@@ -413,7 +398,8 @@ DataType HKVVariable<KeyType, ValueType, Strategy>::value_type() {
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-EvictStrategy HKVVariable<KeyType, ValueType, Strategy>::evict_strategy() const {
+EvictStrategy
+HKVVariable<KeyType, ValueType, Strategy>::evict_strategy() const {
   return Strategy;
 }
 
@@ -431,13 +417,13 @@ template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::insert_and_evict(
     const size_t n, const void *keys, const void *values, const void *scores,
     void *evicted_keys, void *evicted_values, void *evicted_scores,
-    uint64_t* d_evicted_counter, cudaStream_t stream, bool unique_key,
+    uint64_t *d_evicted_counter, cudaStream_t stream, bool unique_key,
     bool ignore_evict_strategy) {
-  hkv_table_->insert_and_evict(
-      n, (KeyType*)keys, (ValueType*)values, (uint64_t*)scores,
-      (KeyType*)evicted_keys, (ValueType*)evicted_values,
-      (uint64_t*)evicted_scores, d_evicted_counter, stream,
-      unique_key, ignore_evict_strategy);
+  hkv_table_->insert_and_evict(n, (KeyType *)keys, (ValueType *)values,
+                               (uint64_t *)scores, (KeyType *)evicted_keys,
+                               (ValueType *)evicted_values,
+                               (uint64_t *)evicted_scores, d_evicted_counter,
+                               stream, unique_key, ignore_evict_strategy);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -456,49 +442,68 @@ void HKVVariable<KeyType, ValueType, Strategy>::accum_or_assign(
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::find_and_initialize(
     const size_t n, const void *keys, void **value_ptrs, void *values,
-    bool *d_found, std::optional<InitializerArgs> initializer_args_, const cudaStream_t& stream) {
+    bool *d_found, std::optional<InitializerArgs> initializer_args_,
+    const cudaStream_t &stream) {
   if (n == 0)
     return;
   int dim = dim_;
-  const_cast<const HKVVariable<KeyType, ValueType, Strategy>*>(this)->find_pointers(n, keys, value_ptrs, d_found, nullptr, stream);
+  const_cast<const HKVVariable<KeyType, ValueType, Strategy> *>(this)
+      ->find_pointers(n, keys, value_ptrs, d_found, nullptr, stream);
   auto &device_prop = DeviceProp::getDeviceProp();
   int block_size = dim < device_prop.max_thread_per_block
                        ? dim
                        : device_prop.max_thread_per_block;
-  int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
-  
-  auto &init_args = initializer_args_.has_value() ? initializer_args_.value() : initializer_args;
+  int grid_size =
+      device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
+
+  auto &init_args = initializer_args_.has_value() ? initializer_args_.value()
+                                                  : initializer_args;
   auto &initializer_ = init_args.mode;
   if (initializer_ == "normal") {
     using Generator = NormalEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, init_args.mean, init_args.std_dev};
+    auto generator_args = typename Generator::Args{
+        curand_states_, init_args.mean, init_args.std_dev};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values),
+            reinterpret_cast<ValueType **>(value_ptrs), d_found,
+            generator_args);
   } else if (initializer_ == "truncated_normal") {
     using Generator = TruncatedNormalEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, init_args.mean, init_args.std_dev, init_args.lower, init_args.upper};
+    auto generator_args = typename Generator::Args{
+        curand_states_, init_args.mean, init_args.std_dev, init_args.lower,
+        init_args.upper};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values),
+            reinterpret_cast<ValueType **>(value_ptrs), d_found,
+            generator_args);
   } else if (initializer_ == "uniform") {
     using Generator = UniformEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, init_args.lower, init_args.upper};
+    auto generator_args = typename Generator::Args{
+        curand_states_, init_args.lower, init_args.upper};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values),
+            reinterpret_cast<ValueType **>(value_ptrs), d_found,
+            generator_args);
   } else if (initializer_ == "debug") {
     using Generator = MappingEmbeddingGenerator<KeyType>;
-    auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys), 100000};
+    auto generator_args = typename Generator::Args{
+        reinterpret_cast<const KeyType *>(keys), 100000};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values),
+            reinterpret_cast<ValueType **>(value_ptrs), d_found,
+            generator_args);
   } else if (initializer_ == "constant") {
     using Generator = ConstEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {init_args.value};
+    auto generator_args = typename Generator::Args{init_args.value};
     load_or_initialize_embeddings_kernel<ValueType, Generator>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), reinterpret_cast<ValueType **>(value_ptrs), d_found, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values),
+            reinterpret_cast<ValueType **>(value_ptrs), d_found,
+            generator_args);
   } else {
     throw std::runtime_error("Unrecognized initializer {" + initializer_ + "}");
   }
@@ -528,59 +533,71 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
   int block_size = dim < device_prop.max_thread_per_block
                        ? dim
                        : device_prop.max_thread_per_block;
-  int grid_size = device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
+  int grid_size =
+      device_prop.num_sms * (device_prop.max_thread_per_sm / block_size);
   using TableVector = TableVector<ValueType>;
-  auto table_vec_args = typename TableVector::Args {reinterpret_cast<ValueType **>(value_ptrs), d_found};
+  auto table_vec_args = typename TableVector::Args{
+      reinterpret_cast<ValueType **>(value_ptrs), d_found};
 
   auto &initializer_ = initializer_args.mode;
   if (initializer_ == "normal") {
     using Generator = NormalEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev};
+    auto generator_args = typename Generator::Args{
+        curand_states_, initializer_args.mean, initializer_args.std_dev};
     fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values), table_vec_args,
+            generator_args);
   } else if (initializer_ == "truncated_normal") {
     using Generator = TruncatedNormalEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, initializer_args.mean, initializer_args.std_dev, initializer_args.lower, initializer_args.upper};
+    auto generator_args = typename Generator::Args{
+        curand_states_, initializer_args.mean, initializer_args.std_dev,
+        initializer_args.lower, initializer_args.upper};
     fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values), table_vec_args,
+            generator_args);
   } else if (initializer_ == "uniform") {
     using Generator = UniformEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {curand_states_, initializer_args.lower, initializer_args.upper};
+    auto generator_args = typename Generator::Args{
+        curand_states_, initializer_args.lower, initializer_args.upper};
     fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values), table_vec_args,
+            generator_args);
   } else if (initializer_ == "debug") {
     using Generator = MappingEmbeddingGenerator<KeyType>;
-    auto generator_args = typename Generator::Args {reinterpret_cast<const KeyType *>(keys), 100000};
+    auto generator_args = typename Generator::Args{
+        reinterpret_cast<const KeyType *>(keys), 100000};
     fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values), table_vec_args,
+            generator_args);
   } else if (initializer_ == "constant") {
     using Generator = ConstEmbeddingGenerator;
-    auto generator_args = typename Generator::Args {initializer_args.value};
+    auto generator_args = typename Generator::Args{initializer_args.value};
     fill_output_with_table_vectors_kernel<ValueType, Generator, TableVector>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, reinterpret_cast<ValueType *>(values), table_vec_args, generator_args);
+        <<<grid_size, block_size, 0, stream>>>(
+            n, dim, reinterpret_cast<ValueType *>(values), table_vec_args,
+            generator_args);
   } else {
     throw std::runtime_error("Unrecognized initializer {" + initializer_ + "}");
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   int optstate_dim = get_optimizer_state_dim<ValueType>(optimizer_type_, dim);
-  if (optstate_dim == 0) return;
+  if (optstate_dim == 0)
+    return;
   using OptStateInitializer = OptStateInitializer<ValueType, int>;
-  OptStateInitializer optstate_initializer {optstate_dim, initial_optstate_};
+  OptStateInitializer optstate_initializer{optstate_dim, initial_optstate_};
 
   constexpr int kWarpSize = 32;
   constexpr int MULTIPLIER = 4;
   constexpr int BLOCK_SIZE_VEC = 64;
   constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
   const int max_grid_size =
-      device_prop.num_sms *
-      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
-  
+      device_prop.num_sms * (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+
   int grid_size_opt = 0;
   if (n / WARP_PER_BLOCK < max_grid_size) {
     grid_size_opt = (n - 1) / WARP_PER_BLOCK + 1;
@@ -591,17 +608,19 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
   }
 
   if (dim % 4 == 0 and optstate_dim % 4 == 0) {
-    initialize_optimizer_state_kernel_vec4<ValueType, OptStateInitializer, TableVector>
-      <<<grid_size_opt, BLOCK_SIZE_VEC, 0, stream>>>(
-      n, dim, table_vec_args, optstate_initializer);
+    initialize_optimizer_state_kernel_vec4<ValueType, OptStateInitializer,
+                                           TableVector>
+        <<<grid_size_opt, BLOCK_SIZE_VEC, 0, stream>>>(n, dim, table_vec_args,
+                                                       optstate_initializer);
   } else {
     int block_size = optstate_dim < device_prop.max_thread_per_block
-                        ? optstate_dim
-                        : device_prop.max_thread_per_block;
+                         ? optstate_dim
+                         : device_prop.max_thread_per_block;
     int grid_size = n;
-    initialize_optimizer_state_kernel<ValueType, OptStateInitializer, TableVector>
-      <<<grid_size, block_size, 0, stream>>>(
-      n, dim, table_vec_args, optstate_initializer);
+    initialize_optimizer_state_kernel<ValueType, OptStateInitializer,
+                                      TableVector>
+        <<<grid_size, block_size, 0, stream>>>(n, dim, table_vec_args,
+                                               optstate_initializer);
   }
 
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -610,7 +629,8 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert(
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::find_or_insert_pointers(
     const size_t n, const void *keys, void **value_ptrs, bool *d_found,
-    void *scores, cudaStream_t stream, bool unique_key, bool ignore_evict_strategy) {
+    void *scores, cudaStream_t stream, bool unique_key,
+    bool ignore_evict_strategy) {
   if (n == 0)
     return;
   int64_t dim = cols();
@@ -633,8 +653,8 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_pointers(
     void *scores, cudaStream_t stream) const {
   if (n == 0)
     return;
-  hkv_table_->find(n, (KeyType *)keys, (ValueType **)value_ptrs,
-                   founds, (uint64_t *)scores, stream);
+  hkv_table_->find(n, (KeyType *)keys, (ValueType **)value_ptrs, founds,
+                   (uint64_t *)scores, stream);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -644,9 +664,8 @@ void HKVVariable<KeyType, ValueType, Strategy>::find_pointers(
     void *scores, cudaStream_t stream) {
   if (n == 0)
     return;
-  hkv_table_->find_and_update(
-    n, (KeyType *)keys, (ValueType **)value_ptrs,
-    founds, (uint64_t *)scores, stream);
+  hkv_table_->find_and_update(n, (KeyType *)keys, (ValueType **)value_ptrs,
+                              founds, (uint64_t *)scores, stream);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -680,7 +699,7 @@ void HKVVariable<KeyType, ValueType, Strategy>::erase(const size_t n,
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-void HKVVariable<KeyType, ValueType,Strategy >::clear(cudaStream_t stream){
+void HKVVariable<KeyType, ValueType, Strategy>::clear(cudaStream_t stream) {
   hkv_table_->clear(stream);
 }
 
@@ -703,10 +722,8 @@ void HKVVariable<KeyType, ValueType, Strategy>::export_batch(
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-void HKVVariable<KeyType, ValueType,Strategy>::count_matched(
-    uint64_t threshold, 
-    uint64_t* d_counter, 
-    cudaStream_t stream) const {
+void HKVVariable<KeyType, ValueType, Strategy>::count_matched(
+    uint64_t threshold, uint64_t *d_counter, cudaStream_t stream) const {
   using ExecutionFunc = EvalAndInc<KeyType, ValueType, uint64_t>;
   ExecutionFunc func(threshold, d_counter);
   hkv_table_->for_each(0, hkv_table_->capacity(), func, stream);
@@ -714,81 +731,75 @@ void HKVVariable<KeyType, ValueType,Strategy>::count_matched(
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-void HKVVariable<KeyType, ValueType,Strategy >::export_batch_matched(
-    uint64_t threshold,
-    const uint64_t n,
-    const uint64_t offset,
-    uint64_t* d_counter,
-    void* keys,              // (n)
-    void* values,            // (n, DIM)
-    void* scores,            // (n)
+void HKVVariable<KeyType, ValueType, Strategy>::export_batch_matched(
+    uint64_t threshold, const uint64_t n, const uint64_t offset,
+    uint64_t *d_counter,
+    void *keys,   // (n)
+    void *values, // (n, DIM)
+    void *scores, // (n)
     cudaStream_t stream) const {
 
   using PredFunc = ExportIfPredFunctor<KeyType, ValueType, uint64_t>;
   PredFunc func(threshold);
-  hkv_table_->export_batch_if_v2(
-    func, n, offset, d_counter, 
-    reinterpret_cast<KeyType*>(keys),
-    reinterpret_cast<ValueType*>(values),
-    reinterpret_cast<uint64_t*>(scores), stream);
+  hkv_table_->export_batch_if_v2(func, n, offset, d_counter,
+                                 reinterpret_cast<KeyType *>(keys),
+                                 reinterpret_cast<ValueType *>(values),
+                                 reinterpret_cast<uint64_t *>(scores), stream);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::lock(
     const size_t n,
-    const void* keys,            // (n)
-    void** locked_keys_ptr,      // (n)
-    bool* flags,                 // (n)
-    void* scores,
-    cudaStream_t stream
-)  {
-  hkv_table_->lock_keys(
-    n,
-    reinterpret_cast<const KeyType*>(keys),
-    reinterpret_cast<KeyType**>(locked_keys_ptr),
-    flags, stream, (uint64_t*)scores);
+    const void *keys,       // (n)
+    void **locked_keys_ptr, // (n)
+    bool *flags,            // (n)
+    void *scores, cudaStream_t stream) {
+  hkv_table_->lock_keys(n, reinterpret_cast<const KeyType *>(keys),
+                        reinterpret_cast<KeyType **>(locked_keys_ptr), flags,
+                        stream, (uint64_t *)scores);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
 void HKVVariable<KeyType, ValueType, Strategy>::unlock(
     const size_t n,
-    void** locked_keys_ptr,      // (n)
-    const void* keys,            // (n)
-    bool* flags,                 // (n)
-    cudaStream_t stream
-) {
-  hkv_table_->unlock_keys(
-    n,
-    reinterpret_cast<KeyType**>(locked_keys_ptr),
-    reinterpret_cast<const KeyType*>(keys),
-    flags, stream);
+    void **locked_keys_ptr, // (n)
+    const void *keys,       // (n)
+    bool *flags,            // (n)
+    cudaStream_t stream) {
+  hkv_table_->unlock_keys(n, reinterpret_cast<KeyType **>(locked_keys_ptr),
+                          reinterpret_cast<const KeyType *>(keys), flags,
+                          stream);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-curandState* HKVVariable<KeyType, ValueType, Strategy>::get_curand_states() const {
+curandState *
+HKVVariable<KeyType, ValueType, Strategy>::get_curand_states() const {
   return curand_states_;
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-const InitializerArgs&  HKVVariable<KeyType, ValueType, Strategy>::get_initializer_args() const {
+const InitializerArgs &
+HKVVariable<KeyType, ValueType, Strategy>::get_initializer_args() const {
   return initializer_args;
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-const int  HKVVariable<KeyType, ValueType, Strategy>::optstate_dim() const {
+const int HKVVariable<KeyType, ValueType, Strategy>::optstate_dim() const {
   return hkv_table_option_.dim - dim_;
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-void HKVVariable<KeyType, ValueType, Strategy>::set_initial_optstate(const float value) {
+void HKVVariable<KeyType, ValueType, Strategy>::set_initial_optstate(
+    const float value) {
   this->initial_optstate_ = value;
 }
 
 template <typename KeyType, typename ValueType, EvictStrategy Strategy>
-const float HKVVariable<KeyType, ValueType, Strategy>::get_initial_optstate() const {
+const float
+HKVVariable<KeyType, ValueType, Strategy>::get_initial_optstate() const {
   return this->initial_optstate_;
 }
 

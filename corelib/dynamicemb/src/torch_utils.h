@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,9 +27,9 @@
 #include "ATen/AccumulateType.h"
 #include <pybind11/pybind11.h>
 // #include <torch/python.h>
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
-#include <cstdint>
 
 namespace dyn_emb {
 
@@ -41,11 +41,11 @@ namespace dyn_emb {
 // c10::ScalarType
 DataType scalartype_to_datatype(at::ScalarType scalar_type);
 at::ScalarType datatype_to_scalartype(dyn_emb::DataType dtype);
-at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta& typeMeta);
+at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta &typeMeta);
 
 uint64_t device_timestamp();
 
 } // namespace dyn_emb
 
-//PYTHON WRAP
-void bind_utils(py::module& m);
+// PYTHON WRAP
+void bind_utils(py::module &m);

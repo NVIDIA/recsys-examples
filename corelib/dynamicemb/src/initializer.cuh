@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,18 +17,18 @@
 
 #pragma once
 
-#include <cstdint>
-#include <random>
-#include <cuda_runtime.h>
-#include <curand_kernel.h>
-#include <cooperative_groups.h>
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <pybind11/pybind11.h>
-#include "utils.h"
 #include "check.h"
 #include "lookup_kernel.cuh"
 #include "torch_utils.h"
+#include "utils.h"
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cooperative_groups.h>
+#include <cstdint>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+#include <pybind11/pybind11.h>
+#include <random>
 
 namespace dyn_emb {
 
@@ -39,13 +39,14 @@ DEVICE_INLINE unsigned int worker_id() {
 
 struct UniformEmbeddingGenerator {
   struct Args {
-    curandState* state;
+    curandState *state;
     float lower;
     float upper;
   };
 
-  DEVICE_INLINE UniformEmbeddingGenerator(Args args): load_(false), state_(args.state), 
-    lower(args.lower), upper(args.upper) {}
+  DEVICE_INLINE UniformEmbeddingGenerator(Args args)
+      : load_(false), state_(args.state), lower(args.lower), upper(args.upper) {
+  }
 
   DEVICE_INLINE float generate(int64_t vec_id) {
     if (!load_) {
@@ -64,21 +65,22 @@ struct UniformEmbeddingGenerator {
 
   bool load_;
   curandState localState_;
-  curandState* state_;
+  curandState *state_;
   float lower;
   float upper;
 };
 
 struct NormalEmbeddingGenerator {
   struct Args {
-    curandState* state;
+    curandState *state;
     float mean;
     float std_dev;
   };
 
   DEVICE_INLINE
-  NormalEmbeddingGenerator(Args args): load_(false), state_(args.state),
-    mean(args.mean), std_dev(args.std_dev) {}
+  NormalEmbeddingGenerator(Args args)
+      : load_(false), state_(args.state), mean(args.mean),
+        std_dev(args.std_dev) {}
 
   DEVICE_INLINE
   float generate(int64_t vec_id) {
@@ -98,14 +100,14 @@ struct NormalEmbeddingGenerator {
 
   bool load_;
   curandState localState_;
-  curandState* state_;
+  curandState *state_;
   float mean;
   float std_dev;
 };
 
 struct TruncatedNormalEmbeddingGenerator {
   struct Args {
-    curandState* state;
+    curandState *state;
     float mean;
     float std_dev;
     float lower;
@@ -113,8 +115,9 @@ struct TruncatedNormalEmbeddingGenerator {
   };
 
   DEVICE_INLINE
-  TruncatedNormalEmbeddingGenerator(Args args): load_(false), state_(args.state),
-    mean(args.mean), std_dev(args.std_dev), lower(args.lower), upper(args.upper) {}
+  TruncatedNormalEmbeddingGenerator(Args args)
+      : load_(false), state_(args.state), mean(args.mean),
+        std_dev(args.std_dev), lower(args.lower), upper(args.upper) {}
 
   DEVICE_INLINE
   float generate(int64_t vec_id) {
@@ -144,7 +147,7 @@ struct TruncatedNormalEmbeddingGenerator {
 
   bool load_;
   curandState localState_;
-  curandState* state_;
+  curandState *state_;
   float mean;
   float std_dev;
   float lower;
@@ -152,15 +155,14 @@ struct TruncatedNormalEmbeddingGenerator {
   double scale = sqrt(2.0f);
 };
 
-template <typename K>
-struct MappingEmbeddingGenerator {
+template <typename K> struct MappingEmbeddingGenerator {
   struct Args {
-    const K* keys;
+    const K *keys;
     uint64_t mod;
   };
 
   DEVICE_INLINE
-  MappingEmbeddingGenerator(Args args): mod(args.mod), keys(args.keys) {}
+  MappingEmbeddingGenerator(Args args) : mod(args.mod), keys(args.keys) {}
 
   DEVICE_INLINE
   float generate(int64_t vec_id) {
@@ -171,7 +173,7 @@ struct MappingEmbeddingGenerator {
   DEVICE_INLINE void destroy() {}
 
   uint64_t mod;
-  const K* keys;
+  const K *keys;
 };
 
 struct ConstEmbeddingGenerator {
@@ -180,12 +182,10 @@ struct ConstEmbeddingGenerator {
   };
 
   DEVICE_INLINE
-  ConstEmbeddingGenerator(Args args): val(args.val) {}
-  
+  ConstEmbeddingGenerator(Args args) : val(args.val) {}
+
   DEVICE_INLINE
-  float generate(int64_t vec_id) {
-    return val;
-  }
+  float generate(int64_t vec_id) { return val; }
 
   DEVICE_INLINE void destroy() {}
 

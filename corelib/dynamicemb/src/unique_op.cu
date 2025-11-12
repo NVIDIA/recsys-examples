@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,15 +64,22 @@ void bind_unique_op(py::module &m) {
              const at::Tensor &d_output_index, const at::Tensor &d_unique_key,
              const at::Tensor &d_output_counter, uint64_t stream = 0,
              const c10::optional<at::Tensor> &offset = c10::nullopt,
-             const c10::optional<at::Tensor> &d_frequency_counters = c10::nullopt,
-             const c10::optional<at::Tensor> &d_input_frequencies = c10::nullopt) {
+             const c10::optional<at::Tensor> &d_frequency_counters =
+                 c10::nullopt,
+             const c10::optional<at::Tensor> &d_input_frequencies =
+                 c10::nullopt) {
             cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
 
-            at::Tensor offset_tensor = offset.has_value() ? offset.value() : at::Tensor();
-            at::Tensor frequency_counters_tensor = d_frequency_counters.has_value() ? d_frequency_counters.value() : at::Tensor();
-            at::Tensor input_frequencies_tensor = d_input_frequencies.has_value() ? d_input_frequencies.value() : at::Tensor();
+            at::Tensor offset_tensor =
+                offset.has_value() ? offset.value() : at::Tensor();
+            at::Tensor frequency_counters_tensor =
+                d_frequency_counters.has_value() ? d_frequency_counters.value()
+                                                 : at::Tensor();
+            at::Tensor input_frequencies_tensor =
+                d_input_frequencies.has_value() ? d_input_frequencies.value()
+                                                : at::Tensor();
 
-              self.unique(d_key, len, d_output_index, d_unique_key,
+            self.unique(d_key, len, d_output_index, d_unique_key,
                         d_output_counter, cuda_stream, offset_tensor,
                         frequency_counters_tensor, input_frequencies_tensor);
           },
