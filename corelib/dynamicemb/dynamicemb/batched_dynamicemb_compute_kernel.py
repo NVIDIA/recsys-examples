@@ -523,7 +523,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
 
     def forward(self, features) -> torch.Tensor:
         return self._emb_module(
-            features.values(),
-            features.offsets(),
+            indices=features.values().long(),
+            offsets=features.offsets().long(),
             per_sample_weights=features.weights_or_none(),
         )
