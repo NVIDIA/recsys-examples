@@ -758,7 +758,10 @@ def get_common_preprocessors(dataset_path: str):
         file_name="KuaiRand-27K.tar.gz",
         prefix="KuaiRand-27K",
     )
-    return {key: locals()[f"{key}_dp".replace("-", "_")] for key in dataset_names}
+    preprocessors = {}
+    for key in dataset_names:
+        preprocessors[key] = locals()[f"{key}_dp".replace("-", "_")]
+    return preprocessors
 
 
 if __name__ == "__main__":
