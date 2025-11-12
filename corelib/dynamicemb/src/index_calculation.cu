@@ -301,21 +301,21 @@ void SegmentedUniqueDevice::operator()(
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename T>
+template <typename InT, typename OutT>
 __global__ void get_table_range_kernel(
   int64_t num_table,
   int64_t feature_x_batch,
-  T const * __restrict__ offsets,
-  T const * __restrict__ feature_offsets,
-  T * __restrict__ table_range
+  InT const * __restrict__ offsets,
+  OutT const * __restrict__ feature_offsets,
+  OutT * __restrict__ table_range
 ) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < num_table + 1) {
-    T num_feature = feature_offsets[num_table];
+    OutT num_feature = feature_offsets[num_table];
     int64_t batch = feature_x_batch / num_feature;
-    T feature_offset = feature_offsets[tid];
-    T feature_x_batch_offset = feature_offset * batch;
-    table_range[tid] = offsets[feature_x_batch_offset];
+    OutT feature_offset = feature_offsets[tid];
+    int64_t feature_x_batch_offset = feature_offset * batch;
+    table_range[tid] = static_cast<OutT>(offsets[feature_x_batch_offset]);
   }
 }
 
@@ -338,12 +338,15 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
   }
   int grid_size = (num_table + block_size) / block_size;
   auto offset_type = scalartype_to_datatype(offsets.dtype().toScalarType());
+  auto range_type = scalartype_to_datatype(feature_offsets.dtype().toScalarType());
   DISPATCH_OFFSET_INT_TYPE(offset_type, offset_t, [&] {
-    get_table_range_kernel<offset_t><<<grid_size, block_size, 0, stream>>>(
-      num_table, feature_x_batch, reinterpret_cast<offset_t*>(offsets.data_ptr()),
-      reinterpret_cast<offset_t*>(feature_offsets.data_ptr()),
-      reinterpret_cast<offset_t*>(table_range.data_ptr())
-    );
+    DISPATCH_OFFSET_INT_TYPE(range_type, range_t, [&] {
+      get_table_range_kernel<offset_t, range_t><<<grid_size, block_size, 0, stream>>>(
+        num_table, feature_x_batch, reinterpret_cast<offset_t*>(offsets.data_ptr()),
+        reinterpret_cast<range_t*>(feature_offsets.data_ptr()),
+        reinterpret_cast<range_t*>(table_range.data_ptr())
+      );
+    });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   return table_range;
