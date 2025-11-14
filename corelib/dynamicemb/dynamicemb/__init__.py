@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .admission_strategy import AdmissionStrategy, FrequencyAdmissionStrategy
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
@@ -32,6 +33,8 @@ from .dynamicemb_config import (
 from .optimizer import EmbOptimType, OptimizerArgs
 
 __all__ = [
+    "AdmissionStrategy",
+    "FrequencyAdmissionStrategy",
     "DynamicEmbCheckMode",
     "DynamicEmbInitializerArgs",
     "DynamicEmbInitializerMode",
