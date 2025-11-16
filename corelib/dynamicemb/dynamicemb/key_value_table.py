@@ -28,7 +28,15 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
-from dynamicemb.types import Cache, Storage
+from dynamicemb.types import (
+    EMBEDDING_TYPE,
+    KEY_TYPE,
+    OPT_STATE_TYPE,
+    SCORE_TYPE,
+    Cache,
+    Storage,
+    torch_dtype_to_np_dtype,
+)
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
@@ -50,17 +58,6 @@ from dynamicemb_extensions import (
     select,
     select_index,
 )
-
-torch_dtype_to_np_dtype = {
-    torch.uint64: np.uint64,
-    torch.int64: np.int64,
-    torch.float32: np.float32,
-}
-
-KEY_TYPE = torch.int64
-EMBEDDING_TYPE = torch.float32
-SCORE_TYPE = torch.int64
-OPT_STATE_TYPE = torch.float32
 
 
 def save_to_json(data: Dict[str, Any], file_path: str) -> None:

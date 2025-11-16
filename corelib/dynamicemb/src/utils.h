@@ -107,6 +107,15 @@ enum class EvictStrategy : uint32_t {
     exit(EXIT_FAILURE);                                                        \
   }
 
+#define DISPATCH_BOOLEAN(flag, HINT, ...)                                      \
+  if (flag) {                                                                  \
+    constexpr bool HINT = true;                                                \
+    __VA_ARGS__();                                                             \
+  } else {                                                                     \
+    constexpr bool HINT = false;                                               \
+    __VA_ARGS__();                                                             \
+  }
+
 #define HOST_INLINE __host__ __forceinline__
 #define DEVICE_INLINE __device__ __forceinline__
 #define HOST_DEVICE_INLINE __host__ __device__ __forceinline__

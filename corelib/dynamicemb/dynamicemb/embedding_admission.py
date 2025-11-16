@@ -14,7 +14,15 @@
 # limitations under the License.
 
 
+from typing import Optional
+
 import torch
+from dynamicemb.scored_hashtable import (
+    ScoreArg,
+    ScorePolicy,
+    ScoreSpec,
+    get_scored_table,
+)
 from dynamicemb.types import Counter, MemoryType
 
 
@@ -23,7 +31,26 @@ class KVCounter(Counter):
     Interface of a counter table which maps a key to a counter.
     """
 
-    def add(self, keys: torch.Tensor, counters: torch.Tensor) -> torch.Tensor:
+    def __init__(
+        self,
+        capacity: int,
+        bucket_capacity: Optional[int] = 128,
+        key_type: Optional[torch.dtype] = torch.int64,
+        device: torch.device = None,
+    ):
+        self.score_name_ = "counter"
+        self.score_specs_ = [
+            ScoreSpec(name=self.score_name_, policy=ScorePolicy.ACCUMULATE)
+        ]
+        self.score_args_ = [ScoreArg(name=self.score_name_, is_return=True)]
+
+        self.table_ = get_scored_table(
+            capacity, bucket_capacity, key_type, self.score_specs_, device
+        )
+
+    def add(
+        self, keys: torch.Tensor, counters: torch.Tensor, inplace: bool
+    ) -> torch.Tensor:
         """
         Add keys with counters to the `Counter` and get accumulated counter of each key.
         For not existed keys, the counters will be assigned directly.
@@ -32,12 +59,16 @@ class KVCounter(Counter):
         Args:
             keys (torch.Tensor): The input keys, should be unique keys.
             counters (torch.Tensor): The input counters, serve as initial or incremental values of counters' states.
+            inplace: If true then store the accumulated_counters to counter.
 
         Returns:
             accumulated_counters (torch.Tensor): the counters' state in the `Counter` for the input keys.
         """
-        accumulated_counters: torch.Tensor
-        return accumulated_counters
+        assert inplace == True, "Only support inplace=True"
+        self.score_args_[0].value = counters
+
+        self.table_.insert(keys, self.score_args_)
+        return counters
 
     def erase(self, keys) -> None:
         """
@@ -46,7 +77,7 @@ class KVCounter(Counter):
         Args:
             keys (torch.Tensor): The input keys to be erased.
         """
-        return None
+        self.table_.erase(keys)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         """
@@ -55,7 +86,7 @@ class KVCounter(Counter):
         Args:
             mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
         """
-        return 0
+        return self.table_.memory_usage(mem_type)
 
     def load(self, key_file, counter_file) -> None:
         """
@@ -65,7 +96,7 @@ class KVCounter(Counter):
             key_file (str): the file path of keys.
             counter_file (str): the file path of counters.
         """
-        return None
+        self.table_.load(key_file, {self.score_name_: counter_file})
 
     def dump(self, key_file, counter_file) -> None:
         """
@@ -75,4 +106,4 @@ class KVCounter(Counter):
             key_file (str): the file path of keys.
             counter_file (str): the file path of counters.
         """
-        return None
+        self.table_.dump(key_file, {self.score_name_: counter_file})

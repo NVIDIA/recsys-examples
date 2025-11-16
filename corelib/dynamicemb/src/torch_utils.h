@@ -45,6 +45,28 @@ at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta &typeMeta);
 
 uint64_t device_timestamp();
 
+inline DataType get_data_type(at::Tensor tensor) {
+  return scalartype_to_datatype(tensor.dtype().toScalarType());
+}
+
+template <typename T> T *get_pointer(at::Tensor tensor) {
+  if (not tensor.defined()) {
+    throw std::invalid_argument("Tensor is undefined.");
+  }
+  return static_cast<T *>(tensor.data_ptr());
+}
+
+template <typename T> T *get_pointer(const std::optional<at::Tensor> &tensor) {
+  if (not tensor.has_value()) {
+    return nullptr;
+  }
+  auto value = tensor.value();
+  if (not value.defined()) {
+    throw std::invalid_argument("Tensor is undefined.");
+  }
+  return static_cast<T *>(value.data_ptr());
+}
+
 } // namespace dyn_emb
 
 // PYTHON WRAP

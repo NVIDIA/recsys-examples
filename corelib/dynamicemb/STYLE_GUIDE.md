@@ -22,7 +22,7 @@ sudo apt install clang-format-18
 
 format all with:
 ```bash
-find ./ \( -path ./HierarchicalKV -prune \) -o \( -iname *.h -o -iname *.cpp -o -iname *.cc -o -iname *.cu -o -iname *.cuh \) -print | xargs clang-format-18 -i --style=file
+find ./src -type f \( -name "*.cu" -o -name "*.cuh" -o -name "*.cpp" -o -name "*.h" \) -exec clang-format-18 -i {} \;
 
 ```
 

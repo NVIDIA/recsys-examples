@@ -17,6 +17,7 @@ import abc
 import enum
 from typing import Generic, Optional, Tuple, TypeVar
 
+import numpy as np
 import torch
 
 
@@ -30,6 +31,18 @@ class MemoryType(enum.Enum):
 
 TableOptionType = TypeVar("TableOptionType")
 OptimizerInterface = TypeVar("OptimizerInterface")
+
+KEY_TYPE = torch.int64
+EMBEDDING_TYPE = torch.float32
+SCORE_TYPE = torch.int64
+OPT_STATE_TYPE = torch.float32
+COUNTER_TYPE = torch.int64
+
+torch_dtype_to_np_dtype = {
+    torch.uint64: np.uint64,
+    torch.int64: np.int64,
+    torch.float32: np.float32,
+}
 
 
 # make it standalone to avoid recursive references.
@@ -229,7 +242,9 @@ class Counter(abc.ABC):
     """
 
     @abc.abstractmethod
-    def add(self, keys: torch.Tensor, counters: torch.Tensor) -> torch.Tensor:
+    def add(
+        self, keys: torch.Tensor, counters: torch.Tensor, inplace: bool
+    ) -> torch.Tensor:
         """
         Add keys with counters to the `Counter` and get accumulated counter of each key.
         For not existed keys, the counters will be assigned directly.
@@ -238,6 +253,7 @@ class Counter(abc.ABC):
         Args:
             keys (torch.Tensor): The input keys, should be unique keys.
             counters (torch.Tensor): The input counters, serve as initial or incremental values of counters' states.
+            inplace: If true then store the accumulated_counters to counter.
 
         Returns:
             accumulated_counters (torch.Tensor): the counters' state in the `Counter` for the input keys.
