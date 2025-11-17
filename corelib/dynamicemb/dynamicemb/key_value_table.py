@@ -20,6 +20,8 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+from dynamicemb.admission_strategy import AdmissionStrategy
+from dynamicemb.embedding_admission import Counter
 from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     create_dynamicemb_table,
@@ -220,7 +222,7 @@ class KeyValueTable(
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         if unique_keys.dtype != self.key_type():
             unique_keys = unique_keys.to(self.key_type())
 
@@ -799,6 +801,7 @@ class KeyValueTableFunction:
         initializer: Callable,
         training: bool,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        admit_strategy: Optional[AdmissionStrategy] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         h_num_toatl = unique_keys.numel()
@@ -849,10 +852,24 @@ class KeyValueTableFunction:
                 missing_values_in_storage[
                     :, emb_dim - val_dim :
                 ] = storage.init_optimizer_state()
+            keys_to_insert = missing_keys_in_storage
+            values_to_insert = missing_values_in_storage
+            scores_to_insert = missing_scores_in_storage
+            # 4.Optional Admission part
+            if admit_strategy is not None:
+                admit_mask = admit_strategy.admit(
+                    missing_keys_in_storage, 
+                    missing_scores_in_storage
+                )
+                keys_to_insert = missing_keys_in_storage[admit_mask]
+                values_to_insert = missing_values_in_storage[admit_mask]
+                if missing_scores_in_storage is not None:
+                    scores_to_insert = missing_scores_in_storage[admit_mask]
+
             storage.insert(
-                missing_keys_in_storage,
-                missing_values_in_storage,
-                missing_scores_in_storage,
+                keys_to_insert,
+                values_to_insert,
+                scores_to_insert,
             )
         # ignore the storage missed in eval mode
 
@@ -900,6 +917,7 @@ class KeyValueTableCachingFunction:
         enable_prefetch: bool,
         training: bool,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        admit_strategy: Optional[AdmissionStrategy] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         unique_keys.numel()

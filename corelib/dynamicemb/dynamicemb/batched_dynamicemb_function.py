@@ -355,6 +355,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         emb_dtype = storages[0].embedding_dtype()
         emb_dim = storages[0].embedding_dim()
         caching = caches[0] is not None
+        admit_strategy = storages[0].options.admit_strategy
 
         is_lfu_enabled = False
         if isinstance(storages[0], KeyValueTable):
@@ -415,6 +416,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     enable_prefetch,
                     training,
                     lfu_accumulated_frequency_per_table,
+                    admit_strategy,
                 )
             else:
                 KeyValueTableFunction.lookup(
@@ -424,6 +426,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     initializers[i],
                     training,
                     lfu_accumulated_frequency_per_table,
+                    admit_strategy,
                 )
 
         if training or caching:
