@@ -855,16 +855,17 @@ class KeyValueTableFunction:
             keys_to_insert = missing_keys_in_storage
             values_to_insert = missing_values_in_storage
             scores_to_insert = missing_scores_in_storage
+
             # 4.Optional Admission part
             if admit_strategy is not None:
+                freq_for_missing_keys = Counter.add(missing_keys_in_storage,missing_scores_in_storage) 
                 admit_mask = admit_strategy.admit(
-                    missing_keys_in_storage, 
-                    missing_scores_in_storage
+                    freq_for_missing_keys
                 )
                 keys_to_insert = missing_keys_in_storage[admit_mask]
+                Counter.erase(keys_to_insert)
                 values_to_insert = missing_values_in_storage[admit_mask]
-                if missing_scores_in_storage is not None:
-                    scores_to_insert = missing_scores_in_storage[admit_mask]
+                scores_to_insert = freq_for_missing_keys ## TODO: need to check if this is correct. Counter.add return shape?
 
             storage.insert(
                 keys_to_insert,
