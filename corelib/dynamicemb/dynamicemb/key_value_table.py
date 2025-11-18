@@ -858,14 +858,14 @@ class KeyValueTableFunction:
 
             # 4.Optional Admission part
             if admit_strategy is not None:
-                freq_for_missing_keys = Counter.add(missing_keys_in_storage,missing_scores_in_storage) 
+                freq_for_missing_keys = Counter.add(missing_keys_in_storage,missing_scores_in_storage) #TODO when pass Counter instance to lookup, change here to instance.
                 admit_mask = admit_strategy.admit(
                     freq_for_missing_keys
                 )
                 keys_to_insert = missing_keys_in_storage[admit_mask]
-                Counter.erase(keys_to_insert)
+                Counter.erase(keys_to_insert) #TODO when pass Counter instance to lookup, change here to instance.
                 values_to_insert = missing_values_in_storage[admit_mask]
-                scores_to_insert = freq_for_missing_keys ## TODO: need to check if this is correct. Counter.add return shape?
+                scores_to_insert = freq_for_missing_keys #TODO: need to check if this is correct. Counter.add return shape?
 
             storage.insert(
                 keys_to_insert,
@@ -981,8 +981,36 @@ class KeyValueTableCachingFunction:
                 values_for_storage[
                     missing_indices_in_storage, emb_dim - val_dim :
                 ] = storage.init_optimizer_state()
+            # 5.Optional Admission part
+            keys_to_update = keys_for_storage
+            values_to_update = values_for_storage
+            scores_to_update = scores_for_storage
+            
+            if admit_strategy is not None:
+                freq_for_missing_keys = Counter.add(missing_keys_in_storage, missing_scores_in_storage) #TODO when pass Counter instance to lookup, change here to instance.
+                admit_mask_for_missing_keys = admit_strategy.admit(freq_for_missing_keys)
+                
+                admitted_keys = missing_keys_in_storage[admit_mask_for_missing_keys]
+                Counter.erase(admitted_keys) #TODO when pass Counter instance to lookup, change here to instance.
+                
+                # build mask: including storage hit keys + keys that are both miss and admitted
+                mask_to_cache = founds
+                admitted_indices = missing_indices_in_storage[admit_mask_for_missing_keys]
+                mask_to_cache[admitted_indices] = True
+                
+                if scores_for_storage is not None:
+                    updated_scores = scores_for_storage.clone()
+                    # update freq for missing keys to the corresponding positions (through missing_indices_in_storage index)
+                    updated_scores[missing_indices_in_storage] = freq_for_missing_keys
+                    scores_to_update = updated_scores[mask_to_cache]
+                else:
+                    scores_to_update = None
+                
+                keys_to_update = keys_for_storage[mask_to_cache]
+                values_to_update = values_for_storage[mask_to_cache]
+            
             update_cache(
-                cache, storage, keys_for_storage, values_for_storage, scores_for_storage
+                cache, storage, keys_to_update, values_to_update, scores_to_update
             )
         else:  # only update those found in the storage to cache.
             found_keys_in_storage = keys_for_storage[founds].contiguous()
