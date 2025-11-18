@@ -23,19 +23,16 @@ if TYPE_CHECKING:
 
 
 class AdmissionStrategy(abc.ABC):
-
     @abc.abstractmethod
     def admit(
         self,
         keys: torch.Tensor,
         scores: torch.Tensor,
     ) -> torch.Tensor:
-
         pass
 
     @abc.abstractmethod
     def get_initializer_args(self) -> Optional["DynamicEmbInitializerArgs"]:
-
         pass
 
 
@@ -43,7 +40,7 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
     """
     Frequency-based admission strategy.
     Only admits keys whose frequency (score) meets or exceeds a threshold.
-    
+
     Parameters
     ----------
     threshold : int
@@ -61,7 +58,7 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
     ):
         if threshold < 0:
             raise ValueError(f"Threshold must be non-negative, got {threshold}")
-        
+
         self.threshold = threshold
         self.initializer_args = initializer_args
 
@@ -89,13 +86,10 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
             raise ValueError(
                 f"Keys and scores must have same length, got {keys.shape[0]} and {scores.shape[0]}"
             )
-        
+
         # Admit keys whose frequency meets or exceeds threshold
         admit_mask = scores >= self.threshold
         return admit_mask
 
     def get_initializer_args(self) -> Optional["DynamicEmbInitializerArgs"]:
         return self.initializer_args
-
-
-

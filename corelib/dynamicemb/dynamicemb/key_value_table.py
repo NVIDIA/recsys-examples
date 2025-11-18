@@ -21,13 +21,13 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.admission_strategy import AdmissionStrategy
-from dynamicemb.embedding_admission import Counter
 from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     create_dynamicemb_table,
     dyn_emb_to_torch,
     torch_to_dyn_emb,
 )
+from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.types import (
@@ -802,6 +802,7 @@ class KeyValueTableFunction:
         training: bool,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         admit_strategy: Optional[AdmissionStrategy] = None,
+        admission_counter: Optional[KVCounter] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         h_num_toatl = unique_keys.numel()
@@ -858,14 +859,16 @@ class KeyValueTableFunction:
 
             # 4.Optional Admission part
             if admit_strategy is not None:
-                freq_for_missing_keys = Counter.add(missing_keys_in_storage,missing_scores_in_storage) #TODO when pass Counter instance to lookup, change here to instance.
-                admit_mask = admit_strategy.admit(
-                    freq_for_missing_keys
-                )
+                freq_for_missing_keys = admission_counter.add(
+                    missing_keys_in_storage, missing_scores_in_storage
+                )  # TODO when pass Counter instance to lookup, change here to instance.
+                admit_mask = admit_strategy.admit(freq_for_missing_keys)
                 keys_to_insert = missing_keys_in_storage[admit_mask]
-                Counter.erase(keys_to_insert) #TODO when pass Counter instance to lookup, change here to instance.
+                admission_counter.erase(
+                    keys_to_insert
+                )  # TODO when pass Counter instance to lookup, change here to instance.
                 values_to_insert = missing_values_in_storage[admit_mask]
-                scores_to_insert = freq_for_missing_keys #TODO: need to check if this is correct. Counter.add return shape?
+                scores_to_insert = freq_for_missing_keys  # TODO: need to check if this is correct. Counter.add return shape?
 
             storage.insert(
                 keys_to_insert,
@@ -919,6 +922,7 @@ class KeyValueTableCachingFunction:
         training: bool,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         admit_strategy: Optional[AdmissionStrategy] = None,
+        admission_counter: Optional[KVCounter] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         unique_keys.numel()
@@ -985,19 +989,27 @@ class KeyValueTableCachingFunction:
             keys_to_update = keys_for_storage
             values_to_update = values_for_storage
             scores_to_update = scores_for_storage
-            
+
             if admit_strategy is not None:
-                freq_for_missing_keys = Counter.add(missing_keys_in_storage, missing_scores_in_storage) #TODO when pass Counter instance to lookup, change here to instance.
-                admit_mask_for_missing_keys = admit_strategy.admit(freq_for_missing_keys)
-                
+                freq_for_missing_keys = admission_counter.add(
+                    missing_keys_in_storage, missing_scores_in_storage
+                )  # TODO when pass Counter instance to lookup, change here to instance.
+                admit_mask_for_missing_keys = admit_strategy.admit(
+                    freq_for_missing_keys
+                )
+
                 admitted_keys = missing_keys_in_storage[admit_mask_for_missing_keys]
-                Counter.erase(admitted_keys) #TODO when pass Counter instance to lookup, change here to instance.
-                
+                admission_counter.erase(
+                    admitted_keys
+                )  # TODO when pass Counter instance to lookup, change here to instance.
+
                 # build mask: including storage hit keys + keys that are both miss and admitted
                 mask_to_cache = founds
-                admitted_indices = missing_indices_in_storage[admit_mask_for_missing_keys]
+                admitted_indices = missing_indices_in_storage[
+                    admit_mask_for_missing_keys
+                ]
                 mask_to_cache[admitted_indices] = True
-                
+
                 if scores_for_storage is not None:
                     updated_scores = scores_for_storage.clone()
                     # update freq for missing keys to the corresponding positions (through missing_indices_in_storage index)
@@ -1005,10 +1017,10 @@ class KeyValueTableCachingFunction:
                     scores_to_update = updated_scores[mask_to_cache]
                 else:
                     scores_to_update = None
-                
+
                 keys_to_update = keys_for_storage[mask_to_cache]
                 values_to_update = values_for_storage[mask_to_cache]
-            
+
             update_cache(
                 cache, storage, keys_to_update, values_to_update, scores_to_update
             )
