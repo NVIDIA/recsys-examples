@@ -990,6 +990,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.use_index_dedup,
                 self.training,
                 per_sample_weights,  # Pass frequency counters as weights
+                self._admission_counter,
                 self._empty_tensor,
             )
             for cache in self._caches:
