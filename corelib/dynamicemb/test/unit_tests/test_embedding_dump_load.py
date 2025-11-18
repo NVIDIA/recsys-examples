@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+from dynamicemb.admission_strategy import AdmissionStrategy
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -195,6 +196,7 @@ def apply_dmp(
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
+    admit_strategy: AdmissionStrategy = None,
 ):
     eb_configs = []
     dynamicemb_options_dict = {}
@@ -260,6 +262,7 @@ def apply_dmp(
                     max_capacity=emb_num_embeddings_next_power_of_2,
                     caching=caching,
                     local_hbm_for_values=1024**3,
+                    admit_strategy=admit_strategy,
                 )
     planner = get_planner(
         eb_configs,
@@ -298,6 +301,7 @@ def create_model(
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
+    admit_strategy: AdmissionStrategy = None,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -333,6 +337,7 @@ def create_model(
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
+        admit_strategy=admit_strategy,
     )
     return model
 

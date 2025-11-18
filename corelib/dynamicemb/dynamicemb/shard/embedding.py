@@ -46,7 +46,6 @@ from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel, DynamicEmbScoreStrategy
-from ..planner.planner import DynamicEmbParameterSharding
 from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from ..unique_op import UniqueOp
 
@@ -74,7 +73,11 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
     ] + [DynamicEmbKernel]
 
     def __init__(
-        self, *args, score_strategy: Optional[DynamicEmbScoreStrategy] = None, has_admit_strategy: bool = False, **kwargs
+        self,
+        *args,
+        score_strategy: Optional[DynamicEmbScoreStrategy] = None,
+        has_admit_strategy: bool = False,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         # Store the global score strategy
@@ -83,6 +86,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
             (score_strategy == DynamicEmbScoreStrategy.LFU) if score_strategy else False
         )
         self._has_admit_strategy = has_admit_strategy
+
     @classmethod
     def create_embedding_sharding(
         cls,
@@ -399,7 +403,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
 
     def create_context(self) -> DynamicEmbeddingCollectionContext:
         # pre-allocate frequency_counters list, ensure all ranks have the same structure
-        frequency_counters = [] if not (self._is_lfu_enabled or self._has_admit_strategy) else None
+        frequency_counters = (
+            [] if not (self._is_lfu_enabled or self._has_admit_strategy) else None
+        )
         return DynamicEmbeddingCollectionContext(
             sharding_contexts=[], frequency_counters=frequency_counters
         )
@@ -434,8 +440,10 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
                 if param_sharding.dynamicemb_options:
                     # 检查 score_strategy
                     if param_sharding.dynamicemb_options.score_strategy is not None:
-                        global_score_strategy = param_sharding.dynamicemb_options.score_strategy
-                    
+                        global_score_strategy = (
+                            param_sharding.dynamicemb_options.score_strategy
+                        )
+
                     if param_sharding.dynamicemb_options.admit_strategy is not None:
                         has_admit_strategy = True
 

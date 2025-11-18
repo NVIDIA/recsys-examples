@@ -377,11 +377,12 @@ segmented_unique(
   h_segment_range.copy_(segment_range, /*non_blocking=*/true);
 
   int table_num = segment_range.size(0) - 1;
-  
+  bool need_frequency_output = false;
+  need_frequency_output = is_lfu_enabled.value() || frequency_counts_uint64.has_value();
   // Use single shared buffer instead of table_num separate buffers
   at::Tensor shared_unique_buffer = at::empty(num_total, keys.options());
   at::Tensor shared_frequency_buffer;
-  if (is_lfu_enabled.value()) {
+  if (need_frequency_output) {
     shared_frequency_buffer = at::zeros(
         num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
   }
@@ -435,7 +436,7 @@ segmented_unique(
                           tmp_unique_buffer_slice, tmp_d_unique_num, stream,
                           previous_d_unique_num, tmp_frequency_output_slice,
                           tmp_frequency_counts_uint64);
-      } else if (is_lfu_enabled.value()) {
+      } else if (need_frequency_output) {
         tmp_frequency_output_slice =
             shared_frequency_buffer.slice(0, indices_begin, indices_end);
         unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
@@ -469,7 +470,7 @@ segmented_unique(
   at::Tensor unique_keys = at::empty(num_unique_total, keys.options());
   at::Tensor output_scores;
   output_scores = at::Tensor();
-  if (is_lfu_enabled.value()) {
+  if (need_frequency_output) {
     output_scores = at::empty(num_unique_total, keys.options());
   }
   for (int i = 0; i < table_num; ++i) {
@@ -486,7 +487,7 @@ segmented_unique(
       size_t copy_size = tmp_unique_num * unique_keys.element_size();
       AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                     cudaMemcpyDeviceToDevice, stream));
-      if (is_lfu_enabled.value()) {
+      if (need_frequency_output) {
         void *dst_ptr = reinterpret_cast<char *>(output_scores.data_ptr()) +
                         unique_embs_offset * output_scores.element_size();
         void *src_ptr = reinterpret_cast<char *>(shared_frequency_buffer.data_ptr()) +
