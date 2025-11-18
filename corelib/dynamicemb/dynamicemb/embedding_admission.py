@@ -23,6 +23,10 @@ class KVCounter(Counter):
     Interface of a counter table which maps a key to a counter.
     """
 
+    def __init__(self):
+        super().__init__()
+        self._counter_dict = {}
+
     def add(self, keys: torch.Tensor, counters: torch.Tensor) -> torch.Tensor:
         """
         Add keys with counters to the `Counter` and get accumulated counter of each key.
@@ -36,8 +40,16 @@ class KVCounter(Counter):
         Returns:
             accumulated_counters (torch.Tensor): the counters' state in the `Counter` for the input keys.
         """
-        accumulated_counters: torch.Tensor
-        return accumulated_counters
+        # accumulated_counters: torch.Tensor
+        keys_cpu = keys.cpu().tolist()
+        counters_cpu = counters.cpu().tolist()
+
+        accumulated = []
+        for k, c in zip(keys_cpu, counters_cpu):
+            self._counter_dict[k] = self._counter_dict.get(k, 0) + c
+            accumulated.append(self._counter_dict[k])
+
+        return torch.tensor(accumulated, device=keys.device, dtype=counters.dtype)
 
     def erase(self, keys) -> None:
         """
@@ -46,7 +58,9 @@ class KVCounter(Counter):
         Args:
             keys (torch.Tensor): The input keys to be erased.
         """
-        return None
+        keys_cpu = keys.cpu().tolist()
+        for k in keys_cpu:
+            self._counter_dict.pop(k, None)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         """
