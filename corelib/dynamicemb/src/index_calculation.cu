@@ -384,7 +384,9 @@ segmented_unique(
 
   // Create vector of tensors for per-table frequency output
   std::vector<at::Tensor> tmp_accumulated_frequency_output(table_num);
-  if (is_lfu_enabled.value()) {
+  bool need_frequency_output = false;
+  need_frequency_output = is_lfu_enabled.value() || frequency_counts_uint64.has_value();
+  if (need_frequency_output) {
     for (int i = 0; i < table_num; ++i) {
       tmp_accumulated_frequency_output[i] = at::zeros_like(
           keys, at::TensorOptions().dtype(at::kLong).device(keys.device()));
@@ -443,7 +445,7 @@ segmented_unique(
                           tmp_unique_indices[i], tmp_d_unique_num, stream,
                           previous_d_unique_num, tmp_frequency_output_counter,
                           tmp_frequency_counts_uint64);
-      } else if (is_lfu_enabled.value()) {
+      } else if (need_frequency_output) {
         tmp_frequency_output_counter =
             tmp_accumulated_frequency_output[i].slice(0, 0, indices_length);
         unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
@@ -477,7 +479,7 @@ segmented_unique(
   at::Tensor unique_keys = at::empty(num_unique_total, keys.options());
   at::Tensor output_scores;
   output_scores = at::Tensor();
-  if (is_lfu_enabled.value()) {
+  if (need_frequency_output) {
     output_scores = at::empty(num_unique_total, keys.options());
   }
   for (int i = 0; i < table_num; ++i) {
@@ -491,7 +493,7 @@ segmented_unique(
       size_t copy_size = tmp_unique_num * unique_keys.element_size();
       AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                     cudaMemcpyDeviceToDevice, stream));
-      if (is_lfu_enabled.value()) {
+      if (need_frequency_output) {
         void *dst_ptr = reinterpret_cast<char *>(output_scores.data_ptr()) +
                         unique_embs_offset * output_scores.element_size();
         void *src_ptr = tmp_accumulated_frequency_output[i].data_ptr();

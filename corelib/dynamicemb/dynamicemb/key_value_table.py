@@ -803,6 +803,7 @@ class KeyValueTableFunction:
         unique_embs: torch.Tensor,
         initializer: Callable,
         training: bool,
+        is_lfu_enabled: bool,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         admit_strategy: Optional[AdmissionStrategy] = None,
         admission_counter: Optional[KVCounter] = None,
@@ -827,7 +828,7 @@ class KeyValueTableFunction:
             unique_keys,
             unique_embs,
             founds=founds,
-            input_scores=lfu_accumulated_frequency,
+            input_scores=lfu_accumulated_frequency if is_lfu_enabled else None,
         )
 
         # 2. initialize missing embeddings
@@ -859,17 +860,29 @@ class KeyValueTableFunction:
             keys_to_insert = missing_keys_in_storage
             values_to_insert = missing_values_in_storage
             scores_to_insert = missing_scores_in_storage
-
             # 4.Optional Admission part
             if admit_strategy is not None:
+                # Get frequency counters for admission:
+                # 1. Use missing_scores_in_storage if available (LFU mode)
+                # 2. Otherwise, extract from lfu_accumulated_frequency using missing_indices_in_storage
+                # 3. Otherwise, use default value 1
+                if lfu_accumulated_frequency is not None:
+                    counters_for_admission = lfu_accumulated_frequency[
+                        missing_indices_in_storage
+                    ]
+                else:
+                    counters_for_admission = torch.ones_like(
+                        missing_keys_in_storage, dtype=torch.int64
+                    )
+
                 freq_for_missing_keys = admission_counter.add(
-                    missing_keys_in_storage, missing_scores_in_storage
-                )  # TODO when pass Counter instance to lookup, change here to instance.
-                admit_mask = admit_strategy.admit(freq_for_missing_keys)
+                    missing_keys_in_storage, counters_for_admission
+                )
+                admit_mask = admit_strategy.admit(
+                    freq_for_missing_keys, freq_for_missing_keys
+                )
                 keys_to_insert = missing_keys_in_storage[admit_mask]
-                admission_counter.erase(
-                    keys_to_insert
-                )  # TODO when pass Counter instance to lookup, change here to instance.
+                admission_counter.erase(keys_to_insert)
                 values_to_insert = missing_values_in_storage[admit_mask]
                 scores_to_insert = freq_for_missing_keys  # TODO: need to check if this is correct. Counter.add return shape?
 
@@ -923,6 +936,7 @@ class KeyValueTableCachingFunction:
         initializer: Callable,
         enable_prefetch: bool,
         training: bool,
+        is_lfu_enabled: bool,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         admit_strategy: Optional[AdmissionStrategy] = None,
         admission_counter: Optional[KVCounter] = None,
@@ -941,7 +955,9 @@ class KeyValueTableCachingFunction:
             missing_indices,
             missing_scores,
         ) = cache.find_embeddings(
-            unique_keys, unique_embs, input_scores=lfu_accumulated_frequency
+            unique_keys,
+            unique_embs,
+            input_scores=lfu_accumulated_frequency if is_lfu_enabled else None,
         )
         if h_num_keys_for_storage == 0:
             return
@@ -994,17 +1010,30 @@ class KeyValueTableCachingFunction:
             scores_to_update = scores_for_storage
 
             if admit_strategy is not None:
+                # Get frequency counters for admission:
+                # 1. Use missing_scores_in_storage if available (LFU mode)
+                # 2. Otherwise, extract from scores_for_storage using missing_indices_in_storage
+                # 3. Otherwise, use default value 1
+                if missing_scores_in_storage is not None:
+                    counters_for_admission = missing_scores_in_storage
+                elif scores_for_storage is not None:
+                    counters_for_admission = scores_for_storage[
+                        missing_indices_in_storage
+                    ]
+                else:
+                    counters_for_admission = torch.ones_like(
+                        missing_keys_in_storage, dtype=torch.int64
+                    )
+
                 freq_for_missing_keys = admission_counter.add(
-                    missing_keys_in_storage, missing_scores_in_storage
-                )  # TODO when pass Counter instance to lookup, change here to instance.
+                    missing_keys_in_storage, counters_for_admission
+                )
                 admit_mask_for_missing_keys = admit_strategy.admit(
                     freq_for_missing_keys
                 )
 
                 admitted_keys = missing_keys_in_storage[admit_mask_for_missing_keys]
-                admission_counter.erase(
-                    admitted_keys
-                )  # TODO when pass Counter instance to lookup, change here to instance.
+                admission_counter.erase(admitted_keys)
 
                 # build mask: including storage hit keys + keys that are both miss and admitted
                 mask_to_cache = founds
