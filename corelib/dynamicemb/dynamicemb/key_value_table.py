@@ -1008,25 +1008,20 @@ class KeyValueTableCachingFunction:
 
             if admit_strategy is not None:
                 # Get frequency counters for admission:
-                # 1. Use missing_scores_in_storage if available (LFU mode)
-                # 2. Otherwise, extract from scores_for_storage using missing_indices_in_storage
-                # 3. Otherwise, use default value 1
-                if missing_scores_in_storage is not None:
-                    counters_for_admission = missing_scores_in_storage
-                elif scores_for_storage is not None:
-                    counters_for_admission = scores_for_storage[
-                        missing_indices_in_storage
-                    ]
+                if lfu_accumulated_frequency is not None:
+                    # missing_indices_in_storage is index in keys_for_storage, Need to convert to index in unique_keys via missing_indices
+                    indices_in_unique_keys = missing_indices[missing_indices_in_storage]
+                    counters_for_admission = lfu_accumulated_frequency[indices_in_unique_keys]
                 else:
                     counters_for_admission = torch.ones_like(
                         missing_keys_in_storage, dtype=torch.int64
                     )
-
+  
                 freq_for_missing_keys = admission_counter.add(
                     missing_keys_in_storage, counters_for_admission
                 )
                 admit_mask_for_missing_keys = admit_strategy.admit(
-                    freq_for_missing_keys
+                    freq_for_missing_keys, freq_for_missing_keys,
                 )
 
                 admitted_keys = missing_keys_in_storage[admit_mask_for_missing_keys]
