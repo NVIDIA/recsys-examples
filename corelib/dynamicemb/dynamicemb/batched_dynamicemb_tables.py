@@ -486,7 +486,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
-
+        self.frequency_threshold = table_option.frequency_threshold
+        self.mask_dims = table_option.mask_dims
         if device is not None:
             self.device_id = int(str(device)[-1])
         else:
@@ -987,6 +988,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.use_index_dedup,
                 self.training,
                 per_sample_weights,  # Pass frequency counters as weights
+                self.frequency_threshold,
+                self.mask_dims,
                 self._empty_tensor,
             )
             for cache in self._caches:

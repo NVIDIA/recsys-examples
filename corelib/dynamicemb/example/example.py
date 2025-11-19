@@ -486,9 +486,11 @@ def get_planner(device, eb_configs, batch_size, optimizer_type, training, cachin
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
-                score_strategy=DynamicEmbScoreStrategy.STEP,
+                score_strategy=DynamicEmbScoreStrategy.LFU,
                 caching=caching,
                 training=training,
+                frequency_threshold=10,
+                mask_dims=10,
             ),
         )
 
