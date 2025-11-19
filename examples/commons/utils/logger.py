@@ -21,21 +21,20 @@ from rich.logging import RichHandler
 # Set up logger with RichHandler if not already configured
 
 console = Console()
-_LOGGER = logging.getLogger("rich_rank0")
+_logger = logging.getLogger("rich_rank0")
 
-if not _LOGGER.hasHandlers():
-    handler = RichHandler(
-        console=console, show_time=True, show_path=False, rich_tracebacks=True
-    )
-    _LOGGER.addHandler(handler)
-    _LOGGER.propagate = False
-    _LOGGER.setLevel(logging.INFO)
+handler = RichHandler(
+    console=console, show_time=True, show_path=False, rich_tracebacks=True
+)
+_logger.addHandler(handler)
+_logger.propagate = False
+_logger.setLevel(logging.INFO)
 
 
 def print_rank_0(message):
     """If distributed is initialized, print only on rank 0."""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
-            _LOGGER.info(message)
+            _logger.info(message)
     else:
         print(message, flush=True)
