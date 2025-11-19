@@ -14,11 +14,13 @@
 # limitations under the License.
 import os
 import warnings
+from itertools import chain
 from typing import List, Optional, Tuple, Union
 
 import torch
 from configs import (
     InferenceHSTUConfig,
+    InferenceMode,
     KVCacheConfig,
     KVCacheMetadata,
     RankingConfig,
@@ -26,8 +28,6 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from dataset.utils import Batch
-from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
-from modules.host_kv_storage_manager import HSTUHostKVStorageManager
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.inference_embedding import InferenceEmbedding
 from modules.jagged_data import JaggedData
@@ -120,11 +120,14 @@ class InferenceRankingGR(torch.nn.Module):
         task_config: RankingConfig,
         use_cudagraph=False,
         cudagraph_configs=None,
+        mode=InferenceMode.default,
+        sparse_shareables=None,
     ):
         super().__init__()
         self._device = torch.cuda.current_device()
         self._hstu_config = hstu_config
         self._task_config = task_config
+        self._mode = mode
 
         self._embedding_dim = hstu_config.hidden_size
         for ebc_config in task_config.embedding_configs:
@@ -132,12 +135,39 @@ class InferenceRankingGR(torch.nn.Module):
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
 
-        self._embedding_collection = InferenceEmbedding(task_config.embedding_configs)
-
-        self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(hstu_config, kvcache_config)
-        self._host_kv_storage_manager = HSTUHostKVStorageManager(
-            hstu_config, kvcache_config
+        self._feature_names = list(
+            chain(
+                *[
+                    ebc_config.feature_names
+                    for ebc_config in task_config.embedding_configs
+                ]
+            )
         )
+        self._contextual_feature_names = self._feature_names[:-2]
+        self._item_feature_name = self._feature_names[-2]
+        self._action_feature_name = self._feature_names[-1]
+
+        self._embedding_collection = None
+        if mode in {InferenceMode.default, InferenceMode.sparse}:
+            self._embedding_collection = InferenceEmbedding(
+                task_config.embedding_configs,
+                hstu_config.embedding_backend,
+                sparse_shareables,
+            )
+            return
+
+        self._use_kvcache = False
+        if kvcache_config is not None:
+            from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
+            from modules.host_kv_storage_manager import HSTUHostKVStorageManager
+
+            self._use_kvcache = True
+            self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(
+                hstu_config, kvcache_config
+            )
+            self._host_kv_storage_manager = HSTUHostKVStorageManager(
+                hstu_config, kvcache_config
+            )
 
         self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
         self._mlp = MLP(
@@ -160,8 +190,8 @@ class InferenceRankingGR(torch.nn.Module):
         )
         device = torch.cuda.current_device()
 
-        max_batch_size = kvcache_config.max_batch_size
-        max_seq_len = kvcache_config.max_seq_len
+        max_batch_size = hstu_config.max_batch_size
+        max_seq_len = hstu_config.max_seq_len
         hidden_dim = hstu_config.hidden_size
 
         self._hidden_states = torch.randn(
@@ -170,21 +200,23 @@ class InferenceRankingGR(torch.nn.Module):
         self._jagged_metadata = get_jagged_metadata_buffer(
             max_batch_size, max_seq_len, hstu_config.contextual_max_seqlen
         )
-        self._kvcache_metadata = get_kvcache_metadata_buffer(
-            hstu_config, kvcache_config
-        )
-        self._offload_states = None
-        self._kvcache_metadata.onload_history_kv_buffer = [
-            self._gpu_kv_cache_manager.get_onload_buffers(layer_idx)
-            for layer_idx in range(hstu_config.num_layers)
-        ]
-        self._kvcache_metadata.onload_history_kv_events = [
-            torch.cuda.Event() for _ in range(hstu_config.num_layers)
-        ]
-        self._kvcache_metadata.kv_cache_table = [
-            self._gpu_kv_cache_manager.get_kvcache_table(layer_idx)
-            for layer_idx in range(hstu_config.num_layers)
-        ]
+
+        if self._use_kvcache:
+            self._kvcache_metadata = get_kvcache_metadata_buffer(
+                hstu_config, kvcache_config
+            )
+            self._offload_states = None
+            self._kvcache_metadata.onload_history_kv_buffer = [
+                self._gpu_kv_cache_manager.get_onload_buffers(layer_idx)
+                for layer_idx in range(hstu_config.num_layers)
+            ]
+            self._kvcache_metadata.onload_history_kv_events = [
+                torch.cuda.Event() for _ in range(hstu_config.num_layers)
+            ]
+            self._kvcache_metadata.kv_cache_table = [
+                self._gpu_kv_cache_manager.get_kvcache_table(layer_idx)
+                for layer_idx in range(hstu_config.num_layers)
+            ]
 
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
@@ -194,7 +226,7 @@ class InferenceRankingGR(torch.nn.Module):
                 max_seq_len,
                 self._hidden_states,
                 self._jagged_metadata,
-                self._kvcache_metadata,
+                self._kvcache_metadata if self._use_kvcache else None,
                 cudagraph_configs=cudagraph_configs,
             )
 
@@ -205,8 +237,9 @@ class InferenceRankingGR(torch.nn.Module):
         Returns:
             RankingGR: The model with bfloat16 precision.
         """
-        self._hstu_block.bfloat16()
-        self._mlp.bfloat16()
+        if self._mode != InferenceMode.sparse:
+            self._hstu_block.bfloat16()
+            self._mlp.bfloat16()
         return self
 
     def half(self):
@@ -216,36 +249,42 @@ class InferenceRankingGR(torch.nn.Module):
         Returns:
             RankingGR: The model with half precision.
         """
-        self._hstu_block.half()
-        self._mlp.half()
+        if self._mode != InferenceMode.sparse:
+            self._hstu_block.half()
+            self._mlp.half()
         return self
 
     def load_checkpoint(self, checkpoint_dir):
-        embedding_table_dir = os.path.join(
-            checkpoint_dir,
-            "dynamicemb_module",
-            "model._embedding_collection._model_parallel_embedding_collection",
-        )
-        dynamic_tables = (
-            self._embedding_collection._dynamic_embedding_collection._embedding_tables
-        )
+        if checkpoint_dir is None:
+            return
 
-        try:
-            for idx, table_name in enumerate(dynamic_tables.table_names):
-                dynamic_tables.load(
-                    embedding_table_dir, optim=False, table_names=[table_name]
-                )
-        except ValueError as e:
-            warnings.warn(
-                f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
-                "Please check if the checkpoint is version 1. The loading of this old version is disabled."
+        if self._mode in {InferenceMode.default, InferenceMode.sparse}:
+            embedding_table_dir = os.path.join(
+                checkpoint_dir,
+                "dynamicemb_module",
+                "model._embedding_collection._model_parallel_embedding_collection",
+            )
+            dynamic_tables = (
+                self._embedding_collection._dynamic_embedding_collection._embedding_tables
             )
 
-        model_state_dict_path = os.path.join(
-            checkpoint_dir, "torch_module", "model.0.pth"
-        )
-        model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
-        self.load_state_dict(model_state_dict, strict=False)
+            try:
+                for idx, table_name in enumerate(dynamic_tables.table_names):
+                    dynamic_tables.load(
+                        embedding_table_dir, optim=False, table_names=[table_name]
+                    )
+            except ValueError as e:
+                warnings.warn(
+                    f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
+                    "Please check if the checkpoint is version 1. The loading of this old version is disabled."
+                )
+
+        if self._mode in {InferenceMode.default, InferenceMode.dense}:
+            model_state_dict_path = os.path.join(
+                checkpoint_dir, "torch_module", "model.0.pth"
+            )
+            model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
+            self.load_state_dict(model_state_dict, strict=False)
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
         new_state_dict = {}
@@ -308,11 +347,12 @@ class InferenceRankingGR(torch.nn.Module):
             hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
             hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
 
-        assert unloaded_modules.missing_keys == [
-            "_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor"
-        ]
-        if self._hstu_config.contextual_max_seqlen != 0:
-            assert unloaded_modules.unexpected_keys == []
+        if self._mode == InferenceMode.default:
+            assert unloaded_modules.missing_keys == [
+                "_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor"
+            ]
+            if self._hstu_config.contextual_max_seqlen != 0:
+                assert unloaded_modules.unexpected_keys == []
 
     def get_user_kvdata_info(
         self,
@@ -470,22 +510,28 @@ class InferenceRankingGR(torch.nn.Module):
     def forward(
         self,
         batch: Batch,
-        user_ids: torch.Tensor,
-        user_start_pos: torch.Tensor,
+        user_ids: torch.Tensor = None,
+        user_start_pos: torch.Tensor = None,
     ):
         with torch.inference_mode():
-            user_start_pos_cuda = user_start_pos.to(
-                device=torch.cuda.current_device(), non_blocking=True
-            )
-            kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            if self._use_kvcache:
+                assert user_ids is not None and user_start_pos is not None
+                user_start_pos_cuda = user_start_pos.to(
+                    device=torch.cuda.current_device(), non_blocking=True
+                )
+                kvcache_metadata = self.prepare_kv_cache(
+                    batch, user_ids, user_start_pos
+                )
+
             embeddings = self._embedding_collection(batch.features)
-            embeddings, batch = self.strip_contextual_features(
-                embeddings, batch, user_start_pos
-            )
+            if user_start_pos is not None:
+                embeddings, batch = self.strip_contextual_features(
+                    embeddings, batch, user_start_pos
+                )
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,
-                seq_start_position=user_start_pos_cuda,
+                seq_start_position=user_start_pos_cuda if self._use_kvcache else None,
             )
 
             num_tokens = batch.features.values().shape[0]
@@ -494,43 +540,89 @@ class InferenceRankingGR(torch.nn.Module):
                     jagged_data.values, non_blocking=True
                 )
                 copy_jagged_metadata(self._jagged_metadata, jagged_data)
-                self._kvcache_metadata.total_history_offsets += (
-                    self._jagged_metadata.num_candidates_offsets
-                )
-                # self.offload_kv_cache_wait(self._offload_states)
+                if self._use_kvcache:
+                    self._kvcache_metadata.total_history_offsets += (
+                        self._jagged_metadata.num_candidates_offsets
+                    )
 
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
                     num_tokens,
                     self._hidden_states,
                     self._jagged_metadata,
-                    self._kvcache_metadata,
+                    self._kvcache_metadata if self._use_kvcache else None,
                 )
                 jagged_data.values = hstu_output
             else:
-                kvcache_metadata.total_history_offsets += (
-                    jagged_data.num_candidates_offsets
-                )
-                # self.offload_kv_cache_wait(self._offload_states)
+                if self._use_kvcache:
+                    kvcache_metadata.total_history_offsets += (
+                        jagged_data.num_candidates_offsets
+                    )
+
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
                     num_tokens,
                     jagged_data.values,
                     jagged_data,
-                    kvcache_metadata,
+                    kvcache_metadata if self._use_kvcache else None,
                 )
                 jagged_data.values = hstu_output
 
-            self._gpu_kv_cache_manager._offload_start_event.record(
-                torch.cuda.current_stream()
-            )
+            if self._use_kvcache:
+                self._gpu_kv_cache_manager._offload_start_event.record(
+                    torch.cuda.current_stream()
+                )
 
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)
-            self._offload_states = self.offload_kv_cache_async(
-                user_ids, kvcache_metadata
+
+            if self._use_kvcache:
+                self._offload_states = self.offload_kv_cache_async(
+                    user_ids, kvcache_metadata
+                )
+                self.offload_kv_cache_wait(self._offload_states)
+                self.finalize_kv_cache(user_ids)
+
+        return jagged_item_logit
+
+    def forward_dense(
+        self,
+        batch: Batch,
+        embeddings: dict,
+    ):
+        with torch.inference_mode():
+            jagged_data = self._hstu_block._preprocessor(
+                embeddings=embeddings,
+                batch=batch,
+                seq_start_position=None,
             )
-            self.offload_kv_cache_wait(self._offload_states)
-            self.finalize_kv_cache(user_ids)
+
+            num_tokens = batch.features.values().shape[0]
+            if self.use_cudagraph:
+                self._hidden_states[:num_tokens, ...].copy_(
+                    jagged_data.values, non_blocking=True
+                )
+                copy_jagged_metadata(self._jagged_metadata, jagged_data)
+
+                hstu_output = self._hstu_block.predict(
+                    batch.batch_size,
+                    num_tokens,
+                    self._hidden_states,
+                    self._jagged_metadata,
+                    None,
+                )
+                jagged_data.values = hstu_output
+            else:
+                hstu_output = self._hstu_block.predict(
+                    batch.batch_size,
+                    num_tokens,
+                    jagged_data.values,
+                    jagged_data,
+                    None,
+                )
+                jagged_data.values = hstu_output
+
+            jagged_data = self._hstu_block._postprocessor(jagged_data)
+            jagged_item_logit = self._mlp(jagged_data.values)
 
         return jagged_item_logit

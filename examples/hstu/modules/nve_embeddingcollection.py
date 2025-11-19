@@ -30,6 +30,7 @@ try:
             use_gpu_only: bool = False,
             gpu_cache_ratio: float = 0.01,
             is_weighted: bool = False,
+            sparse_shareables=None,
         ):
             super().__init__()
             self._is_weighted = is_weighted
@@ -60,6 +61,9 @@ try:
                         cache_type=nve_layers.CacheType.LinearUVM,
                         gpu_cache_size=gpu_cache_size,
                         optimize_for_training=False,
+                        memblock=sparse_shareables[embedding_config.name]
+                        if sparse_shareables
+                        else None,
                     )
                 else:
                     self.embeddings[embedding_config.name] = nve_layers.NVEmbedding(
@@ -85,6 +89,9 @@ try:
             self._feature_names: List[List[str]] = [
                 table.feature_names for table in configs
             ]
+
+        def set_feature_splits(self, features_split_size, features_split_indices):
+            pass
 
         def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
             """

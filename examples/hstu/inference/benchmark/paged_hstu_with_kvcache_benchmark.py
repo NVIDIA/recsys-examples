@@ -81,6 +81,8 @@ def benchmark_model(
         num_layers=num_layers,
         num_attention_heads=num_heads,
         head_dim=head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=total_max_seqlen,
     )
 
     pages_in_primary_pool = (
@@ -100,8 +102,6 @@ def benchmark_model(
         blocks_in_primary_pool=pages_in_primary_pool,
         page_size=page_size,
         offload_chunksize=offload_chunksize,
-        max_batch_size=max_batch_size,
-        max_seq_len=total_max_seqlen,
     )
     emb_configs = [
         InferenceEmbeddingConfig(

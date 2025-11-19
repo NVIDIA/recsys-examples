@@ -60,6 +60,7 @@ def create_dynamic_embedding_tables(
     output_dtype: torch.dtype = torch.float32,
     device: torch.device = None,
     ps: Optional[ParameterServer] = None,
+    sparse_shareables=None,
 ):
     table_options = [
         DynamicEmbTableOptions(
@@ -92,11 +93,12 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         embedding_configs,
         ps: Optional[ParameterServer] = None,
         enable_cache: bool = False,
+        sparse_shareables=None,
     ):
         super().__init__()
 
         self._embedding_tables = create_dynamic_embedding_tables(
-            embedding_configs, ps=ps
+            embedding_configs, ps=ps, sparse_shareables=sparse_shareables
         )
 
         self._cache = (
@@ -158,13 +160,17 @@ def create_embedding_collection(configs, backend, use_static: bool = False, **kw
         ), "Only support dynamic embedding table with DynamicEmb backend"
         ps = kwargs.get("ps", None)
         enable_cache = kwargs.get("enable_cache", False)
-        return InferenceDynamicEmbeddingCollection(configs, ps, enable_cache)
+        sparse_shareables = kwargs.get("sparse_shareables", False)
+        return InferenceDynamicEmbeddingCollection(
+            configs, ps, enable_cache, sparse_shareables
+        )
     elif backend == EmbeddingBackend.NVEMB:
         from modules.nve_embeddingcollection import InferenceNVEEmbeddingCollection
 
         assert (
             InferenceNVEEmbeddingCollection is not None
         ), "Cannot create embedding collection for NV-Embeddings backend"
+        sparse_shareables = kwargs.get("sparse_shareables", False)
         return InferenceNVEEmbeddingCollection(
             configs=[
                 EmbeddingConfig(
@@ -180,6 +186,7 @@ def create_embedding_collection(configs, backend, use_static: bool = False, **kw
             use_gpu_only=use_static,
             gpu_cache_ratio=kwargs.get("gpu_cache_ratio", 0.1),
             is_weighted=kwargs.get("is_weighted", False),
+            sparse_shareables=sparse_shareables,
         )
     else:
         raise Exception("Unsupported embedding backend: {}".format(backend))
@@ -198,6 +205,7 @@ class InferenceEmbedding(torch.nn.Module):
         self,
         embedding_configs: List[InferenceEmbeddingConfig],
         embedding_backend: Optional[EmbeddingBackend] = None,
+        sparse_shareables=None,
     ):
         super(InferenceEmbedding, self).__init__()
 
@@ -209,28 +217,29 @@ class InferenceEmbedding(torch.nn.Module):
             else:
                 dynamic_embedding_configs.append(config)
 
-        dynamic_emb_backend = (
+        self.dynamic_emb_backend = (
             EmbeddingBackend.DYNAMICEMB
             if embedding_backend is None
             else embedding_backend
         )
-        static_emb_backend = (
+        self.static_emb_backend = (
             EmbeddingBackend.TORCHREC
             if embedding_backend is None
             else embedding_backend
         )
         self._dynamic_embedding_collection = create_embedding_collection(
             configs=dynamic_embedding_configs,
-            backend=dynamic_emb_backend,
+            backend=self.dynamic_emb_backend,
             use_static=False,
             ps=None,
             enable_cache=False,
             gpu_cache_ratio=0.1,
+            sparse_shareables=sparse_shareables,
         )
 
         self._static_embedding_collection = create_embedding_collection(
             configs=static_embedding_configs,
-            backend=static_emb_backend,
+            backend=self.static_emb_backend,
             use_static=True,
         )
         self._side_stream = torch.cuda.Stream()

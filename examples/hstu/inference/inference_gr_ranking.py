@@ -129,6 +129,7 @@ def get_inference_hstu_model(
     num_contextual_features,
     total_max_seqlen,
     checkpoint_dir,
+    use_kvcache,
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -152,18 +153,17 @@ def get_inference_hstu_model(
         num_layers=network_args.num_layers,
         num_attention_heads=network_args.num_attention_heads,
         head_dim=network_args.kv_channels,
+        max_batch_size=max_batch_size,
+        max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=num_contextual_features,
-        scaling_seqlen=network_args.scaling_seqlen,
     )
 
     kvcache_args = {
         "blocks_in_primary_pool": 10240,
         "page_size": 32,
         "offload_chunksize": 1024,
-        "max_batch_size": max_batch_size,
-        "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
     kv_cache_config = get_kvcache_config(**kvcache_args)
 
@@ -184,7 +184,7 @@ def get_inference_hstu_model(
 
     model = InferenceRankingGR(
         hstu_config=hstu_config,
-        kvcache_config=kv_cache_config,
+        kvcache_config=kv_cache_config if use_kvcache else None,
         task_config=task_config,
         use_cudagraph=True,
         cudagraph_configs=hstu_cudagraph_configs,
@@ -226,6 +226,7 @@ def run_ranking_gr_simulate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            True,
         )
 
         if check_auc:
@@ -326,6 +327,7 @@ def run_ranking_gr_simulate(
 def run_ranking_gr_evaluate(
     checkpoint_dir: str,
     disable_contextual_features: bool = False,
+    disable_kvcache: bool = False,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -338,7 +340,7 @@ def run_ranking_gr_evaluate(
         else 0
     )
 
-    max_batch_size = 1
+    max_batch_size = 4
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
@@ -369,12 +371,14 @@ def run_ranking_gr_evaluate(
         return batch
 
     with torch.inference_mode():
+        use_kvcache = not disable_kvcache
         model = get_inference_hstu_model(
             emb_configs,
             max_batch_size,
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            use_kvcache,
         )
 
         eval_module = get_multi_event_metric_module(
@@ -437,6 +441,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--disable_context", action="store_true")
+    parser.add_argument("--disable_kvcache", action="store_true")
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -447,9 +452,11 @@ if __name__ == "__main__":
         if args.disable_context:
             print("disable_context is ignored in Eval mode.")
         run_ranking_gr_evaluate(
-            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_dir=args.checkpoint_dir, disable_kvcache=args.disable_kvcache
         )
     elif args.mode == RunningMode.SIMULATE:
+        if args.disable_kvcache:
+            print("disable_kvcache is ignored in Eval mode.")
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,

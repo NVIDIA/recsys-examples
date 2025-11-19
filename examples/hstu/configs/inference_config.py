@@ -92,16 +92,12 @@ class KVCacheConfig:
         blocks_in_primary_pool (int): The number of cache pages per layer.
         page_size (int): The number of tokens per cache page.
         offload_chunksize (int): The size of basic offload data chunk.
-        max_batch_size (int): The maximum batch size for the inference input.
-        max_seq_len (int): The upper bound of sequence length for each sequence in the inference batch.
         max_attention_window (int): (Optional) The maximum window size for HSTU attention calculation.
     """
 
     blocks_in_primary_pool: int
     page_size: int
     offload_chunksize: int
-    max_batch_size: int
-    max_seq_len: int
     max_attention_window: Optional[int] = None
 
 
@@ -109,8 +105,6 @@ def get_kvcache_config(
     blocks_in_primary_pool: int,
     page_size: int,
     offload_chunksize: int,
-    max_batch_size: int,
-    max_seq_len: int,
     max_attention_window: Optional[int] = None,
 ) -> KVCacheConfig:
     """
@@ -120,9 +114,6 @@ def get_kvcache_config(
         blocks_in_primary_pool (int): The number of cache pages per layer.
         page_size (int): The number of tokens per cache page in the paged KV cache.
         offload_chunksize (int): The size of basic offload data chunk.
-        max_batch_size (int): The max batch size.
-        max_gpu_cache_seqlen (int): The upper bound of sequence length in gpu cache.
-        max_host_cache_seqlen (int): The upper bound of sequence length in host cache.
         max_attention_window (int): The max attention window size.
 
     Returns:
@@ -133,8 +124,6 @@ def get_kvcache_config(
         blocks_in_primary_pool=blocks_in_primary_pool,
         page_size=page_size,
         offload_chunksize=offload_chunksize,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seq_len,
         max_attention_window=max_attention_window,
     )
 
@@ -149,6 +138,8 @@ class InferenceHSTUConfig:
         num_layers (int): Number of attention layers.
         num_heads (int): Number of attention heads.
         head_dim (int): Number of key-value channels (per attention head).
+        max_batch_size (int): The maximum batch size for the inference input.
+        max_seq_len (int): The upper bound of sequence length for each sequence in the inference batch.
         layernorm_epsilon (float): Epsilon value for normalization.
         bf16 (bool): Whether to inference in bfloat16.
         fp16 (bool): Whether to inference in float16.
@@ -158,13 +149,17 @@ class InferenceHSTUConfig:
         is_causal (bool):Whether the attention is causal.
         target_group_size (int):  The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking).
         position_encoding_config (PositionEncodingConfig, optional): Position embedding config.
+        hstu_preprocessing_config (HSTUPreprocessingConfig, optional): HSTU preprocessing config.
         contextual_max_seqlen (int): The (maximum) length of contextual features.
+        embedding_backend (EmbeddingBackend, optional): Embedding backend to use.
     """
 
     hidden_size: int
     num_layers: int
     num_heads: int
     head_dim: int
+    max_batch_size: int
+    max_seq_len: int
     layernorm_epsilon: float = 1e-5
     bf16: bool = True
     fp16: bool = False
@@ -177,10 +172,18 @@ class InferenceHSTUConfig:
     hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None
     contextual_max_seqlen: int = 0
     scaling_seqlen: int = -1
+    embedding_backend: Optional[EmbeddingBackend] = None
 
     def __post_init__(self):
         assert self.is_causal
         assert self.target_group_size == 1
+
+
+@unique
+class InferenceMode(Enum):
+    default = 0
+    sparse = 1
+    dense = 2
 
 
 def get_inference_hstu_config(
@@ -188,6 +191,8 @@ def get_inference_hstu_config(
     num_layers: int,
     num_attention_heads: int,
     head_dim: int,
+    max_batch_size: int,
+    max_seq_len: int,
     norm_epsilon=1e-5,
     dtype: torch.dtype = torch.bfloat16,
     learnable_input_layernorm: bool = True,
@@ -197,6 +202,7 @@ def get_inference_hstu_config(
     position_encoding_config: Optional[PositionEncodingConfig] = None,
     contextual_max_seqlen: int = 0,
     scaling_seqlen: int = -1,
+    embedding_backend=None,
 ) -> InferenceHSTUConfig:
     """
     Create the HSTU configuration.
@@ -206,6 +212,8 @@ def get_inference_hstu_config(
         num_layers (int): Number of attention layers.
         num_attention_heads (int): Number of attention heads.
         head_dim (int): Number of key-value channels (per attention head).
+        max_batch_size (int): The maximum batch size for the inference input.
+        max_seq_len (int): The upper bound of sequence length for each sequence in the inference batch.
         norm_epsilon (float, optional): Epsilon value for normalization. Defaults to 1e-5.
         dtype (torch.dtype): Data type (e.g., torch.float16).
         learnable_input_layernorm (bool, optional): Whether to have input layernorm weights. Defaults to True.
@@ -224,6 +232,8 @@ def get_inference_hstu_config(
         num_layers=num_layers,
         num_heads=num_attention_heads,
         head_dim=head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
         layernorm_epsilon=norm_epsilon,
         bf16=is_bf16,
         fp16=is_fp16,
@@ -234,6 +244,7 @@ def get_inference_hstu_config(
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=contextual_max_seqlen,
         scaling_seqlen=scaling_seqlen,
+        embedding_backend=embedding_backend,
     )
 
 
@@ -243,33 +254,28 @@ def get_kvcache_metadata_buffer(
     device = torch.cuda.current_device()
     torch.bfloat16 if hstu_config.bf16 else torch.float16 if hstu_config.fp16 else torch.float32
 
-    max_new_history_seqlen = kvcache_config.max_batch_size * kvcache_config.max_seq_len
+    max_new_history_seqlen = hstu_config.max_batch_size * hstu_config.max_seq_len
     max_num_pages_per_seq = (
-        kvcache_config.max_seq_len
-        + kvcache_config.max_seq_len
-        + kvcache_config.page_size
-        - 1
+        hstu_config.max_seq_len + hstu_config.max_seq_len + kvcache_config.page_size - 1
     ) // kvcache_config.page_size
     max_host_kv_buffer_size = (
-        kvcache_config.max_batch_size * kvcache_config.max_seq_len,
+        hstu_config.max_batch_size * hstu_config.max_seq_len,
         hstu_config.num_heads * hstu_config.head_dim,
     )
 
     default_num_pages_per_seq = 4
     paged_indices_buffer = torch.randint(
         kvcache_config.blocks_in_primary_pool,
-        (kvcache_config.max_batch_size * max_num_pages_per_seq,),
+        (hstu_config.max_batch_size * max_num_pages_per_seq,),
         dtype=torch.int32,
         device=device,
     )
     page_indptr_buffer = (
-        torch.arange(
-            kvcache_config.max_batch_size + 1, dtype=torch.int32, device=device
-        )
+        torch.arange(hstu_config.max_batch_size + 1, dtype=torch.int32, device=device)
         * default_num_pages_per_seq
     )
     last_page_lens_buffer = torch.full(
-        (kvcache_config.max_batch_size,),
+        (hstu_config.max_batch_size,),
         kvcache_config.page_size,
         dtype=torch.int32,
         device=device,
@@ -281,9 +287,7 @@ def get_kvcache_metadata_buffer(
         (max_new_history_seqlen,), dtype=torch.int32, device=device
     )
     total_history_offsets_buffer = (
-        torch.arange(
-            kvcache_config.max_batch_size + 1, dtype=torch.int32, device=device
-        )
+        torch.arange(hstu_config.max_batch_size + 1, dtype=torch.int32, device=device)
         * default_num_pages_per_seq
         * kvcache_config.page_size
     )

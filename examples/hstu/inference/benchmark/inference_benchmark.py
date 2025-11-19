@@ -65,6 +65,8 @@ def run_ranking_gr_inference():
         num_layers=num_layers,
         num_attention_heads=num_heads,
         head_dim=head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=total_max_seqlen,
         dtype=inference_dtype,
     )
 
@@ -75,8 +77,6 @@ def run_ranking_gr_inference():
         blocks_in_primary_pool=_blocks_in_primary_pool,
         page_size=_page_size,
         offload_chunksize=_offload_chunksize,
-        max_batch_size=max_batch_size,
-        max_seq_len=total_max_seqlen,
     )
     emb_configs = [
         InferenceEmbeddingConfig(
