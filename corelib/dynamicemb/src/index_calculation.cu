@@ -17,10 +17,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "check.h"
 #include "index_calculation.h"
+#include "utils.h"
 #include <cuda/std/tuple>
 #include <iostream>
 #include <torch/extension.h>
 #include <type_traits>
+
 namespace { // anonymous namespace
 
 template <typename T>
@@ -357,7 +359,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique(
     at::Tensor keys, at::Tensor segment_range,
     std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
-    const c10::optional<bool> is_lfu_enabled = false,
+    // const c10::optional<bool> is_lfu_enabled = false,
+    const c10::optional<EvictStrategy> evict_strategy = c10::nullopt,
     const c10::optional<at::Tensor> frequency_counts_uint64 = c10::nullopt) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -382,10 +385,15 @@ segmented_unique(
     tmp_unique_indices[i] = at::empty_like(keys);
   }
 
+  // Determine score strategy
+  bool is_lfu_enabled = false;
+  if (evict_strategy.has_value()) {
+    is_lfu_enabled = evict_strategy.value() == EvictStrategy::kLfu;
+  }
   // Create vector of tensors for per-table frequency output
   std::vector<at::Tensor> tmp_accumulated_frequency_output(table_num);
   bool need_frequency_output = false;
-  need_frequency_output = is_lfu_enabled.value() || frequency_counts_uint64.has_value();
+  need_frequency_output = is_lfu_enabled || frequency_counts_uint64.has_value();
   if (need_frequency_output) {
     for (int i = 0; i < table_num; ++i) {
       tmp_accumulated_frequency_output[i] = at::zeros_like(
@@ -564,7 +572,7 @@ void bind_index_calculation_op(py::module &m) {
         "tuple<unique_keys, inverse, unique_keys_table_range, "
         "h_unique_keys_table_range>",
         py::arg("keys"), py::arg("segment_range"), py::arg("unique_op"),
-        py::arg("is_lfu_enabled") = false,
+        py::arg("evict_strategy") = c10::nullopt,
         py::arg("frequency_counts_uint64") = c10::nullopt);
 
   m.def("select", &dyn_emb::select,

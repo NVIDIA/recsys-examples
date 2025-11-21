@@ -18,7 +18,7 @@ import os
 import warnings
 from dataclasses import dataclass, field
 from math import sqrt
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 from dynamicemb.types import Storage
@@ -31,6 +31,9 @@ from dynamicemb_extensions import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
+
+if TYPE_CHECKING:
+    from dynamicemb.admission_strategy import AdmissionStrategy
 
 DEFAULT_INDEX_TYPE = torch.int64
 DYNAMICEMB_CSTM_SCORE_CHECK = "DYNAMICEMB_CSTM_SCORE_CHECK"
@@ -391,7 +394,7 @@ class DynamicEmbTableOptions(_ContextOptions):
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
-    admit_strategy: Optional["AdmissionStrategy"] = None  # type: ignore
+    admit_strategy: Optional["AdmissionStrategy"] = None
 
     def __post_init__(self):
         assert (
