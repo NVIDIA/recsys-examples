@@ -20,12 +20,14 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+from dynamicemb.admission_strategy import AdmissionStrategy
 from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     create_dynamicemb_table,
     dyn_emb_to_torch,
     torch_to_dyn_emb,
 )
+from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.types import Cache, Storage
@@ -223,7 +225,7 @@ class KeyValueTable(
         unique_embs: torch.Tensor,
         founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         if unique_keys.dtype != self.key_type():
             unique_keys = unique_keys.to(self.key_type())
 
@@ -801,13 +803,20 @@ class KeyValueTableFunction:
         unique_embs: torch.Tensor,
         initializer: Callable,
         training: bool,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        evict_strategy: EvictStrategy,
+        accumulated_frequency: Optional[torch.Tensor] = None,
+        admit_strategy: Optional[AdmissionStrategy] = None,
+        admission_counter: Optional[KVCounter] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         h_num_toatl = unique_keys.numel()
         emb_dim = storage.embedding_dim()
         emb_dtype = storage.embedding_dtype()
         val_dim = storage.value_dim()
+
+        is_lfu_enabled = False
+        if evict_strategy == EvictStrategy.KLfu:
+            is_lfu_enabled = True
 
         if h_num_toatl == 0:
             return
@@ -823,7 +832,7 @@ class KeyValueTableFunction:
             unique_keys,
             unique_embs,
             founds=founds,
-            input_scores=lfu_accumulated_frequency,
+            input_scores=accumulated_frequency if is_lfu_enabled else None,
         )
 
         # 2. initialize missing embeddings
@@ -852,10 +861,39 @@ class KeyValueTableFunction:
                 missing_values_in_storage[
                     :, emb_dim - val_dim :
                 ] = storage.init_optimizer_state()
+            keys_to_insert = missing_keys_in_storage
+            values_to_insert = missing_values_in_storage
+            scores_to_insert = missing_scores_in_storage
+            # 4.Optional Admission part
+            if admit_strategy is not None:
+                # Get frequency counters for admission:
+                # 1. Use missing_scores_in_storage if available (LFU mode)
+                # 2. Otherwise, extract from lfu_accumulated_frequency using missing_indices_in_storage
+                # 3. Otherwise, use default value 1
+                if accumulated_frequency is not None:
+                    counters_for_admission = accumulated_frequency[
+                        missing_indices_in_storage
+                    ]
+                else:
+                    counters_for_admission = torch.ones_like(
+                        missing_keys_in_storage, dtype=torch.int64
+                    )
+
+                freq_for_missing_keys = admission_counter.add(
+                    missing_keys_in_storage, counters_for_admission
+                )
+                admit_mask = admit_strategy.admit(
+                    freq_for_missing_keys, freq_for_missing_keys
+                )
+                keys_to_insert = missing_keys_in_storage[admit_mask]
+                admission_counter.erase(keys_to_insert)
+                values_to_insert = missing_values_in_storage[admit_mask]
+                scores_to_insert = freq_for_missing_keys  # TODO: need to check if this is correct. Counter.add return shape?
+
             storage.insert(
-                missing_keys_in_storage,
-                missing_values_in_storage,
-                missing_scores_in_storage,
+                keys_to_insert,
+                values_to_insert,
+                scores_to_insert,
             )
         # ignore the storage missed in eval mode
 
@@ -902,7 +940,10 @@ class KeyValueTableCachingFunction:
         initializer: Callable,
         enable_prefetch: bool,
         training: bool,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        evict_strategy: EvictStrategy,
+        accumulated_frequency: Optional[torch.Tensor] = None,
+        admit_strategy: Optional[AdmissionStrategy] = None,
+        admission_counter: Optional[KVCounter] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         unique_keys.numel()
@@ -912,13 +953,19 @@ class KeyValueTableCachingFunction:
             storage.value_dim()
         )  # value is generally composed of embedding and optimizer state
 
+        is_lfu_enabled = False
+        if evict_strategy == EvictStrategy.KLfu:
+            is_lfu_enabled = True
+
         (
             h_num_keys_for_storage,
             missing_keys,
             missing_indices,
             missing_scores,
         ) = cache.find_embeddings(
-            unique_keys, unique_embs, input_scores=lfu_accumulated_frequency
+            unique_keys,
+            unique_embs,
+            input_scores=accumulated_frequency if is_lfu_enabled else None,
         )
         if h_num_keys_for_storage == 0:
             return
@@ -965,8 +1012,55 @@ class KeyValueTableCachingFunction:
                 values_for_storage[
                     missing_indices_in_storage, emb_dim - val_dim :
                 ] = storage.init_optimizer_state()
+            # 5.Optional Admission part
+            keys_to_update = keys_for_storage
+            values_to_update = values_for_storage
+            scores_to_update = scores_for_storage
+
+            if admit_strategy is not None:
+                # Get frequency counters for admission:
+                if accumulated_frequency is not None:
+                    # missing_indices_in_storage is index in keys_for_storage, Need to convert to index in unique_keys via missing_indices
+                    indices_in_unique_keys = missing_indices[missing_indices_in_storage]
+                    counters_for_admission = accumulated_frequency[
+                        indices_in_unique_keys
+                    ]
+                else:
+                    counters_for_admission = torch.ones_like(
+                        missing_keys_in_storage, dtype=torch.int64
+                    )
+
+                freq_for_missing_keys = admission_counter.add(
+                    missing_keys_in_storage, counters_for_admission
+                )
+                admit_mask_for_missing_keys = admit_strategy.admit(
+                    freq_for_missing_keys,
+                    freq_for_missing_keys,
+                )
+
+                admitted_keys = missing_keys_in_storage[admit_mask_for_missing_keys]
+                admission_counter.erase(admitted_keys)
+
+                # build mask: including storage hit keys + keys that are both miss and admitted
+                mask_to_cache = founds
+                admitted_indices = missing_indices_in_storage[
+                    admit_mask_for_missing_keys
+                ]
+                mask_to_cache[admitted_indices] = True
+
+                if scores_for_storage is not None:
+                    updated_scores = scores_for_storage.clone()
+                    # update freq for missing keys to the corresponding positions (through missing_indices_in_storage index)
+                    updated_scores[missing_indices_in_storage] = freq_for_missing_keys
+                    scores_to_update = updated_scores[mask_to_cache]
+                else:
+                    scores_to_update = None
+
+                keys_to_update = keys_for_storage[mask_to_cache]
+                values_to_update = values_for_storage[mask_to_cache]
+
             update_cache(
-                cache, storage, keys_for_storage, values_for_storage, scores_for_storage
+                cache, storage, keys_to_update, values_to_update, scores_to_update
             )
         else:  # only update those found in the storage to cache.
             found_keys_in_storage = keys_for_storage[founds].contiguous()
