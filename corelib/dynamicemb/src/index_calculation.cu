@@ -17,10 +17,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "check.h"
 #include "index_calculation.h"
+#include "utils.h"
 #include <cuda/std/tuple>
 #include <iostream>
 #include <torch/extension.h>
 #include <type_traits>
+
 namespace { // anonymous namespace
 
 template <typename T>
@@ -357,7 +359,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique(
     at::Tensor keys, at::Tensor segment_range,
     std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
-    const c10::optional<bool> is_lfu_enabled = false,
+    // const c10::optional<bool> is_lfu_enabled = false,
+    const c10::optional<EvictStrategy> evict_strategy = c10::nullopt,
     const c10::optional<at::Tensor> frequency_counts_uint64 = c10::nullopt) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -559,7 +562,7 @@ void bind_index_calculation_op(py::module &m) {
         "tuple<unique_keys, inverse, unique_keys_table_range, "
         "h_unique_keys_table_range>",
         py::arg("keys"), py::arg("segment_range"), py::arg("unique_op"),
-        py::arg("is_lfu_enabled") = false,
+        py::arg("evict_strategy") = c10::nullopt,
         py::arg("frequency_counts_uint64") = c10::nullopt);
 
   m.def("select", &dyn_emb::select,

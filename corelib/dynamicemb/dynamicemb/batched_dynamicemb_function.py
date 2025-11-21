@@ -25,7 +25,6 @@ from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.key_value_table import (
     Cache,
-    KeyValueTable,
     KeyValueTableCachingFunction,
     KeyValueTableFunction,
     Storage,
@@ -34,7 +33,6 @@ from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
-    EvictStrategy,
     find_and_initialize,
     find_or_insert,
     gather_embedding,
@@ -359,9 +357,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         caching = caches[0] is not None
         admit_strategy = storages[0].options.admit_strategy
 
-        is_lfu_enabled = False
-        if isinstance(storages[0], KeyValueTable):
-            is_lfu_enabled = storages[0].evict_strategy() == EvictStrategy.KLfu
+        evict_strategy = storages[0].evict_strategy()
 
         frequency_counts_int64 = None
         if frequency_counters is not None:
@@ -382,7 +378,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 indices,
                 indices_table_range,
                 unique_op,
-                is_lfu_enabled,
+                evict_strategy,
                 frequency_counts_int64,
             )
             # TODO: only return device unique_indices_table_range
@@ -417,7 +413,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     initializers[i],
                     enable_prefetch,
                     training,
-                    is_lfu_enabled,
+                    evict_strategy,
                     lfu_accumulated_frequency_per_table,
                     admit_strategy,
                     admission_counter[i],
@@ -429,7 +425,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     unique_embs_per_table,
                     initializers[i],
                     training,
-                    is_lfu_enabled,
+                    evict_strategy,
                     lfu_accumulated_frequency_per_table,
                     admit_strategy,
                     admission_counter[i],
