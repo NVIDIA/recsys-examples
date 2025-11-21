@@ -30,6 +30,7 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_prefetch,
 )
 from dynamicemb.dynamicemb_config import *
+from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.initializer import *
 from dynamicemb.key_value_table import Cache, KeyValueTable, Storage
 from dynamicemb.optimizer import *
@@ -588,6 +589,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._initializers = []
         self._eval_initializers = []
         self._create_initializers()
+        # TODO: support external counter
+        self._admission_counter = [KVCounter() for _ in table_options]
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -1231,6 +1234,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 include_meta=(rank == 0),
             )
 
+            counter_key_files, counter_val_files = [], []
+            for i, (key_file, val_file) in enumerate(
+                zip(counter_key_files, counter_val_files)
+            ):
+                self._admission_counter[i].dump(
+                    key_file,
+                    val_file,
+                )
+
     def load(
         self,
         save_dir: str,
@@ -1275,6 +1287,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     emb_score_files[i] if len(emb_score_files) > 0 else None,
                     opt_value_files[i] if len(opt_value_files) > 0 else None,
                     include_optim=optim,
+                )
+
+            counter_key_files, counter_val_files = [], []
+            for i, (key_file, val_file) in enumerate(
+                zip(counter_key_files, counter_val_files)
+            ):
+                self._admission_counter[i].load(
+                    key_file,
+                    val_file,
                 )
 
     def export_keys_values(
