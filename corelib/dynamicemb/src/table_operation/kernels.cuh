@@ -61,7 +61,9 @@ table_lookup_kernel(Table table, int64_t batch,
     int64_t bucket_id;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
-      bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
+      uint64_t global_idx = static_cast<uint64_t>(hashcode % table.capacity());
+      bucket_id = global_idx / table.bucket_capacity();
+      // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
     }
     Iter iter = Iter(hashcode % table.bucket_capacity());
@@ -123,6 +125,8 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
+  // extern __shared__ ScoreType sm_scores[];
+  // cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
 
@@ -133,10 +137,12 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
 
     Bucket bucket;
     KeyType hashcode = KeyType();
-    int64_t bucket_id;
+    uint64_t bucket_id;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
-      bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
+      uint64_t global_idx = static_cast<uint64_t>(hashcode % table.capacity());
+      bucket_id = global_idx / table.bucket_capacity();
+      // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
     }
     Iter iter = Iter(hashcode % table.bucket_capacity());
@@ -146,6 +152,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
       probe_res = bucket.probe<ProbingGroupSize>(key, iter, step);
       if (probe_res == ProbeResult::Existed) {
         KeyType expected_key = key;
+
         if (bucket.try_lock(iter, expected_key)) {
           result = InsertResult::Assign;
           // bucket.unlock(iter, key); // will not unlock, to avoid 2 threads
@@ -156,6 +163,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
       }
       if (probe_res == ProbeResult::Empty) {
         KeyType expected_key = Bucket::empty_key();
+
         if (bucket.try_lock(iter, expected_key)) {
           *bucket.digests(iter) = Bucket::key_to_digest(key);
           atomicAdd(&bucket_sizes[bucket_id], 1);
@@ -170,10 +178,9 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
       KeyType evict_key;
       ScoreType evict_score =
           ScorePolicy::score_for_compare(policy_type, score);
+
       bool succeed = bucket.template reduce<ReductionGroupSize, BufferDim>(
-          iter, evict_key, evict_score,
-          sm_scores + threadIdx.x / ReductionGroupSize * ReductionGroupSize *
-                          BufferDim);
+          iter, evict_key, evict_score, sm_scores);
 
       if (succeed) {
 
@@ -185,8 +192,10 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
             *bucket.digests(iter) = Bucket::key_to_digest(key);
             if (evict_key == Bucket::reclaimed_key()) {
               atomicAdd(bucket_sizes + bucket_id, 1);
+              result = InsertResult::Insert;
+            } else {
+              result = InsertResult::Evict;
             }
-            result = InsertResult::Evict;
             break;
           }
         } // else it was locked by another thread.
@@ -254,7 +263,9 @@ __global__ void table_insert_and_evict_kernel(
     int64_t bucket_id;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
-      bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
+      uint64_t global_idx = static_cast<uint64_t>(hashcode % table.capacity());
+      bucket_id = global_idx / table.bucket_capacity();
+      // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
     }
     Iter iter = Iter(hashcode % table.bucket_capacity());
@@ -304,8 +315,10 @@ __global__ void table_insert_and_evict_kernel(
             *bucket.digests(iter) = Bucket::key_to_digest(key);
             if (evict_key == Bucket::reclaimed_key()) {
               atomicAdd(&bucket_sizes[bucket_id], 1);
+              result = InsertResult::Insert;
+            } else {
+              result = InsertResult::Evict;
             }
-            result = InsertResult::Evict;
             break;
           }
         } // else it was locked by another thread.
@@ -398,7 +411,9 @@ table_erase_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
     int64_t bucket_id;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
-      bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
+      uint64_t global_idx = static_cast<uint64_t>(hashcode % table.capacity());
+      bucket_id = global_idx / table.bucket_capacity();
+      // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
     }
     Iter iter = Iter(hashcode % table.bucket_capacity());

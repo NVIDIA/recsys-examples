@@ -24,11 +24,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <utility>
 
 #include <cuda/atomic>
+#include <cuda/pipeline>
 #include <cuda/std/semaphore>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
 #include "score.cuh"
+
+extern "C" __device__ size_t __cvta_generic_to_shared(const void *);
 
 namespace dyn_emb {
 
@@ -73,6 +76,7 @@ template <typename T, int N, int Stride,
           typename = std::enable_if_t<sizeof(T) * Stride <= 16>>
 __forceinline__ __device__ void async_copy_bulk(T *dst, T const *src) {
   static_assert(N % Stride == 0);
+  // dst = (ScoreType*)__cvta_generic_to_shared((void*)dst);
 #pragma unroll
   for (int i = 0; i < N; i += Stride) {
     __pipeline_memcpy_async(dst + i, src + i, sizeof(T) * Stride);
@@ -84,7 +88,7 @@ template <typename KeyType_,
                                       sizeof(KeyType_) == 8>>
 struct LinearBucket {
 
-  __forceinline__ __device__ LinearBucket(uint8_t *storage, int capacity)
+  __forceinline__ __device__ LinearBucket(uint8_t *storage, uint32_t capacity)
       : storage_(storage), capacity_(capacity) {}
 
   __forceinline__ __device__ LinearBucket() : LinearBucket(nullptr, 0) {}
@@ -92,7 +96,7 @@ struct LinearBucket {
   /*
   Iterator:
   */
-  using Iterator = int;
+  using Iterator = uint32_t;
 
   template <uint32_t AlignSize>
   static __forceinline__ __device__ int align(Iterator &iter) {
@@ -113,14 +117,14 @@ struct LinearBucket {
 
   static constexpr uint64_t ReserveKeyMask = UINT64_C(0xFFFFFFFFFFFFFFFC);
 
-  static __device__ __forceinline__ KeyType hash(uint64_t key) {
+  static __device__ __forceinline__ uint64_t hash(uint64_t key) {
     uint64_t k = key;
     k ^= k >> 33;
     k *= UINT64_C(0xff51afd7ed558ccd);
     k ^= k >> 33;
     k *= UINT64_C(0xc4ceb9fe1a85ec53);
     k ^= k >> 33;
-    return static_cast<KeyType>(k);
+    return static_cast<uint64_t>(k);
   }
 
   static __device__ __forceinline__ KeyType empty_key() { return EmptyKey; }
@@ -135,7 +139,7 @@ struct LinearBucket {
   }
 
   static __device__ __forceinline__ bool is_valid(uint64_t const &key) {
-    return (key & ReserveKeyMask) == ReserveKeyMask;
+    return (key & ReserveKeyMask) != ReserveKeyMask;
   }
 
   __device__ __forceinline__ bool is_empty(Iterator &iter) const {
@@ -191,14 +195,14 @@ struct LinearBucket {
         return -1;
       // CUDA uses little endian,
       // and the lowest byte in register stores in the lowest address.
-      int index = (__ffs(cmp_result) - 1) >> 3;
+      uint32_t index = (__ffs(cmp_result) - 1) >> 3;
       cmp_result &= (cmp_result - 1);
       return index;
     }
   };
 
   static __device__ __forceinline__ DigestType
-  hashcode_to_digest(KeyType hashcode) {
+  hashcode_to_digest(uint64_t hashcode) {
     return static_cast<DigestType>(hashcode >> 32);
   }
 
@@ -241,7 +245,7 @@ struct LinearBucket {
     return BucketBytes * size;
   }
 
-  __forceinline__ __device__ int capacity() const { return capacity_; }
+  __forceinline__ __device__ uint32_t capacity() const { return capacity_; }
 
   __forceinline__ __device__ KeyType *keys(const Iterator &iter) const {
     return reinterpret_cast<KeyType *>(storage_ + KeyOffset * capacity_) + iter;
@@ -274,6 +278,7 @@ struct LinearBucket {
                                                int &step) const {
     static_assert(GroupSize == 1);
     if (not storage_) {
+      step = capacity_;
       return ProbeResult::Failed;
     }
 
@@ -294,8 +299,8 @@ struct LinearBucket {
     if (iter < 0 or iter > capacity_) {
       iter = hashcode % capacity_;
     }
-    constexpr int Stride = BufferDim;
 
+    constexpr int Stride = BufferDim;
     iter = align<Stride>(iter);
 
     auto empty_digest = key_to_digest(EmptyKey);
@@ -305,18 +310,22 @@ struct LinearBucket {
 
     for (; step < capacity_; step += Stride) {
 
-      iter = (iter + step) % capacity_;
-
       auto buffer = *(reinterpret_cast<DigestBuffer *>(digests(iter)));
+      // DigestBuffer buffer;
 
       constexpr int Length = NumVectorPerBuffer;
 
-      DigestVector vec[Length];
-      digest_buffer_to_vector(buffer, vec);
+      DigestVector vec[Length] = {buffer.x, buffer.y, buffer.z, buffer.w};
+      // digest_buffer_to_vector(buffer, vec);
+
+      // vec[0] = buffer.x;
+      // vec[1] = buffer.y;
+      // vec[2] = buffer.z;
+      // vec[3] = buffer.w;
 
       for (int i = 0; i < Length; i++) {
 
-        auto cmp_res = VectorComparator::compare(vec[i], digest_vec);
+        int cmp_res = VectorComparator::compare(vec[i], digest_vec);
         while (true) {
           int offset = VectorComparator::equal_index(cmp_res);
           if (offset < 0)
@@ -355,6 +364,7 @@ struct LinearBucket {
           }
         }
       }
+      iter = (iter + Stride) % capacity_;
     }
     return ProbeResult::Exhausted;
   }
@@ -367,14 +377,21 @@ struct LinearBucket {
     static_assert(GroupSize == 1);
 
     static constexpr int BulkDim = BufferDim / 2;
+    static_assert(BulkDim == 4);
 
     static constexpr int Stride = NumScorePerVector;
 
     Iterator iter = 0;
-
     int rank = threadIdx.x;
 
-    async_copy_bulk<ScoreType, BulkDim, Stride>(sm_buffers + rank * BufferDim,
+    // ScoreType* sm_buffers =
+    // (ScoreType*)__cvta_generic_to_shared(sm_buffers_); sm_buffers =
+    // reinterpret_cast<ScoreType
+    // *>(__cvta_generic_to_shared((void*)sm_buffers));
+
+    // asm("cvta.to.shared.u64 %0, %1;" : "=l"(sm_buffers) : "l"(sm_buffers));
+
+    async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
                                                 scores(iter));
     __pipeline_commit();
 
@@ -383,7 +400,7 @@ struct LinearBucket {
     for (; iter < capacity_; iter += BulkDim) {
       if (iter < capacity_ - BulkDim) {
         async_copy_bulk<ScoreType, BulkDim, Stride>(
-            sm_buffers + rank * BufferDim + diff_buf(iter / BulkDim) * BulkDim,
+            &sm_buffers[rank * BufferDim] + diff_buf(iter / BulkDim) * BulkDim,
             scores(iter) + BulkDim);
       }
       __pipeline_commit();
@@ -419,19 +436,19 @@ struct LinearBucket {
   }
 
   uint8_t *__restrict__ storage_;
-  int capacity_;
+  uint32_t capacity_;
 };
 
 template <typename BucketType_> struct LinearBucketTable {
   using BucketType = BucketType_;
   using KeyType = typename BucketType::KeyType;
 
-  LinearBucketTable(uint8_t *storage, int64_t num_buckets,
-                    int64_t bucket_capacity)
+  LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
+                    uint32_t bucket_capacity)
       : storage_(storage), num_buckets_(num_buckets),
         bucket_capacity_(bucket_capacity) {}
 
-  static __device__ __forceinline__ KeyType hash(uint64_t key) {
+  static __device__ __forceinline__ uint64_t hash(uint64_t key) {
     return BucketType::hash(key);
   }
 
@@ -442,11 +459,11 @@ template <typename BucketType_> struct LinearBucketTable {
     return BucketType(bucket_raw_data, bucket_capacity_);
   }
 
-  __device__ __forceinline__ int64_t capacity() const {
+  __device__ __forceinline__ uint64_t capacity() const {
     return num_buckets_ * bucket_capacity_;
   }
 
-  __device__ __forceinline__ int bucket_capacity() const {
+  __device__ __forceinline__ uint32_t bucket_capacity() const {
     return bucket_capacity_;
   }
 
@@ -459,8 +476,8 @@ template <typename BucketType_> struct LinearBucketTable {
   }
 
   uint8_t *__restrict__ storage_;
-  int64_t num_buckets_;
-  int64_t bucket_capacity_;
+  uint64_t num_buckets_;
+  uint32_t bucket_capacity_;
 };
 
 } // namespace dyn_emb

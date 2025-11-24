@@ -597,7 +597,7 @@ class LinearBucketTable(ScoredHashTable):
 
         for score in scores:
             index = self.score_names_.index(score.name)
-            if score.is_returns:
+            if score.is_return:
                 assert score.value is not None
             scores_[index] = score.value
             policies[index] = (
@@ -1000,7 +1000,9 @@ def get_grouped_scored_table(
     capacities: List[int],
     bucket_capacity: Optional[List[int]] = None,
     key_type: Optional[torch.dtype] = torch.int64,
-    score_specs: List[ScoreSpec] = [ScoreSpec(name="timestamp")],
+    score_specs: List[ScoreSpec] = [
+        ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
+    ],
     device: torch.device = None,
     probing_type=ProbingType.LINEAR,
     reduction_type=ReductionType.LINEAR,

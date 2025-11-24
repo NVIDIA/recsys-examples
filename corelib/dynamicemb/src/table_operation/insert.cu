@@ -43,7 +43,7 @@ void table_insert_single_score(at::Tensor table_storage,
 
   int64_t num_total = keys.size(0);
 
-  auto table_key_slots = at::empty(
+  auto table_key_slots = at::zeros(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
 
   constexpr int BLOCK_SIZE = 256;

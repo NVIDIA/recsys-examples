@@ -134,8 +134,10 @@ void bind_table_operation(py::module &m) {
 
   py::enum_<dyn_emb::InsertResult>(m, "InsertResult")
       .value("INSERT", dyn_emb::InsertResult::Insert)
+      .value("ASSIGN", dyn_emb::InsertResult::Assign)
       .value("EVICT", dyn_emb::InsertResult::Evict)
       .value("DUPLICATED", dyn_emb::InsertResult::Duplicated)
       .value("BUSY", dyn_emb::InsertResult::Busy)
+      .value("INIT", dyn_emb::InsertResult::Init)
       .export_values();
 }
