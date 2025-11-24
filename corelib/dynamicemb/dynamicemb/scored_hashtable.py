@@ -747,7 +747,7 @@ class LinearBucketTable(ScoredHashTable):
             score_files: Dict[str, str]: Dict from score name to score file path.
         """
 
-        for score_name in self.score_names:
+        for score_name in self.score_names_:
             if score_name not in score_files or not os.path.exists(
                 score_files[score_name]
             ):
@@ -758,13 +758,13 @@ class LinearBucketTable(ScoredHashTable):
         fkey = open(key_file, "rb")
 
         fscores: Dict[str, Any] = {}
-        for score_name, score_path in score_files:
+        for score_name, score_path in score_files.items():
             if score_name not in self.score_names_:
                 print(
                     f"Score name {score_name} not existed, will not load from {score_path}."
                 )
             elif os.path.exists(score_path):
-                fscores[score_name] = open(score_path, "wb")
+                fscores[score_name] = open(score_path, "rb")
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -775,7 +775,7 @@ class LinearBucketTable(ScoredHashTable):
 
             if num_keys != num_scores:
                 raise ValueError(
-                    f"The number of keys in {key_file} does not match with number of scores in {score_files[score_name]}."
+                    f"The number of keys({num_keys}) in {key_file} does not match with number of scores({num_keys}) in {score_files[score_name]}."
                 )
 
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -789,8 +789,8 @@ class LinearBucketTable(ScoredHashTable):
             keys_bytes = fkey.read(KEY_TYPE.itemsize * num_keys_to_read)
 
             score_bytes_dict: Dict[str, Any] = {}
-            for score_name, fscore in fscores.items():
-                score_bytes_dict[score_name] = fscore.read(
+            for score_name in fscores.keys():
+                score_bytes_dict[score_name] = fscores[score_name].read(
                     SCORE_TYPE.itemsize * num_keys_to_read
                 )
 
@@ -827,8 +827,8 @@ class LinearBucketTable(ScoredHashTable):
             self.insert(keys, score_args)
 
         fkey.close()
-        for fscore in fscores.values():
-            fscore.close()
+        for name in fscores.keys():
+            fscores[name].close()
 
     def _batched_export_keys_scores(
         self,
@@ -877,12 +877,11 @@ class LinearBucketTable(ScoredHashTable):
             actual_length = d_counter.item()
             if actual_length > 0:
                 named_scores: Dict[str, torch.Tensor] = {}
-                for score_name in score_name:
-                    index = self.score_names_.index[score_name]
+                for score_name in score_names:
+                    index = self.score_names_.index(score_name)
+                    scores_ = scores_list[index]
                     named_scores[score_name] = (
-                        scores_list[index][:actual_length]
-                        .to(SCORE_TYPE)
-                        .to(target_device),
+                        scores_[:actual_length].to(SCORE_TYPE).to(target_device)
                     )
 
                 yield (
@@ -906,7 +905,7 @@ class LinearBucketTable(ScoredHashTable):
 
         fkey = open(key_file, "wb")
         fscores: Dict[str, Any] = {}
-        for score_name, score_path in score_files:
+        for score_name, score_path in score_files.items():
             if score_name not in self.score_names_:
                 print(
                     f"Score name {score_name} not existed, will not dump to {score_path}."
