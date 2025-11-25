@@ -72,6 +72,10 @@ void table_lookup(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
                   std::vector<bool> is_returns, at::Tensor founds,
                   std::optional<at::Tensor> indices) {
 
+  int64_t num_total = keys.size(0);
+  if (num_total == 0)
+    return;
+
   if (scores.size() == 1) {
     table_lookup_single_score(table_storage, dtypes, bucket_capacity, keys,
                               scores, policy_types, is_returns, founds,

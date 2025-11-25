@@ -24,13 +24,15 @@ void table_erase(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, std::optional<at::Tensor> indices) {
 
+  int64_t num_total = keys.size(0);
+  if (num_total == 0)
+    return;
+
   auto key_type = get_data_type(keys);
   auto bucket_sizes_ = get_pointer<int>(bucket_sizes);
   auto indices_ = get_pointer<IndexType>(indices);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  int64_t num_total = keys.size(0);
 
   constexpr int BLOCK_SIZE = 256;
 

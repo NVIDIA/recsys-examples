@@ -86,6 +86,10 @@ void table_insert(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
                   std::vector<bool> is_returns,
                   std::optional<at::Tensor> indices,
                   std::optional<at::Tensor> insert_results) {
+
+  int64_t num_total = keys.size(0);
+  if (num_total == 0)
+    return;
   if (scores.size() == 1) {
     table_insert_single_score(table_storage, dtypes, bucket_capacity,
                               bucket_sizes, keys, scores, policy_types,

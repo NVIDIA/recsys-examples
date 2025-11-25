@@ -101,6 +101,11 @@ void table_insert_and_evict(
     std::optional<at::Tensor> insert_results, std::optional<at::Tensor> indices,
     at::Tensor num_evicted, at::Tensor evicted_keys, at::Tensor evicted_indices,
     std::vector<at::Tensor> evicted_scores) {
+
+  int64_t num_total = keys.size(0);
+  if (num_total == 0)
+    return;
+
   if (scores.size() == 1) {
     table_insert_and_evict_single_score(
         table_storage, dtypes, bucket_capacity, bucket_sizes, keys, scores,

@@ -78,6 +78,8 @@ void table_export_batch(at::Tensor table_storage,
                         at::Tensor counter, at::Tensor keys,
                         std::vector<std::optional<at::Tensor>> scores,
                         std::optional<at::Tensor> indices) {
+  if (batch == 0)
+    return;
 
   if (scores.size() == 1) {
     table_export_single_score(table_storage, dtypes, bucket_capacity, batch,

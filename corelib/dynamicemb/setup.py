@@ -36,6 +36,7 @@ subprocess.run(
         "--break-system-packages",
     ]
 )
+subprocess.run(["pip", "install", "ordered-set", "--break-system-packages"])
 
 # TODO: update when torchrec release compatible commit.
 compatible_versions = "1.2.0"

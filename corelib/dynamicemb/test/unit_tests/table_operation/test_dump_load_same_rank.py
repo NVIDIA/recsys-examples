@@ -14,65 +14,13 @@
 # limitations under the License.
 
 import os
-import random
 import shutil
-from typing import List
 
 import pytest
 import torch
 import torch.distributed as dist
-import torchrec
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
-
-
-@pytest.fixture
-def current_device():
-    assert torch.cuda.is_available()
-    return torch.cuda.current_device()
-
-
-def random_indices(batch, min_index, max_index):
-    result = set({})
-    while len(result) < batch:
-        result.add(random.randint(min_index, max_index))
-    return result
-
-
-def generate_sparse_feature(
-    feature_names: List[str],
-    multi_hot_sizes: List[int],
-    local_batch_size: int,
-    unique_indices_list: List[set],
-    use_dynamicembs: List[bool],
-    num_embeddings: List[int],
-):
-    feature_num = len(feature_names)
-    feature_batch = feature_num * local_batch_size
-
-    indices = []
-    lengths = []
-
-    for i in range(feature_batch):
-        f = i // local_batch_size
-        cur_bag_size = random.randint(0, multi_hot_sizes[f])
-        cur_bag = set({})
-        while len(cur_bag) < cur_bag_size:
-            if use_dynamicembs[f]:
-                cur_bag.add(random.randint(0, (1 << 63) - 1))
-            else:
-                cur_bag.add(random.randint(0, num_embeddings[f] - 1))
-
-        unique_indices_list[f].update(cur_bag)
-        indices.extend(list(cur_bag))
-        lengths.append(cur_bag_size)
-
-    return torchrec.KeyedJaggedTensor(
-        keys=feature_names,
-        values=torch.tensor(indices, dtype=torch.int64).cuda(),
-        lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
-    )
-
 
 score_step = 0
 
