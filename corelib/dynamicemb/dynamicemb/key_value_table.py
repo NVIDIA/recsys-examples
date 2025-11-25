@@ -20,7 +20,6 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-from dynamicemb.admission_strategy import AdmissionStrategy
 from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     create_dynamicemb_table,
@@ -34,6 +33,7 @@ from dynamicemb.types import (
     KEY_TYPE,
     OPT_STATE_TYPE,
     SCORE_TYPE,
+    AdmissionStrategy,
     Cache,
     Counter,
     Storage,

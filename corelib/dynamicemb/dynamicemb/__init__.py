@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .admission_strategy import AdmissionStrategy, FrequencyAdmissionStrategy
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
@@ -30,11 +29,14 @@ from .dynamicemb_config import (
     string_to_evict_strategy,
     torch_to_dyn_emb,
 )
+from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from .optimizer import EmbOptimType, OptimizerArgs
+from .types import AdmissionStrategy
 
 __all__ = [
     "AdmissionStrategy",
     "FrequencyAdmissionStrategy",
+    "KVCounter",
     "DynamicEmbCheckMode",
     "DynamicEmbInitializerArgs",
     "DynamicEmbInitializerMode",

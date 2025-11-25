@@ -25,7 +25,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
-from dynamicemb.admission_strategy import AdmissionStrategy
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -39,6 +38,7 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.get_planner import get_planner
 from dynamicemb.key_value_table import batched_export_keys_values
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
+from dynamicemb.types import AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType

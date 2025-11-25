@@ -298,3 +298,15 @@ class Counter(abc.ABC):
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
         """
+
+
+class AdmissionStrategy(abc.ABC):
+    @abc.abstractmethod
+    def admit(
+        self,
+        keys: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Admit keys with scores >= threshold.
+        """

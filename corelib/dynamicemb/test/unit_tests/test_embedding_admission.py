@@ -11,13 +11,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb import (
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
     DynamicEmbScoreStrategy,
 )
-from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
 from dynamicemb.key_value_table import batched_export_keys_values
+
+# from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import create_model, get_optimizer_kwargs, idx_to_name
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -288,10 +288,6 @@ def test_admission_strategy_validation(
     # Create admission strategy
     admission_strategy = FrequencyAdmissionStrategy(
         threshold=threshold,
-        initializer_args=DynamicEmbInitializerArgs(
-            mode=DynamicEmbInitializerMode.CONSTANT,
-            value=0.0,
-        ),
     )
 
     # Create model with admission strategy

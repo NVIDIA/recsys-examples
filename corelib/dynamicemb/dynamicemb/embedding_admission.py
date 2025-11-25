@@ -23,7 +23,7 @@ from dynamicemb.scored_hashtable import (
     ScoreSpec,
     get_scored_table,
 )
-from dynamicemb.types import Counter, MemoryType
+from dynamicemb.types import AdmissionStrategy, Counter, MemoryType
 
 
 class KVCounter(Counter):
@@ -107,3 +107,54 @@ class KVCounter(Counter):
             counter_file (str): the file path of frequencies.
         """
         self.table_.dump(key_file, {self.score_name_: counter_file})
+
+
+class FrequencyAdmissionStrategy(AdmissionStrategy):
+    """
+    Frequency-based admission strategy.
+    Only admits keys whose frequency (score) meets or exceeds a threshold.
+
+    Parameters
+    ----------
+    threshold : int
+        Minimum frequency threshold for admission. Keys with frequency >= threshold
+        will be admitted into the embedding table.
+    """
+
+    def __init__(
+        self,
+        threshold: int,
+    ):
+        if threshold < 0:
+            raise ValueError(f"Threshold must be non-negative, got {threshold}")
+
+        self.threshold = threshold
+
+    def admit(
+        self,
+        keys: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Admit keys with frequency >= threshold.
+
+        Parameters
+        ----------
+        keys : torch.Tensor
+            Keys to evaluate (shape: [N])
+        scores : torch.Tensor
+            Frequency counts for each key (shape: [N])
+
+        Returns
+        -------
+        torch.Tensor
+            Boolean mask (shape: [N]) where True indicates admission
+        """
+        if keys.shape[0] != scores.shape[0]:
+            raise ValueError(
+                f"Keys and scores must have same length, got {keys.shape[0]} and {scores.shape[0]}"
+            )
+
+        # Admit keys whose frequency meets or exceeds threshold
+        admit_mask = scores >= self.threshold
+        return admit_mask
