@@ -21,7 +21,6 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbPoolingMode,
     dyn_emb_to_torch,
 )
-from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.key_value_table import (
     Cache,
@@ -30,6 +29,7 @@ from dynamicemb.key_value_table import (
     Storage,
 )
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.types import Counter
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
@@ -347,7 +347,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         input_dist_dedup: bool = False,
         training: bool = True,
         frequency_counters: Optional[torch.Tensor] = None,
-        admission_counter: Optional[list[KVCounter]] = None,
+        admission_counter: Optional[list[Counter]] = None,
         *args,
     ):
         table_num = len(storages)

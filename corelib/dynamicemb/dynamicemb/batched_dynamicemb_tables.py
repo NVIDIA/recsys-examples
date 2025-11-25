@@ -590,7 +590,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._eval_initializers = []
         self._create_initializers()
         # TODO: support external counter
+<<<<<<< HEAD
         self._admission_counter = [KVCounter(1024 * 1024) for _ in table_options]
+=======
+        self._admission_counter = [
+            KVCounter(max(1024 * 1024, option.max_capacity // 4))
+            for option in table_options
+        ]
+>>>>>>> 9c3d53c (Rebase Counter table and fix some comment's issues.)
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(

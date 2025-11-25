@@ -27,7 +27,6 @@ from dynamicemb.dynamicemb_config import (
     dyn_emb_to_torch,
     torch_to_dyn_emb,
 )
-from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.types import (
@@ -36,6 +35,7 @@ from dynamicemb.types import (
     OPT_STATE_TYPE,
     SCORE_TYPE,
     Cache,
+    Counter,
     Storage,
     torch_dtype_to_np_dtype,
 )
@@ -803,7 +803,7 @@ class KeyValueTableFunction:
         evict_strategy: EvictStrategy,
         accumulated_frequency: Optional[torch.Tensor] = None,
         admit_strategy: Optional[AdmissionStrategy] = None,
-        admission_counter: Optional[KVCounter] = None,
+        admission_counter: Optional[Counter] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         h_num_toatl = unique_keys.numel()
@@ -811,9 +811,7 @@ class KeyValueTableFunction:
         emb_dtype = storage.embedding_dtype()
         val_dim = storage.value_dim()
 
-        is_lfu_enabled = False
-        if evict_strategy == EvictStrategy.KLfu:
-            is_lfu_enabled = True
+        is_lfu_enabled = evict_strategy == EvictStrategy.KLfu
 
         if h_num_toatl == 0:
             return
@@ -863,21 +861,19 @@ class KeyValueTableFunction:
             scores_to_insert = missing_scores_in_storage
             # 4.Optional Admission part
             if admit_strategy is not None:
-                # Get frequency counters for admission:
-                # 1. Use missing_scores_in_storage if available (LFU mode)
-                # 2. Otherwise, extract from lfu_accumulated_frequency using missing_indices_in_storage
-                # 3. Otherwise, use default value 1
                 if accumulated_frequency is not None:
                     counters_for_admission = accumulated_frequency[
                         missing_indices_in_storage
                     ]
                 else:
-                    counters_for_admission = torch.ones_like(
-                        missing_keys_in_storage, dtype=torch.int64
+                    counters_for_admission = torch.ones(
+                        missing_keys_in_storage.shape[0],
+                        dtype=torch.int64,
+                        device=unique_keys.device,
                     )
 
                 freq_for_missing_keys = admission_counter.add(
-                    missing_keys_in_storage, counters_for_admission
+                    missing_keys_in_storage, counters_for_admission, inplace=True
                 )
                 admit_mask = admit_strategy.admit(
                     freq_for_missing_keys, freq_for_missing_keys
@@ -940,7 +936,7 @@ class KeyValueTableCachingFunction:
         evict_strategy: EvictStrategy,
         accumulated_frequency: Optional[torch.Tensor] = None,
         admit_strategy: Optional[AdmissionStrategy] = None,
-        admission_counter: Optional[KVCounter] = None,
+        admission_counter: Optional[Counter] = None,
     ) -> None:
         assert unique_keys.dim() == 1
         unique_keys.numel()
@@ -950,9 +946,7 @@ class KeyValueTableCachingFunction:
             storage.value_dim()
         )  # value is generally composed of embedding and optimizer state
 
-        is_lfu_enabled = False
-        if evict_strategy == EvictStrategy.KLfu:
-            is_lfu_enabled = True
+        is_lfu_enabled = evict_strategy == EvictStrategy.KLfu
 
         (
             h_num_keys_for_storage,
@@ -1023,12 +1017,14 @@ class KeyValueTableCachingFunction:
                         indices_in_unique_keys
                     ]
                 else:
-                    counters_for_admission = torch.ones_like(
-                        missing_keys_in_storage, dtype=torch.int64
+                    counters_for_admission = torch.ones(
+                        missing_keys_in_storage.shape[0],
+                        dtype=torch.int64,
+                        device=unique_keys.device,
                     )
 
                 freq_for_missing_keys = admission_counter.add(
-                    missing_keys_in_storage, counters_for_admission
+                    missing_keys_in_storage, counters_for_admission, inplace=True
                 )
                 admit_mask_for_missing_keys = admit_strategy.admit(
                     freq_for_missing_keys,

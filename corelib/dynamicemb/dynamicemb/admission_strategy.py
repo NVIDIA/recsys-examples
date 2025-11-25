@@ -31,10 +31,6 @@ class AdmissionStrategy(abc.ABC):
     ) -> torch.Tensor:
         pass
 
-    @abc.abstractmethod
-    def get_initializer_args(self) -> Optional["DynamicEmbInitializerArgs"]:
-        pass
-
 
 class FrequencyAdmissionStrategy(AdmissionStrategy):
     """
@@ -90,6 +86,3 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         # Admit keys whose frequency meets or exceeds threshold
         admit_mask = scores >= self.threshold
         return admit_mask
-
-    def get_initializer_args(self) -> Optional["DynamicEmbInitializerArgs"]:
-        return self.initializer_args
