@@ -243,23 +243,23 @@ class Counter(abc.ABC):
 
     @abc.abstractmethod
     def add(
-        self, keys: torch.Tensor, counters: torch.Tensor, inplace: bool
+        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
     ) -> torch.Tensor:
         """
-        Add keys with counters to the `Counter` and get accumulated counter of each key.
-        For not existed keys, the counters will be assigned directly.
-        For existing keys, the counters will be accumulated.
+        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
+        For not existed keys, the frequencies will be assigned directly.
+        For existing keys, the frequencies will be accumulated.
 
         Args:
             keys (torch.Tensor): The input keys, should be unique keys.
-            counters (torch.Tensor): The input counters, serve as initial or incremental values of counters' states.
-            inplace: If true then store the accumulated_counters to counter.
+            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
+            inplace: If true then store the accumulated_frequencies to counter.
 
         Returns:
-            accumulated_counters (torch.Tensor): the counters' state in the `Counter` for the input keys.
+            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
         """
-        accumulated_counters: torch.Tensor
-        return accumulated_counters
+        accumulated_frequencies: torch.Tensor
+        return accumulated_frequencies
 
     @abc.abstractmethod
     def erase(self, keys) -> None:
@@ -282,19 +282,19 @@ class Counter(abc.ABC):
     @abc.abstractmethod
     def load(self, key_file, counter_file) -> None:
         """
-        Load keys and counters from input file path.
+        Load keys and frequencies from input file path.
 
         Args:
             key_file (str): the file path of keys.
-            counter_file (str): the file path of counters.
+            counter_file (str): the file path of frequencies.
         """
 
     @abc.abstractmethod
     def dump(self, key_file, counter_file) -> None:
         """
-        Dump keys and counters to output file path.
+        Dump keys and frequencies to output file path.
 
         Args:
             key_file (str): the file path of keys.
-            counter_file (str): the file path of counters.
+            counter_file (str): the file path of frequencies.
         """

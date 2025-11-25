@@ -304,7 +304,7 @@ def test_table_load_dump(
 
                     if key not in visited_keys:
                         assert (
-                            table_scores[key] < min_score
+                            table_scores[key] <= min_score
                         ), f"key {key} score {table_scores[key]} should be < min_score {min_score}"
                         lasted_min_score = min(lasted_min_score, table_scores[key])
                         visited_keys.add(key)

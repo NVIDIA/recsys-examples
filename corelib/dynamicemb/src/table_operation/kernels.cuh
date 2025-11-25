@@ -192,8 +192,9 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
             *bucket.digests(iter) = Bucket::key_to_digest(key);
             if (evict_key == Bucket::reclaimed_key()) {
               atomicAdd(bucket_sizes + bucket_id, 1);
-              result = InsertResult::Insert;
+              result = InsertResult::Reclaim;
             } else {
+              *bucket.scores(iter) = ScoreType();
               result = InsertResult::Evict;
             }
             break;
@@ -301,9 +302,7 @@ __global__ void table_insert_and_evict_kernel(
 
       evict_score = ScorePolicy::score_for_compare(policy_type, score);
       bool succeed = bucket.template reduce<ReductionGroupSize, BufferDim>(
-          iter, evict_key, evict_score,
-          sm_scores + threadIdx.x / ReductionGroupSize * ReductionGroupSize *
-                          BufferDim);
+          iter, evict_key, evict_score, sm_scores);
 
       if (succeed) {
 
@@ -315,8 +314,9 @@ __global__ void table_insert_and_evict_kernel(
             *bucket.digests(iter) = Bucket::key_to_digest(key);
             if (evict_key == Bucket::reclaimed_key()) {
               atomicAdd(&bucket_sizes[bucket_id], 1);
-              result = InsertResult::Insert;
+              result = InsertResult::Reclaim;
             } else {
+              *bucket.scores(iter) = ScoreType();
               result = InsertResult::Evict;
             }
             break;
@@ -324,13 +324,17 @@ __global__ void table_insert_and_evict_kernel(
         } // else it was locked by another thread.
       } else {
         result = InsertResult::Busy;
+        evict_key = key;
+        evict_score = score;
         break;
       }
     }
 
     auto g = cg::tiled_partition<KernelTraits::CompactTileSize>(
         cg::this_thread_block());
-    bool evicted = result == InsertResult::Evict ? true : false;
+    bool evicted =
+        (result == InsertResult::Evict or result == InsertResult::Busy) ? true
+                                                                        : false;
     uint32_t vote = g.ballot(evicted);
     int group_cnt = __popc(vote);
     CounterType group_offset = 0;
@@ -349,7 +353,13 @@ __global__ void table_insert_and_evict_kernel(
         evicted_scores[out_id] = evict_score;
       }
       if (evicted_indices) {
-        evicted_indices[out_id] = bucket_id * bucket.capacity() + iter;
+        IndexType index;
+        if (result == InsertResult::Evict) {
+          index = bucket_id * bucket.capacity() + iter;
+        } else {
+          index = -1;
+        }
+        evicted_indices[out_id] = index;
       }
     }
 

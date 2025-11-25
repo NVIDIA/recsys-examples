@@ -686,9 +686,9 @@ class LinearBucketTable(ScoredHashTable):
         scores_, policies, is_returns = self._parse_scores(scores)
 
         batch = keys.numel()
-        num_evicted = torch.empty(1, dtype=COUNTER_TYPE, device=keys.device)
+        num_evicted = torch.zeros(1, dtype=COUNTER_TYPE, device=keys.device)
         evicted_keys = torch.empty(batch, dtype=self.key_type_, device=keys.device)
-        evicted_indices = torch.empty(batch, dtype=self.value_type, device=keys.device)
+        evicted_indices = torch.empty(batch, dtype=self.index_type, device=keys.device)
         evicted_scores_list = [
             torch.empty(batch, dtype=dtype, device=keys.device)
             for dtype in self.score_types_

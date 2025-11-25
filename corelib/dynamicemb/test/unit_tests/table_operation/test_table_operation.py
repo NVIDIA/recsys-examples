@@ -115,6 +115,7 @@ def test_table_partition(
     bucket_capacity,
     num_buckets,
 ):
+    print("--------------------------------------------------------")
     assert torch.cuda.is_available()
     device = torch.cuda.current_device()
 
@@ -183,6 +184,14 @@ def test_table_partition(
     assert table.key_type == key_type
     assert len(table.score_specs) == 1
 
+    print(
+        "Table partition passed: table capacity and bucket capacity rounded as expected."
+    )
+    print("Table partition passed: sizes, strides and dtype all matched.")
+    print(
+        "Table partition passed: there was no overlap across keys, digests and scores in memory address."
+    )
+
 
 @pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("bucket_capacity", [128, 1024])
@@ -191,7 +200,7 @@ def test_table_partition(
 @pytest.mark.parametrize(
     "score_policy",
     [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE, ScorePolicy.GLOBAL_TIMER],
-)  # [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE, ScorePolicy.GLOBAL_TIMER]
+)
 def test_table_basic(
     key_type,
     num_buckets,
@@ -199,6 +208,7 @@ def test_table_basic(
     batch_size,
     score_policy,
 ):
+    print("--------------------------------------------------------")
     assert torch.cuda.is_available()
     device = torch.cuda.current_device()
 
@@ -270,7 +280,14 @@ def test_table_basic(
     table.lookup(keys, score_args_lookup, founds, indices_lookup)
     assert not founds.any()
 
-    offset = bucket_capacity
+    max_num_reclaim = keys.numel()
+    accum_num_reclaim = 0
+
+    print(
+        "Basic table operation(insert, lookup, erase) passed during the filling stage."
+    )
+
+    offset = batch_size
     max_step = 20
     step = 1
     while table.size() < table.capacity() and step < max_step:
@@ -292,16 +309,28 @@ def test_table_basic(
 
         table.insert(keys, score_args, indices, insert_results)
 
-        # not assign or busy
-        assert (
-            (insert_results == InsertResult.INSERT.value)
-            | (insert_results == InsertResult.EVICT.value)
-        ).all()
+        num_inserted = (insert_results == InsertResult.INSERT.value).sum()
+        num_reclaimed = (insert_results == InsertResult.RECLAIM.value).sum()
+        num_eviction = (insert_results == InsertResult.EVICT.value).sum()
+        num_assign = (insert_results == InsertResult.ASSIGN.value).sum()
+
+        assert keys.numel() == num_inserted + num_reclaimed + num_eviction
+        assert num_assign == 0
+
+        accum_num_reclaim += num_reclaimed
+
+        print(
+            f"Table insert passed when load factor({table.load_factor():.3f}) with : insert({num_inserted}), reclaim({num_reclaimed}), evict({num_eviction})"
+        )
 
         offset += bucket_capacity
         step += 1
 
     if table.size() == table.capacity():
+        assert (
+            accum_num_reclaim == max_num_reclaim
+        ), f"Occupyied({accum_num_reclaim}/{max_num_reclaim}) reclaimed slots when table is full."
+
         keys = torch.randperm(batch_size, device=device, dtype=torch.int64) + offset
         keys = keys.to(key_type)
 
@@ -331,8 +360,121 @@ def test_table_basic(
         ).fill_(-1)
         table.insert(keys, score_args, indices_reinsert, insert_results)
 
-        assert (insert_results == InsertResult.INSERT.value).all()
+        assert (insert_results == InsertResult.RECLAIM.value).all()
 
         assert torch.equal(
             torch.sort(indices).values, torch.sort(indices_reinsert).values
+        )
+
+        print("Table operation(insert, erase, lookup) passed when table is full.")
+
+
+@pytest.mark.parametrize("key_type", [torch.int64])
+@pytest.mark.parametrize("bucket_capacity", [128, 1024])
+@pytest.mark.parametrize("num_buckets", [8192])
+@pytest.mark.parametrize("batch_size", [65536, 1048576])
+@pytest.mark.parametrize(
+    "score_policy",
+    [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE, ScorePolicy.GLOBAL_TIMER],
+)
+def test_table_evict(
+    key_type,
+    num_buckets,
+    bucket_capacity,
+    batch_size,
+    score_policy,
+):
+    print("--------------------------------------------------------")
+    assert torch.cuda.is_available()
+    device = torch.cuda.current_device()
+
+    table = get_scored_table(
+        capacity=num_buckets * bucket_capacity,
+        bucket_capacity=bucket_capacity,
+        key_type=key_type,
+        score_specs=[ScoreSpec(name="score1", policy=score_policy)],
+    )
+
+    score_args = [ScoreArg(name="score1", is_return=True)]
+    score_args_lookup = [
+        ScoreArg(
+            name="score1",
+            policy=ScorePolicy.CONST,
+            is_return=True,
+        )
+    ]
+
+    offset = 0
+
+    while table.size() < table.capacity():
+        keys = torch.randperm(batch_size, device=device, dtype=torch.int64) + offset
+        offset += batch_size
+        keys = keys.to(key_type)
+
+        score_args[0].value = get_scores(score_policy, keys)
+        score_args_lookup[0].value = torch.zeros(
+            batch_size, dtype=torch.uint64, device=device
+        )
+
+        insert_results = torch.empty(
+            batch_size, dtype=table.result_type, device=device
+        ).fill_(InsertResult.INIT.value)
+
+        indices = torch.zeros(batch_size, dtype=table.index_type, device=device)
+
+        (
+            num_evicted,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+        ) = table.insert_and_evict(keys, score_args, indices, insert_results)
+        evicted_scores = evicted_scores[0]
+
+        founds = torch.empty(batch_size, dtype=torch.bool, device=device).fill_(False)
+        indices_lookup = torch.empty(
+            batch_size, dtype=table.index_type, device=device
+        ).fill_(-1)
+
+        table.lookup(keys, score_args_lookup, founds, indices_lookup)
+
+        num_existed = founds.sum()
+
+        num_inserted = (insert_results == InsertResult.INSERT.value).sum()
+        num_reclaim = (insert_results == InsertResult.RECLAIM.value).sum()
+        num_assign = (insert_results == InsertResult.ASSIGN.value).sum()
+        num_inserted_by_eviction = (insert_results == InsertResult.EVICT.value).sum()
+        num_insert_failed = (insert_results == InsertResult.BUSY.value).sum()
+
+        assert (
+            num_reclaim == 0
+        ), f"There is no erase operation, but got {num_reclaim} reclaimed slots when insert."
+        assert (
+            num_assign == 0
+        ), f"There is no duplicated keys, but got {num_assign} duplicated keys when insert."
+
+        assert batch_size == num_inserted + num_inserted_by_eviction + num_insert_failed
+        assert num_existed == num_inserted + num_inserted_by_eviction
+        assert num_evicted == num_inserted_by_eviction + num_insert_failed
+
+        assert torch.equal(indices, indices_lookup)
+
+        if table.score_specs[0].policy == ScorePolicy.ASSIGN:
+            assert torch.equal(
+                score_args_lookup[0].value.to(torch.int64)[founds],
+                score_args[0].value.to(torch.int64)[founds],
+            )
+            global score_step
+            assert (
+                score_args_lookup[0].value.to(torch.int64)[founds] == score_step
+            ).all()
+        elif table.score_specs[0].policy == ScorePolicy.ACCUMULATE:
+            assert (score_args_lookup[0].value.to(torch.int64)[founds] == 1).all()
+        else:
+            assert torch.equal(
+                score_args_lookup[0].value.to(torch.int64)[founds],
+                score_args[0].value.to(torch.int64)[founds],
+            )
+
+        print(
+            f"Table insert_and_evict passed when load factor:({table.load_factor():.3f}) with: insert({num_inserted}), evict({num_inserted_by_eviction}), failed({num_insert_failed})"
         )

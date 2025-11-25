@@ -50,7 +50,8 @@ __device__ __forceinline__ CounterType atomicAdd(CounterType *address,
 }
 
 enum class InsertResult : uint8_t {
-  Insert,     // Insert into an empty or reclaimed slot.
+  Insert,     // Insert into an empty slot.
+  Reclaim,    // Insert into a reclaimed slot.
   Assign,     // Hit and assign.
   Evict,      // Evict a key and insert into the evicted slot.
   Duplicated, // Meet duplicated keys on the fly.
