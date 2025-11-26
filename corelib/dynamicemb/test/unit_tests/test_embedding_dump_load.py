@@ -35,6 +35,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
+from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
 from dynamicemb.key_value_table import batched_export_keys_values
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
@@ -252,6 +253,9 @@ def apply_dmp(
                     * emb_num_embeddings_next_power_of_2
                 )
 
+                admission_counter = KVCounter(
+                    max(1024 * 1024, emb_num_embeddings_next_power_of_2 // 4)
+                )
                 dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
                     global_hbm_for_values=total_hbm_need,
                     score_strategy=score_strategy,
@@ -264,6 +268,7 @@ def apply_dmp(
                     caching=caching,
                     local_hbm_for_values=1024**3,
                     admit_strategy=admit_strategy,
+                    admission_counter=admission_counter,
                 )
     planner = get_planner(
         eb_configs,

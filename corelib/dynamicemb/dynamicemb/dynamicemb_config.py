@@ -21,7 +21,7 @@ from math import sqrt
 from typing import Dict, Optional
 
 import torch
-from dynamicemb.types import AdmissionStrategy, Storage
+from dynamicemb.types import AdmissionStrategy, Counter, Storage
 from dynamicemb_extensions import (
     DynamicEmbDataType,
     DynamicEmbTable,
@@ -363,7 +363,10 @@ class DynamicEmbTableOptions(_ContextOptions):
         If provided, only keys that meet the strategy's criteria will be inserted into the table.
         Keys that don't meet the criteria will still be initialized and used in the forward pass,
         but won't be stored in the table. Default is None (all keys are admitted).
-
+    admission_counter : Optional[Counter], optional
+        Counter for tracking the number of keys that have been admitted to the embedding table.
+        If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
+        Default is None (no counter is used).
     Notes
     -----
     For detailed descriptions and additional context on each parameter, please refer to the documentation at
@@ -392,6 +395,7 @@ class DynamicEmbTableOptions(_ContextOptions):
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
     admit_strategy: Optional["AdmissionStrategy"] = None
+    admission_counter: Optional[Counter] = None
 
     def __post_init__(self):
         assert (

@@ -10,9 +10,7 @@ import click
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from dynamicemb import (
-    DynamicEmbScoreStrategy,
-)
+from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
 from dynamicemb.key_value_table import batched_export_keys_values

@@ -30,7 +30,6 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_prefetch,
 )
 from dynamicemb.dynamicemb_config import *
-from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.initializer import *
 from dynamicemb.key_value_table import Cache, KeyValueTable, Storage
 from dynamicemb.optimizer import *
@@ -589,15 +588,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._initializers = []
         self._eval_initializers = []
         self._create_initializers()
-        # TODO: support external counter
-<<<<<<< HEAD
-        self._admission_counter = [KVCounter(1024 * 1024) for _ in table_options]
-=======
-        self._admission_counter = [
-            KVCounter(max(1024 * 1024, option.max_capacity // 4))
-            for option in table_options
-        ]
->>>>>>> 9c3d53c (Rebase Counter table and fix some comment's issues.)
+
+        self._admission_counter = [option.admission_counter for option in table_options]
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
