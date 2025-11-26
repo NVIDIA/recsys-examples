@@ -394,7 +394,7 @@ class DynamicEmbTableOptions(_ContextOptions):
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
-    admit_strategy: Optional["AdmissionStrategy"] = None
+    admit_strategy: Optional[AdmissionStrategy] = None
     admission_counter: Optional[Counter] = None
 
     def __post_init__(self):

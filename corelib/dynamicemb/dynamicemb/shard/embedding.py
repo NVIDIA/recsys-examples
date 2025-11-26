@@ -438,7 +438,6 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
         if global_score_strategy is None:
             for param_name, param_sharding in params.items():
                 if param_sharding.dynamicemb_options:
-                    # 检查 score_strategy
                     if param_sharding.dynamicemb_options.score_strategy is not None:
                         global_score_strategy = (
                             param_sharding.dynamicemb_options.score_strategy
