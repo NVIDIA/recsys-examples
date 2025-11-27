@@ -35,6 +35,7 @@ from dynamicemb_extensions import (
     export_batch_matched,
     find,
     find_or_insert,
+    find_pointers_with_scores,
     insert_and_evict,
 )
 
@@ -219,6 +220,7 @@ class LFUSimulator:
         Returns: (evicted_keys, num_evicted)
         """
         evicted_keys = []
+        evicted_scores = []
 
         for i, key in enumerate(keys):
             key_item = key.item()
@@ -235,7 +237,7 @@ class LFUSimulator:
                 )
             else:
                 # Key doesn't exist, need to insert
-                if len(self.table) >= self.capacity:
+                if len(self.table) == self.capacity:
                     # Need to evict
                     min_freq = float("inf")
                     min_key = None
@@ -250,6 +252,7 @@ class LFUSimulator:
                     if min_key is not None:
                         del self.table[min_key]
                         evicted_keys.append(min_key)
+                        evicted_scores.append(min_freq)
 
                 # Insert new key
                 self.table[key_item] = (
@@ -258,7 +261,21 @@ class LFUSimulator:
                     self.insertion_counter,
                 )
 
-        return evicted_keys, len(evicted_keys)
+        return evicted_keys, evicted_scores, len(evicted_keys)
+
+    def erase(self, keys: Set[int]):
+        for key in keys:
+            assert key in self.table, "Key is not in the table, can't be erased."
+
+            del self.table[key]
+
+    def get_keys_frequency(self, keys: Set[int]):
+        scores = []
+
+        for key in keys:
+            assert key in self.table, "Key is not in the table, can't get its score."
+            scores.append(self.table[key][1])
+        return scores
 
     def get_keys_by_score_threshold(self, min_score: int) -> Set[int]:
         """Get all keys with frequency >= min_score"""
@@ -550,6 +567,29 @@ def export_all_keys_values_scores(table, device):
         )
 
 
+def find_hkv_score(table, key: int, device: torch.device) -> Tuple[bool, int]:
+    founds = torch.empty(1, dtype=torch.bool, device=device).fill_(False)
+    keys = torch.tensor([key], dtype=torch.int64, device=device)
+    values = torch.empty(1, dtype=torch.int64, device=device)
+    scores = torch.empty(1, dtype=torch.uint64, device=device).fill_(0)
+    find_pointers_with_scores(table, 1, keys, values, founds, scores)
+    return founds[0].item(), scores[0].item()
+
+
+def simulator_insert_and_evict(lfu_simulator, key, score, ext_option):
+    random_val = torch.randn(
+        1,
+        ext_option.dim,
+        dtype=dyn_emb_to_torch(ext_option.value_type),
+    )
+    _, _, num_evict = lfu_simulator.insert_and_evict(
+        torch.tensor([key], dtype=torch.int64),
+        random_val,
+        score,
+    )
+    return num_evict
+
+
 @pytest.mark.parametrize("evict_strategy", [EvictStrategy.KLfu])
 @pytest.mark.parametrize(
     "bucket_capacity, batch, capacity, num_iteration",
@@ -628,6 +668,16 @@ def test_dynamicemb_extensions_lfu(
         hkv_size_before = dyn_emb_rows(table)
         sim_size_before = lfu_simulator.size()
 
+        found_values = torch.empty(
+            batch,
+            ext_option.dim,
+            dtype=dyn_emb_to_torch(ext_option.value_type),
+            device=device,
+        )
+        founds = torch.full([batch], False, dtype=torch.bool, device=device)
+
+        find(table, batch, keys, found_values, founds)
+
         # HKV table operation: insert_and_evict
         evict_keys = torch.empty_like(keys)
         evict_vals = torch.empty_like(values)
@@ -651,17 +701,149 @@ def test_dynamicemb_extensions_lfu(
         # LFU simulator operation: insert_and_evict
         sim_keys = keys.cpu()
         sim_values = values.cpu()
-        sim_evicted_keys, sim_evicted_count = lfu_simulator.insert_and_evict(
-            sim_keys, sim_values, score
+        (
+            sim_evicted_keys,
+            sim_eviceted_scores,
+            sim_evicted_count,
+        ) = lfu_simulator.insert_and_evict(sim_keys, sim_values, score)
+
+        """
+        If HKV needs to evict m keys, but n keys meet the criteria, there are at most C^m_n possibilities (this is a combinatorial problem...). 
+        The p keys with the smallest scores must be evicted (0 <= p <= m).
+
+        During concurrent insertion, a key that should have been found in the current batch might be evicted by another thread, causing it to be re-inserted, and the score count reset. 
+        However, sequential insertion in the Simulator might cause the score to accumulate, and vice versa (scores originally evictted in the Simulator might accumulate in HKV).
+
+        After each insertion, based on the results of insertions in HKV and the Simulator, we can determine whether the evictment is reasonable and calibrate the Simulator's keys to match those in HKV, using this as the basis for the next insertion's judgment.
+        """
+
+        print(
+            f"Iteration{iteration}: HKV evict {hkv_evicted_count} keys, Simulator evict {sim_evicted_count} keys."
+        )
+        # Check the eviction results whether reasonable or not
+        if sim_evicted_count == 0:
+            # case1: Simulator have enough empty slots, so HKV should also be.
+            # case2: Keys all existed in Simulator, and it should be the same to HKV.
+            # case3: Part of keys existed, and there are enough slots for un-existed keys, and it should be the same to HKV.
+            # That's because HKV should not evict keys as there existed enough empty slots.
+            assert (
+                hkv_evicted_count == 0
+            ), f"HKV Eviction should not to be happened as capacity old({hkv_size_before}), new({hkv_size_after}), batch({batch})"
+
+        evict_keys = evict_keys[:hkv_evicted_count].cpu().tolist()
+        evict_scores = evict_scores[:hkv_evicted_count].cpu().tolist()
+
+        cur_batch_keys = keys.cpu().tolist()
+
+        # If a key was evict by HKV but not evict by Simulator, will add to the dict, and vice versa
+        # Keys in current batch will not append to the dict.
+        ambiguous_key_score: Dict[int, int] = {}
+        hkv_ambiguous_cnt = 0
+        sim_ambiguous_cnt = 0
+
+        for i, hkv_key in enumerate(evict_keys):
+            hkv_score = evict_scores[i]
+            # the key was evicted from both HKV table and Simulator table, or the key insert failed into both table.
+            if hkv_key in sim_evicted_keys:
+                # maybe hkv_key in cur_batch_keys, but if so they should still keep the same.
+                index = sim_evicted_keys.index(hkv_key)
+                sim_score = sim_eviceted_scores[index]
+                assert (
+                    hkv_score == sim_score
+                ), f"HKV and Simulator both evict key{hkv_key}, but score is different: HKV({hkv_score}/Simulator({sim_score}))"
+            else:
+                if hkv_key not in cur_batch_keys:
+                    assert hkv_key not in ambiguous_key_score
+                    ambiguous_key_score[hkv_key] = hkv_score
+                    hkv_ambiguous_cnt += 1
+
+                # The hkv_key still existed in Simulator table.
+                sim_score = lfu_simulator.get_key_frequency(hkv_key)
+                assert (
+                    sim_score is not None
+                ), f"Key({hkv_key} is expected to exist in Simulator as not be evicted."
+
+                if hkv_key in cur_batch_keys:
+                    found, hkv_score_1 = find_hkv_score(table, hkv_key, device)
+
+                    if found:
+                        # case1: existed key in HKV was evicted by other thread, and reinsert succeeded.
+                        assert (
+                            hkv_score + hkv_score_1 == sim_score
+                        ), "score_in_hkv + score_evict_by_hkv should equal to score_in_simulator, as simulator doesn't evict the key, so the score should be accumulated."
+
+                        # Calibration two tables
+                        lfu_simulator.erase([hkv_key])
+                        num_evict = simulator_insert_and_evict(
+                            lfu_simulator, hkv_key, hkv_score_1, ext_option
+                        )
+                        assert num_evict == 0
+                    else:
+                        # case2: HKV insert failed, but Simulator insert succeed.
+                        assert hkv_score == sim_score, "Score should keep the same."
+                        # Calibration two tables
+                        lfu_simulator.erase([hkv_key])
+                else:
+                    assert hkv_score == sim_score, "Score should keep the same."
+                    # Calibration two tables
+                    lfu_simulator.erase([hkv_key])
+
+        for i, sim_key in enumerate(sim_evicted_keys):
+            sim_score = sim_eviceted_scores[i]
+            if sim_key not in evict_keys:
+                if sim_key not in cur_batch_keys:
+                    assert sim_key not in ambiguous_key_score
+                    ambiguous_key_score[sim_key] = sim_score
+                    sim_ambiguous_cnt += 1
+
+                found, hkv_score = find_hkv_score(table, sim_key, device)
+
+                sim_score_1 = lfu_simulator.get_key_frequency(sim_key)
+
+                if sim_score_1 is None:
+                    assert hkv_score == sim_score
+
+                    # Calibration two tables
+                    num_evict = simulator_insert_and_evict(
+                        lfu_simulator, sim_key, sim_score, ext_option
+                    )
+                    assert num_evict == 0
+                else:
+                    assert hkv_score == sim_score + sim_score_1
+                    # Calibration two tables
+
+                    lfu_simulator.erase([sim_key])
+                    num_evict = simulator_insert_and_evict(
+                        lfu_simulator, sim_key, hkv_score, ext_option
+                    )
+                    assert num_evict == 0
+
+        ambiguous_scores = list(ambiguous_key_score.values())
+        assert len(set(ambiguous_scores)) <= 1
+        assert len(ambiguous_scores) == hkv_ambiguous_cnt + sim_ambiguous_cnt
+
+        print(
+            f"Iteration{iteration}: there are {len(ambiguous_scores)} ambiguous scores and has the same score: HKV({hkv_ambiguous_cnt})/Simulator({sim_ambiguous_cnt})."
         )
 
         # Record size after operation
         hkv_size_after = dyn_emb_rows(table)
         sim_size_after = lfu_simulator.size()
+        assert hkv_size_after == sim_size_after
 
         # Calculate insertion and eviction counts
         hkv_net_change = hkv_size_after - hkv_size_before
         sim_net_change = sim_size_after - sim_size_before
+
+        if hkv_net_change == 0:
+            assert founds.sum() + hkv_evicted_count == batch
+            print(f"Found: {founds.sum().item()}, evict{hkv_evicted_count}")
+        print(
+            f"HKV capacity: before{hkv_size_before}, after{hkv_size_after}, evicted{hkv_evicted_count}, change{hkv_net_change}"
+        )
+        print(
+            f"LFUTable capacity: before{sim_size_before}, after{sim_size_after}, evicted{sim_evicted_count}, change{sim_net_change}"
+        )
 
         # Verify eviction count consistency
         assert (
@@ -677,7 +859,7 @@ def test_dynamicemb_extensions_lfu(
         total_hkv_evictions += hkv_evicted_count
         total_sim_evictions += sim_evicted_count
 
-        # Regular consistency checks (don't assert)
+        # Regular consistency checks
         if iteration % comparison_interval == 0 or iteration == num_iteration - 1:
             print(f"\n=== Status Check at iteration {iteration} ===")
 
@@ -694,8 +876,9 @@ def test_dynamicemb_extensions_lfu(
             sim_size = lfu_simulator.size()
 
             print(f"Table sizes - HKV: {hkv_size}, Simulator: {sim_size}")
+            assert hkv_size == sim_size
 
-            # Calculate size difference (don't assert)
+            # Calculate size difference
             size_diff = abs(hkv_size - sim_size)
             size_diff_ratio = (
                 size_diff / max(hkv_size, sim_size, 1)
@@ -705,13 +888,15 @@ def test_dynamicemb_extensions_lfu(
 
             print(f"Size difference: {size_diff} ({size_diff_ratio:.3%})")
 
-            # Compare frequency consistency of common keys (don't assert)
+            # Compare frequency consistency of common keys
             hkv_key_set = set(hkv_keys.tolist())
             common_keys = hkv_key_set & sim_all_keys
 
             print(
                 f"Common keys: {len(common_keys)} out of {len(hkv_key_set | sim_all_keys)} total unique keys"
             )
+
+            assert set(hkv_key_set) == set(sim_all_keys)
 
             if len(common_keys) > 0:
                 # Check frequency consistency of common keys
@@ -725,6 +910,7 @@ def test_dynamicemb_extensions_lfu(
                     sim_freq = lfu_simulator.get_key_frequency(key)
                     if sim_freq is None or hkv_freq != sim_freq:
                         frequency_mismatches += 1
+                assert frequency_mismatches == 0
 
                 frequency_consistency_rate = (
                     len(common_keys) - frequency_mismatches
@@ -746,8 +932,9 @@ def test_dynamicemb_extensions_lfu(
 
     print(f"Final HKV size: {final_hkv_size}")
     print(f"Final Simulator size: {final_sim_size}")
+    assert final_hkv_size == final_sim_size
 
-    # Calculate final size difference (only report)
+    # Calculate final size difference
     final_size_diff = abs(final_hkv_size - final_sim_size)
     final_size_diff_ratio = (
         final_size_diff / max(final_hkv_size, final_sim_size, 1)
@@ -757,11 +944,13 @@ def test_dynamicemb_extensions_lfu(
 
     print(f"Final size difference: {final_size_diff} ({final_size_diff_ratio:.3%})")
 
-    # Final frequency consistency check (only report)
+    # Final frequency consistency check
     if final_hkv_size > 0:
         final_hkv_key_set = set(final_hkv_keys.tolist())
         final_sim_all_keys = lfu_simulator.get_all_keys()
         final_common_keys = final_hkv_key_set & final_sim_all_keys
+
+        assert set(final_hkv_key_set) == set(final_sim_all_keys)
 
         print(
             f"Final common keys: {len(final_common_keys)} out of {len(final_hkv_key_set | final_sim_all_keys)} total unique keys"
@@ -779,6 +968,8 @@ def test_dynamicemb_extensions_lfu(
                 sim_freq = lfu_simulator.get_key_frequency(key)
                 if sim_freq is None or hkv_freq != sim_freq:
                     final_frequency_mismatches += 1
+
+            assert final_frequency_mismatches == 0
 
             final_frequency_consistency_rate = (
                 len(final_common_keys) - final_frequency_mismatches
