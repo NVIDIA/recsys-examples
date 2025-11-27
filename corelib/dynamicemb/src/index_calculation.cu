@@ -377,18 +377,13 @@ segmented_unique(
   h_segment_range.copy_(segment_range, /*non_blocking=*/true);
 
   int table_num = segment_range.size(0) - 1;
-  std::vector<at::Tensor> tmp_unique_indices(table_num);
-  for (int i = 0; i < table_num; ++i) {
-    tmp_unique_indices[i] = at::empty_like(keys);
-  }
-
-  // Create vector of tensors for per-table frequency output
-  std::vector<at::Tensor> tmp_accumulated_frequency_output(table_num);
+  
+  // Use single shared buffer instead of table_num separate buffers
+  at::Tensor shared_unique_buffer = at::empty(num_total, keys.options());
+  at::Tensor shared_frequency_buffer;
   if (is_lfu_enabled.value()) {
-    for (int i = 0; i < table_num; ++i) {
-      tmp_accumulated_frequency_output[i] = at::zeros_like(
-          keys, at::TensorOptions().dtype(at::kLong).device(keys.device()));
-    }
+    shared_frequency_buffer = at::zeros(
+        num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
   }
 
   at::Tensor d_unique_nums = at::empty(table_num, segment_range.options());
@@ -422,37 +417,34 @@ segmented_unique(
           inverse_idx.slice(0, indices_begin, indices_end);
       at::Tensor tmp_d_unique_num = d_unique_nums.slice(0, i, table_num);
 
-      // TODO: change tmp_unique_indices[i] to tmp_unique_indices_i to reduce
-      // gpu buffer cost at::Tensor tmp_unique_indices_i =
-      // unique_indices.slice(0, indices_begin, num_total);
-
       at::Tensor previous_d_unique_num =
           d_unique_indices_table_range.slice(0, i, table_num + 1);
 
+      at::Tensor tmp_unique_buffer_slice = 
+          shared_unique_buffer.slice(0, indices_begin, indices_end);
+
       at::Tensor tmp_frequency_counts_uint64;
-      at::Tensor tmp_frequency_output_counter;
+      at::Tensor tmp_frequency_output_slice;
       if (frequency_counts_uint64.has_value()) {
         // LFU mode: use input frequency counts
         tmp_frequency_counts_uint64 = frequency_counts_uint64.value().slice(
             0, indices_begin, indices_end);
-        // Use slice of the per-table frequency output buffer (size =
-        // indices_length)
-        tmp_frequency_output_counter =
-            tmp_accumulated_frequency_output[i].slice(0, 0, indices_length);
+        tmp_frequency_output_slice =
+            shared_frequency_buffer.slice(0, indices_begin, indices_end);
         unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
-                          tmp_unique_indices[i], tmp_d_unique_num, stream,
-                          previous_d_unique_num, tmp_frequency_output_counter,
+                          tmp_unique_buffer_slice, tmp_d_unique_num, stream,
+                          previous_d_unique_num, tmp_frequency_output_slice,
                           tmp_frequency_counts_uint64);
       } else if (is_lfu_enabled.value()) {
-        tmp_frequency_output_counter =
-            tmp_accumulated_frequency_output[i].slice(0, 0, indices_length);
+        tmp_frequency_output_slice =
+            shared_frequency_buffer.slice(0, indices_begin, indices_end);
         unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
-                          tmp_unique_indices[i], tmp_d_unique_num, stream,
-                          previous_d_unique_num, tmp_frequency_output_counter);
+                          tmp_unique_buffer_slice, tmp_d_unique_num, stream,
+                          previous_d_unique_num, tmp_frequency_output_slice);
       } else {
         // Non-LFU mode: call unique without frequency counting
         unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
-                          tmp_unique_indices[i], tmp_d_unique_num, stream,
+                          tmp_unique_buffer_slice, tmp_d_unique_num, stream,
                           previous_d_unique_num);
       }
 
@@ -485,16 +477,20 @@ segmented_unique(
         h_unique_indices_table_range[i + 1].item<int64_t>() -
         h_unique_indices_table_range[i].item<int64_t>();
     if (tmp_unique_num != 0) {
+      int64_t indices_begin = h_segment_range[i].item<int64_t>();
+      
       void *dst_ptr = reinterpret_cast<char *>(unique_keys.data_ptr()) +
                       unique_embs_offset * unique_keys.element_size();
-      void *src_ptr = tmp_unique_indices[i].data_ptr();
+      void *src_ptr = reinterpret_cast<char *>(shared_unique_buffer.data_ptr()) +
+                      indices_begin * shared_unique_buffer.element_size();
       size_t copy_size = tmp_unique_num * unique_keys.element_size();
       AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                     cudaMemcpyDeviceToDevice, stream));
       if (is_lfu_enabled.value()) {
         void *dst_ptr = reinterpret_cast<char *>(output_scores.data_ptr()) +
                         unique_embs_offset * output_scores.element_size();
-        void *src_ptr = tmp_accumulated_frequency_output[i].data_ptr();
+        void *src_ptr = reinterpret_cast<char *>(shared_frequency_buffer.data_ptr()) +
+                        indices_begin * shared_frequency_buffer.element_size();
         size_t copy_size = tmp_unique_num * output_scores.element_size();
         AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                       cudaMemcpyDeviceToDevice, stream));
