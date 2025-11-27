@@ -27,7 +27,7 @@ from configs import RetrievalConfig
 from distributed.sharding import make_optimizer_and_shard
 from model import get_retrieval_model
 from modules.metrics import RetrievalTaskMetricWithSampling
-from pipeline.train_pipeline import (
+from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,

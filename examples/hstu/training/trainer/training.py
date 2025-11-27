@@ -20,17 +20,17 @@ import commons.checkpoint as checkpoint
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from commons.checkpoint import get_unwrapped_module
+from commons.pipeline.train_pipeline import (
+    JaggedMegatronPrefetchTrainPipelineSparseDist,
+    JaggedMegatronTrainNonePipeline,
+    JaggedMegatronTrainPipelineSparseDist,
+)
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logger import print_rank_0
 from commons.utils.stringify import stringify_dict
 from megatron.core import parallel_state
 from model import RankingGR, RetrievalGR
 from modules.metrics import RetrievalTaskMetricWithSampling
-from pipeline.train_pipeline import (
-    JaggedMegatronPrefetchTrainPipelineSparseDist,
-    JaggedMegatronTrainNonePipeline,
-    JaggedMegatronTrainPipelineSparseDist,
-)
 from trainer.utils import cal_flops
 from utils import TrainerArgs
 
