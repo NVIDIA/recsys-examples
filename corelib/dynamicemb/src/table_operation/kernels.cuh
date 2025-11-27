@@ -215,6 +215,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
       table_key_slot = bucket.keys(iter);
     }
     ScorePolicy::set(return_scores, scores, i, score);
+    //TODO: unlock using index.
     table_key_slots[i] = table_key_slot;
     if (indices) {
       indices[i] = index;
