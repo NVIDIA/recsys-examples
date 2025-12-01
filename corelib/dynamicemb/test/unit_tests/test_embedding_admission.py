@@ -10,13 +10,17 @@ import click
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
 from dynamicemb.key_value_table import batched_export_keys_values
 
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
-from test_embedding_dump_load import create_model, get_optimizer_kwargs, idx_to_name
+from test_embedding_dump_load import (
+    create_model,
+    get_optimizer_kwargs,
+    get_score_strategy,
+    idx_to_name,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -105,13 +109,13 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     return kjts, table_frequency_counters
 
 
-def local_DynamicEmbDumpKeys(
+def get_table_keys(
     model: nn.Module,
     table_names: Optional[Dict[str, List[str]]] = None,
     pg: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, Set[int]]:
     """
-    Load keys from dynamic embedding tables directly (without disk I/O).
+    Get keys from dynamic embedding tables directly (without disk I/O).
 
     Returns:
         Dict[table_name, Set[key]]: Keys stored in each table
@@ -235,6 +239,12 @@ def validate_admission_keys(
     default=0.5,
     help="Cache capacity as ratio of storage capacity (only used when --caching is enabled)",
 )
+@click.option(
+    "--score-strategy",
+    type=click.Choice(["timestamp", "lfu", "step"]),
+    default="timestamp",
+    help="Score strategy",
+)
 def test_admission_strategy_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -246,6 +256,7 @@ def test_admission_strategy_validation(
     threshold: int,
     caching: bool,
     cache_capacity_ratio: float,
+    score_strategy: str,
 ):
     """Test admission strategy correctness by comparing with naive frequency counting.
 
@@ -277,6 +288,7 @@ def test_admission_strategy_validation(
     print(f"  - Iterations: {num_iterations}")
     print(f"  - Admission threshold: {threshold}")
     print(f"  - Use index dedup: {use_index_dedup}")
+    print(f"  - Score strategy: {score_strategy}")
     if caching:
         print(f"  - Caching: ENABLED ✓")
         print(f"  - Cache capacity ratio: {cache_capacity_ratio}")
@@ -295,7 +307,9 @@ def test_admission_strategy_validation(
         num_embeddings=num_embeddings,
         embedding_dim=embedding_dim,
         optimizer_kwargs=optimizer_kwargs,
-        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,  # Use timestamp for admission
+        score_strategy=get_score_strategy(
+            score_strategy
+        ),  # Use timestamp for admission
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
@@ -333,7 +347,7 @@ def test_admission_strategy_validation(
         torch.cuda.synchronize()
 
     # Extract actual keys stored in tables
-    actual_keys = local_DynamicEmbDumpKeys(model)
+    actual_keys = get_table_keys(model)
 
     torch.cuda.synchronize()
 

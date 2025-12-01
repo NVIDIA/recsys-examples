@@ -792,6 +792,31 @@ def update_cache(
         )
 
 
+def admission(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    scores: torch.Tensor,
+    freqs: torch.Tensor,
+    admit_strategy: AdmissionStrategy,
+    admission_counter: Counter,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    freq_for_missing_keys = admission_counter.add(keys, freqs, inplace=True)
+    admit_mask = admit_strategy.admit(
+        keys,
+        freq_for_missing_keys,
+    )
+
+    admitted_keys = keys[admit_mask]
+    admission_counter.erase(admitted_keys)
+
+    return (
+        keys[admit_mask],
+        values[admit_mask],
+        scores[admit_mask] if scores is not None else None,
+        admit_mask,
+    )
+
+
 class KeyValueTableFunction:
     @staticmethod
     def lookup(
@@ -830,6 +855,11 @@ class KeyValueTableFunction:
             input_scores=accumulated_frequency if is_lfu_enabled else None,
         )
 
+        # initializing_indices = missing_indices
+        # if training and adimit_strategy is not None:
+        #     initialize new non_adimitted part
+        #     initializing_indices = adimitted_indices
+        # initialize(initializing_indices)
         # 2. initialize missing embeddings
         if h_num_missing_in_storage != 0:
             initializer(
@@ -872,16 +902,19 @@ class KeyValueTableFunction:
                         device=unique_keys.device,
                     )
 
-                freq_for_missing_keys = admission_counter.add(
-                    missing_keys_in_storage, counters_for_admission, inplace=True
+                (
+                    keys_to_insert,
+                    values_to_insert,
+                    scores_to_insert,
+                    admit_mask,
+                ) = admission(
+                    missing_keys_in_storage,
+                    missing_values_in_storage,
+                    missing_scores_in_storage,
+                    counters_for_admission,
+                    admit_strategy,
+                    admission_counter,
                 )
-                admit_mask = admit_strategy.admit(
-                    freq_for_missing_keys, freq_for_missing_keys
-                )
-                keys_to_insert = missing_keys_in_storage[admit_mask]
-                admission_counter.erase(keys_to_insert)
-                values_to_insert = missing_values_in_storage[admit_mask]
-                scores_to_insert = freq_for_missing_keys  # TODO: need to check if this is correct. Counter.add return shape?
 
             storage.insert(
                 keys_to_insert,
@@ -1023,16 +1056,14 @@ class KeyValueTableCachingFunction:
                         device=unique_keys.device,
                     )
 
-                freq_for_missing_keys = admission_counter.add(
-                    missing_keys_in_storage, counters_for_admission, inplace=True
+                _, _, _, admit_mask_for_missing_keys = admission(
+                    missing_keys_in_storage,
+                    values_for_storage,
+                    scores_for_storage,
+                    counters_for_admission,
+                    admit_strategy,
+                    admission_counter,
                 )
-                admit_mask_for_missing_keys = admit_strategy.admit(
-                    freq_for_missing_keys,
-                    freq_for_missing_keys,
-                )
-
-                admitted_keys = missing_keys_in_storage[admit_mask_for_missing_keys]
-                admission_counter.erase(admitted_keys)
 
                 # build mask: including storage hit keys + keys that are both miss and admitted
                 mask_to_cache = founds
@@ -1041,17 +1072,14 @@ class KeyValueTableCachingFunction:
                 ]
                 mask_to_cache[admitted_indices] = True
 
-                if scores_for_storage is not None:
-                    updated_scores = scores_for_storage.clone()
-                    # update freq for missing keys to the corresponding positions (through missing_indices_in_storage index)
-                    updated_scores[missing_indices_in_storage] = freq_for_missing_keys
-                    scores_to_update = updated_scores[mask_to_cache]
-                else:
-                    scores_to_update = None
-
                 keys_to_update = keys_for_storage[mask_to_cache]
                 values_to_update = values_for_storage[mask_to_cache]
-
+                scores_to_update = (
+                    scores_for_storage[mask_to_cache]
+                    if scores_for_storage is not None
+                    else None
+                )
+            # TODO: need to move initializer to here.
             update_cache(
                 cache, storage, keys_to_update, values_to_update, scores_to_update
             )

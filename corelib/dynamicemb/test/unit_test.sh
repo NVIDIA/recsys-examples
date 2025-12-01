@@ -1,5 +1,6 @@
 set -e
 TEST_FILES=(
+    "test/unit_tests/test_embedding_admission.sh"
     "test/unit_tests/table_operation/test_table_operation.sh"
     "test/unit_tests/test_lfu_scores.sh"
     "test/test_batched_dynamic_embedding_tables_v2.py"
