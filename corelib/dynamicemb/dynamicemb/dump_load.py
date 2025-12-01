@@ -93,6 +93,7 @@ def DynamicEmbDump(
     model: nn.Module,
     table_names: Optional[Dict[str, List[str]]] = None,
     optim: Optional[bool] = False,
+    counter: Optional[bool] = False,
     pg: dist.ProcessGroup = dist.group.WORLD,
     allow_overwrite: bool = False,
 ) -> None:
@@ -115,6 +116,8 @@ def DynamicEmbDump(
         and the value is a list of dynamic embedding table names within that collection. Defaults to None.
     optim : Optional[bool], optional
         Whether to dump the optimizer states. Defaults to False.
+    counter : Optional[bool], optional
+        Whether to dump the embedding admission counter table. Defaults to False.
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the dump. Defaults to None.
 
@@ -175,6 +178,7 @@ def DynamicEmbDump(
             dynamic_emb_module.dump(
                 full_collection_path,
                 optim=optim,
+                counter=counter,
                 table_names=table_names_to_dump,
                 pg=pg,
             )
@@ -197,6 +201,7 @@ def DynamicEmbLoad(
     model: nn.Module,
     table_names: Optional[List[str]] = None,
     optim: bool = False,
+    counter: bool = False,
     pg: dist.ProcessGroup = dist.group.WORLD,
 ):
     """
@@ -216,6 +221,8 @@ def DynamicEmbLoad(
         and the value is a list of dynamic embedding table names within that collection. Defaults to None.
     optim : bool, optional
         Whether to load the optimizer states. Defaults to False.
+    counter : bool, optional
+        Whether to load the embedding admission counter table. Defaults to False.
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the load. Defaults to None.
 
@@ -257,6 +264,7 @@ def DynamicEmbLoad(
             dynamic_emb_module.load(
                 full_collection_path,
                 optim=optim,
+                counter=counter,
                 table_names=table_names_to_load,
                 pg=pg,
             )

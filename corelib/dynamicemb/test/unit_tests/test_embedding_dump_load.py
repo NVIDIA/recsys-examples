@@ -24,7 +24,11 @@ import click
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+from dynamicemb import (
+    DynamicEmbScoreStrategy,
+    DynamicEmbTableOptions,
+    FrequencyAdmissionStrategy,
+)
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -38,6 +42,7 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
 from dynamicemb.key_value_table import batched_export_keys_values
+from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.types import AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
@@ -348,6 +353,40 @@ def create_model(
     return model
 
 
+def check_counter_table_checkpoint(x, y):
+    device = torch.cuda.current_device()
+    tables_x = get_dynamic_emb_module(x)
+    tables_y = get_dynamic_emb_module(y)
+
+    for table_x, table_y in zip(tables_x, tables_y):
+        for cnt_tx, cnt_ty in zip(table_x, table_y):
+            assert cnt_tx.table_.size() == cnt_ty.table_.size()
+
+            for keys, named_scores in cnt_tx._batched_export_keys_scores(
+                cnt_tx.table_.score_names_, torch.device(f"cuda:{device}")
+            ):
+                if keys.numel() == 0:
+                    continue
+                freq_name = cnt_tx.table_.score_names_[0]
+                frequencies = named_scores[freq_name]
+
+                score_args_lookup = [
+                    ScoreArg(
+                        name=freq_name,
+                        value=torch.zeros_like(frequencies),
+                        policy=ScorePolicy.CONST,
+                        is_return=True,
+                    )
+                ]
+                founds = torch.empty(
+                    keys.numel(), dtype=torch.bool, device=device
+                ).fill_(False)
+
+                cnt_ty.lookup(keys, score_args_lookup, founds)
+
+                assert torch.equal(frequencies, score_args_lookup)
+
+
 @click.command()
 @click.option("--num-embedding-collections", type=int, required=True)
 @click.option("--num-embeddings", type=str, required=True)
@@ -366,6 +405,7 @@ def create_model(
     required=True,
 )
 @click.option("--optim", type=bool, required=True)
+@click.option("--counter", type=bool, required=True)
 def test_model_load_dump(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -376,6 +416,7 @@ def test_model_load_dump(
     mode: str,
     save_path: str,
     optim: bool,
+    counter: bool,
     batch_size: int = 128,
     num_iterations: int = 10,
 ):
@@ -400,6 +441,9 @@ def test_model_load_dump(
         embedding_dim=embedding_dim,
         optimizer_kwargs=optimizer_kwargs,
         score_strategy=score_strategy_,
+        admit_strategy=FrequencyAdmissionStrategy(
+            threshold=2 if counter else 1,
+        ),
     )
 
     expect_scores_collection: Dict[str, Dict[int, int]] = {}
@@ -424,7 +468,7 @@ def test_model_load_dump(
 
     if mode == "dump":
         shutil.rmtree(save_path, ignore_errors=True)
-        DynamicEmbDump(save_path, ref_model, optim=optim)
+        DynamicEmbDump(save_path, ref_model, optim=optim, counter=counter)
 
     if mode == "load":
         model = create_model(
@@ -433,16 +477,24 @@ def test_model_load_dump(
             embedding_dim=embedding_dim,
             optimizer_kwargs=optimizer_kwargs,
             score_strategy=score_strategy_,
+            admit_strategy=FrequencyAdmissionStrategy(
+                threshold=2 if counter else 1,
+            ),
         )
 
-        DynamicEmbLoad(save_path, model, optim=optim)
+        DynamicEmbLoad(save_path, model, optim=optim, counter=counter)
+
+        if counter:
+            check_counter_table_checkpoint(model, ref_model)
 
         table_name_to_key_score_dict = {}
         for _, _, sharded_module in find_sharded_modules(model):
             dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
             for dynamic_emb_module in dynamic_emb_modules:
-                for table_name, table in zip(
-                    dynamic_emb_module.table_names, dynamic_emb_module.tables
+                for table_name, table, counter_table in zip(
+                    dynamic_emb_module.table_names,
+                    dynamic_emb_module.tables,
+                    dynamic_emb_module._admission_counter,
                 ):
                     key_to_score = {}
                     for batched_key, _, _, batched_score in batched_export_keys_values(
@@ -452,6 +504,21 @@ def test_model_load_dump(
                             batched_key.tolist(), batched_score.tolist()
                         ):
                             key_to_score[key] = score
+
+                    for (
+                        keys,
+                        named_scores,
+                    ) in counter_table.table_._batched_export_keys_scores(
+                        counter_table.table_.score_names_, torch.device(f"cpu")
+                    ):
+                        if keys.numel() == 0:
+                            continue
+                        freq_name = counter_table.table_.score_names_[0]
+                        frequencies = named_scores[freq_name]
+
+                        for key, score in zip(keys.tolist(), frequencies.tolist()):
+                            key_to_score[key] = score
+
                     table_name_to_key_score_dict[table_name] = key_to_score
 
         for embedding_collection_idx, embedding_idx in product(
