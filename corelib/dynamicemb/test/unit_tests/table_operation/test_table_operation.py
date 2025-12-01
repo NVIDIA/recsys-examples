@@ -478,3 +478,116 @@ def test_table_evict(
         print(
             f"Table insert_and_evict passed when load factor:({table.load_factor():.3f}) with: insert({num_inserted}), evict({num_inserted_by_eviction}), failed({num_insert_failed})"
         )
+
+
+@pytest.mark.parametrize("key_type", [torch.int64])
+@pytest.mark.parametrize("bucket_capacity", [128, 1024])
+@pytest.mark.parametrize("min_num_buckets", [1024])
+@pytest.mark.parametrize("max_num_buckets", [16384])
+@pytest.mark.parametrize("batch_size", [65536])
+@pytest.mark.parametrize(
+    "score_policy",
+    [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE, ScorePolicy.GLOBAL_TIMER],
+)
+def test_table_reserve(
+    key_type,
+    min_num_buckets,
+    max_num_buckets,
+    bucket_capacity,
+    batch_size,
+    score_policy,
+):
+    print("--------------------------------------------------------")
+    assert torch.cuda.is_available()
+    device = torch.cuda.current_device()
+
+    table = get_scored_table(
+        capacity=min_num_buckets * bucket_capacity,
+        bucket_capacity=bucket_capacity,
+        key_type=key_type,
+        score_specs=[ScoreSpec(name="score1", policy=score_policy)],
+    )
+
+    ref_table = get_scored_table(
+        capacity=max_num_buckets * bucket_capacity,
+        bucket_capacity=bucket_capacity,
+        key_type=key_type,
+        score_specs=[ScoreSpec(name="score1", policy=score_policy)],
+    )
+
+    score_args = [ScoreArg(name="score1", is_return=False)]
+    score_args_lookup = [
+        ScoreArg(
+            name="score1",
+            policy=ScorePolicy.CONST,
+            is_return=True,
+        )
+    ]
+
+    offset = 0
+    max_load_factor = 0.5
+
+    while table.capacity() != ref_table.capacity():
+        keys = torch.randperm(batch_size, device=device, dtype=torch.int64) + offset
+        offset += batch_size
+        keys = keys.to(key_type)
+
+        score_args[0].value = get_scores(score_policy, keys)
+
+        insert_results = torch.empty(
+            batch_size, dtype=table.result_type, device=device
+        ).fill_(InsertResult.INIT.value)
+
+        indices = torch.zeros(batch_size, dtype=table.index_type, device=device)
+
+        (
+            num_evicted,
+            _,
+            _,
+            _,
+        ) = table.insert_and_evict(keys, score_args, indices, insert_results)
+
+        if num_evicted != 0:
+            raise RuntimeError(
+                f"There are {num_evicted} evictions when fill the table, and adjust the batch_size or min_num_buckets."
+            )
+
+        (
+            num_evicted,
+            _,
+            _,
+            _,
+        ) = ref_table.insert_and_evict(keys, score_args, indices, insert_results)
+        if num_evicted != 0:
+            raise RuntimeError(
+                f"There are {num_evicted} evictions when fill the reference table, and adjust max_num_buckets."
+            )
+
+        if table.load_factor() >= max_load_factor:
+            table.reserve(table.capacity() * 2)
+
+            for keys_, named_scores in table._batched_export_keys_scores(
+                ["score1"], device
+            ):
+                scores_ = named_scores["score1"].to(torch.uint64)
+                batch_ = keys_.numel()
+                if batch_ == 0:
+                    continue
+
+                score_args_lookup[0].value = torch.zeros(
+                    batch_, dtype=torch.uint64, device=device
+                )
+                founds = torch.empty(batch_, dtype=torch.bool, device=device).fill_(
+                    False
+                )
+
+                ref_table.lookup(keys_, score_args_lookup, founds)
+
+                assert founds.sum() == batch_
+
+                if table.score_specs[0].policy != ScorePolicy.GLOBAL_TIMER:
+                    assert torch.equal(scores_, score_args_lookup[0].value)
+
+            print(
+                f"Table reserve passed from capacity({table.capacity() // 2}) to capacity({table.capacity()})"
+            )

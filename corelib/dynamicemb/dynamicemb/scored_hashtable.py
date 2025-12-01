@@ -1001,7 +1001,7 @@ class LinearBucketTable(ScoredHashTable):
                 score_args.append(
                     ScoreArg(name=name, value=scores, policy=ScorePolicy.ASSIGN)
                 )
-            scores_, policies, is_returns = self._parse_scores(scores)
+            scores_, policies, is_returns = self._parse_scores(score_args)
 
             insert_results = torch.empty(
                 keys_.numel(), dtype=self.result_type, device=self.device
@@ -1020,7 +1020,7 @@ class LinearBucketTable(ScoredHashTable):
                 insert_results,
             )
 
-            evicted_cnt = (insert_results == InsertResult.EVICT).sum()
+            evicted_cnt = insert_results.eq(InsertResult.EVICT.value).sum()
             if evicted_cnt != 0:
                 warnings.warn(
                     f"There are {evicted_cnt} keys were evicted during reserve, try a larger target capacity."
