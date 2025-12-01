@@ -805,7 +805,6 @@ def admission(
         keys,
         freq_for_missing_keys,
     )
-
     admitted_keys = keys[admit_mask]
     admission_counter.erase(admitted_keys)
 
@@ -855,22 +854,17 @@ class KeyValueTableFunction:
             input_scores=accumulated_frequency if is_lfu_enabled else None,
         )
 
+        if h_num_missing_in_storage == 0:
+            return
         # initializing_indices = missing_indices
         # if training and adimit_strategy is not None:
         #     initialize new non_adimitted part
         #     initializing_indices = adimitted_indices
         # initialize(initializing_indices)
-        # 2. initialize missing embeddings
-        if h_num_missing_in_storage != 0:
-            initializer(
-                unique_embs,
-                missing_indices_in_storage,
-                unique_keys,
-            )
-        else:
-            return
+        keys_to_insert = None
+        values_to_insert = None
+        scores_to_insert = None
 
-        # 3. insert missing values into table.
         if training:
             # insert missing values
             missing_values_in_storage = torch.empty(
@@ -889,33 +883,43 @@ class KeyValueTableFunction:
             keys_to_insert = missing_keys_in_storage
             values_to_insert = missing_values_in_storage
             scores_to_insert = missing_scores_in_storage
-            # 4.Optional Admission part
-            if admit_strategy is not None:
-                if accumulated_frequency is not None:
-                    counters_for_admission = accumulated_frequency[
-                        missing_indices_in_storage
-                    ]
-                else:
-                    counters_for_admission = torch.ones(
-                        missing_keys_in_storage.shape[0],
-                        dtype=torch.int64,
-                        device=unique_keys.device,
-                    )
 
-                (
-                    keys_to_insert,
-                    values_to_insert,
-                    scores_to_insert,
-                    admit_mask,
-                ) = admission(
-                    missing_keys_in_storage,
-                    missing_values_in_storage,
-                    missing_scores_in_storage,
-                    counters_for_admission,
-                    admit_strategy,
-                    admission_counter,
+        if training and admit_strategy is not None:
+            # do admission first
+            if accumulated_frequency is not None:
+                counters_for_admission = accumulated_frequency[
+                    missing_indices_in_storage
+                ]
+            else:
+                counters_for_admission = torch.ones(
+                    missing_keys_in_storage.shape[0],
+                    dtype=torch.int64,
+                    device=unique_keys.device,
                 )
 
+            (
+                keys_to_insert,
+                values_to_insert,
+                scores_to_insert,
+                admit_mask,
+            ) = admission(
+                missing_keys_in_storage,
+                missing_values_in_storage,
+                missing_scores_in_storage,
+                counters_for_admission,
+                admit_strategy,
+                admission_counter,
+            )
+
+        # 2. initialize missing embeddings
+        initializer(
+            unique_embs,
+            missing_indices_in_storage,
+            unique_keys,
+        )
+
+        # 3. insert missing values into table.
+        if training:
             storage.insert(
                 keys_to_insert,
                 values_to_insert,
@@ -1031,6 +1035,10 @@ class KeyValueTableCachingFunction:
         # 4. copy embeddings to unique_embs
         unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
 
+        keys_to_update = None
+        values_to_update = None
+        scores_to_update = None
+
         if training:
             if emb_dim != val_dim:
                 values_for_storage[
@@ -1091,13 +1099,11 @@ class KeyValueTableCachingFunction:
                 if scores_for_storage is not None
                 else None
             )
-            update_cache(
-                cache,
-                storage,
-                found_keys_in_storage,
-                found_values_in_storage,
-                found_scores_in_storage,
-            )
+            keys_to_update = found_keys_in_storage
+            values_to_update = found_values_in_storage
+            scores_to_update = found_scores_in_storage
+
+        update_cache(cache, storage, keys_to_update, values_to_update, scores_to_update)
         return
 
     @staticmethod
