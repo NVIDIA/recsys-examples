@@ -32,6 +32,7 @@ from dynamicemb.types import (
     torch_dtype_to_np_dtype,
 )
 from dynamicemb_extensions import (
+    InsertResult,
     ScorePolicy,
     device_timestamp,
     table_erase,
@@ -519,6 +520,12 @@ class LinearBucketTable(ScoredHashTable):
                 f"Bucket capacity is rounded from {bucket_capacity} to {self.bucket_capacity_}.",
                 UserWarning,
             )
+
+        # storage
+        self.fileds_type_ = [self.key_type_, self.digest_type_] + self.score_types_
+        self.fields_byte_ = [dtype_to_bytes(x) for x in self.fileds_type_]
+
+        # variable part when reserve.
         self.num_buckets_ = (
             capacity + self.bucket_capacity_ - 1
         ) // self.bucket_capacity_
@@ -529,12 +536,8 @@ class LinearBucketTable(ScoredHashTable):
                 UserWarning,
             )
 
-        # storage
-        self.fileds_type_ = [self.key_type_, self.digest_type_] + self.score_types_
-        fields_byte = [dtype_to_bytes(x) for x in self.fileds_type_]
-
         self.storage_bytes_ = (
-            sum(fields_byte) * self.bucket_capacity_ * self.num_buckets_
+            sum(self.fields_byte_) * self.bucket_capacity_ * self.num_buckets_
         )
         self.table_storage_ = torch.empty(
             self.storage_bytes_, dtype=torch.uint8, device=self.device
@@ -546,7 +549,7 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_capacity_,
             self.num_buckets_,
         )
-        self._init_table()
+        self._init_table(self.keys_, self.scores_list, self.digests_)
 
         self.bucket_sizes = torch.zeros(
             self.num_buckets_, dtype=torch.int32, device=self.device
@@ -554,21 +557,24 @@ class LinearBucketTable(ScoredHashTable):
 
     def _init_table(
         self,
+        keys,
+        scores_list,
+        digests,
     ):
         # init keys
         empty_key = 0xFFFFFFFFFFFFFFFF
         if self.key_type_ == torch.int64:
             empty_key = uint64_to_int64(empty_key)
-        self.keys_.fill_(empty_key)
+        keys.fill_(empty_key)
 
         # init scores
         empty_score = 0
-        for scores in self.scores_list:
+        for scores in scores_list:
             scores.fill_(empty_score)
 
         # init digest
         empty_digest = (murmur3_hash_64bits(empty_key) >> 32) & 0xFF
-        self.digests_.fill_(empty_digest)
+        digests.fill_(empty_digest)
 
     @property
     def key_type(self) -> torch.dtype:
@@ -956,7 +962,79 @@ class LinearBucketTable(ScoredHashTable):
         """
         Table's growth is controlled outside.
         """
-        raise NotImplementedError
+
+        if target_capacity <= self.capacity_:
+            return
+
+        num_buckets = (
+            target_capacity + self.bucket_capacity_ - 1
+        ) // self.bucket_capacity_
+        capacity = num_buckets * self.bucket_capacity_
+        if capacity != target_capacity:
+            warnings.warn(
+                f"Table capacity is rounded from {target_capacity} to {capacity}.",
+                UserWarning,
+            )
+
+        # Apply for resources
+        storage_bytes = sum(self.fields_byte_) * self.bucket_capacity_ * num_buckets
+        table_storage = torch.empty(
+            storage_bytes, dtype=torch.uint8, device=self.device
+        )
+
+        keys, digests, scores_list = table_partition(
+            table_storage,
+            self.fileds_type_,
+            self.bucket_capacity_,
+            num_buckets,
+        )
+        self._init_table(keys, scores_list, digests)
+
+        bucket_sizes = torch.zeros(num_buckets, dtype=torch.int32, device=self.device)
+
+        # move existed data to new table
+        for keys_, named_scores in self._batched_export_keys_scores(
+            self.score_names_, self.device
+        ):
+            score_args = []
+            for name, scores in named_scores.items():
+                score_args.append(
+                    ScoreArg(name=name, value=scores, policy=ScorePolicy.ASSIGN)
+                )
+            scores_, policies, is_returns = self._parse_scores(scores)
+
+            insert_results = torch.empty(
+                keys_.numel(), dtype=self.result_type, device=self.device
+            )
+
+            table_insert(
+                table_storage,
+                self.fileds_type_,
+                self.bucket_capacity_,
+                bucket_sizes,
+                keys_,
+                scores_,
+                policies,
+                is_returns,
+                None,
+                insert_results,
+            )
+
+            evicted_cnt = (insert_results == InsertResult.EVICT).sum()
+            if evicted_cnt != 0:
+                warnings.warn(
+                    f"There are {evicted_cnt} keys were evicted during reserve, try a larger target capacity."
+                )
+
+        # replace and release resources
+        self.table_storage_ = table_storage
+        self.keys_ = keys
+        self.scores_list = scores_list
+        self.digests_ = digests
+        self.bucket_sizes = bucket_sizes
+        self.num_buckets_ = num_buckets
+        self.capacity_ = capacity
+        self.storage_bytes_ = storage_bytes
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         """
