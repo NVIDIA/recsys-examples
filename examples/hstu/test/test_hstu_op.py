@@ -19,6 +19,7 @@ import commons.utils.initialize as init
 import fbgemm_gpu  # pylint: disable-unused-import
 import pytest
 import torch
+from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.utils.hstu_assert_close import assert_hstu_close
 from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
@@ -27,7 +28,6 @@ from modules.debug.debug_hstu_layer import HSTULayer
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from ops.fused_hstu_op import fused_hstu_op
-from ops.length_to_offsets import length_to_complete_offsets
 
 
 def generate_or_copy_parameters(

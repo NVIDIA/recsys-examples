@@ -79,5 +79,5 @@ RUN cd /workspace/recsys-examples/corelib/hstu && \
     cd hopper && \
     HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=FALSE HSTU_DISABLE_DRAB=TRUE pip install .
 
-RUN cd /workspace/recsys-examples/examples/hstu && \
+RUN cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 9.0" python3 setup.py install

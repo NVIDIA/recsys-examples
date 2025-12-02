@@ -14,6 +14,7 @@
 # limitations under the License.
 import copy
 import os
+from dataclasses import dataclass
 
 # pyre-strict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -23,7 +24,6 @@ import torch
 import torch.fx
 import torch.nn as nn
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
-from configs.task_config import ShardedEmbeddingConfig
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
@@ -50,6 +50,40 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+
+
+@dataclass
+class ShardedEmbeddingConfig:
+    """
+    Configuration for sharded embeddings with sharding type. Inherits from BaseShardedEmbeddingConfig.
+
+    Args:
+        config (EmbeddingConfig): The embedding configuration.
+        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
+    """
+
+    """
+    Base configuration for sharded embeddings.
+
+    Args:
+        feature_names (List[str]): The name of the features in this embedding.
+        table_name (str): The name of the table.
+        vocab_size (int): The size of the vocabulary.
+        dim (int): The dimension size of the embeddings.
+        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
+    """
+
+    feature_names: List[str]
+    table_name: str
+    vocab_size: int
+    dim: int
+    sharding_type: str
+
+    def __post_init__(self):
+        assert self.sharding_type in [
+            "data_parallel",
+            "model_parallel",
+        ], "sharding type should be data_parallel or model_parallel"
 
 
 def create_data_parallel_sharding_infos_by_sharding(
@@ -381,7 +415,7 @@ class ShardedEmbedding(torch.nn.Module):
         Example:
             >>> # assume we have 2 ranks
             >>> import torch
-            >>> from modules.embedding import ShardedEmbedding
+            >>> from commons.modules.embedding import ShardedEmbedding
             >>> from configs.task_config import ShardedEmbeddingConfig
             >>> from commons.utils.initialize as init
             >>> from commons.utils.logger import print_rank_0

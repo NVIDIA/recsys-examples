@@ -3,7 +3,7 @@ from typing import List, Tuple
 import pytest
 import torch
 import torch.distributed as dist
-from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 backend = "nccl"

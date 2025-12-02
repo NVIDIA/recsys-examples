@@ -15,12 +15,12 @@
 from typing import Any, Dict, Tuple
 
 import torch
+from commons.modules.embedding import ShardedEmbedding
 from configs import HSTUConfig, RankingConfig
 from dataset.utils import RankingBatch
 from distributed.dmp_to_tp import dmp_batch_to_tp, jt_dict_grad_scaling_and_allgather
 from megatron.core import parallel_state
 from model.base_model import BaseModel
-from modules.embedding import ShardedEmbedding
 from modules.hstu_block import HSTUBlock
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP

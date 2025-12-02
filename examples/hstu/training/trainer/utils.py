@@ -19,6 +19,7 @@ import configs
 import dataset
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
+from commons.modules.embedding import ShardedEmbeddingConfig
 from configs import (
     HSTUConfig,
     HSTULayerType,
@@ -29,7 +30,6 @@ from configs import (
     get_hstu_config,
 )
 from dynamicemb import DynamicEmbTableOptions
-from modules.embedding import ShardedEmbeddingConfig
 from utils import (
     BenchmarkDatasetArgs,
     DatasetArgs,

@@ -2,7 +2,7 @@ from typing import List
 
 import hstu_cuda_ops
 import torch
-from ops.length_to_offsets import length_to_complete_offsets
+from commons.ops.length_to_offsets import length_to_complete_offsets
 
 
 class _JaggedTensorOpFunction(torch.autograd.Function):

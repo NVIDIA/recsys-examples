@@ -18,6 +18,7 @@ import commons.utils.initialize as init
 import fbgemm_gpu  # pylint: disable-unused-import
 import pytest
 import torch
+from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.utils.hstu_assert_close import assert_hstu_close
 from configs import get_hstu_config
 from configs.hstu_config import HSTULayerType, KernelBackend
@@ -25,7 +26,6 @@ from megatron.core.transformer.module import Float16Module
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
-from ops.length_to_offsets import length_to_complete_offsets
 from test_utils import init_fused_weights_from_debug
 
 
