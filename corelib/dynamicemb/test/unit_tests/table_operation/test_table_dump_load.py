@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import random
 import shutil
 
 import pytest
@@ -21,6 +22,7 @@ import torch
 import torch.distributed as dist
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
+from ordered_set import OrderedSet
 
 score_step = 0
 
@@ -53,6 +55,110 @@ def backend_session():
 
     dist.barrier()
     dist.destroy_process_group()
+
+
+def generate_files_for_accumulate(
+    batch_size: int,
+    # rank: int,
+    # world_size: int,
+    seed: int = 42,
+):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    total_keys = OrderedSet()
+    # select_keys = OrderedSet()
+    while len(total_keys) < batch_size:
+        x = random.randint(0, (1 << 63) - 1)
+        total_keys.add(x)
+
+        # if x % world_size == rank:
+        #     select_keys.add(x)
+
+    keys = torch.tensor(list(total_keys), dtype=torch.int64).cuda()
+    scores = torch.ones_like(keys)
+    return keys, scores
+
+
+@pytest.mark.parametrize("key_type", [torch.int64])
+@pytest.mark.parametrize("bucket_capacity", [128, 1024])
+@pytest.mark.parametrize("num_buckets", [8192])
+@pytest.mark.parametrize("batch_size", [128 * 4096])
+@pytest.mark.parametrize(
+    "score_policy",
+    [ScorePolicy.ACCUMULATE],
+)
+def test_table_load(
+    key_type,
+    bucket_capacity,
+    num_buckets,
+    batch_size,
+    score_policy,
+    backend_session,
+):
+    print("--------------------------------------------------------")
+    assert torch.cuda.is_available()
+    device = torch.cuda.current_device()
+    rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    device = torch.cuda.current_device()
+
+    table = get_scored_table(
+        capacity=num_buckets * bucket_capacity,
+        bucket_capacity=bucket_capacity,
+        key_type=key_type,
+        score_specs=[ScoreSpec(name="score1", policy=score_policy)],
+    )
+
+    score_args_lookup = [
+        ScoreArg(
+            name="score1",
+            policy=ScorePolicy.CONST,
+            is_return=True,
+        )
+    ]
+
+    key_file = "debug_keys"
+    score_file = "debug_scores"
+    keys, scores = generate_files_for_accumulate(batch_size)
+
+    if rank == 0:
+        fkey = open(key_file, "wb")
+        fscore = open(score_file, "wb")
+        fkey.write(keys.cpu().numpy().tobytes())
+        fscore.write(scores.cpu().numpy().tobytes())
+        fkey.close()
+        fscore.close()
+
+    dist.barrier()
+
+    table.load(key_file, {"score1": score_file})
+
+    masks = keys % world_size == rank
+    selected_keys = keys[masks]
+
+    assert table.size() == selected_keys.numel()
+
+    founds = torch.empty(selected_keys.numel(), dtype=torch.bool, device=device).fill_(
+        False
+    )
+    score_args_lookup[0].value = torch.zeros(
+        selected_keys.numel(), dtype=torch.uint64, device=device
+    )
+
+    table.lookup(selected_keys, score_args_lookup, founds)
+
+    assert founds.sum() == selected_keys.numel()
+    assert torch.equal(
+        score_args_lookup[0].value, torch.ones_like(selected_keys).to(torch.uint64)
+    )
+
+    print(
+        f"Table load passed when world size={world_size} and bucket capacity={bucket_capacity})"
+    )
 
 
 @pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
