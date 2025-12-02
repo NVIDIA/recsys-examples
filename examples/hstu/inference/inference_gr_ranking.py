@@ -35,6 +35,9 @@ from modules.metrics import get_multi_event_metric_module
 from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
+from dynamicemb.inference import apply_dynamicemb_inference
+from dynamicemb.utils import EmbeddingBackend
+from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
@@ -186,9 +189,17 @@ def get_inference_hstu_model(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config,
         task_config=task_config,
-        use_cudagraph=True,
+        use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
     )
+    dynamicemb_options_dict = {}
+    for emb_config in emb_configs:
+        if emb_config.use_dynamicemb:
+            dynamicemb_options_dict[emb_config.table_name] = DynamicEmbTableOptions(
+                global_hbm_for_values=1024 * 1024,  # 1M HBM (maybe cached)
+                caching=False,
+            )
+    model = apply_dynamicemb_inference(model, dynamicemb_options_dict=dynamicemb_options_dict, backend=EmbeddingBackend.NVEMB)
     if hstu_config.bf16:
         model.bfloat16()
     elif hstu_config.fp16:
