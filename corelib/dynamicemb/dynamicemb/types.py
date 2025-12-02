@@ -15,10 +15,13 @@
 
 import abc
 import enum
-from typing import Generic, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Generic, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from dynamicemb.dynamicemb_config import DynamicEmbInitializerArgs
 
 
 @enum.unique
@@ -309,4 +312,10 @@ class AdmissionStrategy(abc.ABC):
     ) -> torch.Tensor:
         """
         Admit keys with scores >= threshold.
+        """
+
+    @abc.abstractmethod
+    def get_initializer_args(self) -> Optional["DynamicEmbInitializerArgs"]:
+        """
+        Get the initializer args for keys that are not admitted.
         """

@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+from dynamicemb.dynamicemb_config import DynamicEmbInitializerArgs
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
 from dynamicemb.key_value_table import batched_export_keys_values
 
@@ -298,6 +299,9 @@ def test_admission_strategy_validation(
     # Create admission strategy
     admission_strategy = FrequencyAdmissionStrategy(
         threshold=threshold,
+        initializer_args=DynamicEmbInitializerArgs(
+            value=0.0,
+        ),
     )
 
     # Create model with admission strategy

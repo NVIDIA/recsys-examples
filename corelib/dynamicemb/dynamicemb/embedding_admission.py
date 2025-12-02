@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from dynamicemb.scored_hashtable import (
@@ -24,6 +24,9 @@ from dynamicemb.scored_hashtable import (
     get_scored_table,
 )
 from dynamicemb.types import AdmissionStrategy, Counter, MemoryType
+
+if TYPE_CHECKING:
+    from dynamicemb.dynamicemb_config import DynamicEmbInitializerArgs
 
 
 class KVCounter(Counter):
@@ -124,11 +127,13 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
     def __init__(
         self,
         threshold: int,
+        initializer_args: Optional["DynamicEmbInitializerArgs"] = None,
     ):
         if threshold < 0:
             raise ValueError(f"Threshold must be non-negative, got {threshold}")
 
         self.threshold = threshold
+        self.initializer_args = initializer_args
 
     def admit(
         self,
@@ -158,3 +163,6 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         # Admit keys whose frequency meets or exceeds threshold
         admit_mask = scores >= self.threshold
         return admit_mask
+
+    def get_initializer_args(self) -> Optional["DynamicEmbInitializerArgs"]:
+        return self.initializer_args
