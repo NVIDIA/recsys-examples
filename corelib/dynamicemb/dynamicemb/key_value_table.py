@@ -794,12 +794,10 @@ def update_cache(
 
 def admission(
     keys: torch.Tensor,
-    values: torch.Tensor,
-    scores: torch.Tensor,
     freqs: torch.Tensor,
     admit_strategy: AdmissionStrategy,
     admission_counter: Counter,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     freq_for_missing_keys = admission_counter.add(keys, freqs, inplace=True)
     admit_mask = admit_strategy.admit(
         keys,
@@ -808,12 +806,7 @@ def admission(
     admitted_keys = keys[admit_mask]
     admission_counter.erase(admitted_keys)
 
-    return (
-        keys[admit_mask],
-        values[admit_mask],
-        scores[admit_mask] if scores is not None else None,
-        admit_mask,
-    )
+    return admit_mask
 
 
 class KeyValueTableFunction:
@@ -856,15 +849,41 @@ class KeyValueTableFunction:
 
         if h_num_missing_in_storage == 0:
             return
+
+        # if training and admit_strategy is not None:
+
+        admit_mask = None
+        if training and admit_strategy is not None:
+            # do admission first
+            if accumulated_frequency is not None:
+                counters_for_admission = accumulated_frequency[
+                    missing_indices_in_storage
+                ]
+            else:
+                counters_for_admission = torch.ones(
+                    missing_keys_in_storage.shape[0],
+                    dtype=torch.int64,
+                    device=unique_keys.device,
+                )
+
+            admit_mask = admission(
+                missing_keys_in_storage,
+                counters_for_admission,
+                admit_strategy,
+                admission_counter,
+            )
+
+        # 2. initialize missing embeddings
+        initializer(
+            unique_embs,
+            missing_indices_in_storage,
+            unique_keys,
+        )
         # initializing_indices = missing_indices
         # if training and adimit_strategy is not None:
         #     initialize new non_adimitted part
         #     initializing_indices = adimitted_indices
         # initialize(initializing_indices)
-        keys_to_insert = None
-        values_to_insert = None
-        scores_to_insert = None
-
         if training:
             # insert missing values
             missing_values_in_storage = torch.empty(
@@ -883,43 +902,16 @@ class KeyValueTableFunction:
             keys_to_insert = missing_keys_in_storage
             values_to_insert = missing_values_in_storage
             scores_to_insert = missing_scores_in_storage
-
-        if training and admit_strategy is not None:
-            # do admission first
-            if accumulated_frequency is not None:
-                counters_for_admission = accumulated_frequency[
-                    missing_indices_in_storage
-                ]
-            else:
-                counters_for_admission = torch.ones(
-                    missing_keys_in_storage.shape[0],
-                    dtype=torch.int64,
-                    device=unique_keys.device,
+            if training and admit_strategy is not None:
+                keys_to_insert = keys_to_insert[admit_mask]
+                values_to_insert = values_to_insert[admit_mask]
+                scores_to_insert = (
+                    scores_to_insert[admit_mask]
+                    if scores_to_insert is not None
+                    else None
                 )
 
-            (
-                keys_to_insert,
-                values_to_insert,
-                scores_to_insert,
-                admit_mask,
-            ) = admission(
-                missing_keys_in_storage,
-                missing_values_in_storage,
-                missing_scores_in_storage,
-                counters_for_admission,
-                admit_strategy,
-                admission_counter,
-            )
-
-        # 2. initialize missing embeddings
-        initializer(
-            unique_embs,
-            missing_indices_in_storage,
-            unique_keys,
-        )
-
-        # 3. insert missing values into table.
-        if training:
+            # 3. insert missing values into table.
             storage.insert(
                 keys_to_insert,
                 values_to_insert,
@@ -1024,13 +1016,36 @@ class KeyValueTableCachingFunction:
             input_scores=scores_for_storage,
         )
 
-        # 3. initialize missing embeddings
-        if h_num_missing_in_storage != 0:
-            initializer(
-                values_for_storage[:, :emb_dim],
-                missing_indices_in_storage,
-                keys_for_storage,
+        if h_num_missing_in_storage == 0:
+            return
+
+        admit_mask_for_missing_keys = None
+        if training and admit_strategy is not None:
+            # Get frequency counters for admission:
+            if accumulated_frequency is not None:
+                # missing_indices_in_storage is index in keys_for_storage, Need to convert to index in unique_keys via missing_indices
+                indices_in_unique_keys = missing_indices[missing_indices_in_storage]
+                counters_for_admission = accumulated_frequency[indices_in_unique_keys]
+            else:
+                counters_for_admission = torch.ones(
+                    missing_keys_in_storage.shape[0],
+                    dtype=torch.int64,
+                    device=unique_keys.device,
+                )
+
+            admit_mask_for_missing_keys = admission(
+                missing_keys_in_storage,
+                counters_for_admission,
+                admit_strategy,
+                admission_counter,
             )
+
+        # 3. initialize missing embeddings
+        initializer(
+            values_for_storage[:, :emb_dim],
+            missing_indices_in_storage,
+            keys_for_storage,
+        )
 
         # 4. copy embeddings to unique_embs
         unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
@@ -1050,29 +1065,6 @@ class KeyValueTableCachingFunction:
             scores_to_update = scores_for_storage
 
             if admit_strategy is not None:
-                # Get frequency counters for admission:
-                if accumulated_frequency is not None:
-                    # missing_indices_in_storage is index in keys_for_storage, Need to convert to index in unique_keys via missing_indices
-                    indices_in_unique_keys = missing_indices[missing_indices_in_storage]
-                    counters_for_admission = accumulated_frequency[
-                        indices_in_unique_keys
-                    ]
-                else:
-                    counters_for_admission = torch.ones(
-                        missing_keys_in_storage.shape[0],
-                        dtype=torch.int64,
-                        device=unique_keys.device,
-                    )
-
-                _, _, _, admit_mask_for_missing_keys = admission(
-                    missing_keys_in_storage,
-                    values_for_storage,
-                    scores_for_storage,
-                    counters_for_admission,
-                    admit_strategy,
-                    admission_counter,
-                )
-
                 # build mask: including storage hit keys + keys that are both miss and admitted
                 mask_to_cache = founds
                 admitted_indices = missing_indices_in_storage[
@@ -1087,10 +1079,6 @@ class KeyValueTableCachingFunction:
                     if scores_for_storage is not None
                     else None
                 )
-            # TODO: need to move initializer to here.
-            update_cache(
-                cache, storage, keys_to_update, values_to_update, scores_to_update
-            )
         else:  # only update those found in the storage to cache.
             found_keys_in_storage = keys_for_storage[founds].contiguous()
             found_values_in_storage = values_for_storage[founds, :].contiguous()
