@@ -28,6 +28,22 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
     EmbeddingBagCollection,
     EmbeddingCollection,
 }
+from enum import Enum, unique
+
+@unique
+class EmbeddingBackend(Enum):
+    """
+    Enum class representing different embedding backends (for inference).
+
+    Attributes:
+      TORCHREC: Represents the TorchRec backend.
+      DYNAMICEMB: Represents the DynamicEmb backend.
+      NVEMB: Represents the NV-Embeddings backend.
+    """
+
+    TORCHREC = "TorchRec"
+    DYNAMICEMB = "DynamicEmb"
+    NVEMB = "NVEmb"
 
 
 def tabulate(

@@ -21,22 +21,6 @@ import torch
 from .hstu_config import HSTUPreprocessingConfig, PositionEncodingConfig
 
 
-@unique
-class EmbeddingBackend(Enum):
-    """
-    Enum class representing different embedding backends (for inference).
-
-    Attributes:
-      TORCHREC: Represents the TorchRec backend.
-      DYNAMICEMB: Represents the DynamicEmb backend.
-      NVEMB: Represents the NV-Embeddings backend.
-    """
-
-    TORCHREC = "TorchRec"
-    DYNAMICEMB = "DynamicEmb"
-    NVEMB = "NVEmb"
-
-
 @dataclass
 class InferenceEmbeddingConfig:
     """

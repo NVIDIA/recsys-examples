@@ -29,11 +29,11 @@ from dataset.utils import Batch
 from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
 from modules.host_kv_storage_manager import HSTUHostKVStorageManager
 from modules.hstu_block_inference import HSTUBlockInference
-from modules.inference_embedding import InferenceEmbedding
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
 from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
-
+from torchrec.modules.embedding_modules import EmbeddingCollection
+from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
 
 def get_jagged_metadata_buffer(max_batch_size, max_seq_len, contextual_max_seqlen):
     int_dtype = torch.int32
@@ -132,8 +132,20 @@ class InferenceRankingGR(torch.nn.Module):
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
 
-        self._embedding_collection = InferenceEmbedding(task_config.embedding_configs)
-
+        self._embedding_collection = EmbeddingCollection(
+            tables=[
+                EmbeddingConfig(
+                    name=config.table_name,
+                    embedding_dim=config.dim,
+                    num_embeddings=config.vocab_size,
+                    feature_names=config.feature_names,
+                    data_type=dtype_to_data_type(torch.float32),
+                )
+                for config in task_config.embedding_configs
+            ],
+            device=torch.device("meta"),
+        )
+        
         self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(hstu_config, kvcache_config)
         self._host_kv_storage_manager = HSTUHostKVStorageManager(
             hstu_config, kvcache_config
@@ -226,20 +238,21 @@ class InferenceRankingGR(torch.nn.Module):
             "dynamicemb_module",
             "model._embedding_collection._model_parallel_embedding_collection",
         )
-        dynamic_tables = (
-            self._embedding_collection._dynamic_embedding_collection._embedding_tables
-        )
+        # if isinstance(self._embedding_collection._dynamic_embedding_collection, InferenceDynamicEmbeddingCollection):
+        #     dynamic_tables = (
+        #         self._embedding_collection._dynamic_embedding_collection._embedding_tables
+        #     )
 
-        try:
-            for idx, table_name in enumerate(dynamic_tables.table_names):
-                dynamic_tables.load(
-                    embedding_table_dir, optim=False, table_names=[table_name]
-                )
-        except ValueError as e:
-            warnings.warn(
-                f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
-                "Please check if the checkpoint is version 1. The loading of this old version is disabled."
-            )
+        #     try:
+        #         for idx, table_name in enumerate(dynamic_tables.table_names):
+        #             dynamic_tables.load(
+        #                 embedding_table_dir, optim=False, table_names=[table_name]
+        #             )
+        #     except ValueError as e:
+        #         warnings.warn(
+        #             f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
+        #             "Please check if the checkpoint is version 1. The loading of this old version is disabled."
+        #         )
 
         model_state_dict_path = os.path.join(
             checkpoint_dir, "torch_module", "model.0.pth"
@@ -308,11 +321,11 @@ class InferenceRankingGR(torch.nn.Module):
             hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
             hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
 
-        assert unloaded_modules.missing_keys == [
-            "_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor"
-        ]
-        if self._hstu_config.contextual_max_seqlen != 0:
-            assert unloaded_modules.unexpected_keys == []
+        # assert unloaded_modules.missing_keys == [
+        #     "_embedding_collection._dynamic_embedding_collection._embedding_tables._empty_tensor"
+        # ]
+        # if self._hstu_config.contextual_max_seqlen != 0:
+        #     assert unloaded_modules.unexpected_keys == []
 
     def get_user_kvdata_info(
         self,

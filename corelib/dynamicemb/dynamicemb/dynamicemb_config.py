@@ -213,6 +213,12 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     LFU = 3
 
 
+@enum.unique
+class FeatureProcessingMode(enum.Enum):
+    Dense = "dense"
+    Sparse = "sparse"
+
+
 # TODO: jiashuy, reorganize it
 @dataclass
 class _ContextOptions:
@@ -358,7 +364,8 @@ class DynamicEmbTableOptions(_ContextOptions):
         If not provided, will using KeyValueTable as the Storage.
     index_type : Optional[torch.dtype], optional
         Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
-
+    feature_processing_mode: FeatureProcessingMode
+        The mode of input features processing, default to FeatureProcessingMode.Sparse. If set to FeatureProcessingMode.Dense, the input features should be processed as dense features(ranging from 0 to num_embeddings). If set to FeatureProcessingMode.Sparse, the input features does not require additional processing and will be hashed in embedding.
     Notes
     -----
     For detailed descriptions and additional context on each parameter, please refer to the documentation at
@@ -386,6 +393,8 @@ class DynamicEmbTableOptions(_ContextOptions):
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
+
+    feature_processing_mode: FeatureProcessingMode = FeatureProcessingMode.Sparse
 
     def __post_init__(self):
         assert (
