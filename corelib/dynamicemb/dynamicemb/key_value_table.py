@@ -21,12 +21,21 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import (
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
     create_dynamicemb_table,
     dyn_emb_to_torch,
     torch_to_dyn_emb,
 )
-from dynamicemb.initializer import BaseDynamicEmbInitializer
+from dynamicemb.initializer import (
+    BaseDynamicEmbInitializer,
+    ConstantInitializer,
+    DebugInitializer,
+    NormalInitializer,
+    TruncatedNormalInitializer,
+    UniformInitializer,
+)
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.types import (
     EMBEDDING_TYPE,
@@ -809,6 +818,24 @@ def admission(
     return admit_mask
 
 
+def _create_initializer_from_args(
+    initializer_args: DynamicEmbInitializerArgs,
+) -> BaseDynamicEmbInitializer:
+    mode = initializer_args.mode
+    if mode == DynamicEmbInitializerMode.NORMAL:
+        return NormalInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
+        return TruncatedNormalInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.UNIFORM:
+        return UniformInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.CONSTANT:
+        return ConstantInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.DEBUG:
+        return DebugInitializer(initializer_args)
+    else:
+        raise ValueError(f"Not supported initializer type: {mode}")
+
+
 class KeyValueTableFunction:
     @staticmethod
     def lookup(
@@ -853,6 +880,7 @@ class KeyValueTableFunction:
         # if training and admit_strategy is not None:
 
         admit_mask = None
+        indices_to_init = missing_indices_in_storage
         if training and admit_strategy is not None:
             # do admission first
             if accumulated_frequency is not None:
@@ -873,12 +901,31 @@ class KeyValueTableFunction:
                 admission_counter,
             )
 
-        # 2. initialize missing embeddings
-        initializer(
-            unique_embs,
-            missing_indices_in_storage,
-            unique_keys,
-        )
+            # Initialize non-admitted embeddings with special initializer (if provided)
+            non_admit_initializer_args = admit_strategy.get_initializer_args()
+            if non_admit_initializer_args is not None:
+                non_admitted_mask = ~admit_mask
+                non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
+                if non_admitted_indices.numel() > 0:
+                    non_admit_initializer = _create_initializer_from_args(
+                        non_admit_initializer_args
+                    )
+                    non_admit_initializer(
+                        unique_embs,
+                        non_admitted_indices,
+                        unique_keys,
+                    )
+
+            # Only initialize admitted embeddings with the regular initializer
+            indices_to_init = missing_indices_in_storage[admit_mask]
+
+        # 2. initialize missing embeddings (admitted or all if no admission)
+        if indices_to_init.numel() > 0:
+            initializer(
+                unique_embs,
+                indices_to_init,
+                unique_keys,
+            )
         # initializing_indices = missing_indices
         # if training and adimit_strategy is not None:
         #     initialize new non_adimitted part
@@ -1020,6 +1067,7 @@ class KeyValueTableCachingFunction:
             return
 
         admit_mask_for_missing_keys = None
+        indices_to_init = missing_indices_in_storage
         if training and admit_strategy is not None:
             # Get frequency counters for admission:
             if accumulated_frequency is not None:
@@ -1040,12 +1088,31 @@ class KeyValueTableCachingFunction:
                 admission_counter,
             )
 
-        # 3. initialize missing embeddings
-        initializer(
-            values_for_storage[:, :emb_dim],
-            missing_indices_in_storage,
-            keys_for_storage,
-        )
+            # Initialize non-admitted embeddings with special initializer (if provided)
+            non_admit_initializer_args = admit_strategy.get_initializer_args()
+            if non_admit_initializer_args is not None:
+                non_admitted_mask = ~admit_mask_for_missing_keys
+                non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
+                if non_admitted_indices.numel() > 0:
+                    non_admit_initializer = _create_initializer_from_args(
+                        non_admit_initializer_args
+                    )
+                    non_admit_initializer(
+                        values_for_storage[:, :emb_dim],
+                        non_admitted_indices,
+                        keys_for_storage,
+                    )
+
+            # Only initialize admitted embeddings with the regular initializer
+            indices_to_init = missing_indices_in_storage[admit_mask_for_missing_keys]
+
+        # 3. initialize missing embeddings (admitted or all if no admission)
+        if indices_to_init.numel() > 0:
+            initializer(
+                values_for_storage[:, :emb_dim],
+                indices_to_init,
+                keys_for_storage,
+            )
 
         # 4. copy embeddings to unique_embs
         unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
