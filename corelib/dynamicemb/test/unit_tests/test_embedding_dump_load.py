@@ -78,6 +78,23 @@ def get_score_strategy(score_strategy_str: str) -> DynamicEmbScoreStrategy:
         raise ValueError(f"Invalid score strategy: {score_strategy_str}")
 
 
+def update_scores(
+    score_strategy: str,
+    expect_scores: Dict[int, int],
+    key: int,
+    step: int,
+):
+    if score_strategy == "step":
+        expect_scores[key] = step
+    elif score_strategy == "lfu":
+        if key not in expect_scores:
+            expect_scores[key] = 1
+        else:
+            expect_scores[key] = expect_scores[key] + 1
+    else:
+        return
+
+
 def generate_sparse_feature(
     num_embedding_collections: int,
     num_embeddings: List[int],
@@ -86,6 +103,8 @@ def generate_sparse_feature(
     world_size: int,
     batch_size: int,
     num_iterations: int,
+    score_strategy: str,
+    scores_collection: Dict[str, Dict[int, int]],
     seed: int = 42,
 ):
     random.seed(seed)
@@ -96,13 +115,22 @@ def generate_sparse_feature(
     batch_size_per_rank = batch_size // world_size
     kjts = []
     all_kjts = []
+    for embedding_collection_id in range(num_embedding_collections):
+        for embedding_id, _ in enumerate(num_embeddings):
+            _, table_name = idx_to_name(embedding_collection_id, embedding_id)
+            scores_collection[table_name] = {}
+    step = 0
     for _ in range(num_iterations):
+        step += 1
         cur_indices, cur_lengths = [], []
         all_indices, all_lengths = [], []
         keys = []
         for embedding_collection_id in range(num_embedding_collections):
             for embedding_id, num_embedding in enumerate(num_embeddings):
-                feature_name, _ = idx_to_name(embedding_collection_id, embedding_id)
+                feature_name, table_name = idx_to_name(
+                    embedding_collection_id, embedding_id
+                )
+                expected_scores: Dict[int, int] = scores_collection[table_name]
                 for sample_id in range(batch_size):
                     hotness = random.randint(
                         0, multi_hot_sizes[embedding_collection_id]
@@ -113,6 +141,8 @@ def generate_sparse_feature(
                     if sample_id // batch_size_per_rank == rank:
                         cur_indices.extend(indices)
                         cur_lengths.append(hotness)
+                    for index in indices:
+                        update_scores(score_strategy, expected_scores, index, step)
                 keys.append(feature_name)
         kjts.append(
             KeyedJaggedTensor.from_lengths_sync(
@@ -338,6 +368,9 @@ def test_model_load_dump(
     batch_size: int = 128,
     num_iterations: int = 10,
 ):
+    rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
 
@@ -358,6 +391,7 @@ def test_model_load_dump(
         score_strategy=score_strategy_,
     )
 
+    expect_scores_collection: Dict[str, Dict[int, int]] = {}
     kjts, feature_names, all_kjts = generate_sparse_feature(
         num_embedding_collections=num_embedding_collections,
         num_embeddings=num_embeddings,
@@ -366,6 +400,8 @@ def test_model_load_dump(
         world_size=dist.get_world_size(),
         batch_size=batch_size,
         num_iterations=num_iterations,
+        score_strategy=score_strategy,
+        scores_collection=expect_scores_collection,
     )
 
     for kjt in kjts:
@@ -414,24 +450,48 @@ def test_model_load_dump(
                 embedding_collection_idx, embedding_idx
             )
             key_to_score_dict = table_name_to_key_score_dict[table_name].copy()
+            expect_scores = expect_scores_collection[table_name]
 
+            if score_strategy == "step" or score_strategy == "lfu":
+                for kjt in reversed(all_kjts):
+                    keys = kjt[feature_name].values().tolist()
+                    for key in keys:
+                        if key % world_size == rank:
+                            assert (
+                                key in key_to_score_dict
+                            ), f"Key {key} must exist in table of rank {rank}."
+                            assert (
+                                key_to_score_dict[key] == expect_scores[key]
+                            ), f"Expect {key_to_score_dict[key]} = {expect_scores[key]}"
             # The idea is that the score of a newer key is greater than that of an older key. Therefore, I iterate through the input in reverse order and track the minimum score encountered. For each batch, the score should be lower than the minimum score from the previous batch. To avoid issues caused by duplicate keys, every time I access a key, I set its score to -inf. This ensures that if that key appears again, its score will be sufficiently small to remain below the minimum score.
-            min_score = float("inf")
-            for kjt in reversed(all_kjts):
-                keys = kjt[feature_name].values().tolist()
-                for key in keys:
-                    if key not in key_to_score_dict and dist.get_world_size() > 1:
-                        continue
-                    score = key_to_score_dict[key]
-                    assert (
-                        score <= min_score
-                    ), f"key {key} score {score} should be <= min_score {min_score}"
+            elif score_strategy == "timestamp":
+                visited_keys = set({})
+                min_score = float("inf")
+                lasted_min_score = float("inf")
+                for kjt in reversed(all_kjts):
+                    keys = kjt[feature_name].values().tolist()
+                    for key in keys:
+                        if key % world_size == rank:
+                            assert (
+                                key in key_to_score_dict
+                            ), f"Key {key} must exist in table of rank {rank}."
+                        else:
+                            continue
 
-                for key in set(keys):
-                    if key not in key_to_score_dict and dist.get_world_size() > 1:
-                        continue
-                    min_score = min(min_score, key_to_score_dict[key])
-                    key_to_score_dict[key] = float("-inf")
+                        if key not in visited_keys:
+                            assert (
+                                key_to_score_dict[key] <= min_score
+                            ), f"key {key} score {key_to_score_dict[key]} should be < min_score {min_score}"
+                            lasted_min_score = min(
+                                lasted_min_score, key_to_score_dict[key]
+                            )
+                            visited_keys.add(key)
+
+                    min_score = lasted_min_score
+                    lasted_min_score = min_score
+
+            else:
+                raise RuntimeError("Not supported score strategy.")
 
         if optim:
             for kjt in kjts:
