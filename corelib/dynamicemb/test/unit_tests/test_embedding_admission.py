@@ -11,9 +11,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.dynamicemb_config import DynamicEmbInitializerArgs
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
 from dynamicemb.key_value_table import batched_export_keys_values
+from dynamicemb.types import DynamicEmbInitializerArgs
 
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import (
