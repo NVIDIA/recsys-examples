@@ -24,6 +24,18 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 subprocess.run(
     ["git", "submodule", "update", "--init", "../../third_party/HierarchicalKV"]
 )
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "uninstall",
+        "-y",
+        "dynamicemb",
+        "--break-system-packages",
+    ]
+)
+subprocess.run(["pip", "install", "ordered-set", "--break-system-packages"])
 
 # TODO: update when torchrec release compatible commit.
 compatible_versions = "1.1.0"

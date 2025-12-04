@@ -24,6 +24,15 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
+from dynamicemb.types import (
+    EMBEDDING_TYPE,
+    KEY_TYPE,
+    OPT_STATE_TYPE,
+    SCORE_TYPE,
+    Cache,
+    Storage,
+    torch_dtype_to_np_dtype,
+)
 from dynamicemb_extensions import (
     EvictStrategy,
     clear,
@@ -42,24 +51,6 @@ from dynamicemb_extensions import (
     select,
     select_index,
 )
-
-
-class EventQueue:
-    def __init__(
-        self,
-    ):
-        self._events = []
-
-    def produce(self) -> torch.cuda.Event:
-        event = torch.cuda.Event()
-        self._events.append(event)
-        return event
-
-    def consume(self) -> torch.cuda.Event:
-        return self._events.pop(0)
-
-    def clear(self) -> None:
-        self._events = []
 
 
 class Storage(abc.ABC):

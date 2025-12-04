@@ -1,0 +1,119 @@
+/******************************************************************************
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+******************************************************************************/
+
+#include "kernels.cuh"
+#include "table.cuh"
+
+namespace dyn_emb {
+
+void table_insert_and_evict_single_score(
+    at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    std::vector<std::optional<at::Tensor>> scores,
+    std::vector<ScorePolicyType> policy_types, std::vector<bool> is_returns,
+    std::optional<at::Tensor> insert_results, std::optional<at::Tensor> indices,
+    at::Tensor num_evicted, at::Tensor evicted_keys, at::Tensor evicted_indices,
+    std::vector<at::Tensor> evicted_scores) {
+
+  auto key_type = get_data_type(keys);
+
+  bool is_return = is_returns[0];
+  ScorePolicyType policy_type = policy_types[0];
+  auto scores_ = get_pointer<ScoreType>(scores[0]);
+  auto indices_ = get_pointer<IndexType>(indices);
+  auto insert_results_ = get_pointer<InsertResult>(insert_results);
+  auto bucket_sizes_ = get_pointer<int>(bucket_sizes);
+
+  auto evict_counter_ = get_pointer<CounterType>(num_evicted);
+  auto evicted_scores_ = get_pointer<ScoreType>(evicted_scores[0]);
+  auto evicted_indices_ = get_pointer<IndexType>(evicted_indices);
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  int64_t num_total = keys.size(0);
+
+  auto table_key_slots = at::zeros(
+      num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
+
+  constexpr int BLOCK_SIZE = 256;
+
+  DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
+    auto keys_ = get_pointer<KeyType>(keys);
+    auto evicted_keys_ = get_pointer<KeyType>(evicted_keys);
+    auto table_key_slots_ = get_pointer<KeyType *>(table_key_slots);
+
+    constexpr int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t bucket_bytes = bucket_capacity * total_size;
+    int64_t num_buckets =
+        table_storage.numel() * table_storage.element_size() / bucket_bytes;
+
+    using Bucket = LinearBucket<KeyType>;
+    using Table = LinearBucketTable<Bucket>;
+
+    auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
+                       num_buckets, bucket_capacity);
+
+    if (num_total % 32 == 0) {
+      using KernelTraits = InsertKernelTraits<BLOCK_SIZE, 1, 1, 32, 8>;
+      table_insert_and_evict_kernel<Table, KernelTraits>
+          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+             stream>>>(table, bucket_sizes_, num_total, keys_, insert_results_,
+                       indices_, scores_, policy_type, is_return,
+                       table_key_slots_, evict_counter_, evicted_keys_,
+                       evicted_scores_, evicted_indices_);
+    } else {
+      using KernelTraits = InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8>;
+      table_insert_and_evict_kernel<Table, KernelTraits>
+          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+             stream>>>(table, bucket_sizes_, num_total, keys_, insert_results_,
+                       indices_, scores_, policy_type, is_return,
+                       table_key_slots_, evict_counter_, evicted_keys_,
+                       evicted_scores_, evicted_indices_);
+    }
+
+    table_unlock_kernel<Table>
+        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table, num_total, keys_, table_key_slots_);
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void table_insert_and_evict(
+    at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    std::vector<std::optional<at::Tensor>> scores,
+    std::vector<ScorePolicyType> policy_types, std::vector<bool> is_returns,
+    std::optional<at::Tensor> insert_results, std::optional<at::Tensor> indices,
+    at::Tensor num_evicted, at::Tensor evicted_keys, at::Tensor evicted_indices,
+    std::vector<at::Tensor> evicted_scores) {
+
+  int64_t num_total = keys.size(0);
+  if (num_total == 0)
+    return;
+
+  if (scores.size() == 1) {
+    table_insert_and_evict_single_score(
+        table_storage, dtypes, bucket_capacity, bucket_sizes, keys, scores,
+        policy_types, is_returns, insert_results, indices, num_evicted,
+        evicted_keys, evicted_indices, evicted_scores);
+  } else {
+    throw std::runtime_error("Not support multi-scores.");
+  }
+}
+
+} // namespace dyn_emb
