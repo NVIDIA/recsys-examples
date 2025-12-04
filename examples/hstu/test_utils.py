@@ -21,6 +21,7 @@ import configs
 import dataset
 import model
 import torch
+from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend, OptimizerParam
@@ -348,14 +349,14 @@ def create_model(
     item_emb_size = 1024 * 1024
     action_vocab_size = 16
     emb_configs = [
-        configs.ShardedEmbeddingConfig(
+        ShardedEmbeddingConfig(
             feature_names=[action_feature_name],
             table_name="act",
             vocab_size=action_vocab_size,
             dim=embdim,
             sharding_type="data_parallel",
         ),
-        configs.ShardedEmbeddingConfig(
+        ShardedEmbeddingConfig(
             feature_names=[item_feature_name],
             table_name="item",
             vocab_size=item_emb_size,
@@ -386,7 +387,7 @@ def create_model(
             )
         )
         emb_configs.append(
-            configs.ShardedEmbeddingConfig(
+            ShardedEmbeddingConfig(
                 feature_names=contextual_feature_names,
                 table_name="context",
                 vocab_size=contextual_emb_size,
