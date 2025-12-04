@@ -8,7 +8,7 @@ export NGPU=1
 bash ./run_example.sh
 ```
 
-- The [example.py](./example.py) will show you how to train and evaluate the embedding module, as well as dump, load and incremental dump the module.
+- The [example.py](./example.py) will show you how to train and evaluate the embedding module, as well as dump, load and incremental dump the module, and this example also demonstrates how to customize embedding admissions.
 
 
 - For detailed explanations of specific APIs and parameters, please refer to [API Doc](../DynamicEmb_APIs.md).

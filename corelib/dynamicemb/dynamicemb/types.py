@@ -392,10 +392,10 @@ class AdmissionStrategy(abc.ABC):
     def admit(
         self,
         keys: torch.Tensor,
-        scores: torch.Tensor,
+        frequencies: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Admit keys with scores >= threshold.
+        Admit keys with frequencies >= threshold.
         """
 
     @abc.abstractmethod

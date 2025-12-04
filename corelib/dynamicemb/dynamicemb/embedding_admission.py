@@ -124,6 +124,8 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
     threshold : int
         Minimum frequency threshold for admission. Keys with frequency >= threshold
         will be admitted into the embedding table.
+    initializer_args: Optional[DynamicEmbInitializerArgs]
+        Initializer arguments which determine how to initialize the embedding if the key is not admitted.
     """
 
     def __init__(
@@ -140,16 +142,16 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
     def admit(
         self,
         keys: torch.Tensor,
-        scores: torch.Tensor,
+        frequencies: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Admit keys with frequency >= threshold.
+        Admit keys with frequencies >= threshold.
 
         Parameters
         ----------
         keys : torch.Tensor
             Keys to evaluate (shape: [N])
-        scores : torch.Tensor
+        frequencies : torch.Tensor
             Frequency counts for each key (shape: [N])
 
         Returns
@@ -157,13 +159,13 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         torch.Tensor
             Boolean mask (shape: [N]) where True indicates admission
         """
-        if keys.shape[0] != scores.shape[0]:
+        if keys.shape[0] != frequencies.shape[0]:
             raise ValueError(
-                f"Keys and scores must have same length, got {keys.shape[0]} and {scores.shape[0]}"
+                f"Keys and frequencies must have same length, got {keys.shape[0]} and {frequencies.shape[0]}"
             )
 
         # Admit keys whose frequency meets or exceeds threshold
-        admit_mask = scores >= self.threshold
+        admit_mask = frequencies >= self.threshold
         return admit_mask
 
     def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
