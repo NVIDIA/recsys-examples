@@ -17,10 +17,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "check.h"
 #include "index_calculation.h"
+#include "utils.h"
 #include <cuda/std/tuple>
 #include <iostream>
 #include <torch/extension.h>
 #include <type_traits>
+
 namespace { // anonymous namespace
 
 template <typename T>
@@ -357,7 +359,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique(
     at::Tensor keys, at::Tensor segment_range,
     std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
-    const c10::optional<bool> is_lfu_enabled = false,
+    const c10::optional<EvictStrategy> evict_strategy = c10::nullopt,
     const c10::optional<at::Tensor> frequency_counts_uint64 = c10::nullopt) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -377,15 +379,22 @@ segmented_unique(
   h_segment_range.copy_(segment_range, /*non_blocking=*/true);
 
   int table_num = segment_range.size(0) - 1;
-  
+
+  // Determine score strategy
+  bool is_lfu_enabled = false;
+  if (evict_strategy.has_value()) {
+    is_lfu_enabled = evict_strategy.value() == EvictStrategy::kLfu;
+  }
+  // Create vector of tensors for per-table frequency output
+  bool need_frequency_output = false;
+  need_frequency_output = is_lfu_enabled || frequency_counts_uint64.has_value();
   // Use single shared buffer instead of table_num separate buffers
   at::Tensor shared_unique_buffer = at::empty(num_total, keys.options());
   at::Tensor shared_frequency_buffer;
-  if (is_lfu_enabled.value()) {
+  if (need_frequency_output) {
     shared_frequency_buffer = at::zeros(
-        num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
+      num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
   }
-
   at::Tensor d_unique_nums = at::empty(table_num, segment_range.options());
   at::Tensor d_unique_indices_table_range =
       at::zeros(table_num + 1, segment_range.options());
@@ -435,7 +444,7 @@ segmented_unique(
                           tmp_unique_buffer_slice, tmp_d_unique_num, stream,
                           previous_d_unique_num, tmp_frequency_output_slice,
                           tmp_frequency_counts_uint64);
-      } else if (is_lfu_enabled.value()) {
+      } else if (need_frequency_output) {
         tmp_frequency_output_slice =
             shared_frequency_buffer.slice(0, indices_begin, indices_end);
         unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
@@ -469,7 +478,7 @@ segmented_unique(
   at::Tensor unique_keys = at::empty(num_unique_total, keys.options());
   at::Tensor output_scores;
   output_scores = at::Tensor();
-  if (is_lfu_enabled.value()) {
+  if (need_frequency_output) {
     output_scores = at::empty(num_unique_total, keys.options());
   }
   for (int i = 0; i < table_num; ++i) {
@@ -486,7 +495,7 @@ segmented_unique(
       size_t copy_size = tmp_unique_num * unique_keys.element_size();
       AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                     cudaMemcpyDeviceToDevice, stream));
-      if (is_lfu_enabled.value()) {
+      if (need_frequency_output) {
         void *dst_ptr = reinterpret_cast<char *>(output_scores.data_ptr()) +
                         unique_embs_offset * output_scores.element_size();
         void *src_ptr = reinterpret_cast<char *>(shared_frequency_buffer.data_ptr()) +
@@ -558,7 +567,7 @@ void bind_index_calculation_op(py::module &m) {
         "tuple<unique_keys, inverse, unique_keys_table_range, "
         "h_unique_keys_table_range>",
         py::arg("keys"), py::arg("segment_range"), py::arg("unique_op"),
-        py::arg("is_lfu_enabled") = false,
+        py::arg("evict_strategy") = c10::nullopt,
         py::arg("frequency_counts_uint64") = c10::nullopt);
 
   m.def("select", &dyn_emb::select,

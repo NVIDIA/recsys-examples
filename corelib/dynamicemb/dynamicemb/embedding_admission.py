@@ -23,7 +23,12 @@ from dynamicemb.scored_hashtable import (
     ScoreSpec,
     get_scored_table,
 )
-from dynamicemb.types import Counter, MemoryType
+from dynamicemb.types import (
+    AdmissionStrategy,
+    Counter,
+    DynamicEmbInitializerArgs,
+    MemoryType,
+)
 
 
 class KVCounter(Counter):
@@ -107,3 +112,61 @@ class KVCounter(Counter):
             counter_file (str): the file path of frequencies.
         """
         self.table_.dump(key_file, {self.score_name_: counter_file})
+
+
+class FrequencyAdmissionStrategy(AdmissionStrategy):
+    """
+    Frequency-based admission strategy.
+    Only admits keys whose frequency (score) meets or exceeds a threshold.
+
+    Parameters
+    ----------
+    threshold : int
+        Minimum frequency threshold for admission. Keys with frequency >= threshold
+        will be admitted into the embedding table.
+    initializer_args: Optional[DynamicEmbInitializerArgs]
+        Initializer arguments which determine how to initialize the embedding if the key is not admitted.
+    """
+
+    def __init__(
+        self,
+        threshold: int,
+        initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+    ):
+        if threshold < 0:
+            raise ValueError(f"Threshold must be non-negative, got {threshold}")
+
+        self.threshold = threshold
+        self.initializer_args = initializer_args
+
+    def admit(
+        self,
+        keys: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Admit keys with frequencies >= threshold.
+
+        Parameters
+        ----------
+        keys : torch.Tensor
+            Keys to evaluate (shape: [N])
+        frequencies : torch.Tensor
+            Frequency counts for each key (shape: [N])
+
+        Returns
+        -------
+        torch.Tensor
+            Boolean mask (shape: [N]) where True indicates admission
+        """
+        if keys.shape[0] != frequencies.shape[0]:
+            raise ValueError(
+                f"Keys and frequencies must have same length, got {keys.shape[0]} and {frequencies.shape[0]}"
+            )
+
+        # Admit keys whose frequency meets or exceeds threshold
+        admit_mask = frequencies >= self.threshold
+        return admit_mask
+
+    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
+        return self.initializer_args

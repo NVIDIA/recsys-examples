@@ -17,6 +17,8 @@ This document consists of two parts, one is the introduction to the API, which c
 - [incremental_dump](#incremental_dump)
 - [get_score](#get_score)
 - [set_score](#set_score)
+- [Counter](#counter)
+- [AdmissionStrategy](#admisssion_strategy)
 
 ## DynamicEmbParameterConstraints
 
@@ -390,7 +392,16 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
             The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
             If not provided, will using KeyValueTable as the Storage.
         index_type : Optional[torch.dtype], optional
-            Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.    
+            Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
+        admit_strategy : Optional[AdmissionStrategy], optional
+            Admission strategy for controlling which keys are allowed to enter the embedding table.
+            If provided, only keys that meet the strategy's criteria will be inserted into the table.
+            Keys that don't meet the criteria will still be initialized and used in the forward pass,
+            but won't be stored in the table. Default is None (all keys are admitted).
+        admission_counter : Optional[Counter], optional
+            Counter for tracking the number of keys that have been admitted to the embedding table.
+            If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
+            Default is None (no counter is used).    
         
         Notes
         -----
@@ -419,6 +430,8 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
         global_hbm_for_values: int = 0  # in bytes
         external_storage: Storage = None
         index_type: Optional[torch.dtype] = None
+        admit_strategy: Optional[AdmissionStrategy] = None
+        admission_counter: Optional[Counter] = None
 
     ```
 
@@ -607,6 +620,136 @@ Setting the environment variable DYNAMICEMB_CSTM_SCORE_CHECK to 0 will not throw
             None.
         """
     ```
+
+## Counter
+
+**dynamicemb** provides an interface to the Counter which will be used in the embedding admission, and the users can customize the counter implementation by inherit the class `Counter`.
+
+
+```python
+class Counter(abc.ABC):
+    """
+    Interface of a counter table which maps a key to a counter.
+    """
+
+    @abc.abstractmethod
+    def add(
+        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
+    ) -> torch.Tensor:
+        """
+        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
+        For not existed keys, the frequencies will be assigned directly.
+        For existing keys, the frequencies will be accumulated.
+        Args:
+            keys (torch.Tensor): The input keys, should be unique keys.
+            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
+            inplace: If true then store the accumulated_frequencies to counter.
+        Returns:
+            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
+        """
+        accumulated_frequencies: torch.Tensor
+        return accumulated_frequencies
+
+    @abc.abstractmethod
+    def erase(self, keys) -> None:
+        """
+        Erase keys form the `Counter`.
+        Args:
+            keys (torch.Tensor): The input keys to be erased.
+        """
+
+    @abc.abstractmethod
+    def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
+        """
+        Get the consumption of a specific memory type.
+        Args:
+            mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
+        """
+
+    @abc.abstractmethod
+    def load(self, key_file, counter_file) -> None:
+        """
+        Load keys and frequencies from input file path.
+        Args:
+            key_file (str): the file path of keys.
+            counter_file (str): the file path of frequencies.
+        """
+
+    @abc.abstractmethod
+    def dump(self, key_file, counter_file) -> None:
+        """
+        Dump keys and frequencies to output file path.
+        Args:
+            key_file (str): the file path of keys.
+            counter_file (str): the file path of frequencies.
+        """
+```
+
+**dynamicemb** also provides a built-in counter implementation named `KVCounter`.
+There is as capacity limit of `KVCounter` which is bucketized, and the key with the smallest frequency will be evicted from the bucket for a new key if the bucket is full. 
+
+```python
+
+class KVCounter(Counter):
+    """
+    Interface of a counter table which maps a key to a counter.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        bucket_capacity: Optional[int] = 128,
+        key_type: Optional[torch.dtype] = torch.int64,
+        device: torch.device = None,
+    )
+```
+
+## AdmissionStrategy
+
+**AdmissionStrategy** is another component for implementing embedding admission.
+The keys not in the dynamic embedding table, will first be passed to the `Counter`, after get the accumulated frequencies among the previous training process, the `AdmissionStrategy` will determine which keys will be admitted into the dynamic embedding table.
+
+```python
+class AdmissionStrategy(abc.ABC):
+    @abc.abstractmethod
+    def admit(
+        self,
+        keys: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Admit keys with frequencies >= threshold.
+        """
+
+    @abc.abstractmethod
+    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
+        """
+        Get the initializer args for keys that are not admitted.
+        """
+```
+
+**dynamicemn** provides built-in `FrequencyAdmissionStrategy`, which will return keys whose frequencies are not less than the threshold.
+
+```python
+class FrequencyAdmissionStrategy(AdmissionStrategy):
+    """
+    Frequency-based admission strategy.
+    Only admits keys whose frequency (score) meets or exceeds a threshold.
+    Parameters
+    ----------
+    threshold : int
+        Minimum frequency threshold for admission. Keys with frequency >= threshold
+        will be admitted into the embedding table.
+    initializer_args: Optional[DynamicEmbInitializerArgs]
+        Initializer arguments which determine how to initialize the embedding if the key is not admitted.
+    """
+
+    def __init__(
+        self,
+        threshold: int,
+        initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+    )
+```
 
 # Functionality and User interface
 

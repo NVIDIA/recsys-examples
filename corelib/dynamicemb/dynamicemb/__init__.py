@@ -18,8 +18,6 @@ from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
     DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -29,9 +27,18 @@ from .dynamicemb_config import (
     string_to_evict_strategy,
     torch_to_dyn_emb,
 )
+from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from .optimizer import EmbOptimType, OptimizerArgs
+from .types import (
+    AdmissionStrategy,
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
+)
 
 __all__ = [
+    "AdmissionStrategy",
+    "FrequencyAdmissionStrategy",
+    "KVCounter",
     "DynamicEmbCheckMode",
     "DynamicEmbInitializerArgs",
     "DynamicEmbInitializerMode",

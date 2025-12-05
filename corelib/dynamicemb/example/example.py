@@ -20,6 +20,8 @@ from dynamicemb import (
     DynamicEmbLoad,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    FrequencyAdmissionStrategy,
+    KVCounter,
 )
 from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim
 from dynamicemb.incremental_dump import get_score, incremental_dump
@@ -158,6 +160,13 @@ def parse_args():
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="random seed used for initialization"
+    )
+    # torchrun --standalone --nproc_per_node=${NGPU} example.py --train "$@" --admission_threshold 5
+    parser.add_argument(
+        "--admission_threshold",
+        type=int,
+        default=0,
+        help="Frequency threshold for admission strategy (0 disable admission strategy, >0 enable admission strategy and only keys appearing >= threshold will be stored in tables)",
     )
     return parser.parse_args()
 
@@ -434,7 +443,9 @@ def get_sharder(args, optimizer_type):
 
 
 # use a function warp all the Planner code
-def get_planner(device, eb_configs, batch_size, optimizer_type, training, caching):
+def get_planner(
+    device, eb_configs, batch_size, optimizer_type, training, caching, args
+):
     DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
         DataType.FP32: 32,
         DataType.FP16: 16,
@@ -474,6 +485,30 @@ def get_planner(device, eb_configs, batch_size, optimizer_type, training, cachin
             embedding_type_bytes * total_dim * emb_num_embeddings_next_power_of_2
         )
 
+        # Setup admission strategy if threshold > 0
+        admit_strategy = None
+        admission_counter = None
+        if args.admission_threshold > 0:
+            print(
+                f"Admission strategy enabled with threshold={args.admission_threshold}"
+            )
+            # Create counter to track key frequencies
+            admission_counter = KVCounter(
+                capacity=emb_num_embeddings_next_power_of_2,
+                bucket_capacity=bucket_capacity,
+                key_type=torch.int64,
+                device=device,
+            )
+
+            # Create admission strategy with threshold
+            admit_strategy = FrequencyAdmissionStrategy(
+                threshold=args.admission_threshold,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.CONSTANT,
+                    value=0.0,  # Initialize rejected keys to 0
+                ),
+            )
+
         const = DynamicEmbParameterConstraints(
             sharding_types=[
                 ShardingType.ROW_WISE.value,  # dynamicemb embedding table only support to be sharded in row-wise.
@@ -489,6 +524,8 @@ def get_planner(device, eb_configs, batch_size, optimizer_type, training, cachin
                 score_strategy=DynamicEmbScoreStrategy.STEP,
                 caching=caching,
                 training=training,
+                admit_strategy=admit_strategy,
+                admission_counter=admission_counter,
             ),
         )
 
@@ -561,6 +598,7 @@ def apply_dmp(model, args, training):
         optimizer_type=optimizer_type,
         training=training,
         caching=args.caching,
+        args=args,
     )
     # get plan for all ranks.
     # ShardingPlan is a dict, mapping table name to ParameterSharding/DynamicEmbParameterSharding.

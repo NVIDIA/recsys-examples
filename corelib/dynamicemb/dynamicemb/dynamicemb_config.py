@@ -21,12 +21,17 @@ from math import sqrt
 from typing import Dict, Optional
 
 import torch
-from dynamicemb.types import Storage
+from dynamicemb.types import (
+    AdmissionStrategy,
+    Counter,
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
+    Storage,
+)
 from dynamicemb_extensions import (
     DynamicEmbDataType,
     DynamicEmbTable,
     EvictStrategy,
-    InitializerArgs,
     OptimizerType,
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
@@ -45,91 +50,6 @@ def warning_for_cstm_score() -> None:
 
 
 DynamicEmbKernel = "DynamicEmb"
-
-
-class DynamicEmbInitializerMode(enum.Enum):
-    """
-    Enumeration for different modes of initializing dynamic embedding vector values.
-
-    Attributes
-    ----------
-    NORMAL : str
-        Normal Distribution.
-    UNIFORM : str
-        Uniform distribution of random values.
-    CONSTANT : str
-        All dynamic embedding vector values are a given constant.
-    DEBUG : str
-        Debug value generation mode for testing.
-    """
-
-    NORMAL = "normal"
-    TRUNCATED_NORMAL = "truncated_normal"
-    UNIFORM = "uniform"
-    CONSTANT = "constant"
-    DEBUG = "debug"
-
-
-@dataclass
-class DynamicEmbInitializerArgs:
-    """
-    Arguments for initializing dynamic embedding vector values.
-
-    Attributes
-    ----------
-    mode : DynamicEmbInitializerMode
-        The mode of initialization, one of the DynamicEmbInitializerMode values.
-    mean : float, optional
-        The mean value for (truncated) normal distributions. Defaults to 0.0.
-    std_dev : float, optional
-        The standard deviation for (truncated) normal distributions. Defaults to 1.0.
-    lower : float, optional
-        The lower bound for uniform/truncated_normal distribution. Defaults to 0.0.
-    upper : float, optional
-        The upper bound for uniform/truncated_normal distribution. Defaults to 1.0.
-    value : float, optional
-        The constant value for constant initialization. Defaults to 0.0.
-    """
-
-    mode: DynamicEmbInitializerMode = DynamicEmbInitializerMode.UNIFORM
-    mean: float = 0.0
-    std_dev: float = 1.0
-    lower: float = None
-    upper: float = None
-    value: float = 0.0
-
-    def __eq__(self, other):
-        if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
-        if self.mode == DynamicEmbInitializerMode.NORMAL:
-            return self.mean == other.mean and self.std_dev == other.std_dev
-        elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-            return (
-                self.mean == other.mean
-                and self.std_dev == other.std_dev
-                and self.lower == other.lower
-                and self.upper == other.upper
-            )
-        elif self.mode == DynamicEmbInitializerMode.UNIFORM:
-            return self.lower == other.lower and self.upper == other.upper
-        elif self.mode == DynamicEmbInitializerMode.CONSTANT:
-            return self.value == other.value
-        return True
-
-    def __ne__(self, other):
-        if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
-        return not (self == other)
-
-    def as_ctype(self) -> InitializerArgs:
-        return InitializerArgs(
-            self.mode.value,
-            self.mean,
-            self.std_dev,
-            self.lower if self.lower else 0.0,
-            self.upper if self.upper else 1.0,
-            self.value,
-        )
 
 
 @enum.unique
@@ -358,7 +278,15 @@ class DynamicEmbTableOptions(_ContextOptions):
         If not provided, will using KeyValueTable as the Storage.
     index_type : Optional[torch.dtype], optional
         Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
-
+    admit_strategy : Optional[AdmissionStrategy], optional
+        Admission strategy for controlling which keys are allowed to enter the embedding table.
+        If provided, only keys that meet the strategy's criteria will be inserted into the table.
+        Keys that don't meet the criteria will still be initialized and used in the forward pass,
+        but won't be stored in the table. Default is None (all keys are admitted).
+    admission_counter : Optional[Counter], optional
+        Counter for tracking the number of keys that have been admitted to the embedding table.
+        If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
+        Default is None (no counter is used).
     Notes
     -----
     For detailed descriptions and additional context on each parameter, please refer to the documentation at
@@ -386,6 +314,8 @@ class DynamicEmbTableOptions(_ContextOptions):
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
+    admit_strategy: Optional[AdmissionStrategy] = None
+    admission_counter: Optional[Counter] = None
 
     def __post_init__(self):
         assert (

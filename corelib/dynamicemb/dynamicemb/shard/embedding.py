@@ -46,7 +46,6 @@ from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel, DynamicEmbScoreStrategy
-from ..planner.planner import DynamicEmbParameterSharding
 from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from ..unique_op import UniqueOp
 
@@ -74,7 +73,11 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
     ] + [DynamicEmbKernel]
 
     def __init__(
-        self, *args, score_strategy: Optional[DynamicEmbScoreStrategy] = None, **kwargs
+        self,
+        *args,
+        score_strategy: Optional[DynamicEmbScoreStrategy] = None,
+        has_admit_strategy: bool = False,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         # Store the global score strategy
@@ -82,6 +85,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         self._is_lfu_enabled = (
             (score_strategy == DynamicEmbScoreStrategy.LFU) if score_strategy else False
         )
+        self._has_admit_strategy = has_admit_strategy
 
     @classmethod
     def create_embedding_sharding(
@@ -244,7 +248,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
 
                 # Only create frequency_counters if LFU strategy is enabled
                 # For non-LFU strategies, pass empty tensor (C++ extension will check size)
-                if self._is_lfu_enabled:
+                if self._is_lfu_enabled or self._has_admit_strategy:
                     # TODO: use only one frequency_counters tensor for all tables
                     # frequency_counters = torch.zeros_like(
                     #     indices_input, device=self._device, dtype=torch.uint64
@@ -275,7 +279,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         frequency_counters_list,
                     )
                 else:
-                    # Empty tensor for non-LFU strategies
+                    # Empty tensor for non-LFU and non-admit strategies
                     dedup_input_indices(
                         indices_input,
                         offsets,
@@ -310,7 +314,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     unique_idx[start_pos:end_pos].copy_(
                         unique_idx_list[i][:length], non_blocking=True
                     )
-                    if self._is_lfu_enabled:
+                    if self._is_lfu_enabled or self._has_admit_strategy:
                         frequency_counters[start_pos:end_pos].copy_(
                             frequency_counters_list[i][:length], non_blocking=True
                         )
@@ -331,8 +335,8 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 )
                 ctx.input_features.append(input_feature)
                 ctx.reverse_indices.append(reverse_idx)
-                # Only store frequency_counters if LFU is enabled
-                if self._is_lfu_enabled:
+                # Only store frequency_counters if LFU or admit strategy is enabled
+                if self._is_lfu_enabled or self._has_admit_strategy:
                     ctx.frequency_counters.append(frequency_counters)
                     assert frequency_counters.size(0) == unique_idx_out.size(
                         0
@@ -371,7 +375,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 # Attach frequency counters as weights if LFU strategy is enabled
                 if (
                     self._use_index_dedup
-                    and self._is_lfu_enabled
+                    and (self._is_lfu_enabled or self._has_admit_strategy)
                     and len(ctx.frequency_counters) > i
                 ):
                     frequency_counters = ctx.frequency_counters[i]
@@ -399,7 +403,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
 
     def create_context(self) -> DynamicEmbeddingCollectionContext:
         # pre-allocate frequency_counters list, ensure all ranks have the same structure
-        frequency_counters = [] if not self._is_lfu_enabled else None
+        frequency_counters = (
+            [] if not (self._is_lfu_enabled or self._has_admit_strategy) else None
+        )
         return DynamicEmbeddingCollectionContext(
             sharding_contexts=[], frequency_counters=frequency_counters
         )
@@ -428,17 +434,19 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
         # Extract global score_strategy from params (only once, as it's a global configuration)
         # Strategy is expected to be consistent across all tables
         global_score_strategy = None
+        has_admit_strategy = False
         if global_score_strategy is None:
             for param_name, param_sharding in params.items():
-                if isinstance(param_sharding, DynamicEmbParameterSharding):
-                    if (
-                        param_sharding.dynamicemb_options
-                        and param_sharding.dynamicemb_options.score_strategy is not None
-                    ):
+                if param_sharding.dynamicemb_options:
+                    if param_sharding.dynamicemb_options.score_strategy is not None:
                         global_score_strategy = (
                             param_sharding.dynamicemb_options.score_strategy
                         )
-                        break
+
+                    if param_sharding.dynamicemb_options.admit_strategy is not None:
+                        has_admit_strategy = True
+
+                    break
 
         # Pass score_strategy directly as a parameter to ShardedDynamicEmbeddingCollection
         return ShardedDynamicEmbeddingCollection(
@@ -450,4 +458,5 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             use_index_dedup=self._use_index_dedup,
             score_strategy=global_score_strategy,  # Pass as direct parameter
+            has_admit_strategy=has_admit_strategy,
         )

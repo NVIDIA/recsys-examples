@@ -24,7 +24,11 @@ import click
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+from dynamicemb import (
+    DynamicEmbScoreStrategy,
+    DynamicEmbTableOptions,
+    FrequencyAdmissionStrategy,
+)
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -35,9 +39,12 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
+from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
 from dynamicemb.key_value_table import batched_export_keys_values
+from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
+from dynamicemb.types import AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType
@@ -195,6 +202,7 @@ def apply_dmp(
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
+    admit_strategy: AdmissionStrategy = None,
 ):
     eb_configs = []
     dynamicemb_options_dict = {}
@@ -208,6 +216,7 @@ def apply_dmp(
                 embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
                 emb_num_embeddings = (
                     eb_config.num_embeddings * cache_capacity_ratio
+                    # eb_config.num_embeddings
                     if caching
                     else eb_config.num_embeddings
                 )
@@ -249,6 +258,9 @@ def apply_dmp(
                     * emb_num_embeddings_next_power_of_2
                 )
 
+                admission_counter = KVCounter(
+                    max(1024 * 1024, emb_num_embeddings_next_power_of_2 // 4)
+                )
                 dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
                     global_hbm_for_values=total_hbm_need,
                     score_strategy=score_strategy,
@@ -260,6 +272,8 @@ def apply_dmp(
                     max_capacity=emb_num_embeddings_next_power_of_2,
                     caching=caching,
                     local_hbm_for_values=1024**3,
+                    admit_strategy=admit_strategy,
+                    admission_counter=admission_counter,
                 )
     planner = get_planner(
         eb_configs,
@@ -298,6 +312,7 @@ def create_model(
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
+    admit_strategy: AdmissionStrategy = None,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -333,8 +348,45 @@ def create_model(
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
+        admit_strategy=admit_strategy,
     )
     return model
+
+
+def check_counter_table_checkpoint(x, y):
+    device = torch.cuda.current_device()
+    tables_x = get_dynamic_emb_module(x)
+    tables_y = get_dynamic_emb_module(y)
+
+    for table_x, table_y in zip(tables_x, tables_y):
+        for cnt_tx, cnt_ty in zip(
+            table_x._admission_counter, table_y._admission_counter
+        ):
+            assert cnt_tx.table_.size() == cnt_ty.table_.size()
+
+            for keys, named_scores in cnt_tx._batched_export_keys_scores(
+                cnt_tx.table_.score_names_, torch.device(f"cuda:{device}")
+            ):
+                if keys.numel() == 0:
+                    continue
+                freq_name = cnt_tx.table_.score_names_[0]
+                frequencies = named_scores[freq_name]
+
+                score_args_lookup = [
+                    ScoreArg(
+                        name=freq_name,
+                        value=torch.zeros_like(frequencies),
+                        policy=ScorePolicy.CONST,
+                        is_return=True,
+                    )
+                ]
+                founds = torch.empty(
+                    keys.numel(), dtype=torch.bool, device=device
+                ).fill_(False)
+
+                cnt_ty.lookup(keys, score_args_lookup, founds)
+
+                assert torch.equal(frequencies, score_args_lookup)
 
 
 @click.command()
@@ -355,6 +407,7 @@ def create_model(
     required=True,
 )
 @click.option("--optim", type=bool, required=True)
+@click.option("--counter", type=bool, required=True)
 def test_model_load_dump(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -365,6 +418,7 @@ def test_model_load_dump(
     mode: str,
     save_path: str,
     optim: bool,
+    counter: bool,
     batch_size: int = 128,
     num_iterations: int = 10,
 ):
@@ -389,6 +443,9 @@ def test_model_load_dump(
         embedding_dim=embedding_dim,
         optimizer_kwargs=optimizer_kwargs,
         score_strategy=score_strategy_,
+        admit_strategy=FrequencyAdmissionStrategy(
+            threshold=2 if counter else 1,
+        ),
     )
 
     expect_scores_collection: Dict[str, Dict[int, int]] = {}
@@ -413,7 +470,7 @@ def test_model_load_dump(
 
     if mode == "dump":
         shutil.rmtree(save_path, ignore_errors=True)
-        DynamicEmbDump(save_path, ref_model, optim=optim)
+        DynamicEmbDump(save_path, ref_model, optim=optim, counter=counter)
 
     if mode == "load":
         model = create_model(
@@ -422,18 +479,28 @@ def test_model_load_dump(
             embedding_dim=embedding_dim,
             optimizer_kwargs=optimizer_kwargs,
             score_strategy=score_strategy_,
+            admit_strategy=FrequencyAdmissionStrategy(
+                threshold=2 if counter else 1,
+            ),
         )
 
-        DynamicEmbLoad(save_path, model, optim=optim)
+        DynamicEmbLoad(save_path, model, optim=optim, counter=counter)
+
+        if counter:
+            check_counter_table_checkpoint(model, ref_model)
 
         table_name_to_key_score_dict = {}
+        table_name_to_visited_key_dict = {}
         for _, _, sharded_module in find_sharded_modules(model):
             dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
             for dynamic_emb_module in dynamic_emb_modules:
-                for table_name, table in zip(
-                    dynamic_emb_module.table_names, dynamic_emb_module.tables
+                for table_name, table, counter_table in zip(
+                    dynamic_emb_module.table_names,
+                    dynamic_emb_module.tables,
+                    dynamic_emb_module._admission_counter,
                 ):
                     key_to_score = {}
+                    visited_keys = set({})
                     for batched_key, _, _, batched_score in batched_export_keys_values(
                         table.table, torch.device(f"cpu")
                     ):
@@ -441,7 +508,20 @@ def test_model_load_dump(
                             batched_key.tolist(), batched_score.tolist()
                         ):
                             key_to_score[key] = score
+
+                    for (
+                        keys,
+                        named_scores,
+                    ) in counter_table.table_._batched_export_keys_scores(
+                        counter_table.table_.score_names_, torch.device(f"cpu")
+                    ):
+                        if keys.numel() == 0:
+                            continue
+                        for key in keys.tolist():
+                            visited_keys.add(key)
+
                     table_name_to_key_score_dict[table_name] = key_to_score
+                    table_name_to_visited_key_dict[table_name] = visited_keys
 
         for embedding_collection_idx, embedding_idx in product(
             range(num_embedding_collections), range(len(num_embeddings))
@@ -451,12 +531,13 @@ def test_model_load_dump(
             )
             key_to_score_dict = table_name_to_key_score_dict[table_name].copy()
             expect_scores = expect_scores_collection[table_name]
+            visited_keys = table_name_to_visited_key_dict[table_name]
 
             if score_strategy == "step" or score_strategy == "lfu":
                 for kjt in reversed(all_kjts):
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
-                        if key % world_size == rank:
+                        if key % world_size == rank and key not in visited_keys:
                             assert (
                                 key in key_to_score_dict
                             ), f"Key {key} must exist in table of rank {rank}."
@@ -465,27 +546,23 @@ def test_model_load_dump(
                             ), f"Expect {key_to_score_dict[key]} = {expect_scores[key]}"
             # The idea is that the score of a newer key is greater than that of an older key. Therefore, I iterate through the input in reverse order and track the minimum score encountered. For each batch, the score should be lower than the minimum score from the previous batch. To avoid issues caused by duplicate keys, every time I access a key, I set its score to -inf. This ensures that if that key appears again, its score will be sufficiently small to remain below the minimum score.
             elif score_strategy == "timestamp":
-                visited_keys = set({})
                 min_score = float("inf")
                 lasted_min_score = float("inf")
                 for kjt in reversed(all_kjts):
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
-                        if key % world_size == rank:
+                        if key % world_size == rank and key not in visited_keys:
                             assert (
                                 key in key_to_score_dict
                             ), f"Key {key} must exist in table of rank {rank}."
                         else:
                             continue
 
-                        if key not in visited_keys:
-                            assert (
-                                key_to_score_dict[key] <= min_score
-                            ), f"key {key} score {key_to_score_dict[key]} should be < min_score {min_score}"
-                            lasted_min_score = min(
-                                lasted_min_score, key_to_score_dict[key]
-                            )
-                            visited_keys.add(key)
+                        assert (
+                            key_to_score_dict[key] <= min_score
+                        ), f"key {key} score {key_to_score_dict[key]} should be < min_score {min_score}"
+                        lasted_min_score = min(lasted_min_score, key_to_score_dict[key])
+                        visited_keys.add(key)
 
                     min_score = lasted_min_score
                     lasted_min_score = min_score
