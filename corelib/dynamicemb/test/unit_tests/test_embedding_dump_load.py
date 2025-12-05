@@ -359,7 +359,9 @@ def check_counter_table_checkpoint(x, y):
     tables_y = get_dynamic_emb_module(y)
 
     for table_x, table_y in zip(tables_x, tables_y):
-        for cnt_tx, cnt_ty in zip(table_x, table_y):
+        for cnt_tx, cnt_ty in zip(
+            table_x._admission_counter, table_y._admission_counter
+        ):
             assert cnt_tx.table_.size() == cnt_ty.table_.size()
 
             for keys, named_scores in cnt_tx._batched_export_keys_scores(
@@ -488,6 +490,7 @@ def test_model_load_dump(
             check_counter_table_checkpoint(model, ref_model)
 
         table_name_to_key_score_dict = {}
+        table_name_to_visited_key_dict = {}
         for _, _, sharded_module in find_sharded_modules(model):
             dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
             for dynamic_emb_module in dynamic_emb_modules:
@@ -497,6 +500,7 @@ def test_model_load_dump(
                     dynamic_emb_module._admission_counter,
                 ):
                     key_to_score = {}
+                    visited_keys = set({})
                     for batched_key, _, _, batched_score in batched_export_keys_values(
                         table.table, torch.device(f"cpu")
                     ):
@@ -513,13 +517,11 @@ def test_model_load_dump(
                     ):
                         if keys.numel() == 0:
                             continue
-                        freq_name = counter_table.table_.score_names_[0]
-                        frequencies = named_scores[freq_name]
-
-                        for key, score in zip(keys.tolist(), frequencies.tolist()):
-                            key_to_score[key] = score
+                        for key in keys.tolist():
+                            visited_keys.add(key)
 
                     table_name_to_key_score_dict[table_name] = key_to_score
+                    table_name_to_visited_key_dict[table_name] = visited_keys
 
         for embedding_collection_idx, embedding_idx in product(
             range(num_embedding_collections), range(len(num_embeddings))
@@ -529,6 +531,7 @@ def test_model_load_dump(
             )
             key_to_score_dict = table_name_to_key_score_dict[table_name].copy()
             expect_scores = expect_scores_collection[table_name]
+            visited_keys = table_name_to_visited_key_dict[table_name]
 
             if score_strategy == "step" or score_strategy == "lfu":
                 for kjt in reversed(all_kjts):
@@ -543,27 +546,23 @@ def test_model_load_dump(
                             ), f"Expect {key_to_score_dict[key]} = {expect_scores[key]}"
             # The idea is that the score of a newer key is greater than that of an older key. Therefore, I iterate through the input in reverse order and track the minimum score encountered. For each batch, the score should be lower than the minimum score from the previous batch. To avoid issues caused by duplicate keys, every time I access a key, I set its score to -inf. This ensures that if that key appears again, its score will be sufficiently small to remain below the minimum score.
             elif score_strategy == "timestamp":
-                visited_keys = set({})
                 min_score = float("inf")
                 lasted_min_score = float("inf")
                 for kjt in reversed(all_kjts):
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
-                        if key % world_size == rank:
+                        if key % world_size == rank and key not in visited_keys:
                             assert (
                                 key in key_to_score_dict
                             ), f"Key {key} must exist in table of rank {rank}."
                         else:
                             continue
 
-                        if key not in visited_keys:
-                            assert (
-                                key_to_score_dict[key] <= min_score
-                            ), f"key {key} score {key_to_score_dict[key]} should be < min_score {min_score}"
-                            lasted_min_score = min(
-                                lasted_min_score, key_to_score_dict[key]
-                            )
-                            visited_keys.add(key)
+                        assert (
+                            key_to_score_dict[key] <= min_score
+                        ), f"key {key} score {key_to_score_dict[key]} should be < min_score {min_score}"
+                        lasted_min_score = min(lasted_min_score, key_to_score_dict[key])
+                        visited_keys.add(key)
 
                     min_score = lasted_min_score
                     lasted_min_score = min_score
