@@ -126,7 +126,14 @@ void table_export_batch(at::Tensor table_storage,
                         int64_t bucket_capacity, int64_t batch, int64_t offset,
                         at::Tensor counter, at::Tensor keys,
                         std::vector<std::optional<at::Tensor>> scores,
+                        std::optional<std::vector<ScoreType>> thresholds,
                         std::optional<at::Tensor> indices);
+
+void table_count_matched(at::Tensor table_storage,
+                         std::vector<torch::Dtype> dtypes,
+                         int64_t bucket_capacity,
+                         std::vector<ScoreType> thresholds,
+                         at::Tensor num_matched);
 
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,

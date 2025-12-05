@@ -120,10 +120,16 @@ void bind_table_operation(py::module &m) {
         py::arg("indices") = py::none());
 
   m.def("table_export_batch", &dyn_emb::table_export_batch,
-        "erase items[offset, offset + batch) from the table",
+        "export items[offset, offset + batch) from the table",
         py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
         py::arg("batch"), py::arg("offset"), py::arg("counter"),
-        py::arg("keys"), py::arg("scores"), py::arg("indices") = py::none());
+        py::arg("keys"), py::arg("scores"), py::arg("thresholds") = py::none(),
+        py::arg("indices") = py::none());
+
+  m.def("table_count_matched", &dyn_emb::table_count_matched,
+        "count number of items in the table whose scores >= thresholds",
+        py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
+        py::arg("thresholds"), py::arg("num_matched"));
 
   py::enum_<dyn_emb::ScorePolicyType>(m, "ScorePolicy")
       .value("CONST", dyn_emb::ScorePolicyType::Const)
