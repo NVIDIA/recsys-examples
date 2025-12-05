@@ -359,7 +359,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique(
     at::Tensor keys, at::Tensor segment_range,
     std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
-    // const c10::optional<bool> is_lfu_enabled = false,
     const c10::optional<EvictStrategy> evict_strategy = c10::nullopt,
     const c10::optional<at::Tensor> frequency_counts_uint64 = c10::nullopt) {
 
@@ -380,6 +379,13 @@ segmented_unique(
   h_segment_range.copy_(segment_range, /*non_blocking=*/true);
 
   int table_num = segment_range.size(0) - 1;
+
+  // Determine score strategy
+  bool is_lfu_enabled = false;
+  if (evict_strategy.has_value()) {
+    is_lfu_enabled = evict_strategy.value() == EvictStrategy::kLfu;
+  }
+  // Create vector of tensors for per-table frequency output
   bool need_frequency_output = false;
   need_frequency_output = is_lfu_enabled.value() || frequency_counts_uint64.has_value();
   // Use single shared buffer instead of table_num separate buffers
@@ -387,9 +393,8 @@ segmented_unique(
   at::Tensor shared_frequency_buffer;
   if (need_frequency_output) {
     shared_frequency_buffer = at::zeros(
-        num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
+      num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
   }
-
   at::Tensor d_unique_nums = at::empty(table_num, segment_range.options());
   at::Tensor d_unique_indices_table_range =
       at::zeros(table_num + 1, segment_range.options());
