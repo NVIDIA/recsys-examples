@@ -26,6 +26,7 @@ void table_export_single_score(at::Tensor table_storage,
                                int64_t offset, at::Tensor counter,
                                at::Tensor keys,
                                std::vector<std::optional<at::Tensor>> scores,
+                               std::optional<std::vector<ScoreType>> thresholds,
                                std::optional<at::Tensor> indices) {
   auto key_type = get_data_type(keys);
   auto scores_ = get_pointer<ScoreType>(scores[0]);
@@ -33,6 +34,8 @@ void table_export_single_score(at::Tensor table_storage,
   auto counter_ = get_pointer<CounterType>(counter);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+  bool score_pred = thresholds.has_value();
+  ScoreType threshold = score_pred ? thresholds.value()[0] : 0;
 
   int64_t num_total = batch;
 
@@ -58,15 +61,24 @@ void table_export_single_score(at::Tensor table_storage,
     }
 
     if (num_total % 32 == 0) {
-      table_export_batch_kernel<Table, 32>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, offset, offset + num_total, counter_, keys_,
-                       scores_, indices_);
+      DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
+        using PredFunc = ExportPredFunctor<PredFlag>;
+        PredFunc pred(threshold);
+        table_export_batch_kernel<Table, PredFunc, 32>
+            <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+               stream>>>(table, offset, offset + num_total, counter_, keys_,
+                         scores_, pred, indices_);
+      });
+
     } else {
-      table_export_batch_kernel<Table, 1>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, offset, offset + num_total, counter_, keys_,
-                       scores_, indices_);
+      DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
+        using PredFunc = ExportPredFunctor<PredFlag>;
+        PredFunc pred(threshold);
+        table_export_batch_kernel<Table, PredFunc, 1>
+            <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+               stream>>>(table, offset, offset + num_total, counter_, keys_,
+                         scores_, pred, indices_);
+      });
     }
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -77,13 +89,15 @@ void table_export_batch(at::Tensor table_storage,
                         int64_t bucket_capacity, int64_t batch, int64_t offset,
                         at::Tensor counter, at::Tensor keys,
                         std::vector<std::optional<at::Tensor>> scores,
+                        std::optional<std::vector<ScoreType>> thresholds,
                         std::optional<at::Tensor> indices) {
   if (batch == 0)
     return;
 
   if (scores.size() == 1) {
     table_export_single_score(table_storage, dtypes, bucket_capacity, batch,
-                              offset, counter, keys, scores, indices);
+                              offset, counter, keys, scores, thresholds,
+                              indices);
   } else {
     throw std::runtime_error("Not support multi-scores.");
   }
