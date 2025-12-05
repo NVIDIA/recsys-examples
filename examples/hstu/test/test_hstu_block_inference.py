@@ -55,6 +55,8 @@ def get_test_setup():
         num_layers,
         num_heads,
         head_dim,
+        max_batch_size,
+        max_seqlen,
     )
 
     _blocks_in_primary_pool = 10240
@@ -64,8 +66,6 @@ def get_test_setup():
         blocks_in_primary_pool=_blocks_in_primary_pool,
         page_size=_page_size,
         offload_chunksize=_offload_chunksize,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seqlen,
     )
     emb_configs = [
         InferenceEmbeddingConfig(

@@ -520,14 +520,14 @@ class TestModule:
             num_layers=4,
             num_heads=4,
             head_dim=128,
+            max_batch_size=16,
+            max_seq_len=4096,
             bf16=True,
         )
         self.kvcache_config = get_kvcache_config(
             blocks_in_primary_pool=10240,
             page_size=32,
             offload_chunksize=1024,
-            max_batch_size=16,
-            max_seq_len=4096,
         )
         device = torch.cuda.current_device()
 

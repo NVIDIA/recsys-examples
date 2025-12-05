@@ -114,14 +114,14 @@ class HSTUHostKVStorageManager:
         self.page_size = kv_cache_config.page_size
         self.num_cache_pages = kv_cache_config.blocks_in_primary_pool
 
-        self.max_seq_len = kv_cache_config.max_seq_len
+        self.max_seq_len = hstu_config.max_seq_len
         if kv_cache_config.max_attention_window is None:
-            self.max_attention_window = kv_cache_config.max_seq_len
+            self.max_attention_window = hstu_config.max_seq_len
         else:
             self.max_attention_window = max(kv_cache_config.max_attention_window)
 
         self.offload_chunksize = kv_cache_config.offload_chunksize
-        self.max_batch_size = kv_cache_config.max_batch_size
+        self.max_batch_size = hstu_config.max_batch_size
 
         self.impl: HSTUHostKVStorageImpl = DummyHSTUHostKVStorageImpl(
             self.num_layers, self.page_size, self.offload_chunksize

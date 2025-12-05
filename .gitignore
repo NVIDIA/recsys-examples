@@ -31,3 +31,4 @@ embedding_checkpoint/
 *.pickle
 *.xlsx
 pcie_lookup_poc/*
+**/triton/**/[0-9]*
