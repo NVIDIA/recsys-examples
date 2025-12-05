@@ -387,7 +387,7 @@ segmented_unique(
   }
   // Create vector of tensors for per-table frequency output
   bool need_frequency_output = false;
-  need_frequency_output = is_lfu_enabled.value() || frequency_counts_uint64.has_value();
+  need_frequency_output = is_lfu_enabled || frequency_counts_uint64.has_value();
   // Use single shared buffer instead of table_num separate buffers
   at::Tensor shared_unique_buffer = at::empty(num_total, keys.options());
   at::Tensor shared_frequency_buffer;
