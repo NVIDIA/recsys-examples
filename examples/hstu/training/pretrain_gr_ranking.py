@@ -23,6 +23,7 @@ from typing import List, Union
 import commons.utils.initialize as init
 import gin
 import torch  # pylint: disable-unused-import
+from commons.distributed.sharding import make_optimizer_and_shard
 from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
@@ -30,7 +31,6 @@ from commons.pipeline.train_pipeline import (
 )
 from commons.utils.logger import print_rank_0
 from configs import RankingConfig
-from distributed.sharding import make_optimizer_and_shard
 from megatron.core import parallel_state
 from model import get_ranking_model
 from modules.metrics import get_multi_event_metric_module

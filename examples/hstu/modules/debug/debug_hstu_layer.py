@@ -20,6 +20,7 @@ from typing import Callable
 import nvtx
 import torch
 import torch.nn.functional as F
+from commons.ops.collective_ops import gather_along_last_dim, split_along_last_dim
 from commons.utils.distributed_utils import (
     collective_assert_tensor,
     grad_collective_equal_assert_hook,
@@ -35,7 +36,6 @@ from megatron.core.transformer.module import MegatronModule
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.utils import init_mlp_weights_optional_bias
-from ops.collective_ops import gather_along_last_dim, split_along_last_dim
 from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
 from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout
 

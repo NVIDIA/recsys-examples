@@ -19,11 +19,11 @@ from typing import Any, Dict, Tuple, Type, Union
 import torch
 import torch.distributed as dist
 import torchrec
-from commons.modules.embedding import DataParallelEmbeddingCollection
-from configs.task_config import OptimizerParam
 
 # import our own finalize model grads
-from distributed.finalize_model_grads import finalize_model_grads
+from commons.distributed.finalize_model_grads import finalize_model_grads
+from commons.modules.embedding import DataParallelEmbeddingCollection
+from commons.optimizer import OptimizerParam
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.get_planner import get_planner
 from dynamicemb.planner import (

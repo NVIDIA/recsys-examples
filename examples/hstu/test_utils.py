@@ -21,11 +21,12 @@ import configs
 import dataset
 import model
 import torch
+from commons.distributed.sharding import apply_megatron_ddp, make_optimizer_and_shard
 from commons.modules.embedding import ShardedEmbeddingConfig
+from commons.optimizer import OptimizerParam
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.hstu_assert_close import hstu_close
-from configs import HSTULayerType, KernelBackend, OptimizerParam
-from distributed.sharding import apply_megatron_ddp, make_optimizer_and_shard
+from configs import HSTULayerType, KernelBackend
 from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state, tensor_parallel
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer

@@ -18,7 +18,7 @@ from .inference_config import (
     get_kvcache_config,
     get_kvcache_metadata_buffer,
 )
-from .task_config import OptimizerParam, RankingConfig, RetrievalConfig
+from .task_config import RankingConfig, RetrievalConfig
 
 __all__ = [
     "hstu_config",
@@ -31,7 +31,6 @@ __all__ = [
     "get_hstu_config",
     "RankingConfig",
     "RetrievalConfig",
-    "OptimizerParam",
     "KernelBackend",
     "HSTULayerType",
     "KVCacheMetadata",

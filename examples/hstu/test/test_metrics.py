@@ -19,9 +19,9 @@ import random
 import commons.utils.initialize as init
 import pytest
 import torch
+from commons.ops.collective_ops import grouped_allgatherv_tensor_list
 from megatron.core import parallel_state, tensor_parallel
 from modules.metrics.metric_modules import RetrievalTaskMetricWithSampling
-from ops.collective_ops import grouped_allgatherv_tensor_list
 
 
 @pytest.mark.parametrize("num_embeddings", [10000])

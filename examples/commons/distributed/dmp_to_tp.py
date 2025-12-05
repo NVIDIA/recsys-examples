@@ -2,15 +2,15 @@ from typing import Dict, Optional, Union
 
 import torch
 import torch.distributed as dist
-from dataset.utils import RankingBatch, RetrievalBatch
-from megatron.core import parallel_state
-from ops.collective_ops import (
+from commons.ops.collective_ops import (
     gather_along_first_dim,
     gatherv_along_first_dim,
     jagged_tensor_allgather,
     keyed_jagged_tensor_allgather,
 )
-from ops.grad_scaling import grad_scaling
+from commons.ops.grad_scaling import grad_scaling
+from dataset.utils import RankingBatch, RetrievalBatch
+from megatron.core import parallel_state
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 

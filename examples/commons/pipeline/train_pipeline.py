@@ -39,6 +39,7 @@ from typing import (
 
 import nvtx
 import torch
+from commons.distributed.finalize_model_grads import finalize_model_grads
 from commons.pipeline.utils import (
     In,
     Out,
@@ -56,7 +57,6 @@ from commons.pipeline.utils import (
     _wait_for_batch,
 )
 from commons.utils.distributed_utils import collective_assert
-from distributed.finalize_model_grads import finalize_model_grads
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from torch.autograd.profiler import record_function
