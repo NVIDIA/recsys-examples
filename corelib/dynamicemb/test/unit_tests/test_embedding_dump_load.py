@@ -537,7 +537,7 @@ def test_model_load_dump(
                 for kjt in reversed(all_kjts):
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
-                        if key % world_size == rank:
+                        if key % world_size == rank and key not in visited_keys:
                             assert (
                                 key in key_to_score_dict
                             ), f"Key {key} must exist in table of rank {rank}."

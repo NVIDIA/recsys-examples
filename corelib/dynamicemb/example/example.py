@@ -166,7 +166,7 @@ def parse_args():
         "--admission_threshold",
         type=int,
         default=0,
-        help="Frequency threshold for admission strategy (0 diasble admission strategy, >0 enable admission strategy and only keys appearing >= threshold will be stored in tables)",
+        help="Frequency threshold for admission strategy (0 disable admission strategy, >0 enable admission strategy and only keys appearing >= threshold will be stored in tables)",
     )
     return parser.parse_args()
 
