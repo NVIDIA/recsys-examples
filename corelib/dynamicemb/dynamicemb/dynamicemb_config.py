@@ -348,6 +348,8 @@ class DynamicEmbTableOptions(_ContextOptions):
         grouped_key["caching"] = self.caching
         grouped_key["external_storage"] = self.external_storage
         grouped_key["index_type"] = self.index_type
+        grouped_key["score_strategy"] = self.score_strategy
+        grouped_key["admit_strategy"] = self.admit_strategy
         return grouped_key
 
     def __hash__(self):
