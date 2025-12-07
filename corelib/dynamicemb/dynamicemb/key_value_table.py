@@ -21,8 +21,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import (
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
     create_dynamicemb_table,
     dyn_emb_to_torch,
@@ -30,11 +28,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.initializer import (
     BaseDynamicEmbInitializer,
-    ConstantInitializer,
-    DebugInitializer,
-    NormalInitializer,
-    TruncatedNormalInitializer,
-    UniformInitializer,
+    create_initializer_from_args,
 )
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.types import (
@@ -818,24 +812,6 @@ def admission(
     return admit_mask
 
 
-def _create_initializer_from_args(
-    initializer_args: DynamicEmbInitializerArgs,
-) -> BaseDynamicEmbInitializer:
-    mode = initializer_args.mode
-    if mode == DynamicEmbInitializerMode.NORMAL:
-        return NormalInitializer(initializer_args)
-    elif mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-        return TruncatedNormalInitializer(initializer_args)
-    elif mode == DynamicEmbInitializerMode.UNIFORM:
-        return UniformInitializer(initializer_args)
-    elif mode == DynamicEmbInitializerMode.CONSTANT:
-        return ConstantInitializer(initializer_args)
-    elif mode == DynamicEmbInitializerMode.DEBUG:
-        return DebugInitializer(initializer_args)
-    else:
-        raise ValueError(f"Not supported initializer type: {mode}")
-
-
 class KeyValueTableFunction:
     @staticmethod
     def lookup(
@@ -907,7 +883,7 @@ class KeyValueTableFunction:
                 non_admitted_mask = ~admit_mask
                 non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
                 if non_admitted_indices.numel() > 0:
-                    non_admit_initializer = _create_initializer_from_args(
+                    non_admit_initializer = create_initializer_from_args(
                         non_admit_initializer_args
                     )
                     non_admit_initializer(
@@ -1094,7 +1070,7 @@ class KeyValueTableCachingFunction:
                 non_admitted_mask = ~admit_mask_for_missing_keys
                 non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
                 if non_admitted_indices.numel() > 0:
-                    non_admit_initializer = _create_initializer_from_args(
+                    non_admit_initializer = create_initializer_from_args(
                         non_admit_initializer_args
                     )
                     non_admit_initializer(

@@ -31,6 +31,7 @@ from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (
     AdmissionStrategy,
+    Counter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
@@ -38,6 +39,7 @@ from .types import (
 __all__ = [
     "AdmissionStrategy",
     "FrequencyAdmissionStrategy",
+    "Counter",
     "KVCounter",
     "DynamicEmbCheckMode",
     "DynamicEmbInitializerArgs",

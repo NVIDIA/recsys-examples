@@ -107,3 +107,24 @@ class DebugInitializer(BaseDynamicEmbInitializer):
         keys: Optional[torch.Tensor],  # remove it when debug mode is removed
     ) -> None:
         debug_init(buffer, indices, keys)
+
+
+def create_initializer_from_args(
+    initializer_args: DynamicEmbInitializerArgs,
+) -> BaseDynamicEmbInitializer:
+    """
+    Factory function to create an initializer instance from initializer arguments.
+    """
+    mode = initializer_args.mode
+    if mode == DynamicEmbInitializerMode.NORMAL:
+        return NormalInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
+        return TruncatedNormalInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.UNIFORM:
+        return UniformInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.CONSTANT:
+        return ConstantInitializer(initializer_args)
+    elif mode == DynamicEmbInitializerMode.DEBUG:
+        return DebugInitializer(initializer_args)
+    else:
+        raise ValueError(f"Not supported initializer type: {mode}")

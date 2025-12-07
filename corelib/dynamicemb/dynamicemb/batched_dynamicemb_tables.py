@@ -714,28 +714,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
 
     def _create_initializers(self) -> None:
-        def _get_initializer(initializer_args):
-            mode = initializer_args.mode
-            if mode == DynamicEmbInitializerMode.NORMAL:
-                initializer = NormalInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-                initializer = TruncatedNormalInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.UNIFORM:
-                initializer = UniformInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.CONSTANT:
-                initializer = ConstantInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.DEBUG:
-                initializer = DebugInitializer(initializer_args)
-            else:
-                raise ValueError(
-                    f"Not supported initializer type({mode}) {type(mode)} {mode.value}."
-                )
-            return initializer
-
         for option in self._dynamicemb_options:
-            initializer = _get_initializer(option.initializer_args)
+            initializer = create_initializer_from_args(option.initializer_args)
             self._initializers.append(initializer)
-            eval_initializer = _get_initializer(option.eval_initializer_args)
+            eval_initializer = create_initializer_from_args(
+                option.eval_initializer_args
+            )
             self._eval_initializers.append(eval_initializer)
 
     def _create_bag_optimizer(
