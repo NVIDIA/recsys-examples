@@ -33,7 +33,7 @@
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 
@@ -128,55 +128,6 @@ except ImportError:
         CUDA = "CUDA"
         TRITON_CC = "TRITON_CC"
 
-
-class GRModuleBase(torch.nn.Module):
-    _is_inference: bool
-    _use_triton_cc: bool
-    _custom_kernel: bool
-    _hammer_kernel: Optional[HammerKernel] = None
-
-    def __init__(
-        self,
-        is_inference: bool,
-        use_triton_cc: bool = True,
-        custom_kernel: bool = True,
-        hammer_kernel: Optional[HammerKernel] = None,
-    ) -> None:
-        super().__init__()
-        self._is_inference = is_inference
-        self._use_triton_cc = use_triton_cc
-        self._custom_kernel = custom_kernel
-        self._hammer_kernel = hammer_kernel
-
-    def hammer_kernel(self) -> HammerKernel:
-        kernel = self._hammer_kernel
-        if kernel is not None:
-            return kernel
-        if self._custom_kernel:
-            if self._is_inference and self._use_triton_cc:
-                return HammerKernel.TRITON_CC
-            else:
-                return HammerKernel.TRITON
-        else:
-            return HammerKernel.PYTORCH
-
-    # pyre-ignore[2]
-    def recursive_setattr(self, name: str, value: Any) -> None:
-        for _, module in self.named_modules():
-            if hasattr(module, name):
-                setattr(module, name, value)
-
-    @property
-    def predict_mode(self) -> bool:
-        return self._is_inference
-
-    @property
-    def eval_mode(self) -> bool:
-        return (not self._is_inference) and (not self.training)
-
-    @property
-    def train_mode(self) -> bool:
-        return (not self._is_inference) and self.training
 
 
 def generate_sparse_seq_len(

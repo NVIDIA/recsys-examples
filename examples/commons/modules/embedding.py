@@ -166,6 +166,7 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
     """
     Sharded implementation of `EmbeddingCollection`.
     This is part of the public API to allow for manual data dist pipelining.
+    We re-implement the DP embedding so that it can be wrapped by Megatron DDP.
     """
 
     def __init__(
@@ -388,14 +389,19 @@ class ShardedEmbedding(torch.nn.Module):
         Returns:
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
-        mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+        assert not (
+            self._model_parallel_embedding_collection is None
+            and self._data_parallel_embedding_collection is None
+        ), "either model_parallel_embedding_collection or data_parallel_embedding_collection must be not None"
+        embeddings: Dict[str, JaggedTensor] = {}
+        if self._model_parallel_embedding_collection is not None:
+            mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+            embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
         if self._data_parallel_embedding_collection is not None:
             with torch.cuda.stream(self._side_stream):
                 dp_embeddings = self._data_parallel_embedding_collection(kjt)
             torch.cuda.current_stream().wait_stream(self._side_stream)
-            embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
-        else:
-            embeddings = mp_embeddings_awaitables.wait()
+            embeddings = {**embeddings, **dp_embeddings}
         return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:

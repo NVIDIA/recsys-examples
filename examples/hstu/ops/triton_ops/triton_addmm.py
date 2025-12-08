@@ -24,7 +24,7 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-from ops.triton_ops.common import triton_autotune
+from commons.ops.triton_ops.common import triton_autotune
 
 ENABLE_FULL_TURNING_SPACE = False
 
