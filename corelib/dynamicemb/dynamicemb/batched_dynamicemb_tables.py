@@ -532,7 +532,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
-
+        self._admit_strategy = self._dynamicemb_options[0].admit_strategy
+        self._evict_strategy = self._dynamicemb_options[0].evict_strategy.value
         if device is not None:
             self.device_id = int(str(device)[-1])
         else:
@@ -1018,6 +1019,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._enable_prefetch,
                 self.use_index_dedup,
                 self.training,
+                self._admit_strategy,
+                self._evict_strategy,
                 per_sample_weights,  # Pass frequency counters as weights
                 self._admission_counter,
                 self._empty_tensor,

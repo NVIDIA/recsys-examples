@@ -33,6 +33,7 @@ from dynamicemb.types import Counter
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
+    EvictStrategy,
     find_and_initialize,
     find_or_insert,
     gather_embedding,
@@ -346,6 +347,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         enable_prefetch: bool = False,
         input_dist_dedup: bool = False,
         training: bool = True,
+        admit_strategy=None,
+        evict_strategy=None,
         frequency_counters: Optional[torch.Tensor] = None,
         admission_counter: Optional[list[Counter]] = None,
         *args,
@@ -355,15 +358,13 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         emb_dtype = storages[0].embedding_dtype()
         emb_dim = storages[0].embedding_dim()
         caching = caches[0] is not None
-        admit_strategy = storages[0].options.admit_strategy
+        # admit_strategy = storages[0].options.admit_strategy
 
-        evict_strategy = storages[0].evict_strategy()
+        # evict_strategy = storages[0].options.score_strategy
 
         frequency_counts_int64 = None
         if frequency_counters is not None:
             frequency_counts_int64 = frequency_counters.long()
-
-        # TODO: Use frequency_counts_uint64 for LFU strategy in pooled embeddings
 
         lfu_accumulated_frequency = None
         indices_table_range = get_table_range(offsets, feature_offsets)
@@ -378,7 +379,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 indices,
                 indices_table_range,
                 unique_op,
-                evict_strategy,
+                EvictStrategy(evict_strategy.value) if evict_strategy else None,
                 frequency_counts_int64,
             )
             # TODO: only return device unique_indices_table_range
@@ -413,10 +414,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     initializers[i],
                     enable_prefetch,
                     training,
-                    evict_strategy,
+                    EvictStrategy(evict_strategy.value) if evict_strategy else None,
                     lfu_accumulated_frequency_per_table,
                     admit_strategy,
-                    admission_counter[i],
+                    admission_counter[i] if admission_counter else None,
                 )
             else:
                 KeyValueTableFunction.lookup(
@@ -425,10 +426,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     unique_embs_per_table,
                     initializers[i],
                     training,
-                    evict_strategy,
+                    EvictStrategy(evict_strategy.value) if evict_strategy else None,
                     lfu_accumulated_frequency_per_table,
                     admit_strategy,
-                    admission_counter[i],
+                    admission_counter[i] if admission_counter else None,
                 )
 
         if training or caching:
@@ -510,4 +511,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     optimizer,
                 )
 
-        return (None,) * 15
+        return (None,) * 17
