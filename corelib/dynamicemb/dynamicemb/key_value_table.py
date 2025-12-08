@@ -49,6 +49,7 @@ from dynamicemb_extensions import (
     erase,
     export_batch,
     export_batch_matched,
+    find,
     find_pointers,
     find_pointers_with_scores,
     insert_and_evict,
@@ -345,6 +346,29 @@ class KeyValueTable(
             return scores
         else:
             return None
+
+    def query_scores(self, unique_keys: torch.Tensor) -> torch.Tensor:
+        """Query scores for given keys from the table.
+
+        Returns:
+            scores: Tensor of scores, with 0 for keys not found in table
+        """
+
+        batch = unique_keys.size(0)
+        device = unique_keys.device
+
+        scores = torch.empty(batch, device=device, dtype=torch.long)
+        values = torch.empty(
+            batch, self.value_dim(), device=device, dtype=self.embedding_dtype()
+        )
+        founds = torch.empty(batch, device=device, dtype=torch.bool)
+
+        find(self.table, batch, unique_keys, values, founds, score=scores)
+
+        # for not found keys, set score to 0
+        scores[~founds] = 0
+
+        return scores
 
     def insert(
         self,

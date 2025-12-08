@@ -45,6 +45,61 @@ from dynamicemb_extensions import (
 )
 
 
+def _mask_embeddings_by_frequency(
+    cache: Optional[Cache],
+    storage: Storage,
+    unique_keys: torch.Tensor,
+    unique_embs: torch.Tensor,
+    frequency_threshold: int,
+    mask_dims: int,
+) -> None:
+    """
+    Mask low-frequency embeddings by setting specific dimensions to zero.
+
+    This function queries scores from cache and storage, then masks embeddings
+    whose scores are below the frequency threshold.
+
+    Args:
+        cache: Optional cache table (can be None if caching is disabled)
+        storage: Storage table (always present)
+        unique_keys: Keys to query scores for
+        unique_embs: Embeddings to mask (modified in-place)
+        frequency_threshold: Minimum score threshold
+        mask_dims: Number of dimensions to mask (from the end)
+    """
+    batch = unique_keys.size(0)
+    if batch == 0:
+        return
+    assert hasattr(
+        storage, "query_scores"
+    ), "If you want to use frequency masking, storage must implement the query_scores method"
+    # Query scores from cache and storage
+    if cache is not None:
+        # 1. Query cache first
+        cache_scores = cache.query_scores(unique_keys)
+        cache_founds = cache_scores > 0
+
+        # 2. Query storage for cache misses
+        if (~cache_founds).any():
+            missing_keys = unique_keys[~cache_founds]
+            storage_scores = storage.query_scores(missing_keys)
+            cache_scores[~cache_founds] = storage_scores
+
+        scores = cache_scores
+    else:
+        # Without cache: query from storage only
+        scores = storage.query_scores(unique_keys)
+
+    # Apply masking
+    low_freq_mask = scores < frequency_threshold
+    if low_freq_mask.any():
+        unique_embs[low_freq_mask, -mask_dims:] = 0.0
+    for i in range(unique_embs.size(0)):
+        print(
+            f"Row {i}: score = {scores[i].item()}, last {mask_dims} dims = {unique_embs[i, -mask_dims:].tolist()}"
+        )
+
+
 # TODO: BatchedDynamicEmbeddingFunction is more concrete.
 class DynamicEmbeddingBagFunction(torch.autograd.Function):
     @staticmethod
@@ -348,6 +403,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         input_dist_dedup: bool = False,
         training: bool = True,
         frequency_counters: Optional[torch.Tensor] = None,
+        frequency_threshold: int = 0,
+        mask_dims: int = 0,
         *args,
     ):
         table_num = len(storages)
@@ -424,6 +481,17 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     initializers[i],
                     training,
                     lfu_accumulated_frequency_per_table,
+                )
+
+            # Apply frequency-based masking if enabled
+            if is_lfu_enabled and mask_dims > 0 and frequency_threshold > 0:
+                _mask_embeddings_by_frequency(
+                    caches[i] if caching else None,
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    frequency_threshold,
+                    mask_dims,
                 )
 
         if training or caching:
@@ -505,4 +573,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     optimizer,
                 )
 
-        return (None,) * 14
+        return (None,) * 16
