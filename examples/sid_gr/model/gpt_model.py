@@ -3,14 +3,14 @@ from typing import Dict, List, Literal, Optional, Tuple
 import torch
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
-from commons.ops.length_to_complete_offsets import length_to_complete_offsets
+from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
-from data.GPTBatch import to_packed_seq_params
-from data.T5Batch import GPTSIDBatch
-from megatron.core import MegatronModule, TransformerConfig, tensor_parallel
+from data.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from megatron.core.enums import ModelType
-from megatron.core.packed_sequence_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from modules.gpt_loss_module import GPTSIDLossModule
@@ -32,20 +32,18 @@ class SIDGRDecoder(MegatronModule):
         ] = "learned_absolute",
         relative_attention_num_buckets: int = 32,
         relative_attention_max_distance: int = 128,
-        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        super().__init__(config=decoder_config, pg_collection=pg_collection)
+        super().__init__(config=decoder_config)
 
         self.config: TransformerConfig = decoder_config
 
         self.transformer_decoder_layer_spec: ModuleSpec = transformer_decoder_layer_spec
         self.max_sequence_length = max_sequence_length
         # TODO, add position encoder
-        self.model_type = ModelType.endoer_or_decoder
+        self.model_type = ModelType.encoder_or_decoder
         self.decoder = TransformerBlock(
-            config=self.decoder_config,
+            config=self.config,
             spec=self.transformer_decoder_layer_spec,
-            pg_collection=pg_collection,
         )
 
     def forward(
@@ -78,19 +76,16 @@ class SIDGRModel(MegatronModule):
         codebook_sizes: List[int],
         num_hierarchies: int,
         transformer_decoder_layer_spec: ModuleSpec,
-        max_sequence_length: int,
+        max_sequence_length: int,  # TODO, remove this?
         position_embedding_type: Literal[
             "learned_absolute", "rope", "relative"
-        ] = "learned_absolute",
+        ] = "relative",
         user_embedding_config: Optional[ShardedEmbeddingConfig] = None,
         relative_attention_num_buckets: int = 32,
         relative_attention_max_distance: int = 128,
         should_add_sep_token: bool = True,
-        pg_collection: ProcessGroupCollection = None,
     ):
-        super(SIDGRModel, self).__init__(
-            config=decoder_config, pg_collection=pg_collection
-        )
+        super(SIDGRModel, self).__init__(config=decoder_config)
         assert (
             position_embedding_type == "relative"
         ), "only relative position embedding is supported"
@@ -109,7 +104,6 @@ class SIDGRModel(MegatronModule):
             decoder_config,
             transformer_decoder_layer_spec,
             max_sequence_length,
-            pg_collection=pg_collection,
             position_embedding_type="relative",
         )
         self.codebook_sizes = codebook_sizes
@@ -135,10 +129,15 @@ class SIDGRModel(MegatronModule):
         # TODO, combine into single linear layer!
         self._decoder_mlp = torch.nn.ModuleList(
             [
-                tensor_parallel.ColumnParallelLinear(
-                    self.embedding_dim,
-                    codebook_size,
+                TEColumnParallelLinear(
+                    input_size=self.embedding_dim,
+                    output_size=codebook_size,
+                    init_method=self.config.init_method,
+                    config=self.config,
                     bias=False,
+                    gather_output=False,
+                    skip_bias_add=True,
+                    is_expert=False,
                 )
                 for codebook_size in self.codebook_sizes
             ]
@@ -147,6 +146,30 @@ class SIDGRModel(MegatronModule):
         self.loss_module = GPTSIDLossModule(
             reduction="none",
         )
+
+        self._training_dtype = (
+            torch.float16
+            if decoder_config.fp16
+            else (torch.bfloat16 if decoder_config.bf16 else torch.float32)
+        )
+
+    def bfloat16(self):
+        """
+        Convert the model to use bfloat16 precision. Only affects the decoder & mlp module.
+
+        """
+        self.decoder.bfloat16()
+        self._decoder_mlp.bfloat16()
+        return self
+
+    def half(self):
+        """
+        Convert the model to use half precision. Only affects the decoder & mlp module.
+
+        """
+        self.decoder.half()
+        self._decoder_mlp.half()
+        return self
 
     # TODO
     def _inject_sep_token_between_sids(
@@ -158,6 +181,11 @@ class SIDGRModel(MegatronModule):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return id_embeddings, attention_mask
 
+    def preprocess_embeddings(
+        self, embeddings: Dict[str, JaggedTensor]
+    ) -> Dict[str, JaggedTensor]:
+        pass
+
     def _concat_history_bos_candidate(
         self,
         history_hidden_states: torch.Tensor,  # sid
@@ -167,15 +195,17 @@ class SIDGRModel(MegatronModule):
         cu_seqlens_bos: torch.Tensor,  # bos
         max_seqlen_history: int,
         max_seqlen_candidate: int,
+        bos_token: torch.Tensor,
         batch_size: int,
         num_hierarchies: int,
     ) -> torch.Tensor:
-        assert history_hidden_states.size(0) == candidate_hidden_states.size(
+        assert cu_seqlens_history.size(0) == cu_seqlens_candidate.size(
             0
         ), "history and candidate must have the same batch size"
+
         # we now only have one bos token.
-        bos_token = self.bos_token.expand(
-            batch_size
+        bos_token = bos_token.repeat(
+            batch_size, 1
         ).contiguous()  # seqlens * num_hierarchies
 
         # [
@@ -203,13 +233,13 @@ class SIDGRModel(MegatronModule):
         candidate_features = batch.features[candidate_feature_name]
 
         # 1. embedding lookuo
-        embeddings: Dict[str, JaggedTensor] = self._embedding_collection(batch.features)
+        embeddings: Dict[str, JaggedTensor] = self._codebooks_collection(batch.features)
         # TODO, remove the assertion
         assert all(
             feature_name in embeddings.keys() for feature_name in batch.features.keys()
         ), "history and candidate feature names must be in the embeddings"
         assert (
-            self._num_hierarchies == batch.num_hierarchies
+            self._num_hierarchies == batch._num_hierarchies
         ), "number of hierarchies must match"
         # total_seqlen = history_features.size(0) // self._num_hierarchies
         # candidate_seqlen = candidate_features.size(0) // self._num_hierarchies
@@ -221,20 +251,30 @@ class SIDGRModel(MegatronModule):
             device=history_features.offsets().device,
             dtype=history_features.offsets().dtype,
         )
-
-        # 2. preprocess: concat history, bos, candidate ( TODO: add position encoder )
+        # 2. preprocess:concat history, bos, candidate ( TODO: add position encoder )
         (
             input_hidden_states,
             input_offsets,
             input_max_seqlen,
         ) = self._concat_history_bos_candidate(
-            embeddings[history_feature_name].values(),
-            embeddings[candidate_feature_name].values(),
+            embeddings[history_feature_name]
+            .values()
+            .to(
+                self._training_dtype
+            ),  # embedding output type is decoupeld, we need to cvt to training dtype.
+            embeddings[candidate_feature_name]
+            .values()
+            .to(
+                self._training_dtype
+            ),  # embedding output type is decoupeld, we need to cvt to training dtype.
             history_features.offsets(),
             candidate_features.offsets(),
             bos_offsets,
             max_seqlen_history,  # note that this is already multiplied by num_hierarchies
             max_seqlen_candidate,  # note that this is already multiplied by num_hierarchies
+            self.bos_token.to(
+                self._training_dtype
+            ),  # embedding output type is decoupeld, we need to cvt to training dtype.
             batch.batch_size,
             self._num_hierarchies,
         )
@@ -242,22 +282,24 @@ class SIDGRModel(MegatronModule):
             input_offsets,
             input_max_seqlen,
         )
+        # we need to unsqueeze the hidden states to [T, 1, hidden_size] and unsqueeze back after decoder
+        input_hidden_states = input_hidden_states.unsqueeze(1)
         # 3. decoder (causal self-attention)
         output_hidden_states = self.decoder(
             hidden_states=input_hidden_states,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )
+        output_hidden_states = output_hidden_states.squeeze(1)
 
         # 4. postprocess: split history, candidate, note that we append a bos token, so we need to remove the last token.
         # history are dropped.
+        candidate_offsets = candidate_features.offsets()
         _, output_hidden_states_bos_candidate = triton_split_2D_jagged(
             output_hidden_states,
             max_seq_len=input_max_seqlen,
-            offsets_a=input_offsets - candidate_features - bos_offsets,
-            offsets_b=candidate_features + bos_offsets,
-            dense_size=self._num_hierarchies,
-            n_prefix_to_right=1,
+            offsets_a=input_offsets - candidate_offsets - bos_offsets,
+            offsets_b=candidate_offsets + bos_offsets,
         )
         output_hidden_states_bos_candidate = output_hidden_states_bos_candidate.reshape(
             -1, self._num_hierarchies + 1, self.embedding_dim
@@ -266,27 +308,28 @@ class SIDGRModel(MegatronModule):
         candidate_hidden_states = output_hidden_states_bos_candidate[:, :-1, :]
         losses_per_hierarchy = []
         logits_per_hierarchy = []
-        merged_labels = batch.labels.values().view(-1, self._num_hierarchies)
-
+        merged_labels = batch.labels.view(-1, self._num_hierarchies)
+        # import pdb; pdb.set_trace()
         # 5. output linear projection & loss
         # TODO, merge into single linear layer
         # note that the labels
         for hierarchy_idx, mlp in enumerate(self._decoder_mlp):
-            candidate_hierarchy_logits = mlp(
-                candidate_hidden_states[:, hierarchy_idx, :]
+            tuple_or_tensor = mlp(candidate_hidden_states[:, hierarchy_idx, :])
+            candidate_hierarchy_logits = (
+                tuple_or_tensor[0]
+                if isinstance(tuple_or_tensor, tuple)
+                else tuple_or_tensor
             )
+
             losses_per_hierarchy.append(
                 self.loss_module(
-                    candidate_hierarchy_logits, merged_labels[:, hierarchy_idx]
+                    candidate_hierarchy_logits.float(), merged_labels[:, hierarchy_idx]
                 )
-            )
+            )  # loss needs to be float for
             logits_per_hierarchy.append(candidate_hierarchy_logits)
-
         # (T, num_hierarchies)
-        merged_losses = torch.cat(losses_per_hierarchy, dim=1)
-        merged_logits = torch.cat(logits_per_hierarchy, dim=1)
+        merged_losses = torch.stack(losses_per_hierarchy, dim=1).view(-1)
+        merged_logits = torch.stack(logits_per_hierarchy, dim=1).view(
+            -1, self.embedding_dim
+        )
         return merged_losses, merged_logits
-
-
-# class (MegatronModule):
-# class
