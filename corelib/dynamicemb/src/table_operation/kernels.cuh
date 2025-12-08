@@ -60,7 +60,8 @@ struct EvalAndCount {
 
   template <int GroupSize>
   __forceinline__ __device__ void
-  operator()(ScoreType score, cg::thread_block_tile<GroupSize> &g, bool valid) {
+  operator()(const ScoreType score, cg::thread_block_tile<GroupSize> &g,
+             bool valid) {
 
     bool match = valid && (score >= threshold);
 
@@ -550,7 +551,8 @@ __global__ void table_traverse_kernel(Table table, IndexType begin,
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
 
-  auto g = cg::tiled_partition<TileSize>(cg::this_thread_block());
+  cg::thread_block_tile<TileSize> g =
+      cg::tiled_partition<TileSize>(cg::this_thread_block());
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 

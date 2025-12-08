@@ -25,6 +25,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <torch/torch.h>
 // #include <ATen/cuda/DeviceUtils.cuh>
 #include "ATen/AccumulateType.h"
+#include <c10/core/ScalarType.h>
 #include <pybind11/pybind11.h>
 // #include <torch/python.h>
 #include <cstdint>
@@ -42,6 +43,7 @@ namespace dyn_emb {
 DataType scalartype_to_datatype(at::ScalarType scalar_type);
 at::ScalarType datatype_to_scalartype(dyn_emb::DataType dtype);
 at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta &typeMeta);
+at::ScalarType toScalarType(torch::Dtype dt);
 
 uint64_t device_timestamp();
 

@@ -120,6 +120,28 @@ at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta &typeMeta) {
     throw std::invalid_argument("Unsupported DataType");
   }
 }
+
+at::ScalarType toScalarType(torch::Dtype dt) {
+  switch (dt) {
+  case torch::kInt64:
+    return at::kLong;
+  case torch::kUInt64:
+    return at::kUInt64;
+  case torch::kInt32:
+    at::kInt;
+  case torch::kUInt32:
+    at::kUInt32;
+  case torch::kFloat32:
+    at::kFloat;
+  case torch::kFloat64:
+    at::kDouble;
+  case torch::kBool:
+    at::kBool;
+  }
+
+  TORCH_CHECK(false, "Unsupported torch::Dtype");
+}
+
 } // namespace dyn_emb
 
 // PYTHON WRAP
