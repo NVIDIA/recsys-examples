@@ -13,38 +13,72 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+from typing import Tuple
 
 import commons.utils.initialize as init
 import gin
 import torch
 from commons.distributed.sharding import make_optimizer_and_shard
+from commons.optimizer import OptimizerParam
 from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
 )
 from commons.utils.logger import print_rank_0
-from megatron.core import parallel_state
-from model import get_ranking_model
-from modules.metrics import get_multi_event_metric_module
-from trainer.training import maybe_load_ckpts, train_with_pipeline
-from trainer.utils import (
-    create_optimizer_params,
-    get_data_loader,
-    get_dataset_and_embedding_args,
-    get_embedding_vector_storage_multiplier,
+from configs.args_to_config import create_embedding_config
+from configs.gpt_config import get_gpt_config
+from configs.sid_gin_config_args import (
+    DatasetArgs,
+    EmbeddingArgs,
+    NetworkArgs,
+    OptimizerArgs,
+    TensorModelParallelArgs,
+    TrainerArgs,
 )
+from data.sid_data_loader import get_data_loader
+from model import get_sid_gr_model
+from trainer.training import maybe_load_ckpts, train_with_pipeline
+
+
+def get_dataset_and_embedding_args() -> Tuple[DatasetArgs, EmbeddingArgs]:
+    dataset_args = DatasetArgs()  # type: ignore[call-arg]
+
+    assert isinstance(dataset_args, DatasetArgs)
+    codebook_sizes = dataset_args.codebook_sizes
+    aggragated_codebook_size = sum(codebook_sizes)
+    embedding_args = EmbeddingArgs(  # sid tuples share a embedding table
+        feature_names=["hist_sids", "cand_sids"],  # sid tuples share a embedding table
+        table_name="codebook",
+        item_vocab_size_or_capacity=aggragated_codebook_size,
+        sharding_type="data_parallel",
+    )
+
+    return dataset_args, embedding_args
+
+
+def create_optimizer_params(optimizer_args: OptimizerArgs):
+    return OptimizerParam(
+        optimizer_str=optimizer_args.optimizer_str,
+        learning_rate=optimizer_args.learning_rate,
+        adam_beta1=optimizer_args.adam_beta1,
+        adam_beta2=optimizer_args.adam_beta2,
+        adam_eps=optimizer_args.adam_eps,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HSTU Example Arguments", allow_abbrev=False
+        description="SID-GR Example Arguments", allow_abbrev=False
     )
     parser.add_argument("--gin-config-file", type=str)
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
     trainer_args = TrainerArgs()
-    dataset_args, embedding_args = get_dataset_and_embedding_args()
+    (
+        dataset_args,
+        embedding_args,
+    ) = get_dataset_and_embedding_args()  # auto-set by gin-config
     network_args = NetworkArgs()
     optimizer_args = OptimizerArgs()
     tp_args = TensorModelParallelArgs()
@@ -58,41 +92,34 @@ def main():
     print_rank_0(
         f"distributed env initialization done. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
     )
-    hstu_config = create_hstu_config(network_args, tp_args)
-    task_config = create_ranking_config(dataset_args, network_args, embedding_args)
-    model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
-
-    dynamic_options_dict = create_dynamic_optitons_dict(
-        embedding_args,
+    gpt_config = get_gpt_config(
         network_args.hidden_size,
-        training=True,
-        embedding_dim_multiplier=get_embedding_vector_storage_multiplier(
-            optimizer_args.optimizer_str
-        ),
+        network_args.kv_channels,
+        network_args.num_attention_heads,
+        network_args.num_layers,
+        torch.bfloat16,
+        tensor_model_parallel_size=tp_args.tensor_model_parallel_size,
+    )
+    embedding_config = create_embedding_config(network_args.hidden_size, embedding_args)
+    model = get_sid_gr_model(
+        decoder_config=gpt_config,
+        codebook_embedding_config=embedding_config,
+        codebook_sizes=dataset_args.codebook_sizes,
+        num_hierarchies=dataset_args.num_hierarchies,
+        max_history_length=dataset_args.max_history_length,
     )
 
     optimizer_param = create_optimizer_params(optimizer_args)
     model_train, dense_optimizer = make_optimizer_and_shard(
         model,
-        config=hstu_config,
+        config=gpt_config,
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
-        dynamicemb_options_dict=dynamic_options_dict,
+        dynamicemb_options_dict={},
         pipeline_type=trainer_args.pipeline_type,
     )
-
-    stateful_metric_module = get_multi_event_metric_module(
-        num_classes=task_config.prediction_head_arch[-1],
-        num_tasks=task_config.num_tasks,
-        metric_types=task_config.eval_metrics,
-        comm_pg=parallel_state.get_data_parallel_group(
-            with_context_parallel=True
-        ),  # ranks in the same TP group do the same compute
-    )
-
-    train_dataloader, test_dataloader = get_data_loader(
-        "ranking", dataset_args, trainer_args, task_config.num_tasks
-    )
+    stateful_metric_module = None
+    train_dataloader, test_dataloader = get_data_loader(dataset_args, trainer_args)
     free_memory, total_memory = torch.cuda.mem_get_info()
     print_rank_0(
         f"model initialization done, start training. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"

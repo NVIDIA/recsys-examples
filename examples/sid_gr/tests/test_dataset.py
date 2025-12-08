@@ -16,14 +16,14 @@ def test_batch(batch_size):
             ],
             max_item_ids=[128, 128, 128, 128, 100000],
             min_item_ids=[0, 0, 0, 0, 0],
-            max_sequence_length=128,
+            max_history_length=128,
             is_jagged=True,
         ),
         FeatureConfig(
             feature_names=["cand_sid_0", "cand_sid_1", "cand_sid_2", "cand_sid_3"],
             max_item_ids=[128, 128, 128, 128],
             min_item_ids=[0, 0, 0, 0],
-            max_sequence_length=128,
+            max_history_length=128,
             is_jagged=True,
         ),
         FeatureConfig(
@@ -39,7 +39,7 @@ def test_batch(batch_size):
                 0,
                 0,
             ],
-            max_sequence_length=4,
+            max_history_length=4,
             is_jagged=False,
         ),
     ]

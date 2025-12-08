@@ -1,5 +1,5 @@
 import torch
-from configs.gin_config_args import DatasetArgs, TrainerArgs
+from configs.sid_gin_config_args import DatasetArgs, TrainerArgs
 from torch.utils.data import DataLoader
 
 from .dataset import get_dataset

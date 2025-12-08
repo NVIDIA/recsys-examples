@@ -127,7 +127,7 @@ class DatasetArgs:
 
     Attributes:
         dataset_name (str): **Required**. Dataset name.
-        max_sequence_length (int): **Required**. Maximum sequence length.
+        max_history_length (int): **Required**. Maximum sequence length.
         sequence_features_data_path (Optional[str]): Path to dataset. Default: None.
         max_num_candidates (int): Maximum number of candidates. Default: 0.
         shuffle (bool): Whether to shuffle data. Default: False.
@@ -137,8 +137,9 @@ class DatasetArgs:
     """
 
     dataset_name: str
-    max_sequence_length: int
+    max_history_length: int
     dataset_type: DatasetType = DatasetType.InMemoryRandomDataset
+    dataset_type_str: str = "in_memory_random_dataset"
     sequence_features_data_path: Optional[
         str
     ] = None  # None when dataset_type is InMemoryRandomDataset
@@ -155,6 +156,16 @@ class DatasetArgs:
         assert (
             len(self.codebook_sizes) == self.num_hierarchies
         ), "codebook_sizes should have the same length as num_hierarchies"
+        assert self.dataset_type_str.lower() in [
+            "in_memory_random_dataset",
+            "disk_sequence_dataset",
+        ], "dataset_type_str should be in ['in_memory_random_dataset', 'disk_sequence_dataset']"
+        if self.dataset_type_str == "in_memory_random_dataset":
+            self.dataset_type = DatasetType.InMemoryRandomDataset
+        elif self.dataset_type_str == "disk_sequence_dataset":
+            self.dataset_type = DatasetType.DiskSequenceDataset
+        else:
+            raise ValueError(f"Invalid dataset type: {self.dataset_type_str}")
 
 
 @gin.configurable

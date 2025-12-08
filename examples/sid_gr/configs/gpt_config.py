@@ -12,13 +12,19 @@ class GPTConfig(TransformerConfig):
 
 def get_gpt_config(
     hidden_size: int,
-    kv_channels,
-    num_attention_heads,
-    num_layers,
-    dtype,
+    kv_channels: int,
+    num_attention_heads: int,
+    num_layers: int,
+    dtype: torch.dtype,
+    normalization: str = "LayerNorm",  # "LayerNorm" or "rmsnorm"
     norm_epsilon: float = 1e-5,
     hidden_dropout=0.2,
+    tensor_model_parallel_size: int = 1,
 ) -> GPTConfig:
+    """
+    normalization: { 'LayerNorm', 'RMSNorm' }, default = 'LayerNorm'
+                    type of normalization applied.
+    """
     is_bf16 = dtype == torch.bfloat16
     is_fp16 = dtype == torch.float16
     return GPTConfig(  # type: ignore
@@ -30,4 +36,5 @@ def get_gpt_config(
         layernorm_epsilon=norm_epsilon,
         bf16=is_bf16,
         fp16=is_fp16,
+        tensor_model_parallel_size=tensor_model_parallel_size,
     )

@@ -1,4 +1,4 @@
-from configs.gin_config_args import DatasetArgs, DatasetType, TrainerArgs
+from configs.sid_gin_config_args import DatasetArgs, DatasetType, TrainerArgs
 
 from .gpt_sid_batch import FeatureConfig
 from .in_memory_random_dataset import InMemoryRandomDataset
@@ -10,7 +10,7 @@ def get_dataset(
     trainer_args: TrainerArgs,
     is_train_dataset: bool,
 ):
-    max_sequence_length = dataset_args.max_sequence_length
+    max_history_length = dataset_args.max_history_length
     num_hierarchies = dataset_args.num_hierarchies
     codebook_sizes = dataset_args.codebook_sizes
     assert (
@@ -27,7 +27,7 @@ def get_dataset(
                 feature_names=raw_hist_sid_names + raw_cand_sid_names,
                 max_item_ids=[codebook_sizes[i] for i in range(num_hierarchies)]
                 + [codebook_sizes[i] for i in range(num_hierarchies)],
-                max_sequence_length=max_sequence_length,
+                max_history_length=max_history_length,
                 is_jagged=True,
             )
         )
@@ -36,7 +36,7 @@ def get_dataset(
             FeatureConfig(
                 feature_names=raw_cand_sid_names,
                 max_item_ids=[codebook_sizes[i] for i in range(num_hierarchies)],
-                max_sequence_length=max_sequence_length,
+                max_history_length=1,
                 is_jagged=True,
             )
         )
@@ -71,6 +71,6 @@ def get_dataset(
         common_preprocessor.history_feature_name
         common_preprocessor.candidate_feature_name
         common_preprocessor.item_id_to_sid_mapping_path
-
+        raise NotImplementedError("DiskSequenceDataset is not implemented yet")
     else:
         raise ValueError(f"Invalid dataset type: {dataset_args.dataset_type}")

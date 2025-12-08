@@ -12,7 +12,7 @@ from tests.test_utils import create_sid_gr_model_and_optimizer
 def generate_batches(
     batchsize: int,
     num_batches: int,
-    max_sequence_length: int,
+    max_history_length: int,
     codebook_sizes: List[int],
     combined_history_feature_name: str,
     combined_candidate_feature_name: str,
@@ -30,14 +30,14 @@ def generate_batches(
             feature_names=raw_hist_sid_names,
             max_item_ids=max_item_ids,
             min_item_ids=min_item_ids,
-            max_sequence_length=max_sequence_length,
+            max_history_length=max_history_length,
             is_jagged=True,
         ),
         FeatureConfig(
             feature_names=raw_cand_sid_names,
             max_item_ids=max_item_ids,
             min_item_ids=min_item_ids,
-            max_sequence_length=1,  # candidate sid is a single sid
+            max_history_length=1,  # candidate sid is a single sid
             is_jagged=False,
         ),
     ]
@@ -61,7 +61,7 @@ def generate_batches(
 @pytest.mark.parametrize("num_attention_heads", [4])
 @pytest.mark.parametrize("kv_channels", [128])
 @pytest.mark.parametrize("num_layers", [1])
-@pytest.mark.parametrize("max_sequence_length", [128])
+@pytest.mark.parametrize("max_history_length", [128])
 @pytest.mark.parametrize("codebook_sizes", [[128, 128, 128, 128], [256, 256, 256]])
 def test_model_smoke(
     dtype,
@@ -69,7 +69,7 @@ def test_model_smoke(
     num_attention_heads,
     kv_channels,
     num_layers,
-    max_sequence_length,
+    max_history_length,
     codebook_sizes,
 ):
     num_hierarchies = len(codebook_sizes)
@@ -90,7 +90,7 @@ def test_model_smoke(
     batches = generate_batches(
         batchsize=batchsize,
         num_batches=num_batches,
-        max_sequence_length=max_sequence_length,
+        max_history_length=max_history_length,
         codebook_sizes=codebook_sizes,
         combined_history_feature_name=history_sid_feature_name,
         combined_candidate_feature_name=candidate_sid_feature_name,
@@ -104,7 +104,7 @@ def test_model_smoke(
             kv_channels=kv_channels,
             num_layers=num_layers,
             num_hierarchies=num_hierarchies,
-            max_sequence_length=max_sequence_length,
+            max_history_length=max_history_length,
             codebook_embedding_config=codebook_embedding_config,
             codebook_sizes=codebook_sizes,
         )

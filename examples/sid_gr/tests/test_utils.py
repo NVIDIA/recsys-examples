@@ -16,7 +16,7 @@ def create_sid_gr_model_and_optimizer(
     kv_channels: int,
     num_layers: int,
     num_hierarchies: int,
-    max_sequence_length: int,
+    max_history_length: int,
     codebook_embedding_config: ShardedEmbeddingConfig,
     codebook_sizes: List[int],
     should_add_sep_token: bool = False,
@@ -31,7 +31,7 @@ def create_sid_gr_model_and_optimizer(
         num_layers=num_layers,
         bf16=True if dtype == torch.bfloat16 else False,
         fp16=True if dtype == torch.float16 else False,
-        # max_sequence_length=max_sequence_length,
+        # max_history_length=max_history_length,
         # position_embedding_type="relative",
     )
 
@@ -46,7 +46,7 @@ def create_sid_gr_model_and_optimizer(
         codebook_sizes=codebook_sizes,
         num_hierarchies=num_hierarchies,
         transformer_decoder_layer_spec=transformer_decoder_layer_spec,
-        max_sequence_length=max_sequence_length,
+        max_history_length=max_history_length,
         should_add_sep_token=should_add_sep_token,
     )
 

@@ -34,14 +34,14 @@ class FeatureConfig:
 
     Attributes:
       max_item_ids (List[int]): List of maximum item IDs for each feature.
-      max_sequence_length (int): The maximum length of sequences in the dataset.
+      max_history_length (int): The maximum length of sequences in the dataset.
       is_jagged (bool): Whether the sequences are jagged (i.e., have varying lengths).
       min_item_ids (List[int]): List of minimum item IDs for each feature.
       feature_names (List[str]): List of feature names.
     """
 
     max_item_ids: List[int]  # From embedding args
-    max_sequence_length: int
+    max_history_length: int
     is_jagged: bool
 
     min_item_ids: Optional[List[int]] = None
@@ -129,13 +129,13 @@ class GPTSIDBatch(Pipelineable):
         for feature_config in feature_configs:
             if feature_config.is_jagged:
                 seqlen = torch.randint(
-                    feature_config.max_sequence_length, (batch_size,), device=device
+                    feature_config.max_history_length, (batch_size,), device=device
                 )
                 # the random guarantee the sequence length is at least 1.
                 seqlen = seqlen.clamp(min=1)
             else:
                 seqlen = torch.full(
-                    (batch_size,), feature_config.max_sequence_length, device=device
+                    (batch_size,), feature_config.max_history_length, device=device
                 )
             total_seqlen = torch.sum(seqlen).item()
             feature_names = feature_config.feature_names
@@ -155,7 +155,7 @@ class GPTSIDBatch(Pipelineable):
                 feature_name_kvl[key] = (
                     value,
                     seqlen,
-                    feature_config.max_sequence_length,
+                    feature_config.max_history_length,
                 )
 
         history_sid_kvl = {key: feature_name_kvl.pop(key) for key in raw_hist_sid_names}

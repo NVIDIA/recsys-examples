@@ -1,4 +1,4 @@
-# from configs.gin_config_args import DatasetArgs, EmbeddingArgs
+# from configs.sid_gin_config_args import DatasetArgs, EmbeddingArgs
 
 
 # def get_dataset_and_embedding_args():

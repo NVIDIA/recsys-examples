@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
@@ -26,7 +26,7 @@ class SIDGRDecoder(MegatronModule):
         self,
         decoder_config: TransformerConfig,  # decoder config
         transformer_decoder_layer_spec: ModuleSpec,
-        max_sequence_length: int,
+        max_history_length: int,
         position_embedding_type: Literal[
             "learned_absolute", "rope", "relative"
         ] = "learned_absolute",
@@ -38,7 +38,7 @@ class SIDGRDecoder(MegatronModule):
         self.config: TransformerConfig = decoder_config
 
         self.transformer_decoder_layer_spec: ModuleSpec = transformer_decoder_layer_spec
-        self.max_sequence_length = max_sequence_length
+        self.max_history_length = max_history_length
         # TODO, add position encoder
         self.model_type = ModelType.encoder_or_decoder
         self.decoder = TransformerBlock(
@@ -76,7 +76,7 @@ class SIDGRModel(MegatronModule):
         codebook_sizes: List[int],
         num_hierarchies: int,
         transformer_decoder_layer_spec: ModuleSpec,
-        max_sequence_length: int,  # TODO, remove this?
+        max_history_length: int,  # TODO, remove this?
         position_embedding_type: Literal[
             "learned_absolute", "rope", "relative"
         ] = "relative",
@@ -91,6 +91,10 @@ class SIDGRModel(MegatronModule):
         ), "only relative position embedding is supported"
         # TODO, use different embedding dim???
         self.embedding_dim = decoder_config.hidden_size
+        self.codebook_size = codebook_sizes[0]
+        assert all(
+            size == self.codebook_size for size in codebook_sizes
+        ), "all codebook sizes should be the same"
         self._num_hierarchies = num_hierarchies
         self._codebooks_collection = ShardedEmbedding(
             [codebook_embedding_config]
@@ -103,7 +107,7 @@ class SIDGRModel(MegatronModule):
         self.decoder = SIDGRDecoder(
             decoder_config,
             transformer_decoder_layer_spec,
-            max_sequence_length,
+            max_history_length,
             position_embedding_type="relative",
         )
         self.codebook_sizes = codebook_sizes
@@ -251,6 +255,8 @@ class SIDGRModel(MegatronModule):
             device=history_features.offsets().device,
             dtype=history_features.offsets().dtype,
         )
+        history_offsets = history_features.offsets()
+        candidate_offsets = candidate_features.offsets()
         # 2. preprocess:concat history, bos, candidate ( TODO: add position encoder )
         (
             input_hidden_states,
@@ -267,8 +273,8 @@ class SIDGRModel(MegatronModule):
             .to(
                 self._training_dtype
             ),  # embedding output type is decoupeld, we need to cvt to training dtype.
-            history_features.offsets(),
-            candidate_features.offsets(),
+            history_offsets,
+            candidate_offsets,
             bos_offsets,
             max_seqlen_history,  # note that this is already multiplied by num_hierarchies
             max_seqlen_candidate,  # note that this is already multiplied by num_hierarchies
@@ -294,26 +300,30 @@ class SIDGRModel(MegatronModule):
 
         # 4. postprocess: split history, candidate, note that we append a bos token, so we need to remove the last token.
         # history are dropped.
-        candidate_offsets = candidate_features.offsets()
+        # TODO, replace with one-shottorch op
         _, output_hidden_states_bos_candidate = triton_split_2D_jagged(
             output_hidden_states,
             max_seq_len=input_max_seqlen,
-            offsets_a=input_offsets - candidate_offsets - bos_offsets,
+            offsets_a=history_offsets,
             offsets_b=candidate_offsets + bos_offsets,
         )
-        output_hidden_states_bos_candidate = output_hidden_states_bos_candidate.reshape(
-            -1, self._num_hierarchies + 1, self.embedding_dim
+        _, output_hidden_states = triton_split_2D_jagged(
+            output_hidden_states_bos_candidate,
+            max_seq_len=max_seqlen_candidate + 1,
+            offsets_a=bos_offsets,
+            offsets_b=candidate_offsets,
         )
-        # the output shape should be [sum(candidate_seqlen), num_hierarchies, hidden_size]
-        candidate_hidden_states = output_hidden_states_bos_candidate[:, :-1, :]
+        # the output shape should be [(sum(candidate_seqlen)) , num_hierarchies, hidden_size]
+        candidate_hidden_states = output_hidden_states.reshape(
+            -1, self._num_hierarchies, self.embedding_dim
+        )
         losses_per_hierarchy = []
         logits_per_hierarchy = []
         merged_labels = batch.labels.view(-1, self._num_hierarchies)
-        # import pdb; pdb.set_trace()
         # 5. output linear projection & loss
         # TODO, merge into single linear layer
         # note that the labels
-        for hierarchy_idx, mlp in enumerate(self._decoder_mlp):
+        for hierarchy_idx, mlp in enumerate[Any](self._decoder_mlp):
             tuple_or_tensor = mlp(candidate_hidden_states[:, hierarchy_idx, :])
             candidate_hierarchy_logits = (
                 tuple_or_tensor[0]
@@ -330,6 +340,6 @@ class SIDGRModel(MegatronModule):
         # (T, num_hierarchies)
         merged_losses = torch.stack(losses_per_hierarchy, dim=1).view(-1)
         merged_logits = torch.stack(logits_per_hierarchy, dim=1).view(
-            -1, self.embedding_dim
+            -1, self.codebook_size
         )
         return merged_losses, merged_logits

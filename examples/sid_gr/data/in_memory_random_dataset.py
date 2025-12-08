@@ -64,8 +64,8 @@ class InMemoryRandomDataset(IterableDataset[GPTSIDBatch]):
             feature_configs=feature_configs,
             raw_hist_sid_names=raw_hist_sid_names,
             raw_cand_sid_names=raw_cand_sid_names,
-            _history_feature_name=combined_history_feature_name,
-            _candidate_feature_name=combined_candidate_feature_name,
+            combined_history_feature_name=combined_history_feature_name,
+            combined_candidate_feature_name=combined_candidate_feature_name,
             contextual_feature_names=contextual_feature_names,
             device=torch.cpu.current_device(),
         )
