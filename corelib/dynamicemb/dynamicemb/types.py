@@ -403,3 +403,13 @@ class AdmissionStrategy(abc.ABC):
         """
         Get the initializer args for keys that are not admitted.
         """
+
+    @abc.abstractmethod
+    def initialize_non_admitted_embeddings(
+        self,
+        buffer: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> None:
+        """
+        Initialize the embeddings for the keys that are not admitted.
+        """

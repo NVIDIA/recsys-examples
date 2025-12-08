@@ -26,10 +26,7 @@ from dynamicemb.dynamicemb_config import (
     dyn_emb_to_torch,
     torch_to_dyn_emb,
 )
-from dynamicemb.initializer import (
-    BaseDynamicEmbInitializer,
-    create_initializer_from_args,
-)
+from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.types import (
     EMBEDDING_TYPE,
@@ -883,13 +880,9 @@ class KeyValueTableFunction:
                 non_admitted_mask = ~admit_mask
                 non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
                 if non_admitted_indices.numel() > 0:
-                    non_admit_initializer = create_initializer_from_args(
-                        non_admit_initializer_args
-                    )
-                    non_admit_initializer(
-                        unique_embs,
+                    admit_strategy.initialize_non_admitted_embeddings(
+                        unique_embs[:, :emb_dim],
                         non_admitted_indices,
-                        unique_keys,
                     )
 
             # Only initialize admitted embeddings with the regular initializer
@@ -1070,13 +1063,9 @@ class KeyValueTableCachingFunction:
                 non_admitted_mask = ~admit_mask_for_missing_keys
                 non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
                 if non_admitted_indices.numel() > 0:
-                    non_admit_initializer = create_initializer_from_args(
-                        non_admit_initializer_args
-                    )
-                    non_admit_initializer(
+                    admit_strategy.initialize_non_admitted_embeddings(
                         values_for_storage[:, :emb_dim],
                         non_admitted_indices,
-                        keys_for_storage,
                     )
 
             # Only initialize admitted embeddings with the regular initializer

@@ -17,6 +17,7 @@
 from typing import Optional
 
 import torch
+from dynamicemb.initializer import create_initializer_from_args
 from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScorePolicy,
@@ -170,3 +171,18 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
 
     def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
         return self.initializer_args
+
+    def initialize_non_admitted_embeddings(
+        self,
+        buffer: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> None:
+        """
+        Initialize the embeddings for the keys that are not admitted.
+        """
+        non_admit_initializer = create_initializer_from_args(self.initializer_args)
+        non_admit_initializer(
+            buffer,
+            indices,
+            None,
+        )

@@ -187,8 +187,6 @@ def validate_admission_keys(
         expected = expected_frequencies[table_name]
         actual = actual_keys[table_name]
 
-        # Validate keys that are actually in the table (sharded to this rank)
-        # For each key in actual, verify it meets the admission criteria
         for key in actual:
             if key not in expected:
                 raise AssertionError(
@@ -196,7 +194,6 @@ def validate_admission_keys(
                     f"Found in table but not in expected frequencies (unexpected key)"
                 )
 
-            # Verify that admitted keys have frequency >= threshold
             if expected[key] < threshold:
                 raise AssertionError(
                     f"Table {table_name}, Key {key}: "

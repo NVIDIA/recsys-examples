@@ -24,7 +24,7 @@ class BaseDynamicEmbInitializer(abc.ABC):
         self,
         buffer: torch.Tensor,
         indices: torch.Tensor,
-        keys: Optional[torch.Tensor],  # remove it when debug mode is removed
+        # keys: Optional[torch.Tensor],  # remove it when debug mode is removed
     ) -> None:
         ...
 
