@@ -26,13 +26,11 @@ void table_count_matched_single_score(at::Tensor table_storage,
                                       std::vector<ScoreType> thresholds,
                                       at::Tensor num_matched) {
 
-  auto key_type = scalartype_to_datatype(dtypes[0].toScalarType());
+  auto key_type = scalartype_to_datatype(toScalarType(dtypes[0]));
   auto counter_ = get_pointer<CounterType>(num_matched);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   ScoreType threshold = thresholds[0];
-
-  int64_t num_total = batch;
 
   EvalAndCount func(threshold, counter_);
 
