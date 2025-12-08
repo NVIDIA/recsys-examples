@@ -216,7 +216,6 @@ def apply_dmp(
                 embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
                 emb_num_embeddings = (
                     eb_config.num_embeddings * cache_capacity_ratio
-                    # eb_config.num_embeddings
                     if caching
                     else eb_config.num_embeddings
                 )

@@ -171,6 +171,10 @@ def validate_admission_keys(
     """
     Validate that only keys with frequency >= threshold are stored in tables.
 
+    In multi-GPU scenarios, keys are sharded across GPUs. Each rank only validates
+    keys that are actually present in its local tables (i.e., keys that were sharded to it).
+    This is similar to how LFU score validation works.
+
     Args:
         expected_frequencies: Dict mapping table_name -> {key: frequency}
         actual_keys: Dict mapping table_name -> Set[key]
@@ -183,39 +187,37 @@ def validate_admission_keys(
         expected = expected_frequencies[table_name]
         actual = actual_keys[table_name]
 
-        # Build expected admitted and rejected keys
-        expected_admitted = {k for k, freq in expected.items() if freq >= threshold}
-        expected_rejected = {k for k, freq in expected.items() if freq < threshold}
-
-        # Validate admitted keys
-        for key in expected_admitted:
-            if key not in actual:
+        # Validate keys that are actually in the table (sharded to this rank)
+        # For each key in actual, verify it meets the admission criteria
+        for key in actual:
+            if key not in expected:
                 raise AssertionError(
                     f"Table {table_name}, Key {key}: "
-                    f"Expected to be admitted (frequency={expected[key]} >= threshold={threshold}), "
-                    f"but not found in table"
+                    f"Found in table but not in expected frequencies (unexpected key)"
                 )
 
-        # Validate rejected keys
-        for key in expected_rejected:
-            if key in actual:
+            # Verify that admitted keys have frequency >= threshold
+            if expected[key] < threshold:
                 raise AssertionError(
                     f"Table {table_name}, Key {key}: "
-                    f"Expected to be rejected (frequency={expected[key]} < threshold={threshold}), "
-                    f"but found in table"
+                    f"Admitted with frequency={expected[key]} < threshold={threshold} "
+                    f"(should have been rejected)"
                 )
 
-        # Check for unexpected keys
-        unexpected_keys = actual - set(expected.keys())
-        if unexpected_keys:
-            raise AssertionError(
-                f"Table {table_name}: Found unexpected keys in table: {unexpected_keys}"
-            )
+        # Count expected admitted/rejected for reporting
+        expected_admitted_count = sum(
+            1 for freq in expected.values() if freq >= threshold
+        )
+        expected_rejected_count = sum(
+            1 for freq in expected.values() if freq < threshold
+        )
+        actual_admitted_count = len(actual)
 
         print(
             f"✓ Table {table_name}: "
-            f"{len(expected_admitted)} admitted, "
-            f"{len(expected_rejected)} rejected, "
+            f"{actual_admitted_count} keys admitted on this rank "
+            f"(global: {expected_admitted_count} expected admitted, "
+            f"{expected_rejected_count} expected rejected), "
             f"threshold={threshold}"
         )
 
