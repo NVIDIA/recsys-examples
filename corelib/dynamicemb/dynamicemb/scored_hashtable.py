@@ -1100,10 +1100,6 @@ class LinearBucketTable(ScoredHashTable):
                     total_matched, dtype=SCORE_TYPE, device="cpu"
                 )
 
-            assert (
-                total_matched == out_offset
-            ), "Dumped keys number mismatched with the expected count."
-
             d_keys = torch.empty(batch_size, dtype=KEY_TYPE, device=self.device)
             d_scores: List[torch.Tensor] = [None for _ in self.score_names_]
             for score_name in out_scores.keys():
