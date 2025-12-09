@@ -874,9 +874,6 @@ class KeyValueTableFunction:
                 admission_counter,
             )
 
-            # Initialize non-admitted embeddings with special initializer (if provided)
-            # non_admit_initializer_args = admit_strategy.get_initializer_args()
-            # if non_admit_initializer_args is not None:
             non_admitted_mask = ~admit_mask
             non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
             initiailized_non_admitted_indices = False
@@ -899,11 +896,7 @@ class KeyValueTableFunction:
                 indices_to_init,
                 unique_keys,
             )
-        # initializing_indices = missing_indices
-        # if training and adimit_strategy is not None:
-        #     initialize new non_adimitted part
-        #     initializing_indices = adimitted_indices
-        # initialize(initializing_indices)
+
         if training:
             # insert missing values
             missing_values_in_storage = torch.empty(
@@ -1058,9 +1051,6 @@ class KeyValueTableCachingFunction:
                 admission_counter,
             )
 
-            # Initialize non-admitted embeddings with special initializer (if provided)
-            # non_admit_initializer_args = admit_strategy.get_initializer_args()
-            # if non_admit_initializer_args is not None:
             non_admitted_mask = ~admit_mask_for_missing_keys
             non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
             initiailized_non_admitted_indices = False
