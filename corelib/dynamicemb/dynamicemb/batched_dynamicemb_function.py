@@ -24,12 +24,12 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.key_value_table import (
     Cache,
-    KeyValueTable,
     KeyValueTableCachingFunction,
     KeyValueTableFunction,
     Storage,
 )
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.types import Counter
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,

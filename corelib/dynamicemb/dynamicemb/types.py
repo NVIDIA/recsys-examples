@@ -15,10 +15,12 @@
 
 import abc
 import enum
+from dataclasses import dataclass
 from typing import Generic, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+from dynamicemb_extensions import InitializerArgs
 
 
 @enum.unique
@@ -27,6 +29,91 @@ class MemoryType(enum.Enum):
     MANAGED = "managed"  # memory allocated using cudaMallocManaged
     PINNED_HOST = "pinned_host"  # memory allocated using cudaHostAlloc/cudaMallocHost
     HOST = "host"  # system memory allocated using e.g. malloc.
+
+
+class DynamicEmbInitializerMode(enum.Enum):
+    """
+    Enumeration for different modes of initializing dynamic embedding vector values.
+
+    Attributes
+    ----------
+    NORMAL : str
+        Normal Distribution.
+    UNIFORM : str
+        Uniform distribution of random values.
+    CONSTANT : str
+        All dynamic embedding vector values are a given constant.
+    DEBUG : str
+        Debug value generation mode for testing.
+    """
+
+    NORMAL = "normal"
+    TRUNCATED_NORMAL = "truncated_normal"
+    UNIFORM = "uniform"
+    CONSTANT = "constant"
+    DEBUG = "debug"
+
+
+@dataclass
+class DynamicEmbInitializerArgs:
+    """
+    Arguments for initializing dynamic embedding vector values.
+
+    Attributes
+    ----------
+    mode : DynamicEmbInitializerMode
+        The mode of initialization, one of the DynamicEmbInitializerMode values.
+    mean : float, optional
+        The mean value for (truncated) normal distributions. Defaults to 0.0.
+    std_dev : float, optional
+        The standard deviation for (truncated) normal distributions. Defaults to 1.0.
+    lower : float, optional
+        The lower bound for uniform/truncated_normal distribution. Defaults to 0.0.
+    upper : float, optional
+        The upper bound for uniform/truncated_normal distribution. Defaults to 1.0.
+    value : float, optional
+        The constant value for constant initialization. Defaults to 0.0.
+    """
+
+    mode: DynamicEmbInitializerMode = DynamicEmbInitializerMode.UNIFORM
+    mean: float = 0.0
+    std_dev: float = 1.0
+    lower: float = None
+    upper: float = None
+    value: float = 0.0
+
+    def __eq__(self, other):
+        if not isinstance(other, DynamicEmbInitializerArgs):
+            return NotImplementedError
+        if self.mode == DynamicEmbInitializerMode.NORMAL:
+            return self.mean == other.mean and self.std_dev == other.std_dev
+        elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
+            return (
+                self.mean == other.mean
+                and self.std_dev == other.std_dev
+                and self.lower == other.lower
+                and self.upper == other.upper
+            )
+        elif self.mode == DynamicEmbInitializerMode.UNIFORM:
+            return self.lower == other.lower and self.upper == other.upper
+        elif self.mode == DynamicEmbInitializerMode.CONSTANT:
+            return self.value == other.value
+        return True
+
+    def __ne__(self, other):
+        if not isinstance(other, DynamicEmbInitializerArgs):
+            return NotImplementedError
+        return not (self == other)
+
+    def as_ctype(self) -> InitializerArgs:
+        return InitializerArgs(
+            self.mode.value,
+            self.mean,
+            self.std_dev,
+            self.lower if self.lower else 0.0,
+            self.upper if self.upper else 1.0,
+            self.value,
+        )
 
 
 TableOptionType = TypeVar("TableOptionType")
@@ -297,4 +384,26 @@ class Counter(abc.ABC):
         Args:
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
+        """
+
+
+class AdmissionStrategy(abc.ABC):
+    @abc.abstractmethod
+    def admit(
+        self,
+        keys: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Admit keys with frequencies >= threshold.
+        """
+
+    @abc.abstractmethod
+    def initialize_non_admitted_embeddings(
+        self,
+        buffer: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> None:
+        """
+        Initialize the embeddings for the keys that are not admitted.
         """

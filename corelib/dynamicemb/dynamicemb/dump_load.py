@@ -927,7 +927,9 @@ def DynamicEmbDump(
     model: nn.Module,
     table_names: Optional[Dict[str, List[str]]] = None,
     optim: Optional[bool] = False,
-    pg: Optional[dist.ProcessGroup] = None,
+    counter: Optional[bool] = False,
+    pg: dist.ProcessGroup = dist.group.WORLD,
+    allow_overwrite: bool = False,
 ) -> None:
     """
     Dump the distributed weights and corresponding optimizer states of dynamic embedding tables from the model to the filesystem.
@@ -948,6 +950,8 @@ def DynamicEmbDump(
         and the value is a list of dynamic embedding table names within that collection. Defaults to None.
     optim : Optional[bool], optional
         Whether to dump the optimizer states. Defaults to False.
+    counter : Optional[bool], optional
+        Whether to dump the embedding admission counter table. Defaults to False.
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the dump. Defaults to None.
 
@@ -1071,62 +1075,20 @@ def DynamicEmbDump(
     for i, tmp_collection in enumerate(collections_list):
         collection_path, tmp_collection_name, tmp_collection_module = tmp_collection
         full_collection_path = os.path.join(path, collection_path)
-        tmp_dynamic_emb_module_list = get_dynamic_emb_module(tmp_collection_module)
-
-        for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
-            tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
-
-            filtered_table_names: List[str] = []
-            filtered_dynamic_tables: List[DynamicEmbTable] = []
-            # TODO:need a warning
-            if table_names is not None:
-                tmp_input_names = table_names[tmp_collection_name]
-                for name in tmp_input_names:
-                    if name in tmp_table_names:
-                        index = tmp_table_names.index(name)
-                        filtered_table_names.append(tmp_table_names[index])
-                        filtered_dynamic_tables.append(tmp_tables[index])
-            else:
-                filtered_table_names = tmp_table_names
-                filtered_dynamic_tables = tmp_tables
-            if len(filtered_table_names) == 0:
-                continue
-
-            if optim:
-                optimizer = dynamic_emb_module.optimizer
-                opt_args = optimizer.get_opt_args()
-
-            tmp_tables_dict: Dict[str, DynamicEmbTable] = {
-                name: table
-                for name, table in zip(filtered_table_names, filtered_dynamic_tables)
-            }
-
-            if rank == 0:
-                # Rank 0 determines the order of keys
-                ordered_keys = tmp_tables_dict.keys()
-                ordered_keys_str = ",".join(ordered_keys)
-            else:
-                ordered_keys_str = ""
-
-            ordered_keys_str = broadcast_string(ordered_keys_str, rank=rank, pg=pg)
-            ordered_keys = ordered_keys_str.split(",")
-
-            for k, dump_name in enumerate(ordered_keys):
-                dynamic_table = tmp_tables_dict[dump_name]
-                gather_and_export(
-                    dynamic_table, full_collection_path, dump_name, pg=pg, optim=optim
-                )
-
-                if optim:
-                    args_filename = dump_name + "_opt_args.json"
-                    args_path = os.path.join(full_collection_path, args_filename)
-                    save_to_json(opt_args, args_path)
-                if rank == 0:
-                    print(
-                        f"DynamicEmb dump table {dump_name} from module {tmp_collection_name} success!"
-                    )
-
+        current_dynamic_emb_module_list = get_dynamic_emb_module(
+            tmp_collection_module
+        )
+        table_names_to_dump = (
+            table_names.get(collection_path, None) if table_names else None
+        )
+        for dynamic_emb_module in current_dynamic_emb_module_list:
+            dynamic_emb_module.dump(
+                full_collection_path,
+                optim=optim,
+                counter=counter,
+                table_names=table_names_to_dump,
+                pg=pg,
+            )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -1150,7 +1112,8 @@ def DynamicEmbLoad(
     model: nn.Module,
     table_names: Optional[List[str]] = None,
     optim: bool = False,
-    pg: Optional[dist.ProcessGroup] = None,
+    counter: bool = False,
+    pg: dist.ProcessGroup = dist.group.WORLD,
 ):
     """
     Load the distributed weights and corresponding optimizer states of dynamic embedding tables from the filesystem into the model.
@@ -1169,6 +1132,8 @@ def DynamicEmbLoad(
         and the value is a list of dynamic embedding table names within that collection. Defaults to None.
     optim : bool, optional
         Whether to load the optimizer states. Defaults to False.
+    counter : bool, optional
+        Whether to load the embedding admission counter table. Defaults to False.
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the load. Defaults to None.
 

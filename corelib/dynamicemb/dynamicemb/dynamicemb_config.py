@@ -20,11 +20,17 @@ from math import sqrt
 from typing import Dict, Optional
 
 import torch
+from dynamicemb.types import (
+    AdmissionStrategy,
+    Counter,
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
+    Storage,
+)
 from dynamicemb_extensions import (
     DynamicEmbDataType,
     DynamicEmbTable,
     EvictStrategy,
-    InitializerArgs,
     OptimizerType,
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
@@ -43,91 +49,6 @@ def warning_for_cstm_score() -> None:
 
 
 DynamicEmbKernel = "DynamicEmb"
-
-
-class DynamicEmbInitializerMode(enum.Enum):
-    """
-    Enumeration for different modes of initializing dynamic embedding vector values.
-
-    Attributes
-    ----------
-    NORMAL : str
-        Normal Distribution.
-    UNIFORM : str
-        Uniform distribution of random values.
-    CONSTANT : str
-        All dynamic embedding vector values are a given constant.
-    DEBUG : str
-        Debug value generation mode for testing.
-    """
-
-    NORMAL = "normal"
-    TRUNCATED_NORMAL = "truncated_normal"
-    UNIFORM = "uniform"
-    CONSTANT = "constant"
-    DEBUG = "debug"
-
-
-@dataclass
-class DynamicEmbInitializerArgs:
-    """
-    Arguments for initializing dynamic embedding vector values.
-
-    Attributes
-    ----------
-    mode : DynamicEmbInitializerMode
-        The mode of initialization, one of the DynamicEmbInitializerMode values.
-    mean : float, optional
-        The mean value for (truncated) normal distributions. Defaults to 0.0.
-    std_dev : float, optional
-        The standard deviation for (truncated) normal distributions. Defaults to 1.0.
-    lower : float, optional
-        The lower bound for uniform/truncated_normal distribution. Defaults to 0.0.
-    upper : float, optional
-        The upper bound for uniform/truncated_normal distribution. Defaults to 1.0.
-    value : float, optional
-        The constant value for constant initialization. Defaults to 0.0.
-    """
-
-    mode: DynamicEmbInitializerMode = DynamicEmbInitializerMode.UNIFORM
-    mean: float = 0.0
-    std_dev: float = 1.0
-    lower: float = None
-    upper: float = None
-    value: float = 0.0
-
-    def __eq__(self, other):
-        if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
-        if self.mode == DynamicEmbInitializerMode.NORMAL:
-            return self.mean == other.mean and self.std_dev == other.std_dev
-        elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-            return (
-                self.mean == other.mean
-                and self.std_dev == other.std_dev
-                and self.lower == other.lower
-                and self.upper == other.upper
-            )
-        elif self.mode == DynamicEmbInitializerMode.UNIFORM:
-            return self.lower == other.lower and self.upper == other.upper
-        elif self.mode == DynamicEmbInitializerMode.CONSTANT:
-            return self.value == other.value
-        return True
-
-    def __ne__(self, other):
-        if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
-        return not (self == other)
-
-    def as_ctype(self) -> InitializerArgs:
-        return InitializerArgs(
-            self.mode.value,
-            self.mean,
-            self.std_dev,
-            self.lower if self.lower else 0.0,
-            self.upper if self.upper else 1.0,
-            self.value,
-        )
 
 
 @enum.unique
@@ -321,12 +242,25 @@ class DynamicEmbTableOptions(HKVConfig):
     safe_check_mode : DynamicEmbCheckMode
         Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
         Please refer to the API documentation for DynamicEmbCheckMode for more information.
-    training: bool
-        Flag to indicate dynamic embedding tables is working on training mode or evaluation mode, default to `True`.
-    caching: bool
-        Flag to indicate dynamic embedding tables is working on caching mode, which will support to prefetch embeddings
-        from host memory to HBM if existed, default to `False`.
-
+    global_hbm_for_values : int
+        Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
+        It has different meanings under `caching=True` and  `caching=False`.
+            When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
+            When `caching=True`, it decides the table capacity of the GPU table.
+    external_storage: Storage
+        The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
+        If not provided, will using KeyValueTable as the Storage.
+    index_type : Optional[torch.dtype], optional
+        Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
+    admit_strategy : Optional[AdmissionStrategy], optional
+        Admission strategy for controlling which keys are allowed to enter the embedding table.
+        If provided, only keys that meet the strategy's criteria will be inserted into the table.
+        Keys that don't meet the criteria will still be initialized and used in the forward pass,
+        but won't be stored in the table. Default is None (all keys are admitted).
+    admission_counter : Optional[Counter], optional
+        Counter for tracking the number of keys that have been admitted to the embedding table.
+        If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
+        Default is None (no counter is used).
     Notes
     -----
     For detailed descriptions and additional context on each parameter, please refer to the documentation at
@@ -343,8 +277,26 @@ class DynamicEmbTableOptions(HKVConfig):
         )
     )
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
-    training: bool = True
-    caching: bool = False
+    bucket_capacity: int = 128
+    safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
+    global_hbm_for_values: int = 0  # in bytes
+    external_storage: Storage = None
+    index_type: Optional[torch.dtype] = None
+    admit_strategy: Optional[AdmissionStrategy] = None
+    admission_counter: Optional[Counter] = None
+
+    def __post_init__(self):
+        assert (
+            self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
+        ), "eval_initializer_args must be constant initialization"
+
+        if self.init_capacity is not None:
+            target_init_capacity = _next_power_of_2(self.init_capacity)
+            if self.init_capacity != target_init_capacity:
+                warnings.warn(
+                    f"init_capacity is changed to {target_init_capacity} from {self.init_capacity}"
+                )
+                self.init_capacity = target_init_capacity
 
     def __post_init__(self):
         assert (
@@ -366,6 +318,11 @@ class DynamicEmbTableOptions(HKVConfig):
     def get_grouped_key(self):
         grouped_key = {f.name: getattr(self, f.name) for f in fields(GroupedHKVConfig)}
         grouped_key["training"] = self.training
+        grouped_key["caching"] = self.caching
+        grouped_key["external_storage"] = self.external_storage
+        grouped_key["index_type"] = self.index_type
+        grouped_key["score_strategy"] = self.score_strategy
+        grouped_key["admit_strategy"] = self.admit_strategy
         return grouped_key
 
     def __hash__(self):
