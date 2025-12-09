@@ -399,12 +399,6 @@ class AdmissionStrategy(abc.ABC):
         """
 
     @abc.abstractmethod
-    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
-        """
-        Get the initializer args for keys that are not admitted.
-        """
-
-    @abc.abstractmethod
     def initialize_non_admitted_embeddings(
         self,
         buffer: torch.Tensor,

@@ -875,18 +875,22 @@ class KeyValueTableFunction:
             )
 
             # Initialize non-admitted embeddings with special initializer (if provided)
-            non_admit_initializer_args = admit_strategy.get_initializer_args()
-            if non_admit_initializer_args is not None:
-                non_admitted_mask = ~admit_mask
-                non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
-                if non_admitted_indices.numel() > 0:
+            # non_admit_initializer_args = admit_strategy.get_initializer_args()
+            # if non_admit_initializer_args is not None:
+            non_admitted_mask = ~admit_mask
+            non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
+            initiailized_non_admitted_indices = False
+            if non_admitted_indices.numel() > 0:
+                initiailized_non_admitted_indices = (
                     admit_strategy.initialize_non_admitted_embeddings(
                         unique_embs[:, :emb_dim],
                         non_admitted_indices,
                     )
+                )
 
             # Only initialize admitted embeddings with the regular initializer
-            indices_to_init = missing_indices_in_storage[admit_mask]
+            if not initiailized_non_admitted_indices:
+                indices_to_init = missing_indices_in_storage[admit_mask]
 
         # 2. initialize missing embeddings (admitted or all if no admission)
         if indices_to_init.numel() > 0:
@@ -1032,9 +1036,6 @@ class KeyValueTableCachingFunction:
             input_scores=scores_for_storage,
         )
 
-        if h_num_missing_in_storage == 0:
-            return
-
         admit_mask_for_missing_keys = None
         indices_to_init = missing_indices_in_storage
         if training and admit_strategy is not None:
@@ -1058,18 +1059,24 @@ class KeyValueTableCachingFunction:
             )
 
             # Initialize non-admitted embeddings with special initializer (if provided)
-            non_admit_initializer_args = admit_strategy.get_initializer_args()
-            if non_admit_initializer_args is not None:
-                non_admitted_mask = ~admit_mask_for_missing_keys
-                non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
-                if non_admitted_indices.numel() > 0:
+            # non_admit_initializer_args = admit_strategy.get_initializer_args()
+            # if non_admit_initializer_args is not None:
+            non_admitted_mask = ~admit_mask_for_missing_keys
+            non_admitted_indices = missing_indices_in_storage[non_admitted_mask]
+            initiailized_non_admitted_indices = False
+            if non_admitted_indices.numel() > 0:
+                initiailized_non_admitted_indices = (
                     admit_strategy.initialize_non_admitted_embeddings(
                         values_for_storage[:, :emb_dim],
                         non_admitted_indices,
                     )
+                )
 
             # Only initialize admitted embeddings with the regular initializer
-            indices_to_init = missing_indices_in_storage[admit_mask_for_missing_keys]
+            if not initiailized_non_admitted_indices:
+                indices_to_init = missing_indices_in_storage[
+                    admit_mask_for_missing_keys
+                ]
 
         # 3. initialize missing embeddings (admitted or all if no admission)
         if indices_to_init.numel() > 0:
@@ -1081,6 +1088,9 @@ class KeyValueTableCachingFunction:
 
         # 4. copy embeddings to unique_embs
         unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
+
+        if h_num_missing_in_storage == 0:
+            return
 
         keys_to_update = None
         values_to_update = None

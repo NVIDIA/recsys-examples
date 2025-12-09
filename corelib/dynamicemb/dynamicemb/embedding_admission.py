@@ -169,20 +169,23 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         admit_mask = frequencies >= self.threshold
         return admit_mask
 
-    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
-        return self.initializer_args
-
     def initialize_non_admitted_embeddings(
         self,
         buffer: torch.Tensor,
         indices: torch.Tensor,
-    ) -> None:
+    ) -> bool:
         """
         Initialize the embeddings for the keys that are not admitted.
+
+        Returns:
+            bool: True if the embeddings are initialized, False otherwise.
         """
+        if self.initializer_args is None:
+            return False
         non_admit_initializer = create_initializer_from_args(self.initializer_args)
         non_admit_initializer(
             buffer,
             indices,
             None,
         )
+        return True
