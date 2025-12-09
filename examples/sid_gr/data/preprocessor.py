@@ -62,24 +62,24 @@ class DataProcessor(ABC):
 
 
 class AmazonBeautyPreprocessor(DataProcessor):
-    def __init__(self, sequence_features_data_path: str, num_hierarchies: int):
-        self.num_hierarchies = num_hierarchies
+    def __init__(self, sequence_features_data_path: str):
         super().__init__()
+        self._num_hierarchies = 4
 
     @property
     def num_hierarchies(self) -> int:
-        return self.num_hierarchies
+        return self._num_hierarchies
 
     @property
-    def history_feature_name(self):
+    def history_feature_name(self) -> str:
         return "history_sequence"
 
     @property
-    def candidate_feature_name(self):
+    def candidate_feature_name(self) -> str:
         return "candidate_sequence"
 
     @property
-    def contextual_feature_names(self):
+    def contextual_feature_names(self) -> List[str]:
         return []
 
     @property
@@ -87,7 +87,7 @@ class AmazonBeautyPreprocessor(DataProcessor):
         return False
 
     @property
-    def raw_sequence_feature_name(self) -> List[str]:
+    def raw_sequence_feature_name(self) -> str:
         """
         a raw sequence is split into history and candidate sequences.
         """

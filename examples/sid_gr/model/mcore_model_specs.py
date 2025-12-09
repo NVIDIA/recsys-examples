@@ -465,7 +465,7 @@ def get_gpt_mtp_block_spec(
     if len(mtp_layer_specs) > 0:
         assert (
             len(mtp_layer_specs) == config.mtp_num_layers
-        ), +f"currently all of the mtp layers must stage in the same pipeline stage."
+        ), f"currently all of the mtp layers must stage in the same pipeline stage."
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(
             layer_specs=mtp_layer_specs
         )

@@ -40,15 +40,15 @@ class FeatureConfig:
       feature_names (List[str]): List of feature names.
     """
 
-    max_item_ids: List[int]  # From embedding args
+    max_item_ids: List[int]  # From dataset args
     max_history_length: int
     is_jagged: bool
+    feature_names: List[str]
 
-    min_item_ids: Optional[List[int]] = None
-    feature_names: Optional[List[str]] = None
+    min_item_ids: List[int] = field(default_factory=list)
 
     def __post_init__(self):
-        if self.min_item_ids is None:
+        if len(self.min_item_ids) == 0:
             self.min_item_ids = [0] * len(self.max_item_ids)
         else:
             assert len(self.min_item_ids) == len(

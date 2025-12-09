@@ -105,8 +105,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
     def __len__(self) -> int:
         return len(self.raw_sequence_data)
 
-    def __getitem__(self, index: int) -> GPTSIDBatch:
-        pass
+    # def __getitem__(self, index: int) -> GPTSIDBatch:
+    #     pass
 
     #   pass
 

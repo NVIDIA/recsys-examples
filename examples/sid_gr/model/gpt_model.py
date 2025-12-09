@@ -185,11 +185,6 @@ class SIDGRModel(MegatronModule):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return id_embeddings, attention_mask
 
-    def preprocess_embeddings(
-        self, embeddings: Dict[str, JaggedTensor]
-    ) -> Dict[str, JaggedTensor]:
-        pass
-
     def _concat_history_bos_candidate(
         self,
         history_hidden_states: torch.Tensor,  # sid
