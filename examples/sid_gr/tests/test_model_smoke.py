@@ -13,6 +13,7 @@ def generate_batches(
     batchsize: int,
     num_batches: int,
     max_history_length: int,
+    max_candidate_length: int,
     codebook_sizes: List[int],
     combined_history_feature_name: str,
     combined_candidate_feature_name: str,
@@ -30,14 +31,14 @@ def generate_batches(
             feature_names=raw_hist_sid_names,
             max_item_ids=max_item_ids,
             min_item_ids=min_item_ids,
-            max_history_length=max_history_length,
+            max_sequence_length=max_history_length,
             is_jagged=True,
         ),
         FeatureConfig(
             feature_names=raw_cand_sid_names,
             max_item_ids=max_item_ids,
             min_item_ids=min_item_ids,
-            max_history_length=1,  # candidate sid is a single sid
+            max_sequence_length=max_candidate_length,  # candidate sid is a single sid
             is_jagged=False,
         ),
     ]
@@ -72,6 +73,8 @@ def test_model_smoke(
     max_history_length,
     codebook_sizes,
 ):
+    # we now only support max_candidate_length = 1 for now
+    max_candidate_length = 1
     num_hierarchies = len(codebook_sizes)
     init.initialize_distributed()
     init.initialize_model_parallel(1)  # tp1
@@ -91,6 +94,7 @@ def test_model_smoke(
         batchsize=batchsize,
         num_batches=num_batches,
         max_history_length=max_history_length,
+        max_candidate_length=max_candidate_length,
         codebook_sizes=codebook_sizes,
         combined_history_feature_name=history_sid_feature_name,
         combined_candidate_feature_name=candidate_sid_feature_name,
@@ -104,7 +108,6 @@ def test_model_smoke(
             kv_channels=kv_channels,
             num_layers=num_layers,
             num_hierarchies=num_hierarchies,
-            max_history_length=max_history_length,
             codebook_embedding_config=codebook_embedding_config,
             codebook_sizes=codebook_sizes,
         )

@@ -34,13 +34,13 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         self,
         raw_sequence_data_path: str,
         batch_size: int,  # local batch size
-        max_history_seqlen: int,  # history seqlen
+        max_history_length: int,  # history seqlen
         raw_sequence_feature_name: str,  # 'sequence_data'
         num_hierarchies: int,
         codebook_sizes: List[int],
         output_history_sid_feature_name: Optional[str] = None,
         output_candidate_sid_feature_name: Optional[str] = None,
-        max_candidate_seqlen: int = 1,  # candidate seqlen
+        max_candidate_length: int = 1,  # candidate seqlen
         contextual_feature_names: List[str] = [],
         item_id_to_sid_mapping_tensor_path: Optional[str] = None,
         *,
@@ -63,21 +63,25 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             raw_sequence_data["sequence_length"] = raw_sequence_data[
                 raw_sequence_feature_name
             ].apply(len)
-        num_raw_samples = len(raw_sequence_data)
+        assert max_candidate_length == 1, "max_candidate_length should be 1 for now"
+
+        # clamp the sequence length to 1 + max_candidate_length (at least 1 history item)
         raw_sequence_data = raw_sequence_data[
-            raw_sequence_data["sequence_length"] >= 2
+            raw_sequence_data["sequence_length"] >= 1 + max_candidate_length
         ]  # at least 2 items in the sequence
-        print(
-            f"{num_raw_samples - len(raw_sequence_data)} sequences are filtered out due to length < 2"
-        )
+
+        # truncate the sequence to the total sequence length
+        # note that max_history_length + max_candidate_length is the total sequence length
         raw_sequence_data[raw_sequence_feature_name] = raw_sequence_data[
             raw_sequence_feature_name
         ].apply(
-            lambda x: x[:max_history_seqlen] if isinstance(x, (list, np.ndarray)) else x
+            lambda x: x[: max_history_length + max_candidate_length]
+            if isinstance(x, (list, np.ndarray))
+            else x
         )
         self._feature_to_max_seqlen = {
-            output_history_sid_feature_name: max_history_seqlen * num_hierarchies,
-            output_candidate_sid_feature_name: max_candidate_seqlen * num_hierarchies,
+            output_history_sid_feature_name: max_history_length * num_hierarchies,
+            output_candidate_sid_feature_name: max_candidate_length * num_hierarchies,
         }
         try:
             self.item_id_to_sid_mapping_tensor = torch.load(
@@ -107,8 +111,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         self._output_candidate_sid_feature_name = output_candidate_sid_feature_name
         self._num_hierarchies = num_hierarchies
 
-        assert max_candidate_seqlen == 1, "max_candidate_seqlen should be 1 for now"
-        self._max_candidate_seqlen = max_candidate_seqlen
+        self._max_candidate_length = max_candidate_length
         self._batch_size = batch_size
         self._global_batch_size = batch_size * world_size
         self._is_train_dataset = is_train_dataset
@@ -145,7 +148,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             # [1,2, |3]      => [1,2], [3]
             history_item_ids = torch.tensor(
                 sequence_data[self._raw_sequence_feature_name]
-                .apply(lambda x: x[: -self._max_candidate_seqlen])
+                .apply(lambda x: x[: -self._max_candidate_length])
                 .explode()
                 .to_numpy()
                 .astype(np.int64),
@@ -153,7 +156,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             )
             candidate_item_ids = torch.tensor(
                 sequence_data[self._raw_sequence_feature_name]
-                .apply(lambda x: x[-self._max_candidate_seqlen :])
+                .apply(lambda x: x[-self._max_candidate_length :])
                 .explode()
                 .to_numpy()
                 .astype(np.int64),
@@ -169,11 +172,11 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             candidate_sids = torch.index_select(
                 self.item_id_to_sid_mapping_tensor, dim=1, index=candidate_item_ids
             ).transpose(0, 1).contiguous() + self._codebook_offsets.unsqueeze(0)
-
+            # 'sequence length' is the total length
             history_lengths = (
                 torch.tensor(
                     sequence_data["sequence_length"].to_numpy().astype(np.int64)
-                    - self._max_candidate_seqlen,
+                    - self._max_candidate_length,
                     device=self._device,
                     dtype=torch.int64,
                 )
@@ -181,6 +184,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             )
             candidate_lengths = (
                 torch.ones(actual_batch_size, device=self._device, dtype=torch.int64)
+                * self._max_candidate_length
                 * self._num_hierarchies
             )
 
@@ -227,8 +231,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         raw_sequence_data_path: str,
         item_id_to_sid_mapping_tensor_path: str,
         batch_size: int,
-        max_history_seqlen: int,
-        max_candidate_seqlen: int,
+        max_history_length: int,
+        max_candidate_length: int,
         raw_sequence_feature_name: str,
         num_hierarchies: int,
         codebook_sizes: List[int],
@@ -243,8 +247,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             raw_sequence_data_path=raw_sequence_data_path,
             item_id_to_sid_mapping_tensor_path=item_id_to_sid_mapping_tensor_path,
             batch_size=batch_size,
-            max_history_seqlen=max_history_seqlen,
-            max_candidate_seqlen=max_candidate_seqlen,
+            max_history_length=max_history_length,
+            max_candidate_length=max_candidate_length,
             raw_sequence_feature_name=raw_sequence_feature_name,
             num_hierarchies=num_hierarchies,
             codebook_sizes=codebook_sizes,

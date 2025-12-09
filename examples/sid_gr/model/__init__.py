@@ -14,7 +14,6 @@ def get_sid_gr_model(
     codebook_embedding_config: ShardedEmbeddingConfig,
     codebook_sizes: List[int],
     num_hierarchies: int,
-    max_history_length: int,
 ) -> SIDGRModel:
     sid_gr_model = SIDGRModel(
         decoder_config=decoder_config,
@@ -24,7 +23,6 @@ def get_sid_gr_model(
         transformer_decoder_layer_spec=get_gpt_decoder_block_spec(
             decoder_config, use_transformer_engine=True
         ),
-        max_history_length=max_history_length,
         should_add_sep_token=True,
     )
 

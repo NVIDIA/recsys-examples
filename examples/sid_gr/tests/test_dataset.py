@@ -18,14 +18,14 @@ def test_batch(batch_size):
             ],
             max_item_ids=[128, 128, 128, 128, 100000],
             min_item_ids=[0, 0, 0, 0, 0],
-            max_history_length=128,
+            max_sequence_length=128,
             is_jagged=True,
         ),
         FeatureConfig(
             feature_names=["cand_sid_0", "cand_sid_1", "cand_sid_2", "cand_sid_3"],
             max_item_ids=[128, 128, 128, 128],
             min_item_ids=[0, 0, 0, 0],
-            max_history_length=128,
+            max_sequence_length=128,
             is_jagged=True,
         ),
         FeatureConfig(
@@ -41,7 +41,7 @@ def test_batch(batch_size):
                 0,
                 0,
             ],
-            max_history_length=4,
+            max_sequence_length=4,
             is_jagged=False,
         ),
     ]
@@ -81,18 +81,18 @@ def test_batch(batch_size):
 
 
 @pytest.mark.parametrize("batch_size", [128, 256, 512])
-@pytest.mark.parametrize("max_history_seqlen", [64, 128, 256])
+@pytest.mark.parametrize("max_history_length", [64, 128, 256])
 def test_disk_sequence_dataset(
     batch_size,
-    max_history_seqlen,
+    max_history_length,
 ):
     num_hierarchies = 4
     disk_sequence_dataset = DiskSequenceDataset(
         raw_sequence_data_path="./tmp_data/amzn/beauty/training/22363.parquet",
         item_id_to_sid_mapping_tensor_path="./tmp_data/amzn/beauty/item-sid-mapping.pt",
         batch_size=batch_size,
-        max_history_seqlen=max_history_seqlen,
-        max_candidate_seqlen=1,
+        max_history_length=max_history_length,
+        max_candidate_length=1,
         raw_sequence_feature_name="sequence_data",
         num_hierarchies=num_hierarchies,
         codebook_sizes=[256, 256, 256, 256],

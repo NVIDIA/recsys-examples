@@ -26,7 +26,6 @@ class SIDGRDecoder(MegatronModule):
         self,
         decoder_config: TransformerConfig,  # decoder config
         transformer_decoder_layer_spec: ModuleSpec,
-        max_history_length: int,
         position_embedding_type: Literal[
             "learned_absolute", "rope", "relative"
         ] = "learned_absolute",
@@ -38,7 +37,6 @@ class SIDGRDecoder(MegatronModule):
         self.config: TransformerConfig = decoder_config
 
         self.transformer_decoder_layer_spec: ModuleSpec = transformer_decoder_layer_spec
-        self.max_history_length = max_history_length
         # TODO, add position encoder
         self.model_type = ModelType.encoder_or_decoder
         self.decoder = TransformerBlock(
@@ -76,7 +74,6 @@ class SIDGRModel(MegatronModule):
         codebook_sizes: List[int],
         num_hierarchies: int,
         transformer_decoder_layer_spec: ModuleSpec,
-        max_history_length: int,  # TODO, remove this?
         position_embedding_type: Literal[
             "learned_absolute", "rope", "relative"
         ] = "relative",
@@ -107,7 +104,6 @@ class SIDGRModel(MegatronModule):
         self.decoder = SIDGRDecoder(
             decoder_config,
             transformer_decoder_layer_spec,
-            max_history_length,
             position_embedding_type="relative",
         )
         self.codebook_sizes = codebook_sizes

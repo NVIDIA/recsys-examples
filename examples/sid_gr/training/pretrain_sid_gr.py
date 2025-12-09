@@ -108,7 +108,6 @@ def main():
         codebook_embedding_config=embedding_config,
         codebook_sizes=dataset_args.codebook_sizes,
         num_hierarchies=dataset_args.num_hierarchies,
-        max_history_length=dataset_args.max_history_length,
     )
 
     optimizer_param = create_optimizer_params(optimizer_args)

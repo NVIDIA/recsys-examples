@@ -14,6 +14,7 @@ def get_dataset(
     random_seed: int = 1234,
 ):
     max_history_length = dataset_args.max_history_length
+    max_candidate_length = dataset_args.max_candidate_length
     num_hierarchies = dataset_args.num_hierarchies
     codebook_sizes = dataset_args.codebook_sizes
     assert (
@@ -27,10 +28,9 @@ def get_dataset(
         # history sid features
         feature_configs.append(
             FeatureConfig(
-                feature_names=raw_hist_sid_names + raw_cand_sid_names,
-                max_item_ids=[codebook_sizes[i] for i in range(num_hierarchies)]
-                + [codebook_sizes[i] for i in range(num_hierarchies)],
-                max_history_length=max_history_length,
+                feature_names=raw_hist_sid_names,
+                max_item_ids=[codebook_sizes[i] for i in range(num_hierarchies)],
+                max_sequence_length=max_history_length,
                 is_jagged=True,
             )
         )
@@ -39,7 +39,7 @@ def get_dataset(
             FeatureConfig(
                 feature_names=raw_cand_sid_names,
                 max_item_ids=[codebook_sizes[i] for i in range(num_hierarchies)],
-                max_history_length=1,
+                max_sequence_length=max_candidate_length,
                 is_jagged=True,
             )
         )
@@ -69,9 +69,8 @@ def get_dataset(
             batch_size=trainer_args.train_batch_size
             if is_train_dataset
             else trainer_args.eval_batch_size,
-            max_history_seqlen=dataset_args.max_history_length
-            + 1,  # +1 for the candidate
-            max_candidate_seqlen=1,  # only 1 candidate item for now
+            max_history_length=max_history_length,  # +1 for the candidate
+            max_candidate_length=max_candidate_length,  # only 1 candidate item for now
             raw_sequence_feature_name="sequence_data",  # TODO: make it configurable!!!
             num_hierarchies=num_hierarchies,
             codebook_sizes=codebook_sizes,

@@ -41,7 +41,7 @@ class FeatureConfig:
     """
 
     max_item_ids: List[int]  # From dataset args
-    max_history_length: int
+    max_sequence_length: int
     is_jagged: bool
     feature_names: List[str]
 
@@ -128,16 +128,18 @@ class GPTSIDBatch(Pipelineable):
         values = []
         lengths = []
         feature_to_max_seqlen = {}
+        sid_min_ids = []
         for feature_config in feature_configs:
             if feature_config.is_jagged:
                 seqlen = torch.randint(
-                    feature_config.max_history_length, (batch_size,), device=device
+                    feature_config.max_sequence_length, (batch_size,), device=device
                 )
                 # the random guarantee the sequence length is at least 1.
+                # when candidate
                 seqlen = seqlen.clamp(min=1)
             else:
                 seqlen = torch.full(
-                    (batch_size,), feature_config.max_history_length, device=device
+                    (batch_size,), feature_config.max_sequence_length, device=device
                 )
             total_seqlen = torch.sum(seqlen).item()
             feature_names = feature_config.feature_names
@@ -157,8 +159,11 @@ class GPTSIDBatch(Pipelineable):
                 feature_name_kvl[key] = (
                     value,
                     seqlen,
-                    feature_config.max_history_length,
+                    feature_config.max_sequence_length,
                 )
+                # we use candidate
+                if key in raw_cand_sid_names:
+                    sid_min_ids.append(min_item_ids[i])
 
         history_sid_kvl = {key: feature_name_kvl.pop(key) for key in raw_hist_sid_names}
         candidate_sid_kvl = {
@@ -202,11 +207,11 @@ class GPTSIDBatch(Pipelineable):
             lengths=torch.cat(lengths).to(device).long(),
         )
 
-        min_item_ids = torch.tensor(min_item_ids, device=device).unsqueeze(0)
-        # labels are the candidate sids but starting from 0.
+        sid_min_ids = torch.tensor(sid_min_ids, device=device).unsqueeze(0)
+        #!! labels are the candidate sids but starting from 0.
         labels = (
             features[combined_candidate_feature_name].values().view(-1, num_hierarchies)
-            - min_item_ids
+            - sid_min_ids
         )
         return GPTSIDBatch(
             features=features,

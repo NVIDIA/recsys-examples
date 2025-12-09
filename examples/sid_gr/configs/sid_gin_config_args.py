@@ -155,6 +155,7 @@ class DatasetArgs:
     ] = None  # None when dataset_type is InMemoryRandomDataset or the dataset is already sid features
     num_hierarchies: int = 4
     codebook_sizes: List[int] = field(default_factory=lambda: [500] * 4)
+    max_candidate_length: int = 1
 
     def __post_init__(self):
         assert (
