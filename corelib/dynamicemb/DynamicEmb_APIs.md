@@ -11,6 +11,11 @@
 - [DynamicEmbTableOptions](#dynamicembtableoptions)
 - [DynamicEmbDump](#dynamicembdump)
 - [DynamicEmbLoad](#dynamicembload)
+- [incremental_dump](#incremental_dump)
+- [get_score](#get_score)
+- [set_score](#set_score)
+- [Counter](#counter)
+- [AdmissionStrategy](#admisssion_strategy)
 
 ## DynamicEmbParameterConstraints
 
@@ -379,7 +384,26 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
         safe_check_mode : DynamicEmbCheckMode
             Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
             Please refer to the API documentation for DynamicEmbCheckMode for more information.
-
+        global_hbm_for_values : int
+            Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
+            It has different meanings under `caching=True` and  `caching=False`.
+                When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
+                When `caching=True`, it decides the table capacity of the GPU table.
+        external_storage: Storage
+            The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
+            If not provided, will using KeyValueTable as the Storage.
+        index_type : Optional[torch.dtype], optional
+            Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
+        admit_strategy : Optional[AdmissionStrategy], optional
+            Admission strategy for controlling which keys are allowed to enter the embedding table.
+            If provided, only keys that meet the strategy's criteria will be inserted into the table.
+            Keys that don't meet the criteria will still be initialized and used in the forward pass,
+            but won't be stored in the table. Default is None (all keys are admitted).
+        admission_counter : Optional[Counter], optional
+            Counter for tracking the number of keys that have been admitted to the embedding table.
+            If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
+            Default is None (no counter is used).    
+        
         Notes
         -----
         For detailed descriptions and additional context on each parameter, please refer to the documentation at
@@ -390,6 +414,13 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
             default_factory=DynamicEmbInitializerArgs
         )
         score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
+        bucket_capacity: int = 128
+        safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
+        global_hbm_for_values: int = 0  # in bytes
+        external_storage: Storage = None
+        index_type: Optional[torch.dtype] = None
+        admit_strategy: Optional[AdmissionStrategy] = None
+        admission_counter: Optional[Counter] = None
 
     ```
 If using `DynamicEmbInitializerMode.UNIFORM`, `DynamicEmbeddingShardingPlanner` will set the `initializer_args.upper` and `initializer_args.lower` to +/- sqrt(1 / eb_config.num_embeddings)
@@ -580,3 +611,170 @@ Setting the environment variable DYNAMICEMB_CSTM_SCORE_CHECK to 0 will not throw
             None.
         """
     ```
+
+## Counter
+
+**dynamicemb** provides an interface to the Counter which will be used in the embedding admission, and the users can customize the counter implementation by inherit the class `Counter`.
+
+
+```python
+class Counter(abc.ABC):
+    """
+    Interface of a counter table which maps a key to a counter.
+    """
+
+    @abc.abstractmethod
+    def add(
+        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
+    ) -> torch.Tensor:
+        """
+        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
+        For not existed keys, the frequencies will be assigned directly.
+        For existing keys, the frequencies will be accumulated.
+        Args:
+            keys (torch.Tensor): The input keys, should be unique keys.
+            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
+            inplace: If true then store the accumulated_frequencies to counter.
+        Returns:
+            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
+        """
+        accumulated_frequencies: torch.Tensor
+        return accumulated_frequencies
+
+    @abc.abstractmethod
+    def erase(self, keys) -> None:
+        """
+        Erase keys form the `Counter`.
+        Args:
+            keys (torch.Tensor): The input keys to be erased.
+        """
+
+    @abc.abstractmethod
+    def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
+        """
+        Get the consumption of a specific memory type.
+        Args:
+            mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
+        """
+
+    @abc.abstractmethod
+    def load(self, key_file, counter_file) -> None:
+        """
+        Load keys and frequencies from input file path.
+        Args:
+            key_file (str): the file path of keys.
+            counter_file (str): the file path of frequencies.
+        """
+
+    @abc.abstractmethod
+    def dump(self, key_file, counter_file) -> None:
+        """
+        Dump keys and frequencies to output file path.
+        Args:
+            key_file (str): the file path of keys.
+            counter_file (str): the file path of frequencies.
+        """
+```
+
+**dynamicemb** also provides a built-in counter implementation named `KVCounter`.
+There is as capacity limit of `KVCounter` which is bucketized, and the key with the smallest frequency will be evicted from the bucket for a new key if the bucket is full. 
+
+```python
+
+class KVCounter(Counter):
+    """
+    Interface of a counter table which maps a key to a counter.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        bucket_capacity: Optional[int] = 128,
+        key_type: Optional[torch.dtype] = torch.int64,
+        device: torch.device = None,
+    )
+```
+
+## AdmissionStrategy
+
+**AdmissionStrategy** is another component for implementing embedding admission.
+The keys not in the dynamic embedding table, will first be passed to the `Counter`, after get the accumulated frequencies among the previous training process, the `AdmissionStrategy` will determine which keys will be admitted into the dynamic embedding table.
+
+```python
+class AdmissionStrategy(abc.ABC):
+    @abc.abstractmethod
+    def admit(
+        self,
+        keys: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Admit keys with frequencies >= threshold.
+        """
+
+    @abc.abstractmethod
+    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
+        """
+        Get the initializer args for keys that are not admitted.
+        """
+```
+
+**dynamicemn** provides built-in `FrequencyAdmissionStrategy`, which will return keys whose frequencies are not less than the threshold.
+
+```python
+class FrequencyAdmissionStrategy(AdmissionStrategy):
+    """
+    Frequency-based admission strategy.
+    Only admits keys whose frequency (score) meets or exceeds a threshold.
+    Parameters
+    ----------
+    threshold : int
+        Minimum frequency threshold for admission. Keys with frequency >= threshold
+        will be admitted into the embedding table.
+    initializer_args: Optional[DynamicEmbInitializerArgs]
+        Initializer arguments which determine how to initialize the embedding if the key is not admitted.
+    """
+
+    def __init__(
+        self,
+        threshold: int,
+        initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+    )
+```
+
+# Functionality and User interface
+
+## Distributed embedding training and evaluation
+
+Once the model containing `EmbeddingCollection` is built and initialized through `DistributedModelParallel`, it can be trained and evaluated on each GPU like a single GPU, with torchrec completing communication between different GPUs.
+
+The switching between training and evaluation modes should be consistent with `nn.Module`, while `training` in [DynamicEmbTableOptions](../dynamicemb/dynamicemb_config.py) is used to guide whether to allocate memory to optimizer states when builds the table.
+
+Due to limited resources, the dynamic embedding table does not pre allocate memory for all keys. If a key appears for the first time during training, it will be initialized immediately during the training process. Please see `initializer_args` and `eval_initializer_args` in `DynamicEmbTableOptions` for more information.
+
+## Automatic eviction
+
+The size of the table is finite, but the set of keys during training may be infinite. dynamicemb provides the function of automatic eviction, which constrains the size of tables reasonably when there is no available space. See `score_strategy` and `bucket_capacity` for more information.
+
+## Caching and prefetch
+
+dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch keys from host to device like torchrec(document and example is waiting to append, and now please see `test_prefetch_flush_in_cache` in [test prefetch](./test/test_batched_dynamic_embedding_tables_v2.py)).
+
+## External storage
+
+dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](../dynamicemb/types.py). 
+Refer to demo `PyDictStorage` in [uint test](../test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
+
+
+## Table expansion
+
+Users can specify the initial capacity of a table on a single GPU. When the specified load factor is reached, the capacity of the table will double until the limit is reached. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions` for more information.
+
+
+## Dump/Load and Incremental dump
+
+Dump/Load and incremental dump is different from general module in PyTorch, because dynamicemb's underlying implementation is a hash table instead of a dense `torch.Tensor`.
+
+So dynamicemb provides dedicated interface to load/save models' states, and provide conditional dump to support online training.
+
+Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](../DynamicEmb_APIs.md) for more information.

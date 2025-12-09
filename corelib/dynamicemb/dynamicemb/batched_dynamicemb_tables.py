@@ -114,6 +114,145 @@ class CowClipDefinition:
     lower_bound: float = 0.0
 
 
+def encode_meta_json_file_path(root_path: str, table_name: str) -> str:
+    return os.path.join(root_path, f"{table_name}_opt_args.json")
+
+
+def encode_checkpoint_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int, item: str
+) -> str:
+    assert item in ["keys", "values", "scores", "opt_values"]
+    return os.path.join(
+        root_path, f"{table_name}_emb_{item}.rank_{rank}.world_size_{world_size}"
+    )
+
+
+def encode_counter_checkpoint_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int, item: str
+) -> str:
+    assert item in ["keys", "frequencies"]
+    return os.path.join(
+        root_path, f"{table_name}_counter_{item}.rank_{rank}.world_size_{world_size}"
+    )
+
+
+def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str], int]:
+    suffix_to_encode_file_path_func = {
+        "emb_keys": partial(encode_checkpoint_file_path, item="keys"),
+        "emb_values": partial(encode_checkpoint_file_path, item="values"),
+        "emb_scores": partial(encode_checkpoint_file_path, item="scores"),
+        "opt_values": partial(encode_checkpoint_file_path, item="opt_values"),
+        "counter_keys": partial(encode_counter_checkpoint_file_path, item="keys"),
+        "counter_frequencies": partial(
+            encode_counter_checkpoint_file_path, item="frequencies"
+        ),
+    }
+    if suffix not in suffix_to_encode_file_path_func:
+        raise RuntimeError(f"Invalid suffix: {suffix}")
+    encode_file_path_func = suffix_to_encode_file_path_func[suffix]
+
+    import glob
+
+    # v2 version
+    files = glob.glob(encode_file_path_func(root_path, table_name, "*", "*"))
+    if len(files) == 0:
+        return [], 0
+    files = sorted(files)
+    world_size = int(files[0].split(".")[-1].split("_")[-1])
+    if len(files) != world_size:
+        raise RuntimeError(
+            f"Checkpoints is corrupted. Found {len(files)} under path {root_path} for table {table_name}, but the number of checkpointed world size is {world_size}."
+        )
+
+    for i in range(world_size):
+        expected_file_path = encode_file_path_func(root_path, table_name, i, world_size)
+        if expected_file_path not in set(files):
+            raise RuntimeError(
+                f"Checkpoints is corrupted. Expected file path {expected_file_path} for table {table_name}, but it is not found."
+            )
+
+    return files, len(files)
+
+
+def get_loading_files(
+    root_path: str,
+    name: str,
+    rank: int,
+    world_size: int,
+) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
+    if not os.path.exists(root_path):
+        raise RuntimeError(f"can't find path to load, path:", root_path)
+
+    key_files, num_key_files = find_files(root_path, name, "emb_keys")
+    value_files, num_value_files = find_files(root_path, name, "emb_values")
+    score_files, num_score_files = find_files(root_path, name, "emb_scores")
+    opt_files, num_opt_files = find_files(root_path, name, "opt_values")
+
+    if num_key_files != num_value_files:
+        assert (
+            num_key_files > 0
+        ), "No key files found under path {root_path} for table {name}"
+        raise RuntimeError(
+            f"The number of key files under path {root_path} for table {name} does not match the number of value files."
+        )
+
+    counter_key_files, num_counter_key_files = find_files(
+        root_path, name, "counter_keys"
+    )
+    counter_freq_files, num_counter_freq_files = find_files(
+        root_path, name, "counter_frequencies"
+    )
+
+    if num_counter_key_files != num_counter_freq_files:
+        raise RuntimeError(
+            f"The number of key files of admission counter under path {root_path} for table {name} does not match the number of frequency files({num_counter_key_files}/{num_counter_freq_files})."
+        )
+
+    if num_counter_key_files > 0 and num_counter_key_files != num_key_files:
+        raise RuntimeError(
+            f"The number of key files under path {root_path} for table {name} does not match the number of keys files of admission counter({num_key_files}/{num_counter_key_files})."
+        )
+
+    if world_size == num_key_files:
+        return (
+            [encode_checkpoint_file_path(root_path, name, rank, world_size, "keys")],
+            [encode_checkpoint_file_path(root_path, name, rank, world_size, "values")],
+            [encode_checkpoint_file_path(root_path, name, rank, world_size, "scores")]
+            if num_score_files == num_key_files
+            else [],
+            [
+                encode_checkpoint_file_path(
+                    root_path, name, rank, world_size, "opt_values"
+                )
+            ]
+            if num_opt_files == num_key_files
+            else [],
+            [
+                encode_counter_checkpoint_file_path(
+                    root_path, name, rank, world_size, "keys"
+                )
+            ]
+            if num_counter_key_files == num_key_files
+            else [],
+            [
+                encode_counter_checkpoint_file_path(
+                    root_path, name, rank, world_size, "frequencies"
+                )
+            ]
+            if num_counter_freq_files == num_key_files
+            else [],
+        )
+    # TODO: support skipping files.
+    return (
+        key_files,
+        value_files,
+        score_files,
+        opt_files,
+        counter_key_files,
+        counter_freq_files,
+    )
+
+
 def _export_matched_and_gather(
     dynamic_table: DynamicEmbTable,
     threshold: int,
@@ -888,7 +1027,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
-
+        self._admit_strategy = self._dynamicemb_options[0].admit_strategy
+        self._evict_strategy = self._dynamicemb_options[0].evict_strategy.value
         if device is not None:
             self.device_id = int(str(device)[-1])
         else:
@@ -983,6 +1123,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._initializers = []
         self._eval_initializers = []
         self._create_initializers()
+
+        self._admission_counter = [option.admission_counter for option in table_options]
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -1089,28 +1231,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
 
     def _create_initializers(self) -> None:
-        def _get_initializer(initializer_args):
-            mode = initializer_args.mode
-            if mode == DynamicEmbInitializerMode.NORMAL:
-                initializer = NormalInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-                initializer = TruncatedNormalInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.UNIFORM:
-                initializer = UniformInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.CONSTANT:
-                initializer = ConstantInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.DEBUG:
-                initializer = DebugInitializer(initializer_args)
-            else:
-                raise ValueError(
-                    f"Not supported initializer type({mode}) {type(mode)} {mode.value}."
-                )
-            return initializer
-
         for option in self._dynamicemb_options:
-            initializer = _get_initializer(option.initializer_args)
+            initializer = create_initializer_from_args(option.initializer_args)
             self._initializers.append(initializer)
-            eval_initializer = _get_initializer(option.eval_initializer_args)
+            eval_initializer = create_initializer_from_args(
+                option.eval_initializer_args
+            )
             self._eval_initializers.append(eval_initializer)
 
     def _create_table_optimizer(
@@ -1395,6 +1521,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._enable_prefetch,
                 self.use_index_dedup,
                 self.training,
+                self._admit_strategy,
+                self._evict_strategy,
+                per_sample_weights,  # Pass frequency counters as weights
+                self._admission_counter,
                 self._empty_tensor,
             )
             for cache in self._caches:
@@ -1588,6 +1718,168 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
             ret_scores.append(new_score)
         return ret_scores
+
+    def dump(
+        self,
+        save_dir: str,
+        optim: bool = False,
+        counter: bool = False,
+        table_names: Optional[List[str]] = None,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> None:
+        if table_names is None:
+            table_names = self._table_names
+
+        if pg is None:
+            assert dist.is_initialized(), "Distributed is not initialized."
+            pg = dist.group.WORLD
+        rank = dist.get_rank(group=pg)
+        world_size = dist.get_world_size(group=pg)
+
+        self.flush()
+        for table_name, storage, counter_table in zip(
+            self._table_names, self._storages, self._admission_counter
+        ):
+            if table_name not in set(table_names):
+                continue
+
+            meta_file_path = encode_meta_json_file_path(save_dir, table_name)
+            emb_key_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "keys"
+            )
+            emb_value_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "values"
+            )
+            emb_score_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "scores"
+            )
+            opt_value_path = encode_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "opt_values"
+            )
+
+            if isinstance(storage, KeyValueTable) and not storage._use_score:
+                dist.barrier()  # sync global timestamp
+                cast(KeyValueTable, storage).update_timestamp()
+            storage.dump(
+                meta_file_path,
+                emb_key_path,
+                emb_value_path,
+                emb_score_path,
+                opt_value_path,
+                include_optim=optim,
+                include_meta=(rank == 0),
+            )
+
+            if not counter:
+                continue
+
+            counter_key_path = encode_counter_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "keys"
+            )
+            counter_frequency_path = encode_counter_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "frequencies"
+            )
+
+            if counter_table is not None:
+                counter_table.dump(counter_key_path, counter_frequency_path)
+            else:
+                warnings.warn(
+                    f"Counter table is none and will not dump it for table: {table_name}"
+                )
+
+    def load(
+        self,
+        save_dir: str,
+        optim: bool = False,
+        counter: bool = False,
+        table_names: Optional[List[str]] = None,
+        pg: Optional[dist.ProcessGroup] = None,
+    ):
+        if table_names is None:
+            table_names = self._table_names
+
+        if pg is None and not dist.is_initialized():  # for inference load
+            rank = 0
+            world_size = 1
+        else:
+            rank = dist.get_rank(group=pg)
+            world_size = dist.get_world_size(group=pg)
+
+        for table_name, storage, counter_table in zip(
+            self._table_names, self._storages, self._admission_counter
+        ):
+            if table_name not in set(table_names):
+                continue
+            (
+                emb_key_files,
+                emb_value_files,
+                emb_score_files,
+                opt_value_files,
+                counter_key_files,
+                counter_frequency_files,
+            ) = get_loading_files(
+                save_dir,
+                table_name,
+                rank=rank,
+                world_size=world_size,
+            )
+            meta_json_file = encode_meta_json_file_path(save_dir, table_name)
+
+            if isinstance(storage, KeyValueTable) and not storage._use_score:
+                cast(KeyValueTable, storage).update_timestamp()
+            num_key_files = len(emb_key_files)
+            for i in range(num_key_files):
+                storage.load(
+                    meta_json_file,
+                    emb_key_files[i],
+                    emb_value_files[i],
+                    emb_score_files[i] if len(emb_score_files) > 0 else None,
+                    opt_value_files[i] if len(opt_value_files) > 0 else None,
+                    include_optim=optim,
+                )
+
+            if not counter:
+                continue
+            if counter_table is None:
+                warnings.warn(
+                    f"Counter table is none and will not load for table: {table_name}"
+                )
+                continue
+            num_counter_key_files = len(counter_key_files)
+            for i in range(num_counter_key_files):
+                counter_table.load(counter_key_files[i], counter_frequency_files[i])
+
+    def export_keys_values(
+        self, table_name: str, device: torch.device, batch_size: int = 65536
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from dynamicemb.key_value_table import batched_export_keys_values
+
+        keys_list = []
+        values_list = []
+        self.flush()
+        for dynamic_table_name, dynamic_table in zip(self.table_names, self.tables):
+            assert isinstance(
+                dynamic_table, KeyValueTable
+            ), "Only KeyValueTable is supported for batched export keys and values"
+            if table_name != dynamic_table_name:
+                continue
+
+            local_max_rows = dynamic_table.size()
+            accumulated_counts = 0
+
+            for keys, embeddings, _, _ in batched_export_keys_values(
+                dynamic_table.table, device, batch_size
+            ):
+                keys_list.append(keys)
+                values_list.append(embeddings)
+                accumulated_counts += keys.numel()
+
+            if local_max_rows != accumulated_counts:
+                raise ValueError(
+                    f"Rank {dist.get_rank()} has accumulated count {accumulated_counts} which is different from expected {local_max_rows}, "
+                    f"difference: {accumulated_counts - local_max_rows}"
+                )
+        return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
     def incremental_dump(
         self,
