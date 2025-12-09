@@ -68,10 +68,10 @@ class GPTSIDBatch(Pipelineable):
     contextual_feature_names: List[str] = field(default_factory=lambda: [])
     raw_hist_sid_names: List[str] = field(
         default_factory=lambda: []
-    )  # all those features compose history_feature_name
+    )  # all those features compose history_feature_name, this is used for random generation
     raw_cand_sid_names: List[str] = field(
         default_factory=lambda: []
-    )  # all those features compose history_feature_name
+    )  # all those features compose history_feature_name, this is used for random generation
 
     history_feature_name: str = (
         "history_sequence"  # raw sid features are combined into this feature.
@@ -81,7 +81,9 @@ class GPTSIDBatch(Pipelineable):
     )
     _num_hierarchies: int = 4
     user_id: Optional[torch.Tensor] = None
-    labels: Optional[torch.Tensor] = None  # For retrieval, candidates are labels!
+    labels: Optional[
+        torch.Tensor
+    ] = None  # For retrieval, candidates are labels! Inference batch does not have labels.
 
     def to(self, device: torch.device, non_blocking: bool = True) -> "GPTSIDBatch":  # type: ignore
         return GPTSIDBatch(

@@ -11,11 +11,11 @@ TrainerArgs.max_eval_iters = 16
 DatasetArgs.dataset_name = 'amzn_beauty'
 DatasetArgs.max_history_length = 120 # 120 is the max sequence length for the training. We need to Downsample the original dataset to 120.
 DatasetArgs.dataset_type = "DiskSequenceDataset"
-DatasetArgs.sequence_features_data_path = "data/amzn_beauty/train.jsonl"
-DatasetArgs.item_to_sid_mapping_path = "data/amzn_beauty/item-sid-mapping.pt"
+DatasetArgs.sequence_features_training_data_path = "./tmp_data/amzn/beauty" # training/testing
+DatasetArgs.item_to_sid_mapping_path = "./tmp_data/amzn/beauty/item-sid-mapping.pt"
 DatasetArgs.shuffle = True
 DatasetArgs.num_hierarchies = 4
-DatasetArgs.codebook_sizes = [256, 256, 256, 100] # embedding vocab size for each hierarchy, the last one is used for de-duplication
+DatasetArgs.codebook_sizes = [256, 256, 256, 256] # embedding vocab size for each hierarchy, the last one is used for de-duplication
 
 NetworkArgs.num_layers = 1
 NetworkArgs.num_attention_heads = 4

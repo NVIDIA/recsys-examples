@@ -1,14 +1,17 @@
 from configs.sid_gin_config_args import DatasetArgs, DatasetType, TrainerArgs
 
+from .disk_sequence_dataset import DiskSequenceDataset
 from .gpt_sid_batch import FeatureConfig
 from .in_memory_random_dataset import InMemoryRandomDataset
-from .preprocessor import get_common_preprocessors
 
 
 def get_dataset(
     dataset_args: DatasetArgs,
     trainer_args: TrainerArgs,
     is_train_dataset: bool,
+    rank: int = 0,
+    world_size: int = 1,
+    random_seed: int = 1234,
 ):
     max_history_length = dataset_args.max_history_length
     num_hierarchies = dataset_args.num_hierarchies
@@ -57,20 +60,27 @@ def get_dataset(
             else trainer_args.max_eval_iters,
         )
     elif dataset_args.dataset_type == DatasetType.DiskSequenceDataset:
-        dataset_name = dataset_args.dataset_name
-        common_preprocessor = get_common_preprocessors(
-            dataset_args.sequence_features_data_path
-        )[dataset_name]
-        common_preprocessor.sequence_is_sid
-        num_hierarchies = common_preprocessor.num_hierarchies
-
-        common_preprocessor.raw_sequence_feature_name
-
-        common_preprocessor.contextual_feature_names
-        # a raw sequence is split into history and candidate sequences
-        common_preprocessor.history_feature_name
-        common_preprocessor.candidate_feature_name
-        common_preprocessor.item_id_to_sid_mapping_path
-        raise NotImplementedError("DiskSequenceDataset is not implemented yet")
+        dataset_args.dataset_name
+        return DiskSequenceDataset.get_dataset(
+            raw_sequence_data_path=dataset_args.sequence_features_training_data_path
+            if is_train_dataset
+            else dataset_args.sequence_features_testing_data_path,
+            item_id_to_sid_mapping_tensor_path=dataset_args.item_to_sid_mapping_path,
+            batch_size=trainer_args.train_batch_size
+            if is_train_dataset
+            else trainer_args.eval_batch_size,
+            max_history_seqlen=dataset_args.max_history_length
+            + 1,  # +1 for the candidate
+            max_candidate_seqlen=1,  # only 1 candidate item for now
+            raw_sequence_feature_name="sequence_data",  # TODO: make it configurable!!!
+            num_hierarchies=num_hierarchies,
+            codebook_sizes=codebook_sizes,
+            rank=rank,
+            world_size=world_size,
+            shuffle=dataset_args.shuffle,
+            random_seed=random_seed,
+            is_train_dataset=is_train_dataset,
+            deduplicate_sid_across_hierarchy=True,
+        )
     else:
         raise ValueError(f"Invalid dataset type: {dataset_args.dataset_type}")

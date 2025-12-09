@@ -12,41 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
+import math
 from typing import Iterator, List, Optional
 
+import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data.dataset import IterableDataset
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from .gpt_sid_batch import GPTSIDBatch
-
-
-def _transform_item_id_to_sid(
-    raw_sequence_df: pd.DataFrame,
-    item_to_sid_mapping: pd.DataFrame,
-    item_id_column_name: str,
-    sid_column_names: List[str],
-) -> pd.DataFrame:
-    df_merged = raw_sequence_df.merge(
-        item_to_sid_mapping, on=item_id_column_name, how="left"
-    )
-    assert (
-        df_merged[sid_column_names].isnull().sum() == 0
-    ), "all item_ids should be mapped to sids"
-    return df_merged
 
 
 class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
@@ -57,78 +33,225 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
     def __init__(
         self,
         raw_sequence_data_path: str,
-        batch_size: int,
-        max_seqlen: int,
-        raw_sequence_feature_name: str,
-        contextual_feature_names: List[str],
-        raw_sequence_is_sid: bool,
+        batch_size: int,  # local batch size
+        max_history_seqlen: int,  # history seqlen
+        raw_sequence_feature_name: str,  # 'sequence_data'
         num_hierarchies: int,
-        output_history_sid_feature_name: str,
-        output_candidate_sid_feature_name: str,
-        item_to_sid_mapping_path: Optional[str] = None,
+        codebook_sizes: List[int],
+        output_history_sid_feature_name: Optional[str] = None,
+        output_candidate_sid_feature_name: Optional[str] = None,
+        max_candidate_seqlen: int = 1,  # candidate seqlen
+        contextual_feature_names: List[str] = [],
+        item_id_to_sid_mapping_tensor_path: Optional[str] = None,
         *,
         rank: int,
         world_size: int,
         shuffle: bool,
         random_seed: int,
         is_train_dataset: bool,
-        nrows: Optional[int] = None,
+        deduplicate_sid_across_hierarchy: bool = True,
     ):
         # items and timestamps are nested
-        # user_id,item_ids,timestamps
-        # 1, [128,122,134], [100,200,300]
+        super().__init__()
+        if output_history_sid_feature_name is None:
+            output_history_sid_feature_name = f"hist_sids{num_hierarchies}d"
+        if output_candidate_sid_feature_name is None:
+            output_candidate_sid_feature_name = f"cand_sids{num_hierarchies}d"
+        self._device = torch.cpu.current_device()
         raw_sequence_data = pd.read_parquet(raw_sequence_data_path)
-        if not raw_sequence_is_sid:
-            assert (
-                item_to_sid_mapping_path is not None
-            ), "item_id_to_sid_mapping_path is required when raw_sequence_is_sid is False"
-            # in item_to_sid_mapping_path, sids are not nested so that we can validate the hierarchy with the number of columns
-            # item,sid0,sid1,sid2,sid3
-            # 1,11,23,24,25
-            self.item_id_to_sid_mapping = pd.read_parquet(
-                item_to_sid_mapping_path
-            ).fillna(0)
-            assert (
-                len(self.item_id_to_sid_mapping.columns) == num_hierarchies
-            ), "item_id_to_sid_mapping should have the same number of columns as num_hierarchies"
-        else:
-            self.item_id_to_sid_mapping = None
+        if "sequence_length" not in raw_sequence_data.columns:
+            raw_sequence_data["sequence_length"] = raw_sequence_data[
+                raw_sequence_feature_name
+            ].apply(len)
+        num_raw_samples = len(raw_sequence_data)
+        raw_sequence_data = raw_sequence_data[
+            raw_sequence_data["sequence_length"] >= 2
+        ]  # at least 2 items in the sequence
+        print(
+            f"{num_raw_samples - len(raw_sequence_data)} sequences are filtered out due to length < 2"
+        )
+        raw_sequence_data[raw_sequence_feature_name] = raw_sequence_data[
+            raw_sequence_feature_name
+        ].apply(
+            lambda x: x[:max_history_seqlen] if isinstance(x, (list, np.ndarray)) else x
+        )
+        self._feature_to_max_seqlen = {
+            output_history_sid_feature_name: max_history_seqlen * num_hierarchies,
+            output_candidate_sid_feature_name: max_candidate_seqlen * num_hierarchies,
+        }
+        try:
+            self.item_id_to_sid_mapping_tensor = torch.load(
+                item_id_to_sid_mapping_tensor_path
+            )
 
-        raw_sequence_data[contextual_feature_names]
-        # we need to split the raw sequence data into history and candidate sequences
-        raw_sequence_data[raw_sequence_feature_name]
+            if not isinstance(self.item_id_to_sid_mapping_tensor, torch.Tensor):
+                raise TypeError("item_id_to_sid_mapping_tensor should be a tensor")
+            assert (
+                self.item_id_to_sid_mapping_tensor.dim() == 2
+            ), "item_id_to_sid_mapping_tensor should be a 2D tensor"
+            (
+                mappping_num_hierarchies,
+                num_items,
+            ) = self.item_id_to_sid_mapping_tensor.shape
+            assert (
+                mappping_num_hierarchies == num_hierarchies
+            ), "item_id_to_sid_mapping_tensor should have the same number of rows as num_hierarchies"
+        except:
+            raise RuntimeError("Failed to load item_id_to_sid_mapping_tensor")
+
+        self._raw_sequence_data = raw_sequence_data
+        self._num_samples = raw_sequence_data.shape[0]
+
+        self._raw_sequence_feature_name = raw_sequence_feature_name
+        self._output_history_sid_feature_name = output_history_sid_feature_name
+        self._output_candidate_sid_feature_name = output_candidate_sid_feature_name
+        self._num_hierarchies = num_hierarchies
+
+        assert max_candidate_seqlen == 1, "max_candidate_seqlen should be 1 for now"
+        self._max_candidate_seqlen = max_candidate_seqlen
+        self._batch_size = batch_size
+        self._global_batch_size = batch_size * world_size
+        self._is_train_dataset = is_train_dataset
+        self._rank = rank
+        self._world_size = world_size
+        self._sample_ids = np.arange(self._num_samples)
+
+        if deduplicate_sid_across_hierarchy:
+            codebook_offsets = torch.tensor(
+                np.cumsum([0] + codebook_sizes[:-1]), device=self._device
+            )
+            self._codebook_offsets = codebook_offsets
+        else:
+            self._codebook_offsets = torch.zeros(
+                self._num_hierarchies, device=self._device
+            )
+        # TODO: Add shuffle and random seed
 
     def __iter__(self) -> Iterator[GPTSIDBatch]:
         for i in range(len(self)):
-            yield self[i]
+            local_batch_start = (
+                i * self._global_batch_size + self._rank * self._batch_size
+            )
+            local_batch_end = min(
+                i * self._global_batch_size + (self._rank + 1) * self._batch_size,
+                len(self._sample_ids),
+            )
+            actual_batch_size = local_batch_end - local_batch_start
+            sample_ids = self._sample_ids[local_batch_start:local_batch_end]
+            sequence_data = self._raw_sequence_data.iloc[sample_ids]
+            # split history and candidate
+            # [1,2,| 3]      => [1,2], [3]
+            # [1,2,3,4, | 5] => [1,2,3,4], [5]
+            # [1,2, |3]      => [1,2], [3]
+            history_item_ids = torch.tensor(
+                sequence_data[self._raw_sequence_feature_name]
+                .apply(lambda x: x[: -self._max_candidate_seqlen])
+                .explode()
+                .to_numpy()
+                .astype(np.int64),
+                device=self._device,
+            )
+            candidate_item_ids = torch.tensor(
+                sequence_data[self._raw_sequence_feature_name]
+                .apply(lambda x: x[-self._max_candidate_seqlen :])
+                .explode()
+                .to_numpy()
+                .astype(np.int64),
+                device=self._device,
+            )
+            # add offset to the sids to avoid duplicate sids across hierarchy
+
+            # [T, num_hierarchies]
+            history_sids = torch.index_select(
+                self.item_id_to_sid_mapping_tensor, dim=1, index=history_item_ids
+            ).transpose(0, 1).contiguous() + self._codebook_offsets.unsqueeze(0)
+            # [T, num_hierarchies]
+            candidate_sids = torch.index_select(
+                self.item_id_to_sid_mapping_tensor, dim=1, index=candidate_item_ids
+            ).transpose(0, 1).contiguous() + self._codebook_offsets.unsqueeze(0)
+
+            history_lengths = (
+                torch.tensor(
+                    sequence_data["sequence_length"].to_numpy().astype(np.int64)
+                    - self._max_candidate_seqlen,
+                    device=self._device,
+                    dtype=torch.int64,
+                )
+                * self._num_hierarchies
+            )
+            candidate_lengths = (
+                torch.ones(actual_batch_size, device=self._device, dtype=torch.int64)
+                * self._num_hierarchies
+            )
+
+            def pad_tensor(padding_length: int, tensor: torch.Tensor) -> torch.Tensor:
+                if padding_length == 0:
+                    return tensor
+                return torch.nn.functional.pad(
+                    tensor, (0, padding_length), "constant", 0
+                )
+
+            history_lengths = pad_tensor(
+                self._batch_size - actual_batch_size, history_lengths
+            )
+            candidate_lengths = pad_tensor(
+                self._batch_size - actual_batch_size, candidate_lengths
+            )
+
+            batch_kwargs = dict(
+                features=KeyedJaggedTensor.from_lengths_sync(
+                    keys=[
+                        self._output_history_sid_feature_name,
+                        self._output_candidate_sid_feature_name,
+                    ],
+                    values=torch.cat([history_sids, candidate_sids], dim=0),
+                    lengths=torch.cat([history_lengths, candidate_lengths], dim=0),
+                ),
+                batch_size=self._batch_size,
+                feature_to_max_seqlen=self._feature_to_max_seqlen,
+                _num_hierarchies=self._num_hierarchies,
+                history_feature_name=self._output_history_sid_feature_name,
+                candidate_feature_name=self._output_candidate_sid_feature_name,
+                labels=candidate_sids
+                if self._is_train_dataset
+                else None,  # labels are the candidate sids but starting from 0.
+            )
+            yield GPTSIDBatch(**batch_kwargs)
 
     def __len__(self) -> int:
-        return len(self.raw_sequence_data)
+        return math.ceil(self._num_samples / self._global_batch_size)
 
-    # def __getitem__(self, index: int) -> GPTSIDBatch:
-    #     pass
-
-    #   pass
-
-    # @classmethod
-    # def get_dataset(cls,
-    #     dataset_name: str,
-    #     sequence_features_data_path: str,
-    #     max_seqlen: int,
-    #     batch_size: int,
-    #     rank: int,
-    #     world_size: int,
-    #     shuffle: bool,
-    #     random_seed: int,
-    # ):
-
-    #   return cls(
-    #     dataset_name=dataset_name,
-    #     sequence_features_data_path=sequence_features_data_path,
-    #     max_seqlen=max_seqlen,
-    #     batch_size=batch_size,
-    #     rank=rank,
-    #     world_size=world_size,
-    #     shuffle=shuffle,
-    #     random_seed=random_seed,
-    #   )
+    @classmethod
+    def get_dataset(
+        cls,
+        raw_sequence_data_path: str,
+        item_id_to_sid_mapping_tensor_path: str,
+        batch_size: int,
+        max_history_seqlen: int,
+        max_candidate_seqlen: int,
+        raw_sequence_feature_name: str,
+        num_hierarchies: int,
+        codebook_sizes: List[int],
+        rank: int,
+        world_size: int,
+        shuffle: bool,
+        random_seed: int,
+        is_train_dataset: bool,
+        deduplicate_sid_across_hierarchy: bool,
+    ) -> "DiskSequenceDataset":
+        return cls(
+            raw_sequence_data_path=raw_sequence_data_path,
+            item_id_to_sid_mapping_tensor_path=item_id_to_sid_mapping_tensor_path,
+            batch_size=batch_size,
+            max_history_seqlen=max_history_seqlen,
+            max_candidate_seqlen=max_candidate_seqlen,
+            raw_sequence_feature_name=raw_sequence_feature_name,
+            num_hierarchies=num_hierarchies,
+            codebook_sizes=codebook_sizes,
+            rank=rank,
+            world_size=world_size,
+            shuffle=shuffle,
+            random_seed=random_seed,
+            is_train_dataset=is_train_dataset,
+            deduplicate_sid_across_hierarchy=deduplicate_sid_across_hierarchy,
+        )

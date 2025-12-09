@@ -97,7 +97,7 @@ class EmbeddingArgs:
         A table could be only one of type `EmbeddingArgs`.
         When movielen* or kuairand* datasets are used, `EmbeddingArgs`
         are predefined. Setting the proper DatasetArgs.dataset_name in the gin config file will automatically set the proper EmbeddingArgs.
-        See `examples/sid_gr/data/sid_data_loader.py::get_data_loader()` for more details.
+        See `examples/sid_gr/data/sid_data_loader.py::get_train_and_test_data_loader()` for more details.
     """
 
     feature_names: List[str]
@@ -128,19 +128,23 @@ class DatasetArgs:
     Attributes:
         dataset_name (str): **Required**. Dataset name.
         max_history_length (int): **Required**. Maximum sequence length.
-        sequence_features_data_path (Optional[str]): Path to dataset. Default: None.
+        sequence_features_training_data_path (Optional[str]): Path to dataset. Default: None.
+        sequence_features_testing_data_path (Optional[str]): Path to dataset. Default: None.
         max_num_candidates (int): Maximum number of candidates. Default: 0.
         shuffle (bool): Whether to shuffle data. Default: False.
 
     Note:
-        sequence_features_data_path could be None if your dataset is preprocessed and moved under
+        sequence_features_training_data_path could be None if your dataset is preprocessed and moved under
     """
 
     dataset_name: str
     max_history_length: int
     dataset_type: DatasetType = DatasetType.InMemoryRandomDataset
     dataset_type_str: str = "in_memory_random_dataset"
-    sequence_features_data_path: Optional[
+    sequence_features_training_data_path: Optional[
+        str
+    ] = None  # None when dataset_type is InMemoryRandomDataset
+    sequence_features_testing_data_path: Optional[
         str
     ] = None  # None when dataset_type is InMemoryRandomDataset
     shuffle: bool = False

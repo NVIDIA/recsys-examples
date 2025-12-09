@@ -36,7 +36,7 @@ from configs.sid_gin_config_args import (
     TensorModelParallelArgs,
     TrainerArgs,
 )
-from data.sid_data_loader import get_data_loader
+from data.sid_data_loader import get_train_and_test_data_loader
 from model import get_sid_gr_model
 from trainer.training import maybe_load_ckpts, train_with_pipeline
 
@@ -44,11 +44,13 @@ from trainer.training import maybe_load_ckpts, train_with_pipeline
 def get_dataset_and_embedding_args() -> Tuple[DatasetArgs, EmbeddingArgs]:
     dataset_args = DatasetArgs()  # type: ignore[call-arg]
 
-    assert isinstance(dataset_args, DatasetArgs)
     codebook_sizes = dataset_args.codebook_sizes
     aggragated_codebook_size = sum(codebook_sizes)
-    embedding_args = EmbeddingArgs(  # sid tuples share a embedding table
-        feature_names=["hist_sids", "cand_sids"],  # sid tuples share a embedding table
+    embedding_args = EmbeddingArgs(  # sid tuples share one embedding table
+        feature_names=[
+            "hist_sids",
+            "cand_sids",
+        ],  # sid tuples share one embedding table
         table_name="codebook",
         item_vocab_size_or_capacity=aggragated_codebook_size,
         sharding_type="data_parallel",
@@ -119,7 +121,9 @@ def main():
         pipeline_type=trainer_args.pipeline_type,
     )
     stateful_metric_module = None
-    train_dataloader, test_dataloader = get_data_loader(dataset_args, trainer_args)
+    train_dataloader, test_dataloader = get_train_and_test_data_loader(
+        dataset_args, trainer_args
+    )
     free_memory, total_memory = torch.cuda.mem_get_info()
     print_rank_0(
         f"model initialization done, start training. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"

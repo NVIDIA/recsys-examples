@@ -62,7 +62,7 @@ class DataProcessor(ABC):
 
 
 class AmazonBeautyPreprocessor(DataProcessor):
-    def __init__(self, sequence_features_data_path: str):
+    def __init__(self, sequence_features_training_data_path: str):
         super().__init__()
         self._num_hierarchies = 4
 
@@ -94,7 +94,7 @@ class AmazonBeautyPreprocessor(DataProcessor):
         return "item_ids"
 
 
-def get_common_preprocessors(sequence_features_data_path: str):
+def get_common_preprocessors(sequence_features_training_data_path: str):
     return {
-        "amazon_beauty": AmazonBeautyPreprocessor(sequence_features_data_path),
+        "amazon_beauty": AmazonBeautyPreprocessor(sequence_features_training_data_path),
     }
