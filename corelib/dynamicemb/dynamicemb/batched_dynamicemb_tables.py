@@ -1391,13 +1391,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         ret_tensors: Dict[str, Tuple[Tensor, Tensor]] = {}
         ret_scores: Dict[str, int] = {}
 
-        def _export_matched_per_table(pg, table, threshold):
-            if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
-                key, value = _export_matched(table, threshold)
-            else:
-                key, value = _export_matched_and_gather(table, threshold, pg)
-            return key, value
-
         for table_name, threshold in zip(table_names, table_thresholds):
             index = self._table_names.index(table_name)
 
@@ -1406,28 +1399,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 raise RuntimeError(
                     "Only KeyValueTable is supported for incremental dump"
                 )
-            key, value = _export_matched_per_table(pg, storage, threshold)
-            if self._caches[index] is not None:
-                # flush will change the score(timestamp) in storage
-                # self._caches[index].flush(self._storages[index])
-                cache = self._caches[index]
-                key_c, value_c = _export_matched_per_table(pg, cache, threshold)
-                mask = ~torch.isin(key, key_c)
-                if key.numel() != 0:
-                    if mask.sum() != 0:
-                        value = (
-                            value.view(key.numel(), -1)[mask, :].contiguous().view(-1)
-                        )
-                        key = key[mask].contiguous()
-                        key = torch.cat((key_c, key), dim=0).contiguous()
-                        value = torch.cat((value_c, value), dim=0).contiguous()
-                    else:
-                        key = key_c
-                        value = value_c
-                else:
-                    key = key_c
-                    value = value_c
+
+            cache = self._caches[index]
+            if cache is not None:
+                cache.flush(storage)
+
+            key, value = storage.incremental_dump(threshold, pg)
 
             ret_tensors[table_name] = (key, value)
             ret_scores[table_name] = self._scores[table_name]
+
         return ret_tensors, ret_scores

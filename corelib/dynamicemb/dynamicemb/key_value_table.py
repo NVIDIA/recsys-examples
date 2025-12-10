@@ -49,22 +49,15 @@ from dynamicemb.types import (
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
-    clear,
-    count_matched,
     device_timestamp,
     dyn_emb_capacity,
     dyn_emb_cols,
-    dyn_emb_rows,
-    erase,
     export_batch,
-    export_batch_matched,
-    find_pointers,
-    insert_and_evict,
-    insert_and_evict_with_scores,
     insert_or_assign,
     load_from_combined_buffer,
     select,
     select_index,
+    store_to_combined_buffer,
 )
 
 
@@ -190,6 +183,78 @@ def load_key_values(
     )
 
 
+def load_key_values_v1(
+    key_value_table: Any,
+    keys: torch.Tensor,
+    embeddings: torch.Tensor,
+    scores: Optional[torch.Tensor] = None,
+    opt_states: Optional[torch.Tensor] = None,
+):
+    dim = embeddings.size(1)
+    optstate_dim = opt_states.size(1) if opt_states is not None else 0
+    if not keys.is_cuda:
+        raise RuntimeError("Keys must be on GPU")
+    if not embeddings.is_cuda:
+        raise RuntimeError("Embeddings must be on GPU")
+    if scores is not None and not scores.is_cuda:
+        raise RuntimeError("Scores must be on GPU")
+    if opt_states is not None and not opt_states.is_cuda:
+        raise RuntimeError("Opt states must be on GPU")
+
+    if opt_states is None and optstate_dim > 0:
+        opt_states = (
+            torch.ones(
+                keys.numel(),
+                optstate_dim,
+                dtype=key_value_table.value_type(),
+                device=embeddings.device,
+            )
+            * key_value_table.init_optimizer_state()
+        )
+
+    values = (
+        torch.cat([embeddings.view(-1, dim), opt_states.view(-1, optstate_dim)], dim=-1)
+        if opt_states is not None
+        else embeddings
+    )
+
+    key_type = key_value_table.key_index_map.key_type
+    value_type = key_value_table.value_type()
+
+    # when load into the table, we always assign the scores from the file.
+    policy = ScorePolicy.ASSIGN
+
+    if scores is None:
+        assert (
+            key_value_table.evict_strategy() == EvictStrategy.KLru
+        ), "scores is None for KLru evict strategy is allowed but will be deprecated in future."
+        policy = ScorePolicy.GLOBAL_TIMER
+    else:
+        scores = scores.to(SCORE_TYPE)
+
+    key_value_table.insert(keys.to(key_type), values.to(value_type), scores)
+
+    score_args_insert = [
+        ScoreArg(
+            name=key_value_table.score_policy.name,
+            value=scores,
+            policy=policy,
+            is_return=False,
+        )
+    ]
+    indices = torch.zeros(
+        keys.numel(), dtype=key_value_table.key_index_map.index_type, device=keys.device
+    )
+
+    key_value_table.key_index_map.insert(keys, score_args_insert, indices)
+    store_to_combined_buffer(
+        key_value_table.dev_table,
+        key_value_table.uvm_table,
+        indices,
+        values.to(value_type),
+    )
+
+
 def get_score_policy(score_strategy):
     if score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
         return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
@@ -236,6 +301,7 @@ class KeyValueTable(
         ), "Capacity growth is appending..."
 
         self.score_policy = get_score_policy(options.score_strategy)
+        self.evict_strategy_ = options.evict_strategy.value
 
         self.key_index_map = get_scored_table(
             capacity=options.init_capacity,
@@ -252,8 +318,8 @@ class KeyValueTable(
         # self.embedding_weights_uvm = None
         # self.optimizer_states_dev = None
         # self.optimizer_states_uvm = None
-        self.value_dev = None
-        self.value_uvm = None
+        self.dev_table = None
+        self.uvm_table = None
 
         self._emb_dtype = self.options.embedding_dtype
         self._emb_dim = self.options.dim
@@ -270,12 +336,12 @@ class KeyValueTable(
             # self.embedding_weights_uvm = get_uvm_tensor(weight_uvm_size, self._emb_dtype, self.device)
             # self.embedding_weights_uvm = get_uvm_tensor(optim_states_uvm_size, self._emb_dtype, self.device)
             uvm_size = self._capacity * self._value_dim
-            self.value_uvm = get_uvm_tensor(
+            self.uvm_table = get_uvm_tensor(
                 uvm_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
         elif options.local_hbm_for_values >= total_memory_need:
             dev_size = self._capacity * self._value_dim
-            self.value_dev = torch.empty(
+            self.dev_table = torch.empty(
                 dev_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
         else:
@@ -286,10 +352,10 @@ class KeyValueTable(
                 * self._value_dim
             )
             uvm_size = self._capacity * self._value_dim - dev_size
-            self.value_dev = torch.empty(
+            self.dev_table = torch.empty(
                 dev_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
-            self.value_uvm = get_uvm_tensor(
+            self.uvm_table = get_uvm_tensor(
                 uvm_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
 
@@ -308,7 +374,7 @@ class KeyValueTable(
 
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
-        self._use_score = self.table.evict_strategy() != EvictStrategy.KLru
+        self._use_score = self.evict_strategy_ != EvictStrategy.KLru
         self._timestamp = device_timestamp()
 
     def find_impl(
@@ -343,7 +409,7 @@ class KeyValueTable(
 
         score_args_lookup = [
             ScoreArg(
-                name=self.key_index_map.score_specs[0].name,
+                name=self.score_policy.name,
                 value=scores,
                 policy=self.score_policy if self._score_update else ScorePolicy.CONST,
                 is_return=False,
@@ -354,7 +420,7 @@ class KeyValueTable(
 
         if load_dim != 0:
             load_from_combined_buffer(
-                self.value_dev, self.value_uvm, indices, unique_embs
+                self.dev_table, self.uvm_table, indices, unique_embs
             )
 
         missing = torch.logical_not(founds)
@@ -455,33 +521,43 @@ class KeyValueTable(
     ) -> None:
         h_num_unique_keys = unique_keys.numel()
 
-        score_args_lookup = [
+        if self._use_score and scores is None:
+            scores = torch.empty(
+                h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
+            )
+            scores.fill_(self.score)
+
+        policy = self.score_policy.policy
+
+        if self.score_policy.policy == ScorePolicy.ACCUMULATE:
+            # Case 1: table works on cache+storage mode, frequencies should be assigned but not accumulated.
+            # Case 2: table works on storage mode, frequencies should be accumulated but unique_keys are not in the table.
+            #           so ASSIGIN has the same result as ACCUMULATE, so we didn't distinguish them
+            policy = ScorePolicy.ASSIGN
+
+        if not self._use_score and scores is not None:
+            # Case: table works on cache+storage and LRU mode, and the scores is from the cache,
+            # we assign it to preserve the distribution of score values ​​in the cache.
+            policy = ScorePolicy.ASSIGN
+
+        score_args_insert = [
             ScoreArg(
-                name=self.key_index_map.score_specs[0].name,
+                name=self.score_policy.name,
                 value=scores,
-                policy=self.score_policy if self._score_update else ScorePolicy.CONST,
+                policy=policy,
                 is_return=False,
             )
         ]
 
-        if self._use_score:
-            if scores is None:
-                scores = torch.empty(
-                    h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
-                )
-                scores.fill_(self.score)
-        else:
-            scores = None
-
-        if self.evict_strategy() == EvictStrategy.KLfu:
-            erase(self.table, h_num_unique_keys, unique_keys)
-
-        insert_or_assign(
-            self.table,
+        indices = torch.zeros(
             h_num_unique_keys,
-            unique_keys,
-            unique_values.to(self.value_type()),
-            scores,
+            dtype=self.key_index_map.index_type,
+            device=unique_keys.device,
+        )
+
+        self.key_index_map.insert(unique_keys, score_args_insert, indices)
+        store_to_combined_buffer(
+            self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
 
     def update(
@@ -496,11 +572,21 @@ class KeyValueTable(
 
         device = keys.device
         founds = torch.empty(batch, dtype=torch.bool, device=device)
-        pointers = torch.empty(batch, dtype=torch.long, device=device)
-        find_pointers(self.table, batch, keys, pointers, founds)
+        indices = torch.empty(batch, dtype=self.key_index_map.index_type, device=device)
 
-        self.optimizer.fused_update_with_pointer(
-            grads.to(self.value_type()), pointers, self._de_emb_dtype
+        score_args_lookup = [
+            ScoreArg(
+                name=self.score_policy.name,
+                value=None,
+                policy=ScorePolicy.CONST,
+                is_return=False,
+            )
+        ]
+
+        self.key_index_map.lookup(keys, score_args_lookup, founds, indices)
+
+        self.optimizer.fused_update_with_index(
+            grads.to(self.value_type()), indices, self.dev_table, self.uvm_table
         )
 
         if return_missing:
@@ -561,7 +647,7 @@ class KeyValueTable(
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
-            meta_data["evict_strategy"] = str(self.table.evict_strategy())
+            meta_data["evict_strategy"] = str(self.evict_strategy_)
             save_to_json(meta_data, meta_json_file_path)
 
         fkey = open(emb_key_path, "wb")
@@ -569,14 +655,38 @@ class KeyValueTable(
         fscore = open(score_file_path, "wb")
         fopt_states = open(opt_file_path, "wb") if include_optim else None
 
-        for keys, embeddings, opt_states, scores in batched_export_keys_values(
-            self.table, device
+        for (
+            keys,
+            named_scores,
+            indices,
+        ) in self.key_index_map._batched_export_keys_scores(
+            [self.score_policy.name], device, index=True
         ):
             fkey.write(keys.cpu().numpy().tobytes())
-            fembedding.write(embeddings.cpu().numpy().tobytes())
-            if self.table.evict_strategy() == EvictStrategy.KLru:
+            scores = named_scores[self.score_policy.name]
+            if self.evict_strategy_ == EvictStrategy.KLru:
                 scores = self._timestamp - scores
             fscore.write(scores.cpu().numpy().tobytes())
+
+            values = torch.empty(
+                (keys.numel(), self._value_dim), dtype=self.value_type(), device=device
+            )
+            load_from_combined_buffer(self.dev_table, self.uvm_table, indices, values)
+            embeddings = (
+                values[:, : self._emb_dim].to(dtype=EMBEDDING_TYPE).contiguous()
+            )
+
+            if self.optim_state_dim() != 0:
+                opt_states = (
+                    values[:, -self.optim_state_dim() :]
+                    .to(dtype=OPT_STATE_TYPE)
+                    .contiguous()
+                )
+            else:
+                opt_states = None
+
+            fembedding.write(embeddings.cpu().numpy().tobytes())
+
             if fopt_states:
                 fopt_states.write(opt_states.cpu().numpy().tobytes())
 
@@ -611,9 +721,9 @@ class KeyValueTable(
             )
 
         evict_strategy = meta_data.get("evict_strategy", None)
-        if evict_strategy and str(self.table.evict_strategy()) != evict_strategy:
+        if evict_strategy and str(self.evict_strategy_) != evict_strategy:
             raise ValueError(
-                f"Evict strategy mismatch: {evict_strategy} != {self.table.evict_strategy()}"
+                f"Evict strategy mismatch: {evict_strategy} != {self.evict_strategy_}"
             )
 
         if score_file_path is None:
@@ -629,8 +739,8 @@ class KeyValueTable(
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-        dim = dyn_emb_cols(self.table)
-        optstate_dim = self.table.optstate_dim()
+        dim = self._emb_dim
+        optstate_dim = self.optim_state_dim()
 
         if optstate_dim == 0:
             include_optim = False
@@ -723,7 +833,7 @@ class KeyValueTable(
                     dtype=SCORE_TYPE,
                     device=device,
                 )
-                if self.table.evict_strategy() == EvictStrategy.KLru:
+                if self.evict_strategy_ == EvictStrategy.KLru:
                     scores = torch.clamp(self._timestamp - scores, min=0)
 
             if world_size > 1:
@@ -734,7 +844,15 @@ class KeyValueTable(
                     scores = scores[masks]
                 if opt_states is not None:
                     opt_states = opt_states[masks, :]
-            load_key_values(self.table, keys, embeddings, scores, opt_states)
+            load_key_values_v1(
+                self.key_index_map,
+                self.dev_table,
+                self.uvm_table,
+                keys,
+                embeddings,
+                scores,
+                opt_states,
+            )
 
         fkey.close()
         fembedding.close()
@@ -770,61 +888,79 @@ class KeyValueTable(
         scores: Optional[torch.Tensor] = None,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = keys.numel()
-        num_evicted: torch.Tensor = torch.zeros(1, dtype=torch.long, device=keys.device)
-        evicted_keys: torch.Tensor = torch.empty_like(keys)
         evicted_values: torch.Tensor = torch.empty_like(values)
-        evicted_scores: torch.Tensor = torch.empty(
-            batch, dtype=torch.uint64, device=keys.device
+
+        if self._use_score and scores is None:
+            scores = torch.empty(batch, device=keys.device, dtype=torch.uint64)
+            scores.fill_(self.score)
+
+        score_args_insert = [
+            ScoreArg(
+                name=self.score_policy.name,
+                value=scores,
+                policy=self.score_policy.policy,
+                is_return=False,
+            )
+        ]
+
+        indices = torch.zeros(
+            batch, dtype=self.key_index_map.index_type, device=keys.device
         )
-        if scores is not None:
-            insert_and_evict_with_scores(
-                self.table,
-                batch,
-                keys,
-                values,
-                evicted_keys,
-                evicted_values,
-                evicted_scores,
-                num_evicted,
-                scores=scores,  # scores as keyword argument
-            )
-        else:
-            # TODO: Fix prefetch issue when scores is not provided
-            insert_and_evict(
-                self.table,
-                batch,
-                keys,
-                values,
-                self.score if self._use_score else None,
-                evicted_keys,
-                evicted_values,
-                evicted_scores,
-                num_evicted,
-            )
+
+        (
+            num_evicted,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+        ) = self.key_index_map.insert_and_evict(keys, score_args_insert, indices)
+        evicted_scores = evicted_scores[0]
+
+        load_from_combined_buffer(
+            self.dev_table,
+            self.uvm_table,
+            evicted_indices,
+            evicted_values[:num_evicted, :],
+        )
+
+        store_to_combined_buffer(
+            self.dev_table, self.uvm_table, indices, values.to(self.value_type())
+        )
+
         if self._record_cache_metrics:
             self._cache_metrics[2] = batch
-            self._cache_metrics[3] = num_evicted.cpu().item()
-        h_num_evict = num_evicted.cpu().item()
+            self._cache_metrics[3] = num_evicted
         return (
-            h_num_evict,
-            evicted_keys[:h_num_evict],
-            evicted_values[:h_num_evict, :],
-            evicted_scores[:h_num_evict],
+            num_evicted,
+            evicted_keys,
+            evicted_values[:num_evicted, :],
+            evicted_scores,
         )
 
     def flush(self, storage: Storage) -> None:
         batch_size = self._threads_in_wave
-        for keys, embeddings, opt_states, scores in batched_export_keys_values(
-            self.table, self.device, batch_size
+
+        for (
+            keys,
+            named_scores,
+            indices,
+        ) in self.key_index_map._batched_export_keys_scores(
+            [self.score_policy.name], self.device, batch_size=batch_size, index=True
         ):
-            if keys.numel() != 0:
-                values = torch.cat((embeddings, opt_states), dim=1).contiguous()
-                storage.insert(keys, values, scores)
+            scores = named_scores[self.score_policy.name]
+            values = torch.empty(
+                keys.numel(),
+                self._value_dim,
+                dtype=self.value_type(),
+                device=self.device,
+            )
+
+            load_from_combined_buffer(self.dev_table, self.uvm_table, indices, values)
+            storage.insert(keys, values, scores)
 
     def reset(
         self,
     ) -> None:
-        clear(self.table)
+        self.key_index_map.reset()
 
     @property
     def cache_metrics(self) -> Optional[torch.Tensor]:
@@ -834,49 +970,61 @@ class KeyValueTable(
         self._record_cache_metrics = record
         return
 
-    def count_matched(
-        self,
-        threshold: int,
-        num_matched: torch.Tensor,
-    ) -> None:
-        count_matched(self.table, threshold, num_matched)
-
     def key_type(
         self,
     ) -> torch.dtype:
-        return dyn_emb_to_torch(self.table.key_type())
+        return self.key_index_map.key_type
 
     def value_type(
         self,
     ) -> torch.dtype:
-        return dyn_emb_to_torch(self.table.value_type())
+        self._emb_dtype
 
     def capacity(
         self,
     ) -> int:
         return self._capacity
 
-    def export_batch_matched(
-        self, threshold, batch_size, search_offset, d_count, d_keys, d_vals
-    ) -> None:
-        export_batch_matched(
-            self.table,
-            threshold,
-            batch_size,
-            search_offset,
-            d_count,
-            d_keys,
-            d_vals,
+    def incremental_dump(
+        self,
+        score_threshold: int,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Dump incremental keys and embeddings and combine them for all ranks into cpu tensors.
+
+        Args:
+            score_threshold (int): input threshold.
+            pg (Optional[dist.ProcessGroup]): process group.
+
+        Returns:
+            out_keys (torch.Tensor): output tensor of keys
+            out_embeddings (torch.Tensor): output tensors of embeddings.
+        """
+        batch_size = self._threads_in_wave
+        keys, _, indices = self.key_index_map.incremental_dump(
+            {self.score_policy.name, score_threshold}, batch_size, pg, index=True
         )
+        if keys.numel() == 0:
+            return None, None
+
+        # TODO: pay attention to OOM
+        embs = torch.empty(
+            keys.numel(), self._emb_dim, dtype=self._emb_dtype, device=self.device
+        )
+        load_from_combined_buffer(
+            self.dev_table, self.uvm_table, indices.to(self.device), embs
+        )
+        return keys, embs.cpu()
 
     def evict_strategy(self) -> EvictStrategy:
-        return self.table.evict_strategy()
+        return self.evict_strategy_
 
     def optim_state_dim(self) -> int:
         return self.value_dim() - self.embedding_dim()
 
     def size(self) -> int:
-        return dyn_emb_rows(self.table)
+        return self.key_index_map.size()
 
 
 def update_cache(

@@ -885,9 +885,10 @@ class LinearBucketTable(ScoredHashTable):
         target_device: torch.device,
         thresholds: Optional[List[int]] = None,
         batch_size: int = 65536,
-    ) -> Iterator[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        index: bool = False,
+    ) -> Iterator[Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]]:
         """
-        export keys, {score_name: scores}
+        export keys, {score_name: scores}, indices
 
         Args:
             score_names (List[str]): list of score names
@@ -896,10 +897,12 @@ class LinearBucketTable(ScoredHashTable):
                 only dump a key when all its scores which in score_names are not less than thresholds.
                 only dump scores for score_names.
             batch_size (int): the batch size when scan the table.
+            index (bool) : whether export indices or not, default to False.
 
         Returns:
             out_keys (torch.Tensor): output tensor of keys
             out_scores (Dict[str, torch.Tensor]): output tensors of scores.
+            out_indices (Optional[torch.Tensor]): output tensor of indices
         """
 
         search_capacity = self.capacity_
@@ -1013,7 +1016,8 @@ class LinearBucketTable(ScoredHashTable):
         score_threshold: Dict[str, int],
         batch_size: int = 65536,
         pg: Optional[dist.ProcessGroup] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        index: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
         """
         Dump incremental keys and scores into cpu tensors.
 
@@ -1025,6 +1029,7 @@ class LinearBucketTable(ScoredHashTable):
         Returns:
             out_keys (torch.Tensor): output tensor of keys
             out_scores (Dict[str, torch.Tensor]): output tensors of scores.
+            out_indices (Optional[torch.Tensor]): output tensors of indices.
         """
 
         out_keys: torch.Tensor
