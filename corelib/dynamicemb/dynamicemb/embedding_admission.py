@@ -40,8 +40,8 @@ class KVCounter(Counter):
     def __init__(
         self,
         capacity: int,
-        bucket_capacity: Optional[int] = 128,
-        key_type: Optional[torch.dtype] = torch.int64,
+        bucket_capacity: int = 1024,
+        key_type: torch.dtype = torch.int64,
         device: torch.device = None,
     ):
         self.score_name_ = "counter"
