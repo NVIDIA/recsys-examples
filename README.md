@@ -9,6 +9,8 @@ The project includes:
 - Dynamic Embeddings with GPU acceleration
 
 # What's New
+- **[2025/12/10]** 🎉v25.11 released!
+  - DynamicEmb supports embedding admission, that decides whether a new feature ID is allowed to create or update an embedding entry in the dynamic embedding table. By controlling admission, the system can prevent very rare or noisy IDs from consuming parameters and optimizer state that bring little training benefit.
 - **[2025/11/11]** 🎉v25.10 released!
   - HSTU training example supports sequence parallelism.
   - DynamicEmb supports LRU score checkpointing, gradient clipping.
@@ -18,13 +20,14 @@ The project includes:
   - DynamicEmb now supports distributed embedding dumping and memory scaling.
   - Added kernel fusion in the HSTU block for inference, including KVCache fixes.
   - HSTU attention now supports FP8 quantization.
+
+<details>
+<summary>More</summary>
+
 - **[2025/9/8]** 🎉v25.08 released!
   - Added cache support for dynamicemb, enabling seamless hot embedding migration between cache and storage.
   - Released an end-to-end HSTU inference example, demonstrating precision aligned with training.
   - Enabled evaluation mode support for dynamicemb.
-
-<details>
-<summary>More</summary>
 
 - **[2025/8/1]** 🎉v25.07 released!
   - Released HSTU inference benchmark, including paged kvcache HSTU kernel, kvcache manager based on trt-llm, CUDA graph, and other optimizations.
