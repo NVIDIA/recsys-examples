@@ -50,6 +50,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         random_seed: int,
         is_train_dataset: bool,
         deduplicate_sid_across_hierarchy: bool = True,
+        sort_by_user_id: bool = True,  # for debugging purpose
     ):
         # items and timestamps are nested
         super().__init__()
@@ -59,6 +60,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             output_candidate_sid_feature_name = f"cand_sids{num_hierarchies}d"
         self._device = torch.cpu.current_device()
         raw_sequence_data = pd.read_parquet(raw_sequence_data_path)
+        if sort_by_user_id:
+            raw_sequence_data = raw_sequence_data.sort_values(by="user_id")
         if "sequence_length" not in raw_sequence_data.columns:
             raw_sequence_data["sequence_length"] = raw_sequence_data[
                 raw_sequence_feature_name
