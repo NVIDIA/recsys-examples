@@ -79,6 +79,9 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             if isinstance(x, (list, np.ndarray))
             else x
         )
+        raw_sequence_data["sequence_length"] = raw_sequence_data[
+            "sequence_length"
+        ].clip(upper=max_history_length + max_candidate_length)
         self._feature_to_max_seqlen = {
             output_history_sid_feature_name: max_history_length * num_hierarchies,
             output_candidate_sid_feature_name: max_candidate_length * num_hierarchies,
@@ -163,15 +166,20 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 device=self._device,
             )
             # add offset to the sids to avoid duplicate sids across hierarchy
-
             # [T, num_hierarchies]
             history_sids = torch.index_select(
                 self.item_id_to_sid_mapping_tensor, dim=1, index=history_item_ids
             ).transpose(0, 1).contiguous() + self._codebook_offsets.unsqueeze(0)
-            # [T, num_hierarchies]
-            candidate_sids = torch.index_select(
-                self.item_id_to_sid_mapping_tensor, dim=1, index=candidate_item_ids
-            ).transpose(0, 1).contiguous() + self._codebook_offsets.unsqueeze(0)
+            # labels are the candidate sids but starting from 0.
+            candidate_sids = (
+                torch.index_select(
+                    self.item_id_to_sid_mapping_tensor, dim=1, index=candidate_item_ids
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+            labels = candidate_sids if self._is_train_dataset else None
+            candidate_sids = candidate_sids + self._codebook_offsets.unsqueeze(0)
             # 'sequence length' is the total length
             history_lengths = (
                 torch.tensor(
@@ -208,17 +216,15 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                         self._output_history_sid_feature_name,
                         self._output_candidate_sid_feature_name,
                     ],
-                    values=torch.cat([history_sids, candidate_sids], dim=0),
-                    lengths=torch.cat([history_lengths, candidate_lengths], dim=0),
+                    values=torch.cat([history_sids.view(-1), candidate_sids.view(-1)]),
+                    lengths=torch.cat([history_lengths, candidate_lengths]),
                 ),
                 batch_size=self._batch_size,
                 feature_to_max_seqlen=self._feature_to_max_seqlen,
                 _num_hierarchies=self._num_hierarchies,
                 history_feature_name=self._output_history_sid_feature_name,
                 candidate_feature_name=self._output_candidate_sid_feature_name,
-                labels=candidate_sids
-                if self._is_train_dataset
-                else None,  # labels are the candidate sids but starting from 0.
+                labels=labels.view(-1) if self._is_train_dataset else None,
             )
             yield GPTSIDBatch(**batch_kwargs)
 
@@ -242,6 +248,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         random_seed: int,
         is_train_dataset: bool,
         deduplicate_sid_across_hierarchy: bool,
+        output_history_sid_feature_name: str,
+        output_candidate_sid_feature_name: str,
     ) -> "DiskSequenceDataset":
         return cls(
             raw_sequence_data_path=raw_sequence_data_path,
@@ -252,6 +260,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             raw_sequence_feature_name=raw_sequence_feature_name,
             num_hierarchies=num_hierarchies,
             codebook_sizes=codebook_sizes,
+            output_history_sid_feature_name=output_history_sid_feature_name,
+            output_candidate_sid_feature_name=output_candidate_sid_feature_name,
             rank=rank,
             world_size=world_size,
             shuffle=shuffle,

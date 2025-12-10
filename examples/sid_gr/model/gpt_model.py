@@ -228,6 +228,7 @@ class SIDGRModel(MegatronModule):
         candidate_features = batch.features[candidate_feature_name]
 
         # 1. embedding lookuo
+        batch.features[history_feature_name].offsets()[-1].item()
         embeddings: Dict[str, JaggedTensor] = self._codebooks_collection(batch.features)
         # TODO, remove the assertion
         assert all(
@@ -311,6 +312,7 @@ class SIDGRModel(MegatronModule):
         losses_per_hierarchy = []
         logits_per_hierarchy = []
         merged_labels = batch.labels.view(-1, self._num_hierarchies)
+
         # 5. output linear projection & loss
         # TODO, merge into single linear layer
         # note that the labels

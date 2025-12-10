@@ -46,10 +46,11 @@ def get_dataset_and_embedding_args() -> Tuple[DatasetArgs, EmbeddingArgs]:
 
     codebook_sizes = dataset_args.codebook_sizes
     aggragated_codebook_size = sum(codebook_sizes)
+    # embedding feature names should match the dataset batch feature names
     embedding_args = EmbeddingArgs(  # sid tuples share one embedding table
         feature_names=[
-            "hist_sids",
-            "cand_sids",
+            dataset_args._history_sid_feature_name,
+            dataset_args._candidate_sid_feature_name,
         ],  # sid tuples share one embedding table
         table_name="codebook",
         item_vocab_size_or_capacity=aggragated_codebook_size,

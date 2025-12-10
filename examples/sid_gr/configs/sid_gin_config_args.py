@@ -157,6 +157,11 @@ class DatasetArgs:
     codebook_sizes: List[int] = field(default_factory=lambda: [500] * 4)
     max_candidate_length: int = 1
 
+    # below are used to describe the sid features in the dataset batch
+    # and the embedding feature names should match the dataset batch feature names
+    _history_sid_feature_name: str = "hist_sids"
+    _candidate_sid_feature_name: str = "cand_sids"
+
     def __post_init__(self):
         assert (
             len(self.codebook_sizes) == self.num_hierarchies

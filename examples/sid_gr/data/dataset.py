@@ -74,6 +74,8 @@ def get_dataset(
             raw_sequence_feature_name="sequence_data",  # TODO: make it configurable!!!
             num_hierarchies=num_hierarchies,
             codebook_sizes=codebook_sizes,
+            output_history_sid_feature_name=dataset_args._history_sid_feature_name,
+            output_candidate_sid_feature_name=dataset_args._candidate_sid_feature_name,
             rank=rank,
             world_size=world_size,
             shuffle=dataset_args.shuffle,
