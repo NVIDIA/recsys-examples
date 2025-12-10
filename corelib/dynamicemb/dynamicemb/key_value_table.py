@@ -21,13 +21,20 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import (
+    DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
-    create_dynamicemb_table,
+    dtype_to_bytes,
     dyn_emb_to_torch,
     torch_to_dyn_emb,
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
+from dynamicemb.scored_hashtable import (
+    ScoreArg,
+    ScorePolicy,
+    ScoreSpec,
+    get_scored_table,
+)
 from dynamicemb.types import (
     EMBEDDING_TYPE,
     KEY_TYPE,
@@ -52,11 +59,10 @@ from dynamicemb_extensions import (
     export_batch,
     export_batch_matched,
     find_pointers,
-    find_pointers_with_scores,
     insert_and_evict,
     insert_and_evict_with_scores,
     insert_or_assign,
-    load_from_pointers,
+    load_from_combined_buffer,
     select,
     select_index,
 )
@@ -184,6 +190,35 @@ def load_key_values(
     )
 
 
+def get_score_policy(score_strategy):
+    if score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
+        return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
+    elif score_strategy == DynamicEmbScoreStrategy.STEP:
+        return ScoreSpec(name="step", policy=ScorePolicy.ASSIGN)
+    elif score_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
+        return ScoreSpec(name="customized", policy=ScorePolicy.ASSIGN)
+    elif score_strategy == DynamicEmbScoreStrategy.LFU:
+        return ScoreSpec(name="frequency", policy=ScorePolicy.ACCUMULATE)
+    else:
+        raise RuntimeError("Not supported score strategy.")
+
+
+def get_uvm_tensor(dim, dtype, device, is_managed=False):
+    return torch.zeros(
+        dim,
+        out=torch.ops.fbgemm.new_unified_tensor(
+            # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]`
+            #  for 3rd param but got `Type[Type[torch._dtype]]`.
+            torch.zeros(1, device=device, dtype=dtype),
+            [dim],
+            #  is_host_mapped (bool = False): If True, allocate every UVM tensor
+            # using `malloc` + `cudaHostRegister`. Otherwise use
+            # `cudaMallocManaged`
+            is_host_mapped=(not is_managed),
+        ),
+    )
+
+
 class KeyValueTable(
     Cache, Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizerV2]
 ):
@@ -193,19 +228,79 @@ class KeyValueTable(
         optimizer: BaseDynamicEmbeddingOptimizerV2,
     ):
         self.options = options
-        self.table = create_dynamicemb_table(options)
-        self._capacity = options.max_capacity
-        self.optimizer = optimizer
-        self.score: int = None
-        self._score_update = False
-        self._emb_dim = self.options.dim
-        self._emb_dtype = self.options.embedding_dtype
-        self._de_emb_dtype = torch_to_dyn_emb(self._emb_dtype)
-        self._value_dim = self._emb_dim + optimizer.get_state_dim(self._emb_dim)
-        self._initial_optim_state = optimizer.get_initial_optim_states()
-
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
+
+        assert (
+            options.init_capacity == options.max_capacity
+        ), "Capacity growth is appending..."
+
+        self.score_policy = get_score_policy(options.score_strategy)
+
+        self.key_index_map = get_scored_table(
+            capacity=options.init_capacity,
+            bucket_capacity=options.bucket_capacity,
+            key_type=options.index_type,
+            score_specs=[self.score_policy],
+            device=self.device,
+        )
+
+        self._capacity = self.key_index_map.capacity()
+
+        # TODO: maybe we can separate it in the future like fbgemm
+        # self.embedding_weights_dev = None
+        # self.embedding_weights_uvm = None
+        # self.optimizer_states_dev = None
+        # self.optimizer_states_uvm = None
+        self.value_dev = None
+        self.value_uvm = None
+
+        self._emb_dtype = self.options.embedding_dtype
+        self._emb_dim = self.options.dim
+        self._optim_states_dim = optimizer.get_state_dim(self._emb_dim)
+        self._value_dim = self._emb_dim + self._optim_states_dim
+
+        total_memory_need = (
+            self._capacity * self._value_dim * dtype_to_bytes(self._emb_dtype)
+        )
+
+        if options.local_hbm_for_values == 0:
+            # weight_uvm_size = self._capacity * self._emb_dim
+            # optim_states_uvm_size = self._capacity * self._optim_states_dim
+            # self.embedding_weights_uvm = get_uvm_tensor(weight_uvm_size, self._emb_dtype, self.device)
+            # self.embedding_weights_uvm = get_uvm_tensor(optim_states_uvm_size, self._emb_dtype, self.device)
+            uvm_size = self._capacity * self._value_dim
+            self.value_uvm = get_uvm_tensor(
+                uvm_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+        elif options.local_hbm_for_values >= total_memory_need:
+            dev_size = self._capacity * self._value_dim
+            self.value_dev = torch.empty(
+                dev_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+        else:
+            # hybrid mode
+            dev_size = (
+                options.local_hbm_for_values
+                // (self._value_dim * dtype_to_bytes(self._emb_dtype))
+                * self._value_dim
+            )
+            uvm_size = self._capacity * self._value_dim - dev_size
+            self.value_dev = torch.empty(
+                dev_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+            self.value_uvm = get_uvm_tensor(
+                uvm_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+
+        self.score: int = None
+        self._score_update = False
+
+        self.optimizer = optimizer
+        self._de_emb_dtype = torch_to_dyn_emb(self._emb_dtype)
+
+        self._initial_optim_state = optimizer.get_initial_optim_states()
+
         props = torch.cuda.get_device_properties(device_idx)
         self._threads_in_wave = (
             props.multi_processor_count * props.max_threads_per_multi_processor
@@ -242,21 +337,25 @@ class KeyValueTable(
         device = unique_keys.device
         if founds is None:
             founds = torch.empty(batch, dtype=torch.bool, device=device)
-        pointers = torch.empty(batch, dtype=torch.long, device=device)
+        indices = torch.empty(batch, dtype=self.key_index_map.index_type, device=device)
 
         scores = self.create_scores(batch, device, input_scores)
 
-        if self._score_update:
-            find_pointers_with_scores(
-                self.table, batch, unique_keys, pointers, founds, scores
+        score_args_lookup = [
+            ScoreArg(
+                name=self.key_index_map.score_specs[0].name,
+                value=scores,
+                policy=self.score_policy if self._score_update else ScorePolicy.CONST,
+                is_return=False,
             )
-        else:
-            find_pointers(self.table, batch, unique_keys, pointers, founds)
+        ]
 
-        self.value_dim()
+        self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
 
         if load_dim != 0:
-            load_from_pointers(pointers, unique_embs)
+            load_from_combined_buffer(
+                self.value_dev, self.value_uvm, indices, unique_embs
+            )
 
         missing = torch.logical_not(founds)
         num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
@@ -355,6 +454,16 @@ class KeyValueTable(
         scores: Optional[torch.Tensor] = None,
     ) -> None:
         h_num_unique_keys = unique_keys.numel()
+
+        score_args_lookup = [
+            ScoreArg(
+                name=self.key_index_map.score_specs[0].name,
+                value=scores,
+                policy=self.score_policy if self._score_update else ScorePolicy.CONST,
+                is_return=False,
+            )
+        ]
+
         if self._use_score:
             if scores is None:
                 scores = torch.empty(
