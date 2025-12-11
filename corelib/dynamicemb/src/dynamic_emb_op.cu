@@ -838,6 +838,294 @@ void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename IndexT, typename ValueT>
+__global__ void load_from_combined_table_kernel_vec4(
+    int64_t batch, int emb_dim, int stride, int split_index,
+    ValueT const *__restrict__ dev_table, ValueT const *__restrict__ uvm_table,
+    ValueT *__restrict__ output_buffer, IndexT const *__restrict__ indices) {
+
+  constexpr int kWarpSize = 32;
+  constexpr int VecSize = 4;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+
+  Vec4T<ValueT> emb;
+  for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+       emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
+    IndexT const index = indices[emb_id];
+    ValueT const *src = nullptr;
+    if (index < split_index) {
+      src = dev_table + index * stride;
+    } else {
+      src = uvm_table + (index - split_index) * stride;
+    }
+    ValueT *dst = output_buffer + emb_id * emb_dim;
+    if (index >= 0) {
+      for (int i = 0; VecSize * (kWarpSize * i + lane_id) < emb_dim; ++i) {
+        int idx4 = VecSize * (kWarpSize * i + lane_id);
+        emb.load(src + idx4);
+        emb.store(dst + idx4);
+      }
+    }
+  }
+}
+
+template <typename IndexT, typename ValueT>
+__global__ void load_from_combined_table_kernel(
+    int64_t batch, int emb_dim, int stride, int split_index,
+    ValueT const *__restrict__ dev_table, ValueT const *__restrict__ uvm_table,
+    ValueT *__restrict__ output_buffer, IndexT const *__restrict__ indices) {
+
+  for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
+    IndexT const index = indices[emb_id];
+    ValueT const *src = nullptr;
+    if (index < split_index) {
+      src = dev_table + index * stride;
+    } else {
+      src = uvm_table + (index - split_index) * stride;
+    }
+    ValueT *dst = output_buffer + emb_id * emb_dim;
+    if (index >= 0) {
+      for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
+        dst[i] = src[i];
+      }
+    }
+  }
+}
+
+void load_from_combined_table(std::optional<at::Tensor> dev_table,
+                              std::optional<at::Tensor> uvm_table,
+                              at::Tensor indices, at::Tensor output) {
+
+  int64_t stride = -1;
+  int64_t dim = output.size(1);
+  if ((not dev_table.has_value()) and (not uvm_table.has_value())) {
+    throw std::runtime_error("Two tables cannot both be None.");
+  } else {
+    if (dev_table.has_value()) {
+      stride = dev_table.value().size(1);
+      if (stride < dim) {
+        throw std::runtime_error(
+            "Output tensor's dim1 should not be greater than the table's.");
+      }
+    } else {
+      stride = uvm_table.value().size(1);
+      if (stride < dim) {
+        throw std::runtime_error(
+            "Output tensor's dim1 should not be greater than the table's.");
+      }
+    }
+  }
+
+  if (output.dim() != 2) {
+    throw std::runtime_error("Output tensor should be 2-dim.");
+  }
+
+  if (output.size(0) != indices.size(0)) {
+    throw std::runtime_error("Output tensor mismatches with indices at dim-0.");
+  }
+
+  int64_t split_index = 0;
+  if (dev_table.has_value()) {
+    split_index = dev_table.value().size(0);
+  }
+
+  auto val_type = get_data_type(output);
+  auto index_type = get_data_type(indices);
+
+  int64_t num_total = indices.size(0);
+
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  auto &device_prop = DeviceProp::getDeviceProp();
+  const int max_grid_size =
+      device_prop.num_sms * (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+
+  int grid_size = 0;
+  if (num_total / WARP_PER_BLOCK < max_grid_size) {
+    grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
+  } else if (num_total / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size = max_grid_size;
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, ValueType, [&] {
+    DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
+      auto dev_ptr = get_pointer<ValueType>(dev_table);
+      auto uvm_ptr = get_pointer<ValueType>(uvm_table);
+      auto out_ptr = get_pointer<ValueType>(output);
+      auto index_ptr = get_pointer<IndexType>(indices);
+
+      if (dim % 4 == 0) {
+        load_from_combined_table_kernel_vec4<IndexType, ValueType>
+            <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
+                num_total, dim, stride, split_index, dev_ptr, uvm_ptr, out_ptr,
+                index_ptr);
+      } else {
+        int block_size = dim < device_prop.max_thread_per_block
+                             ? dim
+                             : device_prop.max_thread_per_block;
+        int grid_size = num_total;
+        load_from_combined_table_kernel<IndexType, ValueType>
+            <<<grid_size, block_size, 0, stream>>>(num_total, dim, stride,
+                                                   split_index, dev_ptr,
+                                                   uvm_ptr, out_ptr, index_ptr);
+      }
+    });
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename IndexT, typename ValueT>
+__global__ void store_to_combined_table_kernel_vec4(
+    int64_t batch, int stride, int split_index, ValueT *__restrict__ dev_table,
+    ValueT *__restrict__ uvm_table, ValueT const *__restrict__ input_buffer,
+    IndexT const *__restrict__ indices) {
+
+  constexpr int kWarpSize = 32;
+  constexpr int VecSize = 4;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+
+  Vec4T<ValueT> emb;
+  for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+       emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
+    IndexT const index = indices[emb_id];
+    ValueT *dst = nullptr;
+    if (index < split_index) {
+      dst = dev_table + index * stride;
+    } else {
+      dst = uvm_table + (index - split_index) * stride;
+    }
+    ValueT const *src = input_buffer + emb_id * stride;
+    if (index >= 0) {
+      for (int i = 0; VecSize * (kWarpSize * i + lane_id) < stride; ++i) {
+        int idx4 = VecSize * (kWarpSize * i + lane_id);
+        emb.load(src + idx4);
+        emb.store(dst + idx4);
+      }
+    }
+  }
+}
+
+template <typename IndexT, typename ValueT>
+__global__ void store_to_combined_table_kernel(
+    int64_t batch, int stride, int split_index, ValueT *__restrict__ dev_table,
+    ValueT *__restrict__ uvm_table, ValueT const *__restrict__ input_buffer,
+    IndexT const *__restrict__ indices) {
+
+  for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
+    IndexT const index = indices[emb_id];
+    ValueT *dst = nullptr;
+    if (index < split_index) {
+      dst = dev_table + index * stride;
+    } else {
+      dst = uvm_table + (index - split_index) * stride;
+    }
+    ValueT const *src = input_buffer + emb_id * stride;
+    if (index >= 0) {
+      for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+        dst[i] = src[i];
+      }
+    }
+  }
+}
+
+void store_to_combined_table(std::optional<at::Tensor> dev_table,
+                             std::optional<at::Tensor> uvm_table,
+                             at::Tensor indices, at::Tensor input) {
+
+  int64_t stride = -1;
+  int64_t dim = input.size(1);
+  if ((not dev_table.has_value()) and (not uvm_table.has_value())) {
+    throw std::runtime_error("Two tables cannot both be None.");
+  } else {
+    if (dev_table.has_value()) {
+      stride = dev_table.value().size(1);
+      if (stride != dim) {
+        throw std::runtime_error(
+            "Input tensor's dim1 should equal to the table's.");
+      }
+    } else {
+      stride = uvm_table.value().size(1);
+      if (stride != dim) {
+        throw std::runtime_error(
+            "Input tensor's dim1 should equal to the table's.");
+      }
+    }
+  }
+
+  if (input.dim() != 2) {
+    throw std::runtime_error("Input tensor should be 2-dim.");
+  }
+
+  if (input.size(0) != indices.size(0)) {
+    throw std::runtime_error("Input tensor mismatches with indices at dim-0.");
+  }
+
+  int64_t split_index = 0;
+  if (dev_table.has_value()) {
+    split_index = dev_table.value().size(0);
+  }
+
+  auto val_type = get_data_type(input);
+  auto index_type = get_data_type(indices);
+
+  int64_t num_total = indices.size(0);
+
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  auto &device_prop = DeviceProp::getDeviceProp();
+  const int max_grid_size =
+      device_prop.num_sms * (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+
+  int grid_size = 0;
+  if (num_total / WARP_PER_BLOCK < max_grid_size) {
+    grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
+  } else if (num_total / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size = max_grid_size;
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, ValueType, [&] {
+    DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
+      auto dev_ptr = get_pointer<ValueType>(dev_table);
+      auto uvm_ptr = get_pointer<ValueType>(uvm_table);
+      auto input_ptr = get_pointer<ValueType>(input);
+      auto index_ptr = get_pointer<IndexType>(indices);
+
+      if (dim % 4 == 0) {
+        store_to_combined_table_kernel_vec4<IndexType, ValueType>
+            <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
+                num_total, stride, split_index, dev_ptr, uvm_ptr, input_ptr,
+                index_ptr);
+      } else {
+        int block_size = dim < device_prop.max_thread_per_block
+                             ? dim
+                             : device_prop.max_thread_per_block;
+        int grid_size = num_total;
+        store_to_combined_table_kernel<IndexType, ValueType>
+            <<<grid_size, block_size, 0, stream>>>(
+                num_total, stride, split_index, dev_ptr, uvm_ptr, input_ptr,
+                index_ptr);
+      }
+    });
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // PYTHON WARP
 void bind_dyn_emb_op(py::module &m) {
   py::class_<dyn_emb::InitializerArgs>(m, "InitializerArgs")
@@ -1062,4 +1350,12 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("gather_embedding", &gather_embedding,
         "Gather embedding based on index.", py::arg("input"), py::arg("output"),
         py::arg("index"));
+
+  m.def("load_from_combined_table", &load_from_combined_table,
+        "load_from_combined_table", py::arg("dev_table"), py::arg("uvm_table"),
+        py::arg("indices"), py::arg("output"));
+
+  m.def("store_to_combined_table", &store_to_combined_table,
+        "store_to_combined_table", py::arg("dev_table"), py::arg("uvm_table"),
+        py::arg("indices"), py::arg("input"));
 }
