@@ -1,0 +1,15 @@
+ARG DEVEL_IMAGE=recsys-examples:inference_tritonserver
+
+FROM ${DEVEL_IMAGE} AS build_nve
+
+WORKDIR /workspace/nve
+RUN rm -rf /workspace/nve/*
+COPY . .
+
+RUN apt-get update && apt-get install libssl-dev -y
+
+RUN cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX
+
+RUN CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install .
+
+WORKDIR /workspace/recsys-examples

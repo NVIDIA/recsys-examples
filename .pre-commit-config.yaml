@@ -25,5 +25,6 @@ repos:
     hooks:
     -   id: mypy
         entry: mypy examples
-        args: ["--ignore-missing-imports", "--explicit-package-bases"]
+        args: ["--ignore-missing-imports", "--explicit-package-bases", 
+               "--exclude=examples/hstu/inference/triton/hstu_.*/[0-9]*/model.py$"]
         pass_filenames: false

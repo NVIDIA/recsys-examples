@@ -56,6 +56,8 @@ def get_test_model(num_layers, blocks_in_primary_pool, page_size, offload_chunks
         num_layers=num_layers,
         num_attention_heads=num_heads,
         head_dim=head_dim,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seqlen,
         dtype=inference_dtype,
     )
 
@@ -63,8 +65,6 @@ def get_test_model(num_layers, blocks_in_primary_pool, page_size, offload_chunks
         blocks_in_primary_pool=blocks_in_primary_pool,
         page_size=page_size,
         offload_chunksize=offload_chunksize,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seqlen,
     )
     emb_configs = [
         InferenceEmbeddingConfig(

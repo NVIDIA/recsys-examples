@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Dict, List, Optional
 
 import torch
@@ -20,7 +21,11 @@ from torchrec.modules.embedding_modules import get_embedding_names_by_table
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 try:
-    import pynve.torch.nve_layers as nve_layers
+    import pynve.torch.nve_ps as nve_ps
+    from pynve.torch.nve_layers import CacheType, NVEmbedding
+
+    def get_nve_local_ps(vocab_size, embedding_dim, torch_dtype):
+        return nve_ps.NVLocalParameterServer(vocab_size, embedding_dim, torch_dtype)
 
     class InferenceNVEEmbeddingCollection(torch.nn.Module):
         def __init__(
@@ -30,6 +35,7 @@ try:
             use_gpu_only: bool = False,
             gpu_cache_ratio: float = 0.01,
             is_weighted: bool = False,
+            sparse_shareables=None,
         ):
             super().__init__()
             self._is_weighted = is_weighted
@@ -53,20 +59,26 @@ try:
                     gpu_cache_size *= torch.tensor(
                         [], dtype=embedding_config.data_type
                     ).element_size()
-                    self.embeddings[embedding_config.name] = nve_layers.NVEmbedding(
+                    self.embeddings[embedding_config.name] = NVEmbedding(
                         num_embeddings=embedding_config.num_embeddings,
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
-                        cache_type=nve_layers.CacheType.LinearUVM,
+                        cache_type=CacheType.Hierarchical,
                         gpu_cache_size=gpu_cache_size,
+                        host_cache_size=0,
                         optimize_for_training=False,
+                        remote_interface=sparse_shareables[embedding_config.name]
+                        if sparse_shareables
+                        else get_nve_local_ps(
+                            0, embedding_config.embedding_dim, torch.float32
+                        ),
                     )
                 else:
-                    self.embeddings[embedding_config.name] = nve_layers.NVEmbedding(
+                    self.embeddings[embedding_config.name] = NVEmbedding(
                         num_embeddings=embedding_config.num_embeddings,
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
-                        cache_type=nve_layers.CacheType.NoCache,
+                        cache_type=CacheType.NoCache,
                         optimize_for_training=False,
                     )
 
@@ -85,6 +97,33 @@ try:
             self._feature_names: List[List[str]] = [
                 table.feature_names for table in configs
             ]
+
+        def set_feature_splits(self, features_split_size, features_split_indices):
+            pass
+
+        def load_checkpoint(self, checkpoint_dir, model_state_dict=None):
+            pass
+
+        @classmethod
+        def load_checkpoint_into_ps(
+            self, ps_dict, checkpoint_dir=None, rank=0, world_size=1
+        ):
+            if checkpoint_dir is None:
+                return
+
+            for table_name in ps_dict:
+                ps_dict[table_name].load_from_numpy_file(
+                    os.path.join(
+                        checkpoint_dir,
+                        "ps_module",
+                        f"{table_name}_emb_keys.rank_{rank}.world_size_{world_size}.npy",
+                    ),
+                    os.path.join(
+                        checkpoint_dir,
+                        "ps_module",
+                        f"{table_name}_emb_values.rank_{rank}.world_size_{world_size}.npy",
+                    ),
+                )
 
         def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
             """
@@ -107,9 +146,6 @@ try:
                     )
 
             return result_embeddings
-
-        def load(self):
-            pass
 
         def embedding_configs(
             self,

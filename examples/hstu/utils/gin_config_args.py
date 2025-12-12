@@ -305,6 +305,7 @@ class NetworkArgs:
     contextual_embedding_dim: int = -1
 
     scaling_seqlen: int = -1
+    embedding_backend: Optional[str] = None
 
     def __post_init__(self):
         assert self.dtype_str in [
