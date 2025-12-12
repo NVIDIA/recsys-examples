@@ -393,7 +393,7 @@ segmented_unique(
   at::Tensor shared_frequency_buffer;
   if (need_frequency_output) {
     shared_frequency_buffer = at::zeros(
-      num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
+        num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
   }
   at::Tensor d_unique_nums = at::empty(table_num, segment_range.options());
   at::Tensor d_unique_indices_table_range =
@@ -429,7 +429,7 @@ segmented_unique(
       at::Tensor previous_d_unique_num =
           d_unique_indices_table_range.slice(0, i, table_num + 1);
 
-      at::Tensor tmp_unique_buffer_slice = 
+      at::Tensor tmp_unique_buffer_slice =
           shared_unique_buffer.slice(0, indices_begin, indices_end);
 
       at::Tensor tmp_frequency_counts_uint64;
@@ -487,19 +487,21 @@ segmented_unique(
         h_unique_indices_table_range[i].item<int64_t>();
     if (tmp_unique_num != 0) {
       int64_t indices_begin = h_segment_range[i].item<int64_t>();
-      
+
       void *dst_ptr = reinterpret_cast<char *>(unique_keys.data_ptr()) +
                       unique_embs_offset * unique_keys.element_size();
-      void *src_ptr = reinterpret_cast<char *>(shared_unique_buffer.data_ptr()) +
-                      indices_begin * shared_unique_buffer.element_size();
+      void *src_ptr =
+          reinterpret_cast<char *>(shared_unique_buffer.data_ptr()) +
+          indices_begin * shared_unique_buffer.element_size();
       size_t copy_size = tmp_unique_num * unique_keys.element_size();
       AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                     cudaMemcpyDeviceToDevice, stream));
       if (need_frequency_output) {
         void *dst_ptr = reinterpret_cast<char *>(output_scores.data_ptr()) +
                         unique_embs_offset * output_scores.element_size();
-        void *src_ptr = reinterpret_cast<char *>(shared_frequency_buffer.data_ptr()) +
-                        indices_begin * shared_frequency_buffer.element_size();
+        void *src_ptr =
+            reinterpret_cast<char *>(shared_frequency_buffer.data_ptr()) +
+            indices_begin * shared_frequency_buffer.element_size();
         size_t copy_size = tmp_unique_num * output_scores.element_size();
         AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
                                       cudaMemcpyDeviceToDevice, stream));

@@ -37,6 +37,42 @@ struct InsertKernelTraits {
   static constexpr int NumScorePerThread = NumScorePerThread_;
 };
 
+template <bool Pred> struct ExportPredFunctor {
+  ScoreType threshold;
+  ExportPredFunctor(ScoreType threshold) : threshold(threshold) {}
+
+  __forceinline__ __device__ bool operator()(const ScoreType score) {
+    if constexpr (Pred) {
+      return score >= threshold;
+    } else {
+      return true;
+    }
+  }
+};
+
+// Increment the counter when matched
+struct EvalAndCount {
+  ScoreType threshold;
+  CounterType *d_counter;
+
+  EvalAndCount(ScoreType threshold, CounterType *d_counter)
+      : threshold(threshold), d_counter(d_counter) {}
+
+  template <int GroupSize>
+  __forceinline__ __device__ void
+  operator()(const ScoreType score, cg::thread_block_tile<GroupSize> &g,
+             bool valid) {
+
+    bool match = valid && (score >= threshold);
+
+    uint32_t vote = g.ballot(match);
+    int group_cnt = __popc(vote);
+    if (g.thread_rank() == 0) {
+      atomicAdd(d_counter, static_cast<CounterType>(group_cnt));
+    }
+  }
+};
+
 template <typename Table, int ProbingGroupSize>
 __global__ void
 table_lookup_kernel(Table table, int64_t batch,
@@ -215,7 +251,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
       table_key_slot = bucket.keys(iter);
     }
     ScorePolicy::set(return_scores, scores, i, score);
-    //TODO: unlock using index.
+    // TODO: unlock using index.
     table_key_slots[i] = table_key_slot;
     if (indices) {
       indices[i] = index;
@@ -455,12 +491,12 @@ table_erase_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
   }
 }
 
-template <typename Table, int TileSize>
+template <typename Table, typename PredFunctor, int TileSize>
 __global__ void
 table_export_batch_kernel(Table table, IndexType begin, IndexType end,
                           CounterType *__restrict__ counter,
                           typename Table::KeyType *__restrict__ keys,
-                          ScoreType *__restrict__ scores,
+                          ScoreType *__restrict__ scores, PredFunctor pred,
                           IndexType *__restrict__ indices) {
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -483,7 +519,9 @@ table_export_batch_kernel(Table table, IndexType begin, IndexType end,
     const IndexType index = i;
 
     bool valid = Bucket::is_valid(key);
-    uint32_t vote = g.ballot(valid);
+    bool match = valid and pred.template operator()(score);
+    // bool match = valid and pred(score);
+    uint32_t vote = g.ballot(match);
     int group_cnt = __popc(vote);
     CounterType group_offset = 0;
     if (g.thread_rank() == 0) {
@@ -494,7 +532,7 @@ table_export_batch_kernel(Table table, IndexType begin, IndexType end,
     int previous_cnt = group_cnt - __popc(vote >> g.thread_rank());
     int64_t out_id = group_offset + previous_cnt;
 
-    if (valid) {
+    if (match) {
       keys[out_id] = key;
       if (scores) {
         scores[out_id] = score;
@@ -503,6 +541,34 @@ table_export_batch_kernel(Table table, IndexType begin, IndexType end,
         indices[out_id] = index;
       }
     }
+  }
+}
+
+template <typename Table, typename ExecFunctor, int TileSize>
+__global__ void table_traverse_kernel(Table table, IndexType begin,
+                                      IndexType end, ExecFunctor f) {
+  using KeyType = typename Table::KeyType;
+  using Bucket = typename Table::BucketType;
+  using Iter = typename Bucket::Iterator;
+
+  cg::thread_block_tile<TileSize> g =
+      cg::tiled_partition<TileSize>(cg::this_thread_block());
+
+  auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  for (int64_t i = begin + tid; i < end; i += gridDim.x * blockDim.x) {
+
+    int64_t bucket_id = i / table.bucket_capacity();
+
+    Bucket bucket = table[bucket_id];
+
+    Iter iter = Iter(i % bucket.capacity());
+
+    const KeyType key = *bucket.keys(iter);
+    const ScoreType score = *bucket.scores(iter);
+
+    bool valid = Bucket::is_valid(key);
+    f.template operator()<TileSize>(score, g, valid);
   }
 }
 
