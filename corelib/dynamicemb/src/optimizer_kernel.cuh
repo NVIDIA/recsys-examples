@@ -480,6 +480,70 @@ __global__ void update_kernel_fused(const uint32_t num_keys, const uint32_t dim,
   }
 }
 
+template <typename wgrad_t, typename weight_t, typename index_t,
+          typename OptimizerFunc>
+__global__ void
+update4_with_index_kernel(const uint32_t num_keys, const uint32_t dim,
+                          const uint32_t stride, const uint32_t split_index,
+                          const wgrad_t *grad_evs, weight_t *dev_table,
+                          weight_t *uvm_table, index_t *indices,
+                          const bool *masks, OptimizerFunc optimizer) {
+  constexpr int kWarpSize = 32;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+
+  for (uint32_t ev_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+       ev_id < num_keys; ev_id += gridDim.x * warp_num_per_block) {
+    bool mask = masks ? masks[ev_id] : true;
+    index_t const index = indices[ev_id];
+
+    weight_t *weight_ptr = nullptr;
+    if (index < split_index) {
+      weight_ptr = dev_table + index * stride;
+    } else {
+      weight_ptr = uvm_table + (index - split_index) * stride;
+    }
+
+    const wgrad_t *grad_ptr = grad_evs + ev_id * dim;
+    if ((!mask) or (weight_ptr == nullptr)) {
+      continue;
+    }
+    OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, dim};
+    optimizer.update4(input);
+  }
+}
+
+template <typename wgrad_t, typename weight_t, typename index_t,
+          typename OptimizerFunc>
+__global__ void
+update_with_index_kernel(const uint32_t num_keys, const uint32_t dim,
+                         const uint32_t stride, const uint32_t split_index,
+                         const wgrad_t *grad_evs, weight_t *dev_table,
+                         weight_t *uvm_table, index_t *indices,
+                         const bool *masks, OptimizerFunc optimizer) {
+  constexpr int kWarpSize = 32;
+
+  for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
+    bool mask = masks ? masks[ev_id] : true;
+
+    index_t const index = indices[ev_id];
+
+    weight_t *weight_ptr = nullptr;
+    if (index < split_index) {
+      weight_ptr = dev_table + index * stride;
+    } else {
+      weight_ptr = uvm_table + (index - split_index) * stride;
+    }
+
+    const wgrad_t *grad_ptr = grad_evs + ev_id * dim;
+    if ((!mask) or (weight_ptr == nullptr)) {
+      continue;
+    }
+    OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, dim};
+    optimizer.update(input);
+  }
+}
+
 template <typename grad_t, typename emb_t> struct OptimizierInputV2 {
   const grad_t *grad_;
   const emb_t *emb_;
