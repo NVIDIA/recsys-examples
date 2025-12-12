@@ -34,6 +34,10 @@ from dynamicemb_extensions import (  # dynamic_emb_sgd,; dynamic_emb_adam,; dyna
     dynamic_emb_sgd_fused,
     dynamic_emb_sgd_with_pointer,
     dynamic_emb_sgd_with_table,
+    sgd_update_for_combined_table,
+    adam_update_for_combined_table,
+    adagrad_update_for_combined_table,
+    rowwise_adagrad_for_combined_table,
 )
 
 
@@ -472,6 +476,16 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
         ...
 
     @abc.abstractmethod
+    def fused_update_with_index(
+        self,
+        grads: torch.Tensor,
+        indices: torch.Tensor,
+        dev_table: torch.Tensor,
+        uvm_table: torch.Tensor,
+    ) -> None:
+        ...
+
+    @abc.abstractmethod
     def get_opt_args(self) -> Dict[str, Any]:
         ...
 
@@ -553,6 +567,22 @@ class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
             grads,
             value_ptr,
             value_type,
+            lr,
+        )
+
+    def fused_update_with_index(
+        self,
+        grads: torch.Tensor,
+        indices: torch.Tensor,
+        dev_table: torch.Tensor,
+        uvm_table: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        sgd_update_for_combined_table(
+            grads,
+            indices,
+            dev_table,
+            uvm_table,
             lr,
         )
 
@@ -663,6 +693,36 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
             self._iterations,
         )
 
+    def fused_update_with_index(
+        self,
+        grads: torch.Tensor,
+        indices: torch.Tensor,
+        dev_table: torch.Tensor,
+        uvm_table: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        beta1 = self._opt_args.beta1
+        beta2 = self._opt_args.beta2
+        weight_decay = self._opt_args.weight_decay
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        adam_update_for_combined_table(
+            grads,
+            indices,
+            dev_table,
+            uvm_table,
+            state_dim,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            self._iterations,
+        )
+
     def get_opt_args(self):
         ret_args = {
             "opt_type": "adam",
@@ -748,6 +808,29 @@ class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
             grads,
             value_ptr,
             value_type,
+            state_dim,
+            lr,
+            eps,
+        )
+
+    def fused_update_with_index(
+        self,
+        grads: torch.Tensor,
+        indices: torch.Tensor,
+        dev_table: torch.Tensor,
+        uvm_table: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        adagrad_update_for_combined_table(
+            grads,
+            indices,
+            dev_table,
+            uvm_table,
             state_dim,
             lr,
             eps,
@@ -844,6 +927,29 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
             grads,
             value_ptr,
             value_type,
+            state_dim,
+            lr,
+            eps,
+        )
+    
+    def fused_update_with_index(
+        self,
+        grads: torch.Tensor,
+        indices: torch.Tensor,
+        dev_table: torch.Tensor,
+        uvm_table: torch.Tensor,
+    ) -> None:
+        lr = self._opt_args.learning_rate
+        eps = self._opt_args.eps
+
+        emb_dim = grads.size(1)
+        state_dim = self.get_state_dim(emb_dim)
+
+        rowwise_adagrad_for_combined_table(
+            grads,
+            indices,
+            dev_table,
+            uvm_table,
             state_dim,
             lr,
             eps,
