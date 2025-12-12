@@ -5,7 +5,7 @@ from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
-from data.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
+from data.gpt_sid_batch import GPTSIDBatch
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -15,6 +15,83 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor
+
+
+def _padding_to_dense_and_transpose(
+    jagged_input_hidden_states: torch.Tensor,
+    input_offsets: torch.Tensor,
+    input_max_seqlen: int,
+) -> torch.Tensor:
+    """
+    Padding the jagged input hidden states to dense.
+    input is Batch major, output is Sequence major.
+    """
+    batch_size = input_offsets.size(0) - 1
+    assert (
+        jagged_input_hidden_states.dim() == 2
+    ), "jagged input hidden states should be 2D"
+
+    # torch.ops.fbgemm.jagged_to_padded_dense(values=jagged_input_hidden_states, offsets=[input_offsets], max_lengths=[input_max_seqlen], padding_value=0.0)
+    padded_hidden_states = (
+        torch.ops.fbgemm.jagged_to_padded_dense(
+            values=jagged_input_hidden_states,
+            offsets=[input_offsets],
+            max_lengths=[input_max_seqlen],
+            padding_value=0.0,
+        )
+        .view(batch_size, input_max_seqlen, -1)
+        .transpose(1, 0)
+    )  # [S, B, D]
+    return padded_hidden_states
+
+
+def _transpose_dense_to_jagged(
+    dense_hidden_states: torch.Tensor,
+    input_offsets: torch.Tensor,
+    input_max_seqlen: int,
+) -> torch.Tensor:
+    """
+    Convert the dense hidden states to jagged.
+    input is Sequence major, output is Batch major.
+    """
+
+    assert dense_hidden_states.dim() == 3, "dense hidden states should be 3D"
+    jagged_hidden_states = torch.ops.fbgemm.dense_to_jagged(
+        dense_hidden_states.transpose(1, 0),  # [S, B, D] -> [B, S, D]
+        [input_offsets],
+    )[0]
+    return jagged_hidden_states
+
+
+def _get_padded_dense_attention_mask(
+    input_offsets: torch.Tensor,
+    input_max_seqlen: int,
+) -> torch.Tensor:
+    B = input_offsets.size(0) - 1
+    S = input_max_seqlen
+    # bs, num_head, seq, seq
+    lower_triangle_mask = torch.tril(
+        torch.ones(
+            (B, 1, S, S),
+            dtype=torch.bool,
+            device=torch.cuda.current_device(),
+        )
+    )
+    # broadcast num_head, s_kv
+    mask = (
+        torch.ops.fbgemm.jagged_to_padded_dense(
+            values=torch.ones(size=(input_offsets[-1],)).cuda(),
+            offsets=[input_offsets],
+            max_lengths=[input_max_seqlen],
+        )
+        .unsqueeze(1)
+        .unsqueeze(-1)
+    )
+    jagged_causal_mask = torch.logical_and(
+        lower_triangle_mask,
+        mask,
+    )
+    return jagged_causal_mask
 
 
 class SIDGRDecoder(MegatronModule):
@@ -205,8 +282,8 @@ class SIDGRModel(MegatronModule):
 
         # [
         #    [s0_0,s1_0,s2_0], [bos], [c0_0, c1_0, c2_0],
-        #    [s0_1,s1_1,s2_1; s0_2,s1_2,s2_2], [bos], [c0_1, c1_1, c2_1, c0_2, c1_2, c2_2],
-        #    [s0_4,s1_4,s2_4], [bos], [c0_4, c1_4, c2_4], [c0_5, c1_5, c2_5],
+        #    [s0_1,s1_1,s2_1; s0_2,s1_2,s2_2], [bos], [c0_1, c1_1, c2_1],
+        #    [s0_4,s1_4,s2_4], [bos], [c0_4, c1_4, c2_4],
         # ]
         max_seqlen_concat = max_seqlen_history + 1 + max_seqlen_candidate
         cated_hidden_states, cated_seqlens = jagged_2D_tensor_concat(
@@ -276,25 +353,41 @@ class SIDGRModel(MegatronModule):
             batch.batch_size,
             self._num_hierarchies,
         )
-        packed_seq_params = to_packed_seq_params(
+
+        # packed_seq_params = to_packed_seq_params(
+        #     input_offsets,
+        #     input_max_seqlen,
+        # )
+        # we need to unsqueeze the hidden states to [T, 1, hidden_size] and unsqueeze back after decoder
+
+        # THD still needs batch dimension
+        # input_hidden_states = input_hidden_states.unsqueeze(1)
+        # output_hidden_states = output_hidden_states.squeeze(1)
+        smajor_dense_input_hidden_states = _padding_to_dense_and_transpose(
+            input_hidden_states,
             input_offsets,
             input_max_seqlen,
         )
-        # we need to unsqueeze the hidden states to [T, 1, hidden_size] and unsqueeze back after decoder
-        input_hidden_states = input_hidden_states.unsqueeze(1)
-        # 3. decoder (causal self-attention)
-        output_hidden_states = self.decoder(
-            hidden_states=input_hidden_states,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
+        attention_mask = _get_padded_dense_attention_mask(
+            input_offsets,
+            input_max_seqlen,
         )
-        output_hidden_states = output_hidden_states.squeeze(1)
-
+        # 3. decoder (causal self-attention)
+        dense_output_hidden_states = self.decoder(
+            hidden_states=smajor_dense_input_hidden_states,  # input_hidden_states,
+            attention_mask=attention_mask,
+            packed_seq_params=None,  # we now enforce arbitrary attention mask + dense padding
+        )
+        jagged_output_hidden_states = _transpose_dense_to_jagged(
+            dense_output_hidden_states,
+            input_offsets,
+            input_max_seqlen,
+        )
         # 4. postprocess: split history, candidate, note that we append a bos token, so we need to remove the last token.
         # history are dropped.
-        # TODO, replace with one-shottorch op
+        # TODO, replace with one-shot op
         _, output_hidden_states_bos_candidate = triton_split_2D_jagged(
-            output_hidden_states,
+            jagged_output_hidden_states,
             max_seq_len=input_max_seqlen,
             offsets_a=history_offsets,
             offsets_b=candidate_offsets + bos_offsets,

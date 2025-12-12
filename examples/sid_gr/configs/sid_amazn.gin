@@ -1,11 +1,11 @@
 TrainerArgs.train_batch_size = 32
 TrainerArgs.eval_batch_size = 32
-TrainerArgs.log_interval = 50
+TrainerArgs.log_interval = 2
 TrainerArgs.eval_interval = 50000000
 TrainerArgs.profile = True
 TrainerArgs.profile_step_start = 50
 TrainerArgs.profile_step_end = 80
-TrainerArgs.max_train_iters = 512
+TrainerArgs.max_train_iters = 1000
 TrainerArgs.max_eval_iters = 16
 
 DatasetArgs.dataset_name = 'amzn_beauty'

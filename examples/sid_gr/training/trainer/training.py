@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from datetime import datetime
 from itertools import chain, count, cycle, islice
 from typing import Iterator, Optional, Union
 
@@ -148,15 +149,31 @@ def train_with_pipeline(
     iter_slices = batched(train_loader_iter, n)
     start_iter = 0
     pipeline._model.train()
+    # note that torch profiler is exclusive with cuda profiler on GPU side.
+    torch_profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        # record_shapes=True,
+        with_stack=True,
+        with_flops=True,
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     for batched_iterator in iter_slices:
         # for one slice(every eval interval)
         for train_iter in count(start_iter):
             if trainer_args.profile and train_iter == trainer_args.profile_step_start:
                 dist.barrier(device_ids=[torch.cuda.current_device()])
                 torch.cuda.profiler.start()
+                torch_profiler.start()
             if trainer_args.profile and train_iter == trainer_args.profile_step_end:
                 torch.cuda.profiler.stop()
                 dist.barrier(device_ids=[torch.cuda.current_device()])
+                torch_profiler.stop()
+                trace_name = f"sid_gr_trace_{timestamp}.json"
+                trace_file = os.path.join(trainer_args.log_dir, trace_name)
+                torch_profiler.export_chrome_trace(trace_file)
             if (
                 train_iter * trainer_args.ckpt_save_interval > 0
                 and train_iter % trainer_args.ckpt_save_interval == 0

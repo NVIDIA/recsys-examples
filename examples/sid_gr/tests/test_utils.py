@@ -32,10 +32,11 @@ def create_sid_gr_model_and_optimizer(
         fp16=True if dtype == torch.float16 else False,
         # position_embedding_type="relative",
     )
-
+    # thd + causal + TE
     transformer_decoder_layer_spec = get_gpt_decoder_block_spec(
         decoder_config,
-        use_transformer_engine=True,
+        use_transformer_engine=False,
+        arbitrary_attention_mask=True,
     )
 
     sid_gr_model = SIDGRModel(

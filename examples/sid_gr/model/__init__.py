@@ -21,9 +21,12 @@ def get_sid_gr_model(
         codebook_sizes=codebook_sizes,
         num_hierarchies=num_hierarchies,
         transformer_decoder_layer_spec=get_gpt_decoder_block_spec(
-            decoder_config, use_transformer_engine=True
+            # padding + arbitrary attention mask + Megatron-Core
+            decoder_config,
+            use_transformer_engine=False,
+            arbitrary_attention_mask=True,
         ),
-        should_add_sep_token=True,
+        should_add_sep_token=False,
     )
 
     return sid_gr_model

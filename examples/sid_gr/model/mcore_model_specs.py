@@ -65,7 +65,7 @@ except ImportError:
     LNImpl = WrappedTorchNorm
 
 
-def get_gpt_layer_with_transformer_engine_spec(
+def _get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
@@ -91,11 +91,11 @@ def get_gpt_layer_with_transformer_engine_spec(
     """
     if fp8 is not None:
         warnings.warn(
-            'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
+            'The fp8 argument in "_get_gpt_layer_with_transformer_engine_spec" has been deprecated'
             " and will be removed soon. Please update your code accordingly."
         )
 
-    mlp = get_mlp_module_spec(
+    mlp = _get_mlp_module_spec(
         use_te=True,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
@@ -172,7 +172,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         )
 
 
-def get_gpt_layer_local_spec(
+def _get_gpt_layer_local_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
@@ -181,6 +181,7 @@ def get_gpt_layer_local_spec(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
+    arbitrary_attention_mask: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -197,6 +198,10 @@ def get_gpt_layer_local_spec(
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
     """
+    if arbitrary_attention_mask:
+        attention_mask_type = AttnMaskType.arbitrary
+    else:
+        attention_mask_type = AttnMaskType.causal
 
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
@@ -205,11 +210,11 @@ def get_gpt_layer_local_spec(
 
     if fp8 is not None:
         warnings.warn(
-            'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
+            'The fp8 argument in "_get_gpt_layer_local_spec" has been deprecated'
             " and will be removed soon. Please update your code accordingly."
         )
 
-    mlp = get_mlp_module_spec(
+    mlp = _get_mlp_module_spec(
         use_te=False,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
@@ -224,7 +229,7 @@ def get_gpt_layer_local_spec(
                 input_layernorm=LNImpl,
                 self_attention=ModuleSpec(
                     module=MLASelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                    params={"attn_mask_type": attention_mask_type},
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=ColumnParallelLinear,
                         linear_q_down_proj=ColumnParallelLinear,
@@ -244,13 +249,14 @@ def get_gpt_layer_local_spec(
             ),
         )
     else:
+        # this is the selected path for sid_gr for now.
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=LNImpl,
                 self_attention=ModuleSpec(
                     module=SelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                    params={"attn_mask_type": attention_mask_type},
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=ColumnParallelLinear,
                         core_attention=DotProductAttention,
@@ -279,7 +285,7 @@ def get_gpt_layer_local_spec(
         )
 
 
-def _get_mlp_module_spec(
+def __get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -287,11 +293,11 @@ def _get_mlp_module_spec(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ):
     warnings.warn(
-        """This private function is on a deprecation track. Please switch to `get_mlp_module_spec`
+        """This private function is on a deprecation track. Please switch to `_get_mlp_module_spec`
         since it will be removed in a future release."""
     )
 
-    return get_mlp_module_spec(
+    return _get_mlp_module_spec(
         use_te=use_te,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
@@ -300,7 +306,7 @@ def _get_mlp_module_spec(
     )
 
 
-def get_mlp_module_spec(
+def _get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -310,7 +316,7 @@ def get_mlp_module_spec(
     """Helper function to get module spec for MLP/MoE"""
     if fp8 is not None:
         warnings.warn(
-            'The fp8 argument in "_get_mlp_module_spec" has been deprecated'
+            'The fp8 argument in "__get_mlp_module_spec" has been deprecated'
             " and will be removed soon. Please update your code accordingly."
         )
 
@@ -338,6 +344,7 @@ def get_mlp_module_spec(
 def get_gpt_decoder_block_spec(
     config: TransformerConfig,
     use_transformer_engine: bool,
+    arbitrary_attention_mask: Optional[bool] = False,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
 ) -> TransformerBlockSubmodules:
@@ -347,9 +354,14 @@ def get_gpt_decoder_block_spec(
     else:
         layer_norm_impl = LNImpl
 
+    if arbitrary_attention_mask:
+        assert (
+            not use_transformer_engine
+        ), "arbitrary attention mask is only supported with Megatron-Core modules"
+
     # Layer specs.
     dense_layer_spec = (
-        get_gpt_layer_with_transformer_engine_spec(
+        _get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
@@ -358,7 +370,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
         )
         if use_transformer_engine
-        else get_gpt_layer_local_spec(
+        else _get_gpt_layer_local_spec(
             num_experts=None,
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
@@ -366,10 +378,11 @@ def get_gpt_decoder_block_spec(
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
+            arbitrary_attention_mask=arbitrary_attention_mask,
         )
     )
     moe_layer_spec = (
-        get_gpt_layer_with_transformer_engine_spec(
+        _get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
@@ -378,7 +391,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
         )
         if use_transformer_engine
-        else get_gpt_layer_local_spec(
+        else _get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
@@ -386,6 +399,7 @@ def get_gpt_decoder_block_spec(
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
+            arbitrary_attention_mask=arbitrary_attention_mask,
         )
     )
 

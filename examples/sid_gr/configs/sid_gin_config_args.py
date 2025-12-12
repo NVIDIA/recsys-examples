@@ -67,6 +67,9 @@ class TrainerArgs:
     ckpt_save_dir: str = "./checkpoints"
     ckpt_load_dir: str = ""
 
+    # log_dir
+    log_dir: str = "./logs"
+
     # overlap pipeline type
     # - none -> no overlap
     # - native -> overlap [h2d, input dist, fwd+bwd]
