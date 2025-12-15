@@ -24,7 +24,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.key_value_table import batched_export_keys_values
 from test_embedding_dump_load import create_model, get_optimizer_kwargs, idx_to_name
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -153,9 +152,7 @@ def local_DynamicEmbDump(
 
                 table_key_scores = {}
 
-                for keys, _, _, scores in batched_export_keys_values(
-                    table.table, device, batch_size
-                ):
+                for keys, _, _, scores in table.export_keys_values(device, batch_size):
                     for key, score in zip(keys, scores):
                         table_key_scores[int(key)] = int(score)
 

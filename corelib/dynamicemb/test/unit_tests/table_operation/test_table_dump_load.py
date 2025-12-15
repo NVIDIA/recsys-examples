@@ -385,7 +385,7 @@ def test_table_incremental_dump(
     assert table_num_matched(table, 0) == bucket_capacity
 
     # check 2: table.incremental_dump is consistent with count_matched
-    dumped_keys, dumped_named_scores = table.incremental_dump({"score1": 0})
+    dumped_keys, dumped_named_scores, _ = table.incremental_dump({"score1": 0})
     assert dumped_keys.numel() == bucket_capacity * world_size
     assert set(dumped_keys[(dumped_keys % world_size == local_rank)].tolist()) == set(
         keys.tolist()
@@ -406,7 +406,7 @@ def test_table_incremental_dump(
 
         # pre-check: using uninsert score will dump nothing.
         if score_policy != ScorePolicy.ACCUMULATE:
-            dumped_keys, _ = table.incremental_dump({"score1": undumped_score})
+            dumped_keys, _, _ = table.incremental_dump({"score1": undumped_score})
             assert dumped_keys.numel() == 0
 
         interval_keys = torch.arange(
@@ -475,7 +475,7 @@ def test_table_incremental_dump(
             num_remain -= evict_keys_interval_mask.numel()
 
         # check 3: incremental dump as expected
-        keys, named_scores = table.incremental_dump({"score1": undumped_score})
+        keys, named_scores, _ = table.incremental_dump({"score1": undumped_score})
         masks = keys % world_size == local_rank
         keys = keys.to(device)[masks]
         scores = named_scores["score1"].to(device)[masks]
@@ -492,7 +492,7 @@ def test_table_incremental_dump(
             assert torch.isin(interval_keys[interval_existed_in_table], keys).all()
 
         # check 4: using min_score to count will get table's size
-        dumped_keys, _ = table.incremental_dump({"score1": 0})
+        dumped_keys, _, _ = table.incremental_dump({"score1": 0})
         assert (
             dumped_keys[dumped_keys % world_size == local_rank].numel() == table.size()
         )

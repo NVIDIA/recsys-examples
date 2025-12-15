@@ -12,7 +12,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
-from dynamicemb.key_value_table import batched_export_keys_values
 from dynamicemb.types import DynamicEmbInitializerArgs
 
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
@@ -147,9 +146,7 @@ def get_table_keys(
 
                 table_keys = set()
 
-                for keys, _, _, _ in batched_export_keys_values(
-                    table.table, device, batch_size
-                ):
+                for keys, _, _, _ in table.export_keys_values(device, batch_size):
                     for key in keys:
                         table_keys.add(int(key))
 

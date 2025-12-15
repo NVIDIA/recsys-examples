@@ -566,7 +566,7 @@ def test_table_reserve(
         if table.load_factor() >= max_load_factor:
             table.reserve(table.capacity() * 2)
 
-            for keys_, named_scores in table._batched_export_keys_scores(
+            for keys_, named_scores, _ in table._batched_export_keys_scores(
                 ["score1"], device
             ):
                 scores_ = named_scores["score1"].to(torch.uint64)

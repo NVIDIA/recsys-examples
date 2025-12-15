@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 from dynamicemb.dynamicemb_config import DynamicEmbCheckMode
-from dynamicemb.key_value_table import KeyValueTable, batched_export_keys_values
+from dynamicemb.key_value_table import KeyValueTable
 from dynamicemb.optimizer import *
 from dynamicemb_extensions import OptimizerType, find
 from torchrec.distributed.comm import get_local_rank
@@ -81,7 +81,7 @@ def assert_two_dynamicemb_table_equal(
     dump_optim: bool,
     load_optim: bool,
 ):
-    table_data_iterator = batched_export_keys_values(table.table, device)
+    table_data_iterator = table.export_keys_values(device)
     for keys, embeddings, opt_states, scores in table_data_iterator:
         dim = reference_table.embedding_dim()
         optstate_dim = reference_table.optim_state_dim()

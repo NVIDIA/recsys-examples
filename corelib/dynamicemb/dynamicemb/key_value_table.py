@@ -183,78 +183,6 @@ def load_key_values(
     )
 
 
-def load_key_values_v1(
-    key_value_table: Any,
-    keys: torch.Tensor,
-    embeddings: torch.Tensor,
-    scores: Optional[torch.Tensor] = None,
-    opt_states: Optional[torch.Tensor] = None,
-):
-    dim = embeddings.size(1)
-    optstate_dim = opt_states.size(1) if opt_states is not None else 0
-    if not keys.is_cuda:
-        raise RuntimeError("Keys must be on GPU")
-    if not embeddings.is_cuda:
-        raise RuntimeError("Embeddings must be on GPU")
-    if scores is not None and not scores.is_cuda:
-        raise RuntimeError("Scores must be on GPU")
-    if opt_states is not None and not opt_states.is_cuda:
-        raise RuntimeError("Opt states must be on GPU")
-
-    if opt_states is None and optstate_dim > 0:
-        opt_states = (
-            torch.ones(
-                keys.numel(),
-                optstate_dim,
-                dtype=key_value_table.value_type(),
-                device=embeddings.device,
-            )
-            * key_value_table.init_optimizer_state()
-        )
-
-    values = (
-        torch.cat([embeddings.view(-1, dim), opt_states.view(-1, optstate_dim)], dim=-1)
-        if opt_states is not None
-        else embeddings
-    )
-
-    key_type = key_value_table.key_index_map.key_type
-    value_type = key_value_table.value_type()
-
-    # when load into the table, we always assign the scores from the file.
-    policy = ScorePolicy.ASSIGN
-
-    if scores is None:
-        assert (
-            key_value_table.evict_strategy() == EvictStrategy.KLru
-        ), "scores is None for KLru evict strategy is allowed but will be deprecated in future."
-        policy = ScorePolicy.GLOBAL_TIMER
-    else:
-        scores = scores.to(SCORE_TYPE)
-
-    key_value_table.insert(keys.to(key_type), values.to(value_type), scores)
-
-    score_args_insert = [
-        ScoreArg(
-            name=key_value_table.score_policy.name,
-            value=scores,
-            policy=policy,
-            is_return=False,
-        )
-    ]
-    indices = torch.zeros(
-        keys.numel(), dtype=key_value_table.key_index_map.index_type, device=keys.device
-    )
-
-    key_value_table.key_index_map.insert(keys, score_args_insert, indices)
-    store_to_combined_table(
-        key_value_table.dev_table,
-        key_value_table.uvm_table,
-        indices,
-        values.to(value_type),
-    )
-
-
 def get_score_policy(score_strategy):
     if score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
         return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
@@ -657,39 +585,18 @@ class KeyValueTable(
         fscore = open(score_file_path, "wb")
         fopt_states = open(opt_file_path, "wb") if include_optim else None
 
-        for (
-            keys,
-            named_scores,
-            indices,
-        ) in self.key_index_map._batched_export_keys_scores(
-            [self.score_policy.name], device, return_index=True
+        for keys, embeddings, opt_states, scores in self.export_keys_values(
+            device=device
         ):
             fkey.write(keys.cpu().numpy().tobytes())
-            scores = named_scores[self.score_policy.name]
+
             if self.evict_strategy_ == EvictStrategy.KLru:
                 scores = self._timestamp - scores
             fscore.write(scores.cpu().numpy().tobytes())
 
-            values = torch.empty(
-                (keys.numel(), self._value_dim), dtype=self.value_type(), device=device
-            )
-            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
-            embeddings = (
-                values[:, : self._emb_dim].to(dtype=EMBEDDING_TYPE).contiguous()
-            )
-
-            if self.optim_state_dim() != 0:
-                opt_states = (
-                    values[:, -self.optim_state_dim() :]
-                    .to(dtype=OPT_STATE_TYPE)
-                    .contiguous()
-                )
-            else:
-                opt_states = None
-
             fembedding.write(embeddings.cpu().numpy().tobytes())
 
-            if fopt_states:
+            if fopt_states and opt_states is not None:
                 fopt_states.write(opt_states.cpu().numpy().tobytes())
 
         fkey.close()
@@ -846,10 +753,7 @@ class KeyValueTable(
                     scores = scores[masks]
                 if opt_states is not None:
                     opt_states = opt_states[masks, :]
-            load_key_values_v1(
-                self.key_index_map,
-                self.dev_table,
-                self.uvm_table,
+            self.load_key_values(
                 keys,
                 embeddings,
                 scores,
@@ -862,6 +766,135 @@ class KeyValueTable(
             fscore.close()
         if fopt_states:
             fopt_states.close()
+
+    def load_key_values(
+        self,
+        keys: torch.Tensor,
+        embeddings: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        opt_states: Optional[torch.Tensor] = None,
+    ):
+        dim = embeddings.size(1)
+        optstate_dim = self.optim_state_dim()
+        if not keys.is_cuda:
+            raise RuntimeError("Keys must be on GPU")
+        if not embeddings.is_cuda:
+            raise RuntimeError("Embeddings must be on GPU")
+        if scores is not None and not scores.is_cuda:
+            raise RuntimeError("Scores must be on GPU")
+        if opt_states is not None and not opt_states.is_cuda:
+            raise RuntimeError("Opt states must be on GPU")
+
+        if opt_states is None and optstate_dim > 0:
+            opt_states = (
+                torch.ones(
+                    keys.numel(),
+                    optstate_dim,
+                    dtype=self.value_type(),
+                    device=embeddings.device,
+                )
+                * self.init_optimizer_state()
+            )
+
+        values = (
+            torch.cat(
+                [embeddings.view(-1, dim), opt_states.view(-1, optstate_dim)], dim=-1
+            )
+            if opt_states is not None
+            else embeddings
+        )
+
+        key_type = self.key_index_map.key_type
+        value_type = self.value_type()
+
+        # when load into the table, we always assign the scores from the file.
+        policy = ScorePolicy.ASSIGN
+
+        if scores is None:
+            assert (
+                self.evict_strategy() == EvictStrategy.KLru
+            ), "scores is None for KLru evict strategy is allowed but will be deprecated in future."
+            policy = ScorePolicy.GLOBAL_TIMER
+        else:
+            scores = scores.to(SCORE_TYPE)
+
+        self.insert(keys.to(key_type), values.to(value_type), scores)
+
+        score_args_insert = [
+            ScoreArg(
+                name=self.score_policy.name,
+                value=scores,
+                policy=policy,
+                is_return=False,
+            )
+        ]
+        indices = torch.zeros(
+            keys.numel(), dtype=self.key_index_map.index_type, device=keys.device
+        )
+
+        self.key_index_map.insert(keys, score_args_insert, indices)
+        store_to_combined_table(
+            self.dev_table,
+            self.uvm_table,
+            indices,
+            values.to(value_type),
+        )
+
+    def export_keys_values(
+        self,
+        device: torch.device,
+        batch_size: int = 65536,
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        export keys, embeddings, opt_states, scores
+        """
+
+        for (
+            keys,
+            named_scores,
+            indices,
+        ) in self.key_index_map._batched_export_keys_scores(
+            [self.score_policy.name],
+            self.device,
+            batch_size=batch_size,
+            return_index=True,
+        ):
+            scores = named_scores[self.score_policy.name]
+
+            values = torch.empty(
+                (keys.numel(), self._value_dim),
+                dtype=self.value_type(),
+                device=self.device,
+            )
+            torch.cuda.synchronize()
+            print(f"export key values 865")
+            dev_shape = self.dev_table.shape if self.dev_table is not None else None
+            uvm_shape = self.uvm_table.shape if self.uvm_table is not None else None
+            print(
+                f"{dev_shape}, {uvm_shape}, {torch.max(indices)}, {torch.min(indices)}, {self.dev_table.dtype}, {values.dtype}, {indices.shape}, {values.shape}"
+            )
+            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
+            torch.cuda.synchronize()
+            print(f"export key values 868")
+            embeddings = (
+                values[:, : self._emb_dim].to(dtype=EMBEDDING_TYPE).contiguous()
+            )
+
+            if self.optim_state_dim() != 0:
+                opt_states = (
+                    values[:, -self.optim_state_dim() :]
+                    .to(dtype=OPT_STATE_TYPE)
+                    .contiguous()
+                ).to(device)
+            else:
+                opt_states = None
+
+            yield (
+                keys.to(device),
+                embeddings.to(device),
+                opt_states,
+                scores.to(SCORE_TYPE).to(device),
+            )
 
     def embedding_dtype(
         self,
@@ -1008,7 +1041,7 @@ class KeyValueTable(
         """
         batch_size = self._threads_in_wave
         keys, _, indices = self.key_index_map.incremental_dump(
-            {self.score_policy.name, score_threshold}, batch_size, pg, return_index=True
+            {self.score_policy.name: score_threshold}, batch_size, pg, return_index=True
         )
         if keys.numel() == 0:
             return None, None

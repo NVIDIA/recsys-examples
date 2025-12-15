@@ -962,6 +962,9 @@ class LinearBucketTable(ScoredHashTable):
                     scores_list.append(None)
             d_counter = torch.zeros(1, dtype=COUNTER_TYPE, device=device)
 
+            torch.cuda.synchronize()
+            print(f"OK at 966")
+
             table_export_batch(
                 self.table_storage_,
                 self.fileds_type_,
@@ -974,6 +977,9 @@ class LinearBucketTable(ScoredHashTable):
                 thresholds_,
                 indices,
             )
+
+            torch.cuda.synchronize()
+            print(f"OK at 983")
 
             actual_length = d_counter.item()
             if actual_length > 0:
@@ -1017,7 +1023,7 @@ class LinearBucketTable(ScoredHashTable):
 
         dump_timestamp = device_timestamp()
 
-        for keys, named_scores in self._batched_export_keys_scores(
+        for keys, named_scores, _ in self._batched_export_keys_scores(
             fscores.keys(), self.device
         ):
             fkey.write(keys.cpu().numpy().tobytes())
@@ -1297,7 +1303,7 @@ class LinearBucketTable(ScoredHashTable):
         bucket_sizes = torch.zeros(num_buckets, dtype=torch.int32, device=self.device)
 
         # move existed data to new table
-        for keys_, named_scores in self._batched_export_keys_scores(
+        for keys_, named_scores, _ in self._batched_export_keys_scores(
             self.score_names_, self.device
         ):
             score_args = []

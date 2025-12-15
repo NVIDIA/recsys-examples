@@ -1326,6 +1326,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             meta_json_file = encode_meta_json_file_path(save_dir, table_name)
 
             if isinstance(storage, KeyValueTable) and not storage._use_score:
+                dist.barrier()  # sync global timestamp
                 cast(KeyValueTable, storage).update_timestamp()
             num_key_files = len(emb_key_files)
             for i in range(num_key_files):
@@ -1352,8 +1353,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def export_keys_values(
         self, table_name: str, device: torch.device, batch_size: int = 65536
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from dynamicemb.key_value_table import batched_export_keys_values
-
         keys_list = []
         values_list = []
         self.flush()
@@ -1367,8 +1366,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             local_max_rows = dynamic_table.size()
             accumulated_counts = 0
 
-            for keys, embeddings, _, _ in batched_export_keys_values(
-                dynamic_table.table, device, batch_size
+            for keys, embeddings, _, _ in dynamic_table.export_keys_values(
+                device, batch_size
             ):
                 keys_list.append(keys)
                 values_list.append(embeddings)

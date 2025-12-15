@@ -509,21 +509,44 @@ class ConstructTwinModule:
         for feature, result in final_results.items():
             indices = result["indices"]
             values = result["values"]
-            filtered_indices = indices[indices % self._world_size == self._rank]
+            print(f"B: {indices.shape}, {values.shape}")
+
+            mask = indices % self._world_size == self._rank
+            filtered_indices = indices[mask]
 
             # Get the dimension for this feature
             dim = self._dims[self._feature_names.index(feature)]
 
             # Reshape values to [num_indices, dim]
             values = values.reshape(-1, dim)
+            print(f"C: {indices.shape}, {values.shape}")
+
             # Select values based on filtered indices
-            filtered_values = values[filtered_indices, :]
+            filtered_values = values[mask, :]
+            print(f"B: {filtered_indices.shape}, {filtered_values.shape}")
 
             # Remove duplicates from filtered indices and values
-            unique_indices, unique_inverse_indices = torch.unique(
-                filtered_indices, return_inverse=True
+            sorted_key, idx = torch.sort(filtered_indices)
+            sorted_value = filtered_values[idx, :]
+
+            uniq_key, inv, counts = torch.unique(
+                sorted_key, sorted=True, return_inverse=True, return_counts=True
             )
-            unique_values = filtered_values[unique_inverse_indices, :]
+            # start pos in sorted_key
+            first_pos = torch.cumsum(
+                torch.cat([torch.tensor([0], device=sorted_key.device), counts[:-1]]),
+                dim=0,
+            )
+            chosen_value = sorted_value[first_pos, :]
+
+            # unique_indices, unique_inverse_indices = torch.unique(
+            #     filtered_indices, return_inverse=True
+            # )
+            unique_indices = uniq_key
+            unique_values = chosen_value
+
+            # unique_values = filtered_values[unique_inverse_indices, :]
+            print(f"A: {unique_indices.shape}, {unique_values.shape}")
 
             tmp_table_name = feature.replace("f_", "t_")
             cur_hkv_table: KeyValueTable = table_name_map_hkv_table[tmp_table_name]
@@ -539,7 +562,10 @@ class ConstructTwinModule:
                 * initial_accumulator
             )
             unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
-            unique_values = unique_values.reshape(-1)
+            unique_values = unique_values.reshape(-1).view(-1, dim + optstate_dim)
+
+            print("Twin model:")
+            print(unique_indices.shape, unique_values.shape)
 
             cur_hkv_table.insert(unique_indices, unique_values)
         # In TorchREC, once a forward lookup occurs, the iteration in the module gets updated(even you don't do backward).
