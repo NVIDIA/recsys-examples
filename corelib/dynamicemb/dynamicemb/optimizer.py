@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Union
 import torch  # usort:skip
 from dynamicemb.dynamicemb_config import *
 from dynamicemb_extensions import (  # dynamic_emb_sgd,; dynamic_emb_adam,; dynamic_emb_adagrad,; dynamic_emb_rowwise_adagrad,
+    adagrad_update_for_combined_table,
+    adam_update_for_combined_table,
     dynamic_emb_adagrad_fused,
     dynamic_emb_adagrad_with_pointer,
     dynamic_emb_adagrad_with_table,
@@ -34,10 +36,8 @@ from dynamicemb_extensions import (  # dynamic_emb_sgd,; dynamic_emb_adam,; dyna
     dynamic_emb_sgd_fused,
     dynamic_emb_sgd_with_pointer,
     dynamic_emb_sgd_with_table,
-    sgd_update_for_combined_table,
-    adam_update_for_combined_table,
-    adagrad_update_for_combined_table,
     rowwise_adagrad_for_combined_table,
+    sgd_update_for_combined_table,
 )
 
 
@@ -931,7 +931,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
             lr,
             eps,
         )
-    
+
     def fused_update_with_index(
         self,
         grads: torch.Tensor,

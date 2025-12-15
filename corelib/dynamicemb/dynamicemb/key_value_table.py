@@ -54,10 +54,10 @@ from dynamicemb_extensions import (
     dyn_emb_cols,
     export_batch,
     insert_or_assign,
-    load_from_combined_buffer,
+    load_from_combined_table,
     select,
     select_index,
-    store_to_combined_buffer,
+    store_to_combined_table,
 )
 
 
@@ -247,7 +247,7 @@ def load_key_values_v1(
     )
 
     key_value_table.key_index_map.insert(keys, score_args_insert, indices)
-    store_to_combined_buffer(
+    store_to_combined_table(
         key_value_table.dev_table,
         key_value_table.uvm_table,
         indices,
@@ -411,7 +411,9 @@ class KeyValueTable(
             ScoreArg(
                 name=self.score_policy.name,
                 value=scores,
-                policy=self.score_policy if self._score_update else ScorePolicy.CONST,
+                policy=self.score_policy.policy
+                if self._score_update
+                else ScorePolicy.CONST,
                 is_return=False,
             )
         ]
@@ -419,7 +421,7 @@ class KeyValueTable(
         self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
 
         if load_dim != 0:
-            load_from_combined_buffer(
+            load_from_combined_table(
                 self.dev_table, self.uvm_table, indices, unique_embs
             )
 
@@ -556,7 +558,7 @@ class KeyValueTable(
         )
 
         self.key_index_map.insert(unique_keys, score_args_insert, indices)
-        store_to_combined_buffer(
+        store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
 
@@ -660,7 +662,7 @@ class KeyValueTable(
             named_scores,
             indices,
         ) in self.key_index_map._batched_export_keys_scores(
-            [self.score_policy.name], device, index=True
+            [self.score_policy.name], device, return_index=True
         ):
             fkey.write(keys.cpu().numpy().tobytes())
             scores = named_scores[self.score_policy.name]
@@ -671,7 +673,7 @@ class KeyValueTable(
             values = torch.empty(
                 (keys.numel(), self._value_dim), dtype=self.value_type(), device=device
             )
-            load_from_combined_buffer(self.dev_table, self.uvm_table, indices, values)
+            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
             embeddings = (
                 values[:, : self._emb_dim].to(dtype=EMBEDDING_TYPE).contiguous()
             )
@@ -915,14 +917,14 @@ class KeyValueTable(
         ) = self.key_index_map.insert_and_evict(keys, score_args_insert, indices)
         evicted_scores = evicted_scores[0]
 
-        load_from_combined_buffer(
+        load_from_combined_table(
             self.dev_table,
             self.uvm_table,
             evicted_indices,
             evicted_values[:num_evicted, :],
         )
 
-        store_to_combined_buffer(
+        store_to_combined_table(
             self.dev_table, self.uvm_table, indices, values.to(self.value_type())
         )
 
@@ -944,7 +946,10 @@ class KeyValueTable(
             named_scores,
             indices,
         ) in self.key_index_map._batched_export_keys_scores(
-            [self.score_policy.name], self.device, batch_size=batch_size, index=True
+            [self.score_policy.name],
+            self.device,
+            batch_size=batch_size,
+            return_index=True,
         ):
             scores = named_scores[self.score_policy.name]
             values = torch.empty(
@@ -954,7 +959,7 @@ class KeyValueTable(
                 device=self.device,
             )
 
-            load_from_combined_buffer(self.dev_table, self.uvm_table, indices, values)
+            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
             storage.insert(keys, values, scores)
 
     def reset(
@@ -978,7 +983,7 @@ class KeyValueTable(
     def value_type(
         self,
     ) -> torch.dtype:
-        self._emb_dtype
+        return self._emb_dtype
 
     def capacity(
         self,
@@ -1003,7 +1008,7 @@ class KeyValueTable(
         """
         batch_size = self._threads_in_wave
         keys, _, indices = self.key_index_map.incremental_dump(
-            {self.score_policy.name, score_threshold}, batch_size, pg, index=True
+            {self.score_policy.name, score_threshold}, batch_size, pg, return_index=True
         )
         if keys.numel() == 0:
             return None, None
@@ -1012,7 +1017,7 @@ class KeyValueTable(
         embs = torch.empty(
             keys.numel(), self._emb_dim, dtype=self._emb_dtype, device=self.device
         )
-        load_from_combined_buffer(
+        load_from_combined_table(
             self.dev_table, self.uvm_table, indices.to(self.device), embs
         )
         return keys, embs.cpu()
@@ -1335,9 +1340,6 @@ class KeyValueTableCachingFunction:
 
         # 4. copy embeddings to unique_embs
         unique_embs[missing_indices, :] = values_for_storage[:, :emb_dim]
-
-        if h_num_missing_in_storage == 0:
-            return
 
         keys_to_update = None
         values_to_update = None

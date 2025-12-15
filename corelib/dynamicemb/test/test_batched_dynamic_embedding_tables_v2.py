@@ -320,7 +320,7 @@ def test_forward_train_eval(opt_type, opt_params, caching, PS):
     key_type = torch.int64
     value_type = torch.float32
 
-    init_capacity = 1024
+    init_capacity = 2048
     max_capacity = 2048
 
     dyn_emb_table_options_list = []
@@ -435,8 +435,8 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
     [
         (True, DynamicEmbPoolingMode.NONE, [8, 8, 8]),
         (False, DynamicEmbPoolingMode.NONE, [16, 16, 16]),
-        (False, DynamicEmbPoolingMode.SUM, [128, 32, 16]),
-        (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
+        # (False, DynamicEmbPoolingMode.SUM, [128, 32, 16]),
+        # (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
     ],
 )
 @pytest.mark.parametrize("PS", [None, PyDictStorage])

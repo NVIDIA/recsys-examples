@@ -496,6 +496,9 @@ update4_with_index_kernel(const uint32_t num_keys, const uint32_t dim,
        ev_id < num_keys; ev_id += gridDim.x * warp_num_per_block) {
     bool mask = masks ? masks[ev_id] : true;
     index_t const index = indices[ev_id];
+    if ((!mask) or (index == -1)) {
+      continue;
+    }
 
     weight_t *weight_ptr = nullptr;
     if (index < split_index) {
@@ -505,9 +508,6 @@ update4_with_index_kernel(const uint32_t num_keys, const uint32_t dim,
     }
 
     const wgrad_t *grad_ptr = grad_evs + ev_id * dim;
-    if ((!mask) or (weight_ptr == nullptr)) {
-      continue;
-    }
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, dim};
     optimizer.update4(input);
   }
@@ -527,7 +527,9 @@ update_with_index_kernel(const uint32_t num_keys, const uint32_t dim,
     bool mask = masks ? masks[ev_id] : true;
 
     index_t const index = indices[ev_id];
-
+    if ((!mask) or (index == -1)) {
+      continue;
+    }
     weight_t *weight_ptr = nullptr;
     if (index < split_index) {
       weight_ptr = dev_table + index * stride;
@@ -536,9 +538,7 @@ update_with_index_kernel(const uint32_t num_keys, const uint32_t dim,
     }
 
     const wgrad_t *grad_ptr = grad_evs + ev_id * dim;
-    if ((!mask) or (weight_ptr == nullptr)) {
-      continue;
-    }
+
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, dim};
     optimizer.update(input);
   }

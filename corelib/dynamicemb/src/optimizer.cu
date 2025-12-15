@@ -981,4 +981,28 @@ void bind_optimizer_kernel_op(py::module &m) {
         &dyn_emb::dynamic_emb_rowwise_adagrad_fused,
         "Row Wise Adagrad optimizer for Dynamic Emb", py::arg("grads"),
         py::arg("values"), py::arg("lr"), py::arg("eps"));
+
+  m.def("sgd_update_for_combined_table",
+        &dyn_emb::sgd_update_for_combined_table,
+        "SGD optimizer for Dynamic Emb", py::arg("grads"), py::arg("indices"),
+        py::arg("dev_table"), py::arg("uvm_table"), py::arg("lr"));
+
+  m.def("adam_update_for_combined_table",
+        &dyn_emb::adam_update_for_combined_table,
+        "Adam optimizer for Dynamic Emb", py::arg("grads"), py::arg("indices"),
+        py::arg("dev_table"), py::arg("uvm_table"), py::arg("state_dim"),
+        py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
+        py::arg("weight_decay"), py::arg("iter_num"));
+
+  m.def("adagrad_update_for_combined_table",
+        &dyn_emb::adagrad_update_for_combined_table,
+        "Adagrad optimizer for Dynamic Emb", py::arg("grads"),
+        py::arg("indices"), py::arg("dev_table"), py::arg("uvm_table"),
+        py::arg("state_dim"), py::arg("lr"), py::arg("eps"));
+
+  m.def("rowwise_adagrad_for_combined_table",
+        &dyn_emb::rowwise_adagrad_for_combined_table,
+        "Row Wise Adagrad optimizer for Dynamic Emb", py::arg("grads"),
+        py::arg("indices"), py::arg("dev_table"), py::arg("uvm_table"),
+        py::arg("state_dim"), py::arg("lr"), py::arg("eps"));
 }
