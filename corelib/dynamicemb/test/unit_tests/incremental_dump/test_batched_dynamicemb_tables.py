@@ -86,9 +86,8 @@ def generate_sparse_feature(feature_num, batch, multi_hot_size):
 )
 @pytest.mark.parametrize(
     "pooling_mode",
-    [
-        DynamicEmbPoolingMode.NONE
-    ],  # [DynamicEmbPoolingMode.SUM, DynamicEmbPoolingMode.NONE]
+    # [DynamicEmbPoolingMode.NONE],
+    [DynamicEmbPoolingMode.SUM, DynamicEmbPoolingMode.NONE],
 )
 @pytest.mark.parametrize(
     "table_num, features_per_table, num_embeddings, dim",

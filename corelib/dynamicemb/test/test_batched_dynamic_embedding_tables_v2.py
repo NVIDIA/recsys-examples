@@ -262,7 +262,6 @@ def init_embedding_tables(stbe, bdet):
                 scores = None
             insert_or_assign(table, num_emb, indices, values, scores)
         elif isinstance(table, KeyValueTable):
-            table = cast(KeyValueTable, table)
             val_dim = table.value_dim()
             assert emb_dim == table.embedding_dim()
             values = torch.empty(
@@ -435,8 +434,8 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
     [
         (True, DynamicEmbPoolingMode.NONE, [8, 8, 8]),
         (False, DynamicEmbPoolingMode.NONE, [16, 16, 16]),
-        # (False, DynamicEmbPoolingMode.SUM, [128, 32, 16]),
-        # (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
+        (False, DynamicEmbPoolingMode.SUM, [128, 32, 16]),
+        (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
     ],
 )
 @pytest.mark.parametrize("PS", [None, PyDictStorage])

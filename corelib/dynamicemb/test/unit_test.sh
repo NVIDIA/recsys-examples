@@ -1,15 +1,15 @@
 set -e
 TEST_FILES=(
-    # "test/unit_tests/test_embedding_admission.sh" # Passed
-    # "test/unit_tests/table_operation/test_table_operation.sh" # Passed
+    "test/unit_tests/test_embedding_admission.sh" # Passed
+    "test/unit_tests/table_operation/test_table_operation.sh" # Passed
     # "test/unit_tests/test_lfu_scores.sh" # Failed: TODO
-    # "test/test_batched_dynamic_embedding_tables_v2.py" # Passed
-    # "test/test_unique_op.py" # Passed
-    # "test/unit_tests/test_sequence_embedding.sh" # Passed
-    # "test/unit_tests/test_pooled_embedding.sh" # Failed: pooled implementation
+    "test/test_batched_dynamic_embedding_tables_v2.py" # Passed
+    "test/test_unique_op.py" # Passed
+    "test/unit_tests/test_sequence_embedding.sh" # Passed
+    "test/unit_tests/test_pooled_embedding.sh" # Passed
     # "test/unit_tests/test_dynamicemb_table_dump_load.sh" # Failed: reserve
-    # "test/unit_tests/test_embedding_dump_load.sh" # Passed
-    # "test/unit_tests/test_twin_module.sh" # Passed
+    "test/unit_tests/test_embedding_dump_load.sh" # Passed
+    "test/unit_tests/test_twin_module.sh" # Passed
     "test/unit_tests/incremental_dump/test_incremental_dump.sh" # Passed
 )
 export DYNAMICEMB_DUMP_LOAD_DEBUG=1

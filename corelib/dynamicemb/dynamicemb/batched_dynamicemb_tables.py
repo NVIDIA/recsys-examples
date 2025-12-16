@@ -31,7 +31,12 @@ from dynamicemb.batched_dynamicemb_function import (
 )
 from dynamicemb.dynamicemb_config import *
 from dynamicemb.initializer import *
-from dynamicemb.key_value_table import Cache, KeyValueTable, Storage
+from dynamicemb.key_value_table import (
+    Cache,
+    DynamicEmbeddingTable,
+    KeyValueTable,
+    Storage,
+)
 from dynamicemb.optimizer import *
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb.utils import tabulate
@@ -250,121 +255,6 @@ def get_loading_files(
         counter_key_files,
         counter_freq_files,
     )
-
-
-def _export_matched_and_gather(
-    dynamic_table: KeyValueTable,
-    threshold: int,
-    pg: Optional[dist.ProcessGroup] = None,
-    batch_size: int = BATCH_SIZE_PER_DUMP,
-) -> Tuple[Tensor, Tensor]:
-    # Get the rank of the current process
-    rank = dist.get_rank(group=pg)
-    world_size = dist.get_world_size(group=pg)
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-    d_num_matched = torch.zeros(1, dtype=torch.uint64, device=device)
-    dynamic_table.count_matched(threshold, d_num_matched)
-
-    gathered_num_matched = [
-        torch.tensor(0, dtype=torch.int64, device=device) for _ in range(world_size)
-    ]
-    dist.all_gather(gathered_num_matched, d_num_matched.to(dtype=torch.int64), group=pg)
-
-    total_matched = sum([t.item() for t in gathered_num_matched])  # t is on device.
-    key_dtype = dynamic_table.key_type()
-    value_dtype = dynamic_table.value_type()
-    dim: int = dynamic_table.embedding_dim()
-    total_dim = dynamic_table.value_dim()
-
-    ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
-    ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
-    ret_offset = 0
-
-    search_offset = 0
-    search_capacity = dynamic_table.capacity()
-
-    d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_embs = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
-    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
-    d_count = torch.zeros(1, dtype=torch.uint64, device=device)
-
-    # Gather keys and values for all ranks
-    gathered_keys = [torch.empty_like(d_keys) for _ in range(world_size)]
-    gathered_vals = [torch.empty_like(d_embs) for _ in range(world_size)]
-    gathered_counts = [
-        torch.empty_like(d_count, dtype=torch.int64) for _ in range(world_size)
-    ]
-
-    while search_offset < search_capacity:
-        dynamic_table.export_batch_matched(
-            threshold, batch_size, search_offset, d_count, d_keys, d_vals
-        )
-
-        d_embs = d_vals.view(batch_size, total_dim)[:, :dim].reshape(-1)
-        dist.all_gather(gathered_keys, d_keys, group=pg)
-        dist.all_gather(gathered_vals, d_embs, group=pg)
-        dist.all_gather(gathered_counts, d_count.to(dtype=torch.int64), group=pg)
-
-        for d_keys_, d_vals_, d_count_ in zip(
-            gathered_keys, gathered_vals, gathered_counts
-        ):
-            h_count = d_count_.cpu().item()
-            ret_keys[ret_offset : ret_offset + h_count] = d_keys_[0:h_count].cpu()
-            ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = d_vals_[
-                0 : h_count * dim
-            ].cpu()
-            ret_offset += h_count
-
-        search_offset += batch_size
-        d_count.fill_(0)
-
-    return ret_keys, ret_vals
-
-
-def _export_matched(
-    dynamic_table: KeyValueTable,
-    threshold: int,
-    batch_size: int = BATCH_SIZE_PER_DUMP,
-) -> Tuple[Tensor, Tensor]:
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    d_num_matched = torch.zeros(1, dtype=torch.uint64, device=device)
-    dynamic_table.count_matched(threshold, d_num_matched)
-
-    total_matched = d_num_matched.cpu().item()
-    key_dtype = dynamic_table.key_type()
-    value_dtype = dynamic_table.value_type()
-    dim: int = dynamic_table.embedding_dim()
-    total_dim = dynamic_table.value_dim()
-
-    ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
-    ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
-    ret_offset = 0
-
-    search_offset = 0
-    search_capacity = dynamic_table.capacity()
-    batch_size = batch_size if batch_size < search_capacity else search_capacity
-
-    d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
-    d_count = torch.zeros(1, dtype=torch.uint64, device=device)
-
-    while search_offset < search_capacity:
-        dynamic_table.export_batch_matched(
-            threshold, batch_size, search_offset, d_count, d_keys, d_vals
-        )
-
-        h_count = d_count.cpu().item()
-        ret_keys[ret_offset : ret_offset + h_count] = d_keys[0:h_count].cpu()
-        ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = (
-            d_vals.view(batch_size, total_dim)[:h_count, :dim].reshape(-1).cpu()
-        )
-        ret_offset += h_count
-
-        search_offset += batch_size
-        d_count.fill_(0)
-
-    return ret_keys, ret_vals
 
 
 def _print_memory_consume(
@@ -679,6 +569,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "Set OptimizerType to Null as not on training mode.", UserWarning
                 )
 
+            if self.pooling_mode == DynamicEmbPoolingMode.NONE:
+                TableImpl = DynamicEmbeddingTable
+            else:
+                TableImpl = KeyValueTable
+
             if option.caching and option.training:
                 cache_option = deepcopy(option)
                 cache_option.bucket_capacity = 1024
@@ -696,7 +591,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
                 cache_option.max_capacity = capacity
                 cache_option.init_capacity = capacity
-                self._caches.append(KeyValueTable(cache_option, self._optimizer))
+                self._caches.append(TableImpl(cache_option, self._optimizer))
 
                 storage_option = deepcopy(option)
                 storage_option.local_hbm_for_values = 0
@@ -704,11 +599,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._storages.append(
                     PS(storage_option, self._optimizer)
                     if PS
-                    else KeyValueTable(storage_option, self._optimizer)
+                    else TableImpl(storage_option, self._optimizer)
                 )
             else:
                 self._caches.append(None)
-                self._storages.append(KeyValueTable(option, self._optimizer))
+                self._storages.append(TableImpl(option, self._optimizer))
 
         _print_memory_consume(
             self._table_names, self._dynamicemb_options, self._optimizer, self.device_id
@@ -1395,9 +1290,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
             storage = self._storages[index]
             if not isinstance(storage, KeyValueTable):
-                raise RuntimeError(
-                    "Only KeyValueTable is supported for incremental dump"
-                )
+                raise RuntimeError("Only KeyValueTable support incremental dump.")
 
             cache = self._caches[index]
             if cache is not None:

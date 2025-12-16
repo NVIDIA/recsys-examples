@@ -312,7 +312,7 @@ class TableShim:
         if isinstance(table, DynamicEmbTable):
             self.table = cast(DynamicEmbTable, table)
         elif isinstance(table, KeyValueTable):
-            self.table = cast(KeyValueTable, table)
+            self.table = table
         else:
             raise ValueError("Not support table type")
 
