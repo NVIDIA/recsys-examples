@@ -410,7 +410,9 @@ def create_dynamic_embedding_tables(args, device):
                 * initial_accumulator
             )
             unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
-            unique_values = unique_values.reshape(-1)
+            unique_values = unique_values.reshape(-1).view(
+                -1, args.embedding_dim + optstate_dim
+            )
 
             n = unique_indices.shape[0]
             scores = (
@@ -717,7 +719,9 @@ def main():
     features_file = f"{args.num_iterations}-{args.feature_distribution}-{num_embs}-{args.batch_size}-{args.alpha}.pt"
     try:
         with open(features_file, "rb") as f:
-            sparse_features = torch.load(f, map_location=f"cuda:{local_rank}", weights_only=False)
+            sparse_features = torch.load(
+                f, map_location=f"cuda:{local_rank}", weights_only=False
+            )
     except FileNotFoundError:
         sparse_features = []
         for i in range(args.num_iterations):
