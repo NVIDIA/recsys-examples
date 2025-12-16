@@ -144,8 +144,7 @@ def backend_session():
     ],
 )
 @pytest.mark.parametrize(
-    "is_pooled, pooling_mode",
-    [(True, PoolingType.SUM), (False, None)],  # [(False, None)],
+    "is_pooled, pooling_mode", [(True, PoolingType.SUM), (False, None)]
 )
 @pytest.mark.parametrize("batch_size", [32, 2048])
 @pytest.mark.parametrize("num_iteration", [10])
