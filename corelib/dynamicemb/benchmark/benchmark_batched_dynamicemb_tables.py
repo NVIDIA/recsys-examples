@@ -717,7 +717,7 @@ def main():
     features_file = f"{args.num_iterations}-{args.feature_distribution}-{num_embs}-{args.batch_size}-{args.alpha}.pt"
     try:
         with open(features_file, "rb") as f:
-            sparse_features = torch.load(f, map_location=f"cuda:{local_rank}")
+            sparse_features = torch.load(f, map_location=f"cuda:{local_rank}", weights_only=False)
     except FileNotFoundError:
         sparse_features = []
         for i in range(args.num_iterations):
