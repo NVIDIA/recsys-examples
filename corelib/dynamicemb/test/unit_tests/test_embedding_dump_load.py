@@ -352,7 +352,6 @@ def create_model(
 
 
 def check_counter_table_checkpoint(x, y):
-    print("Hello, check counter table")
     device = torch.cuda.current_device()
     tables_x = get_dynamic_emb_module(x)
     tables_y = get_dynamic_emb_module(y)
@@ -584,7 +583,7 @@ def test_model_load_dump(
             for kjt in kjts:
                 ret = model(kjt)
                 ref_ret = ref_model(kjt)
-                # assert torch.allclose(ret, ref_ret)
+                assert torch.allclose(ret, ref_ret)
 
 
 if __name__ == "__main__":

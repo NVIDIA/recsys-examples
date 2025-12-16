@@ -423,5 +423,4 @@ def test_incremental_dump_api(
                 ############### Test the dumped embeddings ###############
                 dump_keys = dump_keys % 100000
                 dump_vals = dump_vals.to(dump_keys.dtype)
-                # assert torch.all(dump_keys.unsqueeze(1).expand(-1, dim) == dump_vals)
-                assert torch.allclose(dump_keys.unsqueeze(1).expand(-1, dim), dump_vals)
+                assert torch.all(dump_keys.unsqueeze(1).expand(-1, dim) == dump_vals)
