@@ -181,7 +181,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 .transpose(0, 1)
                 .contiguous()
             )
-            labels = candidate_sids if self._is_train_dataset else None
+            labels = candidate_sids
             candidate_sids = candidate_sids + self._codebook_offsets.unsqueeze(0)
             # 'sequence length' is the total length
             history_lengths = (
@@ -227,7 +227,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 _num_hierarchies=self._num_hierarchies,
                 history_feature_name=self._output_history_sid_feature_name,
                 candidate_feature_name=self._output_candidate_sid_feature_name,
-                labels=labels.view(-1) if self._is_train_dataset else None,
+                labels=labels,  # for eval, we need label to calculate metrics.
             )
             yield GPTSIDBatch(**batch_kwargs)
 

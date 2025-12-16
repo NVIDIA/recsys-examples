@@ -1,11 +1,11 @@
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
-from data.gpt_sid_batch import GPTSIDBatch
+from data.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -13,8 +13,9 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
+from modules.eval_metrics import SIDRetrievalEvaluator, metric_str_to_object
 from modules.gpt_loss_module import GPTSIDLossModule
-from torchrec.sparse.jagged_tensor import JaggedTensor
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 def _padding_to_dense_and_transpose(
@@ -94,6 +95,67 @@ def _get_padded_dense_attention_mask(
     return jagged_causal_mask
 
 
+def _create_multi_region_candidate_causal_mask(
+    batchsize,
+    max_history_seqlen: int,
+    num_candidate_region: int,
+    candidate_max_seqlen_per_region: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    input sequence is : [history, candidate_region_0, candidate_region_1, ...],
+                        where history length is max_history_seqlen, each candidate region length is candidate_max_seqlen_per_region.
+    intra region: causal ; inter region: invisible.
+    each candidate needs to attend to the history
+
+    return shape [batchsize, 1 , max_history_seqlen + candidate_max_seqlen_per_region * num_candidate_region, max_history_seqlen + candidate_max_seqlen_per_region * num_candidate_region ]
+    """
+    total_seqlen = (
+        max_history_seqlen + num_candidate_region * candidate_max_seqlen_per_region
+    )
+
+    # create row and col indices [total_seqlen, total_seqlen]
+    row_indices = torch.arange(total_seqlen, device=device).unsqueeze(
+        1
+    )  # [total_seqlen, 1]
+    col_indices = torch.arange(total_seqlen, device=device).unsqueeze(
+        0
+    )  # [1, total_seqlen]
+
+    # history region: causal (row < max_history_seqlen AND col < max_history_seqlen AND row >= col)
+    is_history_row = row_indices < max_history_seqlen
+    is_history_col = col_indices < max_history_seqlen
+    history_causal = is_history_row & is_history_col & (row_indices >= col_indices)
+
+    # candidate to history (row >= max_history_seqlen AND col < max_history_seqlen)
+    is_candidate_row = row_indices >= max_history_seqlen
+    candidate_attend_history = is_candidate_row & is_history_col
+
+    # intra region: causal
+    candidate_row_idx = row_indices - max_history_seqlen  # candidate region row index
+    candidate_col_idx = col_indices - max_history_seqlen  # candidate region col index
+    row_region_id = candidate_row_idx // candidate_max_seqlen_per_region
+    row_offset = candidate_row_idx % candidate_max_seqlen_per_region
+
+    col_region_id = candidate_col_idx // candidate_max_seqlen_per_region
+    col_offset = candidate_col_idx % candidate_max_seqlen_per_region
+
+    # 判断是否在candidate区域内部 且 同一region 且 满足causal
+    is_candidate_col = col_indices >= max_history_seqlen
+    same_region = row_region_id == col_region_id
+    causal_within_region = row_offset >= col_offset
+    candidate_internal_mask = (
+        is_candidate_row & is_candidate_col & same_region & causal_within_region
+    )
+
+    mask = history_causal | candidate_attend_history | candidate_internal_mask
+
+    # expand batch dimension: [batchsize, 1, total_seqlen, total_seqlen]
+    mask = mask.unsqueeze(0).unsqueeze(0).expand(batchsize, 1, -1, -1)
+
+    return mask
+
+
 class SIDGRDecoder(MegatronModule):
     """
     Don't support PP currently. Does not include embedding
@@ -158,6 +220,9 @@ class SIDGRModel(MegatronModule):
         relative_attention_num_buckets: int = 32,
         relative_attention_max_distance: int = 128,
         should_add_sep_token: bool = True,
+        top_k_for_generation: int = 10,  # this is used for eval
+        eval_metrics: List[str] = [],  # this is used for eval
+        eval_top_k_list: List[int] = [],  # this is used for eval
     ):
         super(SIDGRModel, self).__init__(config=decoder_config)
         assert (
@@ -230,6 +295,25 @@ class SIDGRModel(MegatronModule):
             else (torch.bfloat16 if decoder_config.bf16 else torch.float32)
         )
 
+        # below are used for eval
+        self.top_k_for_generation = top_k_for_generation  # beam search width.
+        metrics = {}
+        for top_k in eval_top_k_list:
+            assert (
+                top_k <= top_k_for_generation
+            ), "top_k for generation should be greater than top_k for evaluation"
+        for metric_str in eval_metrics:
+            metrics.update(
+                {
+                    metric_str: metric_str_to_object[metric_str]
+                    for top_k in eval_top_k_list
+                }
+            )
+        self.evaluator = SIDRetrievalEvaluator(
+            metrics=metrics,
+            top_k_list=eval_top_k_list,
+        )
+
     def bfloat16(self):
         """
         Convert the model to use bfloat16 precision. Only affects the decoder & mlp module.
@@ -258,132 +342,100 @@ class SIDGRModel(MegatronModule):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return id_embeddings, attention_mask
 
-    def _concat_history_bos_candidate(
+    def _concat_jagged(
         self,
-        history_hidden_states: torch.Tensor,  # sid
-        candidate_hidden_states: torch.Tensor,  # sid
-        cu_seqlens_history: torch.Tensor,  # sid
-        cu_seqlens_candidate: torch.Tensor,  # sid
-        cu_seqlens_bos: torch.Tensor,  # bos
-        max_seqlen_history: int,
-        max_seqlen_candidate: int,
-        bos_token: torch.Tensor,
-        batch_size: int,
-        num_hierarchies: int,
+        jagged_embeddings: List[torch.Tensor],
+        jagged_offsets: List[torch.Tensor],
+        jagged_max_seqlens: List[int],
     ) -> torch.Tensor:
-        assert cu_seqlens_history.size(0) == cu_seqlens_candidate.size(
-            0
-        ), "history and candidate must have the same batch size"
-
-        # we now only have one bos token.
-        bos_token = bos_token.repeat(
-            batch_size, 1
-        ).contiguous()  # seqlens * num_hierarchies
-
+        assert (
+            len(jagged_embeddings) == len(jagged_offsets) == len(jagged_max_seqlens)
+        ), "all jagged tensors should have the same length"
         # [
         #    [s0_0,s1_0,s2_0], [bos], [c0_0, c1_0, c2_0],
         #    [s0_1,s1_1,s2_1; s0_2,s1_2,s2_2], [bos], [c0_1, c1_1, c2_1],
         #    [s0_4,s1_4,s2_4], [bos], [c0_4, c1_4, c2_4],
         # ]
-        max_seqlen_concat = max_seqlen_history + 1 + max_seqlen_candidate
+        max_seqlen_concat = sum(jagged_max_seqlens)
         cated_hidden_states, cated_seqlens = jagged_2D_tensor_concat(
-            [history_hidden_states, bos_token, candidate_hidden_states],
-            [cu_seqlens_history, cu_seqlens_bos, cu_seqlens_candidate],
-            [max_seqlen_history, 1, max_seqlen_candidate],
+            jagged_embeddings,
+            jagged_offsets,
+            jagged_max_seqlens,
         )
         cated_offsets = length_to_complete_offsets(cated_seqlens)
         return cated_hidden_states, cated_offsets, max_seqlen_concat
 
-    def forward(
+    def _prepare_embeddings(
         self,
         batch: GPTSIDBatch,
-    ) -> torch.Tensor:
+        include_candidate: bool = True,  # False for generation
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
         history_feature_name = batch.history_feature_name
-        candidate_feature_name = batch.candidate_feature_name
-        # here assume the input sids are hierarchically properly biased.
         history_features = batch.features[history_feature_name]
-        candidate_features = batch.features[candidate_feature_name]
+        max_seqlen_history = batch.feature_to_max_seqlen[history_feature_name]
+        history_offsets = history_features.offsets()
 
-        # 1. embedding lookuo
-        batch.features[history_feature_name].offsets()[-1].item()
+        # 1. embedding lookup
         embeddings: Dict[str, JaggedTensor] = self._codebooks_collection(batch.features)
         # TODO, remove the assertion
         assert all(
             feature_name in embeddings.keys() for feature_name in batch.features.keys()
-        ), "history and candidate feature names must be in the embeddings"
+        ), "all embedding feature names should be valid"
         assert (
             self._num_hierarchies == batch._num_hierarchies
         ), "number of hierarchies must match"
         # total_seqlen = history_features.size(0) // self._num_hierarchies
-        # candidate_seqlen = candidate_features.size(0) // self._num_hierarchies
-        max_seqlen_history = batch.feature_to_max_seqlen[history_feature_name]
-        max_seqlen_candidate = batch.feature_to_max_seqlen[candidate_feature_name]
         bos_offsets = torch.arange(
             0,
             batch.batch_size + 1,
-            device=history_features.offsets().device,
-            dtype=history_features.offsets().dtype,
+            device=history_offsets.device,
+            dtype=history_offsets.dtype,
         )
-        history_offsets = history_features.offsets()
-        candidate_offsets = candidate_features.offsets()
-        # 2. preprocess:concat history, bos, candidate ( TODO: add position encoder )
+        # 2. concat history, bos, optionally candidate ( TODO: add position encoder )
+        bos_token = (
+            self.bos_token.repeat(batch.batch_size, 1)
+            .contiguous()
+            .to(self._training_dtype)
+        )  # seqlens * num_hierarchies
+        jagged_embeddings: List[torch.Tensor] = [
+            embeddings[history_feature_name].values().to(self._training_dtype),
+            bos_token,
+        ]
+        jagged_offsets: List[torch.Tensor] = [history_offsets, bos_offsets]
+        jagged_max_seqlens: List[int] = [max_seqlen_history, 1]
+        if include_candidate:
+            candidate_feature_name = batch.candidate_feature_name
+            jagged_embeddings.append(
+                embeddings[candidate_feature_name].values().to(self._training_dtype)
+            )
+            jagged_offsets.append(batch.features[candidate_feature_name].offsets())
+            jagged_max_seqlens.append(
+                batch.feature_to_max_seqlen[candidate_feature_name]
+            )
+
         (
             input_hidden_states,
             input_offsets,
             input_max_seqlen,
-        ) = self._concat_history_bos_candidate(
-            embeddings[history_feature_name]
-            .values()
-            .to(
-                self._training_dtype
-            ),  # embedding output type is decoupeld, we need to cvt to training dtype.
-            embeddings[candidate_feature_name]
-            .values()
-            .to(
-                self._training_dtype
-            ),  # embedding output type is decoupeld, we need to cvt to training dtype.
-            history_offsets,
-            candidate_offsets,
-            bos_offsets,
-            max_seqlen_history,  # note that this is already multiplied by num_hierarchies
-            max_seqlen_candidate,  # note that this is already multiplied by num_hierarchies
-            self.bos_token.to(
-                self._training_dtype
-            ),  # embedding output type is decoupeld, we need to cvt to training dtype.
-            batch.batch_size,
-            self._num_hierarchies,
+        ) = self._concat_jagged(
+            jagged_embeddings,
+            jagged_offsets,
+            jagged_max_seqlens,
         )
 
-        # packed_seq_params = to_packed_seq_params(
-        #     input_offsets,
-        #     input_max_seqlen,
-        # )
-        # we need to unsqueeze the hidden states to [T, 1, hidden_size] and unsqueeze back after decoder
+        # TODO, considering removing the bos_offsets from the return value for better readability.
+        return input_hidden_states, input_offsets, input_max_seqlen, bos_offsets
 
-        # THD still needs batch dimension
-        # input_hidden_states = input_hidden_states.unsqueeze(1)
-        # output_hidden_states = output_hidden_states.squeeze(1)
-        smajor_dense_input_hidden_states = _padding_to_dense_and_transpose(
-            input_hidden_states,
-            input_offsets,
-            input_max_seqlen,
-        )
-        attention_mask = _get_padded_dense_attention_mask(
-            input_offsets,
-            input_max_seqlen,
-        )
-        # 3. decoder (causal self-attention)
-        dense_output_hidden_states = self.decoder(
-            hidden_states=smajor_dense_input_hidden_states,  # input_hidden_states,
-            attention_mask=attention_mask,
-            packed_seq_params=None,  # we now enforce arbitrary attention mask + dense padding
-        )
-        jagged_output_hidden_states = _transpose_dense_to_jagged(
-            dense_output_hidden_states,
-            input_offsets,
-            input_max_seqlen,
-        )
-        # 4. postprocess: split history, candidate, note that we append a bos token, so we need to remove the last token.
+    def _postprocess_output(
+        self,
+        jagged_output_hidden_states: torch.Tensor,
+        input_max_seqlen: int,
+        history_offsets: torch.Tensor,
+        candidate_offsets: torch.Tensor,
+        bos_offsets: torch.Tensor,
+        max_seqlen_candidate: int,
+    ) -> torch.Tensor:
+        # split history, candidate, note that we append a bos token, so we need to remove the last token.
         # history are dropped.
         # TODO, replace with one-shot op
         _, output_hidden_states_bos_candidate = triton_split_2D_jagged(
@@ -402,13 +454,100 @@ class SIDGRModel(MegatronModule):
         candidate_hidden_states = output_hidden_states.reshape(
             -1, self._num_hierarchies, self.embedding_dim
         )
+        return candidate_hidden_states
+
+    def decoder_step(
+        self,
+        input_hidden_states: torch.Tensor,
+        input_offsets: torch.Tensor,
+        input_max_seqlen: int,
+        attention_mask: Optional[torch.Tensor] = None,
+        padding_to_dense: bool = True,
+    ) -> torch.Tensor:
+        """
+        Input and Output are both jagged.
+        attention_mask is used only when padding_to_dense is True.
+        When attention mask is None, we will construct a causal attention mask if padding_to_dense is True.
+        """
+        # TODO, remove the padding.
+        if padding_to_dense:
+            decoder_input_hidden_states = _padding_to_dense_and_transpose(
+                input_hidden_states,
+                input_offsets,
+                input_max_seqlen,
+            )
+            packed_seq_params = None
+            if attention_mask is None:
+                attention_mask = _get_padded_dense_attention_mask(
+                    input_offsets,
+                    input_max_seqlen,
+                )
+        else:
+            # THD still needs batch dimension
+            # we need to unsqueeze the hidden states to [T, 1, hidden_size] and unsqueeze back after decoder
+            assert input_hidden_states.dim() == 2, "input_hidden_states should be 2D"
+            decoder_input_hidden_states = input_hidden_states.unsqueeze(1)
+            attention_mask = None
+            packed_seq_params = to_packed_seq_params(
+                input_offsets,
+                input_max_seqlen,
+            )
+
+        # causal self-attention
+        decoder_output_hidden_states = self.decoder(
+            hidden_states=decoder_input_hidden_states,  # input_hidden_states,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,  # we now enforce arbitrary attention mask + dense padding
+        )
+
+        if padding_to_dense:
+            output_hidden_states = _transpose_dense_to_jagged(
+                decoder_output_hidden_states,
+                input_offsets,
+                input_max_seqlen,
+            )
+        else:
+            # remove batch dim if THD
+            output_hidden_states = decoder_output_hidden_states.squeeze(1)
+        return output_hidden_states
+
+    def forward(
+        self,
+        batch: GPTSIDBatch,
+    ) -> torch.Tensor:
+        # 1. prepare embeddings: embedding lookup + history, bos and candidate concat
+        (
+            input_hidden_states,
+            input_offsets,
+            input_max_seqlen,
+            bos_offsets,
+        ) = self._prepare_embeddings(batch)
+        history_offsets = batch.features[batch.history_feature_name].offsets()
+        candidate_offsets = batch.features[batch.candidate_feature_name].offsets()
+        max_seqlen_candidate = batch.feature_to_max_seqlen[batch.candidate_feature_name]
+
+        # 2. decoder step
+        jagged_output_hidden_states = self.decoder_step(
+            input_hidden_states,
+            input_offsets,
+            input_max_seqlen,
+            attention_mask=None,
+        )
+        # 3. postprocess: only keep the candidate hidden states
+        candidate_hidden_states = self._postprocess_output(
+            jagged_output_hidden_states,
+            input_max_seqlen,
+            history_offsets,
+            candidate_offsets,
+            bos_offsets,
+            max_seqlen_candidate,
+        )
         losses_per_hierarchy = []
         logits_per_hierarchy = []
         merged_labels = batch.labels.view(-1, self._num_hierarchies)
 
-        # 5. output linear projection & loss
+        # 4. output linear projection & loss
         # TODO, merge into single linear layer
-        # note that the labels
         for hierarchy_idx, mlp in enumerate[Any](self._decoder_mlp):
             tuple_or_tensor = mlp(candidate_hidden_states[:, hierarchy_idx, :])
             candidate_hierarchy_logits = (
@@ -429,3 +568,224 @@ class SIDGRModel(MegatronModule):
             -1, self.codebook_size
         )
         return merged_losses, merged_logits
+
+    def _beam_search_generate(
+        self,
+        candidate_hidden_states: torch.Tensor,
+        batch_size: int,
+        step: int,
+        generated_sids: Optional[
+            torch.Tensor
+        ] = None,  # None in the first step, we will iteratively update the previous generated sids with the filtered sids!
+        log_probs: Optional[torch.Tensor] = None,  # None in the first step
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        hidden_states: [T, hidden_size] where T is the history + past candidates. The dense shape: [B, max_history_seqlen + max_candidates_seqlen, hidden_size ]
+        We will perform embedding lookup for the candidates, and then perform the beam search generation.
+        return generated_sids, log_probs
+
+        generated_sids : [batch_size, topk_last_step, generated_step]
+        log_probs: [batch_size, topk_last_step]
+        """
+        ## TODO Remove those assertions for performance!
+        assert (
+            step < self._num_hierarchies
+        ), "step should be less than the number of hierarchies"
+
+        topk_last_step = 1
+        # TODO, we might have dynamic beam search width!
+        topk_this_step = self.top_k_for_generation
+        if step > 0:
+            assert (
+                generated_sids is not None and log_probs is not None
+            ), "generated_sids and log_probs should be provided in the subsequent steps"
+            _, topk_last_step, generated_step = generated_sids.shape
+            assert (
+                generated_step == step
+            ), "current step should match the hierarchy index"
+        else:
+            topk_last_step, generated_step = 1, 1
+
+        # we keep the last step of the candidate hidden states for current step.
+        candidate_hidden_states = candidate_hidden_states.view(
+            batch_size, topk_last_step, generated_step, -1
+        )[:, :, -1, :]
+        # [batch_size, topk_last_step, current_codebook_size]
+        tuple_or_tensor: Union[
+            Tuple[torch.Tensor, torch.Tensor], torch.Tensor
+        ] = self._decoder_mlp[step](candidate_hidden_states)
+
+        candidates_logits = (
+            tuple_or_tensor[0]
+            if isinstance(tuple_or_tensor, tuple)
+            else tuple_or_tensor
+        )
+
+        probs_this_step: torch.Tensor = torch.log(
+            torch.nn.functional.softmax(candidates_logits.float(), dim=-1)
+        )
+        current_codebook_size = probs_this_step.size(-1)
+
+        # [batch_size, topk_last_step * current_codebook_size]
+        accumulated_log_probs = (
+            (
+                log_probs.view(batch_size, topk_last_step, 1)
+                if log_probs is not None
+                else 0.0
+            )
+            + probs_this_step
+        ).view(batch_size, -1)
+        topk_probs, topk_indices = torch.topk(
+            accumulated_log_probs, topk_this_step, dim=-1
+        )
+
+        current_step_sids = (
+            topk_indices % current_codebook_size
+        )  # selected codebook index
+        # TODO, add validity filter for the generated sids!
+        if generated_sids is not None:
+            last_step_indices = (
+                topk_indices // current_codebook_size
+            )  # selected history index
+            last_step_indices = last_step_indices.unsqueeze(-1).expand(
+                -1, -1, generated_step
+            )
+            last_step_sids = torch.gather(
+                generated_sids, dim=1, index=last_step_indices
+            )
+            generated_sids = torch.cat(
+                [last_step_sids, current_step_sids.unsqueeze(-1)], dim=-1
+            )
+        else:
+            generated_sids = current_step_sids.unsqueeze(
+                -1
+            )  # [batch_size, topk_this_step, 1]
+
+        return generated_sids, topk_probs
+
+    @torch.no_grad
+    def generate(self, batch: GPTSIDBatch) -> torch.Tensor:
+        """
+        Generate the output sids for the given batch. The generation will autogressively generate the output sids with a constrained fixed-width beam search strategy.
+        Args:
+          batch (GPTSIDBatch): The batch of data.
+        Returns:
+          torch.Tensor: The generated sids.
+        """
+
+        generated_sids: Optional[torch.Tensor] = None
+        log_probs: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None
+        # iteratively generate the output sids with a fixed-width beam search strategy.
+        # 0. prepare history and bos embeddings.
+        (
+            input_hidden_states,
+            input_offsets,
+            input_max_seqlen,
+            _,
+        ) = self._prepare_embeddings(batch, include_candidate=False)
+
+        # TODO : fix the incomplete batch
+        batch_size = input_offsets.size(0) - 1
+        # we no don't have the KV cache!
+        for i in range(self._num_hierarchies):
+            # 1. prepare embeddings: [concat history, generated sids]
+            if generated_sids is not None:
+                # topk might be not always equal to the beam width because we have validation check.
+                batch_size, topk_this_step, candidate_length = generated_sids.shape
+                assert (
+                    candidate_length == i
+                ), "current step should match the hierarchy index"
+
+                # we must append hist. This is the defect of torchrec. Considering using torch.nn.Embedding
+                generated_sids_kjt = KeyedJaggedTensor.from_lengths_sync(
+                    keys=[
+                        batch.candidate_feature_name,
+                        batch.history_feature_name,
+                    ],
+                    values=generated_sids.view(-1),
+                    lengths=torch.cat(
+                        [
+                            torch.full(
+                                (batch_size,),
+                                topk_this_step * candidate_length,
+                                device=generated_sids.device,
+                                dtype=torch.long,
+                            ),
+                            torch.zeros(
+                                (batch_size,),
+                                device=generated_sids.device,
+                                dtype=torch.long,
+                            ),
+                        ]
+                    ),
+                )
+                generated_embeddings = (
+                    self._codebooks_collection(generated_sids_kjt)[
+                        batch.candidate_feature_name
+                    ]
+                    .values()
+                    .to(self._training_dtype)
+                )
+                candidate_offsets = generated_sids_kjt[
+                    batch.candidate_feature_name
+                ].offsets()
+                # Jagged concat!
+                (
+                    cated_hidden_states,
+                    cated_offsets,
+                    cated_max_seqlen,
+                ) = self._concat_jagged(
+                    [input_hidden_states, generated_embeddings],
+                    [input_offsets, candidate_offsets],
+                    [input_max_seqlen, topk_this_step * candidate_length],
+                )
+            else:
+                # when we are at the first step, we do not have any generated sids and only bos token appended to the input.
+                topk_this_step, candidate_length = 0, 0
+                cated_hidden_states = input_hidden_states
+                cated_offsets = input_offsets
+                cated_max_seqlen = input_max_seqlen
+
+                # we fake the candidate offsets for the first step, it will be updated in the next step.
+                candidate_offsets = torch.arange(
+                    0,
+                    batch_size + 1,
+                    device=input_offsets.device,
+                    dtype=input_offsets.dtype,
+                )
+
+            # 2. prepare the attention mask
+            attention_mask = _create_multi_region_candidate_causal_mask(
+                batch_size,
+                input_max_seqlen,
+                topk_this_step,
+                candidate_length,
+                device=cated_hidden_states.device,
+            )
+
+            # 3. we need a decoder step with the concatenated hidden states and offsets
+            jagged_output_hidden_states = self.decoder_step(
+                cated_hidden_states,
+                cated_offsets,
+                cated_max_seqlen,
+                attention_mask=attention_mask,
+                padding_to_dense=True,
+            )
+            _, candidate_hidden_states = triton_split_2D_jagged(
+                jagged_output_hidden_states,
+                max_seq_len=cated_max_seqlen,
+                offsets_a=cated_offsets - candidate_offsets,
+                offsets_b=candidate_offsets,
+            )
+
+            # 4. filter the topk candidates, update the generated_sids and log_probs for the next step
+            generated_sids, log_probs = self._beam_search_generate(
+                candidate_hidden_states,
+                batch_size=batch_size,
+                step=i,
+                generated_sids=generated_sids,  # None in the first step.
+                log_probs=log_probs,  # None in the first step.
+            )
+
+        return generated_sids, log_probs

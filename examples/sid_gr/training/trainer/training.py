@@ -20,6 +20,7 @@ from typing import Iterator, Optional, Union
 import commons.checkpoint as checkpoint
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
+from commons.checkpoint import get_unwrapped_module
 from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
@@ -41,7 +42,27 @@ def evaluate(
     trainer_args: TrainerArgs,
     eval_loader: torch.utils.data.DataLoader,
 ):
-    pass
+    iterated_eval_loader = islice(eval_loader, len(eval_loader))
+    model = get_unwrapped_module(pipeline._model)
+    trainer_args.max_eval_iters or len(eval_loader)
+    min(trainer_args.max_eval_iters, len(eval_loader))
+    for i in range(trainer_args.max_eval_iters):
+        # for batch in iterated_eval_loader:
+        batch = next(iterated_eval_loader)
+        batch = batch.to(torch.cuda.current_device())
+        labels = batch.labels
+        generated_sids, log_probs = model.generate(batch)
+        # stateful_metric_module.compute(generated_sids, log_probs, labels)
+        # labels should batch_size, num_hierarchies
+        hit = (generated_sids - labels.unsqueeze(1)).sum(dim=-1).sum(-1) == 0
+        # [batch_size, topk]
+        print(f" iter {i} last identifier", generated_sids[:, :, -1])
+        if hit.any():
+            print("eval hit labels!!")
+            import pdb
+
+            pdb.set_trace()
+
     # eval_iter = 0
     # torch.cuda.nvtx.range_push(f"#evaluate")
     # max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
