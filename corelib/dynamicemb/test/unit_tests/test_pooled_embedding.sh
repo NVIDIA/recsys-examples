@@ -36,10 +36,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
   --nproc_per_node 4 \
   ./test/unit_tests/test_pooled_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --batch_size=1024 --num_embeddings_per_feature=8388608,4194304,524288,1048576
 
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
-#   --nnodes 1 \
-#   --nproc_per_node 8 \
-#   ./test/unit_tests/test_pooled_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --batch_size=1024 --num_embeddings_per_feature=8388608,4194304,524288,1048576
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
+  --nnodes 1 \
+  --nproc_per_node 8 \
+  ./test/unit_tests/test_pooled_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --batch_size=1024 --num_embeddings_per_feature=8388608,4194304,524288,1048576
 
 
 # Test sequence embedding's backward on a single GPU with different ["use_index_dedup", "dim", "batch_size", "multi_hot_sizes"]

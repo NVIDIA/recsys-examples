@@ -1087,7 +1087,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             uvm_table = get_uvm_tensor(
                 uvm_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
-        elif self.local_hbm_for_values >= total_memory_need:
+        elif self.options.local_hbm_for_values >= total_memory_need:
             dev_size = target_capacity * self._value_dim
             dev_table = torch.empty(
                 dev_size, dtype=self._emb_dtype, device=self.device
@@ -1095,7 +1095,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         else:
             # hybrid mode
             dev_size = (
-                self.local_hbm_for_values
+                self.options.local_hbm_for_values
                 // (self._value_dim * dtype_to_bytes(self._emb_dtype))
                 * self._value_dim
             )
@@ -1188,7 +1188,7 @@ class DynamicEmbeddingTable(KeyValueTable):
                 policy=self.score_policy.policy
                 if self._score_update
                 else ScorePolicy.CONST,
-                is_return=False,
+                is_return=True,
             )
         ]
 
