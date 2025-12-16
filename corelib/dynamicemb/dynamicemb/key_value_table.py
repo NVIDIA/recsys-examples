@@ -955,6 +955,19 @@ class KeyValueTable(
         key, value = _export_matched_per_table(pg, self, score_threshold)
         return key, value.view(-1, self._emb_dim)
 
+    def export_keys_values(
+        self,
+        device: torch.device,
+        batch_size: int = 65536,
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        export keys, embeddings, opt_states, scores
+        """
+
+        return batched_export_keys_values(
+            self.table, device=device, batch_size=batch_size
+        )
+
 
 class DynamicEmbeddingTable(KeyValueTable):
     def __init__(
@@ -966,9 +979,9 @@ class DynamicEmbeddingTable(KeyValueTable):
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
 
-        assert (
-            options.init_capacity == options.max_capacity
-        ), "Capacity growth is appending..."
+        # assert (
+        #     options.init_capacity == options.max_capacity
+        # ), "Capacity growth is appending..."
 
         self.score_policy = get_score_policy(options.score_strategy)
         self.evict_strategy_ = options.evict_strategy.value
@@ -1046,6 +1059,97 @@ class DynamicEmbeddingTable(KeyValueTable):
         self._record_cache_metrics = False
         self._use_score = self.evict_strategy_ != EvictStrategy.KLru
         self._timestamp = device_timestamp()
+
+    def expand(self):
+        if self.capacity == self.options.max_capacity:
+            return
+        if self.key_index_map.load_factor() < self.options.max_load_factor:
+            return
+
+        target_capacity = min(self.options.max_capacity, self._capacity * 2)
+        total_memory_need = (
+            target_capacity * self._value_dim * dtype_to_bytes(self._emb_dtype)
+        )
+
+        key_index_map = get_scored_table(
+            capacity=target_capacity,
+            bucket_capacity=self.options.bucket_capacity,
+            key_type=self.options.index_type,
+            score_specs=[self.score_policy],
+            device=self.device,
+        )
+
+        dev_table = None
+        uvm_table = None
+
+        if self.options.local_hbm_for_values == 0:
+            uvm_size = target_capacity * self._value_dim
+            uvm_table = get_uvm_tensor(
+                uvm_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+        elif self.local_hbm_for_values >= total_memory_need:
+            dev_size = target_capacity * self._value_dim
+            dev_table = torch.empty(
+                dev_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+        else:
+            # hybrid mode
+            dev_size = (
+                self.local_hbm_for_values
+                // (self._value_dim * dtype_to_bytes(self._emb_dtype))
+                * self._value_dim
+            )
+            uvm_size = target_capacity * self._value_dim - dev_size
+            dev_table = torch.empty(
+                dev_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+            uvm_table = get_uvm_tensor(
+                uvm_size, dtype=self._emb_dtype, device=self.device
+            ).view(-1, self._value_dim)
+
+        for (
+            keys,
+            named_scores,
+            indices,
+        ) in self.key_index_map._batched_export_keys_scores(
+            [self.score_policy.name],
+            self.device,
+            return_index=True,
+        ):
+            scores = named_scores[self.score_policy.name]
+
+            values = torch.empty(
+                (keys.numel(), self._value_dim),
+                dtype=self.value_type(),
+                device=self.device,
+            )
+            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
+
+            # when load into the table, we always assign the scores from the file.
+            score_args_insert = [
+                ScoreArg(
+                    name=self.score_policy.name,
+                    value=scores,
+                    policy=ScorePolicy.ASSIGN,
+                    is_return=False,
+                )
+            ]
+            indices = torch.zeros(
+                keys.numel(), dtype=key_index_map.index_type, device=keys.device
+            )
+
+            key_index_map.insert(keys, score_args_insert, indices)
+            store_to_combined_table(
+                dev_table,
+                uvm_table,
+                indices,
+                values,
+            )
+
+        self.key_index_map = key_index_map
+        self.dev_table = dev_table
+        self.uvm_table = uvm_table
+        self._capacity = target_capacity
 
     def find_impl(
         self,
@@ -1191,6 +1295,8 @@ class DynamicEmbeddingTable(KeyValueTable):
         unique_values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> None:
+        self.expand()
+
         h_num_unique_keys = unique_keys.numel()
 
         if self._use_score and scores is None:
@@ -1516,6 +1622,8 @@ class DynamicEmbeddingTable(KeyValueTable):
         scores: Optional[torch.Tensor] = None,
         opt_states: Optional[torch.Tensor] = None,
     ):
+        self.expand()
+
         dim = embeddings.size(1)
         optstate_dim = self.optim_state_dim()
         if not keys.is_cuda:
@@ -1546,7 +1654,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             else embeddings
         )
 
-        key_type = self.key_index_map.key_type
+        self.key_index_map.key_type
         value_type = self.value_type()
 
         # when load into the table, we always assign the scores from the file.
@@ -1560,7 +1668,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         else:
             scores = scores.to(SCORE_TYPE)
 
-        self.insert(keys.to(key_type), values.to(value_type), scores)
+        # self.insert(keys.to(key_type), values.to(value_type), scores)
 
         score_args_insert = [
             ScoreArg(
@@ -1655,6 +1763,8 @@ class DynamicEmbeddingTable(KeyValueTable):
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self.expand()
+
         batch = keys.numel()
         evicted_values: torch.Tensor = torch.empty_like(values)
 

@@ -319,7 +319,7 @@ def test_forward_train_eval(opt_type, opt_params, caching, PS):
     key_type = torch.int64
     value_type = torch.float32
 
-    init_capacity = 2048
+    init_capacity = 1024
     max_capacity = 2048
 
     dyn_emb_table_options_list = []

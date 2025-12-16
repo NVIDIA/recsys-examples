@@ -386,7 +386,7 @@ def test_table_incremental_dump(
 
     # check 2: table.incremental_dump is consistent with count_matched
     dumped_keys, dumped_named_scores, _ = table.incremental_dump({"score1": 0})
-    assert dumped_keys.numel() == bucket_capacity * world_size
+    assert dumped_keys.numel() == bucket_capacity
     assert set(dumped_keys[(dumped_keys % world_size == local_rank)].tolist()) == set(
         keys.tolist()
     )
