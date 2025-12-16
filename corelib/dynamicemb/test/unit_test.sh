@@ -2,7 +2,7 @@ set -e
 TEST_FILES=(
     "test/unit_tests/test_embedding_admission.sh" # Passed
     "test/unit_tests/table_operation/test_table_operation.sh" # Passed
-    # "test/unit_tests/test_lfu_scores.sh" # Failed: TODO
+    "test/unit_tests/test_lfu_scores.sh" # Failed: TODO
     "test/test_batched_dynamic_embedding_tables_v2.py" # Passed
     "test/test_unique_op.py" # Passed
     "test/unit_tests/test_sequence_embedding.sh" # Passed

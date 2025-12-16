@@ -503,7 +503,6 @@ def test_model_load_dump(
                     for batched_key, _, _, batched_score in table.export_keys_values(
                         torch.device(f"cpu")
                     ):
-                        print("OK at 506")
                         for key, score in zip(
                             batched_key.tolist(), batched_score.tolist()
                         ):
@@ -516,7 +515,6 @@ def test_model_load_dump(
                     ) in counter_table.table_._batched_export_keys_scores(
                         counter_table.table_.score_names_, torch.device(f"cpu")
                     ):
-                        print("OK at 517")
                         if keys.numel() == 0:
                             continue
                         for key in keys.tolist():

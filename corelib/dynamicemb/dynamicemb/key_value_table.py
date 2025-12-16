@@ -1608,16 +1608,7 @@ class DynamicEmbeddingTable(KeyValueTable):
                 dtype=self.value_type(),
                 device=self.device,
             )
-            torch.cuda.synchronize()
-            print(f"export key values 865")
-            dev_shape = self.dev_table.shape if self.dev_table is not None else None
-            uvm_shape = self.uvm_table.shape if self.uvm_table is not None else None
-            print(
-                f"{dev_shape}, {uvm_shape}, {torch.max(indices)}, {torch.min(indices)}, {self.dev_table.dtype}, {values.dtype}, {indices.shape}, {values.shape}"
-            )
             load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
-            torch.cuda.synchronize()
-            print(f"export key values 868")
             embeddings = (
                 values[:, : self._emb_dim].to(dtype=EMBEDDING_TYPE).contiguous()
             )

@@ -962,9 +962,6 @@ class LinearBucketTable(ScoredHashTable):
                     scores_list.append(None)
             d_counter = torch.zeros(1, dtype=COUNTER_TYPE, device=device)
 
-            torch.cuda.synchronize()
-            print(f"OK at 966")
-
             table_export_batch(
                 self.table_storage_,
                 self.fileds_type_,
@@ -977,9 +974,6 @@ class LinearBucketTable(ScoredHashTable):
                 thresholds_,
                 indices,
             )
-
-            torch.cuda.synchronize()
-            print(f"OK at 983")
 
             actual_length = d_counter.item()
             if actual_length > 0:
@@ -1123,119 +1117,6 @@ class LinearBucketTable(ScoredHashTable):
         assert (
             total_matched == out_offset
         ), "Dumped keys number mismatched with the expected count."
-
-        # else:
-        #     # Get the rank of the current process
-        #     world_size = dist.get_world_size(group=pg)
-
-        #     gathered_num_matched = [
-        #         torch.tensor(0, dtype=COUNTER_TYPE, device=self.device)
-        #         for _ in range(world_size)
-        #     ]
-        #     dist.all_gather(gathered_num_matched, d_num_matched, group=pg)
-
-        #     total_matched = sum([t.item() for t in gathered_num_matched])
-
-        #     out_keys = torch.empty(total_matched, dtype=KEY_TYPE, device="cpu")
-        #     out_indices = (
-        #         torch.empty(total_matched, dtype=self.index_type, device="cpu")
-        #         if return_index
-        #         else None
-        #     )
-        #     for score_name in out_scores.keys():
-        #         out_scores[score_name] = torch.empty(
-        #             total_matched, dtype=SCORE_TYPE, device="cpu"
-        #         )
-
-        #     d_keys = torch.empty(batch_size, dtype=KEY_TYPE, device=self.device)
-        #     d_scores: List[torch.Tensor] = [None for _ in self.score_names_]
-        #     d_indices = (
-        #         torch.empty(batch_size, dtype=self.index_type, device=self.device)
-        #         if return_index
-        #         else None
-        #     )
-        #     for score_name in out_scores.keys():
-        #         index = self.score_names_.index(score_name)
-        #         d_scores[index] = torch.empty(
-        #             batch_size, dtype=SCORE_TYPE, device=self.device
-        #         )
-        #     d_count = torch.zeros(1, dtype=COUNTER_TYPE, device=self.device)
-
-        #     # Gather keys and scores for all ranks
-        #     gathered_keys = [torch.empty_like(d_keys) for _ in range(world_size)]
-        #     gathered_scores: Dict[str, List[torch.Tensor]] = {}
-        #     gathered_indices = (
-        #         [torch.empty_like(d_indices) for _ in range(world_size)]
-        #         if return_index
-        #         else None
-        #     )
-
-        #     for score_name in out_scores.keys():
-        #         index = self.score_names_.index(score_name)
-        #         gathered_scores[score_name] = [
-        #             torch.empty_like(d_scores[index]) for _ in range(world_size)
-        #         ]
-
-        #     gathered_counts = [
-        #         torch.empty_like(d_count, dtype=COUNTER_TYPE) for _ in range(world_size)
-        #     ]
-
-        #     out_offset = 0
-        #     search_offset = 0
-        #     search_capacity = self.capacity_
-
-        #     while search_offset < search_capacity:
-        #         batch_ = min(batch_size, search_capacity - search_offset)
-        #         table_export_batch(
-        #             self.table_storage_,
-        #             self.fileds_type_,
-        #             self.bucket_capacity_,
-        #             batch_,
-        #             search_offset,
-        #             d_count,
-        #             d_keys,
-        #             d_scores,
-        #             thresholds_total,
-        #             d_indices,
-        #         )
-
-        #         dist.all_gather(gathered_keys, d_keys, group=pg)
-        #         for score_name in out_scores.keys():
-        #             index = self.score_names_.index(score_name)
-        #             dist.all_gather(
-        #                 gathered_scores[score_name], d_scores[index], group=pg
-        #             )
-
-        #         if return_index:
-        #             dist.all_gather(gathered_indices, d_indices, group=pg)
-
-        #         dist.all_gather(gathered_counts, d_count, group=pg)
-
-        #         for i in range(world_size):
-        #             d_keys_ = gathered_keys[i]
-        #             d_count_ = gathered_counts[i]
-
-        #             h_count = d_count_.cpu().item()
-        #             out_keys[out_offset : out_offset + h_count].copy_(
-        #                 d_keys_[:h_count], non_blocking=True
-        #             )
-
-        #             if return_index:
-        #                 d_indices_ = gathered_indices[i]
-        #                 out_indices[out_offset : out_offset + h_count].copy_(
-        #                     d_indices_[:h_count], non_blocking=True
-        #                 )
-        #             for score_name in out_scores.keys():
-        #                 out_scores[score_name][out_offset : out_offset + h_count].copy_(
-        #                     gathered_scores[score_name][i][:h_count], non_blocking=True
-        #                 )
-
-        #             out_offset += h_count
-
-        #         search_offset += batch_
-        #         d_count.fill_(0)
-
-        #     assert out_offset == total_matched
 
         return out_keys, out_scores, out_indices
 
