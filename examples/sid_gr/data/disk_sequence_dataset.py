@@ -168,6 +168,10 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 .astype(np.int64),
                 device=self._device,
             )
+            user_id = torch.tensor(
+                sequence_data["user_id"].to_numpy().astype(np.int64),
+                device=self._device,
+            )
             # add offset to the sids to avoid duplicate sids across hierarchy
             # [T, num_hierarchies]
             history_sids = torch.index_select(
@@ -228,6 +232,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 history_feature_name=self._output_history_sid_feature_name,
                 candidate_feature_name=self._output_candidate_sid_feature_name,
                 labels=labels,  # for eval, we need label to calculate metrics.
+                user_id=user_id,
             )
             yield GPTSIDBatch(**batch_kwargs)
 

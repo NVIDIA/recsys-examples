@@ -14,7 +14,7 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import gin
 
@@ -54,6 +54,10 @@ class TrainerArgs:
 
     eval_interval: int = 100
     log_interval: int = 100
+
+    top_k_for_generation: int = 10
+    eval_metrics: Tuple[str, ...] = field(default_factory=lambda: ("HR@2", "NDCG@10"))
+
     max_train_iters: Optional[int] = None
     max_eval_iters: Optional[int] = None
     seed: int = 1234
@@ -79,6 +83,12 @@ class TrainerArgs:
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
             self.max_train_iters = int(self.max_train_iters)
+        for metric_spec in self.eval_metrics:
+            metric_name, top_k = metric_spec.split("@")
+            assert metric_name.lower() in ["ndcg", "recall"], "invalid metric name"
+            assert (
+                int(top_k) <= self.top_k_for_generation
+            ), "top_k for evaluation should be less than top_k for generation"
 
 
 @gin.configurable
