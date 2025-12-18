@@ -8,7 +8,7 @@ TrainerArgs.profile_step_end = 80
 TrainerArgs.max_train_iters = 20000
 TrainerArgs.max_eval_iters = 200
 
-TrainerArgs.top_k_for_generation = 10 # beam search width
+TrainerArgs.top_k_for_generation = 1000 # beam search width
 TrainerArgs.eval_metrics = ('NDCG@10', 'Recall@10') # evaluation metrics
 
 DatasetArgs.dataset_name = 'amzn_beauty'

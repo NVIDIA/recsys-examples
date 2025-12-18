@@ -583,15 +583,14 @@ class SIDGRModel(MegatronModule):
         ) = self._prepare_embeddings(batch, include_candidate=False)
         # TODO : fix the incomplete batch
         batch_size = input_offsets.size(0) - 1
-        topk_previous_step = 1
-        topk_this_step = self.top_k_for_generation
+        topk_prev_step = 1
         self.beam_search.reset()
         for i in range(self._num_hierarchies):
             generated_sids = self.beam_search.get_sids()
             # 1. prepare embeddings: [concat history, generated sids]
             if generated_sids is not None:
                 # topk might be not always equal to the beam width because we have validation check.
-                batch_size, topk_this_step, candidate_length = generated_sids.shape
+                batch_size, topk_prev_step, candidate_length = generated_sids.shape
                 assert (
                     candidate_length == i
                 ), "current step should match the hierarchy index"
@@ -607,7 +606,7 @@ class SIDGRModel(MegatronModule):
                         [
                             torch.full(
                                 (batch_size,),
-                                topk_this_step * candidate_length,
+                                topk_prev_step * candidate_length,
                                 device=generated_sids.device,
                                 dtype=torch.long,
                             ),
@@ -637,7 +636,7 @@ class SIDGRModel(MegatronModule):
                 ) = self._concat_jagged(
                     [input_hidden_states, generated_embeddings],
                     [input_offsets, candidate_offsets],
-                    [input_max_seqlen, topk_this_step * candidate_length],
+                    [input_max_seqlen, topk_prev_step * candidate_length],
                 )
             else:
                 # when we are at the first step, we do not have any generated sids and only bos token appended to the input.
@@ -658,7 +657,7 @@ class SIDGRModel(MegatronModule):
             attention_mask = _create_multi_region_candidate_causal_mask(
                 batch_size,
                 input_max_seqlen,
-                0 if i == 0 else topk_this_step,
+                0 if i == 0 else topk_prev_step,
                 candidate_length,
                 device=cated_hidden_states.device,
             )
@@ -681,7 +680,7 @@ class SIDGRModel(MegatronModule):
 
             # 4. calculate the probs for the current step
             candidate_hidden_states = candidate_hidden_states.view(
-                batch_size, topk_previous_step, -1, self.embedding_dim
+                batch_size, topk_prev_step, -1, self.embedding_dim
             )[:, :, -1, :]
             tuple_or_tensor: Union[
                 Tuple[torch.Tensor, torch.Tensor], torch.Tensor
@@ -698,7 +697,6 @@ class SIDGRModel(MegatronModule):
 
             # 5. filter the topk candidates, update the generated_sids and log_probs for the next step
             self.beam_search.propagate(probs_this_step)
-            topk_previous_step = topk_this_step
         # only for debugging purpose
         losses, logits = self.forward(batch)
         generated_sids = self.beam_search.get_sids()

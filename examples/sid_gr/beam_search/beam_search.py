@@ -3,7 +3,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 
-# TODO, add dynamic beam width support!
 # TODO, make it graphable
 # do not have kv cache
 class BeamSearch:
@@ -60,8 +59,11 @@ class BeamSearch:
                 "Reached the last hierarchy, please call reset to start a new generation"
             )
         batch_size, codebook_size_this_step = log_probs.shape[0], log_probs.shape[-1]
-        topk_previous_step = self.beam_widths[step - 1] if step > 0 else 1
-        topk_this_step = self.beam_widths[step]
+        topk_previous_step = self.generated_sids.shape[1] if step > 0 else 1
+        topk_this_step = min(
+            self.beam_widths[step], topk_previous_step * codebook_size_this_step
+        )
+
         assert (
             codebook_size_this_step == self.codebook_sizes[step]
         ), "codebook_size_this_step should be the same as the codebook_size[step] in the constructor"
@@ -110,8 +112,6 @@ class BeamSearch:
         )
         if self.record_history:
             self.history_sids.append(generated_sids)
-            # self.history_parents_indices.append(last_step_indices)
-            # self.history_log_probs.append(topk_probs)
         self.generated_sids = generated_sids
         self.accumulated_log_probs = topk_probs
         self.step += 1
@@ -131,7 +131,6 @@ class BeamSearch:
         """
         return the generated sids at step i if step is valid, otherwise return None.
         """
-        # return full
         if step is None:
             return self.generated_sids
         elif step == -1:
