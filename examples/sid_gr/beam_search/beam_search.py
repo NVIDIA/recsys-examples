@@ -4,6 +4,7 @@ import torch
 
 
 # TODO, add dynamic beam width support!
+# TODO, make it graphable
 # do not have kv cache
 class BeamSearch:
     def __init__(
@@ -15,6 +16,7 @@ class BeamSearch:
             torch.Tensor
         ] = None,  # to check if the sid is mapped into the codebook
         prefix_valid_check: bool = False,  # to check if the prefix is valid
+        record_history: bool = False,
     ):
         """
         codebooks : [num_items, num_hierarchies]
@@ -32,9 +34,17 @@ class BeamSearch:
             assert (
                 codebooks is not None
             ), "codebooks should be provided if prefix_valid_check is True"
-        self.accumulated_log_probs: torch.Tensor = torch.tensor()
-        self.generated_sids: torch.Tensor = torch.tensor()
+        self.accumulated_log_probs: torch.Tensor = torch.tensor(
+            []
+        )  # to perceive the mppy check
+        self.generated_sids: torch.Tensor = torch.tensor(
+            []
+        )  # to perceive the mppy check
         self.step: int = 0
+
+        self.history_sids: List[torch.Tensor] = []
+        self.record_history: bool = record_history
+        self.reset()
 
     def propagate(
         self,
@@ -85,19 +95,23 @@ class BeamSearch:
         topk_probs, topk_indices = torch.topk(
             accumulated_log_probs_this_step, topk_this_step, dim=-1
         )
-
         current_step_sids = topk_indices % codebook_size_this_step
         last_step_indices = topk_indices // codebook_size_this_step
         # [batch_size, topk_this_step, step]
         # it's safe to expand to zero when step is 0,
-        last_step_indices = last_step_indices.unsqueeze(-1).expand(-1, -1, step)
+        last_step_indices_expanded = last_step_indices.unsqueeze(-1).expand(
+            -1, -1, step
+        )
         last_step_sids = torch.gather(
-            self.generated_sids, dim=1, index=last_step_indices
+            self.generated_sids, dim=1, index=last_step_indices_expanded
         )
         generated_sids = torch.cat(
             [last_step_sids, current_step_sids.unsqueeze(-1)], dim=-1
         )
-
+        if self.record_history:
+            self.history_sids.append(generated_sids)
+            # self.history_parents_indices.append(last_step_indices)
+            # self.history_log_probs.append(topk_probs)
         self.generated_sids = generated_sids
         self.accumulated_log_probs = topk_probs
         self.step += 1
@@ -108,19 +122,30 @@ class BeamSearch:
         self.generated_sids = None
         self.accumulated_log_probs = None
         self.step = 0
+        self.history_sids = []
 
     def get_sids(
         self,
-        step: Optional[int] = None,
+        step: Optional[int] = None,  # [-1 ~ num_hierarchies)
     ) -> torch.Tensor:
+        """
+        return the generated sids at step i if step is valid, otherwise return None.
+        """
+        # return full
         if step is None:
             return self.generated_sids
-        elif step <= self.step:
-            return self.generated_sids[:, :, step] if step > 0 else None
+        elif step == -1:
+            return None
+        elif step < self.step:
+            return self.generated_sids[:, :, step]
         else:
-            raise ValueError(
-                f"Step {step} is not valid, the current step is {self.step}"
-            )
+            raise ValueError(f"Step {step} is not valid, current step is {self.step}")
+
+    def generate_valid_mask(self) -> torch.Tensor:
+        """
+        update the valid mask between current step and previous step,
+        this can be used for transformer attention
+        """
 
     def get_log_probs(self) -> torch.Tensor:
         return self.accumulated_log_probs

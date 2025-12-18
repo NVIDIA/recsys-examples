@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
+from beam_search.beam_search import BeamSearch
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
@@ -13,7 +14,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
-from modules.eval_metrics import SIDRetrievalEvaluator, metric_str_to_object
+from modules.eval_metrics import SIDRetrievalEvaluator
 from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
@@ -32,7 +33,6 @@ def _padding_to_dense_and_transpose(
         jagged_input_hidden_states.dim() == 2
     ), "jagged input hidden states should be 2D"
 
-    # torch.ops.fbgemm.jagged_to_padded_dense(values=jagged_input_hidden_states, offsets=[input_offsets], max_lengths=[input_max_seqlen], padding_value=0.0)
     padded_hidden_states = (
         torch.ops.fbgemm.jagged_to_padded_dense(
             values=jagged_input_hidden_states,
@@ -140,7 +140,7 @@ def _create_multi_region_candidate_causal_mask(
     col_region_id = candidate_col_idx // candidate_max_seqlen_per_region
     col_offset = candidate_col_idx % candidate_max_seqlen_per_region
 
-    # 判断是否在candidate区域内部 且 同一region 且 满足causal
+    # intra candidate region: causal
     is_candidate_col = col_indices >= max_history_seqlen
     same_region = row_region_id == col_region_id
     causal_within_region = row_offset >= col_offset
@@ -221,8 +221,7 @@ class SIDGRModel(MegatronModule):
         relative_attention_max_distance: int = 128,
         should_add_sep_token: bool = True,
         top_k_for_generation: int = 10,  # this is used for eval
-        eval_metrics: List[str] = [],  # this is used for eval
-        eval_top_k_list: List[int] = [],  # this is used for eval
+        eval_metrics: Tuple[str, ...] = (),  # this is used for eval
     ):
         super(SIDGRModel, self).__init__(config=decoder_config)
         assert (
@@ -294,24 +293,19 @@ class SIDGRModel(MegatronModule):
             if decoder_config.fp16
             else (torch.bfloat16 if decoder_config.bf16 else torch.float32)
         )
-
+        for metric_spec in eval_metrics:
+            metric_name, top_k = metric_spec.split("@")
+            assert metric_name.lower() in ["ndcg", "recall"], "invalid metric name"
+            assert (
+                int(top_k) <= top_k_for_generation
+            ), "top_k for evaluation should be less than top_k for generation"
         # below are used for eval
         self.top_k_for_generation = top_k_for_generation  # beam search width.
-        metrics = {}
-        for top_k in eval_top_k_list:
-            assert (
-                top_k <= top_k_for_generation
-            ), "top_k for generation should be greater than top_k for evaluation"
-        for metric_str in eval_metrics:
-            metrics.update(
-                {
-                    metric_str: metric_str_to_object[metric_str]
-                    for top_k in eval_top_k_list
-                }
-            )
-        self.evaluator = SIDRetrievalEvaluator(
-            metrics=metrics,
-            top_k_list=eval_top_k_list,
+        self.evaluator = SIDRetrievalEvaluator(eval_metrics)
+        self.beam_search = BeamSearch(
+            beam_width=top_k_for_generation,
+            num_hierarchies=num_hierarchies,
+            codebook_sizes=codebook_sizes,
         )
 
     def bfloat16(self):
@@ -569,100 +563,6 @@ class SIDGRModel(MegatronModule):
         )
         return merged_losses, merged_logits
 
-    def _beam_search_generate(
-        self,
-        candidate_hidden_states: torch.Tensor,
-        batch_size: int,
-        step: int,
-        generated_sids: Optional[
-            torch.Tensor
-        ] = None,  # None in the first step, we will iteratively update the previous generated sids with the filtered sids!
-        log_probs: Optional[torch.Tensor] = None,  # None in the first step
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        hidden_states: [T, hidden_size] where T is the history + past candidates. The dense shape: [B, max_history_seqlen + max_candidates_seqlen, hidden_size ]
-        We will perform embedding lookup for the candidates, and then perform the beam search generation.
-        return generated_sids, log_probs
-
-        generated_sids : [batch_size, topk_last_step, generated_step]
-        log_probs: [batch_size, topk_last_step]
-        """
-        ## TODO Remove those assertions for performance!
-        assert (
-            step < self._num_hierarchies
-        ), "step should be less than the number of hierarchies"
-
-        topk_last_step = 1
-        # TODO, we might have dynamic beam search width!
-        topk_this_step = self.top_k_for_generation
-        if step > 0:
-            assert (
-                generated_sids is not None and log_probs is not None
-            ), "generated_sids and log_probs should be provided in the subsequent steps"
-            _, topk_last_step, generated_step = generated_sids.shape
-            assert (
-                generated_step == step
-            ), "current step should match the hierarchy index"
-        else:
-            topk_last_step, generated_step = 1, 1
-
-        # we keep the last step of the candidate hidden states for current step.
-        candidate_hidden_states = candidate_hidden_states.view(
-            batch_size, topk_last_step, generated_step, -1
-        )[:, :, -1, :]
-        # [batch_size, topk_last_step, current_codebook_size]
-        tuple_or_tensor: Union[
-            Tuple[torch.Tensor, torch.Tensor], torch.Tensor
-        ] = self._decoder_mlp[step](candidate_hidden_states)
-
-        candidates_logits = (
-            tuple_or_tensor[0]
-            if isinstance(tuple_or_tensor, tuple)
-            else tuple_or_tensor
-        )
-
-        probs_this_step: torch.Tensor = torch.log(
-            torch.nn.functional.softmax(candidates_logits.float(), dim=-1)
-        )
-        current_codebook_size = probs_this_step.size(-1)
-
-        # [batch_size, topk_last_step * current_codebook_size]
-        accumulated_log_probs = (
-            (
-                log_probs.view(batch_size, topk_last_step, 1)
-                if log_probs is not None
-                else 0.0
-            )
-            + probs_this_step
-        ).view(batch_size, -1)
-        topk_probs, topk_indices = torch.topk(
-            accumulated_log_probs, topk_this_step, dim=-1
-        )
-
-        current_step_sids = (
-            topk_indices % current_codebook_size
-        )  # selected codebook index
-        # TODO, add validity filter for the generated sids!
-        if generated_sids is not None:
-            last_step_indices = (
-                topk_indices // current_codebook_size
-            )  # selected history index
-            last_step_indices = last_step_indices.unsqueeze(-1).expand(
-                -1, -1, generated_step
-            )
-            last_step_sids = torch.gather(
-                generated_sids, dim=1, index=last_step_indices
-            )
-            generated_sids = torch.cat(
-                [last_step_sids, current_step_sids.unsqueeze(-1)], dim=-1
-            )
-        else:
-            generated_sids = current_step_sids.unsqueeze(
-                -1
-            )  # [batch_size, topk_this_step, 1]
-
-        return generated_sids, topk_probs
-
     @torch.no_grad
     def generate(self, batch: GPTSIDBatch) -> torch.Tensor:
         """
@@ -673,10 +573,7 @@ class SIDGRModel(MegatronModule):
           torch.Tensor: The generated sids.
         """
 
-        generated_sids: Optional[torch.Tensor] = None
-        log_probs: Optional[torch.Tensor] = None
         attention_mask: Optional[torch.Tensor] = None
-        # iteratively generate the output sids with a fixed-width beam search strategy.
         # 0. prepare history and bos embeddings.
         (
             input_hidden_states,
@@ -684,11 +581,13 @@ class SIDGRModel(MegatronModule):
             input_max_seqlen,
             _,
         ) = self._prepare_embeddings(batch, include_candidate=False)
-
         # TODO : fix the incomplete batch
         batch_size = input_offsets.size(0) - 1
-        # we no don't have the KV cache!
+        topk_previous_step = 1
+        topk_this_step = self.top_k_for_generation
+        self.beam_search.reset()
         for i in range(self._num_hierarchies):
+            generated_sids = self.beam_search.get_sids()
             # 1. prepare embeddings: [concat history, generated sids]
             if generated_sids is not None:
                 # topk might be not always equal to the beam width because we have validation check.
@@ -742,7 +641,7 @@ class SIDGRModel(MegatronModule):
                 )
             else:
                 # when we are at the first step, we do not have any generated sids and only bos token appended to the input.
-                topk_this_step, candidate_length = 0, 0
+                candidate_length = 0
                 cated_hidden_states = input_hidden_states
                 cated_offsets = input_offsets
                 cated_max_seqlen = input_max_seqlen
@@ -759,7 +658,7 @@ class SIDGRModel(MegatronModule):
             attention_mask = _create_multi_region_candidate_causal_mask(
                 batch_size,
                 input_max_seqlen,
-                topk_this_step,
+                0 if i == 0 else topk_this_step,
                 candidate_length,
                 device=cated_hidden_states.device,
             )
@@ -772,6 +671,7 @@ class SIDGRModel(MegatronModule):
                 attention_mask=attention_mask,
                 padding_to_dense=True,
             )
+            # remove history[batchsize * topk_last_step * max(1,i), embedding_dim]
             _, candidate_hidden_states = triton_split_2D_jagged(
                 jagged_output_hidden_states,
                 max_seq_len=cated_max_seqlen,
@@ -779,13 +679,29 @@ class SIDGRModel(MegatronModule):
                 offsets_b=candidate_offsets,
             )
 
-            # 4. filter the topk candidates, update the generated_sids and log_probs for the next step
-            generated_sids, log_probs = self._beam_search_generate(
-                candidate_hidden_states,
-                batch_size=batch_size,
-                step=i,
-                generated_sids=generated_sids,  # None in the first step.
-                log_probs=log_probs,  # None in the first step.
+            # 4. calculate the probs for the current step
+            candidate_hidden_states = candidate_hidden_states.view(
+                batch_size, topk_previous_step, -1, self.embedding_dim
+            )[:, :, -1, :]
+            tuple_or_tensor: Union[
+                Tuple[torch.Tensor, torch.Tensor], torch.Tensor
+            ] = self._decoder_mlp[i](candidate_hidden_states)
+            # [batch_size, topk_last_step, current_codebook_size]
+            candidates_logits = (
+                tuple_or_tensor[0]
+                if isinstance(tuple_or_tensor, tuple)
+                else tuple_or_tensor
             )
+            probs_this_step: torch.Tensor = torch.log(
+                torch.nn.functional.softmax(candidates_logits.float(), dim=-1)
+            )
+
+            # 5. filter the topk candidates, update the generated_sids and log_probs for the next step
+            self.beam_search.propagate(probs_this_step)
+            topk_previous_step = topk_this_step
+        # only for debugging purpose
+        losses, logits = self.forward(batch)
+        generated_sids = self.beam_search.get_sids()
+        log_probs = self.beam_search.get_log_probs()
 
         return generated_sids, log_probs

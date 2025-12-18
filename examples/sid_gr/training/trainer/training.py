@@ -31,6 +31,11 @@ from commons.utils.logger import print_rank_0
 from configs.sid_gin_config_args import TrainerArgs
 from model.gpt_model import SIDGRModel
 
+try:
+    from rich.progress import track
+except ImportError:
+    track = lambda x, description: x
+
 
 def evaluate(
     pipeline: Union[
@@ -52,17 +57,14 @@ def evaluate(
         batch = batch.to(torch.cuda.current_device())
         labels = batch.labels
         generated_sids, log_probs = model.generate(batch)
-        # stateful_metric_module.compute(generated_sids, log_probs, labels)
-        # labels should batch_size, num_hierarchies
-        hit = (generated_sids - labels.unsqueeze(1)).sum(dim=-1).sum(-1) == 0
-        # [batch_size, topk]
-        print(f" iter {i} last identifier", generated_sids[:, :, -1])
+        model.evaluator(log_probs, generated_sids, labels)
+        # [batch_size, topk, num_hierarchies]
+        hit = torch.all(generated_sids == labels.unsqueeze(1), dim=-1)
         if hit.any():
-            print("eval hit labels!!")
-            import pdb
-
-            pdb.set_trace()
-
+            indices = hit.nonzero()
+            print(f"eval hit labels!! {hit.sum().item()}, indices: {indices}")
+    compute_res = model.evaluator.compute()
+    print(f"eval result: {compute_res}")
     # eval_iter = 0
     # torch.cuda.nvtx.range_push(f"#evaluate")
     # max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)

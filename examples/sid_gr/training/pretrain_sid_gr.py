@@ -109,6 +109,8 @@ def main():
         codebook_embedding_config=embedding_config,
         codebook_sizes=dataset_args.codebook_sizes,
         num_hierarchies=dataset_args.num_hierarchies,
+        top_k_for_generation=trainer_args.top_k_for_generation,
+        eval_metrics=trainer_args.eval_metrics,
     )
 
     optimizer_param = create_optimizer_params(optimizer_args)

@@ -6,9 +6,11 @@ from beam_search.beam_search import BeamSearch
 @pytest.mark.parametrize("batchsize", [10, 20, 50])
 @pytest.mark.parametrize("beam_width", [10, 20, 50])
 @pytest.mark.parametrize("codebook_sizes", [[100, 100, 100]])
-def test_beam_search_smoke(batchsize, beam_width, codebook_sizes):
+def test_beam_search_sanity_check(batchsize, beam_width, codebook_sizes):
     num_hierarchies = len(codebook_sizes)
-    beam_search = BeamSearch(beam_width, num_hierarchies, codebook_sizes)
+    beam_search = BeamSearch(
+        beam_width, num_hierarchies, codebook_sizes, record_history=True
+    )
     topk_prev_step = 1
     for i in range(num_hierarchies):
         log_probs = torch.randn(
@@ -19,11 +21,27 @@ def test_beam_search_smoke(batchsize, beam_width, codebook_sizes):
         )
 
         beam_search.propagate(log_probs)
-
         topk_prev_step = beam_width
-        import pdb
 
-        pdb.set_trace()
+    for i in range(1, num_hierarchies):
+        # shape [batchsize, cur_beam, i + 1]
+        current_sids = beam_search.history_sids[i]
+        # shape [batchsize, par_beam, i]
+        parent_sids = beam_search.history_sids[i - 1]
+        current_sids_depth = current_sids.shape[-1]
+        parent_sids_depth = parent_sids.shape[-1]
+        assert (
+            parent_sids_depth + 1 == current_sids_depth
+        ), "current_sids_depth should be parent_sids_depth + 1"
+        current_slice = current_sids[:, :, :parent_sids_depth]  # [B, cur_beam, K]
+        parent_slice = parent_sids  # [B, par_beam, K]
+
+        # [batchsize, cur_beam, 1, K] == [batchsize, 1, par_beam, K]
+        is_in = current_slice.unsqueeze(2) == parent_slice.unsqueeze(
+            1
+        )  # [B, cur_beam, par_beam, K]
+        in_any_parent = is_in.any(dim=2)  # [B, cur_beam, K]
+        assert torch.all(in_any_parent)
 
 
 @pytest.mark.parametrize("batchsize", [10, 20, 50])
