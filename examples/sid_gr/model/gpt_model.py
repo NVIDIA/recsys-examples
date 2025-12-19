@@ -306,6 +306,7 @@ class SIDGRModel(MegatronModule):
             beam_width=top_k_for_generation,
             num_hierarchies=num_hierarchies,
             codebook_sizes=codebook_sizes,
+            record_history=True,  # for debugging purpose
         )
 
     def bfloat16(self):
@@ -429,7 +430,7 @@ class SIDGRModel(MegatronModule):
         bos_offsets: torch.Tensor,
         max_seqlen_candidate: int,
     ) -> torch.Tensor:
-        # split history, candidate, note that we append a bos token, so we need to remove the last token.
+        # split history, candidate, note that we append a bos token,
         # history are dropped.
         # TODO, replace with one-shot op
         _, output_hidden_states_bos_candidate = triton_split_2D_jagged(
@@ -438,11 +439,12 @@ class SIDGRModel(MegatronModule):
             offsets_a=history_offsets,
             offsets_b=candidate_offsets + bos_offsets,
         )
-        _, output_hidden_states = triton_split_2D_jagged(
+        # remove the last token.
+        output_hidden_states, _ = triton_split_2D_jagged(
             output_hidden_states_bos_candidate,
             max_seq_len=max_seqlen_candidate + 1,
-            offsets_a=bos_offsets,
-            offsets_b=candidate_offsets,
+            offsets_a=candidate_offsets,
+            offsets_b=bos_offsets,
         )
         # the output shape should be [(sum(candidate_seqlen)) , num_hierarchies, hidden_size]
         candidate_hidden_states = output_hidden_states.reshape(

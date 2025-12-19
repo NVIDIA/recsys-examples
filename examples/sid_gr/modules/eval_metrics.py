@@ -233,11 +233,6 @@ class SIDRetrievalEvaluator(torch.nn.Module):
                 indexes=expanded_indexes.to(preds.device),
             )
 
-        if target.sum().item() > 0:
-            import pdb
-
-            pdb.set_trace()
-
     def compute(self):
         return {
             metric_name: metric.compute()

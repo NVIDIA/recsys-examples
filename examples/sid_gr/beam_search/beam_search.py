@@ -4,7 +4,6 @@ import torch
 
 
 # TODO, make it graphable
-# do not have kv cache
 class BeamSearch:
     def __init__(
         self,
@@ -41,13 +40,16 @@ class BeamSearch:
         )  # to perceive the mppy check
         self.step: int = 0
 
-        self.history_sids: List[torch.Tensor] = []
+        # for debugging purpose
         self.record_history: bool = record_history
+        self.history_topk_sids: List[torch.Tensor] = []
+        self.history_accumulate_topk_probs: List[torch.Tensor] = []
+        self.history_probs: List[torch.Tensor] = []
         self.reset()
 
     def propagate(
         self,
-        log_probs: torch.Tensor,  # [batch_size, codebook_size[step]]
+        log_probs: torch.Tensor,  # [batch_size, topk_previous_step, codebook_size[step]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         In the beginning of step i, we have already generated sids [batchsize, beam_widths[i-1], i],
@@ -111,7 +113,9 @@ class BeamSearch:
             [last_step_sids, current_step_sids.unsqueeze(-1)], dim=-1
         )
         if self.record_history:
-            self.history_sids.append(generated_sids)
+            self.history_topk_sids.append(generated_sids)
+            self.history_accumulate_topk_probs.append(torch.exp(topk_probs))
+            self.history_probs.append(torch.exp(log_probs_this_step))
         self.generated_sids = generated_sids
         self.accumulated_log_probs = topk_probs
         self.step += 1
@@ -122,7 +126,9 @@ class BeamSearch:
         self.generated_sids = None
         self.accumulated_log_probs = None
         self.step = 0
-        self.history_sids = []
+        self.history_topk_sids = []
+        self.history_accumulate_topk_probs = []
+        self.history_probs = []
 
     def get_sids(
         self,
