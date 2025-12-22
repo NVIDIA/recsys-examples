@@ -34,6 +34,7 @@ from dynamicemb.types import (
 from dynamicemb_extensions import (
     InsertResult,
     ScorePolicy,
+    bucketize_keys,
     device_timestamp,
     table_count_matched,
     table_erase,
@@ -1236,6 +1237,16 @@ class LinearBucketTable(ScoredHashTable):
             self.storage_bytes_
             + self.bucket_sizes.numel() * self.bucket_sizes.element_size()
         )
+
+    def bucketize_keys(
+        self,
+        keys,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # bkt_keys = keys[inverse]
+        bkt_keys, offsets, inverse = bucketize_keys(
+            keys, self.bucket_capacity_, self.num_buckets_
+        )
+        return bkt_keys, offsets, inverse
 
 
 def get_scored_table(

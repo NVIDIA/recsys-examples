@@ -131,6 +131,11 @@ void bind_table_operation(py::module &m) {
         py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
         py::arg("thresholds"), py::arg("num_matched"));
 
+  m.def("bucketize_keys", &dyn_emb::bucketize_keys,
+        "bucketize input keys into a dense tensor, and return the output keys, "
+        "buckets offset, inverse indices.",
+        py::arg("keys"), py::arg("bucket_capacity"), py::arg("num_buckets"));
+
   py::enum_<dyn_emb::ScorePolicyType>(m, "ScorePolicy")
       .value("CONST", dyn_emb::ScorePolicyType::Const)
       .value("ASSIGN", dyn_emb::ScorePolicyType::Assign)
@@ -145,6 +150,7 @@ void bind_table_operation(py::module &m) {
       .value("EVICT", dyn_emb::InsertResult::Evict)
       .value("DUPLICATED", dyn_emb::InsertResult::Duplicated)
       .value("BUSY", dyn_emb::InsertResult::Busy)
+      .value("ILLEGAL", dyn_emb::InsertResult::Illegal)
       .value("INIT", dyn_emb::InsertResult::Init)
       .export_values();
 }

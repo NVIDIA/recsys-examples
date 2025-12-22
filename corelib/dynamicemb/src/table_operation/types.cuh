@@ -56,6 +56,7 @@ enum class InsertResult : uint8_t {
   Evict,      // Evict a key and insert into the evicted slot.
   Duplicated, // Meet duplicated keys on the fly.
   Busy,       // Insert failed as all slots busy.
+  Illegal, // The key is illagal key which means conflicts with reserved keys.
   Init,
 };
 

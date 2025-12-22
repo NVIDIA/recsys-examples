@@ -15,7 +15,7 @@
 
 import json
 import os
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, cast
 
 import numpy as np
 import torch  # usort:skip
@@ -34,6 +34,7 @@ from dynamicemb.initializer import BaseDynamicEmbInitializer
 from dynamicemb.optimizer import *
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
 from dynamicemb.scored_hashtable import (
+    LinearBucketTable,
     ScoreArg,
     ScorePolicy,
     ScoreSpec,
@@ -75,6 +76,7 @@ from dynamicemb_extensions import (
     store_to_combined_table,
 )
 from torch import Tensor, nn  # usort:skip
+from torchrec import JaggedTensor
 
 
 def save_to_json(data: Dict[str, Any], file_path: str) -> None:
@@ -1295,6 +1297,9 @@ class DynamicEmbeddingTable(KeyValueTable):
         unique_values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> None:
+        if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
+            return deterministic_insert(unique_keys, unique_values, scores)
+
         self.expand()
 
         h_num_unique_keys = unique_keys.numel()
@@ -1960,6 +1965,89 @@ class DynamicEmbeddingTable(KeyValueTable):
 
     def size(self) -> int:
         return self.key_index_map.size()
+
+    def deterministic_insert(
+        self,
+        unique_keys: torch.Tensor,
+        unique_values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.expand()
+
+        # 1.Preprocess
+        h_num_unique_keys = unique_keys.numel()
+
+        if self._use_score and scores is None:
+            scores = torch.empty(
+                h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
+            )
+            scores.fill_(self.score)
+
+        policy = self.score_policy.policy
+
+        if self.score_policy.policy == ScorePolicy.ACCUMULATE:
+            # Case 1: table works on cache+storage mode, frequencies should be assigned but not accumulated.
+            # Case 2: table works on storage mode, frequencies should be accumulated but unique_keys are not in the table.
+            #           so ASSIGIN has the same result as ACCUMULATE, so we didn't distinguish them
+            policy = ScorePolicy.ASSIGN
+
+        if not self._use_score and scores is not None:
+            # Case: table works on cache+storage and LRU mode, and the scores is from the cache,
+            # we assign it to preserve the distribution of score values ​​in the cache.
+            policy = ScorePolicy.ASSIGN
+
+        # 2. Bucketize keys: bkt_keys=unique_keys[inverse]
+        assert isinstance(
+            self.key_index_map, LinearBucketTable
+        ), "deterministic insert implementation only supports LinearBucketTable as key-index-map."
+        bkt_keys, offsets, inverse = cast(
+            LinearBucketTable, self.key_index_map
+        ).bucketize_keys(unique_keys)
+
+        jagged_keys = JaggedTensor(
+            values=bkt_keys.to(torch.int64),
+            offsets=offsets,
+            weights=scores[inverse] if scores is not None else None,
+        )
+
+        # static_cast<int64_t>(double(-1)) will get 0xFFFFFFFFFFFFFFFF, which is EmptyKey for table.
+        pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
+        pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
+
+        keys_t = pad_keys.transpose(0, 1).to(self.key_type).contiguous()
+        score_t = pad_scores.transpose(0, 1).contiguous()
+
+        # 3. Insert iteratively
+        num_iter = keys_t.size(1)
+        for i in range(num_iter):
+            score_args_insert = [
+                ScoreArg(
+                    name=self.score_policy.name,
+                    value=score_t[i],
+                    policy=policy,
+                    is_return=False,
+                )
+            ]
+
+            self.key_index_map.insert(keys_t[i], score_args_insert)
+
+        # 4. lookup the indices in unique_keys' order and store the values.
+        score_args_lookup = [
+            ScoreArg(
+                name=self.score_policy.name,
+                policy=ScorePolicy.CONST,
+                is_return=False,
+            )
+        ]
+        indices = torch.zeros(
+            h_num_unique_keys,
+            dtype=self.key_index_map.index_type,
+            device=unique_keys.device,
+        )
+        self.key_index_map.lookup(unique_keys, score_args_lookup, None, indices)
+        store_to_combined_table(
+            self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
+        )
 
 
 def update_cache(

@@ -144,4 +144,7 @@ std::vector<at::Tensor> tensor_partition(at::Tensor input,
                                          std::vector<int64_t> byte_range,
                                          std::vector<torch::Dtype> dtypes);
 
+std::vector<at::Tensor> bucketize_keys(at::Tensor keys, int64_t bucket_capacity,
+                                       int64_t num_buckets);
+
 } // namespace dyn_emb

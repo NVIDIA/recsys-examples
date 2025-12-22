@@ -207,6 +207,11 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
           break;
         } // else it was locked by another thread.
       }
+
+      if (probe_res == ProbeResult::Failed) {
+        result = InsertResult::Illegal;
+        break;
+      }
     }
 
     while (result == InsertResult::Init) {
@@ -329,6 +334,11 @@ __global__ void table_insert_and_evict_kernel(
           result = InsertResult::Insert;
           break;
         } // else it was locked by another thread.
+      }
+
+      if (probe_res == ProbeResult::Failed) {
+        result = InsertResult::Illegal;
+        break;
       }
     }
 
