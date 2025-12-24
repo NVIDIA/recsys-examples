@@ -1188,7 +1188,7 @@ class DynamicEmbeddingTable(KeyValueTable):
                 policy=self.score_policy.policy
                 if self._score_update
                 else ScorePolicy.CONST,
-                is_return=True,
+                is_return=scores is not None,
             )
         ]
 
