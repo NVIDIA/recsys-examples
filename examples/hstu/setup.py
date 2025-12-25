@@ -46,7 +46,7 @@ setup(
                 "ops/cuda_ops/csrc/paged_kvcache_ops_kernel.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
         ),

@@ -160,12 +160,25 @@ class InferenceDataset(IterableDataset[Batch]):
                 )
                 dates.append(self._batch_logs_frame.iloc[sample_id][self._date_name])
                 seq_endptrs.append(seq_endptr)
-            if len(user_ids) == 0:
-                continue
+            
+            last_date = dates[0]
+            final_user_ids: List[int] = []
+            final_dates: List[int] = []
+            final_seq_endptrs: List[int] = []
+            for (uid, date, endp) in zip(user_ids, dates, seq_endptrs):
+                if date != last_date:
+                    continue
+                if uid not in final_user_ids:
+                    final_user_ids.append(uid)
+                    final_dates.append(date)
+                    final_seq_endptrs.append(endp)
+                else:
+                    idx = final_user_ids.index(uid)
+                    final_seq_endptrs[idx] = max(final_seq_endptrs[idx], endp)
             yield (
-                torch.tensor(user_ids),
-                torch.tensor(dates),
-                torch.tensor(seq_endptrs),
+                torch.tensor(final_user_ids),
+                torch.tensor(final_dates),
+                torch.tensor(final_seq_endptrs),
             )
 
     def get_input_batch(
@@ -306,7 +319,7 @@ class InferenceDataset(IterableDataset[Batch]):
         labels = torch.tensor(labels, dtype=torch.int64, device=self._device)
         batch_kwargs = dict(
             features=features,
-            batch_size=self._batch_size,
+            batch_size=len(user_ids), # self._batch_size,
             feature_to_max_seqlen=feature_to_max_seqlen,
             contextual_feature_names=self._contextual_feature_names,
             item_feature_name=self._item_feature_name,

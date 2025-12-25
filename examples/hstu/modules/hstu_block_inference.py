@@ -160,9 +160,10 @@ class HSTUBlockInference(torch.nn.Module):
 
             self._hstu_graph[batch_size][num_tokens_padded][0].replay()  # type: ignore
             for idx in range(1, self.config.num_layers + 1):
-                kv_cache_metadata.onload_history_kv_events[idx - 1].wait(
-                    torch.cuda.current_stream()
-                )
+                # kv_cache_metadata.onload_history_kv_events[idx - 1].wait(
+                #     torch.cuda.current_stream()
+                # )
+                kv_cache_metadata.kv_onload_handle.wait_host(idx - 1)
                 self._hstu_graph[batch_size][num_tokens_padded][idx].replay()  # type: ignore
 
             hstu_output = torch.zeros_like(hidden_states[:num_tokens, ...])

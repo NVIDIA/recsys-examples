@@ -63,17 +63,17 @@ class KVCacheMetadata:
     """
 
     # paged cache metadata
-    kv_indices: torch.Tensor = None
-    kv_indptr: torch.Tensor = None
-    kv_last_page_len: torch.Tensor = None
-    total_history_lengths: torch.Tensor = None
-    total_history_offsets: torch.Tensor = None
+    kv_indices: torch.Tensor = None  # num_pages
+    kv_indptr: torch.Tensor = None   # num_seq + 1
+    kv_last_page_len: torch.Tensor = None # num_seq
+    total_history_lengths: torch.Tensor = None # num_seq
+    total_history_offsets: torch.Tensor = None # num_seq + 1
 
     # appending metadata
-    batch_indices: torch.Tensor = None
-    position: torch.Tensor = None
+    batch_indices: torch.Tensor = None  # num_tokens
+    position: torch.Tensor = None       # num_tokens
     new_history_nnz: int = 0
-    new_history_nnz_cuda: torch.Tensor = None
+    new_history_nnz_cuda: torch.Tensor = None  # 1
 
     # onload utility
     onload_history_kv_buffer: Optional[List[torch.Tensor]] = None
@@ -82,6 +82,16 @@ class KVCacheMetadata:
     # paged cache table pointers
     kv_cache_table: Optional[List[torch.Tensor]] = None
 
+    # async attributes
+    kv_onload_handle: Optional[object] = None
+    kv_offload_handle: Optional[object] = None
+
+    offload_user_ids: Optional[torch.Tensor] = None
+    offload_page_ids: Optional[torch.Tensor] = None
+    new_offload_startpos: Optional[torch.Tensor] = None
+    new_offload_lengths: Optional[torch.Tensor] = None
+
+    max_seqlen: Optional[int] = 0
 
 @dataclass
 class KVCacheConfig:

@@ -56,28 +56,14 @@ ERROR: The input sequence has overlapping tokens from 5 to 9 (both inclusive).
 
 ## How to Setup
 
-1. Build TensorRT-LLM (with HSTU KV cache extension):
-
-The HSTU inference utilize customized KV cache manager from TensorRT-LLM.
-The current version is based on the HSTU specialized implementation based on TensorRT-LLM v0.19.0.
-
-```bash
-~$ cd ${WORKING_DIR}
-~$ git clone -b hstu-kvcache-recsys-examples https://github.com/geoffreyQiu/TensorRT-LLM.git tensorrt-llm-kvcache && cd tensorrt-llm-kvcache
-~$ git submodule update --init --recursive
-~$ make -C docker release_build CUDA_ARCHS="80-real;86-real"
-# This will build a docker image with TensorRT-LLM installed.
-```
-
-2. Install the dependencies for Recsys-Examples.
+1. Install the dependencies for Recsys-Examples.
 
 Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not required for inference.
 
 ```bash
 ~$ cd ${WORKING_DIR}
 ~$ git clone --recursive -b ${TEST_BRANCH} ${TEST_REPO} recsys-examples && cd recsys-examples
-~$ TRTLLM_KVCACHE_IMAGE="tensorrt_llm/release:latest" docker build \
-    --build-arg BASE_IMAGE=${TRTLLM_KVCACHE_IMAGE} \
+~$ docker build \
     --build-arg INFERENCEBUILD=1 \
     -t recsys-examples:inference \
     -f docker/Dockerfile .
@@ -93,7 +79,7 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
 ~$ python3 ./preprocessor.py --dataset_name "kuairand-1k" --inference
 ~$
 ~$ # Run the inference example
-~$ python3 ./inference/inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT}  --mode eval
+~$ python3 ./inference/inference_gr_ranking_async.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT}  --mode eval
 ```
 
 ## Consistency Check for Inference
@@ -131,7 +117,7 @@ TrainerArgs.ckpt_save_interval = 550
 
 2. Evaluation metrics from inference
 ```
-/workspace/recsys-examples$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT} --mode eval
+/workspace/recsys-examples$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/inference_gr_ranking_async.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT} --mode eval
 ... [inference output] ...
 [eval]:
     Metrics.task0.AUC:0.556894
