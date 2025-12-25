@@ -49,54 +49,36 @@ def evaluate(
 ):
     iterated_eval_loader = islice(eval_loader, len(eval_loader))
     model = get_unwrapped_module(pipeline._model)
-    trainer_args.max_eval_iters or len(eval_loader)
-    min(trainer_args.max_eval_iters, len(eval_loader))
-    for i in range(trainer_args.max_eval_iters):
+    max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
+    max_eval_iters = min(max_eval_iters, len(eval_loader))
+    for i in range(max_eval_iters):
         # for batch in iterated_eval_loader:
         batch = next(iterated_eval_loader)
         batch = batch.to(torch.cuda.current_device())
         labels = batch.labels
         generated_sids, log_probs = model.generate(batch)
         model.evaluator(log_probs, generated_sids, labels)
+        beam_search = model.beam_search
+        beam_search.history_topk_sids
+        beam_search.history_accumulate_topk_probs
+        beam_search.history_probs
+        # [batch_size, topk, num_hierarchies]
+        generated_sids.transpose(0, 2)
         # [batch_size, topk, num_hierarchies]
         hit = torch.all(generated_sids == labels.unsqueeze(1), dim=-1)
+        # labels
+        codebook_offsets = torch.tensor(
+            [0, 256, 512, 768], device=generated_sids.device
+        )
+        sid_hits = generated_sids == labels.unsqueeze(1)
+        # [batchsize, topk]
+        num_sid_hits = sid_hits.sum(dim=-1)
         if hit.any():
-            indices = hit.nonzero()
-            print(f"eval hit labels!! {hit.sum().item()}, indices: {indices}")
+            hit.nonzero()
     compute_res = model.evaluator.compute()
+    # reset the evaluator for the next evaluation
+    model.evaluator.reset()
     print(f"eval result: {compute_res}")
-    # eval_iter = 0
-    # torch.cuda.nvtx.range_push(f"#evaluate")
-    # max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
-    # max_eval_iters = min(max_eval_iters, len(eval_loader))
-    # # make a copy of eval_loader to avoid modifying the original loader
-    # iterated_eval_loader = islice(eval_loader, len(eval_loader))
-    # with torch.no_grad():
-    #     for i in range(max_eval_iters):
-    #         eval_iter += 1
-    #         reporting_loss, (_, logits, labels, _) = pipeline.progress(
-    #             iterated_eval_loader
-    #         )
-    #         # metric module forward
-    #         stateful_metric_module(logits, labels)
-    #     # compute will reset the states
-    #     if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):
-    #         retrieval_gr = get_unwrapped_module(pipeline._model)
-    #         export_table_name = retrieval_gr.get_item_feature_table_name()
-    #         eval_metric_dict, _, _ = stateful_metric_module.compute(
-    #             *retrieval_gr._embedding_collection.export_local_embedding(
-    #                 export_table_name
-    #             ),
-    #         )
-    #     else:
-    #         eval_metric_dict = stateful_metric_module.compute()
-    #     dp_size = parallel_state.get_data_parallel_world_size()
-    # # TODO, fix the samples when there is incomplete batch
-    # print_rank_0(
-    #     f"[eval] [eval {eval_iter * dp_size * trainer_args.eval_batch_size} users]:\n    "
-    #     + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
-    # )
-    # torch.cuda.nvtx.range_pop()
 
 
 def maybe_load_ckpts(
@@ -207,29 +189,40 @@ def train_with_pipeline(
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
                 torch.cuda.nvtx.range_push(f"step {train_iter}")
-                reporting_loss, logits = pipeline.progress(batched_iterator)
+                reporting_loss, logits = pipeline.progress(
+                    batched_iterator
+                )  # Exception raised here
                 tokens_logged += reporting_loss[1]
-                torch.cuda.nvtx.range_pop()
+                if (
+                    train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0
+                ) or trainer_args.log_interval == 1:
+                    gpu_timer.stop()
+                    cur_td = gpu_timer.elapsed_time() - last_td
+                    print_rank_0(
+                        f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                    )
+                    last_td = cur_td + last_td
+                    tokens_logged.zero_()
+                # evaluate the model
+                if (
+                    train_iter > 0 and train_iter % trainer_args.eval_interval == 0
+                ) or trainer_args.eval_interval == 1:
+                    pipeline._model.eval()
+                    evaluate(
+                        pipeline,
+                        stateful_metric_module,
+                        trainer_args=trainer_args,
+                        eval_loader=eval_loader,
+                    )
+                    pipeline._model.train()
+
             except StopIteration:
                 start_iter = train_iter
-                torch.cuda.nvtx.range_pop()
                 break
-            # log
-            if train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0:
-                gpu_timer.stop()
-                cur_td = gpu_timer.elapsed_time() - last_td
-                print_rank_0(
-                    f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
-                )
-                last_td = cur_td + last_td
-                tokens_logged.zero_()
-        # TODO CHECK if train pipeline is flushed
-        if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
-            pipeline._model.eval()
-            evaluate(
-                pipeline,
-                stateful_metric_module,
-                trainer_args=trainer_args,
-                eval_loader=eval_loader,
-            )
-            pipeline._model.train()
+            finally:
+                # log
+                torch.cuda.nvtx.range_pop()
+
+            logits_probs = torch.nn.functional.softmax(logits, dim=-1)
+
+            max_values, max_indices = torch.max(logits_probs, dim=-1)

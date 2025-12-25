@@ -85,7 +85,11 @@ class TrainerArgs:
             self.max_train_iters = int(self.max_train_iters)
         for metric_spec in self.eval_metrics:
             metric_name, top_k = metric_spec.split("@")
-            assert metric_name.lower() in ["ndcg", "recall"], "invalid metric name"
+            assert metric_name.lower() in [
+                "ndcg",
+                "recall",
+                "hitrate",
+            ], "invalid metric name"
             assert (
                 int(top_k) <= self.top_k_for_generation
             ), "top_k for evaluation should be less than top_k for generation"

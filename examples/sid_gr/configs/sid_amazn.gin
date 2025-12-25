@@ -1,15 +1,16 @@
-TrainerArgs.train_batch_size = 32
-TrainerArgs.eval_batch_size = 32
-TrainerArgs.log_interval = 50
-TrainerArgs.eval_interval = 200
+TrainerArgs.train_batch_size = 4
+TrainerArgs.eval_batch_size = 4
+TrainerArgs.log_interval = 1
+TrainerArgs.eval_interval = 10
 TrainerArgs.profile = False
 TrainerArgs.profile_step_start = 50
 TrainerArgs.profile_step_end = 80
-TrainerArgs.max_train_iters = 20000
-TrainerArgs.max_eval_iters = 200
+TrainerArgs.max_train_iters = 10000
+TrainerArgs.max_eval_iters = 1
+TrainerArgs.pipeline_type = "none"
 
-TrainerArgs.top_k_for_generation = 1000 # beam search width
-TrainerArgs.eval_metrics = ('NDCG@10', 'Recall@10') # evaluation metrics
+TrainerArgs.top_k_for_generation = 20 # beam search width
+TrainerArgs.eval_metrics = ('NDCG@1', 'Recall@1',  'HitRate@1') # evaluation metrics
 
 DatasetArgs.dataset_name = 'amzn_beauty'
 DatasetArgs.max_history_length = 120 # 120 is the max sequence length for the training. We need to Downsample the original dataset to 120.
@@ -21,7 +22,7 @@ DatasetArgs.shuffle = True
 DatasetArgs.num_hierarchies = 4
 DatasetArgs.codebook_sizes = [256, 256, 256, 256] # embedding vocab size for each hierarchy, the last one is used for de-duplication
 
-NetworkArgs.num_layers = 4
+NetworkArgs.num_layers = 1
 NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 512 # embedding dim
 # per head dim

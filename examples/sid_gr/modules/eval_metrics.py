@@ -166,6 +166,7 @@ class DistributedRetrievalHitRate(DistributedRetrievalMetric):
 _metric_str_to_object = {
     "ndcg": DistributedRetrievalNDCG,
     "recall": DistributedRetrievalRecall,
+    "hitrate": DistributedRetrievalHitRate,
 }
 
 

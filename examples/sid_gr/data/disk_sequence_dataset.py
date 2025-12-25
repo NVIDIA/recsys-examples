@@ -137,7 +137,9 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         # TODO: Add shuffle and random seed
 
     def __iter__(self) -> Iterator[GPTSIDBatch]:
-        for i in range(len(self)):
+        for j in range(len(self)):
+            # fixed the first batch debug purpose
+            i = 0
             local_batch_start = (
                 i * self._global_batch_size + self._rank * self._batch_size
             )

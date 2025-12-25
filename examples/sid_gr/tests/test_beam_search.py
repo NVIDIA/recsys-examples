@@ -22,7 +22,7 @@ def test_beam_search_sanity_check(batchsize, beam_width, codebook_sizes):
 
         beam_search.propagate(log_probs)
         topk_prev_step = beam_width
-
+    # check the childrens' prefix should be from parent
     for i in range(1, num_hierarchies):
         # shape [batchsize, cur_beam, i + 1]
         current_sids = beam_search.history_sids[i]

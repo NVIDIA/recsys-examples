@@ -61,6 +61,7 @@ class FeatureConfig:
 
 @dataclass
 class GPTSIDBatch(Pipelineable):
+    # TODO: check if candidates are always dense.
     features: KeyedJaggedTensor  # contextual features, user history features, candidate features
     batch_size: int
     feature_to_max_seqlen: Dict[str, int]
@@ -108,6 +109,52 @@ class GPTSIDBatch(Pipelineable):
         self.features.record_stream(stream)
         if self.labels is not None:
             self.labels.record_stream(stream)
+
+    def retain_candidate_hierarchies(
+        self,
+        remained_hierarchies: int,
+    ) -> "GPTSIDBatch":
+        candidate_jt = self.features[self.candidate_feature_name]
+        original_hierarchies = self._num_hierarchies
+        assert (
+            original_hierarchies >= remained_hierarchies
+        ), "remained_hierarchies should be less than or equal to original_hierarchies"
+        candidate_lengths = candidate_jt.lengths() - (
+            original_hierarchies - remained_hierarchies
+        )
+        candidate_features = (
+            candidate_jt.values()
+            .view(-1, original_hierarchies)[:, :remained_hierarchies]
+            .reshape(-1)
+        )
+        if self.labels is not None:
+            labels = self.labels[:, :remained_hierarchies]
+        history_jt = self.features[self.history_feature_name]
+        history_lengths = history_jt.lengths()
+        history_features = history_jt.values()
+
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=[
+                self.history_feature_name,
+                self.candidate_feature_name,
+            ],
+            values=torch.cat([history_features, candidate_features]),
+            lengths=torch.cat([history_lengths, candidate_lengths]),
+        )
+        new_batch = GPTSIDBatch(
+            features=kjt,
+            batch_size=self.batch_size,
+            feature_to_max_seqlen=self.feature_to_max_seqlen,
+            contextual_feature_names=self.contextual_feature_names,
+            raw_hist_sid_names=self.raw_hist_sid_names,
+            raw_cand_sid_names=self.raw_cand_sid_names,
+            _num_hierarchies=remained_hierarchies,
+            history_feature_name=self.history_feature_name,
+            candidate_feature_name=self.candidate_feature_name,
+            user_id=self.user_id,
+            labels=labels,
+        )
+        return new_batch
 
     @staticmethod
     def random(

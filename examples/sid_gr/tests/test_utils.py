@@ -30,7 +30,8 @@ def create_sid_gr_model_and_optimizer(
         num_layers=num_layers,
         bf16=True if dtype == torch.bfloat16 else False,
         fp16=True if dtype == torch.float16 else False,
-        # position_embedding_type="relative",
+        hidden_dropout=0.0,
+        attention_dropout=0.0,  # TODO?
     )
     # thd + causal + TE
     transformer_decoder_layer_spec = get_gpt_decoder_block_spec(

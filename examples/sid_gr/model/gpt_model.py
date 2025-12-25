@@ -92,19 +92,22 @@ def _get_padded_dense_attention_mask(
         lower_triangle_mask,
         mask,
     )
-    return jagged_causal_mask
+    # note that we return the inverse of the mask to match the attention mask format.
+    return ~jagged_causal_mask
 
 
 def _create_multi_region_candidate_causal_mask(
     batchsize,
+    history_seqlen: int,
     max_history_seqlen: int,
     num_candidate_region: int,
     candidate_max_seqlen_per_region: int,
     device: torch.device,
 ) -> torch.Tensor:
     """
-    input sequence is : [history, candidate_region_0, candidate_region_1, ...],
-                        where history length is max_history_seqlen, each candidate region length is candidate_max_seqlen_per_region.
+    input sequence is : [history, candidate_region_0, candidate_region_1, ... padding_0, padding_1, ...],
+                        where history length is history_seqlen, each candidate region length is candidate_max_seqlen_per_region,
+                        and padding length is (max_history_seqlen - history_seqlen).
     intra region: causal ; inter region: invisible.
     each candidate needs to attend to the history
 
@@ -113,7 +116,9 @@ def _create_multi_region_candidate_causal_mask(
     total_seqlen = (
         max_history_seqlen + num_candidate_region * candidate_max_seqlen_per_region
     )
-
+    valid_seqlen = (
+        history_seqlen + candidate_max_seqlen_per_region * num_candidate_region
+    )
     # create row and col indices [total_seqlen, total_seqlen]
     row_indices = torch.arange(total_seqlen, device=device).unsqueeze(
         1
@@ -123,17 +128,17 @@ def _create_multi_region_candidate_causal_mask(
     )  # [1, total_seqlen]
 
     # history region: causal (row < max_history_seqlen AND col < max_history_seqlen AND row >= col)
-    is_history_row = row_indices < max_history_seqlen
-    is_history_col = col_indices < max_history_seqlen
+    is_history_row = row_indices < history_seqlen
+    is_history_col = col_indices < history_seqlen
     history_causal = is_history_row & is_history_col & (row_indices >= col_indices)
 
     # candidate to history (row >= max_history_seqlen AND col < max_history_seqlen)
-    is_candidate_row = row_indices >= max_history_seqlen
+    is_candidate_row = (row_indices >= history_seqlen) & (row_indices < valid_seqlen)
     candidate_attend_history = is_candidate_row & is_history_col
 
     # intra region: causal
-    candidate_row_idx = row_indices - max_history_seqlen  # candidate region row index
-    candidate_col_idx = col_indices - max_history_seqlen  # candidate region col index
+    candidate_row_idx = row_indices - history_seqlen  # candidate region row index
+    candidate_col_idx = col_indices - history_seqlen  # candidate region col index
     row_region_id = candidate_row_idx // candidate_max_seqlen_per_region
     row_offset = candidate_row_idx % candidate_max_seqlen_per_region
 
@@ -141,7 +146,7 @@ def _create_multi_region_candidate_causal_mask(
     col_offset = candidate_col_idx % candidate_max_seqlen_per_region
 
     # intra candidate region: causal
-    is_candidate_col = col_indices >= max_history_seqlen
+    is_candidate_col = (col_indices >= history_seqlen) & (col_indices < valid_seqlen)
     same_region = row_region_id == col_region_id
     causal_within_region = row_offset >= col_offset
     candidate_internal_mask = (
@@ -153,12 +158,13 @@ def _create_multi_region_candidate_causal_mask(
     # expand batch dimension: [batchsize, 1, total_seqlen, total_seqlen]
     mask = mask.unsqueeze(0).unsqueeze(0).expand(batchsize, 1, -1, -1)
 
-    return mask
+    # note that we return the inverse of the mask to match the attention mask format.
+    return ~mask
 
 
 class SIDGRDecoder(MegatronModule):
     """
-    Don't support PP currently. Does not include embedding
+    Don't support PP currently. Does not inclu de embedding
     """
 
     def __init__(
@@ -295,7 +301,11 @@ class SIDGRModel(MegatronModule):
         )
         for metric_spec in eval_metrics:
             metric_name, top_k = metric_spec.split("@")
-            assert metric_name.lower() in ["ndcg", "recall"], "invalid metric name"
+            assert metric_name.lower() in [
+                "ndcg",
+                "recall",
+                "hitrate",
+            ], "invalid metric name"
             assert (
                 int(top_k) <= top_k_for_generation
             ), "top_k for evaluation should be less than top_k for generation"
@@ -376,10 +386,9 @@ class SIDGRModel(MegatronModule):
         assert all(
             feature_name in embeddings.keys() for feature_name in batch.features.keys()
         ), "all embedding feature names should be valid"
-        assert (
-            self._num_hierarchies == batch._num_hierarchies
-        ), "number of hierarchies must match"
-        # total_seqlen = history_features.size(0) // self._num_hierarchies
+        # assert (
+        #     self._num_hierarchies == batch._num_hierarchies
+        # ), "number of hierarchies must match"
         bos_offsets = torch.arange(
             0,
             batch.batch_size + 1,
@@ -429,6 +438,7 @@ class SIDGRModel(MegatronModule):
         candidate_offsets: torch.Tensor,
         bos_offsets: torch.Tensor,
         max_seqlen_candidate: int,
+        output_hierarchies: int,
     ) -> torch.Tensor:
         # split history, candidate, note that we append a bos token,
         # history are dropped.
@@ -448,7 +458,7 @@ class SIDGRModel(MegatronModule):
         )
         # the output shape should be [(sum(candidate_seqlen)) , num_hierarchies, hidden_size]
         candidate_hidden_states = output_hidden_states.reshape(
-            -1, self._num_hierarchies, self.embedding_dim
+            -1, output_hierarchies, self.embedding_dim
         )
         return candidate_hidden_states
 
@@ -466,6 +476,7 @@ class SIDGRModel(MegatronModule):
         When attention mask is None, we will construct a causal attention mask if padding_to_dense is True.
         """
         # TODO, remove the padding.
+        input_offsets[-1].item()
         if padding_to_dense:
             decoder_input_hidden_states = _padding_to_dense_and_transpose(
                 input_hidden_states,
@@ -537,14 +548,18 @@ class SIDGRModel(MegatronModule):
             candidate_offsets,
             bos_offsets,
             max_seqlen_candidate,
+            batch._num_hierarchies,
         )
         losses_per_hierarchy = []
         logits_per_hierarchy = []
-        merged_labels = batch.labels.view(-1, self._num_hierarchies)
+        merged_labels = batch.labels.view(-1, batch._num_hierarchies)
 
         # 4. output linear projection & loss
         # TODO, merge into single linear layer
         for hierarchy_idx, mlp in enumerate[Any](self._decoder_mlp):
+            # TODO: remove this for debugging purpose
+            if hierarchy_idx >= batch._num_hierarchies:
+                break
             tuple_or_tensor = mlp(candidate_hidden_states[:, hierarchy_idx, :])
             candidate_hierarchy_logits = (
                 tuple_or_tensor[0]
@@ -578,13 +593,14 @@ class SIDGRModel(MegatronModule):
         attention_mask: Optional[torch.Tensor] = None
         # 0. prepare history and bos embeddings.
         (
-            input_hidden_states,
+            history_embeddings,
             input_offsets,
             input_max_seqlen,
             _,
         ) = self._prepare_embeddings(batch, include_candidate=False)
         # TODO : fix the incomplete batch
         batch_size = input_offsets.size(0) - 1
+        actual_history_seqlen = input_offsets[-1].item()
         topk_prev_step = 1
         self.beam_search.reset()
         for i in range(self._num_hierarchies):
@@ -636,18 +652,18 @@ class SIDGRModel(MegatronModule):
                     cated_offsets,
                     cated_max_seqlen,
                 ) = self._concat_jagged(
-                    [input_hidden_states, generated_embeddings],
+                    [history_embeddings, generated_embeddings],
                     [input_offsets, candidate_offsets],
                     [input_max_seqlen, topk_prev_step * candidate_length],
                 )
             else:
                 # when we are at the first step, we do not have any generated sids and only bos token appended to the input.
                 candidate_length = 0
-                cated_hidden_states = input_hidden_states
+                cated_hidden_states = history_embeddings
                 cated_offsets = input_offsets
                 cated_max_seqlen = input_max_seqlen
 
-                # we fake the candidate offsets for the first step, it will be updated in the next step.
+                # for first step, a single bos token for each sequence
                 candidate_offsets = torch.arange(
                     0,
                     batch_size + 1,
@@ -658,6 +674,7 @@ class SIDGRModel(MegatronModule):
             # 2. prepare the attention mask
             attention_mask = _create_multi_region_candidate_causal_mask(
                 batch_size,
+                actual_history_seqlen,
                 input_max_seqlen,
                 0 if i == 0 else topk_prev_step,
                 candidate_length,
@@ -679,7 +696,6 @@ class SIDGRModel(MegatronModule):
                 offsets_a=cated_offsets - candidate_offsets,
                 offsets_b=candidate_offsets,
             )
-
             # 4. calculate the probs for the current step
             candidate_hidden_states = candidate_hidden_states.view(
                 batch_size, topk_prev_step, -1, self.embedding_dim
@@ -693,15 +709,13 @@ class SIDGRModel(MegatronModule):
                 if isinstance(tuple_or_tensor, tuple)
                 else tuple_or_tensor
             )
-            probs_this_step: torch.Tensor = torch.log(
-                torch.nn.functional.softmax(candidates_logits.float(), dim=-1)
+            probs_this_step: torch.Tensor = torch.nn.functional.log_softmax(
+                candidates_logits.float(), dim=-1
             )
 
             # 5. filter the topk candidates, update the generated_sids and log_probs for the next step
             self.beam_search.propagate(probs_this_step)
         # only for debugging purpose
-        losses, logits = self.forward(batch)
         generated_sids = self.beam_search.get_sids()
         log_probs = self.beam_search.get_log_probs()
-
         return generated_sids, log_probs
