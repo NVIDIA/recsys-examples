@@ -207,7 +207,6 @@ def _get_gpt_layer_local_spec(
     if normalization == "RMSNorm":
         global LNImpl
         LNImpl = WrappedTorchNorm
-
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "_get_gpt_layer_local_spec" has been deprecated'
@@ -352,7 +351,11 @@ def get_gpt_decoder_block_spec(
     if use_transformer_engine:
         layer_norm_impl = TENorm
     else:
-        layer_norm_impl = LNImpl
+        # adjust for rmsnorm
+        if normalization == "RMSNorm":
+            layer_norm_impl = WrappedTorchNorm
+        else:
+            layer_norm_impl = LNImpl
 
     if arbitrary_attention_mask:
         assert (

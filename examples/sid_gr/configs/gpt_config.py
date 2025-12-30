@@ -16,7 +16,7 @@ def get_gpt_config(
     num_attention_heads: int,
     num_layers: int,
     dtype: torch.dtype,
-    normalization: str = "LayerNorm",  # "LayerNorm" or "rmsnorm"
+    normalization: str = "RMSNorm",  # "LayerNorm" or "RMSNorm"
     norm_epsilon: float = 1e-5,
     hidden_dropout=0.0,
     tensor_model_parallel_size: int = 1,
@@ -38,4 +38,5 @@ def get_gpt_config(
         bf16=is_bf16,
         fp16=is_fp16,
         tensor_model_parallel_size=tensor_model_parallel_size,
+        normalization=normalization,
     )

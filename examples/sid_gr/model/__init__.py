@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from commons.modules.embedding import ShardedEmbeddingConfig
 from megatron.core.transformer import TransformerConfig
@@ -14,6 +14,7 @@ def get_sid_gr_model(
     codebook_embedding_config: ShardedEmbeddingConfig,
     codebook_sizes: List[int],
     num_hierarchies: int,
+    normalization: Optional[str] = None,
     top_k_for_generation: int = 10,
     eval_metrics: Tuple[str, ...] = (),
 ) -> SIDGRModel:
@@ -27,6 +28,7 @@ def get_sid_gr_model(
             decoder_config,
             use_transformer_engine=False,
             arbitrary_attention_mask=True,
+            normalization=normalization,
         ),
         should_add_sep_token=False,
         top_k_for_generation=top_k_for_generation,
