@@ -86,10 +86,13 @@ class GPTSIDBatch(Pipelineable):
         torch.Tensor
     ] = None  # For retrieval, candidates are labels! Inference batch does not have labels.
 
+    actual_batch_size: Optional[int] = None  # in case of padding
+
     def to(self, device: torch.device, non_blocking: bool = True) -> "GPTSIDBatch":  # type: ignore
         return GPTSIDBatch(
             features=self.features.to(device=device, non_blocking=non_blocking),
             batch_size=self.batch_size,
+            actual_batch_size=self.actual_batch_size,
             feature_to_max_seqlen=self.feature_to_max_seqlen,
             contextual_feature_names=self.contextual_feature_names,
             raw_hist_sid_names=self.raw_hist_sid_names,

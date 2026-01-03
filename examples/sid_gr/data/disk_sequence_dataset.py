@@ -66,7 +66,9 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             raw_sequence_data["sequence_length"] = raw_sequence_data[
                 raw_sequence_feature_name
             ].apply(len)
-        assert max_candidate_length == 1, "max_candidate_length should be 1 for now"
+        assert (
+            max_candidate_length <= 1
+        ), "max_candidate_length should be less than or equal to 1 for now"
 
         # clamp the sequence length to 1 + max_candidate_length (at least 1 history item)
         raw_sequence_data = raw_sequence_data[
@@ -137,9 +139,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         # TODO: Add shuffle and random seed
 
     def __iter__(self) -> Iterator[GPTSIDBatch]:
-        for j in range(len(self)):
-            # fixed the first batch debug purpose
-            i = 0
+        for i in range(len(self)):
             local_batch_start = (
                 i * self._global_batch_size + self._rank * self._batch_size
             )
@@ -154,21 +154,30 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             # [1,2,| 3]      => [1,2], [3]
             # [1,2,3,4, | 5] => [1,2,3,4], [5]
             # [1,2, |3]      => [1,2], [3]
+            # candidate might be empty, so we need to handle it separately
             history_item_ids = torch.tensor(
                 sequence_data[self._raw_sequence_feature_name]
-                .apply(lambda x: x[: -self._max_candidate_length])
+                .apply(
+                    lambda x: x[: -self._max_candidate_length]
+                    if self._max_candidate_length > 0
+                    else x
+                )
                 .explode()
                 .to_numpy()
                 .astype(np.int64),
                 device=self._device,
             )
-            candidate_item_ids = torch.tensor(
-                sequence_data[self._raw_sequence_feature_name]
-                .apply(lambda x: x[-self._max_candidate_length :])
-                .explode()
-                .to_numpy()
-                .astype(np.int64),
-                device=self._device,
+            candidate_item_ids = (
+                torch.tensor(
+                    sequence_data[self._raw_sequence_feature_name]
+                    .apply(lambda x: x[-self._max_candidate_length :])
+                    .explode()
+                    .to_numpy()
+                    .astype(np.int64),
+                    device=self._device,
+                )
+                if self._max_candidate_length > 0
+                else None
             )
             user_id = torch.tensor(
                 sequence_data["user_id"].to_numpy().astype(np.int64),
@@ -181,14 +190,45 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             ).transpose(0, 1).contiguous() + self._codebook_offsets.unsqueeze(0)
             # labels are the candidate sids but starting from 0.
             candidate_sids = (
-                torch.index_select(
-                    self.item_id_to_sid_mapping_tensor, dim=1, index=candidate_item_ids
+                (
+                    torch.index_select(
+                        self.item_id_to_sid_mapping_tensor,
+                        dim=1,
+                        index=candidate_item_ids,
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
                 )
-                .transpose(0, 1)
-                .contiguous()
+                if self._max_candidate_length > 0
+                else None
             )
-            labels = candidate_sids
-            candidate_sids = candidate_sids + self._codebook_offsets.unsqueeze(0)
+
+            if self._max_candidate_length > 0:
+                labels = candidate_sids
+            else:
+                # we need to remove the starting sids for each sequence.
+                # TODO@junzhang, to optimize the redundant df operations and sid transformations.
+                label_item_ids = torch.tensor(
+                    sequence_data[self._raw_sequence_feature_name]
+                    .apply(lambda x: x[1:])
+                    .explode()
+                    .to_numpy()
+                    .astype(np.int64),
+                    device=self._device,
+                )
+                labels = (
+                    torch.index_select(
+                        self.item_id_to_sid_mapping_tensor, dim=1, index=label_item_ids
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+
+            candidate_sids = (
+                candidate_sids + self._codebook_offsets.unsqueeze(0)
+                if self._max_candidate_length > 0
+                else None
+            )
             # 'sequence length' is the total length
             history_lengths = (
                 torch.tensor(
@@ -225,7 +265,9 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                         self._output_history_sid_feature_name,
                         self._output_candidate_sid_feature_name,
                     ],
-                    values=torch.cat([history_sids.view(-1), candidate_sids.view(-1)]),
+                    values=torch.cat([history_sids.view(-1), candidate_sids.view(-1)])
+                    if self._max_candidate_length > 0
+                    else history_sids.view(-1),
                     lengths=torch.cat([history_lengths, candidate_lengths]),
                 ),
                 batch_size=self._batch_size,
@@ -235,6 +277,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 candidate_feature_name=self._output_candidate_sid_feature_name,
                 labels=labels,  # for eval, we need label to calculate metrics.
                 user_id=user_id,
+                actual_batch_size=actual_batch_size,
             )
             yield GPTSIDBatch(**batch_kwargs)
 

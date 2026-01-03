@@ -70,7 +70,9 @@ def get_dataset(
             if is_train_dataset
             else trainer_args.eval_batch_size,
             max_history_length=max_history_length,  # +1 for the candidate
-            max_candidate_length=max_candidate_length,  # only 1 candidate item for now
+            max_candidate_length=max_candidate_length
+            if is_train_dataset
+            else 1,  # only 1 candidate item for eval.
             raw_sequence_feature_name="sequence_data",  # TODO: make it configurable!!!
             num_hierarchies=num_hierarchies,
             codebook_sizes=codebook_sizes,

@@ -133,6 +133,7 @@ class DistributedRetrievalRecall(DistributedRetrievalMetric):
         topk_indices = torch.topk(preds, self.top_k, dim=1).indices
         topk_target = target.gather(1, topk_indices)  # [batch, top_k]
         num_hit_in_topk = topk_target.sum(dim=1)  # [batch], total recalled samples
+        # for sid, total_relevant <= 1. Because the labels for each query contain single item.
         total_relevant = target.sum(
             dim=1
         )  # how many relevant items in the ground truth

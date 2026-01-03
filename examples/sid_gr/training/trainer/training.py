@@ -73,8 +73,10 @@ def evaluate(
         sid_hits = generated_sids == labels.unsqueeze(1)
         # [batchsize, topk]
         num_sid_hits = sid_hits.sum(dim=-1)
+
         if hit.any():
             hit.nonzero()
+
     compute_res = model.evaluator.compute()
     # reset the evaluator for the next evaluation
     model.evaluator.reset()

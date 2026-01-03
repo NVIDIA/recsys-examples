@@ -102,6 +102,7 @@ def main():
         network_args.num_layers,
         torch.bfloat16,
         tensor_model_parallel_size=tp_args.tensor_model_parallel_size,
+        loss_on_history=dataset_args.max_candidate_length == 0,
     )
     embedding_config = create_embedding_config(network_args.hidden_size, embedding_args)
     model = get_sid_gr_model(

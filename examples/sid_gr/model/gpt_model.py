@@ -6,6 +6,7 @@ from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
+from configs.gpt_config import BOSMode
 from data.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
@@ -17,6 +18,11 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from modules.eval_metrics import SIDRetrievalEvaluator
 from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+
+from .attention_mask import (
+    padded_causal_mask_with_optional_bos,
+    padded_target_aware_causal_mask,
+)
 
 
 def _padding_to_dense_and_transpose(
@@ -62,104 +68,6 @@ def _transpose_dense_to_jagged(
         [input_offsets],
     )[0]
     return jagged_hidden_states
-
-
-def _get_padded_dense_attention_mask(
-    input_offsets: torch.Tensor,
-    input_max_seqlen: int,
-) -> torch.Tensor:
-    B = input_offsets.size(0) - 1
-    S = input_max_seqlen
-    # bs, num_head, seq, seq
-    lower_triangle_mask = torch.tril(
-        torch.ones(
-            (B, 1, S, S),
-            dtype=torch.bool,
-            device=torch.cuda.current_device(),
-        )
-    )
-    # broadcast num_head, s_kv
-    mask = (
-        torch.ops.fbgemm.jagged_to_padded_dense(
-            values=torch.ones(size=(input_offsets[-1],)).cuda(),
-            offsets=[input_offsets],
-            max_lengths=[input_max_seqlen],
-        )
-        .unsqueeze(1)
-        .unsqueeze(-1)
-    )
-    jagged_causal_mask = torch.logical_and(
-        lower_triangle_mask,
-        mask,
-    )
-    # note that we return the inverse of the mask to match the attention mask format.
-    return ~jagged_causal_mask
-
-
-def _create_multi_region_candidate_causal_mask(
-    batchsize,
-    history_seqlen: int,
-    max_history_seqlen: int,
-    num_candidate_region: int,
-    candidate_max_seqlen_per_region: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    input sequence is : [history, candidate_region_0, candidate_region_1, ... padding_0, padding_1, ...],
-                        where history length is history_seqlen, each candidate region length is candidate_max_seqlen_per_region,
-                        and padding length is (max_history_seqlen - history_seqlen).
-    intra region: causal ; inter region: invisible.
-    each candidate needs to attend to the history
-
-    return shape [batchsize, 1 , max_history_seqlen + candidate_max_seqlen_per_region * num_candidate_region, max_history_seqlen + candidate_max_seqlen_per_region * num_candidate_region ]
-    """
-    total_seqlen = (
-        max_history_seqlen + num_candidate_region * candidate_max_seqlen_per_region
-    )
-    valid_seqlen = (
-        history_seqlen + candidate_max_seqlen_per_region * num_candidate_region
-    )
-    # create row and col indices [total_seqlen, total_seqlen]
-    row_indices = torch.arange(total_seqlen, device=device).unsqueeze(
-        1
-    )  # [total_seqlen, 1]
-    col_indices = torch.arange(total_seqlen, device=device).unsqueeze(
-        0
-    )  # [1, total_seqlen]
-
-    # history region: causal (row < max_history_seqlen AND col < max_history_seqlen AND row >= col)
-    is_history_row = row_indices < history_seqlen
-    is_history_col = col_indices < history_seqlen
-    history_causal = is_history_row & is_history_col & (row_indices >= col_indices)
-
-    # candidate to history (row >= max_history_seqlen AND col < max_history_seqlen)
-    is_candidate_row = (row_indices >= history_seqlen) & (row_indices < valid_seqlen)
-    candidate_attend_history = is_candidate_row & is_history_col
-
-    # intra region: causal
-    candidate_row_idx = row_indices - history_seqlen  # candidate region row index
-    candidate_col_idx = col_indices - history_seqlen  # candidate region col index
-    row_region_id = candidate_row_idx // candidate_max_seqlen_per_region
-    row_offset = candidate_row_idx % candidate_max_seqlen_per_region
-
-    col_region_id = candidate_col_idx // candidate_max_seqlen_per_region
-    col_offset = candidate_col_idx % candidate_max_seqlen_per_region
-
-    # intra candidate region: causal
-    is_candidate_col = (col_indices >= history_seqlen) & (col_indices < valid_seqlen)
-    same_region = row_region_id == col_region_id
-    causal_within_region = row_offset >= col_offset
-    candidate_internal_mask = (
-        is_candidate_row & is_candidate_col & same_region & causal_within_region
-    )
-
-    mask = history_causal | candidate_attend_history | candidate_internal_mask
-
-    # expand batch dimension: [batchsize, 1, total_seqlen, total_seqlen]
-    mask = mask.unsqueeze(0).unsqueeze(0).expand(batchsize, 1, -1, -1)
-
-    # note that we return the inverse of the mask to match the attention mask format.
-    return ~mask
 
 
 class SIDGRDecoder(MegatronModule):
@@ -236,6 +144,10 @@ class SIDGRModel(MegatronModule):
         # TODO, use different embedding dim???
         self.embedding_dim = decoder_config.hidden_size
         self.codebook_size = codebook_sizes[0]
+        self.add_bos_to_history_for_training = (
+            decoder_config.bos_token_mode & BOSMode.HISTORY
+        ) != 0
+
         assert all(
             size == self.codebook_size for size in codebook_sizes
         ), "all codebook sizes should be the same"
@@ -326,6 +238,7 @@ class SIDGRModel(MegatronModule):
         """
         self.decoder.bfloat16()
         self._decoder_mlp.bfloat16()
+        self.bos_token.data = self.bos_token.data.bfloat16()
         return self
 
     def half(self):
@@ -335,6 +248,7 @@ class SIDGRModel(MegatronModule):
         """
         self.decoder.half()
         self._decoder_mlp.half()
+        self.bos_token.data = self.bos_token.data.half()
         return self
 
     # TODO
@@ -352,16 +266,14 @@ class SIDGRModel(MegatronModule):
         jagged_embeddings: List[torch.Tensor],
         jagged_offsets: List[torch.Tensor],
         jagged_max_seqlens: List[int],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         assert (
             len(jagged_embeddings) == len(jagged_offsets) == len(jagged_max_seqlens)
         ), "all jagged tensors should have the same length"
-        # [
-        #    [s0_0,s1_0,s2_0], [bos], [c0_0, c1_0, c2_0],
-        #    [s0_1,s1_1,s2_1; s0_2,s1_2,s2_2], [bos], [c0_1, c1_1, c2_1],
-        #    [s0_4,s1_4,s2_4], [bos], [c0_4, c1_4, c2_4],
-        # ]
+        if len(jagged_embeddings) == 1:
+            return jagged_embeddings[0], jagged_offsets[0], jagged_max_seqlens[0]
         max_seqlen_concat = sum(jagged_max_seqlens)
+
         cated_hidden_states, cated_seqlens = jagged_2D_tensor_concat(
             jagged_embeddings,
             jagged_offsets,
@@ -373,41 +285,108 @@ class SIDGRModel(MegatronModule):
     def _prepare_embeddings(
         self,
         batch: GPTSIDBatch,
-        include_candidate: bool = True,  # False for generation
-    ) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+        add_bos_to_history: bool = False,
+        is_generation: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        input has 3 possible cases:
+          generation: [history,bos]
+          loss on candidate:[history, bos, candidate]
+          loss on history and candidate:[history_with_bos_interleaved, bos, candidate]; but note that candidate might be empty.
+        """
         history_feature_name = batch.history_feature_name
+        candidate_feature_name = batch.candidate_feature_name
         history_features = batch.features[history_feature_name]
         max_seqlen_history = batch.feature_to_max_seqlen[history_feature_name]
+        max_seqlen_candidate = batch.feature_to_max_seqlen[candidate_feature_name]
+        actual_batch_size = batch.actual_batch_size
         history_offsets = history_features.offsets()
-
+        if is_generation:
+            assert (
+                not add_bos_to_history
+            ), "No need to add bos to history for generation"
         # 1. embedding lookup
         embeddings: Dict[str, JaggedTensor] = self._codebooks_collection(batch.features)
         # TODO, remove the assertion
         assert all(
             feature_name in embeddings.keys() for feature_name in batch.features.keys()
         ), "all embedding feature names should be valid"
-        # assert (
-        #     self._num_hierarchies == batch._num_hierarchies
-        # ), "number of hierarchies must match"
-        bos_offsets = torch.arange(
-            0,
-            batch.batch_size + 1,
-            device=history_offsets.device,
-            dtype=history_offsets.dtype,
+
+        history_embeddings = (
+            embeddings[history_feature_name].values().to(self._training_dtype)
         )
-        # 2. concat history, bos, optionally candidate ( TODO: add position encoder )
-        bos_token = (
-            self.bos_token.repeat(batch.batch_size, 1)
-            .contiguous()
-            .to(self._training_dtype)
-        )  # seqlens * num_hierarchies
-        jagged_embeddings: List[torch.Tensor] = [
-            embeddings[history_feature_name].values().to(self._training_dtype),
-            bos_token,
-        ]
-        jagged_offsets: List[torch.Tensor] = [history_offsets, bos_offsets]
-        jagged_max_seqlens: List[int] = [max_seqlen_history, 1]
-        if include_candidate:
+        assert (
+            self._num_hierarchies == batch._num_hierarchies
+        ), "number of hierarchies must match"
+
+        jagged_embeddings = []
+        jagged_offsets = []
+        jagged_max_seqlens = []
+        # 2. if add_bos_to_history, we insert bos token after each item (except the last one)
+        if add_bos_to_history:
+            # each item is a tuple of sid, and we need to insert bos token after each item (except the last one).
+            # [[item0, item1, item2, ...], [item3, item4, item5, ...], ...] ->
+            # [[{item0| bos, item1| bos, item2|...| bos, itemN}], [{item3| bos, item4| bos, item5|...| bos, itemM}]]
+            # we use cat to implement this.
+            history_embeddings = history_embeddings.view(
+                -1, self._num_hierarchies, self.embedding_dim
+            )
+            bos_token = (
+                self.bos_token.view(1, 1, -1)
+                .expand_as(history_embeddings)[:, :1, :]
+                .to(self._training_dtype)
+            )
+            history_embeddings = torch.cat([history_embeddings, bos_token], dim=1).view(
+                -1, self.embedding_dim
+            )
+            history_offsets = history_offsets // self._num_hierarchies + history_offsets
+            max_seqlen_history = (
+                max_seqlen_history + max_seqlen_history // self._num_hierarchies
+            )
+            # remove the last bos token of each sequence
+            last_bos_offsets = torch.arange(
+                history_offsets.size(0),
+                device=history_offsets.device,
+                dtype=history_offsets.dtype,
+            ).clamp(max=batch.actual_batch_size)
+            history_embeddings, _ = triton_split_2D_jagged(
+                history_embeddings,
+                max_seq_len=max_seqlen_history,
+                offsets_a=history_offsets - last_bos_offsets,
+                offsets_b=last_bos_offsets,
+            )
+            max_seqlen_history -= 1
+            history_offsets -= last_bos_offsets
+        jagged_embeddings.append(history_embeddings)
+        jagged_offsets.append(history_offsets)
+        jagged_max_seqlens.append(max_seqlen_history)
+        if is_generation or max_seqlen_candidate > 0:
+            # when is_generation, we need to append bos
+            # when include_candidate, we need to append [bos, candidate]
+
+            # [[item0, item1, item2, ...], [item3, item4, item5, ...], ...] ->
+            # [[{item0, item1, item2, ..., itemN} | {bos}], [{item3, item4, item5, ..., itemM} | {bos}]]
+            # the last bos of each sequence is retained for later decoding.
+            # we use jagged concat
+            candidate_bos_offsets = torch.arange(
+                0,
+                batch.batch_size + 1,
+                device=history_offsets.device,
+                dtype=history_offsets.dtype,
+            ).clamp(max=actual_batch_size)
+            bos_token = (
+                self.bos_token.repeat(actual_batch_size, 1)
+                .contiguous()
+                .to(self._training_dtype)
+            )  # seqlens * num_hierarchies
+            jagged_embeddings.append(bos_token)
+            jagged_offsets.append(candidate_bos_offsets)
+            jagged_max_seqlens.append(1)
+
+        # For generation, we skip this step
+        # 3. append candidate.
+        if not is_generation and max_seqlen_candidate > 0:
+            # [[{item0| bos, item1| bos, item2|...| bos, itemN}, {bos, candidate0}], [{item3| bos, item4| bos, item5|...| bos, itemM}, {bos, candidate1}]]
             candidate_feature_name = batch.candidate_feature_name
             jagged_embeddings.append(
                 embeddings[candidate_feature_name].values().to(self._training_dtype)
@@ -416,7 +395,6 @@ class SIDGRModel(MegatronModule):
             jagged_max_seqlens.append(
                 batch.feature_to_max_seqlen[candidate_feature_name]
             )
-
         (
             input_hidden_states,
             input_offsets,
@@ -427,39 +405,50 @@ class SIDGRModel(MegatronModule):
             jagged_max_seqlens,
         )
 
-        # TODO, considering removing the bos_offsets from the return value for better readability.
-        return input_hidden_states, input_offsets, input_max_seqlen, bos_offsets
+        return input_hidden_states, input_offsets, input_max_seqlen
 
     def _postprocess_output(
         self,
         jagged_output_hidden_states: torch.Tensor,
         input_max_seqlen: int,
+        input_offsets: torch.Tensor,
+        actual_batch_size: int,
         history_offsets: torch.Tensor,
-        candidate_offsets: torch.Tensor,
-        bos_offsets: torch.Tensor,
-        max_seqlen_candidate: int,
         output_hierarchies: int,
+        add_bos_to_history: bool = False,
     ) -> torch.Tensor:
+        """
+        input has 2 possible cases:
+          loss on candidate:[history, bos, candidate]
+          loss on history and candidate:[history_with_bos_interleaved, bos, candidate]
+
+          but note that candidate might be empty.
+        """
         # split history, candidate, note that we append a bos token,
         # history are dropped.
-        # TODO, replace with one-shot op
-        _, output_hidden_states_bos_candidate = triton_split_2D_jagged(
+        # [[{item0| bos, item1| bos, item2|...| bos, itemN}, {bos, candidate0}], [{item3| bos, item4| bos, item5|...| bos, itemM}, {bos,candidate1}]] or
+        # [[{item0,item1,item2... itemN}, {bos, candidate0}], [{item3, item4, item5... itemM}, {bos,candidate1}]]
+        prefix_offsets_to_remove = (
+            torch.arange(
+                history_offsets.size(0),
+                device=history_offsets.device,
+                dtype=history_offsets.dtype,
+            ).clamp(max=actual_batch_size)
+            * self._num_hierarchies
+            if add_bos_to_history
+            else history_offsets
+        )
+
+        # [bos, s0,s1,s2(dropped), bos,s3,s4,s5(dropped), bos,s6,s7,s8(dropped), ... bos,c_n, c_n+1, c_n+2(dropped)]
+        _, bos_and_candidate_hidden_states = triton_split_2D_jagged(
             jagged_output_hidden_states,
             max_seq_len=input_max_seqlen,
-            offsets_a=history_offsets,
-            offsets_b=candidate_offsets + bos_offsets,
+            offsets_a=prefix_offsets_to_remove,
+            offsets_b=input_offsets - prefix_offsets_to_remove,
         )
-        # remove the last token.
-        output_hidden_states, _ = triton_split_2D_jagged(
-            output_hidden_states_bos_candidate,
-            max_seq_len=max_seqlen_candidate + 1,
-            offsets_a=candidate_offsets,
-            offsets_b=bos_offsets,
-        )
-        # the output shape should be [(sum(candidate_seqlen)) , num_hierarchies, hidden_size]
-        candidate_hidden_states = output_hidden_states.reshape(
-            -1, output_hierarchies, self.embedding_dim
-        )
+        candidate_hidden_states = bos_and_candidate_hidden_states.view(
+            -1, self._num_hierarchies + 1, self.embedding_dim
+        )[:, :output_hierarchies, :]
         return candidate_hidden_states
 
     def decoder_step(
@@ -469,12 +458,17 @@ class SIDGRModel(MegatronModule):
         input_max_seqlen: int,
         attention_mask: Optional[torch.Tensor] = None,
         padding_to_dense: bool = True,
+        add_bos_to_history: bool = False,
     ) -> torch.Tensor:
         """
         Input and Output are both jagged.
         attention_mask is used only when padding_to_dense is True.
         When attention mask is None, we will construct a causal attention mask if padding_to_dense is True.
         """
+        if add_bos_to_history:
+            assert (
+                attention_mask is None
+            ), "attention mask should be None when adding bos to history"
         # TODO, remove the padding.
         input_offsets[-1].item()
         if padding_to_dense:
@@ -485,9 +479,11 @@ class SIDGRModel(MegatronModule):
             )
             packed_seq_params = None
             if attention_mask is None:
-                attention_mask = _get_padded_dense_attention_mask(
+                attention_mask = padded_causal_mask_with_optional_bos(
                     input_offsets,
                     input_max_seqlen,
+                    add_bos_to_history=add_bos_to_history,
+                    bos_interval=self._num_hierarchies,
                 )
         else:
             # THD still needs batch dimension
@@ -499,7 +495,6 @@ class SIDGRModel(MegatronModule):
                 input_offsets,
                 input_max_seqlen,
             )
-
         # causal self-attention
         decoder_output_hidden_states = self.decoder(
             hidden_states=decoder_input_hidden_states,  # input_hidden_states,
@@ -527,11 +522,12 @@ class SIDGRModel(MegatronModule):
             input_hidden_states,
             input_offsets,
             input_max_seqlen,
-            bos_offsets,
-        ) = self._prepare_embeddings(batch)
+        ) = self._prepare_embeddings(
+            batch,
+            add_bos_to_history=self.add_bos_to_history_for_training,
+            is_generation=False,
+        )
         history_offsets = batch.features[batch.history_feature_name].offsets()
-        candidate_offsets = batch.features[batch.candidate_feature_name].offsets()
-        max_seqlen_candidate = batch.feature_to_max_seqlen[batch.candidate_feature_name]
 
         # 2. decoder step
         jagged_output_hidden_states = self.decoder_step(
@@ -539,21 +535,21 @@ class SIDGRModel(MegatronModule):
             input_offsets,
             input_max_seqlen,
             attention_mask=None,
+            add_bos_to_history=self.add_bos_to_history_for_training,
         )
         # 3. postprocess: only keep the candidate hidden states
         candidate_hidden_states = self._postprocess_output(
             jagged_output_hidden_states,
             input_max_seqlen,
+            input_offsets,
+            batch.actual_batch_size,
             history_offsets,
-            candidate_offsets,
-            bos_offsets,
-            max_seqlen_candidate,
             batch._num_hierarchies,
+            add_bos_to_history=self.add_bos_to_history_for_training,
         )
         losses_per_hierarchy = []
         logits_per_hierarchy = []
         merged_labels = batch.labels.view(-1, batch._num_hierarchies)
-
         # 4. output linear projection & loss
         # TODO, merge into single linear layer
         for hierarchy_idx, mlp in enumerate[Any](self._decoder_mlp):
@@ -566,7 +562,6 @@ class SIDGRModel(MegatronModule):
                 if isinstance(tuple_or_tensor, tuple)
                 else tuple_or_tensor
             )
-
             losses_per_hierarchy.append(
                 self.loss_module(
                     candidate_hierarchy_logits.float(), merged_labels[:, hierarchy_idx]
@@ -591,13 +586,14 @@ class SIDGRModel(MegatronModule):
         """
 
         attention_mask: Optional[torch.Tensor] = None
-        # 0. prepare history and bos embeddings.
+        # 0. prepare history and bos embeddings. Note that we do not append bos to history.
         (
             history_embeddings,
             input_offsets,
             input_max_seqlen,
-            _,
-        ) = self._prepare_embeddings(batch, include_candidate=False)
+        ) = self._prepare_embeddings(
+            batch, add_bos_to_history=False, is_generation=True
+        )
         # TODO : fix the incomplete batch
         batch_size = input_offsets.size(0) - 1
         actual_history_seqlen = input_offsets[-1].item()
@@ -672,7 +668,7 @@ class SIDGRModel(MegatronModule):
                 )
 
             # 2. prepare the attention mask
-            attention_mask = _create_multi_region_candidate_causal_mask(
+            attention_mask = padded_target_aware_causal_mask(
                 batch_size,
                 actual_history_seqlen,
                 input_max_seqlen,
@@ -681,13 +677,14 @@ class SIDGRModel(MegatronModule):
                 device=cated_hidden_states.device,
             )
 
-            # 3. we need a decoder step with the concatenated hidden states and offsets
+            # 3. we need a decoder step with the concatenated hidden states and offsets. Note that we do not add bos to history for generation.
             jagged_output_hidden_states = self.decoder_step(
                 cated_hidden_states,
                 cated_offsets,
                 cated_max_seqlen,
                 attention_mask=attention_mask,
                 padding_to_dense=True,
+                add_bos_to_history=False,
             )
             # remove history[batchsize * topk_last_step * max(1,i), embedding_dim]
             _, candidate_hidden_states = triton_split_2D_jagged(

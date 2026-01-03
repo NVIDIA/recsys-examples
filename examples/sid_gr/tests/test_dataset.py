@@ -82,9 +82,11 @@ def test_batch(batch_size):
 
 @pytest.mark.parametrize("batch_size", [128, 256, 512])
 @pytest.mark.parametrize("max_history_length", [64, 128, 256])
+@pytest.mark.parametrize("max_candidate_length", [0, 1])
 def test_disk_sequence_dataset(
     batch_size,
     max_history_length,
+    max_candidate_length,
 ):
     num_hierarchies = 4
     disk_sequence_dataset = DiskSequenceDataset(
@@ -92,7 +94,7 @@ def test_disk_sequence_dataset(
         item_id_to_sid_mapping_tensor_path="./tmp_data/amzn/beauty/item-sid-mapping.pt",
         batch_size=batch_size,
         max_history_length=max_history_length,
-        max_candidate_length=1,
+        max_candidate_length=max_candidate_length,
         raw_sequence_feature_name="sequence_data",
         num_hierarchies=num_hierarchies,
         codebook_sizes=[256, 256, 256, 256],
@@ -115,10 +117,14 @@ def test_disk_sequence_dataset(
             assert (
                 batch.features[key].lengths().numel() == batch_size
             ), f"length of {key} should be {batch_size}"
-        if idx < len(disk_sequence_dataset) - 1:
+        if idx < len(disk_sequence_dataset) - 1 and max_candidate_length > 0:
             assert (
                 batch.labels.view(-1, num_hierarchies).shape[0] == batch_size
             ), f"labels should be {batch_size}"
+        if max_candidate_length == 0:
+            assert (
+                batch.labels is None
+            ), "labels should be None when max_candidate_length is 0"
 
 
 def test_sid_data_loader():

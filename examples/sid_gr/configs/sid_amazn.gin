@@ -1,32 +1,34 @@
-TrainerArgs.train_batch_size = 4
-TrainerArgs.eval_batch_size = 4
-TrainerArgs.log_interval = 1
-TrainerArgs.eval_interval = 10
+TrainerArgs.train_batch_size = 32
+TrainerArgs.eval_batch_size = 32
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 100
 TrainerArgs.profile = False
 TrainerArgs.profile_step_start = 50
 TrainerArgs.profile_step_end = 80
-TrainerArgs.max_train_iters = 10000
-TrainerArgs.max_eval_iters = 1
+TrainerArgs.max_train_iters = 32000
+TrainerArgs.max_eval_iters = 200
 TrainerArgs.pipeline_type = "none"
 
 TrainerArgs.top_k_for_generation = 20 # beam search width
-TrainerArgs.eval_metrics = ('NDCG@1', 'Recall@1',  'HitRate@1') # evaluation metrics
+TrainerArgs.eval_metrics = ('NDCG@10', 'Recall@10',  'HitRate@10') # evaluation metrics
 
 DatasetArgs.dataset_name = 'amzn_beauty'
 DatasetArgs.max_history_length = 120 # 120 is the max sequence length for the training. We need to Downsample the original dataset to 120.
+DatasetArgs.max_candidate_length = 0 # when loss_on_history is off, we only calculate loss on the candidate. Otherwise, we calculate loss on the history and candidate.
 DatasetArgs.dataset_type_str = "disk_sequence_dataset"
 DatasetArgs.sequence_features_training_data_path = "./tmp_data/amzn/beauty/training/22363.parquet" # training/testing
 DatasetArgs.sequence_features_testing_data_path = "./tmp_data/amzn/beauty/training/22363.parquet"
 DatasetArgs.item_to_sid_mapping_path = "./tmp_data/amzn/beauty/item-sid-mapping.pt"
-DatasetArgs.shuffle = True
+DatasetArgs.shuffle = False
 DatasetArgs.num_hierarchies = 4
 DatasetArgs.codebook_sizes = [256, 256, 256, 256] # embedding vocab size for each hierarchy, the last one is used for de-duplication
 
-NetworkArgs.num_layers = 1
-NetworkArgs.num_attention_heads = 4
-NetworkArgs.hidden_size = 512 # embedding dim
+NetworkArgs.num_layers = 4
+NetworkArgs.num_attention_heads = 6
+NetworkArgs.hidden_size = 128 # embedding dim
 # per head dim
-NetworkArgs.kv_channels = 128
+NetworkArgs.kv_channels = 64
+
 
 OptimizerArgs.optimizer_str = 'adam'
 OptimizerArgs.learning_rate = 1e-3
