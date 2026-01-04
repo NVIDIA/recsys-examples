@@ -1,5 +1,6 @@
 import pytest
 import torch
+from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from data.disk_sequence_dataset import DiskSequenceDataset
 from data.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from tqdm import tqdm
@@ -103,7 +104,7 @@ def test_disk_sequence_dataset(
         shuffle=False,
         random_seed=1234,
         is_train_dataset=True,
-        deduplicate_sid_across_hierarchy=True,
+        deduplicate_sid_across_hierarchy=False,
     )
     num_batches = len(disk_sequence_dataset)
     for idx, batch in enumerate(
@@ -113,6 +114,7 @@ def test_disk_sequence_dataset(
             desc="Testing disk sequence dataset",
         )
     ):
+        batch = batch.to(torch.cuda.current_device())
         for key in batch.features.keys():
             assert (
                 batch.features[key].lengths().numel() == batch_size
@@ -122,9 +124,34 @@ def test_disk_sequence_dataset(
                 batch.labels.view(-1, num_hierarchies).shape[0] == batch_size
             ), f"labels should be {batch_size}"
         if max_candidate_length == 0:
-            assert (
-                batch.labels is None
-            ), "labels should be None when max_candidate_length is 0"
+            # labels are the history sids
+            history_sids = (
+                batch.features[batch.history_feature_name]
+                .values()
+                .view(-1, num_hierarchies)
+            )
+            prefix_to_remove = torch.arange(
+                batch_size + 1, device=batch.labels.device
+            ).clamp(max=batch.actual_batch_size)
+            _, shifted_history_sids = triton_split_2D_jagged(
+                history_sids,
+                max_seq_len=max_history_length,
+                offsets_a=prefix_to_remove,
+                offsets_b=batch.features[batch.history_feature_name].offsets()
+                // num_hierarchies
+                - prefix_to_remove,
+            )
+            labels = batch.labels.view(-1, num_hierarchies)
+            assert torch.all(labels == shifted_history_sids)
+
+        if batch.actual_batch_size != batch_size:
+            if max_candidate_length == 1:
+                assert batch.labels.shape[0] == batch.actual_batch_size
+            else:
+                assert (
+                    batch.labels.shape[0]
+                    == history_sids.shape[0] - batch.actual_batch_size
+                )
 
 
 def test_sid_data_loader():
