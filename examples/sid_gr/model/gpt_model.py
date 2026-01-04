@@ -10,6 +10,9 @@ from configs.gpt_config import BOSMode
 from data.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+from megatron.core.models.common.embeddings.relative_pos_embedding import (
+    RelativePositionEmbedding,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -92,6 +95,14 @@ class SIDGRDecoder(MegatronModule):
         self.transformer_decoder_layer_spec: ModuleSpec = transformer_decoder_layer_spec
         # TODO, add position encoder
         self.model_type = ModelType.encoder_or_decoder
+        self.position_embedding_type = position_embedding_type
+        self.decoder_relative_pos_emb = RelativePositionEmbedding(
+            bidirectional=False,
+            init_method=self.config.init_method,
+            num_attention_heads=self.config.num_attention_heads,
+            relative_attention_num_buckets=relative_attention_num_buckets,
+            relative_attention_max_distance=relative_attention_max_distance,
+        )
         self.decoder = TransformerBlock(
             config=self.config,
             spec=self.transformer_decoder_layer_spec,
@@ -105,12 +116,21 @@ class SIDGRDecoder(MegatronModule):
         ] = None,  # decoder attention mask, always causal
         *,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
-        #
+        attention_bias = None
+        # if self.position_embedding_type == 'relative':
+        #     # attention bias is supported by cudnn, but not fa.
+        #     # TODO@junzhang add jagged support once we have attention kernels
+        #     query_seq_length = input_max_seqlen
+        #     key_seq_length = query_seq_length
+        #     attention_bias = self.decoder_relative_pos_emb(query_seq_length, key_seq_length)
         output = self.decoder(
             hidden_states=hidden_states,  # query
             attention_mask=attention_mask,  # attention mask
             packed_seq_params=packed_seq_params,  # query and kv seqlens
+            attention_bias=attention_bias,
+            **kwargs,
         )
         return output
 
@@ -464,6 +484,8 @@ class SIDGRModel(MegatronModule):
         Input and Output are both jagged.
         attention_mask is used only when padding_to_dense is True.
         When attention mask is None, we will construct a causal attention mask if padding_to_dense is True.
+
+        We now only support dense input.
         """
         if add_bos_to_history:
             assert (
@@ -495,7 +517,7 @@ class SIDGRModel(MegatronModule):
                 input_offsets,
                 input_max_seqlen,
             )
-        # causal self-attention
+
         decoder_output_hidden_states = self.decoder(
             hidden_states=decoder_input_hidden_states,  # input_hidden_states,
             attention_mask=attention_mask,
@@ -594,8 +616,8 @@ class SIDGRModel(MegatronModule):
         ) = self._prepare_embeddings(
             batch, add_bos_to_history=False, is_generation=True
         )
-        # TODO : fix the incomplete batch
-        batch_size = input_offsets.size(0) - 1
+        batch_size = batch.actual_batch_size
+        input_offsets = input_offsets[: batch_size + 1]
         actual_history_seqlen = input_offsets[-1].item()
         topk_prev_step = 1
         self.beam_search.reset()
@@ -669,7 +691,7 @@ class SIDGRModel(MegatronModule):
 
             # 2. prepare the attention mask
             attention_mask = padded_target_aware_causal_mask(
-                batch_size,
+                batch_size,  # note we use full batch size for attention mask
                 actual_history_seqlen,
                 input_max_seqlen,
                 0 if i == 0 else topk_prev_step,
@@ -709,7 +731,6 @@ class SIDGRModel(MegatronModule):
             probs_this_step: torch.Tensor = torch.nn.functional.log_softmax(
                 candidates_logits.float(), dim=-1
             )
-
             # 5. filter the topk candidates, update the generated_sids and log_probs for the next step
             self.beam_search.propagate(probs_this_step)
         # only for debugging purpose
