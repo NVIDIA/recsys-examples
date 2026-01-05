@@ -517,7 +517,6 @@ class SIDGRModel(MegatronModule):
                 input_offsets,
                 input_max_seqlen,
             )
-
         decoder_output_hidden_states = self.decoder(
             hidden_states=decoder_input_hidden_states,  # input_hidden_states,
             attention_mask=attention_mask,
@@ -618,7 +617,6 @@ class SIDGRModel(MegatronModule):
         )
         batch_size = batch.actual_batch_size
         input_offsets = input_offsets[: batch_size + 1]
-        actual_history_seqlen = input_offsets[-1].item()
         topk_prev_step = 1
         self.beam_search.reset()
         for i in range(self._num_hierarchies):
@@ -691,12 +689,10 @@ class SIDGRModel(MegatronModule):
 
             # 2. prepare the attention mask
             attention_mask = padded_target_aware_causal_mask(
-                batch_size,  # note we use full batch size for attention mask
-                actual_history_seqlen,
+                torch.diff(input_offsets),
                 input_max_seqlen,
                 0 if i == 0 else topk_prev_step,
                 candidate_length,
-                device=cated_hidden_states.device,
             )
 
             # 3. we need a decoder step with the concatenated hidden states and offsets. Note that we do not add bos to history for generation.

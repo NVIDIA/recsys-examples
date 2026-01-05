@@ -64,16 +64,62 @@ def padded_causal_mask_with_optional_bos(
     return ~jagged_causal_mask
 
 
+@torch.fx.wrap
+def padded_history_mask_with_causal_target(
+    history_offsets: torch.Tensor,
+    history_max_seqlen: int,
+    target_seqlen: int,
+    history_causal: bool = True,
+) -> torch.Tensor:
+    """
+    generate a mask for the history and the causal target.
+    For history, we pretend it's an encoder, while for target, we pretend it's a decoder.
+    Args:
+        history_offsets: [batchsize + 1]
+        history_max_seqlen: int
+        target_offsets: [batchsize + 1]
+        target_max_seqlen: int
+    Returns:
+        mask: [batchsize, 1, history_max_seqlen, history_max_seqlen + target_max_seqlen]
+
+
+    Example:
+
+       history_max_seqlen = 4
+       target_seqlen = 3
+       history_offsets = [0, 4, 6]
+       [[a0,a1,a2,a3,c0,c1,c2], [a4,a5,c3,c4,c5]]
+    mask:
+        [
+         [ [1,1,1,1,0,0,0],
+           [1,1,1,1,0,0,0],
+           [1,1,1,1,0,0,0],
+           [1,1,1,1,0,0,0]]
+           [1,1,1,1,1,0,0]]
+           [1,1,1,1,1,1,0]]
+           [1,1,1,1,1,1,1]],
+
+         [ [1,1,0,0,0,0,0],
+           [1,1,0,0,0,0,0],
+           [1,1,1,0,0,0,0],
+           [1,1,1,1,0,0,0],
+           [1,1,1,1,1,0,0],
+           [0,0,0,0,0,0,0],
+           [0,0,0,0,0,0,0],
+         ]
+    """
+
+
 # refer to hstu https://github.com/jiayus-nvidia/FBGEMM/blob/main/fbgemm_gpu/experimental/hstu/img/context_causal_target.png
 def padded_target_aware_causal_mask(
-    batchsize,
-    history_seqlen: int,
+    history_seqlen: torch.Tensor,
     max_history_seqlen: int,
     num_target_region: int,
     target_max_seqlen_per_region: int,
-    device: torch.device,
+    causal: bool = True,
 ) -> torch.Tensor:
     """
+    Used for the beam search where there are multiple beams (targets) for each history.
     input sequence is : [history, target_region_0, target_region_1, ... padding_0, padding_1, ...],
                         where history length is history_seqlen, each target region length is target_max_seqlen_per_region,
                         and padding length is (max_history_seqlen - history_seqlen).
@@ -81,46 +127,59 @@ def padded_target_aware_causal_mask(
     each target needs to attend to the history
 
     """
-    total_seqlen = max_history_seqlen + num_target_region * target_max_seqlen_per_region
-    valid_seqlen = history_seqlen + target_max_seqlen_per_region * num_target_region
-    # create row and col indices [total_seqlen, total_seqlen]
-    row_indices = torch.arange(total_seqlen, device=device).unsqueeze(
-        1
-    )  # [total_seqlen, 1]
-    col_indices = torch.arange(total_seqlen, device=device).unsqueeze(
-        0
-    )  # [1, total_seqlen]
+    device = history_seqlen.device
+    target_lengths = target_max_seqlen_per_region * num_target_region
+    N = max_history_seqlen + target_lengths
+    valid_lengths = (history_seqlen + target_lengths).view(-1, 1, 1)
 
-    # history region: causal (row < max_history_seqlen AND col < max_history_seqlen AND row >= col)
-    is_history_row = row_indices < history_seqlen
-    is_history_col = col_indices < history_seqlen
-    history_causal = is_history_row & is_history_col & (row_indices >= col_indices)
+    ids = torch.arange(0, N, device=device).view(1, N)
+    # [B,1,1]
+    row_ids = ids.unsqueeze(-1).expand(-1, N, N)
+    col_ids = row_ids.transpose(1, 2)
+    row_col_dist = row_ids - col_ids
+    valid_attn_mask = torch.eye(N, device=device, dtype=torch.bool).view(1, N, N)
 
-    # target to history (row >= max_history_seqlen AND col < max_history_seqlen)
-    is_target_row = (row_indices >= history_seqlen) & (row_indices < valid_seqlen)
-    target_attend_history = is_target_row & is_history_col
-
-    # intra region: causal
-    target_row_idx = row_indices - history_seqlen  # target region row index
-    target_col_idx = col_indices - history_seqlen  # target region col index
-    row_region_id = target_row_idx // target_max_seqlen_per_region
-    row_offset = target_row_idx % target_max_seqlen_per_region
-
-    col_region_id = target_col_idx // target_max_seqlen_per_region
-    col_offset = target_col_idx % target_max_seqlen_per_region
-
-    # intra target region: causal
-    is_target_col = (col_indices >= history_seqlen) & (col_indices < valid_seqlen)
-    same_region = row_region_id == col_region_id
-    causal_within_region = row_offset >= col_offset
-    target_internal_mask = (
-        is_target_row & is_target_col & same_region & causal_within_region
+    valid_region_mask = torch.logical_and(
+        row_ids < valid_lengths.view(-1, 1, 1), col_ids < valid_lengths.view(-1, 1, 1)
     )
+    if not causal:
+        row_col_dist = torch.where(row_col_dist > 0, row_col_dist, -row_col_dist)
+    valid_attn_mask = torch.logical_or(valid_attn_mask, row_col_dist > 0)
+    if num_target_region > 0:
+        target_group_row_ids = (
+            torch.clamp(row_ids - valid_lengths + target_lengths, min=-1)
+            // target_max_seqlen_per_region
+        )
+        target_group_col_ids = target_group_row_ids.transpose(1, 2)
+        target_dist = target_group_row_ids - target_group_col_ids
 
-    mask = history_causal | target_attend_history | target_internal_mask
+        target_group_mask = torch.logical_or(
+            target_dist == 0, (target_group_row_ids < 0) + (target_group_col_ids < 0)
+        )
+        # preserve the intra-target-group attention and purge the inter-target-group attention
+        valid_attn_mask = torch.logical_and(valid_attn_mask, target_group_mask)
 
-    # expand batch dimension: [batchsize, 1, total_seqlen, total_seqlen]
-    mask = mask.unsqueeze(0).unsqueeze(0).expand(batchsize, 1, -1, -1)
+    # [B, N, N]
+    valid_attn_mask = valid_attn_mask & valid_region_mask
 
+    # [B, 1, N, N] for num_head attention
+    valid_attn_mask = valid_attn_mask.unsqueeze(1)
     # note that we return the inverse of the mask to match the attention mask format.
-    return ~mask
+    return ~valid_attn_mask
+
+
+if __name__ == "__main__":
+    history_seqlen = torch.tensor([4, 3]).cuda()
+    max_history_seqlen = 6
+    num_target_region = 3
+    target_max_seqlen_per_region = 3
+    device = torch.device("cuda")
+    history_causal = False
+    mask = padded_target_aware_causal_mask(
+        history_seqlen,
+        max_history_seqlen,
+        num_target_region,
+        target_max_seqlen_per_region,
+        history_causal,
+    )
+    valid_mask = ~mask
