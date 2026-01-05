@@ -74,6 +74,7 @@ from dynamicemb_extensions import (
     select,
     select_index,
     store_to_combined_table,
+    InsertResult,
 )
 from torch import Tensor, nn  # usort:skip
 from torchrec import JaggedTensor
@@ -1298,7 +1299,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         scores: Optional[torch.Tensor] = None,
     ) -> None:
         if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
-            return deterministic_insert(unique_keys, unique_values, scores)
+            return self.deterministic_insert(unique_keys, unique_values, scores)
 
         self.expand()
 
@@ -2014,22 +2015,32 @@ class DynamicEmbeddingTable(KeyValueTable):
         pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
         pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
 
-        keys_t = pad_keys.transpose(0, 1).to(self.key_type).contiguous()
-        score_t = pad_scores.transpose(0, 1).contiguous()
+        keys_t = pad_keys.transpose(0, 1).to(self.key_type()).contiguous()
+        score_t = pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
 
         # 3. Insert iteratively
-        num_iter = keys_t.size(1)
+        num_iter = keys_t.size(0)
+        eviction = 0
+        insert = 0
         for i in range(num_iter):
+            valid_mask = keys_t[i] != -1
+            valid_batch = valid_mask.sum().item()
+            valid_keys = keys_t[i][valid_mask].contiguous()
+            insert_results = torch.empty(valid_batch, dtype=torch.uint8, device=keys_t[i].device)
             score_args_insert = [
                 ScoreArg(
                     name=self.score_policy.name,
-                    value=score_t[i],
+                    # value=score_t[i] if score_t is not None else None,
+                    value=score_t[i][valid_mask].contiguous() if score_t is not None else None,
                     policy=policy,
                     is_return=False,
                 )
             ]
 
-            self.key_index_map.insert(keys_t[i], score_args_insert)
+            # self.key_index_map.insert(keys_t[i], score_args_insert)
+            self.key_index_map.insert(valid_keys, score_args_insert, None, insert_results)
+            eviction += (insert_results == InsertResult.EVICT.value).sum().item()
+            insert += (insert_results == InsertResult.INSERT.value).sum().item()
 
         # 4. lookup the indices in unique_keys' order and store the values.
         score_args_lookup = [
@@ -2044,10 +2055,16 @@ class DynamicEmbeddingTable(KeyValueTable):
             dtype=self.key_index_map.index_type,
             device=unique_keys.device,
         )
-        self.key_index_map.lookup(unique_keys, score_args_lookup, None, indices)
+        founds = torch.zeros(h_num_unique_keys, dtype=torch.bool, device=unique_keys.device)
+        self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
+        
+        
+        founds = torch.zeros(h_num_unique_keys, dtype=torch.bool, device=unique_keys.device)
+        self.key_index_map.lookup(bkt_keys, score_args_lookup, founds, indices)
+        return indices, eviction, insert
 
 
 def update_cache(
@@ -2177,6 +2194,7 @@ class KeyValueTableFunction:
                 unique_keys,
             )
 
+        ret_indices = None
         if training:
             # insert missing values
             missing_values_in_storage = torch.empty(
@@ -2205,12 +2223,13 @@ class KeyValueTableFunction:
                 )
 
             # 3. insert missing values into table.
-            storage.insert(
+            ret_indices = storage.insert(
                 keys_to_insert,
                 values_to_insert,
                 scores_to_insert,
             )
         # ignore the storage missed in eval mode
+        return ret_indices
 
     @staticmethod
     def update(

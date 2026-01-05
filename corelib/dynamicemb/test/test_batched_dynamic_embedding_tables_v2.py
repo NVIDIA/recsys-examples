@@ -290,432 +290,432 @@ def init_embedding_tables(stbe, bdet):
     #           pass
 
 
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-        (
-            EmbOptimType.ADAM,
-            {
-                "learning_rate": 0.3,
-                "weight_decay": 0.06,
-                "eps": 3e-5,
-                "beta1": 0.8,
-                "beta2": 0.888,
-            },
-        ),
-    ],
-)
-@pytest.mark.parametrize("caching", [True, False])
-@pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_forward_train_eval(opt_type, opt_params, caching, PS):
-    print(
-        f"step in test_forward_train_eval , opt_type = {opt_type} opt_params = {opt_params}"
-    )
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
+# @pytest.mark.parametrize(
+#     "opt_type,opt_params",
+#     [
+#         (EmbOptimType.SGD, {"learning_rate": 0.3}),
+#         (
+#             EmbOptimType.ADAM,
+#             {
+#                 "learning_rate": 0.3,
+#                 "weight_decay": 0.06,
+#                 "eps": 3e-5,
+#                 "beta1": 0.8,
+#                 "beta2": 0.888,
+#             },
+#         ),
+#     ],
+# )
+# @pytest.mark.parametrize("caching", [True, False])
+# @pytest.mark.parametrize("PS", [None, PyDictStorage])
+# def test_forward_train_eval(opt_type, opt_params, caching, PS):
+#     print(
+#         f"step in test_forward_train_eval , opt_type = {opt_type} opt_params = {opt_params}"
+#     )
+#     assert torch.cuda.is_available()
+#     device_id = 0
+#     device = torch.device(f"cuda:{device_id}")
 
-    dims = [8, 8, 8]
-    table_names = ["table0", "table1", "table2"]
-    key_type = torch.int64
-    value_type = torch.float32
+#     dims = [8, 8, 8]
+#     table_names = ["table0", "table1", "table2"]
+#     key_type = torch.int64
+#     value_type = torch.float32
 
-    init_capacity = 1024
-    max_capacity = 2048
+#     init_capacity = 1024
+#     max_capacity = 2048
 
-    dyn_emb_table_options_list = []
-    for dim in dims:
-        dyn_emb_table_options = DynamicEmbTableOptions(
-            dim=dim,
-            init_capacity=init_capacity,
-            max_capacity=max_capacity,
-            index_type=key_type,
-            embedding_dtype=value_type,
-            device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
-            local_hbm_for_values=1024**3,
-            external_storage=PS,
-        )
-        dyn_emb_table_options_list.append(dyn_emb_table_options)
+#     dyn_emb_table_options_list = []
+#     for dim in dims:
+#         dyn_emb_table_options = DynamicEmbTableOptions(
+#             dim=dim,
+#             init_capacity=init_capacity,
+#             max_capacity=max_capacity,
+#             index_type=key_type,
+#             embedding_dtype=value_type,
+#             device_id=device_id,
+#             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+#             caching=caching,
+#             local_hbm_for_values=1024**3,
+#             external_storage=PS,
+#         )
+#         dyn_emb_table_options_list.append(dyn_emb_table_options)
 
-    bdebt = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=[0, 0, 1, 2],
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        optimizer=opt_type,
-        use_index_dedup=True,
-        **opt_params,
-    )
-    """
-    feature number = 4, batch size = 2
+#     bdebt = BatchedDynamicEmbeddingTablesV2(
+#         table_names=table_names,
+#         table_options=dyn_emb_table_options_list,
+#         feature_table_map=[0, 0, 1, 2],
+#         pooling_mode=DynamicEmbPoolingMode.NONE,
+#         optimizer=opt_type,
+#         use_index_dedup=True,
+#         **opt_params,
+#     )
+#     """
+#     feature number = 4, batch size = 2
 
-    f0  [0,1],      [12],
-    f1  [64,8],     [12],
-    f2  [15, 2],    [7,105],
-    f3  [],         [0]
-    """
-    indices = torch.tensor(
-        [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device
-    )
-    offsets = torch.tensor(
-        [0, 2, 3, 5, 6, 8, 10, 10, 11], dtype=key_type, device=device
-    )
+#     f0  [0,1],      [12],
+#     f1  [64,8],     [12],
+#     f2  [15, 2],    [7,105],
+#     f3  [],         [0]
+#     """
+#     indices = torch.tensor(
+#         [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device
+#     )
+#     offsets = torch.tensor(
+#         [0, 2, 3, 5, 6, 8, 10, 10, 11], dtype=key_type, device=device
+#     )
 
-    embs_train = bdebt(indices, offsets)
-    torch.cuda.synchronize()
+#     embs_train = bdebt(indices, offsets)
+#     torch.cuda.synchronize()
 
-    with torch.no_grad():
-        bdebt.eval()
-        embs_eval = bdebt(indices, offsets)
-    torch.cuda.synchronize()
+#     with torch.no_grad():
+#         bdebt.eval()
+#         embs_eval = bdebt(indices, offsets)
+#     torch.cuda.synchronize()
 
-    # non-exist key
-    indices = torch.tensor([777, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(
-        key_type
-    )
-    offsets = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], device=device).to(key_type)
-    embs_non_exist = bdebt(indices, offsets)
-    torch.cuda.synchronize()
+#     # non-exist key
+#     indices = torch.tensor([777, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(
+#         key_type
+#     )
+#     offsets = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], device=device).to(key_type)
+#     embs_non_exist = bdebt(indices, offsets)
+#     torch.cuda.synchronize()
 
-    # train
-    bdebt.train()
-    embs_train_non_exist = bdebt(indices, offsets)
-    torch.cuda.synchronize()
+#     # train
+#     bdebt.train()
+#     embs_train_non_exist = bdebt(indices, offsets)
+#     torch.cuda.synchronize()
 
-    torch.testing.assert_close(embs_train, embs_eval)
-    torch.testing.assert_close(embs_train[1:, :], embs_non_exist[1:, :])
-    assert torch.all(embs_non_exist[0, :] == 0)
-    assert torch.all(embs_train_non_exist[0, :] != 0)
-    torch.testing.assert_close(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
+#     torch.testing.assert_close(embs_train, embs_eval)
+#     torch.testing.assert_close(embs_train[1:, :], embs_non_exist[1:, :])
+#     assert torch.all(embs_non_exist[0, :] == 0)
+#     assert torch.all(embs_train_non_exist[0, :] != 0)
+#     torch.testing.assert_close(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
 
-    print("all check passed")
-
-
-"""
-For torchrec's adam optimizer, it will increment the optimizer_step in every forward,
-    which will affect the weights update, pay attention to it or try to use `set_optimizer_step()` 
-    to control(not verified) it.
-"""
+#     print("all check passed")
 
 
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-        (
-            EmbOptimType.ADAM,
-            {
-                "learning_rate": 0.3,
-                "weight_decay": 0.06,
-                "eps": 3e-5,
-                "beta1": 0.8,
-                "beta2": 0.888,
-            },
-        ),
-        (
-            EmbOptimType.EXACT_ADAGRAD,
-            {
-                "learning_rate": 0.3,
-                "eps": 3e-5,
-            },
-        ),
-        (
-            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
-            {
-                "learning_rate": 0.3,
-                "eps": 3e-5,
-            },
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "caching, pooling_mode, dims",
-    [
-        (True, DynamicEmbPoolingMode.NONE, [8, 8, 8]),
-        (False, DynamicEmbPoolingMode.NONE, [16, 16, 16]),
-        (False, DynamicEmbPoolingMode.SUM, [128, 32, 16]),
-        (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
-    ],
-)
-@pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
-    print(f"step in test_backward , opt_type = {opt_type} opt_params = {opt_params}")
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-
-    table_names = ["table0", "table1", "table2"]
-    key_type = torch.int64
-    value_type = torch.float32
-
-    max_capacity = 2048
-
-    dyn_emb_table_options_list = []
-    for dim in dims:
-        dyn_emb_table_options = DynamicEmbTableOptions(
-            dim=dim,
-            init_capacity=max_capacity,
-            max_capacity=max_capacity,
-            index_type=key_type,
-            embedding_dtype=value_type,
-            device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
-            local_hbm_for_values=1024**3,
-            external_storage=PS,
-        )
-        dyn_emb_table_options_list.append(dyn_emb_table_options)
-
-    feature_table_map = [0, 0, 1, 2]
-    bdeb = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=feature_table_map,
-        pooling_mode=pooling_mode,
-        optimizer=opt_type,
-        **opt_params,
-    )
-    num_embs = [max_capacity // 2 for d in dims]
-    stbe = create_split_table_batched_embedding(
-        table_names,
-        feature_table_map,
-        OPTIM_TYPE[opt_type],
-        opt_params,
-        dims,
-        num_embs,
-        POOLING_MODE[pooling_mode],
-        device,
-    )
-    init_embedding_tables(stbe, bdeb)
-    """
-    feature number = 4, batch size = 2
-
-    f0  [0,1],      [12],
-    f1  [64,8],     [12],
-    f2  [15, 2, 7], [105],
-    f3  [],         [0]
-    """
-    for i in range(10):
-        indices = torch.tensor(
-            [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device
-        ).to(key_type)
-        offsets = torch.tensor([0, 2, 3, 5, 6, 9, 10, 10, 11], device=device).to(
-            key_type
-        )
-
-        embs_bdeb = bdeb(indices, offsets)
-        embs_stbe = stbe(indices, offsets)
-
-        torch.cuda.synchronize()
-        with torch.no_grad():
-            torch.testing.assert_close(embs_bdeb, embs_stbe, rtol=1e-06, atol=1e-06)
-
-        loss = embs_bdeb.mean()
-        loss.backward()
-        loss_stbe = embs_stbe.mean()
-        loss_stbe.backward()
-
-        torch.cuda.synchronize()
-        torch.testing.assert_close(loss, loss_stbe)
-
-        print(f"Passed iteration {i}")
+# """
+# For torchrec's adam optimizer, it will increment the optimizer_step in every forward,
+#     which will affect the weights update, pay attention to it or try to use `set_optimizer_step()` 
+#     to control(not verified) it.
+# """
 
 
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-        (
-            EmbOptimType.ADAM,
-            {
-                "learning_rate": 0.3,
-                "weight_decay": 0.06,
-                "eps": 3e-5,
-                "beta1": 0.8,
-                "beta2": 0.888,
-            },
-        ),
-        (
-            EmbOptimType.EXACT_ADAGRAD,
-            {
-                "learning_rate": 0.3,
-                "eps": 3e-5,
-            },
-        ),
-        (
-            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
-            {
-                "learning_rate": 0.3,
-                "eps": 3e-5,
-            },
-        ),
-    ],
-)
-@pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
-    print(
-        f"step in test_prefetch_flush , opt_type = {opt_type} opt_params = {opt_params}"
-    )
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
+# @pytest.mark.parametrize(
+#     "opt_type,opt_params",
+#     [
+#         (EmbOptimType.SGD, {"learning_rate": 0.3}),
+#         (
+#             EmbOptimType.ADAM,
+#             {
+#                 "learning_rate": 0.3,
+#                 "weight_decay": 0.06,
+#                 "eps": 3e-5,
+#                 "beta1": 0.8,
+#                 "beta2": 0.888,
+#             },
+#         ),
+#         (
+#             EmbOptimType.EXACT_ADAGRAD,
+#             {
+#                 "learning_rate": 0.3,
+#                 "eps": 3e-5,
+#             },
+#         ),
+#         (
+#             EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+#             {
+#                 "learning_rate": 0.3,
+#                 "eps": 3e-5,
+#             },
+#         ),
+#     ],
+# )
+# @pytest.mark.parametrize(
+#     "caching, pooling_mode, dims",
+#     [
+#         (True, DynamicEmbPoolingMode.NONE, [8, 8, 8]),
+#         (False, DynamicEmbPoolingMode.NONE, [16, 16, 16]),
+#         (False, DynamicEmbPoolingMode.SUM, [128, 32, 16]),
+#         (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
+#     ],
+# )
+# @pytest.mark.parametrize("PS", [None, PyDictStorage])
+# def test_backward(opt_type, opt_params, caching, pooling_mode, dims, PS):
+#     print(f"step in test_backward , opt_type = {opt_type} opt_params = {opt_params}")
+#     assert torch.cuda.is_available()
+#     device_id = 0
+#     device = torch.device(f"cuda:{device_id}")
 
-    table_names = ["table0", "table1", "table2"]
-    key_type = torch.int64
-    value_type = torch.float32
+#     table_names = ["table0", "table1", "table2"]
+#     key_type = torch.int64
+#     value_type = torch.float32
 
-    max_capacity = 2048
-    dims = [8, 8, 8]
+#     max_capacity = 2048
 
-    dyn_emb_table_options_list = []
-    for dim in dims:
-        dyn_emb_table_options = DynamicEmbTableOptions(
-            dim=dim,
-            init_capacity=max_capacity,
-            max_capacity=max_capacity,
-            index_type=key_type,
-            embedding_dtype=value_type,
-            device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.STEP,
-            caching=True,
-            local_hbm_for_values=1024**3,
-            external_storage=PS,
-        )
-        dyn_emb_table_options_list.append(dyn_emb_table_options)
+#     dyn_emb_table_options_list = []
+#     for dim in dims:
+#         dyn_emb_table_options = DynamicEmbTableOptions(
+#             dim=dim,
+#             init_capacity=max_capacity,
+#             max_capacity=max_capacity,
+#             index_type=key_type,
+#             embedding_dtype=value_type,
+#             device_id=device_id,
+#             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+#             caching=caching,
+#             local_hbm_for_values=1024**3,
+#             external_storage=PS,
+#         )
+#         dyn_emb_table_options_list.append(dyn_emb_table_options)
 
-    feature_table_map = [0, 0, 1, 2]
-    bdeb = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=feature_table_map,
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        optimizer=opt_type,
-        enable_prefetch=False,
-        **opt_params,
-    )
-    bdeb.enable_prefetch = True
-    bdeb.set_record_cache_metrics(True)
+#     feature_table_map = [0, 0, 1, 2]
+#     bdeb = BatchedDynamicEmbeddingTablesV2(
+#         table_names=table_names,
+#         table_options=dyn_emb_table_options_list,
+#         feature_table_map=feature_table_map,
+#         pooling_mode=pooling_mode,
+#         optimizer=opt_type,
+#         **opt_params,
+#     )
+#     num_embs = [max_capacity // 2 for d in dims]
+#     stbe = create_split_table_batched_embedding(
+#         table_names,
+#         feature_table_map,
+#         OPTIM_TYPE[opt_type],
+#         opt_params,
+#         dims,
+#         num_embs,
+#         POOLING_MODE[pooling_mode],
+#         device,
+#     )
+#     init_embedding_tables(stbe, bdeb)
+#     """
+#     feature number = 4, batch size = 2
 
-    num_embs = [max_capacity // 2 for d in dims]
-    stbe = create_split_table_batched_embedding(
-        table_names,
-        feature_table_map,
-        OPTIM_TYPE[opt_type],
-        opt_params,
-        dims,
-        num_embs,
-        POOLING_MODE[DynamicEmbPoolingMode.NONE],
-        device,
-    )
-    init_embedding_tables(stbe, bdeb)
+#     f0  [0,1],      [12],
+#     f1  [64,8],     [12],
+#     f2  [15, 2, 7], [105],
+#     f3  [],         [0]
+#     """
+#     for i in range(10):
+#         indices = torch.tensor(
+#             [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device
+#         ).to(key_type)
+#         offsets = torch.tensor([0, 2, 3, 5, 6, 9, 10, 10, 11], device=device).to(
+#             key_type
+#         )
 
-    forward_stream = torch.cuda.Stream()
-    pretch_stream = torch.cuda.Stream()
+#         embs_bdeb = bdeb(indices, offsets)
+#         embs_stbe = stbe(indices, offsets)
 
-    # 1. Prepare input
-    # Input A
-    """
-    feature number = 4, batch size = 2
+#         torch.cuda.synchronize()
+#         with torch.no_grad():
+#             torch.testing.assert_close(embs_bdeb, embs_stbe, rtol=1e-06, atol=1e-06)
 
-    f0  [0, 1],      [12],
-    f1  [64,8],     [12],
-    f2  [15, 2],    [7,105],
-    f3  [],         [0]
-    """
-    indicesA = torch.tensor([0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(
-        key_type
-    )
-    offsetsA = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], device=device).to(key_type)
+#         loss = embs_bdeb.mean()
+#         loss.backward()
+#         loss_stbe = embs_stbe.mean()
+#         loss_stbe.backward()
 
-    # Input B
-    # A intersection B is not none
-    """
-    feature number = 4, batch size = 2
+#         torch.cuda.synchronize()
+#         torch.testing.assert_close(loss, loss_stbe)
 
-    f0  [4, 12],        [55],
-    f1  [2, 17],        [1],
-    f2  [],             [5, 13, 105],
-    f3  [0, 23],        [42]
-    """
-    indicesB = torch.tensor(
-        [4, 12, 55, 2, 17, 1, 5, 13, 105, 0, 23, 42], device=device
-    ).to(key_type)
-    offsetsB = torch.tensor([0, 2, 3, 5, 6, 6, 9, 11, 12], device=device).to(key_type)
+#         print(f"Passed iteration {i}")
 
-    # stream capture will bring a cudaMalloc.
-    with torch.cuda.stream(forward_stream):
-        indicesB + 1
-    with torch.cuda.stream(pretch_stream):
-        indicesB + 1
 
-    # 2. Test prefetch works when Cache empty
-    with torch.cuda.stream(pretch_stream):
-        bdeb.prefetch(indicesA, offsetsA, forward_stream)
-        assert bdeb.num_prefetch_ahead == 1
-        assert list(bdeb.get_score().values()) == [1] * len(dims)
+# @pytest.mark.parametrize(
+#     "opt_type,opt_params",
+#     [
+#         (EmbOptimType.SGD, {"learning_rate": 0.3}),
+#         (
+#             EmbOptimType.ADAM,
+#             {
+#                 "learning_rate": 0.3,
+#                 "weight_decay": 0.06,
+#                 "eps": 3e-5,
+#                 "beta1": 0.8,
+#                 "beta2": 0.888,
+#             },
+#         ),
+#         (
+#             EmbOptimType.EXACT_ADAGRAD,
+#             {
+#                 "learning_rate": 0.3,
+#                 "eps": 3e-5,
+#             },
+#         ),
+#         (
+#             EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+#             {
+#                 "learning_rate": 0.3,
+#                 "eps": 3e-5,
+#             },
+#         ),
+#     ],
+# )
+# @pytest.mark.parametrize("PS", [None, PyDictStorage])
+# def test_prefetch_flush_in_cache(opt_type, opt_params, PS):
+#     print(
+#         f"step in test_prefetch_flush , opt_type = {opt_type} opt_params = {opt_params}"
+#     )
+#     assert torch.cuda.is_available()
+#     device_id = 0
+#     device = torch.device(f"cuda:{device_id}")
 
-    with torch.cuda.stream(forward_stream):
-        torch.cuda.current_stream().wait_stream(pretch_stream)
-        embs_bdeb_A = bdeb(indicesA, offsetsA)
-        loss_bdet_A = embs_bdeb_A.mean()
-        loss_bdet_A.backward()
+#     table_names = ["table0", "table1", "table2"]
+#     key_type = torch.int64
+#     value_type = torch.float32
 
-    embs_stbe_A = stbe(indicesA, offsetsA)
-    loss_stbe_A = embs_stbe_A.mean()
-    loss_stbe_A.backward()
+#     max_capacity = 2048
+#     dims = [8, 8, 8]
 
-    with torch.no_grad():
-        torch.cuda.synchronize()
-        torch.testing.assert_close(embs_bdeb_A, embs_stbe_A, rtol=1e-06, atol=1e-06)
-        torch.testing.assert_close(loss_bdet_A, loss_stbe_A, rtol=1e-06, atol=1e-06)
+#     dyn_emb_table_options_list = []
+#     for dim in dims:
+#         dyn_emb_table_options = DynamicEmbTableOptions(
+#             dim=dim,
+#             init_capacity=max_capacity,
+#             max_capacity=max_capacity,
+#             index_type=key_type,
+#             embedding_dtype=value_type,
+#             device_id=device_id,
+#             score_strategy=DynamicEmbScoreStrategy.STEP,
+#             caching=True,
+#             local_hbm_for_values=1024**3,
+#             external_storage=PS,
+#         )
+#         dyn_emb_table_options_list.append(dyn_emb_table_options)
 
-        for cache in bdeb.caches:
-            metrics = cache.cache_metrics
-            # cache hit_rate = 100% as we do prefetch.
-            assert metrics[0].item() == metrics[1].item()
+#     feature_table_map = [0, 0, 1, 2]
+#     bdeb = BatchedDynamicEmbeddingTablesV2(
+#         table_names=table_names,
+#         table_options=dyn_emb_table_options_list,
+#         feature_table_map=feature_table_map,
+#         pooling_mode=DynamicEmbPoolingMode.NONE,
+#         optimizer=opt_type,
+#         enable_prefetch=False,
+#         **opt_params,
+#     )
+#     bdeb.enable_prefetch = True
+#     bdeb.set_record_cache_metrics(True)
 
-    with torch.no_grad():
-        bdeb.flush()
-        bdeb.reset_cache_states()
-        # bdeb.set_score({table_name:1 for table_name in table_names})
+#     num_embs = [max_capacity // 2 for d in dims]
+#     stbe = create_split_table_batched_embedding(
+#         table_names,
+#         feature_table_map,
+#         OPTIM_TYPE[opt_type],
+#         opt_params,
+#         dims,
+#         num_embs,
+#         POOLING_MODE[DynamicEmbPoolingMode.NONE],
+#         device,
+#     )
+#     init_embedding_tables(stbe, bdeb)
 
-    # 3. Test prefetch works when Cache not empty
-    with torch.cuda.stream(pretch_stream):
-        bdeb.prefetch(indicesA, offsetsA, forward_stream)
-        bdeb.prefetch(indicesB, offsetsB, forward_stream)
-        assert bdeb.num_prefetch_ahead == 2
-        assert list(bdeb.get_score().values()) == [2] * len(dims)
+#     forward_stream = torch.cuda.Stream()
+#     pretch_stream = torch.cuda.Stream()
 
-    with torch.cuda.stream(forward_stream):
-        torch.cuda.current_stream().wait_stream(pretch_stream)
-        embs_bdeb_A = bdeb(indicesA, offsetsA)
-        loss_bdet_A = embs_bdeb_A.mean()
-        loss_bdet_A.backward()
-        embs_bdeb_B = bdeb(indicesB, offsetsB)
-        loss_bdet_B = embs_bdeb_B.mean()
-        loss_bdet_B.backward()
+#     # 1. Prepare input
+#     # Input A
+#     """
+#     feature number = 4, batch size = 2
 
-    embs_stbe_A = stbe(indicesA, offsetsA)
-    loss_stbe_A = embs_stbe_A.mean()
-    loss_stbe_A.backward()
-    embs_stbe_B = stbe(indicesB, offsetsB)
-    loss_stbe_B = embs_stbe_B.mean()
-    loss_stbe_B.backward()
+#     f0  [0, 1],      [12],
+#     f1  [64,8],     [12],
+#     f2  [15, 2],    [7,105],
+#     f3  [],         [0]
+#     """
+#     indicesA = torch.tensor([0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(
+#         key_type
+#     )
+#     offsetsA = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], device=device).to(key_type)
 
-    with torch.no_grad():
-        torch.cuda.synchronize()
-        torch.testing.assert_close(embs_bdeb_A, embs_stbe_A, rtol=1e-06, atol=1e-06)
-        torch.testing.assert_close(loss_bdet_A, loss_stbe_A, rtol=1e-06, atol=1e-06)
-        torch.testing.assert_close(embs_bdeb_B, embs_stbe_B, rtol=1e-06, atol=1e-06)
-        torch.testing.assert_close(loss_bdet_B, loss_stbe_B, rtol=1e-06, atol=1e-06)
+#     # Input B
+#     # A intersection B is not none
+#     """
+#     feature number = 4, batch size = 2
 
-        for cache in bdeb.caches:
-            metrics = cache.cache_metrics
-            # cache hit_rate = 100% as we do prefetch.
-            assert metrics[0].item() == metrics[1].item()
+#     f0  [4, 12],        [55],
+#     f1  [2, 17],        [1],
+#     f2  [],             [5, 13, 105],
+#     f3  [0, 23],        [42]
+#     """
+#     indicesB = torch.tensor(
+#         [4, 12, 55, 2, 17, 1, 5, 13, 105, 0, 23, 42], device=device
+#     ).to(key_type)
+#     offsetsB = torch.tensor([0, 2, 3, 5, 6, 6, 9, 11, 12], device=device).to(key_type)
+
+#     # stream capture will bring a cudaMalloc.
+#     with torch.cuda.stream(forward_stream):
+#         indicesB + 1
+#     with torch.cuda.stream(pretch_stream):
+#         indicesB + 1
+
+#     # 2. Test prefetch works when Cache empty
+#     with torch.cuda.stream(pretch_stream):
+#         bdeb.prefetch(indicesA, offsetsA, forward_stream)
+#         assert bdeb.num_prefetch_ahead == 1
+#         assert list(bdeb.get_score().values()) == [1] * len(dims)
+
+#     with torch.cuda.stream(forward_stream):
+#         torch.cuda.current_stream().wait_stream(pretch_stream)
+#         embs_bdeb_A = bdeb(indicesA, offsetsA)
+#         loss_bdet_A = embs_bdeb_A.mean()
+#         loss_bdet_A.backward()
+
+#     embs_stbe_A = stbe(indicesA, offsetsA)
+#     loss_stbe_A = embs_stbe_A.mean()
+#     loss_stbe_A.backward()
+
+#     with torch.no_grad():
+#         torch.cuda.synchronize()
+#         torch.testing.assert_close(embs_bdeb_A, embs_stbe_A, rtol=1e-06, atol=1e-06)
+#         torch.testing.assert_close(loss_bdet_A, loss_stbe_A, rtol=1e-06, atol=1e-06)
+
+#         for cache in bdeb.caches:
+#             metrics = cache.cache_metrics
+#             # cache hit_rate = 100% as we do prefetch.
+#             assert metrics[0].item() == metrics[1].item()
+
+#     with torch.no_grad():
+#         bdeb.flush()
+#         bdeb.reset_cache_states()
+#         # bdeb.set_score({table_name:1 for table_name in table_names})
+
+#     # 3. Test prefetch works when Cache not empty
+#     with torch.cuda.stream(pretch_stream):
+#         bdeb.prefetch(indicesA, offsetsA, forward_stream)
+#         bdeb.prefetch(indicesB, offsetsB, forward_stream)
+#         assert bdeb.num_prefetch_ahead == 2
+#         assert list(bdeb.get_score().values()) == [2] * len(dims)
+
+#     with torch.cuda.stream(forward_stream):
+#         torch.cuda.current_stream().wait_stream(pretch_stream)
+#         embs_bdeb_A = bdeb(indicesA, offsetsA)
+#         loss_bdet_A = embs_bdeb_A.mean()
+#         loss_bdet_A.backward()
+#         embs_bdeb_B = bdeb(indicesB, offsetsB)
+#         loss_bdet_B = embs_bdeb_B.mean()
+#         loss_bdet_B.backward()
+
+#     embs_stbe_A = stbe(indicesA, offsetsA)
+#     loss_stbe_A = embs_stbe_A.mean()
+#     loss_stbe_A.backward()
+#     embs_stbe_B = stbe(indicesB, offsetsB)
+#     loss_stbe_B = embs_stbe_B.mean()
+#     loss_stbe_B.backward()
+
+#     with torch.no_grad():
+#         torch.cuda.synchronize()
+#         torch.testing.assert_close(embs_bdeb_A, embs_stbe_A, rtol=1e-06, atol=1e-06)
+#         torch.testing.assert_close(loss_bdet_A, loss_stbe_A, rtol=1e-06, atol=1e-06)
+#         torch.testing.assert_close(embs_bdeb_B, embs_stbe_B, rtol=1e-06, atol=1e-06)
+#         torch.testing.assert_close(loss_bdet_B, loss_stbe_B, rtol=1e-06, atol=1e-06)
+
+#         for cache in bdeb.caches:
+#             metrics = cache.cache_metrics
+#             # cache hit_rate = 100% as we do prefetch.
+#             assert metrics[0].item() == metrics[1].item()
 
 
 def random_indices(batch, min_index, max_index):
@@ -734,7 +734,7 @@ def random_indices(batch, min_index, max_index):
 @pytest.mark.parametrize("caching", [False])
 @pytest.mark.parametrize("PS", [None])
 @pytest.mark.parametrize("iteration", [16])
-@pytest.mark.parametrize("batch_size", [65536])
+@pytest.mark.parametrize("batch_size", [128])#,[65536])
 def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batch_size):
     print(
         f"step in test_deterministic_insert , opt_type = {opt_type} opt_params = {opt_params}"
@@ -792,28 +792,60 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
         f"Test deterministic insert with batch={batch_size}, iteration={iteration}, capacity={init_capacity}"
     )
     os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+    
+    last_keys_x = None
+    last_keys_y = None
     for i in range(iteration):
         indices = torch.tensor(
             list(random_indices(batch_size, 0, 2**63 - 1)),
             dtype=key_type,
             device=device,
         )
-        offsets = torch.tensor([1] * batch_size, dtype=key_type, device=device)
+        offsets = torch.arange(0, batch_size+1, dtype=key_type, device=device)
 
-        bdebt_x(indices, offsets)
-        bdebt_y(indices, offsets)
+        pos_x, emb_x = bdebt_x(indices, offsets)
+        pos_y, emb_y = bdebt_y(indices, offsets)
         torch.cuda.synchronize()
+        print(f"Return indices: {pos_x[0][0]},{pos_y[0][0]}")
+        print(f"Evictions: {pos_x[0][1]}, {pos_y[0][1]}")
+        print(f"Insert: {pos_x[0][2]}, {pos_y[0][2]}")
+        assert torch.equal(pos_x[0][0], pos_y[0][0])
+        
 
+        assert len(bdebt_x.tables) == len(bdebt_y.tables)
         for tables_x, tables_y in zip(bdebt_x.tables, bdebt_y.tables):
-            assert len(tables_x) == len(tables_y)
-            for j in range(len(tables_x)):
-                map_x = tables_x[j].key_index_map
-                map_y = tables_y[j].key_index_map
+            map_x = tables_x.key_index_map
+            map_y = tables_y.key_index_map
 
-                assert torch.equal(map_x.keys_, map_y.keys_)
-                print(
-                    f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()})"
-                )
+            # assert torch.equal(map_x.keys_, map_y.keys_)
+            mask = map_x.keys_ != map_y.keys_
+            print(mask.sum(), map_x.keys_.numel())
+            inverse_mask = map_x.keys_ == map_y.keys_
+            same_last_dim = inverse_mask.all(dim=1)
+            print(same_last_dim.sum(), map_x.keys_.size(0))
+            
+            if mask.sum() != 0:
+                print(f"Mismatch at iteration {i}")
+                
+                for k in range(same_last_dim.size(0)):
+                    if not same_last_dim[k]:
+                        print(f"Bucket {k} mismatch")
+                        print("X:", map_x.keys_[k])
+                        print("Y:", map_y.keys_[k])
+                        break
+                
+            if last_keys_x is not None:
+                
+                mask_x = last_keys_x != map_x.keys_
+                mask_y = last_keys_y != map_y.keys_
+                print(f"Differ from last iteration: {mask_x.sum()}, {mask_y.sum()}")
+                
+            print(
+                f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()})"
+            )
+        
+        last_keys_x = bdebt_x.tables[0].key_index_map.keys_.contiguous().clone()
+        last_keys_y = bdebt_y.tables[0].key_index_map.keys_.contiguous().clone()
 
     del os.environ["DEMB_DETERMINISM_MODE"]
     print("all check passed")

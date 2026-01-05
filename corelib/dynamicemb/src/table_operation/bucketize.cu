@@ -210,9 +210,10 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, int64_t bucket_capacity,
 
   result.push_back(keys_out);
   result.push_back(offsets.slice(/*dim=*/0, /*start=*/0,
-                                 /*end=*/num_active_buckets_, /*step=*/1));
+                                 /*end=*/num_active_buckets_ + 1, /*step=*/1));
   result.push_back(inverse);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  return result;
 }
 
 } // namespace dyn_emb
