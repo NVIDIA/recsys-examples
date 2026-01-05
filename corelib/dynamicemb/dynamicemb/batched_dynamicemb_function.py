@@ -392,7 +392,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
         )
 
-        table_indices = []
         for i in range(table_num):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
@@ -421,7 +420,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     admission_counter[i] if admission_counter else None,
                 )
             else:
-                tmp = KeyValueTableFunction.lookup(
+                KeyValueTableFunction.lookup(
                     storages[i],
                     unique_indices_per_table,
                     unique_embs_per_table,
@@ -432,7 +431,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     admit_strategy,
                     admission_counter[i] if admission_counter else None,
                 )
-                table_indices.append(tmp)
 
         if training or caching:
             output_embs = torch.empty(
@@ -462,7 +460,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             ctx.optimizer = optimizer
             ctx.enable_prefetch = enable_prefetch
 
-        return table_indices, output_embs
+        return output_embs
 
     @staticmethod
     def backward(ctx, grads):

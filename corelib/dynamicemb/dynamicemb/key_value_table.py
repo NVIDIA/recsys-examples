@@ -1064,7 +1064,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         self._timestamp = device_timestamp()
 
     def expand(self):
-        if self.capacity == self.options.max_capacity:
+        if self._capacity == self.options.max_capacity:
             return
         if self.key_index_map.load_factor() < self.options.max_load_factor:
             return
@@ -2020,8 +2020,6 @@ class DynamicEmbeddingTable(KeyValueTable):
 
         # 3. Insert iteratively
         num_iter = keys_t.size(0)
-        eviction = 0
-        insert = 0
         for i in range(num_iter):
             valid_mask = keys_t[i] != -1
             valid_batch = valid_mask.sum().item()
@@ -2039,8 +2037,6 @@ class DynamicEmbeddingTable(KeyValueTable):
 
             # self.key_index_map.insert(keys_t[i], score_args_insert)
             self.key_index_map.insert(valid_keys, score_args_insert, None, insert_results)
-            eviction += (insert_results == InsertResult.EVICT.value).sum().item()
-            insert += (insert_results == InsertResult.INSERT.value).sum().item()
 
         # 4. lookup the indices in unique_keys' order and store the values.
         score_args_lookup = [
@@ -2060,11 +2056,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
-        
-        
-        founds = torch.zeros(h_num_unique_keys, dtype=torch.bool, device=unique_keys.device)
-        self.key_index_map.lookup(bkt_keys, score_args_lookup, founds, indices)
-        return indices, eviction, insert
+        return
 
 
 def update_cache(
@@ -2194,7 +2186,6 @@ class KeyValueTableFunction:
                 unique_keys,
             )
 
-        ret_indices = None
         if training:
             # insert missing values
             missing_values_in_storage = torch.empty(
@@ -2223,13 +2214,12 @@ class KeyValueTableFunction:
                 )
 
             # 3. insert missing values into table.
-            ret_indices = storage.insert(
+            storage.insert(
                 keys_to_insert,
                 values_to_insert,
                 scores_to_insert,
             )
         # ignore the storage missed in eval mode
-        return ret_indices
 
     @staticmethod
     def update(

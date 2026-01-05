@@ -731,10 +731,10 @@ def random_indices(batch, min_index, max_index):
         (EmbOptimType.SGD, {"learning_rate": 0.3}),
     ],
 )
-@pytest.mark.parametrize("caching", [False])
+@pytest.mark.parametrize("caching", [False, True])
 @pytest.mark.parametrize("PS", [None])
 @pytest.mark.parametrize("iteration", [16])
-@pytest.mark.parametrize("batch_size", [128])#,[65536])
+@pytest.mark.parametrize("batch_size", [2048, 65536])#,[])
 def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batch_size):
     print(
         f"step in test_deterministic_insert , opt_type = {opt_type} opt_params = {opt_params}"
@@ -792,9 +792,7 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
         f"Test deterministic insert with batch={batch_size}, iteration={iteration}, capacity={init_capacity}"
     )
     os.environ["DEMB_DETERMINISM_MODE"] = "ON"
-    
-    last_keys_x = None
-    last_keys_y = None
+
     for i in range(iteration):
         indices = torch.tensor(
             list(random_indices(batch_size, 0, 2**63 - 1)),
@@ -803,49 +801,22 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
         )
         offsets = torch.arange(0, batch_size+1, dtype=key_type, device=device)
 
-        pos_x, emb_x = bdebt_x(indices, offsets)
-        pos_y, emb_y = bdebt_y(indices, offsets)
+        bdebt_x(indices, offsets)
+        bdebt_y(indices, offsets)
+
         torch.cuda.synchronize()
-        print(f"Return indices: {pos_x[0][0]},{pos_y[0][0]}")
-        print(f"Evictions: {pos_x[0][1]}, {pos_y[0][1]}")
-        print(f"Insert: {pos_x[0][2]}, {pos_y[0][2]}")
-        assert torch.equal(pos_x[0][0], pos_y[0][0])
-        
+    
 
         assert len(bdebt_x.tables) == len(bdebt_y.tables)
         for tables_x, tables_y in zip(bdebt_x.tables, bdebt_y.tables):
             map_x = tables_x.key_index_map
             map_y = tables_y.key_index_map
 
-            # assert torch.equal(map_x.keys_, map_y.keys_)
-            mask = map_x.keys_ != map_y.keys_
-            print(mask.sum(), map_x.keys_.numel())
-            inverse_mask = map_x.keys_ == map_y.keys_
-            same_last_dim = inverse_mask.all(dim=1)
-            print(same_last_dim.sum(), map_x.keys_.size(0))
-            
-            if mask.sum() != 0:
-                print(f"Mismatch at iteration {i}")
-                
-                for k in range(same_last_dim.size(0)):
-                    if not same_last_dim[k]:
-                        print(f"Bucket {k} mismatch")
-                        print("X:", map_x.keys_[k])
-                        print("Y:", map_y.keys_[k])
-                        break
-                
-            if last_keys_x is not None:
-                
-                mask_x = last_keys_x != map_x.keys_
-                mask_y = last_keys_y != map_y.keys_
-                print(f"Differ from last iteration: {mask_x.sum()}, {mask_y.sum()}")
+            assert torch.equal(map_x.keys_, map_y.keys_)
                 
             print(
-                f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()})"
+                f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()}), totoal({map_x.capacity()})"
             )
-        
-        last_keys_x = bdebt_x.tables[0].key_index_map.keys_.contiguous().clone()
-        last_keys_y = bdebt_y.tables[0].key_index_map.keys_.contiguous().clone()
 
     del os.environ["DEMB_DETERMINISM_MODE"]
     print("all check passed")
