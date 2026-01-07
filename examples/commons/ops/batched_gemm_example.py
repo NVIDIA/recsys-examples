@@ -119,36 +119,64 @@ class StridedBmmFunction(torch.autograd.Function):
     """Custom autograd function for BMM with strided output."""
 
     @staticmethod
-    def forward(ctx, x, weight, batch_size, num_groups, output_dim):
+    def forward(ctx, x, weight, batch_size, num_groups, output_dim, batch_first):
         ctx.save_for_backward(x, weight)
-        output = torch.empty(
-            batch_size, num_groups, output_dim, device=x.device, dtype=x.dtype
-        )
-        torch.bmm(x.permute(1, 0, 2), weight, out=output.permute(1, 0, 2))
+        ctx.batch_first = batch_first
+
+        if batch_first:
+            # x: [B, G, D] -> need permute to [G, B, D] for bmm
+            output = torch.empty(
+                batch_size, num_groups, output_dim, device=x.device, dtype=x.dtype
+            )
+            torch.bmm(x.permute(1, 0, 2), weight, out=output.permute(1, 0, 2))
+        else:
+            # x: [G, B, D] -> already in correct layout for bmm
+            output = torch.bmm(x, weight)
+
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         x, weight = ctx.saved_tensors
+        batch_first = ctx.batch_first
         grad_x = grad_weight = None
-        grad_output_t = grad_output.permute(1, 0, 2)
 
-        if ctx.needs_input_grad[0]:
-            grad_x = torch.empty_like(x)
-            torch.bmm(
-                grad_output_t, weight.transpose(-1, -2), out=grad_x.permute(1, 0, 2)
-            )
+        if batch_first:
+            # grad_output: [B, G, D_out]
+            grad_output_t = grad_output.permute(1, 0, 2)  # [G, B, D_out]
 
-        if ctx.needs_input_grad[1]:
-            grad_weight = torch.bmm(x.permute(1, 0, 2).transpose(-1, -2), grad_output_t)
+            if ctx.needs_input_grad[0]:
+                grad_x = torch.empty_like(x)
+                torch.bmm(
+                    grad_output_t, weight.transpose(-1, -2), out=grad_x.permute(1, 0, 2)
+                )
 
-        return grad_x, grad_weight, None, None, None
+            if ctx.needs_input_grad[1]:
+                grad_weight = torch.bmm(
+                    x.permute(1, 0, 2).transpose(-1, -2), grad_output_t
+                )
+        else:
+            # grad_output: [G, B, D_out]
+            if ctx.needs_input_grad[0]:
+                grad_x = torch.bmm(grad_output, weight.transpose(-1, -2))
+
+            if ctx.needs_input_grad[1]:
+                grad_weight = torch.bmm(x.transpose(-1, -2), grad_output)
+
+        return grad_x, grad_weight, None, None, None, None
 
 
-class BmmImpl(nn.Module):
+class GroupedLinear(nn.Module):
     """
-    Optimized implementation using strided BMM.
-    Single kernel launch with fused permute via strided output.
+    Grouped linear layer: applies num_groups different linear transforms in parallel.
+    Optimized using batched GEMM with strided output for single kernel launch.
+
+    Args:
+        input_dim: Input feature dimension.
+        output_dim: Output feature dimension.
+        num_groups: Number of independent linear transforms.
+        batch_first: If True, input layout is [B, G, D] (batch-first, default).
+                     If False, input layout is [G, B, D] (group-first).
     """
 
     def __init__(
@@ -158,11 +186,13 @@ class BmmImpl(nn.Module):
         num_groups: int,
         device="cuda",
         dtype=torch.bfloat16,
+        batch_first: bool = True,
     ):
         super().__init__()
         self.num_groups = num_groups
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.batch_first = batch_first
 
         self.weight = nn.Parameter(
             torch.empty(num_groups, input_dim, output_dim, device=device, dtype=dtype)
@@ -172,14 +202,26 @@ class BmmImpl(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0] // self.num_groups
-        x = x.reshape(batch_size, self.num_groups, self.input_dim)
+
+        if self.batch_first:
+            # Input flattened from [B, G, D] -> reshape to [B, G, D]
+            x = x.reshape(batch_size, self.num_groups, self.input_dim)
+        else:
+            # Input flattened from [G, B, D] -> reshape to [G, B, D]
+            x = x.reshape(self.num_groups, batch_size, self.input_dim)
+
         output = StridedBmmFunction.apply(
-            x, self.weight, batch_size, self.num_groups, self.output_dim
+            x,
+            self.weight,
+            batch_size,
+            self.num_groups,
+            self.output_dim,
+            self.batch_first,
         )
         return output.view(-1, self.output_dim)
 
 
-def copy_weights(ref_model: ReferenceImpl, opt_model: BmmImpl):
+def copy_weights(ref_model: ReferenceImpl, opt_model: GroupedLinear):
     """Copy weights from reference to optimized model."""
     with torch.no_grad():
         for i in range(ref_model.num_groups):
@@ -188,7 +230,7 @@ def copy_weights(ref_model: ReferenceImpl, opt_model: BmmImpl):
 
 def check_correctness(
     ref_model: ReferenceImpl,
-    opt_model: BmmImpl,
+    opt_model: GroupedLinear,
     batch_size: int,
     num_groups: int,
     input_dim: int,
@@ -311,7 +353,7 @@ def main():
 
     # Create models
     ref_model = ReferenceImpl(input_dim, output_dim, num_groups, dtype=dtype).cuda()
-    opt_model = BmmImpl(input_dim, output_dim, num_groups, dtype=dtype).cuda()
+    opt_model = GroupedLinear(input_dim, output_dim, num_groups, dtype=dtype).cuda()
     copy_weights(ref_model, opt_model)
 
     # Correctness check
@@ -341,7 +383,7 @@ def main():
 
     print(f"\nForward pass (ms):")
     print(f"  Reference (loop): {ref_fwd:.4f}")
-    print(f"  Optimized (BMM):  {opt_fwd:.4f}")
+    print(f"  GroupedLinear:  {opt_fwd:.4f}")
     print(f"  Speedup:          {ref_fwd/opt_fwd:.2f}x")
 
     # Forward + Backward
@@ -350,7 +392,7 @@ def main():
 
     print(f"\nForward + Backward (ms):")
     print(f"  Reference (loop): {ref_fwdbwd:.4f}")
-    print(f"  Optimized (BMM):  {opt_fwdbwd:.4f}")
+    print(f"  GroupedLinear:  {opt_fwdbwd:.4f}")
     print(f"  Speedup:          {ref_fwdbwd/opt_fwdbwd:.2f}x")
 
     print("\n" + "=" * 60)
