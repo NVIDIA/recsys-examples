@@ -83,7 +83,8 @@ def get_dataset(
             shuffle=dataset_args.shuffle,
             random_seed=random_seed,
             is_train_dataset=is_train_dataset,
-            deduplicate_sid_across_hierarchy=True,
+            deduplicate_data_across_hierarchy=True,  # deduplicate data because we are using single embedding tables
+            deduplicate_label_across_hierarchy=dataset_args.deduplicate_label_across_hierarchy,
         )
     else:
         raise ValueError(f"Invalid dataset type: {dataset_args.dataset_type}")

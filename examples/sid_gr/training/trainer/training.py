@@ -28,6 +28,7 @@ from commons.pipeline.train_pipeline import (
 )
 from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logger import print_rank_0
+from commons.utils.stringify import stringify_dict
 from configs.sid_gin_config_args import TrainerArgs
 from model.gpt_model import SIDGRModel
 
@@ -51,36 +52,22 @@ def evaluate(
     model = get_unwrapped_module(pipeline._model)
     max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
     max_eval_iters = min(max_eval_iters, len(eval_loader))
-    for i in range(max_eval_iters):
+    for i in track(
+        range(max_eval_iters), total=max_eval_iters, description="Evaluating"
+    ):
         # for batch in iterated_eval_loader:
         batch = next(iterated_eval_loader)
         batch = batch.to(torch.cuda.current_device())
         labels = batch.labels
         generated_sids, log_probs = model.generate(batch)
         model.evaluator(log_probs, generated_sids, labels)
-        beam_search = model.beam_search
-        beam_search.history_topk_sids
-        beam_search.history_accumulate_topk_probs
-        beam_search.history_probs
-        # [batch_size, topk, num_hierarchies]
-        generated_sids.transpose(0, 2)
-        # [batch_size, topk, num_hierarchies]
-        hit = torch.all(generated_sids == labels.unsqueeze(1), dim=-1)
-        # labels
-        codebook_offsets = torch.tensor(
-            [0, 256, 512, 768], device=generated_sids.device
-        )
-        sid_hits = generated_sids == labels.unsqueeze(1)
-        # [batchsize, topk]
-        num_sid_hits = sid_hits.sum(dim=-1)
-
-        if hit.any():
-            hit.nonzero()
-
     compute_res = model.evaluator.compute()
     # reset the evaluator for the next evaluation
     model.evaluator.reset()
-    print(f"eval result: {compute_res}")
+    print_rank_0(
+        f"[evaluation iters:{max_eval_iters}, batch size:{trainer_args.eval_batch_size}], result:\n    "
+        + stringify_dict(compute_res, prefix="Metrics", sep="\n    ")
+    )
 
 
 def maybe_load_ckpts(

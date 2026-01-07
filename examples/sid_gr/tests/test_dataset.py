@@ -104,7 +104,7 @@ def test_disk_sequence_dataset(
         shuffle=False,
         random_seed=1234,
         is_train_dataset=True,
-        deduplicate_sid_across_hierarchy=False,
+        deduplicate_data_across_hierarchy=False,
     )
     num_batches = len(disk_sequence_dataset)
     for idx, batch in enumerate(

@@ -17,6 +17,7 @@ def get_sid_gr_model(
     normalization: Optional[str] = None,
     top_k_for_generation: int = 10,
     eval_metrics: Tuple[str, ...] = (),
+    share_lm_head_across_hierarchies: bool = True,
 ) -> SIDGRModel:
     sid_gr_model = SIDGRModel(
         decoder_config=decoder_config,
@@ -33,6 +34,7 @@ def get_sid_gr_model(
         should_add_sep_token=False,
         top_k_for_generation=top_k_for_generation,
         eval_metrics=eval_metrics,
+        share_lm_head_across_hierarchies=share_lm_head_across_hierarchies,
     )
 
     return sid_gr_model

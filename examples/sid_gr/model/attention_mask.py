@@ -66,7 +66,7 @@ def padded_causal_mask_with_optional_bos(
 
 @torch.fx.wrap
 def padded_history_mask_with_causal_target(
-    history_offsets: torch.Tensor,
+    history_seqlen: torch.Tensor,
     history_max_seqlen: int,
     target_seqlen: int,
     history_causal: bool = True,
@@ -108,6 +108,31 @@ def padded_history_mask_with_causal_target(
            [0,0,0,0,0,0,0],
          ]
     """
+    device = history_seqlen.device
+    # [B,1,1]
+    valid_lengths = (history_seqlen + target_seqlen).view(-1, 1, 1)
+    N = history_max_seqlen + target_seqlen
+    ids = torch.arange(0, N, device=device).view(1, N)
+    # [1,N,N]
+    row_ids = ids.unsqueeze(-1).expand(-1, N, N)
+    col_ids = row_ids.transpose(1, 2)
+    row_col_dist = row_ids - col_ids
+    valid_attn_mask = torch.eye(N, device=device, dtype=torch.bool).view(1, N, N)
+    causal_mask = torch.logical_or(row_col_dist > 0, valid_attn_mask)
+    history_and_target_mask = torch.logical_and(
+        row_ids < valid_lengths.view(-1, 1, 1), col_ids < valid_lengths.view(-1, 1, 1)
+    )
+    if not history_causal:
+        history_mask = torch.logical_and(
+            row_ids < history_seqlen.view(-1, 1, 1),
+            col_ids < history_seqlen.view(-1, 1, 1),
+        )
+        history_upper_mask = torch.logical_and(history_mask, row_ids < col_ids)
+        causal_mask = causal_mask | history_upper_mask
+    valid_attn_mask = history_and_target_mask & causal_mask
+    # [B, 1, N, N] for num_head attention
+    valid_attn_mask = valid_attn_mask.unsqueeze(1)
+    return ~valid_attn_mask
 
 
 # refer to hstu https://github.com/jiayus-nvidia/FBGEMM/blob/main/fbgemm_gpu/experimental/hstu/img/context_causal_target.png
@@ -183,3 +208,10 @@ if __name__ == "__main__":
         history_causal,
     )
     valid_mask = ~mask
+
+    mask = padded_history_mask_with_causal_target(
+        history_seqlen,
+        max_history_seqlen,
+        target_max_seqlen_per_region,
+        history_causal,
+    )

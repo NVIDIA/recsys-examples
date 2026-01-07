@@ -83,6 +83,12 @@ def main():
         embedding_args,
     ) = get_dataset_and_embedding_args()  # auto-set by gin-config
     network_args = NetworkArgs()
+    # this is a kinda hard code.
+    # when share_lm_head_across_hierarchies is True, we must deduplicate the label across hierarchy.
+    dataset_args.deduplicate_label_across_hierarchy = (
+        network_args.share_lm_head_across_hierarchies
+    )
+
     optimizer_args = OptimizerArgs()
     tp_args = TensorModelParallelArgs()
 
@@ -101,6 +107,7 @@ def main():
         network_args.num_attention_heads,
         network_args.num_layers,
         torch.bfloat16,
+        hidden_dropout=network_args.hidden_dropout,
         tensor_model_parallel_size=tp_args.tensor_model_parallel_size,
         loss_on_history=dataset_args.max_candidate_length == 0,
     )
@@ -113,6 +120,7 @@ def main():
         normalization="RMSNorm",
         top_k_for_generation=trainer_args.top_k_for_generation,
         eval_metrics=trainer_args.eval_metrics,
+        share_lm_head_across_hierarchies=network_args.share_lm_head_across_hierarchies,
     )
 
     optimizer_param = create_optimizer_params(optimizer_args)

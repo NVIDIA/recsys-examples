@@ -178,6 +178,7 @@ class DatasetArgs:
     # and the embedding feature names should match the dataset batch feature names
     _history_sid_feature_name: str = "hist_sids"
     _candidate_sid_feature_name: str = "cand_sids"
+    deduplicate_label_across_hierarchy: bool = False
 
     def __post_init__(self):
         assert (
@@ -224,6 +225,7 @@ class NetworkArgs:
     is_causal: bool = True
 
     dtype_str: str = "bfloat16"
+    share_lm_head_across_hierarchies: bool = True
 
 
 @gin.configurable

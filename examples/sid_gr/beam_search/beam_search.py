@@ -66,9 +66,6 @@ class BeamSearch:
             self.beam_widths[step], topk_previous_step * codebook_size_this_step
         )
 
-        assert (
-            codebook_size_this_step == self.codebook_sizes[step]
-        ), "codebook_size_this_step should be the same as the codebook_size[step] in the constructor"
         if step == 0:
             # initialize the generated sids and accumulated log probs
             self.generated_sids = torch.empty(

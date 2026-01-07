@@ -49,7 +49,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         shuffle: bool,
         random_seed: int,
         is_train_dataset: bool,
-        deduplicate_sid_across_hierarchy: bool = True,
+        deduplicate_data_across_hierarchy: bool = True,
+        deduplicate_label_across_hierarchy: bool = False,
         sort_by_user_id: bool = True,  # for debugging purpose
     ):
         # items and timestamps are nested
@@ -126,16 +127,20 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         self._rank = rank
         self._world_size = world_size
         self._sample_ids = np.arange(self._num_samples)
-
-        if deduplicate_sid_across_hierarchy:
-            codebook_offsets = torch.tensor(
-                np.cumsum([0] + codebook_sizes[:-1]), device=self._device
-            )
-            self._codebook_offsets = codebook_offsets
-        else:
-            self._codebook_offsets = torch.zeros(
-                self._num_hierarchies, device=self._device
-            )
+        codebook_offsets = torch.tensor(
+            np.cumsum([0] + codebook_sizes[:-1]), device=self._device
+        )
+        # dedup data and label offsets
+        self.data_codebook_offsets = (
+            codebook_offsets
+            if deduplicate_data_across_hierarchy
+            else torch.zeros(self._num_hierarchies, device=self._device)
+        )
+        self.label_codebook_offsets = (
+            codebook_offsets
+            if deduplicate_label_across_hierarchy
+            else torch.zeros(self._num_hierarchies, device=self._device)
+        )
         # TODO: Add shuffle and random seed
 
     def __iter__(self) -> Iterator[GPTSIDBatch]:
@@ -187,7 +192,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             # [T, num_hierarchies]
             history_sids = torch.index_select(
                 self.item_id_to_sid_mapping_tensor, dim=1, index=history_item_ids
-            ).transpose(0, 1).contiguous() + self._codebook_offsets.unsqueeze(0)
+            ).transpose(0, 1).contiguous() + self.data_codebook_offsets.unsqueeze(0)
             # labels are the candidate sids but starting from 0.
             candidate_sids = (
                 (
@@ -204,7 +209,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             )
 
             if self._max_candidate_length > 0:
-                labels = candidate_sids
+                labels = candidate_sids + self.label_codebook_offsets.unsqueeze(0)
             else:
                 # we need to remove the starting sids for each sequence.
                 # TODO@junzhang, to optimize the redundant df operations and sid transformations.
@@ -222,10 +227,10 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                     )
                     .transpose(0, 1)
                     .contiguous()
-                )
+                ) + self.label_codebook_offsets.unsqueeze(0)
 
             candidate_sids = (
-                candidate_sids + self._codebook_offsets.unsqueeze(0)
+                candidate_sids + self.data_codebook_offsets.unsqueeze(0)
                 if self._max_candidate_length > 0
                 else None
             )
@@ -300,7 +305,8 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         shuffle: bool,
         random_seed: int,
         is_train_dataset: bool,
-        deduplicate_sid_across_hierarchy: bool,
+        deduplicate_data_across_hierarchy: bool,
+        deduplicate_label_across_hierarchy: bool,
         output_history_sid_feature_name: str,
         output_candidate_sid_feature_name: str,
     ) -> "DiskSequenceDataset":
@@ -320,5 +326,6 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             shuffle=shuffle,
             random_seed=random_seed,
             is_train_dataset=is_train_dataset,
-            deduplicate_sid_across_hierarchy=deduplicate_sid_across_hierarchy,
+            deduplicate_data_across_hierarchy=deduplicate_data_across_hierarchy,
+            deduplicate_label_across_hierarchy=deduplicate_label_across_hierarchy,
         )

@@ -134,9 +134,8 @@ class DistributedRetrievalRecall(DistributedRetrievalMetric):
         topk_target = target.gather(1, topk_indices)  # [batch, top_k]
         num_hit_in_topk = topk_target.sum(dim=1)  # [batch], total recalled samples
         # for sid, total_relevant <= 1. Because the labels for each query contain single item.
-        total_relevant = target.sum(
-            dim=1
-        )  # how many relevant items in the ground truth
+        total_relevant = target.sum(dim=1)
+        # denorm is different from standard torchmetrics. We use the min
         denom = total_relevant.minimum(
             torch.tensor(self.top_k, device=target.device)
         ).clamp(min=1)
@@ -176,7 +175,7 @@ class SIDRetrievalEvaluator(torch.nn.Module):
     Helper for evaluating retrieval metrics for semantic ID tasks.
     """
 
-    def __init__(self, eval_metrics: Tuple[str, ...]):
+    def __init__(self, eval_metrics: Tuple[str, ...], sid_prefix_length: int = -1):
         super().__init__()
         self.metrics = torch.nn.ModuleDict()
         for metric_spec in eval_metrics:
@@ -185,6 +184,7 @@ class SIDRetrievalEvaluator(torch.nn.Module):
             self.metrics[metric_spec] = metric_class(
                 top_k=int(top_k), sync_on_compute=False, compute_with_cache=False
             )
+        self.sid_prefix_length = sid_prefix_length
 
     def state_dict(self):
         # Metrics not checkpointed.
@@ -209,6 +209,8 @@ class SIDRetrievalEvaluator(torch.nn.Module):
         batch_size, num_candidates, num_hierarchies = generated_ids.shape
         # Reshape for matching
         labels = labels.view(batch_size, 1, num_hierarchies)
+        generated_ids = generated_ids[:, :, : self.sid_prefix_length]
+        labels = labels[:, :, : self.sid_prefix_length]
         preds = log_probs.reshape(-1)
         # Match each candidate's IDs to groundtruth: [batch, num_candidates]
         matched_id_coord = torch.all(generated_ids == labels, dim=2).nonzero(
@@ -244,3 +246,29 @@ class SIDRetrievalEvaluator(torch.nn.Module):
     def reset(self):
         for metric in self.metrics.values():
             metric.reset()
+
+
+class MultipleEvaluatorWrapper(torch.nn.Module):
+    """
+    Wrapper for multiple evaluators.
+    """
+
+    def __init__(self, evaluators: Dict[str, SIDRetrievalEvaluator]):
+        super().__init__()
+        self.evaluators = torch.nn.ModuleDict(evaluators)
+
+    def forward(
+        self, log_probs: torch.Tensor, generated_ids: torch.Tensor, labels: torch.Tensor
+    ):
+        for evaluator in self.evaluators.values():
+            evaluator(log_probs, generated_ids, labels)
+
+    def compute(self):
+        ret = {}
+        for evaluator_name, evaluator in self.evaluators.items():
+            ret[evaluator_name] = evaluator.compute()
+        return ret
+
+    def reset(self):
+        for evaluator in self.evaluators.values():
+            evaluator.reset()

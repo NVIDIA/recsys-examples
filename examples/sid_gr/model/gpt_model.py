@@ -156,6 +156,7 @@ class SIDGRModel(MegatronModule):
         should_add_sep_token: bool = True,
         top_k_for_generation: int = 10,  # this is used for eval
         eval_metrics: Tuple[str, ...] = (),  # this is used for eval
+        share_lm_head_across_hierarchies: bool = True,
     ):
         super(SIDGRModel, self).__init__(config=decoder_config)
         assert (
@@ -204,23 +205,37 @@ class SIDGRModel(MegatronModule):
             else None
         )
 
+        self.share_lm_head_across_hierarchies = share_lm_head_across_hierarchies
         # output projection for the decoder to project the hidden state to the vocabulary space
-        # TODO, combine into single linear layer!
-        self._decoder_mlp = torch.nn.ModuleList(
-            [
-                TEColumnParallelLinear(
-                    input_size=self.embedding_dim,
-                    output_size=codebook_size,
-                    init_method=self.config.init_method,
-                    config=self.config,
-                    bias=False,
-                    gather_output=False,
-                    skip_bias_add=True,
-                    is_expert=False,
-                )
-                for codebook_size in self.codebook_sizes
-            ]
-        )
+        # TODO@junzhang, TEColumnParallelLinear does not support gather_output=True
+        if not share_lm_head_across_hierarchies:
+            # TODO, combine into single grouped linear layer!
+            self._decoder_mlp = torch.nn.ModuleList(
+                [
+                    TEColumnParallelLinear(
+                        input_size=self.embedding_dim,
+                        output_size=codebook_size,
+                        init_method=self.config.init_method,
+                        config=self.config,
+                        bias=False,
+                        gather_output=False,
+                        skip_bias_add=True,
+                        is_expert=False,
+                    )
+                    for codebook_size in self.codebook_sizes
+                ]
+            )
+        else:
+            self._decoder_mlp = TEColumnParallelLinear(
+                input_size=self.embedding_dim,
+                output_size=sum(self.codebook_sizes),
+                init_method=self.config.init_method,
+                config=self.config,
+                bias=False,
+                gather_output=False,
+                skip_bias_add=True,
+                is_expert=False,
+            )
 
         self.loss_module = GPTSIDLossModule(
             reduction="none",
@@ -243,7 +258,14 @@ class SIDGRModel(MegatronModule):
             ), "top_k for evaluation should be less than top_k for generation"
         # below are used for eval
         self.top_k_for_generation = top_k_for_generation  # beam search width.
-        self.evaluator = SIDRetrievalEvaluator(eval_metrics)
+
+        # below comments are reserved for multiple evaluators and debugging purpose
+        # _evaluators = {}
+        # for i in range(1, num_hierarchies + 1):
+        #   _evaluators[f"eval_hierarchy_{i}"] = SIDRetrievalEvaluator(eval_metrics, i)
+        # self.evaluator = MultipleEvaluatorWrapper(_evaluators)
+
+        self.evaluator = SIDRetrievalEvaluator(eval_metrics, num_hierarchies)
         self.beam_search = BeamSearch(
             beam_width=top_k_for_generation,
             num_hierarchies=num_hierarchies,
@@ -572,11 +594,14 @@ class SIDGRModel(MegatronModule):
         logits_per_hierarchy = []
         merged_labels = batch.labels.view(-1, batch._num_hierarchies)
         # 4. output linear projection & loss
-        # TODO, merge into single linear layer
-        for hierarchy_idx, mlp in enumerate[Any](self._decoder_mlp):
+        # TODO, merge into single grouped linear layer
+        for hierarchy_idx in range(batch._num_hierarchies):
             # TODO: remove this for debugging purpose
-            if hierarchy_idx >= batch._num_hierarchies:
-                break
+            mlp = (
+                self._decoder_mlp[hierarchy_idx]
+                if not self.share_lm_head_across_hierarchies
+                else self._decoder_mlp
+            )
             tuple_or_tensor = mlp(candidate_hidden_states[:, hierarchy_idx, :])
             candidate_hierarchy_logits = (
                 tuple_or_tensor[0]
@@ -694,7 +719,6 @@ class SIDGRModel(MegatronModule):
                 0 if i == 0 else topk_prev_step,
                 candidate_length,
             )
-
             # 3. we need a decoder step with the concatenated hidden states and offsets. Note that we do not add bos to history for generation.
             jagged_output_hidden_states = self.decoder_step(
                 cated_hidden_states,
@@ -715,9 +739,14 @@ class SIDGRModel(MegatronModule):
             candidate_hidden_states = candidate_hidden_states.view(
                 batch_size, topk_prev_step, -1, self.embedding_dim
             )[:, :, -1, :]
+            mlp = (
+                self._decoder_mlp[i]
+                if not self.share_lm_head_across_hierarchies
+                else self._decoder_mlp
+            )
             tuple_or_tensor: Union[
                 Tuple[torch.Tensor, torch.Tensor], torch.Tensor
-            ] = self._decoder_mlp[i](candidate_hidden_states)
+            ] = mlp(candidate_hidden_states)
             # [batch_size, topk_last_step, current_codebook_size]
             candidates_logits = (
                 tuple_or_tensor[0]
