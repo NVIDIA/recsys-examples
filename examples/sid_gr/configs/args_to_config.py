@@ -1,8 +1,21 @@
-from typing import List
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from commons.modules.embedding import ShardedEmbeddingConfig
 
-from .sid_gin_config_args import DatasetArgs, EmbeddingArgs, NetworkArgs
+from .sid_gin_config_args import EmbeddingArgs
 
 
 def create_embedding_config(
@@ -15,47 +28,3 @@ def create_embedding_config(
         dim=hidden_size,
         sharding_type=embedding_args.sharding_type,
     )
-
-
-def create_embedding_configs(
-    dataset_args: DatasetArgs,
-    network_args: NetworkArgs,
-    embedding_args: List[EmbeddingArgs],
-) -> List[ShardedEmbeddingConfig]:
-    raise NotImplementedError("create_embedding_configs is not implemented yet")
-    # if (
-    #     network_args.item_embedding_dim <= 0
-    #     or network_args.contextual_embedding_dim <= 0
-    # ):
-    #     return [
-    #         create_embedding_config(network_args.hidden_size, arg)
-    #         for arg in embedding_args
-    #     ]
-    # if isinstance(dataset_args, DatasetArgs):
-    #     from preprocessor import get_common_preprocessors
-
-    #     common_preprocessors = get_common_preprocessors()
-    #     dp = common_preprocessors[dataset_args.dataset_name]
-    #     item_feature_name = dp._item_feature_name
-    #     contextual_feature_names = dp._contextual_feature_names
-    #     action_feature_name = dp._action_feature_name
-
-    # embedding_configs = []
-    # for arg in embedding_args:
-    #     if (
-    #         item_feature_name in arg.feature_names
-    #         or action_feature_name in arg.feature_names
-    #     ):
-    #         emb_config = create_embedding_config(network_args.item_embedding_dim, arg)
-    #     else:
-    #         if len(set(arg.feature_names) & set(contextual_feature_names)) != len(
-    #             arg.feature_names
-    #         ):
-    #             raise ValueError(
-    #                 f"feature name {arg.feature_name} not match with contextual feature names {contextual_feature_names}"
-    #             )
-    #         emb_config = create_embedding_config(
-    #             network_args.contextual_embedding_dim, arg
-    #         )
-    #     embedding_configs.append(emb_config)
-    # return embedding_configs

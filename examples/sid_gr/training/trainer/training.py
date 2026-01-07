@@ -211,7 +211,3 @@ def train_with_pipeline(
             finally:
                 # log
                 torch.cuda.nvtx.range_pop()
-
-            logits_probs = torch.nn.functional.softmax(logits, dim=-1)
-
-            max_values, max_indices = torch.max(logits_probs, dim=-1)

@@ -268,31 +268,3 @@ class TensorModelParallelArgs:
     """
 
     tensor_model_parallel_size: int = 1
-
-
-@gin.configurable
-@dataclass
-class SIDPretrainArgs:
-    """SID Pretrain Configuration.
-
-    Configuration specific to SID pretrin tasks.
-
-    Attributes:
-        num_hierarchies (int): Number of hierarchies. Default: 1.
-    """
-
-    # From dataset args
-    # num_hierarchies: int = 4
-    # codebook_sizes: List[int] = [500, 500, 500, 500]
-
-    # eval_metrics: Tuple[str, ...] = ("HR@10", "NDCG@10")
-
-    # def __post_init__(self):
-    #     assert (
-    #         self.prediction_head_arch is not None
-    #     ), "Please provide prediction head arch for ranking model"
-    #     if isinstance(self.prediction_head_act_type, str):
-    #         assert self.prediction_head_act_type.lower() in [
-    #             "relu",
-    #             "gelu",
-    #         ], "prediction_head_act_type should be in ['relu', 'gelu']"
