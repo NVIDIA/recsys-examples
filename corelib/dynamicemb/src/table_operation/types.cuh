@@ -279,7 +279,7 @@ struct LinearBucket {
   __forceinline__ __device__ ProbeResult probe(KeyType key, Iterator &iter,
                                                int &step) const {
     static_assert(GroupSize == 1);
-    if (storage_ == nullptr  or capacity_ == 0) {
+    if (storage_ == nullptr or capacity_ == 0) {
       step = capacity_;
       return ProbeResult::Failed;
     }
@@ -394,7 +394,6 @@ struct LinearBucket {
     async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
                                                 scores(iter));
     __pipeline_commit();
-
 
     for (; iter < capacity_; iter += BulkDim) {
       if (iter < capacity_ - BulkDim) {
