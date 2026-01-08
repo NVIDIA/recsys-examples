@@ -787,3 +787,8 @@ Dump/Load and incremental dump is different from general module in PyTorch, beca
 So dynamicemb provides dedicated interface to load/save models' states, and provide conditional dump to support online training.
 
 Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](../DynamicEmb_APIs.md) for more information.
+
+## Deterministic mode
+
+When handling cache eviction and final table eviction, dynamicemb encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
+This mode is enabled by setting the environment variable `DEMB_DETERMINISM_MODE`.
