@@ -9,10 +9,6 @@ from commons.ops.length_to_offsets import length_to_complete_offsets
 from data.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from tests.test_utils import create_sid_gr_model_and_optimizer
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = True
-torch.use_deterministic_algorithms(True)
-
 
 def generate_batches(
     batchsize: int,
@@ -147,9 +143,6 @@ def test_model_decoder_step(
     max_history_length,
     codebook_sizes,
 ):
-    # we now only support max_candidate_length = 1 for now
-    torch.cuda.cudnn.set_allow_tf32(False)
-
     num_hierarchies = len(codebook_sizes)
     init.initialize_distributed()
     init.initialize_model_parallel(1)

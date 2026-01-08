@@ -60,7 +60,9 @@ class TrainerArgs:
     log_interval: int = 100
 
     top_k_for_generation: int = 10
-    eval_metrics: Tuple[str, ...] = field(default_factory=lambda: ("HR@2", "NDCG@10"))
+    eval_metrics: Tuple[str, ...] = field(
+        default_factory=lambda: ("HitRate@2", "NDCG@10")
+    )
 
     max_train_iters: Optional[int] = None
     max_eval_iters: Optional[int] = None

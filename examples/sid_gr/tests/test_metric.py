@@ -58,5 +58,4 @@ def test_sid_retrieval_evaluator(
 
     sid_results = sid_metric.compute()
     ref_results = ref_metric.compute()
-    print(sid_results, ref_results)
     assert torch.equal(sid_results, ref_results)

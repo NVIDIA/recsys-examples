@@ -25,9 +25,9 @@ def test_beam_search_sanity_check(batchsize, beam_width, codebook_sizes):
     # check the childrens' prefix should be from parent
     for i in range(1, num_hierarchies):
         # shape [batchsize, cur_beam, i + 1]
-        current_sids = beam_search.history_sids[i]
+        current_sids = beam_search.history_topk_sids[i]
         # shape [batchsize, par_beam, i]
-        parent_sids = beam_search.history_sids[i - 1]
+        parent_sids = beam_search.history_topk_sids[i - 1]
         current_sids_depth = current_sids.shape[-1]
         parent_sids_depth = parent_sids.shape[-1]
         assert (

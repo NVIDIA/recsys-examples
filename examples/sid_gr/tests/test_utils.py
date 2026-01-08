@@ -4,7 +4,7 @@ import torch
 from commons.distributed.sharding import make_optimizer_and_shard
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.optimizer import OptimizerParam
-from megatron.core.transformer import TransformerConfig
+from configs.gpt_config import get_gpt_config
 from model.gpt_model import SIDGRModel
 from model.mcore_model_specs import get_gpt_decoder_block_spec
 
@@ -23,15 +23,17 @@ def create_sid_gr_model_and_optimizer(
     pipeline_type: str = "none",
     device: torch.device = None,
 ):
-    decoder_config = TransformerConfig(
+    decoder_config = get_gpt_config(
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
         kv_channels=kv_channels,
         num_layers=num_layers,
-        bf16=True if dtype == torch.bfloat16 else False,
-        fp16=True if dtype == torch.float16 else False,
+        dtype=dtype,
+        normalization="LayerNorm",
+        norm_epsilon=1e-5,
         hidden_dropout=0.0,
-        attention_dropout=0.0,  # TODO?
+        tensor_model_parallel_size=1,
+        loss_on_history=False,
     )
     # thd + causal + TE
     transformer_decoder_layer_spec = get_gpt_decoder_block_spec(
@@ -47,6 +49,9 @@ def create_sid_gr_model_and_optimizer(
         num_hierarchies=num_hierarchies,
         transformer_decoder_layer_spec=transformer_decoder_layer_spec,
         should_add_sep_token=should_add_sep_token,
+        top_k_for_generation=10,
+        eval_metrics=("HitRate@2", "NDCG@10"),
+        share_lm_head_across_hierarchies=False,
     )
 
     optimizer_param = OptimizerParam(

@@ -1,11 +1,11 @@
-TrainerArgs.train_batch_size = 32
-TrainerArgs.eval_batch_size = 32
+TrainerArgs.train_batch_size = 128
+TrainerArgs.eval_batch_size = 128
 TrainerArgs.log_interval = 100
 TrainerArgs.eval_interval = 1000
 TrainerArgs.profile = False
 TrainerArgs.profile_step_start = 50
 TrainerArgs.profile_step_end = 80
-TrainerArgs.max_train_iters = 42000
+TrainerArgs.max_train_iters = 32000
 TrainerArgs.max_eval_iters = 700 #
 TrainerArgs.pipeline_type = "none"
 
@@ -14,10 +14,10 @@ TrainerArgs.eval_metrics = ('NDCG@10', 'Recall@10',  'HitRate@10') # evaluation 
 
 DatasetArgs.dataset_name = 'amzn_beauty'
 DatasetArgs.max_history_length = 30 # item-wise
-DatasetArgs.max_candidate_length = 1 # loss on history if 0, else only on candidate.
+DatasetArgs.max_candidate_length = 0 # loss on history if 0, else only on candidate.
 DatasetArgs.dataset_type_str = "disk_sequence_dataset"
-DatasetArgs.sequence_features_training_data_path = "./tmp_data/amzn/beauty/train_test_split/augmented_all_101605.parquet" #"./tmp_data/amzn/beauty/training/22363.parquet"
-DatasetArgs.sequence_features_testing_data_path = "./tmp_data/amzn/beauty/evaluation/22363.parquet" # "./tmp_data/amzn/beauty/train_test_split/augmented_all_101605.parquet" # augmented_test_16996
+DatasetArgs.sequence_features_training_data_path = "./tmp_data/amzn/beauty/training/training_22363.parquet" #"./tmp_data/amzn/beauty/training/22363.parquet"
+DatasetArgs.sequence_features_testing_data_path = "./tmp_data/amzn/beauty/evaluation/eval_22363.parquet" # "./tmp_data/amzn/beauty/train_test_split/augmented_all_101605.parquet" # augmented_test_16996
 DatasetArgs.item_to_sid_mapping_path = "./tmp_data/amzn/beauty/item-sid-mapping.pt"
 DatasetArgs.shuffle = False
 DatasetArgs.num_hierarchies = 4

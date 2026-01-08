@@ -281,6 +281,7 @@ class GPTSIDBatch(Pipelineable):
             features=features,
             labels=labels,
             batch_size=batch_size,
+            actual_batch_size=batch_size,
             feature_to_max_seqlen=feature_to_max_seqlen,
             raw_hist_sid_names=raw_hist_sid_names,
             raw_cand_sid_names=raw_cand_sid_names,
