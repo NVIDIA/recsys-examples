@@ -15,7 +15,9 @@ This example implements a Semantic ID based Generative Recommender (SID-GR) that
 
 In this model, each unique PID (Product ID) is mapped to a fixed-length tuple of semantic identifiers. The number of hierarchies (i.e., tuple length) and the cardinality per hierarchy are determined by the user. To obtain semantic meanings, item information is encoded through an LLM into embeddings, followed by a quantization process. Quantization methods include RQ-KMeans, RQ-VAE, etc. See the diagram below:
 
-![SID-GR Overview](./figs/sid-gr%20scope.png "SID GR overview")
+<p align="center">
+  <img src="./figs/sid-gr%20scope.png" alt="SID GR overview" width="60%">
+</p>
 
 The mapping process can be handled offline and separately, decoupled from GR training. **This preprocessing step is not covered by this example.** Our work focuses solely on sequential GR training and inference. To ensure compatibility with previously processed sequential datasets, we save the processed PID-to-SID mapping as a PyTorch tensor file. During training, we load both the historical sequential dataset and the mapping tensor(s), performing on-the-fly conversion from PIDs to SIDs without any additional preprocessing of the historical dataset files.
 
@@ -36,7 +38,9 @@ In addition to normal SID tokens, a special `<BOS>` (Beginning of Sequence) toke
 
 The diagram below illustrates the loss computation logic:
 
-![Loss Computation](./figs/sid%20loss.png)
+<p align="center">
+  <img src="./figs/sid%20loss.png" alt="Loss Computation" width="50%">
+</p>
 
 ## Embeddings
 
