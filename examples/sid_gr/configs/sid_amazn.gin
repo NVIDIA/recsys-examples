@@ -1,11 +1,11 @@
 TrainerArgs.train_batch_size = 128
 TrainerArgs.eval_batch_size = 128
-TrainerArgs.log_interval = 100
-TrainerArgs.eval_interval = 1000
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 200
 TrainerArgs.profile = False
 TrainerArgs.profile_step_start = 50
 TrainerArgs.profile_step_end = 80
-TrainerArgs.max_train_iters = 32000
+TrainerArgs.max_train_iters = 10000
 TrainerArgs.max_eval_iters = 700 #
 TrainerArgs.pipeline_type = "none"
 
