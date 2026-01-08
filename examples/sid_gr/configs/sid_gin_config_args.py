@@ -32,6 +32,9 @@ class TrainerArgs:
         eval_batch_size (int): **Required**. Evaluation batch size.
         eval_interval (int): Evaluation interval in iterations. Default: 100.
         log_interval (int): Logging interval in iterations. Default: 100.
+        top_k_for_generation (int): Top K items to generate(retrieve) during evaluation. Default: 10.
+        eval_metrics (Tuple[str, ...]): Evaluation metrics (e.g., "HR@2", "NDCG@10").
+            Default: ("HR@2", "NDCG@10").
         max_train_iters (Optional[int]): Maximum training iterations. Default: None.
         max_eval_iters (Optional[int]): Maximum evaluation iterations. Default: None.
         seed (int): Random seed. Default: 1234.
@@ -42,6 +45,7 @@ class TrainerArgs:
             Default: -1.
         ckpt_save_dir (str): Checkpoint save directory. Default: "./checkpoints".
         ckpt_load_dir (str): Checkpoint load directory. Default: "".
+        log_dir (str): Log directory. Default: "./logs".
         pipeline_type (str): Pipeline overlap type: 'none' (no overlap), 'native'
             (overlap h2d, input dist, fwd+bwd), 'prefetch' (includes prefetch overlap).
             Default: "native".
@@ -131,6 +135,12 @@ class EmbeddingArgs:
 
 
 class DatasetType(Enum):
+    """
+    Dataset type:
+    - InMemoryRandomDataset: in-memory random dataset, used for debugging and testing.
+    - DiskSequenceDataset: disk-based sequence dataset, used for training and evaluation.
+    """
+
     InMemoryRandomDataset = "in_memory_random_dataset"
     DiskSequenceDataset = "disk_sequence_dataset"
 
@@ -144,14 +154,17 @@ class DatasetArgs:
 
     Attributes:
         dataset_name (str): **Required**. Dataset name.
-        max_history_length (int): **Required**. Maximum sequence length.
-        sequence_features_training_data_path (Optional[str]): Path to dataset. Default: None.
-        sequence_features_testing_data_path (Optional[str]): Path to dataset. Default: None.
-        max_num_candidates (int): Maximum number of candidates. Default: 0.
+        max_history_length (int): **Required**. Maximum history length.
+        dataset_type (DatasetType): Dataset type. Default: DatasetType.InMemoryRandomDataset.
+        dataset_type_str (str): Dataset type string. Default: "in_memory_random_dataset".
+        sequence_features_training_data_path (Optional[str]): Path to training data. Default: None.
+        sequence_features_testing_data_path (Optional[str]): Path to testing data. Default: None.
         shuffle (bool): Whether to shuffle data. Default: False.
-
-    Note:
-        sequence_features_training_data_path could be None if your dataset is preprocessed and moved under
+        item_to_sid_mapping_path (Optional[str]): Path to item to sid mapping. Default: None.
+        num_hierarchies (int): Number of hierarchies. Default: 4.
+        codebook_sizes (List[int]): Codebook sizes. Default: [500] * 4.
+        max_candidate_length (int): Maximum candidate length. Default: 1.
+        deduplicate_label_across_hierarchy (bool): Whether to deduplicate label across hierarchy. User should not set this explicitly. This is equal to share_lm_head_across_hierarchies.
     """
 
     dataset_name: str
@@ -212,7 +225,8 @@ class NetworkArgs:
         norm_epsilon (float): Normalization epsilon. Default: 1e-5.
         is_causal (bool): Use causal attention mask. Default: True.
         dtype_str (str): Data type: "bfloat16" or "float16". Default: "bfloat16".
-        num_position_buckets (int): Number of position buckets. Default: 8192.
+        share_lm_head_across_hierarchies (bool): Whether to share language model head
+            across hierarchies. Default: True.
     """
 
     num_layers: int
@@ -241,6 +255,7 @@ class OptimizerArgs:
         adam_beta1 (float): Adam optimizer beta1 parameter. Default: 0.9.
         adam_beta2 (float): Adam optimizer beta2 parameter. Default: 0.999.
         adam_eps (float): Adam optimizer epsilon parameter. Default: 1e-8.
+        weight_decay (float): Weight decay parameter. Default: 0.01.
     """
 
     optimizer_str: str

@@ -5,6 +5,7 @@ NVIDIA RecSys Examples is a collection of optimized recommender models and compo
 
 The project includes:
 - Examples for large-scale HSTU ranking and retrieval models through [TorchRec](https://github.com/pytorch/torchrec) and [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) integration
+- Examples for semantic-id based retrieval model through [TorchRec](https://github.com/pytorch/torchrec) and [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) integration
 - HSTU (Hierarchical Sequential Transduction Unit) attention operator support
 - Dynamic Embeddings with GPU acceleration
 
@@ -47,6 +48,7 @@ For more detailed release notes, please refer our [releases](https://github.com/
 # Get Started
 The examples we supported:
 - [HSTU recommender examples](./examples/hstu/README.md)
+- [SID based generative recommender examples](./examples/sid_gr/README.md)
 
 # Contribution Guidelines
 Please see our [contributing guidelines](./CONTRIBUTING.md) for details on how to contribute to this project.
