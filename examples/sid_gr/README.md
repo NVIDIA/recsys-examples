@@ -1,5 +1,9 @@
 # Semantic ID Generative Recommender Example
 
+## Getting Started
+
+- **Training**: See the [SID-GR training example](./training/README.md) for detailed instructions
+
 ## Introduction
 
 **Semantic ID (SID)** based representation addresses the limitations of traditional item representations by tokenizing and quantizing items into a structured semantic space. The key innovation is that items with similar semantic meanings are mapped to nearby positions in the discrete ID space, creating a hierarchical and interpretable item vocabulary. This design offers several advantages:
@@ -79,9 +83,6 @@ The SID-GR model performs retrieval through beam search generation. To retrieve 
 
 These two characteristics necessitate different performance optimization strategies compared to LLM inference. 
 
-## Getting Started
-
-- **Training**: See the [SID-GR training example](./training/README.md) for detailed instructions
 
 ## References
 
