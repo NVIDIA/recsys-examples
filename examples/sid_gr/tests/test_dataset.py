@@ -1,8 +1,8 @@
 import pytest
 import torch
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
-from data.disk_sequence_dataset import DiskSequenceDataset
-from data.gpt_sid_batch import FeatureConfig, GPTSIDBatch
+from datasets.disk_sequence_dataset import DiskSequenceDataset
+from datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from tqdm import tqdm
 
 
@@ -159,7 +159,7 @@ def test_sid_data_loader():
     rank = 0
     world_size = 1
     from configs.sid_gin_config_args import DatasetArgs, TrainerArgs
-    from data.sid_data_loader import get_train_and_test_data_loader
+    from datasets.sid_data_loader import get_train_and_test_data_loader
 
     torch.distributed.init_process_group(
         backend="nccl", rank=rank, world_size=world_size

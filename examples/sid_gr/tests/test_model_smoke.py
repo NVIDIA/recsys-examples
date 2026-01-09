@@ -6,7 +6,7 @@ import torch
 from commons.checkpoint import get_unwrapped_module
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.ops.length_to_offsets import length_to_complete_offsets
-from data.gpt_sid_batch import FeatureConfig, GPTSIDBatch
+from datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from tests.test_utils import create_sid_gr_model_and_optimizer
 
 

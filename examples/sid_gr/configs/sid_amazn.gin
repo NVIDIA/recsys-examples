@@ -5,7 +5,7 @@ TrainerArgs.eval_interval = 200
 TrainerArgs.profile = False
 TrainerArgs.profile_step_start = 50
 TrainerArgs.profile_step_end = 80
-TrainerArgs.max_train_iters = 10000
+TrainerArgs.max_train_iters = 20000
 TrainerArgs.max_eval_iters = 700 #
 TrainerArgs.pipeline_type = "none"
 
