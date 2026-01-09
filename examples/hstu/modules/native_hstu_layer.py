@@ -19,6 +19,7 @@ from functools import partial
 import nvtx
 import torch
 import torch.nn.functional as F
+from commons.ops.collective_ops import gather_along_last_dim, split_along_first_dim
 from commons.utils.clear_tensor_data import clear_tensor_data
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from configs import HSTUConfig
@@ -34,7 +35,6 @@ from megatron.core.utils import divide
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.tp_layer_norm import TPLayerNormMulDropout
-from ops.collective_ops import gather_along_last_dim, split_along_first_dim
 from ops.triton_ops.triton_layer_norm import triton_layer_norm
 
 

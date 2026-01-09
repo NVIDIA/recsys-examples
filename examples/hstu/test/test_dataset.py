@@ -18,10 +18,10 @@ import commons.utils.initialize as init
 import fbgemm_gpu  # to load permute_2D_sparse_data
 import pytest
 import torch
-from dataset import get_data_loader
-from dataset.dummy_dataset import DummySequenceDataset
-from dataset.sequence_dataset import get_dataset
-from dataset.utils import FeatureConfig, RankingBatch, RetrievalBatch, is_batch_valid
+from datasets import get_data_loader
+from datasets.dummy_dataset import DummySequenceDataset
+from datasets.sequence_dataset import get_dataset
+from datasets.utils import FeatureConfig, RankingBatch, RetrievalBatch, is_batch_valid
 from torch import distributed as dist
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 

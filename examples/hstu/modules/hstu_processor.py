@@ -16,16 +16,16 @@ import itertools
 from typing import Dict, Optional, Union
 
 import torch
+from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+from commons.ops.length_to_offsets import length_to_complete_offsets
+from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig
 from configs.inference_config import InferenceHSTUConfig
-from dataset.utils import RankingBatch
+from datasets.utils import RankingBatch
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
-from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
-from ops.length_to_offsets import length_to_complete_offsets
-from ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 try:

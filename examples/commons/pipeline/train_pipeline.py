@@ -39,11 +39,8 @@ from typing import (
 
 import nvtx
 import torch
-from commons.utils.distributed_utils import collective_assert
-from distributed.finalize_model_grads import finalize_model_grads
-from megatron.core import parallel_state
-from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
-from pipeline.utils import (
+from commons.distributed.finalize_model_grads import finalize_model_grads
+from commons.pipeline.utils import (
     In,
     Out,
     PipelinedForward,
@@ -59,6 +56,9 @@ from pipeline.utils import (
     _to_device,
     _wait_for_batch,
 )
+from commons.utils.distributed_utils import collective_assert
+from megatron.core import parallel_state
+from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from torch.autograd.profiler import record_function
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
 from torchrec.distributed.model_parallel import ShardedModule

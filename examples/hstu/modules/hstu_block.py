@@ -5,7 +5,7 @@ from typing import Dict, Tuple, Union
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig, HSTULayerType
-from dataset.utils import RankingBatch, RetrievalBatch
+from datasets.utils import RankingBatch, RetrievalBatch
 from megatron.core.transformer.module import MegatronModule
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer

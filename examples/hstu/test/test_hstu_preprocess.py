@@ -16,7 +16,7 @@ import commons.utils.initialize as init
 import pytest
 import torch
 from configs import get_hstu_config
-from dataset.utils import Batch, FeatureConfig
+from datasets.utils import Batch, FeatureConfig
 from modules.hstu_block import HSTUBlock
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 

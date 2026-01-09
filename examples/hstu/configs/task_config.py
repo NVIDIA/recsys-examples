@@ -15,60 +15,7 @@
 from dataclasses import dataclass
 from typing import List, Tuple, cast
 
-
-@dataclass
-class OptimizerParam:
-    """
-    Configuration for the embedding optimizer.
-
-    Args:
-        optimizer_str (str): The optimizer type as a string: ``'adam'`` | ``'sgd'``.
-        learning_rate (float): The learning rate for the optimizer.
-        adam_beta1 (float, optional): The beta1 parameter for the Adam optimizer. Defaults to 0.9.
-        adam_beta2 (float, optional): The beta2 parameter for the Adam optimizer. Defaults to 0.95.
-        adam_eps (float, optional): The epsilon parameter for the Adam optimizer. Defaults to 1e-08.
-    """
-
-    optimizer_str: str
-    learning_rate: float
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.95
-    adam_eps: float = 1e-08
-    weight_decay: float = 0.01
-
-
-@dataclass
-class ShardedEmbeddingConfig:
-    """
-    Configuration for sharded embeddings with sharding type. Inherits from BaseShardedEmbeddingConfig.
-
-    Args:
-        config (EmbeddingConfig): The embedding configuration.
-        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
-    """
-
-    """
-    Base configuration for sharded embeddings.
-
-    Args:
-        feature_names (List[str]): The name of the features in this embedding.
-        table_name (str): The name of the table.
-        vocab_size (int): The size of the vocabulary.
-        dim (int): The dimension size of the embeddings.
-        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
-    """
-
-    feature_names: List[str]
-    table_name: str
-    vocab_size: int
-    dim: int
-    sharding_type: str
-
-    def __post_init__(self):
-        assert self.sharding_type in [
-            "data_parallel",
-            "model_parallel",
-        ], "sharding type should be data_parallel or model_parallel"
+from commons.modules.embedding import ShardedEmbeddingConfig
 
 
 @dataclass

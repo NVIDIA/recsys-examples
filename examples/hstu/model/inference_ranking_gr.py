@@ -17,7 +17,7 @@ from typing import List, Tuple, Union
 
 import torch
 from configs import InferenceHSTUConfig, KVCacheConfig, RankingConfig
-from dataset.utils import Batch
+from datasets.utils import Batch
 from modules.inference_dense_module import InferenceDenseModule
 from modules.inference_embedding import InferenceEmbedding
 

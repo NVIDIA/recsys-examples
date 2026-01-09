@@ -167,10 +167,10 @@ def get_hstu_config(
     Create the HSTU configuration.
 
     Args:
-        hidden_size (int): The hidden dimension size.
-        kv_channels (int): Number of key-value channels (per attention head).
-        num_attention_heads (int): Number of attention heads.
-        num_layers (int): Number of attention layers.
+        hidden_size (int): The hidden dimension size. (TransformerConfig)
+        kv_channels (int): Number of key-value channels (per attention head). (TransformerConfig)
+        num_attention_heads (int): Number of attention heads. (TransformerConfig)
+        num_layers (int): Number of attention layers. (TransformerConfig)
         dtype (torch.dtype): Data type (e.g., torch.float16).
         hstu_preprocessing_config (Optional[HSTUPreprocessingConfig], optional): HSTU preprocessing config. Defaults to None.
         position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.

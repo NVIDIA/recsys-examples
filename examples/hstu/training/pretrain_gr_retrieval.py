@@ -23,15 +23,15 @@ from typing import List, Union
 import commons.utils.initialize as init
 import gin
 import torch  # pylint: disable-unused-import
-from configs import RetrievalConfig
-from distributed.sharding import make_optimizer_and_shard
-from model import get_retrieval_model
-from modules.metrics import RetrievalTaskMetricWithSampling
-from pipeline.train_pipeline import (
+from commons.distributed.sharding import make_optimizer_and_shard
+from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
 )
+from configs import RetrievalConfig
+from model import get_retrieval_model
+from modules.metrics import RetrievalTaskMetricWithSampling
 from trainer.training import maybe_load_ckpts, train_with_pipeline
 from trainer.utils import (
     create_dynamic_optitons_dict,

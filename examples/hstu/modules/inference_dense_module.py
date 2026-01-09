@@ -25,7 +25,7 @@ from configs import (
     copy_kvcache_metadata,
     get_kvcache_metadata_buffer,
 )
-from dataset.utils import Batch
+from datasets.utils import Batch
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP

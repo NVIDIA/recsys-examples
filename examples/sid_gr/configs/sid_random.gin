@@ -1,0 +1,31 @@
+TrainerArgs.train_batch_size = 32
+TrainerArgs.eval_batch_size = 32
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 5000000
+TrainerArgs.profile = True
+TrainerArgs.profile_step_start = 50
+TrainerArgs.profile_step_end = 80
+TrainerArgs.max_train_iters = 512
+TrainerArgs.max_eval_iters = 16
+TrainerArgs.pipeline_type = "none"
+
+DatasetArgs.dataset_name = 'sid_random'
+DatasetArgs.max_history_length = 200
+DatasetArgs.dataset_type_str = "in_memory_random_dataset"
+DatasetArgs.sequence_features_training_data_path = None
+DatasetArgs.sequence_features_testing_data_path = None
+DatasetArgs.item_to_sid_mapping_path = None
+DatasetArgs.shuffle = False
+DatasetArgs.num_hierarchies = 4
+DatasetArgs.codebook_sizes = [500, 500, 500, 500] # embedding vocab size for each hierarchy
+
+NetworkArgs.num_layers = 1
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 512 # embedding dim
+# per head dim
+NetworkArgs.kv_channels = 128
+NetworkArgs.dtype_str = "bfloat16"
+
+OptimizerArgs.optimizer_str = 'adam'
+OptimizerArgs.learning_rate = 1e-3
+

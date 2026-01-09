@@ -21,8 +21,8 @@ from configs import (
     get_inference_hstu_config,
     get_kvcache_config,
 )
-from dataset.random_inference_dataset import RandomInferenceDataGenerator
-from dataset.utils import FeatureConfig
+from datasets.random_inference_dataset import RandomInferenceDataGenerator
+from datasets.utils import FeatureConfig
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr

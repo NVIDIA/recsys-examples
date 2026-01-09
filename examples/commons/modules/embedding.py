@@ -14,6 +14,7 @@
 # limitations under the License.
 import copy
 import os
+from dataclasses import dataclass
 
 # pyre-strict
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -23,7 +24,6 @@ import torch
 import torch.fx
 import torch.nn as nn
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
-from configs.task_config import ShardedEmbeddingConfig
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
@@ -50,6 +50,40 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+
+
+@dataclass
+class ShardedEmbeddingConfig:
+    """
+    Configuration for sharded embeddings with sharding type. Inherits from BaseShardedEmbeddingConfig.
+
+    Args:
+        config (EmbeddingConfig): The embedding configuration.
+        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
+    """
+
+    """
+    Base configuration for sharded embeddings.
+
+    Args:
+        feature_names (List[str]): The name of the features in this embedding.
+        table_name (str): The name of the table.
+        vocab_size (int): The size of the vocabulary.
+        dim (int): The dimension size of the embeddings.
+        sharding_type (str): The type of sharding, ``'data_parallel'`` | ``'model_parallel'``.
+    """
+
+    feature_names: List[str]
+    table_name: str
+    vocab_size: int
+    dim: int
+    sharding_type: str
+
+    def __post_init__(self):
+        assert self.sharding_type in [
+            "data_parallel",
+            "model_parallel",
+        ], "sharding type should be data_parallel or model_parallel"
 
 
 def create_data_parallel_sharding_infos_by_sharding(
@@ -132,6 +166,7 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
     """
     Sharded implementation of `EmbeddingCollection`.
     This is part of the public API to allow for manual data dist pipelining.
+    We re-implement the DP embedding so that it can be wrapped by Megatron DDP.
     """
 
     def __init__(
@@ -354,14 +389,19 @@ class ShardedEmbedding(torch.nn.Module):
         Returns:
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
-        mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+        assert not (
+            self._model_parallel_embedding_collection is None
+            and self._data_parallel_embedding_collection is None
+        ), "either model_parallel_embedding_collection or data_parallel_embedding_collection must be not None"
+        embeddings: Dict[str, JaggedTensor] = {}
+        if self._model_parallel_embedding_collection is not None:
+            mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+            embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
         if self._data_parallel_embedding_collection is not None:
             with torch.cuda.stream(self._side_stream):
                 dp_embeddings = self._data_parallel_embedding_collection(kjt)
             torch.cuda.current_stream().wait_stream(self._side_stream)
-            embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
-        else:
-            embeddings = mp_embeddings_awaitables.wait()
+            embeddings = {**embeddings, **dp_embeddings}
         return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -381,7 +421,7 @@ class ShardedEmbedding(torch.nn.Module):
         Example:
             >>> # assume we have 2 ranks
             >>> import torch
-            >>> from modules.embedding import ShardedEmbedding
+            >>> from commons.modules.embedding import ShardedEmbedding
             >>> from configs.task_config import ShardedEmbeddingConfig
             >>> from commons.utils.initialize as init
             >>> from commons.utils.logger import print_rank_0

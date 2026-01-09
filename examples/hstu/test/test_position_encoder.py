@@ -14,10 +14,10 @@
 # limitations under the License.
 import pytest
 import torch
+from commons.ops.length_to_offsets import length_to_complete_offsets
 
-# from dataset.utils import Batch, FeatureConfig
+# from datasets.utils import Batch, FeatureConfig
 from modules.position_encoder import HSTUPositionalEncoder
-from ops.length_to_offsets import length_to_complete_offsets
 from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 
 

@@ -34,8 +34,11 @@ from math import sqrt
 from typing import Optional
 
 import torch
+from commons.ops.triton_ops.common import (
+    set_static_max_seq_lens,
+    set_use_runtime_max_seq_len,
+)
 from commons.utils.nvtx_op import output_nvtx_hook
-from ops.triton_ops.common import set_static_max_seq_lens, set_use_runtime_max_seq_len
 from ops.triton_ops.triton_position import (  # type: ignore[attr-defined]
     triton_add_position_embeddings,
     triton_add_timestamp_positional_embeddings,

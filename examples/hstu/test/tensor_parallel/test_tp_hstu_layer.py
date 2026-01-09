@@ -20,17 +20,17 @@ import fbgemm_gpu  # pylint: disable-unused-import
 import pytest
 import torch
 from commons.checkpoint import get_unwrapped_module
+from commons.distributed.finalize_model_grads import finalize_model_grads
+from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
 from commons.utils.hstu_assert_close import hstu_close
 from configs.hstu_config import HSTULayerType, KernelBackend
-from distributed.finalize_model_grads import finalize_model_grads
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
-from ops.length_to_offsets import length_to_complete_offsets
 from test_utils import (
     compare_tpN_to_debug_weights,
     create_hstu_layer_and_optimizer,

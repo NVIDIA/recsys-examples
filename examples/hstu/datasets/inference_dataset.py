@@ -34,7 +34,7 @@ from typing import Dict, Iterator, List, Optional
 import numpy as np
 import pandas as pd
 import torch
-from dataset.utils import Batch, RankingBatch
+from datasets.utils import Batch, RankingBatch
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 

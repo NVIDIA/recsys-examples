@@ -25,7 +25,7 @@ from configs import (
     get_inference_hstu_config,
     get_kvcache_config,
 )
-from dataset.utils import FeatureConfig
+from datasets.utils import FeatureConfig
 from modules.inference_dense_module import InferenceDenseModule, copy_jagged_metadata
 from modules.jagged_data import JaggedData
 

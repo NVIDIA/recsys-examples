@@ -15,21 +15,21 @@
 from typing import Any, Tuple
 
 import torch
+from commons.modules.embedding import ShardedEmbedding
+from commons.ops.length_to_offsets import length_to_complete_offsets
+from commons.ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
+    triton_split_2D_jagged,
+)
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RetrievalConfig
-from dataset.utils import RetrievalBatch
+from datasets.utils import RetrievalBatch
 from megatron.core import parallel_state
 from model.base_model import BaseModel
-from modules.embedding import ShardedEmbedding
 from modules.hstu_block import HSTUBlock
 from modules.negatives_sampler import InBatchNegativesSampler
 from modules.output_postprocessors import L2NormEmbeddingPostprocessor
 from modules.sampled_softmax_loss import SampledSoftmaxLoss
 from modules.similarity.dot_product import DotProductSimilarity
-from ops.length_to_offsets import length_to_complete_offsets
-from ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
-    triton_split_2D_jagged,
-)
 
 
 class RetrievalGR(BaseModel):

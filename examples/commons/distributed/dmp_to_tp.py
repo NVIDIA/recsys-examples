@@ -1,16 +1,15 @@
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.distributed as dist
-from dataset.utils import RankingBatch, RetrievalBatch
-from megatron.core import parallel_state
-from ops.collective_ops import (
+from commons.ops.collective_ops import (
     gather_along_first_dim,
     gatherv_along_first_dim,
     jagged_tensor_allgather,
     keyed_jagged_tensor_allgather,
 )
-from ops.grad_scaling import grad_scaling
+from commons.ops.grad_scaling import grad_scaling
+from megatron.core import parallel_state
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
@@ -35,9 +34,7 @@ def jt_dict_grad_scaling_and_allgather(
 
 
 # The features is a kjt, input to embedding module.
-def dmp_batch_to_tp(
-    batch: Union[RetrievalBatch, RankingBatch], exclude_features: bool = True
-) -> Union[RetrievalBatch, RankingBatch]:
+def dmp_batch_to_tp(batch: Any, exclude_features: bool = True) -> Any:
     tp_pg = parallel_state.get_tensor_model_parallel_group()
     tp_size = dist.get_world_size(group=tp_pg)
     batch_cls = type(batch)

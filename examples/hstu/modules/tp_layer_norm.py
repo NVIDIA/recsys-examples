@@ -1,11 +1,11 @@
 import megatron.core.parallel_state as parallel_state
 import torch
-from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
-from ops.collective_ops import (
+from commons.ops.collective_ops import (
     gather_along_first_dim,
     gather_along_last_dim,
     split_along_last_dim,
 )
+from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
 from ops.pt_ops.pt_norm_mul_dropout import pytorch_norm_mul_dropout
 from ops.triton_ops.triton_layer_norm import triton_layer_norm
 from ops.triton_ops.triton_norm_mul_dropout import triton_norm_mul_dropout

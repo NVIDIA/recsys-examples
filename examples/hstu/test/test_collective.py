@@ -16,13 +16,13 @@ import commons.utils.initialize as init
 import fbgemm_gpu  # for jagged_to_padded_dense
 import pytest
 import torch
-from megatron.core import parallel_state, tensor_parallel
-from ops.collective_ops import (
+from commons.ops.collective_ops import (
     gather_along_first_dim,
     gatherv_along_first_dim,
     grouped_allgatherv_tensor_list,
 )
-from ops.length_to_offsets import length_to_complete_offsets
+from commons.ops.length_to_offsets import length_to_complete_offsets
+from megatron.core import parallel_state, tensor_parallel
 
 
 def get_source_and_ref_tensor(shape=(128, 1), dtype=torch.float):

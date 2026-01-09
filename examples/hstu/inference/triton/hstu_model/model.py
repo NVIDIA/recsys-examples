@@ -42,7 +42,7 @@ from configs import (
     RankingConfig,
     get_inference_hstu_config,
 )
-from dataset.utils import Batch
+from datasets.utils import Batch
 from modules.inference_dense_module import get_inference_dense_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor

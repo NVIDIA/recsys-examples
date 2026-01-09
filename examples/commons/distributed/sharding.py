@@ -19,10 +19,11 @@ from typing import Any, Dict, Tuple, Type, Union
 import torch
 import torch.distributed as dist
 import torchrec
-from configs.task_config import OptimizerParam
 
 # import our own finalize model grads
-from distributed.finalize_model_grads import finalize_model_grads
+from commons.distributed.finalize_model_grads import finalize_model_grads
+from commons.modules.embedding import DataParallelEmbeddingCollection
+from commons.optimizer import OptimizerParam
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.get_planner import get_planner
 from dynamicemb.planner import (
@@ -40,7 +41,6 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from modules.embedding import DataParallelEmbeddingCollection
 from torch import distributed as dist
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,

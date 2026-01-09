@@ -21,8 +21,8 @@ import commons.utils as init
 import pytest
 import torch
 import torch.distributed as dist
+from commons.distributed.finalize_model_grads import finalize_model_grads
 from commons.utils.distributed_utils import collective_assert
-from distributed.finalize_model_grads import finalize_model_grads
 from test_utils import assert_equal_two_state_dict, create_model
 
 
@@ -164,7 +164,7 @@ def test_checkpoint_model(
     init.destroy_global_state()
 
 
-from modules.embedding import DataParallelEmbeddingCollection
+from commons.modules.embedding import DataParallelEmbeddingCollection
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import BoundsCheckMode, ShardingEnv, ShardingType

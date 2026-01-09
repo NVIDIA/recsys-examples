@@ -15,21 +15,20 @@
 import sys
 from typing import Dict, List, Optional, Tuple, Union
 
-import configs
 import dataset
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
+from commons.modules.embedding import ShardedEmbeddingConfig
+from commons.optimizer import OptimizerParam
 from configs import (
     HSTUConfig,
     HSTULayerType,
     HSTUPreprocessingConfig,
     KernelBackend,
-    OptimizerParam,
     PositionEncodingConfig,
     get_hstu_config,
 )
 from dynamicemb import DynamicEmbTableOptions
-from modules.embedding import ShardedEmbeddingConfig
 from utils import (
     BenchmarkDatasetArgs,
     DatasetArgs,
@@ -225,7 +224,7 @@ def get_data_loader(
         "retrieval",
     ], f"task type should be ranking or retrieval not {task_type}"
     if isinstance(dataset_args, BenchmarkDatasetArgs):
-        from dataset.utils import FeatureConfig
+        from datasets.utils import FeatureConfig
 
         assert (
             trainer_args.max_train_iters is not None
@@ -302,14 +301,14 @@ def create_embedding_config(
     hidden_size: int, embedding_args: EmbeddingArgs
 ) -> ShardedEmbeddingConfig:
     if isinstance(embedding_args, DynamicEmbeddingArgs):
-        return configs.ShardedEmbeddingConfig(
+        return ShardedEmbeddingConfig(
             feature_names=embedding_args.feature_names,
             table_name=embedding_args.table_name,
             vocab_size=embedding_args.item_vocab_size_or_capacity,
             dim=hidden_size,
             sharding_type="model_parallel",
         )
-    return configs.ShardedEmbeddingConfig(
+    return ShardedEmbeddingConfig(
         feature_names=embedding_args.feature_names,
         table_name=embedding_args.table_name,
         vocab_size=embedding_args.item_vocab_size_or_capacity,

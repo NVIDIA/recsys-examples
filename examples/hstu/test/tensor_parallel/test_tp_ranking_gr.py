@@ -20,11 +20,11 @@ import commons.utils as init
 import pytest
 import torch
 from commons.checkpoint import get_unwrapped_module
+from commons.pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend
 from megatron.core import parallel_state
-from pipeline.train_pipeline import JaggedMegatronTrainNonePipeline
 from test_utils import (
     compare_tpN_to_debug_weights,
     create_model,
