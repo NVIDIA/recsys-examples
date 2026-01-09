@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 import torch
 from configs import InferenceHSTUConfig, KVCacheConfig
-from dataset.utils import Batch
+from datasets.utils import Batch
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer

@@ -21,7 +21,7 @@ from configs import (
     get_inference_hstu_config,
     get_kvcache_config,
 )
-from dataset.utils import Batch, FeatureConfig
+from datasets.utils import Batch, FeatureConfig
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR

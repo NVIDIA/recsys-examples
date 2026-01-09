@@ -22,7 +22,7 @@ from commons.ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
 )
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RetrievalConfig
-from dataset.utils import RetrievalBatch
+from datasets.utils import RetrievalBatch
 from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.hstu_block import HSTUBlock

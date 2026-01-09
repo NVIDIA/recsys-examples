@@ -224,7 +224,7 @@ def get_data_loader(
         "retrieval",
     ], f"task type should be ranking or retrieval not {task_type}"
     if isinstance(dataset_args, BenchmarkDatasetArgs):
-        from dataset.utils import FeatureConfig
+        from datasets.utils import FeatureConfig
 
         assert (
             trainer_args.max_train_iters is not None

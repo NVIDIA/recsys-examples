@@ -18,7 +18,7 @@ from typing import List, Optional, Union
 
 import commons.utils as init
 import configs
-import dataset
+import datasets
 import model
 import torch
 from commons.distributed.sharding import apply_megatron_ddp, make_optimizer_and_shard
@@ -366,7 +366,7 @@ def create_model(
         ),
     ]
     feature_configs = [
-        dataset.utils.FeatureConfig(
+        datasets.utils.FeatureConfig(
             feature_names=[item_feature_name, action_feature_name],
             max_item_ids=[
                 max(item_emb_size // 2, 1),
@@ -378,7 +378,7 @@ def create_model(
     ]
     if len(contextual_feature_names) > 0:
         feature_configs.append(
-            dataset.utils.FeatureConfig(
+            datasets.utils.FeatureConfig(
                 feature_names=contextual_feature_names,
                 max_item_ids=[
                     contextual_emb_size for _ in range(len(contextual_feature_names))
@@ -419,13 +419,13 @@ def create_model(
         with tensor_parallel.get_cuda_rng_tracker().fork():
             if replicate_batches:
                 history_batches = [
-                    dataset.utils.RankingBatch.random(
+                    datasets.utils.RankingBatch.random(
                         num_tasks=num_tasks, **batch_kwargs
                     )
                 ] * num_batches
             else:
                 history_batches = [
-                    dataset.utils.RankingBatch.random(
+                    datasets.utils.RankingBatch.random(
                         num_tasks=num_tasks, **batch_kwargs
                     )
                     for _ in range(num_batches)
@@ -441,11 +441,11 @@ def create_model(
         with tensor_parallel.get_cuda_rng_tracker().fork():
             if replicate_batches:
                 history_batches = [
-                    dataset.utils.RetrievalBatch.random(**batch_kwargs)
+                    datasets.utils.RetrievalBatch.random(**batch_kwargs)
                 ] * num_batches
             else:
                 history_batches = [
-                    dataset.utils.RetrievalBatch.random(**batch_kwargs)
+                    datasets.utils.RetrievalBatch.random(**batch_kwargs)
                     for _ in range(num_batches)
                 ]
     optimizer_param = OptimizerParam(

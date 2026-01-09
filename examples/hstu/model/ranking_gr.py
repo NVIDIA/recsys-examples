@@ -21,7 +21,7 @@ from commons.distributed.dmp_to_tp import (
 )
 from commons.modules.embedding import ShardedEmbedding
 from configs import HSTUConfig, RankingConfig
-from dataset.utils import RankingBatch
+from datasets.utils import RankingBatch
 from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.hstu_block import HSTUBlock

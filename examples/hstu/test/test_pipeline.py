@@ -21,13 +21,13 @@ import commons.utils as init
 import pytest
 import torch
 import torch.distributed as dist
-from commons.utils.distributed_utils import collective_assert
-from distributed.finalize_model_grads import finalize_model_grads
-from pipeline.train_pipeline import (
+from commons.distributed.finalize_model_grads import finalize_model_grads
+from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
     JaggedMegatronTrainNonePipeline,
     JaggedMegatronTrainPipelineSparseDist,
 )
+from commons.utils.distributed_utils import collective_assert
 from test_utils import create_model
 
 

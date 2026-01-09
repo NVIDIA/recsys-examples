@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 import torch
 from commons.utils.logger import print_rank_0
-from dataset.utils import Batch, RankingBatch, RetrievalBatch
+from datasets.utils import Batch, RankingBatch, RetrievalBatch
 from preprocessor import get_common_preprocessors
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor

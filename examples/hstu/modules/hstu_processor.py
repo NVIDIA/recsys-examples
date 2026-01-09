@@ -22,7 +22,7 @@ from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig
 from configs.inference_config import InferenceHSTUConfig
-from dataset.utils import RankingBatch
+from datasets.utils import RankingBatch
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
