@@ -40,10 +40,74 @@ from dynamicemb_extensions import (
     table_export_batch,
     table_insert,
     table_insert_and_evict,
-    table_lookup,
     table_partition,
 )
 
+import torch
+import torch.library
+from typing import List, Optional
+from dynamicemb_extensions import ScorePolicy
+
+_DTYPE_TO_INT = {
+    torch.float32: 0,
+    torch.float64: 1,
+    torch.float16: 2,
+    torch.bfloat16: 3,
+    torch.uint8: 4,
+    torch.int8: 5,
+    torch.int16: 6,
+    torch.int32: 7,
+    torch.int64: 8,
+    torch.bool: 9,
+    torch.uint64: 10,
+}
+_INT_TO_DTYPE = {v: k for k, v in _DTYPE_TO_INT.items()}
+
+@torch.library.custom_op("dynamicemb::table_lookup", mutates_args={"founds", "indices"})
+def _table_lookup(
+    table_storage: torch.Tensor,
+    dtypes: List[int], 
+    bucket_capacity: int,
+    keys: torch.Tensor,
+    scores: List[Optional[torch.Tensor]],
+    policy_types: List[int],
+    is_returns: List[bool],
+    founds: torch.Tensor,
+    indices: Optional[torch.Tensor],
+) -> None:
+    
+    real_dtypes = [_INT_TO_DTYPE[i] for i in dtypes]
+    
+    # Convert policy_types ints back to ScorePolicy (assuming ScorePolicy can be constructed from int)
+    # The error showed ScorePolicy.GLOBAL_TIMER is 3.
+    # We can cast int to ScorePolicy if it's a pybind enum.
+    real_policy_types = [ScorePolicy(i) for i in policy_types]
+
+    _table_lookup(
+        table_storage,
+        real_dtypes,
+        bucket_capacity,
+        keys,
+        scores,
+        real_policy_types,
+        is_returns,
+        founds,
+        indices,
+    )
+
+@torch.library.register_fake("dynamicemb::table_lookup")
+def table_lookup_fake(
+    table_storage: torch.Tensor,
+    dtypes: List[int],
+    bucket_capacity: int,
+    keys: torch.Tensor,
+    scores: List[Optional[torch.Tensor]],
+    policy_types: List[int],
+    is_returns: List[bool],
+    founds: torch.Tensor,
+    indices: Optional[torch.Tensor],
+) -> None:
+    return
 
 @dataclass(frozen=True)
 class ScoreSpec:
@@ -680,14 +744,18 @@ class LinearBucketTable(ScoredHashTable):
             num_missing: int
         """
         scores_, policies, is_returns = self._parse_scores(scores)
+        
+        # Convert dtypes and policies to ints for the custom op
+        dtype_ints = [_DTYPE_TO_INT[d] for d in self.fileds_type_]
+        policy_ints = [int(p) for p in policies]
 
-        table_lookup(
+        _table_lookup(
             self.table_storage_,
-            self.fileds_type_,
+            dtype_ints,
             self.bucket_capacity_,
             keys,
             scores_,
-            policies,
+            policy_ints,
             is_returns,
             founds,
             indices,
@@ -1296,6 +1364,14 @@ def get_scored_table(
     reduction_type=ReductionType.LINEAR,
     bucket_load_factor=0.5,  # used when probing_type=ProbingType.CHAINED
 ) -> ScoredHashTable:
+    if capacity < bucket_capacity:
+        raise ValueError(
+            f"capacity({capacity}) should be greater than bucket_capacity({bucket_capacity})"
+        )
+    if bucket_capacity % 16 != 0:
+        raise ValueError(
+            f"bucket_capacity({bucket_capacity}) should be divisible by 16"
+        )
     if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
         return LinearBucketTable(
             capacity,
