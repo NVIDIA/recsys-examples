@@ -10,20 +10,24 @@ The project includes:
 - Dynamic Embeddings with GPU acceleration
 
 # What's New
+- **[2026/1/13]** 🎉v25.12 released!
+  - Support TritonServer for HSTU inference. Follow [the HSTU inference TritonServer example](https://github.com/NVIDIA/recsys-examples/tree/main/examples/hstu/inference#example-hstu-model-inference-with-triton-server) to try it out.
+  - We introduced our first semantic-id retrieval model example. Follow the semantic‑id retrieval (sid_gr) [documentation](https://github.com/NVIDIA/recsys-examples/tree/main/examples/sid_gr) to run it. 
 - **[2025/12/10]** 🎉v25.11 released!
   - DynamicEmb supports embedding admission, that decides whether a new feature ID is allowed to create or update an embedding entry in the dynamic embedding table. By controlling admission, the system can prevent very rare or noisy IDs from consuming parameters and optimizer state that bring little training benefit.
 - **[2025/11/11]** 🎉v25.10 released!
   - HSTU training example supports sequence parallelism.
   - DynamicEmb supports LRU score checkpointing, gradient clipping.
   - Decouple scaling sequence length from the maximum sequence length limit in HSTU attention and extend HSTU support to the SM89 GPU architecture for training.
+
+<details>
+<summary>More</summary>
+
 - **[2025/10/20]** 🎉v25.09 released!
   - Integrated prefetching and caching into the HSTU training example.
   - DynamicEmb now supports distributed embedding dumping and memory scaling.
   - Added kernel fusion in the HSTU block for inference, including KVCache fixes.
   - HSTU attention now supports FP8 quantization.
-
-<details>
-<summary>More</summary>
 
 - **[2025/9/8]** 🎉v25.08 released!
   - Added cache support for dynamicemb, enabling seamless hot embedding migration between cache and storage.
