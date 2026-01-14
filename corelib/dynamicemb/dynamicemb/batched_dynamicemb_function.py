@@ -273,7 +273,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
                 table_num,
                 batch_size,
                 feature_num_per_table[i],
-                offsets_list_per_table[i][-1].item(),
+                inverse_indices_list[i].numel(),
                 combiner,
             )
 
