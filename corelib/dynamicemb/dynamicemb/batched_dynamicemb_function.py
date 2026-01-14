@@ -52,6 +52,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         ctx,
         indices: torch.Tensor,
         offsets: torch.Tensor,  # [feature_num * batch_size]
+        feature_offsets: torch.Tensor,
         use_index_dedup: bool,
         table_offsets_in_feature: List[int],
         tables: List[DynamicEmbTable],
@@ -91,8 +92,21 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         #   and we have to copy table_offsets_in_feature from cpu to gpu.
 
         # TODO: if the batch size is large, we can develop a kernel to get: indices boundary.
-
-        h_offsets = offsets.to("cpu")
+        indices_table_range = get_table_range(offsets, feature_offsets)
+        h_indices_table_range = torch.empty(
+            indices_table_range.numel(),
+            out=torch.ops.fbgemm.new_unified_tensor(
+                # pyre-fixme[6]: Expected `Optional[Type[torch._dtype]]`
+                #  for 3rd param but got `Type[Type[torch._dtype]]`.
+                torch.zeros(1, device=device, dtype=indices_table_range.dtype),
+                [indices_table_range.numel()],
+                #  is_host_mapped (bool = False): If True, allocate every UVM tensor
+                # using `malloc` + `cudaHostRegister`. Otherwise use
+                # `cudaMallocManaged`
+                is_host_mapped=True,
+            ),
+        )
+        h_indices_table_range.copy_(indices_table_range)
 
         for i in range(table_num):
             feature_id_begin, feature_id_end = (
@@ -106,7 +120,10 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
             # include offset_end to know the boundary of the last feature.
             biased_offsets_list.append(offsets[offset_begin : offset_end + 1])
 
-            indices_begin, indices_end = h_offsets[offset_begin], h_offsets[offset_end]
+            indices_begin, indices_end = (
+                h_indices_table_range[i],
+                h_indices_table_range[i + 1],
+            )
             indices_list.append(indices[indices_begin:indices_end])
 
         unique_indices_list = []
@@ -273,7 +290,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
                 table_num,
                 batch_size,
                 feature_num_per_table[i],
-                offsets_list_per_table[i][-1].item(),
+                inverse_indices_list[i].numel(),
                 combiner,
             )
 
@@ -283,7 +300,7 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
 
         optimizer.update(tables, unique_indices_list, unique_grads_per_table)
 
-        return (None,) * 19
+        return (None,) * 20
 
 
 def dynamicemb_prefetch(
