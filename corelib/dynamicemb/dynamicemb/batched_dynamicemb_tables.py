@@ -932,6 +932,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             res = DynamicEmbeddingBagFunction.apply(
                 indices,
                 offsets,
+                self.feature_offsets,
                 self.use_index_dedup,
                 self.table_offsets_in_feature,
                 self._tables,
