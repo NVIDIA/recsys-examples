@@ -20,6 +20,8 @@ Plan B:    Fused gate+up into 1 BMM, then down (2 BMMs total)
 
 ================================================================================
 """
+import sys
+sys.path.insert(0, '/home/scratch.runchuz_gpu/repos-github/recsys-examples/examples/hstu')
 
 import argparse
 from typing import Callable, List, Optional, Tuple, Union
@@ -28,6 +30,179 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.cuda.nvtx as nvtx
+import triton
+import triton.language as tl
+try:
+    # @manual=//triton:triton
+    from triton.language.extra.libdevice import fast_dividef
+except ImportError:
+    try:
+        # @manual=//triton:triton
+        from triton.language.extra.cuda.libdevice import fast_dividef
+    except ImportError:
+        # pyre-ignore: Undefined import [21]
+        # @manual=//triton:triton
+        from triton.language.math import fast_dividef
+
+from ops.triton_ops.common import triton_autotune
+
+def silu_configs():
+    configs = []
+    for x_block_size in [256, 512, 1024, 2048]:
+        for num_warps in [2, 4, 8, 16]:
+            config = triton.Config({"x_block_size": x_block_size}, num_warps)
+            configs.append(config)
+    return configs
+
+
+
+
+
+# =============================================================================
+# Fused SiLU * Up (SwiGLU pattern): output = silu(gate) * up
+# =============================================================================
+
+@triton_autotune(silu_configs(), key=["x_size"])
+@triton.jit
+def _silu_mul_forward(
+    output_ptr: tl.tensor,
+    gate_ptr: tl.tensor,
+    up_ptr: tl.tensor,
+    x_size: tl.int32,
+    x_block_size: tl.constexpr,
+):
+    """Fused forward: output = silu(gate) * up"""
+    x_offset = tl.program_id(0) * x_block_size
+    mask = x_offset + tl.arange(0, x_block_size) < x_size
+    cols = tl.arange(0, x_block_size)
+
+    gate = tl.load(gate_ptr + x_offset + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr + x_offset + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # silu(gate) = gate * sigmoid(gate) = gate / (1 + exp(-gate))
+    silu_gate = fast_dividef(gate, 1.0 + tl.exp(-gate))
+    output = (silu_gate * up).to(output_ptr.dtype.element_ty)
+
+    tl.store(output_ptr + x_offset + cols, output, mask=mask)
+
+
+@triton_autotune(silu_configs(), key=["x_size"])
+@triton.jit
+def _silu_mul_backward(
+    grad_gate_ptr: tl.tensor,
+    grad_up_ptr: tl.tensor,
+    grad_output_ptr: tl.tensor,
+    gate_ptr: tl.tensor,
+    up_ptr: tl.tensor,
+    x_size: tl.int32,
+    x_block_size: tl.constexpr,
+):
+    """
+    Fused backward for output = silu(gate) * up
+    
+    grad_gate = grad_output * up * d(silu)/d(gate)
+              = grad_output * up * (sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate)))
+    grad_up   = grad_output * silu(gate)
+    """
+    x_offset = tl.program_id(0) * x_block_size
+    mask = x_offset + tl.arange(0, x_block_size) < x_size
+    cols = tl.arange(0, x_block_size)
+
+    grad_output = tl.load(grad_output_ptr + x_offset + cols, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(gate_ptr + x_offset + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr + x_offset + cols, mask=mask, other=0.0).to(tl.float32)
+
+    sigma = tl.sigmoid(gate)
+    silu_gate = gate * sigma
+    
+    # d(silu)/d(gate) = sigma + gate * sigma * (1 - sigma)
+    dsilu_dgate = sigma + gate * sigma * (1.0 - sigma)
+    
+    grad_gate = grad_output * up * dsilu_dgate
+    grad_up = grad_output * silu_gate
+
+    tl.store(grad_gate_ptr + x_offset + cols, grad_gate.to(grad_gate_ptr.dtype.element_ty), mask=mask)
+    tl.store(grad_up_ptr + x_offset + cols, grad_up.to(grad_up_ptr.dtype.element_ty), mask=mask)
+
+
+def triton_silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Forward: output = silu(gate) * up"""
+    assert gate.shape == up.shape, f"Shape mismatch: gate {gate.shape} vs up {up.shape}"
+    x_size = gate.numel()
+    gate_1d = gate.view(-1).contiguous()
+    up_1d = up.view(-1).contiguous()
+    output = torch.empty_like(gate_1d)
+
+    def grid(meta):
+        return (triton.cdiv(x_size, meta["x_block_size"]),)
+
+    _silu_mul_forward[grid](
+        output,
+        gate_1d,
+        up_1d,
+        x_size,
+    )
+    return output.view(gate.shape)
+
+
+def triton_silu_mul_bwd(
+    grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Backward: returns (grad_gate, grad_up)"""
+    shape = gate.shape
+    x_size = gate.numel()
+    gate_1d = gate.view(-1).contiguous()
+    up_1d = up.view(-1).contiguous()
+    grad_output_1d = grad_output.view(-1).contiguous()
+    grad_gate = torch.empty_like(gate_1d)
+    grad_up = torch.empty_like(up_1d)
+
+    def grid(meta):
+        return (triton.cdiv(x_size, meta["x_block_size"]),)
+
+    _silu_mul_backward[grid](
+        grad_gate,
+        grad_up,
+        grad_output_1d,
+        gate_1d,
+        up_1d,
+        x_size,
+    )
+    return grad_gate.view(shape), grad_up.view(shape)
+
+
+class TritonSiluMul(torch.autograd.Function):
+    """Autograd function for fused silu(gate) * up"""
+    
+    @staticmethod
+    def forward(ctx, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        output = triton_silu_mul_fwd(gate, up)
+        ctx.save_for_backward(gate, up)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        gate, up = ctx.saved_tensors
+        grad_gate, grad_up = triton_silu_mul_bwd(grad_output, gate, up)
+        return grad_gate, grad_up
+
+
+def triton_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """
+    Fused SiLU multiplication (SwiGLU pattern).
+    
+    Computes: output = silu(gate) * up
+    
+    Args:
+        gate: Input tensor that goes through SiLU activation
+        up: Input tensor that multiplies with activated gate
+        
+    Returns:
+        output: silu(gate) * up
+    """
+    gate = gate.contiguous()
+    up = up.contiguous()
+    return TritonSiluMul.apply(gate, up)
 
 
 def warmup_gpu():
@@ -49,6 +224,7 @@ def get_activation_fn(activation: Optional[str]) -> Optional[Callable]:
         "relu": F.relu,
         "tanh": torch.tanh,
         "sigmoid": torch.sigmoid,
+        "swiglu": triton_silu_mul,
     }
     if activation.lower() not in activation_map:
         raise ValueError(f"Unknown activation: {activation}")
@@ -69,7 +245,7 @@ class ReferenceGroupedMLP(nn.Module):
         output_dim: int,
         num_groups: int,
         use_gating: bool = True,
-        activation: Optional[str] = "silu",
+        activation: Optional[str] = "swiglu",
         device: Union[str, torch.device] = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -303,7 +479,8 @@ class GroupedMLP_PlanA(nn.Module):
                     x, self.up_weight, batch_size, self.num_groups, self.hidden_dim
                 )
                 if self.act_fn is not None:
-                    hidden = self.act_fn(gate) * up
+                    # hidden = self.act_fn(gate) * up
+                    hidden = triton_silu_mul(gate, up)
                 else:
                     hidden = gate * up
             else:
