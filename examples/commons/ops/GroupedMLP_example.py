@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Grouped MLP Benchmark: Reference vs Plan A vs Plan B
+Grouped MLP Benchmark: Reference vs Plan A
 
 ================================================================================
 Problem
@@ -16,7 +16,6 @@ Implementations
 ================================================================================
 Reference: Loop over groups with separate nn.Linear layers
 Plan A:    3 independent strided BMMs (gate, up, down)
-Plan B:    Fused gate+up into 1 BMM, then down (2 BMMs total)
 
 ================================================================================
 """
@@ -340,6 +339,29 @@ class ReferenceGroupedMLP(nn.Module):
         
         return output
 
+    def forward_to_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass up to hidden (excluding down projection)."""
+        x = x.reshape(-1, self.num_groups, self.input_dim)
+        x_split = torch.split(x, 1, dim=1)
+        
+        hidden_list = []
+        for i in range(self.num_groups):
+            x_i = x_split[i].squeeze(1)
+            if self.use_gating:
+                gate_i = self.gate_proj[i](x_i)
+                up_i = self.up_proj[i](x_i)
+                if self.act_fn is not None:
+                    hidden_i = self.act_fn(gate_i) * up_i
+                else:
+                    hidden_i = gate_i * up_i
+            else:
+                hidden_i = self.proj[i](x_i)
+                if self.act_fn is not None:
+                    hidden_i = self.act_fn(hidden_i)
+            hidden_list.append(hidden_i)
+        
+        return torch.stack(hidden_list, dim=1).reshape(-1, self.hidden_dim)
+
 
 # =============================================================================
 # Strided BMM Function
@@ -496,224 +518,30 @@ class GroupedMLP_PlanA(nn.Module):
             
             return output.view(-1, self.output_dim)
 
-
-# =============================================================================
-# Plan B: Fused gate+up BMM
-# =============================================================================
-
-class GroupedMLP_PlanB(nn.Module):
-    """Plan B: Fused gate+up into single BMM (2 BMMs total)."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        num_groups: int,
-        use_gating: bool = True,
-        activation: Optional[str] = "silu",
-        device: Union[str, torch.device] = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
-    ):
-        super().__init__()
-        self.num_groups = num_groups
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.use_gating = use_gating
-        self.act_fn = get_activation_fn(activation)
-
-        proj_out_dim = 2 * hidden_dim if use_gating else hidden_dim
-        self.proj_weight = nn.Parameter(
-            torch.empty(num_groups, input_dim, proj_out_dim, device=device, dtype=dtype)
-        )
-
-        self.down_weight = nn.Parameter(
-            torch.empty(num_groups, hidden_dim, output_dim, device=device, dtype=dtype)
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for i in range(self.num_groups):
-            if self.use_gating:
-                nn.init.xavier_normal_(self.proj_weight[i, :, :self.hidden_dim], gain=1.0)
-                nn.init.xavier_normal_(self.proj_weight[i, :, self.hidden_dim:], gain=1.0)
-            else:
-                nn.init.xavier_normal_(self.proj_weight[i], gain=1.0)
-            nn.init.xavier_normal_(self.down_weight[i], gain=1.0)
-
-    def forward(self, x: torch.Tensor, enable_nvtx: bool = False) -> torch.Tensor:
+    def forward_to_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass up to hidden (excluding down projection)."""
         batch_size = x.shape[0] // self.num_groups
+        x = x.reshape(batch_size, self.num_groups, self.input_dim)
         
-        if enable_nvtx:
-            with nvtx.range("PlanB_reshape"):
-                x = x.reshape(batch_size, self.num_groups, self.input_dim)
-            
-            with nvtx.range("PlanB_fused_proj_bmm"):
-                proj_out = StridedBmmFunction.apply(
-                    x, self.proj_weight, batch_size, self.num_groups, self.proj_weight.shape[-1]
-                )
-            
-            with nvtx.range("PlanB_activation"):
-                if self.use_gating:
-                    gate, up = proj_out.chunk(2, dim=-1)
-                    if self.act_fn is not None:
-                        hidden = self.act_fn(gate) * up
-                    else:
-                        hidden = gate * up
-                else:
-                    if self.act_fn is not None:
-                        hidden = self.act_fn(proj_out)
-                    else:
-                        hidden = proj_out
-            
-            with nvtx.range("PlanB_down_bmm"):
-                output = StridedBmmFunction.apply(
-                    hidden, self.down_weight, batch_size, self.num_groups, self.output_dim
-                )
-            
-            with nvtx.range("PlanB_view"):
-                return output.view(-1, self.output_dim)
+        if self.use_gating:
+            gate = StridedBmmFunction.apply(
+                x, self.gate_weight, batch_size, self.num_groups, self.hidden_dim
+            )
+            up = StridedBmmFunction.apply(
+                x, self.up_weight, batch_size, self.num_groups, self.hidden_dim
+            )
+            if self.act_fn is not None:
+                hidden = triton_silu_mul(gate, up)
+            else:
+                hidden = gate * up
         else:
-            x = x.reshape(batch_size, self.num_groups, self.input_dim)
-            
-            proj_out = StridedBmmFunction.apply(
-                x, self.proj_weight, batch_size, self.num_groups, self.proj_weight.shape[-1]
+            hidden = StridedBmmFunction.apply(
+                x, self.proj_weight, batch_size, self.num_groups, self.hidden_dim
             )
-            
-            if self.use_gating:
-                gate, up = proj_out.chunk(2, dim=-1)
-                if self.act_fn is not None:
-                    hidden = self.act_fn(gate) * up
-                else:
-                    hidden = gate * up
-            else:
-                if self.act_fn is not None:
-                    hidden = self.act_fn(proj_out)
-                else:
-                    hidden = proj_out
-            
-            output = StridedBmmFunction.apply(
-                hidden, self.down_weight, batch_size, self.num_groups, self.output_dim
-            )
-            
-            return output.view(-1, self.output_dim)
-
-
-# =============================================================================
-# Plan C: Native torch.bmm (no custom autograd.Function)
-# =============================================================================
-
-class GroupedMLP_PlanC(nn.Module):
-    """
-    Plan C: Use native torch.bmm without custom autograd.Function.
-    
-    This avoids Python callback overhead in autograd by using only native PyTorch ops.
-    The tradeoff is an extra permute->contiguous copy, but autograd is pure C++.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        num_groups: int,
-        use_gating: bool = True,
-        activation: Optional[str] = "silu",
-        device: Union[str, torch.device] = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
-    ):
-        super().__init__()
-        self.num_groups = num_groups
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.use_gating = use_gating
-        self.act_fn = get_activation_fn(activation)
-
-        proj_out_dim = 2 * hidden_dim if use_gating else hidden_dim
-        self.proj_weight = nn.Parameter(
-            torch.empty(num_groups, input_dim, proj_out_dim, device=device, dtype=dtype)
-        )
-
-        self.down_weight = nn.Parameter(
-            torch.empty(num_groups, hidden_dim, output_dim, device=device, dtype=dtype)
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for i in range(self.num_groups):
-            if self.use_gating:
-                nn.init.xavier_normal_(self.proj_weight[i, :, :self.hidden_dim], gain=1.0)
-                nn.init.xavier_normal_(self.proj_weight[i, :, self.hidden_dim:], gain=1.0)
-            else:
-                nn.init.xavier_normal_(self.proj_weight[i], gain=1.0)
-            nn.init.xavier_normal_(self.down_weight[i], gain=1.0)
-
-    def forward(self, x: torch.Tensor, enable_nvtx: bool = False) -> torch.Tensor:
-        batch_size = x.shape[0] // self.num_groups
+            if self.act_fn is not None:
+                hidden = self.act_fn(hidden)
         
-        if enable_nvtx:
-            with nvtx.range("PlanC_reshape"):
-                x = x.reshape(batch_size, self.num_groups, self.input_dim)
-            
-            with nvtx.range("PlanC_fused_proj_bmm"):
-                # Native bmm: (G, B, D_in) @ (G, D_in, D_out) -> (G, B, D_out)
-                x_t = x.permute(1, 0, 2)  # (B, G, D) -> (G, B, D)
-                proj_out_t = torch.bmm(x_t, self.proj_weight)  # (G, B, D_out)
-                proj_out = proj_out_t.permute(1, 0, 2)  # (G, B, D) -> (B, G, D)
-            
-            with nvtx.range("PlanC_activation"):
-                if self.use_gating:
-                    gate, up = proj_out.chunk(2, dim=-1)
-                    if self.act_fn is not None:
-                        hidden = self.act_fn(gate) * up
-                    else:
-                        hidden = gate * up
-                else:
-                    if self.act_fn is not None:
-                        hidden = self.act_fn(proj_out)
-                    else:
-                        hidden = proj_out
-            
-            with nvtx.range("PlanC_down_bmm"):
-                hidden_t = hidden.permute(1, 0, 2)  # (B, G, D) -> (G, B, D)
-                output_t = torch.bmm(hidden_t, self.down_weight)  # (G, B, D_out)
-                output = output_t.permute(1, 0, 2)  # -> (B, G, D_out)
-            
-            with nvtx.range("PlanC_view"):
-                return output.reshape(-1, self.output_dim)
-        else:
-            x = x.reshape(batch_size, self.num_groups, self.input_dim)
-            
-            # Native bmm with permute (autograd handles this in C++)
-            x_t = x.permute(1, 0, 2)
-            proj_out_t = torch.bmm(x_t, self.proj_weight)
-            proj_out = proj_out_t.permute(1, 0, 2)
-            
-            if self.use_gating:
-                gate, up = proj_out.chunk(2, dim=-1)
-                if self.act_fn is not None:
-                    hidden = self.act_fn(gate) * up
-                else:
-                    hidden = gate * up
-            else:
-                if self.act_fn is not None:
-                    hidden = self.act_fn(proj_out)
-                else:
-                    hidden = proj_out
-            
-            hidden_t = hidden.permute(1, 0, 2)
-            output_t = torch.bmm(hidden_t, self.down_weight)
-            output = output_t.permute(1, 0, 2)
-            
-            return output.reshape(-1, self.output_dim)
-
-
-# Alias
-GroupedMLP = GroupedMLP_PlanB
+        return hidden.view(-1, self.hidden_dim)
 
 
 # =============================================================================
@@ -732,29 +560,6 @@ def copy_weights_to_plan_a(ref_model: ReferenceGroupedMLP, opt_model: GroupedMLP
                 opt_model.proj_weight[i].copy_(ref_model.proj[i].weight.T)
         for i in range(num_groups):
             opt_model.down_weight[i].copy_(ref_model.down_proj[i].weight.T)
-
-
-def copy_weights_to_plan_b(ref_model: ReferenceGroupedMLP, opt_model: GroupedMLP_PlanB):
-    with torch.no_grad():
-        num_groups = ref_model.num_groups
-        if ref_model.use_gating:
-            for i in range(num_groups):
-                opt_model.proj_weight[i, :, :opt_model.hidden_dim].copy_(
-                    ref_model.gate_proj[i].weight.T
-                )
-                opt_model.proj_weight[i, :, opt_model.hidden_dim:].copy_(
-                    ref_model.up_proj[i].weight.T
-                )
-        else:
-            for i in range(num_groups):
-                opt_model.proj_weight[i].copy_(ref_model.proj[i].weight.T)
-        for i in range(num_groups):
-            opt_model.down_weight[i].copy_(ref_model.down_proj[i].weight.T)
-
-
-def copy_weights_to_plan_c(ref_model: ReferenceGroupedMLP, opt_model: GroupedMLP_PlanC):
-    # Same structure as Plan B
-    copy_weights_to_plan_b(ref_model, opt_model)
 
 
 # =============================================================================
@@ -826,6 +631,32 @@ def benchmark_forward(
     else:
         for i in range(num_iterations):
             _ = model(x_list[i % len(x_list)], enable_nvtx=False)
+    end_event.record()
+    torch.cuda.synchronize()
+    
+    return start_event.elapsed_time(end_event) / num_iterations
+
+
+def benchmark_forward_to_hidden(
+    model: nn.Module,
+    x_list: List[torch.Tensor],
+    num_iterations: int = 100,
+    num_warmup: int = 10,
+) -> float:
+    """Benchmark forward pass up to hidden (excluding down projection)."""
+    # Warmup
+    for i in range(num_warmup):
+        _ = model.forward_to_hidden(x_list[i % len(x_list)])
+    torch.cuda.synchronize()
+    
+    # Create CUDA events
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    # Benchmark
+    start_event.record()
+    for i in range(num_iterations):
+        _ = model.forward_to_hidden(x_list[i % len(x_list)])
     end_event.record()
     torch.cuda.synchronize()
     
@@ -913,7 +744,7 @@ def benchmark_forward_backward(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Grouped MLP Benchmark: Reference vs Plan A vs Plan B"
+        description="Grouped MLP Benchmark: Reference vs Plan A"
     )
     parser.add_argument("--batch-size", type=int, default=2560)
     parser.add_argument("--num-groups", type=int, default=12)
@@ -943,7 +774,7 @@ def main():
     num_iterations = args.iterations
 
     print("=" * 80)
-    print("Grouped MLP Benchmark: Reference vs Plan A vs Plan B")
+    print("Grouped MLP Benchmark: Reference vs Plan A")
     print("=" * 80)
     
     if args.enable_nvtx:
@@ -977,27 +808,13 @@ Config:
         use_gating=use_gating, activation=activation, dtype=dtype
     ).cuda()
 
-    plan_b_model = GroupedMLP_PlanB(
-        input_dim, hidden_dim, output_dim, num_groups,
-        use_gating=use_gating, activation=activation, dtype=dtype
-    ).cuda()
-
-    plan_c_model = GroupedMLP_PlanC(
-        input_dim, hidden_dim, output_dim, num_groups,
-        use_gating=use_gating, activation=activation, dtype=dtype
-    ).cuda()
-
     copy_weights_to_plan_a(ref_model, plan_a_model)
-    copy_weights_to_plan_b(ref_model, plan_b_model)
-    copy_weights_to_plan_c(ref_model, plan_c_model)
 
     # Apply torch.compile() if requested
     if args.compile:
         print("\nApplying torch.compile() to all models...")
         ref_model = torch.compile(ref_model)
         plan_a_model = torch.compile(plan_a_model)
-        plan_b_model = torch.compile(plan_b_model)
-        plan_c_model = torch.compile(plan_c_model)
         print("Compilation complete (will JIT compile on first run).")
 
     # Correctness check
@@ -1006,12 +823,7 @@ Config:
     print("-" * 60)
     
     fwd_a, bwd_a = check_correctness(ref_model, plan_a_model, batch_size, num_groups, input_dim, dtype)
-    fwd_b, bwd_b = check_correctness(ref_model, plan_b_model, batch_size, num_groups, input_dim, dtype)
-    fwd_c, bwd_c = check_correctness(ref_model, plan_c_model, batch_size, num_groups, input_dim, dtype)
-    
     print(f"Plan A - Forward diff: {fwd_a:.2e}, Backward diff: {bwd_a:.2e}")
-    print(f"Plan B - Forward diff: {fwd_b:.2e}, Backward diff: {bwd_b:.2e}")
-    print(f"Plan C - Forward diff: {fwd_c:.2e}, Backward diff: {bwd_c:.2e}")
 
     # Prepare test data
     x_list = [
@@ -1028,29 +840,31 @@ Config:
     print("\n>>> Forward Pass <<<")
     ref_fwd = benchmark_forward(ref_model, x_list, num_iterations, enable_nvtx=False)
     plan_a_fwd = benchmark_forward(plan_a_model, x_list, num_iterations, enable_nvtx=False)
-    plan_b_fwd = benchmark_forward(plan_b_model, x_list, num_iterations, enable_nvtx=False)
-    plan_c_fwd = benchmark_forward(plan_c_model, x_list, num_iterations, enable_nvtx=False)
 
     print(f"\n{'Model':<30} {'Time (ms)':<12} {'Speedup':<10}")
     print("-" * 52)
     print(f"{'Reference (loop)':<30} {ref_fwd:<12.4f} {'1.00x':<10}")
-    print(f"{'Plan A (custom autograd)':<30} {plan_a_fwd:<12.4f} {ref_fwd/plan_a_fwd:<10.2f}x")
-    print(f"{'Plan B (custom autograd)':<30} {plan_b_fwd:<12.4f} {ref_fwd/plan_b_fwd:<10.2f}x")
-    print(f"{'Plan C (native torch.bmm)':<30} {plan_c_fwd:<12.4f} {ref_fwd/plan_c_fwd:<10.2f}x")
+    print(f"{'Plan A (batched BMM)':<30} {plan_a_fwd:<12.4f} {ref_fwd/plan_a_fwd:<10.2f}x")
+
+    # Forward to Hidden (excluding down projection)
+    print("\n>>> Forward to Hidden (excluding down_proj) <<<")
+    ref_hidden = benchmark_forward_to_hidden(ref_model, x_list, num_iterations)
+    plan_a_hidden = benchmark_forward_to_hidden(plan_a_model, x_list, num_iterations)
+
+    print(f"\n{'Model':<30} {'Time (ms)':<12} {'Speedup':<10}")
+    print("-" * 52)
+    print(f"{'Reference (loop)':<30} {ref_hidden:<12.4f} {'1.00x':<10}")
+    print(f"{'Plan A (batched BMM)':<30} {plan_a_hidden:<12.4f} {ref_hidden/plan_a_hidden:<10.2f}x")
 
     # Forward + Backward - always benchmark without NVTX
     print("\n>>> Forward + Backward <<<")
     ref_fwdbwd = benchmark_forward_backward(ref_model, x_list, num_iterations, enable_nvtx=False)
     plan_a_fwdbwd = benchmark_forward_backward(plan_a_model, x_list, num_iterations, enable_nvtx=False)
-    plan_b_fwdbwd = benchmark_forward_backward(plan_b_model, x_list, num_iterations, enable_nvtx=False)
-    plan_c_fwdbwd = benchmark_forward_backward(plan_c_model, x_list, num_iterations, enable_nvtx=False)
 
     print(f"\n{'Model':<30} {'Time (ms)':<12} {'Speedup':<10}")
     print("-" * 52)
     print(f"{'Reference (loop)':<30} {ref_fwdbwd:<12.4f} {'1.00x':<10}")
-    print(f"{'Plan A (custom autograd)':<30} {plan_a_fwdbwd:<12.4f} {ref_fwdbwd/plan_a_fwdbwd:<10.2f}x")
-    print(f"{'Plan B (custom autograd)':<30} {plan_b_fwdbwd:<12.4f} {ref_fwdbwd/plan_b_fwdbwd:<10.2f}x")
-    print(f"{'Plan C (native torch.bmm)':<30} {plan_c_fwdbwd:<12.4f} {ref_fwdbwd/plan_c_fwdbwd:<10.2f}x")
+    print(f"{'Plan A (batched BMM)':<30} {plan_a_fwdbwd:<12.4f} {ref_fwdbwd/plan_a_fwdbwd:<10.2f}x")
 
     # NVTX profiling run (separate from benchmark)
     if args.enable_nvtx:
@@ -1063,12 +877,8 @@ Config:
         nvtx_iterations = min(10, num_iterations)
         _ = benchmark_forward(ref_model, x_list, nvtx_iterations, enable_nvtx=True)
         _ = benchmark_forward(plan_a_model, x_list, nvtx_iterations, enable_nvtx=True)
-        _ = benchmark_forward(plan_b_model, x_list, nvtx_iterations, enable_nvtx=True)
-        _ = benchmark_forward(plan_c_model, x_list, nvtx_iterations, enable_nvtx=True)
         _ = benchmark_forward_backward(ref_model, x_list, nvtx_iterations, enable_nvtx=True)
         _ = benchmark_forward_backward(plan_a_model, x_list, nvtx_iterations, enable_nvtx=True)
-        _ = benchmark_forward_backward(plan_b_model, x_list, nvtx_iterations, enable_nvtx=True)
-        _ = benchmark_forward_backward(plan_c_model, x_list, nvtx_iterations, enable_nvtx=True)
         
         torch.cuda.profiler.stop()
         print("NVTX profiling complete.")
@@ -1080,21 +890,16 @@ Config:
     print(f"""
 Implementation Details:
   Reference:  Loop over {num_groups} groups, uses nn.Linear (C++ autograd)
-  Plan A/B:   Custom StridedBmmFunction (Python autograd callback overhead)
-  Plan C:     Native torch.bmm + permute (C++ autograd, but extra memory copy)
+  Plan A:     Batched BMM with custom StridedBmmFunction
 
-Forward Speedup:
+Forward Speedup (full MLP):
   Plan A vs Reference: {ref_fwd/plan_a_fwd:.2f}x
-  Plan B vs Reference: {ref_fwd/plan_b_fwd:.2f}x
-  Plan C vs Reference: {ref_fwd/plan_c_fwd:.2f}x
+
+Forward to Hidden (excluding down_proj):
+  Plan A vs Reference: {ref_hidden/plan_a_hidden:.2f}x
 
 Fwd+Bwd Speedup:
   Plan A vs Reference: {ref_fwdbwd/plan_a_fwdbwd:.2f}x
-  Plan B vs Reference: {ref_fwdbwd/plan_b_fwdbwd:.2f}x
-  Plan C vs Reference: {ref_fwdbwd/plan_c_fwdbwd:.2f}x
-
-Note: If Plan C is faster than Plan A/B, the bottleneck is Python autograd callback.
-      Consider using torch.compile() or writing a C++ extension.
 """)
     print("=" * 80)
     print("Done!")
