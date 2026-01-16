@@ -132,7 +132,7 @@ class RankingGR(BaseModel):
         )
         hidden_states = hidden_states_jagged.values
         logits = self._mlp(hidden_states)
-        return logits, seqlen_after_preprocessor, batch.labels
+        return logits, seqlen_after_preprocessor, batch.labels.values()
 
     def forward(  # type: ignore[override]
         self,

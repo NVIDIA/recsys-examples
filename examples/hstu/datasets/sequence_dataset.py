@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 import torch
 from commons.utils.logger import print_rank_0
-from datasets.utils import Batch, RankingBatch, RetrievalBatch
+from datasets.utils import Batch
 from preprocessor import get_common_preprocessors
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -294,6 +294,23 @@ class SequenceDataset(IterableDataset[Batch]):
                     ]
                 ).long(),
             )
+
+            label_kjt = None
+            # for ranking task, we need to generate labels.
+            if self._num_tasks > 0:
+                label_lengths = (
+                    torch.tensor(num_candidates, device=self._device)
+                    if self._max_num_candidates > 0
+                    else features[self._item_feature_name].lengths().clone()
+                )
+                label_kjt = KeyedJaggedTensor.from_lengths_sync(
+                    keys=["label"],
+                    values=torch.tensor(
+                        labels, device=self._device, dtype=torch.int64
+                    ).view(-1),
+                    lengths=label_lengths,
+                )
+
             batch_kwargs = dict(
                 features=features,
                 batch_size=self._batch_size,
@@ -305,17 +322,9 @@ class SequenceDataset(IterableDataset[Batch]):
                 num_candidates=torch.tensor(num_candidates, device=self._device)
                 if self._max_num_candidates > 0
                 else None,
+                labels=label_kjt,
             )
-            if self._num_tasks > 0:
-                # TODO: Need to considering using float in the future.
-                yield RankingBatch(
-                    labels=torch.tensor(
-                        labels, device=self._device, dtype=torch.int64
-                    ).view(-1),
-                    **batch_kwargs,
-                )
-            else:
-                yield RetrievalBatch(**batch_kwargs)
+            yield Batch(**batch_kwargs)
 
     def _shuffle_batch(self):
         """

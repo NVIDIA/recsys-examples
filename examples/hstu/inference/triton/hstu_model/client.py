@@ -166,7 +166,7 @@ def run_ranking_gr_evaluate(use_train_dataset=False):
                         torch.from_numpy(logits).to(
                             dtype=torch.bfloat16, device=torch.cuda.current_device()
                         ),
-                        batch.labels.cuda(),
+                        batch.labels.values().cuda(),
                     )
                 except StopIteration:
                     break
