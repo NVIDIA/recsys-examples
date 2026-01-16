@@ -298,7 +298,7 @@ def run_ranking_gr_simulate(
                         uids[non_contextual_mask].int(),
                         new_cache_start_pos[non_contextual_mask],
                     )
-                    eval_module(logits, batch_0.labels)
+                    eval_module(logits, batch_0.labels.values())
 
                 batch_1 = dataset.get_input_batch(
                     uids[contextual_mask],
@@ -314,7 +314,7 @@ def run_ranking_gr_simulate(
                         uids[contextual_mask].int(),
                         new_cache_start_pos[contextual_mask],
                     )
-                    eval_module(logits, batch_1.labels)
+                    eval_module(logits, batch_1.labels.values())
 
                 num_batches_ctr += 1
             except StopIteration:
@@ -421,7 +421,7 @@ def run_ranking_gr_evaluate(
                     batch = strip_padding_batch(batch, user_ids.shape[0])
 
                 logits = model.forward(batch, user_ids, seq_startpos)
-                eval_module(logits, batch.labels)
+                eval_module(logits, batch.labels.values())
             except StopIteration:
                 break
 

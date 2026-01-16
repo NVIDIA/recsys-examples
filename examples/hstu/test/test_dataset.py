@@ -21,7 +21,13 @@ import torch
 from datasets import get_data_loader
 from datasets.dummy_dataset import DummySequenceDataset
 from datasets.sequence_dataset import get_dataset
-from datasets.utils import FeatureConfig, RankingBatch, RetrievalBatch, is_batch_valid
+from datasets.utils import (
+    Batch,
+    FeatureConfig,
+    RankingBatch,
+    RetrievalBatch,
+    is_batch_valid,
+)
 from torch import distributed as dist
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -72,22 +78,22 @@ def batch_slice(
         max_num_candidates=batch.max_num_candidates,
         num_candidates=num_candidates,
     )
-    if isinstance(batch, RankingBatch):
-        if batch.num_candidates is not None:
-            num_candidates_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                batch.num_candidates
-            )
-            segment_start = num_candidates_offsets[batch_size * rank].cpu().item()
-            segment_end = num_candidates_offsets[batch_size * (rank + 1)].cpu().item()
-        else:
-            item_seqlen_offsets = batch.features[batch.item_feature_name].offsets()
-            segment_start = item_seqlen_offsets[batch_size * rank]
-            segment_end = item_seqlen_offsets[batch_size * (rank + 1)]
-        return RankingBatch(
-            labels=batch.labels[segment_start:segment_end], **batch_kwargs
+    if batch.labels is not None:
+        sliced_lengths = torch.split(batch.labels.lengths(), split_size)[rank]
+        segment_start = batch.labels.offsets()[rank * batch_size]
+        segment_end = batch.labels.offsets()[(rank + 1) * batch_size]
+        # in case of zero-sized segment
+        sliced_values = batch.labels.values()[segment_start:segment_end].to(
+            batch.labels.values().dtype
         )
-    else:
-        return RetrievalBatch(**batch_kwargs)
+        labels = KeyedJaggedTensor.from_lengths_sync(
+            keys=["label"],
+            values=sliced_values,
+            lengths=sliced_lengths,
+        )
+        batch_kwargs["labels"] = labels
+
+    return Batch(**batch_kwargs)
 
 
 def assert_optional_tensor_equal(a: Optional[torch.Tensor], b: Optional[torch.Tensor]):
@@ -252,10 +258,11 @@ def test_sequence_dataset(
             assert torch.allclose(
                 batch_features[key].offsets(), ref_batch_features[key].offsets()
             )
-        if isinstance(batch, RankingBatch):
+        if batch.labels is not None:
+            assert ref_batch.labels is not None, "ref labels should not be None"
             assert torch.allclose(
-                ref_batch.labels, batch.labels
-            ), f"labels result: {ref_batch.labels}, {batch.labels}"
+                ref_batch.labels.values(), batch.labels.values()
+            ), f"labels result: {ref_batch.labels.values()}, {batch.labels.values()}"
 
     logging_txt = []
     logging_txt.append(f"batch_size_per_rank:{batch_size_per_rank}")

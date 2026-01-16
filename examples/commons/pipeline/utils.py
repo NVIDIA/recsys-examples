@@ -1549,6 +1549,9 @@ def _rewrite_model(  # noqa C901
         kjt_name = None
         for attr_name, attr_value in batch.__dict__.items():
             if isinstance(attr_value, KeyedJaggedTensor):
+                # TODO, a WAR, labels is a special case, because it does not engage in model forward
+                if attr_name == "labels":
+                    continue
                 if kjt_name is not None:
                     raise ValueError(
                         f"Multiple KJT tensors found in batch: {kjt_name} and {attr_name}"
