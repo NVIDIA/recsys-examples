@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import random
 from typing import Dict, Optional, Tuple, cast
 
 import pytest
@@ -871,9 +872,7 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
 @pytest.mark.parametrize("caching", [True, False])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("PS", [None])
-def test_forward_train_eval_empty_batch(
-    opt_type, opt_params, dim, caching, deterministic, PS
-):
+def test_empty_batch(opt_type, opt_params, dim, caching, deterministic, PS):
     print(
         f"step in test_forward_train_eval_empty_batch , opt_type = {opt_type} opt_params = {opt_params}"
     )
@@ -939,8 +938,10 @@ def test_forward_train_eval_empty_batch(
             torch.cuda.synchronize()
 
     with torch.cuda.stream(forward_stream):
-        bdebt(indices, offsets)
+        res = bdebt(indices, offsets)
         torch.cuda.synchronize()
+
+        res.mean().backward()
 
         with torch.no_grad():
             bdebt.eval()
