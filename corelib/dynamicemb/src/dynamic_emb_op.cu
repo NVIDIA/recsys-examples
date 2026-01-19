@@ -898,6 +898,10 @@ void load_from_combined_table(std::optional<at::Tensor> dev_table,
                               std::optional<at::Tensor> uvm_table,
                               at::Tensor indices, at::Tensor output) {
 
+  int64_t num_total = indices.size(0);
+  if (num_total == 0) {
+    return;
+  }
   int64_t stride = -1;
   int64_t dim = output.size(1);
   if ((not dev_table.has_value()) and (not uvm_table.has_value())) {
@@ -933,8 +937,6 @@ void load_from_combined_table(std::optional<at::Tensor> dev_table,
 
   auto val_type = get_data_type(output);
   auto index_type = get_data_type(indices);
-
-  int64_t num_total = indices.size(0);
 
   constexpr int kWarpSize = 32;
   constexpr int MULTIPLIER = 4;

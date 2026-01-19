@@ -853,3 +853,92 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
 
     del os.environ["DEMB_DETERMINISM_MODE"]
     print("all check passed")
+
+
+@pytest.mark.parametrize(
+    "opt_type,opt_params",
+    [
+        (EmbOptimType.SGD, {"learning_rate": 0.3}),
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {
+                "learning_rate": 0.3,
+                "eps": 3e-5,
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("dim", [7, 8])
+@pytest.mark.parametrize("caching", [True, False])
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize("PS", [None])
+def test_forward_train_eval_empty_batch(
+    opt_type, opt_params, dim, caching, deterministic, PS
+):
+    print(
+        f"step in test_forward_train_eval_empty_batch , opt_type = {opt_type} opt_params = {opt_params}"
+    )
+
+    if deterministic:
+        os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+
+    assert torch.cuda.is_available()
+    device_id = 0
+    device = torch.device(f"cuda:{device_id}")
+
+    dims = [dim, dim, dim]
+    table_names = ["table0", "table1", "table2"]
+    key_type = torch.int64
+    value_type = torch.float32
+
+    init_capacity = 1024
+    max_capacity = 2048
+
+    dyn_emb_table_options_list = []
+    for dim in dims:
+        dyn_emb_table_options = DynamicEmbTableOptions(
+            dim=dim,
+            init_capacity=init_capacity,
+            max_capacity=max_capacity,
+            index_type=key_type,
+            embedding_dtype=value_type,
+            device_id=device_id,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=caching,
+            local_hbm_for_values=1024**3,
+            external_storage=PS,
+        )
+        dyn_emb_table_options_list.append(dyn_emb_table_options)
+
+    bdebt = BatchedDynamicEmbeddingTablesV2(
+        table_names=table_names,
+        table_options=dyn_emb_table_options_list,
+        feature_table_map=[0, 0, 1, 2],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=opt_type,
+        use_index_dedup=True,
+        **opt_params,
+    )
+    """
+    feature number = 4, batch size = 1
+
+    f0  [],     
+    f1  [],  
+    f2  [],  
+    f3  [],       
+    """
+    indices = torch.tensor([], dtype=key_type, device=device)
+    offsets = torch.tensor([0, 0, 0, 0, 0], dtype=key_type, device=device)
+
+    bdebt(indices, offsets)
+    torch.cuda.synchronize()
+
+    with torch.no_grad():
+        bdebt.eval()
+        bdebt(indices, offsets)
+    torch.cuda.synchronize()
+
+    if deterministic:
+        del os.environ["DEMB_DETERMINISM_MODE"]
+
+    print("all check passed")
