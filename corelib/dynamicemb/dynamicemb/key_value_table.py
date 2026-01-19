@@ -420,8 +420,8 @@ class KeyValueTable(
             load_from_pointers(pointers, unique_embs)
 
         missing = torch.logical_not(founds)
-        num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
-        num_missing_1: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
+        num_missing_0: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
+        num_missing_1: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
         missing_keys: torch.Tensor = torch.empty_like(unique_keys)
         missing_indices: torch.Tensor = torch.empty(
             batch, dtype=torch.long, device=device
@@ -1184,6 +1184,16 @@ class DynamicEmbeddingTable(KeyValueTable):
 
         scores = self.create_scores(batch, device, input_scores)
 
+        if batch == 0:
+            return (
+                0,
+                torch.empty_like(unique_keys),
+                torch.empty(batch, dtype=torch.long, device=device),
+                torch.empty(batch, dtype=torch.uint64, device=device)
+                if scores is not None
+                else None,
+            )
+
         score_args_lookup = [
             ScoreArg(
                 name=self.score_policy.name,
@@ -1203,8 +1213,8 @@ class DynamicEmbeddingTable(KeyValueTable):
             )
 
         missing = torch.logical_not(founds)
-        num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
-        num_missing_1: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
+        num_missing_0: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
+        num_missing_1: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
         missing_keys: torch.Tensor = torch.empty_like(unique_keys)
         missing_indices: torch.Tensor = torch.empty(
             batch, dtype=torch.long, device=device

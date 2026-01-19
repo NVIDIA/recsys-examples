@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import random
 from typing import Dict, Optional, Tuple, cast
 
 import pytest
@@ -404,7 +403,7 @@ def test_forward_train_eval(opt_type, opt_params, caching, deterministic, PS):
 
 """
 For torchrec's adam optimizer, it will increment the optimizer_step in every forward,
-    which will affect the weights update, pay attention to it or try to use `set_optimizer_step()` 
+    which will affect the weights update, pay attention to it or try to use `set_optimizer_step()`
     to control(not verified) it.
 """
 
@@ -919,6 +918,7 @@ def test_forward_train_eval_empty_batch(
         use_index_dedup=True,
         **opt_params,
     )
+    bdebt.enable_prefetch = True
     """
     feature number = 4, batch size = 1
 
@@ -930,13 +930,22 @@ def test_forward_train_eval_empty_batch(
     indices = torch.tensor([], dtype=key_type, device=device)
     offsets = torch.tensor([0, 0, 0, 0, 0], dtype=key_type, device=device)
 
-    bdebt(indices, offsets)
-    torch.cuda.synchronize()
+    pretch_stream = torch.cuda.Stream()
+    forward_stream = torch.cuda.Stream()
 
-    with torch.no_grad():
-        bdebt.eval()
+    if caching:
+        with torch.cuda.stream(pretch_stream):
+            bdebt.prefetch(indices, offsets, forward_stream)
+            torch.cuda.synchronize()
+
+    with torch.cuda.stream(forward_stream):
         bdebt(indices, offsets)
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+
+        with torch.no_grad():
+            bdebt.eval()
+            bdebt(indices, offsets)
+        torch.cuda.synchronize()
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]
