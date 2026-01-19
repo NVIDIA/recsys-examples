@@ -23,7 +23,6 @@ class BaseBatch(Pipelineable):
     actual_batch_size: Optional[int] = None  # in case of padding.
 
     def __post_init__(self):
-        """数据验证"""
         if len(set(self.features.keys())) != len(list(self.features.keys())):
             raise ValueError(f"duplicate features keys {list(self.features.keys())}")
         assert isinstance(self.contextual_feature_names, list)
@@ -48,7 +47,7 @@ class BaseBatch(Pipelineable):
                     - False: Create a new object and return it.
 
         Returns:
-            If inplace=False, returns a new Batch object; otherwise returns None.
+            If inplace=False, returns a new Batch object; otherwise returns self.
         """
         batch_fields = fields(self)
 
@@ -138,38 +137,9 @@ class BaseBatch(Pipelineable):
             else:
                 raise ValueError(f"Unsupported type: {type(t)}")
 
-        return self._apply_to_tensors_or_kjt(
+        new_batch = self._apply_to_tensors_or_kjt(
             applier,
             inplace=False,
         )
-
-
-if __name__ == "__main__":
-    batch_size = 10
-    max_sequence_length = 10
-    feature_names = ["feature1", "feature2"]
-    feature_lengths = torch.randint(1, max_sequence_length, (batch_size * 2,)).cuda()
-    feature_values = torch.randint(0, 100000, (feature_lengths.sum().item(),)).cuda()
-    label_lengths = torch.randint(1, 20, (batch_size,)).cuda()
-    label_values = torch.arange(label_lengths.sum().item(), device=torch.device("cuda"))
-    labels = KeyedJaggedTensor.from_lengths_sync(
-        keys=["label"],
-        values=label_values,
-        lengths=label_lengths,
-    )
-    features = KeyedJaggedTensor.from_lengths_sync(
-        keys=feature_names,
-        values=feature_values,
-        lengths=feature_lengths.view(-1),
-    )
-    batch = BaseBatch(
-        features=features,
-        batch_size=batch_size,
-        feature_to_max_seqlen={
-            "feature1": max_sequence_length,
-            "feature2": max_sequence_length,
-        },
-        labels=labels,
-    )
-    indices = torch.tensor([0, 2, 9]).cuda()
-    selected_batch = batch.index_select(indices)
+        new_batch.actual_batch_size = indices.numel()
+        return new_batch
