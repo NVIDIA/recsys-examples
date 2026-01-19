@@ -22,17 +22,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <vector>
 
 #include <cuda_runtime.h>
+#include "utils.hpp"
 
 namespace dyn_emb {
-
-using ScoreType = uint64_t;
-
-enum class ScorePolicyType : uint8_t {
-  Const = 0,
-  Assign = 1,
-  Accumulate = 2,
-  GlobalTimer = 3,
-};
 
 struct ScorePolicy {
 
