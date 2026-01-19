@@ -306,6 +306,83 @@ def assert_equal_two_state_dict(a_state_dict, b_state_dict):
             assert v == r, f"for {k}, value {v} != {r}"
 
 
+def generate_random_batches(
+    task_type: str,
+    num_tasks: int,
+    batch_size: int,
+    feature_configs,
+    item_feature_name,
+    contextual_feature_names,
+    action_feature_name,
+    max_num_candidates,
+    device,
+    num_batches: int,
+    replicate_batches: bool,
+):
+    """
+    生成random batch列表，支持replicate
+    """
+    history_batches = []
+    with tensor_parallel.get_cuda_rng_tracker().fork():
+        if task_type == "ranking":
+            if replicate_batches:
+                history_batches = [
+                    datasets.utils.RankingBatch.random(
+                        num_tasks=num_tasks,
+                        batch_size=batch_size,
+                        feature_configs=feature_configs,
+                        item_feature_name=item_feature_name,
+                        contextual_feature_names=contextual_feature_names,
+                        action_feature_name=action_feature_name,
+                        max_num_candidates=max_num_candidates,
+                        device=device,
+                    )
+                ] * num_batches
+            else:
+                history_batches = [
+                    datasets.utils.RankingBatch.random(
+                        num_tasks=num_tasks,
+                        batch_size=batch_size,
+                        feature_configs=feature_configs,
+                        item_feature_name=item_feature_name,
+                        contextual_feature_names=contextual_feature_names,
+                        action_feature_name=action_feature_name,
+                        max_num_candidates=max_num_candidates,
+                        device=device,
+                    )
+                    for _ in range(num_batches)
+                ]
+        elif task_type == "retrieval":
+            if replicate_batches:
+                history_batches = [
+                    datasets.utils.RetrievalBatch.random(
+                        batch_size=batch_size,
+                        feature_configs=feature_configs,
+                        item_feature_name=item_feature_name,
+                        contextual_feature_names=contextual_feature_names,
+                        action_feature_name=action_feature_name,
+                        max_num_candidates=max_num_candidates,
+                        device=device,
+                    )
+                ] * num_batches
+            else:
+                history_batches = [
+                    datasets.utils.RetrievalBatch.random(
+                        batch_size=batch_size,
+                        feature_configs=feature_configs,
+                        item_feature_name=item_feature_name,
+                        contextual_feature_names=contextual_feature_names,
+                        action_feature_name=action_feature_name,
+                        max_num_candidates=max_num_candidates,
+                        device=device,
+                    )
+                    for _ in range(num_batches)
+                ]
+        else:
+            raise ValueError(f"Unsupported task_type: {task_type}")
+    return history_batches
+
+
 def create_model(
     task_type,
     contextual_feature_names,
@@ -397,15 +474,6 @@ def create_model(
             )
         )
 
-    batch_kwargs = dict(
-        batch_size=batch_size,
-        feature_configs=feature_configs,
-        item_feature_name=item_feature_name,
-        contextual_feature_names=contextual_feature_names,
-        action_feature_name=action_feature_name,
-        max_num_candidates=max_num_candidates,
-        device=device,
-    )
     if task_type == "ranking":
         num_tasks = 1
         task_config = configs.RankingConfig(
@@ -414,40 +482,29 @@ def create_model(
             prediction_head_bias=False,  # disable bias for better debugging
         )
         model_train = model.RankingGR(hstu_config=hstu_config, task_config=task_config)
-
-        history_batches = []
-        with tensor_parallel.get_cuda_rng_tracker().fork():
-            if replicate_batches:
-                history_batches = [
-                    datasets.utils.RankingBatch.random(
-                        num_tasks=num_tasks, **batch_kwargs
-                    )
-                ] * num_batches
-            else:
-                history_batches = [
-                    datasets.utils.RankingBatch.random(
-                        num_tasks=num_tasks, **batch_kwargs
-                    )
-                    for _ in range(num_batches)
-                ]
     else:
         assert task_type == "retrieval"
+        num_tasks = None  # retrieval不需要num_tasks
         task_config = configs.RetrievalConfig(embedding_configs=emb_configs)
         model_train = model.RetrievalGR(
             hstu_config=hstu_config, task_config=task_config
         )
 
-        history_batches = []
-        with tensor_parallel.get_cuda_rng_tracker().fork():
-            if replicate_batches:
-                history_batches = [
-                    datasets.utils.RetrievalBatch.random(**batch_kwargs)
-                ] * num_batches
-            else:
-                history_batches = [
-                    datasets.utils.RetrievalBatch.random(**batch_kwargs)
-                    for _ in range(num_batches)
-                ]
+    # 参数展开传递
+    history_batches = generate_random_batches(
+        task_type=task_type,
+        num_tasks=num_tasks if num_tasks is not None else 1,  # ranking用1，retrieval不使用
+        batch_size=batch_size,
+        feature_configs=feature_configs,
+        item_feature_name=item_feature_name,
+        contextual_feature_names=contextual_feature_names,
+        action_feature_name=action_feature_name,
+        max_num_candidates=max_num_candidates,
+        device=device,
+        num_batches=num_batches,
+        replicate_batches=replicate_batches,
+    )
+
     optimizer_param = OptimizerParam(
         optimizer_str=optimizer_type_str,
         learning_rate=1e-3 if optimizer_type_str == "adam" else 1e-1,

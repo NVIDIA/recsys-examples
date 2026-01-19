@@ -27,12 +27,19 @@
 # limitations under the License.
 
 import heapq
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Union
 
 import numpy as np
 
+try:
+    from torch import Tensor
+except ImportError:
+    Tensor = None
 
-def karmarkar_karp(seqlen_list: np.ndarray, k_partitions: int, equal_size: bool):
+
+def karmarkar_karp(
+    workloads: Union[np.ndarray, List[int], Tensor], k_partitions: int, equal_size: bool
+):
     # see: https://en.wikipedia.org/wiki/Largest_differencing_method
     class Set:
         def __init__(self) -> None:
@@ -61,8 +68,8 @@ def karmarkar_karp(seqlen_list: np.ndarray, k_partitions: int, equal_size: bool)
             # sets should always be decreasing order
             self.sets = [Set() for _ in range(k)]
             assert len(items) in [1, k], f"{len(items)} not in [1, {k}]"
-            for i, (idx, seqlen) in enumerate(items):
-                self.sets[i].add(idx=idx, val=seqlen)
+            for i, (idx, workload) in enumerate(items):
+                self.sets[i].add(idx=idx, val=workload)
             self.sets = sorted(self.sets, reverse=True)
 
         def get_partitions(self):
@@ -97,29 +104,34 @@ def karmarkar_karp(seqlen_list: np.ndarray, k_partitions: int, equal_size: bool)
                 if i > 0:
                     repr_str += ","
                 repr_str += "{"
-                for j, (_, seqlen) in enumerate(self.sets[i].items):
+                for j, (_, workload) in enumerate(self.sets[i].items):
                     if j > 0:
                         repr_str += ","
-                    repr_str += str(seqlen)
+                    repr_str += str(workload)
                 repr_str += "}"
             repr_str += "]"
             return repr_str
 
-    sorted_seqlen_list = sorted([(seqlen, i) for i, seqlen in enumerate(seqlen_list)])
+    workloads = (
+        workloads.tolist()
+        if isinstance(workloads, Tensor) and Tensor is not None
+        else workloads
+    )
+    sorted_workloads = sorted([(workload, i) for i, workload in enumerate(workloads)])
     states_pq: List[Any] = []
     if equal_size:
         assert (
-            len(seqlen_list) % k_partitions == 0
-        ), f"{len(seqlen_list)} % {k_partitions} != 0"
-        for offset in range(0, len(sorted_seqlen_list), k_partitions):
+            len(workloads) % k_partitions == 0
+        ), f"{len(workloads)} % {k_partitions} != 0"
+        for offset in range(0, len(sorted_workloads), k_partitions):
             items = []
             for i in range(k_partitions):
-                seqlen, idx = sorted_seqlen_list[offset + i]
-                items.append((idx, seqlen))
+                workload, idx = sorted_workloads[offset + i]
+                items.append((idx, workload))
             heapq.heappush(states_pq, State(items=items, k=k_partitions))
     else:
-        for seqlen, idx in sorted_seqlen_list:
-            heapq.heappush(states_pq, State(items=[(idx, seqlen)], k=k_partitions))
+        for workload, idx in sorted_workloads:
+            heapq.heappush(states_pq, State(items=[(idx, workload)], k=k_partitions))
 
     while len(states_pq) > 1:
         state0 = heapq.heappop(states_pq)
@@ -133,19 +145,15 @@ def karmarkar_karp(seqlen_list: np.ndarray, k_partitions: int, equal_size: bool)
     if equal_size:
         for i, partition in enumerate(partitions):
             assert len(partition) * k_partitions == len(
-                seqlen_list
-            ), f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
+                workloads
+            ), f"{len(partition)} * {k_partitions} != {len(workloads)}"
     return partitions
 
 
 if __name__ == "__main__":
-    seqlen_list = [100, 200, 300, 400, 500]
+    workloads = [100, 200, 300, 400, 500]
     k_partitions = 2
     equal_size = False
     partitions = karmarkar_karp(
-        seqlen_list=seqlen_list, k_partitions=k_partitions, equal_size=equal_size
+        workloads=workloads, k_partitions=k_partitions, equal_size=equal_size
     )
-
-    import pdb
-
-    pdb.set_trace()
