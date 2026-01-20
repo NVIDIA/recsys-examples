@@ -35,31 +35,22 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-void sgd_update_for_combined_table(at::Tensor grads, at::Tensor indices,
-                                   std::optional<at::Tensor> dev_table,
-                                   std::optional<at::Tensor> uvm_table,
-                                   float const lr);
+void sgd_update_for_table(at::Tensor grads, at::Tensor indices,
+    at::Tensor table, float const lr);
+    
+void adam_update_for_table(at::Tensor grads, at::Tensor indices,
+                           at::Tensor table, int64_t state_dim, const float lr,
+                           const float beta1, const float beta2,
+                           const float eps, const float weight_decay,
+                           const uint32_t iter_num);
 
-void adam_update_for_combined_table(at::Tensor grads, at::Tensor indices,
-                                    std::optional<at::Tensor> dev_table,
-                                    std::optional<at::Tensor> uvm_table,
+void adagrad_update_for_table(at::Tensor grads, at::Tensor indices,
+                              at::Tensor table, int64_t state_dim,
+                              const float lr, const float eps);
 
-                                    int64_t state_dim, const float lr,
-                                    const float beta1, const float beta2,
-                                    const float eps, const float weight_decay,
-                                    const uint32_t iter_num);
-
-void adagrad_update_for_combined_table(at::Tensor grads, at::Tensor indices,
-                                       std::optional<at::Tensor> dev_table,
-                                       std::optional<at::Tensor> uvm_table,
-                                       int64_t state_dim, const float lr,
-                                       const float eps);
-
-void rowwise_adagrad_for_combined_table(at::Tensor grads, at::Tensor indices,
-                                        std::optional<at::Tensor> dev_table,
-                                        std::optional<at::Tensor> uvm_table,
-                                        int64_t state_dim, const float lr,
-                                        const float eps);
+void rowwise_adagrad_for_table(at::Tensor grads, at::Tensor indices,
+                               at::Tensor table, int64_t state_dim,
+                               const float lr, const float eps);
 
 } // namespace dyn_emb
 #endif // OPTIMIZER_H
