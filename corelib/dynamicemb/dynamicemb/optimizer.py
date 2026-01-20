@@ -22,8 +22,8 @@ from typing import Any, Dict, List, Union
 import torch  # usort:skip
 from dynamicemb.dynamicemb_config import *
 from dynamicemb_extensions import (  # dynamic_emb_sgd,; dynamic_emb_adam,; dynamic_emb_adagrad,; dynamic_emb_rowwise_adagrad,
-    adagrad_update_for_combined_table,
-    adam_update_for_combined_table,
+    adagrad_update_for_table,
+    adam_update_for_table,
     dynamic_emb_adagrad_fused,
     dynamic_emb_adagrad_with_pointer,
     dynamic_emb_adagrad_with_table,
@@ -36,8 +36,8 @@ from dynamicemb_extensions import (  # dynamic_emb_sgd,; dynamic_emb_adam,; dyna
     dynamic_emb_sgd_fused,
     dynamic_emb_sgd_with_pointer,
     dynamic_emb_sgd_with_table,
-    rowwise_adagrad_for_combined_table,
-    sgd_update_for_combined_table,
+    rowwise_adagrad_for_table,
+    sgd_update_for_table,
 )
 
 
@@ -480,8 +480,7 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
         self,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        dev_table: torch.Tensor,
-        uvm_table: torch.Tensor,
+        table: torch.Tensor,
     ) -> None:
         ...
 
@@ -574,15 +573,13 @@ class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         self,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        dev_table: torch.Tensor,
-        uvm_table: torch.Tensor,
+        table: torch.Tensor,
     ) -> None:
         lr = self._opt_args.learning_rate
-        sgd_update_for_combined_table(
+        sgd_update_for_table(
             grads,
             indices,
-            dev_table,
-            uvm_table,
+            table,
             lr,
         )
 
@@ -697,8 +694,7 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         self,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        dev_table: torch.Tensor,
-        uvm_table: torch.Tensor,
+        table: torch.Tensor,
     ) -> None:
         lr = self._opt_args.learning_rate
         beta1 = self._opt_args.beta1
@@ -709,11 +705,10 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         emb_dim = grads.size(1)
         state_dim = self.get_state_dim(emb_dim)
 
-        adam_update_for_combined_table(
+        adam_update_for_table(
             grads,
             indices,
-            dev_table,
-            uvm_table,
+            table,
             state_dim,
             lr,
             beta1,
@@ -817,8 +812,7 @@ class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         self,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        dev_table: torch.Tensor,
-        uvm_table: torch.Tensor,
+        table: torch.Tensor,
     ) -> None:
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
@@ -826,11 +820,10 @@ class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         emb_dim = grads.size(1)
         state_dim = self.get_state_dim(emb_dim)
 
-        adagrad_update_for_combined_table(
+        adagrad_update_for_table(
             grads,
             indices,
-            dev_table,
-            uvm_table,
+            table,
             state_dim,
             lr,
             eps,
@@ -936,8 +929,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
         self,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        dev_table: torch.Tensor,
-        uvm_table: torch.Tensor,
+        table: torch.Tensor,
     ) -> None:
         lr = self._opt_args.learning_rate
         eps = self._opt_args.eps
@@ -945,11 +937,10 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
         emb_dim = grads.size(1)
         state_dim = self.get_state_dim(emb_dim)
 
-        rowwise_adagrad_for_combined_table(
+        rowwise_adagrad_for_table(
             grads,
             indices,
-            dev_table,
-            uvm_table,
+            table,
             state_dim,
             lr,
             eps,

@@ -69,11 +69,11 @@ from dynamicemb_extensions import (
     insert_and_evict,
     insert_and_evict_with_scores,
     insert_or_assign,
-    load_from_combined_table,
     load_from_pointers,
+    load_from_table,
     select,
     select_index,
-    store_to_combined_table,
+    store_to_table,
 )
 from torch import Tensor, nn  # usort:skip
 from torchrec import JaggedTensor
@@ -982,10 +982,6 @@ class DynamicEmbeddingTable(KeyValueTable):
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
 
-        # assert (
-        #     options.init_capacity == options.max_capacity
-        # ), "Capacity growth is appending..."
-
         self.score_policy = get_score_policy(options.score_strategy)
         self.evict_strategy_ = options.evict_strategy.value
 
@@ -999,51 +995,24 @@ class DynamicEmbeddingTable(KeyValueTable):
 
         self._capacity = self.key_index_map.capacity()
 
-        # TODO: maybe we can separate it in the future like fbgemm
-        # self.embedding_weights_dev = None
-        # self.embedding_weights_uvm = None
-        # self.optimizer_states_dev = None
-        # self.optimizer_states_uvm = None
-        self.dev_table = None
-        self.uvm_table = None
-
         self._emb_dtype = self.options.embedding_dtype
         self._emb_dim = self.options.dim
         self._optim_states_dim = optimizer.get_state_dim(self._emb_dim)
         self._value_dim = self._emb_dim + self._optim_states_dim
 
-        total_memory_need = (
-            self._capacity * self._value_dim * dtype_to_bytes(self._emb_dtype)
-        )
-
-        if options.local_hbm_for_values == 0:
-            # weight_uvm_size = self._capacity * self._emb_dim
-            # optim_states_uvm_size = self._capacity * self._optim_states_dim
-            # self.embedding_weights_uvm = get_uvm_tensor(weight_uvm_size, self._emb_dtype, self.device)
-            # self.embedding_weights_uvm = get_uvm_tensor(optim_states_uvm_size, self._emb_dtype, self.device)
-            uvm_size = self._capacity * self._value_dim
-            self.uvm_table = get_uvm_tensor(
-                uvm_size, dtype=self._emb_dtype, device=self.device
-            ).view(-1, self._value_dim)
-        elif options.local_hbm_for_values >= total_memory_need:
-            dev_size = self._capacity * self._value_dim
-            self.dev_table = torch.empty(
-                dev_size, dtype=self._emb_dtype, device=self.device
+        self._on_device = options.local_hbm_for_values != 0
+        num_elements = self._capacity * self._value_dim
+        if self._on_device:
+            self._table = torch.empty(
+                num_elements, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
         else:
-            # hybrid mode
-            dev_size = (
-                options.local_hbm_for_values
-                // (self._value_dim * dtype_to_bytes(self._emb_dtype))
-                * self._value_dim
-            )
-            uvm_size = self._capacity * self._value_dim - dev_size
-            self.dev_table = torch.empty(
-                dev_size, dtype=self._emb_dtype, device=self.device
+            self._table = get_uvm_tensor(
+                num_elements, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
-            self.uvm_table = get_uvm_tensor(
-                uvm_size, dtype=self._emb_dtype, device=self.device
-            ).view(-1, self._value_dim)
+        # TODO: maybe we can separate it in the future like fbgemm
+        # self.embedding_weights = None
+        # self.optimizer_states = None
 
         self.score: int = None
         self._score_update = False
@@ -1082,32 +1051,15 @@ class DynamicEmbeddingTable(KeyValueTable):
             device=self.device,
         )
 
-        dev_table = None
-        uvm_table = None
-
-        if self.options.local_hbm_for_values == 0:
-            uvm_size = target_capacity * self._value_dim
-            uvm_table = get_uvm_tensor(
-                uvm_size, dtype=self._emb_dtype, device=self.device
-            ).view(-1, self._value_dim)
-        elif self.options.local_hbm_for_values >= total_memory_need:
-            dev_size = target_capacity * self._value_dim
-            dev_table = torch.empty(
-                dev_size, dtype=self._emb_dtype, device=self.device
+        table = None
+        num_elements = target_capacity * self._value_dim
+        if self._on_device:
+            table = torch.empty(
+                num_elements, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
         else:
-            # hybrid mode
-            dev_size = (
-                self.options.local_hbm_for_values
-                // (self._value_dim * dtype_to_bytes(self._emb_dtype))
-                * self._value_dim
-            )
-            uvm_size = target_capacity * self._value_dim - dev_size
-            dev_table = torch.empty(
-                dev_size, dtype=self._emb_dtype, device=self.device
-            ).view(-1, self._value_dim)
-            uvm_table = get_uvm_tensor(
-                uvm_size, dtype=self._emb_dtype, device=self.device
+            table = get_uvm_tensor(
+                num_elements, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
 
         for (
@@ -1126,7 +1078,7 @@ class DynamicEmbeddingTable(KeyValueTable):
                 dtype=self.value_type(),
                 device=self.device,
             )
-            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
+            load_from_table(self._table, indices, values)
 
             # when load into the table, we always assign the scores from the file.
             score_args_insert = [
@@ -1142,16 +1094,14 @@ class DynamicEmbeddingTable(KeyValueTable):
             )
 
             key_index_map.insert(keys, score_args_insert, indices)
-            store_to_combined_table(
-                dev_table,
-                uvm_table,
+            store_to_table(
+                table,
                 indices,
                 values,
             )
 
         self.key_index_map = key_index_map
-        self.dev_table = dev_table
-        self.uvm_table = uvm_table
+        self._table = table
         self._capacity = target_capacity
 
     def find_impl(
@@ -1198,9 +1148,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
 
         if load_dim != 0:
-            load_from_combined_table(
-                self.dev_table, self.uvm_table, indices, unique_embs
-            )
+            load_from_table(self._table, indices, unique_embs)
 
         missing = torch.logical_not(founds)
         num_missing_0: torch.Tensor = torch.empty(1, dtype=torch.long, device=device)
@@ -1340,9 +1288,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         )
 
         self.key_index_map.insert(unique_keys, score_args_insert, indices)
-        store_to_combined_table(
-            self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
-        )
+        store_to_table(self._table, indices, unique_values.to(self.value_type()))
 
     def update(
         self,
@@ -1370,7 +1316,9 @@ class DynamicEmbeddingTable(KeyValueTable):
         self.key_index_map.lookup(keys, score_args_lookup, founds, indices)
 
         self.optimizer.fused_update_with_index(
-            grads.to(self.value_type()), indices, self.dev_table, self.uvm_table
+            grads.to(self.value_type()),
+            indices,
+            self._table,
         )
 
         if return_missing:
@@ -1689,9 +1637,8 @@ class DynamicEmbeddingTable(KeyValueTable):
         )
 
         self.key_index_map.insert(keys, score_args_insert, indices)
-        store_to_combined_table(
-            self.dev_table,
-            self.uvm_table,
+        store_to_table(
+            self._table,
             indices,
             values.to(value_type),
         )
@@ -1722,7 +1669,7 @@ class DynamicEmbeddingTable(KeyValueTable):
                 dtype=self.value_type(),
                 device=self.device,
             )
-            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
+            load_from_table(self._table, indices, values)
             embeddings = (
                 values[:, : self._emb_dim].to(dtype=EMBEDDING_TYPE).contiguous()
             )
@@ -1802,16 +1749,13 @@ class DynamicEmbeddingTable(KeyValueTable):
         ) = self.key_index_map.insert_and_evict(keys, score_args_insert, indices)
         evicted_scores = evicted_scores[0]
 
-        load_from_combined_table(
-            self.dev_table,
-            self.uvm_table,
+        load_from_table(
+            self._table,
             evicted_indices,
             evicted_values[:num_evicted, :],
         )
 
-        store_to_combined_table(
-            self.dev_table, self.uvm_table, indices, values.to(self.value_type())
-        )
+        store_to_table(self._table, indices, values.to(self.value_type()))
 
         if self._record_cache_metrics:
             self._cache_metrics[2] = batch
@@ -1844,7 +1788,7 @@ class DynamicEmbeddingTable(KeyValueTable):
                 device=self.device,
             )
 
-            load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
+            load_from_table(self._table, indices, values)
             storage.insert(keys, values, scores)
 
     def reset(
@@ -1900,9 +1844,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             keys.numel(), self._emb_dim, dtype=self._emb_dtype, device=self.device
         )
         if keys.numel() != 0:
-            load_from_combined_table(
-                self.dev_table, self.uvm_table, indices.to(self.device), embs
-            )
+            load_from_table(self._table, indices.to(self.device), embs)
 
         if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
             return keys, embs.cpu()
@@ -2069,9 +2011,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             h_num_unique_keys, dtype=torch.bool, device=unique_keys.device
         )
         self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
-        store_to_combined_table(
-            self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
-        )
+        store_to_table(self._table, indices, unique_values.to(self.value_type()))
         return
 
     def deterministic_insert_and_evict(
@@ -2181,9 +2121,8 @@ class DynamicEmbeddingTable(KeyValueTable):
 
         assert len(set(evicted_indices_accum.tolist())) == num_evicted_accum
 
-        load_from_combined_table(
-            self.dev_table,
-            self.uvm_table,
+        load_from_table(
+            self._table,
             evicted_indices_accum,
             evicted_values_accum,
         )
@@ -2205,9 +2144,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             h_num_unique_keys, dtype=torch.bool, device=unique_keys.device
         )
         self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
-        store_to_combined_table(
-            self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
-        )
+        store_to_table(self._table, indices, unique_values.to(self.value_type()))
 
         if self._record_cache_metrics:
             self._cache_metrics[2] = h_num_unique_keys

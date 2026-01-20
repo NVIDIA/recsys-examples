@@ -530,6 +530,30 @@ def validate_initializer_args(
             initializer_args.upper = default_upper
 
 
+def get_comsued_bytes_of_table(
+    max_capacity,
+    dtype,
+    dim,
+    optimizer_type,
+) -> int:
+    byte_consume_per_vector = (
+        dim + get_optimizer_state_dim(optimizer_type, dim, dtype)
+    ) * dtype_to_bytes(dtype)
+    total_consumed = max_capacity * byte_consume_per_vector
+    return total_consumed
+
+
+def get_value_size(
+    dtype,
+    dim,
+    optimizer_type,
+) -> int:
+    byte_consume_per_vector = (
+        dim + get_optimizer_state_dim(optimizer_type, dim, dtype)
+    ) * dtype_to_bytes(dtype)
+    return byte_consume_per_vector
+
+
 def get_constraint_capacity(
     memory_bytes,
     dtype,
