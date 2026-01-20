@@ -546,8 +546,8 @@ class KeyValueTable(
 
         batch = keys.size(0)
 
-        # if batch == 0:
-        #     return None, None, None
+        if batch == 0:
+            return None, None, None
 
         device = keys.device
         founds = torch.empty(batch, dtype=torch.bool, device=device)
@@ -1367,8 +1367,8 @@ class DynamicEmbeddingTable(KeyValueTable):
 
         batch = keys.size(0)
 
-        # if batch == 0:
-        #     return None, None, None
+        if batch == 0:
+            return None, None, None
 
         device = keys.device
         founds = torch.empty(batch, dtype=torch.bool, device=device)
