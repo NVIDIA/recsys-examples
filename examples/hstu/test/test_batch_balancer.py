@@ -1,3 +1,5 @@
+from typing import Dict
+
 import commons.utils.initialize as init
 import pytest
 import torch
@@ -55,6 +57,7 @@ def test_hstu_batch_balancer(batch_size, num_heads, head_dim):
         replicate_batches=replicate_batches,
     )
     hstu_batch_balancer = HASTUBalancedBatchShuffler(num_heads, head_dim)
+    lengths_item_action: Dict[str, torch.Tensor] = {}
     for batch in history_batches:
         shuffled_batch, indices, workloads = hstu_batch_balancer.shuffle(
             batch,
@@ -67,6 +70,7 @@ def test_hstu_batch_balancer(batch_size, num_heads, head_dim):
         ), "shuffled_batch workloads should match"
         for key in shuffled_batch.features.keys():
             feature = shuffled_batch.features[key]
+            lengths_item_action[key] = feature.lengths()
             lengths_before_shuffle_this_rank = batch.features[key].lengths().sum()
             lengths_after_shuffle_this_rank = feature.lengths().sum()
             # we do allreduce on lengths before and after shuffle
@@ -86,6 +90,16 @@ def test_hstu_batch_balancer(batch_size, num_heads, head_dim):
             assert torch.equal(
                 reduced_lengths_before_shuffle, reduced_lengths_after_shuffle
             ), "numel should match"
+        lengths_to_compare = torch.stack(
+            [
+                lengths_item_action[item_feature_name],
+                lengths_item_action[action_feature_name],
+            ],
+            dim=0,
+        )
+        assert torch.all(
+            torch.all(lengths_to_compare == lengths_to_compare[0], dim=0)
+        ), "lengths should match"
         labels = shuffled_batch.labels
 
         if isinstance(labels, KeyedJaggedTensor):

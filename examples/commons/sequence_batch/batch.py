@@ -13,7 +13,7 @@ class BaseBatch(Pipelineable):
     All tensors must share a same batch size.
     """
 
-    features: KeyedJaggedTensor  # KJT 格式
+    features: KeyedJaggedTensor
     batch_size: int  # local batch size
     feature_to_max_seqlen: Dict[str, int]
 
