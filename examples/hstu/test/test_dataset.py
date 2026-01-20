@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, Union
+from typing import Optional
 
 import commons.utils.initialize as init
 import fbgemm_gpu  # to load permute_2D_sparse_data
@@ -21,79 +21,9 @@ import torch
 from datasets import get_data_loader
 from datasets.dummy_dataset import DummySequenceDataset
 from datasets.sequence_dataset import get_dataset
-from datasets.utils import (
-    Batch,
-    FeatureConfig,
-    RankingBatch,
-    RetrievalBatch,
-    is_batch_valid,
-)
+from datasets.utils import FeatureConfig, is_batch_valid
+from test_utils import batch_slice
 from torch import distributed as dist
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-
-
-def batch_slice(
-    batch: Union[RankingBatch, RetrievalBatch],
-    batch_size: int,
-    rank: int,
-    world_size: int,
-) -> Union[RankingBatch, RetrievalBatch]:
-    """
-    Slice the batch.
-    """
-    split_size = [batch_size for _ in range(world_size)]
-    keys = batch.features.keys()
-    values = []
-    lengths = []
-    for key in keys:
-        feature = batch.features[key]
-        sliced_lengths = torch.split(feature.lengths(), split_size)[rank]
-        segment_start = feature.offsets()[rank * batch_size]
-        segment_end = feature.offsets()[(rank + 1) * batch_size]
-        # in case of zero-sized segment
-        sliced_values = feature.values()[segment_start:segment_end].to(
-            feature.values().dtype
-        )
-        values.extend(sliced_values)
-        lengths.extend(sliced_lengths)
-    sliced_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=keys,
-        values=torch.tensor(values, device=batch.features.device()).long(),
-        lengths=torch.tensor(lengths, device=batch.features.device()),
-    )
-
-    if batch.num_candidates is not None:
-        num_candidates = batch.num_candidates[
-            rank * batch_size : (rank + 1) * batch_size
-        ]
-    else:
-        num_candidates = None
-    batch_kwargs = dict(
-        features=sliced_feature,
-        feature_to_max_seqlen=batch.feature_to_max_seqlen,
-        batch_size=batch_size,
-        contextual_feature_names=batch.contextual_feature_names,
-        item_feature_name=batch.item_feature_name,
-        action_feature_name=batch.action_feature_name,
-        max_num_candidates=batch.max_num_candidates,
-        num_candidates=num_candidates,
-    )
-    if batch.labels is not None:
-        sliced_lengths = torch.split(batch.labels.lengths(), split_size)[rank]
-        segment_start = batch.labels.offsets()[rank * batch_size]
-        segment_end = batch.labels.offsets()[(rank + 1) * batch_size]
-        # in case of zero-sized segment
-        sliced_values = batch.labels.values()[segment_start:segment_end].to(
-            batch.labels.values().dtype
-        )
-        labels = KeyedJaggedTensor.from_lengths_sync(
-            keys=["label"],
-            values=sliced_values,
-            lengths=sliced_lengths,
-        )
-        batch_kwargs["labels"] = labels
-
-    return Batch(**batch_kwargs)
 
 
 def assert_optional_tensor_equal(a: Optional[torch.Tensor], b: Optional[torch.Tensor]):

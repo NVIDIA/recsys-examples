@@ -90,6 +90,7 @@ class Batch(BaseBatch):
         action_feature_name: Optional[str] = None,
         max_num_candidates: int = 0,
         num_tasks: Optional[int] = None,  # used for ranking task
+        actual_batch_size: Optional[int] = None,  # for incomplete batch
         *,
         device: torch.device,
     ) -> "Batch":
@@ -97,17 +98,28 @@ class Batch(BaseBatch):
         Generate a random Batch.
 
         Args:
-            batch_size (int): The number of elements in the batch.
+            batch_size (int): The target batch size (for padding).
             feature_configs (List[FeatureConfig]): List of configurations for each feature.
             item_feature_name (str): The name of the item feature.
             contextual_feature_names (List[str], optional): List of names for the contextual features. Defaults to [].
             action_feature_name (Optional[str], optional): The name of the action feature. Defaults to None.
             max_num_candidates (int, optional): The maximum number of candidate items. Defaults to 0.
+            num_tasks (Optional[int], optional): Number of tasks for ranking. Defaults to None.
+            actual_batch_size (Optional[int], optional): Actual number of samples (< batch_size for incomplete batch).
+                If None, equals to batch_size. Defaults to None.
             device (torch.device): The device on which the batch will be generated.
 
         Returns:
             Batch: The generated random Batch.
         """
+        # Use actual_batch_size for data generation, batch_size for padding
+        if actual_batch_size is None:
+            actual_batch_size = batch_size
+
+        assert (
+            actual_batch_size <= batch_size
+        ), f"actual_batch_size ({actual_batch_size}) must be <= batch_size ({batch_size})"
+
         keys = []
         values = []
         lengths = []
@@ -115,15 +127,27 @@ class Batch(BaseBatch):
         feature_to_max_seqlen = {}
         labels_numel = 0
         history_seqlen = 0
+
         for fc in feature_configs:
+            # Generate data for actual_batch_size samples
             if fc.is_jagged:
                 seqlen = torch.randint(
-                    fc.max_sequence_length, (batch_size,), device=device
+                    fc.max_sequence_length, (actual_batch_size,), device=device
                 )
             else:
                 seqlen = torch.full(
-                    (batch_size,), fc.max_sequence_length, device=device
+                    (actual_batch_size,), fc.max_sequence_length, device=device
                 )
+
+            if actual_batch_size < batch_size:
+                padded_size = batch_size - actual_batch_size
+                seqlen = torch.cat(
+                    [
+                        seqlen,
+                        torch.zeros(padded_size, dtype=seqlen.dtype, device=device),
+                    ]
+                )
+
             cur_seqlen_sum = torch.sum(seqlen).item()
 
             for feature_name, max_item_id in zip(fc.feature_names, fc.max_item_ids):
@@ -141,6 +165,7 @@ class Batch(BaseBatch):
                     num_candidates = seqlen - non_candidates_seqlen
                     labels_numel = num_candidates.sum()
                 feature_to_max_seqlen[feature_name] = fc.max_sequence_length
+
         if num_tasks is not None:
             label_values = torch.randint(1 << num_tasks, (labels_numel,), device=device)
             # when no candidates, we use the history seqlen as the label length.
@@ -168,6 +193,7 @@ class Batch(BaseBatch):
             if num_candidates is not None
             else None,
             labels=labels,
+            actual_batch_size=actual_batch_size,
         )
 
 

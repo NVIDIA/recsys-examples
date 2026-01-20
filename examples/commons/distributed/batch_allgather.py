@@ -15,6 +15,7 @@ def allgather_batch(
 ):
     """
     Allgather the batch across the process group.
+    Note we will update the feature_to_max_seqlen in the batch.
     """
 
     def allgather_tensor_or_kjt(tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor]):
@@ -30,8 +31,23 @@ def allgather_batch(
     new_batch.batch_size = new_batch.batch_size * torch.distributed.get_world_size(
         pg_group
     )
-    # TODO@junzhang, for incomplete batch, we need do Allreduce!
-    new_batch.actual_batch_size = new_batch.batch_size
+    # use allreduce to sum up actual_batch_size on all processes
+    actual_batch_size = torch.tensor(
+        batch.actual_batch_size, device=batch.features.lengths().device
+    )
+    torch.distributed.all_reduce(
+        actual_batch_size, op=torch.distributed.ReduceOp.SUM, group=pg_group
+    )
+    # this will block host until all processes have finished the allreduce.
+    # TODO@junzhang, can we use a non-blocking allreduce?
+    new_batch.actual_batch_size = actual_batch_size.item()
+    # update feature_to_max_seqlen
+    # This will cause a host sync
+    # TODO@junzhang, can we avoid this?
+    for feature_name in batch.features.keys():
+        new_batch.feature_to_max_seqlen[feature_name] = torch.max(
+            new_batch.features[feature_name].lengths()
+        ).item()
     return new_batch
 
 

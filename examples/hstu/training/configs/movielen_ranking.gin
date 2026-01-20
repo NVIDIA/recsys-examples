@@ -7,6 +7,7 @@ TrainerArgs.seed = 1234
 TrainerArgs.max_train_iters = 1000
 TrainerArgs.profile = True
 TrainerArgs.pipeline_type = "prefetch"
+TrainerArgs.enable_balanced_shuffler = True  # Set to True to enable balanced batch shuffling
 
 DatasetArgs.dataset_name = 'ml-20m'
 DatasetArgs.max_sequence_length = 200

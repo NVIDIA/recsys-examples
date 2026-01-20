@@ -27,6 +27,7 @@ from commons.optimizer import OptimizerParam
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend
+from datasets.utils import Batch, RankingBatch, RetrievalBatch
 from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state, tensor_parallel
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
@@ -36,11 +37,76 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 debug_module_path_to_tpN_module_path = {
     "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
     "_output_layernorm_bias": "_output_ln_dropout_mul.bias",
 }
+
+
+def batch_slice(
+    batch: Union[RankingBatch, RetrievalBatch],
+    batch_size: int,
+    rank: int,
+    world_size: int,
+) -> Union[RankingBatch, RetrievalBatch]:
+    """
+    Slice the batch.
+    """
+    split_size = [batch_size for _ in range(world_size)]
+    keys = batch.features.keys()
+    values = []
+    lengths = []
+    for key in keys:
+        feature = batch.features[key]
+        sliced_lengths = torch.split(feature.lengths(), split_size)[rank]
+        segment_start = feature.offsets()[rank * batch_size]
+        segment_end = feature.offsets()[(rank + 1) * batch_size]
+        # in case of zero-sized segment
+        sliced_values = feature.values()[segment_start:segment_end].to(
+            feature.values().dtype
+        )
+        values.extend(sliced_values)
+        lengths.extend(sliced_lengths)
+    sliced_feature = KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=torch.tensor(values, device=batch.features.device()).long(),
+        lengths=torch.tensor(lengths, device=batch.features.device()),
+    )
+
+    if batch.num_candidates is not None:
+        num_candidates = batch.num_candidates[
+            rank * batch_size : (rank + 1) * batch_size
+        ]
+    else:
+        num_candidates = None
+    batch_kwargs = dict(
+        features=sliced_feature,
+        feature_to_max_seqlen=batch.feature_to_max_seqlen,
+        batch_size=batch_size,
+        contextual_feature_names=batch.contextual_feature_names,
+        item_feature_name=batch.item_feature_name,
+        action_feature_name=batch.action_feature_name,
+        max_num_candidates=batch.max_num_candidates,
+        num_candidates=num_candidates,
+    )
+    if batch.labels is not None:
+        sliced_lengths = torch.split(batch.labels.lengths(), split_size)[rank]
+        segment_start = batch.labels.offsets()[rank * batch_size]
+        segment_end = batch.labels.offsets()[(rank + 1) * batch_size]
+        # in case of zero-sized segment
+        sliced_values = batch.labels.values()[segment_start:segment_end].to(
+            batch.labels.values().dtype
+        )
+        labels = KeyedJaggedTensor.from_lengths_sync(
+            keys=["label"],
+            values=sliced_values,
+            lengths=sliced_lengths,
+        )
+        batch_kwargs["labels"] = labels
+
+    return Batch(**batch_kwargs)
 
 
 def get_batch_on_this_tp_rank(batch: JaggedData):
@@ -308,7 +374,7 @@ def assert_equal_two_state_dict(a_state_dict, b_state_dict):
 
 def generate_random_batches(
     task_type: str,
-    num_tasks: int,
+    num_tasks: Optional[int],
     batch_size: int,
     feature_configs,
     item_feature_name,
@@ -319,67 +385,57 @@ def generate_random_batches(
     num_batches: int,
     replicate_batches: bool,
 ):
-    """
-    生成random batch列表，支持replicate
-    """
     history_batches = []
     with tensor_parallel.get_cuda_rng_tracker().fork():
-        if task_type == "ranking":
-            if replicate_batches:
-                history_batches = [
-                    datasets.utils.RankingBatch.random(
-                        num_tasks=num_tasks,
-                        batch_size=batch_size,
-                        feature_configs=feature_configs,
-                        item_feature_name=item_feature_name,
-                        contextual_feature_names=contextual_feature_names,
-                        action_feature_name=action_feature_name,
-                        max_num_candidates=max_num_candidates,
-                        device=device,
-                    )
-                ] * num_batches
-            else:
-                history_batches = [
-                    datasets.utils.RankingBatch.random(
-                        num_tasks=num_tasks,
-                        batch_size=batch_size,
-                        feature_configs=feature_configs,
-                        item_feature_name=item_feature_name,
-                        contextual_feature_names=contextual_feature_names,
-                        action_feature_name=action_feature_name,
-                        max_num_candidates=max_num_candidates,
-                        device=device,
-                    )
-                    for _ in range(num_batches)
-                ]
-        elif task_type == "retrieval":
-            if replicate_batches:
-                history_batches = [
-                    datasets.utils.RetrievalBatch.random(
-                        batch_size=batch_size,
-                        feature_configs=feature_configs,
-                        item_feature_name=item_feature_name,
-                        contextual_feature_names=contextual_feature_names,
-                        action_feature_name=action_feature_name,
-                        max_num_candidates=max_num_candidates,
-                        device=device,
-                    )
-                ] * num_batches
-            else:
-                history_batches = [
-                    datasets.utils.RetrievalBatch.random(
-                        batch_size=batch_size,
-                        feature_configs=feature_configs,
-                        item_feature_name=item_feature_name,
-                        contextual_feature_names=contextual_feature_names,
-                        action_feature_name=action_feature_name,
-                        max_num_candidates=max_num_candidates,
-                        device=device,
-                    )
-                    for _ in range(num_batches)
-                ]
+        if replicate_batches:
+            # All batches are the same (complete batches)
+            history_batches = [
+                datasets.utils.Batch.random(
+                    num_tasks=num_tasks,
+                    batch_size=batch_size,
+                    feature_configs=feature_configs,
+                    item_feature_name=item_feature_name,
+                    contextual_feature_names=contextual_feature_names,
+                    action_feature_name=action_feature_name,
+                    max_num_candidates=max_num_candidates,
+                    device=device,
+                )
+            ] * num_batches
         else:
-            raise ValueError(f"Unsupported task_type: {task_type}")
+            # Generate num_batches-1 complete batches
+            history_batches = [
+                datasets.utils.Batch.random(
+                    num_tasks=num_tasks,
+                    batch_size=batch_size,
+                    feature_configs=feature_configs,
+                    item_feature_name=item_feature_name,
+                    contextual_feature_names=contextual_feature_names,
+                    action_feature_name=action_feature_name,
+                    max_num_candidates=max_num_candidates,
+                    device=device,
+                )
+                for _ in range(num_batches - 1)
+            ]
+            # Generate the last batch as incomplete batch
+            if num_batches > 0:
+                # Random incomplete batch size from 0 to batch_size-1
+                incomplete_batch_size = torch.randint(
+                    0, batch_size, (1,), device=device
+                ).item()
+
+                history_batches.append(
+                    datasets.utils.Batch.random(
+                        num_tasks=num_tasks,
+                        batch_size=batch_size,
+                        actual_batch_size=incomplete_batch_size,
+                        feature_configs=feature_configs,
+                        item_feature_name=item_feature_name,
+                        contextual_feature_names=contextual_feature_names,
+                        action_feature_name=action_feature_name,
+                        max_num_candidates=max_num_candidates,
+                        device=device,
+                    )
+                )
     return history_batches
 
 
@@ -484,16 +540,15 @@ def create_model(
         model_train = model.RankingGR(hstu_config=hstu_config, task_config=task_config)
     else:
         assert task_type == "retrieval"
-        num_tasks = None  # retrieval不需要num_tasks
+        num_tasks = None
         task_config = configs.RetrievalConfig(embedding_configs=emb_configs)
         model_train = model.RetrievalGR(
             hstu_config=hstu_config, task_config=task_config
         )
 
-    # 参数展开传递
     history_batches = generate_random_batches(
         task_type=task_type,
-        num_tasks=num_tasks if num_tasks is not None else 1,  # ranking用1，retrieval不使用
+        num_tasks=num_tasks if num_tasks is not None else 1,
         batch_size=batch_size,
         feature_configs=feature_configs,
         item_feature_name=item_feature_name,
