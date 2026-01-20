@@ -212,6 +212,115 @@ def warmup_gpu():
     torch.cuda.synchronize()
 
 
+def benchmark_fused_silu_mul_bandwidth(
+    batch_size: int,
+    num_groups: int,
+    hidden_dim: int,
+    dtype: torch.dtype = torch.bfloat16,
+    num_iterations: int = 100,
+    num_warmup: int = 10,
+) -> Tuple[float, float, float]:
+    """
+    Benchmark fused SiLU * up kernel and calculate memory bandwidth.
+    
+    Returns:
+        (time_ms, bandwidth_gb_s, achieved_percent)
+    """
+    # Create tensors matching the shape used in GroupedMLP
+    shape = (batch_size, num_groups, hidden_dim)
+    gate = torch.randn(shape, device="cuda", dtype=dtype)
+    up = torch.randn(shape, device="cuda", dtype=dtype)
+    
+    # Calculate data volume
+    numel = gate.numel()
+    bytes_per_element = gate.element_size()  # 2 for bf16, 4 for fp32
+    # Read: gate + up, Write: output
+    total_bytes = 3 * numel * bytes_per_element
+    
+    # Warmup
+    for _ in range(num_warmup):
+        _ = triton_silu_mul(gate, up)
+    torch.cuda.synchronize()
+    
+    # Benchmark
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
+    for _ in range(num_iterations):
+        _ = triton_silu_mul(gate, up)
+    end_event.record()
+    torch.cuda.synchronize()
+    
+    time_ms = start_event.elapsed_time(end_event) / num_iterations
+    time_s = time_ms / 1000.0
+    
+    # Calculate bandwidth
+    bandwidth_gb_s = total_bytes / time_s / 1e9
+    
+    # Get theoretical peak bandwidth (for reference)
+    # H100 SXM: ~3.35 TB/s, A100 SXM: ~2.0 TB/s, A100 PCIe: ~1.9 TB/s
+    # You can query this from torch.cuda.get_device_properties
+    props = torch.cuda.get_device_properties(0)
+    # Memory bandwidth = memory_clock_rate (kHz) * bus_width (bits) * 2 (DDR) / 8 (bits to bytes)
+    # Note: This is approximate; actual peak may differ
+    theoretical_peak_gb_s = 2000.0  # Default estimate, adjust based on your GPU
+    
+    achieved_percent = bandwidth_gb_s / theoretical_peak_gb_s * 100
+    
+    return time_ms, bandwidth_gb_s, achieved_percent
+
+
+def benchmark_fused_silu_mul_backward_bandwidth(
+    batch_size: int,
+    num_groups: int,
+    hidden_dim: int,
+    dtype: torch.dtype = torch.bfloat16,
+    num_iterations: int = 100,
+    num_warmup: int = 10,
+) -> Tuple[float, float]:
+    """
+    Benchmark fused SiLU * up backward kernel and calculate memory bandwidth.
+    
+    Backward reads: grad_output, gate, up (3 tensors)
+    Backward writes: grad_gate, grad_up (2 tensors)
+    Total: 5 * numel * bytes_per_element
+    
+    Returns:
+        (time_ms, bandwidth_gb_s)
+    """
+    shape = (batch_size, num_groups, hidden_dim)
+    gate = torch.randn(shape, device="cuda", dtype=dtype)
+    up = torch.randn(shape, device="cuda", dtype=dtype)
+    grad_output = torch.randn(shape, device="cuda", dtype=dtype)
+    
+    numel = gate.numel()
+    bytes_per_element = gate.element_size()
+    # Read: grad_output + gate + up, Write: grad_gate + grad_up
+    total_bytes = 5 * numel * bytes_per_element
+    
+    # Warmup
+    for _ in range(num_warmup):
+        _ = triton_silu_mul_bwd(grad_output, gate, up)
+    torch.cuda.synchronize()
+    
+    # Benchmark
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
+    for _ in range(num_iterations):
+        _ = triton_silu_mul_bwd(grad_output, gate, up)
+    end_event.record()
+    torch.cuda.synchronize()
+    
+    time_ms = start_event.elapsed_time(end_event) / num_iterations
+    time_s = time_ms / 1000.0
+    bandwidth_gb_s = total_bytes / time_s / 1e9
+    
+    return time_ms, bandwidth_gb_s
+
+
 def get_activation_fn(activation: Optional[str]) -> Optional[Callable]:
     """Get activation function by name."""
     if activation is None:
@@ -883,6 +992,37 @@ Config:
         torch.cuda.profiler.stop()
         print("NVTX profiling complete.")
 
+    # Fused kernel bandwidth benchmark
+    print("\n" + "-" * 60)
+    print("Fused SiLU*Up Kernel Bandwidth Analysis")
+    print("-" * 60)
+    
+    fwd_time, fwd_bw, fwd_pct = benchmark_fused_silu_mul_bandwidth(
+        batch_size, num_groups, hidden_dim, dtype, num_iterations
+    )
+    bwd_time, bwd_bw = benchmark_fused_silu_mul_backward_bandwidth(
+        batch_size, num_groups, hidden_dim, dtype, num_iterations
+    )
+    
+    # Calculate data sizes for reference
+    numel = batch_size * num_groups * hidden_dim
+    bytes_per_elem = 2 if dtype == torch.bfloat16 else 4
+    fwd_data_mb = 3 * numel * bytes_per_elem / 1e6
+    bwd_data_mb = 5 * numel * bytes_per_elem / 1e6
+    
+    print(f"\nTensor shape: ({batch_size}, {num_groups}, {hidden_dim})")
+    print(f"Elements: {numel:,} ({numel * bytes_per_elem / 1e6:.2f} MB per tensor)")
+    
+    print(f"\n{'Kernel':<20} {'Time (ms)':<12} {'Data (MB)':<12} {'BW (GB/s)':<12}")
+    print("-" * 56)
+    print(f"{'Forward (silu*up)':<20} {fwd_time:<12.4f} {fwd_data_mb:<12.2f} {fwd_bw:<12.1f}")
+    print(f"{'Backward':<20} {bwd_time:<12.4f} {bwd_data_mb:<12.2f} {bwd_bw:<12.1f}")
+    
+    print(f"\nNote: Peak memory bandwidth varies by GPU:")
+    print(f"  - H100 SXM: ~3350 GB/s")
+    print(f"  - A100 SXM: ~2039 GB/s") 
+    print(f"  - A100 PCIe: ~1935 GB/s")
+
     # Summary
     print("\n" + "=" * 80)
     print("Summary")
@@ -900,6 +1040,10 @@ Forward to Hidden (excluding down_proj):
 
 Fwd+Bwd Speedup:
   Plan A vs Reference: {ref_fwdbwd/plan_a_fwdbwd:.2f}x
+
+Fused SiLU*Up Kernel:
+  Forward:  {fwd_bw:.1f} GB/s
+  Backward: {bwd_bw:.1f} GB/s
 """)
     print("=" * 80)
     print("Done!")
