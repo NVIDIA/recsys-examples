@@ -468,6 +468,7 @@ def test_model_load_dump(
 
     if mode == "dump":
         shutil.rmtree(save_path, ignore_errors=True)
+        dist.barrier()
         DynamicEmbDump(save_path, ref_model, optim=optim, counter=counter)
 
     if mode == "load":
