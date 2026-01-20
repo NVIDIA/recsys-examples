@@ -20,6 +20,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "optimizer_kernel.cuh"
 #include "torch_utils.h"
 #include "utils.h"
+#include <functional>
 
 void find_pointers(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                    const size_t n, const at::Tensor keys, at::Tensor values,
@@ -545,7 +546,8 @@ void launch_update_kernel_for_combined_table(
     GradType *grads, WeightType *dev_table, WeightType *uvm_table,
     IndexType *indices, OptimizerType opt, int64_t const ev_nums,
     uint32_t const dim, int64_t const stride, int64_t const split_index,
-    int device_id) {
+    int device_id,
+    std::function<float(int)> smem_size_f = [](int block_size) { return 0; }) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(device_id);
   if (dim % 4 == 0) {
@@ -574,7 +576,7 @@ void launch_update_kernel_for_combined_table(
 
     auto kernel = update_with_index_kernel<GradType, WeightType, IndexType,
                                            OptimizerType>;
-    kernel<<<grid_size, block_size, 0, stream>>>(
+    kernel<<<grid_size, block_size, smem_size_f(block_size), stream>>>(
         ev_nums, dim, stride, split_index, grads, dev_table, uvm_table, indices,
         nullptr, opt);
   }
@@ -797,7 +799,8 @@ void rowwise_adagrad_for_combined_table(at::Tensor grads, at::Tensor indices,
 
         launch_update_kernel_for_combined_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, dev_ptr, uvm_ptr, index_ptr, opt, ev_nums, dim, stride,
-            split_index, device_id);
+            split_index, device_id,
+            [](int block_size) { return block_size * sizeof(float); });
       });
     });
   });

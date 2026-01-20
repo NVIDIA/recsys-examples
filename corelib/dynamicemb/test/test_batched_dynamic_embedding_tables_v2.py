@@ -444,6 +444,7 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
     [
         (True, DynamicEmbPoolingMode.NONE, [8, 8, 8]),
         (False, DynamicEmbPoolingMode.NONE, [16, 16, 16]),
+        (False, DynamicEmbPoolingMode.NONE, [17, 17, 17]),
         (False, DynamicEmbPoolingMode.SUM, [128, 32, 16]),
         (False, DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
     ],
@@ -467,7 +468,10 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, determinist
     max_capacity = 2048
 
     dyn_emb_table_options_list = []
+    cmp_with_torchrec = True
     for dim in dims:
+        if dim % 4 != 0:
+            cmp_with_torchrec = False
         dyn_emb_table_options = DynamicEmbTableOptions(
             dim=dim,
             init_capacity=max_capacity,
@@ -492,49 +496,68 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, determinist
         **opt_params,
     )
     num_embs = [max_capacity // 2 for d in dims]
-    stbe = create_split_table_batched_embedding(
-        table_names,
-        feature_table_map,
-        OPTIM_TYPE[opt_type],
-        opt_params,
-        dims,
-        num_embs,
-        POOLING_MODE[pooling_mode],
-        device,
-    )
-    init_embedding_tables(stbe, bdeb)
-    """
-    feature number = 4, batch size = 2
 
-    f0  [0,1],      [12],
-    f1  [64,8],     [12],
-    f2  [15, 2, 7], [105],
-    f3  [],         [0]
-    """
-    for i in range(10):
-        indices = torch.tensor(
-            [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device
-        ).to(key_type)
-        offsets = torch.tensor([0, 2, 3, 5, 6, 9, 10, 10, 11], device=device).to(
-            key_type
+    if cmp_with_torchrec:
+        stbe = create_split_table_batched_embedding(
+            table_names,
+            feature_table_map,
+            OPTIM_TYPE[opt_type],
+            opt_params,
+            dims,
+            num_embs,
+            POOLING_MODE[pooling_mode],
+            device,
         )
+        init_embedding_tables(stbe, bdeb)
+        """
+        feature number = 4, batch size = 2
 
-        embs_bdeb = bdeb(indices, offsets)
-        embs_stbe = stbe(indices, offsets)
+        f0  [0,1],      [12],
+        f1  [64,8],     [12],
+        f2  [15, 2, 7], [105],
+        f3  [],         [0]
+        """
+        for i in range(10):
+            indices = torch.tensor(
+                [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device
+            ).to(key_type)
+            offsets = torch.tensor([0, 2, 3, 5, 6, 9, 10, 10, 11], device=device).to(
+                key_type
+            )
 
-        torch.cuda.synchronize()
-        with torch.no_grad():
-            torch.testing.assert_close(embs_bdeb, embs_stbe, rtol=1e-06, atol=1e-06)
+            embs_bdeb = bdeb(indices, offsets)
+            embs_stbe = stbe(indices, offsets)
 
-        loss = embs_bdeb.mean()
-        loss.backward()
-        loss_stbe = embs_stbe.mean()
-        loss_stbe.backward()
+            torch.cuda.synchronize()
+            with torch.no_grad():
+                torch.testing.assert_close(embs_bdeb, embs_stbe, rtol=1e-06, atol=1e-06)
 
-        torch.cuda.synchronize()
-        torch.testing.assert_close(loss, loss_stbe)
+            loss = embs_bdeb.mean()
+            loss.backward()
+            loss_stbe = embs_stbe.mean()
+            loss_stbe.backward()
 
-        print(f"Passed iteration {i}")
+            torch.cuda.synchronize()
+            torch.testing.assert_close(loss, loss_stbe)
+
+            print(f"Passed iteration {i}")
+    else:
+        # This scenario will not test correctness, but rather test whether it functions correctly.
+        for i in range(10):
+            indices = torch.tensor(
+                [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device
+            ).to(key_type)
+            offsets = torch.tensor([0, 2, 3, 5, 6, 9, 10, 10, 11], device=device).to(
+                key_type
+            )
+
+            embs_bdeb = bdeb(indices, offsets)
+            loss = embs_bdeb.mean()
+            loss.backward()
+
+            torch.cuda.synchronize()
+
+            print(f"Passed iteration {i}")
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]

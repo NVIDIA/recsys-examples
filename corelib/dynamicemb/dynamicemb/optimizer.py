@@ -945,7 +945,6 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
         emb_dim = grads.size(1)
         state_dim = self.get_state_dim(emb_dim)
 
-        print(f"Optimizer: {grads.shape}, {indices.shape}")
         rowwise_adagrad_for_combined_table(
             grads,
             indices,
