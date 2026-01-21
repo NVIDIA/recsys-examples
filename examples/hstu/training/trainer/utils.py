@@ -15,7 +15,7 @@
 import sys
 from typing import Dict, List, Optional, Tuple, Union
 
-import dataset
+import datasets
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from commons.modules.embedding import ShardedEmbeddingConfig
@@ -260,10 +260,10 @@ def get_data_loader(
             num_generated_batches=100,
             num_tasks=num_tasks,
         )
-        train_dataset = dataset.dummy_dataset.DummySequenceDataset(
+        train_dataset = datasets.dummy_dataset.DummySequenceDataset(
             batch_size=trainer_args.train_batch_size, **kwargs
         )
-        test_dataset = dataset.dummy_dataset.DummySequenceDataset(
+        test_dataset = datasets.dummy_dataset.DummySequenceDataset(
             batch_size=trainer_args.eval_batch_size, **kwargs
         )
     else:
@@ -271,7 +271,7 @@ def get_data_loader(
         (
             train_dataset,
             test_dataset,
-        ) = dataset.sequence_dataset.get_dataset(
+        ) = datasets.sequence_dataset.get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
             max_sequence_length=dataset_args.max_sequence_length,
@@ -284,7 +284,7 @@ def get_data_loader(
             random_seed=trainer_args.seed,
             eval_batch_size=trainer_args.eval_batch_size,
         )
-    return dataset.get_data_loader(train_dataset), dataset.get_data_loader(test_dataset)  # type: ignore[attr-defined]
+    return datasets.get_data_loader(train_dataset), datasets.get_data_loader(test_dataset)  # type: ignore[attr-defined]
 
 
 def create_optimizer_params(optimizer_args: OptimizerArgs):
