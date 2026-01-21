@@ -56,9 +56,12 @@ def evaluate(
         range(max_eval_iters), total=max_eval_iters, description="Evaluating"
     ):
         # for batch in iterated_eval_loader:
-        batch = next(iterated_eval_loader)
-        batch = batch.to(torch.cuda.current_device())
-        labels = batch.labels
+        batch = pipeline._copy_batch_to_gpu_and_shuffle(iterated_eval_loader)
+        # for eval, the labels are dense.
+        labels = batch.labels.values().view(
+            batch.actual_batch_size, batch._num_hierarchies
+        )
+
         generated_sids, log_probs = model.generate(batch)
         model.evaluator(log_probs, generated_sids, labels)
     compute_res = model.evaluator.compute()

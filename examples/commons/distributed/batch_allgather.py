@@ -3,6 +3,7 @@ from typing import Union
 import torch
 from commons.ops.collective_ops import (
     gather_along_first_dim,
+    gatherv_along_first_dim,
     keyed_jagged_tensor_allgather,
 )
 from commons.sequence_batch.batch import BaseBatch
@@ -18,9 +19,13 @@ def allgather_batch(
     Note we will update the feature_to_max_seqlen in the batch.
     """
 
+    # TODO@junzhang, we should avoid coping with jagged padding...
     def allgather_tensor_or_kjt(tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor]):
         if isinstance(tensor_or_kjt, torch.Tensor):
-            ag_object = gather_along_first_dim(tensor_or_kjt, pg_group)
+            if batch.actual_batch_size != batch.batch_size:
+                ag_object = gatherv_along_first_dim(tensor_or_kjt, pg_group)
+            else:
+                ag_object = gather_along_first_dim(tensor_or_kjt, pg_group)
             return ag_object
         elif isinstance(tensor_or_kjt, KeyedJaggedTensor):
             return keyed_jagged_tensor_allgather(tensor_or_kjt, pg_group)
@@ -32,6 +37,7 @@ def allgather_batch(
         pg_group
     )
     # use allreduce to sum up actual_batch_size on all processes
+    # We need this for index_select!
     actual_batch_size = torch.tensor(
         batch.actual_batch_size, device=batch.features.lengths().device
     )
