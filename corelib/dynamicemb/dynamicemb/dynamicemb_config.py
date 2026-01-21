@@ -125,12 +125,18 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     CUSTOMIZED:
         Each embedding table's score are managed by users.
         Users have to set the score before every forward pass using `set_score` interface.
+    LFU:
+        If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+    NO_EVICTION:
+        The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
+        When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
     """
 
     TIMESTAMP = 0
     STEP = 1
     CUSTOMIZED = 2
     LFU = 3
+    NO_EVICTION = 4
 
 
 # TODO: jiashuy, reorganize it
@@ -252,6 +258,7 @@ class DynamicEmbTableOptions(_ContextOptions):
         Note: This is the setting for a single table at each rank.
     max_load_factor : float
         The maximum load factor before rehashing occurs. Default is 0.5.
+        In NO EVICTION mode, max_load_factor represents the ratio of the number of rows in the embedding table to the hash table.
     score_strategy(DynamicEmbScoreStrategy):
         dynamicemb gives each key-value pair a score to represent its importance.
         Once there is insufficient space, the key-value pair will be evicted based on the score.

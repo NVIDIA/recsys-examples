@@ -1127,6 +1127,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
                 option.evict_strategy = DynamicEmbEvictStrategy.LFU
                 self._scores[table_name] = 1
+            elif option.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+                option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
+                self._scores[table_name] = 1
+            else:
+                raise RuntimeError(
+                    f"Not supported score strategy({option.score_strategy}) for table {table_name}."
+                )
 
     def _update_score(self):
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
