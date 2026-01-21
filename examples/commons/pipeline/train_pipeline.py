@@ -892,17 +892,25 @@ class JaggedMegatronTrainNonePipeline:
         self._device = device
         self._batch_shuffler = batch_shuffler
 
+    def _copy_batch_to_gpu_and_shuffle(
+        self, dataloader_iter: Iterator[In]
+    ) -> Optional[In]:
+        with nvtx.annotate(f"## H2D and shuffle ##"):
+            batch = next(dataloader_iter)
+            if batch is not None:
+                batch = _to_device(batch, self._device, non_blocking=True)
+                batch = self._batch_shuffler.shuffle(batch)
+            return batch
+
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         dp_size = parallel_state.get_data_parallel_world_size() * 1.0
         with nvtx.annotate("## zero_grad ##"):
             if hasattr(self._model.module, "zero_grad_buffer"):
                 self._model.module.zero_grad_buffer()
             self._optimizer.zero_grad()
-        with nvtx.annotate("## H2D ##"):
-            batch = next(dataloader_iter).to(self._device)
-            # print(f'nopipeline batch.features: {batch.features.values()}')
-        with nvtx.annotate("## balancer shuffle ##"):
-            batch = self._batch_shuffle(batch)
+
+        # H2D and shuffle
+        batch = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
         with nvtx.annotate("## forward ##"):
             losses, output = self._model(batch)
 

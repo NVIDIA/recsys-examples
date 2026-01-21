@@ -45,11 +45,10 @@ class BaseTaskBalancedBatchShuffler:
             dtype=torch.int64,
             device=batch.features.lengths().device,
         )
-        # 3. Allgather the batch
+        # 3. Allgather the batch, the batchsize is multiplied by the world size.
         allgathered_batch = allgather_batch(batch, pg_group)
         # 4. Select the batch
         new_batch = allgathered_batch.index_select(indices_this_rank)
-        selected_workloads = allgather_workloads[indices_this_rank]
         new_batch.batch_size = new_batch.batch_size // torch.distributed.get_world_size(
             pg_group
         )
@@ -57,11 +56,7 @@ class BaseTaskBalancedBatchShuffler:
         if return_indices:
             ret = (ret, indices_this_rank)
         if return_workloads:
-            ret = (
-                (*ret, selected_workloads)
-                if isinstance(ret, tuple)
-                else (ret, selected_workloads)
-            )
+            ret = (*ret, workloads) if isinstance(ret, tuple) else (ret, workloads)
         return ret
 
     def __call__(

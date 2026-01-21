@@ -86,6 +86,11 @@ class TrainerArgs:
     # - prefetch -> overlap [h2d, input dist, prefetch, fwd+bwd]
     pipeline_type: str = "native"  # none, native, prefetch
 
+    # batch shuffler control
+    # - True -> use balanced batch shuffler (e.g., HASTUBalancedBatchShuffler)
+    # - False -> use IdentityBalancedBatchShuffler (no load balancing)
+    enable_balanced_shuffler: bool = False
+
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
             self.max_train_iters = int(self.max_train_iters)

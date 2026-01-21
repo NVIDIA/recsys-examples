@@ -424,6 +424,7 @@ class SIDGRModel(MegatronModule):
             # [[{item0, item1, item2, ..., itemN} | {bos}], [{item3, item4, item5, ..., itemM} | {bos}]]
             # the last bos of each sequence is retained for later decoding.
             # we use jagged concat
+            # note that we use batch_size here instead of actual_batch_size intentionally
             candidate_bos_offsets = torch.arange(
                 0,
                 batch.batch_size + 1,
@@ -606,7 +607,7 @@ class SIDGRModel(MegatronModule):
         )
         losses_per_hierarchy = []
         logits_per_hierarchy = []
-        merged_labels = batch.labels.view(-1, batch._num_hierarchies)
+        merged_labels = batch.labels.values().view(-1, batch._num_hierarchies)
         # 4. output linear projection & loss
         # TODO, merge into single grouped linear layer
         for hierarchy_idx in range(batch._num_hierarchies):
@@ -721,7 +722,7 @@ class SIDGRModel(MegatronModule):
                 # for first step, a single bos token for each sequence
                 candidate_offsets = torch.arange(
                     0,
-                    batch_size + 1,
+                    batch.actual_batch_size + 1,
                     device=input_offsets.device,
                     dtype=input_offsets.dtype,
                 )
