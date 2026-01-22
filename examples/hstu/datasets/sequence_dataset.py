@@ -185,8 +185,9 @@ class SequenceDataset(IterableDataset[Batch]):
 
     def __iter__(self) -> Iterator[Batch]:
         for i in range(len(self)):
-            local_batch_start = (
-                i * self._global_batch_size + self._rank * self._batch_size
+            local_batch_start = min(
+                i * self._global_batch_size + self._rank * self._batch_size,
+                len(self._sample_ids),
             )
             local_batch_end = min(
                 i * self._global_batch_size + (self._rank + 1) * self._batch_size,
@@ -194,6 +195,7 @@ class SequenceDataset(IterableDataset[Batch]):
             )
             sample_ids = self._sample_ids[local_batch_start:local_batch_end]
 
+            actual_batch_size = local_batch_end - local_batch_start
             contextual_features: Dict[str, List[int]] = defaultdict(list)
             contextual_features_seqlen: Dict[str, List[int]] = defaultdict(list)
             item_features: List[int] = []
@@ -323,6 +325,7 @@ class SequenceDataset(IterableDataset[Batch]):
                 if self._max_num_candidates > 0
                 else None,
                 labels=label_kjt,
+                actual_batch_size=actual_batch_size,
             )
             yield Batch(**batch_kwargs)
 

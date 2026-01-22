@@ -10,7 +10,8 @@ from torchrec.streamable import Pipelineable
 @dataclass
 class BaseBatch(Pipelineable):
     """
-    All tensors must share a same batch size.
+    All tensors must share a same batch size to better support index select and allgather.
+    For incomplete batch, all dense tensors and KJT offsets/lengths are padded to the batch size.
     """
 
     features: KeyedJaggedTensor
@@ -103,18 +104,17 @@ class BaseBatch(Pipelineable):
     def index_select(
         self, indices: torch.Tensor, oob_filter: bool = True
     ) -> "BaseBatch":
-        # TODO@junzhang, we should avoid coping with jagged padding...
+        # TODO@junzhang, we presume the dense tensor is padded to the batch size.
         def index_select_dense_tensor(
             tensor: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:
-            # TODO@junzhang, it's possible that the indices are from padded jagged tensor, ranging from 0~batch_size-1,
-            # but the dense tensor is not padded, ranging from [0~actual_batch_size-1], we may need filter if oob_filter is True.
             return (
-                tensor.reshape(self.actual_batch_size, -1)
+                tensor.reshape(self.batch_size, -1)
                 .index_select(dim=0, index=indices)
                 .reshape(-1)
             )
 
+        # KJT index select guarantees the KJT batchsize is not changed(always padded). It's a must because we have KJT ALLGATHER.
         def index_select_kjt(
             features: KeyedJaggedTensor, indices: torch.Tensor
         ) -> KeyedJaggedTensor:
@@ -134,18 +134,15 @@ class BaseBatch(Pipelineable):
                 keys=features.keys(), values=values, lengths=lengths, weights=weights
             )
 
-        if self.actual_batch_size != self.batch_size and oob_filter:
-            # The indices are from padded jagged tensor, ranging from 0~batch_size-1,
-            # but the dense tensor is not padded, ranging from [0~actual_batch_size-1], we need filter those indices that are out of range.
-            dense_indices = indices[indices < self.actual_batch_size]
-            new_actual_batch_size = dense_indices.numel()
+        if self.actual_batch_size != self.batch_size:
+            # we use the actual batch size to filter the indices.
+            actual_batch_size = indices[indices < self.actual_batch_size].numel()
         else:
-            dense_indices = indices
-            new_actual_batch_size = indices.numel()
+            actual_batch_size = indices.numel()
 
         def applier(t: Union[torch.Tensor, KeyedJaggedTensor]) -> Any:
             if isinstance(t, torch.Tensor):
-                return index_select_dense_tensor(t, dense_indices)
+                return index_select_dense_tensor(t, indices)
             elif isinstance(t, KeyedJaggedTensor):
                 return index_select_kjt(t, indices)
             else:
@@ -155,5 +152,5 @@ class BaseBatch(Pipelineable):
             applier,
             inplace=False,
         )
-        new_batch.actual_batch_size = new_actual_batch_size
+        new_batch.actual_batch_size = actual_batch_size
         return new_batch

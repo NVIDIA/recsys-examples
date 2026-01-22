@@ -57,10 +57,8 @@ def evaluate(
     ):
         # for batch in iterated_eval_loader:
         batch = pipeline._copy_batch_to_gpu_and_shuffle(iterated_eval_loader)
-        # for eval, the labels are dense.
-        labels = batch.labels.values().view(
-            batch.actual_batch_size, batch._num_hierarchies
-        )
+        # for eval, the labels are dense. but except for the last batch, the actual batch size is not 128.
+        labels = batch.labels.values().view(-1, batch._num_hierarchies)
 
         generated_sids, log_probs = model.generate(batch)
         model.evaluator(log_probs, generated_sids, labels)
