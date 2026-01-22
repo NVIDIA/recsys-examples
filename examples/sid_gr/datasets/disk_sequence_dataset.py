@@ -269,13 +269,16 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 * self._num_hierarchies
             )
 
-            def pad_tensor(padding_length: int, tensor: torch.Tensor) -> torch.Tensor:
+            def pad_tensor(
+                padding_length: int, tensor: torch.Tensor, padded_value: int = 0
+            ) -> torch.Tensor:
                 if padding_length == 0:
                     return tensor
                 return torch.nn.functional.pad(
-                    tensor, (0, padding_length), "constant", 0
+                    tensor, (0, padding_length), "constant", padded_value
                 )
 
+            user_id = pad_tensor(self._batch_size - actual_batch_size, user_id)
             history_lengths = pad_tensor(
                 self._batch_size - actual_batch_size, history_lengths
             )

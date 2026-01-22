@@ -495,7 +495,6 @@ class SIDGRModel(MegatronModule):
             if add_bos_to_history
             else history_offsets
         )
-
         # [bos, s0,s1,s2(dropped), bos,s3,s4,s5(dropped), bos,s6,s7,s8(dropped), ... bos,c_n, c_n+1, c_n+2(dropped)]
         _, bos_and_candidate_hidden_states = triton_split_2D_jagged(
             jagged_output_hidden_states,

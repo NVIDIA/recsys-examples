@@ -57,11 +57,7 @@ def evaluate(
             reporting_loss, (_, logits, labels, _) = pipeline.progress(
                 iterated_eval_loader
             )
-            # metric module forward
-            # print(f"batch of evaluation, batch size: {labels.shape[0]}, logits shape: {logits.shape}, negative label ratio: {(labels == 0).sum() / labels.numel()}, unique labels: {labels.unique()}")
             stateful_metric_module(logits, labels)
-            # if i == max_eval_iters - 1:
-            #     print(f"last batch of evaluation, batch size: {labels.shape[0]}, logits shape: {logits.shape}")
         # compute will reset the states
         if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):
             retrieval_gr = get_unwrapped_module(pipeline._model)
