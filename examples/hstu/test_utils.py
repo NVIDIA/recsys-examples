@@ -116,6 +116,15 @@ def get_tp_slice(tensor: Optional[torch.Tensor], mode="row"):
         raise ValueError(f"mode {mode} is not supported")
 
 
+def compare_two_modules_state_dict(module1, module2):
+    module1_state_dict = module1.state_dict()
+    module2_state_dict = module2.state_dict()
+    for name, param in module1_state_dict.items():
+        src = param
+        dst = module2_state_dict[name]
+        collective_assert(torch.allclose(src, dst), f"state dict mismatch at {name}")
+
+
 # TODO: Add get_tp_slice for optimizer state.
 def compare_tpN_to_debug_optimizer_state(
     tpN_optimizer, debug_optimizer, debug_fp32_optimizer
@@ -194,7 +203,10 @@ def compare_tpN_to_debug_weights(
             name = name.replace(
                 child_name, debug_module_path_to_tpN_module_path[child_name]
             )
+        if name == "_attention_layers.0._output_ln_dropout_mul.weight":
+            import pdb
 
+            pdb.set_trace()
         dst = tpN_module_params_map[name]
         dst_grad = getattr(dst, "main_grad", None)
         # model parallel embedding table weight is a TableBatchedEmbeddingSlice, which has no grad
