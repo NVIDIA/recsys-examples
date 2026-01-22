@@ -203,10 +203,6 @@ def compare_tpN_to_debug_weights(
             name = name.replace(
                 child_name, debug_module_path_to_tpN_module_path[child_name]
             )
-        if name == "_attention_layers.0._output_ln_dropout_mul.weight":
-            import pdb
-
-            pdb.set_trace()
         dst = tpN_module_params_map[name]
         dst_grad = getattr(dst, "main_grad", None)
         # model parallel embedding table weight is a TableBatchedEmbeddingSlice, which has no grad

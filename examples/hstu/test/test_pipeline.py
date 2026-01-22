@@ -133,7 +133,6 @@ def test_pipeline(
             _,
         ) = target_pipeline.progress(iter_history_batches)
 
-        # import pdb; pdb.set_trace()
         collective_assert(
             torch.allclose(pipelined_reporting_loss, reporting_loss),
             f"reporting loss mismatch",
