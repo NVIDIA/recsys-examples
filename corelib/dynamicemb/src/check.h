@@ -20,10 +20,20 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdio>
 #include <cstdlib>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+
+inline void checkCu(CUresult res, const char *msg) {
+  if (res != CUDA_SUCCESS) {
+    const char *err_str = nullptr;
+    cuGetErrorString(res, &err_str);
+    throw std::runtime_error(std::string(msg) + ": " +
+                             (err_str ? err_str : "unknown"));
+  }
+}
 
 #define CUDACHECK(cmd) DEMB_CUDA_CHECK(cmd)
 #define CUDA_KERNEL_LAUNCH_CHECK() DEMB_CUDA_KERNEL_LAUNCH_CHECK()

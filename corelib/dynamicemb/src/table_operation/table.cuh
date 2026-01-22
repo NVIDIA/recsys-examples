@@ -59,39 +59,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-inline int get_size(torch::ScalarType scalar_type) {
-  switch (scalar_type) {
-  case torch::kUInt8:
-    return 1;
-  case torch::kInt8:
-    return 1;
-  case torch::kInt16:
-    return 2;
-  case torch::kInt32:
-    return 4;
-  case torch::kInt64:
-    return 8;
-  case torch::kFloat32:
-    return 4;
-  case torch::kFloat64:
-    return 8;
-  case torch::kBool:
-    return 1;
-  case torch::kBFloat16:
-    return 2;
-  case torch::kFloat16:
-    return 2;
-  case torch::kUInt16:
-    return 2;
-  case torch::kUInt32:
-    return 4;
-  case torch::kUInt64:
-    return 8;
-  default:
-    throw std::runtime_error("Unsupported scalar type.");
-  }
-}
-
 void table_lookup(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
                   int64_t bucket_capacity, at::Tensor keys,
                   std::vector<std::optional<at::Tensor>> scores,

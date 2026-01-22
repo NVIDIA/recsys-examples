@@ -100,7 +100,10 @@ def get_version():
 
 
 def get_extensions():
-    extra_link_args = []
+    extra_link_args = [
+        "-Wl,--no-as-needed",
+        "-lcuda",  # CUDA drive API
+    ]
     extra_compile_args = {
         "cxx": ["-O3", "-fdiagnostics-color=always", "-w"],
         "nvcc": [

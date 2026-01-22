@@ -1322,6 +1322,9 @@ class DynamicEmbeddingTable(KeyValueTable):
             )
             self._valid_rows += h_num_unique_keys
 
+        # if self._no_eviction:
+        #     if self._valid_rows + h_num_unique_keys > self._capacity:
+
         # Actually the score is very complex here, you can't even adjust the code unless you know what you will do.
         # TODO: we need a ScoreManager/ScoreController.
 
