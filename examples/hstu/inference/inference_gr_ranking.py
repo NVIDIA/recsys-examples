@@ -216,7 +216,9 @@ def run_ranking_gr_simulate(
     )
 
     max_batch_size = 1
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = (
+        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
+    ) * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
     with torch.inference_mode():
@@ -240,7 +242,7 @@ def run_ranking_gr_simulate(
             seq_logs_file=dataproc._inference_sequence_file,
             batch_logs_file=dataproc._inference_batch_file,
             batch_size=max_batch_size,
-            max_seqlen=dataset_args.max_sequence_length,
+            max_seqlen=dataset_args.max_history_seqlen,
             item_feature_name=dataproc._item_feature_name,
             contextual_feature_names=dataproc._contextual_feature_names
             if not disable_contextual_features
@@ -341,7 +343,9 @@ def run_ranking_gr_evaluate(
     )
 
     max_batch_size = 4
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = (
+        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
+    ) * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
     def strip_candidate_action_tokens(batch, action_feature_name):
@@ -390,7 +394,7 @@ def run_ranking_gr_evaluate(
         _, eval_dataset = get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
-            max_sequence_length=dataset_args.max_sequence_length,
+            max_history_seqlen=dataset_args.max_history_seqlen,
             max_num_candidates=dataset_args.max_num_candidates,
             num_tasks=model.get_num_tasks(),
             batch_size=max_batch_size,

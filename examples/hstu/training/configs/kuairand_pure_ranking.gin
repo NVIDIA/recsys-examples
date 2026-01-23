@@ -5,7 +5,7 @@ TrainerArgs.eval_interval = 50
 TrainerArgs.profile = True
 
 DatasetArgs.dataset_name = 'kuairand-pure'
-DatasetArgs.max_sequence_length = 910
+DatasetArgs.max_history_seqlen = 910
 DatasetArgs.max_num_candidates = 20
 DatasetArgs.shuffle = True
 

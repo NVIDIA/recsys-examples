@@ -81,10 +81,9 @@ def run_ranking_gr_evaluate(use_train_dataset=False):
     dataset_args = get_dataset_configs()
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
-    num_contextual_features = len(dataproc._contextual_feature_names)
+    len(dataproc._contextual_feature_names)
 
     max_batch_size = 8
-    dataset_args.max_sequence_length * 2 + num_contextual_features
 
     with torch.inference_mode():
         ranking_args = RankingArgs()
@@ -98,7 +97,7 @@ def run_ranking_gr_evaluate(use_train_dataset=False):
         train_dataset, eval_dataset = get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
-            max_sequence_length=dataset_args.max_sequence_length,
+            max_history_seqlen=dataset_args.max_history_seqlen,
             max_num_candidates=dataset_args.max_num_candidates,
             num_tasks=ranking_args.num_tasks,
             batch_size=max_batch_size,

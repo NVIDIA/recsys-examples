@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -151,6 +152,8 @@ class Batch(BaseBatch):
             cur_seqlen_sum = torch.sum(seqlen).item()
 
             for feature_name, max_item_id in zip(fc.feature_names, fc.max_item_ids):
+                if feature_name in contextual_feature_names and fc.is_jagged:
+                    warnings.warn(f"contextual feature {feature_name} is jagged")
                 value = torch.randint(max_item_id, (cur_seqlen_sum,), device=device)
                 keys.append(feature_name)
                 values.append(value)

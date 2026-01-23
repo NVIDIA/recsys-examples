@@ -274,7 +274,7 @@ def get_data_loader(
         ) = datasets.sequence_dataset.get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
-            max_sequence_length=dataset_args.max_sequence_length,
+            max_history_seqlen=dataset_args.max_history_seqlen,
             max_num_candidates=dataset_args.max_num_candidates,
             num_tasks=num_tasks,
             batch_size=trainer_args.train_batch_size,
@@ -393,12 +393,12 @@ def create_dynamic_optitons_dict(
     return dynamic_options_dict
 
 
-def get_dataset_and_embedding_args() -> (
-    Tuple[
-        Union[DatasetArgs, BenchmarkDatasetArgs],
-        List[Union[DynamicEmbeddingArgs, EmbeddingArgs]],
-    ]
-):
+def get_dataset_and_embedding_args(
+    caching: bool = False,
+) -> Tuple[
+    Union[DatasetArgs, BenchmarkDatasetArgs],
+    List[Union[DynamicEmbeddingArgs, EmbeddingArgs]],
+]:
     try:
         dataset_args = DatasetArgs()  # type: ignore[call-arg]
     except:
@@ -449,12 +449,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="video_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "kuairand-1k":
@@ -500,12 +502,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="video_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "kuairand-27k":
@@ -551,12 +555,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="video_id",
                 item_vocab_size_or_capacity=32038725,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "ml-1m":
@@ -596,12 +602,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="movie_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "ml-20m":
@@ -617,7 +625,7 @@ def get_dataset_and_embedding_args() -> (
                 table_name="movie_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
-                caching=True,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],

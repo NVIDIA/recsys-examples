@@ -1,5 +1,5 @@
 DatasetArgs.dataset_name = 'kuairand-1k'
-DatasetArgs.max_sequence_length = 4096
+DatasetArgs.max_history_seqlen = 4096
 DatasetArgs.max_num_candidates = 100
 DatasetArgs.shuffle = False
 

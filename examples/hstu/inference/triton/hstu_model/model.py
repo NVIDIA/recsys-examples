@@ -178,7 +178,9 @@ def get_inference_dense_model_with_feature_names(
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
     num_contextual_features = len(emb_configs) - 2
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = (
+        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
+    ) * 2 + num_contextual_features
     feature_names = [ebc.feature_names[0] for ebc in emb_configs]
 
     network_args = NetworkArgs()

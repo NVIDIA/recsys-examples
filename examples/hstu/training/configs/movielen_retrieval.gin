@@ -6,7 +6,7 @@ TrainerArgs.ckpt_save_interval = -1
 TrainerArgs.seed = 1234
 
 DatasetArgs.dataset_name = 'ml-20m'
-DatasetArgs.max_sequence_length = 200
+DatasetArgs.max_history_seqlen = 200
 DatasetArgs.shuffle = True
 
 NetworkArgs.dtype_str = "bfloat16"
