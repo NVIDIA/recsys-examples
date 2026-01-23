@@ -58,6 +58,11 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
+RUN cd /workspace/recsys-examples/corelib/hstu && \
+    HSTU_DISABLE_86OR89=FALSE HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
+    cd hopper && \
+    HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=FALSE HSTU_DISABLE_DRAB=TRUE pip install .
+    
 FROM ${DEVEL_IMAGE} AS build
 ARG TRITONSERVER_BUILD
 
@@ -73,11 +78,6 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
 RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
       pip3 uninstall -y hstu_attn hstu_hopper; \
     fi
-
-RUN cd /workspace/recsys-examples/corelib/hstu && \
-    HSTU_DISABLE_86OR89=FALSE HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
-    cd hopper && \
-    HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=FALSE HSTU_DISABLE_DRAB=TRUE pip install .
 
 RUN cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 9.0" python3 setup.py install

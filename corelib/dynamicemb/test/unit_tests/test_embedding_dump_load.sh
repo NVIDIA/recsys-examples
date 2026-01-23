@@ -4,8 +4,8 @@ set -e
 NUM_EMBEDDING_COLLECTIONS=4
 NUM_EMBEDDINGS=1000000,1000000,1000000,1000000,1000000,1000000
 MULTI_HOT_SIZES=10,10,10,10,10,10
-NUM_GPUS=(1 4)
-OPTIMIZER_TYPE=("adam" "sgd" "adagrad" "rowwise_adagrad")
+NUM_GPUS=(1 8)
+OPTIMIZER_TYPE=("adam" "sgd" "rowwise_adagrad")
 INCLUDE_OPTIM=("True" "False")
 SCORE_STRATEGY=("timestamp" "lfu" "step")
 INCLUDE_COUNTER=("True" "False")
