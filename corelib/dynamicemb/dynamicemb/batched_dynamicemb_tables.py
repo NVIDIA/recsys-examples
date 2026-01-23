@@ -526,7 +526,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._eval_initializers = []
         self._create_initializers()
 
-        self._admission_counter = [option.admission_counter for option in table_options]
+        self._admission_counter = self._create_admission_counters(table_options)
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -617,6 +617,25 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 option.eval_initializer_args
             )
             self._eval_initializers.append(eval_initializer)
+
+    def _create_admission_counters(
+        self, table_options: List[DynamicEmbTableOptions]
+    ) -> List[Optional["Counter"]]:
+        """
+        Create admission counters for each table.
+        """
+        counters = []
+        device = torch.device(self.device_id)
+
+        for option in table_options:
+            counter = option.admission_counter
+
+            if counter is None:
+                counters.append(None)
+            else:
+                counters.append(counter.create(device=device))
+
+        return counters
 
     def _create_bag_optimizer(
         self,

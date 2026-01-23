@@ -386,6 +386,12 @@ class Counter(abc.ABC):
             counter_file (str): the file path of frequencies.
         """
 
+    @abc.abstractmethod
+    def create(self, device: torch.device) -> "Counter":
+        """
+        Create the counter table on the specified device.
+        """
+
 
 class AdmissionStrategy(abc.ABC):
     @abc.abstractmethod

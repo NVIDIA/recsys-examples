@@ -492,12 +492,11 @@ def get_planner(
             print(
                 f"Admission strategy enabled with threshold={args.admission_threshold}"
             )
-            # Create counter to track key frequencies
+            # Create counter config (actual table will be created during sharding)
             admission_counter = KVCounter(
                 capacity=emb_num_embeddings_next_power_of_2,
                 bucket_capacity=bucket_capacity,
                 key_type=torch.int64,
-                device=device,
             )
 
             # Create admission strategy with threshold

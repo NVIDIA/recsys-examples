@@ -42,8 +42,29 @@ class KVCounter(Counter):
         capacity: int,
         bucket_capacity: int = 1024,
         key_type: torch.dtype = torch.int64,
-        device: torch.device = None,
     ):
+        # Store configuration only, do not create the table yet
+        self.capacity = capacity
+        self.bucket_capacity = bucket_capacity
+        self.key_type = key_type
+
+        # Will be initialized in create()
+        self._is_created = False
+        self.table_ = None
+        self.score_name_ = None
+        self.score_specs_ = None
+        self.score_args_ = None
+
+    def create(self, device: torch.device) -> "KVCounter":
+        """
+        Create the actual counter table on the specified device.
+
+        Args:
+            device (torch.device): The device to create the counter table on.
+        """
+        if self._is_created:
+            return self  # Idempotent: multiple calls won't recreate
+
         self.score_name_ = "counter"
         self.score_specs_ = [
             ScoreSpec(name=self.score_name_, policy=ScorePolicy.ACCUMULATE)
@@ -51,8 +72,22 @@ class KVCounter(Counter):
         self.score_args_ = [ScoreArg(name=self.score_name_, is_return=True)]
 
         self.table_ = get_scored_table(
-            capacity, bucket_capacity, key_type, self.score_specs_, device
+            self.capacity,
+            self.bucket_capacity,
+            self.key_type,
+            self.score_specs_,
+            device,
         )
+        self._is_created = True
+        return self
+
+    def _ensure_created(self) -> None:
+        """Raise error if create() has not been called."""
+        if not self._is_created:
+            raise RuntimeError(
+                "KVCounter.create() must be called before use. "
+                "This is normally done by the framework during model sharding."
+            )
 
     def add(
         self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
@@ -70,6 +105,7 @@ class KVCounter(Counter):
         Returns:
             accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
         """
+        self._ensure_created()
         assert inplace == True, "Only support inplace=True"
         self.score_args_[0].value = frequencies
 
@@ -83,6 +119,7 @@ class KVCounter(Counter):
         Args:
             keys (torch.Tensor): The input keys to be erased.
         """
+        self._ensure_created()
         self.table_.erase(keys)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
@@ -92,6 +129,7 @@ class KVCounter(Counter):
         Args:
             mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
         """
+        self._ensure_created()
         return self.table_.memory_usage(mem_type)
 
     def load(self, key_file, counter_file) -> None:
@@ -102,6 +140,7 @@ class KVCounter(Counter):
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
         """
+        self._ensure_created()
         self.table_.load(key_file, {self.score_name_: counter_file})
 
     def dump(self, key_file, counter_file) -> None:
@@ -112,6 +151,7 @@ class KVCounter(Counter):
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
         """
+        self._ensure_created()
         self.table_.dump(key_file, {self.score_name_: counter_file})
 
 
