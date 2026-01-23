@@ -95,6 +95,11 @@ def hstu_preprocess_embeddings(
             )
             sequence_max_seqlen = sequence_max_seqlen * 2
         else:
+            # TODO@junyi: We can optimize the concat:
+            # 1. use jagged split to get [history_embs, candidate_embs]
+            # 2. use cat to interleave the history_embs and history_action_embs part
+            # 3. use jagged concat to append the candidate_embs
+
             action_offsets = action_jt.offsets()
             item_offsets = item_jt.offsets()
             candidates_indptr = item_offsets[: batch.batch_size] + action_jt.lengths()
@@ -178,7 +183,6 @@ def hstu_preprocess_embeddings(
             torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
         )
         sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
-
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(

@@ -197,7 +197,7 @@ class DatasetArgs:
 
     Attributes:
         dataset_name (str): **Required**. Dataset name.
-        max_sequence_length (int): **Required**. Maximum sequence length.
+        max_history_seqlen (int): **Required**. Maximum history sequence length.
         dataset_path (Optional[str]): Path to dataset. Default: None.
         max_num_candidates (int): Maximum number of candidates. Default: 0.
         shuffle (bool): Whether to shuffle data. Default: False.
@@ -209,7 +209,7 @@ class DatasetArgs:
     """
 
     dataset_name: str
-    max_sequence_length: int
+    max_history_seqlen: int
     dataset_path: Optional[str] = None
     max_num_candidates: int = 0
     shuffle: bool = False

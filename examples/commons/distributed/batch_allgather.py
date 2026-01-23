@@ -20,22 +20,6 @@ def allgather_batch(
     """
 
     # TODO@junzhang, we should avoid coping with jagged padding...
-    def allgather_tensor_or_kjt(tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor]):
-        if isinstance(tensor_or_kjt, torch.Tensor):
-            if batch.actual_batch_size != batch.batch_size:
-                ag_object = gatherv_along_first_dim(tensor_or_kjt, pg_group)
-            else:
-                ag_object = gather_along_first_dim(tensor_or_kjt, pg_group)
-            return ag_object
-        elif isinstance(tensor_or_kjt, KeyedJaggedTensor):
-            return keyed_jagged_tensor_allgather(tensor_or_kjt, pg_group)
-        else:
-            raise ValueError(f"Unsupported type: {type(tensor_or_kjt)}")
-
-    new_batch = batch._apply_to_tensors_or_kjt(allgather_tensor_or_kjt, inplace=False)
-    new_batch.batch_size = new_batch.batch_size * torch.distributed.get_world_size(
-        pg_group
-    )
     # use allreduce to sum up actual_batch_size on all processes
     # We need this for index_select!
     actual_batch_size = torch.tensor(
@@ -44,16 +28,26 @@ def allgather_batch(
     torch.distributed.all_reduce(
         actual_batch_size, op=torch.distributed.ReduceOp.SUM, group=pg_group
     )
+    world_size = torch.distributed.get_world_size(pg_group)
+    global_batch_size = batch.batch_size * world_size
+
+    def allgather_tensor_or_kjt(tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor]):
+        if isinstance(tensor_or_kjt, torch.Tensor):
+            if actual_batch_size != global_batch_size:
+                ag_object = gatherv_along_first_dim(tensor_or_kjt, pg_group)
+            else:
+                ag_object = gather_along_first_dim(tensor_or_kjt, pg_group)
+            return ag_object
+        elif isinstance(tensor_or_kjt, KeyedJaggedTensor):
+            kjt_out = keyed_jagged_tensor_allgather(tensor_or_kjt, pg_group)
+            return kjt_out
+        else:
+            raise ValueError(f"Unsupported type: {type(tensor_or_kjt)}")
+
+    new_batch = batch._apply_to_tensors_or_kjt(allgather_tensor_or_kjt, inplace=False)
+    new_batch.batch_size = new_batch.batch_size * world_size
     # this will block host until all processes have finished the allreduce.
-    # TODO@junzhang, can we use a non-blocking allreduce?
     new_batch.actual_batch_size = actual_batch_size.item()
-    # update feature_to_max_seqlen
-    # This will cause a host sync
-    # TODO@junzhang, can we avoid this?
-    for feature_name in batch.features.keys():
-        new_batch.feature_to_max_seqlen[feature_name] = torch.max(
-            new_batch.features[feature_name].lengths()
-        ).item()
     return new_batch
 
 
