@@ -15,14 +15,14 @@
 import sys
 
 import torch
+from commons.datasets.hstu_batch import FeatureConfig
+from commons.datasets.random_inference_dataset import RandomInferenceDataGenerator
 from configs import (
     InferenceEmbeddingConfig,
     RankingConfig,
     get_inference_hstu_config,
     get_kvcache_config,
 )
-from datasets.random_inference_dataset import RandomInferenceDataGenerator
-from datasets.utils import FeatureConfig
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr

@@ -15,7 +15,7 @@
 import sys
 from typing import Dict, List, Optional, Tuple, Union
 
-import datasets
+import commons.datasets as datasets
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from commons.modules.embedding import ShardedEmbeddingConfig
@@ -224,7 +224,7 @@ def get_data_loader(
         "retrieval",
     ], f"task type should be ranking or retrieval not {task_type}"
     if isinstance(dataset_args, BenchmarkDatasetArgs):
-        from datasets.utils import FeatureConfig
+        from commons.datasets.hstu_batch import FeatureConfig
 
         assert (
             trainer_args.max_train_iters is not None

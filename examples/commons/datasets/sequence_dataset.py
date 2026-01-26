@@ -34,8 +34,8 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.utils.logger import print_rank_0
-from datasets.utils import Batch
 from preprocessor import get_common_preprocessors
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -59,7 +59,7 @@ def maybe_truncate_seq(
     return y
 
 
-class SequenceDataset(IterableDataset[Batch]):
+class SequenceDataset(IterableDataset[HSTUBatch]):
     """
     SequenceDataset is an iterable dataset designed for distributed recommendation systems.
     It handles loading, shuffling, and batching of sequence data for training models.
@@ -201,7 +201,7 @@ class SequenceDataset(IterableDataset[Batch]):
     def __len__(self) -> int:
         return math.ceil(self._num_samples / self._global_batch_size)
 
-    def __iter__(self) -> Iterator[Batch]:
+    def __iter__(self) -> Iterator[HSTUBatch]:
         for i in range(len(self)):
             local_batch_start = min(
                 i * self._global_batch_size + self._rank * self._batch_size,
@@ -371,7 +371,7 @@ class SequenceDataset(IterableDataset[Batch]):
                 labels=label_kjt,
                 actual_batch_size=actual_batch_size,
             )
-            yield Batch(**batch_kwargs)
+            yield HSTUBatch(**batch_kwargs)
 
     def _shuffle_batch(self):
         """

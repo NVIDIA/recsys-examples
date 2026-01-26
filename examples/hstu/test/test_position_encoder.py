@@ -16,7 +16,7 @@ import pytest
 import torch
 from commons.ops.length_to_offsets import length_to_complete_offsets
 
-# from datasets.utils import Batch, FeatureConfig
+# from.datasets.hstu_batch import Batch, FeatureConfig
 from modules.position_encoder import HSTUPositionalEncoder
 from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 

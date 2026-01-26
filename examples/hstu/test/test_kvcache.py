@@ -15,13 +15,13 @@
 import sys
 
 import torch
+from commons.datasets.hstu_batch import FeatureConfig, HSTUBatch
 from configs import (
     InferenceEmbeddingConfig,
     RankingConfig,
     get_inference_hstu_config,
     get_kvcache_config,
 )
-from datasets.utils import Batch, FeatureConfig
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
@@ -140,7 +140,7 @@ def test_kvcache_offload_onload():
             start_positions = torch.clamp(start_positions, min=0)
             start_positions += lengths
 
-            batch = Batch(
+            batch = HSTUBatch(
                 features=KeyedJaggedTensor.from_lengths_sync(
                     keys=keys,
                     values=torch.randint(100, (cur_seqlen_sum,)),

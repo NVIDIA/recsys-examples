@@ -41,7 +41,7 @@ class FeatureConfig:
 
 
 @dataclass
-class Batch(BaseBatch):
+class HSTUBatch(BaseBatch):
     """
     HSTU Batch class for ranking and retrieval tasks.
 
@@ -94,7 +94,7 @@ class Batch(BaseBatch):
         actual_batch_size: Optional[int] = None,  # for incomplete batch
         *,
         device: torch.device,
-    ) -> "Batch":
+    ) -> "HSTUBatch":
         """
         Generate a random Batch.
 
@@ -111,7 +111,7 @@ class Batch(BaseBatch):
             device (torch.device): The device on which the batch will be generated.
 
         Returns:
-            Batch: The generated random Batch.
+            HSTUBatch: The generated random Batch.
         """
         # Use actual_batch_size for data generation, batch_size for padding
         if actual_batch_size is None:
@@ -180,7 +180,7 @@ class Batch(BaseBatch):
             )
         else:
             labels = None
-        return Batch(
+        return HSTUBatch(
             features=KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
                 values=torch.concat(values).to(device),
@@ -201,18 +201,18 @@ class Batch(BaseBatch):
 
 
 def is_batch_valid(
-    batch: Batch,
+    batch: HSTUBatch,
 ):
     """
     Validates a batch of data to ensure it meets the necessary criteria.
 
     Args:
-        batch (Batch): The batch to validate.
+        batch (HSTUBatch): The batch to validate.
 
     Raises:
         AssertionError: If any of the validation checks fail.
     """
-    assert isinstance(batch, Batch), "batch type should be Batch"
+    assert isinstance(batch, HSTUBatch), "batch type should be HSTUBatch"
 
     assert (
         batch.item_feature_name in batch.features.keys()
@@ -266,8 +266,3 @@ def is_batch_valid(
             batch.features[contextual_feature_name].lengths().numel()
             == batch.batch_size
         ), f"contextual_feature {contextual_feature_name} shape is not equal to batch_size"
-
-
-# TODO, a WAR.
-RankingBatch = Batch
-RetrievalBatch = Batch

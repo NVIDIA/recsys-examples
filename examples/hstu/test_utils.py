@@ -16,18 +16,18 @@
 
 from typing import List, Optional, Union
 
+import commons.datasets as datasets
 import commons.utils as init
 import configs
-import datasets
 import model
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.distributed.sharding import apply_megatron_ddp, make_optimizer_and_shard
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.optimizer import OptimizerParam
 from commons.utils.distributed_utils import collective_assert
 from commons.utils.hstu_assert_close import hstu_close
 from configs import HSTULayerType, KernelBackend
-from datasets.utils import Batch, RankingBatch, RetrievalBatch
 from dynamicemb import DynamicEmbTableOptions
 from megatron.core import parallel_state, tensor_parallel
 from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
@@ -46,11 +46,11 @@ debug_module_path_to_tpN_module_path = {
 
 
 def batch_slice(
-    batch: Union[RankingBatch, RetrievalBatch],
+    batch: HSTUBatch,
     batch_size: int,
     rank: int,
     world_size: int,
-) -> Union[RankingBatch, RetrievalBatch]:
+) -> HSTUBatch:
     """
     Slice the batch.
     """
@@ -106,7 +106,7 @@ def batch_slice(
         )
         batch_kwargs["labels"] = labels
 
-    return Batch(**batch_kwargs)
+    return HSTUBatch(**batch_kwargs)
 
 
 def get_batch_on_this_tp_rank(batch: JaggedData):
@@ -390,7 +390,7 @@ def generate_random_batches(
         if replicate_batches:
             # All batches are the same (complete batches)
             history_batches = [
-                datasets.utils.Batch.random(
+                datasets.hstu_batch.HSTUBatch.random(
                     num_tasks=num_tasks,
                     batch_size=batch_size,
                     feature_configs=feature_configs,
@@ -404,7 +404,7 @@ def generate_random_batches(
         else:
             # Generate num_batches-1 complete batches
             history_batches = [
-                datasets.utils.Batch.random(
+                datasets.hstu_batch.HSTUBatch.random(
                     num_tasks=num_tasks,
                     batch_size=batch_size,
                     feature_configs=feature_configs,
@@ -424,7 +424,7 @@ def generate_random_batches(
                 ).item()
 
                 history_batches.append(
-                    datasets.utils.Batch.random(
+                    datasets.hstu_batch.HSTUBatch.random(
                         num_tasks=num_tasks,
                         batch_size=batch_size,
                         actual_batch_size=incomplete_batch_size,
@@ -499,7 +499,7 @@ def create_model(
         ),
     ]
     feature_configs = [
-        datasets.utils.FeatureConfig(
+        datasets.hstu_batch.FeatureConfig(
             feature_names=[item_feature_name, action_feature_name],
             max_item_ids=[
                 max(item_emb_size // 2, 1),
@@ -511,7 +511,7 @@ def create_model(
     ]
     if len(contextual_feature_names) > 0:
         feature_configs.append(
-            datasets.utils.FeatureConfig(
+            datasets.hstu_batch.FeatureConfig(
                 feature_names=contextual_feature_names,
                 max_item_ids=[
                     contextual_emb_size for _ in range(len(contextual_feature_names))

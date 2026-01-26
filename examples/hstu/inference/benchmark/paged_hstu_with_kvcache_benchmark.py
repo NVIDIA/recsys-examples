@@ -17,6 +17,7 @@ import math
 from typing import List
 
 import torch
+from commons.datasets.hstu_batch import FeatureConfig
 from configs import (
     InferenceEmbeddingConfig,
     KVCacheMetadata,
@@ -25,7 +26,6 @@ from configs import (
     get_inference_hstu_config,
     get_kvcache_config,
 )
-from datasets.utils import FeatureConfig
 from modules.inference_dense_module import InferenceDenseModule, copy_jagged_metadata
 from modules.jagged_data import JaggedData
 

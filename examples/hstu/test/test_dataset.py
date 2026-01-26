@@ -18,10 +18,10 @@ import commons.utils.initialize as init
 import fbgemm_gpu  # to load permute_2D_sparse_data
 import pytest
 import torch
-from datasets import get_data_loader
-from datasets.dummy_dataset import DummySequenceDataset
-from datasets.sequence_dataset import get_dataset
-from datasets.utils import FeatureConfig, is_batch_valid
+from commons.datasets import get_data_loader
+from commons.datasets.dummy_dataset import DummySequenceDataset
+from commons.datasets.hstu_batch import FeatureConfig, is_batch_valid
+from commons.datasets.sequence_dataset import get_dataset
 from test_utils import batch_slice
 from torch import distributed as dist
 

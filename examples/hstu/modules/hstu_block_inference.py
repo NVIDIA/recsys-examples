@@ -4,8 +4,8 @@ import math
 from typing import Any, Dict, Optional
 
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from configs import InferenceHSTUConfig, KVCacheConfig
-from datasets.utils import Batch
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
@@ -43,14 +43,14 @@ class HSTUBlockInference(torch.nn.Module):
     def forward(
         self,
         embeddings: Dict[str, JaggedTensor],
-        batch: Batch,
+        batch: HSTUBatch,
     ) -> JaggedData:
         """
         Forward pass of the HSTUBlock.
 
         Args:
             embeddings (Dict[str, JaggedTensor]): The input embeddings.
-            batch (Batch): The input batch.
+            batch (HSTUBatch): The input batch.
 
         Returns:
             JaggedData: The output jagged data.
