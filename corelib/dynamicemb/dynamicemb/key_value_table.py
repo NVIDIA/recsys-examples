@@ -55,7 +55,6 @@ from dynamicemb.types import (
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
-    InsertResult,
     clear,
     count_matched,
     device_timestamp,
@@ -74,6 +73,7 @@ from dynamicemb_extensions import (
     load_from_pointers,
     select,
     select_index,
+    select_insert_failed_values,
     store_to_combined_table,
 )
 from torch import Tensor, nn  # usort:skip
@@ -1823,13 +1823,17 @@ class DynamicEmbeddingTable(KeyValueTable):
         )
         evicted_scores = evicted_scores[0]
 
-        insert_busy_mask = insert_results == InsertResult.BUSY.value
-        if insert_busy_mask.sum().item() != 0:
-            out_indices = indices[insert_busy_mask]
-            evicted_values[out_indices, :] = values.to(self.value_type())[
-                insert_busy_mask
-            ]
-            indices[insert_busy_mask] = -1
+        select_insert_failed_values(
+            insert_results, indices, values.to(self.value_type()), evicted_values
+        )
+
+        # insert_busy_mask = insert_results == InsertResult.BUSY.value
+        # if insert_busy_mask.sum().item() != 0:
+        #     out_indices = indices[insert_busy_mask]
+        #     evicted_values[out_indices, :] = values.to(self.value_type())[
+        #         insert_busy_mask
+        #     ]
+        #     indices[insert_busy_mask] = -1
 
         load_from_combined_table(
             self.dev_table,
