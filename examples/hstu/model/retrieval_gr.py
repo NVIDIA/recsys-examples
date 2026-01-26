@@ -15,6 +15,7 @@
 from typing import Any, Tuple
 
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.modules.embedding import ShardedEmbedding
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
@@ -22,7 +23,6 @@ from commons.ops.triton_ops.triton_jagged import (  # type: ignore[attr-defined]
 )
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import HSTUConfig, RetrievalConfig
-from datasets.utils import RetrievalBatch
 from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.hstu_block import HSTUBlock
@@ -102,13 +102,13 @@ class RetrievalGR(BaseModel):
         return self
 
     def get_logit_and_labels(
-        self, batch: RetrievalBatch
+        self, batch: HSTUBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get the logits and labels for the batch.
 
         Args:
-            batch (RetrievalBatch): The batch of retrieval data.
+            batch (HSTUBatch): The batch of retrieval data.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The logits, supervision item IDs, and supervision embeddings.
@@ -162,13 +162,13 @@ class RetrievalGR(BaseModel):
     @output_nvtx_hook(nvtx_tag="RetrievalModel", backward=False)
     def forward(  # type: ignore[override]
         self,
-        batch: RetrievalBatch,
+        batch: HSTUBatch,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]:
         """
         Perform the forward pass of the model.
 
         Args:
-            batch (RetrievalBatch): The batch of retrieval data.
+            batch (HSTUBatch): The batch of retrieval data.
 
         Returns:
             Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]: The losses and a tuple of losses, logits, and supervision embeddings.

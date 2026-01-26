@@ -16,14 +16,14 @@ import abc
 from typing import Tuple
 
 import torch
-from datasets.utils import Batch
+from commons.datasets.hstu_batch import HSTUBatch
 
 
 class BaseModel(torch.nn.Module):
     @abc.abstractmethod
     def forward(
         self,
-        batch: Batch,
+        batch: HSTUBatch,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Returns:

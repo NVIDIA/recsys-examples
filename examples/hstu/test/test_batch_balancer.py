@@ -3,7 +3,7 @@ from typing import Dict
 import commons.utils.initialize as init
 import pytest
 import torch
-from datasets.utils import FeatureConfig
+from commons.datasets.hstu_batch import FeatureConfig
 from hstu.utils.hstu_batch_balancer import HASTUBalancedBatchShuffler
 from megatron.core import parallel_state
 from test_utils import generate_random_batches

@@ -17,6 +17,7 @@ import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from configs import (
     InferenceHSTUConfig,
     KVCacheConfig,
@@ -25,7 +26,6 @@ from configs import (
     copy_kvcache_metadata,
     get_kvcache_metadata_buffer,
 )
-from datasets.utils import Batch
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
@@ -310,7 +310,7 @@ class InferenceDenseModule(torch.nn.Module):
         )
 
     def prepare_kv_cache(
-        self, batch: Batch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
+        self, batch: HSTUBatch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
     ) -> KVCacheMetadata:
         batch_size = user_ids.shape[0]
         new_history_lengths = (
@@ -438,7 +438,7 @@ class InferenceDenseModule(torch.nn.Module):
 
     def forward(
         self,
-        batch: Batch,
+        batch: HSTUBatch,
         embeddings: Dict[str, JaggedTensor],
         user_ids: torch.Tensor = None,
         user_start_pos_cuda: torch.Tensor = None,

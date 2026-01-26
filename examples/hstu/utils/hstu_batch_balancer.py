@@ -1,7 +1,7 @@
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.distributed.batch_shuffler import BaseTaskBalancedBatchShuffler
 from commons.distributed.batch_shuffler_factory import register_batch_shuffler
 from commons.perf_model.task_estimator import HSTUAttentionTask
-from hstu.datasets.utils import Batch
 
 
 @register_batch_shuffler("hstu")
@@ -32,7 +32,7 @@ class HASTUBalancedBatchShuffler(BaseTaskBalancedBatchShuffler):
         self.action_interleaved = action_interleaved
         self.task = HSTUAttentionTask()
 
-    def get_workloads(self, batch: Batch, *args, **kwargs):
+    def get_workloads(self, batch: HSTUBatch, *args, **kwargs):
         """
         Calculate workloads based on HSTU attention complexity.
 

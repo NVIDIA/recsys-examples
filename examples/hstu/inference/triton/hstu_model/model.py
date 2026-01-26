@@ -35,6 +35,7 @@ import torch
 # contains some utility functions for extracting information from model_config
 # and converting Triton input/output types to numpy types.
 import triton_python_backend_utils as pb_utils
+from commons.datasets.hstu_batch import HSTUBatch
 from configs import (
     EmbeddingBackend,
     InferenceEmbeddingConfig,
@@ -42,7 +43,6 @@ from configs import (
     RankingConfig,
     get_inference_hstu_config,
 )
-from datasets.utils import Batch
 from modules.inference_dense_module import get_inference_dense_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -262,7 +262,7 @@ def pack_batch_from_numpy_host_input(
             max(token_lengths[idx * batch_size : (idx + 1) * batch_size])
         )
     max_num_candidates = int(max(num_candidates))
-    batch = Batch(
+    batch = HSTUBatch(
         features=features,
         batch_size=batch_size,
         feature_to_max_seqlen=feature_to_max_seqlen,

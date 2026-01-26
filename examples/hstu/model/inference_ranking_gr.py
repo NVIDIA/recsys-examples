@@ -16,8 +16,8 @@ import os
 from typing import List, Tuple, Union
 
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from configs import InferenceHSTUConfig, KVCacheConfig, RankingConfig
-from datasets.utils import Batch
 from modules.inference_dense_module import InferenceDenseModule
 from modules.inference_embedding import InferenceEmbedding
 
@@ -91,7 +91,7 @@ class InferenceRankingGR(torch.nn.Module):
 
     def forward(
         self,
-        batch: Batch,
+        batch: HSTUBatch,
         user_ids: torch.Tensor = None,
         user_start_pos: torch.Tensor = None,
     ):
