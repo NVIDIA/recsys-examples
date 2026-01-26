@@ -421,6 +421,8 @@ __global__ void table_insert_and_evict_kernel(
                           score);
       index = bucket_id * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
+    } else if (result == InsertResult::Busy) {
+      index = out_id;
     }
     ScorePolicy::set(return_scores, scores, i, score);
     table_key_slots[i] = table_key_slot;
