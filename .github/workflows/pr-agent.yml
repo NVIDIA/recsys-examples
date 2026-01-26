@@ -1,0 +1,15 @@
+# .github/workflows/pr-agent.yml
+name: PR Agent
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  pr_agent_job:
+    runs-on: ubuntu-latest
+    steps:
+    - name: PR Agent action step
+      uses: Codium-ai/pr-agent@main
+      env:
+        OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        OPENAI.API_BASE: ${{ secrets.NVIDIA_OPENAI_ENDPOINT }}
