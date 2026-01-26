@@ -40,6 +40,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <stdexcept>
 #include <torch/torch.h>
 
+#include "table_operation/types.cuh"
+
 namespace py = pybind11;
 using namespace dyn_emb;
 
@@ -1128,6 +1130,128 @@ void store_to_combined_table(std::optional<at::Tensor> dev_table,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename IndexT, typename ValueT>
+__global__ void select_insert_failed_values_kernel_vec4(
+    int64_t batch, int64_t stride, ValueT const *__restrict__ in_v_ptr,
+    ValueT *__restrict__ out_v_ptr,
+    InsertResult const *__restrict__ insert_results,
+    IndexT *__restrict__ indices) {
+
+  constexpr int kWarpSize = 32;
+  constexpr int VecSize = 4;
+  const int warp_num_per_block = blockDim.x / kWarpSize;
+  const int warp_id_in_block = threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+
+  Vec4T<ValueT> emb;
+  for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
+       emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
+    InsertResult insert_result = insert_results[emb_id];
+    if (insert_result != InsertResult::Busy) {
+      continue;
+    }
+    IndexT out_idx = indices[emb_id];
+    ValueT *dst = out_v_ptr + out_idx * stride;
+    ValueT const *src = in_v_ptr + emb_id * stride;
+
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < stride; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      emb.load(src + idx4);
+      emb.store(dst + idx4);
+    }
+
+    if (lane_id == 0) {
+      indices[emb_id] = -1;
+    }
+  }
+}
+
+template <typename IndexT, typename ValueT>
+__global__ void select_insert_failed_values_kernel(
+    int64_t batch, int64_t stride, ValueT const *__restrict__ in_v_ptr,
+    ValueT *__restrict__ out_v_ptr,
+    InsertResult const *__restrict__ insert_results,
+    IndexT *__restrict__ indices) {
+
+  for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
+
+    InsertResult insert_result = insert_results[emb_id];
+    if (insert_result != InsertResult::Busy) {
+      continue;
+    }
+    IndexT out_idx = indices[emb_id];
+    ValueT *dst = out_v_ptr + out_idx * stride;
+    ValueT const *src = in_v_ptr + emb_id * stride;
+
+    for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+      dst[i] = src[i];
+    }
+
+    if (threadIdx.x == 0) {
+      indices[emb_id] = -1;
+    }
+  }
+}
+
+void select_insert_failed_values(at::Tensor insert_results, at::Tensor indices,
+                                 at::Tensor input_values,
+                                 at::Tensor evictd_values) {
+  int64_t num_total = insert_results.numel();
+  if (num_total == 0) {
+    return;
+  }
+
+  int64_t dim = input_values.size(1);
+
+  auto val_type = get_data_type(input_values);
+  auto index_type = get_data_type(indices);
+
+  constexpr int kWarpSize = 32;
+  constexpr int MULTIPLIER = 4;
+  constexpr int BLOCK_SIZE_VEC = 64;
+  constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
+  auto &device_prop = DeviceProp::getDeviceProp();
+  const int max_grid_size =
+      device_prop.num_sms * (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+
+  int grid_size = 0;
+  if (num_total / WARP_PER_BLOCK < max_grid_size) {
+    grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
+  } else if (num_total / WARP_PER_BLOCK > max_grid_size * MULTIPLIER) {
+    grid_size = max_grid_size * MULTIPLIER;
+  } else {
+    grid_size = max_grid_size;
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, ValueType, [&] {
+    DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
+      auto in_v_ptr = get_pointer<ValueType>(input_values);
+      auto out_v_ptr = get_pointer<ValueType>(evictd_values);
+      auto insert_results_ptr = get_pointer<InsertResult>(insert_results);
+      auto index_ptr = get_pointer<IndexType>(indices);
+
+      if (dim % 4 == 0) {
+        select_insert_failed_values_kernel_vec4<IndexType, ValueType>
+            <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
+                num_total, dim, in_v_ptr, out_v_ptr, insert_results_ptr,
+                index_ptr);
+      } else {
+        int block_size = dim < device_prop.max_thread_per_block
+                             ? dim
+                             : device_prop.max_thread_per_block;
+        int grid_size = num_total;
+        select_insert_failed_values_kernel<IndexType, ValueType>
+            <<<grid_size, block_size, 0, stream>>>(
+                num_total, dim, in_v_ptr, out_v_ptr, insert_results_ptr,
+                index_ptr);
+      }
+    });
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // PYTHON WARP
 void bind_dyn_emb_op(py::module &m) {
   py::class_<dyn_emb::InitializerArgs>(m, "InitializerArgs")
@@ -1360,4 +1484,8 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("store_to_combined_table", &store_to_combined_table,
         "store_to_combined_table", py::arg("dev_table"), py::arg("uvm_table"),
         py::arg("indices"), py::arg("input"));
+
+  m.def("select_insert_failed_values", &select_insert_failed_values,
+        "select_insert_failed_values", py::arg("insert_results"),
+        py::arg("indices"), py::arg("input_values"), py::arg("evicted_values"));
 }

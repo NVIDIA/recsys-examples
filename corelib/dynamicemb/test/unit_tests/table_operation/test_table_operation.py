@@ -429,6 +429,8 @@ def test_table_evict(
             evicted_scores,
         ) = table.insert_and_evict(keys, score_args, indices, insert_results)
         evicted_scores = evicted_scores[0]
+        insert_busy_mask = insert_results == InsertResult.BUSY.value
+        indices[insert_busy_mask] = -1
 
         founds = torch.empty(batch_size, dtype=torch.bool, device=device).fill_(False)
         indices_lookup = torch.empty(
@@ -546,6 +548,8 @@ def test_table_reserve(
             _,
             _,
         ) = table.insert_and_evict(keys, score_args, indices, insert_results)
+        insert_busy_mask = insert_results == InsertResult.BUSY.value
+        indices[insert_busy_mask] = -1
 
         if num_evicted != 0:
             raise RuntimeError(
@@ -558,6 +562,8 @@ def test_table_reserve(
             _,
             _,
         ) = ref_table.insert_and_evict(keys, score_args, indices, insert_results)
+        insert_busy_mask = insert_results == InsertResult.BUSY.value
+        indices[insert_busy_mask] = -1
         if num_evicted != 0:
             raise RuntimeError(
                 f"There are {num_evicted} evictions when fill the reference table, and adjust max_num_buckets."
