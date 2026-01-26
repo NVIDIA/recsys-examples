@@ -60,7 +60,7 @@ from commons.pipeline.utils import (
     _to_device,
     _wait_for_batch,
 )
-from commons.utils.distributed_utils import collective_any, collective_assert
+from commons.utils.distributed_utils import collective_assert
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from torch.autograd.profiler import record_function
@@ -915,16 +915,6 @@ class JaggedMegatronTrainNonePipeline:
             losses, output = self._model(batch)
 
         with nvtx.annotate("## loss postprocess ##"):
-            if collective_any(torch.isnan(losses), "loss has nan value"):
-                print(
-                    f"[rank {parallel_state.get_data_parallel_rank()}] batch_size: {batch.batch_size}, actual_batch_size: {batch.actual_batch_size}"
-                )
-                print(
-                    f"[rank {parallel_state.get_data_parallel_rank()}] losses: {losses.shape}"
-                )
-                print(
-                    f"[rank {parallel_state.get_data_parallel_rank()}] labels: {batch.labels.values().shape}, label_lengths: {batch.labels.lengths().sum()}"
-                )
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(
                 losses.size(0), device=torch.device("cuda", torch.cuda.current_device())

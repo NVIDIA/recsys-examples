@@ -278,7 +278,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                     tensor, (0, padding_length), "constant", padded_value
                 )
 
-            user_id = pad_tensor(self._batch_size - actual_batch_size, user_id)
+            user_id = pad_tensor(self._batch_size - actual_batch_size, user_id, -1)
             history_lengths = pad_tensor(
                 self._batch_size - actual_batch_size, history_lengths
             )

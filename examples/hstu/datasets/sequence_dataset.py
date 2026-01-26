@@ -107,10 +107,6 @@ class SequenceDataset(IterableDataset[Batch]):
             assert (
                 action_feature_name is not None
             ), "action_feature_name must be provided if load_candidate_action is True"
-        else:
-            assert (
-                action_feature_name is None
-            ), "action_feature_name must be None if load_candidate_action is False"
         self._load_candidate_action = load_candidate_action
 
         if nrows is None:

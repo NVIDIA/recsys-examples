@@ -45,7 +45,10 @@ class BaseTaskBalancedBatchShuffler:
             dtype=torch.int64,
             device=batch.features.lengths().device,
         )
-        indices_this_rank, _ = torch.sort(indices_this_rank)  #
+        #! NOTE: This indices tensor always has a size equal to the full batch size,
+        #! including padding indices for incomplete batches. Sorting ensures padding
+        #! indices are stored contiguously at the tensor's end.
+        # indices_this_rank, _ = torch.sort(indices_this_rank)  #
         # 3. Allgather the batch, the batchsize is multiplied by the world size.
         allgathered_batch = allgather_batch(batch, pg_group)
         # 4. Select the batch
