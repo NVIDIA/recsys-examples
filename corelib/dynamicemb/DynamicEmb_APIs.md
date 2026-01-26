@@ -683,6 +683,12 @@ class Counter(abc.ABC):
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
         """
+        
+    @abc.abstractmethod
+    def create(self, device: torch.device) -> "Counter":
+        """
+        Create the counter table on the specified device.
+        """
 ```
 
 **dynamicemb** also provides a built-in counter implementation named `KVCounter`.
@@ -700,7 +706,6 @@ class KVCounter(Counter):
         capacity: int,
         bucket_capacity: int = 1024,
         key_type: torch.dtype = torch.int64,
-        device: torch.device = None,
     )
 ```
 
