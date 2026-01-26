@@ -38,8 +38,9 @@ class BinaryTask(BaseTask):
     def __init__(self):
         pass
 
-    def get_workloads(self, length: int):
-        return length
+    def get_workloads(self, length: Union[int, ArrayLike[int]]):
+        length_val = cast(Union[int, ArrayLike[int]], length)
+        return length_val  # type: ignore[return-value, operator]
 
     def __repr__(self):
         return f"BinaryTask"
@@ -49,8 +50,9 @@ class FMATask(BaseTask):
     def __init__(self):
         pass
 
-    def get_workloads(self, length: int):
-        return 2 * length
+    def get_workloads(self, length: Union[int, ArrayLike[int]]):
+        length_val = cast(Union[int, ArrayLike[int]], length)
+        return 2 * length_val  # type: ignore[return-value, operator]
 
     def __repr__(self):
         return f"FMATask"

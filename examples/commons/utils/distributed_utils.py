@@ -65,7 +65,7 @@ def collective_all(
     return flag_tensor.item()
 
 
-def collective_any_and_all(
+def any_and_collective_all(
     tensor: torch.Tensor,
     err_msg: str = "",
     group: torch.distributed.ProcessGroup = None,
@@ -82,7 +82,7 @@ def collective_any_and_all(
     return flag_tensor.item()
 
 
-def collective_all_and_any(
+def all_and_collective_any(
     tensor: torch.Tensor,
     err_msg: str = "",
     group: torch.distributed.ProcessGroup = None,
@@ -97,6 +97,18 @@ def collective_all_and_any(
     )
     torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
     return flag_tensor.item()
+
+
+def collective_any_and_all(
+    tensor: torch.Tensor,
+    err_msg: str = "",
+    group: torch.distributed.ProcessGroup = None,
+):
+    """
+    Check if all ranks meets the any condition and all condition.
+    """
+    collective_any(tensor, err_msg, group)
+    return collective_all(tensor, err_msg, group)
 
 
 def collective_assert_tensor(
