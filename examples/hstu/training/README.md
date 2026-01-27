@@ -30,13 +30,13 @@ Before running examples, build and install libs under corelib following instruct
 On top of those two core libs, Megatron-Core along with other libs are required. You can install them via pypi package:
 
 ```bash
-pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath megatron-core==0.9.0
+pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath megatron-core==0.12.1
 ```
 
 If you fail to install the megatron-core package, usually due to the python version incompatibility, please try to clone and then install the source code. 
 
 ```bash
-git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
 pip install -e ./megatron-lm
 ```
 
