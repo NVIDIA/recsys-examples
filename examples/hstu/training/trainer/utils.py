@@ -260,10 +260,10 @@ def get_data_loader(
             num_generated_batches=100,
             num_tasks=num_tasks,
         )
-        train_dataset = datasets.dummy_dataset.DummySequenceDataset(
+        train_dataset = datasets.hstu_random_dataset.HSTURandomDataset(
             batch_size=trainer_args.train_batch_size, **kwargs
         )
-        test_dataset = datasets.dummy_dataset.DummySequenceDataset(
+        test_dataset = datasets.hstu_random_dataset.HSTURandomDataset(
             batch_size=trainer_args.eval_batch_size, **kwargs
         )
     else:
@@ -271,7 +271,7 @@ def get_data_loader(
         (
             train_dataset,
             test_dataset,
-        ) = datasets.sequence_dataset.get_dataset(
+        ) = datasets.hstu_sequence_dataset.get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
             max_history_seqlen=dataset_args.max_history_seqlen,
@@ -331,7 +331,7 @@ def create_embedding_configs(
             for arg in embedding_args
         ]
     if isinstance(dataset_args, DatasetArgs):
-        from preprocessor import get_common_preprocessors
+        from commons.hstu_data_preprocessor import get_common_preprocessors
 
         common_preprocessors = get_common_preprocessors()
         dp = common_preprocessors[dataset_args.dataset_name]

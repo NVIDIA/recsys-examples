@@ -1,25 +1,19 @@
-from . import dummy_dataset, hstu_batch, random_inference_dataset, sequence_dataset
+from . import (
+    hstu_batch,
+    hstu_random_dataset,
+    hstu_sequence_dataset,
+    random_inference_dataset,
+    sid_random_dataset,
+    sid_sequence_dataset,
+)
+from .data_loader import get_data_loader
 
 __all__ = [
-    "dummy_dataset",
+    "get_data_loader",
+    "hstu_random_dataset",
     "random_inference_dataset",
-    "sequence_dataset",
+    "hstu_sequence_dataset",
     "hstu_batch",
+    "sid_random_dataset",
+    "sid_sequence_dataset",
 ]
-
-import torch
-from torch.utils.data import DataLoader
-
-
-def get_data_loader(
-    dataset: torch.utils.data.Dataset,
-    pin_memory: bool = False,
-) -> DataLoader:
-    loader = DataLoader(
-        dataset,
-        batch_size=None,
-        batch_sampler=None,
-        pin_memory=pin_memory,
-        collate_fn=lambda x: x,
-    )
-    return loader

@@ -34,9 +34,9 @@ from configs.sid_gin_config_args import (
     TensorModelParallelArgs,
     TrainerArgs,
 )
-from datasets.sid_data_loader import get_train_and_test_data_loader
 from model import get_sid_gr_model
 from trainer.training import maybe_load_ckpts, train_with_pipeline
+from trainer.utils import get_train_and_test_data_loader
 
 
 def get_dataset_and_embedding_args() -> Tuple[DatasetArgs, EmbeddingArgs]:

@@ -19,9 +19,9 @@ import fbgemm_gpu  # to load permute_2D_sparse_data
 import pytest
 import torch
 from commons.datasets import get_data_loader
-from commons.datasets.dummy_dataset import DummySequenceDataset
 from commons.datasets.hstu_batch import FeatureConfig, is_batch_valid
-from commons.datasets.sequence_dataset import get_dataset
+from commons.datasets.hstu_random_dataset import HSTURandomDataset
+from commons.datasets.hstu_sequence_dataset import get_dataset
 from test_utils import batch_slice
 from torch import distributed as dist
 
@@ -40,7 +40,7 @@ def assert_optional_tensor_equal(a: Optional[torch.Tensor], b: Optional[torch.Te
 )
 @pytest.mark.parametrize("action_feature_name", ["action", None])
 @pytest.mark.parametrize("num_tasks", [2, 1])
-def test_dummy_dataset(
+def test_hstu_random_dataset(
     batch_size,
     max_seqlen,
     contextual_feature_names,
@@ -76,7 +76,7 @@ def test_dummy_dataset(
                 is_jagged=True,
             )
         )
-    dataset = DummySequenceDataset(
+    dataset = HSTURandomDataset(
         batch_size=batch_size,
         feature_configs=feature_configs,
         item_feature_name=item_feature_name,

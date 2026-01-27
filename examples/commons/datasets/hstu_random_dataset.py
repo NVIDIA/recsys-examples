@@ -22,7 +22,7 @@ from torch.utils.data.dataset import IterableDataset
 from .hstu_batch import FeatureConfig, HSTUBatch
 
 
-class DummySequenceDataset(IterableDataset[HSTUBatch]):
+class HSTURandomDataset(IterableDataset[HSTUBatch]):
     """
     A dummy sequence dataset for generating batches of data.
 

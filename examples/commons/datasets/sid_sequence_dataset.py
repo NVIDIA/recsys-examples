@@ -19,15 +19,14 @@ from typing import Iterator, List, Optional
 import numpy as np
 import pandas as pd
 import torch
+from commons.datasets.gpt_sid_batch import GPTSIDBatch
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from .gpt_sid_batch import GPTSIDBatch
 
-
-class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
+class SIDSequenceDataset(IterableDataset[GPTSIDBatch]):
     """
-    DiskSequenceDataset is an iterable dataset designed for sid-gr
+    SIDSequenceDataset is an iterable dataset designed for sid-gr
     """
 
     def __init__(
@@ -336,7 +335,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         deduplicate_label_across_hierarchy: bool,
         output_history_sid_feature_name: str,
         output_candidate_sid_feature_name: str,
-    ) -> "DiskSequenceDataset":
+    ) -> "SIDSequenceDataset":
         return cls(
             raw_sequence_data_path=raw_sequence_data_path,
             item_id_to_sid_mapping_tensor_path=item_id_to_sid_mapping_tensor_path,

@@ -30,10 +30,10 @@ import gin
 import torch
 import tritonclient.http as httpclient
 from commons.datasets import get_data_loader
-from commons.datasets.sequence_dataset import get_dataset
+from commons.datasets.hstu_sequence_dataset import get_dataset
+from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from modules.metrics import get_multi_event_metric_module
-from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from tritonclient.utils import *
 from utils import DatasetArgs, RankingArgs

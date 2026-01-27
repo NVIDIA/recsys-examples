@@ -17,7 +17,7 @@ from typing import List
 import commons.utils.initialize as init
 import pytest
 import torch
-from datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
+from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from megatron.core import parallel_state
 from utils.sid_batch_balancer import SIDGRBalancedBatchShuffler
 

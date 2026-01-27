@@ -21,8 +21,9 @@ import time
 import gin
 import torch
 from commons.datasets import get_data_loader
+from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.datasets.inference_dataset import InferenceDataset
-from commons.datasets.sequence_dataset import get_dataset
+from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from configs import (
     InferenceEmbeddingConfig,
@@ -32,7 +33,6 @@ from configs import (
     get_kvcache_config,
 )
 from modules.metrics import get_multi_event_metric_module
-from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
