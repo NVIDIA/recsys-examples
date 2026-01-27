@@ -17,14 +17,13 @@ from typing import Iterator, List, Optional, cast
 
 import fbgemm_gpu  # pylint: disable-unused-import
 import torch
+from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from torch.utils.data.dataset import IterableDataset
 
-from .gpt_sid_batch import FeatureConfig, GPTSIDBatch
 
-
-class InMemoryRandomDataset(IterableDataset[GPTSIDBatch]):
+class SIDRandomDataset(IterableDataset[GPTSIDBatch]):
     """
-    InMemoryRandomDataset is an iterable dataset for generating random batches of data.
+    SIDRandomDataset is an iterable dataset for generating random batches of data.
 
     Args:
         batch_size (int): The batchsize per rank.

@@ -35,8 +35,8 @@ import numpy as np
 import pandas as pd
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
+from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.logger import print_rank_0
-from preprocessor import get_common_preprocessors
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -59,9 +59,9 @@ def maybe_truncate_seq(
     return y
 
 
-class SequenceDataset(IterableDataset[HSTUBatch]):
+class HSTUSequenceDataset(IterableDataset[HSTUBatch]):
     """
-    SequenceDataset is an iterable dataset designed for distributed recommendation systems.
+    HSTUSequenceDataset is an iterable dataset designed for distributed recommendation systems.
     It handles loading, shuffling, and batching of sequence data for training models.
 
     Args:
@@ -193,7 +193,7 @@ class SequenceDataset(IterableDataset[HSTUBatch]):
         after_count = len(self._seq_logs_frame)
 
         print_rank_0(
-            f"[SequenceDataset] Removed {before_count - after_count} samples with sequence length < max_num_candidates "
+            f"[HSTUSequenceDataset] Removed {before_count - after_count} samples with sequence length < max_num_candidates "
             f"({after_count} samples remaining)."
         )
 
@@ -400,7 +400,7 @@ def get_dataset(
     *,
     nrows=None,
     load_candidate_action: bool = True,
-) -> Tuple[SequenceDataset, Optional[SequenceDataset]]:
+) -> Tuple[HSTUSequenceDataset, Optional[HSTUSequenceDataset]]:
     """
     Retrieves the training and evaluation datasets for sequence-based recommendation tasks.
 
@@ -419,13 +419,13 @@ def get_dataset(
         nrows (Optional[int], optional): The number of rows to read from the dataset file. Defaults to None, meaning all rows are read.
 
     Returns:
-        Tuple[SequenceDataset, Optional[SequenceDataset]]: A tuple containing the training dataset and the evaluation dataset (if `eval_batch_size` is provided).
+        Tuple[HSTUSequenceDataset, Optional[HSTUSequenceDataset]]: A tuple containing the training dataset and the evaluation dataset (if `eval_batch_size` is provided).
     """
     common_preprocessors = get_common_preprocessors(dataset_path)
     if dataset_name not in common_preprocessors:
         raise ValueError(f"{dataset_name} not in preprocessors")
     dp = common_preprocessors[dataset_name]
-    train_dataset = SequenceDataset(
+    train_dataset = HSTUSequenceDataset(
         seq_logs_file=dp._output_file,
         batch_size=batch_size,
         max_history_seqlen=max_history_seqlen,
@@ -443,7 +443,7 @@ def get_dataset(
         nrows=nrows,
     )
     if eval_batch_size is not None:
-        eval_dataset = SequenceDataset(
+        eval_dataset = HSTUSequenceDataset(
             seq_logs_file=dp._output_file,
             batch_size=eval_batch_size,
             load_candidate_action=load_candidate_action,

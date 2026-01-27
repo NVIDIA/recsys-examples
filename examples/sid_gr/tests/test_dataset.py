@@ -1,8 +1,8 @@
 import pytest
 import torch
+from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
+from commons.datasets.sid_sequence_dataset import SIDSequenceDataset
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
-from datasets.disk_sequence_dataset import DiskSequenceDataset
-from datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from tqdm import tqdm
 
@@ -95,7 +95,7 @@ def test_disk_sequence_dataset(
     max_candidate_length,
 ):
     num_hierarchies = 4
-    disk_sequence_dataset = DiskSequenceDataset(
+    disk_sequence_dataset = SIDSequenceDataset(
         raw_sequence_data_path="./tmp_data/amzn/beauty/training/22363.parquet",
         item_id_to_sid_mapping_tensor_path="./tmp_data/amzn/beauty/item-sid-mapping.pt",
         batch_size=batch_size,
@@ -188,7 +188,7 @@ def test_sid_data_loader():
     rank = 0
     world_size = 1
     from configs.sid_gin_config_args import DatasetArgs, TrainerArgs
-    from datasets.sid_data_loader import get_train_and_test_data_loader
+    from training.trainer.utils import get_train_and_test_data_loader
 
     torch.distributed.init_process_group(
         backend="nccl", rank=rank, world_size=world_size
@@ -197,7 +197,7 @@ def test_sid_data_loader():
     dataset_args = DatasetArgs(
         dataset_name="amzn/beauty",
         max_history_length=128,
-        dataset_type_str="disk_sequence_dataset",
+        dataset_type_str="sid_sequence_dataset",
         sequence_features_training_data_path="./tmp_data/amzn/beauty/training/22363.parquet",
         sequence_features_testing_data_path="./tmp_data/amzn/beauty/testing/22363.parquet",
         item_to_sid_mapping_path="./tmp_data/amzn/beauty/item-sid-mapping.pt",

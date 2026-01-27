@@ -59,7 +59,7 @@ def maybe_truncate_seq(
 
 class InferenceDataset(IterableDataset[HSTUBatch]):
     """
-    SequenceDataset is an iterable dataset designed for distributed recommendation systems.
+    HSTUSequenceDataset is an iterable dataset designed for distributed recommendation systems.
     It handles loading, shuffling, and batching of sequence data for training models.
 
     Args:

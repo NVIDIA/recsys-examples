@@ -16,12 +16,12 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from beam_search.beam_search import BeamSearch
+from commons.datasets.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from configs.gpt_config import BOSMode
-from datasets.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.models.common.embeddings.relative_pos_embedding import (

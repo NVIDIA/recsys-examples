@@ -17,8 +17,28 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from commons.sequence_batch.batch import BaseBatch
-from megatron.core.packed_seq_params import PackedSeqParams
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+try:
+    from megatron.core.packed_seq_params import PackedSeqParams
+except ImportError:
+    # Define fallback PackedSeqParams if megatron is not available
+    @dataclass
+    class PackedSeqParams:  # type: ignore[no-redef]
+        """
+        parameters to TEDotProductAttention and fused rope kernels for the
+        `thd` (packed) sequence format
+        """
+
+        qkv_format: Optional[str] = None
+        cu_seqlens_q: Optional[torch.Tensor] = None
+        cu_seqlens_kv: Optional[torch.Tensor] = None
+        cu_seqlens_q_padded: Optional[torch.Tensor] = None
+        cu_seqlens_kv_padded: Optional[torch.Tensor] = None
+        max_seqlen_q: Optional[int] = None
+        max_seqlen_kv: Optional[int] = None
+        local_cp_size: Optional[int] = None
+        cp_group: Optional[torch.distributed.ProcessGroup] = None
 
 
 def to_packed_seq_params(

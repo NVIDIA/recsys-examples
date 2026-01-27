@@ -97,7 +97,7 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
 ~$ export PYTHONPATH=${PYTHONPATH}:$(realpath ../)
 ~$ 
 ~$ # Proprocess the dataset for inference:
-~$ python3 ./preprocessor.py --dataset_name "kuairand-1k" --inference
+~$ python3 ../commons/hstu_data_preprocessor.py --dataset_name "kuairand-1k" --inference
 ~$
 ~$ # Run the inference example
 ~$ python3 ./inference/inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT}  --mode eval

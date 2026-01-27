@@ -70,11 +70,11 @@ Before getting started, please make sure that all pre-requisites are fulfilled. 
 
 ### Dataset preprocessing
 
-In order to prepare the dataset for training, you can use our `preprocessor.py` under the hstu example folder of the project.
+In order to prepare the dataset for training, you can use our `hstu_data_preprocessor.py` under the commons folder of the project.
 
 ```bash
-cd <root-to-repo>/examples/hstu && 
-mkdir -p ./tmp_data && python3 ./preprocessor.py --dataset_name <"ml-1m"|"ml-20m"|"kuairand-pure"|"kuairand-1k"|"kuairand-27k">
+cd <root-to-repo>/examples/commons && 
+mkdir -p ./tmp_data && python3 ./hstu_data_preprocessor.py --dataset_name <"ml-1m"|"ml-20m"|"kuairand-pure"|"kuairand-1k"|"kuairand-27k">
 
 ```
 

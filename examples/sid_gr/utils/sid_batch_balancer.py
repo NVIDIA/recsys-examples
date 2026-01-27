@@ -1,7 +1,7 @@
+from commons.datasets.gpt_sid_batch import GPTSIDBatch
 from commons.distributed.batch_shuffler import BaseTaskBalancedBatchShuffler
 from commons.distributed.batch_shuffler_factory import register_batch_shuffler
 from commons.perf_model.task_estimator import SelfAttentionTask
-from sid_gr.datasets.gpt_sid_batch import GPTSIDBatch
 
 
 @register_batch_shuffler("sid_gr")
