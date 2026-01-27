@@ -14,9 +14,10 @@
 # limitations under the License.
 
 import abc
+import platform
 
 import torch
-from dynamicemb_extensions import VMMTensor
+from dynamicemb_extensions import HostVMMTensor, VMMTensor
 
 
 class ExtendableBuffer(abc.ABC):
@@ -35,7 +36,7 @@ class ExtendableBuffer(abc.ABC):
         return tensor
 
 
-class VmmDeviceBuffer:
+class VmmDeviceBuffer(ExtendableBuffer):
     def __init__(self, capacity, dtype, device: torch.device = None):
         device_id = device.index if device is not None else torch.cuda.current_device()
 
@@ -44,6 +45,29 @@ class VmmDeviceBuffer:
         self._device = device_id
 
         self.vmm_tensor = VMMTensor(capacity, dtype, device_id)
+
+    def extend(self, capacity) -> None:
+        torch.cuda.synchronize()
+        self.vmm_tensor.extend(capacity)
+
+    def tensor(self) -> torch.Tensor:
+        return self.vmm_tensor.data()
+
+    def capacity(self) -> int:
+        return self.vmm_tensor.data().numel()
+
+
+class RegisteredHostBuffer(ExtendableBuffer):
+    def __init__(self, capacity, dtype, device):
+        if platform.system() != "Linux":
+            raise RuntimeError("Only support extendable host buffer on Linux platform.")
+        device_id = device.index if device is not None else torch.cuda.current_device()
+
+        self._capacity = capacity
+        self._dtype = dtype
+        self._device = device_id
+
+        self.vmm_tensor = HostVMMTensor(capacity, dtype, device_id)
 
     def extend(self, capacity) -> None:
         torch.cuda.synchronize()

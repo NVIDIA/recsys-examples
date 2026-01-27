@@ -26,7 +26,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <stdexcept>
 #include <string>
 
-inline void checkCu(CUresult res, const char *msg) {
+inline void CU_CHECK(CUresult res, const char *msg) {
   if (res != CUDA_SUCCESS) {
     const char *err_str = nullptr;
     cuGetErrorString(res, &err_str);
@@ -34,6 +34,8 @@ inline void checkCu(CUresult res, const char *msg) {
                              (err_str ? err_str : "unknown"));
   }
 }
+
+#define CUDA_CHECK(cmd) DEMB_CUDA_CHECK(cmd)
 
 #define CUDACHECK(cmd) DEMB_CUDA_CHECK(cmd)
 #define CUDA_KERNEL_LAUNCH_CHECK() DEMB_CUDA_KERNEL_LAUNCH_CHECK()
