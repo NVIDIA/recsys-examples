@@ -35,7 +35,6 @@ class BaseTaskBalancedBatchShuffler:
         rank = torch.distributed.get_rank(pg_group)
         # 1. Allgather the workloads
         allgather_workloads = gather_along_first_dim(workloads, pg_group)
-        torch.distributed.barrier(group=pg_group)
         # 2. Partition the workloads
         partitions_indices = karmarkar_karp(
             allgather_workloads, num_partitions, equal_size=True
@@ -48,7 +47,7 @@ class BaseTaskBalancedBatchShuffler:
         #! NOTE: This indices tensor always has a size equal to the full batch size,
         #! including padding indices for incomplete batches. Sorting ensures padding
         #! indices are stored contiguously at the tensor's end.
-        # indices_this_rank, _ = torch.sort(indices_this_rank)  #
+        indices_this_rank, _ = torch.sort(indices_this_rank)  #
         # 3. Allgather the batch, the batchsize is multiplied by the world size.
         allgathered_batch = allgather_batch(batch, pg_group)
         # 4. Select the batch
