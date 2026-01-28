@@ -225,7 +225,7 @@ def test_sid_data_loader():
             ), f"length of {key} should be {dataset_args.train_batch_size}"
         if idx < len(train_loader) - 1:
             assert (
-                batch.labels.view(-1, dataset_args.num_hierarchies).shape[0]
+                batch.labels.values().view(-1, dataset_args.num_hierarchies).shape[0]
                 == trainer_args.train_batch_size
             ), f"labels should be {trainer_args.train_batch_size}"
 
