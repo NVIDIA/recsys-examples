@@ -137,6 +137,7 @@ public:
   int max_thread_per_sm;
   int max_thread_per_block;
   int total_threads;
+  std::size_t totalGlobalMem;
 
 private:
   explicit DeviceProp(int device_id);
