@@ -139,7 +139,7 @@ def test_sequence_dataset(
     dataset, _ = get_dataset(
         dataset_name,
         None,
-        max_sequence_length=max_seqlen,
+        max_history_seqlen=max_seqlen,
         max_num_candidates=max_num_candidates,
         num_tasks=num_tasks,
         batch_size=batch_size_per_rank,
@@ -152,7 +152,7 @@ def test_sequence_dataset(
     reference_dataset, _ = get_dataset(
         dataset_name,
         None,
-        max_sequence_length=max_seqlen,
+        max_history_seqlen=max_seqlen,
         max_num_candidates=max_num_candidates,
         num_tasks=num_tasks,
         batch_size=batch_size_per_rank * world_size,
