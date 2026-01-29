@@ -12,82 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, Union
+from typing import Optional
 
 import commons.utils.initialize as init
 import fbgemm_gpu  # to load permute_2D_sparse_data
 import pytest
 import torch
-from datasets import get_data_loader
-from datasets.dummy_dataset import DummySequenceDataset
-from datasets.sequence_dataset import get_dataset
-from datasets.utils import FeatureConfig, RankingBatch, RetrievalBatch, is_batch_valid
+from commons.datasets import get_data_loader
+from commons.datasets.hstu_batch import FeatureConfig, is_batch_valid
+from commons.datasets.hstu_random_dataset import HSTURandomDataset
+from commons.datasets.hstu_sequence_dataset import get_dataset
+from test_utils import batch_slice
 from torch import distributed as dist
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-
-
-def batch_slice(
-    batch: Union[RankingBatch, RetrievalBatch],
-    batch_size: int,
-    rank: int,
-    world_size: int,
-) -> Union[RankingBatch, RetrievalBatch]:
-    """
-    Slice the batch.
-    """
-    split_size = [batch_size for _ in range(world_size)]
-    keys = batch.features.keys()
-    values = []
-    lengths = []
-    for key in keys:
-        feature = batch.features[key]
-        sliced_lengths = torch.split(feature.lengths(), split_size)[rank]
-        segment_start = feature.offsets()[rank * batch_size]
-        segment_end = feature.offsets()[(rank + 1) * batch_size]
-        # in case of zero-sized segment
-        sliced_values = feature.values()[segment_start:segment_end].to(
-            feature.values().dtype
-        )
-        values.extend(sliced_values)
-        lengths.extend(sliced_lengths)
-    sliced_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=keys,
-        values=torch.tensor(values, device=batch.features.device()).long(),
-        lengths=torch.tensor(lengths, device=batch.features.device()),
-    )
-
-    if batch.num_candidates is not None:
-        num_candidates = batch.num_candidates[
-            rank * batch_size : (rank + 1) * batch_size
-        ]
-    else:
-        num_candidates = None
-    batch_kwargs = dict(
-        features=sliced_feature,
-        feature_to_max_seqlen=batch.feature_to_max_seqlen,
-        batch_size=batch_size,
-        contextual_feature_names=batch.contextual_feature_names,
-        item_feature_name=batch.item_feature_name,
-        action_feature_name=batch.action_feature_name,
-        max_num_candidates=batch.max_num_candidates,
-        num_candidates=num_candidates,
-    )
-    if isinstance(batch, RankingBatch):
-        if batch.num_candidates is not None:
-            num_candidates_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                batch.num_candidates
-            )
-            segment_start = num_candidates_offsets[batch_size * rank].cpu().item()
-            segment_end = num_candidates_offsets[batch_size * (rank + 1)].cpu().item()
-        else:
-            item_seqlen_offsets = batch.features[batch.item_feature_name].offsets()
-            segment_start = item_seqlen_offsets[batch_size * rank]
-            segment_end = item_seqlen_offsets[batch_size * (rank + 1)]
-        return RankingBatch(
-            labels=batch.labels[segment_start:segment_end], **batch_kwargs
-        )
-    else:
-        return RetrievalBatch(**batch_kwargs)
 
 
 def assert_optional_tensor_equal(a: Optional[torch.Tensor], b: Optional[torch.Tensor]):
@@ -104,7 +40,7 @@ def assert_optional_tensor_equal(a: Optional[torch.Tensor], b: Optional[torch.Te
 )
 @pytest.mark.parametrize("action_feature_name", ["action", None])
 @pytest.mark.parametrize("num_tasks", [2, 1])
-def test_dummy_dataset(
+def test_hstu_random_dataset(
     batch_size,
     max_seqlen,
     contextual_feature_names,
@@ -140,7 +76,7 @@ def test_dummy_dataset(
                 is_jagged=True,
             )
         )
-    dataset = DummySequenceDataset(
+    dataset = HSTURandomDataset(
         batch_size=batch_size,
         feature_configs=feature_configs,
         item_feature_name=item_feature_name,
@@ -203,7 +139,7 @@ def test_sequence_dataset(
     dataset, _ = get_dataset(
         dataset_name,
         None,
-        max_sequence_length=max_seqlen,
+        max_history_seqlen=max_seqlen,
         max_num_candidates=max_num_candidates,
         num_tasks=num_tasks,
         batch_size=batch_size_per_rank,
@@ -216,7 +152,7 @@ def test_sequence_dataset(
     reference_dataset, _ = get_dataset(
         dataset_name,
         None,
-        max_sequence_length=max_seqlen,
+        max_history_seqlen=max_seqlen,
         max_num_candidates=max_num_candidates,
         num_tasks=num_tasks,
         batch_size=batch_size_per_rank * world_size,
@@ -252,10 +188,11 @@ def test_sequence_dataset(
             assert torch.allclose(
                 batch_features[key].offsets(), ref_batch_features[key].offsets()
             )
-        if isinstance(batch, RankingBatch):
+        if batch.labels is not None:
+            assert ref_batch.labels is not None, "ref labels should not be None"
             assert torch.allclose(
-                ref_batch.labels, batch.labels
-            ), f"labels result: {ref_batch.labels}, {batch.labels}"
+                ref_batch.labels.values(), batch.labels.values()
+            ), f"labels result: {ref_batch.labels.values()}, {batch.labels.values()}"
 
     logging_txt = []
     logging_txt.append(f"batch_size_per_rank:{batch_size_per_rank}")

@@ -19,15 +19,14 @@ from typing import Iterator, List, Optional
 import numpy as np
 import pandas as pd
 import torch
+from commons.datasets.gpt_sid_batch import GPTSIDBatch
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from .gpt_sid_batch import GPTSIDBatch
 
-
-class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
+class SIDSequenceDataset(IterableDataset[GPTSIDBatch]):
     """
-    DiskSequenceDataset is an iterable dataset designed for sid-gr
+    SIDSequenceDataset is an iterable dataset designed for sid-gr
     """
 
     def __init__(
@@ -145,8 +144,10 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
 
     def __iter__(self) -> Iterator[GPTSIDBatch]:
         for i in range(len(self)):
-            local_batch_start = (
-                i * self._global_batch_size + self._rank * self._batch_size
+            # some rank may have no samples.
+            local_batch_start = min(
+                i * self._global_batch_size + self._rank * self._batch_size,
+                len(self._sample_ids),
             )
             local_batch_end = min(
                 i * self._global_batch_size + (self._rank + 1) * self._batch_size,
@@ -209,7 +210,16 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
             )
 
             if self._max_candidate_length > 0:
-                labels = candidate_sids + self.label_codebook_offsets.unsqueeze(0)
+                labels_tensor = candidate_sids + self.label_codebook_offsets.unsqueeze(
+                    0
+                )
+                label_lengths = (
+                    torch.ones(
+                        actual_batch_size, device=self._device, dtype=torch.int64
+                    )
+                    * self._max_candidate_length
+                    * self._num_hierarchies
+                )
             else:
                 # we need to remove the starting sids for each sequence.
                 # TODO@junzhang, to optimize the redundant df operations and sid transformations.
@@ -221,14 +231,22 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                     .astype(np.int64),
                     device=self._device,
                 )
-                labels = (
+                labels_tensor = (
                     torch.index_select(
                         self.item_id_to_sid_mapping_tensor, dim=1, index=label_item_ids
                     )
                     .transpose(0, 1)
                     .contiguous()
                 ) + self.label_codebook_offsets.unsqueeze(0)
-
+                label_lengths = (
+                    torch.tensor(
+                        sequence_data["sequence_length"].to_numpy().astype(np.int64)
+                        - 1,
+                        device=self._device,
+                        dtype=torch.int64,
+                    )
+                    * self._num_hierarchies
+                )
             candidate_sids = (
                 candidate_sids + self.data_codebook_offsets.unsqueeze(0)
                 if self._max_candidate_length > 0
@@ -250,18 +268,26 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 * self._num_hierarchies
             )
 
-            def pad_tensor(padding_length: int, tensor: torch.Tensor) -> torch.Tensor:
+            def pad_tensor(
+                padding_length: int, tensor: torch.Tensor, padded_value: int = 0
+            ) -> torch.Tensor:
                 if padding_length == 0:
                     return tensor
                 return torch.nn.functional.pad(
-                    tensor, (0, padding_length), "constant", 0
+                    tensor, (0, padding_length), "constant", padded_value
                 )
 
+            user_id = pad_tensor(self._batch_size - actual_batch_size, user_id, -1)
             history_lengths = pad_tensor(
                 self._batch_size - actual_batch_size, history_lengths
             )
             candidate_lengths = pad_tensor(
                 self._batch_size - actual_batch_size, candidate_lengths
+            )
+            labels_kjt = KeyedJaggedTensor.from_lengths_sync(
+                keys=["label"],
+                values=labels_tensor.view(-1),
+                lengths=pad_tensor(self._batch_size - actual_batch_size, label_lengths),
             )
 
             batch_kwargs = dict(
@@ -280,7 +306,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
                 _num_hierarchies=self._num_hierarchies,
                 history_feature_name=self._output_history_sid_feature_name,
                 candidate_feature_name=self._output_candidate_sid_feature_name,
-                labels=labels,  # for eval, we need label to calculate metrics.
+                labels=labels_kjt,  # Now using KJT format for labels
                 user_id=user_id,
                 actual_batch_size=actual_batch_size,
             )
@@ -309,7 +335,7 @@ class DiskSequenceDataset(IterableDataset[GPTSIDBatch]):
         deduplicate_label_across_hierarchy: bool,
         output_history_sid_feature_name: str,
         output_candidate_sid_feature_name: str,
-    ) -> "DiskSequenceDataset":
+    ) -> "SIDSequenceDataset":
         return cls(
             raw_sequence_data_path=raw_sequence_data_path,
             item_id_to_sid_mapping_tensor_path=item_id_to_sid_mapping_tensor_path,

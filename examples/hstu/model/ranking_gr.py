@@ -15,13 +15,13 @@
 from typing import Any, Dict, Tuple
 
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.distributed.dmp_to_tp import (
     dmp_batch_to_tp,
     jt_dict_grad_scaling_and_allgather,
 )
 from commons.modules.embedding import ShardedEmbedding
 from configs import HSTUConfig, RankingConfig
-from datasets.utils import RankingBatch
 from megatron.core import parallel_state
 from model.base_model import BaseModel
 from modules.hstu_block import HSTUBlock
@@ -100,13 +100,13 @@ class RankingGR(BaseModel):
         return self
 
     def get_logit_and_labels(
-        self, batch: RankingBatch
+        self, batch: HSTUBatch
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get the logits and labels for the batch.
 
         Args:
-            batch (RankingBatch): The batch of ranking data.
+            batch (HSTUBatch): The batch of ranking data.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The logits and labels.
@@ -132,17 +132,17 @@ class RankingGR(BaseModel):
         )
         hidden_states = hidden_states_jagged.values
         logits = self._mlp(hidden_states)
-        return logits, seqlen_after_preprocessor, batch.labels
+        return logits, seqlen_after_preprocessor, batch.labels.values()
 
     def forward(  # type: ignore[override]
         self,
-        batch: RankingBatch,
+        batch: HSTUBatch,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]:
         """
         Perform the forward pass of the model.
 
         Args:
-            batch (RankingBatch): The batch of ranking data.
+            batch (HSTUBatch): The batch of ranking data.
 
         Returns:
             Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]]: The losses and a tuple of losses, logits, and labels.

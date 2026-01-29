@@ -8,10 +8,11 @@ TrainerArgs.profile_step_end = 80
 TrainerArgs.max_train_iters = 512
 TrainerArgs.max_eval_iters = 16
 TrainerArgs.pipeline_type = "none"
+TrainerArgs.enable_balanced_shuffler = True  # Disabled for random data testing
 
 DatasetArgs.dataset_name = 'sid_random'
 DatasetArgs.max_history_length = 200
-DatasetArgs.dataset_type_str = "in_memory_random_dataset"
+DatasetArgs.dataset_type_str = "sid_random_dataset"
 DatasetArgs.sequence_features_training_data_path = None
 DatasetArgs.sequence_features_testing_data_path = None
 DatasetArgs.item_to_sid_mapping_path = None

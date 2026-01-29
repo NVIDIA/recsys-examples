@@ -86,6 +86,11 @@ class TrainerArgs:
     # - prefetch -> overlap [h2d, input dist, prefetch, fwd+bwd]
     pipeline_type: str = "native"  # none, native, prefetch
 
+    # batch shuffler control
+    # - True -> use balanced batch shuffler (e.g., HASTUBalancedBatchShuffler)
+    # - False -> use IdentityBalancedBatchShuffler (no load balancing)
+    enable_balanced_shuffler: bool = False
+
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
             self.max_train_iters = int(self.max_train_iters)
@@ -120,7 +125,7 @@ class EmbeddingArgs:
         A table could be only one of type `EmbeddingArgs`.
         When movielen* or kuairand* datasets are used, `EmbeddingArgs`
         are predefined. Setting the proper DatasetArgs.dataset_name in the gin config file will automatically set the proper EmbeddingArgs.
-        See `examples/sid_gr/data/sid_data_loader.py::get_train_and_test_data_loader()` for more details.
+        See `examples/sid_gr/training/trainer/utils.py::get_train_and_test_data_loader()` for more details.
     """
 
     feature_names: List[str]
@@ -139,12 +144,12 @@ class EmbeddingArgs:
 class DatasetType(Enum):
     """
     Dataset type:
-    - InMemoryRandomDataset: in-memory random dataset, used for debugging and testing.
-    - DiskSequenceDataset: disk-based sequence dataset, used for training and evaluation.
+    - InMemoryRandomDataset (SIDRandomDataset): in-memory random dataset, used for debugging and testing.
+    - DiskSequenceDataset (SIDSequenceDataset): disk-based sequence dataset, used for training and evaluation.
     """
 
-    InMemoryRandomDataset = "in_memory_random_dataset"
-    DiskSequenceDataset = "disk_sequence_dataset"
+    SIDRandomDataset = "sid_random_dataset"
+    SIDSequenceDataset = "sid_sequence_dataset"
 
 
 @gin.configurable
@@ -157,8 +162,8 @@ class DatasetArgs:
     Attributes:
         dataset_name (str): **Required**. Dataset name.
         max_history_length (int): **Required**. Maximum history length.
-        dataset_type (DatasetType): Dataset type. Default: DatasetType.InMemoryRandomDataset.
-        dataset_type_str (str): Dataset type string. Default: "in_memory_random_dataset".
+        dataset_type (DatasetType): Dataset type (maps to SIDRandomDataset or SIDSequenceDataset). Default: DatasetType.SIDRandomDataset.
+        dataset_type_str (str): Dataset type string. Default: "sid_random_dataset".
         sequence_features_training_data_path (Optional[str]): Path to training data. Default: None.
         sequence_features_testing_data_path (Optional[str]): Path to testing data. Default: None.
         shuffle (bool): Whether to shuffle data. Default: False.
@@ -171,8 +176,8 @@ class DatasetArgs:
 
     dataset_name: str
     max_history_length: int
-    dataset_type: DatasetType = DatasetType.InMemoryRandomDataset
-    dataset_type_str: str = "in_memory_random_dataset"
+    dataset_type: DatasetType = DatasetType.SIDRandomDataset
+    dataset_type_str: str = "sid_random_dataset"
     sequence_features_training_data_path: Optional[
         str
     ] = None  # None when dataset_type is InMemoryRandomDataset
@@ -200,13 +205,13 @@ class DatasetArgs:
             len(self.codebook_sizes) == self.num_hierarchies
         ), "codebook_sizes should have the same length as num_hierarchies"
         assert self.dataset_type_str.lower() in [
-            "in_memory_random_dataset",
-            "disk_sequence_dataset",
-        ], "dataset_type_str should be in ['in_memory_random_dataset', 'disk_sequence_dataset']"
-        if self.dataset_type_str == "in_memory_random_dataset":
-            self.dataset_type = DatasetType.InMemoryRandomDataset
-        elif self.dataset_type_str == "disk_sequence_dataset":
-            self.dataset_type = DatasetType.DiskSequenceDataset
+            "sid_random_dataset",
+            "sid_sequence_dataset",
+        ], "dataset_type_str should be in ['sid_random_dataset', 'sid_sequence_dataset']"
+        if self.dataset_type_str == "sid_random_dataset":
+            self.dataset_type = DatasetType.SIDRandomDataset
+        elif self.dataset_type_str == "sid_sequence_dataset":
+            self.dataset_type = DatasetType.SIDSequenceDataset
         else:
             raise ValueError(f"Invalid dataset type: {self.dataset_type_str}")
 

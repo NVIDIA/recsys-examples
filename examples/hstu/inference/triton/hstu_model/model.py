@@ -35,6 +35,7 @@ import torch
 # contains some utility functions for extracting information from model_config
 # and converting Triton input/output types to numpy types.
 import triton_python_backend_utils as pb_utils
+from commons.datasets.hstu_batch import HSTUBatch
 from configs import (
     EmbeddingBackend,
     InferenceEmbeddingConfig,
@@ -42,7 +43,6 @@ from configs import (
     RankingConfig,
     get_inference_hstu_config,
 )
-from datasets.utils import Batch
 from modules.inference_dense_module import get_inference_dense_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -178,7 +178,9 @@ def get_inference_dense_model_with_feature_names(
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
     num_contextual_features = len(emb_configs) - 2
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = (
+        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
+    ) * 2 + num_contextual_features
     feature_names = [ebc.feature_names[0] for ebc in emb_configs]
 
     network_args = NetworkArgs()
@@ -260,7 +262,7 @@ def pack_batch_from_numpy_host_input(
             max(token_lengths[idx * batch_size : (idx + 1) * batch_size])
         )
     max_num_candidates = int(max(num_candidates))
-    batch = Batch(
+    batch = HSTUBatch(
         features=features,
         batch_size=batch_size,
         feature_to_max_seqlen=feature_to_max_seqlen,

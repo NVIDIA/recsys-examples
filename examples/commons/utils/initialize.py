@@ -82,6 +82,7 @@ def destroy_global_state():
 @contextmanager
 def auto_destroy_global_state():
     try:
+        initialize_distributed()
         yield
     finally:
         destroy_global_state()

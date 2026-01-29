@@ -15,8 +15,8 @@
 import commons.utils.initialize as init
 import pytest
 import torch
+from commons.datasets.hstu_batch import FeatureConfig, HSTUBatch
 from configs import get_hstu_config
-from datasets.utils import Batch, FeatureConfig
 from modules.hstu_block import HSTUBlock
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -65,7 +65,7 @@ def test_hstu_preprocess(
             )
         )
 
-    batch = Batch.random(
+    batch = HSTUBatch.random(
         batch_size=batch_size,
         feature_configs=feature_configs,
         item_feature_name=item_feature_name,

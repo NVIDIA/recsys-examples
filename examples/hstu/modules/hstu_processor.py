@@ -16,13 +16,13 @@ import itertools
 from typing import Dict, Optional, Union
 
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs.hstu_config import HSTUConfig
 from configs.inference_config import InferenceHSTUConfig
-from datasets.utils import RankingBatch
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
@@ -42,7 +42,7 @@ except ImportError:
 
 def hstu_preprocess_embeddings(
     embeddings: Dict[str, JaggedTensor],
-    batch: RankingBatch,
+    batch: HSTUBatch,
     is_inference: bool,
     item_mlp: Optional[MLP] = None,
     contextual_mlp: Optional[MLP] = None,
@@ -67,7 +67,7 @@ def hstu_preprocess_embeddings(
 
     Args:
         embeddings (Dict[str, JaggedTensor]): A dictionary of embeddings where each key corresponds to a feature name and the value is a jagged tensor.
-        batch (RankingBatch): The batch of ranking data.
+        batch (HSTUBatch): The batch of ranking data.
         is_inference (bool): Whether is for inference
         dtype (dtype, optional): The output data type of the embeddings.
     Returns:
@@ -95,6 +95,11 @@ def hstu_preprocess_embeddings(
             )
             sequence_max_seqlen = sequence_max_seqlen * 2
         else:
+            # TODO@junyi: We can optimize the concat:
+            # 1. use jagged split to get [history_embs, candidate_embs]
+            # 2. use cat to interleave the history_embs and history_action_embs part
+            # 3. use jagged concat to append the candidate_embs
+
             action_offsets = action_jt.offsets()
             item_offsets = item_jt.offsets()
             candidates_indptr = item_offsets[: batch.batch_size] + action_jt.lengths()
@@ -178,7 +183,6 @@ def hstu_preprocess_embeddings(
             torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
         )
         sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
-
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
@@ -279,7 +283,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
     def forward(
         self,
         embeddings: Dict[str, JaggedTensor],
-        batch: RankingBatch,
+        batch: HSTUBatch,
         seq_start_position: torch.Tensor = None,
     ) -> JaggedData:
         """
@@ -293,7 +297,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
 
         Args:
             embeddings (Dict[str, JaggedTensor]): A dictionary of embeddings where each key corresponds to a feature name and the value is a jagged tensor.
-            batch (RankingBatch): The batch of ranking data.
+            batch (HSTUBatch): The batch of ranking data.
 
         Returns:
             JaggedData: The preprocessed jagged data, ready for further processing in the HSTU architecture.

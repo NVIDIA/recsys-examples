@@ -4,7 +4,7 @@ TrainerArgs.log_interval = 50
 TrainerArgs.eval_interval = 50
 
 DatasetArgs.dataset_name = 'kuairand-27k'
-DatasetArgs.max_sequence_length = 8000
+DatasetArgs.max_history_seqlen = 8000
 DatasetArgs.max_num_candidates = 256
 DatasetArgs.shuffle = True
 

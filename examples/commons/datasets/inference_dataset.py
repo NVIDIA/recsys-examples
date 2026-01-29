@@ -34,7 +34,7 @@ from typing import Dict, Iterator, List, Optional
 import numpy as np
 import pandas as pd
 import torch
-from datasets.utils import Batch, RankingBatch
+from commons.datasets.hstu_batch import HSTUBatch
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -57,9 +57,9 @@ def maybe_truncate_seq(
     return y
 
 
-class InferenceDataset(IterableDataset[Batch]):
+class InferenceDataset(IterableDataset[HSTUBatch]):
     """
-    SequenceDataset is an iterable dataset designed for distributed recommendation systems.
+    HSTUSequenceDataset is an iterable dataset designed for distributed recommendation systems.
     It handles loading, shuffling, and batching of sequence data for training models.
 
     Args:
@@ -140,7 +140,7 @@ class InferenceDataset(IterableDataset[Batch]):
     def __len__(self) -> int:
         return math.ceil(self._num_samples / self._batch_size)
 
-    def __iter__(self) -> Iterator[Batch]:
+    def __iter__(self) -> Iterator[HSTUBatch]:
         for i in range(len(self)):
             batch_start = i * self._batch_size
             batch_end = min(
@@ -316,7 +316,5 @@ class InferenceDataset(IterableDataset[Batch]):
             if self._max_num_candidates > 0
             else None,
         )
-        if with_ranking_labels:
-            return RankingBatch(labels=labels, **batch_kwargs)
-
-        return Batch(**batch_kwargs)
+        labels = labels if with_ranking_labels else None
+        return HSTUBatch(labels=labels, **batch_kwargs)

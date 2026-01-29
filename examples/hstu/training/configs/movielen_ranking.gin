@@ -7,10 +7,15 @@ TrainerArgs.seed = 1234
 TrainerArgs.max_train_iters = 1000
 TrainerArgs.profile = True
 TrainerArgs.pipeline_type = "prefetch"
+TrainerArgs.enable_balanced_shuffler = True  # Set to True to enable balanced batch shuffling
 
+# ml-1m : 5 contextual features, 
+# ml-20m : 1 contextual feature
 DatasetArgs.dataset_name = 'ml-20m'
-DatasetArgs.max_sequence_length = 200
-DatasetArgs.shuffle = True
+# seqlen for attention is 
+# contextual + (history + candidate) * 2
+DatasetArgs.max_history_seqlen = 200
+DatasetArgs.shuffle = False
 DatasetArgs.max_num_candidates = 20
 
 NetworkArgs.dtype_str = "bfloat16"
@@ -20,7 +25,8 @@ NetworkArgs.hidden_size = 128
 NetworkArgs.kv_channels = 128
 NetworkArgs.target_group_size = 1
 
-# ratings 0-5
+# ml-20m ratings 1:0.5:5
+# ml-1m ratings 1:1:5
 RankingArgs.prediction_head_arch = [512, 10]
 RankingArgs.prediction_head_bias = True
 RankingArgs.num_tasks = 1

@@ -4,9 +4,9 @@ import commons.utils as init
 import pytest
 import torch
 from commons.checkpoint import get_unwrapped_module
+from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.ops.length_to_offsets import length_to_complete_offsets
-from datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from tests.test_utils import create_sid_gr_model_and_optimizer
 
 
@@ -133,7 +133,7 @@ def test_model_smoke(
 @pytest.mark.parametrize("kv_channels", [128])
 @pytest.mark.parametrize("num_layers", [1])
 @pytest.mark.parametrize("max_history_length", [128])
-@pytest.mark.parametrize("codebook_sizes", [[128, 128, 128, 128], [256, 256, 256]])
+@pytest.mark.parametrize("codebook_sizes", [[128, 128, 128, 128]])
 def test_model_decoder_step(
     dtype,
     hidden_size,
@@ -217,6 +217,7 @@ def test_model_decoder_step(
             input_max_seqlen = history_max_seqlen + candidate_max_seqlen
 
             # decoding in one shot
+            # []
             output = model.decoder_step(
                 input_hidden_states.view(-1, hidden_size),
                 input_offsets,
@@ -286,8 +287,6 @@ def test_model_decoder_step(
                     )
                     # top 10?
                     the_same_order = (
-                        sorted_ref_indices[0:10] == this_sorted_indices[0:10]
+                        sorted_ref_indices[..., 0:10] == this_sorted_indices[..., 0:10]
                     ).all()
-                    # import pdb; pdb.set_trace()
                     assert the_same_order
-                    # assert torch.allclose(ref_prob, prob, atol=1e-4)

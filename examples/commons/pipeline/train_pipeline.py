@@ -39,6 +39,10 @@ from typing import (
 
 import nvtx
 import torch
+from commons.distributed.batch_shuffler import (
+    BaseTaskBalancedBatchShuffler,
+    IdentityBalancedBatchShuffler,
+)
 from commons.distributed.finalize_model_grads import finalize_model_grads
 from commons.pipeline.utils import (
     In,
@@ -126,13 +130,14 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        batch_shuffler: BaseTaskBalancedBatchShuffler = IdentityBalancedBatchShuffler(),
     ) -> None:
         self._model = model
         self._optimizer = optimizer
         self._device = device
         self._execute_all_batches = execute_all_batches
         self._apply_jit = apply_jit
-
+        self._batch_shuffler = batch_shuffler
         if device.type == "cuda":
             # use two data streams to support two concurrent batches
             # Dynamo does not support cuda stream specification,
@@ -257,7 +262,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         load a data batch from dataloader, and copy it from cpu to gpu
         also create the context for this batch.
         """
-        batch, context = self.copy_batch_to_gpu(dataloader_iter)
+        batch, context = self.copy_batch_to_gpu_and_shuffle(dataloader_iter)
         if batch is None:
             return False
         self.batches.append(batch)
@@ -325,63 +330,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         with record_function("## backward ##"):
             torch.sum(losses, dim=0).backward()
 
-    def progress(self, dataloader_iter: Iterator[In]) -> Out:
-        """
-        For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
-            batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt (expecting input_dist)
-            batches[1]: next batch, for input_dist (expecting copied to device)
-            batches[2]: i+2 batch, for copy_batch_to_gpu (expecting non-exhausted dataloader iter)
-        """
-
-        # attach the model just in case the user forgets to call it, especially when the user
-        # pauses the pipeline.progress and detach the model for other purpose.
-        if not self._model_attached:
-            self.attach(self._model)
-
-        # fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
-        self.fill_pipeline(dataloader_iter)
-
-        # here is the expected stop after exhausting all batches
-        if not self.batches:
-            raise StopIteration
-
-        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
-        self._set_module_context(self.contexts[0])
-
-        if self._model.training:
-            with record_function("## zero_grad ##"):
-                self._optimizer.zero_grad()
-
-        # wait for batches[0] being available on device, this should always be completed since
-        # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
-        self._wait_for_batch()
-
-        if len(self.batches) >= 2:
-            # invoke splits all_to_all comms (first part of input_dist)
-            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
-
-        # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
-        self.enqueue_batch(dataloader_iter)
-
-        # forward
-        with record_function("## forward ##"):
-            losses, output = self._model_fwd(self.batches[0])
-
-        if len(self.batches) >= 2:
-            # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
-            self.wait_sparse_data_dist(self.contexts[1])
-
-        if self._model.training:
-            # backward
-            self._backward(losses)
-
-            # update
-            with record_function("## optimizer ##"):
-                self._optimizer.step()
-
-        self.dequeue_batch()
-        return output
-
     def _create_context(self) -> TrainPipelineContext:
         context = self._context_type(index=self._next_index, version=1)
         self._next_index += 1
@@ -433,7 +381,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         self._pipeline_model(batch, context, pipelined_forward)
 
-    def copy_batch_to_gpu(
+    def copy_batch_to_gpu_and_shuffle(
         self,
         dataloader_iter: Iterator[In],
     ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
@@ -445,11 +393,13 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 `self._execute_all_batches=True`, then returns None.
         """
         context = self._create_context()
-        with nvtx.annotate(f"## copy_batch_to_gpu {self._next_index} ##"):
+        with nvtx.annotate(f"## copy_batch_to_gpu_and_shuffle {self._next_index} ##"):
             with self._stream_context(self._memcpy_stream):
                 batch = self._next_batch(dataloader_iter)
                 if batch is not None:
                     batch = _to_device(batch, self._device, non_blocking=True)
+                    # TODO@junzhang, there are cpu ops / nccl comm and lots of sync in shuffle.
+                    batch = self._batch_shuffle(batch)
                 elif not self._execute_all_batches:
                     raise StopIteration
                 return batch, context
@@ -510,13 +460,20 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         context.input_dist_splits_requests.clear()
         context.fused_splits_awaitables.clear()
 
-    def _copy_batch_to_gpu(self, dataloader_iter: Iterator[In]) -> Optional[In]:
+    def _copy_batch_to_gpu_and_shuffle(
+        self, dataloader_iter: Iterator[In]
+    ) -> Optional[In]:
         """
         DEPRECATED: exists for backward compatibility on TrainPipelineContext.version 0
         """
         self._set_module_context(self._context)
-        batch, _ = self.copy_batch_to_gpu(dataloader_iter)
+        batch, _ = self.copy_batch_to_gpu_and_shuffle(dataloader_iter)
         return batch
+
+    def _batch_shuffle(self, batch: In) -> In:
+        return self._batch_shuffler.shuffle(
+            batch, parallel_state.get_data_parallel_group()
+        )
 
     def _start_sparse_data_dist(self, batch: Optional[In]) -> None:
         """
@@ -555,7 +512,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             return
 
         # batch 1
-        self._batch_i = self._copy_batch_to_gpu(dataloader_iter)
+        self._batch_i = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
         if self._batch_i is None:
             raise StopIteration
 
@@ -564,7 +521,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._wait_sparse_data_dist()
 
         # batch 2
-        self._batch_ip1 = self._copy_batch_to_gpu(dataloader_iter)
+        self._batch_ip1 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
 
 
 class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
@@ -609,6 +566,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        batch_shuffler: BaseTaskBalancedBatchShuffler = IdentityBalancedBatchShuffler(),
     ) -> None:
         super().__init__(
             model=model,
@@ -619,6 +577,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             context_type=PrefetchTrainPipelineContext,
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
+            batch_shuffler=batch_shuffler,
         )
         self._context = PrefetchTrainPipelineContext(version=0)
         self._prefetch_stream: Optional[torch.Stream] = (
@@ -642,7 +601,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             return
 
         # batch 1
-        self._batch_i = self._copy_batch_to_gpu(dataloader_iter)
+        self._batch_i = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
         if self._batch_i is None:
             raise StopIteration
 
@@ -657,7 +616,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         self._prefetch(self._batch_i)
 
         # batch 2
-        self._batch_ip1 = self._copy_batch_to_gpu(dataloader_iter)
+        self._batch_ip1 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
         self._start_sparse_data_dist(self._batch_ip1)
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
@@ -670,7 +629,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         with record_function("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
 
-        self._batch_ip2 = self._copy_batch_to_gpu(dataloader_iter)
+        self._batch_ip2 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
 
         self._wait_sparse_data_dist()
         # forward
@@ -740,6 +699,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        batch_shuffler: BaseTaskBalancedBatchShuffler = IdentityBalancedBatchShuffler(),
     ) -> None:
         super().__init__(
             model,
@@ -750,6 +710,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             TrainPipelineContext,
             pipeline_postproc,
             custom_model_fwd,
+            batch_shuffler=batch_shuffler,
         )
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
@@ -757,7 +718,7 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
             batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt (expecting input_dist)
             batches[1]: next batch, for input_dist (expecting copied to device)
-            batches[2]: i+2 batch, for copy_batch_to_gpu (expecting non-exhausted dataloader iter)
+            batches[2]: i+2 batch, for copy_batch_to_gpu_and_shuffle (expecting non-exhausted dataloader iter)
         """
 
         # attach the model just in case the user forgets to call it, especially when the user
@@ -794,7 +755,6 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
         with nvtx.annotate("## enqueue_batch ##"):
             self.enqueue_batch(dataloader_iter)
-
         # forward
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self.batches[0])
@@ -843,6 +803,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        batch_shuffler: BaseTaskBalancedBatchShuffler = IdentityBalancedBatchShuffler(),
     ) -> None:
         super().__init__(
             model,
@@ -852,6 +813,7 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             apply_jit,
             pipeline_postproc,
             custom_model_fwd,
+            batch_shuffler,
         )
 
     def progress(self, dataloader_iter: Iterator[In]) -> Tuple[torch.Tensor, Out]:
@@ -866,8 +828,8 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         with nvtx.annotate("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
 
-        with nvtx.annotate("## copy_batch_to_gpu ##"):
-            self._batch_ip2 = self._copy_batch_to_gpu(dataloader_iter)
+        with nvtx.annotate("## copy_batch_to_gpu_and_shuffle ##"):
+            self._batch_ip2 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
         with nvtx.annotate("## wait_sparse_data_dist ##"):
             self._wait_sparse_data_dist()
         # forward
@@ -923,10 +885,22 @@ class JaggedMegatronTrainNonePipeline:
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        batch_shuffler: BaseTaskBalancedBatchShuffler = IdentityBalancedBatchShuffler(),
     ):
         self._model = model
         self._optimizer = optimizer
         self._device = device
+        self._batch_shuffler = batch_shuffler
+
+    def _copy_batch_to_gpu_and_shuffle(
+        self, dataloader_iter: Iterator[In]
+    ) -> Optional[In]:
+        with nvtx.annotate(f"## H2D and shuffle ##"):
+            batch = next(dataloader_iter)
+            if batch is not None:
+                batch = _to_device(batch, self._device, non_blocking=True)
+                batch = self._batch_shuffler.shuffle(batch)
+            return batch
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         dp_size = parallel_state.get_data_parallel_world_size() * 1.0
@@ -934,10 +908,9 @@ class JaggedMegatronTrainNonePipeline:
             if hasattr(self._model.module, "zero_grad_buffer"):
                 self._model.module.zero_grad_buffer()
             self._optimizer.zero_grad()
-        with nvtx.annotate("## H2D ##"):
-            batch = next(dataloader_iter).to(self._device)
-            # print(f'nopipeline batch.features: {batch.features.values()}')
 
+        # H2D and shuffle
+        batch = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
         with nvtx.annotate("## forward ##"):
             losses, output = self._model(batch)
 
@@ -965,3 +938,15 @@ class JaggedMegatronTrainNonePipeline:
                 self._optimizer.step()
 
         return reporting_loss, output
+
+
+from commons.pipeline.train_pipeline_factory import TrainPipelineFactory
+
+# Register the three Jagged Megatron training pipelines
+TrainPipelineFactory.register("jagged_none", JaggedMegatronTrainNonePipeline)
+TrainPipelineFactory.register(
+    "jagged_sparse_dist", JaggedMegatronTrainPipelineSparseDist
+)
+TrainPipelineFactory.register(
+    "jagged_prefetch_sparse_dist", JaggedMegatronPrefetchTrainPipelineSparseDist
+)

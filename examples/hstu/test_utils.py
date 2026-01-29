@@ -16,11 +16,12 @@
 
 from typing import List, Optional, Union
 
+import commons.datasets as datasets
 import commons.utils as init
 import configs
-import datasets
 import model
 import torch
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.distributed.sharding import apply_megatron_ddp, make_optimizer_and_shard
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.optimizer import OptimizerParam
@@ -36,11 +37,76 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 debug_module_path_to_tpN_module_path = {
     "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
     "_output_layernorm_bias": "_output_ln_dropout_mul.bias",
 }
+
+
+def batch_slice(
+    batch: HSTUBatch,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+) -> HSTUBatch:
+    """
+    Slice the batch.
+    """
+    split_size = [batch_size for _ in range(world_size)]
+    keys = batch.features.keys()
+    values = []
+    lengths = []
+    for key in keys:
+        feature = batch.features[key]
+        sliced_lengths = torch.split(feature.lengths(), split_size)[rank]
+        segment_start = feature.offsets()[rank * batch_size]
+        segment_end = feature.offsets()[(rank + 1) * batch_size]
+        # in case of zero-sized segment
+        sliced_values = feature.values()[segment_start:segment_end].to(
+            feature.values().dtype
+        )
+        values.extend(sliced_values)
+        lengths.extend(sliced_lengths)
+    sliced_feature = KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=torch.tensor(values, device=batch.features.device()).long(),
+        lengths=torch.tensor(lengths, device=batch.features.device()),
+    )
+
+    if batch.num_candidates is not None:
+        num_candidates = batch.num_candidates[
+            rank * batch_size : (rank + 1) * batch_size
+        ]
+    else:
+        num_candidates = None
+    batch_kwargs = dict(
+        features=sliced_feature,
+        feature_to_max_seqlen=batch.feature_to_max_seqlen,
+        batch_size=batch_size,
+        contextual_feature_names=batch.contextual_feature_names,
+        item_feature_name=batch.item_feature_name,
+        action_feature_name=batch.action_feature_name,
+        max_num_candidates=batch.max_num_candidates,
+        num_candidates=num_candidates,
+    )
+    if batch.labels is not None:
+        sliced_lengths = torch.split(batch.labels.lengths(), split_size)[rank]
+        segment_start = batch.labels.offsets()[rank * batch_size]
+        segment_end = batch.labels.offsets()[(rank + 1) * batch_size]
+        # in case of zero-sized segment
+        sliced_values = batch.labels.values()[segment_start:segment_end].to(
+            batch.labels.values().dtype
+        )
+        labels = KeyedJaggedTensor.from_lengths_sync(
+            keys=["label"],
+            values=sliced_values,
+            lengths=sliced_lengths,
+        )
+        batch_kwargs["labels"] = labels
+
+    return HSTUBatch(**batch_kwargs)
 
 
 def get_batch_on_this_tp_rank(batch: JaggedData):
@@ -306,6 +372,73 @@ def assert_equal_two_state_dict(a_state_dict, b_state_dict):
             assert v == r, f"for {k}, value {v} != {r}"
 
 
+def generate_random_batches(
+    task_type: str,
+    num_tasks: Optional[int],
+    batch_size: int,
+    feature_configs,
+    item_feature_name,
+    contextual_feature_names,
+    action_feature_name,
+    max_num_candidates,
+    device,
+    num_batches: int,
+    replicate_batches: bool,
+):
+    history_batches = []
+    with tensor_parallel.get_cuda_rng_tracker().fork():
+        if replicate_batches:
+            # All batches are the same (complete batches)
+            history_batches = [
+                datasets.hstu_batch.HSTUBatch.random(
+                    num_tasks=num_tasks,
+                    batch_size=batch_size,
+                    feature_configs=feature_configs,
+                    item_feature_name=item_feature_name,
+                    contextual_feature_names=contextual_feature_names,
+                    action_feature_name=action_feature_name,
+                    max_num_candidates=max_num_candidates,
+                    device=device,
+                )
+            ] * num_batches
+        else:
+            # Generate num_batches-1 complete batches
+            history_batches = [
+                datasets.hstu_batch.HSTUBatch.random(
+                    num_tasks=num_tasks,
+                    batch_size=batch_size,
+                    feature_configs=feature_configs,
+                    item_feature_name=item_feature_name,
+                    contextual_feature_names=contextual_feature_names,
+                    action_feature_name=action_feature_name,
+                    max_num_candidates=max_num_candidates,
+                    device=device,
+                )
+                for _ in range(num_batches - 1)
+            ]
+            # Generate the last batch as incomplete batch
+            if num_batches > 0:
+                # Random incomplete batch size from 0 to batch_size-1
+                incomplete_batch_size = torch.randint(
+                    0, batch_size, (1,), device=device
+                ).item()
+
+                history_batches.append(
+                    datasets.hstu_batch.HSTUBatch.random(
+                        num_tasks=num_tasks,
+                        batch_size=batch_size,
+                        actual_batch_size=incomplete_batch_size,
+                        feature_configs=feature_configs,
+                        item_feature_name=item_feature_name,
+                        contextual_feature_names=contextual_feature_names,
+                        action_feature_name=action_feature_name,
+                        max_num_candidates=max_num_candidates,
+                        device=device,
+                    )
+                )
+    return history_batches
+
+
 def create_model(
     task_type,
     contextual_feature_names,
@@ -366,7 +499,7 @@ def create_model(
         ),
     ]
     feature_configs = [
-        datasets.utils.FeatureConfig(
+        datasets.hstu_batch.FeatureConfig(
             feature_names=[item_feature_name, action_feature_name],
             max_item_ids=[
                 max(item_emb_size // 2, 1),
@@ -378,7 +511,7 @@ def create_model(
     ]
     if len(contextual_feature_names) > 0:
         feature_configs.append(
-            datasets.utils.FeatureConfig(
+            datasets.hstu_batch.FeatureConfig(
                 feature_names=contextual_feature_names,
                 max_item_ids=[
                     contextual_emb_size for _ in range(len(contextual_feature_names))
@@ -397,15 +530,6 @@ def create_model(
             )
         )
 
-    batch_kwargs = dict(
-        batch_size=batch_size,
-        feature_configs=feature_configs,
-        item_feature_name=item_feature_name,
-        contextual_feature_names=contextual_feature_names,
-        action_feature_name=action_feature_name,
-        max_num_candidates=max_num_candidates,
-        device=device,
-    )
     if task_type == "ranking":
         num_tasks = 1
         task_config = configs.RankingConfig(
@@ -414,40 +538,28 @@ def create_model(
             prediction_head_bias=False,  # disable bias for better debugging
         )
         model_train = model.RankingGR(hstu_config=hstu_config, task_config=task_config)
-
-        history_batches = []
-        with tensor_parallel.get_cuda_rng_tracker().fork():
-            if replicate_batches:
-                history_batches = [
-                    datasets.utils.RankingBatch.random(
-                        num_tasks=num_tasks, **batch_kwargs
-                    )
-                ] * num_batches
-            else:
-                history_batches = [
-                    datasets.utils.RankingBatch.random(
-                        num_tasks=num_tasks, **batch_kwargs
-                    )
-                    for _ in range(num_batches)
-                ]
     else:
         assert task_type == "retrieval"
+        num_tasks = None
         task_config = configs.RetrievalConfig(embedding_configs=emb_configs)
         model_train = model.RetrievalGR(
             hstu_config=hstu_config, task_config=task_config
         )
 
-        history_batches = []
-        with tensor_parallel.get_cuda_rng_tracker().fork():
-            if replicate_batches:
-                history_batches = [
-                    datasets.utils.RetrievalBatch.random(**batch_kwargs)
-                ] * num_batches
-            else:
-                history_batches = [
-                    datasets.utils.RetrievalBatch.random(**batch_kwargs)
-                    for _ in range(num_batches)
-                ]
+    history_batches = generate_random_batches(
+        task_type=task_type,
+        num_tasks=num_tasks if num_tasks is not None else 1,
+        batch_size=batch_size,
+        feature_configs=feature_configs,
+        item_feature_name=item_feature_name,
+        contextual_feature_names=contextual_feature_names,
+        action_feature_name=action_feature_name,
+        max_num_candidates=max_num_candidates,
+        device=device,
+        num_batches=num_batches,
+        replicate_batches=replicate_batches,
+    )
+
     optimizer_param = OptimizerParam(
         optimizer_str=optimizer_type_str,
         learning_rate=1e-3 if optimizer_type_str == "adam" else 1e-1,

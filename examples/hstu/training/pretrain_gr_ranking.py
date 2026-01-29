@@ -23,12 +23,9 @@ from typing import List, Union
 import commons.utils.initialize as init
 import gin
 import torch  # pylint: disable-unused-import
+from commons.distributed.batch_shuffler_factory import BatchShufflerFactory
 from commons.distributed.sharding import make_optimizer_and_shard
-from commons.pipeline.train_pipeline import (
-    JaggedMegatronPrefetchTrainPipelineSparseDist,
-    JaggedMegatronTrainNonePipeline,
-    JaggedMegatronTrainPipelineSparseDist,
-)
+from commons.pipeline import TrainPipelineFactory
 from commons.utils.logger import print_rank_0
 from configs import RankingConfig
 from megatron.core import parallel_state
@@ -83,7 +80,9 @@ def main():
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
     trainer_args = TrainerArgs()
-    dataset_args, embedding_args = get_dataset_and_embedding_args()
+    dataset_args, embedding_args = get_dataset_and_embedding_args(
+        trainer_args.pipeline_type == "prefetch"
+    )
     network_args = NetworkArgs()
     optimizer_args = OptimizerArgs()
     tp_args = TensorModelParallelArgs()
@@ -129,6 +128,18 @@ def main():
         ),  # ranks in the same TP group do the same compute
     )
 
+    # Create batch shuffler based on configuration
+    # For ranking, we have action interleaved with item
+    if trainer_args.enable_balanced_shuffler:
+        batch_shuffler = BatchShufflerFactory.create(
+            "hstu",
+            num_heads=hstu_config.num_attention_heads,
+            head_dim=hstu_config.kv_channels,
+            action_interleaved=True,
+        )
+    else:
+        batch_shuffler = BatchShufflerFactory.create("identity")
+
     train_dataloader, test_dataloader = get_data_loader(
         "ranking", dataset_args, trainer_args, task_config.num_tasks
     )
@@ -138,23 +149,24 @@ def main():
     )
 
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
-    if trainer_args.pipeline_type in ["prefetch", "native"]:
-        pipeline_factory = (
-            JaggedMegatronPrefetchTrainPipelineSparseDist
-            if trainer_args.pipeline_type == "prefetch"
-            else JaggedMegatronTrainPipelineSparseDist
-        )
-        pipeline = pipeline_factory(
-            model_train,
-            dense_optimizer,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
-    else:
-        pipeline = JaggedMegatronTrainNonePipeline(
-            model_train,
-            dense_optimizer,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
+
+    # Map pipeline type string to factory registered name
+    pipeline_type_map = {
+        "prefetch": "jagged_prefetch_sparse_dist",
+        "native": "jagged_sparse_dist",
+        "none": "jagged_none",
+    }
+    pipeline_name = pipeline_type_map.get(trainer_args.pipeline_type, "jagged_none")
+
+    # Create pipeline using factory
+    pipeline = TrainPipelineFactory.create(
+        pipeline_name,
+        model=model_train,
+        optimizer=dense_optimizer,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        batch_shuffler=batch_shuffler,
+    )
+
     train_with_pipeline(
         pipeline,
         stateful_metric_module,

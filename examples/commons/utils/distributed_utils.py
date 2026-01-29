@@ -20,12 +20,95 @@ import torch
 def collective_assert(
     flag: bool, err_msg: str = "", group: torch.distributed.ProcessGroup = None
 ):
+    """
+    Assert that all ranks have the same flag.
+    """
     flag_tensor = torch.tensor(flag, dtype=torch.bool).cuda()
     torch.distributed.all_reduce(
         flag_tensor, op=torch.distributed.ReduceOp.MIN, group=group
     )
     torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
     assert flag_tensor.item(), err_msg
+
+
+def collective_any(
+    tensor: torch.Tensor,
+    err_msg: str = "",
+    group: torch.distributed.ProcessGroup = None,
+):
+    """
+    Check if any rank has a true value in the tensor.
+    """
+
+    flag_tensor = torch.tensor(torch.any(tensor), dtype=torch.bool).cuda()
+    torch.distributed.all_reduce(
+        flag_tensor, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    return flag_tensor.item()
+
+
+def collective_all(
+    tensor: torch.Tensor,
+    err_msg: str = "",
+    group: torch.distributed.ProcessGroup = None,
+):
+    """
+    Check if all ranks have a true value in the tensor.
+    """
+
+    flag_tensor = torch.tensor(torch.all(tensor), dtype=torch.bool).cuda()
+    torch.distributed.all_reduce(
+        flag_tensor, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    return flag_tensor.item()
+
+
+def any_and_collective_all(
+    tensor: torch.Tensor,
+    err_msg: str = "",
+    group: torch.distributed.ProcessGroup = None,
+):
+    """
+    Check if all ranks meets the any condition and all condition.
+    """
+
+    flag_tensor = torch.tensor(torch.any(tensor), dtype=torch.bool).cuda()
+    torch.distributed.all_reduce(
+        flag_tensor, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    return flag_tensor.item()
+
+
+def all_and_collective_any(
+    tensor: torch.Tensor,
+    err_msg: str = "",
+    group: torch.distributed.ProcessGroup = None,
+):
+    """
+    Check if all ranks meets the any condition and all condition.
+    """
+
+    flag_tensor = torch.tensor(torch.all(tensor), dtype=torch.bool).cuda()
+    torch.distributed.all_reduce(
+        flag_tensor, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    return flag_tensor.item()
+
+
+def collective_any_and_all(
+    tensor: torch.Tensor,
+    err_msg: str = "",
+    group: torch.distributed.ProcessGroup = None,
+):
+    """
+    Check if all ranks meets the any condition and all condition.
+    """
+    collective_any(tensor, err_msg, group)
+    return collective_all(tensor, err_msg, group)
 
 
 def collective_assert_tensor(

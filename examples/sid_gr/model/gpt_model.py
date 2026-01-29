@@ -16,12 +16,12 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from beam_search.beam_search import BeamSearch
+from commons.datasets.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from configs.gpt_config import BOSMode
-from datasets.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.models.common.embeddings.relative_pos_embedding import (
@@ -424,6 +424,7 @@ class SIDGRModel(MegatronModule):
             # [[{item0, item1, item2, ..., itemN} | {bos}], [{item3, item4, item5, ..., itemM} | {bos}]]
             # the last bos of each sequence is retained for later decoding.
             # we use jagged concat
+            # note that we use batch_size here instead of actual_batch_size intentionally
             candidate_bos_offsets = torch.arange(
                 0,
                 batch.batch_size + 1,
@@ -494,7 +495,6 @@ class SIDGRModel(MegatronModule):
             if add_bos_to_history
             else history_offsets
         )
-
         # [bos, s0,s1,s2(dropped), bos,s3,s4,s5(dropped), bos,s6,s7,s8(dropped), ... bos,c_n, c_n+1, c_n+2(dropped)]
         _, bos_and_candidate_hidden_states = triton_split_2D_jagged(
             jagged_output_hidden_states,
@@ -606,7 +606,7 @@ class SIDGRModel(MegatronModule):
         )
         losses_per_hierarchy = []
         logits_per_hierarchy = []
-        merged_labels = batch.labels.view(-1, batch._num_hierarchies)
+        merged_labels = batch.labels.values().view(-1, batch._num_hierarchies)
         # 4. output linear projection & loss
         # TODO, merge into single grouped linear layer
         for hierarchy_idx in range(batch._num_hierarchies):
@@ -721,7 +721,7 @@ class SIDGRModel(MegatronModule):
                 # for first step, a single bos token for each sequence
                 candidate_offsets = torch.arange(
                     0,
-                    batch_size + 1,
+                    batch.actual_batch_size + 1,
                     device=input_offsets.device,
                     dtype=input_offsets.dtype,
                 )

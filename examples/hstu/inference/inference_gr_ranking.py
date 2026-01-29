@@ -20,6 +20,10 @@ import time
 
 import gin
 import torch
+from commons.datasets import get_data_loader
+from commons.datasets.hstu_sequence_dataset import get_dataset
+from commons.datasets.inference_dataset import InferenceDataset
+from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from configs import (
     InferenceEmbeddingConfig,
@@ -28,11 +32,7 @@ from configs import (
     get_inference_hstu_config,
     get_kvcache_config,
 )
-from datasets import get_data_loader
-from datasets.inference_dataset import InferenceDataset
-from datasets.sequence_dataset import get_dataset
 from modules.metrics import get_multi_event_metric_module
-from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
@@ -216,7 +216,9 @@ def run_ranking_gr_simulate(
     )
 
     max_batch_size = 1
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = (
+        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
+    ) * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
     with torch.inference_mode():
@@ -240,7 +242,7 @@ def run_ranking_gr_simulate(
             seq_logs_file=dataproc._inference_sequence_file,
             batch_logs_file=dataproc._inference_batch_file,
             batch_size=max_batch_size,
-            max_seqlen=dataset_args.max_sequence_length,
+            max_seqlen=dataset_args.max_history_seqlen,
             item_feature_name=dataproc._item_feature_name,
             contextual_feature_names=dataproc._contextual_feature_names
             if not disable_contextual_features
@@ -298,7 +300,7 @@ def run_ranking_gr_simulate(
                         uids[non_contextual_mask].int(),
                         new_cache_start_pos[non_contextual_mask],
                     )
-                    eval_module(logits, batch_0.labels)
+                    eval_module(logits, batch_0.labels.values())
 
                 batch_1 = dataset.get_input_batch(
                     uids[contextual_mask],
@@ -314,7 +316,7 @@ def run_ranking_gr_simulate(
                         uids[contextual_mask].int(),
                         new_cache_start_pos[contextual_mask],
                     )
-                    eval_module(logits, batch_1.labels)
+                    eval_module(logits, batch_1.labels.values())
 
                 num_batches_ctr += 1
             except StopIteration:
@@ -341,7 +343,9 @@ def run_ranking_gr_evaluate(
     )
 
     max_batch_size = 4
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = (
+        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
+    ) * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
     def strip_candidate_action_tokens(batch, action_feature_name):
@@ -390,7 +394,7 @@ def run_ranking_gr_evaluate(
         _, eval_dataset = get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
-            max_sequence_length=dataset_args.max_sequence_length,
+            max_history_seqlen=dataset_args.max_history_seqlen,
             max_num_candidates=dataset_args.max_num_candidates,
             num_tasks=model.get_num_tasks(),
             batch_size=max_batch_size,
@@ -421,7 +425,7 @@ def run_ranking_gr_evaluate(
                     batch = strip_padding_batch(batch, user_ids.shape[0])
 
                 logits = model.forward(batch, user_ids, seq_startpos)
-                eval_module(logits, batch.labels)
+                eval_module(logits, batch.labels.values())
             except StopIteration:
                 break
 

@@ -13,16 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
-from typing import Iterator, List, Optional, Union, cast
+from typing import Iterator, List, Optional, cast
 
 import fbgemm_gpu  # pylint: disable-unused-import
 import torch
 from torch.utils.data.dataset import IterableDataset
 
-from .utils import Batch, FeatureConfig, RankingBatch, RetrievalBatch
+from .hstu_batch import FeatureConfig, HSTUBatch
 
 
-class DummySequenceDataset(IterableDataset[Batch]):
+class HSTURandomDataset(IterableDataset[HSTUBatch]):
     """
     A dummy sequence dataset for generating batches of data.
 
@@ -55,7 +55,7 @@ class DummySequenceDataset(IterableDataset[Batch]):
         self.num_batches: int = cast(
             int, num_batches if num_batches is not None else sys.maxsize
         )
-        self._cached_batched: List[Union[RankingBatch, RetrievalBatch]] = []
+        self._cached_batched: List[HSTUBatch] = []
         self._num_generated_batches = num_generated_batches
         kwargs = dict(
             batch_size=batch_size,
@@ -69,18 +69,18 @@ class DummySequenceDataset(IterableDataset[Batch]):
         for _ in range(self._num_generated_batches):
             if num_tasks > 0:
                 self._cached_batched.append(
-                    RankingBatch.random(num_tasks=num_tasks, **kwargs)
+                    HSTUBatch.random(num_tasks=num_tasks, **kwargs)
                 )
             else:
-                self._cached_batched.append(RetrievalBatch.random(**kwargs))
+                self._cached_batched.append(HSTUBatch.random(**kwargs))
         self._iloc = 0
 
-    def __iter__(self) -> Iterator[Union[RankingBatch, RetrievalBatch]]:
+    def __iter__(self) -> Iterator[HSTUBatch]:
         """
         Returns an iterator over the cached batches, cycling through them.
 
         Returns:
-            Union[RankingBatch, RetrievalBatch]: The next batch in the cycle.
+            HSTUBatch: The next batch in the cycle.
         """
         for _ in range(len(self)):
             yield self._cached_batched[self._iloc]

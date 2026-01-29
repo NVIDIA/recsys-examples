@@ -15,7 +15,7 @@
 import sys
 from typing import Dict, List, Optional, Tuple, Union
 
-import datasets
+import commons.datasets as datasets
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
 from commons.modules.embedding import ShardedEmbeddingConfig
@@ -224,7 +224,7 @@ def get_data_loader(
         "retrieval",
     ], f"task type should be ranking or retrieval not {task_type}"
     if isinstance(dataset_args, BenchmarkDatasetArgs):
-        from datasets.utils import FeatureConfig
+        from commons.datasets.hstu_batch import FeatureConfig
 
         assert (
             trainer_args.max_train_iters is not None
@@ -260,10 +260,10 @@ def get_data_loader(
             num_generated_batches=100,
             num_tasks=num_tasks,
         )
-        train_dataset = datasets.dummy_dataset.DummySequenceDataset(
+        train_dataset = datasets.hstu_random_dataset.HSTURandomDataset(
             batch_size=trainer_args.train_batch_size, **kwargs
         )
-        test_dataset = datasets.dummy_dataset.DummySequenceDataset(
+        test_dataset = datasets.hstu_random_dataset.HSTURandomDataset(
             batch_size=trainer_args.eval_batch_size, **kwargs
         )
     else:
@@ -271,10 +271,10 @@ def get_data_loader(
         (
             train_dataset,
             test_dataset,
-        ) = datasets.sequence_dataset.get_dataset(
+        ) = datasets.hstu_sequence_dataset.get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
-            max_sequence_length=dataset_args.max_sequence_length,
+            max_history_seqlen=dataset_args.max_history_seqlen,
             max_num_candidates=dataset_args.max_num_candidates,
             num_tasks=num_tasks,
             batch_size=trainer_args.train_batch_size,
@@ -331,7 +331,7 @@ def create_embedding_configs(
             for arg in embedding_args
         ]
     if isinstance(dataset_args, DatasetArgs):
-        from preprocessor import get_common_preprocessors
+        from commons.hstu_data_preprocessor import get_common_preprocessors
 
         common_preprocessors = get_common_preprocessors()
         dp = common_preprocessors[dataset_args.dataset_name]
@@ -393,12 +393,12 @@ def create_dynamic_optitons_dict(
     return dynamic_options_dict
 
 
-def get_dataset_and_embedding_args() -> (
-    Tuple[
-        Union[DatasetArgs, BenchmarkDatasetArgs],
-        List[Union[DynamicEmbeddingArgs, EmbeddingArgs]],
-    ]
-):
+def get_dataset_and_embedding_args(
+    caching: bool = False,
+) -> Tuple[
+    Union[DatasetArgs, BenchmarkDatasetArgs],
+    List[Union[DynamicEmbeddingArgs, EmbeddingArgs]],
+]:
     try:
         dataset_args = DatasetArgs()  # type: ignore[call-arg]
     except:
@@ -449,12 +449,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="video_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "kuairand-1k":
@@ -500,12 +502,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="video_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "kuairand-27k":
@@ -551,12 +555,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="video_id",
                 item_vocab_size_or_capacity=32038725,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "ml-1m":
@@ -596,12 +602,14 @@ def get_dataset_and_embedding_args() -> (
                 table_name="movie_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
+                caching=caching,
             ),
         ]
     elif dataset_args.dataset_name == "ml-20m":
@@ -617,7 +625,7 @@ def get_dataset_and_embedding_args() -> (
                 table_name="movie_id",
                 item_vocab_size_or_capacity=HASH_SIZE,
                 item_vocab_gpu_capacity_ratio=0.5,
-                caching=True,
+                caching=caching,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],

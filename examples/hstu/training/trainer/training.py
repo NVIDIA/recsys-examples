@@ -57,7 +57,6 @@ def evaluate(
             reporting_loss, (_, logits, labels, _) = pipeline.progress(
                 iterated_eval_loader
             )
-            # metric module forward
             stateful_metric_module(logits, labels)
         # compute will reset the states
         if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):

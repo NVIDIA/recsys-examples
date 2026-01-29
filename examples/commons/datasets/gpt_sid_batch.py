@@ -16,9 +16,29 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from megatron.core.packed_seq_params import PackedSeqParams
+from commons.sequence_batch.batch import BaseBatch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from torchrec.streamable import Pipelineable
+
+try:
+    from megatron.core.packed_seq_params import PackedSeqParams
+except ImportError:
+    # Define fallback PackedSeqParams if megatron is not available
+    @dataclass
+    class PackedSeqParams:  # type: ignore[no-redef]
+        """
+        parameters to TEDotProductAttention and fused rope kernels for the
+        `thd` (packed) sequence format
+        """
+
+        qkv_format: Optional[str] = None
+        cu_seqlens_q: Optional[torch.Tensor] = None
+        cu_seqlens_kv: Optional[torch.Tensor] = None
+        cu_seqlens_q_padded: Optional[torch.Tensor] = None
+        cu_seqlens_kv_padded: Optional[torch.Tensor] = None
+        max_seqlen_q: Optional[int] = None
+        max_seqlen_kv: Optional[int] = None
+        local_cp_size: Optional[int] = None
+        cp_group: Optional[torch.distributed.ProcessGroup] = None
 
 
 def to_packed_seq_params(
@@ -74,19 +94,23 @@ class FeatureConfig:
 
 
 @dataclass
-class GPTSIDBatch(Pipelineable):
-    # TODO: check if candidates are always dense.
-    features: KeyedJaggedTensor  # contextual features, user history features, candidate features
-    batch_size: int
-    feature_to_max_seqlen: Dict[str, int]
-    # currently we do not have contextual features.
-    contextual_feature_names: List[str] = field(default_factory=lambda: [])
+class GPTSIDBatch(BaseBatch):
+    """
+    SID-GR batch data structure, inheriting from BaseBatch for batch shuffler support.
+
+    This batch contains:
+    - History SID features (user behavior sequence)
+    - Candidate SID features (items to predict)
+    - Labels (for training)
+    """
+
+    # SID-GR specific fields
     raw_hist_sid_names: List[str] = field(
         default_factory=lambda: []
     )  # all those features compose history_feature_name, this is used for random generation
     raw_cand_sid_names: List[str] = field(
         default_factory=lambda: []
-    )  # all those features compose history_feature_name, this is used for random generation
+    )  # all those features compose candidate_feature_name, this is used for random generation
 
     history_feature_name: str = (
         "history_sequence"  # raw sid features are combined into this feature.
@@ -96,36 +120,6 @@ class GPTSIDBatch(Pipelineable):
     )
     _num_hierarchies: int = 4
     user_id: Optional[torch.Tensor] = None
-    labels: Optional[
-        torch.Tensor
-    ] = None  # For retrieval, candidates are labels! Inference batch does not have labels.
-
-    actual_batch_size: Optional[int] = None  # in case of padding
-
-    def to(self, device: torch.device, non_blocking: bool = True) -> "GPTSIDBatch":  # type: ignore
-        return GPTSIDBatch(
-            features=self.features.to(device=device, non_blocking=non_blocking),
-            batch_size=self.batch_size,
-            actual_batch_size=self.actual_batch_size,
-            feature_to_max_seqlen=self.feature_to_max_seqlen,
-            contextual_feature_names=self.contextual_feature_names,
-            raw_hist_sid_names=self.raw_hist_sid_names,
-            raw_cand_sid_names=self.raw_cand_sid_names,
-            labels=self.labels.to(device=device, non_blocking=non_blocking)
-            if self.labels is not None
-            else None,
-            history_feature_name=self.history_feature_name,
-            candidate_feature_name=self.candidate_feature_name,
-            _num_hierarchies=self._num_hierarchies,
-            user_id=self.user_id.to(device=device, non_blocking=non_blocking)
-            if self.user_id is not None
-            else None,
-        )
-
-    def record_stream(self, stream: torch.cuda.Stream):
-        self.features.record_stream(stream)
-        if self.labels is not None:
-            self.labels.record_stream(stream)
 
     def retain_candidate_hierarchies(
         self,
@@ -144,8 +138,24 @@ class GPTSIDBatch(Pipelineable):
             .view(-1, original_hierarchies)[:, :remained_hierarchies]
             .reshape(-1)
         )
+        labels = None
         if self.labels is not None:
-            labels = self.labels[:, :remained_hierarchies]
+            # labels is a KeyedJaggedTensor, take only the first remained_hierarchies for candidate labels
+            cand_labels = self.labels[self.candidate_feature_name]
+            cand_labels_values = (
+                cand_labels.values()
+                .view(-1, original_hierarchies)[:, :remained_hierarchies]
+                .reshape(-1)
+            )
+            cand_labels_lengths = cand_labels.lengths() - (
+                original_hierarchies - remained_hierarchies
+            )
+            # Build labels as KeyedJaggedTensor for candidate only.
+            labels = KeyedJaggedTensor.from_lengths_sync(
+                keys=[self.candidate_feature_name],
+                values=cand_labels_values,
+                lengths=cand_labels_lengths,
+            )
         history_jt = self.features[self.history_feature_name]
         history_lengths = history_jt.lengths()
         history_features = history_jt.values()
@@ -225,7 +235,6 @@ class GPTSIDBatch(Pipelineable):
                     seqlen,
                     feature_config.max_sequence_length,
                 )
-                # we use candidate
                 if key in raw_cand_sid_names:
                     sid_min_ids.append(min_item_ids[i])
 
@@ -272,10 +281,16 @@ class GPTSIDBatch(Pipelineable):
         )
 
         sid_min_ids = torch.tensor(sid_min_ids, device=device).unsqueeze(0)
-        #!! labels are the candidate sids but starting from 0.
-        labels = (
+        # labels are the candidate sids but starting from 0 -> we build a KeyedJaggedTensor for labels
+        # with keys ["label_0", "label_1", ...] for each hierarchy
+        cand_values = (
             features[combined_candidate_feature_name].values().view(-1, num_hierarchies)
             - sid_min_ids
+        )
+        labels = KeyedJaggedTensor.from_lengths_sync(
+            keys=["label"],
+            values=cand_values.reshape(-1),
+            lengths=features[combined_candidate_feature_name].lengths(),
         )
         return GPTSIDBatch(
             features=features,

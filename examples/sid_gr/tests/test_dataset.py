@@ -1,8 +1,9 @@
 import pytest
 import torch
+from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
+from commons.datasets.sid_sequence_dataset import SIDSequenceDataset
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
-from datasets.disk_sequence_dataset import DiskSequenceDataset
-from datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from tqdm import tqdm
 
 
@@ -80,6 +81,10 @@ def test_batch(batch_size):
         batch.features["cand_sids"].lengths().numel() == batch_size
     ), "candidate sids feature length should be 128"
 
+    assert isinstance(
+        batch.labels, KeyedJaggedTensor
+    ), "labels should be a KeyedJaggedTensor"
+
 
 @pytest.mark.parametrize("batch_size", [128, 256, 512])
 @pytest.mark.parametrize("max_history_length", [64, 128, 256])
@@ -90,7 +95,7 @@ def test_disk_sequence_dataset(
     max_candidate_length,
 ):
     num_hierarchies = 4
-    disk_sequence_dataset = DiskSequenceDataset(
+    disk_sequence_dataset = SIDSequenceDataset(
         raw_sequence_data_path="./tmp_data/amzn/beauty/training/22363.parquet",
         item_id_to_sid_mapping_tensor_path="./tmp_data/amzn/beauty/item-sid-mapping.pt",
         batch_size=batch_size,
@@ -122,7 +127,7 @@ def test_disk_sequence_dataset(
             ), f"length of {key} should be {batch_size}"
         if idx < len(disk_sequence_dataset) - 1 and max_candidate_length > 0:
             assert (
-                batch.labels.view(-1, num_hierarchies).shape[0] == batch_size
+                batch.labels.values().view(-1, num_hierarchies).shape[0] == batch_size
             ), f"labels should be {batch_size}"
         if max_candidate_length == 0:
             # labels are the history sids
@@ -132,7 +137,7 @@ def test_disk_sequence_dataset(
                 .view(-1, num_hierarchies)
             )
             prefix_to_remove = torch.arange(
-                batch_size + 1, device=batch.labels.device
+                batch_size + 1, device=batch.labels.values().device
             ).clamp(max=batch.actual_batch_size)
             _, shifted_history_sids = triton_split_2D_jagged(
                 history_sids,
@@ -142,24 +147,48 @@ def test_disk_sequence_dataset(
                 // num_hierarchies
                 - prefix_to_remove,
             )
-            labels = batch.labels.view(-1, num_hierarchies)
+            labels = batch.labels.values().view(-1, num_hierarchies)
             assert torch.all(labels == shifted_history_sids)
 
         if batch.actual_batch_size != batch_size:
-            if max_candidate_length == 1:
-                assert batch.labels.shape[0] == batch.actual_batch_size
-            else:
+            assert torch.all(batch.labels.lengths()[batch.actual_batch_size :] == 0)
+            assert torch.all(
+                batch.features[batch.history_feature_name].lengths()[
+                    batch.actual_batch_size :
+                ]
+                == 0
+            )
+            assert torch.all(
+                batch.features[batch.candidate_feature_name].lengths()[
+                    batch.actual_batch_size :
+                ]
+                == 0
+            )
+            if max_candidate_length == 0:
+                assert torch.all(
+                    batch.labels.lengths()[: batch.actual_batch_size]
+                    == batch.features[batch.history_feature_name].lengths()[
+                        : batch.actual_batch_size
+                    ]
+                    - num_hierarchies
+                )
                 assert (
-                    batch.labels.shape[0]
+                    batch.labels.offsets()[-1].item() // num_hierarchies
                     == history_sids.shape[0] - batch.actual_batch_size
                 )
+            else:
+                assert (
+                    batch.labels.values().numel()
+                    == batch.actual_batch_size * num_hierarchies * max_candidate_length
+                )
+            print(f"last incomplete batch size: {batch.actual_batch_size}")
 
 
 def test_sid_data_loader():
     rank = 0
     world_size = 1
     from configs.sid_gin_config_args import DatasetArgs, TrainerArgs
-    from datasets.sid_data_loader import get_train_and_test_data_loader
+    from training.trainer.utils import get_train_and_test_data_loader
 
     torch.distributed.init_process_group(
         backend="nccl", rank=rank, world_size=world_size
@@ -168,7 +197,7 @@ def test_sid_data_loader():
     dataset_args = DatasetArgs(
         dataset_name="amzn/beauty",
         max_history_length=128,
-        dataset_type_str="disk_sequence_dataset",
+        dataset_type_str="sid_sequence_dataset",
         sequence_features_training_data_path="./tmp_data/amzn/beauty/training/22363.parquet",
         sequence_features_testing_data_path="./tmp_data/amzn/beauty/testing/22363.parquet",
         item_to_sid_mapping_path="./tmp_data/amzn/beauty/item-sid-mapping.pt",
@@ -196,7 +225,7 @@ def test_sid_data_loader():
             ), f"length of {key} should be {dataset_args.train_batch_size}"
         if idx < len(train_loader) - 1:
             assert (
-                batch.labels.view(-1, dataset_args.num_hierarchies).shape[0]
+                batch.labels.values().view(-1, dataset_args.num_hierarchies).shape[0]
                 == trainer_args.train_batch_size
             ), f"labels should be {trainer_args.train_batch_size}"
 

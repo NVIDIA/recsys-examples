@@ -177,7 +177,7 @@ def test_forward_backward_verification(
     ]
     max_seqlens = [max(jt.lengths()) for jt in jt_list]
     max(max_seqlens)
-    from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+    from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 
     if num == 2:
         from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
@@ -290,7 +290,7 @@ def test_cudaop_vs_pytorch_benchmark(
         max_seqlens2 = [max(jt.lengths()) for jt in jt_list2]
     max_seqlen1 = max(max_seqlens)
     max_seqlen2 = max(max_seqlens2)
-    from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+    from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 
     for _ in range(20):
         if _ % 2 == 0:
@@ -477,7 +477,7 @@ def test_cudaop_vs_pytorch_benchmark(
 def test_different_type(batch_size, max_len, hidden_dim, dtype):
     jt1 = create_test_jagged_tensor(batch_size, max_len, hidden_dim, dtype=dtype)
     jt2 = create_test_jagged_tensor(batch_size, max_len, hidden_dim, dtype=dtype)
-    from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+    from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 
     result = jagged_2D_tensor_concat(
         [jt1.values(), jt2.values()], [jt1.offsets(), jt2.offsets()], [3, 4]
@@ -498,7 +498,7 @@ def test_different_type(batch_size, max_len, hidden_dim, dtype):
 def test_cudaop_vs_tritonop_benchmark(
     batch_size, max_len, hidden_dim, dtype=torch.float32
 ):
-    from ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
+    from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
     from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 
     # Set random seeds for reproducibility

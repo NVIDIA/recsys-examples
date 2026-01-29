@@ -72,6 +72,11 @@ class TrainerArgs:
     # - prefetch -> overlap [h2d, input dist, prefetch, fwd+bwd]
     pipeline_type: str = "native"  # none, native, prefetch
 
+    # batch shuffler control
+    # - True -> use balanced batch shuffler (e.g., HASTUBalancedBatchShuffler)
+    # - False -> use IdentityBalancedBatchShuffler (no load balancing)
+    enable_balanced_shuffler: bool = False
+
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
             self.max_train_iters = int(self.max_train_iters)
@@ -192,7 +197,7 @@ class DatasetArgs:
 
     Attributes:
         dataset_name (str): **Required**. Dataset name.
-        max_sequence_length (int): **Required**. Maximum sequence length.
+        max_history_seqlen (int): **Required**. Maximum history sequence length.
         dataset_path (Optional[str]): Path to dataset. Default: None.
         max_num_candidates (int): Maximum number of candidates. Default: 0.
         shuffle (bool): Whether to shuffle data. Default: False.
@@ -204,7 +209,7 @@ class DatasetArgs:
     """
 
     dataset_name: str
-    max_sequence_length: int
+    max_history_seqlen: int
     dataset_path: Optional[str] = None
     max_num_candidates: int = 0
     shuffle: bool = False

@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 import torch
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
-from .utils import Batch, FeatureConfig
+from .hstu_batch import FeatureConfig, HSTUBatch
 
 
 class RandomInferenceDataGenerator:
@@ -111,7 +111,7 @@ class RandomInferenceDataGenerator:
 
     def get_random_inference_batch(
         self, user_ids, truncate_start_positions
-    ) -> Optional[Batch]:
+    ) -> Optional[HSTUBatch]:
         batch_size = len(user_ids)
         if batch_size == 0:
             return None
@@ -184,7 +184,7 @@ class RandomInferenceDataGenerator:
             }
         )
 
-        return Batch(
+        return HSTUBatch(
             features=features,
             batch_size=batch_size,
             feature_to_max_seqlen=self._fea_name_to_max_seqlen,
