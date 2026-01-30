@@ -23,11 +23,13 @@ from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
 from ops.triton_ops.triton_layer_norm import triton_weighted_layer_norm_fwd
 from ops.triton_ops.triton_norm_mul_dropout import triton_layer_norm_mul_dropout_fwd
 
+from .debug.debug_paged_hstu_layer import (
+    dump,
+    dump_paged_hstu_forward_naive,
+)
+
 import numpy as np
 
-def init():
-    global dmp
-    dmp = False
 
 class PagedHSTUInferLayer(torch.nn.Module):
     """
@@ -256,6 +258,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
     ):
         pass
 
+    @dump("forward_naive", dump_paged_hstu_forward_naive)
     @torch.inference_mode()
     def forward_naive(
         self,
@@ -305,6 +308,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             )
 
             kv_cache_metadata.kv_onload_handle.wait_host(self.layer_idx)
+            kv_cache_metadata.kv_offload_handle.mark_ready(self.layer_idx)
             jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
                 query,
                 key,

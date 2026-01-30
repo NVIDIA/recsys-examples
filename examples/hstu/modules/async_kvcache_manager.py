@@ -6,8 +6,6 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from configs import KVCacheMetadata
 import os
 
-# def offload_callback(fut):
-#     torch.cuda.empty_cache()
 
 class AsyncHSTUKVCacheManager:
     def __init__(
@@ -23,10 +21,14 @@ class AsyncHSTUKVCacheManager:
         max_num_sequences,
         max_sequence_length,
         max_batch_size,
+        max_queued_offload_tokens,
+        num_onload_buffer_chunks = 1,
+        num_offload_buffer_chunks = 8,
+        num_memcpy_workers = 8,
+        enable_nvcomp = False,
     ):
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.onload_worker = ThreadPoolExecutor(max_workers=1)
-        # self.offload_worker = ThreadPoolExecutor(max_workers=4)
 
         self.num_layers = num_layers
         self.num_heads = num_kv_heads
@@ -53,17 +55,14 @@ class AsyncHSTUKVCacheManager:
             self.num_layers, self.num_heads, self.head_dim, self.page_size,
             self.num_primary_cache_pages, self.num_onload_buffer_pages,
             self.num_reserved_buffer_pages, self.chunk_size,
-            self.max_num_sequences, self.max_num_sequences, 
-            self.cache_table,
-            self.host_kv_mgr
+            self.max_num_sequences, self.max_num_sequences,
+            self.cache_table, self.host_kv_mgr,
+            max_queued_offload_tokens, num_onload_buffer_chunks, num_offload_buffer_chunks, num_memcpy_workers,
+            enable_nvcomp
         )
 
         self.static_page_ids_gpu_buffer = torch.empty([self.max_batch_size * self.max_num_pages_per_seq,], dtype=torch.int32).cuda()
         self.static_offload_page_ids_gpu_buffer = torch.empty([self.max_batch_size * self.max_num_pages_per_seq,], dtype=torch.int32).cuda()
-        # self.static_pinned_kv_buffer = torch.empty(
-        #     [self.num_layers, self.max_batch_size * self.max_num_pages_per_seq, 2, self.page_size, self.num_heads, self.head_dim],
-        #     dtype=torch.bfloat16, pin_memory=True
-        # )
         self.static_onload_handle = paged_kvcache_ops.KVOnloadHandle(self.num_layers)
 
         self.cache_table_list = [ self.cache_table[idx] for idx in range(self.num_layers) ]
@@ -79,9 +78,6 @@ class AsyncHSTUKVCacheManager:
     ):
         origin_cached_lengths = self.gpu_kvcache_mgr.get_total_cache_length(user_ids)
         new_tokens = sum([ total_history_lengths[idx] - origin_cached_lengths[idx] for idx in range(batch_size) ])
-        if new_tokens <= 0:
-            print(total_history_lengths)
-            print(origin_cached_lengths)
 
         offload_uids_buffer = torch.empty([batch_size,], dtype=torch.int64)
         metadata_host_buffer = torch.empty([batch_size * 7 + 7,], dtype=torch.int, pin_memory=True)
@@ -127,20 +123,13 @@ class AsyncHSTUKVCacheManager:
     def offload_kvcache(self, kvcache_metadata):
         num_offload_pages = len(kvcache_metadata.offload_page_ids)
         if num_offload_pages == 0:
+            kvcache_metadata.kv_offload_handle.set_no_offload()
             return None
         
-        kvcache_metadata.kv_offload_handle.record_ready()
-        
-        kvcache_metadata.gather_kv_gpu_buffer = torch.empty(
-            [self.num_layers * num_offload_pages, 2, self.page_size, self.num_heads, self.head_dim],
-            dtype = torch.bfloat16, device = torch.cuda.current_device(),
-        )
-
         self.gpu_kvcache_mgr.offload_kvcache(
             kvcache_metadata.kv_offload_handle,
             kvcache_metadata.offload_user_ids,
             kvcache_metadata.offload_page_ids,
-            kvcache_metadata.gather_kv_gpu_buffer,
             kvcache_metadata.new_offload_startpos,
             kvcache_metadata.new_offload_lengths,
         )
@@ -167,7 +156,7 @@ class AsyncHSTUKVCacheManager:
             new_history_nnz_cuda = metadata_gpu_buffer[batch_size * 4 + 2 : batch_size * 4 + 3],
             kv_cache_table = self.cache_table_list,
             kv_onload_handle = static_onload_handle,
-            kv_offload_handle = paged_kvcache_ops.KVOffloadHandle(),
+            kv_offload_handle = paged_kvcache_ops.KVOffloadHandle(self.num_layers, self.gpu_kvcache_mgr, int(metadata_host_buffer[batch_size * 7 + 5]) > 0),
             offload_user_ids = offload_uids_buffer[: metadata_host_buffer[batch_size * 7 + 6]],
             offload_page_ids = static_offload_page_ids_gpu_buffer[: int(metadata_host_buffer[batch_size * 7 + 5])].clone(),
             new_offload_startpos = metadata_host_buffer[batch_size * 5 + 4 : batch_size * 6 + 4],

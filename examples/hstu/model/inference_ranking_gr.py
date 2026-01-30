@@ -17,6 +17,7 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from configs import (
     InferenceHSTUConfig,
     KVCacheConfig,
@@ -164,7 +165,9 @@ class InferenceRankingGR(torch.nn.Module):
         self._jagged_metadata = get_jagged_metadata_buffer(
             max_batch_size, max_seq_len, hstu_config.contextual_max_seqlen
         )
-        
+
+        if kvcache_config.max_queued_offload_tokens is None:
+            kvcache_config.max_queued_offload_tokens = 4 * kvcache_config.max_batch_size * kvcache_config.max_seq_len
         self.async_kvcache = AsyncHSTUKVCacheManager(
             hstu_config.num_layers,
             hstu_config.num_heads,
@@ -172,11 +175,16 @@ class InferenceRankingGR(torch.nn.Module):
             kvcache_config.page_size,
             kvcache_config.blocks_in_primary_pool,
             math.ceil(kvcache_config.max_batch_size * kvcache_config.max_seq_len / kvcache_config.page_size),
-            4 * math.ceil(kvcache_config.max_batch_size * kvcache_config.max_seq_len / kvcache_config.page_size),
+            0,
             kvcache_config.offload_chunksize,
             -1,
             kvcache_config.max_seq_len,
             kvcache_config.max_batch_size,
+            kvcache_config.max_queued_offload_tokens,
+            kvcache_config.num_onload_buffer_chunks,
+            kvcache_config.num_offload_buffer_chunks,
+            kvcache_config.num_memcpy_workers,
+            kvcache_config.enable_nvcomp,
         )
 
         from ops.triton_ops.common import set_use_runtime_max_seq_len, set_static_max_seq_lens
@@ -225,10 +233,16 @@ class InferenceRankingGR(torch.nn.Module):
         )
 
         try:
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "0000"
+            dist.init_process_group(world_size=1, rank=0)
             for idx, table_name in enumerate(dynamic_tables.table_names):
                 dynamic_tables.load(
                     embedding_table_dir, optim=False, table_names=[table_name]
                 )
+            dist.destroy_process_group()
+            os.environ.pop("MASTER_ADDR")
+            os.environ.pop("MASTER_PORT")
         except ValueError as e:
             warnings.warn(
                 f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
@@ -308,226 +322,9 @@ class InferenceRankingGR(torch.nn.Module):
         if self._hstu_config.contextual_max_seqlen != 0:
             assert unloaded_modules.unexpected_keys == []
 
-    # def get_user_kvdata_info(
-    #     self,
-    #     user_ids: Union[List[int], torch.Tensor],
-    #     allow_bubble: bool = False,
-    #     dbg_print: bool = False,
-    # ) -> Tuple[torch.Tensor, torch.Tensor]:
-    #     kvdata_start_pos = list()
-    #     kvdata_lengths = list()
-    #     for idx in range(len(user_ids)):
-    #         uid = int(user_ids[idx])
-    #         host_sp, host_len = self._host_kv_storage_manager.get_user_kvdata_info(uid)
-    #         gpu_sp, gpu_len = self._gpu_kv_cache_manager.get_user_kvdata_info(uid)
-    #         sp = host_sp if gpu_sp == -1 or gpu_len == 0 else min(host_sp, gpu_sp)
-    #         length = (
-    #             host_len
-    #             if gpu_sp == -1 or gpu_len == 0
-    #             else (gpu_sp + gpu_len - host_sp)
-    #         )
-    #         if gpu_sp > host_sp + host_len and not allow_bubble:
-    #             warnings.warn(
-    #                 f"KVdata missing between host storage and gpu kvcache for user {uid}"
-    #             )
-    #             length = host_len
-    #         kvdata_start_pos.append(sp)
-    #         kvdata_lengths.append(length)
-    #     return (
-    #         torch.tensor(kvdata_start_pos, dtype=torch.int32),
-    #         torch.tensor(kvdata_lengths, dtype=torch.int32),
-    #     )
-
-    # def strip_contextual_features(self, embeddings, batch, user_start_pos):
-    #     if int(min(user_start_pos)) >= len(batch.contextual_feature_names):
-    #         embeddings = {
-    #             batch.item_feature_name: embeddings[batch.item_feature_name],
-    #             batch.action_feature_name: embeddings[batch.action_feature_name],
-    #         }
-    #         batch.contextual_feature_names = []
-    #         return embeddings, batch
-    #     elif int(max(user_start_pos)) < len(batch.contextual_feature_names):
-    #         return embeddings, batch
-    #     else:
-    #         raise Exception("Do not accept mixing contextual features input")
-
-    # def prepare_kv_cache(
-    #     self, batch: Batch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
-    # ) -> KVCacheMetadata:
-    #     batch_size = user_ids.shape[0]
-    #     new_history_lengths = (
-    #         torch.sum(batch.features.lengths().view(-1, batch_size), 0).view(-1)
-    #         - batch.num_candidates
-    #     )
-    #     (
-    #         cached_start_pos,
-    #         cached_lengths,
-    #     ) = self._gpu_kv_cache_manager.get_batch_kvdata_info(user_ids)
-
-    #     self._gpu_kv_cache_manager.allocate(
-    #         user_ids, user_start_pos, new_history_lengths
-    #     )
-    #     kv_cache_metadata = self._gpu_kv_cache_manager.get_cache_metadata(user_ids)
-    #     append_metadata = self._gpu_kv_cache_manager.get_append_metadata(
-    #         new_history_lengths, kv_cache_metadata.total_history_lengths
-    #     )
-    #     for _field_name in [
-    #         "batch_indices",
-    #         "position",
-    #         "new_history_nnz",
-    #         "new_history_nnz_cuda",
-    #     ]:
-    #         setattr(
-    #             kv_cache_metadata, _field_name, getattr(append_metadata, _field_name)
-    #         )
-
-    #     kv_cache_metadata.onload_history_kv_buffer = (
-    #         self._kvcache_metadata.onload_history_kv_buffer[:]
-    #     )
-    #     kv_cache_metadata.onload_history_kv_events = (
-    #         self._kvcache_metadata.onload_history_kv_events[:]
-    #     )
-    #     kv_cache_metadata.kv_cache_table = self._kvcache_metadata.kv_cache_table[:]
-    #     (
-    #         onload_length,
-    #         onload_kv_page_ids,
-    #         onload_kv_page_indptr,
-    #     ) = self._host_kv_storage_manager.lookup_kvdata(
-    #         user_ids, cached_start_pos, cached_lengths
-    #     )
-    #     if onload_length > 0:
-    #         kv_page_ids = triton_concat_2D_jagged(
-    #             max_seq_len=onload_kv_page_indptr[-1] + kv_cache_metadata.kv_indptr[-1],
-    #             values_a=onload_kv_page_ids.view(-1, 1),
-    #             values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-    #             offsets_a=onload_kv_page_indptr.to(torch.int64),
-    #             offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
-    #         )
-    #         kv_cache_metadata.kv_indices = kv_page_ids.view(-1)
-    #         kv_cache_metadata.kv_indptr = (
-    #             onload_kv_page_indptr + kv_cache_metadata.kv_indptr
-    #         )
-    #         self._gpu_kv_cache_manager.onload(
-    #             self._host_kv_storage_manager.get_lookup_buffer(),
-    #             onload_length,
-    #             self._kvcache_metadata if self.use_cudagraph else kv_cache_metadata,
-    #         )
-
-    #     # cudagraph preparation
-    #     if self.use_cudagraph:
-    #         copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
-    #     # assert max(kv_cache_metadata.kv_indices.tolist()) < self._kvcache_metadata.kv_cache_table[0].shape[0]
-
-    #     return kv_cache_metadata
-
-    # def finalize_kv_cache(self, user_ids: torch.Tensor, **kwargs):
-    #     pass
-
     def clear_kv_cache(self):
         self._gpu_kv_cache_manager.evict_all()
         self._host_kv_storage_manager.evict_all_kvdata()
-
-    # def offload_kv_cache(
-    #     self, user_ids: torch.Tensor, kvcache_metadata: KVCacheMetadata
-    # ):
-    #     offload_results = self.offload_kv_cache_async(user_ids, kvcache_metadata)
-    #     if offload_results is not None:
-    #         self.offload_kv_cache_wait(offload_results)
-
-    # def offload_kv_cache_async(
-    #     self, user_ids: torch.Tensor, kvcache_metadata: KVCacheMetadata
-    # ):
-    #     host_kvdata_start_pos, host_kvdata_lengths = zip(
-    #         *[
-    #             self._host_kv_storage_manager.get_user_kvdata_info(int(user_ids[idx]))
-    #             for idx in range(len(user_ids))
-    #         ]
-    #     )
-    #     host_kvdata_start_pos = torch.tensor(host_kvdata_start_pos, dtype=torch.int32)
-    #     host_kvdata_lengths = torch.tensor(host_kvdata_lengths, dtype=torch.int32)
-
-    #     offload_results = self._gpu_kv_cache_manager.offload_async(
-    #         user_ids, host_kvdata_start_pos, host_kvdata_lengths, kvcache_metadata
-    #     )
-    #     return offload_results
-
-    # def offload_kv_cache_wait(
-    #     self,
-    #     offload_results: Optional[
-    #         Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]
-    #     ],
-    # ):
-    #     if offload_results is not None:
-    #         self._gpu_kv_cache_manager.offload_wait()
-    #         self._host_kv_storage_manager.append_kvdata(*offload_results)
-
-    # def forward(
-    #     self,
-    #     batch: Batch,
-    #     user_ids: torch.Tensor,
-    #     user_start_pos: torch.Tensor,
-    # ):
-    #     with torch.inference_mode():
-    #         user_start_pos_cuda = user_start_pos.to(
-    #             device=torch.cuda.current_device(), non_blocking=True
-    #         )
-    #         kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
-    #         embeddings = self._embedding_collection(batch.features)
-    #         embeddings, batch = self.strip_contextual_features(
-    #             embeddings, batch, user_start_pos
-    #         )
-    #         jagged_data = self._hstu_block._preprocessor(
-    #             embeddings=embeddings,
-    #             batch=batch,
-    #             seq_start_position=user_start_pos_cuda,
-    #         )
-
-    #         num_tokens = batch.features.values().shape[0]
-    #         if self.use_cudagraph:
-    #             self._hidden_states[:num_tokens, ...].copy_(
-    #                 jagged_data.values, non_blocking=True
-    #             )
-    #             copy_jagged_metadata(self._jagged_metadata, jagged_data)
-    #             self._kvcache_metadata.total_history_offsets += (
-    #                 self._jagged_metadata.num_candidates_offsets
-    #             )
-    #             # self.offload_kv_cache_wait(self._offload_states)
-
-    #             hstu_output = self._hstu_block.predict(
-    #                 batch.batch_size,
-    #                 num_tokens,
-    #                 self._hidden_states,
-    #                 self._jagged_metadata,
-    #                 self._kvcache_metadata,
-    #             )
-    #             jagged_data.values = hstu_output
-    #         else:
-    #             kvcache_metadata.total_history_offsets += (
-    #                 jagged_data.num_candidates_offsets
-    #             )
-    #             # self.offload_kv_cache_wait(self._offload_states)
-    #             hstu_output = self._hstu_block.predict(
-    #                 batch.batch_size,
-    #                 num_tokens,
-    #                 jagged_data.values,
-    #                 jagged_data,
-    #                 kvcache_metadata,
-    #             )
-    #             jagged_data.values = hstu_output
-
-    #         self._gpu_kv_cache_manager._offload_start_event.record(
-    #             torch.cuda.current_stream()
-    #         )
-
-    #         jagged_data = self._hstu_block._postprocessor(jagged_data)
-    #         jagged_item_logit = self._mlp(jagged_data.values)
-    #         self._offload_states = self.offload_kv_cache_async(
-    #             user_ids, kvcache_metadata
-    #         )
-    #         self.offload_kv_cache_wait(self._offload_states)
-    #         self.finalize_kv_cache(user_ids)
-
-    #     return jagged_item_logit
 
     def forward(
         self,
@@ -536,7 +333,6 @@ class InferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            # print("[DEBUG] total_history_lengths", total_history_lengths)
             user_ids_list = user_ids.tolist()
 
             prepare_kvcache_result = self.async_kvcache.prepare_kvcache_async(
@@ -547,7 +343,6 @@ class InferenceRankingGR(torch.nn.Module):
                 self.async_kvcache.static_offload_page_ids_gpu_buffer,
                 self.async_kvcache.static_onload_handle,
             )
-            # print("[DEBUG] return from trigger\n", flush=True)
 
             (
                 old_cached_lengths,
@@ -558,14 +353,16 @@ class InferenceRankingGR(torch.nn.Module):
                 kvcache_metadata_fut,
                 onload_fut,
             ) = prepare_kvcache_result
-            # print("[DEBUG] old_cached_lengths", old_cached_lengths)
             old_cached_lengths = torch.tensor(old_cached_lengths, dtype=torch.int32)
 
             striped_batch = self.async_kvcache.strip_cached_tokens(
                 batch, old_cached_lengths,
             )
 
+            torch.cuda.nvtx.range_push("HSTU embedding")
             embeddings = self._embedding_collection(striped_batch.features)
+            torch.cuda.nvtx.range_pop()
+
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=striped_batch,
@@ -584,40 +381,11 @@ class InferenceRankingGR(torch.nn.Module):
                 metadata_gpu_buffer,
                 self.async_kvcache.static_onload_handle,
             )
-
-            # print("[DEBUG] kv_indices", kvcache_metadata.kv_indices)
-            # print("[DEBUG] kv_indptr", kvcache_metadata.kv_indptr)
-            # print("[DEBUG] kv_last_page_len", kvcache_metadata.kv_last_page_len)
-            # print("[DEBUG] total_history_lengths", kvcache_metadata.total_history_lengths)
-            # print("[DEBUG] total_history_offsets", kvcache_metadata.total_history_offsets)
-            # print("[DEBUG] seqlen", jagged_data.seqlen)
-            # print("[DEBUG] seqlen_offsets", jagged_data.seqlen_offsets)
-            # print("[DEBUG] num_candidates_offsets", jagged_data.num_candidates_offsets)
-            # print("[DEBUG] >>> ", kvcache_metadata.batch_indices.shape)
-
-            # print("[DEBUG] batch_indices", kvcache_metadata.batch_indices)
-            # print("[DEBUG] position", kvcache_metadata.position)
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[:154])
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[154:154*2])
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*2:154*3])
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*3:154*4])
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*4:154*5])
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*5:154*6])
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*6:154*7])
-            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*7:154*8])
-            # print("[DEBUG] >>> ", kvcache_metadata.position.shape)
-            # print("[DEBUG] new_history_nnz", kvcache_metadata.new_history_nnz)
-            # print("[DEBUG] new_history_nnz_cuda", kvcache_metadata.new_history_nnz_cuda)
-
-            # print("kvcache_metadata.offload_user_ids", kvcache_metadata.offload_user_ids)
-            # print("kvcache_metadata.offload_page_ids", kvcache_metadata.offload_page_ids.shape)
+            self.async_kvcache.offload_kvcache(kvcache_metadata)
 
             kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
             kvcache_metadata.total_history_lengths += jagged_data.num_candidates
             kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
-
-            # print("[DEBUG] <<<V2>>> total_history_offsets", kvcache_metadata.total_history_offsets)
-            # input()
 
             num_tokens = striped_batch.features.values().shape[0]
             hstu_output = self._hstu_block.predict(
@@ -628,8 +396,6 @@ class InferenceRankingGR(torch.nn.Module):
                 kvcache_metadata,
             )
             jagged_data.values = hstu_output
-
-            self.async_kvcache.offload_kvcache(kvcache_metadata)
 
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)

@@ -105,6 +105,11 @@ class KVCacheConfig:
         max_batch_size (int): The maximum batch size for the inference input.
         max_seq_len (int): The upper bound of sequence length for each sequence in the inference batch.
         max_attention_window (int): (Optional) The maximum window size for HSTU attention calculation.
+        max_queued_offload_tokens (int): (Optional) The maximum number of tokens queued to be offloaded.
+        num_onload_buffer_chunks (int): (Default 1) The number of chunks as onloading device buffer.
+        num_offload_buffer_chunks (int): (Default 8) The number of chunks as offloading device buffer.
+        num_memcpy_workers (int): (Default 4) The number of workers memory copying in onload/offload.
+        enable_nvcomp (bool): (Default False) Enable ANS compression in KVCache offloading.
     """
 
     blocks_in_primary_pool: int
@@ -113,6 +118,11 @@ class KVCacheConfig:
     max_batch_size: int
     max_seq_len: int
     max_attention_window: Optional[int] = None
+    max_queued_offload_tokens: Optional[int] = None
+    num_onload_buffer_chunks: int = 1
+    num_offload_buffer_chunks: int = 8
+    num_memcpy_workers: int = 4
+    enable_nvcomp: bool = False
 
 
 def get_kvcache_config(
