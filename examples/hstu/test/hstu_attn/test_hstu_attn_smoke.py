@@ -5,6 +5,7 @@ from commons.utils.hstu_assert_close import assert_hstu_close
 from hopper.hstu_attn_interface import hstu_attn_varlen_func as hopper_attn_func
 from hstu_attn import hstu_attn_varlen_func as ampere_attn_func
 from ops.pt_ops.pt_hstu_attention import pytorch_hstu_mha as pytorch_hstu_mha
+from ops.triton_ops.triton_hstu_attention import triton_hstu_mha as triton_hstu_mha
 
 
 def get_arch_sm():
@@ -29,7 +30,7 @@ def preprocess_input(input_tensor):
 @pytest.mark.parametrize("head_dim", [32])
 @pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("max_num_targets", [10])
-@pytest.mark.parametrize("max_num_contextuals", [4])
+@pytest.mark.parametrize("max_num_contextuals", [0, 4])
 def test_hstn_fwd_bwd(
     batchsize,
     max_seqlen,
@@ -46,7 +47,6 @@ def test_hstn_fwd_bwd(
     else:
         raise ValueError(f"Unsupported SM major version: {arch_sm}")
     device = torch.device("cuda")
-    max_seqlen = torch.randint(10, 100, (1,)).item()
     lengths = torch.randint(
         low=2,
         high=max_seqlen + 1,
@@ -168,6 +168,151 @@ def test_hstn_fwd_bwd(
     torch.cuda.synchronize()
 
     print(f"sm {arch_sm} bwd pass")
+
+    assert_hstu_close(q.grad, ref_q.grad, ref_q_fp32.grad, fwd=False)
+    assert_hstu_close(k.grad, ref_k.grad, ref_k_fp32.grad, fwd=False)
+    assert_hstu_close(v.grad, ref_v.grad, ref_v_fp32.grad, fwd=False)
+
+
+@pytest.mark.parametrize("batchsize", [32])
+@pytest.mark.parametrize("max_seqlen", [200])
+@pytest.mark.parametrize("head_dim", [32, 64])
+@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("max_num_targets", [10])
+@pytest.mark.parametrize("contextual_seq_len", [0, 4])
+def test_triton_hstu_fwd_bwd(
+    batchsize,
+    max_seqlen,
+    head_dim,
+    num_heads,
+    max_num_targets,
+    contextual_seq_len,
+):
+    """
+    Test Triton version of HSTU attention against PyTorch reference implementation.
+    """
+    device = torch.device("cuda")
+    lengths = torch.randint(
+        low=2,
+        high=max_seqlen + 1,
+        size=(batchsize,),
+        device=device,
+        dtype=torch.int,
+    )
+    num_targets = torch.randint(
+        low=0,
+        high=max_num_targets + 1,
+        size=(batchsize,),
+        device=device,
+        dtype=torch.int32,
+    )
+    num_targets = torch.clamp(
+        num_targets, max=lengths - 1, min=torch.zeros_like(num_targets)
+    )  # at least 1 history
+
+    # For triton version, contextual_seq_len is a scalar (same for all batches)
+    # Ensure lengths are large enough to accommodate contextual_seq_len
+    if contextual_seq_len > 0:
+        lengths = torch.clamp(lengths, min=contextual_seq_len + 1)
+        num_targets = torch.clamp(
+            num_targets,
+            max=lengths - contextual_seq_len - 1,
+            min=torch.zeros_like(num_targets),
+        )
+
+    seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+    L = int(seq_offsets[-1].item())
+    N = int(lengths.max().item())
+
+    x = (
+        torch.empty(
+            (L, num_heads * head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        .uniform_(-0.1, 0.1)
+        .requires_grad_(False)
+    )
+
+    q, k, v = preprocess_input(x)
+
+    q = q.view(-1, num_heads, head_dim)
+    k = k.view(-1, num_heads, head_dim)
+    v = v.view(-1, num_heads, head_dim)
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+
+    alpha = 1.0 / (head_dim**0.5)
+
+    # Triton HSTU attention
+    out = triton_hstu_mha(
+        N=N,
+        alpha=alpha,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=seq_offsets,
+        causal=True,
+        num_targets=num_targets,
+        max_attn_len=0,
+        contextual_seq_len=contextual_seq_len,
+        sort_by_length=False,
+        scaling_seqlen=max_seqlen,
+    )
+
+    # PyTorch reference (bf16)
+    ref_q = q.detach().clone().requires_grad_(True)
+    ref_k = k.detach().clone().requires_grad_(True)
+    ref_v = v.detach().clone().requires_grad_(True)
+    ref_out = pytorch_hstu_mha(
+        max_seq_len=max_seqlen,
+        alpha=alpha,
+        q=ref_q,
+        k=ref_k,
+        v=ref_v,
+        seq_offsets=seq_offsets,
+        num_contextuals=contextual_seq_len,
+        num_targets=num_targets,
+        causal=True,
+        dropout_pr=0.0,
+        training=True,
+        target_group_size=1,
+        scaling_seqlen=max_seqlen,
+    )
+
+    # PyTorch reference (fp32 for higher precision comparison)
+    ref_q_fp32 = ref_q.detach().clone().float().requires_grad_(True)
+    ref_k_fp32 = ref_k.detach().clone().float().requires_grad_(True)
+    ref_v_fp32 = ref_v.detach().clone().float().requires_grad_(True)
+    ref_out_fp32 = pytorch_hstu_mha(
+        max_seq_len=max_seqlen,
+        alpha=alpha,
+        q=ref_q_fp32,
+        k=ref_k_fp32,
+        v=ref_v_fp32,
+        seq_offsets=seq_offsets,
+        num_contextuals=contextual_seq_len,
+        num_targets=num_targets,
+        causal=True,
+        dropout_pr=0.0,
+        training=True,
+        target_group_size=1,
+        scaling_seqlen=max_seqlen,
+    )
+
+    torch.cuda.synchronize()
+    assert_hstu_close(out, ref_out, ref_out_fp32, fwd=True)
+    print(f"Triton HSTU fwd pass (contextual_seq_len={contextual_seq_len})")
+
+    # Backward pass
+    dout = torch.rand_like(out)
+    out.backward(dout)
+    ref_out.backward(dout)
+    ref_out_fp32.backward(dout.float())
+    torch.cuda.synchronize()
+
+    print(f"Triton HSTU bwd pass (contextual_seq_len={contextual_seq_len})")
 
     assert_hstu_close(q.grad, ref_q.grad, ref_q_fp32.grad, fwd=False)
     assert_hstu_close(k.grad, ref_k.grad, ref_k_fp32.grad, fwd=False)

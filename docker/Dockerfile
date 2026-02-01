@@ -36,6 +36,7 @@ RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
     fi
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers
+RUN pip install triton==3.6.0
 
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
   git clone --recursive -b v1.2.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
