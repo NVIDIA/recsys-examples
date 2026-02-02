@@ -59,11 +59,16 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
+WORKDIR /workspace/recsys-examples
+COPY . .
+
 RUN cd /workspace/recsys-examples/corelib/hstu && \
     HSTU_DISABLE_86OR89=FALSE HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
     cd hopper && \
     HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=FALSE HSTU_DISABLE_DRAB=TRUE pip install .
-    
+
+RUN rm -rf /workspace/recsys-examples/*
+
 FROM ${DEVEL_IMAGE} AS build
 ARG TRITONSERVER_BUILD
 
