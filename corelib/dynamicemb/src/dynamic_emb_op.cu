@@ -1134,7 +1134,6 @@ template <typename IndexT, typename ValueT>
 __global__ void select_insert_failed_values_kernel_vec4(
     int64_t batch, int64_t stride, ValueT const *__restrict__ in_v_ptr,
     ValueT *__restrict__ out_v_ptr,
-    InsertResult const *__restrict__ insert_results,
     IndexT *__restrict__ indices) {
 
   constexpr int kWarpSize = 32;
@@ -1144,15 +1143,15 @@ __global__ void select_insert_failed_values_kernel_vec4(
   const int lane_id = threadIdx.x % kWarpSize;
 
   Vec4T<ValueT> emb;
-  for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
-       emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
-    InsertResult insert_result = insert_results[emb_id];
-    if (insert_result != InsertResult::Busy) {
+  for (int64_t dst_idx = warp_num_per_block * blockIdx.x + warp_id_in_block;
+       dst_idx < batch; dst_idx += gridDim.x * warp_num_per_block) {
+    IndexT in_idx = indices[dst_idx];
+    if (in_idx >= 0) {
       continue;
     }
-    IndexT out_idx = indices[emb_id];
-    ValueT *dst = out_v_ptr + out_idx * stride;
-    ValueT const *src = in_v_ptr + emb_id * stride;
+    IndexT in_idx_pos = -in_idx - 1;
+    ValueT *dst = out_v_ptr + dst_idx * stride;
+    ValueT const *src = in_v_ptr + in_idx_pos * stride;
 
     for (int i = 0; VecSize * (kWarpSize * i + lane_id) < stride; ++i) {
       int idx4 = VecSize * (kWarpSize * i + lane_id);
@@ -1161,7 +1160,7 @@ __global__ void select_insert_failed_values_kernel_vec4(
     }
 
     if (lane_id == 0) {
-      indices[emb_id] = -1;
+      indices[dst_idx] = -1;
     }
   }
 }
@@ -1170,33 +1169,32 @@ template <typename IndexT, typename ValueT>
 __global__ void select_insert_failed_values_kernel(
     int64_t batch, int64_t stride, ValueT const *__restrict__ in_v_ptr,
     ValueT *__restrict__ out_v_ptr,
-    InsertResult const *__restrict__ insert_results,
     IndexT *__restrict__ indices) {
 
-  for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
+  for (int64_t dst_idx = blockIdx.x; dst_idx < batch; dst_idx += gridDim.x) {
 
-    InsertResult insert_result = insert_results[emb_id];
-    if (insert_result != InsertResult::Busy) {
+    IndexT in_idx = indices[dst_idx];
+    if (in_idx >= 0) {
       continue;
     }
-    IndexT out_idx = indices[emb_id];
-    ValueT *dst = out_v_ptr + out_idx * stride;
-    ValueT const *src = in_v_ptr + emb_id * stride;
+    IndexT in_idx_pos = -in_idx - 1;
+    ValueT *dst = out_v_ptr + dst_idx * stride;
+    ValueT const *src = in_v_ptr + in_idx_pos * stride;
 
     for (int i = threadIdx.x; i < stride; i += blockDim.x) {
       dst[i] = src[i];
     }
 
     if (threadIdx.x == 0) {
-      indices[emb_id] = -1;
+      indices[dst_idx] = -1;
     }
   }
 }
 
-void select_insert_failed_values(at::Tensor insert_results, at::Tensor indices,
+void select_insert_failed_values(at::Tensor indices,
                                  at::Tensor input_values,
                                  at::Tensor evictd_values) {
-  int64_t num_total = insert_results.numel();
+  int64_t num_total = indices.numel();
   if (num_total == 0) {
     return;
   }
@@ -1229,13 +1227,12 @@ void select_insert_failed_values(at::Tensor insert_results, at::Tensor indices,
     DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
       auto in_v_ptr = get_pointer<ValueType>(input_values);
       auto out_v_ptr = get_pointer<ValueType>(evictd_values);
-      auto insert_results_ptr = get_pointer<InsertResult>(insert_results);
       auto index_ptr = get_pointer<IndexType>(indices);
 
       if (dim % 4 == 0) {
         select_insert_failed_values_kernel_vec4<IndexType, ValueType>
             <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
-                num_total, dim, in_v_ptr, out_v_ptr, insert_results_ptr,
+                num_total, dim, in_v_ptr, out_v_ptr,
                 index_ptr);
       } else {
         int block_size = dim < device_prop.max_thread_per_block
@@ -1244,7 +1241,7 @@ void select_insert_failed_values(at::Tensor insert_results, at::Tensor indices,
         int grid_size = num_total;
         select_insert_failed_values_kernel<IndexType, ValueType>
             <<<grid_size, block_size, 0, stream>>>(
-                num_total, dim, in_v_ptr, out_v_ptr, insert_results_ptr,
+                num_total, dim, in_v_ptr, out_v_ptr,
                 index_ptr);
       }
     });
@@ -1486,6 +1483,5 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("indices"), py::arg("input"));
 
   m.def("select_insert_failed_values", &select_insert_failed_values,
-        "select_insert_failed_values", py::arg("insert_results"),
-        py::arg("indices"), py::arg("input_values"), py::arg("evicted_values"));
+        "select_insert_failed_values", py::arg("indices"), py::arg("input_values"), py::arg("evicted_values"));
 }

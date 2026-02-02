@@ -1792,7 +1792,6 @@ class DynamicEmbeddingTable(KeyValueTable):
         self.expand()
 
         batch = keys.numel()
-        evicted_values: torch.Tensor = torch.empty_like(values)
 
         if self._use_score and scores is None:
             scores = torch.empty(batch, device=keys.device, dtype=torch.uint64)
@@ -1811,37 +1810,25 @@ class DynamicEmbeddingTable(KeyValueTable):
             batch, dtype=self.key_index_map.index_type, device=keys.device
         )
 
-        insert_results = torch.empty(batch, dtype=torch.uint8, device=keys.device)
-
         (
             num_evicted,
             evicted_keys,
             evicted_indices,
             evicted_scores,
-        ) = self.key_index_map.insert_and_evict(
-            keys, score_args_insert, indices, insert_results
-        )
+        ) = self.key_index_map.insert_and_evict(keys, score_args_insert, indices)
         evicted_scores = evicted_scores[0]
-
-        select_insert_failed_values(
-            insert_results, indices, values.to(self.value_type()), evicted_values
+        evicted_values: torch.Tensor = torch.empty(
+            num_evicted, values.size(1), device=values.device, dtype=self.value_type()
         )
 
-        # insert_busy_mask = insert_results == InsertResult.BUSY.value
-        # if insert_busy_mask.sum().item() != 0:
-        #     out_indices = indices[insert_busy_mask]
-        #     evicted_values[out_indices, :] = values.to(self.value_type())[
-        #         insert_busy_mask
-        #     ]
-        #     indices[insert_busy_mask] = -1
+        select_insert_failed_values(evicted_indices, values, evicted_values)
 
         load_from_combined_table(
             self.dev_table,
             self.uvm_table,
             evicted_indices,
-            evicted_values[:num_evicted, :],
+            evicted_values,
         )
-
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, values.to(self.value_type())
         )
@@ -1852,7 +1839,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         return (
             num_evicted,
             evicted_keys,
-            evicted_values[:num_evicted, :],
+            evicted_values,
             evicted_scores,
         )
 
@@ -2063,11 +2050,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         num_iter = keys_t.size(0)
         for i in range(num_iter):
             valid_mask = keys_t[i] != -1
-            valid_batch = valid_mask.sum().item()
             valid_keys = keys_t[i][valid_mask].contiguous()
-            insert_results = torch.empty(
-                valid_batch, dtype=torch.uint8, device=keys_t[i].device
-            )
             score_args_insert = [
                 ScoreArg(
                     name=self.score_policy.name,
@@ -2081,9 +2064,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             ]
 
             # self.key_index_map.insert(keys_t[i], score_args_insert)
-            self.key_index_map.insert(
-                valid_keys, score_args_insert, None, insert_results
-            )
+            self.key_index_map.insert(valid_keys, score_args_insert, None)
 
         # 4. lookup the indices in unique_keys' order and store the values.
         score_args_lookup = [
@@ -2166,11 +2147,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         num_iter = keys_t.size(0)
         for i in range(num_iter):
             valid_mask = keys_t[i] != -1
-            valid_batch = valid_mask.sum().item()
             valid_keys = keys_t[i][valid_mask].contiguous()
-            insert_results = torch.empty(
-                valid_batch, dtype=torch.uint8, device=keys_t[i].device
-            )
             score_args_insert = [
                 ScoreArg(
                     name=self.score_policy.name,
@@ -2188,9 +2165,7 @@ class DynamicEmbeddingTable(KeyValueTable):
                 evicted_keys,
                 evicted_indices,
                 evicted_scores,
-            ) = self.key_index_map.insert_and_evict(
-                valid_keys, score_args_insert, None, insert_results
-            )
+            ) = self.key_index_map.insert_and_evict(valid_keys, score_args_insert, None)
             evicted_scores = evicted_scores[0]
 
             if num_evicted != 0:
