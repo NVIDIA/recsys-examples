@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "check.h"
 #include "index_calculation.h"
+#include "unique_op.h"
 #include "utils.h"
 #include <cuda/std/tuple>
 #include <iostream>
@@ -358,20 +359,11 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique(
     at::Tensor keys, at::Tensor segment_range,
-    std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
     const c10::optional<EvictStrategy> evict_strategy = c10::nullopt,
     const c10::optional<at::Tensor> frequency_counts_uint64 = c10::nullopt) {
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   int64_t num_total = keys.size(0);
-  size_t unique_op_capacity = unique_op->get_capacity();
-  if (num_total * 2 > unique_op_capacity) {
-    at::Tensor new_keys = at::empty({num_total * 2}, keys.options());
-    at::Tensor new_vals =
-        at::empty({num_total * 2},
-                  at::TensorOptions().dtype(at::kLong).device(keys.device()));
-    unique_op->reset_capacity(new_keys, new_vals, num_total * 2, stream);
-  }
 
   at::Tensor h_segment_range =
       at::empty(segment_range.sizes(),
@@ -440,22 +432,30 @@ segmented_unique(
             0, indices_begin, indices_end);
         tmp_frequency_output_slice =
             shared_frequency_buffer.slice(0, indices_begin, indices_end);
-        unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
-                          tmp_unique_buffer_slice, tmp_d_unique_num, stream,
-                          previous_d_unique_num, tmp_frequency_output_slice,
-                          tmp_frequency_counts_uint64);
       } else if (need_frequency_output) {
         tmp_frequency_output_slice =
             shared_frequency_buffer.slice(0, indices_begin, indices_end);
-        unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
-                          tmp_unique_buffer_slice, tmp_d_unique_num, stream,
-                          previous_d_unique_num, tmp_frequency_output_slice);
-      } else {
-        // Non-LFU mode: call unique without frequency counting
-        unique_op->unique(tmp_indices, indices_length, tmp_inverse_idx,
-                          tmp_unique_buffer_slice, tmp_d_unique_num, stream,
-                          previous_d_unique_num);
       }
+
+      // Call the stateless unique_cuda function (uses current stream)
+      auto [unique_keys_seg, output_indices_seg, num_unique_seg] =
+          dyn_emb::unique_cuda(tmp_indices,
+                               tmp_frequency_output_slice,
+                               tmp_frequency_counts_uint64);
+
+      // Add cumulative offset to output indices and store in inverse_idx
+      // previous_d_unique_num.select(0, 0) = d_unique_indices_table_range[i] (on device)
+      at::add_out(tmp_inverse_idx, output_indices_seg, previous_d_unique_num.select(0, 0));
+
+      // Copy unique keys to output buffer
+      cudaMemcpyAsync(tmp_unique_buffer_slice.data_ptr(),
+                      unique_keys_seg.data_ptr(),
+                      unique_keys_seg.numel() * unique_keys_seg.element_size(),
+                      cudaMemcpyDeviceToDevice, stream);
+
+      // Copy unique count
+      cudaMemcpyAsync(tmp_d_unique_num.data_ptr(), num_unique_seg.data_ptr(),
+                      sizeof(int64_t), cudaMemcpyDeviceToDevice, stream);
 
       dyn_emb::add_offset(d_unique_nums.data_ptr(),
                           d_unique_indices_table_range.data_ptr(), i,
@@ -525,11 +525,11 @@ void select(at::Tensor flags, at::Tensor inputs, at::Tensor outputs,
 
   if (num_total == 0) {
     DISPATCH_INTEGER_DATATYPE_FUNCTION(
-      num_select_iter_type, NumSelectedIteratorT, [&] {
-        DEMB_CUDA_CHECK(cudaMemsetAsync(
-          reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()), 0,
-          sizeof(NumSelectedIteratorT), stream));
-    });
+        num_select_iter_type, NumSelectedIteratorT, [&] {
+          DEMB_CUDA_CHECK(cudaMemsetAsync(
+              reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()),
+              0, sizeof(NumSelectedIteratorT), stream));
+        });
     return;
   }
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
@@ -556,11 +556,11 @@ void select_index(at::Tensor flags, at::Tensor output_indices,
 
   if (num_total == 0) {
     DISPATCH_INTEGER_DATATYPE_FUNCTION(
-      num_select_iter_type, NumSelectedIteratorT, [&] {
-        DEMB_CUDA_CHECK(cudaMemsetAsync(
-          reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()), 0,
-          sizeof(NumSelectedIteratorT), stream));
-    });
+        num_select_iter_type, NumSelectedIteratorT, [&] {
+          DEMB_CUDA_CHECK(cudaMemsetAsync(
+              reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()),
+              0, sizeof(NumSelectedIteratorT), stream));
+        });
     return;
   }
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
@@ -585,8 +585,8 @@ void bind_index_calculation_op(py::module &m) {
   m.def("segmented_unique", &dyn_emb::segmented_unique,
         "Dose segmented unique operation on keys with segment_range, return "
         "tuple<unique_keys, inverse, unique_keys_table_range, "
-        "h_unique_keys_table_range>",
-        py::arg("keys"), py::arg("segment_range"), py::arg("unique_op"),
+        "h_unique_keys_table_range, output_scores>",
+        py::arg("keys"), py::arg("segment_range"),
         py::arg("evict_strategy") = c10::nullopt,
         py::arg("frequency_counts_uint64") = c10::nullopt);
 

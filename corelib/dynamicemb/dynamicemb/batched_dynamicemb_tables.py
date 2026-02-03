@@ -38,7 +38,6 @@ from dynamicemb.key_value_table import (
     Storage,
 )
 from dynamicemb.optimizer import *
-from dynamicemb.unique_op import UniqueOp
 from dynamicemb.utils import tabulate
 from dynamicemb_extensions import DynamicEmbTable, OptimizerType, device_timestamp
 from torch import Tensor, nn  # usort:skip
@@ -538,22 +537,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         )
 
-        # new a unique op
-        # TODO: in our case maybe we can use torch.uint32
-        if self.pooling_mode == DynamicEmbPoolingMode.NONE:
-            count_dtype = torch.long
-        else:
-            count_dtype = torch.uint64
-        reserve_keys = torch.tensor(
-            2, dtype=self.index_type, device=torch.device(self.device_id)
-        )
-        reserve_vals = torch.tensor(
-            2, dtype=count_dtype, device=torch.device(self.device_id)
-        )
-        counter = torch.tensor(
-            1, dtype=count_dtype, device=torch.device(self.device_id)
-        )
-        self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
 
     def _create_cache_storage(self) -> None:
         self._storages: List[Storage] = []
@@ -929,7 +912,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.output_dtype,
                 self._initializers if self.training else self._eval_initializers,
                 self._optimizer,
-                self._unique_op,
                 self._enable_prefetch,
                 self.use_index_dedup,
                 self.training,
@@ -963,7 +945,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.output_dtype,
                 self.pooling_mode,
                 self._device_num_sms,
-                self._unique_op,
                 torch.device(self.device_id),
                 self._bag_optimizer,
                 self.training,
@@ -1026,7 +1007,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._storages,
             self.feature_offsets,
             self._initializers if self.training else self._eval_initializers,
-            self._unique_op,
             self.training,
             forward_stream,
         )

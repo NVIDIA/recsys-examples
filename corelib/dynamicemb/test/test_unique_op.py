@@ -15,7 +15,7 @@
 
 import pytest
 import torch
-from dynamicemb.unique_op import UniqueOp
+from dynamicemb.unique_op import unique
 
 
 def generate_random_integers(length, device, low=0, high=100, dtype=torch.int64):
@@ -26,13 +26,13 @@ def compare_results(
     custom_unique_keys,
     custom_inversed_indices,
     original_keys,
-    result_counter,
+    num_unique,
     pytorch_unique_keys,
-    offset=0,
 ):
     # Convert tensors to CPU for comparison
-    custom_unique_keys = custom_unique_keys.to("cpu")[: result_counter[0]]
-    custom_inversed_indices = custom_inversed_indices.to("cpu") - offset
+    count = num_unique.item()
+    custom_unique_keys = custom_unique_keys.to("cpu")[:count]
+    custom_inversed_indices = custom_inversed_indices.to("cpu")
     original_keys = original_keys.to("cpu")
     pytorch_unique_keys = pytorch_unique_keys.to("cpu")
 
@@ -65,34 +65,16 @@ def setup_device():
     return torch.device(f"cuda:{device_id}")
 
 
-@pytest.fixture
-def setup_unique_op(setup_device):
+def test_basic_unique(setup_device):
+    """Test basic unique operation."""
     device = setup_device
     key_type = torch.int64
-    val_type = torch.int64
 
     keys = torch.tensor(
         [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device
     )
-    capacity = keys.shape[0] * 2
 
-    reserve_keys = torch.zeros(capacity, dtype=key_type, device=device)
-    reserve_vals = torch.zeros(capacity, dtype=val_type, device=device)
-    counter = torch.tensor(1, dtype=val_type, device=device)
-
-    unique_op = UniqueOp(reserve_keys, reserve_vals, counter, capacity)
-    return unique_op, keys, device, key_type, val_type
-
-
-def test_first_unique(setup_unique_op):
-    unique_op, keys, device, key_type, val_type = setup_unique_op
-
-    capacity = keys.shape[0] * 2
-    unique_keys = torch.zeros(capacity, dtype=key_type, device=device)
-    inversed_indices = torch.zeros(keys.shape[0], dtype=val_type, device=device)
-    result_counter = torch.zeros(1, dtype=val_type, device=device)
-
-    unique_op.unique(keys, keys.shape[0], inversed_indices, unique_keys, result_counter)
+    unique_keys, inversed_indices, num_unique = unique(keys)
 
     pytorch_unique_keys, pytorch_inverse_indices = torch.unique(
         keys, return_inverse=True
@@ -100,92 +82,97 @@ def test_first_unique(setup_unique_op):
     torch.cuda.synchronize()
 
     compare_results(
-        unique_keys, inversed_indices, keys, result_counter, pytorch_unique_keys
+        unique_keys, inversed_indices, keys, num_unique, pytorch_unique_keys
     )
-    current_capacity = unique_op.get_capacity()
-    print(f"first capacity: {current_capacity}")
+    print(f"Basic test: found {num_unique.item()} unique keys")
 
 
-def test_second_unique(setup_unique_op):
-    unique_op, keys, device, key_type, val_type = setup_unique_op
+def test_random_unique(setup_device):
+    """Test unique with random inputs."""
+    device = setup_device
+    key_type = torch.int64
 
-    new_length = 512
-    new_reserve_keys = torch.zeros(new_length * 2, dtype=key_type, device=device)
-    new_reserve_vals = torch.zeros(new_length * 2, dtype=val_type, device=device)
-    unique_op.reset_capacity(new_reserve_keys, new_reserve_vals, new_length * 2)
-
+    length = 512
     low = 0
     high = 132
-    new_keys = generate_random_integers(new_length, device, low, high, dtype=key_type)
-    new_unique_keys = torch.zeros(new_length, dtype=key_type, device=device)
-    new_inversed_indices = torch.zeros(new_length, dtype=val_type, device=device)
-    new_result_counter = torch.zeros(1, dtype=val_type, device=device)
+    keys = generate_random_integers(length, device, low, high, dtype=key_type)
 
-    unique_op.unique(
-        new_keys,
-        new_keys.shape[0],
-        new_inversed_indices,
-        new_unique_keys,
-        new_result_counter,
-    )
-    new_pytorch_unique_keys, new_pytorch_inverse_indices = torch.unique(
-        new_keys, return_inverse=True
+    unique_keys, inversed_indices, num_unique = unique(keys)
+
+    pytorch_unique_keys, pytorch_inverse_indices = torch.unique(
+        keys, return_inverse=True
     )
     torch.cuda.synchronize()
 
     compare_results(
-        new_unique_keys[: new_result_counter.item()],
-        new_inversed_indices,
-        new_keys,
-        new_result_counter,
-        new_pytorch_unique_keys,
+        unique_keys, inversed_indices, keys, num_unique, pytorch_unique_keys
     )
-    current_capacity = unique_op.get_capacity()
-    print(f"second capacity: {current_capacity}")
+    print(f"Random test: found {num_unique.item()} unique keys from {length} inputs")
 
 
-def test_third_unique(setup_unique_op):
-    unique_op, keys, device, key_type, val_type = setup_unique_op
+def test_empty_input(setup_device):
+    """Test unique with empty input."""
+    device = setup_device
+    key_type = torch.int64
 
-    random_length = torch.randint(5000, 10000, (1,)).item()
-    random_offset = torch.randint(0, 100, (1,)).item()
+    keys = torch.tensor([], dtype=key_type, device=device)
 
-    third_reserve_keys = torch.zeros(random_length * 2, dtype=key_type, device=device)
-    third_reserve_vals = torch.zeros(random_length * 2, dtype=val_type, device=device)
-    unique_op.reset_capacity(third_reserve_keys, third_reserve_vals, random_length * 2)
+    unique_keys, inversed_indices, num_unique = unique(keys)
 
-    third_keys = generate_random_integers(
-        random_length, device, low=0, high=132, dtype=key_type
+    assert num_unique.item() == 0, "Empty input should return 0 unique keys"
+    assert unique_keys.numel() == 0, "Empty input should return empty unique keys"
+    assert inversed_indices.numel() == 0, "Empty input should return empty indices"
+    print("Empty input test passed")
+
+
+def test_all_same_keys(setup_device):
+    """Test unique with all same keys."""
+    device = setup_device
+    key_type = torch.int64
+
+    keys = torch.full((1000,), 42, dtype=key_type, device=device)
+
+    unique_keys, inversed_indices, num_unique = unique(keys)
+
+    assert num_unique.item() == 1, "All same keys should return 1 unique key"
+    assert unique_keys[0].item() == 42, "Unique key should be 42"
+    assert torch.all(inversed_indices == 0), "All indices should map to 0"
+    print("All same keys test passed")
+
+
+def test_all_unique_keys(setup_device):
+    """Test unique with all unique keys (no duplicates)."""
+    device = setup_device
+    key_type = torch.int64
+
+    keys = torch.arange(1000, dtype=key_type, device=device)
+
+    unique_keys, inversed_indices, num_unique = unique(keys)
+
+    assert num_unique.item() == 1000, "All unique keys should return same count"
+    print("All unique keys test passed")
+
+
+def test_uint64_dtype(setup_device):
+    """Test unique with uint64 dtype."""
+    device = setup_device
+    key_type = torch.uint64
+
+    keys = torch.tensor(
+        [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device
     )
-    third_unique_keys = torch.zeros(random_length, dtype=key_type, device=device)
-    third_inversed_indices = torch.zeros(random_length, dtype=val_type, device=device)
-    third_result_counter = torch.zeros(1, dtype=val_type, device=device)
 
-    offset_tensor = torch.tensor([random_offset], dtype=val_type, device=device)
-    unique_op.unique(
-        third_keys,
-        third_keys.shape[0],
-        third_inversed_indices,
-        third_unique_keys,
-        third_result_counter,
-        offset=offset_tensor,
-    )
-    third_pytorch_unique_keys, third_pytorch_inverse_indices = torch.unique(
-        third_keys, return_inverse=True
+    unique_keys, inversed_indices, num_unique = unique(keys)
+
+    pytorch_unique_keys, pytorch_inverse_indices = torch.unique(
+        keys, return_inverse=True
     )
     torch.cuda.synchronize()
 
-    compare_results(
-        third_unique_keys[: third_result_counter.item()],
-        third_inversed_indices,
-        third_keys,
-        third_result_counter,
-        third_pytorch_unique_keys,
-        offset=random_offset,
-    )
-    current_capacity = unique_op.get_capacity()
-    print(f"third capacity: {current_capacity}")
+    # Compare count
+    assert num_unique.item() == pytorch_unique_keys.shape[0]
+    print(f"uint64 test: found {num_unique.item()} unique keys")
 
 
 if __name__ == "__main__":
-    pytest.main()
+    pytest.main([__file__, "-v"])

@@ -18,7 +18,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "lookup_forward.h"
 #include "torch_utils.h"
-#include "unique_op.h"
 #include "utils.h"
 #include <cstdint>
 #include <cub/cub.cuh>

@@ -47,7 +47,6 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel, DynamicEmbScoreStrategy
 from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
-from ..unique_op import UniqueOp
 
 
 class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
@@ -139,10 +138,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         # _is_lfu_enabled is already set in __init__ from score_strategy parameter
 
         if self._use_index_dedup:
-            reserve_keys = torch.tensor(2, dtype=torch.int64, device=self._device)
-            reserve_vals = torch.tensor(2, dtype=torch.uint64, device=self._device)
-            counter = torch.tensor(1, dtype=torch.uint64, device=self._device)
-            self._unique_op = UniqueOp(reserve_keys, reserve_vals, counter, 2)
             device_properties = torch.cuda.get_device_properties(self._device.index)
             self._device_num_sms = device_properties.multi_processor_count
 
@@ -275,7 +270,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         new_offsets,
                         new_lengths,
                         self._device_num_sms,
-                        self._unique_op,
                         frequency_counters_list,
                     )
                 else:
@@ -296,7 +290,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         new_offsets,
                         new_lengths,
                         self._device_num_sms,
-                        self._unique_op,
                     )
 
                 unique_num = h_unique_offsets[-1].item()

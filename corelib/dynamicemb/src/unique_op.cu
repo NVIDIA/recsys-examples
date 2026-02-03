@@ -16,89 +16,310 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "unique_op.h"
+#include "check.h"
+#include "torch_utils.h"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <pybind11/pybind11.h>
+#include <torch/extension.h>
+
+#include <cassert>
+#include <limits>
+
+namespace py = pybind11;
 
 namespace dyn_emb {
 
-std::shared_ptr<dyn_emb::UniqueOpBase>
-UniqueOpFactory::create(at::Tensor keys, at::Tensor vals, at::Tensor counter,
-                        const size_t capacity) {
-  auto key_type = keys.dtype();
-  auto val_type = vals.dtype();
-  auto counter_type = counter.dtype();
-  assert(val_type == counter_type);
+constexpr int BLOCK_SIZE = 64;
 
-  if (key_type == at::kLong) {
-    if (val_type == at::kLong) {
-      return std::make_shared<dyn_emb::HashUniqueOp<int64_t, int64_t>>(
-          keys, vals, counter, capacity);
-    } else if (val_type == at::kUInt64) {
-      return std::make_shared<dyn_emb::HashUniqueOp<int64_t, uint64_t>>(
-          keys, vals, counter, capacity);
-    }
-  } else if (key_type == at::kUInt64) {
-    if (val_type == at::kLong) {
-      return std::make_shared<dyn_emb::HashUniqueOp<uint64_t, int64_t>>(
-          keys, vals, counter, capacity);
-    } else if (val_type == at::kUInt64) {
-      return std::make_shared<dyn_emb::HashUniqueOp<uint64_t, uint64_t>>(
-          keys, vals, counter, capacity);
-    }
+// MurmurHash3_32 hash function
+template <typename Key, uint32_t m_seed = 0> struct MurmurHash3_32 {
+  __forceinline__ __host__ __device__ static uint32_t rotl32(uint32_t x,
+                                                             int8_t r) {
+    return (x << r) | (x >> (32 - r));
   }
 
-  throw std::invalid_argument("Invalid key type or value type of unique op.");
+  __forceinline__ __host__ __device__ static uint32_t fmix32(uint32_t h) {
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+  }
+
+  __forceinline__ __host__ __device__ static uint32_t hash(const Key &key) {
+    constexpr int len = sizeof(Key);
+    const uint8_t *const data = reinterpret_cast<const uint8_t *>(&key);
+    constexpr int nblocks = len / 4;
+    uint32_t h1 = m_seed;
+    constexpr uint32_t c1 = 0xcc9e2d51;
+    constexpr uint32_t c2 = 0x1b873593;
+
+    const uint32_t *const blocks =
+        reinterpret_cast<const uint32_t *>(data + nblocks * 4);
+    for (int i = -nblocks; i; i++) {
+      uint32_t k1 = blocks[i];
+      k1 *= c1;
+      k1 = rotl32(k1, 15);
+      k1 *= c2;
+      h1 ^= k1;
+      h1 = rotl32(h1, 13);
+      h1 = h1 * 5 + 0xe6546b64;
+    }
+
+    const uint8_t *tail = data + nblocks * 4;
+    uint32_t k1 = 0;
+    switch (len & 3) {
+    case 3:
+      k1 ^= tail[2] << 16;
+      [[fallthrough]];
+    case 2:
+      k1 ^= tail[1] << 8;
+      [[fallthrough]];
+    case 1:
+      k1 ^= tail[0];
+      k1 *= c1;
+      k1 = rotl32(k1, 15);
+      k1 *= c2;
+      h1 ^= k1;
+    }
+
+    h1 ^= len;
+    return fmix32(h1);
+  }
+};
+
+// Atomic operation overloads for 64-bit types
+__forceinline__ __device__ long atomicAdd(long *address, long val) {
+  return static_cast<long>(
+      ::atomicAdd(reinterpret_cast<unsigned long long *>(address),
+                  static_cast<unsigned long long>(val)));
 }
+
+__forceinline__ __device__ long long atomicAdd(long long *address,
+                                               long long val) {
+  return static_cast<long long>(
+      ::atomicAdd(reinterpret_cast<unsigned long long *>(address),
+                  static_cast<unsigned long long>(val)));
+}
+
+__forceinline__ __device__ unsigned long atomicAdd(unsigned long *address,
+                                                   unsigned long val) {
+  return static_cast<unsigned long>(
+      ::atomicAdd(reinterpret_cast<unsigned long long *>(address),
+                  static_cast<unsigned long long>(val)));
+}
+
+__forceinline__ __device__ uint64_t atomicCAS(uint64_t *address,
+                                              uint64_t compare, uint64_t val) {
+  return static_cast<uint64_t>(
+      ::atomicCAS(reinterpret_cast<unsigned long long *>(address),
+                  static_cast<unsigned long long>(compare),
+                  static_cast<unsigned long long>(val)));
+}
+
+__forceinline__ __device__ int64_t atomicCAS(int64_t *address, int64_t compare,
+                                             int64_t val) {
+  return static_cast<int64_t>(
+      ::atomicCAS(reinterpret_cast<unsigned long long *>(address),
+                  static_cast<unsigned long long>(compare),
+                  static_cast<unsigned long long>(val)));
+}
+
+// Initialize hash table kernel
+template <typename KeyType, typename CounterType>
+__global__ void init_kernel(KeyType *keys, CounterType *vals,
+                            CounterType *counter, size_t capacity,
+                            KeyType empty_key, CounterType empty_val) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < capacity) {
+    keys[idx] = empty_key;
+    vals[idx] = empty_val;
+  }
+  if (idx == 0) {
+    counter[0] = 0;
+  }
+}
+
+// Unique kernel with linear probing hash table
+template <typename KeyType, typename CounterType, typename Hasher>
+__global__ void unique_kernel(const KeyType *d_key, KeyType *d_unique_key,
+                              CounterType *d_output_index, size_t len,
+                              KeyType *keys, CounterType *vals, size_t capacity,
+                              CounterType *counter, KeyType empty_key,
+                              CounterType empty_val,
+                              CounterType *d_frequency_counters,
+                              const CounterType *d_input_frequencies) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= len)
+    return;
+
+  const CounterType input_freq =
+      d_input_frequencies ? d_input_frequencies[idx] : 1;
+
+  const KeyType target_key = d_key[idx];
+  size_t hash_index = Hasher::hash(target_key) % capacity;
+
+  for (size_t probe = 0; probe < capacity; ++probe) {
+    const KeyType existing_key = keys[hash_index];
+    volatile CounterType &slot_val = vals[hash_index];
+
+    if (existing_key == empty_key) {
+      // Try to claim this slot
+      const KeyType old_key =
+          atomicCAS(&keys[hash_index], empty_key, target_key);
+
+      if (old_key == empty_key) {
+        // Successfully claimed - this is a new unique key
+        CounterType unique_idx = atomicAdd(counter, 1);
+        d_unique_key[unique_idx] = target_key;
+        d_output_index[idx] = unique_idx;
+        slot_val = unique_idx;
+
+        if (d_frequency_counters) {
+          atomicCAS(&d_frequency_counters[unique_idx], 0, input_freq);
+        }
+        return;
+      } else if (old_key == target_key) {
+        // Another thread claimed it with same key
+        while (slot_val == empty_val) {
+        }
+        d_output_index[idx] = slot_val;
+        if (d_frequency_counters) {
+          atomicAdd(&d_frequency_counters[slot_val], input_freq);
+        }
+        return;
+      }
+    } else if (existing_key == target_key) {
+      // Key already exists
+      while (slot_val == empty_val) {
+      }
+      d_output_index[idx] = slot_val;
+      if (d_frequency_counters) {
+        atomicAdd(&d_frequency_counters[slot_val], input_freq);
+      }
+      return;
+    }
+
+    hash_index = (hash_index + 1) % capacity;
+  }
+  assert(false && "unique_kernel: hash table full");
+}
+
+// Type dispatch helper
+template <typename Func>
+void dispatch_key_type(at::ScalarType key_type, Func &&func) {
+  if (key_type == at::kLong) {
+    func.template operator()<int64_t>();
+  } else if (key_type == at::kUInt64) {
+    func.template operator()<uint64_t>();
+  } else {
+    throw std::invalid_argument("Unsupported key dtype: must be int64 or uint64");
+  }
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+unique_cuda(at::Tensor keys, at::Tensor frequency_counters,
+            at::Tensor input_frequencies) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  const int64_t num_keys = keys.numel();
+  const auto device = keys.device();
+  const auto key_dtype = keys.scalar_type();
+
+  // Handle empty input
+  if (num_keys == 0) {
+    return std::make_tuple(
+        at::empty({0}, keys.options()),
+        at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
+        at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)));
+  }
+
+  // Allocate output tensors
+  at::Tensor unique_keys = at::empty({num_keys}, keys.options());
+  at::Tensor output_indices =
+      at::empty({num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
+  at::Tensor num_unique =
+      at::empty({1}, at::TensorOptions().dtype(at::kLong).device(device));
+
+  // Allocate internal hash table buffers (capacity = 2x input size for good load factor)
+  const int64_t capacity = num_keys * 2;
+  at::Tensor hash_keys = at::empty({capacity}, keys.options());
+  at::Tensor hash_vals =
+      at::empty({capacity}, at::TensorOptions().dtype(at::kLong).device(device));
+  at::Tensor hash_counter =
+      at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device));
+
+  dispatch_key_type(key_dtype, [&]<typename KeyType>() {
+    using CounterType = int64_t;
+    constexpr auto empty_key = std::numeric_limits<KeyType>::max();
+    constexpr auto empty_val = std::numeric_limits<CounterType>::max();
+
+    // Initialize hash table
+    int grid = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    init_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        get_pointer<KeyType>(hash_keys), get_pointer<CounterType>(hash_vals),
+        get_pointer<CounterType>(hash_counter), capacity, empty_key, empty_val);
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // Get optional pointers
+    CounterType *freq_ptr =
+        (frequency_counters.defined() && frequency_counters.numel() > 0)
+            ? get_pointer<CounterType>(frequency_counters)
+            : nullptr;
+    const CounterType *input_freq_ptr =
+        (input_frequencies.defined() && input_frequencies.numel() > 0)
+            ? get_pointer<CounterType>(input_frequencies)
+            : nullptr;
+
+    // Run unique kernel
+    grid = (num_keys + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    unique_kernel<KeyType, CounterType, MurmurHash3_32<KeyType>>
+        <<<grid, BLOCK_SIZE, 0, stream>>>(
+            get_pointer<const KeyType>(keys),
+            get_pointer<KeyType>(unique_keys),
+            get_pointer<CounterType>(output_indices), num_keys,
+            get_pointer<KeyType>(hash_keys),
+            get_pointer<CounterType>(hash_vals), capacity,
+            get_pointer<CounterType>(hash_counter), empty_key, empty_val,
+            freq_ptr, input_freq_ptr);
+
+    // Copy count to output
+    cudaMemcpyAsync(num_unique.data_ptr(), hash_counter.data_ptr(),
+                    sizeof(CounterType), cudaMemcpyDeviceToDevice, stream);
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  });
+
+  return std::make_tuple(unique_keys, output_indices, num_unique);
+}
+
 } // namespace dyn_emb
 
-// PYTHON WARP
+// Python bindings
 void bind_unique_op(py::module &m) {
+  m.def(
+      "unique_cuda",
+      [](at::Tensor keys,
+         const c10::optional<at::Tensor> &frequency_counters,
+         const c10::optional<at::Tensor> &input_frequencies) {
+        return dyn_emb::unique_cuda(
+            keys,
+            frequency_counters.value_or(at::Tensor()),
+            input_frequencies.value_or(at::Tensor()));
+      },
+      R"doc(
+Deduplicate keys using GPU hash table. Uses the current CUDA stream.
 
-  py::class_<dyn_emb::UniqueOpBase, std::shared_ptr<dyn_emb::UniqueOpBase>>(
-      m, "UniqueOp")
-      .def(py::init([](at::Tensor keys, at::Tensor vals, at::Tensor counter,
-                       const size_t capacity) {
-        return dyn_emb::UniqueOpFactory::create(keys, vals, counter, capacity);
-      }))
-      .def(
-          "unique",
-          [](dyn_emb::UniqueOpBase &self, const at::Tensor &d_key, uint64_t len,
-             const at::Tensor &d_output_index, const at::Tensor &d_unique_key,
-             const at::Tensor &d_output_counter, uint64_t stream = 0,
-             const c10::optional<at::Tensor> &offset = c10::nullopt,
-             const c10::optional<at::Tensor> &d_frequency_counters =
-                 c10::nullopt,
-             const c10::optional<at::Tensor> &d_input_frequencies =
-                 c10::nullopt) {
-            cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+Args:
+    keys: Input keys tensor (int64 or uint64)
+    frequency_counters: Optional output frequency counter tensor
+    input_frequencies: Optional input frequency tensor
 
-            at::Tensor offset_tensor =
-                offset.has_value() ? offset.value() : at::Tensor();
-            at::Tensor frequency_counters_tensor =
-                d_frequency_counters.has_value() ? d_frequency_counters.value()
-                                                 : at::Tensor();
-            at::Tensor input_frequencies_tensor =
-                d_input_frequencies.has_value() ? d_input_frequencies.value()
-                                                : at::Tensor();
-
-            self.unique(d_key, len, d_output_index, d_unique_key,
-                        d_output_counter, cuda_stream, offset_tensor,
-                        frequency_counters_tensor, input_frequencies_tensor);
-          },
-          "Unique operation.", py::arg("d_key"), py::arg("len"),
-          py::arg("d_output_index"), py::arg("d_unique_key"),
-          py::arg("d_output_counter"), py::arg("stream") = 0,
-          py::arg("offset") = c10::nullopt,
-          py::arg("d_frequency_counters") = c10::nullopt,
-          py::arg("d_input_frequencies") = c10::nullopt)
-
-      .def(
-          "reset_capacity",
-          [](dyn_emb::UniqueOpBase &self, const at::Tensor &keys,
-             const at::Tensor &vals, size_t capacity, uint64_t stream = 0) {
-            cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-            self.reset_capacity(keys, vals, capacity, cuda_stream);
-          },
-          "Reset capacity.", py::arg("keys"), py::arg("vals"),
-          py::arg("capacity"), py::arg("stream") = 0)
-      .def("get_capacity", &dyn_emb::UniqueOpBase::get_capacity,
-           "Get capacity");
+Returns:
+    Tuple of (unique_keys, output_indices, num_unique)
+)doc",
+      py::arg("keys"),
+      py::arg("frequency_counters") = py::none(),
+      py::arg("input_frequencies") = py::none());
 }

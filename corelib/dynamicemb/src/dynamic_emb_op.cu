@@ -604,7 +604,6 @@ void dedup_input_indices(
     const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
     std::vector<at::Tensor> unique_idx, const at::Tensor new_offsets,
     const at::Tensor new_lengths, int device_num_sms,
-    std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
     const c10::optional<std::vector<at::Tensor>> &frequency_counters =
         c10::nullopt,
     const c10::optional<at::Tensor> &input_frequencies = c10::nullopt) {
@@ -635,20 +634,6 @@ void dedup_input_indices(
                                 offsets.numel() * offsets.element_size(),
                                 cudaMemcpyDeviceToHost, stream));
 
-  size_t unique_op_capacity = unique_op->get_capacity();
-  if (indices_shape * 2 > unique_op_capacity) {
-    at::Tensor new_keys = at::empty({indices_shape * 2}, indices.options());
-    at::Tensor new_vals = at::empty(
-        {indices_shape * 2},
-        at::TensorOptions().dtype(at::kUInt64).device(indices.device()));
-    unique_op->reset_capacity(new_keys, new_vals, indices_shape * 2, stream);
-  }
-
-  std::vector<at::Tensor> tmp_unique_indices(table_num);
-  for (int i = 0; i < table_num; ++i) {
-    tmp_unique_indices[i] = at::empty_like(indices);
-  }
-
   AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
   for (int i = 0; i < table_num; ++i) {
@@ -668,21 +653,33 @@ void dedup_input_indices(
       dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
                           i, unique_num_type, unique_offset_type, stream);
     } else {
-      at::Tensor tmp_indices = create_sub_tensor(indices, indices_begin);
-      at::Tensor tmp_reverse_idx =
-          create_sub_tensor(reverse_idx, indices_begin);
-      at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
-      at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
+      at::Tensor tmp_indices = indices.slice(0, indices_begin, indices_end);
+      at::Tensor previous_d_unique_num =
+          d_unique_offsets.slice(0, i, d_unique_offsets.size(0));
 
-      // For first stage deduplication, we don't have input frequencies (set to
-      // empty tensor) The unique operation will default each key's frequency to
-      // 1
+      // Get frequency counter for this table if provided
       at::Tensor freq_counter = frequency_counters.has_value()
                                     ? frequency_counters.value()[i]
                                     : at::Tensor();
-      unique_op->unique(tmp_indices, indices_length, tmp_reverse_idx,
-                        unique_idx[i], tmp_d_unique_num, stream,
-                        previous_d_unique_num, freq_counter);
+
+      // Call stateless unique_cuda (allocates buffers internally, uses current stream)
+      auto [unique_keys_seg, output_indices_seg, num_unique_seg] =
+          dyn_emb::unique_cuda(tmp_indices, freq_counter, at::Tensor());
+
+      // Copy unique keys to output buffer
+      cudaMemcpyAsync(unique_idx[i].data_ptr(), unique_keys_seg.data_ptr(),
+                      unique_keys_seg.numel() * unique_keys_seg.element_size(),
+                      cudaMemcpyDeviceToDevice, stream);
+
+      // Add cumulative offset to output indices and store in reverse_idx
+      // previous_d_unique_num.select(0, 0) = d_unique_offsets[i] (on device)
+      at::Tensor tmp_reverse_idx = reverse_idx.slice(0, indices_begin, indices_end);
+      at::add_out(tmp_reverse_idx, output_indices_seg, previous_d_unique_num.select(0, 0));
+      cudaMemcpyAsync(
+          reinterpret_cast<uint64_t *>(d_unique_nums.data_ptr()) + i,
+          num_unique_seg.data_ptr(), sizeof(int64_t), cudaMemcpyDeviceToDevice,
+          stream);
+
       dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
                           i, unique_num_type, unique_offset_type, stream);
     }
@@ -1460,7 +1457,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("h_unique_nums"), py::arg("d_unique_nums"),
         py::arg("h_unique_offsets"), py::arg("d_unique_offsets"),
         py::arg("unique_idx"), py::arg("new_offsets"), py::arg("new_lengths"),
-        py::arg("device_num_sms"), py::arg("unique_op"),
+        py::arg("device_num_sms"),
         py::arg("frequency_counters") = c10::nullopt,
         py::arg("input_frequencies") = c10::nullopt);
 

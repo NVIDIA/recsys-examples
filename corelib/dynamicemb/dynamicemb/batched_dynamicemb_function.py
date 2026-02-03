@@ -30,7 +30,6 @@ from dynamicemb.key_value_table import (
 )
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import Counter
-from dynamicemb.unique_op import UniqueOp
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
@@ -64,7 +63,6 @@ class DynamicEmbeddingBagFunction(torch.autograd.Function):
         output_dtype: torch.dtype,
         pooling_mode: DynamicEmbPoolingMode,
         device_num_sms: int,
-        unique_op: UniqueOp,
         device: torch.device,
         optimizer: BaseDynamicEmbeddingOptimizer,
         training: bool,
@@ -310,7 +308,6 @@ def dynamicemb_prefetch(
     storages: List[Storage],
     feature_offsets: torch.Tensor,
     initializers: List[BaseDynamicEmbInitializer],
-    unique_op,
     training: bool = True,
     forward_stream: Optional[torch.cuda.Stream] = None,
 ):
@@ -326,7 +323,7 @@ def dynamicemb_prefetch(
             unique_indices_table_range,
             h_unique_indices_table_range,
             _,
-        ) = segmented_unique(indices, indices_table_range, unique_op)
+        ) = segmented_unique(indices, indices_table_range)
         # TODO: only return device unique_indices_table_range
         # h_unique_indices_table_range = unique_indices_table_range.cpu()
     else:
@@ -360,7 +357,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         output_dtype: torch.dtype,
         initializers: List[BaseDynamicEmbInitializer],
         optimizer: BaseDynamicEmbeddingOptimizer,
-        unique_op,
         enable_prefetch: bool = False,
         input_dist_dedup: bool = False,
         training: bool = True,
@@ -395,7 +391,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             ) = segmented_unique(
                 indices,
                 indices_table_range,
-                unique_op,
                 EvictStrategy(evict_strategy.value) if evict_strategy else None,
                 frequency_counts_int64,
             )
