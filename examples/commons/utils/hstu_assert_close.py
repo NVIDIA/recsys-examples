@@ -34,6 +34,11 @@ def hstu_close(
     left_abs_max = (actual - fp32_ref).abs().max().item()
     right_abs_max = (out_ref - fp32_ref).abs().max().item()
     # either allclose or meet the abs threshold
+    # if not os.environ.get("HSTU_CLOSE_DEBUG", "0") == "1":
+    if left_abs_max > multiplier * right_abs_max:
+        print(
+            f"[HSTU_CLOSE] assert fail: diff abs max: {left_abs_max:.6f}, threshold: {multiplier * right_abs_max:.6f}, multiplier: {multiplier}"
+        )
     return (left_abs_max <= multiplier * right_abs_max) or (try_allclose)
 
 

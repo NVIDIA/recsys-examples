@@ -160,6 +160,10 @@ class TritonHSTUAttention(HSTUAttention):
         self.attention_dim = attention_dim
         self.linear_dim = linear_dim
         self.is_causal = is_causal
+        self.enable_tma = (
+            True if torch.cuda.get_device_properties(0).major >= 9 else False
+        )
+        assert is_causal, "TritonHSTUAttention does not support is_causal=False"
 
     def forward(
         self,
@@ -209,9 +213,9 @@ class TritonHSTUAttention(HSTUAttention):
             v=tv.view(-1, self.num_heads, self.linear_dim),
             seq_offsets=offsets,
             num_targets=num_candidates,
-            causal=self.is_causal,
             contextual_seq_len=num_contextuals,
             scaling_seqlen=scaling_seqlen,
+            enable_tma=self.enable_tma,
         ).view(-1, self.num_heads * self.linear_dim)
 
 
