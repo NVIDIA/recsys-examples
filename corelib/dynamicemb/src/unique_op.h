@@ -32,7 +32,8 @@ namespace dyn_emb {
  *
  * @param keys Input keys tensor (int64 or uint64)
  * @param frequency_counters Optional: output frequency counter per unique key
- * @param input_frequencies Optional: input frequency per key (for weighted counting)
+ * @param input_frequencies Optional: input frequency per key (for weighted
+ * counting)
  *
  * @return Tuple of (unique_keys, output_indices, num_unique)
  *         - unique_keys: Deduplicated keys
@@ -40,8 +41,7 @@ namespace dyn_emb {
  *         - num_unique: Scalar tensor with count of unique keys
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-unique_cuda(at::Tensor keys,
-            at::Tensor frequency_counters = at::Tensor(),
+unique_cuda(at::Tensor keys, at::Tensor frequency_counters = at::Tensor(),
             at::Tensor input_frequencies = at::Tensor());
 
 } // namespace dyn_emb

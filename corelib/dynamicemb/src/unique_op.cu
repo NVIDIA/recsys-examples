@@ -15,9 +15,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
-#include "unique_op.h"
 #include "check.h"
 #include "torch_utils.h"
+#include "unique_op.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <pybind11/pybind11.h>
@@ -178,12 +178,13 @@ __global__ void unique_kernel(const KeyType *d_key, KeyType *d_unique_key,
         slot_val = unique_idx;
 
         if (d_frequency_counters) {
-          atomicCAS(&d_frequency_counters[unique_idx], 0, input_freq);
+          atomicAdd(&d_frequency_counters[unique_idx], input_freq);
         }
         return;
       } else if (old_key == target_key) {
         // Another thread claimed it with same key
         while (slot_val == empty_val) {
+          __nanosleep(1);
         }
         d_output_index[idx] = slot_val;
         if (d_frequency_counters) {
@@ -194,6 +195,7 @@ __global__ void unique_kernel(const KeyType *d_key, KeyType *d_unique_key,
     } else if (existing_key == target_key) {
       // Key already exists
       while (slot_val == empty_val) {
+        __nanosleep(1);
       }
       d_output_index[idx] = slot_val;
       if (d_frequency_counters) {
@@ -215,7 +217,8 @@ void dispatch_key_type(at::ScalarType key_type, Func &&func) {
   } else if (key_type == at::kUInt64) {
     func.template operator()<uint64_t>();
   } else {
-    throw std::invalid_argument("Unsupported key dtype: must be int64 or uint64");
+    throw std::invalid_argument(
+        "Unsupported key dtype: must be int64 or uint64");
   }
 }
 
@@ -238,16 +241,17 @@ unique_cuda(at::Tensor keys, at::Tensor frequency_counters,
 
   // Allocate output tensors
   at::Tensor unique_keys = at::empty({num_keys}, keys.options());
-  at::Tensor output_indices =
-      at::empty({num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
+  at::Tensor output_indices = at::empty(
+      {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
   at::Tensor num_unique =
       at::empty({1}, at::TensorOptions().dtype(at::kLong).device(device));
 
-  // Allocate internal hash table buffers (capacity = 2x input size for good load factor)
+  // Allocate internal hash table buffers (capacity = 2x input size for good
+  // load factor)
   const int64_t capacity = num_keys * 2;
   at::Tensor hash_keys = at::empty({capacity}, keys.options());
-  at::Tensor hash_vals =
-      at::empty({capacity}, at::TensorOptions().dtype(at::kLong).device(device));
+  at::Tensor hash_vals = at::empty(
+      {capacity}, at::TensorOptions().dtype(at::kLong).device(device));
   at::Tensor hash_counter =
       at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device));
 
@@ -277,8 +281,7 @@ unique_cuda(at::Tensor keys, at::Tensor frequency_counters,
     grid = (num_keys + BLOCK_SIZE - 1) / BLOCK_SIZE;
     unique_kernel<KeyType, CounterType, MurmurHash3_32<KeyType>>
         <<<grid, BLOCK_SIZE, 0, stream>>>(
-            get_pointer<const KeyType>(keys),
-            get_pointer<KeyType>(unique_keys),
+            get_pointer<const KeyType>(keys), get_pointer<KeyType>(unique_keys),
             get_pointer<CounterType>(output_indices), num_keys,
             get_pointer<KeyType>(hash_keys),
             get_pointer<CounterType>(hash_vals), capacity,
@@ -300,13 +303,11 @@ unique_cuda(at::Tensor keys, at::Tensor frequency_counters,
 void bind_unique_op(py::module &m) {
   m.def(
       "unique_cuda",
-      [](at::Tensor keys,
-         const c10::optional<at::Tensor> &frequency_counters,
+      [](at::Tensor keys, const c10::optional<at::Tensor> &frequency_counters,
          const c10::optional<at::Tensor> &input_frequencies) {
-        return dyn_emb::unique_cuda(
-            keys,
-            frequency_counters.value_or(at::Tensor()),
-            input_frequencies.value_or(at::Tensor()));
+        return dyn_emb::unique_cuda(keys,
+                                    frequency_counters.value_or(at::Tensor()),
+                                    input_frequencies.value_or(at::Tensor()));
       },
       R"doc(
 Deduplicate keys using GPU hash table. Uses the current CUDA stream.
@@ -319,7 +320,6 @@ Args:
 Returns:
     Tuple of (unique_keys, output_indices, num_unique)
 )doc",
-      py::arg("keys"),
-      py::arg("frequency_counters") = py::none(),
+      py::arg("keys"), py::arg("frequency_counters") = py::none(),
       py::arg("input_frequencies") = py::none());
 }

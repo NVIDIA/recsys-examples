@@ -439,13 +439,14 @@ segmented_unique(
 
       // Call the stateless unique_cuda function (uses current stream)
       auto [unique_keys_seg, output_indices_seg, num_unique_seg] =
-          dyn_emb::unique_cuda(tmp_indices,
-                               tmp_frequency_output_slice,
+          dyn_emb::unique_cuda(tmp_indices, tmp_frequency_output_slice,
                                tmp_frequency_counts_uint64);
 
       // Add cumulative offset to output indices and store in inverse_idx
-      // previous_d_unique_num.select(0, 0) = d_unique_indices_table_range[i] (on device)
-      at::add_out(tmp_inverse_idx, output_indices_seg, previous_d_unique_num.select(0, 0));
+      // previous_d_unique_num.select(0, 0) = d_unique_indices_table_range[i]
+      // (on device)
+      at::add_out(tmp_inverse_idx, output_indices_seg,
+                  previous_d_unique_num.select(0, 0));
 
       // Copy unique keys to output buffer
       cudaMemcpyAsync(tmp_unique_buffer_slice.data_ptr(),

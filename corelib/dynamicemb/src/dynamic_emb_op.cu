@@ -605,8 +605,7 @@ void dedup_input_indices(
     std::vector<at::Tensor> unique_idx, const at::Tensor new_offsets,
     const at::Tensor new_lengths, int device_num_sms,
     const c10::optional<std::vector<at::Tensor>> &frequency_counters =
-        c10::nullopt,
-    const c10::optional<at::Tensor> &input_frequencies = c10::nullopt) {
+        c10::nullopt) {
 
   if (!offsets.is_cuda() || !indices.is_cuda()) {
     throw std::runtime_error(
@@ -662,7 +661,8 @@ void dedup_input_indices(
                                     ? frequency_counters.value()[i]
                                     : at::Tensor();
 
-      // Call stateless unique_cuda (allocates buffers internally, uses current stream)
+      // Call stateless unique_cuda (allocates buffers internally, uses current
+      // stream)
       auto [unique_keys_seg, output_indices_seg, num_unique_seg] =
           dyn_emb::unique_cuda(tmp_indices, freq_counter, at::Tensor());
 
@@ -673,12 +673,14 @@ void dedup_input_indices(
 
       // Add cumulative offset to output indices and store in reverse_idx
       // previous_d_unique_num.select(0, 0) = d_unique_offsets[i] (on device)
-      at::Tensor tmp_reverse_idx = reverse_idx.slice(0, indices_begin, indices_end);
-      at::add_out(tmp_reverse_idx, output_indices_seg, previous_d_unique_num.select(0, 0));
-      cudaMemcpyAsync(
-          reinterpret_cast<uint64_t *>(d_unique_nums.data_ptr()) + i,
-          num_unique_seg.data_ptr(), sizeof(int64_t), cudaMemcpyDeviceToDevice,
-          stream);
+      at::Tensor tmp_reverse_idx =
+          reverse_idx.slice(0, indices_begin, indices_end);
+      at::add_out(tmp_reverse_idx, output_indices_seg,
+                  previous_d_unique_num.select(0, 0));
+      cudaMemcpyAsync(reinterpret_cast<uint64_t *>(d_unique_nums.data_ptr()) +
+                          i,
+                      num_unique_seg.data_ptr(), sizeof(int64_t),
+                      cudaMemcpyDeviceToDevice, stream);
 
       dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
                           i, unique_num_type, unique_offset_type, stream);
@@ -1130,8 +1132,7 @@ void store_to_combined_table(std::optional<at::Tensor> dev_table,
 template <typename IndexT, typename ValueT>
 __global__ void select_insert_failed_values_kernel_vec4(
     int64_t batch, int64_t stride, ValueT const *__restrict__ in_v_ptr,
-    ValueT *__restrict__ out_v_ptr,
-    IndexT *__restrict__ indices) {
+    ValueT *__restrict__ out_v_ptr, IndexT *__restrict__ indices) {
 
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
@@ -1165,8 +1166,7 @@ __global__ void select_insert_failed_values_kernel_vec4(
 template <typename IndexT, typename ValueT>
 __global__ void select_insert_failed_values_kernel(
     int64_t batch, int64_t stride, ValueT const *__restrict__ in_v_ptr,
-    ValueT *__restrict__ out_v_ptr,
-    IndexT *__restrict__ indices) {
+    ValueT *__restrict__ out_v_ptr, IndexT *__restrict__ indices) {
 
   for (int64_t dst_idx = blockIdx.x; dst_idx < batch; dst_idx += gridDim.x) {
 
@@ -1188,8 +1188,7 @@ __global__ void select_insert_failed_values_kernel(
   }
 }
 
-void select_insert_failed_values(at::Tensor indices,
-                                 at::Tensor input_values,
+void select_insert_failed_values(at::Tensor indices, at::Tensor input_values,
                                  at::Tensor evictd_values) {
   int64_t num_total = indices.numel();
   if (num_total == 0) {
@@ -1228,18 +1227,16 @@ void select_insert_failed_values(at::Tensor indices,
 
       if (dim % 4 == 0) {
         select_insert_failed_values_kernel_vec4<IndexType, ValueType>
-            <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
-                num_total, dim, in_v_ptr, out_v_ptr,
-                index_ptr);
+            <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(num_total, dim, in_v_ptr,
+                                                       out_v_ptr, index_ptr);
       } else {
         int block_size = dim < device_prop.max_thread_per_block
                              ? dim
                              : device_prop.max_thread_per_block;
         int grid_size = num_total;
         select_insert_failed_values_kernel<IndexType, ValueType>
-            <<<grid_size, block_size, 0, stream>>>(
-                num_total, dim, in_v_ptr, out_v_ptr,
-                index_ptr);
+            <<<grid_size, block_size, 0, stream>>>(num_total, dim, in_v_ptr,
+                                                   out_v_ptr, index_ptr);
       }
     });
   });
@@ -1458,8 +1455,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("h_unique_offsets"), py::arg("d_unique_offsets"),
         py::arg("unique_idx"), py::arg("new_offsets"), py::arg("new_lengths"),
         py::arg("device_num_sms"),
-        py::arg("frequency_counters") = c10::nullopt,
-        py::arg("input_frequencies") = c10::nullopt);
+        py::arg("frequency_counters") = c10::nullopt);
 
   m.def("reduce_grads", &reduce_grads, "reduce grads", py::arg("indices"),
         py::arg("grads"), py::arg("segment_range"), py::arg("h_segment_range"));
@@ -1480,5 +1476,6 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("indices"), py::arg("input"));
 
   m.def("select_insert_failed_values", &select_insert_failed_values,
-        "select_insert_failed_values", py::arg("indices"), py::arg("input_values"), py::arg("evicted_values"));
+        "select_insert_failed_values", py::arg("indices"),
+        py::arg("input_values"), py::arg("evicted_values"));
 }

@@ -537,7 +537,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         )
 
-
     def _create_cache_storage(self) -> None:
         self._storages: List[Storage] = []
         self._caches: List[Cache] = []
