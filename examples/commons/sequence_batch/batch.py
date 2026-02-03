@@ -19,9 +19,9 @@ class BaseBatch(Pipelineable):
     feature_to_max_seqlen: Dict[str, int]
 
     contextual_feature_names: List[str] = field(default_factory=list)
-    # when labels is a tensor, it means the labels can be reshaped to [actual_batch_size, ...] and select along the batch dimension.
-    labels: Union[KeyedJaggedTensor, torch.Tensor] = None
-    actual_batch_size: Optional[int] = None  # in case of padding.
+    # KJT should be jagged as well.
+    labels: Optional[KeyedJaggedTensor] = None
+    actual_batch_size: Optional[int] = None
 
     def __post_init__(self):
         if len(set(self.features.keys())) != len(list(self.features.keys())):
