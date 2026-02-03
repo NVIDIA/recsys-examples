@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
@@ -56,7 +56,7 @@ class HSTUBlock(MegatronModule):
     def forward(
         self,
         embeddings: Dict[str, JaggedTensor],
-        batch: Union[HSTUBatch, HSTUBatch],
+        batch: HSTUBatch,
     ) -> Tuple[JaggedData, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass of the HSTUBlock.
