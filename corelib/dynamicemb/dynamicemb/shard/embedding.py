@@ -17,7 +17,11 @@ from itertools import accumulate
 from typing import Dict, List, Optional
 
 import torch
-from dynamicemb_extensions import dedup_input_indices
+from dynamicemb_extensions import (
+    compute_dedup_lengths_cuda,
+    expand_table_ids_cuda,
+    segmented_unique_cuda,
+)
 from torch.autograd.profiler import record_function
 from torchrec.distributed.embedding import (
     EmbeddingCollectionContext,
@@ -176,147 +180,93 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ctx: DynamicEmbeddingCollectionContext,
         input_feature_splits: List[KeyedJaggedTensor],
     ) -> List[KeyedJaggedTensor]:
+        """Deduplicate indices using segmented_unique_cuda."""
         with record_function("## dedup_ec_indices ##"):
             features_by_shards = []
             for i, input_feature in enumerate(input_feature_splits):
                 hash_size_offset = self.get_buffer(f"_hash_size_offset_tensor_{i}")
-                h_table_offset = self.get_buffer(
-                    f"_nonfuse_table_feature_offsets_host_{i}"
-                )
                 d_table_offset = self.get_buffer(
                     f"_nonfuse_table_feature_offsets_device_{i}"
                 )
                 input_feature._values = input_feature._values.contiguous()
-                # for debug
-                # hash_size_cumsum = self.get_buffer(
-                #    f"_hash_size_cumsum_tensor_{i}"
-                # )
 
-                # (
-                #    debug_lengths,
-                #    debug_offsets,
-                #    debug_unique_indices,
-                #    debug_reverse_indices,
-                # ) = torch.ops.fbgemm.jagged_unique_indices(
-                #    hash_size_cumsum,
-                #    hash_size_offset,
-                #    input_feature.offsets().to(torch.int64),
-                #    input_feature.values().to(torch.int64),
-                # )
-
-                table_num = h_table_offset.shape[0] - 1
-                total_B = input_feature.offsets().shape[0] - 1
-                features = hash_size_offset.shape[0] - 1
+                table_num = d_table_offset.numel() - 1
+                total_B = input_feature.offsets().numel() - 1
+                features = hash_size_offset.numel() - 1
                 local_batchsize = total_B // features
 
                 indices = input_feature.values()
-                offsets = input_feature.offsets()
-                lengths = input_feature.lengths()
-                dtype_convert = False
-                if indices.dtype != torch.int64:
-                    indices.dtype
-                    indices_input = indices.to(torch.int64)
-                    dtype_convert = True
-                else:
-                    indices_input = indices
-                reverse_idx = torch.empty_like(
-                    indices, dtype=torch.uint64, device=self._device
-                )
-                unique_idx_list = [
-                    torch.empty_like(indices, dtype=torch.int64, device=self._device)
-                    for i in range(table_num)
-                ]
-                h_unique_nums = torch.empty(table_num, dtype=torch.uint64, device="cpu")
-                d_unique_nums = torch.empty(
-                    table_num, dtype=torch.uint64, device=self._device
+                offsets = input_feature.offsets().to(torch.int64)
+                num_elements = indices.numel()
+
+                # Handle empty input
+                if num_elements == 0:
+                    dedup_features = KeyedJaggedTensor(
+                        keys=input_feature.keys(),
+                        lengths=input_feature.lengths(),
+                        offsets=input_feature.offsets(),
+                        values=indices,
+                    )
+                    ctx.input_features.append(input_feature)
+                    ctx.reverse_indices.append(
+                        torch.empty(0, dtype=torch.uint64, device=self._device)
+                    )
+                    features_by_shards.append(dedup_features)
+                    continue
+
+                # Convert indices to int64 if needed (segmented_unique_cuda supports int64/uint64)
+                dtype_convert = indices.dtype not in (torch.int64, torch.uint64)
+                indices_input = indices.to(torch.int64) if dtype_convert else indices
+
+                # Generate table_ids from jagged offsets (fully on GPU, no sync)
+                table_ids = expand_table_ids_cuda(
+                    offsets,
+                    d_table_offset,
+                    table_num,
+                    local_batchsize,
+                    num_elements,
+                    self._device_num_sms,
                 )
 
-                h_unique_offsets = torch.empty(
-                    table_num + 1, dtype=torch.uint64, device="cpu"
-                )
-                d_unique_offsets = torch.zeros(
-                    table_num + 1, dtype=torch.uint64, device=self._device
-                )
-
-                new_offsets = torch.empty_like(offsets, device=self._device)
-                new_lengths = torch.empty_like(lengths, device=self._device)
-
-                # Only create frequency_counters if LFU strategy is enabled
-                # For non-LFU strategies, pass empty tensor (C++ extension will check size)
+                # Prepare input_frequencies tensor to control frequency counting
+                input_frequencies = None
                 if self._is_lfu_enabled or self._has_admit_strategy:
-                    # TODO: use only one frequency_counters tensor for all tables
-                    # frequency_counters = torch.zeros_like(
-                    #     indices_input, device=self._device, dtype=torch.uint64
-                    # )
-                    frequency_counters_list = [
-                        torch.zeros_like(
-                            indices_input, dtype=torch.uint64, device=self._device
-                        )
-                        for i in range(table_num)
-                    ]
-                    dedup_input_indices(
-                        indices_input,
-                        offsets,
-                        h_table_offset,
-                        d_table_offset,
-                        table_num,
-                        local_batchsize,
-                        reverse_idx,
-                        h_unique_nums,
-                        d_unique_nums,
-                        h_unique_offsets,
-                        d_unique_offsets,
-                        unique_idx_list,
-                        new_offsets,
-                        new_lengths,
-                        self._device_num_sms,
-                        frequency_counters_list,
-                    )
-                else:
-                    # Empty tensor for non-LFU and non-admit strategies
-                    dedup_input_indices(
-                        indices_input,
-                        offsets,
-                        h_table_offset,
-                        d_table_offset,
-                        table_num,
-                        local_batchsize,
-                        reverse_idx,
-                        h_unique_nums,
-                        d_unique_nums,
-                        h_unique_offsets,
-                        d_unique_offsets,
-                        unique_idx_list,
-                        new_offsets,
-                        new_lengths,
-                        self._device_num_sms,
+                    input_frequencies = torch.empty(
+                        0, dtype=torch.int64, device=self._device
                     )
 
-                unique_num = h_unique_offsets[-1].item()
-                unique_idx = torch.empty(
-                    unique_num, dtype=torch.int64, device=indices.device
+                # Call segmented_unique_cuda
+                (
+                    unique_keys,
+                    output_indices,
+                    table_offsets,
+                    freq_counters,
+                ) = segmented_unique_cuda(
+                    indices_input,
+                    table_ids,
+                    table_num,
+                    self._device_num_sms,
+                    input_frequencies,
                 )
-                frequency_counters = torch.empty(
-                    unique_num, device=self._device, dtype=torch.uint64
+
+                # Convert to uint64 for compatibility
+                reverse_idx = output_indices.to(torch.uint64)
+
+                # Compute new lengths and offsets using GPU kernel
+                new_lengths, new_offsets = compute_dedup_lengths_cuda(
+                    table_offsets,
+                    d_table_offset,
+                    table_num,
+                    local_batchsize,
                 )
-                # TODO: check non_blocking=True is valid for device tensor to device tensor
-                for i in range(table_num):
-                    start_pos = h_unique_offsets[i].item()
-                    end_pos = h_unique_offsets[i + 1].item()
-                    length = end_pos - start_pos
-                    unique_idx[start_pos:end_pos].copy_(
-                        unique_idx_list[i][:length], non_blocking=True
-                    )
-                    if self._is_lfu_enabled or self._has_admit_strategy:
-                        frequency_counters[start_pos:end_pos].copy_(
-                            frequency_counters_list[i][:length], non_blocking=True
-                        )
+
+                # Get unique values for the KJT
+                # .item() implicitly syncs GPU to CPU
+                total_unique = table_offsets[-1].item()
+                unique_idx = unique_keys[:total_unique]
 
                 if dtype_convert:
-                    unique_idx_out = torch.empty(
-                        unique_num, dtype=indices.dtype, device=indices.device
-                    )
-                    unique_idx_out.copy_(unique_idx, non_blocking=True)
+                    unique_idx_out = unique_idx.to(indices.dtype)
                 else:
                     unique_idx_out = unique_idx
 
@@ -328,12 +278,10 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 )
                 ctx.input_features.append(input_feature)
                 ctx.reverse_indices.append(reverse_idx)
-                # Only store frequency_counters if LFU or admit strategy is enabled
+
                 if self._is_lfu_enabled or self._has_admit_strategy:
+                    frequency_counters = freq_counters[:total_unique].to(torch.uint64)
                     ctx.frequency_counters.append(frequency_counters)
-                    assert frequency_counters.size(0) == unique_idx_out.size(
-                        0
-                    ), f"Frequency counters size {frequency_counters.size(0)} doesn't match unique indices size {unique_idx_out.size(0)}"
 
                 features_by_shards.append(dedup_features)
         return features_by_shards

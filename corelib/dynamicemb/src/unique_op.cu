@@ -16,6 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "check.h"
+#include "lookup_forward.h"
 #include "torch_utils.h"
 #include "unique_op.h"
 
@@ -91,8 +92,8 @@ template <typename Key, uint32_t m_seed = 0> struct MurmurHash3_32 {
   }
 
   // Combine two hash values (for compound keys)
-  __forceinline__ __host__ __device__ static uint32_t hash_combine(uint32_t h1,
-                                                                   uint32_t h2) {
+  __forceinline__ __host__ __device__ static uint32_t
+  hash_combine(uint32_t h1, uint32_t h2) {
     h1 ^= h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
     return h1;
   }
@@ -293,8 +294,7 @@ unique_cuda(at::Tensor keys, at::Tensor frequency_counters,
             get_pointer<CounterType>(output_indices), num_keys,
             get_pointer<KeyType>(hash_keys),
             get_pointer<CounterType>(hash_vals), capacity,
-            get_pointer<CounterType>(hash_counter),
-            freq_ptr, input_freq_ptr);
+            get_pointer<CounterType>(hash_counter), freq_ptr, input_freq_ptr);
 
     // Copy count to output
     cudaMemcpyAsync(num_unique.data_ptr(), hash_counter.data_ptr(),
@@ -316,7 +316,7 @@ unique_cuda(at::Tensor keys, at::Tensor frequency_counters,
 // This allows us to use only 2 arrays (hash_keys, hash_vals) instead of 3
 
 __device__ __forceinline__ int64_t pack_table_val(int32_t table_id,
-                                                   int32_t local_idx) {
+                                                  int32_t local_idx) {
   // Use uint32_t cast to avoid sign extension issues
   return (static_cast<int64_t>(table_id) << 32) |
          static_cast<uint32_t>(local_idx);
@@ -352,23 +352,28 @@ __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
   }
 }
 
-// Segmented unique kernel - deduplicates (key, table_id) pairs (strided loop version)
-// Uses packed (table_id, local_idx) encoding in hash_vals for efficiency
-// Only hash_vals needs volatile reads - hash_keys uses CAS for synchronization
+// Segmented unique kernel - deduplicates (key, table_id) pairs (strided loop
+// version) Uses packed (table_id, local_idx) encoding in hash_vals for
+// efficiency Only hash_vals needs volatile reads - hash_keys uses CAS for
+// synchronization Supports optional frequency counting for LFU eviction
+// strategy
 template <typename KeyType, typename Hasher,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
-__global__ void segmented_unique_kernel(
-    const KeyType *d_keys, const int32_t *d_table_ids, KeyType *d_unique_keys,
-    int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
-    int64_t *hash_vals, size_t capacity, int64_t *table_counters,
-    size_t max_keys_per_table) {
+__global__ void
+segmented_unique_kernel(const KeyType *d_keys, const int32_t *d_table_ids,
+                        KeyType *d_unique_keys, int64_t *d_output_indices,
+                        size_t num_keys, KeyType *hash_keys, int64_t *hash_vals,
+                        size_t capacity, int64_t *table_counters,
+                        size_t max_keys_per_table, int64_t *frequency_counters,
+                        const int64_t *input_frequencies) {
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
        idx += stride) {
     const KeyType key = d_keys[idx];
     const int32_t table_id = d_table_ids[idx];
+    const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
 
     // Hash the (key, table_id) pair
     uint32_t key_hash = Hasher::hash(key);
@@ -401,20 +406,32 @@ __global__ void segmented_unique_kernel(
               pack_table_val(table_id, local_unique_idx);
 
           d_output_indices[idx] = local_unique_idx;
+
+          // Update frequency counter for new unique key
+          if (frequency_counters) {
+            atomicAdd(&frequency_counters[output_pos], input_freq);
+          }
           done = true;
         } else if (old_key == key) {
           // Another thread claimed with same key, wait for packed value
           int64_t packed_val;
           do {
-            packed_val = *reinterpret_cast<volatile int64_t *>(
-                &hash_vals[hash_index]);
+            packed_val =
+                *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
             __nanosleep(1);
           } while (packed_val == empty_val);
 
           // Check if table_id matches
           if (unpack_table_id(packed_val) == table_id) {
             // Same (key, table_id) pair - use existing index
-            d_output_indices[idx] = unpack_local_idx(packed_val);
+            int32_t local_idx = unpack_local_idx(packed_val);
+            d_output_indices[idx] = local_idx;
+
+            // Update frequency counter for duplicate key
+            if (frequency_counters) {
+              size_t output_pos = table_id * max_keys_per_table + local_idx;
+              atomicAdd(&frequency_counters[output_pos], input_freq);
+            }
             done = true;
           }
           // Different table_id with same key, continue probing
@@ -431,7 +448,14 @@ __global__ void segmented_unique_kernel(
 
         if (unpack_table_id(packed_val) == table_id) {
           // Exact (key, table_id) match found
-          d_output_indices[idx] = unpack_local_idx(packed_val);
+          int32_t local_idx = unpack_local_idx(packed_val);
+          d_output_indices[idx] = local_idx;
+
+          // Update frequency counter for duplicate key
+          if (frequency_counters) {
+            size_t output_pos = table_id * max_keys_per_table + local_idx;
+            atomicAdd(&frequency_counters[output_pos], input_freq);
+          }
           done = true;
         }
         // Different table_id with same key, continue probing
@@ -445,8 +469,8 @@ __global__ void segmented_unique_kernel(
 }
 
 // Binary search helper for compaction
-__device__ __forceinline__ int
-binary_search_upper_bound(const int64_t *arr, int n, int64_t val) {
+__device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
+                                                         int n, int64_t val) {
   int lo = 0, hi = n;
   while (lo < hi) {
     int mid = (lo + hi) / 2;
@@ -459,32 +483,84 @@ binary_search_upper_bound(const int64_t *arr, int n, int64_t val) {
   return lo - 1;
 }
 
-// Compact partitioned keys into contiguous output (strided loop version)
-// d_total_unique is a device pointer to avoid GPU-CPU synchronization
+// Fused kernel to compact both keys and frequency counters from partitioned
+// layout Shares binary search computation between both operations, reducing
+// overhead d_total_unique is a device pointer to avoid GPU-CPU synchronization
+// partitioned_freq and output_freq can be nullptr if frequency counting is
+// disabled
 template <typename KeyType>
-__global__ void compact_keys_kernel(const KeyType *partitioned_keys,
-                                    size_t max_keys_per_table,
-                                    const int64_t *table_offsets,
-                                    int64_t num_tables, KeyType *output_keys,
-                                    const int64_t *d_total_unique) {
+__global__ void compact_keys_and_freq_kernel(
+    const KeyType *partitioned_keys, const int64_t *partitioned_freq,
+    size_t max_keys_per_table, const int64_t *table_offsets, int64_t num_tables,
+    KeyType *output_keys, int64_t *output_freq, const int64_t *d_total_unique) {
   const int64_t total_unique = *d_total_unique;
   const int64_t stride = blockDim.x * gridDim.x;
 
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_unique;
        idx += stride) {
-    // Find which table this index belongs to
-    int table_id = binary_search_upper_bound(table_offsets, num_tables + 1, idx);
+    // Find which table this index belongs to (shared computation)
+    int table_id =
+        binary_search_upper_bound(table_offsets, num_tables + 1, idx);
 
     // Calculate offset within table
     int64_t local_idx = idx - table_offsets[table_id];
 
-    // Read from partitioned layout
-    output_keys[idx] =
-        partitioned_keys[table_id * max_keys_per_table + local_idx];
+    // Compute source position in partitioned layout
+    size_t src_pos = table_id * max_keys_per_table + local_idx;
+
+    // Compact keys
+    output_keys[idx] = partitioned_keys[src_pos];
+
+    // Compact frequency counters if enabled
+    if (partitioned_freq != nullptr) {
+      output_freq[idx] = partitioned_freq[src_pos];
+    }
   }
 }
 
-// Adjust output indices to global indices using table offsets (strided loop version)
+// ============================================================================
+// Helper kernel to expand table IDs from jagged offsets
+// ============================================================================
+
+// Binary search to find which table an index belongs to (for expand_table_ids)
+__device__ __forceinline__ int32_t find_table_for_index(
+    const int64_t *table_offsets_in_feature, const int64_t *offsets,
+    int num_tables, int local_batch_size, int64_t global_idx) {
+  // Binary search through tables to find which one contains this index
+  int lo = 0, hi = num_tables;
+  while (lo < hi) {
+    int mid = (lo + hi + 1) / 2;
+    int64_t table_start_feature = table_offsets_in_feature[mid];
+    int64_t table_start_offset = table_start_feature * local_batch_size;
+    int64_t table_start_idx = offsets[table_start_offset];
+    if (table_start_idx <= global_idx) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return static_cast<int32_t>(lo);
+}
+
+// Expand jagged offsets to per-element table_ids (strided loop version)
+// Given: offsets tensor and table_offsets_in_feature, generate table_id for
+// each element
+__global__ void expand_table_ids_kernel(const int64_t *offsets,
+                                        const int64_t *table_offsets_in_feature,
+                                        int32_t *table_ids, int num_tables,
+                                        int local_batch_size,
+                                        int64_t num_elements) {
+  const int64_t stride = blockDim.x * gridDim.x;
+
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_elements;
+       idx += stride) {
+    table_ids[idx] = find_table_for_index(table_offsets_in_feature, offsets,
+                                          num_tables, local_batch_size, idx);
+  }
+}
+
+// Adjust output indices to global indices using table offsets (strided loop
+// version)
 __global__ void adjust_output_indices_kernel(const int32_t *d_table_ids,
                                              const int64_t *table_offsets,
                                              int64_t *d_output_indices,
@@ -498,9 +574,9 @@ __global__ void adjust_output_indices_kernel(const int32_t *d_table_ids,
   }
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
-                      int64_t num_tables, int64_t device_sm_count) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
+                      int64_t device_sm_count, at::Tensor input_frequencies) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const int64_t num_keys = keys.numel();
@@ -509,10 +585,24 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
 
   TORCH_CHECK(keys.numel() == table_ids.numel(),
               "keys and table_ids must have the same length");
-  TORCH_CHECK(table_ids.scalar_type() == at::kInt,
-              "table_ids must be int32");
+  TORCH_CHECK(table_ids.scalar_type() == at::kInt, "table_ids must be int32");
   TORCH_CHECK(num_tables > 0, "num_tables must be positive");
   TORCH_CHECK(device_sm_count > 0, "device_sm_count must be positive");
+
+  // Frequency counting behavior:
+  // - input_frequencies not defined (None): disable frequency counting entirely
+  // - input_frequencies defined with numel()==0: enable counting, each key
+  // counts as 1
+  // - input_frequencies defined with numel()>0: use provided frequencies (must
+  // match num_keys)
+  const bool enable_freq_counting = input_frequencies.defined();
+  const bool has_input_freq =
+      enable_freq_counting && input_frequencies.numel() > 0;
+
+  if (has_input_freq) {
+    TORCH_CHECK(input_frequencies.numel() == num_keys,
+                "input_frequencies must have same length as keys");
+  }
 
   // Handle empty input
   if (num_keys == 0) {
@@ -520,7 +610,8 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
         at::empty({0}, keys.options()),
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
         at::zeros({num_tables + 1},
-                  at::TensorOptions().dtype(at::kLong).device(device)));
+                  at::TensorOptions().dtype(at::kLong).device(device)),
+        at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)));
   }
 
   // Compute grid size based on SM count (4 blocks per SM is a good heuristic)
@@ -539,12 +630,20 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
       {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
 
   // Per-table unique counters
-  at::Tensor table_counters =
-      at::zeros({num_tables}, at::TensorOptions().dtype(at::kLong).device(device));
+  at::Tensor table_counters = at::zeros(
+      {num_tables}, at::TensorOptions().dtype(at::kLong).device(device));
+
+  // Allocate partitioned frequency counters if needed
+  at::Tensor partitioned_freq_counters;
+  if (enable_freq_counting) {
+    partitioned_freq_counters =
+        at::zeros({num_tables * max_keys_per_table},
+                  at::TensorOptions().dtype(at::kLong).device(device));
+  }
 
   // Allocate shared hash table for (key, table_id) pairs
   // capacity = 2 * num_keys for good load factor
-  // hash_vals stores packed (table_id << 32 | local_idx), eliminating hash_table_ids
+  // hash_vals stores packed (table_id << 32 | local_idx)
   const int64_t capacity = num_keys * 2;
   at::Tensor hash_keys = at::empty({capacity}, keys.options());
   at::Tensor hash_vals = at::empty(
@@ -557,7 +656,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
         get_pointer<int64_t>(table_counters), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // Run segmented unique kernel
+    // Run segmented unique kernel with optional frequency counting
     segmented_unique_kernel<KeyType, MurmurHash3_32<KeyType>>
         <<<grid_size, BLOCK_SIZE, 0, stream>>>(
             get_pointer<const KeyType>(keys),
@@ -565,23 +664,27 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
             get_pointer<KeyType>(partitioned_unique_keys),
             get_pointer<int64_t>(output_indices), num_keys,
             get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
-            capacity, get_pointer<int64_t>(table_counters), max_keys_per_table);
+            capacity, get_pointer<int64_t>(table_counters), max_keys_per_table,
+            enable_freq_counting
+                ? get_pointer<int64_t>(partitioned_freq_counters)
+                : nullptr,
+            has_input_freq ? get_pointer<const int64_t>(input_frequencies)
+                           : nullptr);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
   // Compute table offsets using inclusive scan
-  at::Tensor table_offsets =
-      at::zeros({num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
+  at::Tensor table_offsets = at::zeros(
+      {num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
 
   // Use CUB for inclusive scan
   size_t temp_storage_bytes = 0;
-  cub::DeviceScan::InclusiveSum(nullptr, temp_storage_bytes,
-                                get_pointer<int64_t>(table_counters),
-                                get_pointer<int64_t>(table_offsets) + 1,
-                                num_tables, stream);
-  at::Tensor temp_storage = at::empty(
-      {static_cast<int64_t>(temp_storage_bytes)},
-      at::TensorOptions().dtype(at::kByte).device(device));
+  cub::DeviceScan::InclusiveSum(
+      nullptr, temp_storage_bytes, get_pointer<int64_t>(table_counters),
+      get_pointer<int64_t>(table_offsets) + 1, num_tables, stream);
+  at::Tensor temp_storage =
+      at::empty({static_cast<int64_t>(temp_storage_bytes)},
+                at::TensorOptions().dtype(at::kByte).device(device));
   cub::DeviceScan::InclusiveSum(temp_storage.data_ptr(), temp_storage_bytes,
                                 get_pointer<int64_t>(table_counters),
                                 get_pointer<int64_t>(table_offsets) + 1,
@@ -590,13 +693,27 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
   // Allocate compacted output with size num_keys (worst case: all keys unique)
   // Actual count is table_offsets[num_tables], available on device
   at::Tensor unique_keys = at::empty({num_keys}, keys.options());
+  at::Tensor output_freq_counters;
+  if (enable_freq_counting) {
+    output_freq_counters = at::empty(
+        {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
+  } else {
+    // Return an empty tensor when frequency counting is disabled
+    output_freq_counters =
+        at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device));
+  }
 
-  // Compact keys from partitioned layout to contiguous output
+  // Compact keys and frequency counters in a single fused kernel
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
-    compact_keys_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
-        get_pointer<const KeyType>(partitioned_unique_keys), max_keys_per_table,
-        get_pointer<const int64_t>(table_offsets), num_tables,
-        get_pointer<KeyType>(unique_keys),
+    compact_keys_and_freq_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
+        get_pointer<const KeyType>(partitioned_unique_keys),
+        enable_freq_counting
+            ? get_pointer<const int64_t>(partitioned_freq_counters)
+            : nullptr,
+        max_keys_per_table, get_pointer<const int64_t>(table_offsets),
+        num_tables, get_pointer<KeyType>(unique_keys),
+        enable_freq_counting ? get_pointer<int64_t>(output_freq_counters)
+                             : nullptr,
         get_pointer<const int64_t>(table_offsets) + num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
@@ -608,7 +725,90 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids,
       get_pointer<int64_t>(output_indices), num_keys);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-  return std::make_tuple(unique_keys, output_indices, table_offsets);
+  return std::make_tuple(unique_keys, output_indices, table_offsets,
+                         output_freq_counters);
+}
+
+// Helper function to expand table IDs from jagged offsets
+at::Tensor expand_table_ids_cuda(at::Tensor offsets,
+                                 at::Tensor table_offsets_in_feature,
+                                 int64_t num_tables, int64_t local_batch_size,
+                                 int64_t num_elements,
+                                 int64_t device_sm_count) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  const auto device = offsets.device();
+
+  TORCH_CHECK(offsets.is_cuda(), "offsets must be on CUDA device");
+  TORCH_CHECK(table_offsets_in_feature.is_cuda(),
+              "table_offsets_in_feature must be on CUDA device");
+  TORCH_CHECK(device_sm_count > 0, "device_sm_count must be positive");
+
+  // Handle empty input
+  if (num_elements == 0) {
+    return at::empty({0}, at::TensorOptions().dtype(at::kInt).device(device));
+  }
+
+  // Compute grid size based on SM count
+  constexpr int BLOCKS_PER_SM = 4;
+  const int grid_size = device_sm_count * BLOCKS_PER_SM;
+
+  // Allocate output table_ids
+  at::Tensor table_ids = at::empty(
+      {num_elements}, at::TensorOptions().dtype(at::kInt).device(device));
+
+  expand_table_ids_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
+      get_pointer<const int64_t>(offsets),
+      get_pointer<const int64_t>(table_offsets_in_feature),
+      get_pointer<int32_t>(table_ids), num_tables, local_batch_size,
+      num_elements);
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return table_ids;
+}
+
+// Compute dedup lengths and offsets using GPU kernel
+std::tuple<at::Tensor, at::Tensor>
+compute_dedup_lengths_cuda(at::Tensor unique_offsets,
+                           at::Tensor table_offsets_in_feature,
+                           int64_t num_tables, int64_t local_batch_size) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  const auto device = unique_offsets.device();
+
+  TORCH_CHECK(unique_offsets.is_cuda(),
+              "unique_offsets must be on CUDA device");
+  TORCH_CHECK(table_offsets_in_feature.is_cuda(),
+              "table_offsets_in_feature must be on CUDA device");
+
+  // Compute total number of (feature, batch) buckets
+  int64_t total_features = table_offsets_in_feature[num_tables].item<int64_t>();
+  int64_t new_lengths_size = total_features * local_batch_size;
+
+  // Handle empty case
+  if (new_lengths_size == 0) {
+    return std::make_tuple(
+        at::empty({0}, at::TensorOptions().dtype(at::kInt).device(device)),
+        at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)));
+  }
+
+  // Allocate output tensors
+  at::Tensor new_lengths = at::empty(
+      {new_lengths_size}, at::TensorOptions().dtype(at::kInt).device(device));
+  at::Tensor new_offsets =
+      at::empty({new_lengths_size + 1},
+                at::TensorOptions().dtype(at::kLong).device(device));
+
+  // Convert unique_offsets to uint64_t for the kernel
+  // The kernel expects uint64_t*, but int64_t is bit-compatible
+  get_new_length_and_offsets(
+      reinterpret_cast<uint64_t *>(get_pointer<int64_t>(unique_offsets)),
+      get_pointer<int64_t>(table_offsets_in_feature), num_tables,
+      new_lengths_size, local_batch_size, DataType::Int32, DataType::Int64,
+      get_pointer<int64_t>(new_offsets), get_pointer<int32_t>(new_lengths),
+      stream);
+
+  return std::make_tuple(new_lengths, new_offsets);
 }
 
 } // namespace dyn_emb
@@ -640,9 +840,19 @@ Returns:
   m.def(
       "segmented_unique_cuda",
       [](at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
-         int64_t device_sm_count) {
+         int64_t device_sm_count,
+         const c10::optional<at::Tensor> &input_frequencies) {
+        // Convert optional to tensor:
+        // - None -> undefined tensor (disables frequency counting)
+        // - Some(tensor) -> that tensor (enables frequency counting)
+        at::Tensor freq_tensor;
+        if (input_frequencies.has_value()) {
+          freq_tensor = input_frequencies.value();
+        }
+        // If input_frequencies was None, freq_tensor remains undefined
+        // which will disable frequency counting in the C++ implementation
         return dyn_emb::segmented_unique_cuda(keys, table_ids, num_tables,
-                                              device_sm_count);
+                                              device_sm_count, freq_tensor);
       },
       R"doc(
 Segmented unique: deduplicate keys per table using GPU hash table.
@@ -658,18 +868,83 @@ Args:
     table_ids: Table ID for each key (int32, same length as keys,
                must be in ascending order)
     num_tables: Total number of tables
-    device_sm_count: Number of SMs on the device (used to determine
-                     optimal grid size for kernel launches)
+    device_sm_count: Number of SMs on the device
+    input_frequencies: Controls frequency counting behavior:
+                       - None: Disable frequency counting (output freq_counters empty)
+                       - Empty tensor (numel==0): Enable counting, each key counts as 1
+                       - Tensor with numel==num_keys: Use provided frequencies
 
 Returns:
-    Tuple of (unique_keys, output_indices, table_offsets)
+    Tuple of (unique_keys, output_indices, table_offsets, frequency_counters)
     - unique_keys: Compacted unique keys with size=len(keys). Only first
                    table_offsets[num_tables] elements are valid.
     - output_indices: Index mapping (input idx -> global unique idx)
     - table_offsets: Tensor of size (num_tables + 1) with cumulative counts
                      table_offsets[i] is the start index for table i
                      table_offsets[num_tables] is the total unique count
+    - frequency_counters: Per-unique-key frequency counts (empty if disabled)
 )doc",
       py::arg("keys"), py::arg("table_ids"), py::arg("num_tables"),
-      py::arg("device_sm_count"));
+      py::arg("device_sm_count"), py::arg("input_frequencies") = py::none());
+
+  m.def(
+      "expand_table_ids_cuda",
+      [](at::Tensor offsets, at::Tensor table_offsets_in_feature,
+         int64_t num_tables, int64_t local_batch_size, int64_t num_elements,
+         int64_t device_sm_count) {
+        return dyn_emb::expand_table_ids_cuda(offsets, table_offsets_in_feature,
+                                              num_tables, local_batch_size,
+                                              num_elements, device_sm_count);
+      },
+      R"doc(
+Expand table IDs from jagged offsets.
+
+Given a jagged tensor's offsets and table structure, generates a table_id
+for each element. This is a helper function to prepare input for
+segmented_unique_cuda.
+
+Args:
+    offsets: Jagged tensor offsets (int64)
+    table_offsets_in_feature: Feature offsets per table (int64)
+    num_tables: Number of tables
+    local_batch_size: Batch size per feature
+    num_elements: Total number of elements
+    device_sm_count: Number of SMs on the device
+
+Returns:
+    table_ids tensor (int32) with same length as num_elements
+)doc",
+      py::arg("offsets"), py::arg("table_offsets_in_feature"),
+      py::arg("num_tables"), py::arg("local_batch_size"),
+      py::arg("num_elements"), py::arg("device_sm_count"));
+
+  m.def(
+      "compute_dedup_lengths_cuda",
+      [](at::Tensor unique_offsets, at::Tensor table_offsets_in_feature,
+         int64_t num_tables, int64_t local_batch_size) {
+        return dyn_emb::compute_dedup_lengths_cuda(
+            unique_offsets, table_offsets_in_feature, num_tables,
+            local_batch_size);
+      },
+      R"doc(
+Compute new lengths and offsets by evenly distributing unique keys.
+
+This is a GPU kernel that evenly distributes unique keys across (feature, batch)
+buckets. For each table, unique keys are distributed so each bucket gets
+(unique_count / num_buckets) keys, with the first (unique_count % num_buckets)
+buckets getting one extra.
+
+Args:
+    unique_offsets: Cumulative unique counts per table (int64, device)
+    table_offsets_in_feature: Feature offsets per table (int64, device)
+    num_tables: Number of tables
+    local_batch_size: Batch size per feature
+
+Returns:
+    Tuple of (new_lengths, new_offsets)
+    - new_lengths: Length for each bucket (int32)
+    - new_offsets: Offset for each bucket (int64)
+)doc",
+      py::arg("unique_offsets"), py::arg("table_offsets_in_feature"),
+      py::arg("num_tables"), py::arg("local_batch_size"));
 }

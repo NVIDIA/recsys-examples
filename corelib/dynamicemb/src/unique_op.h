@@ -60,17 +60,69 @@ unique_cuda(at::Tensor keys, at::Tensor frequency_counters = at::Tensor(),
  * @param num_tables Total number of tables
  * @param device_sm_count Number of SMs on the device (used to determine
  *                        optimal grid size for kernel launches)
+ * @param input_frequencies Controls frequency counting behavior:
+ *                          - Undefined/empty tensor with numel()==0: Enable
+ *                            frequency counting with each occurrence counted as
+ * 1
+ *                          - Tensor with numel()==num_keys: Use provided
+ *                            frequencies for weighted counting
+ *                          - Pass None from Python to disable frequency
+ * counting entirely (output freq_counters will be empty)
  *
- * @return Tuple of (unique_keys, output_indices, table_offsets)
+ * @return Tuple of (unique_keys, output_indices, table_offsets, freq_counters)
  *         - unique_keys: Compacted unique keys with size=num_keys (same as
  *           input). Only first table_offsets[num_tables] elements are valid.
  *         - output_indices: Index mapping (input idx -> global unique idx)
  *         - table_offsets: Tensor of size (num_tables + 1) with cumulative
  *           counts. table_offsets[num_tables] contains total unique count.
+ *         - freq_counters: Frequency counts per unique key. Empty if frequency
+ *           counting is disabled (input_frequencies was None).
  */
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
-                      int64_t device_sm_count);
+                      int64_t device_sm_count,
+                      at::Tensor input_frequencies = at::Tensor());
+
+/**
+ * @brief Expand table IDs from jagged offsets.
+ *
+ * Given a jagged tensor's offsets and table structure, generates a table_id
+ * for each element. This is a helper function to prepare input for
+ * segmented_unique_cuda.
+ *
+ * @param offsets Jagged tensor offsets (int64)
+ * @param table_offsets_in_feature Feature offsets per table (int64)
+ * @param num_tables Number of tables
+ * @param local_batch_size Batch size per feature
+ * @param num_elements Total number of elements (values in jagged tensor)
+ * @param device_sm_count Number of SMs on the device
+ *
+ * @return table_ids tensor (int32) with same length as num_elements
+ */
+at::Tensor expand_table_ids_cuda(at::Tensor offsets,
+                                 at::Tensor table_offsets_in_feature,
+                                 int64_t num_tables, int64_t local_batch_size,
+                                 int64_t num_elements, int64_t device_sm_count);
+
+/**
+ * @brief Compute new lengths and offsets by evenly distributing unique keys.
+ *
+ * This is a GPU kernel that evenly distributes unique keys across (feature,
+ * batch) buckets. For each table, unique keys are distributed so each bucket
+ * gets (unique_count / num_buckets) keys, with the first (unique_count %
+ * num_buckets) buckets getting one extra.
+ *
+ * @param unique_offsets Cumulative unique counts per table (int64, device)
+ * @param table_offsets_in_feature Feature offsets per table (int64, device)
+ * @param num_tables Number of tables
+ * @param local_batch_size Batch size per feature
+ *
+ * @return Tuple of (new_lengths, new_offsets)
+ */
+std::tuple<at::Tensor, at::Tensor>
+compute_dedup_lengths_cuda(at::Tensor unique_offsets,
+                           at::Tensor table_offsets_in_feature,
+                           int64_t num_tables, int64_t local_batch_size);
 
 } // namespace dyn_emb
 
