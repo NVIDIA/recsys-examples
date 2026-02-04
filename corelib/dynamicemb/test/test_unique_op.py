@@ -15,7 +15,7 @@
 
 import pytest
 import torch
-from dynamicemb.unique_op import unique
+from dynamicemb_extensions import unique_cuda
 
 
 def generate_random_integers(length, device, low=0, high=100, dtype=torch.int64):
@@ -74,7 +74,7 @@ def test_basic_unique(setup_device):
         [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device
     )
 
-    unique_keys, inversed_indices, num_unique = unique(keys)
+    unique_keys, inversed_indices, num_unique = unique_cuda(keys, None, None)
 
     pytorch_unique_keys, pytorch_inverse_indices = torch.unique(
         keys, return_inverse=True
@@ -97,7 +97,7 @@ def test_random_unique(setup_device):
     high = 132
     keys = generate_random_integers(length, device, low, high, dtype=key_type)
 
-    unique_keys, inversed_indices, num_unique = unique(keys)
+    unique_keys, inversed_indices, num_unique = unique_cuda(keys, None, None)
 
     pytorch_unique_keys, pytorch_inverse_indices = torch.unique(
         keys, return_inverse=True
@@ -117,7 +117,7 @@ def test_empty_input(setup_device):
 
     keys = torch.tensor([], dtype=key_type, device=device)
 
-    unique_keys, inversed_indices, num_unique = unique(keys)
+    unique_keys, inversed_indices, num_unique = unique_cuda(keys, None, None)
 
     assert num_unique.item() == 0, "Empty input should return 0 unique keys"
     assert unique_keys.numel() == 0, "Empty input should return empty unique keys"
@@ -132,7 +132,7 @@ def test_all_same_keys(setup_device):
 
     keys = torch.full((1000,), 42, dtype=key_type, device=device)
 
-    unique_keys, inversed_indices, num_unique = unique(keys)
+    unique_keys, inversed_indices, num_unique = unique_cuda(keys, None, None)
 
     assert num_unique.item() == 1, "All same keys should return 1 unique key"
     assert unique_keys[0].item() == 42, "Unique key should be 42"
@@ -147,7 +147,7 @@ def test_all_unique_keys(setup_device):
 
     keys = torch.arange(1000, dtype=key_type, device=device)
 
-    unique_keys, inversed_indices, num_unique = unique(keys)
+    unique_keys, inversed_indices, num_unique = unique_cuda(keys, None, None)
 
     assert num_unique.item() == 1000, "All unique keys should return same count"
     print("All unique keys test passed")
@@ -162,7 +162,7 @@ def test_uint64_dtype(setup_device):
         [0, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], dtype=key_type, device=device
     )
 
-    unique_keys, inversed_indices, num_unique = unique(keys)
+    unique_keys, inversed_indices, num_unique = unique_cuda(keys, None, None)
 
     pytorch_unique_keys, pytorch_inverse_indices = torch.unique(
         keys, return_inverse=True
