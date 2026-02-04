@@ -95,10 +95,10 @@ void bind_table_operation(py::module &m) {
         "split the tensor into several sub-partitions.", py::arg("storage"),
         py::arg("dtypes"), py::arg("bucket_capacity"), py::arg("num_buckets"));
 
-  m.def("table_lookup", &dyn_emb::table_lookup, "lookup the table",
-        py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
-        py::arg("keys"), py::arg("scores"), py::arg("policy_types"),
-        py::arg("is_returns"), py::arg("founds"), py::arg("indices"));
+//   m.def("table_lookup", &dyn_emb::table_lookup, "lookup the table",
+//         py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
+//         py::arg("keys"), py::arg("scores"), py::arg("policy_types"),
+//         py::arg("is_returns"), py::arg("founds"), py::arg("indices"));
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
