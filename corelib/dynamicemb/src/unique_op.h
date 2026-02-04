@@ -44,6 +44,34 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor>
 unique_cuda(at::Tensor keys, at::Tensor frequency_counters = at::Tensor(),
             at::Tensor input_frequencies = at::Tensor());
 
+/**
+ * @brief Segmented unique operation that deduplicates keys per table.
+ *
+ * This function performs unique operation on keys partitioned by table_ids.
+ * Keys are deduplicated within each table independently, allowing the same key
+ * to appear in different tables. Uses compound hashing on (key, table_id) pairs
+ * with a single shared hash table for memory efficiency.
+ *
+ * NOTE: This function is fully asynchronous with no GPU-CPU synchronization.
+ *
+ * @param keys Input keys tensor (int64 or uint64)
+ * @param table_ids Table ID for each key (int32, same length as keys,
+ *                  must be in ascending order)
+ * @param num_tables Total number of tables
+ * @param device_sm_count Number of SMs on the device (used to determine
+ *                        optimal grid size for kernel launches)
+ *
+ * @return Tuple of (unique_keys, output_indices, table_offsets)
+ *         - unique_keys: Compacted unique keys with size=num_keys (same as
+ *           input). Only first table_offsets[num_tables] elements are valid.
+ *         - output_indices: Index mapping (input idx -> global unique idx)
+ *         - table_offsets: Tensor of size (num_tables + 1) with cumulative
+ *           counts. table_offsets[num_tables] contains total unique count.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
+                      int64_t device_sm_count);
+
 } // namespace dyn_emb
 
 // Python binding

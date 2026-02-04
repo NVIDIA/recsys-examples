@@ -15,7 +15,7 @@
 
 import pytest
 import torch
-from dynamicemb_extensions import unique_cuda
+from dynamicemb_extensions import unique_cuda, segmented_unique_cuda
 
 
 def generate_random_integers(length, device, low=0, high=100, dtype=torch.int64):
@@ -172,6 +172,247 @@ def test_uint64_dtype(setup_device):
     # Compare count
     assert num_unique.item() == pytorch_unique_keys.shape[0]
     print(f"uint64 test: found {num_unique.item()} unique keys")
+
+
+# ============================================================================
+# Segmented Unique Tests
+# ============================================================================
+
+
+def test_segmented_unique_basic(setup_device):
+    """Test basic segmented unique operation with large input (1M keys)."""
+    device = setup_device
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    num_tables = 10
+    num_keys = 1_000_000
+    num_unique_per_table = 10000  # Each table has ~10K unique keys
+
+    # Generate keys with controlled uniqueness per table
+    keys = torch.randint(0, num_unique_per_table, (num_keys,), dtype=torch.int64, device=device)
+
+    # Generate ascending table_ids (simulate sorted input)
+    table_ids = torch.sort(
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+    ).values
+
+    unique_keys, output_indices, table_offsets = segmented_unique_cuda(
+        keys, table_ids, num_tables, device_sm_count
+    )
+    torch.cuda.synchronize()
+
+    # Check table offsets
+    table_offsets_cpu = table_offsets.cpu()
+    assert table_offsets_cpu[0].item() == 0, "First offset should be 0"
+
+    # Verify offsets are non-decreasing
+    for i in range(num_tables):
+        assert table_offsets_cpu[i + 1] >= table_offsets_cpu[i], "Table offsets should be non-decreasing"
+
+    # Check that output indices correctly reconstruct keys
+    unique_keys_cpu = unique_keys.cpu()
+    output_indices_cpu = output_indices.cpu()
+    keys_cpu = keys.cpu()
+
+    reconstructed = unique_keys_cpu[output_indices_cpu]
+    assert torch.equal(reconstructed, keys_cpu), "Reconstruction failed"
+
+    total_unique = table_offsets_cpu[-1].item()
+    print(f"Segmented unique basic test passed: {total_unique} unique from {num_keys} keys, {num_tables} tables")
+
+
+def test_segmented_unique_overlapping_keys(setup_device):
+    """Test segmented unique with same keys in different tables (1M keys)."""
+    device = setup_device
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    num_tables = 8
+    num_keys = 1_000_000
+    num_unique_keys = 1000  # Small unique key space to maximize overlaps
+
+    # Same keys appear across all tables - should be counted separately per table
+    keys = torch.randint(0, num_unique_keys, (num_keys,), dtype=torch.int64, device=device)
+
+    # Generate ascending table_ids
+    table_ids = torch.sort(
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+    ).values
+
+    unique_keys, output_indices, table_offsets = segmented_unique_cuda(
+        keys, table_ids, num_tables, device_sm_count
+    )
+    torch.cuda.synchronize()
+
+    table_offsets_cpu = table_offsets.cpu()
+
+    # Each table should have at most num_unique_keys unique keys
+    for i in range(num_tables):
+        table_count = table_offsets_cpu[i + 1].item() - table_offsets_cpu[i].item()
+        assert table_count <= num_unique_keys, f"Table {i} has more unique keys than possible"
+
+    # Total unique count from table_offsets[num_tables]
+    total_unique = table_offsets_cpu[num_tables].item()
+
+    # Verify reconstruction
+    unique_keys_cpu = unique_keys.cpu()
+    output_indices_cpu = output_indices.cpu()
+    keys_cpu = keys.cpu()
+
+    reconstructed = unique_keys_cpu[output_indices_cpu]
+    assert torch.equal(reconstructed, keys_cpu), "Reconstruction failed"
+
+    print(f"Segmented unique overlapping keys test passed: {total_unique} unique from {num_keys} keys")
+
+
+def test_segmented_unique_empty_tables(setup_device):
+    """Test segmented unique with some empty tables (1M keys)."""
+    device = setup_device
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    num_tables = 10
+    num_keys = 1_000_000
+
+    # Create table_ids that skip some tables (tables 2, 5, 7 will be empty)
+    active_tables = [0, 1, 3, 4, 6, 8, 9]
+    table_ids_list = torch.randint(0, len(active_tables), (num_keys,), dtype=torch.int32, device=device)
+    # Map to actual table IDs
+    active_tables_tensor = torch.tensor(active_tables, dtype=torch.int32, device=device)
+    table_ids = torch.sort(active_tables_tensor[table_ids_list]).values
+
+    keys = torch.randint(0, 10000, (num_keys,), dtype=torch.int64, device=device)
+
+    unique_keys, output_indices, table_offsets = segmented_unique_cuda(
+        keys, table_ids, num_tables, device_sm_count
+    )
+    torch.cuda.synchronize()
+
+    table_offsets_cpu = table_offsets.cpu()
+
+    # Check empty tables have 0 count
+    empty_tables = [2, 5, 7]
+    for t in empty_tables:
+        count = table_offsets_cpu[t + 1].item() - table_offsets_cpu[t].item()
+        assert count == 0, f"Table {t} should be empty, got {count} keys"
+
+    # Check active tables have non-zero counts
+    for t in active_tables:
+        count = table_offsets_cpu[t + 1].item() - table_offsets_cpu[t].item()
+        # Active tables should have some keys (unless extremely unlucky with random)
+        # Just verify it doesn't exceed max possible
+        assert count <= 10000, f"Table {t} has more unique keys than possible"
+
+    # Verify reconstruction
+    unique_keys_cpu = unique_keys.cpu()
+    output_indices_cpu = output_indices.cpu()
+    keys_cpu = keys.cpu()
+
+    reconstructed = unique_keys_cpu[output_indices_cpu]
+    assert torch.equal(reconstructed, keys_cpu), "Reconstruction failed"
+
+    total_unique = table_offsets_cpu[-1].item()
+    print(f"Segmented unique empty tables test passed: {total_unique} unique, {len(empty_tables)} empty tables")
+
+
+def test_segmented_unique_empty_input(setup_device):
+    """Test segmented unique with empty input."""
+    device = setup_device
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    keys = torch.tensor([], dtype=torch.int64, device=device)
+    table_ids = torch.tensor([], dtype=torch.int32, device=device)
+    num_tables = 3
+
+    unique_keys, output_indices, table_offsets = segmented_unique_cuda(
+        keys, table_ids, num_tables, device_sm_count
+    )
+    torch.cuda.synchronize()
+
+    assert unique_keys.numel() == 0, "Empty input should return empty unique keys"
+    assert output_indices.numel() == 0, "Empty input should return empty indices"
+    assert table_offsets.numel() == num_tables + 1, "Table offsets should have num_tables+1 elements"
+    assert torch.all(table_offsets == 0), "All offsets should be 0 for empty input"
+
+    print("Segmented unique empty input test passed")
+
+
+def test_segmented_unique_random(setup_device):
+    """Test segmented unique with random data (1M keys)."""
+    device = setup_device
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    num_tables = 16
+    num_keys = 1_000_000
+
+    # Generate random keys with high uniqueness
+    keys = torch.randint(0, 100000, (num_keys,), dtype=torch.int64, device=device)
+
+    # Generate ascending table_ids (simulate sorted input)
+    table_ids = torch.sort(
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+    ).values
+
+    unique_keys, output_indices, table_offsets = segmented_unique_cuda(
+        keys, table_ids, num_tables, device_sm_count
+    )
+    torch.cuda.synchronize()
+
+    # Verify reconstruction
+    unique_keys_cpu = unique_keys.cpu()
+    output_indices_cpu = output_indices.cpu()
+    keys_cpu = keys.cpu()
+
+    reconstructed = unique_keys_cpu[output_indices_cpu]
+    assert torch.equal(reconstructed, keys_cpu), "Reconstruction failed for random test"
+
+    # Verify table offsets are non-decreasing
+    table_offsets_cpu = table_offsets.cpu()
+    for i in range(num_tables):
+        assert table_offsets_cpu[i + 1] >= table_offsets_cpu[i], "Table offsets should be non-decreasing"
+
+    total_unique = table_offsets_cpu[-1].item()
+    print(f"Segmented unique random test passed: {total_unique} unique from {num_keys} keys, {num_tables} tables")
+
+
+def test_segmented_unique_stress(setup_device):
+    """Stress test with very large input (4M keys, many tables)."""
+    device = setup_device
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    num_tables = 32
+    num_keys = 4_000_000
+
+    # Generate random keys
+    keys = torch.randint(0, 500000, (num_keys,), dtype=torch.int64, device=device)
+
+    # Generate ascending table_ids
+    table_ids = torch.sort(
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+    ).values
+
+    # Warmup
+    torch.cuda.synchronize()
+
+    import time
+    start = time.perf_counter()
+
+    unique_keys, output_indices, table_offsets = segmented_unique_cuda(
+        keys, table_ids, num_tables, device_sm_count
+    )
+    torch.cuda.synchronize()
+
+    elapsed = time.perf_counter() - start
+
+    # Verify reconstruction
+    unique_keys_cpu = unique_keys.cpu()
+    output_indices_cpu = output_indices.cpu()
+    keys_cpu = keys.cpu()
+
+    reconstructed = unique_keys_cpu[output_indices_cpu]
+    assert torch.equal(reconstructed, keys_cpu), "Reconstruction failed for stress test"
+
+    total_unique = table_offsets.cpu()[-1].item()
+    throughput = num_keys / elapsed / 1e6
+    print(f"Segmented unique stress test: {total_unique} unique from {num_keys} keys in {elapsed*1000:.2f}ms ({throughput:.2f}M keys/s)")
 
 
 if __name__ == "__main__":
