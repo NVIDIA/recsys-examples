@@ -56,7 +56,7 @@ bash ./benchmark/benchmark_batched_dynamicemb_tables.sh
 
 We test the `BatchedDynamicEmbeddingTablesV2` under `capacity=128x1024x1024`.
 
-The overhead(ms) on H100 80GB HBM3, used pow-law(alpha=1.05) as input.
+The overhead(ms) is tested with pow-law(alpha=1.05) as input.
 - embedding_dtype: float32
 - embedding_dim: 128
 - cache_algorithm: lru
@@ -64,4 +64,10 @@ The overhead(ms) on H100 80GB HBM3, used pow-law(alpha=1.05) as input.
 - capacity: 24M when cache_ratio=1.0, 256M when cache_ratio=0.1 
 - num_iterations: 100
 
+**Overhead on H100 80GB HBM3**
+
 ![benchmark result of BatchedDynamicEmbeddingTables with torchrec](./benchmark_bdet_results.png)
+
+**Overhead on NVIDIA H200**
+
+![benchmark result of BatchedDynamicEmbeddingTables with torchrec on H200](./benchmark_bdet_results_h200.png)
