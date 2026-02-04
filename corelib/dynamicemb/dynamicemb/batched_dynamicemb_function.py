@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import (
@@ -33,6 +33,7 @@ from dynamicemb.types import Counter
 from dynamicemb_extensions import (
     DynamicEmbTable,
     EvictStrategy,
+    expand_table_ids_cuda,
     find_and_initialize,
     find_or_insert,
     gather_embedding,
@@ -40,8 +41,106 @@ from dynamicemb_extensions import (
     lookup_backward,
     lookup_forward,
     reduce_grads,
-    segmented_unique,
+    segmented_unique_cuda,
 )
+
+
+def segmented_unique(
+    keys: torch.Tensor,
+    segment_range: torch.Tensor,
+    evict_strategy: Optional[EvictStrategy] = None,
+    frequency_counts: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Perform segmented unique operation on keys with segment_range.
+
+    This function deduplicates keys within each table segment, using the
+    GPU-accelerated segmented_unique_cuda kernel.
+
+    Args:
+        keys: Input key tensor (int64 or uint64)
+        segment_range: Table boundary offsets where segment_range[i] is the
+                       start index for table i (int64)
+        evict_strategy: Optional eviction strategy (for LFU mode)
+        frequency_counts: Optional input frequency counts per key
+
+    Returns:
+        Tuple of (unique_keys, inverse, unique_keys_table_range,
+                  h_unique_keys_table_range, output_scores)
+    """
+    num_keys = keys.size(0)
+    num_tables = segment_range.size(0) - 1
+    device = keys.device
+
+    # Handle empty input
+    if num_keys == 0:
+        empty_keys = torch.empty(0, dtype=keys.dtype, device=device)
+        empty_inverse = torch.empty(0, dtype=torch.int64, device=device)
+        d_table_range = torch.zeros(num_tables + 1, dtype=torch.int64, device=device)
+        h_table_range = torch.zeros(num_tables + 1, dtype=torch.int64, device="cpu")
+        return (empty_keys, empty_inverse, d_table_range, h_table_range, torch.Tensor())
+
+    # Determine if we need frequency output
+    is_lfu_enabled = evict_strategy == EvictStrategy.KLfu if evict_strategy else False
+    need_frequency_output = is_lfu_enabled or frequency_counts is not None
+
+    # Get device SM count
+    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    # Generate table_ids from segment_range
+    # segment_range has size (num_tables + 1), treating each table as one feature
+    # with local_batch_size=1. When table_offsets_in_feature=None, each feature
+    # maps to a separate table.
+    table_ids = expand_table_ids_cuda(
+        segment_range,
+        None,  # table_offsets_in_feature=None -> each feature = separate table
+        num_tables,  # ignored when table_offsets_in_feature is None
+        1,  # local_batch_size
+        num_keys,
+        device_sm_count,
+    )
+
+    # Prepare input_frequencies tensor
+    input_frequencies = None
+    if frequency_counts is not None:
+        input_frequencies = frequency_counts
+    elif need_frequency_output:
+        # Enable frequency counting with count=1 per key
+        input_frequencies = torch.empty(0, dtype=torch.int64, device=device)
+
+    # Convert keys to int64 if needed (segmented_unique_cuda supports int64/uint64)
+    keys_input = keys
+    if keys.dtype not in (torch.int64, torch.uint64):
+        keys_input = keys.to(torch.int64)
+
+    # Call segmented_unique_cuda
+    unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
+        keys_input, table_ids, num_tables, device_sm_count, input_frequencies
+    )
+
+    # Get total unique count and slice the output
+    # .item() implicitly syncs
+    total_unique = table_offsets[num_tables].item()
+    unique_keys_out = unique_keys[:total_unique]
+
+    # Convert unique_keys back to original dtype if needed
+    if keys.dtype != keys_input.dtype:
+        unique_keys_out = unique_keys_out.to(keys.dtype)
+
+    # Prepare output tensors in the expected format
+    h_table_offsets = table_offsets.cpu()
+
+    output_scores = torch.Tensor()
+    if need_frequency_output and total_unique > 0:
+        output_scores = freq_counters[:total_unique]
+
+    return (
+        unique_keys_out,
+        output_indices,
+        table_offsets,
+        h_table_offsets,
+        output_scores,
+    )
 
 
 # TODO: BatchedDynamicEmbeddingFunction is more concrete.

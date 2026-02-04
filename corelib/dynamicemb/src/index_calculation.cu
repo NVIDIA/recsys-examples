@@ -17,7 +17,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "check.h"
 #include "index_calculation.h"
-#include "unique_op.h"
 #include "utils.h"
 #include <cuda/std/tuple>
 #include <iostream>
@@ -356,164 +355,6 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
   return table_range;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-segmented_unique(
-    at::Tensor keys, at::Tensor segment_range,
-    const c10::optional<EvictStrategy> evict_strategy = c10::nullopt,
-    const c10::optional<at::Tensor> frequency_counts_uint64 = c10::nullopt) {
-
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t num_total = keys.size(0);
-
-  at::Tensor h_segment_range =
-      at::empty(segment_range.sizes(),
-                segment_range.options().device(at::kCPU).pinned_memory(true));
-  h_segment_range.copy_(segment_range, /*non_blocking=*/true);
-
-  int table_num = segment_range.size(0) - 1;
-
-  // Determine score strategy
-  bool is_lfu_enabled = false;
-  if (evict_strategy.has_value()) {
-    is_lfu_enabled = evict_strategy.value() == EvictStrategy::kLfu;
-  }
-  // Create vector of tensors for per-table frequency output
-  bool need_frequency_output = false;
-  need_frequency_output = is_lfu_enabled || frequency_counts_uint64.has_value();
-  // Use single shared buffer instead of table_num separate buffers
-  at::Tensor shared_unique_buffer = at::empty(num_total, keys.options());
-  at::Tensor shared_frequency_buffer;
-  if (need_frequency_output) {
-    shared_frequency_buffer = at::zeros(
-        num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
-  }
-  at::Tensor d_unique_nums = at::empty(table_num, segment_range.options());
-  at::Tensor d_unique_indices_table_range =
-      at::zeros(table_num + 1, segment_range.options());
-
-  auto unique_num_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_nums.dtype()));
-  auto unique_offset_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_indices_table_range.dtype()));
-  auto inverse_idx = at::empty(num_total, segment_range.options());
-
-  // sync for h_segment_range
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  for (int i = 0; i < table_num; ++i) {
-    int64_t indices_begin = h_segment_range[i].item<int64_t>();
-    int64_t indices_end = h_segment_range[i + 1].item<int64_t>();
-    int64_t indices_length = indices_end - indices_begin;
-
-    if (indices_length == 0) {
-      DEMB_CUDA_CHECK(cudaMemsetAsync(
-          reinterpret_cast<int64_t *>(d_unique_nums.data_ptr()) + i, 0,
-          sizeof(int64_t), stream));
-      dyn_emb::add_offset(d_unique_nums.data_ptr(),
-                          d_unique_indices_table_range.data_ptr(), i,
-                          unique_num_type, unique_offset_type, stream);
-    } else {
-      at::Tensor tmp_indices = keys.slice(0, indices_begin, indices_end);
-      at::Tensor tmp_inverse_idx =
-          inverse_idx.slice(0, indices_begin, indices_end);
-      at::Tensor tmp_d_unique_num = d_unique_nums.slice(0, i, table_num);
-
-      at::Tensor previous_d_unique_num =
-          d_unique_indices_table_range.slice(0, i, table_num + 1);
-
-      at::Tensor tmp_unique_buffer_slice =
-          shared_unique_buffer.slice(0, indices_begin, indices_end);
-
-      at::Tensor tmp_frequency_counts_uint64;
-      at::Tensor tmp_frequency_output_slice;
-      if (frequency_counts_uint64.has_value()) {
-        // LFU mode: use input frequency counts
-        tmp_frequency_counts_uint64 = frequency_counts_uint64.value().slice(
-            0, indices_begin, indices_end);
-        tmp_frequency_output_slice =
-            shared_frequency_buffer.slice(0, indices_begin, indices_end);
-      } else if (need_frequency_output) {
-        tmp_frequency_output_slice =
-            shared_frequency_buffer.slice(0, indices_begin, indices_end);
-      }
-
-      // Call the stateless unique_cuda function (uses current stream)
-      auto [unique_keys_seg, output_indices_seg, num_unique_seg] =
-          dyn_emb::unique_cuda(tmp_indices, tmp_frequency_output_slice,
-                               tmp_frequency_counts_uint64);
-
-      // Add cumulative offset to output indices and store in inverse_idx
-      // previous_d_unique_num.select(0, 0) = d_unique_indices_table_range[i]
-      // (on device)
-      at::add_out(tmp_inverse_idx, output_indices_seg,
-                  previous_d_unique_num.select(0, 0));
-
-      // Copy unique keys to output buffer
-      cudaMemcpyAsync(tmp_unique_buffer_slice.data_ptr(),
-                      unique_keys_seg.data_ptr(),
-                      unique_keys_seg.numel() * unique_keys_seg.element_size(),
-                      cudaMemcpyDeviceToDevice, stream);
-
-      // Copy unique count
-      cudaMemcpyAsync(tmp_d_unique_num.data_ptr(), num_unique_seg.data_ptr(),
-                      sizeof(int64_t), cudaMemcpyDeviceToDevice, stream);
-
-      dyn_emb::add_offset(d_unique_nums.data_ptr(),
-                          d_unique_indices_table_range.data_ptr(), i,
-                          unique_num_type, unique_offset_type, stream);
-    }
-  }
-
-  at::Tensor h_unique_indices_table_range =
-      at::empty(table_num + 1, segment_range.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaMemcpyAsync(h_unique_indices_table_range.data_ptr(),
-                                d_unique_indices_table_range.data_ptr(),
-                                (d_unique_indices_table_range.size(0)) *
-                                    d_unique_indices_table_range.element_size(),
-                                cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  int64_t unique_embs_offset = 0;
-  int64_t num_unique_total =
-      h_unique_indices_table_range[table_num].item<int64_t>();
-  at::Tensor unique_keys = at::empty(num_unique_total, keys.options());
-  at::Tensor output_scores;
-  output_scores = at::Tensor();
-  if (need_frequency_output) {
-    output_scores = at::empty(num_unique_total, keys.options());
-  }
-  for (int i = 0; i < table_num; ++i) {
-    int64_t tmp_unique_num =
-        h_unique_indices_table_range[i + 1].item<int64_t>() -
-        h_unique_indices_table_range[i].item<int64_t>();
-    if (tmp_unique_num != 0) {
-      int64_t indices_begin = h_segment_range[i].item<int64_t>();
-
-      void *dst_ptr = reinterpret_cast<char *>(unique_keys.data_ptr()) +
-                      unique_embs_offset * unique_keys.element_size();
-      void *src_ptr =
-          reinterpret_cast<char *>(shared_unique_buffer.data_ptr()) +
-          indices_begin * shared_unique_buffer.element_size();
-      size_t copy_size = tmp_unique_num * unique_keys.element_size();
-      AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
-                                    cudaMemcpyDeviceToDevice, stream));
-      if (need_frequency_output) {
-        void *dst_ptr = reinterpret_cast<char *>(output_scores.data_ptr()) +
-                        unique_embs_offset * output_scores.element_size();
-        void *src_ptr =
-            reinterpret_cast<char *>(shared_frequency_buffer.data_ptr()) +
-            indices_begin * shared_frequency_buffer.element_size();
-        size_t copy_size = tmp_unique_num * output_scores.element_size();
-        AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
-                                      cudaMemcpyDeviceToDevice, stream));
-      }
-    }
-    unique_embs_offset += tmp_unique_num;
-  }
-  return std::make_tuple(unique_keys, inverse_idx, d_unique_indices_table_range,
-                         h_unique_indices_table_range, output_scores);
-}
-
 void select(at::Tensor flags, at::Tensor inputs, at::Tensor outputs,
             at::Tensor num_selected) {
 
@@ -582,14 +423,6 @@ void bind_index_calculation_op(py::module &m) {
   m.def("get_table_range", &dyn_emb::get_table_range,
         "Make offsets from <feature, batch> scope into <table> scope",
         py::arg("offsets"), py::arg("feature_offsets"));
-
-  m.def("segmented_unique", &dyn_emb::segmented_unique,
-        "Dose segmented unique operation on keys with segment_range, return "
-        "tuple<unique_keys, inverse, unique_keys_table_range, "
-        "h_unique_keys_table_range, output_scores>",
-        py::arg("keys"), py::arg("segment_range"),
-        py::arg("evict_strategy") = c10::nullopt,
-        py::arg("frequency_counts_uint64") = c10::nullopt);
 
   m.def("select", &dyn_emb::select,
         "Select items in inputs which flags are true.", py::arg("flags"),

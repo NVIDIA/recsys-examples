@@ -84,25 +84,34 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
                       at::Tensor input_frequencies = at::Tensor());
 
 /**
- * @brief Expand table IDs from jagged offsets.
+ * @brief Expand table IDs from offsets.
  *
- * Given a jagged tensor's offsets and table structure, generates a table_id
- * for each element. This is a helper function to prepare input for
- * segmented_unique_cuda.
+ * Generates a table_id for each element based on offsets structure.
+ * This is a helper function to prepare input for segmented_unique_cuda.
  *
  * @param offsets Jagged tensor offsets (int64)
- * @param table_offsets_in_feature Feature offsets per table (int64)
- * @param num_tables Number of tables
+ *                Size = num_features * local_batch_size + 1
+ *                Indexed by (feature_id * local_batch_size + batch_id)
+ *
+ * @param table_offsets_in_feature Feature offsets per table (int64), or None
+ *                Size = num_tables + 1
+ *                Maps features to tables (adjacent features may share a table)
+ *                table_offsets_in_feature[t] is the first feature index for
+ * table t If None: each feature is treated as a separate table
+ *
+ * @param num_tables Number of tables (ignored if table_offsets_in_feature is
+ * None)
  * @param local_batch_size Batch size per feature
- * @param num_elements Total number of elements (values in jagged tensor)
+ * @param num_elements Total number of elements (keys)
  * @param device_sm_count Number of SMs on the device
  *
  * @return table_ids tensor (int32) with same length as num_elements
  */
-at::Tensor expand_table_ids_cuda(at::Tensor offsets,
-                                 at::Tensor table_offsets_in_feature,
-                                 int64_t num_tables, int64_t local_batch_size,
-                                 int64_t num_elements, int64_t device_sm_count);
+at::Tensor
+expand_table_ids_cuda(at::Tensor offsets,
+                      c10::optional<at::Tensor> table_offsets_in_feature,
+                      int64_t num_tables, int64_t local_batch_size,
+                      int64_t num_elements, int64_t device_sm_count);
 
 /**
  * @brief Compute new lengths and offsets by evenly distributing unique keys.
