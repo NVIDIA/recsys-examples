@@ -202,7 +202,7 @@ def test_segmented_unique_basic(setup_device):
         torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
     ).values
 
-    unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count
     )
     torch.cuda.synchronize()
@@ -230,7 +230,8 @@ def test_segmented_unique_basic(setup_device):
         freq_counters.numel() == 0
     ), "freq_counters should be empty when not requested"
 
-    total_unique = table_offsets_cpu[-1].item()
+    total_unique = num_uniques.item()
+    assert total_unique == table_offsets_cpu[-1].item(), "num_uniques should match table_offsets[-1]"
     print(
         f"Segmented unique basic test passed: {total_unique} unique from {num_keys} keys, {num_tables} tables"
     )
@@ -255,7 +256,7 @@ def test_segmented_unique_overlapping_keys(setup_device):
         torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
     ).values
 
-    unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count
     )
     torch.cuda.synchronize()
@@ -304,7 +305,7 @@ def test_segmented_unique_empty_tables(setup_device):
 
     keys = torch.randint(0, 10000, (num_keys,), dtype=torch.int64, device=device)
 
-    unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count
     )
     torch.cuda.synchronize()
@@ -332,7 +333,7 @@ def test_segmented_unique_empty_tables(setup_device):
     reconstructed = unique_keys_cpu[output_indices_cpu]
     assert torch.equal(reconstructed, keys_cpu), "Reconstruction failed"
 
-    total_unique = table_offsets_cpu[-1].item()
+    total_unique = num_uniques.item()
     print(
         f"Segmented unique empty tables test passed: {total_unique} unique, {len(empty_tables)} empty tables"
     )
@@ -347,13 +348,14 @@ def test_segmented_unique_empty_input(setup_device):
     table_ids = torch.tensor([], dtype=torch.int32, device=device)
     num_tables = 3
 
-    unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count
     )
     torch.cuda.synchronize()
 
     assert unique_keys.numel() == 0, "Empty input should return empty unique keys"
     assert output_indices.numel() == 0, "Empty input should return empty indices"
+    assert num_uniques.item() == 0, "Empty input should have 0 unique keys"
     assert (
         table_offsets.numel() == num_tables + 1
     ), "Table offsets should have num_tables+1 elements"
@@ -379,7 +381,7 @@ def test_segmented_unique_random(setup_device):
         torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
     ).values
 
-    unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count
     )
     torch.cuda.synchronize()
@@ -399,7 +401,7 @@ def test_segmented_unique_random(setup_device):
             table_offsets_cpu[i + 1] >= table_offsets_cpu[i]
         ), "Table offsets should be non-decreasing"
 
-    total_unique = table_offsets_cpu[-1].item()
+    total_unique = num_uniques.item()
     print(
         f"Segmented unique random test passed: {total_unique} unique from {num_keys} keys, {num_tables} tables"
     )
@@ -428,7 +430,7 @@ def test_segmented_unique_stress(setup_device):
 
     start = time.perf_counter()
 
-    unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count
     )
     torch.cuda.synchronize()
@@ -468,13 +470,13 @@ def test_segmented_unique_with_frequency_counters(setup_device):
     # This enables counting with each key occurrence counted as 1
     empty_freq_tensor = torch.empty(0, dtype=torch.int64, device=device)
 
-    unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count, empty_freq_tensor
     )
     torch.cuda.synchronize()
 
     # freq_counters should have values
-    total_unique = table_offsets.cpu()[-1].item()
+    total_unique = num_uniques.item()
     assert (
         freq_counters.numel() == num_keys
     ), "freq_counters should have num_keys elements"
@@ -517,12 +519,12 @@ def test_segmented_unique_with_custom_frequencies(setup_device):
     # Custom frequencies: each key occurrence has frequency 2
     input_frequencies = torch.full((num_keys,), 2, dtype=torch.int64, device=device)
 
-    unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
+    num_uniques, unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count, input_frequencies
     )
     torch.cuda.synchronize()
 
-    total_unique = table_offsets.cpu()[-1].item()
+    total_unique = num_uniques.item()
 
     # Sum of frequencies should equal 2 * num_keys (each input counted as 2)
     freq_sum = freq_counters[:total_unique].sum().item()

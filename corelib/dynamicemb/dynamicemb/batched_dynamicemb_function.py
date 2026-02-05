@@ -108,24 +108,15 @@ def segmented_unique(
         # Enable frequency counting with count=1 per key
         input_frequencies = torch.empty(0, dtype=torch.int64, device=device)
 
-    # Convert keys to int64 if needed (segmented_unique_cuda supports int64/uint64)
-    keys_input = keys
-    if keys.dtype not in (torch.int64, torch.uint64):
-        keys_input = keys.to(torch.int64)
-
     # Call segmented_unique_cuda
-    unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
-        keys_input, table_ids, num_tables, device_sm_count, input_frequencies
+    num_uniques, unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
+        keys, table_ids, num_tables, device_sm_count, input_frequencies
     )
 
     # Get total unique count and slice the output
     # .item() implicitly syncs
-    total_unique = table_offsets[num_tables].item()
+    total_unique = num_uniques.item()
     unique_keys_out = unique_keys[:total_unique]
-
-    # Convert unique_keys back to original dtype if needed
-    if keys.dtype != keys_input.dtype:
-        unique_keys_out = unique_keys_out.to(keys.dtype)
 
     # Prepare output tensors in the expected format
     h_table_offsets = table_offsets.cpu()

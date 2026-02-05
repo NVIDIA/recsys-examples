@@ -69,16 +69,19 @@ unique_cuda(at::Tensor keys, at::Tensor frequency_counters = at::Tensor(),
  *                          - Pass None from Python to disable frequency
  * counting entirely (output freq_counters will be empty)
  *
- * @return Tuple of (unique_keys, output_indices, table_offsets, freq_counters)
+ * @return Tuple of (num_uniques, unique_keys, output_indices, table_offsets,
+ *         freq_counters)
+ *         - num_uniques: Tensor of size 1 containing total unique count
+ *           (view of table_offsets[num_tables])
  *         - unique_keys: Compacted unique keys with size=num_keys (same as
- *           input). Only first table_offsets[num_tables] elements are valid.
+ *           input). Only first num_uniques elements are valid.
  *         - output_indices: Index mapping (input idx -> global unique idx)
  *         - table_offsets: Tensor of size (num_tables + 1) with cumulative
- *           counts. table_offsets[num_tables] contains total unique count.
+ *           counts.
  *         - freq_counters: Frequency counts per unique key. Empty if frequency
  *           counting is disabled (input_frequencies was None).
  */
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
                       int64_t device_sm_count,
                       at::Tensor input_frequencies = at::Tensor());
@@ -125,13 +128,15 @@ expand_table_ids_cuda(at::Tensor offsets,
  * @param table_offsets_in_feature Feature offsets per table (int64, device)
  * @param num_tables Number of tables
  * @param local_batch_size Batch size per feature
+ * @param new_lengths_size Total size of output (num_features * local_batch_size)
  *
  * @return Tuple of (new_lengths, new_offsets)
  */
 std::tuple<at::Tensor, at::Tensor>
 compute_dedup_lengths_cuda(at::Tensor unique_offsets,
                            at::Tensor table_offsets_in_feature,
-                           int64_t num_tables, int64_t local_batch_size);
+                           int64_t num_tables, int64_t local_batch_size,
+                           int64_t new_lengths_size);
 
 } // namespace dyn_emb
 

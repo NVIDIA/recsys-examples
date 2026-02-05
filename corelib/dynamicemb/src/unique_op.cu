@@ -579,7 +579,7 @@ __global__ void adjust_output_indices_kernel(const int32_t *d_table_ids,
   }
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
                       int64_t device_sm_count, at::Tensor input_frequencies) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -593,7 +593,9 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
   TORCH_CHECK(table_ids.scalar_type() == at::kInt, "table_ids must be int32");
   TORCH_CHECK(num_tables > 0, "num_tables must be positive");
   TORCH_CHECK(device_sm_count > 0, "device_sm_count must be positive");
-
+  TORCH_CHECK(num_keys < std::numeric_limits<int32_t>::max(), "num_keys must be less than std::numeric_limits<int32_t>::max()");
+  TORCH_CHECK(num_tables < std::numeric_limits<int32_t>::max(), "num_tables must be less than std::numeric_limits<int32_t>::max()");
+  
   // Frequency counting behavior:
   // - input_frequencies not defined (None): disable frequency counting entirely
   // - input_frequencies defined with numel()==0: enable counting, each key
@@ -611,11 +613,14 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
 
   // Handle empty input
   if (num_keys == 0) {
+    at::Tensor table_offsets = at::zeros(
+        {num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
+    at::Tensor num_uniques = table_offsets.slice(0, num_tables, num_tables + 1);
     return std::make_tuple(
+        num_uniques,
         at::empty({0}, keys.options()),
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
-        at::zeros({num_tables + 1},
-                  at::TensorOptions().dtype(at::kLong).device(device)),
+        table_offsets,
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)));
   }
 
@@ -730,7 +735,10 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
       get_pointer<int64_t>(output_indices), num_keys);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-  return std::make_tuple(unique_keys, output_indices, table_offsets,
+  // Extract num_uniques as a separate tensor (view of table_offsets[num_tables])
+  at::Tensor num_uniques = table_offsets.slice(0, num_tables, num_tables + 1);
+
+  return std::make_tuple(num_uniques, unique_keys, output_indices, table_offsets,
                          output_freq_counters);
 }
 
@@ -807,7 +815,8 @@ expand_table_ids_cuda(at::Tensor offsets,
 std::tuple<at::Tensor, at::Tensor>
 compute_dedup_lengths_cuda(at::Tensor unique_offsets,
                            at::Tensor table_offsets_in_feature,
-                           int64_t num_tables, int64_t local_batch_size) {
+                           int64_t num_tables, int64_t local_batch_size,
+                           int64_t new_lengths_size) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const auto device = unique_offsets.device();
@@ -816,10 +825,6 @@ compute_dedup_lengths_cuda(at::Tensor unique_offsets,
               "unique_offsets must be on CUDA device");
   TORCH_CHECK(table_offsets_in_feature.is_cuda(),
               "table_offsets_in_feature must be on CUDA device");
-
-  // Compute total number of (feature, batch) buckets
-  int64_t total_features = table_offsets_in_feature[num_tables].item<int64_t>();
-  int64_t new_lengths_size = total_features * local_batch_size;
 
   // Handle empty case
   if (new_lengths_size == 0) {
@@ -911,13 +916,13 @@ Args:
                        - Tensor with numel==num_keys: Use provided frequencies
 
 Returns:
-    Tuple of (unique_keys, output_indices, table_offsets, frequency_counters)
+    Tuple of (num_uniques, unique_keys, output_indices, table_offsets, frequency_counters)
+    - num_uniques: Tensor of size 1 with total unique count (on device)
     - unique_keys: Compacted unique keys with size=len(keys). Only first
-                   table_offsets[num_tables] elements are valid.
+                   num_uniques elements are valid.
     - output_indices: Index mapping (input idx -> global unique idx)
     - table_offsets: Tensor of size (num_tables + 1) with cumulative counts
                      table_offsets[i] is the start index for table i
-                     table_offsets[num_tables] is the total unique count
     - frequency_counters: Per-unique-key frequency counts (empty if disabled)
 )doc",
       py::arg("keys"), py::arg("table_ids"), py::arg("num_tables"),
@@ -964,10 +969,10 @@ Returns:
   m.def(
       "compute_dedup_lengths_cuda",
       [](at::Tensor unique_offsets, at::Tensor table_offsets_in_feature,
-         int64_t num_tables, int64_t local_batch_size) {
+         int64_t num_tables, int64_t local_batch_size, int64_t new_lengths_size) {
         return dyn_emb::compute_dedup_lengths_cuda(
             unique_offsets, table_offsets_in_feature, num_tables,
-            local_batch_size);
+            local_batch_size, new_lengths_size);
       },
       R"doc(
 Compute new lengths and offsets by evenly distributing unique keys.
@@ -982,6 +987,7 @@ Args:
     table_offsets_in_feature: Feature offsets per table (int64, device)
     num_tables: Number of tables
     local_batch_size: Batch size per feature
+    new_lengths_size: Total output size (num_features * local_batch_size)
 
 Returns:
     Tuple of (new_lengths, new_offsets)
@@ -989,5 +995,5 @@ Returns:
     - new_offsets: Offset for each bucket (int64)
 )doc",
       py::arg("unique_offsets"), py::arg("table_offsets_in_feature"),
-      py::arg("num_tables"), py::arg("local_batch_size"));
+      py::arg("num_tables"), py::arg("local_batch_size"), py::arg("new_lengths_size"));
 }

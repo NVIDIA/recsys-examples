@@ -51,7 +51,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel, DynamicEmbScoreStrategy
 from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
-
+import torch.distributed as dist
 
 class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
     """Extended EmbeddingCollectionContext that includes frequency_counters for LFU strategy."""
@@ -214,10 +214,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     features_by_shards.append(dedup_features)
                     continue
 
-                # Convert indices to int64 if needed (segmented_unique_cuda supports int64/uint64)
-                dtype_convert = indices.dtype not in (torch.int64, torch.uint64)
-                indices_input = indices.to(torch.int64) if dtype_convert else indices
-
                 # Generate table_ids from jagged offsets (fully on GPU, no sync)
                 table_ids = expand_table_ids_cuda(
                     offsets,
@@ -237,44 +233,39 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
 
                 # Call segmented_unique_cuda
                 (
+                    num_uniques,
                     unique_keys,
-                    output_indices,
+                    reverse_idx,
                     table_offsets,
                     freq_counters,
                 ) = segmented_unique_cuda(
-                    indices_input,
+                    indices,
                     table_ids,
                     table_num,
                     self._device_num_sms,
                     input_frequencies,
                 )
 
-                # Convert to uint64 for compatibility
-                reverse_idx = output_indices.to(torch.uint64)
-
                 # Compute new lengths and offsets using GPU kernel
+                # new_lengths_size = total_B (total number of feature/batch buckets)
                 new_lengths, new_offsets = compute_dedup_lengths_cuda(
                     table_offsets,
                     d_table_offset,
                     table_num,
                     local_batchsize,
+                    total_B,
                 )
 
                 # Get unique values for the KJT
                 # .item() implicitly syncs GPU to CPU
-                total_unique = table_offsets[-1].item()
-                unique_idx = unique_keys[:total_unique]
-
-                if dtype_convert:
-                    unique_idx_out = unique_idx.to(indices.dtype)
-                else:
-                    unique_idx_out = unique_idx
+                total_unique = num_uniques.item()
+                unique_keys = unique_keys[:total_unique]
 
                 dedup_features = KeyedJaggedTensor(
                     keys=input_feature.keys(),
                     lengths=new_lengths,
                     offsets=new_offsets,
-                    values=unique_idx_out,
+                    values=unique_keys,
                 )
                 ctx.input_features.append(input_feature)
                 ctx.reverse_indices.append(reverse_idx)
