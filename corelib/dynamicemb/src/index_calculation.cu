@@ -19,7 +19,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "index_calculation.h"
 #include "utils.h"
 #include <cuda/std/tuple>
-#include <iostream>
 #include <torch/extension.h>
 #include <type_traits>
 

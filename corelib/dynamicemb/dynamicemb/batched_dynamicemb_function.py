@@ -109,7 +109,13 @@ def segmented_unique(
         input_frequencies = torch.empty(0, dtype=torch.int64, device=device)
 
     # Call segmented_unique_cuda
-    num_uniques, unique_keys, output_indices, table_offsets, freq_counters = segmented_unique_cuda(
+    (
+        num_uniques,
+        unique_keys,
+        output_indices,
+        table_offsets,
+        freq_counters,
+    ) = segmented_unique_cuda(
         keys, table_ids, num_tables, device_sm_count, input_frequencies
     )
 

@@ -136,90 +136,6 @@ __forceinline__ __device__ int64_t atomicCAS(int64_t *address, int64_t compare,
                   static_cast<unsigned long long>(val)));
 }
 
-// Initialize hash table kernel
-template <typename KeyType, typename CounterType,
-          KeyType empty_key = std::numeric_limits<KeyType>::max(),
-          CounterType empty_val = std::numeric_limits<CounterType>::max()>
-__global__ void init_kernel(KeyType *keys, CounterType *vals,
-                            CounterType *counter, size_t capacity) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < capacity) {
-    keys[idx] = empty_key;
-    vals[idx] = empty_val;
-  }
-  if (idx == 0) {
-    counter[0] = 0;
-  }
-}
-
-// Unique kernel with linear probing hash table
-template <typename KeyType, typename CounterType, typename Hasher,
-          KeyType empty_key = std::numeric_limits<KeyType>::max(),
-          CounterType empty_val = std::numeric_limits<CounterType>::max()>
-__global__ void unique_kernel(const KeyType *d_key, KeyType *d_unique_key,
-                              CounterType *d_output_index, size_t len,
-                              KeyType *keys, CounterType *vals, size_t capacity,
-                              CounterType *counter,
-                              CounterType *d_frequency_counters,
-                              const CounterType *d_input_frequencies) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= len)
-    return;
-
-  const CounterType input_freq =
-      d_input_frequencies ? d_input_frequencies[idx] : 1;
-
-  const KeyType target_key = d_key[idx];
-  size_t hash_index = Hasher::hash(target_key) % capacity;
-
-  for (size_t probe = 0; probe < capacity; ++probe) {
-    const KeyType existing_key = keys[hash_index];
-    volatile CounterType &slot_val = vals[hash_index];
-
-    if (existing_key == empty_key) {
-      // Try to claim this slot
-      const KeyType old_key =
-          atomicCAS(&keys[hash_index], empty_key, target_key);
-
-      if (old_key == empty_key) {
-        // Successfully claimed - this is a new unique key
-        CounterType unique_idx = atomicAdd(counter, 1);
-        d_unique_key[unique_idx] = target_key;
-        d_output_index[idx] = unique_idx;
-        slot_val = unique_idx;
-
-        if (d_frequency_counters) {
-          atomicAdd(&d_frequency_counters[unique_idx], input_freq);
-        }
-        return;
-      } else if (old_key == target_key) {
-        // Another thread claimed it with same key
-        while (slot_val == empty_val) {
-          __nanosleep(1);
-        }
-        d_output_index[idx] = slot_val;
-        if (d_frequency_counters) {
-          atomicAdd(&d_frequency_counters[slot_val], input_freq);
-        }
-        return;
-      }
-    } else if (existing_key == target_key) {
-      // Key already exists
-      while (slot_val == empty_val) {
-        __nanosleep(1);
-      }
-      d_output_index[idx] = slot_val;
-      if (d_frequency_counters) {
-        atomicAdd(&d_frequency_counters[slot_val], input_freq);
-      }
-      return;
-    }
-
-    hash_index = (hash_index + 1) % capacity;
-  }
-  assert(false && "unique_kernel: hash table full");
-}
-
 // Type dispatch helper
 template <typename Func>
 void dispatch_key_type(at::ScalarType key_type, Func &&func) {
@@ -231,78 +147,6 @@ void dispatch_key_type(at::ScalarType key_type, Func &&func) {
     throw std::invalid_argument(
         "Unsupported key dtype: must be int64 or uint64");
   }
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-unique_cuda(at::Tensor keys, at::Tensor frequency_counters,
-            at::Tensor input_frequencies) {
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
-  const int64_t num_keys = keys.numel();
-  const auto device = keys.device();
-  const auto key_dtype = keys.scalar_type();
-
-  // Handle empty input
-  if (num_keys == 0) {
-    return std::make_tuple(
-        at::empty({0}, keys.options()),
-        at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
-        at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)));
-  }
-
-  // Allocate output tensors
-  at::Tensor unique_keys = at::empty({num_keys}, keys.options());
-  at::Tensor output_indices = at::empty(
-      {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
-  at::Tensor num_unique =
-      at::empty({1}, at::TensorOptions().dtype(at::kLong).device(device));
-
-  // Allocate internal hash table buffers (capacity = 2x input size for good
-  // load factor)
-  const int64_t capacity = num_keys * 2;
-  at::Tensor hash_keys = at::empty({capacity}, keys.options());
-  at::Tensor hash_vals = at::empty(
-      {capacity}, at::TensorOptions().dtype(at::kLong).device(device));
-  at::Tensor hash_counter =
-      at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device));
-
-  dispatch_key_type(key_dtype, [&]<typename KeyType>() {
-    using CounterType = int64_t;
-
-    // Initialize hash table
-    int grid = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    init_kernel<KeyType, CounterType><<<grid, BLOCK_SIZE, 0, stream>>>(
-        get_pointer<KeyType>(hash_keys), get_pointer<CounterType>(hash_vals),
-        get_pointer<CounterType>(hash_counter), capacity);
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-
-    // Get optional pointers
-    CounterType *freq_ptr =
-        (frequency_counters.defined() && frequency_counters.numel() > 0)
-            ? get_pointer<CounterType>(frequency_counters)
-            : nullptr;
-    const CounterType *input_freq_ptr =
-        (input_frequencies.defined() && input_frequencies.numel() > 0)
-            ? get_pointer<CounterType>(input_frequencies)
-            : nullptr;
-
-    // Run unique kernel
-    grid = (num_keys + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    unique_kernel<KeyType, CounterType, MurmurHash3_32<KeyType>>
-        <<<grid, BLOCK_SIZE, 0, stream>>>(
-            get_pointer<const KeyType>(keys), get_pointer<KeyType>(unique_keys),
-            get_pointer<CounterType>(output_indices), num_keys,
-            get_pointer<KeyType>(hash_keys),
-            get_pointer<CounterType>(hash_vals), capacity,
-            get_pointer<CounterType>(hash_counter), freq_ptr, input_freq_ptr);
-
-    // Copy count to output
-    cudaMemcpyAsync(num_unique.data_ptr(), hash_counter.data_ptr(),
-                    sizeof(CounterType), cudaMemcpyDeviceToDevice, stream);
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-  });
-
-  return std::make_tuple(unique_keys, output_indices, num_unique);
 }
 
 // ============================================================================
@@ -596,9 +440,12 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
   TORCH_CHECK(table_ids.scalar_type() == at::kInt, "table_ids must be int32");
   TORCH_CHECK(num_tables > 0, "num_tables must be positive");
   TORCH_CHECK(device_sm_count > 0, "device_sm_count must be positive");
-  TORCH_CHECK(num_keys < std::numeric_limits<int32_t>::max(), "num_keys must be less than std::numeric_limits<int32_t>::max()");
-  TORCH_CHECK(num_tables < std::numeric_limits<int32_t>::max(), "num_tables must be less than std::numeric_limits<int32_t>::max()");
-  
+  TORCH_CHECK(num_keys < std::numeric_limits<int32_t>::max(),
+              "num_keys must be less than std::numeric_limits<int32_t>::max()");
+  TORCH_CHECK(
+      num_tables < std::numeric_limits<int32_t>::max(),
+      "num_tables must be less than std::numeric_limits<int32_t>::max()");
+
   // Frequency counting behavior:
   // - input_frequencies not defined (None): disable frequency counting entirely
   // - input_frequencies defined with numel()==0: enable counting, each key
@@ -620,8 +467,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
         {num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
     at::Tensor num_uniques = table_offsets.slice(0, num_tables, num_tables + 1);
     return std::make_tuple(
-        num_uniques,
-        at::empty({0}, keys.options()),
+        num_uniques, at::empty({0}, keys.options()),
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
         table_offsets,
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)));
@@ -738,11 +584,12 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
       get_pointer<int64_t>(output_indices), num_keys);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-  // Extract num_uniques as a separate tensor (view of table_offsets[num_tables])
+  // Extract num_uniques as a separate tensor (view of
+  // table_offsets[num_tables])
   at::Tensor num_uniques = table_offsets.slice(0, num_tables, num_tables + 1);
 
-  return std::make_tuple(num_uniques, unique_keys, output_indices, table_offsets,
-                         output_freq_counters);
+  return std::make_tuple(num_uniques, unique_keys, output_indices,
+                         table_offsets, output_freq_counters);
 }
 
 // Helper function to expand table IDs from offsets
@@ -815,11 +662,9 @@ expand_table_ids_cuda(at::Tensor offsets,
 }
 
 // Compute dedup lengths and offsets using GPU kernel
-std::tuple<at::Tensor, at::Tensor>
-compute_dedup_lengths_cuda(at::Tensor unique_offsets,
-                           at::Tensor table_offsets_in_feature,
-                           int64_t num_tables, int64_t local_batch_size,
-                           int64_t new_lengths_size) {
+std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
+    at::Tensor unique_offsets, at::Tensor table_offsets_in_feature,
+    int64_t num_tables, int64_t local_batch_size, int64_t new_lengths_size) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const auto device = unique_offsets.device();
@@ -859,28 +704,6 @@ compute_dedup_lengths_cuda(at::Tensor unique_offsets,
 
 // Python bindings
 void bind_unique_op(py::module &m) {
-  m.def(
-      "unique_cuda",
-      [](at::Tensor keys, const c10::optional<at::Tensor> &frequency_counters,
-         const c10::optional<at::Tensor> &input_frequencies) {
-        return dyn_emb::unique_cuda(keys,
-                                    frequency_counters.value_or(at::Tensor()),
-                                    input_frequencies.value_or(at::Tensor()));
-      },
-      R"doc(
-Deduplicate keys using GPU hash table. Uses the current CUDA stream.
-
-Args:
-    keys: Input keys tensor (int64 or uint64)
-    frequency_counters: Optional output frequency counter tensor
-    input_frequencies: Optional input frequency tensor
-
-Returns:
-    Tuple of (unique_keys, output_indices, num_unique)
-)doc",
-      py::arg("keys"), py::arg("frequency_counters") = py::none(),
-      py::arg("input_frequencies") = py::none());
-
   m.def(
       "segmented_unique_cuda",
       [](at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
@@ -972,7 +795,8 @@ Returns:
   m.def(
       "compute_dedup_lengths_cuda",
       [](at::Tensor unique_offsets, at::Tensor table_offsets_in_feature,
-         int64_t num_tables, int64_t local_batch_size, int64_t new_lengths_size) {
+         int64_t num_tables, int64_t local_batch_size,
+         int64_t new_lengths_size) {
         return dyn_emb::compute_dedup_lengths_cuda(
             unique_offsets, table_offsets_in_feature, num_tables,
             local_batch_size, new_lengths_size);
@@ -998,5 +822,6 @@ Returns:
     - new_offsets: Offset for each bucket (int64)
 )doc",
       py::arg("unique_offsets"), py::arg("table_offsets_in_feature"),
-      py::arg("num_tables"), py::arg("local_batch_size"), py::arg("new_lengths_size"));
+      py::arg("num_tables"), py::arg("local_batch_size"),
+      py::arg("new_lengths_size"));
 }

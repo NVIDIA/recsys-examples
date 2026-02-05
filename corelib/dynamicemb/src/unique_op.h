@@ -24,27 +24,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 /**
- * @brief Deduplicate keys using a GPU hash table.
- *
- * This function allocates internal hash table buffers automatically based on
- * input size. The buffers are temporary and freed after the operation.
- * Uses the current CUDA stream.
- *
- * @param keys Input keys tensor (int64 or uint64)
- * @param frequency_counters Optional: output frequency counter per unique key
- * @param input_frequencies Optional: input frequency per key (for weighted
- * counting)
- *
- * @return Tuple of (unique_keys, output_indices, num_unique)
- *         - unique_keys: Deduplicated keys
- *         - output_indices: Index mapping (input idx -> unique idx)
- *         - num_unique: Scalar tensor with count of unique keys
- */
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-unique_cuda(at::Tensor keys, at::Tensor frequency_counters = at::Tensor(),
-            at::Tensor input_frequencies = at::Tensor());
-
-/**
  * @brief Segmented unique operation that deduplicates keys per table.
  *
  * This function performs unique operation on keys partitioned by table_ids.
@@ -128,15 +107,14 @@ expand_table_ids_cuda(at::Tensor offsets,
  * @param table_offsets_in_feature Feature offsets per table (int64, device)
  * @param num_tables Number of tables
  * @param local_batch_size Batch size per feature
- * @param new_lengths_size Total size of output (num_features * local_batch_size)
+ * @param new_lengths_size Total size of output (num_features *
+ * local_batch_size)
  *
  * @return Tuple of (new_lengths, new_offsets)
  */
-std::tuple<at::Tensor, at::Tensor>
-compute_dedup_lengths_cuda(at::Tensor unique_offsets,
-                           at::Tensor table_offsets_in_feature,
-                           int64_t num_tables, int64_t local_batch_size,
-                           int64_t new_lengths_size);
+std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
+    at::Tensor unique_offsets, at::Tensor table_offsets_in_feature,
+    int64_t num_tables, int64_t local_batch_size, int64_t new_lengths_size);
 
 } // namespace dyn_emb
 

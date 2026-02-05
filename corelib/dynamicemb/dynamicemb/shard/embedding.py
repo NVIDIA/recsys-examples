@@ -51,7 +51,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel, DynamicEmbScoreStrategy
 from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
-import torch.distributed as dist
+
 
 class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
     """Extended EmbeddingCollectionContext that includes frequency_counters for LFU strategy."""

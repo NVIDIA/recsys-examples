@@ -30,7 +30,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "lookup_forward.h"
 #include "lookup_kernel.cuh"
 #include "torch_utils.h"
-#include "unique_op.h"
 #include "utils.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <cooperative_groups.h>
@@ -49,48 +48,6 @@ template <typename T, class = std::enable_if_t<std::is_integral_v<T>>>
 inline bool power2(T v) {
 
   return v && (v & -v) == v;
-}
-
-at::Tensor create_sub_tensor(const at::Tensor &original_tensor,
-                             int64_t offset) {
-  if (offset < 0 || offset >= original_tensor.numel()) {
-    throw std::runtime_error("Invalid offset");
-  }
-
-  void *data_ptr =
-      original_tensor.data_ptr() + offset * original_tensor.element_size();
-
-  int64_t new_size = original_tensor.numel() - offset;
-
-  at::Tensor new_tensor =
-      at::from_blob(data_ptr, {new_size}, original_tensor.options());
-
-  return new_tensor;
-}
-
-// REMOVE LATER:check result create_sub_tensor correct
-void check_sub_tensor(const at::Tensor &original_tensor,
-                      const at::Tensor &new_tensor, int64_t offset) {
-  void *original_data_ptr = original_tensor.data_ptr();
-
-  void *new_data_ptr = new_tensor.data_ptr();
-
-  std::cout << "Original tensor data pointer: " << original_data_ptr
-            << std::endl;
-  std::cout << "New tensor data pointer: " << new_data_ptr << std::endl;
-
-  void *expected_new_data_ptr = static_cast<char *>(original_data_ptr) +
-                                offset * original_tensor.element_size();
-
-  if (new_data_ptr == expected_new_data_ptr) {
-    std::cout << "The new tensor data pointer is correctly referencing the "
-                 "original tensor's memory."
-              << std::endl;
-  } else {
-    std::cout << "The new tensor data pointer is NOT correctly referencing the "
-                 "original tensor's memory."
-              << std::endl;
-  }
 }
 
 // Dyn_emb API
@@ -195,25 +152,6 @@ void insert_and_evict_with_scores(
         unique_key, ignore_evict_strategy);
   }
 }
-void accum_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-                     const size_t n, const at::Tensor keys,
-                     const at::Tensor value_or_deltas,
-                     const at::Tensor accum_or_assigns,
-                     const c10::optional<at::Tensor> &score = c10::nullopt,
-                     bool ignore_evict_strategy = false) {
-
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  if (score.has_value()) {
-    at::Tensor score_ = score.value();
-    table->accum_or_assign(n, keys.data_ptr(), value_or_deltas.data_ptr(),
-                           accum_or_assigns.data_ptr<bool>(), score_.data_ptr(),
-                           stream, ignore_evict_strategy);
-  } else {
-    table->accum_or_assign(n, keys.data_ptr(), value_or_deltas.data_ptr(),
-                           accum_or_assigns.data_ptr<bool>(), nullptr, stream,
-                           ignore_evict_strategy);
-  }
-}
 
 void find_and_initialize(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                          const size_t n, const at::Tensor keys,
@@ -283,40 +221,6 @@ void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
   }
 }
 
-void find_or_insert_pointers(
-    std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
-    const at::Tensor keys, at::Tensor values, at::Tensor founds,
-    const std::optional<uint64_t> score = std::nullopt, bool unique_key = true,
-    bool ignore_evict_strategy = false) {
-  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized ||
-                     table->evict_strategy() == EvictStrategy::kLfu)) {
-    throw std::invalid_argument(
-        "Must specify the score when evict strategy is customized or LFU.");
-  }
-  if (n == 0)
-    return;
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  auto values_data_ptr = reinterpret_cast<void **>(values.data_ptr<int64_t>());
-  auto found_tensor_data_ptr = founds.data_ptr<bool>();
-
-  if (table->evict_strategy() == EvictStrategy::kCustomized ||
-      table->evict_strategy() == EvictStrategy::kLfu) {
-    auto &&option =
-        at::TensorOptions().dtype(at::kUInt64).device(keys.device());
-    // broadcast scores
-    at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
-    bc_scores.fill_(score.value());
-    table->find_or_insert_pointers(n, keys.data_ptr(), values_data_ptr,
-                                   found_tensor_data_ptr, bc_scores.data_ptr(),
-                                   stream, unique_key, ignore_evict_strategy);
-  } else {
-    table->find_or_insert_pointers(n, keys.data_ptr(), values_data_ptr,
-                                   found_tensor_data_ptr, nullptr, stream,
-                                   unique_key, ignore_evict_strategy);
-  }
-  AT_CUDA_CHECK(cudaGetLastError());
-}
-
 void find_pointers(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                    const size_t n, const at::Tensor keys, at::Tensor values,
                    at::Tensor founds,
@@ -377,23 +281,6 @@ void find_pointers_with_scores(
                                found_tensor_data_ptr, nullptr, stream);
   }
 }
-
-void assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
-            const at::Tensor keys, const at::Tensor values,
-            const c10::optional<at::Tensor> &score = c10::nullopt,
-            bool unique_key = true) {
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  if (score.has_value()) {
-    at::Tensor score_ = score.value();
-    table->assign(n, keys.data_ptr(), values.data_ptr(), score_.data_ptr(),
-                  stream, unique_key);
-  } else {
-    table->assign(n, keys.data_ptr(), values.data_ptr(), nullptr, stream,
-                  unique_key);
-  }
-}
-
 void find(std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
           const at::Tensor keys, const at::Tensor values,
           const at::Tensor founds,
@@ -420,12 +307,6 @@ void erase(std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
 void clear(std::shared_ptr<dyn_emb::DynamicVariableBase> table) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   table->clear(stream);
-}
-
-void reserve(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-             const size_t new_capacity) {
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  table->reserve(new_capacity, stream);
 }
 
 void export_batch(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
@@ -1225,11 +1106,6 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("evicted_score"), py::arg("d_evicted_counter"),
         py::arg("unique_key") = true, py::arg("ignore_evict_strategy") = false,
         py::arg("scores") = py::none());
-  m.def("accum_or_assign", &accum_or_assign,
-        "Accumulate or assign values to the table", py::arg("table"),
-        py::arg("n"), py::arg("keys"), py::arg("value_or_deltas"),
-        py::arg("accum_or_assigns"), py::arg("score") = c10::nullopt,
-        py::arg("ignore_evict_strategy") = false);
 
   m.def("find_and_initialize", &find_and_initialize,
         "Find and initialize a key-value pair in the table", py::arg("table"),
@@ -1242,13 +1118,6 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("score") = py::none(), py::arg("unique_key") = true,
         py::arg("ignore_evict_strategy") = false);
 
-  m.def("find_or_insert_pointers", &find_or_insert_pointers,
-        "Find or insert a key-value pair in the table , and return every "
-        "value's ptr",
-        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
-        py::arg("founds"), py::arg("score") = py::none(),
-        py::arg("unique_key") = true, py::arg("ignore_evict_strategy") = false);
-
   m.def("find_pointers", &find_pointers,
         "Find a key-value pair in the table , and return every "
         "value's ptr",
@@ -1260,19 +1129,12 @@ void bind_dyn_emb_op(py::module &m) {
         "value's ptr",
         py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
         py::arg("founds"), py::arg("scores") = py::none());
-  m.def("assign", &assign, "Assign values to the table based on keys",
-        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
-        py::arg("score") = c10::nullopt, py::arg("unique_key") = true);
-
   m.def("find", &find, "Find values in the table based on keys",
         py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
         py::arg("founds"), py::arg("score") = c10::nullopt);
 
   m.def("erase", &erase, "Erase values from the table based on keys",
         py::arg("table"), py::arg("n"), py::arg("keys"));
-
-  m.def("reserve", &reserve, "reserve hash table capacity", py::arg("table"),
-        py::arg("new_capacity"));
 
   py::enum_<dyn_emb::DataType>(m, "DynamicEmbDataType")
       .value("Float32", dyn_emb::DataType::Float32)
@@ -1285,9 +1147,6 @@ void bind_dyn_emb_op(py::module &m) {
       .value("Size_t", dyn_emb::DataType::Size_t)
       .export_values();
   m.def("clear", &clear, "Clear all keys in the table", py::arg("table"));
-
-  m.def("reserve", &reserve, "reserve hash table capacity", py::arg("table"),
-        py::arg("new_capacity"));
 
   m.def("export_batch", &export_batch, "export key value from table",
         py::arg("table"), py::arg("n"), py::arg("offset"), py::arg("d_counter"),
