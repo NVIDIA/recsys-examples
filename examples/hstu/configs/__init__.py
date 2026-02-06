@@ -9,6 +9,7 @@ from .hstu_config import (
 )
 from .inference_config import (
     EmbeddingBackend,
+    EmbeddingBackendConfig,
     InferenceEmbeddingConfig,
     InferenceHSTUConfig,
     KVCacheConfig,
@@ -39,6 +40,7 @@ __all__ = [
     "get_kvcache_metadata_buffer",
     "copy_kvcache_metadata",
     "EmbeddingBackend",
+    "EmbeddingBackendConfig",
     "InferenceEmbeddingConfig",
     "InferenceHSTUConfig",
     "get_inference_hstu_config",

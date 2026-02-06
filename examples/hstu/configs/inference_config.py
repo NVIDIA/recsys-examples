@@ -38,6 +38,12 @@ class EmbeddingBackend(Enum):
 
 
 @dataclass
+class EmbeddingBackendConfig:
+    backend: EmbeddingBackend
+    device: torch.cuda.Device
+
+
+@dataclass
 class InferenceEmbeddingConfig:
     """
     Configuration for inference embeddings with dynamic option.

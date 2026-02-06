@@ -17,10 +17,14 @@ import os
 import warnings
 
 # pyre-strict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Object
 
 import torch
-from configs import EmbeddingBackend, InferenceEmbeddingConfig
+from configs import (
+    EmbeddingBackend, 
+    EmbeddingBackendConfig, 
+    InferenceEmbeddingConfig,
+)
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -28,122 +32,105 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from modules.nve_embeddingcollection import NVEEmbeddingCollection
 from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
-class ParameterServer(torch.nn.Module):
-    pass
+EMBEDDING_COLLECTION_MODULE_NAME = "_embedding_collections"
 
 
-class DummyParameterServer(ParameterServer):
-    def __init__(self, embedding_configs):
-        super().__init__()
-        self._embedding_collection = EmbeddingCollection(
-            tables=[
-                EmbeddingConfig(
-                    name=config.table_name,
-                    embedding_dim=config.dim,
-                    num_embeddings=config.vocab_size,
-                    feature_names=config.feature_names,
-                    data_type=dtype_to_data_type(torch.float32),
-                )
-                for config in embedding_configs
-            ],
-            device=torch.device("meta"),
-        )
-
-    def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
-        return self._embedding_collection(features)
+@dataclass
+class DynamicemBackendConfig(EmbeddingBackendConfig):
+    caching: bool
+    bucket_capacity: int = 128
+    gpu_ratio_for_values: float = 0.0
 
 
-def create_dynamic_embedding_tables(
-    embedding_configs: List[InferenceEmbeddingConfig],
-    output_dtype: torch.dtype = torch.float32,
-    device: torch.device = None,
-    ps: Optional[ParameterServer] = None,
-    sparse_shareables=None,
-):
-    table_options = [
-        DynamicEmbTableOptions(
-            index_type=torch.int64,
-            embedding_dtype=torch.float32,
-            dim=config.dim,
-            max_capacity=config.vocab_size,
-            local_hbm_for_values=0,
-            bucket_capacity=128,
-            initializer_args=DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.NORMAL,
-            ),
-            training=False,
-        )
-        for config in embedding_configs
-    ]
-
-    table_names = [config.table_name for config in embedding_configs]
-
-    return BatchedDynamicEmbeddingTablesV2(
-        table_options=table_options,
-        table_names=table_names,
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        output_dtype=output_dtype,
-    )
-
-
-class InferenceDynamicEmbeddingCollection(torch.nn.Module):
+class DynamicembEmbeddingCollection(torch.nn.Module):
     def __init__(
         self,
-        embedding_configs,
-        ps: Optional[ParameterServer] = None,
-        enable_cache: bool = False,
-        sparse_shareables=None,
+        embedding_configs: List[EmbeddingConfig],
+        embedding_backend_config: EmbeddingBackendConfig,
+        dynamic_table_names: List[str],
     ):
         super().__init__()
+        self.mappings = None
 
-        self._embedding_tables = create_dynamic_embedding_tables(
-            embedding_configs, ps=ps, sparse_shareables=sparse_shareables
-        )
+        self._dynamic_table_names = dynamic_table_names
+        self._device = embedding_backend_config.device
 
-        self._cache = (
-            create_dynamic_embedding_tables(
-                embedding_configs, device=torch.cuda.current_device()
+        table_options = list()
+        table_names = list()
+        for config in embedding_configs:
+            if config.name in self._dynamic_table_names:
+                continue
+            
+            global_hbm_for_values = int(
+                embedding_backend_config.gpu_ratio_for_values
+                * config.num_embeddings 
+                * config.embedding_dim
             )
-            if enable_cache
-            else None
+            table_options.append(
+                DynamicEmbTableOptions(
+                    index_type=torch.int64,
+                    embedding_dtype=dtype_to_data_type(config.data_type),
+                    dim=config.embedding_dim,
+                    training=False,
+                    caching=embedding_backend_config.caching,
+                    bucket_capacity=config.num_embeddings,
+                    global_hbm_for_values=global_hbm_for_values,
+                )
+            )
+            table_names.append(config.name)
+
+        self.embeddings = BatchedDynamicEmbeddingTablesV2(
+            table_options=table_options,
+            table_names=table_names,
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            output_dtype=embedding_backend_config.output_dtype,
+            device=self._device
         )
 
-        self._feature_names = [
-            feature for config in embedding_configs for feature in config.feature_names
-        ]
+        table_options = list()
+        table_names = list()
+        for config in embedding_configs:
+            if config.name not in self._dynamic_table_names:
+                continue
 
+            global_hbm_for_values = int(
+                embedding_backend_config.gpu_ratio_for_values
+                * config.num_embeddings 
+                * config.embedding_dim
+            )
+            table_options.append(
+                DynamicEmbTableOptions(
+                    index_type=torch.int64,
+                    embedding_dtype=dtype_to_data_type(config.data_type),
+                    dim=config.embedding_dim,
+                    training=False,
+                    caching=embedding_backend_config.caching,
+                    bucket_capacity=config.num_embeddings,
+                    global_hbm_for_values=embedding_backend_config.hbm_ratio,
+                )
+            )
+            table_names.append(config.name)
+
+        self.dynamic_embeddings = BatchedDynamicEmbeddingTablesV2(
+            table_options=table_options,
+            table_names=table_names,
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            output_dtype=embedding_backend_config.output_dtype,
+            device=self._device
+        )
+
+        # split features in static tables vs features in dynamic tables
         self._features_split_sizes: List[int] = []
         self._features_split_indices: List[int] = []
 
-    def set_feature_splits(self, features_split_size, features_split_indices):
-        self._features_split_sizes = features_split_size
-        self._features_split_indices = features_split_indices
-
     def load_checkpoint(self, checkpoint_dir):
-        if checkpoint_dir is None:
-            return
-
-        embedding_table_dir = os.path.join(
-            checkpoint_dir,
-            "dynamicemb_module",
-            "model._embedding_collection._model_parallel_embedding_collection",
-        )
-
-        try:
-            for idx, table_name in enumerate(self._embedding_tables.table_names):
-                self._embedding_tables.load(
-                    embedding_table_dir, optim=False, table_names=[table_name]
-                )
-        except ValueError as e:
-            warnings.warn(
-                f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"
-                "Please check if the checkpoint is version 1. The loading of this old version is disabled."
-            )
+        pass
 
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         with torch.no_grad():
@@ -161,194 +148,38 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         return embeddings_kjt.to_dict()
 
 
-def create_embedding_collection(configs, backend, use_static: bool = False, **kwargs):
-    if backend == EmbeddingBackend.TORCHREC:
-        assert (
-            use_static == True
-        ), "Do not support dynamic embedding table with TorchRec backend"
-        return EmbeddingCollection(
-            tables=[
-                EmbeddingConfig(
-                    name=config.table_name,
-                    embedding_dim=config.dim,
-                    num_embeddings=config.vocab_size,
-                    feature_names=config.feature_names,
-                    data_type=dtype_to_data_type(torch.float32),
-                )
-                for config in configs
-            ],
-            device=torch.cuda.current_device(),
-        )
-    elif backend == EmbeddingBackend.DYNAMICEMB:
-        assert (
-            use_static == False
-        ), "Only support dynamic embedding table with DynamicEmb backend"
-        ps = kwargs.get("ps", None)
-        enable_cache = kwargs.get("enable_cache", False)
-        sparse_shareables = kwargs.get("sparse_shareables", False)
-        return InferenceDynamicEmbeddingCollection(
-            configs, ps, enable_cache, sparse_shareables
-        )
-    elif backend == EmbeddingBackend.NVEMB:
-        from modules.nve_embeddingcollection import InferenceNVEEmbeddingCollection
-
-        assert (
-            InferenceNVEEmbeddingCollection is not None
-        ), "Cannot create embedding collection for NV-Embeddings backend"
-        sparse_shareables = kwargs.get("sparse_shareables", False)
-        return InferenceNVEEmbeddingCollection(
-            configs=[
-                EmbeddingConfig(
-                    name=config.table_name,
-                    embedding_dim=config.dim,
-                    num_embeddings=config.vocab_size,
-                    feature_names=config.feature_names,
-                    data_type=torch.float32,
-                )
-                for config in configs
-            ],
-            device=torch.cuda.current_device(),
-            use_gpu_only=use_static,
-            gpu_cache_ratio=kwargs.get("gpu_cache_ratio", 0.1),
-            is_weighted=kwargs.get("is_weighted", False),
-            sparse_shareables=sparse_shareables,
-        )
-    else:
-        raise Exception("Unsupported embedding backend: {}".format(backend))
-
-
-class InferenceEmbedding(torch.nn.Module):
+class Embedding(torch.nn.Module):
     """
     InferenceEmbedding is a module for embeddings in the inference stage.
 
     Args:
         embedding_configs (List[InferenceEmbeddingConfig]): Configuration for the hstu (sharded) embedding.
-        embedding_backend (EmbeddingBackend): Embedding collection backend.
     """
 
     def __init__(
         self,
-        embedding_configs: List[InferenceEmbeddingConfig],
-        embedding_backend: Optional[EmbeddingBackend] = None,
-        sparse_shareables=None,
+        embedding_configs: List[List[EmbeddingConfig]],
     ):
-        super(InferenceEmbedding, self).__init__()
+        super(Embedding, self).__init__()
 
-        self.dynamic_embedding_configs = []
-        self.static_embedding_configs = []
-        for config in embedding_configs:
-            if not config.use_dynamicemb:
-                self.static_embedding_configs.append(config)
-            else:
-                self.dynamic_embedding_configs.append(config)
-
-        self.dynamic_emb_backend = (
-            EmbeddingBackend.DYNAMICEMB
-            if embedding_backend is None
-            else embedding_backend
-        )
-        self.static_emb_backend = (
-            EmbeddingBackend.TORCHREC
-            if embedding_backend is None
-            else embedding_backend
-        )
-        self._dynamic_embedding_collection = create_embedding_collection(
-            configs=self.dynamic_embedding_configs,
-            backend=self.dynamic_emb_backend,
-            use_static=False,
-            ps=None,
-            enable_cache=False,
-            gpu_cache_ratio=0.05,
-            sparse_shareables=sparse_shareables,
-        )
-
-        self._static_embedding_collection = create_embedding_collection(
-            configs=self.static_embedding_configs,
-            backend=self.static_emb_backend,
-            use_static=True,
-        )
-        self._side_stream = torch.cuda.Stream()
-        self._static_embedding_collection = self._static_embedding_collection.to(
-            torch.cuda.current_device()
-        )
-
-        features_split_sizes, features_split_indices = self.get_features_splits(
-            embedding_configs
-        )
-        self._dynamic_embedding_collection.set_feature_splits(
-            features_split_sizes, features_split_indices
-        )
+        self._embedding_collections = ModuleList([
+            EmbeddingCollection(
+                tables=configs,
+                device=torch.device("meta"),
+            ) for configs in embedding_configs
+        ])
+        self._embedding_configs = embedding_configs
 
     def load_checkpoint(self, checkpoint_dir, model_state_dict=None):
-        if checkpoint_dir is None:
-            return
-
-        self._dynamic_embedding_collection.load_checkpoint(checkpoint_dir)
-
-        if model_state_dict is None:
-            model_state_dict_path = os.path.join(
-                checkpoint_dir, "torch_module", "model.0.pth"
-            )
-            model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
-        self.load_state_dict(model_state_dict, strict=False)
+        pass
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
-        new_state_dict = {}
-        for k in model_state_dict:
-            if k.startswith(
-                "_embedding_collection._data_parallel_embedding_collection.embeddings."
-            ):
-                emb_table_names = k.split(".")[-1].removesuffix("_weights").split("/")
-                old_emb_table_weights = model_state_dict[k].view(
-                    -1, self.static_embedding_configs[0].dim
-                )
-                weight_offset = 0
-                # TODO(junyiq): Use a more flexible way to skip contextual features.
-                for name in emb_table_names:
-                    for emb_config in self.static_embedding_configs:
-                        if name == emb_config.table_name:
-                            emb_table_size = emb_config.vocab_size
-                    newk = "_static_embedding_collection.embeddings." + name + ".weight"
-                    new_state_dict[newk] = old_emb_table_weights[
-                        weight_offset : weight_offset + emb_table_size
-                    ]
-                    weight_offset += emb_table_size
-            else:
-                continue
-
-        unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
-
-        if self.dynamic_emb_backend == EmbeddingBackend.DYNAMICEMB:
-            assert set(unloaded_modules.missing_keys) == set(
-                ["_dynamic_embedding_collection._embedding_tables._empty_tensor"]
-            )
-        elif self.dynamic_emb_backend == EmbeddingBackend.NVEMB:
-            for key in unloaded_modules.missing_keys:
-                assert key.startswith("_dynamic_embedding_collection.embeddings")
-        assert unloaded_modules.unexpected_keys == []
-
-    def get_features_splits(self, embedding_configs):
-        last_dynamic = None
-        last_index = -1
-        features_split_sizes = []
-        for idx, emb_config in enumerate(embedding_configs):
-            use_dynamicemb = emb_config.use_dynamicemb
-            if last_dynamic != emb_config.use_dynamicemb:
-                if last_dynamic is not None:
-                    features_split_sizes.append(idx - last_index)
-                last_index = idx
-            last_dynamic = use_dynamicemb
-        features_split_sizes.append(len(embedding_configs) - last_index)
-
-        index = 1 if len(embedding_configs) % 2 != 0 ^ last_dynamic else 0
-        features_split_indices = list(range(index, len(features_split_sizes), 2))
-
-        return (features_split_sizes, features_split_indices)
+        pass
 
     # @output_nvtx_hook(nvtx_tag="InferenceEmbedding", hook_tensor_attr_name="_values")
     def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         """
-        Forward pass of the sharded embedding module.
+        Forward pass of embedding module.
 
         Args:
             kjt (`KeyedJaggedTensor <https://pytorch.org/torchrec/concepts.html#keyedjaggedtensor>`): The input tokens.
@@ -357,24 +188,97 @@ class InferenceEmbedding(torch.nn.Module):
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
 
-        dynamic_embeddings = self._dynamic_embedding_collection(kjt)
-        if self._static_embedding_collection is not None:
-            with torch.cuda.stream(self._side_stream):
-                static_embeddings = self._static_embedding_collection(kjt)
-            torch.cuda.current_stream().wait_stream(self._side_stream)
-            embeddings = {**dynamic_embeddings, **static_embeddings}
-        else:
-            embeddings = dynamic_embeddings
+        embeddings = { **embc(kjt) for embc in self._embedding_collections }
         return embeddings
 
 
-def get_inference_sparse_model(
-    embedding_configs: List[InferenceEmbeddingConfig],
-    embedding_backend=None,
-    sparse_shareables=None,
-):
-    return InferenceEmbedding(
-        embedding_configs,
-        embedding_backend,
-        sparse_shareables,
+def create_torchrec_embedding(
+    embedding_collection: EmbeddingCollection,
+    embedding_configs: List[EmbeddingConfig],
+    embedding_backend_config: EmbeddingBackendConfig,
+    dynamic_table_names: List[str],
+) -> torch.nn.Module:
+    if len(embedding_configs) == 0:
+        return None
+    return embedding_collection.to(device=embedding_backend_config.device)
+    
+def create_dynamicemb(
+    embedding_collection: EmbeddingCollection,
+    embedding_configs: List[EmbeddingConfig],
+    embedding_backend_config: EmbeddingBackendConfig,
+    dynamic_table_names: List[str],
+) -> torch.nn.Module:
+    if len(embedding_configs) == 0:
+        return None
+    return DynamicembEmbeddingCollection(
+        configs=embedding_configs,
+        embedding_backend_config=embedding_backend_config,
+        dynamic_table_names=dynamic_table_names,
     )
+
+def create_nve(
+    embedding_collection: EmbeddingCollection,
+    embedding_configs: List[EmbeddingConfig],
+    embedding_backend_config: EmbeddingBackendConfig,
+    dynamic_table_names: List[str],
+) -> torch.nn.Module:
+    if len(embedding_configs) == 0:
+        return None
+    return NVEEmbeddingCollection(
+        configs=embedding_configs,
+        embedding_backend_config=embedding_backend_config,
+        dynamic_table_names=dynamic_table_names,
+    )
+
+
+def select_embedding(backend: EmbeddingBackend):
+    if backend == EmbeddingBackend.TORCHREC:
+        return create_torchrec_embedding
+    elif backend == EmbeddingBackend.DYNAMICEMB:
+        return create_dynamicemb
+    elif backend == EmbeddingBackend.NVEMB:
+        return create_nve
+    else:
+        raise InvalidValueError(f"No support for embedding backend {backend}")
+
+
+def apply_inference_embedding(
+    model: torch.nn.Module, 
+    embedding_backend_configs: List[EmbeddingBackendConfig],
+    dynamic_table_names: List[str],
+) -> torch.nn.Module:
+
+    def get_module_by_name(module_name) -> Optional[torch.nn.Module]:
+        for name, module in model.named_modules():
+            if name == module_name:
+                return module
+        return None
+    
+    embc_parent_module_names = set()
+    for name, module in model.named_modules():
+        if type(module) in TORCHREC_TYPES:
+            parent_name = name.rsplit('.', 1)[0]
+            embc_parent_module_names.add(parent_name)
+            # eb_configs.append(module.embedding_configs())
+    assert len(embc_parent_module_names) == 1
+
+    emb_module_name = list(embc_parent_module_names)[0]
+    emb_module = get_module_by_name(embedding_module_name)
+    inference_embedding_collections = list()
+    for idx, embc in enumerate(emb_module._embedding_collections):
+        emb_backend = embedding_backend_configs[idx].backend
+        create_embedding_collection = select_embedding(emb_backend)
+        inference_embc = create_embedding_collection(
+            embc,
+            embc.embedding_configs(),
+            embedding_backend_configs[idx],
+            dynamic_table_names,
+        )
+        inference_embedding_collections.append(inference_embc)
+    setattr(
+        emb_module,
+        EMBEDDING_COLLECTION_MODULE_NAME,
+        inference_embedding_collections,
+    )
+    
+    return model
