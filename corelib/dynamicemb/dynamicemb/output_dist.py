@@ -64,7 +64,6 @@ class RwSequenceEmbeddingDist(
         Returns:
             Awaitable[torch.Tensor]: awaitable of sequence embeddings.
         """
-        print("forward RwSequenceEmbeddingDist--------------------------------")
         assert sharding_ctx is not None
         return self._dist(
             local_embs,
@@ -129,7 +128,6 @@ class RwPooledEmbeddingDist(
         Returns:
             Awaitable[torch.Tensor]: awaitable of pooled embeddings tensor.
         """
-        print("forward RwPooledEmbeddingDist--------------------------------")
         if self._dist is None:
             self._create_output_dist_module(sharding_ctx)
 
