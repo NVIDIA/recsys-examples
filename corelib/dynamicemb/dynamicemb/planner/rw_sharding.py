@@ -27,7 +27,9 @@ from torchrec.distributed.embedding_lookup import (
     GroupedPooledEmbeddingsLookup as _GroupedPooledEmbeddingsLookup,
 )
 from torchrec.distributed.embedding_sharding import (
+    BaseEmbeddingDist,
     BaseSparseFeaturesDist,
+    EmbeddingShardingContext,
     EmbeddingShardingInfo,
 )
 from torchrec.distributed.embedding_types import (
@@ -40,6 +42,7 @@ from torchrec.distributed.sharding.rw_sequence_sharding import (
     RwSequenceEmbeddingSharding,
 )
 from torchrec.distributed.sharding.rw_sharding import RwPooledEmbeddingSharding
+from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import QuantizedCommCodecs, ShardingEnv, ShardingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -48,6 +51,7 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbeddingBag,
 )
 from ..input_dist import RwSparseFeaturesDist
+from ..output_dist import RwPooledEmbeddingDist, RwSequenceEmbeddingDist
 
 
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
@@ -148,6 +152,19 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             device=device if device is not None else self._device,
         )
 
+    def create_output_dist(
+        self,
+        device: Optional[torch.device] = None,
+    ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
+        return RwSequenceEmbeddingDist(
+            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
+            self._pg,
+            self._get_num_features(),
+            device if device is not None else self._device,
+            qcomm_codecs_registry=self.qcomm_codecs_registry,
+        )
+
 
 class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
     def _create_embedding_kernel(
@@ -243,3 +260,16 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             feature_processor=feature_processor,
             sharding_type=ShardingType.ROW_WISE,
         )
+
+    def create_output_dist(
+        self,
+        device: Optional[torch.device] = None,
+    ) -> BaseEmbeddingDist[EmbeddingShardingContext, torch.Tensor, torch.Tensor]:
+        return RwPooledEmbeddingDist(
+            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
+            self._pg,
+            qcomm_codecs_registry=self.qcomm_codecs_registry,
+            embedding_dims=self.embedding_dims(),
+        )
+        # TODO: confirm what is qcomm_codecs_registry
