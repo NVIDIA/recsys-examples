@@ -612,12 +612,17 @@ class KeyValueTable(
         opt_file_path: str,
         include_optim: bool,
         include_meta: bool,
+        current_score: Optional[int] = None,
     ) -> None:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
             meta_data["evict_strategy"] = str(self.table.evict_strategy())
+            
+            if current_score is not None:
+                meta_data["step_score"] = current_score
+
             save_to_json(meta_data, meta_json_file_path)
 
         fkey = open(emb_key_path, "wb")
@@ -655,7 +660,7 @@ class KeyValueTable(
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
         include_optim: bool,
-    ) -> None:
+    ) -> Optional[int]:
         meta_data = load_from_json(meta_json_file_path)
         opt_type = meta_data.get(
             "opt_type", None
@@ -798,6 +803,9 @@ class KeyValueTable(
             fscore.close()
         if fopt_states:
             fopt_states.close()
+
+        step_score = meta_data.get("step_score", None)
+        return step_score
 
     def embedding_dtype(
         self,
@@ -1443,12 +1451,15 @@ class DynamicEmbeddingTable(KeyValueTable):
         opt_file_path: str,
         include_optim: bool,
         include_meta: bool,
+        current_score: Optional[int] = None,
     ) -> None:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
             meta_data["evict_strategy"] = str(self.evict_strategy_)
+            if current_score is not None:
+                meta_data["step_score"] = current_score
             save_to_json(meta_data, meta_json_file_path)
 
         fkey = open(emb_key_path, "wb")
@@ -1489,7 +1500,7 @@ class DynamicEmbeddingTable(KeyValueTable):
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
         include_optim: bool,
-    ) -> None:
+    ) -> Optional[int]:
         meta_data = load_from_json(meta_json_file_path)
         opt_type = meta_data.get(
             "opt_type", None
@@ -1637,6 +1648,8 @@ class DynamicEmbeddingTable(KeyValueTable):
             fscore.close()
         if fopt_states:
             fopt_states.close()
+        step_score = meta_data.get("step_score", None)
+        return step_score
 
     def load_key_values(
         self,
