@@ -1154,6 +1154,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if isinstance(storage, KeyValueTable) and not storage._use_score:
                 dist.barrier()  # sync global timestamp
                 cast(KeyValueTable, storage).update_timestamp()
+            
+            current_score = self._scores.get(table_name, None) if hasattr(self, '_scores') else None
+
             storage.dump(
                 meta_file_path,
                 emb_key_path,
@@ -1162,6 +1165,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 opt_value_path,
                 include_optim=optim,
                 include_meta=(rank == 0),
+                current_score=current_score,
             )
 
             if not counter:
@@ -1224,7 +1228,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 cast(KeyValueTable, storage).update_timestamp()
             num_key_files = len(emb_key_files)
             for i in range(num_key_files):
-                storage.load(
+                loaded_score = storage.load(
                     meta_json_file,
                     emb_key_files[i],
                     emb_value_files[i],
@@ -1232,6 +1236,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     opt_value_files[i] if len(opt_value_files) > 0 else None,
                     include_optim=optim,
                 )
+                if loaded_score is not None and table_name in self._scores:
+                    self._scores[table_name] = loaded_score
+                    print(f"Restored step score for table '{table_name}': {loaded_score}")
 
             if not counter:
                 continue
