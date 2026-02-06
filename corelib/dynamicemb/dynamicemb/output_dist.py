@@ -1,9 +1,7 @@
-
-from typing import cast, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, cast
 
 import torch
 from torch import distributed as dist
-
 from torchrec.distributed.dist_data import (
     PooledEmbeddingsReduceScatter,
     SequenceEmbeddingsAllToAll,
@@ -15,6 +13,8 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import Awaitable, CommOp, QuantizedCommCodecs
+
+
 class RwSequenceEmbeddingDist(
     BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]
 ):
@@ -64,7 +64,7 @@ class RwSequenceEmbeddingDist(
         Returns:
             Awaitable[torch.Tensor]: awaitable of sequence embeddings.
         """
-        print("forward RwSequenceEmbeddingDist--------------------------------") 
+        print("forward RwSequenceEmbeddingDist--------------------------------")
         assert sharding_ctx is not None
         return self._dist(
             local_embs,
@@ -75,7 +75,6 @@ class RwSequenceEmbeddingDist(
             sparse_features_recat=sharding_ctx.sparse_features_recat,
             unbucketize_permute_tensor=sharding_ctx.unbucketize_permute_tensor,
         )
-
 
 
 class RwPooledEmbeddingDist(
