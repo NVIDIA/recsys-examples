@@ -42,13 +42,25 @@ setup(
         CUDAExtension(
             name="paged_kvcache_ops",
             sources=[
+                "ops/cuda_ops/csrc/kvcache_manager_impl.cpp",
                 "ops/cuda_ops/csrc/paged_kvcache_ops_cuda.cpp",
                 "ops/cuda_ops/csrc/paged_kvcache_ops_kernel.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"] + [
+                    "-I/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/include",
+                    "-L/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/lib",
+                    "-lnvcomp_static",
+                ],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
+            include_dirs=[
+                "/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/include", 
+            ],
+            library_dirs=[
+                "/home/junyiq/newscratch/november/dl/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive/lib", 
+            ],
+            libraries=["nvcomp_static"],
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

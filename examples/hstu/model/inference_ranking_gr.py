@@ -81,27 +81,49 @@ class InferenceRankingGR(torch.nn.Module):
         self.sparse_module.load_checkpoint(checkpoint_dir, model_state_dict)
         self.dense_module.load_state_dict(model_state_dict, strict=False)
 
-    def get_user_kvdata_info(
-        self,
-        user_ids: Union[List[int], torch.Tensor],
-        allow_bubble: bool = False,
-        dbg_print: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.dense_module.get_user_kvdata_info(user_ids, allow_bubble, dbg_print)
-
     def forward(
         self,
         batch: HSTUBatch,
-        user_ids: torch.Tensor = None,
-        user_start_pos: torch.Tensor = None,
+        user_ids: torch.Tensor,
+        total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            user_start_pos_cuda, kvcache_metadata = self.dense_module.kvcache_prelogue(
-                batch, user_ids, user_start_pos
+            prepare_kvcache_result = self.dense_module.async_kvcache.prepare_kvcache_async(
+                batch.batch_size,
+                user_ids.tolist(),
+                total_history_lengths.tolist(),
+                self.dense_module.async_kvcache.static_page_ids_gpu_buffer,
+                self.dense_module.async_kvcache.static_offload_page_ids_gpu_buffer,
+                self.dense_module.async_kvcache.static_metadata_gpu_buffer,
+                self.dense_module.async_kvcache.static_onload_handle,
             )
-            embeddings = self.sparse_module(batch.features)
+            
+            old_cached_lengths = torch.tensor(prepare_kvcache_result[0], dtype=torch.int32)
+            striped_batch = self.dense_module.async_kvcache.strip_cached_tokens(
+                batch, old_cached_lengths,
+            )
+
+            torch.cuda.nvtx.range_push("HSTU embedding")
+            embeddings = self.sparse_module(striped_batch.features)
+            torch.cuda.nvtx.range_pop()
+
+            prepare_kvcache_result = [old_cached_lengths] + prepare_kvcache_result[1:]
             logits = self.dense_module(
-                batch, embeddings, user_ids, user_start_pos_cuda, kvcache_metadata
+                striped_batch, embeddings, user_ids, total_history_lengths, prepare_kvcache_result
+            )
+
+        return logits
+    
+    def forward_nokvcache(
+        self,
+        batch: HSTUBatch,
+    ):
+        with torch.inference_mode():
+            torch.cuda.nvtx.range_push("HSTU embedding")
+            embeddings = self.sparse_module(batch.features)
+            torch.cuda.nvtx.range_pop()
+            logits = self.dense_module.forward_nokvcache(
+                batch, embeddings
             )
 
         return logits

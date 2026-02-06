@@ -28,6 +28,7 @@ from configs import (
 )
 from modules.inference_dense_module import InferenceDenseModule, copy_jagged_metadata
 from modules.jagged_data import JaggedData
+import paged_kvcache_ops
 
 _item_fea_name = "item_feat"
 _item_vocab_size = 10000
@@ -154,6 +155,7 @@ def test_input(
     page_size,
     kvcache_num_pages,
     dtype,
+    kv_cache_table,
 ):
     # jd const
     seq_len = new_history_length + num_targets
@@ -218,8 +220,11 @@ def test_input(
             position=positions.int().cuda(),
             new_history_nnz=new_history_nnz,
             new_history_nnz_cuda=new_history_nnz_cuda.int().cuda(),
+            total_history_lengths=None,
             total_history_offsets=kv_seqlen_offsets.int().cuda(),
-            onload_history_kv_events=[torch.cuda.Event() for _ in range(num_layers)],
+            kv_cache_table=kv_cache_table,
+            kv_onload_handle=paged_kvcache_ops.KVOnloadHandle(),
+            kv_offload_handle=paged_kvcache_ops.KVOffloadHandle(),
         )
         input_lists.append(
             (
@@ -251,14 +256,15 @@ def run_single_bench(
         new_history_length,
         num_targets,  # total_history_length + num_targets <= max_seqlen (already doubled)
         # global config
-        model._gpu_kv_cache_manager.max_seq_len,
+        model._hstu_config.max_seq_len,
         num_targets,
         0,
         model._hstu_config.num_layers,
         model._embedding_dim,
-        model._gpu_kv_cache_manager.page_size,
-        model._gpu_kv_cache_manager.num_cache_pages,
+        model.async_kvcache.page_size,
+        model.async_kvcache.num_cache_pages,
         model._hidden_states.dtype,
+        model.async_kvcache.cache_table_list,
     )
 
     num_warumps = 10
@@ -449,7 +455,7 @@ def run_benchmark():
                 continue
             if (
                 new_history_length + num_targets
-                > model._gpu_kv_cache_manager.max_seq_len
+                > model.async_kvcache.max_sequence_length
             ):
                 print("too large input length:", new_history_length + num_targets)
                 continue

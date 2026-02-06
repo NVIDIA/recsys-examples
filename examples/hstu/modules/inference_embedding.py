@@ -20,6 +20,7 @@ import warnings
 from typing import Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 from configs import EmbeddingBackend, InferenceEmbeddingConfig
 from dynamicemb import (
     DynamicEmbInitializerArgs,
@@ -135,10 +136,16 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         )
 
         try:
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "0000"
+            dist.init_process_group(world_size=1, rank=0)
             for idx, table_name in enumerate(self._embedding_tables.table_names):
                 self._embedding_tables.load(
                     embedding_table_dir, optim=False, table_names=[table_name]
                 )
+            dist.destroy_process_group()
+            os.environ.pop("MASTER_ADDR")
+            os.environ.pop("MASTER_PORT")
         except ValueError as e:
             warnings.warn(
                 f"FAILED TO LOAD dynamic embedding tables failed due to ValueError:\n\t{e}\n\n"

@@ -343,3 +343,154 @@ cudaError_t GatherPagedKVCache<nv_half, int32_t>(
   nv_half* kv_cache,
   uint32_t nnz,
   cudaStream_t stream);
+
+template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
+__global__ void GatherPagedKVCacheAllLayersKernel(DType* gather_kv,
+                                                  IdType* page_ids,
+                                                  uint32_t num_layers,
+                                                  uint32_t stride_layer_gather,
+                                                  uint32_t stride_layer,
+                                                  uint32_t page_size,
+                                                  uint32_t stride_page,
+                                                  uint32_t stride_k2v,
+                                                  uint32_t stride_n,
+                                                  uint32_t stride_h,
+                                                  uint32_t nnz,
+                                                  DType* __restrict__ kv_cache,
+                                                  uint32_t m, uint32_t s, uint32_t a) {
+  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t head_idx = ty;
+  uint32_t cta_id = blockIdx.x;
+  uint32_t num_ctas = gridDim.x;
+
+  for (uint32_t layer_idx = 0; layer_idx < num_layers; layer_idx++) {
+    DType* gather_k = gather_kv + layer_idx * stride_layer_gather;
+    DType* gather_v = gather_kv + layer_idx * stride_layer_gather + stride_k2v;
+    DType* __restrict__ k_cache = kv_cache + layer_idx * stride_layer;
+    DType* __restrict__ v_cache = kv_cache + layer_idx * stride_layer + stride_k2v;
+
+#pragma unroll 4
+    for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
+      uint32_t page_id_idx, entry_idx;
+      divmod(i, page_size, m, s, a,
+            page_id_idx, entry_idx);
+      size_t inner_page_offset = head_idx * stride_h + entry_idx * stride_n + tx * vec_size;
+      size_t src_offset = __ldg(page_ids + page_id_idx) * stride_page + inner_page_offset;
+      size_t dst_offset = page_id_idx * stride_page + inner_page_offset;
+      vec_t<DType, vec_size>::memcpy(
+          gather_k + dst_offset, k_cache + src_offset);
+      vec_t<DType, vec_size>::memcpy(
+          gather_v + dst_offset, v_cache + src_offset);
+    }
+  }
+}
+
+template <typename DType, typename IdType>
+cudaError_t GatherPagedKVCacheAllLayers(DType* gather_kv,
+                               IdType* page_ids,
+                               uint32_t num_layers,
+                               uint32_t stride_gather,
+                               uint32_t stride_layer,
+                               uint32_t num_heads,
+                               uint32_t head_dim,
+                               uint32_t page_size,
+                               uint32_t stride_page,
+                               uint32_t stride_k2v,
+                               uint32_t stride_n,
+                               uint32_t stride_h,
+                               DType* kv_cache,
+                               uint32_t nnz,
+                               cudaStream_t stream) {
+  int dev_id = 0;
+  int num_sms = 0;
+  int num_blocks_per_sm = 0;
+  cudaGetDevice(&dev_id);
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id);
+
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+    uint32_t bdx = HEAD_DIM / vec_size;
+    uint32_t bdy = num_heads;
+    uint32_t num_threads = bdx * bdy;
+    uint32_t smem_size = 0;
+    auto kernel = GatherPagedKVCacheAllLayersKernel<HEAD_DIM, vec_size, DType, IdType>;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                  num_threads, smem_size);
+    num_blocks_per_sm = min(num_blocks_per_sm, ((int(nnz) + num_sms - 1) / num_sms));
+    dim3 nblks(num_blocks_per_sm * num_sms);
+    dim3 nthrs(bdx, bdy);
+
+    uint32_t m, s, a;
+    get_uint_fastdiv_msa(page_size, m, s, a);
+
+    void* args[] = {(void*)&gather_kv,     (void*)&page_ids,      (void*)&num_layers,    
+                    (void*)&stride_gather, (void*)&stride_layer,  (void*)&page_size,
+                    (void*)&stride_page,   (void*)&stride_k2v,    (void*)&stride_n,
+                    (void*)&stride_h,      (void*)&nnz,           (void*)&kv_cache,
+                    (void*)&m,             (void*)&s,             (void*)&a};
+    cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
+  });
+  return cudaSuccess;
+}
+
+template 
+cudaError_t GatherPagedKVCacheAllLayers<nv_bfloat16, int32_t>(
+  nv_bfloat16* gather_kv,
+  int32_t* page_ids,
+  uint32_t num_layers,
+  uint32_t stride_gather,
+  uint32_t stride_layer,
+  uint32_t num_heads,
+  uint32_t head_dim,
+  uint32_t page_size,
+  uint32_t stride_page,
+  uint32_t stride_k2v,
+  uint32_t stride_n,
+  uint32_t stride_h,
+  nv_bfloat16* kv_cache,
+  uint32_t nnz,
+  cudaStream_t stream);
+
+
+__global__ void GetPagedBatchIndicesPositionsKernel(
+  int32_t batch_size,
+  int32_t* append_indptr,
+  int32_t* seq_lens_ptr,
+  int32_t* batch_indices_ptr,
+  int32_t* positions_ptr) {
+
+  int32_t tx = threadIdx.x;
+  int32_t seq_idx = blockIdx.x;
+  int32_t seq_start = append_indptr[seq_idx];
+  int32_t total_seq_len = seq_lens_ptr[seq_idx];
+  int32_t append_per_seq = append_indptr[seq_idx + 1] - seq_start;
+
+  int32_t* batch_indices_ptr_per_seq = batch_indices_ptr + seq_start;
+  int32_t* positions_ptr_per_seq = positions_ptr + seq_start;
+  int32_t pos_start = total_seq_len - append_per_seq;
+
+#pragma unroll 4
+  for (int32_t i = tx; i < append_per_seq; i += blockDim.x) {
+    batch_indices_ptr_per_seq[i] = seq_idx;
+    positions_ptr_per_seq[i] = pos_start + i;
+  }
+}
+
+cudaError_t GetPagedBatchIndicesPositions(
+  int32_t batch_size,
+  int32_t* append_indptr,
+  int32_t* seq_lens_ptr,
+  int32_t* batch_indices_ptr,
+  int32_t* positions_ptr,
+  cudaStream_t stream
+)
+{
+  dim3 nblks(batch_size);
+  dim3 nthrs(128, 1);
+
+  void* args[] = {(void*)&batch_size,     (void*)&append_indptr,      (void*)&seq_lens_ptr,    
+                  (void*)&batch_indices_ptr,   (void*)&positions_ptr};
+  auto kernel = GetPagedBatchIndicesPositionsKernel;
+  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
+  return cudaSuccess;
+}

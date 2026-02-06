@@ -63,25 +63,31 @@ class KVCacheMetadata:
     """
 
     # paged cache metadata
-    kv_indices: torch.Tensor = None
-    kv_indptr: torch.Tensor = None
-    kv_last_page_len: torch.Tensor = None
-    total_history_lengths: torch.Tensor = None
-    total_history_offsets: torch.Tensor = None
+    kv_indices: torch.Tensor = None  # num_pages
+    kv_indptr: torch.Tensor = None   # num_seq + 1
+    kv_last_page_len: torch.Tensor = None # num_seq
+    total_history_lengths: torch.Tensor = None # num_seq
+    total_history_offsets: torch.Tensor = None # num_seq + 1
 
     # appending metadata
-    batch_indices: torch.Tensor = None
-    position: torch.Tensor = None
+    batch_indices: torch.Tensor = None  # num_tokens
+    position: torch.Tensor = None       # num_tokens
     new_history_nnz: int = 0
-    new_history_nnz_cuda: torch.Tensor = None
-
-    # onload utility
-    onload_history_kv_buffer: Optional[List[torch.Tensor]] = None
-    onload_history_kv_events: Optional[List[torch.cuda.Event]] = None
+    new_history_nnz_cuda: torch.Tensor = None  # 1
 
     # paged cache table pointers
     kv_cache_table: Optional[List[torch.Tensor]] = None
 
+    # async attributes
+    kv_onload_handle: Optional[object] = None
+    kv_offload_handle: Optional[object] = None
+
+    offload_user_ids: Optional[torch.Tensor] = None
+    offload_page_ids: Optional[torch.Tensor] = None
+    new_offload_startpos: Optional[torch.Tensor] = None
+    new_offload_lengths: Optional[torch.Tensor] = None
+
+    max_seqlen: Optional[int] = 0
 
 @dataclass
 class KVCacheConfig:
@@ -93,12 +99,22 @@ class KVCacheConfig:
         page_size (int): The number of tokens per cache page.
         offload_chunksize (int): The size of basic offload data chunk.
         max_attention_window (int): (Optional) The maximum window size for HSTU attention calculation.
+        max_queued_offload_tokens (int): (Optional) The maximum number of tokens queued to be offloaded.
+        num_onload_buffer_chunks (int): (Default 1) The number of chunks as onloading device buffer.
+        num_offload_buffer_chunks (int): (Default 8) The number of chunks as offloading device buffer.
+        num_memcpy_workers (int): (Default 4) The number of workers memory copying in onload/offload.
+        enable_nvcomp (bool): (Default False) Enable ANS compression in KVCache offloading.
     """
 
     blocks_in_primary_pool: int
     page_size: int
     offload_chunksize: int
     max_attention_window: Optional[int] = None
+    max_queued_offload_tokens: Optional[int] = None
+    num_onload_buffer_chunks: int = 1
+    num_offload_buffer_chunks: int = 8
+    num_memcpy_workers: int = 4
+    enable_nvcomp: bool = False
 
 
 def get_kvcache_config(
@@ -293,8 +309,6 @@ def get_kvcache_metadata_buffer(
         new_history_nnz=max_new_history_seqlen,
         new_history_nnz_cuda=torch.ones((1,), dtype=torch.int32, device=device),
         total_history_offsets=total_history_offsets_buffer,
-        onload_history_kv_buffer=[],
-        onload_history_kv_events=[],
     )
 
 
@@ -316,3 +330,6 @@ def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metata: KVCacheMeta
     copy_offsets(dst_metadata.total_history_offsets, src_metata.total_history_offsets)
 
     dst_metadata.new_history_nnz = src_metata.new_history_nnz
+
+    dst_metadata.kv_onload_handle = src_metata.kv_onload_handle
+    dst_metadata.kv_offload_handle = src_metata.kv_offload_handle

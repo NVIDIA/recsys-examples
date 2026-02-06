@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
+import argparse
 
 import torch
+from commons.datasets import get_data_loader
 from commons.datasets.hstu_batch import FeatureConfig
-from commons.datasets.random_inference_dataset import RandomInferenceDataGenerator
+from commons.datasets.random_inference_dataset import RandomInferenceDataset
 from configs import (
     InferenceEmbeddingConfig,
     RankingConfig,
@@ -28,11 +30,12 @@ sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
 
 
-def run_ranking_gr_inference():
+def run_ranking_gr_inference(disable_kvcache: bool):
     max_batch_size = 16
-    max_seqlen = 4096
+    max_num_history = 2048
     max_num_candidates = 256
     max_incremental_seqlen = 128
+    max_seqlen = max_num_history * 2 + max_num_candidates 
 
     # context_emb_size = 1000
     item_fea_name, item_vocab_size = "item_feat", 10000
@@ -46,9 +49,9 @@ def run_ranking_gr_inference():
         ),
     ]
     max_contextual_seqlen = 0
-    total_max_seqlen = sum(
-        [fc.max_sequence_length * len(fc.feature_names) for fc in feature_configs]
-    )
+    # total_max_seqlen = sum(
+    #     [fc.max_sequence_length * len(fc.feature_names) for fc in feature_configs]
+    # )
 
     hidden_dim_size = 1024
     num_heads = 4
@@ -66,7 +69,7 @@ def run_ranking_gr_inference():
         num_attention_heads=num_heads,
         head_dim=head_dim,
         max_batch_size=max_batch_size,
-        max_seq_len=total_max_seqlen,
+        max_seq_len=max_seqlen,
         dtype=inference_dtype,
     )
 
@@ -108,61 +111,49 @@ def run_ranking_gr_inference():
             hstu_config=hstu_config,
             kvcache_config=kv_cache_config,
             task_config=task_config,
-            use_cudagraph=True,
+            use_cudagraph=False, #True,
             cudagraph_configs=hstu_cudagraph_configs,
         )
         model_predict.bfloat16()
         model_predict.eval()
 
-        data_generator = RandomInferenceDataGenerator(
+        dataset = RandomInferenceDataset(
             feature_configs=feature_configs,
             item_feature_name=item_fea_name,
             contextual_feature_names=[],
             action_feature_name=action_fea_name,
-            max_num_users=16,
+            max_num_users=8,
             max_batch_size=8,  # test batch size
-            max_seqlen=2304,
+            max_history_length=max_num_history,
             max_num_candidates=max_num_candidates,
             max_incremental_seqlen=max_incremental_seqlen,
+            max_num_cached_batches = 16,
             full_mode=True,
         )
 
-        num_warmup_batches = 16
-        for idx in range(num_warmup_batches):
-            uids = data_generator.get_inference_batch_user_ids()
+        dataloader = get_data_loader(dataset)
 
-            if uids is None:
-                break
-
-            cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
-            truncate_start_pos = cached_start_pos + cached_len
-            batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
-            batch = batch.to(device=torch.cuda.current_device())
-
-            model_predict.forward(batch, uids, truncate_start_pos)
+        num_warmup = 16
+        for idx in range(num_warmup):
+            pass 
 
         num_test_batches = 16
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-        predict_time = 0.0
-        for idx in range(num_test_batches):
-            uids = data_generator.get_inference_batch_user_ids()
+        ts_start.record()
+        for (batch, user_ids, total_history_lengths) in dataloader:
+            if not disable_kvcache:
+                logits = model_predict.forward(batch, user_ids, total_history_lengths)
+            else:
+                logits = model_predict.forward_nokvcache(batch)
 
-            if uids is None:
-                break
-
-            cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
-            truncate_start_pos = cached_start_pos + cached_len
-            batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
-            batch = batch.to(device=torch.cuda.current_device())
-
-            torch.cuda.synchronize()
-            ts_start.record()
-            model_predict.forward(batch, uids, truncate_start_pos)
-            ts_end.record()
-            torch.cuda.synchronize()
-            predict_time += ts_start.elapsed_time(ts_end)
+        ts_end.record()
+        predict_time = ts_start.elapsed_time(ts_end)
         print("Total time(ms):", predict_time)
 
 
 if __name__ == "__main__":
-    run_ranking_gr_inference()
+    parser = argparse.ArgumentParser(description="Inference KVCache Demo Benchmark")
+    parser.add_argument("--disable_kvcache", action="store_true")
+
+    args = parser.parse_args()
+    run_ranking_gr_inference(args.disable_kvcache)

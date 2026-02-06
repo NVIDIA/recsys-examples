@@ -160,29 +160,33 @@ def hstu_preprocess_embeddings(
             contextual_jts_offsets,
             contextual_max_seqlens,
         )
-        if contextual_mlp is not None:
-            contextual_sequence_embeddings = contextual_mlp(
-                contextual_sequence_embeddings
+        if torch.sum(contextual_seqlen, dim=0).cpu().item() == 0:
+            contextual_seqlen = None
+        else:
+            if contextual_mlp is not None:
+                contextual_sequence_embeddings = contextual_mlp(
+                    contextual_sequence_embeddings
+                )
+            contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                contextual_seqlen
             )
-        contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-            contextual_seqlen
-        )
-        contextual_max_seqlen = max(
-            len(batch.contextual_feature_names), sum(contextual_max_seqlens)
-        )
-        (
-            sequence_embeddings,
-            sequence_embeddings_lengths,
-        ) = jagged_2D_tensor_concat(
-            [contextual_sequence_embeddings, sequence_embeddings],
-            [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
-            [contextual_max_seqlen, sequence_max_seqlen],
-        )
+            contextual_max_seqlen = max(
+                len(batch.contextual_feature_names), sum(contextual_max_seqlens)
+            )
+            (
+                sequence_embeddings,
+                sequence_embeddings_lengths,
+            ) = jagged_2D_tensor_concat(
+                [contextual_sequence_embeddings, sequence_embeddings],
+                [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
+                [contextual_max_seqlen, sequence_max_seqlen],
+            )
 
-        sequence_embeddings_lengths_offsets = (
-            torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
-        )
-        sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
+            sequence_embeddings_lengths_offsets = (
+                torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
+            )
+            sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
+
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(

@@ -18,23 +18,24 @@ import torch
 from commons.datasets.hstu_batch import FeatureConfig, HSTUBatch
 from configs import (
     InferenceEmbeddingConfig,
+    KVCacheMetadata,
     RankingConfig,
     get_inference_hstu_config,
     get_kvcache_config,
 )
+from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
+import paged_kvcache_ops
+import math
+import random
+import time
 
-sys.path.append("./model/")
-from inference_ranking_gr import InferenceRankingGR
-from torchrec import KeyedJaggedTensor
 
-
-def get_test_model(num_layers, blocks_in_primary_pool, page_size, offload_chunksize):
+def get_test_kvcache_mgr(num_layers, blocks_in_primary_pool, page_size, offload_chunksize, enable_nvcomp = False):
     # requires to test sequentientially
     max_batch_size = 8
-    max_seqlen = 512
+    max_seqlen = 10240
 
-    # context_emb_size = 1000
-    item_fea_name, item_vocab_size = "item_feat", 10000
+    item_fea_name, item_vocab_size = "item_feat", 100
     action_fea_name, action_vocab_size = "act_feat", 128
     feature_configs = [
         FeatureConfig(
@@ -66,148 +67,114 @@ def get_test_model(num_layers, blocks_in_primary_pool, page_size, offload_chunks
         page_size=page_size,
         offload_chunksize=offload_chunksize,
     )
-    emb_configs = [
-        InferenceEmbeddingConfig(
-            feature_names=["act_feat"],
-            table_name="act",
-            vocab_size=action_vocab_size,
-            dim=hidden_dim_size,
-            use_dynamicemb=False,
-        ),
-        InferenceEmbeddingConfig(
-            feature_names=["context_feat", "item_feat"]
-            if max_contextual_seqlen > 0
-            else ["item_feat"],
-            table_name="item",
-            vocab_size=item_vocab_size,
-            dim=hidden_dim_size,
-            use_dynamicemb=True,
-        ),
-    ]
-    task_config = RankingConfig(
-        embedding_configs=emb_configs,
-        prediction_head_arch=[128, 10, 1],
+
+    async_kvcache_mgr = AsyncHSTUKVCacheManager(
+        hstu_config.num_layers,
+        hstu_config.num_heads,
+        hstu_config.head_dim,
+        kv_cache_config.page_size,
+        kv_cache_config.blocks_in_primary_pool,
+        math.ceil(hstu_config.max_batch_size * hstu_config.max_seq_len / kv_cache_config.page_size),
+        4 * hstu_config.max_batch_size * hstu_config.max_seq_len,
+        kv_cache_config.offload_chunksize,
+        -1,
+        hstu_config.max_seq_len,
+        hstu_config.max_batch_size,
+        4 * hstu_config.max_batch_size * hstu_config.max_seq_len,
+        1, 8, 8,
+        enable_nvcomp,
     )
 
-    model = InferenceRankingGR(
-        hstu_config=hstu_config,
-        kvcache_config=kv_cache_config,
-        task_config=task_config,
-        use_cudagraph=False,
-    )
-    model.bfloat16()
-    model.eval()
+    # randomnize kvcache data
+    for idx in range(num_layers):
+        async_kvcache_mgr.cache_table[idx].uniform_(-0.5, 0.5)
 
-    return model
+    return async_kvcache_mgr
+
+def init_random_kvcache_status():
+    pass
+
+def reset_kvcache_status():
+    pass
+
+def get_test_userids_and_metadata(min_user_id, seq_lengths, num_layers, gpu_kvcache_mgr):
+    batch_size = len(seq_lengths)
+    page_size = 32
+    chunk_size = 1024
+    blocks_in_primary_pool = 10240
+
+    uids = list(range(min_user_id * 2, (min_user_id + batch_size) * 2))
+    random.shuffle(uids)
+    user_ids = torch.tensor(uids[:batch_size]).long().cuda()
+    offload_user_ids = user_ids.clone().cpu()
+    
+    num_pages = torch.floor(seq_lengths / chunk_size).int() * int(chunk_size / page_size)
+    num_pages = num_pages.cpu().tolist()
+    offload_page_ids = torch.cat([ torch.randint(blocks_in_primary_pool, (int(num_pages[idx]),)) for idx in range(batch_size) ], 0).int()
+
+    kv_offload_handle = paged_kvcache_ops.KVOffloadHandle(num_layers, gpu_kvcache_mgr, True)
+
+    # zero start
+    new_offload_startpos = torch.zeros((batch_size,)).int().cpu()
+    new_offload_lengths = torch.floor(seq_lengths / chunk_size).int().cpu() * int(chunk_size)
+
+    kvcache_metadata = KVCacheMetadata(
+        offload_user_ids=offload_user_ids,
+        offload_page_ids=offload_page_ids,
+        kv_offload_handle=kv_offload_handle,
+        new_offload_startpos=new_offload_startpos,
+        new_offload_lengths=new_offload_lengths,
+    )
+
+    return user_ids, kvcache_metadata
 
 
 def test_kvcache_offload_onload():
-    keys = ["item_feat", "act_feat"]
-    feat_max_len = {"item_feat": 256, "act_feat": 256}
-
     num_layers = 4
-    blocks_in_primary_pool = 4096
+    blocks_in_primary_pool = 10240
     page_size = 32
-    offload_chunksize = 64
+    offload_chunksize = 1024
 
     with torch.inference_mode():
-        model_predict = get_test_model(
-            num_layers, blocks_in_primary_pool, page_size, offload_chunksize
-        )
-        for idx in range(num_layers):
-            model_predict._gpu_kv_cache_manager.get_kvcache_table(idx).uniform_(
-                -0.5, 0.5
-            )
-        torch.cuda.synchronize()
+        async_kvcache_mgr = get_test_kvcache_mgr(
+            num_layers, blocks_in_primary_pool, page_size, offload_chunksize)
 
-        max_uid = 0
-        for batch_size, seq_len, num_candidate in [
-            (3, 200, 90),
-            (5, 100, 50),
-            (6, 100, 50),
+        uid_min_limit = 0
+        for batch_size, seq_len in [
+            (3, 5000),
+            (5, 10000),
+            (6, 8000),
         ]:
-            uids = torch.arange(max_uid, max_uid + batch_size).long()
-            max_uid += batch_size
-
-            seqlen = torch.full((batch_size,), seq_len)
-            num_candidates = torch.full((batch_size,), num_candidate)
-            cur_seqlen_sum = torch.sum(seqlen * 2 - num_candidates).item()
-
-            (
-                start_positions,
-                lengths,
-            ) = model_predict._gpu_kv_cache_manager.get_batch_kvdata_info(uids)
-            start_positions = torch.clamp(start_positions, min=0)
-            start_positions += lengths
-
-            batch = HSTUBatch(
-                features=KeyedJaggedTensor.from_lengths_sync(
-                    keys=keys,
-                    values=torch.randint(100, (cur_seqlen_sum,)),
-                    lengths=torch.concat([seqlen, seqlen - num_candidates]).long(),
-                ),
-                batch_size=batch_size,
-                feature_to_max_seqlen=feat_max_len,
-                contextual_feature_names=[],
-                item_feature_name="item_feat",
-                action_feature_name="act_feat",
-                max_num_candidates=128,
-                num_candidates=num_candidates,
+            uids, kv_metadata = get_test_userids_and_metadata(
+                uid_min_limit, torch.tensor([seq_len] * batch_size).int().cuda(),
+                num_layers, async_kvcache_mgr.gpu_kvcache_mgr,
             )
-
-            kv_cache_metadata = model_predict.prepare_kv_cache(
-                batch, uids, start_positions
-            )
-            torch.cuda.synchronize()
-            model_predict.offload_kv_cache(uids, kv_cache_metadata)
-            offload_chunks = (seq_len - num_candidate) * 2 // offload_chunksize
-            offload_pages = offload_chunks * offload_chunksize // page_size
-
-            page_indptr = []
-            for idx in range(batch_size):
-                page_start = kv_cache_metadata.kv_indptr[idx].item()
-                page_indptr.append(torch.arange(page_start, page_start + offload_pages))
-            page_indptr = torch.concat(page_indptr).cpu()
-            gather_pages = kv_cache_metadata.kv_indices[page_indptr]
-
-            (
-                onload_length,
-                _,
-                _,
-            ) = model_predict._host_kv_storage_manager.lookup_kvdata(
-                uids, torch.zeros_like(uids), torch.zeros_like(uids)
-            )
-
-            offload_length = batch_size * offload_chunks * offload_chunksize
-            offload_pages = offload_length // page_size
+            async_kvcache_mgr.offload_kvcache(kv_metadata)
 
             for layer_idx in range(num_layers):
-                assert torch.allclose(
-                    kv_cache_metadata.kv_cache_table[layer_idx][gather_pages].cpu(),
-                    model_predict._host_kv_storage_manager.static_kvdata_buffer_[
-                        layer_idx, :offload_pages
-                    ],
-                )
+                kv_metadata.kv_offload_handle.mark_ready(layer_idx)
 
-            onload_length = offload_length
-            onload_pages = offload_pages
-            kv_cache_metadata.onload_history_kv_events = (
-                model_predict._kvcache_metadata.onload_history_kv_events[:]
-            )
-            model_predict._gpu_kv_cache_manager.onload(
-                model_predict._host_kv_storage_manager.get_lookup_buffer(),
-                onload_length,
-                kv_cache_metadata,
-            )
-            torch.cuda.synchronize()
+            while async_kvcache_mgr.gpu_kvcache_mgr.is_busy_offloading():
+                pass
+            
+            async_kvcache_mgr.static_onload_handle.reset()
+            async_kvcache_mgr.gpu_kvcache_mgr.onload_kvcache(uids.tolist(), async_kvcache_mgr.static_onload_handle)
+
             for layer_idx in range(num_layers):
-                assert torch.allclose(
-                    kv_cache_metadata.kv_cache_table[layer_idx][gather_pages],
-                    kv_cache_metadata.kv_cache_table[layer_idx][
-                        blocks_in_primary_pool : blocks_in_primary_pool + onload_pages
-                    ],
-                )
+                async_kvcache_mgr.static_onload_handle.wait_host(layer_idx)
 
+            # check data
+            total_onload_pages = len(kv_metadata.offload_page_ids)
+            origin_kvdata = async_kvcache_mgr.cache_table[:, kv_metadata.offload_page_ids, ...]
+            onload_kvdata = async_kvcache_mgr.cache_table[:, blocks_in_primary_pool:blocks_in_primary_pool+total_onload_pages, ...]
+            assert torch.allclose(onload_kvdata, origin_kvdata)
+            
+            torch.cuda.synchronize()
+
+            uid_min_limit += batch_size
+        
 
 if __name__ == "__main__":
+    random.seed(1)
+    torch.manual_seed(0)
     test_kvcache_offload_onload()
