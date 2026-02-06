@@ -27,7 +27,9 @@ from torchrec.distributed.embedding_lookup import (
     GroupedPooledEmbeddingsLookup as _GroupedPooledEmbeddingsLookup,
 )
 from torchrec.distributed.embedding_sharding import (
+    BaseEmbeddingDist,
     BaseSparseFeaturesDist,
+    EmbeddingShardingContext,
     EmbeddingShardingInfo,
 )
 from torchrec.distributed.embedding_types import (
@@ -40,6 +42,7 @@ from torchrec.distributed.sharding.rw_sequence_sharding import (
     RwSequenceEmbeddingSharding,
 )
 from torchrec.distributed.sharding.rw_sharding import RwPooledEmbeddingSharding
+from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import QuantizedCommCodecs, ShardingEnv, ShardingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -48,10 +51,8 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbeddingBag,
 )
 from ..input_dist import RwSparseFeaturesDist
-from torchrec.distributed.embedding_sharding import BaseEmbeddingDist, EmbeddingShardingContext
-from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
-
 from ..output_dist import RwPooledEmbeddingDist, RwSequenceEmbeddingDist
+
 
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
     def _create_embedding_kernel(
@@ -151,7 +152,6 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             device=device if device is not None else self._device,
         )
 
-
     def create_output_dist(
         self,
         device: Optional[torch.device] = None,
@@ -164,6 +164,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             device if device is not None else self._device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
         )
+
 
 class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
     def _create_embedding_kernel(
