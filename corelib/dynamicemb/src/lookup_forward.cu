@@ -61,8 +61,8 @@ struct ForwardMultiToOneFMLayoutDesc {
 
   int num_vec_;
   int combiner;
-  int ev_size;  // uniform: embedding dim; multi-dim: max_D (src row stride)
-  const int *__restrict__ D_offsets_ptr;  // nullptr → uniform, [F+1] → multi-dim
+  int ev_size; // uniform: embedding dim; multi-dim: max_D (src row stride)
+  const int *__restrict__ D_offsets_ptr; // nullptr → uniform, [F+1] → multi-dim
   const offset_t *__restrict__ offset_ptr;
   const offset_t *__restrict__ reverse_idx_ptr;
   const SrcType *__restrict__ src_ptr;
@@ -94,53 +94,6 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                                    total_D,
                                    accum_D};
         copy_multi_to_one(multi_to_one_desc, ev_size, stream);
-      });
-    });
-  });
-}
-
-template <typename SrcType, typename DstType, typename offset_t>
-struct ForwardSequenceCopyDesc {
-
-  using SrcT = SrcType;
-  using DstT = DstType;
-  HOST_DEVICE_INLINE int get_vec_length() {
-    // TODO:now only have one size
-    return ev_size;
-  }
-  HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
-    offset_t idx = reverse_idx_ptr[i];
-    return src_ptr + idx * ev_size;
-  }
-  HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
-    offset_t offset = offset_ptr[0];
-    return dst_ptr + (offset + i) * ev_size;
-  }
-
-  int num_vec_;
-  int ev_size;
-  const offset_t *__restrict__ offset_ptr;
-  const offset_t *__restrict__ reverse_idx_ptr;
-  const SrcType *__restrict__ src_ptr;
-  DstType *dst_ptr;
-};
-
-void scatter(void *src_ptr, void *dst_ptr, void *offset_ptr,
-             void *inverse_idx_ptr, int num_emb, int ev_size, DataType src_type,
-             DataType dst_type, DataType offset_type, int device_num_sms,
-             cudaStream_t stream) {
-  DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
-        using CopyDesc = ForwardSequenceCopyDesc<src_t, dst_t, offset_t>;
-        CopyDesc sequence_copy_desc{num_emb,
-                                    ev_size,
-                                    (offset_t *)offset_ptr,
-                                    (offset_t *)inverse_idx_ptr,
-                                    (src_t *)src_ptr,
-                                    (dst_t *)dst_ptr};
-        copy_one_to_one<CopyDesc>(sequence_copy_desc, ev_size, device_num_sms,
-                                  stream);
       });
     });
   });
@@ -186,53 +139,6 @@ void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
       });
     });
   });
-}
-
-template <typename SrcType, typename DstType> struct ForwardOneToOneCopyDesc {
-
-  using SrcT = SrcType;
-  using DstT = DstType;
-  HOST_DEVICE_INLINE int get_vec_length() {
-    // TODO:now only have one size
-    return vec_length;
-  }
-  HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
-    return src_ptr + i * vec_length;
-  }
-  HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
-    return dst_ptr + i * vec_length;
-  }
-  int num_vec_;
-  int vec_length;
-  const SrcType *__restrict__ src_ptr;
-  DstType *dst_ptr;
-};
-
-void batched_vector_copy_device(void *src_ptr, void *dst_ptr, int batch_size,
-                                int vec_length, DataType src_type,
-                                DataType dst_type, int device_num_sms,
-                                cudaStream_t stream) {
-  DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
-      using CopyDesc = ForwardOneToOneCopyDesc<src_t, dst_t>;
-      CopyDesc sequence_dedup_copy_desc{batch_size, vec_length,
-                                        (src_t *)src_ptr, (dst_t *)dst_ptr};
-      copy_one_to_one<CopyDesc>(sequence_dedup_copy_desc, vec_length,
-                                device_num_sms, stream);
-    });
-  });
-}
-
-void add_offset(void *src_ptr, void *dst_ptr, int idx, DataType src_type,
-                DataType dst_type, cudaStream_t stream) {
-  DISPATCH_INTEGER_DATATYPE_FUNCTION(src_type, src_t, [&] {
-    DISPATCH_INTEGER_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
-      add_offset_kernel<src_t, dst_t>
-          <<<1, 1, 0, stream>>>(reinterpret_cast<const src_t *>(src_ptr),
-                                reinterpret_cast<dst_t *>(dst_ptr), idx);
-    });
-  });
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void get_new_length_and_offsets(uint64_t *d_unique_offsets,

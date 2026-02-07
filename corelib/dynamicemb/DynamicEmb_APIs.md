@@ -390,7 +390,7 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
                 When `caching=True`, it decides the table capacity of the GPU table.
         external_storage: Storage
             The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
-            If not provided, will using KeyValueTable as the Storage.
+            If not provided, will using DynamicEmbeddingTable as the Storage.
         index_type : Optional[torch.dtype], optional
             Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
         admit_strategy : Optional[AdmissionStrategy], optional

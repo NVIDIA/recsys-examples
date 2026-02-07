@@ -17,9 +17,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #ifndef LOOKUP_BACKWARD_H
 #define LOOKUP_BACKWARD_H
-#include <optional>
 #include "index_calculation.h"
 #include "utils.h"
+#include <optional>
 
 namespace dyn_emb {
 
@@ -53,15 +53,5 @@ public:
                     int B = 0, int F = 0, int total_D = 0, int combiner = 0);
 };
 
-void backward(void *grads, void *unique_buffer, void *unique_indices,
-              void *inverse_indices, void *biased_offset, const int dim,
-              const int batch_size, const int feature_num, const int num_key,
-              int combiner, DataType key_type, DataType value_type,
-              cudaStream_t stream);
-void one_to_one_atomic(void *grads, void *unique_indices, void *reverse_indices,
-                       void *unique_grads, const int ev_size,
-                       const int64_t key_num, const int64_t unique_key_num,
-                       DataType rev_idx_type, DataType grad_type,
-                       DataType key_type, int num_sms, cudaStream_t stream);
 } // namespace dyn_emb
 #endif // LOOKUP_BACKWARD_H

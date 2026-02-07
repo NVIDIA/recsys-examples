@@ -1,5 +1,5 @@
 ## Description
-A embedding pooling kernel to address performance issues with `DynamicEmbeddingBagFunction`.
+A embedding pooling kernel to address performance issues with the old pooling implementation.
 
 ### Core Implementation
 - `embedding_pooling_kernel.py`: Triton kernels (forward + backward)

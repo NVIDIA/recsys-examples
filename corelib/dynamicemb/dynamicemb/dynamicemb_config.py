@@ -28,12 +28,7 @@ from dynamicemb.types import (
     DynamicEmbInitializerMode,
     Storage,
 )
-from dynamicemb_extensions import (
-    DynamicEmbDataType,
-    DynamicEmbTable,
-    EvictStrategy,
-    OptimizerType,
-)
+from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy, OptimizerType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 
@@ -275,7 +270,7 @@ class DynamicEmbTableOptions(_ContextOptions):
             When `caching=True`, it decides the table capacity of the GPU table.
     external_storage: Storage
         The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
-        If not provided, will using KeyValueTable as the Storage.
+        If not provided, will using DynamicEmbeddingTable as the Storage.
     index_type : Optional[torch.dtype], optional
         Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
     admit_strategy : Optional[AdmissionStrategy], optional
@@ -489,32 +484,6 @@ def get_optimizer_state_dim(optimizer_type, dim, dtype):
         return dim
     else:
         return 0
-
-
-def create_dynamicemb_table(table_options: DynamicEmbTableOptions) -> DynamicEmbTable:
-    if not table_options.training:
-        table_options.optimizer_type = OptimizerType.Null
-    return DynamicEmbTable(
-        torch_to_dyn_emb(table_options.index_type),
-        torch_to_dyn_emb(table_options.embedding_dtype),
-        table_options.evict_strategy.value,
-        table_options.dim,
-        table_options.init_capacity,
-        table_options.max_capacity,
-        table_options.local_hbm_for_values,
-        table_options.bucket_capacity,
-        table_options.max_load_factor,
-        table_options.block_size,
-        table_options.io_block_size,
-        table_options.device_id,
-        table_options.io_by_cpu,
-        table_options.use_constant_memory,
-        table_options.reserved_key_start_bit,
-        table_options.num_of_buckets_per_alloc,
-        table_options.initializer_args.as_ctype(),
-        table_options.safe_check_mode.value,
-        table_options.optimizer_type,
-    )
 
 
 # TODO: sync with table

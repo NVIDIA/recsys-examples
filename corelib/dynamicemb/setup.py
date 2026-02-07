@@ -23,9 +23,6 @@ from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 subprocess.run(
-    ["git", "submodule", "update", "--init", "../../third_party/HierarchicalKV"]
-)
-subprocess.run(
     [
         sys.executable,
         "-m",
@@ -121,7 +118,6 @@ def get_extensions():
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-            "-UCUDA_ERROR_CHECK",  # this is to disable HKV error check
         ],
     }
 
@@ -131,7 +127,6 @@ def get_extensions():
     )
 
     include_dirs = [
-        root_path / "../../third_party/HierarchicalKV" / "include",
         root_path / "src",
     ]
     cuda_sources = [str(path) for path in cuda_sources]

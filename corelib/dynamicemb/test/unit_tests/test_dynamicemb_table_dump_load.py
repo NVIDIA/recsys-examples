@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 from dynamicemb.dynamicemb_config import DynamicEmbCheckMode
-from dynamicemb.key_value_table import KeyValueTable
+from dynamicemb.key_value_table import DynamicEmbeddingTable
 from dynamicemb.optimizer import *
 from dynamicemb_extensions import OptimizerType, find
 from torchrec.distributed.comm import get_local_rank
@@ -36,7 +36,7 @@ device = torch.device(f"cuda:{local_rank}")
 
 
 def init_dynamicemb_table(
-    dynamicemb_table: KeyValueTable, num_embeddings: int, embedding_dim: int
+    dynamicemb_table: DynamicEmbeddingTable, num_embeddings: int, embedding_dim: int
 ):
     # Generate exactly num_embeddings unique random keys in range 0 to sys.maxsize
     # Use torch.randint to sample from the large range without creating a massive tensor
@@ -74,9 +74,9 @@ def init_dynamicemb_table(
 
 
 def assert_two_dynamicemb_table_equal(
-    reference_table: KeyValueTable,
+    reference_table: DynamicEmbeddingTable,
     reference_table_optimizer_type: str,
-    table: KeyValueTable,
+    table: DynamicEmbeddingTable,
     table_optimizer_type: str,
     dump_optim: bool,
     load_optim: bool,
@@ -293,7 +293,7 @@ def test_dynamic_table_load_dump(
         dump_optimizer_type if dump_mode == "training" else "sgd",
         dump_table_options.embedding_dtype,
     )
-    dynamicemb_table = KeyValueTable(dump_table_options, dump_dummy_optimizer)
+    dynamicemb_table = DynamicEmbeddingTable(dump_table_options, dump_dummy_optimizer)
     init_dynamicemb_table(dynamicemb_table, num_embeddings, embedding_dim)
 
     dynamicemb_table.dump(
@@ -310,7 +310,9 @@ def test_dynamic_table_load_dump(
         load_optimizer_type if load_mode == "training" else "sgd",
         load_table_options.embedding_dtype,
     )
-    new_dynamicemb_table = KeyValueTable(load_table_options, load_dummy_optimizer)
+    new_dynamicemb_table = DynamicEmbeddingTable(
+        load_table_options, load_dummy_optimizer
+    )
 
     new_dynamicemb_table.load(
         "metadata.json",
