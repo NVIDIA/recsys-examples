@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #ifndef LOOKUP_BACKWARD_H
 #define LOOKUP_BACKWARD_H
+#include <optional>
 #include "index_calculation.h"
 #include "utils.h"
 
@@ -40,9 +41,16 @@ public:
   LocalReduce(c10::Device &device, int64_t num_key, int64_t len_vec,
               DataType id_type, DataType accum_type);
 
-  void local_reduce(const at::Tensor &in_grad, at::Tensor &out_grad,
+  // Unified reduce.  When D_offsets is provided, uses multi-dim addressing
+  // (source is grads[B, total_D], per-feature offsets via D_offsets, MEAN
+  // scaling fused).  Otherwise, uniform-dim addressing.
+  // len_vec_ must be set to max_D when using multi-dim mode.
+  void local_reduce(const at::Tensor &in_grads, at::Tensor &out_grads,
                     const at::Tensor &sorted_key_ids,
-                    const at::Tensor &unique_key_ids, cudaStream_t &stream);
+                    const at::Tensor &unique_key_ids, cudaStream_t &stream,
+                    const std::optional<at::Tensor> &D_offsets = std::nullopt,
+                    const std::optional<at::Tensor> &offsets = std::nullopt,
+                    int B = 0, int F = 0, int total_D = 0, int combiner = 0);
 };
 
 void backward(void *grads, void *unique_buffer, void *unique_indices,

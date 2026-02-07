@@ -21,6 +21,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
+// Unified pooled-gather descriptor.
+// When D_offsets_ptr is non-null (multi-dim), each feature f has dim
+// D_offsets_ptr[f+1]-D_offsets_ptr[f] and the destination column start is
+// D_offsets_ptr[f].  Source rows use ev_size (= max_D) as stride.
+// When D_offsets_ptr is null (uniform-dim), every feature has dim ev_size and
+// the destination column start is accum_D + f * ev_size.
 template <typename SrcType, typename DstType, typename offset_t>
 struct ForwardMultiToOneFMLayoutDesc {
   using SrcT = SrcType;
@@ -30,27 +36,33 @@ struct ForwardMultiToOneFMLayoutDesc {
     return offset_ptr[i] - offset_ptr[0];
   }
   HOST_DEVICE_INLINE int get_vec_length(int i) {
-    // TODO:now only have one size
+    if (D_offsets_ptr) {
+      int f = i / batch_size;
+      return D_offsets_ptr[f + 1] - D_offsets_ptr[f];
+    }
     return ev_size;
   }
   HOST_DEVICE_INLINE int get_average_pooling_factor(int i) {
     int pooling_factor = static_cast<int>(offset_ptr[i + 1] - offset_ptr[i]);
-    // TODO:now use 1 = Average, 0 = SUM or None
     return combiner == 1 ? pooling_factor : 1;
   }
   HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
     int idx = reverse_idx_ptr[i];
-    return src_ptr + ev_size * idx;
+    return src_ptr + (int64_t)ev_size * idx;
   }
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
     int b = i % batch_size;
     int f = i / batch_size;
+    if (D_offsets_ptr) {
+      return dst_ptr + b * total_D + D_offsets_ptr[f];
+    }
     return dst_ptr + b * total_D + accum_D + f * ev_size;
   }
 
   int num_vec_;
   int combiner;
-  int ev_size;
+  int ev_size;  // uniform: embedding dim; multi-dim: max_D (src row stride)
+  const int *__restrict__ D_offsets_ptr;  // nullptr → uniform, [F+1] → multi-dim
   const offset_t *__restrict__ offset_ptr;
   const offset_t *__restrict__ reverse_idx_ptr;
   const SrcType *__restrict__ src_ptr;
@@ -64,7 +76,7 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      void *inverse_idx_ptr, int combiner, int total_D,
                      int accum_D, int ev_size, int num_vec, int batch_size,
                      DataType src_type, DataType dst_type, DataType offset_type,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, const int *D_offsets_ptr) {
 
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
@@ -73,6 +85,7 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
         CopyDesc multi_to_one_desc{num_vec,
                                    combiner,
                                    ev_size,
+                                   D_offsets_ptr,
                                    (offset_t *)offset_ptr,
                                    (offset_t *)inverse_idx_ptr,
                                    (src_t *)src_ptr,

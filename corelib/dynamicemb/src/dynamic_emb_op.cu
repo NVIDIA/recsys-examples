@@ -404,20 +404,79 @@ void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
                          num_sms, stream);
 }
 
+void gather_embedding_pooled(at::Tensor input, at::Tensor output,
+                             at::Tensor index, at::Tensor offsets,
+                             int combiner, int total_D, int batch_size,
+                             const std::optional<at::Tensor> &D_offsets =
+                                 std::nullopt,
+                             int max_D = 0) {
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  int num_slots = offsets.size(0) - 1;
+
+  auto src_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(input.dtype()));
+  auto dst_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(output.dtype()));
+  auto offset_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(offsets.dtype()));
+
+  int dim = D_offsets.has_value() ? max_D : static_cast<int>(input.size(1));
+  const int *d_D_offsets =
+      D_offsets.has_value()
+          ? reinterpret_cast<const int *>(D_offsets.value().data_ptr())
+          : nullptr;
+  dyn_emb::scatter_combine(input.data_ptr(), output.data_ptr(),
+                           offsets.data_ptr(), index.data_ptr(), combiner,
+                           total_D, /*accum_D=*/0, dim, num_slots, batch_size,
+                           src_type, dst_type, offset_type, stream,
+                           d_D_offsets);
+}
+
+// Generate permutation-aware gather_ids from CSR offsets.
+// grads is [B*F, D] batch-first (row r → b=r/F, f=r%F).
+// Index j belongs to slot s (feature-first); slot s has f=s/B, b=s%B.
+// gather_ids[j] = b*F + f  — the row in [B*F, D] that LocalReduce reads.
+template <typename offset_t, typename id_t>
+__global__ void generate_gather_ids_pooled_kernel(
+    const offset_t *__restrict__ offsets, id_t *__restrict__ gather_ids,
+    int64_t num_indices, int num_slots, int B, int F) {
+  for (int64_t j = blockIdx.x * blockDim.x + threadIdx.x; j < num_indices;
+       j += gridDim.x * blockDim.x) {
+    int slot = static_cast<int>(
+        bs_upper_bound_sub_one(offsets, (int64_t)(num_slots + 1), (offset_t)j));
+    int f = slot / B;
+    int b = slot % B;
+    gather_ids[j] = static_cast<id_t>(b * F + f);
+  }
+}
+
+
 at::Tensor reduce_grads(at::Tensor reverse_indices, at::Tensor grads,
-                        int64_t num_unique) {
-  // Sort (reverse_indices, arange(N)) by reverse_indices value to get:
-  //   sorted_reverse_indices → unique_key_ids  (boundary detection + scatter)
-  //   sorted_original_ids   → sorted_key_ids  (gather index into grads)
-  // Then run the same 2-stage local_reduce.
+                        int64_t num_unique,
+                        const std::optional<at::Tensor> &offsets =
+                            std::nullopt,
+                        int combiner = -1, int batch_size = 0,
+                        const std::optional<at::Tensor> &D_offsets =
+                            std::nullopt,
+                        int max_D = 0, int total_D = 0) {
+  // When D_offsets is provided (multi-dim pooling):
+  //   grads is [B, total_D].  Permutation-aware gather_ids are generated,
+  //   sorted with reverse_indices, then a multi-dim variant of LocalReduce
+  //   reads directly from grads using D_offsets to compute per-feature source
+  //   offsets and widths.  MEAN scaling is fused in the stage-1 kernel.
+  //   No padded intermediate buffer is needed.
+  //
+  // When offsets is provided without D_offsets (uniform-dim pooling):
+  //   grads is [B*F, D] batch-first (free reshape from [B, total_D]).
+  //   1. For MEAN, an in-place kernel scales each row by 1/pool_size.
+  //   2. Permutation-aware gather_ids are generated via binary search so that
+  //      LocalReduce reads from the correct batch-first rows directly — no
+  //      intermediate permuted tensor is allocated.
+  //
+  // When offsets is absent (sequence mode), gather_ids = arange(num_keys)
+  //   and LocalReduce gathers directly from grads.
 
   int64_t num_keys = reverse_indices.size(0);
-  int64_t dim = grads.size(1);
-  at::Tensor unique_grads = at::empty({num_unique, dim}, grads.options());
-
-  if (num_keys == 0) {
-    return unique_grads;
-  }
 
   if (!reverse_indices.is_cuda() || !grads.is_cuda()) {
     throw std::runtime_error("All argument tensors should be on device");
@@ -428,12 +487,50 @@ at::Tensor reduce_grads(at::Tensor reverse_indices, at::Tensor grads,
   auto id_stype = reverse_indices.dtype().toScalarType();
   auto id_dtype = scalartype_to_datatype(id_stype);
 
-  auto original_ids = at::arange(num_keys, reverse_indices.options());
-  auto sorted_reverse_indices = at::empty_like(reverse_indices);
-  auto sorted_original_ids = at::empty_like(original_ids);
+  bool multi_dim = D_offsets.has_value() && offsets.has_value();
 
-  // reverse_indices values are in [0, num_unique), so we only need enough bits
-  // to represent num_unique — reduces radix sort passes significantly.
+  // Determine output width: max_D for multi-dim, grads.size(1) otherwise.
+  int64_t out_dim = multi_dim ? (int64_t)max_D : grads.size(1);
+  at::Tensor unique_grads =
+      at::empty({num_unique, out_dim}, grads.options());
+
+  if (num_keys == 0)
+    return unique_grads;
+
+  // --- Generate gather_ids ---
+  at::Tensor gather_ids;
+  if (offsets.has_value()) {
+    auto &offs = offsets.value();
+    int num_slots = static_cast<int>(offs.size(0) - 1);
+    int num_features = num_slots / batch_size;
+    auto offset_type =
+        scalartype_to_datatype(convertTypeMetaToScalarType(offs.dtype()));
+
+    constexpr int kBlockSize = 256;
+
+    // Generate permutation-aware gather_ids via binary search.
+    gather_ids = at::empty({num_keys}, reverse_indices.options());
+    int slot_grid = static_cast<int>(
+        std::min((num_keys + kBlockSize - 1) / kBlockSize, (int64_t)8192));
+
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
+      DISPATCH_INTEGER_DATATYPE_FUNCTION(id_dtype, id_t, [&] {
+        generate_gather_ids_pooled_kernel<offset_t, id_t>
+            <<<slot_grid, kBlockSize, 0, stream>>>(
+                reinterpret_cast<const offset_t *>(offs.data_ptr()),
+                reinterpret_cast<id_t *>(gather_ids.data_ptr()), num_keys,
+                num_slots, batch_size, num_features);
+      });
+    });
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    gather_ids = at::arange(num_keys, reverse_indices.options());
+  }
+
+  // --- Sort (reverse_indices, gather_ids) by reverse_indices ---
+  auto sorted_reverse_indices = at::empty_like(reverse_indices);
+  auto sorted_gather_ids = at::empty_like(gather_ids);
+
   int end_bit =
       (num_unique > 1)
           ? (64 - __builtin_clzll(static_cast<uint64_t>(num_unique - 1)))
@@ -444,8 +541,8 @@ at::Tensor reduce_grads(at::Tensor reverse_indices, at::Tensor grads,
         nullptr, temp_storage_bytes,
         reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
         reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
-        reinterpret_cast<id_t *>(original_ids.data_ptr()),
-        reinterpret_cast<id_t *>(sorted_original_ids.data_ptr()), num_keys, 0,
+        reinterpret_cast<id_t *>(gather_ids.data_ptr()),
+        reinterpret_cast<id_t *>(sorted_gather_ids.data_ptr()), num_keys, 0,
         end_bit, stream);
     auto temp_storage =
         at::empty({static_cast<int64_t>(temp_storage_bytes)},
@@ -454,15 +551,29 @@ at::Tensor reduce_grads(at::Tensor reverse_indices, at::Tensor grads,
         temp_storage.data_ptr(), temp_storage_bytes,
         reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
         reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
-        reinterpret_cast<id_t *>(original_ids.data_ptr()),
-        reinterpret_cast<id_t *>(sorted_original_ids.data_ptr()), num_keys, 0,
+        reinterpret_cast<id_t *>(gather_ids.data_ptr()),
+        reinterpret_cast<id_t *>(sorted_gather_ids.data_ptr()), num_keys, 0,
         end_bit, stream);
   });
 
-  LocalReduce localReduceOp(device_, num_keys, dim, id_dtype,
+  // --- LocalReduce ---
+  // MEAN scaling is fused inside the reduce kernel for both uniform and
+  // multi-dim modes, so no separate scaling pass is needed.
+  LocalReduce localReduceOp(device_, num_keys, out_dim, id_dtype,
                             DataType::Float32);
-  localReduceOp.local_reduce(grads, unique_grads, sorted_original_ids,
-                             sorted_reverse_indices, stream);
+
+  if (offsets.has_value()) {
+    auto &offs = offsets.value();
+    int num_slots = static_cast<int>(offs.size(0) - 1);
+    int num_features = num_slots / batch_size;
+
+    localReduceOp.local_reduce(
+        grads, unique_grads, sorted_gather_ids, sorted_reverse_indices, stream,
+        D_offsets, offs, batch_size, num_features, total_D, combiner);
+  } else {
+    localReduceOp.local_reduce(grads, unique_grads, sorted_gather_ids,
+                               sorted_reverse_indices, stream);
+  }
 
   return unique_grads;
 }
@@ -511,9 +622,10 @@ void lookup_backward(const at::Tensor grad, const at::Tensor unique_buffer,
 }
 
 template <typename T>
-__global__ void
-load_from_pointers_kernel_vec4(int batch, int emb_dim, T *__restrict__ outputs,
-                               T *const *__restrict__ src_ptrs) {
+__global__ void load_from_pointers_kernel_vec4(int batch, int emb_dim,
+                                               int64_t output_stride,
+                                               T *__restrict__ outputs,
+                                               T *const *__restrict__ src_ptrs) {
 
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
@@ -525,7 +637,7 @@ load_from_pointers_kernel_vec4(int batch, int emb_dim, T *__restrict__ outputs,
   for (int emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
        emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
     T *const src_ptr = src_ptrs[emb_id];
-    T *dst_ptr = outputs + emb_id * emb_dim;
+    T *dst_ptr = outputs + emb_id * output_stride;
     if (src_ptr != nullptr) {
       for (int i = 0; VecSize * (kWarpSize * i + lane_id) < emb_dim; ++i) {
         int idx4 = VecSize * (kWarpSize * i + lane_id);
@@ -538,12 +650,13 @@ load_from_pointers_kernel_vec4(int batch, int emb_dim, T *__restrict__ outputs,
 
 template <typename T>
 __global__ void load_from_pointers_kernel(int batch, int emb_dim,
+                                          int64_t output_stride,
                                           T *__restrict__ outputs,
                                           T *const *__restrict__ src_ptrs) {
 
   for (int emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
     T *const src_ptr = src_ptrs[emb_id];
-    T *dst_ptr = outputs + emb_id * emb_dim;
+    T *dst_ptr = outputs + emb_id * output_stride;
     if (src_ptr != nullptr) {
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         dst_ptr[i] = src_ptr[i];
@@ -555,6 +668,7 @@ __global__ void load_from_pointers_kernel(int batch, int emb_dim,
 void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
   int64_t num_total = pointers.size(0);
   int64_t dim = dst.size(1);
+  int64_t output_stride = dst.stride(0);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   constexpr int kWarpSize = 32;
@@ -580,7 +694,8 @@ void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
     if (dim % 4 == 0) {
       load_from_pointers_kernel_vec4<ValueType>
           <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
-              num_total, dim, reinterpret_cast<ValueType *>(dst.data_ptr()),
+              num_total, dim, output_stride,
+              reinterpret_cast<ValueType *>(dst.data_ptr()),
               reinterpret_cast<ValueType **>(pointers.data_ptr()));
     } else {
       int block_size = dim < device_prop.max_thread_per_block
@@ -589,7 +704,8 @@ void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
       int grid_size = num_total;
       load_from_pointers_kernel<ValueType>
           <<<grid_size, block_size, 0, stream>>>(
-              num_total, dim, reinterpret_cast<ValueType *>(dst.data_ptr()),
+              num_total, dim, output_stride,
+              reinterpret_cast<ValueType *>(dst.data_ptr()),
               reinterpret_cast<ValueType **>(pointers.data_ptr()));
     }
   });
@@ -598,9 +714,10 @@ void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
 
 template <typename IndexT, typename ValueT>
 __global__ void load_from_combined_table_kernel_vec4(
-    int64_t batch, int emb_dim, int stride, int split_index,
-    ValueT const *__restrict__ dev_table, ValueT const *__restrict__ uvm_table,
-    ValueT *__restrict__ output_buffer, IndexT const *__restrict__ indices) {
+    int64_t batch, int emb_dim, int stride, int64_t output_stride,
+    int split_index, ValueT const *__restrict__ dev_table,
+    ValueT const *__restrict__ uvm_table, ValueT *__restrict__ output_buffer,
+    IndexT const *__restrict__ indices) {
 
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
@@ -618,7 +735,7 @@ __global__ void load_from_combined_table_kernel_vec4(
     } else {
       src = uvm_table + (index - split_index) * stride;
     }
-    ValueT *dst = output_buffer + emb_id * emb_dim;
+    ValueT *dst = output_buffer + emb_id * output_stride;
     if (index >= 0) {
       for (int i = 0; VecSize * (kWarpSize * i + lane_id) < emb_dim; ++i) {
         int idx4 = VecSize * (kWarpSize * i + lane_id);
@@ -631,9 +748,10 @@ __global__ void load_from_combined_table_kernel_vec4(
 
 template <typename IndexT, typename ValueT>
 __global__ void load_from_combined_table_kernel(
-    int64_t batch, int emb_dim, int stride, int split_index,
-    ValueT const *__restrict__ dev_table, ValueT const *__restrict__ uvm_table,
-    ValueT *__restrict__ output_buffer, IndexT const *__restrict__ indices) {
+    int64_t batch, int emb_dim, int stride, int64_t output_stride,
+    int split_index, ValueT const *__restrict__ dev_table,
+    ValueT const *__restrict__ uvm_table, ValueT *__restrict__ output_buffer,
+    IndexT const *__restrict__ indices) {
 
   for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
     IndexT const index = indices[emb_id];
@@ -643,7 +761,7 @@ __global__ void load_from_combined_table_kernel(
     } else {
       src = uvm_table + (index - split_index) * stride;
     }
-    ValueT *dst = output_buffer + emb_id * emb_dim;
+    ValueT *dst = output_buffer + emb_id * output_stride;
     if (index >= 0) {
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         dst[i] = src[i];
@@ -662,6 +780,7 @@ void load_from_combined_table(std::optional<at::Tensor> dev_table,
   }
   int64_t stride = -1;
   int64_t dim = output.size(1);
+  int64_t output_stride = output.stride(0);
   if ((not dev_table.has_value()) and (not uvm_table.has_value())) {
     throw std::runtime_error("Two tables cannot both be None.");
   } else {
@@ -725,17 +844,17 @@ void load_from_combined_table(std::optional<at::Tensor> dev_table,
       if (dim % 4 == 0) {
         load_from_combined_table_kernel_vec4<IndexType, ValueType>
             <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
-                num_total, dim, stride, split_index, dev_ptr, uvm_ptr, out_ptr,
-                index_ptr);
+                num_total, dim, stride, output_stride, split_index, dev_ptr,
+                uvm_ptr, out_ptr, index_ptr);
       } else {
         int block_size = dim < device_prop.max_thread_per_block
                              ? dim
                              : device_prop.max_thread_per_block;
         int grid_size = num_total;
         load_from_combined_table_kernel<IndexType, ValueType>
-            <<<grid_size, block_size, 0, stream>>>(num_total, dim, stride,
-                                                   split_index, dev_ptr,
-                                                   uvm_ptr, out_ptr, index_ptr);
+            <<<grid_size, block_size, 0, stream>>>(
+                num_total, dim, stride, output_stride, split_index, dev_ptr,
+                uvm_ptr, out_ptr, index_ptr);
       }
     });
   });
@@ -1181,7 +1300,11 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("num_key"), py::arg("combiner"));
 
   m.def("reduce_grads", &reduce_grads, "reduce grads",
-        py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"));
+        py::arg("reverse_indices"), py::arg("grads"),
+        py::arg("num_unique"), py::arg("offsets") = py::none(),
+        py::arg("combiner") = -1, py::arg("batch_size") = 0,
+        py::arg("D_offsets") = py::none(), py::arg("max_D") = 0,
+        py::arg("total_D") = 0);
 
   m.def("load_from_pointers", &load_from_pointers, "load from pointers to dst.",
         py::arg("pointers"), py::arg("dst"));
@@ -1189,6 +1312,13 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("gather_embedding", &gather_embedding,
         "Gather embedding based on index.", py::arg("input"), py::arg("output"),
         py::arg("index"));
+
+  m.def("gather_embedding_pooled", &gather_embedding_pooled,
+        "Gather embedding with pooling (SUM/MEAN) based on index and offsets.",
+        py::arg("input"), py::arg("output"), py::arg("index"),
+        py::arg("offsets"), py::arg("combiner"), py::arg("total_D"),
+        py::arg("batch_size"), py::arg("D_offsets") = py::none(),
+        py::arg("max_D") = 0);
 
   m.def("load_from_combined_table", &load_from_combined_table,
         "load_from_combined_table", py::arg("dev_table"), py::arg("uvm_table"),

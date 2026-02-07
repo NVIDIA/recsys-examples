@@ -37,6 +37,7 @@ from dynamicemb_extensions import (
     find_and_initialize,
     find_or_insert,
     gather_embedding,
+    gather_embedding_pooled,
     get_table_range,
     lookup_backward,
     lookup_forward,
@@ -466,6 +467,13 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         evict_strategy=None,
         frequency_counters: Optional[torch.Tensor] = None,
         admission_counter: Optional[list[Counter]] = None,
+        pooling_mode: int = 2,  # DynamicEmbPoolingMode.NONE = 2
+        total_D: int = 0,
+        batch_size: int = 0,
+        device_num_sms: int = 0,
+        dims: Optional[List[int]] = None,
+        max_D: int = 0,
+        D_offsets: Optional[torch.Tensor] = None,
         *args,
     ):
         table_num = len(storages)
@@ -473,9 +481,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         emb_dtype = storages[0].embedding_dtype()
         emb_dim = storages[0].embedding_dim()
         caching = caches[0] is not None
-        # admit_strategy = storages[0].options.admit_strategy
 
-        # evict_strategy = storages[0].options.score_strategy
+        # Determine if we have mixed dimensions (pooling multi-dim)
+        is_pooling = pooling_mode != DynamicEmbPoolingMode.NONE
+        mixed_D = is_pooling and dims is not None and max_D > min(dims)
 
         frequency_counts_int64 = None
         if frequency_counters is not None:
@@ -496,22 +505,25 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 EvictStrategy(evict_strategy.value) if evict_strategy else None,
                 frequency_counts_int64,
             )
-            # TODO: only return device unique_indices_table_range
-            # h_unique_indices_table_range = unique_indices_table_range.cpu()
         else:
             h_unique_indices_table_range = indices_table_range.cpu()
             unique_indices = indices
 
+        # Allocate unique_embs buffer.
+        # For mixed_D pooling: pad to max_D so all rows share the same stride.
+        # For uniform dim: allocate with emb_dim directly.
+        out_dim = max_D if mixed_D else emb_dim
         unique_embs = torch.empty(
-            unique_indices.shape[0], emb_dim, dtype=emb_dtype, device=indices.device
+            unique_indices.shape[0],
+            out_dim,
+            dtype=emb_dtype,
+            device=indices.device,
         )
 
         for i in range(table_num):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
             unique_indices_per_table = unique_indices[begin:end]
-            unique_embs_per_table = unique_embs[begin:end, :]
-            # Slice lfu_accumulated_frequency to match the table
             lfu_accumulated_frequency_per_table = (
                 lfu_accumulated_frequency[begin:end]
                 if lfu_accumulated_frequency is not None
@@ -519,6 +531,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 else None
             )
 
+            dim_i = dims[i] if dims is not None else emb_dim
+            unique_embs_per_table = unique_embs[begin:end, :dim_i]
             if caching:
                 KeyValueTableCachingFunction.lookup(
                     caches[i],
@@ -528,7 +542,9 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     initializers[i],
                     enable_prefetch,
                     training,
-                    EvictStrategy(evict_strategy.value) if evict_strategy else None,
+                    EvictStrategy(evict_strategy.value)
+                    if evict_strategy
+                    else None,
                     lfu_accumulated_frequency_per_table,
                     admit_strategy,
                     admission_counter[i] if admission_counter else None,
@@ -540,19 +556,51 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     unique_embs_per_table,
                     initializers[i],
                     training,
-                    EvictStrategy(evict_strategy.value) if evict_strategy else None,
+                    EvictStrategy(evict_strategy.value)
+                    if evict_strategy
+                    else None,
                     lfu_accumulated_frequency_per_table,
                     admit_strategy,
                     admission_counter[i] if admission_counter else None,
                 )
 
-        if training or caching:
-            output_embs = torch.empty(
-                indices.shape[0], emb_dim, dtype=output_dtype, device=indices.device
-            )
-            gather_embedding(unique_embs, output_embs, reverse_indices)
+        if is_pooling:
+            combiner = (
+                0 if pooling_mode == DynamicEmbPoolingMode.SUM else 1
+            )  # 0=SUM, 1=MEAN
         else:
-            output_embs = unique_embs
+            combiner = -1  # sequence (no pooling)
+
+        if is_pooling:
+            output_embs = torch.empty(
+                batch_size, total_D, dtype=output_dtype, device=indices.device
+            )
+            if not (training or caching):
+                reverse_indices = torch.arange(
+                    indices.numel(), device=indices.device, dtype=torch.int64
+                )
+            gather_embedding_pooled(
+                unique_embs,
+                output_embs,
+                reverse_indices,
+                offsets,
+                combiner,
+                total_D,
+                batch_size,
+                D_offsets,
+                max_D,
+            )
+        else:
+            if training or caching:
+                output_embs = torch.empty(
+                    indices.shape[0],
+                    emb_dim,
+                    dtype=output_dtype,
+                    device=indices.device,
+                )
+                gather_embedding(unique_embs, output_embs, reverse_indices)
+            else:
+                output_embs = unique_embs
 
         if training:
             ctx.unique_indices = unique_indices
@@ -561,6 +609,17 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             ctx.caches = caches
             ctx.storages = storages
             ctx.optimizer = optimizer
+            ctx.pooling_mode = pooling_mode
+            ctx.combiner = combiner
+            ctx.offsets = offsets
+            ctx.batch_size = batch_size
+            ctx.total_D = total_D
+            ctx.emb_dim = emb_dim
+            ctx.mixed_D = mixed_D
+            ctx.dims = dims
+            ctx.max_D = max_D
+            ctx.D_offsets = D_offsets
+            ctx.num_features = (offsets.shape[0] - 1) // batch_size if batch_size > 0 else 0
 
         return output_embs
 
@@ -577,16 +636,42 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         if optimizer.need_gradient_clipping():
             optimizer.clip_gradient(grads)
 
-        unique_grads = reduce_grads(
-            ctx.reverse_indices, grads, ctx.unique_indices.numel()
-        )
+        is_pooling = ctx.pooling_mode != DynamicEmbPoolingMode.NONE
+        if is_pooling:
+            # Pooling backward: grads is [B, total_D].  D_offsets is always
+            # available (uniform: [0, D, 2D, ...]; mixed: per-feature).
+            # The kernel uses D_offsets for per-feature source addressing and
+            # fuses MEAN scaling.  No reshape needed for either case.
+            unique_grads = reduce_grads(
+                ctx.reverse_indices,
+                grads,
+                ctx.unique_indices.numel(),
+                ctx.offsets,
+                ctx.combiner,
+                ctx.batch_size,
+                ctx.D_offsets,
+                ctx.max_D,
+                ctx.total_D,
+            )
+        else:
+            # Sequence: no offsets -> arange gather_ids internally.
+            unique_grads = reduce_grads(
+                ctx.reverse_indices, grads, ctx.unique_indices.numel()
+            )
+
         optimizer.step()
         table_num = len(storages)
         for i in range(table_num):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
             unique_indices_per_table = ctx.unique_indices[begin:end]
-            unique_grads_per_table = unique_grads[begin:end, :]
+
+            # Slice to the actual dim for this table (for uniform-dim,
+            # dim_i == max_D so this is a full-row slice — no copy).
+            dim_i = ctx.dims[i] if ctx.dims is not None else ctx.emb_dim
+            unique_grads_per_table = unique_grads[begin:end, :dim_i]
+            if dim_i < ctx.max_D:
+                unique_grads_per_table = unique_grads_per_table.contiguous()
 
             if caching:
                 KeyValueTableCachingFunction.update(
@@ -604,4 +689,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     optimizer,
                 )
 
-        return (None,) * 17
+        return (None,) * 24

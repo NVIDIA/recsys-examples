@@ -70,22 +70,23 @@ __global__ void one_to_one_atomic_vec4_kernel(CopyDesc copy_desc) {
   return;
 }
 
-template <typename io_t,    // element type of input/output.
-          typename accum_t, // element type of accumulator.
-          typename id_t,
-          int kWarpSize = 32>
+// Stage-1 no-vec reduce kernel.
+// kMultiDim=false: uniform dim — source is in_grads[gather_id * max_vec_length].
+// kMultiDim=true:  multi-dim   — source is in_grads[b*total_D + D_offsets[f]],
+//   vec_length = D_f.  Writes use max_vec_length stride.
+// MEAN scaling (1/pool_size) is fused for both modes when combiner==1.
+template <typename io_t, typename accum_t, typename id_t,
+          int kWarpSize = 32, bool kMultiDim = false,
+          typename offset_t = int64_t>
 __global__ void multi_to_one_reduce_kernel1_no_vec(
-    int64_t num_vec, // n
-    int64_t max_vec_length,
-    const io_t *__restrict__ in_grads,     // [n]
-    io_t *__restrict__ out_grads,          // [m]
-    const id_t *__restrict__ original_ids, // there exists shuffle.
-    const id_t *__restrict__ unique_ids, // multi-to-one mapping. [n] ~(0, m-1)
-    accum_t *__restrict__ partial_buffer,
-    id_t *__restrict__ partial_unique_ids) {
+    int64_t num_vec, int64_t max_vec_length,
+    const io_t *__restrict__ in_grads, io_t *__restrict__ out_grads,
+    const id_t *__restrict__ original_ids, const id_t *__restrict__ unique_ids,
+    accum_t *__restrict__ partial_buffer, id_t *__restrict__ partial_unique_ids,
+    const int *__restrict__ D_offsets, int total_D, int F,
+    const offset_t *__restrict__ offsets, int B, int combiner) {
 
   const int block_id = blockIdx.x;
-  const int block_num = gridDim.x;
   int local_sample_num = kWarpSize;
 
   int global_index = block_id * local_sample_num;
@@ -100,18 +101,43 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
   int vec_length = -1;
   for (int sp = 0; sp < local_sample_num; ++sp) {
     tmp_dst_id = unique_ids[global_index];
-    const io_t *tmp_src =
-        in_grads + original_ids[global_index] * max_vec_length;
-    vec_length = max_vec_length;
-    if (threadIdx.x < vec_length)
-      accum += (accum_t)(tmp_src[threadIdx.x]);
+    id_t gather_id = original_ids[global_index];
 
-    // when key is change , write to dst
+    const io_t *tmp_src;
+    float scale = 1.0f;
+    if constexpr (kMultiDim) {
+      int f = static_cast<int>(gather_id) % F;
+      int b = static_cast<int>(gather_id) / F;
+      vec_length = D_offsets[f + 1] - D_offsets[f];
+      tmp_src = in_grads + (int64_t)b * total_D + D_offsets[f];
+      if (combiner == 1) {
+        int slot = f * B + b;
+        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        if (pool_size > 0)
+          scale = 1.0f / (float)pool_size;
+      }
+    } else {
+      tmp_src = in_grads + gather_id * max_vec_length;
+      vec_length = max_vec_length;
+      if (combiner == 1) {
+        int f = static_cast<int>(gather_id) % F;
+        int b = static_cast<int>(gather_id) / F;
+        int slot = f * B + b;
+        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        if (pool_size > 0)
+          scale = 1.0f / (float)pool_size;
+      }
+    }
+
+    if (threadIdx.x < vec_length)
+      accum += (accum_t)(tmp_src[threadIdx.x]) * (accum_t)scale;
+
+    // when key changes, write to dst and reset
     if (sp < local_sample_num - 1) {
       id_t new_id = unique_ids[global_index + 1];
       if (new_id != tmp_dst_id) {
         io_t *tmp_dst = out_grads + tmp_dst_id * max_vec_length;
-        if (threadIdx.x < vec_length)
+        if (threadIdx.x < max_vec_length)
           tmp_dst[threadIdx.x] = (io_t)accum;
         accum = 0;
       }
@@ -129,16 +155,14 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
 
     if (is_last) {
       io_t *tmp_dst = out_grads + tmp_dst_id * max_vec_length;
-      if (threadIdx.x < vec_length)
+      if (threadIdx.x < max_vec_length)
         tmp_dst[threadIdx.x] = (io_t)accum;
       if (threadIdx.x == 0) {
-        // max(unique ids) < num_vec, therefore (num_vec + 1) means no partial
-        // gradient.
         partial_unique_ids[blockIdx.x] = num_vec + 1;
       }
     } else {
       accum_t *tmp_partial_ptr = partial_buffer + blockIdx.x * max_vec_length;
-      if (threadIdx.x < vec_length)
+      if (threadIdx.x < max_vec_length)
         tmp_partial_ptr[threadIdx.x] = accum;
       if (threadIdx.x == 0) {
         partial_unique_ids[blockIdx.x] = tmp_dst_id;
@@ -191,19 +215,21 @@ __global__ void multi_to_one_reduce_kernel2_no_vec(
   return;
 }
 
-template <typename io_t,    // element type of input/output.
-          typename accum_t, // element type of accumulator.
-          typename id_t, int kMaxElemPerThread,
-          int kWarpSize = 32>
+// Stage-1 vec4 reduce kernel.
+// kMultiDim=false: uniform dim — source is in_grads[gather_id * max_vec_length].
+// kMultiDim=true:  multi-dim   — source is in_grads[b*total_D + D_offsets[f]],
+//   vec_length = D_f.  Writes use max_vec_length stride.
+// MEAN scaling (1/pool_size) is fused for both modes when combiner==1.
+template <typename io_t, typename accum_t, typename id_t,
+          int kMaxElemPerThread, int kWarpSize = 32,
+          bool kMultiDim = false, typename offset_t = int64_t>
 __global__ void multi_to_one_reduce_kernel1_vec4(
-    int64_t num_vec, // n
-    int64_t max_vec_length,
-    const io_t *__restrict__ in_grads,     // [n]
-    io_t *__restrict__ out_grads,          // [m]
-    const id_t *__restrict__ original_ids, // there exists shuffle.
-    const id_t *__restrict__ unique_ids, // multi-to-one mapping. [n] ~(0, m-1)
-    accum_t *__restrict__ partial_buffer,
-    id_t *__restrict__ partial_unique_ids) {
+    int64_t num_vec, int64_t max_vec_length,
+    const io_t *__restrict__ in_grads, io_t *__restrict__ out_grads,
+    const id_t *__restrict__ original_ids, const id_t *__restrict__ unique_ids,
+    accum_t *__restrict__ partial_buffer, id_t *__restrict__ partial_unique_ids,
+    const int *__restrict__ D_offsets, int total_D, int F,
+    const offset_t *__restrict__ offsets, int B, int combiner) {
 
   const int lane_id = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
@@ -223,9 +249,34 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
   int vec_length = -1;
   for (int sp = 0; sp < local_sample_num; ++sp) {
     tmp_dst_id = unique_ids[global_index];
-    const io_t *tmp_src =
-        in_grads + original_ids[global_index] * max_vec_length;
-    vec_length = max_vec_length;
+    id_t gather_id = original_ids[global_index];
+
+    const io_t *tmp_src;
+    float scale = 1.0f;
+    if constexpr (kMultiDim) {
+      int f = static_cast<int>(gather_id) % F;
+      int b = static_cast<int>(gather_id) / F;
+      vec_length = D_offsets[f + 1] - D_offsets[f];
+      tmp_src = in_grads + (int64_t)b * total_D + D_offsets[f];
+      if (combiner == 1) {
+        int slot = f * B + b;
+        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        if (pool_size > 0)
+          scale = 1.0f / (float)pool_size;
+      }
+    } else {
+      tmp_src = in_grads + gather_id * max_vec_length;
+      vec_length = max_vec_length;
+      if (combiner == 1) {
+        int f = static_cast<int>(gather_id) % F;
+        int b = static_cast<int>(gather_id) / F;
+        int slot = f * B + b;
+        offset_t pool_size = offsets[slot + 1] - offsets[slot];
+        if (pool_size > 0)
+          scale = 1.0f / (float)pool_size;
+      }
+    }
+
     for (int i = 0; i < kMaxElemPerThread &&
                     (4 * kWarpSize * i + 4 * lane_id) < vec_length;
          ++i) {
@@ -233,19 +284,19 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
       int idx4 = 4 * kWarpSize * i + 4 * lane_id;
       int n = min(vec_length - idx4, copy_width);
       src_elem.load(tmp_src + idx4, n);
-      accum[i].accumulate(src_elem);
+      accum[i].accumulate_multiply(src_elem, scale);
     }
 
-    // when key is change , write to dst
+    // when key changes, write to dst and reset
     if (sp < local_sample_num - 1) {
       id_t new_id = unique_ids[global_index + 1];
       if (new_id != tmp_dst_id) {
         io_t *tmp_dst = out_grads + tmp_dst_id * max_vec_length;
         for (int i = 0; i < kMaxElemPerThread &&
-                        (4 * kWarpSize * i + 4 * lane_id) < vec_length;
+                        (4 * kWarpSize * i + 4 * lane_id) < max_vec_length;
              ++i) {
           int idx4 = 4 * kWarpSize * i + 4 * lane_id;
-          int n = min(vec_length - idx4, copy_width);
+          int n = min((int)max_vec_length - idx4, copy_width);
           accum[i].store(tmp_dst + idx4, n);
           accum[i].reset();
         }
@@ -265,24 +316,22 @@ __global__ void multi_to_one_reduce_kernel1_vec4(
     if (is_last) {
       io_t *tmp_dst = out_grads + tmp_dst_id * max_vec_length;
       for (int i = 0; i < kMaxElemPerThread &&
-                      (4 * kWarpSize * i + 4 * lane_id) < vec_length;
+                      (4 * kWarpSize * i + 4 * lane_id) < max_vec_length;
            ++i) {
         int idx4 = 4 * kWarpSize * i + 4 * lane_id;
-        int n = min(vec_length - idx4, copy_width);
+        int n = min((int)max_vec_length - idx4, copy_width);
         accum[i].store(tmp_dst + idx4, n);
         accum[i].reset();
       }
       if (lane_id == 0) {
-        // max(unique ids) < num_vec, therefore (num_vec + 1) means no partial
-        // gradient.
         partial_unique_ids[blockIdx.x * warp_num + warp_id] = num_vec + 1;
       }
     } else {
       for (int i = 0; i < kMaxElemPerThread &&
-                      (4 * kWarpSize * i + 4 * lane_id) < vec_length;
+                      (4 * kWarpSize * i + 4 * lane_id) < max_vec_length;
            ++i) {
         int idx4 = 4 * kWarpSize * i + 4 * lane_id;
-        int n = min(vec_length - idx4, copy_width);
+        int n = min((int)max_vec_length - idx4, copy_width);
         accum[i].store(partial_buffer +
                            (blockIdx.x * warp_num + warp_id) * max_vec_length +
                            idx4,
@@ -396,13 +445,22 @@ inline void get_kernel_config_use_warp(
   return;
 }
 
-template <typename io_t, typename accum_t, typename id_t, int kWarpSize = 32>
-void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
-                         at::Tensor &out_grads,
-                         const at::Tensor &sorted_key_ids,
-                         const at::Tensor &unique_key_ids,
-                         at::Tensor &partial_buffer,
-                         at::Tensor &partial_unique_ids, cudaStream_t &stream) {
+// Unified dispatch: when d_D_offsets is non-null, stage-1 uses kMultiDim=true
+// addressing (source is grads[B, total_D], per-feature offsets via D_offsets).
+// Otherwise kMultiDim=false (uniform-dim).
+// MEAN scaling (1/pool_size) is fused in stage-1 for both modes when
+// combiner==1 and d_offsets is provided.
+// Stage 2 is identical for both modes.
+template <typename io_t, typename accum_t, typename id_t,
+          typename offset_t = int64_t, int kWarpSize = 32>
+void multi_to_one_reduce(
+    int64_t n, int64_t len_vec, const at::Tensor &in_grads,
+    at::Tensor &out_grads, const at::Tensor &sorted_key_ids,
+    const at::Tensor &unique_key_ids, at::Tensor &partial_buffer,
+    at::Tensor &partial_unique_ids, cudaStream_t &stream,
+    const int *d_D_offsets = nullptr, int total_D = 0, int F = 0,
+    const offset_t *d_offsets = nullptr, int B = 0, int combiner = 0) {
+  const bool multi_dim = (d_D_offsets != nullptr);
   auto &device_prop = DeviceProp::getDeviceProp(in_grads.device().index());
   const uint64_t first_stage_key_num = n;
   const uint64_t second_stage_key_num = (n - 1) / kWarpSize + 1;
@@ -413,17 +471,31 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
   bool aligned = len_vec % 4 == 0;
   bool small_than_256 = len_vec <= 256;
 
+  // Common kernel args (same for both multi_dim and uniform).
+  auto *p_in = reinterpret_cast<const io_t *>(in_grads.data_ptr());
+  auto *p_out = reinterpret_cast<io_t *>(out_grads.data_ptr());
+  auto *p_sorted = reinterpret_cast<const id_t *>(sorted_key_ids.data_ptr());
+  auto *p_unique = reinterpret_cast<const id_t *>(unique_key_ids.data_ptr());
+  auto *p_partial = reinterpret_cast<accum_t *>(partial_buffer.data_ptr());
+  auto *p_partial_ids = reinterpret_cast<id_t *>(partial_unique_ids.data_ptr());
+
   if (aligned && small_than_256) {
     if (len_vec <= 128) {
-      multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 1, kWarpSize>
-          <<<grid_size, block_size, 0, stream>>>(
-              n, len_vec, reinterpret_cast<io_t *>(in_grads.data_ptr()),
-              reinterpret_cast<io_t *>(out_grads.data_ptr()),
-              reinterpret_cast<id_t *>(sorted_key_ids.data_ptr()),
-              reinterpret_cast<id_t *>(unique_key_ids.data_ptr()),
-              reinterpret_cast<accum_t *>(partial_buffer.data_ptr()),
-              reinterpret_cast<id_t *>(partial_unique_ids.data_ptr()));
-
+      // Stage 1
+      if (multi_dim) {
+        multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 1, kWarpSize,
+                                         true, offset_t>
+            <<<grid_size, block_size, 0, stream>>>(
+                n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
+                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, combiner);
+      } else {
+        multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 1, kWarpSize,
+                                         false, offset_t>
+            <<<grid_size, block_size, 0, stream>>>(
+                n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
+                p_partial_ids, nullptr, 0, F, d_offsets, B, combiner);
+      }
+      // Stage 2
       int second_grid_size =
           (second_stage_key_num - 1) / WGRAD_REDUCE_BLOCK_SIZE + 1;
       int second_local_sample = kWarpSize;
@@ -435,24 +507,27 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
         second_local_sample = 8;
       multi_to_one_reduce_kernel2<io_t, accum_t, id_t, 1, kWarpSize>
           <<<second_grid_size, block_size, 0, stream>>>(
-              second_stage_key_num, n, second_local_sample,
-              reinterpret_cast<accum_t *>(partial_buffer.data_ptr()),
-              reinterpret_cast<id_t *>(partial_unique_ids.data_ptr()),
-              reinterpret_cast<io_t *>(out_grads.data_ptr()), len_vec);
+              second_stage_key_num, n, second_local_sample, p_partial,
+              p_partial_ids, p_out, len_vec);
     } else if (len_vec <= 256) {
-      multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 2, kWarpSize>
-          <<<grid_size, block_size, 0, stream>>>(
-              n, len_vec, reinterpret_cast<io_t *>(in_grads.data_ptr()),
-              reinterpret_cast<io_t *>(out_grads.data_ptr()),
-              reinterpret_cast<id_t *>(sorted_key_ids.data_ptr()),
-              reinterpret_cast<id_t *>(unique_key_ids.data_ptr()),
-              reinterpret_cast<accum_t *>(partial_buffer.data_ptr()),
-              reinterpret_cast<id_t *>(partial_unique_ids.data_ptr()));
-
+      // Stage 1
+      if (multi_dim) {
+        multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 2, kWarpSize,
+                                         true, offset_t>
+            <<<grid_size, block_size, 0, stream>>>(
+                n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
+                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, combiner);
+      } else {
+        multi_to_one_reduce_kernel1_vec4<io_t, accum_t, id_t, 2, kWarpSize,
+                                         false, offset_t>
+            <<<grid_size, block_size, 0, stream>>>(
+                n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
+                p_partial_ids, nullptr, 0, F, d_offsets, B, combiner);
+      }
+      // Stage 2
       int second_grid_size =
           (second_stage_key_num - 1) / WGRAD_REDUCE_BLOCK_SIZE + 1;
       int second_local_sample = kWarpSize;
-      /// TODO: the last param is 2?
       get_kernel_config_use_warp(
           device_prop.num_sms, device_prop.max_thread_per_sm,
           WGRAD_REDUCE_BLOCK_SIZE, device_prop.warp_size, second_stage_key_num,
@@ -461,42 +536,41 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
         second_local_sample = 8;
       multi_to_one_reduce_kernel2<io_t, accum_t, id_t, 2, kWarpSize>
           <<<second_grid_size, block_size, 0, stream>>>(
-              second_stage_key_num, n, second_local_sample,
-              reinterpret_cast<accum_t *>(partial_buffer.data_ptr()),
-              reinterpret_cast<id_t *>(partial_unique_ids.data_ptr()),
-              reinterpret_cast<io_t *>(out_grads.data_ptr()), len_vec);
+              second_stage_key_num, n, second_local_sample, p_partial,
+              p_partial_ids, p_out, len_vec);
     } else {
       throw std::runtime_error("DynamicEmb aligned wgrad reduce does not "
                                "support emb vector size > 256");
     }
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
-
     if (len_vec <= 1024) {
       int grid_size_unaligned = (first_stage_key_num - 1) / kWarpSize + 1;
       int block_size_unaligned = ((len_vec - 1) / kWarpSize + 1) * kWarpSize;
 
-      // sorted_key_ids_h
-
-      multi_to_one_reduce_kernel1_no_vec<io_t, accum_t, id_t, kWarpSize>
-          <<<grid_size_unaligned, block_size_unaligned, 0, stream>>>(
-              n, len_vec, reinterpret_cast<io_t *>(in_grads.data_ptr()),
-              reinterpret_cast<io_t *>(out_grads.data_ptr()),
-              reinterpret_cast<id_t *>(sorted_key_ids.data_ptr()),
-              reinterpret_cast<id_t *>(unique_key_ids.data_ptr()),
-              reinterpret_cast<accum_t *>(partial_buffer.data_ptr()),
-              reinterpret_cast<id_t *>(partial_unique_ids.data_ptr()));
-
+      // Stage 1
+      if (multi_dim) {
+        multi_to_one_reduce_kernel1_no_vec<io_t, accum_t, id_t, kWarpSize,
+                                           true, offset_t>
+            <<<grid_size_unaligned, block_size_unaligned, 0, stream>>>(
+                n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
+                p_partial_ids, d_D_offsets, total_D, F, d_offsets, B, combiner);
+      } else {
+        multi_to_one_reduce_kernel1_no_vec<io_t, accum_t, id_t, kWarpSize,
+                                           false, offset_t>
+            <<<grid_size_unaligned, block_size_unaligned, 0, stream>>>(
+                n, len_vec, p_in, p_out, p_sorted, p_unique, p_partial,
+                p_partial_ids, nullptr, 0, F, d_offsets, B, combiner);
+      }
       DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
+      // Stage 2
       int second_grid_size = (second_stage_key_num - 1) / kWarpSize + 1;
       int second_local_sample = kWarpSize;
       multi_to_one_reduce_kernel2_no_vec<io_t, accum_t, id_t, kWarpSize>
           <<<second_grid_size, block_size_unaligned, 0, stream>>>(
-              second_stage_key_num, n, second_local_sample,
-              reinterpret_cast<accum_t *>(partial_buffer.data_ptr()),
-              reinterpret_cast<id_t *>(partial_unique_ids.data_ptr()),
-              reinterpret_cast<io_t *>(out_grads.data_ptr()), len_vec);
+              second_stage_key_num, n, second_local_sample, p_partial,
+              p_partial_ids, p_out, len_vec);
       DEMB_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
       throw std::runtime_error(
@@ -504,6 +578,7 @@ void multi_to_one_reduce(int64_t n, int64_t len_vec, const at::Tensor &in_grads,
     }
   }
 }
+
 } // namespace
 
 namespace dyn_emb {
@@ -530,11 +605,12 @@ LocalReduce::LocalReduce(c10::Device &device, int64_t num_key, int64_t len_vec,
   });
 }
 
-void LocalReduce::local_reduce(const at::Tensor &in_grads,
-                               at::Tensor &out_grads,
-                               const at::Tensor &sorted_key_ids,
-                               const at::Tensor &unique_key_ids,
-                               cudaStream_t &stream) {
+void LocalReduce::local_reduce(
+    const at::Tensor &in_grads, at::Tensor &out_grads,
+    const at::Tensor &sorted_key_ids, const at::Tensor &unique_key_ids,
+    cudaStream_t &stream, const std::optional<at::Tensor> &D_offsets,
+    const std::optional<at::Tensor> &offsets, int B, int F, int total_D,
+    int combiner) {
   if (num_key_ == 0)
     return;
   auto scalar_type = out_grads.dtype().toScalarType();
@@ -548,9 +624,27 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, grad_t, [&] {
     DISPATCH_FLOAT_ACCUM_TYPE_FUNC(accum_type_, accum_t, [&] {
       DISPATCH_INTEGER_DATATYPE_FUNCTION(id_type_, id_t, [&] {
-        multi_to_one_reduce<grad_t, accum_t, id_t, WarpSize>(
-            num_key_, len_vec_, in_grads, out_grads, sorted_key_ids,
-            unique_key_ids, partial_buffer, partial_unique_ids, stream);
+        if (offsets.has_value()) {
+          auto offset_type =
+              scalartype_to_datatype(offsets.value().dtype().toScalarType());
+          const int *d_D_ptr =
+              D_offsets.has_value()
+                  ? reinterpret_cast<const int *>(D_offsets.value().data_ptr())
+                  : nullptr;
+          DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
+            multi_to_one_reduce<grad_t, accum_t, id_t, offset_t, WarpSize>(
+                num_key_, len_vec_, in_grads, out_grads, sorted_key_ids,
+                unique_key_ids, partial_buffer, partial_unique_ids, stream,
+                d_D_ptr, total_D, F,
+                reinterpret_cast<const offset_t *>(
+                    offsets.value().data_ptr()),
+                B, combiner);
+          });
+        } else {
+          multi_to_one_reduce<grad_t, accum_t, id_t, int64_t, WarpSize>(
+              num_key_, len_vec_, in_grads, out_grads, sorted_key_ids,
+              unique_key_ids, partial_buffer, partial_unique_ids, stream);
+        }
       });
     });
   });
