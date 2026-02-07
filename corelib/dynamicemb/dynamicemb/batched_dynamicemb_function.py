@@ -549,35 +549,19 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             output_embs = unique_embs
 
         if training:
-            # save context
-            backward_tensors = [
-                indices,
-            ]
-            ctx.save_for_backward(*backward_tensors)
-            ctx.input_dist_dedup = input_dist_dedup
-            if input_dist_dedup:
-                ctx.unique_indices = unique_indices
-                ctx.unique_embs = unique_embs
-                ctx.inverse = inverse
-            ctx.indices_table_range = indices_table_range
-            ctx.h_indices_table_range = indices_table_range.cpu()
+            ctx.unique_indices = unique_indices
+            ctx.reverse_indices = inverse
             ctx.h_unique_indices_table_range = h_unique_indices_table_range
-            ctx.unique_indices_table_range = unique_indices_table_range
             ctx.caches = caches
             ctx.storages = storages
             ctx.optimizer = optimizer
-            ctx.enable_prefetch = enable_prefetch
 
         return output_embs
 
     @staticmethod
     def backward(ctx, grads):
         # parse context
-        (indices,) = ctx.saved_tensors
-        indices_table_range = ctx.indices_table_range
-        h_indices_table_range = ctx.h_indices_table_range
         h_unique_indices_table_range = ctx.h_unique_indices_table_range
-        ctx.unique_indices_table_range
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
@@ -587,35 +571,30 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         if optimizer.need_gradient_clipping():
             optimizer.clip_gradient(grads)
 
-        input_dist_dedup = ctx.input_dist_dedup
-        if input_dist_dedup:
-            unique_indices = ctx.unique_indices
-            unique_embs = ctx.unique_embs
-            ctx.inverse
-        unique_indices, unique_embs = reduce_grads(
-            indices, grads, indices_table_range, h_indices_table_range
+        unique_grads = reduce_grads(
+            ctx.reverse_indices, grads, ctx.unique_indices.numel()
         )
         optimizer.step()
         table_num = len(storages)
         for i in range(table_num):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
-            unique_indices_per_table = unique_indices[begin:end]
-            unique_embs_per_table = unique_embs[begin:end, :]
+            unique_indices_per_table = ctx.unique_indices[begin:end]
+            unique_grads_per_table = unique_grads[begin:end, :]
 
             if caching:
                 KeyValueTableCachingFunction.update(
                     caches[i],
                     storages[i],
                     unique_indices_per_table,
-                    unique_embs_per_table,
+                    unique_grads_per_table,
                     optimizer,
                 )
             else:
                 KeyValueTableFunction.update(
                     storages[i],
                     unique_indices_per_table,
-                    unique_embs_per_table,
+                    unique_grads_per_table,
                     optimizer,
                 )
 

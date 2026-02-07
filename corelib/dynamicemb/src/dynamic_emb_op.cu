@@ -17,24 +17,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
-// #include <torch/python.h>
 
 #include "ATen/ATen.h"
-#include "ATen/AccumulateType.h"
 #include "ATen/cuda/CUDAContext.h"
-#include "ATen/cuda/DeviceUtils.cuh"
 #include "check.h"
 #include "dynamic_variable_base.h"
-#include "index_calculation.h"
 #include "lookup_backward.h"
 #include "lookup_forward.h"
 #include "lookup_kernel.cuh"
 #include "torch_utils.h"
 #include "utils.h"
 #include <c10/cuda/CUDAGuard.h>
-#include <cooperative_groups.h>
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <torch/torch.h>
@@ -410,70 +404,67 @@ void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
                          num_sms, stream);
 }
 
-void lookup_backward_dense(const at::Tensor indices, const at::Tensor grads,
-                           int32_t dim, const at::Tensor table_offsets,
-                           at::Tensor unique_indices, at::Tensor unique_grads) {
-  // Doc for dynamic embedding's backward:
-  //   Step 1: using SegmentedSortDevice to sort the indices per table.
-  //   Step 2: using SegmentedUniqueDevice to dedup the indices per table.
-  //   Step 3: using 2-stage reduction to reduce the gradients.
+at::Tensor reduce_grads(at::Tensor reverse_indices, at::Tensor grads,
+                        int64_t num_unique) {
+  // Sort (reverse_indices, arange(N)) by reverse_indices value to get:
+  //   sorted_reverse_indices → unique_key_ids  (boundary detection + scatter)
+  //   sorted_original_ids   → sorted_key_ids  (gather index into grads)
+  // Then run the same 2-stage local_reduce.
 
-  // Initialization
-  if (!indices.is_cuda() || !grads.is_cuda() || !table_offsets.is_cuda() ||
-      !table_offsets.is_cuda() || !unique_indices.is_cuda() ||
-      !unique_grads.is_cuda()) {
-    throw std::runtime_error("All argument tensors should on device");
-  }
-  auto device_ = indices.device();
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  // Number of tables should <= 2^31-1
-  int32_t table_num = static_cast<int32_t>(table_offsets.size(0) - 1);
-  auto scalar_type = indices.dtype().toScalarType();
-  auto key_type = scalartype_to_datatype(scalar_type);
-  auto id_stype = table_offsets.dtype().toScalarType(); // scalar type
-  auto id_dtype = scalartype_to_datatype(id_stype);     // data type
-  auto key_num = indices.size(0);
-
-  // Step 1: using SegmentedSortDevice to sort the indices by table.
-  SegmentedSortDevice sort_op =
-      SegmentedSortDevice(device_, key_num, table_num, key_type, id_dtype);
-  auto original_ids =
-      at::empty_like(indices, indices.options().dtype(id_stype));
-  auto sorted_keys = at::empty_like(indices, indices.options());
-  auto sorted_key_ids =
-      at::empty_like(indices, indices.options().dtype(id_stype));
-  auto sorted_table_ids =
-      at::empty_like(indices, indices.options().dtype(at::kInt));
-  sort_op(indices, original_ids, table_offsets, sorted_keys, sorted_key_ids,
-          sorted_table_ids, stream, true, true);
-
-  // Step 2: using SegmentedUniqueDevice to dedup the indices by table.
-  SegmentedUniqueDevice unique_op =
-      SegmentedUniqueDevice(device_, key_num, key_type, id_dtype);
-  auto unique_key_ids =
-      at::empty_like(indices, indices.options().dtype(id_stype));
-  unique_op(sorted_keys, sorted_table_ids, unique_indices, unique_key_ids,
-            stream);
-
-  // Step 3: using 2-stage reduction to reduce the gradients.
-  LocalReduce localReduceOp(device_, key_num, dim, id_dtype, DataType::Float32);
-  localReduceOp.local_reduce(grads, unique_grads, sorted_key_ids,
-                             unique_key_ids, stream);
-}
-
-std::tuple<at::Tensor, at::Tensor> reduce_grads(at::Tensor indices,
-                                                at::Tensor grads,
-                                                at::Tensor segment_range,
-                                                at::Tensor h_segment_range) {
-  int64_t num_total = indices.size(0);
+  int64_t num_keys = reverse_indices.size(0);
   int64_t dim = grads.size(1);
-  int64_t num_segment = h_segment_range.size(0) - 1;
-  int64_t num_unique_total = h_segment_range[num_segment].item<int64_t>();
-  at::Tensor unique_indices = at::empty(num_unique_total, indices.options());
-  at::Tensor unique_grads = at::empty({num_unique_total, dim}, grads.options());
-  lookup_backward_dense(indices, grads, dim, segment_range, unique_indices,
-                        unique_grads);
-  return std::make_tuple(unique_indices, unique_grads);
+  at::Tensor unique_grads = at::empty({num_unique, dim}, grads.options());
+
+  if (num_keys == 0) {
+    return unique_grads;
+  }
+
+  if (!reverse_indices.is_cuda() || !grads.is_cuda()) {
+    throw std::runtime_error("All argument tensors should be on device");
+  }
+
+  auto device_ = reverse_indices.device();
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto id_stype = reverse_indices.dtype().toScalarType();
+  auto id_dtype = scalartype_to_datatype(id_stype);
+
+  auto original_ids = at::arange(num_keys, reverse_indices.options());
+  auto sorted_reverse_indices = at::empty_like(reverse_indices);
+  auto sorted_original_ids = at::empty_like(original_ids);
+
+  // reverse_indices values are in [0, num_unique), so we only need enough bits
+  // to represent num_unique — reduces radix sort passes significantly.
+  int end_bit =
+      (num_unique > 1)
+          ? (64 - __builtin_clzll(static_cast<uint64_t>(num_unique - 1)))
+          : 1;
+  DISPATCH_INTEGER_DATATYPE_FUNCTION(id_dtype, id_t, [&] {
+    size_t temp_storage_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(
+        nullptr, temp_storage_bytes,
+        reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
+        reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
+        reinterpret_cast<id_t *>(original_ids.data_ptr()),
+        reinterpret_cast<id_t *>(sorted_original_ids.data_ptr()), num_keys, 0,
+        end_bit, stream);
+    auto temp_storage =
+        at::empty({static_cast<int64_t>(temp_storage_bytes)},
+                  at::TensorOptions().dtype(at::kByte).device(device_));
+    cub::DeviceRadixSort::SortPairs(
+        temp_storage.data_ptr(), temp_storage_bytes,
+        reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
+        reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
+        reinterpret_cast<id_t *>(original_ids.data_ptr()),
+        reinterpret_cast<id_t *>(sorted_original_ids.data_ptr()), num_keys, 0,
+        end_bit, stream);
+  });
+
+  LocalReduce localReduceOp(device_, num_keys, dim, id_dtype,
+                            DataType::Float32);
+  localReduceOp.local_reduce(grads, unique_grads, sorted_original_ids,
+                             sorted_reverse_indices, stream);
+
+  return unique_grads;
 }
 
 void lookup_forward(const at::Tensor src, const at::Tensor dst,
@@ -1189,8 +1180,8 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("tables_num"), py::arg("batch_size"), py::arg("num_feature"),
         py::arg("num_key"), py::arg("combiner"));
 
-  m.def("reduce_grads", &reduce_grads, "reduce grads", py::arg("indices"),
-        py::arg("grads"), py::arg("segment_range"), py::arg("h_segment_range"));
+  m.def("reduce_grads", &reduce_grads, "reduce grads",
+        py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"));
 
   m.def("load_from_pointers", &load_from_pointers, "load from pointers to dst.",
         py::arg("pointers"), py::arg("dst"));
