@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb_extensions import DynamicEmbTable
 from torch import nn
 
 
@@ -126,11 +125,9 @@ def set_score(
 
         for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
             tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
 
             filtered_table_names: List[str] = []
             filtered_table_scores: List[int] = []
-            filtered_dynamic_tables: List[DynamicEmbTable] = []
             # TODO:need a warning
             if not set_all_table:
                 tmp_collection_scores = table_score[tmp_collection_name]
@@ -140,11 +137,9 @@ def set_score(
                         index = tmp_table_names.index(name)
                         filtered_table_names.append(tmp_table_names[index])
                         filtered_table_scores.append(tmp_collection_scores[name])
-                        filtered_dynamic_tables.append(tmp_tables[index])
             else:
                 filtered_table_names = tmp_table_names
                 filtered_table_scores.extend([table_score] * len(tmp_table_names))
-                filtered_dynamic_tables = tmp_tables
             if len(filtered_table_names) == 0:
                 continue
             # do set score
@@ -323,11 +318,9 @@ def incremental_dump(
 
         for j, dynamic_emb_module in enumerate(tmp_dynamic_emb_module_list):
             tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
 
             filtered_table_names: List[str] = []
             filtered_thresholds: List[int] = []
-            filtered_dynamic_tables: List[DynamicEmbTable] = []
             # TODO:need a warning
             if not set_all_table:
                 tmp_collection_scores = score_threshold[collection_path]
@@ -337,11 +330,9 @@ def incremental_dump(
                         index = tmp_table_names.index(name)
                         filtered_table_names.append(tmp_table_names[index])
                         filtered_thresholds.append(tmp_collection_scores[name])
-                        filtered_dynamic_tables.append(tmp_tables[index])
             else:
                 filtered_table_names = tmp_table_names
                 filtered_thresholds.extend([score_threshold] * len(tmp_table_names))
-                filtered_dynamic_tables = tmp_tables
             if len(filtered_table_names) == 0:
                 continue
             # do incremental dump

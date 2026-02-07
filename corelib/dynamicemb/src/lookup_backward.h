@@ -19,6 +19,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #define LOOKUP_BACKWARD_H
 #include "index_calculation.h"
 #include "utils.h"
+#include <optional>
 
 namespace dyn_emb {
 
@@ -40,20 +41,17 @@ public:
   LocalReduce(c10::Device &device, int64_t num_key, int64_t len_vec,
               DataType id_type, DataType accum_type);
 
-  void local_reduce(const at::Tensor &in_grad, at::Tensor &out_grad,
+  // Unified reduce.  When D_offsets is provided, uses multi-dim addressing
+  // (source is grads[B, total_D], per-feature offsets via D_offsets, MEAN
+  // scaling fused).  Otherwise, uniform-dim addressing.
+  // len_vec_ must be set to max_D when using multi-dim mode.
+  void local_reduce(const at::Tensor &in_grads, at::Tensor &out_grads,
                     const at::Tensor &sorted_key_ids,
-                    const at::Tensor &unique_key_ids, cudaStream_t &stream);
+                    const at::Tensor &unique_key_ids, cudaStream_t &stream,
+                    const std::optional<at::Tensor> &D_offsets = std::nullopt,
+                    const std::optional<at::Tensor> &offsets = std::nullopt,
+                    int B = 0, int F = 0, int total_D = 0, int combiner = 0);
 };
 
-void backward(void *grads, void *unique_buffer, void *unique_indices,
-              void *inverse_indices, void *biased_offset, const int dim,
-              const int batch_size, const int feature_num, const int num_key,
-              int combiner, DataType key_type, DataType value_type,
-              cudaStream_t stream);
-void one_to_one_atomic(void *grads, void *unique_indices, void *reverse_indices,
-                       void *unique_grads, const int ev_size,
-                       const int64_t key_num, const int64_t unique_key_num,
-                       DataType rev_idx_type, DataType grad_type,
-                       DataType key_type, int num_sms, cudaStream_t stream);
 } // namespace dyn_emb
 #endif // LOOKUP_BACKWARD_H

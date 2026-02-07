@@ -242,7 +242,8 @@ segmented_unique_kernel(const KeyType *d_keys, const int32_t *d_table_ids,
 
           // Store unique key in partitioned layout
           size_t output_pos =
-              static_cast<size_t>(table_id) * max_keys_per_table + local_unique_idx;
+              static_cast<size_t>(table_id) * max_keys_per_table +
+              local_unique_idx;
           d_unique_keys[output_pos] = key;
 
           // Pack and store (table_id, local_idx) - this signals completion
@@ -275,7 +276,8 @@ segmented_unique_kernel(const KeyType *d_keys, const int32_t *d_table_ids,
             // Update frequency counter for duplicate key
             if (frequency_counters) {
               size_t output_pos =
-                  static_cast<size_t>(table_id) * max_keys_per_table + local_idx;
+                  static_cast<size_t>(table_id) * max_keys_per_table +
+                  local_idx;
               atomicAdd(&frequency_counters[output_pos], input_freq);
             }
             done = true;
@@ -353,7 +355,8 @@ __global__ void compact_keys_and_freq_kernel(
     int64_t local_idx = idx - table_offsets[table_id];
 
     // Compute source position in partitioned layout
-    size_t src_pos = static_cast<size_t>(table_id) * max_keys_per_table + local_idx;
+    size_t src_pos =
+        static_cast<size_t>(table_id) * max_keys_per_table + local_idx;
 
     // Compact keys
     output_keys[idx] = partitioned_keys[src_pos];

@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.key_value_table import KeyValueTable
+from dynamicemb.key_value_table import DynamicEmbeddingTable
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -540,7 +540,9 @@ class ConstructTwinModule:
             unique_values = chosen_value
 
             tmp_table_name = feature.replace("f_", "t_")
-            cur_hkv_table: KeyValueTable = table_name_map_hkv_table[tmp_table_name]
+            cur_hkv_table: DynamicEmbeddingTable = table_name_map_hkv_table[
+                tmp_table_name
+            ]
             optstate_dim = cur_hkv_table.optim_state_dim()
             initial_accumulator = cur_hkv_table.init_optimizer_state()
             optstate = (

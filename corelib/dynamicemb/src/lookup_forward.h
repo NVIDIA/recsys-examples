@@ -21,24 +21,20 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
+// Unified pooled gather (scatter-combine).
+// When D_offsets_ptr is non-null, multi-dim mode: ev_size is max_D (source row
+// stride), per-feature dims from D_offsets_ptr, accum_D ignored (pass 0).
+// When D_offsets_ptr is null, uniform-dim mode: ev_size is the embedding dim.
 void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      void *inverse_idx_ptr, int combiner, int total_D,
                      int accum_D, int ev_size, int num_vec, int batch_size,
                      DataType src_type, DataType dst_type, DataType offset_type,
-                     cudaStream_t stream);
-
-void scatter(void *src_ptr, void *dst_ptr, void *offset_ptr,
-             void *inverse_idx_ptr, int num_emb, int ev_size, DataType src_type,
-             DataType dst_type, DataType offset_type, int device_num_sms,
-             cudaStream_t stream);
+                     cudaStream_t stream, const int *D_offsets_ptr = nullptr);
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
                    int num_emb, int ev_size, DataType src_type,
                    DataType dst_type, DataType offset_type, int device_num_sms,
                    cudaStream_t stream);
-
-void add_offset(void *src_ptr, void *dst_ptr, int idx, DataType src_type,
-                DataType dst_type, cudaStream_t stream);
 
 void get_new_length_and_offsets(uint64_t *d_unique_offsets,
                                 int64_t *d_table_offsets_in_feature,
@@ -46,11 +42,6 @@ void get_new_length_and_offsets(uint64_t *d_unique_offsets,
                                 int local_batch_size, DataType length_type,
                                 DataType offset_type, void *new_offsets,
                                 void *new_lenghths, cudaStream_t stream);
-
-void batched_vector_copy_device(void *src_ptr, void *dst_ptr, int batch_size,
-                                int vec_length, DataType src_type,
-                                DataType dst_type, int num_sms,
-                                cudaStream_t stream);
 
 } // namespace dyn_emb
 #endif // LOOKUP_FORWARD_H
