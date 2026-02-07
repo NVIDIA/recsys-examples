@@ -65,7 +65,7 @@ def segmented_unique(
         frequency_counts: Optional input frequency counts per key
 
     Returns:
-        Tuple of (unique_keys, inverse, unique_keys_table_range,
+        Tuple of (unique_keys, reverse_indices, unique_keys_table_range,
                   h_unique_keys_table_range, output_scores)
     """
     num_keys = keys.size(0)
@@ -75,10 +75,16 @@ def segmented_unique(
     # Handle empty input
     if num_keys == 0:
         empty_keys = torch.empty(0, dtype=keys.dtype, device=device)
-        empty_inverse = torch.empty(0, dtype=torch.int64, device=device)
+        empty_reverse_indices = torch.empty(0, dtype=torch.int64, device=device)
         d_table_range = torch.zeros(num_tables + 1, dtype=torch.int64, device=device)
         h_table_range = torch.zeros(num_tables + 1, dtype=torch.int64, device="cpu")
-        return (empty_keys, empty_inverse, d_table_range, h_table_range, torch.Tensor())
+        return (
+            empty_keys,
+            empty_reverse_indices,
+            d_table_range,
+            h_table_range,
+            torch.Tensor(),
+        )
 
     # Determine if we need frequency output
     is_lfu_enabled = evict_strategy == EvictStrategy.KLfu if evict_strategy else False
@@ -112,7 +118,7 @@ def segmented_unique(
     (
         num_uniques,
         unique_keys,
-        output_indices,
+        reverse_indices,
         table_offsets,
         freq_counters,
     ) = segmented_unique_cuda(
@@ -133,7 +139,7 @@ def segmented_unique(
 
     return (
         unique_keys_out,
-        output_indices,
+        reverse_indices,
         table_offsets,
         h_table_offsets,
         output_scores,
@@ -415,7 +421,7 @@ def dynamicemb_prefetch(
     if training or caching:
         (
             unique_indices,
-            inverse,
+            reverse_indices,
             unique_indices_table_range,
             h_unique_indices_table_range,
             _,
@@ -480,7 +486,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         if training or caching:
             (
                 unique_indices,
-                inverse,
+                reverse_indices,
                 unique_indices_table_range,
                 h_unique_indices_table_range,
                 lfu_accumulated_frequency,
@@ -544,40 +550,24 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             output_embs = torch.empty(
                 indices.shape[0], emb_dim, dtype=output_dtype, device=indices.device
             )
-            gather_embedding(unique_embs, output_embs, inverse)
+            gather_embedding(unique_embs, output_embs, reverse_indices)
         else:
             output_embs = unique_embs
 
         if training:
-            # save context
-            backward_tensors = [
-                indices,
-            ]
-            ctx.save_for_backward(*backward_tensors)
-            ctx.input_dist_dedup = input_dist_dedup
-            if input_dist_dedup:
-                ctx.unique_indices = unique_indices
-                ctx.unique_embs = unique_embs
-                ctx.inverse = inverse
-            ctx.indices_table_range = indices_table_range
-            ctx.h_indices_table_range = indices_table_range.cpu()
+            ctx.unique_indices = unique_indices
+            ctx.reverse_indices = reverse_indices
             ctx.h_unique_indices_table_range = h_unique_indices_table_range
-            ctx.unique_indices_table_range = unique_indices_table_range
             ctx.caches = caches
             ctx.storages = storages
             ctx.optimizer = optimizer
-            ctx.enable_prefetch = enable_prefetch
 
         return output_embs
 
     @staticmethod
     def backward(ctx, grads):
         # parse context
-        (indices,) = ctx.saved_tensors
-        indices_table_range = ctx.indices_table_range
-        h_indices_table_range = ctx.h_indices_table_range
         h_unique_indices_table_range = ctx.h_unique_indices_table_range
-        ctx.unique_indices_table_range
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
@@ -587,35 +577,30 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         if optimizer.need_gradient_clipping():
             optimizer.clip_gradient(grads)
 
-        input_dist_dedup = ctx.input_dist_dedup
-        if input_dist_dedup:
-            unique_indices = ctx.unique_indices
-            unique_embs = ctx.unique_embs
-            ctx.inverse
-        unique_indices, unique_embs = reduce_grads(
-            indices, grads, indices_table_range, h_indices_table_range
+        unique_grads = reduce_grads(
+            ctx.reverse_indices, grads, ctx.unique_indices.numel()
         )
         optimizer.step()
         table_num = len(storages)
         for i in range(table_num):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
-            unique_indices_per_table = unique_indices[begin:end]
-            unique_embs_per_table = unique_embs[begin:end, :]
+            unique_indices_per_table = ctx.unique_indices[begin:end]
+            unique_grads_per_table = unique_grads[begin:end, :]
 
             if caching:
                 KeyValueTableCachingFunction.update(
                     caches[i],
                     storages[i],
                     unique_indices_per_table,
-                    unique_embs_per_table,
+                    unique_grads_per_table,
                     optimizer,
                 )
             else:
                 KeyValueTableFunction.update(
                     storages[i],
                     unique_indices_per_table,
-                    unique_embs_per_table,
+                    unique_grads_per_table,
                     optimizer,
                 )
 
