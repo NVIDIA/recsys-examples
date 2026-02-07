@@ -469,7 +469,7 @@ def get_planner(
         emb_num_embeddings = eb_config.num_embeddings
         emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
             math.log2(emb_num_embeddings)
-        )  # HKV need embedding vector num is power of 2
+        )  # hash table needs embedding vector num to be power of 2
         threshold = (bucket_capacity * world_size) / cache_ratio
         threshold_int = math.ceil(threshold)
         if emb_num_embeddings_next_power_of_2 < threshold_int:
@@ -572,9 +572,9 @@ def apply_dmp(model, args, training):
     """
     After configuring the `EmbeddingCollection`, you need to configure `DynamicEmbeddingCollectionSharder`. 
     It can create an instance of `ShardedDynamicEmbeddingCollection`.
-    `ShardedDynamicEmbeddingCollection` provides customized embedding lookup module base on 
-        [HKV](https://github.com/NVIDIA-Merlin/HierarchicalKV), a GPU hash table which can utilize both device and host memory,
-        support automatic eviction based on score(per key) while provide a better performance.
+    `ShardedDynamicEmbeddingCollection` provides customized embedding lookup module based on 
+        a GPU-optimized scored hash table which can utilize both device and host memory,
+        support automatic eviction based on score(per key) while providing better performance.
     Besides, due to differences in deduplication between hash tables and array based static tables, 
         `ShardedDynamicEmbeddingCollection` also provide customized input distributor to support deduplication when `use_index_dedup=True`.
     The actual sharding operation occurs during the initialization of the `ShardedDynamicEmbeddingCollection`, 

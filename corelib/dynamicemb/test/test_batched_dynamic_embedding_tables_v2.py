@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import random
-from typing import Dict, Optional, Tuple, cast
+from typing import Dict, Iterator, Optional, Tuple, cast
 
+import numpy as np
 import pytest
 import torch
 from dynamicemb import (
@@ -26,10 +28,8 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.dynamicemb_config import DynamicEmbTable
-from dynamicemb.key_value_table import KeyValueTable, Storage, insert_or_assign
+from dynamicemb.key_value_table import DynamicEmbeddingTable, Storage
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
-from dynamicemb_extensions import EvictStrategy
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
@@ -63,16 +63,21 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     ):
         self.options = options
         self.dict: Dict[int, torch.Tensor] = {}
+        self.scores: Dict[int, int] = {}
         self.capacity = options.max_capacity
         self.optimizer = optimizer
 
         self._emb_dim = self.options.dim
         self._emb_dtype = self.options.embedding_dtype
         self._value_dim = self._emb_dim + optimizer.get_state_dim(self._emb_dim)
+        self._optstate_dim = optimizer.get_state_dim(self._emb_dim)
         self._initial_optim_state = optimizer.get_initial_optim_states()
 
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
+
+    def size(self) -> int:
+        return len(self.dict)
 
     def find_impl(
         self,
@@ -152,18 +157,17 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         scores: Optional[torch.Tensor] = None,
     ) -> None:
         h_keys = keys.cpu()
+        h_scores = scores.cpu() if scores is not None else None
         for i in range(h_keys.size(0)):
             key = h_keys[i].item()
             self.dict[key] = values[i, :].clone()
+            if h_scores is not None:
+                self.scores[key] = h_scores[i].item()
 
     def update(
         self, keys: torch.Tensor, grads: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        raise ValueError("Can't call update of PyDictSotrage")
-        num_missing: torch.Tensor
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
+        raise ValueError("Can't call update of PyDictStorage")
 
     def enable_update(self) -> bool:
         return False
@@ -175,19 +179,158 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         embedding_file_path: str,
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
+        include_optim: bool = False,
+        include_meta: bool = False,
     ) -> None:
-        raise NotImplementedError
+        if include_meta:
+            meta_data = {}
+            meta_data.update(self.optimizer.get_opt_args())
+            with open(meta_file_path, "w") as f:
+                json.dump(meta_data, f)
+
+        fkey = open(emb_key_path, "wb")
+        fembedding = open(embedding_file_path, "wb")
+        fscore = open(score_file_path, "wb") if score_file_path else None
+        fopt_states = open(opt_file_path, "wb") if include_optim else None
+
+        for keys, embeddings, opt_states, scores_out in self.export_keys_values(
+            self.device
+        ):
+            fkey.write(keys.cpu().numpy().tobytes())
+            if fscore is not None:
+                fscore.write(scores_out.cpu().numpy().tobytes())
+            fembedding.write(embeddings.cpu().numpy().tobytes())
+            if fopt_states is not None and opt_states is not None:
+                fopt_states.write(opt_states.cpu().numpy().tobytes())
+
+        fkey.close()
+        fembedding.close()
+        if fscore:
+            fscore.close()
+        if fopt_states:
+            fopt_states.close()
 
     def load(
         self,
         meta_file_path: str,
-        emb_file_path: str,
+        emb_key_path: str,
         embedding_file_path: str,
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
-        include_optim: bool,
+        include_optim: bool = False,
     ) -> None:
-        raise NotImplementedError
+        if meta_file_path and os.path.exists(meta_file_path):
+            with open(meta_file_path, "r") as f:
+                meta_data = json.load(f)
+            opt_type = meta_data.get("opt_type", None)
+            if (
+                opt_type
+                and self.optimizer.get_opt_args().get("opt_type", None) != opt_type
+            ):
+                include_optim = False
+            if include_optim:
+                self.optimizer.set_opt_args(meta_data)
+
+        if not opt_file_path or not os.path.exists(opt_file_path):
+            include_optim = False
+
+        dim = self._emb_dim
+        optstate_dim = self._optstate_dim
+
+        num_keys = os.path.getsize(emb_key_path) // 8  # int64
+
+        fkey = open(emb_key_path, "rb")
+        fembedding = open(embedding_file_path, "rb")
+        fscore = (
+            open(score_file_path, "rb")
+            if score_file_path and os.path.exists(score_file_path)
+            else None
+        )
+        fopt_states = open(opt_file_path, "rb") if include_optim else None
+
+        batch_size = 65536
+        for start in range(0, num_keys, batch_size):
+            n = min(num_keys - start, batch_size)
+
+            keys_bytes = fkey.read(8 * n)
+            keys = torch.tensor(
+                np.frombuffer(keys_bytes, dtype=np.int64).copy(),
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+            emb_bytes = fembedding.read(4 * dim * n)
+            embeddings = torch.tensor(
+                np.frombuffer(emb_bytes, dtype=np.float32).copy(),
+                dtype=torch.float32,
+                device=self.device,
+            ).view(-1, dim)
+
+            opt_states = None
+            if fopt_states and optstate_dim > 0:
+                opt_bytes = fopt_states.read(4 * optstate_dim * n)
+                opt_states = torch.tensor(
+                    np.frombuffer(opt_bytes, dtype=np.float32).copy(),
+                    dtype=torch.float32,
+                    device=self.device,
+                ).view(-1, optstate_dim)
+
+            scores = None
+            if fscore:
+                score_bytes = fscore.read(8 * n)
+                scores = torch.tensor(
+                    np.frombuffer(score_bytes, dtype=np.int64).copy(),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+
+            # Build full values tensor [N, value_dim]
+            if opt_states is not None:
+                values = torch.cat([embeddings, opt_states], dim=1)
+            else:
+                if self._value_dim > dim:
+                    values = torch.empty(
+                        n, self._value_dim, dtype=torch.float32, device=self.device
+                    )
+                    values[:, :dim] = embeddings
+                    values[:, dim:] = self._initial_optim_state
+                else:
+                    values = embeddings
+
+            self.insert(keys, values, scores)
+
+        fkey.close()
+        fembedding.close()
+        if fscore:
+            fscore.close()
+        if fopt_states:
+            fopt_states.close()
+
+    def export_keys_values(
+        self,
+        device: torch.device,
+        batch_size: int = 65536,
+    ) -> Iterator[
+        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+    ]:
+        """Yield (keys, embeddings, opt_states, scores) batches."""
+        all_keys = list(self.dict.keys())
+        for start in range(0, len(all_keys), batch_size):
+            batch_keys = all_keys[start : start + batch_size]
+            len(batch_keys)
+
+            keys_t = torch.tensor(batch_keys, dtype=torch.int64, device=device)
+            values_t = torch.stack([self.dict[k].to(device) for k in batch_keys], dim=0)
+            embeddings = values_t[:, : self._emb_dim].contiguous()
+
+            opt_states = None
+            if self._optstate_dim > 0:
+                opt_states = values_t[:, self._emb_dim :].contiguous()
+
+            scores_list = [self.scores.get(k, 0) for k in batch_keys]
+            scores_t = torch.tensor(scores_list, dtype=torch.int64, device=device)
+
+            yield keys_t, embeddings, opt_states, scores_t
 
     def embedding_dtype(
         self,
@@ -250,20 +393,7 @@ def init_embedding_tables(stbe, bdet):
         num_emb = split.size(0)
         emb_dim = split.size(1)
         indices = torch.arange(num_emb, device=split.device, dtype=torch.long)
-        if isinstance(table, DynamicEmbTable):
-            val_dim = table.optstate_dim() + emb_dim
-            values = torch.empty(
-                num_emb, val_dim, dtype=split.dtype, device=split.device
-            )
-            values[:, :emb_dim] = split
-            values[:, emb_dim:val_dim] = table.get_initial_optstate()
-            if table.evict_strategy() != EvictStrategy.KLru:
-                scores = torch.empty(num_emb, device=indices.device, dtype=torch.uint64)
-                scores.fill_(1)
-            else:
-                scores = None
-            insert_or_assign(table, num_emb, indices, values, scores)
-        elif isinstance(table, KeyValueTable):
+        if isinstance(table, DynamicEmbeddingTable):
             val_dim = table.value_dim()
             assert emb_dim == table.embedding_dim()
             values = torch.empty(
@@ -309,9 +439,22 @@ def init_embedding_tables(stbe, bdet):
 @pytest.mark.parametrize("caching", [True, False])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_forward_train_eval(opt_type, opt_params, caching, deterministic, PS):
+@pytest.mark.parametrize(
+    "pooling_mode, dims",
+    [
+        (DynamicEmbPoolingMode.NONE, [8, 8, 8]),
+        (DynamicEmbPoolingMode.SUM, [8, 8, 8]),
+        (DynamicEmbPoolingMode.MEAN, [8, 8, 8]),
+        (DynamicEmbPoolingMode.SUM, [8, 16, 32]),
+        (DynamicEmbPoolingMode.MEAN, [8, 16, 32]),
+    ],
+)
+def test_forward_train_eval(
+    opt_type, opt_params, caching, deterministic, PS, pooling_mode, dims
+):
     print(
         f"step in test_forward_train_eval , opt_type = {opt_type} opt_params = {opt_params}"
+        f" pooling_mode = {pooling_mode} dims = {dims}"
     )
 
     if deterministic:
@@ -321,8 +464,8 @@ def test_forward_train_eval(opt_type, opt_params, caching, deterministic, PS):
     device_id = 0
     device = torch.device(f"cuda:{device_id}")
 
-    dims = [8, 8, 8]
     table_names = ["table0", "table1", "table2"]
+    feature_table_map = [0, 0, 1, 2]
     key_type = torch.int64
     value_type = torch.float32
 
@@ -348,8 +491,8 @@ def test_forward_train_eval(opt_type, opt_params, caching, deterministic, PS):
     bdebt = BatchedDynamicEmbeddingTablesV2(
         table_names=table_names,
         table_options=dyn_emb_table_options_list,
-        feature_table_map=[0, 0, 1, 2],
-        pooling_mode=DynamicEmbPoolingMode.NONE,
+        feature_table_map=feature_table_map,
+        pooling_mode=pooling_mode,
         optimizer=opt_type,
         use_index_dedup=True,
         **opt_params,
@@ -368,33 +511,58 @@ def test_forward_train_eval(opt_type, opt_params, caching, deterministic, PS):
     offsets = torch.tensor(
         [0, 2, 3, 5, 6, 8, 10, 10, 11], dtype=key_type, device=device
     )
+    batch_size = 2
 
     embs_train = bdebt(indices, offsets)
     torch.cuda.synchronize()
+
+    # Verify output shape
+    if pooling_mode == DynamicEmbPoolingMode.NONE:
+        assert embs_train.shape == (indices.numel(), dims[0])
+    else:
+        total_D = sum(dims[feature_table_map[f]] for f in range(len(feature_table_map)))
+        assert embs_train.shape == (batch_size, total_D)
 
     with torch.no_grad():
         bdebt.eval()
         embs_eval = bdebt(indices, offsets)
     torch.cuda.synchronize()
 
-    # non-exist key
-    indices = torch.tensor([777, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device).to(
+    # Train and eval should produce identical results for the same keys
+    torch.testing.assert_close(embs_train, embs_eval)
+
+    # non-exist key: replace index 0 (key=0) with key=777
+    indices_ne = torch.tensor(
+        [777, 1, 12, 64, 8, 12, 15, 2, 7, 105, 0], device=device
+    ).to(key_type)
+    offsets_ne = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], device=device).to(
         key_type
     )
-    offsets = torch.tensor([0, 2, 3, 5, 6, 8, 10, 10, 11], device=device).to(key_type)
-    embs_non_exist = bdebt(indices, offsets)
+    embs_non_exist = bdebt(indices_ne, offsets_ne)
     torch.cuda.synchronize()
 
     # train
     bdebt.train()
-    embs_train_non_exist = bdebt(indices, offsets)
+    embs_train_non_exist = bdebt(indices_ne, offsets_ne)
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(embs_train, embs_eval)
-    torch.testing.assert_close(embs_train[1:, :], embs_non_exist[1:, :])
-    assert torch.all(embs_non_exist[0, :] == 0)
-    assert torch.all(embs_train_non_exist[0, :] != 0)
-    torch.testing.assert_close(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
+    if pooling_mode == DynamicEmbPoolingMode.NONE:
+        # Sequence mode: row 0 is the embedding for key 777
+        # In eval, non-exist key -> zero embedding
+        torch.testing.assert_close(embs_train[1:, :], embs_non_exist[1:, :])
+        assert torch.all(embs_non_exist[0, :] == 0)
+        # In train, non-exist key gets initialized -> non-zero
+        assert torch.all(embs_train_non_exist[0, :] != 0)
+        torch.testing.assert_close(embs_train_non_exist[1:, :], embs_non_exist[1:, :])
+    else:
+        # Pooled mode: sample 1 is unaffected by the non-exist key (key 777
+        # only appears in sample 0's f0 bag).
+        torch.testing.assert_close(embs_non_exist[1, :], embs_train[1, :])
+        torch.testing.assert_close(embs_train_non_exist[1, :], embs_non_exist[1, :])
+        # Sample 0 should differ from the original because key 777 replaced
+        # key 0 in f0's bag.  In eval the missing key contributes zero, so
+        # the pooled result for sample 0 changes compared to embs_train.
+        assert not torch.allclose(embs_non_exist[0, :], embs_train[0, :])
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]

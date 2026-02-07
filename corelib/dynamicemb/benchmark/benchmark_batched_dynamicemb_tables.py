@@ -16,7 +16,6 @@
 import argparse
 import json
 import os
-from typing import cast
 
 import numpy as np
 import torch
@@ -32,8 +31,6 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.key_value_table import KeyValueTable
-from dynamicemb_extensions import DynamicEmbTable, insert_or_assign
 from fbgemm_gpu.runtime_monitor import StdLogStatsReporterConfig
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -305,41 +302,6 @@ def generate_sequence_sparse_feature(args, device):
         raise ValueError(
             f"Not support distribution {args.feature_distribution} of sparse features."
         )
-
-
-class TableShim:
-    def __init__(self, table):
-        if isinstance(table, DynamicEmbTable):
-            self.table = cast(DynamicEmbTable, table)
-        elif isinstance(table, KeyValueTable):
-            self.table = table
-        else:
-            raise ValueError("Not support table type")
-
-    def optim_states_dim(self) -> int:
-        if isinstance(self.table, DynamicEmbTable):
-            return self.table.optstate_dim()
-        else:
-            return self.table.value_dim() - self.table.embedding_dim()
-
-    def init_optim_state(self) -> float:
-        if isinstance(self.table, DynamicEmbTable):
-            return self.table.get_initial_optstate()
-        else:
-            return self.table.init_optimizer_state()
-
-    def insert(
-        self,
-        n,
-        unique_indices,
-        unique_values,
-        scores,
-    ) -> None:
-        if isinstance(self.table, DynamicEmbTable):
-            insert_or_assign(self.table, n, unique_indices, unique_values, scores)
-        else:
-            # self.table.set_score(scores[0].item())
-            self.table.insert(unique_indices, unique_values, scores)
 
 
 def create_dynamic_embedding_tables(args, device):

@@ -22,6 +22,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <stdexcept>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -115,6 +116,40 @@ enum class EvictStrategy : uint32_t {
     constexpr bool HINT = false;                                               \
     __VA_ARGS__();                                                             \
   }
+
+enum class OptimizerType : int {
+  Null = 0, // used in inference mode.
+  SGD,
+  Adam,
+  AdaGrad,
+  RowWiseAdaGrad,
+};
+
+template <typename T>
+uint32_t get_optimizer_state_dim(OptimizerType opt_type, uint32_t emb_dim) {
+  uint32_t optstate_dim = 0;
+  switch (opt_type) {
+  case OptimizerType::Null:
+  case OptimizerType::SGD: {
+    break;
+  }
+  case OptimizerType::Adam: {
+    optstate_dim = emb_dim * 2;
+    break;
+  }
+  case OptimizerType::AdaGrad: {
+    optstate_dim = emb_dim;
+    break;
+  }
+  case OptimizerType::RowWiseAdaGrad: {
+    optstate_dim = 16 / sizeof(T);
+    break;
+  }
+  default:
+    throw std::invalid_argument("Unsupported optimizer type.");
+  }
+  return optstate_dim;
+}
 
 #define HOST_INLINE __host__ __forceinline__
 #define DEVICE_INLINE __device__ __forceinline__

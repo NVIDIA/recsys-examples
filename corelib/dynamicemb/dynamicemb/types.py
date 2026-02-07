@@ -20,7 +20,6 @@ from typing import Generic, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
-from dynamicemb_extensions import InitializerArgs
 
 
 @enum.unique
@@ -104,16 +103,6 @@ class DynamicEmbInitializerArgs:
         if not isinstance(other, DynamicEmbInitializerArgs):
             return NotImplementedError
         return not (self == other)
-
-    def as_ctype(self) -> InitializerArgs:
-        return InitializerArgs(
-            self.mode.value,
-            self.mean,
-            self.std_dev,
-            self.lower if self.lower else 0.0,
-            self.upper if self.upper else 1.0,
-            self.value,
-        )
 
 
 TableOptionType = TypeVar("TableOptionType")
