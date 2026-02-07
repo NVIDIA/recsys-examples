@@ -148,7 +148,7 @@ class _ContextOptions:
                 The maximum capacity of the shard of the embedding table on a single GPU. Automatically set in the shared planner.
                 It is not configurable, but it's important for the total memory consumption.
                 It will be automatically inferred from EmbeddingConfig.num_embeddings and the world size, rounded up to a power of 2，
-                    and minimized to the size of bucket capacity of the HKV.
+                    and minimized to the size of bucket capacity of the hash table.
                 If init_capacity is set, max_capacity will not be smaller than init_capacity.
         evict_strategy : DynamicEmbEvictStrategy
             Strategy used for evicting entries when the table exceeds its capacity. Default is DynamicEmbEvictStrategy.LRU.
@@ -225,18 +225,18 @@ class DynamicEmbTableOptions(_ContextOptions):
     caching: bool
         Flag to indicate dynamic embedding tables is working on caching mode, default to `False`.
         When the device memory on a single GPU is insufficient to accommodate a single shard of the dynamic embedding table,
-            HKV supports the mixed use of device memory and host memory(pinned memory).
+            dynamicemb supports the mixed use of device memory and host memory(pinned memory).
         But by default, the values of the entire table are concatenated with device memory and host memory.
-        This means that the storage location of one embeddng is determined by `hash_function(key)`, and mapping to device memory will bring better lookup performance.
+        This means that the storage location of one embedding is determined by `hash_function(key)`, and mapping to device memory will bring better lookup performance.
         However, sparse features in training are often with temporal locality.
-        In order to store hot keys in device memory, dynamicemb creates two HKV instances,
-            whose values are stored in device memory and memory respectively, and store hot keys on the GPU table priorily.
-        If the GPU table is full, the evicted keys will be inserted into the CPU table.
-        If the CPU table is also full, the key granularity will be evicted(all the eviction is based on the score per key).
+        In order to store hot keys in device memory, dynamicemb creates two table instances,
+            whose values are stored in device memory and host memory respectively, and store hot keys on the GPU table priorily.
+        If the GPU table is full, the evicted keys will be inserted into the host table.
+        If the host table is also full, the key will be evicted(all the eviction is based on the score per key).
         The original intention of eviction is based on this insight: features that only appear once should not occupy memory(even host memory) for a long time.
         In short:
-            set **`caching=True`** will create a GPU table and a CPU table, and make GPU table serves as a cache;
-            set **`caching=False`** will create a hybrid table which use GPU and CPU memory in a concated way to store value.
+            set **`caching=True`** will create a GPU table and a host table, and make GPU table serves as a cache;
+            set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
             All keys and other meta data are always stored on GPU for both cases.
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
@@ -255,7 +255,7 @@ class DynamicEmbTableOptions(_ContextOptions):
         For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
             as they are the same table, but stored on different ranks.
     bucket_capacity : int
-        Capacity of each bucket in HKV, and default is 128(using 1024 when HKV serves as cache).
+        Capacity of each bucket in the hash table, and default is 128 (using 1024 when the table serves as cache).
         A key will only be mapped to one bucket.
         When the bucket is full, the key with the smallest score in the bucket will be evicted, and its slot will be used to store a new key.
         The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
@@ -284,8 +284,7 @@ class DynamicEmbTableOptions(_ContextOptions):
         Default is None (no counter is used).
     Notes
     -----
-    For detailed descriptions and additional context on each parameter, please refer to the documentation at
-    https://github.com/NVIDIA-Merlin/HierarchicalKV.
+    For detailed descriptions and additional context on each parameter, please refer to the documentation in this repository.
     """
 
     training: bool = True

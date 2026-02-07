@@ -1,6 +1,6 @@
 # DynamicEmb
 
-DynamicEmb is a Python package that provides model-parallel dynamic embedding tables and embedding lookup functionalities for TorchREC, specifically targeting the sparse training aspects of recommendation systems. Currently, DynamicEmb utilizes the [HierarchicalKV](https://github.com/NVIDIA-Merlin/HierarchicalKV) hash table backend, which is designed to store key-value (feature-embedding) pairs in the high-bandwidth memory (HBM) of GPUs as well as in host memory.
+DynamicEmb is a Python package that provides model-parallel dynamic embedding tables and embedding lookup functionalities for TorchREC, specifically targeting the sparse training aspects of recommendation systems. DynamicEmb uses a GPU-optimized scored hash table backend to store key-value (feature-embedding) pairs in the high-bandwidth memory (HBM) of GPUs as well as in host memory.
 
 The lookup kernel algorithms implemented in DynamicEmb primarily leverage portions of the algorithms from the [EMBark](https://dl.acm.org/doi/abs/10.1145/3640457.3688111) paper (Embedding Optimization for Training Large-scale Deep Learning Recommendation Systems with EMBark).
 
@@ -28,6 +28,8 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 - **Embedded in DistributedGR Repository Supporting Generative-Recommenders(GR) Models**: Currently, DynamicEmb is integrated into the DistributedGR repository, serving as an embedding backend for GR models.
 
 - Support for creating dynamic embedding tables within `EmbeddingBagCollection` and `EmbeddingCollection` in TorchREC, allowing for embedding storage and lookup, and enabling coexistence with native Torch embedding tables within Torch models.
+
+- **Pooling Mode Support**: DynamicEmb supports `SUM`, `MEAN`, and `NONE` (sequence) pooling modes with fused CUDA kernels for both forward and backward passes. Tables with different embedding dimensions (mixed-D) are fully supported in pooling mode.
 
 - Support for optimizer types: `EXACT_SGD`,`ADAM`,`EXACT_ADAGRAD`,`EXACT_ROWWISE_ADAGRAD`.
 
@@ -93,7 +95,7 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 3. The allocated memory for dynamic embedding tables may have slight differences from the specified `num_embeddings` because each dynamic embedding table must set a capacity as a power of 2. This will be automatically calculated by the code, so please ensure that `num_embeddings` is aligned to a power of 2 when applying.
 4. The lookup process for each dynamic embedding table incurs additional overhead from unique or radix sort operations. Therefore, if you request a large number of small dynamic embedding tables for lookup, the performance will be poor. Since the lookup range of dynamic embedding tables is particularly large (using the entire range of `int64_t`), it is recommended to create one large embedding table and perform a fused lookup for multiple features.
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
-6. Currently, DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` and `EmbeddingCollection`. However, in version v0.1, the main lookup process of `EmbeddingBagCollection` is implemented using torch's ops, not fuse a lot of cuda kernels, which may result in some performance issues. Will fix this performance problem in future versions.
+6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
 
 ### DynamicEmb Insertion Behavior Checking Modes
 
@@ -106,7 +108,7 @@ To prevent this behavior from affecting training without user awareness, Dynamic
 #### Example
 
 ```python
-from dynamic_emb import DynamicEmbTableOptions, DynamicEmbCheckMode
+from dynamicemb import DynamicEmbTableOptions, DynamicEmbCheckMode
 
 # Configure the DynamicEmbTableOptions with safe check mode enabled
 table_options = DynamicEmbTableOptions(
@@ -126,12 +128,11 @@ To get started with DynamicEmb, we highly recommend checking out the [example.py
 ## Future Plans
 
 1. Support the latest version of TorchREC and continuously follow TorchREC's version updates.
-2. Continuously optimize the performance of embedding lookup and embedding bag lookup.
-3. Support multiple optimizer types, aligning with the optimizer types supported by TorchREC.
-4. Support more configurations for dynamic embedding table eviction mechanisms.
-5. Support the separation of backward and optimizer update (required by certain large language model frameworks like Megatron), to better support large-scale GR training.
-6. Add more shard types for dynamic embedding tables, including `table-wise`, `table-row-wise` and `column-wise`.
+2. Support the separation of backward and optimizer update (required by certain large language model frameworks like Megatron), to better support large-scale GR training.
+3. Add more shard types for dynamic embedding tables, including `table-wise`, `table-row-wise` and `column-wise`.
 
 ## Acknowledgements
 
-We would like to thank the Meta team and specially [Huanyu He](https://github.com/TroyGarden) for their support in [TorchRec](https://github.com/pytorch/torchrec). 
+We would like to thank the Meta team and specially [Huanyu He](https://github.com/TroyGarden) for their support in [TorchRec](https://github.com/pytorch/torchrec).
+
+We also acknowledge the [HierarchicalKV](https://github.com/NVIDIA-Merlin/HierarchicalKV) project, which inspired the scored hash table design used in DynamicEmb.

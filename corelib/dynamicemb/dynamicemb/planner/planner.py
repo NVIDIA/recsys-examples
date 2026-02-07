@@ -71,7 +71,7 @@ class DynamicEmbParameterConstraints(ParameterConstraints):
     use_dynamicemb : Optional[bool]
         A flag indicating whether to use DynamicEmb storage. Defaults to False.
     dynamicemb_options : Optional[DynamicEmbTableOptions]
-        Including HKV Configs and Initializer Args. The initialization method for the parameters.
+        Configuration for the dynamic embedding table, including initializer args. The initialization method for the parameters.
         Common choices include "uniform", "normal", etc. Defaults to "uniform".
     """
 

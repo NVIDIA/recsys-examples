@@ -30,7 +30,11 @@ from dynamicemb.batched_dynamicemb_function import (
 )
 from dynamicemb.dynamicemb_config import *
 from dynamicemb.initializer import *
-from dynamicemb.key_value_table import Cache, DynamicEmbeddingTable, Storage
+from dynamicemb.key_value_table import (
+    Cache,
+    DynamicEmbeddingTable,
+    Storage,
+)
 from dynamicemb.optimizer import *
 from dynamicemb.utils import tabulate
 from dynamicemb_extensions import OptimizerType, device_timestamp
@@ -343,7 +347,7 @@ def _print_memory_consume(
 
 class BatchedDynamicEmbeddingTablesV2(nn.Module):
     """
-    Dynamic Embedding is based on [HKV](https://github.com/NVIDIA-Merlin/HierarchicalKV/tree/master).
+    Dynamic Embedding uses a GPU-optimized scored hash table backend.
     Looks up one or more dynamic embedding tables. The module is application for training.
 
     Its optional to fuse the optimizer with the backward operator by parameter *update_grads_explicitly*.
@@ -434,7 +438,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # Sequence mode requires uniform embedding dim because the output is
         # [N, D].  Pooling mode supports mixed dims natively via D_offsets.
         if pooling_mode == DynamicEmbPoolingMode.NONE:
-            assert all(d == self.dims[0] for d in self.dims), (
+            assert all(
+                d == self.dims[0] for d in self.dims
+            ), (
                 f"Sequence mode requires uniform embedding dim, got {set(self.dims)}. "
                 "Tables with different dims are automatically split into separate "
                 "BatchedDynamicEmbeddingTablesV2 instances by the planner."
@@ -463,9 +469,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # by multi-dim pooling kernels.
         self.register_buffer(
             "D_offsets_t",
-            torch.tensor(
-                D_offsets, device=torch.device(self.device_id), dtype=torch.int32
-            ),
+            torch.tensor(D_offsets, device=torch.device(self.device_id), dtype=torch.int32),
         )
 
         self.feature_num = len(self.feature_table_map)
@@ -555,9 +559,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
                 cache_option.max_capacity = capacity
                 cache_option.init_capacity = capacity
-                self._caches.append(
-                    DynamicEmbeddingTable(cache_option, self._optimizer)
-                )
+                self._caches.append(DynamicEmbeddingTable(cache_option, self._optimizer))
 
                 storage_option = deepcopy(option)
                 storage_option.local_hbm_for_values = 0
@@ -840,9 +842,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         # Compute batch_size for pooling modes
         feature_batch_size = offsets.shape[0] - 1
-        batch_size = (
-            feature_batch_size // self.feature_num if self.feature_num > 0 else 0
-        )
+        batch_size = feature_batch_size // self.feature_num if self.feature_num > 0 else 0
 
         res = DynamicEmbeddingFunctionV2.apply(
             indices,
@@ -1213,9 +1213,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
             storage = self._storages[index]
             if not isinstance(storage, DynamicEmbeddingTable):
-                raise RuntimeError(
-                    "Only DynamicEmbeddingTable support incremental dump."
-                )
+                raise RuntimeError("Only DynamicEmbeddingTable support incremental dump.")
 
             cache = self._caches[index]
             if cache is not None:
