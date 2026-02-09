@@ -1238,7 +1238,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
                 if loaded_score is not None and table_name in self._scores:
                     self._scores[table_name] = loaded_score
-                    print(f"Restored step score for table '{table_name}': {loaded_score}")
 
             if not counter:
                 continue
