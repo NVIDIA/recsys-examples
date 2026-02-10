@@ -114,6 +114,7 @@ class DynamicEmbeddingTable(
         options: DynamicEmbTableOptions,
         optimizer: BaseDynamicEmbeddingOptimizerV2,
     ):
+        print(f"DynamicEmbeddingTable init start")
         self.options = options
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
@@ -132,7 +133,7 @@ class DynamicEmbeddingTable(
             score_specs=[self.score_policy],
             device=self.device,
         )
-
+        print(f"key_index_map init end")
         self._capacity = self.key_index_map.capacity()
 
         # TODO: maybe we can separate it in the future like fbgemm
@@ -151,7 +152,7 @@ class DynamicEmbeddingTable(
         total_memory_need = (
             self._capacity * self._value_dim * dtype_to_bytes(self._emb_dtype)
         )
-
+        print(f"total_memory_need: {total_memory_need}")
         if options.local_hbm_for_values == 0:
             # weight_uvm_size = self._capacity * self._emb_dim
             # optim_states_uvm_size = self._capacity * self._optim_states_dim
@@ -181,6 +182,7 @@ class DynamicEmbeddingTable(
                 uvm_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
 
+        print(f"uvm_table/dev_table init end")
         self.score: int = None
         self._score_update = False
 

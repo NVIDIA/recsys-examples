@@ -308,7 +308,6 @@ def create_dynamic_embedding_tables(args, device):
     table_options = []
     table_num = args.num_embedding_table
     for i in range(table_num):
-        TableModule = BatchedDynamicEmbeddingTablesV2
         table_options.append(
             DynamicEmbTableOptions(
                 index_type=torch.int64,
@@ -327,7 +326,7 @@ def create_dynamic_embedding_tables(args, device):
             )
         )
 
-    var = TableModule(
+    var = BatchedDynamicEmbeddingTablesV2(
         table_options=table_options,
         table_names=[table_idx_to_name(i) for i in range(table_num)],
         use_index_dedup=args.use_index_dedup,

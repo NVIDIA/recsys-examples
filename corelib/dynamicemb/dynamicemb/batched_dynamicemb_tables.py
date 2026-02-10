@@ -493,8 +493,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if option.init_capacity is None:
                 option.init_capacity = option.max_capacity
 
-        self._optimizer: BaseDynamicEmbeddingOptimizerV2 = None
-        self._create_optimizer(
+        self._optimizer: BaseDynamicEmbeddingOptimizerV2 = self._create_optimizer(
             optimizer,
             stochastic_rounding,
             gradient_clipping,
@@ -627,7 +626,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         weight_decay_mode: WeightDecayMode,
         counter_based_regularization: Optional[CounterBasedRegularizationDefinition],
         cowclip_regularization: Optional[CowClipDefinition],
-    ) -> None:
+    ) -> BaseDynamicEmbeddingOptimizerV2:
         self._optimizer_type = optimizer_type
         self.stochastic_rounding = stochastic_rounding
 
@@ -711,23 +710,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._optimizer_args = optimizer_args
 
         if optimizer_type == EmbOptimType.SGD:
-            self._optimizer = SGDDynamicEmbeddingOptimizerV2(
+            optimizer = SGDDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_SGD:
-            self._optimizer = SGDDynamicEmbeddingOptimizerV2(
+            optimizer = SGDDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.ADAM:
-            self._optimizer = AdamDynamicEmbeddingOptimizerV2(
+            optimizer = AdamDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_ADAGRAD:
-            self._optimizer = AdaGradDynamicEmbeddingOptimizerV2(
+            optimizer = AdaGradDynamicEmbeddingOptimizerV2(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-            self._optimizer = RowWiseAdaGradDynamicEmbeddingOptimizerV2(
+            optimizer = RowWiseAdaGradDynamicEmbeddingOptimizerV2(
                 optimizer_args,
                 self.embedding_dtype,
             )
@@ -735,6 +734,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             raise ValueError(
                 f"Not supported optimizer type ,optimizer type = {optimizer_type} {type(optimizer_type)} {optimizer_type.value}."
             )
+        return optimizer
 
     def split_embedding_weights(self) -> List[Tensor]:
         """
