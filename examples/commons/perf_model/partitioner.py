@@ -33,8 +33,10 @@ import numpy as np
 
 try:
     from torch import Tensor
+    from torch.cuda import nvtx
 except ImportError:
     Tensor = None
+    nvtx = None
 
 
 def karmarkar_karp(
@@ -112,6 +114,9 @@ def karmarkar_karp(
             repr_str += "]"
             return repr_str
 
+    if nvtx is not None:
+        nvtx.range_push("karmarkar_karp")
+
     workloads = (
         workloads.tolist()
         if isinstance(workloads, Tensor) and Tensor is not None
@@ -147,6 +152,8 @@ def karmarkar_karp(
             assert len(partition) * k_partitions == len(
                 workloads
             ), f"{len(partition)} * {k_partitions} != {len(workloads)}"
+    if nvtx is not None:
+        nvtx.range_pop()  # karmarkar_karp
     return partitions
 
 
