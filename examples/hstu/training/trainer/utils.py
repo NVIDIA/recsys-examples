@@ -248,6 +248,8 @@ def get_data_loader(
                     ],
                     max_sequence_length=f.max_sequence_length,
                     is_jagged=f.is_jagged,
+                    seqlen_dist=f.seqlen_dist,
+                    value_dists=f.value_dists,
                 )
             )
 
