@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union, cast
+from typing import Dict, List, Optional, Tuple, Union, cast
 
 import gin
+from commons.datasets.hstu_batch import (  # noqa: F401 — registers @gin.configurable
+    RandomDistribution,
+)
 
 
 @gin.configurable
@@ -218,30 +221,83 @@ class DatasetArgs:
 @gin.configurable
 @dataclass
 class FeatureArgs:
-    """Feature Configuration.
+    """Feature Configuration (benchmark only).
 
-    Feature-specific configuration parameters.
+    Gin-configurable entry point for defining per-feature settings when using
+    ``BenchmarkDatasetArgs`` (synthetic / random data).  Each ``FeatureArgs``
+    is converted to a :class:`~commons.datasets.hstu_batch.FeatureConfig` at
+    runtime by ``get_data_loader``.
+
+    .. note::
+        **Benchmark only** — ``FeatureArgs`` is only consumed inside
+        ``BenchmarkDatasetArgs``.  It has no effect when training with real
+        datasets (e.g. MovieLens, KuaiRand).
 
     Attributes:
         feature_names (List[str]): **Required**. List of feature names.
         max_sequence_length (int): **Required**. Maximum sequence length.
         is_jagged (bool): Whether features are jagged (variable length). Default: False.
+        seqlen_dist (Optional[RandomDistribution]): Distribution for generating random
+            sequence lengths. Only effective when ``is_jagged=True``. If None, defaults to
+            uniform [0, max_sequence_length).  When ``seqlen_dist.high`` is not set, it is
+            automatically filled with ``max_sequence_length``; if set, it must be
+            ``<= max_sequence_length``.
+        value_dists (Optional[Dict[str, RandomDistribution]]): Per-feature distributions
+            for generating random values, keyed by feature name. Features absent from the
+            dict fall back to uniform [0, max_item_id). If None, all features use the
+            default uniform.
 
-    Note:
-        `FeatureArgs` are only used when the dataset is of `BenchmarkDatasetArgs` type.
+    Example gin config::
+
+        # Define distributions
+        item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
+        item_seqlen_dist/RandomDistribution.alpha = 1.5
+        item_seqlen_dist/RandomDistribution.low = 1
+        item_seqlen_dist/RandomDistribution.high = 4096
+
+        item_value_dist/RandomDistribution.dist_type = 'zipf'
+        item_value_dist/RandomDistribution.alpha = 1.2
+
+        # Attach distributions to FeatureArgs
+        item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
+        item_and_action_feature/FeatureArgs.value_dists = {
+            'item': @item_value_dist/RandomDistribution(),
+        }
     """
 
     feature_names: List[str]
     max_sequence_length: int
     is_jagged: bool = False
+    seqlen_dist: Optional[RandomDistribution] = None
+    value_dists: Optional[Dict[str, RandomDistribution]] = None
+
+    def __post_init__(self):
+        if self.seqlen_dist is not None:
+            if self.seqlen_dist.high is None:
+                # Auto-fill high with max_sequence_length when not specified
+                self.seqlen_dist.high = self.max_sequence_length
+            else:
+                assert self.seqlen_dist.high <= self.max_sequence_length, (
+                    f"seqlen_dist.high ({self.seqlen_dist.high}) must be "
+                    f"<= max_sequence_length ({self.max_sequence_length})"
+                )
 
 
 @gin.configurable
 @dataclass
 class BenchmarkDatasetArgs:
-    """Benchmark Dataset Configuration.
+    """Benchmark Dataset Configuration (benchmark only).
 
-    Configuration for benchmark datasets combining features and embeddings.
+    Gin-configurable top-level entry for synthetic / random data generation used in
+    benchmarking and testing.  When this class is used as the dataset argument (instead
+    of :class:`DatasetArgs`), the training script generates random batches via
+    :class:`~commons.datasets.hstu_random_dataset.HSTURandomDataset` rather than
+    loading data from disk.
+
+    .. note::
+        **Benchmark only** — This class (together with :class:`FeatureArgs`) is not
+        used when training with real datasets (e.g. MovieLens, KuaiRand), which use
+        :class:`DatasetArgs` instead.
 
     Attributes:
         feature_args (List[FeatureArgs]): **Required**. List of feature arguments.

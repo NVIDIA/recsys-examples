@@ -14,30 +14,156 @@
 # limitations under the License.
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional
+from enum import Enum
+from typing import Dict, List, Optional
 
+import gin
+import numpy as np
 import torch
 from commons.sequence_batch.batch import BaseBatch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
+class DistType(str, Enum):
+    """Supported random distribution types.
+
+    Only used for benchmark / random data generation (see :class:`RandomDistribution`).
+    """
+
+    UNIFORM = "uniform"
+    NORMAL = "normal"
+    ZIPF = "zipf"
+
+
+@gin.configurable
+@dataclass
+class RandomDistribution:
+    """
+    A configurable random distribution for generating non-negative integer (natural number) samples.
+
+    .. note::
+        **Benchmark only** — This class is designed for synthetic / random data generation
+        in benchmarking and testing scenarios.  It is **not** used when training with real
+        datasets (e.g. MovieLens, KuaiRand).
+
+    All samples are natural numbers (>= 0). The default lower bound is 0, and the default
+    upper bound is unbounded (None means no upper clamp).
+
+    Supports three distribution types:
+      - **uniform**: Samples uniformly from [low, high). ``high`` is required for uniform.
+      - **normal**: Samples from N(mean, std), then rounds and clamps to [low, high].
+      - **zipf**: Samples from Zipf(alpha) with P(k) ∝ k^{-alpha} (k >= 1),
+            shifted to start from ``low``, then clamps to [low, high].
+
+    Args:
+        dist_type: One of ``DistType.UNIFORM``, ``DistType.NORMAL``, ``DistType.ZIPF``.
+        low: Inclusive lower bound. Default: 0.
+        high: Optional exclusive upper bound for uniform, or inclusive upper clamp for
+              normal/zipf. Default: None (no upper bound, except uniform which requires it).
+        mean: Mean for normal distribution. Default: None (auto-inferred).
+        std: Standard deviation for normal distribution. Default: None (auto-inferred).
+        alpha: Shape parameter for Zipf distribution (must be > 1.0). Default: 1.5.
+
+    Example:
+        >>> # Zipf with no upper limit
+        >>> dist = RandomDistribution(DistType.ZIPF, alpha=1.2)
+        >>> samples = dist.sample(size=128, device=torch.device("cpu"))
+        >>> # Normal clamped to [10, 500]
+        >>> dist = RandomDistribution(DistType.NORMAL, low=10, high=500, mean=100, std=50)
+    """
+
+    dist_type: DistType
+    low: int = 0
+    high: Optional[int] = None
+    # normal distribution parameters
+    mean: Optional[float] = None
+    std: Optional[float] = None
+    # zipf distribution parameter
+    alpha: Optional[float] = None
+
+    def sample(
+        self,
+        size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Generate ``size`` non-negative integer samples from the configured distribution.
+
+        Args:
+            size: Number of samples to generate.
+            device: Target device for the returned tensor.
+
+        Returns:
+            A 1-D ``torch.Tensor`` of shape ``(size,)`` with dtype ``torch.long``.
+        """
+        lo = self.low
+        hi = self.high  # None means no upper bound
+
+        if self.dist_type == DistType.UNIFORM:
+            assert hi is not None, "uniform distribution requires `high` to be set"
+            assert hi > lo, f"uniform requires high > low, got [{lo}, {hi})"
+            return torch.randint(lo, hi, (size,), device=device)
+
+        elif self.dist_type == DistType.NORMAL:
+            assert (
+                self.mean is not None and self.std is not None
+            ), "normal distribution requires `mean` and `std` to be set"
+            assert self.std > 0, f"normal requires std > 0, got {self.std}"
+            samples = torch.normal(self.mean, self.std, (size,))
+            samples = samples.clamp(min=lo)
+            if hi is not None:
+                samples = samples.clamp(max=hi - 1)
+            return samples.round().long().to(device)
+
+        elif self.dist_type == DistType.ZIPF:
+            alpha = self.alpha if self.alpha is not None else 1.5
+            assert alpha > 1.0, f"zipf requires alpha > 1.0, got {alpha}"
+            # numpy zipf generates integers >= 1, shift by (lo - 1) so minimum is lo
+            raw = np.random.zipf(alpha, size=size)
+            samples = torch.from_numpy(raw).long() + (lo - 1)
+            samples = samples.clamp(min=lo)
+            if hi is not None:
+                samples = samples.clamp(max=hi - 1)
+            return samples.to(device)
+
+        else:
+            raise ValueError(f"Unknown distribution type: {self.dist_type}")
+
+
 @dataclass
 class FeatureConfig:
     """
-    Configuration for features in a dataset. A FeatureConfig is a collection of features that share the same seqlen (also the same max_seqlence_length).
-    For example, in HSTU based models, an item is always associated with a timestamp token.
+    Configuration for features in a dataset.
+
+    .. note::
+        **Benchmark / test only** — ``FeatureConfig`` is consumed by
+        :meth:`HSTUBatch.random` and :class:`HSTURandomDataset` to generate synthetic
+        data.  It is **not** used when training with real datasets (e.g. MovieLens,
+        KuaiRand).  In the gin configuration layer the corresponding entry point is
+        :class:`FeatureArgs` (inside ``BenchmarkDatasetArgs``).
+
+    A ``FeatureConfig`` groups features that share the same sequence length (and the
+    same ``max_sequence_length``).  For example, in HSTU-based models an item feature
+    is always paired with a timestamp token — both share one ``FeatureConfig``.
 
     Attributes:
       feature_names (List[str]): List of names for the features.
       max_item_ids (List[int]): List of maximum item IDs for each feature.
       max_sequence_length (int): The maximum length of sequences in the dataset.
       is_jagged (bool): Whether the sequences are jagged (i.e., have varying lengths).
+      seqlen_dist (Optional[RandomDistribution]): Distribution for generating sequence lengths.
+          Only used when ``is_jagged=True``. If None, defaults to uniform [0, max_sequence_length).
+      value_dists (Optional[Dict[str, RandomDistribution]]): Per-feature distributions for
+          generating values, keyed by feature name. Features not present in the dict fall back
+          to uniform [0, max_item_id). If None, all features use the default uniform distribution.
     """
 
     feature_names: List[str]
     max_item_ids: List[int]
     max_sequence_length: int
     is_jagged: bool
+    seqlen_dist: Optional[RandomDistribution] = None
+    value_dists: Optional[Dict[str, RandomDistribution]] = None
 
 
 @dataclass
@@ -132,9 +258,15 @@ class HSTUBatch(BaseBatch):
         for fc in feature_configs:
             # Generate data for actual_batch_size samples
             if fc.is_jagged:
-                seqlen = torch.randint(
-                    fc.max_sequence_length, (actual_batch_size,), device=device
-                )
+                if fc.seqlen_dist is not None:
+                    seqlen = fc.seqlen_dist.sample(
+                        size=actual_batch_size,
+                        device=device,
+                    )
+                else:
+                    seqlen = torch.randint(
+                        fc.max_sequence_length, (actual_batch_size,), device=device
+                    )
             else:
                 seqlen = torch.full(
                     (actual_batch_size,), fc.max_sequence_length, device=device
@@ -154,7 +286,13 @@ class HSTUBatch(BaseBatch):
             for feature_name, max_item_id in zip(fc.feature_names, fc.max_item_ids):
                 if feature_name in contextual_feature_names and fc.is_jagged:
                     warnings.warn(f"contextual feature {feature_name} is jagged")
-                value = torch.randint(max_item_id, (cur_seqlen_sum,), device=device)
+                if fc.value_dists is not None and feature_name in fc.value_dists:
+                    value = fc.value_dists[feature_name].sample(
+                        size=cur_seqlen_sum,
+                        device=device,
+                    )
+                else:
+                    value = torch.randint(max_item_id, (cur_seqlen_sum,), device=device)
                 keys.append(feature_name)
                 values.append(value)
                 lengths.append(seqlen)
