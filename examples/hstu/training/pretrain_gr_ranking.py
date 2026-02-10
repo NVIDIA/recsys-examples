@@ -28,7 +28,7 @@ from commons.distributed.sharding import make_optimizer_and_shard
 from commons.pipeline import TrainPipelineFactory
 from commons.utils.logger import print_rank_0
 from configs import RankingConfig
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from model import get_ranking_model
 from modules.metrics import get_multi_event_metric_module
 from trainer.training import maybe_load_ckpts, train_with_pipeline
@@ -98,6 +98,12 @@ def main():
     )
     hstu_config = create_hstu_config(network_args, tp_args)
     task_config = create_ranking_config(dataset_args, network_args, embedding_args)
+    # We need to create the dataloader before model initialization in case the dataset is random.
+    # In our scenario, the dataset across tp rank should be different. We need to fork the state
+    with tensor_parallel.get_cuda_rng_tracker().fork():
+        train_dataloader, test_dataloader = get_data_loader(
+            "ranking", dataset_args, trainer_args, task_config.num_tasks
+        )
     model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
 
     dynamic_options_dict = create_dynamic_optitons_dict(
@@ -140,9 +146,6 @@ def main():
     else:
         batch_shuffler = BatchShufflerFactory.create("identity")
 
-    train_dataloader, test_dataloader = get_data_loader(
-        "ranking", dataset_args, trainer_args, task_config.num_tasks
-    )
     free_memory, total_memory = torch.cuda.mem_get_info()
     print_rank_0(
         f"model initialization done, start training. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"

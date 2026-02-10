@@ -24,7 +24,14 @@ from .hstu_batch import FeatureConfig, HSTUBatch
 
 class HSTURandomDataset(IterableDataset[HSTUBatch]):
     """
-    A dummy sequence dataset for generating batches of data.
+    A synthetic (random) dataset for benchmark and testing purposes.
+
+    .. note::
+        **Benchmark / test only** — This dataset generates random batches via
+        :meth:`HSTUBatch.random` and is **not** used when training with real
+        datasets (e.g. MovieLens, KuaiRand).  It is instantiated automatically
+        when :class:`~utils.gin_config_args.BenchmarkDatasetArgs` is provided
+        as the dataset configuration.
 
     Args:
         batch_size (int): The batchsize per rank.
