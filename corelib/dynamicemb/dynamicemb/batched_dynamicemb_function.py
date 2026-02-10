@@ -82,9 +82,6 @@ def segmented_unique(
     is_lfu_enabled = evict_strategy == EvictStrategy.KLfu if evict_strategy else False
     need_frequency_output = is_lfu_enabled or frequency_counts is not None
 
-    # Get device SM count
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-
     # Generate table_ids from segment_range
     # segment_range has size (num_tables + 1), treating each table as one feature
     # with local_batch_size=1. When table_offsets_in_feature=None, each feature
@@ -95,7 +92,6 @@ def segmented_unique(
         num_tables,  # ignored when table_offsets_in_feature is None
         1,  # local_batch_size
         num_keys,
-        device_sm_count,
     )
 
     # Prepare input_frequencies tensor
@@ -113,9 +109,7 @@ def segmented_unique(
         reverse_indices,
         table_offsets,
         freq_counters,
-    ) = segmented_unique_cuda(
-        keys, table_ids, num_tables, device_sm_count, input_frequencies
-    )
+    ) = segmented_unique_cuda(keys, table_ids, num_tables, input_frequencies)
 
     # Get total unique count and slice the output
     # .item() implicitly syncs
@@ -204,7 +198,6 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         pooling_mode: int = 2,  # DynamicEmbPoolingMode.NONE = 2
         total_D: int = 0,
         batch_size: int = 0,
-        device_num_sms: int = 0,
         dims: Optional[List[int]] = None,
         max_D: int = 0,
         D_offsets: Optional[torch.Tensor] = None,
@@ -427,4 +420,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     optimizer,
                 )
 
-        return (None,) * 23
+        return (None,) * 22

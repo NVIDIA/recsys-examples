@@ -141,10 +141,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
 
         # _is_lfu_enabled is already set in __init__ from score_strategy parameter
 
-        if self._use_index_dedup:
-            device_properties = torch.cuda.get_device_properties(self._device.index)
-            self._device_num_sms = device_properties.multi_processor_count
-
         for i, sharding in enumerate(self._sharding_type_to_sharding.values()):
             nonfuse_table_feature_offsets: List[int] = []
             for table in sharding.embedding_tables():
@@ -221,7 +217,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     table_num,
                     local_batchsize,
                     num_elements,
-                    self._device_num_sms,
                 )
 
                 # Prepare input_frequencies tensor to control frequency counting
@@ -242,7 +237,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     indices,
                     table_ids,
                     table_num,
-                    self._device_num_sms,
                     input_frequencies,
                 )
 

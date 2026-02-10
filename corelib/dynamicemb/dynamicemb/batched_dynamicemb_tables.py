@@ -426,10 +426,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if table_option.device_id is None:
             for option in self._dynamicemb_options:
                 option.device_id = self.device_id
-        # get cuda device config
-        device_properties = torch.cuda.get_device_properties(self.device_id)
-        self._device_num_sms = device_properties.multi_processor_count
-
         self.dims: List[int] = [option.dim for option in self._dynamicemb_options]
         # Sequence mode requires uniform embedding dim because the output is
         # [N, D].  Pooling mode supports mixed dims natively via D_offsets.
@@ -756,7 +752,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 cache.flush(storage)
 
     def reset_cache_states(self) -> None:
-        if self.pooling_mode == DynamicEmbPoolingMode.NONE and self._caching:
+        if self._caching:
             for cache in self._caches:
                 cache.reset()
 
@@ -844,8 +840,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 table.score_update = self.training or self._caching
                 table.set_score(self._scores[self.table_names[i]])
 
-        # Compute batch_size for pooling modes
-        feature_batch_size = offsets.shape[0] - 1
+        feature_batch_size = offsets.numel() - 1
+        assert feature_batch_size > 0, "feature_batch_size must be greater than 0"
+        assert (
+            feature_batch_size % self.feature_num == 0
+        ), "feature_batch_size must be divisible by feature_num"
         batch_size = (
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
@@ -869,7 +868,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             int(self.pooling_mode),
             self.total_D,
             batch_size,
-            self._device_num_sms,
             self.dims,
             self.max_D,
             self.D_offsets_t,

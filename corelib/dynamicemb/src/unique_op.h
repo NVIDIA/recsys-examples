@@ -37,8 +37,6 @@ namespace dyn_emb {
  * @param table_ids Table ID for each key (int32, same length as keys,
  *                  must be in ascending order)
  * @param num_tables Total number of tables
- * @param device_sm_count Number of SMs on the device (used to determine
- *                        optimal grid size for kernel launches)
  * @param input_frequencies Controls frequency counting behavior:
  *                          - Undefined/empty tensor with numel()==0: Enable
  *                            frequency counting with each occurrence counted as
@@ -62,7 +60,6 @@ namespace dyn_emb {
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
-                      int64_t device_sm_count,
                       at::Tensor input_frequencies = at::Tensor());
 
 /**
@@ -85,7 +82,6 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
  * None)
  * @param local_batch_size Batch size per feature
  * @param num_elements Total number of elements (keys)
- * @param device_sm_count Number of SMs on the device
  *
  * @return table_ids tensor (int32) with same length as num_elements
  */
@@ -93,7 +89,7 @@ at::Tensor
 expand_table_ids_cuda(at::Tensor offsets,
                       c10::optional<at::Tensor> table_offsets_in_feature,
                       int64_t num_tables, int64_t local_batch_size,
-                      int64_t num_elements, int64_t device_sm_count);
+                      int64_t num_elements);
 
 /**
  * @brief Compute new lengths and offsets by evenly distributing unique keys.

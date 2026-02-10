@@ -19,6 +19,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "lookup_forward.h"
 #include "torch_utils.h"
 #include "unique_op.h"
+#include "utils.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/cub.cuh>
@@ -431,18 +432,18 @@ __global__ void adjust_output_indices_kernel(const int32_t *d_table_ids,
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
-                      int64_t device_sm_count, at::Tensor input_frequencies) {
+                      at::Tensor input_frequencies) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const int64_t num_keys = keys.numel();
   const auto device = keys.device();
   const auto key_dtype = keys.scalar_type();
+  const int device_sm_count = DeviceProp::getDeviceProp(device.index()).num_sms;
 
   TORCH_CHECK(keys.numel() == table_ids.numel(),
               "keys and table_ids must have the same length");
   TORCH_CHECK(table_ids.scalar_type() == at::kInt, "table_ids must be int32");
   TORCH_CHECK(num_tables > 0, "num_tables must be positive");
-  TORCH_CHECK(device_sm_count > 0, "device_sm_count must be positive");
   TORCH_CHECK(num_keys < std::numeric_limits<int32_t>::max(),
               "num_keys must be less than std::numeric_limits<int32_t>::max()");
   TORCH_CHECK(
@@ -613,13 +614,13 @@ at::Tensor
 expand_table_ids_cuda(at::Tensor offsets,
                       c10::optional<at::Tensor> table_offsets_in_feature,
                       int64_t num_tables, int64_t local_batch_size,
-                      int64_t num_elements, int64_t device_sm_count) {
+                      int64_t num_elements) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const auto device = offsets.device();
+  const int device_sm_count = DeviceProp::getDeviceProp(device.index()).num_sms;
 
   TORCH_CHECK(offsets.is_cuda(), "offsets must be on CUDA device");
-  TORCH_CHECK(device_sm_count > 0, "device_sm_count must be positive");
   TORCH_CHECK(local_batch_size > 0, "local_batch_size must be positive");
 
   // Handle empty input
@@ -710,7 +711,6 @@ void bind_unique_op(py::module &m) {
   m.def(
       "segmented_unique_cuda",
       [](at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
-         int64_t device_sm_count,
          const c10::optional<at::Tensor> &input_frequencies) {
         // Convert optional to tensor:
         // - None -> undefined tensor (disables frequency counting)
@@ -722,7 +722,7 @@ void bind_unique_op(py::module &m) {
         // If input_frequencies was None, freq_tensor remains undefined
         // which will disable frequency counting in the C++ implementation
         return dyn_emb::segmented_unique_cuda(keys, table_ids, num_tables,
-                                              device_sm_count, freq_tensor);
+                                              freq_tensor);
       },
       R"doc(
 Segmented unique: deduplicate keys per table using GPU hash table.
@@ -738,7 +738,6 @@ Args:
     table_ids: Table ID for each key (int32, same length as keys,
                must be in ascending order)
     num_tables: Total number of tables
-    device_sm_count: Number of SMs on the device
     input_frequencies: Controls frequency counting behavior:
                        - None: Disable frequency counting (output freq_counters empty)
                        - Empty tensor (numel==0): Enable counting, each key counts as 1
@@ -755,16 +754,15 @@ Returns:
     - frequency_counters: Per-unique-key frequency counts (empty if disabled)
 )doc",
       py::arg("keys"), py::arg("table_ids"), py::arg("num_tables"),
-      py::arg("device_sm_count"), py::arg("input_frequencies") = py::none());
+      py::arg("input_frequencies") = py::none());
 
   m.def(
       "expand_table_ids_cuda",
       [](at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
-         int64_t num_tables, int64_t local_batch_size, int64_t num_elements,
-         int64_t device_sm_count) {
+         int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
         return dyn_emb::expand_table_ids_cuda(offsets, table_offsets_in_feature,
                                               num_tables, local_batch_size,
-                                              num_elements, device_sm_count);
+                                              num_elements);
       },
       R"doc(
 Expand table IDs from offsets.
@@ -786,14 +784,13 @@ Args:
     num_tables: Number of tables (ignored if table_offsets_in_feature is None)
     local_batch_size: Batch size per feature
     num_elements: Total number of elements (keys)
-    device_sm_count: Number of SMs on the device
 
 Returns:
     table_ids tensor (int32) with same length as num_elements
 )doc",
       py::arg("offsets"), py::arg("table_offsets_in_feature") = py::none(),
       py::arg("num_tables") = 0, py::arg("local_batch_size") = 1,
-      py::arg("num_elements") = 0, py::arg("device_sm_count") = 0);
+      py::arg("num_elements") = 0);
 
   m.def(
       "compute_dedup_lengths_cuda",
