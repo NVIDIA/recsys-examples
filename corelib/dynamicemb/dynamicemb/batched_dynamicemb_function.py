@@ -375,15 +375,16 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             # available (uniform: [0, D, 2D, ...]; mixed: per-feature).
             # The kernel uses D_offsets for per-feature source addressing and
             # fuses MEAN scaling.  No reshape needed for either case.
+            out_dim = ctx.max_D if ctx.mixed_D else ctx.emb_dim
             unique_grads = reduce_grads(
                 ctx.reverse_indices,
                 grads,
                 ctx.unique_indices.numel(),
                 ctx.batch_size,
+                out_dim,
                 ctx.offsets,
-                ctx.combiner,
                 ctx.D_offsets,
-                ctx.max_D,
+                ctx.combiner,
                 ctx.total_D,
             )
         else:
@@ -393,6 +394,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 grads,
                 ctx.unique_indices.numel(),
                 ctx.batch_size,
+                ctx.emb_dim,
             )
 
         optimizer.step()
@@ -425,4 +427,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     optimizer,
                 )
 
-        return (None,) * 24
+        return (None,) * 23

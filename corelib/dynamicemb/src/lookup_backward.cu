@@ -598,10 +598,14 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
         if (offsets.has_value()) {
           auto offset_type =
               scalartype_to_datatype(offsets.value().dtype().toScalarType());
-          const int *d_D_ptr =
-              D_offsets.has_value()
-                  ? reinterpret_cast<const int *>(D_offsets.value().data_ptr())
-                  : nullptr;
+          const int *d_D_ptr = nullptr;
+          if (D_offsets.has_value()) {
+            TORCH_CHECK(D_offsets.value().numel() == F + 1,
+                        "D_offsets.numel() (", D_offsets.value().numel(),
+                        ") must equal F + 1 (", F + 1, ")");
+            d_D_ptr =
+                reinterpret_cast<const int *>(D_offsets.value().data_ptr());
+          }
           DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
             multi_to_one_reduce<grad_t, accum_t, id_t, offset_t, WarpSize>(
                 num_key_, len_vec_, in_grads, out_grads, sorted_key_ids,

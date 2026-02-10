@@ -152,11 +152,11 @@ generate_gather_ids_pooled_kernel(const offset_t *__restrict__ offsets,
 
 at::Tensor
 reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
-             int batch_size,
+             int batch_size, int64_t out_dim,
              const std::optional<at::Tensor> &offsets = std::nullopt,
-             int combiner = -1,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
-             int max_D = 0, int total_D = 0) {
+             int combiner = -1,
+             int total_D = 0) {
   // When D_offsets is provided (multi-dim pooling):
   //   grads is [B, total_D].  Permutation-aware gather_ids are generated,
   //   sorted with reverse_indices, then a multi-dim variant of LocalReduce
@@ -187,17 +187,9 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
 
   bool multi_dim = D_offsets.has_value() && offsets.has_value();
 
-  // Determine output width:
-  //   Pooling (max_D > 0): use max_D as the per-feature row width.
-  //     - Mixed-dim: kernel uses D_offsets to read variable-width slices,
-  //       output is padded to max_D.
-  //     - Uniform-dim: gather_id = b*F + f, stride = max_D = D, so
-  //       offset (b*F + f)*D = b*total_D + f*D into [B, total_D].
-  //   Sequence (max_D == 0): grads is [N, D], use grads.size(1).
-  int64_t out_dim = (max_D > 0) ? (int64_t)max_D : grads.size(1);
   at::Tensor unique_grads = at::empty({num_unique, out_dim}, grads.options());
 
-  if (num_keys == 0)
+  if (num_keys == 0 || batch_size == 0)
     return unique_grads;
   // --- Generate gather_ids ---
   at::Tensor gather_ids;
@@ -725,10 +717,10 @@ void bind_dyn_emb_op(py::module &m) {
 
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
-        py::arg("batch_size"),
-        py::arg("offsets") = py::none(), py::arg("combiner") = -1,
-        py::arg("D_offsets") = py::none(),
-        py::arg("max_D") = 0, py::arg("total_D") = 0);
+        py::arg("batch_size"), py::arg("out_dim"),
+        py::arg("offsets") = py::none(),
+        py::arg("D_offsets") = py::none(), py::arg("combiner") = -1,
+        py::arg("total_D") = 0);
 
   m.def("gather_embedding", &gather_embedding,
         "Gather embedding based on index.", py::arg("input"), py::arg("output"),
