@@ -141,7 +141,7 @@ generate_gather_ids_pooled_kernel(const offset_t *__restrict__ offsets,
        s += gridDim.x * blockDim.x) {
     int f = s / B;
     int b = s % B;
-    id_t val = static_cast<id_t>(b * F + f);
+    id_t val = static_cast<id_t>(b) * static_cast<id_t>(F) + static_cast<id_t>(f);
     offset_t start = offsets[s];
     offset_t end = offsets[s + 1];
     for (offset_t j = start; j < end; ++j) {
