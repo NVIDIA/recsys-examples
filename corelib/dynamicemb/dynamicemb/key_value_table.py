@@ -114,7 +114,6 @@ class DynamicEmbeddingTable(
         options: DynamicEmbTableOptions,
         optimizer: BaseDynamicEmbeddingOptimizerV2,
     ):
-        print(f"DynamicEmbeddingTable init start")
         self.options = options
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
@@ -133,7 +132,6 @@ class DynamicEmbeddingTable(
             score_specs=[self.score_policy],
             device=self.device,
         )
-        print(f"key_index_map init end")
         self._capacity = self.key_index_map.capacity()
 
         # TODO: maybe we can separate it in the future like fbgemm
@@ -152,7 +150,6 @@ class DynamicEmbeddingTable(
         total_memory_need = (
             self._capacity * self._value_dim * dtype_to_bytes(self._emb_dtype)
         )
-        print(f"total_memory_need: {total_memory_need}")
         if options.local_hbm_for_values == 0:
             # weight_uvm_size = self._capacity * self._emb_dim
             # optim_states_uvm_size = self._capacity * self._optim_states_dim
@@ -182,7 +179,6 @@ class DynamicEmbeddingTable(
                 uvm_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
 
-        print(f"uvm_table/dev_table init end")
         self.score: int = None
         self._score_update = False
 
@@ -583,7 +579,7 @@ class DynamicEmbeddingTable(
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
-            meta_data["evict_strategy"] = str(self.table.evict_strategy())
+            meta_data["evict_strategy"] = str(self.evict_strategy())
 
             if current_score is not None:
                 meta_data["step_score"] = current_score
@@ -595,15 +591,15 @@ class DynamicEmbeddingTable(
         fscore = open(score_file_path, "wb")
         fopt_states = open(opt_file_path, "wb") if include_optim else None
 
-        for keys, embeddings, opt_states, scores in batched_export_keys_values(
-            self.table, device
+        for keys, embeddings, opt_states, scores in self.export_keys_values(
+            device=device
         ):
             fkey.write(keys.cpu().numpy().tobytes())
             fembedding.write(embeddings.cpu().numpy().tobytes())
-            if self.table.evict_strategy() == EvictStrategy.KLru:
+            if self.evict_strategy() == EvictStrategy.KLru:
                 scores = self._timestamp - scores
             fscore.write(scores.cpu().numpy().tobytes())
-            if fopt_states:
+            if fopt_states and opt_states is not None:
                 fopt_states.write(opt_states.cpu().numpy().tobytes())
 
         fkey.close()
@@ -637,9 +633,9 @@ class DynamicEmbeddingTable(
             )
 
         evict_strategy = meta_data.get("evict_strategy", None)
-        if evict_strategy and str(self.table.evict_strategy()) != evict_strategy:
+        if evict_strategy and str(self.evict_strategy()) != evict_strategy:
             raise ValueError(
-                f"Evict strategy mismatch: {evict_strategy} != {self.table.evict_strategy()}"
+                f"Evict strategy mismatch: {evict_strategy} != {self.evict_strategy()}"
             )
 
         if score_file_path is None:
@@ -655,8 +651,8 @@ class DynamicEmbeddingTable(
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-        dim = dyn_emb_cols(self.table)
-        optstate_dim = self.table.optstate_dim()
+        dim = self._emb_dim
+        optstate_dim = self.optim_state_dim()
 
         if optstate_dim == 0:
             include_optim = False
@@ -749,7 +745,7 @@ class DynamicEmbeddingTable(
                     dtype=SCORE_TYPE,
                     device=device,
                 )
-                if self.table.evict_strategy() == EvictStrategy.KLru:
+                if self.evict_strategy() == EvictStrategy.KLru:
                     scores = torch.clamp(self._timestamp - scores, min=0)
 
             if world_size > 1:
@@ -760,7 +756,12 @@ class DynamicEmbeddingTable(
                     scores = scores[masks]
                 if opt_states is not None:
                     opt_states = opt_states[masks, :]
-            load_key_values(self.table, keys, embeddings, scores, opt_states)
+            self.load_key_values(
+                keys,
+                embeddings,
+                scores,
+                opt_states,
+            )
 
         fkey.close()
         fembedding.close()

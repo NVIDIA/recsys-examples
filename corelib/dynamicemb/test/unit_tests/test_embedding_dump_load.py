@@ -533,7 +533,7 @@ def test_model_load_dump(
             expect_scores = expect_scores_collection[table_name]
             visited_keys = table_name_to_visited_key_dict[table_name]
 
-            if score_strategy == "step" or score_strategy == "lfu":
+            if score_strategy == "lfu":
                 for kjt in reversed(all_kjts):
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
@@ -545,7 +545,7 @@ def test_model_load_dump(
                                 key_to_score_dict[key] == expect_scores[key]
                             ), f"Expect {key_to_score_dict[key]} = {expect_scores[key]}"
             # The idea is that the score of a newer key is greater than that of an older key. Therefore, I iterate through the input in reverse order and track the minimum score encountered. For each batch, the score should be lower than the minimum score from the previous batch. To avoid issues caused by duplicate keys, every time I access a key, I set its score to -inf. This ensures that if that key appears again, its score will be sufficiently small to remain below the minimum score.
-            elif score_strategy == "timestamp":
+            elif score_strategy == "timestamp" or score_strategy == "step":
                 min_score = float("inf")
                 lasted_min_score = float("inf")
                 for kjt in reversed(all_kjts):

@@ -152,8 +152,9 @@ generate_gather_ids_pooled_kernel(const offset_t *__restrict__ offsets,
 
 at::Tensor
 reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
+             int batch_size,
              const std::optional<at::Tensor> &offsets = std::nullopt,
-             int combiner = -1, int batch_size = 0,
+             int combiner = -1,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
              int max_D = 0, int total_D = 0) {
   // When D_offsets is provided (multi-dim pooling):
@@ -198,12 +199,12 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
 
   if (num_keys == 0)
     return unique_grads;
-  TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
   // --- Generate gather_ids ---
   at::Tensor gather_ids;
   if (offsets.has_value()) {
     auto &offs = offsets.value();
     int num_slots = static_cast<int>(offs.numel() - 1);
+    TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
     TORCH_CHECK(num_slots % batch_size == 0, "num_slots (", num_slots, ") must be divisible by batch_size (", batch_size, ")");
     int num_features = num_slots / batch_size;
     auto offset_type =
@@ -724,8 +725,9 @@ void bind_dyn_emb_op(py::module &m) {
 
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
+        py::arg("batch_size"),
         py::arg("offsets") = py::none(), py::arg("combiner") = -1,
-        py::arg("batch_size") = 0, py::arg("D_offsets") = py::none(),
+        py::arg("D_offsets") = py::none(),
         py::arg("max_D") = 0, py::arg("total_D") = 0);
 
   m.def("gather_embedding", &gather_embedding,

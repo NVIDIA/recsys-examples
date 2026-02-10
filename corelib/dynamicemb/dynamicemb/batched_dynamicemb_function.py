@@ -379,9 +379,9 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 ctx.reverse_indices,
                 grads,
                 ctx.unique_indices.numel(),
+                ctx.batch_size,
                 ctx.offsets,
                 ctx.combiner,
-                ctx.batch_size,
                 ctx.D_offsets,
                 ctx.max_D,
                 ctx.total_D,
@@ -389,7 +389,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         else:
             # Sequence: no offsets -> arange gather_ids internally.
             unique_grads = reduce_grads(
-                ctx.reverse_indices, grads, ctx.unique_indices.numel()
+                ctx.reverse_indices,
+                grads,
+                ctx.unique_indices.numel(),
+                ctx.batch_size,
             )
 
         optimizer.step()
