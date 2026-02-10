@@ -198,7 +198,7 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
 
   if (num_keys == 0)
     return unique_grads;
-
+  TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
   // --- Generate gather_ids ---
   at::Tensor gather_ids;
   if (offsets.has_value()) {
