@@ -195,7 +195,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         evict_strategy=None,
         frequency_counters: Optional[torch.Tensor] = None,
         admission_counter: Optional[list[Counter]] = None,
-        pooling_mode: int = 2,  # DynamicEmbPoolingMode.NONE = 2
+        pooling_mode: DynamicEmbPoolingMode = DynamicEmbPoolingMode.NONE,
         total_D: int = 0,
         batch_size: int = 0,
         dims: Optional[List[int]] = None,

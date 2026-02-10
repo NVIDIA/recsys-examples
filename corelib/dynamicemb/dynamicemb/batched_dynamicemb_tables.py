@@ -865,7 +865,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._evict_strategy,
             per_sample_weights,  # Pass frequency counters as weights
             self._admission_counter,
-            int(self.pooling_mode),
+            self.pooling_mode,
             self.total_D,
             batch_size,
             self.dims,
