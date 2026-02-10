@@ -117,10 +117,13 @@ void gather_embedding_pooled(
       scalartype_to_datatype(convertTypeMetaToScalarType(offsets.dtype()));
 
   int dim = D_offsets.has_value() ? max_D : static_cast<int>(input.size(1));
-  const int *d_D_offsets =
-      D_offsets.has_value()
-          ? reinterpret_cast<const int *>(D_offsets.value().data_ptr())
-          : nullptr;
+  const int *d_D_offsets = nullptr;
+  if (D_offsets.has_value()) {
+    TORCH_CHECK(D_offsets.value().scalar_type() == at::kInt,
+                "D_offsets must be int32, got ", D_offsets.value().scalar_type());
+    d_D_offsets =
+        reinterpret_cast<const int *>(D_offsets.value().data_ptr());
+  }
   dyn_emb::scatter_combine(
       input.data_ptr(), output.data_ptr(), offsets.data_ptr(), index.data_ptr(),
       combiner, total_D, /*accum_D=*/0, dim, num_slots, batch_size, src_type,

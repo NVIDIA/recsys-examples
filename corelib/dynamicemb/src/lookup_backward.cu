@@ -600,6 +600,9 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
               scalartype_to_datatype(offsets.value().dtype().toScalarType());
           const int *d_D_ptr = nullptr;
           if (D_offsets.has_value()) {
+            TORCH_CHECK(D_offsets.value().scalar_type() == at::kInt,
+                        "D_offsets must be int32, got ",
+                        D_offsets.value().scalar_type());
             TORCH_CHECK(D_offsets.value().numel() == F + 1,
                         "D_offsets.numel() (", D_offsets.value().numel(),
                         ") must equal F + 1 (", F + 1, ")");
