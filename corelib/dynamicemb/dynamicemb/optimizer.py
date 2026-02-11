@@ -499,6 +499,13 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
         Get the state dim.
         """
 
+    def get_ckpt_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the checkpoint state dim. By default returns get_state_dim().
+        Override this for optimizers where checkpoint dim differs from runtime dim.
+        """
+        return self.get_state_dim(emb_dim)
+
     def set_learning_rate(self, new_lr) -> None:
         self._opt_args.learning_rate = new_lr
         return
@@ -976,3 +983,10 @@ class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2)
         Get the state dim.
         """
         return self._optim_state_dim
+
+    def get_ckpt_state_dim(self, emb_dim: int) -> int:
+        """
+        Get the checkpoint state dim.
+        RowWise AdaGrad only needs 1 element per row in checkpoint.
+        """
+        return 1

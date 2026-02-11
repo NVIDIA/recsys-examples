@@ -1154,8 +1154,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if isinstance(storage, KeyValueTable) and not storage._use_score:
                 dist.barrier()  # sync global timestamp
                 cast(KeyValueTable, storage).update_timestamp()
-            
-            current_score = self._scores.get(table_name, None) if hasattr(self, '_scores') else None
+
+            current_score = (
+                self._scores.get(table_name, None) if hasattr(self, "_scores") else None
+            )
 
             storage.dump(
                 meta_file_path,
