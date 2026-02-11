@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 
 import torch
 from rich.console import Console
@@ -28,13 +29,33 @@ handler = RichHandler(
 )
 _logger.addHandler(handler)
 _logger.propagate = False
-_logger.setLevel(logging.INFO)
+_logger.setLevel(
+    getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+)
 
 
-def print_rank_0(message):
+def print_rank_0(message, level=logging.INFO):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            _logger.log(level, message)
+    else:
+        print(message, flush=True)
+
+
+def info_rank_0(message):
     """If distributed is initialized, print only on rank 0."""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
             _logger.info(message)
+    else:
+        print(message, flush=True)
+
+
+def debug_rank_0(message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            _logger.debug(message)
     else:
         print(message, flush=True)
