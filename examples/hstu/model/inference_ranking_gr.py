@@ -116,13 +116,14 @@ def get_inference_ranking_gr(
     sparse_shareables=None,
 ):
     for ebc_config in task_config.embedding_configs:
-        assert (
-            ebc_config.dim == hstu_config.hidden_size
-        ), "hstu layer hidden size should equal to embedding dim"
+        for config in ebc_config:
+            assert (
+                config.embedding_dim == hstu_config.hidden_size
+            ), "hstu layer hidden size should equal to embedding dim"
 
     inference_sparse = InferenceEmbedding(
         task_config.embedding_configs,
-        sparse_shareables,
+        # sparse_shareables,
     )
     inference_dense = InferenceDenseModule(
         hstu_config,

@@ -39,21 +39,8 @@ class EmbeddingBackend(Enum):
 
 @dataclass
 class InferenceEmbeddingConfig:
-    """
-    Configuration for inference embeddings with dynamic option.
-    Args:
-        feature_names (List[str]): The name of the features in this embedding.
-        table_name (str): The name of the table.
-        vocab_size (int): The size of the vocabulary.
-        dim (int): The dimension size of the embeddings.
-        use_dynamicemb (bool): The option for dynamic embedding.
-    """
-
-    feature_names: List[str]
-    table_name: str
-    vocab_size: int
-    dim: int
-    use_dynamicemb: bool
+    backend: EmbeddingBackend
+    device: torch.cuda.Device
 
 
 @dataclass

@@ -125,11 +125,6 @@ class InferenceDenseModule(torch.nn.Module):
         self._task_config = task_config
 
         self._embedding_dim = hstu_config.hidden_size
-        for ebc_config in task_config.embedding_configs:
-            assert (
-                ebc_config.dim == self._embedding_dim
-            ), "hstu layer hidden size should equal to embedding dim"
-
         self._use_kvcache = False
         if kvcache_config is not None:
             from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
