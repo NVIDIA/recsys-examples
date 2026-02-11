@@ -59,3 +59,27 @@ def debug_rank_0(message):
             _logger.debug(message)
     else:
         print(message, flush=True)
+
+
+def print_rank_all(message, level=logging.INFO):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        _logger.log(level, message)
+    else:
+        print(message, flush=True)
+
+
+def info_rank_all(message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        _logger.info(message)
+    else:
+        print(message, flush=True)
+
+
+def debug_rank_all(message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        _logger.debug(message)
+    else:
+        print(message, flush=True)
