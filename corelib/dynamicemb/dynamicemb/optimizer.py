@@ -112,7 +112,7 @@ def convert_optimizer_type(optimizer: EmbOptimType) -> OptimizerType:
         )
 
 
-class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
+class BaseDynamicEmbeddingOptimizer(abc.ABC):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -181,7 +181,7 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
         )
 
 
-class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -222,7 +222,7 @@ class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         return 0
 
 
-class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -291,7 +291,7 @@ class AdamDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         return emb_dim * 2
 
 
-class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,
@@ -344,7 +344,7 @@ class AdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
         return emb_dim
 
 
-class RowWiseAdaGradDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
+class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
         self,
         opt_args: OptimizerArgs,

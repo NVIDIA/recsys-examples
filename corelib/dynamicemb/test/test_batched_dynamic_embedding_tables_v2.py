@@ -29,7 +29,7 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import DynamicEmbeddingTable, Storage
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
@@ -55,11 +55,11 @@ OPTIM_TYPE: Dict[EmbOptimType, OptimType] = {
 }
 
 
-class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizerV2]):
+class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizer]):
     def __init__(
         self,
         options: DynamicEmbTableOptions,
-        optimizer: BaseDynamicEmbeddingOptimizerV2,
+        optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         self.options = options
         self.dict: Dict[int, torch.Tensor] = {}

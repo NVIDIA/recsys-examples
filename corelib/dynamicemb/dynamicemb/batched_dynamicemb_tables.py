@@ -25,7 +25,7 @@ from typing import List, Optional, Tuple, cast
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import (
-    DynamicEmbeddingFunctionV2,
+    DynamicEmbeddingFunction,
     dynamicemb_prefetch,
 )
 from dynamicemb.dynamicemb_config import *
@@ -489,7 +489,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if option.init_capacity is None:
                 option.init_capacity = option.max_capacity
 
-        self._optimizer: BaseDynamicEmbeddingOptimizerV2 = self._create_optimizer(
+        self._optimizer: BaseDynamicEmbeddingOptimizer = self._create_optimizer(
             optimizer,
             stochastic_rounding,
             gradient_clipping,
@@ -622,7 +622,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         weight_decay_mode: WeightDecayMode,
         counter_based_regularization: Optional[CounterBasedRegularizationDefinition],
         cowclip_regularization: Optional[CowClipDefinition],
-    ) -> BaseDynamicEmbeddingOptimizerV2:
+    ) -> BaseDynamicEmbeddingOptimizer:
         self._optimizer_type = optimizer_type
         self.stochastic_rounding = stochastic_rounding
 
@@ -706,23 +706,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._optimizer_args = optimizer_args
 
         if optimizer_type == EmbOptimType.SGD:
-            optimizer = SGDDynamicEmbeddingOptimizerV2(
+            optimizer = SGDDynamicEmbeddingOptimizer(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_SGD:
-            optimizer = SGDDynamicEmbeddingOptimizerV2(
+            optimizer = SGDDynamicEmbeddingOptimizer(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.ADAM:
-            optimizer = AdamDynamicEmbeddingOptimizerV2(
+            optimizer = AdamDynamicEmbeddingOptimizer(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_ADAGRAD:
-            optimizer = AdaGradDynamicEmbeddingOptimizerV2(
+            optimizer = AdaGradDynamicEmbeddingOptimizer(
                 optimizer_args,
             )
         elif optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-            optimizer = RowWiseAdaGradDynamicEmbeddingOptimizerV2(
+            optimizer = RowWiseAdaGradDynamicEmbeddingOptimizer(
                 optimizer_args,
                 self.embedding_dtype,
             )
@@ -763,7 +763,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     @property
     def optimizer(
         self,
-    ) -> BaseDynamicEmbeddingOptimizerV2:
+    ) -> BaseDynamicEmbeddingOptimizer:
         return self._optimizer
 
     @property
@@ -849,7 +849,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
 
-        res = DynamicEmbeddingFunctionV2.apply(
+        res = DynamicEmbeddingFunction.apply(
             indices,
             offsets,
             self._caches,
@@ -859,7 +859,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._initializers if self.training else self._eval_initializers,
             self._optimizer,
             self._enable_prefetch,
-            self.use_index_dedup,
             self.training,
             self._admit_strategy,
             self._evict_strategy,

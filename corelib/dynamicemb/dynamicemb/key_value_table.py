@@ -27,7 +27,7 @@ from dynamicemb.dynamicemb_config import (
     torch_to_dyn_emb,
 )
 from dynamicemb.initializer import BaseDynamicEmbInitializer
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
     LinearBucketTable,
     ScoreArg,
@@ -107,12 +107,12 @@ def get_uvm_tensor(dim, dtype, device, is_managed=False):
 
 
 class DynamicEmbeddingTable(
-    Cache, Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizerV2]
+    Cache, Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizer]
 ):
     def __init__(
         self,
         options: DynamicEmbTableOptions,
-        optimizer: BaseDynamicEmbeddingOptimizerV2,
+        optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         self.options = options
         device_idx = torch.cuda.current_device()
@@ -1530,7 +1530,7 @@ class KeyValueTableFunction:
         storage: Storage,
         unique_keys: torch.Tensor,
         unique_grads: torch.Tensor,
-        optimizer: BaseDynamicEmbeddingOptimizerV2,
+        optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         if storage.enable_update():
             storage.update(unique_keys, unique_grads, return_missing=False)
@@ -1722,7 +1722,7 @@ class KeyValueTableCachingFunction:
         storage: Storage,
         unique_keys: torch.Tensor,
         unique_grads: torch.Tensor,
-        optimizer: BaseDynamicEmbeddingOptimizerV2,
+        optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         h_num_keys_for_storage, missing_keys, missing_indices = cache.update(
             unique_keys, unique_grads

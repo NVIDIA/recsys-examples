@@ -24,7 +24,7 @@ from dynamicemb.key_value_table import (
     KeyValueTableFunction,
     Storage,
 )
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizerV2
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import Counter
 from dynamicemb_extensions import (
     EvictStrategy,
@@ -176,7 +176,7 @@ def dynamicemb_prefetch(
         )
 
 
-class DynamicEmbeddingFunctionV2(torch.autograd.Function):
+class DynamicEmbeddingFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -187,9 +187,8 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         feature_offsets: torch.Tensor,
         output_dtype: torch.dtype,
         initializers: List[BaseDynamicEmbInitializer],
-        optimizer: BaseDynamicEmbeddingOptimizerV2,
+        optimizer: BaseDynamicEmbeddingOptimizer,
         enable_prefetch: bool = False,
-        input_dist_dedup: bool = False,
         training: bool = True,
         admit_strategy=None,
         evict_strategy=None,
@@ -420,4 +419,4 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     optimizer,
                 )
 
-        return (None,) * 22
+        return (None,) * 21
