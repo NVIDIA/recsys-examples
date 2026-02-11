@@ -27,6 +27,7 @@ except ImportError:
     pass
 import nvtx
 import torch
+from commons.utils.attn_perf_tracker import PRINT_HSTU_PERF
 from commons.utils.clear_tensor_data import clear_tensor_data
 from configs import KernelBackend
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
@@ -437,6 +438,22 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             tq = tq.view(-1, num_heads, attention_dim_per_head)
             tk = tk.view(-1, num_heads, attention_dim_per_head)
 
+        if PRINT_HSTU_PERF:
+            from commons.utils.attn_perf_tracker import _get_attn_perf_accum
+            from commons.utils.perf import _compute_attn_fwd_flops
+
+            _perf_fwd_flops = _compute_attn_fwd_flops(
+                seqlen_offsets,
+                num_heads,
+                attention_dim_per_head,
+                linear_dim_per_head,
+                causal,
+                num_targets,
+                num_contextuals,
+            )
+            _perf_fwd_start = torch.cuda.Event(enable_timing=True)
+            _perf_fwd_start.record()
+
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 # attn_output: [T, num_heads * attention_dim_per_head]
@@ -471,6 +488,15 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     num_targets=num_targets,
                     contextual_seq_len=num_contextuals,
                 )
+
+        if PRINT_HSTU_PERF:
+            _perf_fwd_end = torch.cuda.Event(enable_timing=True)
+            _perf_fwd_end.record()
+            _get_attn_perf_accum().add_fwd(
+                _perf_fwd_start, _perf_fwd_end, _perf_fwd_flops
+            )
+            ctx._perf_attn_fwd_flops = _perf_fwd_flops
+
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             # dropout ratio and seed are set in ctx
 
@@ -832,6 +858,12 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 wait_event=ctx.wgrad_event,
                 du=pre_du,
             )
+        if PRINT_HSTU_PERF:
+            from commons.utils.attn_perf_tracker import _get_attn_perf_accum
+
+            _perf_bwd_start = torch.cuda.Event(enable_timing=True)
+            _perf_bwd_start.record()
+
         with nvtx.annotate("hstu attn bwd", color="BLUE"):
             if ctx.attn_backend == KernelBackend.CUTLASS:
                 grad_q, grad_k, grad_v = _hstu_attn_cutlass_bwd(
@@ -878,6 +910,15 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output = torch.cat(
                     [grad_u, grad_v, grad_q, grad_k], dim=-1
                 ).contiguous()
+
+        if PRINT_HSTU_PERF:
+            _perf_bwd_end = torch.cuda.Event(enable_timing=True)
+            _perf_bwd_end.record()
+            _perf_bwd_flops = ctx._perf_attn_fwd_flops * 2.5
+            _get_attn_perf_accum().add_bwd(
+                _perf_bwd_start, _perf_bwd_end, _perf_bwd_flops
+            )
+
         with nvtx.annotate("ln_linear_silu bwd", color="RED"):
             if ctx.recompute_input_layernorm:
                 (
