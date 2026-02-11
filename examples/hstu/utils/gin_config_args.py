@@ -147,8 +147,6 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
         item_vocab_gpu_capacity_ratio (Optional[float]): Item vocabulary GPU capacity ratio
             (lowest priority). Default: None.
         evict_strategy (str): Eviction strategy: "lru" or "lfu". Default: "lru".
-        caching (bool): Enable caching on HBM. When caching is enabled, the
-            global_hbm_for_values indicates the cache size. Default: False.
 
     Note:
         - sharding_type is automatically set to "model_parallel".
@@ -166,7 +164,6 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
     item_vocab_gpu_capacity_ratio: Optional[float] = None
 
     evict_strategy: str = "lru"
-    caching: bool = False
 
     def __post_init__(self):
         self.sharding_type = "model_parallel"

@@ -482,7 +482,6 @@ def test_forward_train_eval(
             embedding_dtype=value_type,
             device_id=device_id,
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
             local_hbm_for_values=1024**3,
             external_storage=PS,
         )
@@ -648,7 +647,6 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, determinist
             embedding_dtype=value_type,
             device_id=device_id,
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
             local_hbm_for_values=1024**3,
             external_storage=PS,
         )
@@ -791,7 +789,6 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
             embedding_dtype=value_type,
             device_id=device_id,
             score_strategy=DynamicEmbScoreStrategy.STEP,
-            caching=True,
             local_hbm_for_values=1024**3,
             external_storage=PS,
         )
@@ -976,7 +973,6 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
             embedding_dtype=value_type,
             device_id=device_id,
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
             local_hbm_for_values=init_capacity * dim * 4,
             external_storage=PS,
         )
@@ -1093,7 +1089,6 @@ def test_empty_batch(opt_type, opt_params, dim, caching, deterministic, PS):
             embedding_dtype=value_type,
             device_id=device_id,
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
             local_hbm_for_values=1024**3,
             external_storage=PS,
         )

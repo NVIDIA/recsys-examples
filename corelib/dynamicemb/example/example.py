@@ -521,7 +521,6 @@ def get_planner(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
                 score_strategy=DynamicEmbScoreStrategy.STEP,
-                caching=caching,
                 training=training,
                 admit_strategy=admit_strategy,
                 admission_counter=admission_counter,
@@ -596,7 +595,7 @@ def apply_dmp(model, args, training):
         args.batch_size,
         optimizer_type=optimizer_type,
         training=training,
-        caching=args.caching,
+        caching=args.caching,  # used for HBM budget calculation, not passed to options
         args=args,
     )
     # get plan for all ranks.

@@ -199,7 +199,6 @@ def apply_dmp(
     device: torch.device,
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
     use_index_dedup: bool = False,
-    caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
 ):
@@ -213,11 +212,7 @@ def apply_dmp(
                 tmp_type = eb_config.data_type
 
                 embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-                emb_num_embeddings = (
-                    eb_config.num_embeddings * cache_capacity_ratio
-                    if caching
-                    else eb_config.num_embeddings
-                )
+                emb_num_embeddings = eb_config.num_embeddings
                 emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
                     math.log2(emb_num_embeddings)
                 )  # HKV need embedding vector num is power of 2
@@ -249,11 +244,19 @@ def apply_dmp(
                     else 0
                 )
 
-                # Include optimizer state in HBM calculation
-                total_hbm_need = (
+                # Include optimizer state in HBM calculation.
+                # When cache_capacity_ratio < 1, scale down so that only a
+                # fraction of the table fits in HBM (triggers cache+storage).
+                # When cache_capacity_ratio >= 1, use full size (all-HBM mode).
+                full_table_hbm = (
                     embedding_type_bytes
                     * (dim + optimizer_state_dim)
                     * emb_num_embeddings_next_power_of_2
+                )
+                total_hbm_need = int(
+                    full_table_hbm * cache_capacity_ratio
+                    if cache_capacity_ratio < 1.0
+                    else full_table_hbm
                 )
 
                 admission_counter = KVCounter(
@@ -268,7 +271,6 @@ def apply_dmp(
                     ),
                     bucket_capacity=emb_num_embeddings_next_power_of_2,
                     max_capacity=emb_num_embeddings_next_power_of_2,
-                    caching=caching,
                     local_hbm_for_values=1024**3,
                     admit_strategy=admit_strategy,
                     admission_counter=admission_counter,
@@ -308,7 +310,6 @@ def create_model(
     optimizer_kwargs: Dict[str, Any],
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
     use_index_dedup: bool = False,
-    caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
 ):
@@ -344,7 +345,6 @@ def create_model(
         torch.device(f"cuda:{torch.cuda.current_device()}"),
         score_strategy=score_strategy,
         use_index_dedup=use_index_dedup,
-        caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
     )

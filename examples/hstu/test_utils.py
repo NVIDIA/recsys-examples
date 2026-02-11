@@ -577,8 +577,6 @@ def create_model(
             "item": DynamicEmbTableOptions(
                 global_hbm_for_values=1024 * 1024,  # 1M HBM (maybe cached)
                 score_strategy=DynamicEmbScoreStrategy.STEP,
-                caching=pipeline_type
-                == "prefetch",  # when prefetch is enabled, we must enable caching
             ),
         }
         if use_dynamic_emb

@@ -133,7 +133,6 @@ def test_without_eviction(
             local_hbm_for_values=1024**3,
             score_strategy=score_strategy,
             num_of_buckets_per_alloc=num_embeddings[i] // bucket_capacity,
-            caching=caching,
         )
         for i in range(table_num)
     ]

@@ -322,7 +322,6 @@ def create_dynamic_embedding_tables(args, device):
                 score_strategy=DynamicEmbScoreStrategy.LFU
                 if args.cache_algorithm == "lfu"
                 else DynamicEmbScoreStrategy.TIMESTAMP,
-                caching=args.caching,
             )
         )
 

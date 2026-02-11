@@ -80,9 +80,7 @@ def main():
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
     trainer_args = TrainerArgs()
-    dataset_args, embedding_args = get_dataset_and_embedding_args(
-        trainer_args.pipeline_type == "prefetch"
-    )
+    dataset_args, embedding_args = get_dataset_and_embedding_args()
     network_args = NetworkArgs()
     optimizer_args = OptimizerArgs()
     tp_args = TensorModelParallelArgs()

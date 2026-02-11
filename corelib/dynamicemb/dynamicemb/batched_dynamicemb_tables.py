@@ -524,48 +524,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 dtype=self.embedding_dtype,
             )
         )
-        
-    def _enable_cache_decision(
-        self, caching, hbm_budget, value_size, capacity, bucket_capacity
-    ) -> Tuple[bool, int, bool]:
-        """
-        The principles are as follows:
-            1. Cannot exceed the budget
-            2. If the budget is too small, HBM is not necessary
-        """
-
-        # if not caching, it is the flag to represent the single table on device or host.
-        on_device = True
-
-        if not caching:
-            if hbm_budget == 0:
-                on_device = False
-            elif hbm_budget > 0 and hbm_budget < value_size * capacity:
-                # Caching is not enabled but HBM is not enough to hold the entire table, so adjust to caching mode
-                # to utilize the reserved HBM
-                caching = True
-
-        if caching:
-            # If the budget is too small, HBM is not necessary
-            if hbm_budget < bucket_capacity * value_size:
-                warnings.warn(
-                    "The HBM budget is too small to serve as a cache, fallback to host table.",
-                    UserWarning,
-                )
-                caching = False
-                on_device = False
-
-        if caching:
-            cache_capacity = hbm_budget // value_size
-        else:
-            cache_capacity = -1
-
-        return caching, cache_capacity, on_device
 
     def _create_cache_storage(self) -> None:
         self._storages: List[Storage] = []
         self._caches: List[Cache] = []
-        self._caching = self._dynamicemb_options[0].caching
+        self._caching = False
 
         for option in self._dynamicemb_options:
             if option.training and option.optimizer_type == OptimizerType.Null:
@@ -576,28 +539,39 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "Set OptimizerType to Null as not on training mode.", UserWarning
                 )
 
-            bucket_capacity_for_cache = 1024
-
-            caching, cache_capacity, on_device = self._enable_cache_decision(
-                option.caching,
-                option.local_hbm_for_values,
-                get_value_size(
-                    option.embedding_dtype,
-                    option.dim,
-                    option.optimizer_type,
-                ),
-                option.max_capacity,
-                bucket_capacity_for_cache,
+            value_size = get_value_size(
+                option.embedding_dtype,
+                option.dim,
+                option.optimizer_type,
             )
+            total_table_bytes = value_size * option.max_capacity
+            hbm_budget = option.local_hbm_for_values
 
-            if caching:
+            if hbm_budget == 0:
+                # No HBM budget -> storage only, on host
+                option.local_hbm_for_values = 0
+                self._caches.append(None)
+                self._storages.append(DynamicEmbeddingTable(option, self._optimizer))
+            elif total_table_bytes <= hbm_budget:
+                # Entire table fits in HBM -> single table on GPU serves as
+                # both cache and storage (no eviction needed).
+                self._caching = True
+                table = DynamicEmbeddingTable(option, self._optimizer)
+                self._caches.append(table)
+                self._storages.append(table)
+            else:
+                # Partial HBM -> cache (GPU) + storage (host or external)
+                self._caching = True
+                bucket_capacity_for_cache = 1024
+                cache_capacity = hbm_budget // value_size
+
                 cache_option = deepcopy(option)
                 cache_option.bucket_capacity = bucket_capacity_for_cache
-
                 cache_option.max_capacity = cache_capacity
                 cache_option.init_capacity = cache_capacity
-
-                self._caches.append(DynamicEmbeddingTable(cache_option, self._optimizer))
+                self._caches.append(
+                    DynamicEmbeddingTable(cache_option, self._optimizer)
+                )
 
                 storage_option = deepcopy(option)
                 storage_option.local_hbm_for_values = 0
@@ -607,11 +581,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     if PS
                     else DynamicEmbeddingTable(storage_option, self._optimizer)
                 )
-            else:
-                self._caches.append(None)
-                if not on_device:
-                    option.local_hbm_for_values = 0
-                self._storages.append(DynamicEmbeddingTable(option, self._optimizer))
 
         _print_memory_consume(
             self._table_names, self._dynamicemb_options, self._optimizer, self.device_id

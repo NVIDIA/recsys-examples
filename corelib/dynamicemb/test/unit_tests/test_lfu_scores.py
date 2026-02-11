@@ -270,8 +270,7 @@ def test_lfu_score_validation(
         optimizer_kwargs=optimizer_kwargs,
         score_strategy=DynamicEmbScoreStrategy.LFU,
         use_index_dedup=use_index_dedup,
-        caching=caching,
-        cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
+        cache_capacity_ratio=cache_capacity_ratio if caching else 1.0,
     )
 
     # Generate features with frequency tracking

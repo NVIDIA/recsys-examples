@@ -222,22 +222,6 @@ class DynamicEmbTableOptions(_ContextOptions):
         For `UNIFORM` and `TRUNCATED_NORMAL`, the `lower` and `upper` will set to $\pm {1 \over \sqrt{EmbeddingConfig.num\_embeddings}}$.
     eval_initializer_args: DynamicEmbInitializerArgs
         The initializer args for evaluation mode, and will return torch.zeros(...) as embedding by default if index/sparse feature is missing.
-    caching: bool
-        Flag to indicate dynamic embedding tables is working on caching mode, default to `False`.
-        When the device memory on a single GPU is insufficient to accommodate a single shard of the dynamic embedding table,
-            dynamicemb supports the mixed use of device memory and host memory(pinned memory).
-        But by default, the values of the entire table are concatenated with device memory and host memory.
-        This means that the storage location of one embedding is determined by `hash_function(key)`, and mapping to device memory will bring better lookup performance.
-        However, sparse features in training are often with temporal locality.
-        In order to store hot keys in device memory, dynamicemb creates two table instances,
-            whose values are stored in device memory and host memory respectively, and store hot keys on the GPU table priorily.
-        If the GPU table is full, the evicted keys will be inserted into the host table.
-        If the host table is also full, the key will be evicted(all the eviction is based on the score per key).
-        The original intention of eviction is based on this insight: features that only appear once should not occupy memory(even host memory) for a long time.
-        In short:
-            set **`caching=True`** will create a GPU table and a host table, and make GPU table serves as a cache;
-            set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
-            All keys and other meta data are always stored on GPU for both cases.
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
         If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
@@ -265,9 +249,9 @@ class DynamicEmbTableOptions(_ContextOptions):
         Please refer to the API documentation for DynamicEmbCheckMode for more information.
     global_hbm_for_values : int
         Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
-        It has different meanings under `caching=True` and  `caching=False`.
-            When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
-            When `caching=True`, it decides the table capacity of the GPU table.
+        If the budget can hold the entire table (max_capacity * value_size), the table lives entirely on GPU.
+        If the budget is nonzero but smaller, it determines the GPU cache capacity while the full table is stored on host/external storage.
+        If zero, the table is stored entirely on host memory.
     external_storage: Storage
         The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
         If not provided, will using DynamicEmbeddingTable as the Storage.
@@ -297,7 +281,6 @@ class DynamicEmbTableOptions(_ContextOptions):
             value=0.0,
         )
     )
-    caching: bool = False
     init_capacity: Optional[
         int
     ] = None  # if not set then set to max_capcacity after sharded
@@ -339,7 +322,6 @@ class DynamicEmbTableOptions(_ContextOptions):
     def get_grouped_key(self):
         grouped_key = {}
         grouped_key["training"] = self.training
-        grouped_key["caching"] = self.caching
         grouped_key["external_storage"] = self.external_storage
         grouped_key["index_type"] = self.index_type
         grouped_key["score_strategy"] = self.score_strategy

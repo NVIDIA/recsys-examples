@@ -311,8 +311,7 @@ def test_admission_strategy_validation(
             score_strategy
         ),  # Use timestamp for admission
         use_index_dedup=use_index_dedup,
-        caching=caching,
-        cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
+        cache_capacity_ratio=cache_capacity_ratio if caching else 1.0,
         admit_strategy=admission_strategy,  # Pass admission strategy
     )
 
