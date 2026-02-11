@@ -619,11 +619,14 @@ class KeyValueTable(
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
             meta_data["evict_strategy"] = str(self.table.evict_strategy())
-            
+
             if current_score is not None:
                 meta_data["step_score"] = current_score
 
             save_to_json(meta_data, meta_json_file_path)
+
+        ckpt_state_dim = self.optimizer.get_ckpt_state_dim(self._emb_dim)
+        state_dim = self.optimizer.get_state_dim(self._emb_dim)
 
         fkey = open(emb_key_path, "wb")
         fembedding = open(embedding_file_path, "wb")
@@ -639,6 +642,8 @@ class KeyValueTable(
                 scores = self._timestamp - scores
             fscore.write(scores.cpu().numpy().tobytes())
             if fopt_states:
+                if ckpt_state_dim != state_dim:
+                    opt_states = opt_states[:, :ckpt_state_dim].contiguous()
                 fopt_states.write(opt_states.cpu().numpy().tobytes())
 
         fkey.close()
@@ -692,6 +697,7 @@ class KeyValueTable(
 
         dim = dyn_emb_cols(self.table)
         optstate_dim = self.table.optstate_dim()
+        ckpt_state_dim = self.optimizer.get_ckpt_state_dim(dim)
 
         if optstate_dim == 0:
             include_optim = False
@@ -729,7 +735,7 @@ class KeyValueTable(
             num_opt_states = (
                 os.path.getsize(opt_file_path)
                 // OPT_STATE_TYPE.itemsize
-                // optstate_dim
+                // ckpt_state_dim
             )
             if num_keys != num_opt_states:
                 raise ValueError(
@@ -758,7 +764,7 @@ class KeyValueTable(
             opt_states = None
             if fopt_states:
                 opt_state_bytes = fopt_states.read(
-                    OPT_STATE_TYPE.itemsize * optstate_dim * num_keys_to_read
+                    OPT_STATE_TYPE.itemsize * ckpt_state_dim * num_keys_to_read
                 )
                 opt_states = torch.tensor(
                     np.frombuffer(
@@ -766,7 +772,19 @@ class KeyValueTable(
                     ),
                     dtype=OPT_STATE_TYPE,
                     device=device,
-                ).view(-1, optstate_dim)
+                ).view(-1, ckpt_state_dim)
+                if ckpt_state_dim != optstate_dim:
+                    padded = (
+                        torch.ones(
+                            opt_states.size(0),
+                            optstate_dim,
+                            dtype=OPT_STATE_TYPE,
+                            device=device,
+                        )
+                        * self._initial_optim_state
+                    )
+                    padded[:, :ckpt_state_dim] = opt_states
+                    opt_states = padded
 
             keys = torch.tensor(
                 np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
@@ -1462,6 +1480,9 @@ class DynamicEmbeddingTable(KeyValueTable):
                 meta_data["step_score"] = current_score
             save_to_json(meta_data, meta_json_file_path)
 
+        ckpt_state_dim = self.optimizer.get_ckpt_state_dim(self._emb_dim)
+        state_dim = self.optimizer.get_state_dim(self._emb_dim)
+
         fkey = open(emb_key_path, "wb")
         fembedding = open(embedding_file_path, "wb")
         fscore = open(score_file_path, "wb")
@@ -1479,6 +1500,8 @@ class DynamicEmbeddingTable(KeyValueTable):
             fembedding.write(embeddings.cpu().numpy().tobytes())
 
             if fopt_states and opt_states is not None:
+                if ckpt_state_dim != state_dim:
+                    opt_states = opt_states[:, :ckpt_state_dim].contiguous()
                 fopt_states.write(opt_states.cpu().numpy().tobytes())
 
         fkey.close()
@@ -1532,6 +1555,7 @@ class DynamicEmbeddingTable(KeyValueTable):
 
         dim = self._emb_dim
         optstate_dim = self.optim_state_dim()
+        ckpt_state_dim = self.optimizer.get_ckpt_state_dim(dim)
 
         if optstate_dim == 0:
             include_optim = False
@@ -1569,7 +1593,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             num_opt_states = (
                 os.path.getsize(opt_file_path)
                 // OPT_STATE_TYPE.itemsize
-                // optstate_dim
+                // ckpt_state_dim
             )
             if num_keys != num_opt_states:
                 raise ValueError(
@@ -1598,7 +1622,7 @@ class DynamicEmbeddingTable(KeyValueTable):
             opt_states = None
             if fopt_states:
                 opt_state_bytes = fopt_states.read(
-                    OPT_STATE_TYPE.itemsize * optstate_dim * num_keys_to_read
+                    OPT_STATE_TYPE.itemsize * ckpt_state_dim * num_keys_to_read
                 )
                 opt_states = torch.tensor(
                     np.frombuffer(
@@ -1606,7 +1630,19 @@ class DynamicEmbeddingTable(KeyValueTable):
                     ),
                     dtype=OPT_STATE_TYPE,
                     device=device,
-                ).view(-1, optstate_dim)
+                ).view(-1, ckpt_state_dim)
+                if ckpt_state_dim != optstate_dim:
+                    padded = (
+                        torch.ones(
+                            opt_states.size(0),
+                            optstate_dim,
+                            dtype=OPT_STATE_TYPE,
+                            device=device,
+                        )
+                        * self._initial_optim_state
+                    )
+                    padded[:, :ckpt_state_dim] = opt_states
+                    opt_states = padded
 
             keys = torch.tensor(
                 np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
