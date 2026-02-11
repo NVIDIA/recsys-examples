@@ -33,7 +33,7 @@ def setup_device():
 def test_segmented_unique_basic(setup_device):
     """Test basic segmented unique operation with large input (1M keys)."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     num_tables = 10
     num_keys = 1_000_000
@@ -55,7 +55,7 @@ def test_segmented_unique_basic(setup_device):
         output_indices,
         table_offsets,
         freq_counters,
-    ) = segmented_unique_cuda(keys, table_ids, num_tables, device_sm_count)
+    ) = segmented_unique_cuda(keys, table_ids, num_tables)
     torch.cuda.synchronize()
 
     # Check table offsets
@@ -93,7 +93,7 @@ def test_segmented_unique_basic(setup_device):
 def test_segmented_unique_overlapping_keys(setup_device):
     """Test segmented unique with same keys in different tables (1M keys)."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     num_tables = 8
     num_keys = 1_000_000
@@ -110,7 +110,7 @@ def test_segmented_unique_overlapping_keys(setup_device):
     ).values
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
-        keys, table_ids, num_tables, device_sm_count
+        keys, table_ids, num_tables
     )
     torch.cuda.synchronize()
 
@@ -142,7 +142,7 @@ def test_segmented_unique_overlapping_keys(setup_device):
 def test_segmented_unique_empty_tables(setup_device):
     """Test segmented unique with some empty tables (1M keys)."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     num_tables = 10
     num_keys = 1_000_000
@@ -159,7 +159,7 @@ def test_segmented_unique_empty_tables(setup_device):
     keys = torch.randint(0, 10000, (num_keys,), dtype=torch.int64, device=device)
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
-        keys, table_ids, num_tables, device_sm_count
+        keys, table_ids, num_tables
     )
     torch.cuda.synchronize()
 
@@ -195,7 +195,7 @@ def test_segmented_unique_empty_tables(setup_device):
 def test_segmented_unique_empty_input(setup_device):
     """Test segmented unique with empty input."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     keys = torch.tensor([], dtype=torch.int64, device=device)
     table_ids = torch.tensor([], dtype=torch.int32, device=device)
@@ -207,7 +207,7 @@ def test_segmented_unique_empty_input(setup_device):
         output_indices,
         table_offsets,
         freq_counters,
-    ) = segmented_unique_cuda(keys, table_ids, num_tables, device_sm_count)
+    ) = segmented_unique_cuda(keys, table_ids, num_tables)
     torch.cuda.synchronize()
 
     assert unique_keys.numel() == 0, "Empty input should return empty unique keys"
@@ -225,7 +225,7 @@ def test_segmented_unique_empty_input(setup_device):
 def test_segmented_unique_random(setup_device):
     """Test segmented unique with random data (1M keys)."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     num_tables = 16
     num_keys = 1_000_000
@@ -239,7 +239,7 @@ def test_segmented_unique_random(setup_device):
     ).values
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
-        keys, table_ids, num_tables, device_sm_count
+        keys, table_ids, num_tables
     )
     torch.cuda.synchronize()
 
@@ -267,7 +267,7 @@ def test_segmented_unique_random(setup_device):
 def test_segmented_unique_stress(setup_device):
     """Stress test with very large input (4M keys, many tables)."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     num_tables = 32
     num_keys = 4_000_000
@@ -288,7 +288,7 @@ def test_segmented_unique_stress(setup_device):
     start = time.perf_counter()
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
-        keys, table_ids, num_tables, device_sm_count
+        keys, table_ids, num_tables
     )
     torch.cuda.synchronize()
 
@@ -312,7 +312,7 @@ def test_segmented_unique_stress(setup_device):
 def test_segmented_unique_with_frequency_counters(setup_device):
     """Test segmented unique with frequency counting enabled."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     num_tables = 4
     num_keys = 100000
@@ -333,9 +333,7 @@ def test_segmented_unique_with_frequency_counters(setup_device):
         output_indices,
         table_offsets,
         freq_counters,
-    ) = segmented_unique_cuda(
-        keys, table_ids, num_tables, device_sm_count, empty_freq_tensor
-    )
+    ) = segmented_unique_cuda(keys, table_ids, num_tables, empty_freq_tensor)
     torch.cuda.synchronize()
 
     # freq_counters should have values
@@ -368,7 +366,7 @@ def test_segmented_unique_with_frequency_counters(setup_device):
 def test_segmented_unique_with_custom_frequencies(setup_device):
     """Test segmented unique with custom input frequencies."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     num_tables = 2
     num_keys = 1000
@@ -388,9 +386,7 @@ def test_segmented_unique_with_custom_frequencies(setup_device):
         output_indices,
         table_offsets,
         freq_counters,
-    ) = segmented_unique_cuda(
-        keys, table_ids, num_tables, device_sm_count, input_frequencies
-    )
+    ) = segmented_unique_cuda(keys, table_ids, num_tables, input_frequencies)
     torch.cuda.synchronize()
 
     total_unique = num_uniques.item()
@@ -417,7 +413,7 @@ def test_segmented_unique_with_custom_frequencies(setup_device):
 def test_expand_table_ids(setup_device):
     """Test expand_table_ids_cuda helper function."""
     device = setup_device
-    device_sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda.get_device_properties(device).multi_processor_count
 
     # Simulate a jagged tensor with 2 tables, 2 features per table, batch_size=3
     # Table 0: features 0, 1
@@ -467,7 +463,6 @@ def test_expand_table_ids(setup_device):
         num_tables,
         local_batch_size,
         num_elements,
-        device_sm_count,
     )
     torch.cuda.synchronize()
 
