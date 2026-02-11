@@ -712,6 +712,28 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd,
             batch_shuffler=batch_shuffler,
         )
+        # Background thread for H2D + batch shuffle so it doesn't block
+        # the main thread's forward / backward.
+        import concurrent.futures
+
+        self._shuffle_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="shuffle"
+        )
+        self._shuffle_future: Optional["concurrent.futures.Future[Optional[In]]"] = None
+
+    def _h2d_and_shuffle(self, batch: In) -> In:
+        """
+        H2D transfer + batch shuffle, executed on a background thread.
+
+        All CUDA / NCCL work is issued on ``_memcpy_stream`` so that it can
+        run concurrently with the default-stream forward / backward on the
+        main thread.
+        """
+        torch.cuda.set_device(self._device)
+        with self._stream_context(self._memcpy_stream):
+            batch = _to_device(batch, self._device, non_blocking=True)
+            batch = self._batch_shuffle(batch)
+        return batch
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
@@ -752,12 +774,39 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                 # invoke splits all_to_all comms (first part of input_dist)
                 self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
-        # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
-        with nvtx.annotate("## enqueue_batch ##"):
-            self.enqueue_batch(dataloader_iter)
-        # forward
+        # ---- Submit H2D + shuffle for batch i+2 to background thread ----
+        # _next_batch and _create_context stay on the main thread.
+        # Only the GPU / NCCL work is offloaded.
+        with nvtx.annotate("## enqueue_copy_and_shuffle ##"):
+            enqueue_context = self._create_context()
+            raw_batch = self._next_batch(dataloader_iter)
+            if raw_batch is not None:
+                self._shuffle_future = self._shuffle_executor.submit(
+                    self._h2d_and_shuffle, raw_batch
+                )
+            else:
+                self._shuffle_future = None
+            self._enqueue_context = enqueue_context
+
+        # ---- Main thread continues immediately — no blocking! ----
+        # NOTE: forward does NOT call any NCCL collective on the DP process
+        # group, so it is safe to overlap with the background shuffle (which
+        # uses the DP group for AllGather / AllReduce).
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self.batches[0])
+
+        # ---- Wait for background shuffle BEFORE any DP-group NCCL call ----
+        # CRITICAL: same NCCL ordering constraint as the prefetch variant —
+        # we must not touch the DP communicator from the main thread until
+        # the background thread's DP-group NCCL calls have all been enqueued.
+        with nvtx.annotate("## wait_copy_and_shuffle ##"):
+            if self._shuffle_future is not None:
+                shuffled_batch = self._shuffle_future.result()
+                self._shuffle_future = None
+                self.batches.append(shuffled_batch)
+                self.contexts.append(self._enqueue_context)
+            # else: dataloader exhausted, nothing to append
+
         with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
@@ -815,6 +864,30 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             custom_model_fwd,
             batch_shuffler,
         )
+        # Background thread for H2D + batch shuffle so it doesn't block
+        # the main thread's forward / backward.
+        # The thread uses _memcpy_stream for all CUDA / NCCL operations,
+        # which is independent of the default stream used by fwd/bwd.
+        import concurrent.futures
+
+        self._shuffle_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="shuffle"
+        )
+        self._shuffle_future: Optional["concurrent.futures.Future[Optional[In]]"] = None
+
+    def _h2d_and_shuffle(self, batch: In) -> In:
+        """
+        H2D transfer + batch shuffle, executed on a background thread.
+
+        All CUDA / NCCL work is issued on ``_memcpy_stream`` so that it can
+        run concurrently with the default-stream forward / backward on the
+        main thread.
+        """
+        torch.cuda.set_device(self._device)
+        with self._stream_context(self._memcpy_stream):
+            batch = _to_device(batch, self._device, non_blocking=True)
+            batch = self._batch_shuffle(batch)
+        return batch
 
     def progress(self, dataloader_iter: Iterator[In]) -> Tuple[torch.Tensor, Out]:
         self._fill_pipeline(dataloader_iter)
@@ -828,14 +901,49 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         with nvtx.annotate("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
 
-        with nvtx.annotate("## copy_batch_to_gpu_and_shuffle ##"):
-            self._batch_ip2 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
+        # ---- Submit H2D + shuffle for batch_ip2 to background thread ----
+        # _next_batch stays on the main thread (dataloader iter is not thread-safe).
+        # Only the GPU / NCCL work is offloaded.
+        with nvtx.annotate("## enqueue_copy_and_shuffle ##"):
+            raw_batch = self._next_batch(dataloader_iter)
+            if raw_batch is not None:
+                self._shuffle_future = self._shuffle_executor.submit(
+                    self._h2d_and_shuffle, raw_batch
+                )
+            elif not self._execute_all_batches:
+                raise StopIteration
+            else:
+                self._shuffle_future = None
+
+        # ---- Main thread continues immediately — no blocking! ----
+        # NOTE: wait_sparse_data_dist and forward do NOT call any NCCL
+        # collective on the DP process group, so they are safe to overlap
+        # with the background shuffle (which uses the DP group for
+        # AllGather / AllReduce).
         with nvtx.annotate("## wait_sparse_data_dist ##"):
             self._wait_sparse_data_dist()
         # forward
         reporting_loss = None
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self._batch_i)
+
+        # ---- Wait for background shuffle BEFORE any DP-group NCCL call ----
+        # CRITICAL: The background thread issues NCCL collectives on the DP
+        # process group (AllGather for workloads, AllReduce for actual_bs,
+        # AllGather for KJT lengths/values).  If the main thread were to
+        # issue its own DP-group NCCL call (loss AllReduce below) while the
+        # background thread's NCCL calls are still in-flight, the resulting
+        # per-rank enqueue order on the shared NCCL communicator may differ,
+        # causing a **deadlock**.  Waiting here ensures the background
+        # thread's NCCL calls have ALL been enqueued before the main thread
+        # touches the DP communicator.
+        with nvtx.annotate("## wait_copy_and_shuffle ##"):
+            if self._shuffle_future is not None:
+                self._batch_ip2 = self._shuffle_future.result()
+                self._shuffle_future = None
+            else:
+                self._batch_ip2 = None
+
         with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
