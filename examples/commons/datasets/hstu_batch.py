@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import warnings
 from dataclasses import dataclass
 from enum import Enum
@@ -33,6 +34,7 @@ class DistType(str, Enum):
     UNIFORM = "uniform"
     NORMAL = "normal"
     ZIPF = "zipf"
+    LOGNORMAL = "lognormal"
 
 
 @gin.configurable
@@ -49,19 +51,31 @@ class RandomDistribution:
     All samples are natural numbers (>= 0). The default lower bound is 0, and the default
     upper bound is unbounded (None means no upper clamp).
 
-    Supports three distribution types:
+    Supports four distribution types:
       - **uniform**: Samples uniformly from [low, high). ``high`` is required for uniform.
       - **normal**: Samples from N(mean, std), then rounds and clamps to [low, high].
       - **zipf**: Samples from Zipf(alpha) with P(k) ∝ k^{-alpha} (k >= 1),
             shifted to start from ``low``, then clamps to [low, high].
+      - **lognormal**: Samples from LogNormal(mean, std), then rounds and clamps to
+            [low, high]. Useful for modeling sequence lengths which are typically
+            right-skewed (many short sequences, few long ones). For lognormal, the [M/r,M⋅r]
+            interval ratio only depends on r, and is independent of M.
 
     Args:
-        dist_type: One of ``DistType.UNIFORM``, ``DistType.NORMAL``, ``DistType.ZIPF``.
+        dist_type: One of ``DistType.UNIFORM``, ``DistType.NORMAL``, ``DistType.ZIPF``,
+                   ``DistType.LOGNORMAL``.
         low: Inclusive lower bound. Default: 0.
         high: Optional exclusive upper bound for uniform, or inclusive upper clamp for
               normal/zipf. Default: None (no upper bound, except uniform which requires it).
-        mean: Mean for normal distribution. Default: None (auto-inferred).
-        std: Standard deviation for normal distribution. Default: None (auto-inferred).
+        mean: Mean parameter. For normal this is the distribution mean; for lognormal
+              this is the **actual (real-space) mean** E[X], *not* the underlying μ.
+              Default: None (auto-inferred).
+        std: Std parameter. For normal this is the distribution std; for lognormal
+             this is the **actual (real-space) standard deviation** SD[X], *not* the
+             underlying σ.  The underlying lognormal parameters are derived as:
+             ``σ² = ln(1 + (std/mean)²)``, ``μ = ln(mean) - σ²/2``.
+             Default: None. For lognormal, defaults to ``mean / 2`` (CV = 0.5,
+             ~80% of samples within [0.49M, 1.64M]).
         alpha: Shape parameter for Zipf distribution (must be > 1.0). Default: 1.5.
 
     Example:
@@ -70,6 +84,8 @@ class RandomDistribution:
         >>> samples = dist.sample(size=128, device=torch.device("cpu"))
         >>> # Normal clamped to [10, 500]
         >>> dist = RandomDistribution(DistType.NORMAL, low=10, high=500, mean=100, std=50)
+        >>> # Lognormal: actual mean=512, actual std=256 (80% within ~[256, 1024])
+        >>> dist = RandomDistribution(DistType.LOGNORMAL, mean=512, std=256, high=2048)
     """
 
     dist_type: DistType
@@ -110,6 +126,28 @@ class RandomDistribution:
             ), "normal distribution requires `mean` and `std` to be set"
             assert self.std > 0, f"normal requires std > 0, got {self.std}"
             samples = torch.normal(self.mean, self.std, (size,))
+            samples = samples.clamp(min=lo)
+            if hi is not None:
+                samples = samples.clamp(max=hi - 1)
+            return samples.round().long().to(device)
+
+        elif self.dist_type == DistType.LOGNORMAL:
+            assert (
+                self.mean is not None
+            ), "lognormal distribution requires `mean` to be set"
+            assert self.mean > 0, f"lognormal requires mean > 0, got {self.mean}"
+            # Default CV = 0.5 (std = mean / 2) when std is not specified
+            actual_std = self.std if self.std is not None else self.mean / 2.0
+            assert actual_std > 0, f"lognormal requires std > 0, got {actual_std}"
+            # User specifies actual (real-space) mean M and std S.
+            # Convert to underlying normal parameters:
+            #   σ² = ln(1 + (S/M)²)
+            #   μ  = ln(M) - σ²/2
+            cv_sq = (actual_std / self.mean) ** 2
+            sigma_sq = math.log(1.0 + cv_sq)
+            mu = math.log(self.mean) - sigma_sq / 2.0
+            sigma = math.sqrt(sigma_sq)
+            samples = torch.distributions.LogNormal(mu, sigma).sample((size,))
             samples = samples.clamp(min=lo)
             if hi is not None:
                 samples = samples.clamp(max=hi - 1)
