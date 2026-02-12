@@ -1,0 +1,138 @@
+
+# ===== Trainer Configuration =====
+TrainerArgs.train_batch_size = 32
+TrainerArgs.eval_batch_size = 32
+TrainerArgs.log_interval = 100
+TrainerArgs.eval_interval = 400
+TrainerArgs.max_train_iters = 1000
+TrainerArgs.max_eval_iters = 50
+TrainerArgs.seed = 1234
+TrainerArgs.pipeline_type = 'none'
+TrainerArgs.enable_balanced_shuffler = True
+
+# Profiling
+TrainerArgs.profile = True
+TrainerArgs.profile_step_start = 10
+TrainerArgs.profile_step_end = 50
+
+# Checkpoint
+TrainerArgs.ckpt_save_dir = './checkpoints/'
+TrainerArgs.ckpt_save_interval = 999999999
+
+# ===== Dataset Configuration =====
+# Main sequence features (item + action)
+
+# === Random distributions (optional, for BenchmarkDataset) ===
+# Sequence length distribution: Zipf, values in [low, max_sequence_length)
+item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
+item_and_action_feature/FeatureArgs.max_sequence_length = 2048
+item_and_action_feature/FeatureArgs.is_jagged = True
+item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
+item_seqlen_dist/RandomDistribution.alpha = 1.2
+item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length
+item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
+
+# Contextual Features (only 3)
+user_contextual_features/FeatureArgs.feature_names = ['user_id', 'user_age']
+user_contextual_features/FeatureArgs.max_sequence_length = 1
+user_contextual_features/FeatureArgs.is_jagged = False
+
+item_contextual_features/FeatureArgs.feature_names = ['item_category_l1']
+item_contextual_features/FeatureArgs.max_sequence_length = 1
+item_contextual_features/FeatureArgs.is_jagged = False
+
+BenchmarkDatasetArgs.feature_args = [
+    @item_and_action_feature/FeatureArgs(),
+    @user_contextual_features/FeatureArgs(),
+    @item_contextual_features/FeatureArgs(),
+]
+
+BenchmarkDatasetArgs.item_feature_name = 'item'
+BenchmarkDatasetArgs.contextual_feature_names = [
+    'user_id',
+    'user_age',
+    'item_category_l1',
+]  # Total 3 contextual features
+BenchmarkDatasetArgs.action_feature_name = 'action'
+BenchmarkDatasetArgs.max_num_candidates = 0
+
+# ===== Embedding Configuration =====
+# Item embedding (main ID)
+item_embedding/DynamicEmbeddingArgs.feature_names = ['item']
+item_embedding/DynamicEmbeddingArgs.table_name = 'item'
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
+item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
+item_embedding/DynamicEmbeddingArgs.caching = False
+
+# Action embedding
+action_embedding/EmbeddingArgs.feature_names = ['action']
+action_embedding/EmbeddingArgs.table_name = 'action'
+action_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 100
+action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
+
+# Contextual Feature Embeddings (3 total)
+user_id_emb/DynamicEmbeddingArgs.feature_names = ['user_id']
+user_id_emb/DynamicEmbeddingArgs.table_name = 'user_id'
+user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 10000  # 10K (smaller than item)
+user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+user_id_emb/DynamicEmbeddingArgs.caching = False
+
+user_age_emb/DynamicEmbeddingArgs.feature_names = ['user_age']
+user_age_emb/DynamicEmbeddingArgs.table_name = 'user_age'
+user_age_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 100
+user_age_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+user_age_emb/DynamicEmbeddingArgs.caching = False
+
+item_cat_l1_emb/DynamicEmbeddingArgs.feature_names = ['item_category_l1']
+item_cat_l1_emb/DynamicEmbeddingArgs.table_name = 'item_category_l1'
+item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50
+item_cat_l1_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0
+item_cat_l1_emb/DynamicEmbeddingArgs.caching = False
+
+# Aggregate all embedding configs (5 embedding tables total)
+BenchmarkDatasetArgs.embedding_args = [
+    @item_embedding/DynamicEmbeddingArgs(),
+    @action_embedding/EmbeddingArgs(),
+    @user_id_emb/DynamicEmbeddingArgs(),
+    @user_age_emb/DynamicEmbeddingArgs(),
+    @item_cat_l1_emb/DynamicEmbeddingArgs(),
+]
+
+# ===== Network Configuration =====
+NetworkArgs.item_embedding_dim = 128
+NetworkArgs.contextual_embedding_dim = 128  # Same as item_embedding_dim
+NetworkArgs.num_layers = 10
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 1024
+NetworkArgs.kv_channels = 256
+
+# Kernel config (Baseline: Triton)
+NetworkArgs.kernel_backend = 'cutlass'
+NetworkArgs.recompute_input_layernorm = False
+NetworkArgs.recompute_input_silu = False
+
+# ===== Ranking Head =====
+RankingArgs.prediction_head_arch = [512, 8]
+RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 8
+RankingArgs.eval_metrics = ['AUC']
+
+# ===== Optimizer =====
+OptimizerArgs.optimizer_str = 'adam'
+OptimizerArgs.learning_rate = 1e-3
+OptimizerArgs.adam_beta1 = 0.9
+OptimizerArgs.adam_beta2 = 0.999
+OptimizerArgs.adam_eps = 1e-8
+
+# ===== Parallelism =====
+TensorModelParallelArgs.tensor_model_parallel_size = 1  # No TP
+TrainerArgs.train_batch_size = 32
+TrainerArgs.eval_batch_size = 32
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 5000
+TrainerArgs.profile = True
+TrainerArgs.profile_step_start = 50
+TrainerArgs.profile_step_end = 80
+TrainerArgs.max_train_iters = 512
+TrainerArgs.max_eval_iters = 16
