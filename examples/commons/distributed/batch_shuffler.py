@@ -66,6 +66,107 @@ class BaseTaskBalancedBatchShuffler:
             return False
         return True
 
+    def compute_partition_indices(
+        self,
+        workloads: torch.Tensor,
+        local_batch_size: int,
+        pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+    ) -> torch.Tensor:
+        """Phase 1: AllGather workloads → KK partitioning → this-rank indices.
+
+        This is **batch-type agnostic** — it only operates on a 1-D workload
+        tensor and returns the global indices assigned to this rank.
+
+        Args:
+            workloads: 1-D tensor of per-sample workloads (length = local_batch_size).
+            local_batch_size: number of samples on this rank before allgather.
+            pg_group: distributed process group.
+
+        Returns:
+            Sorted 1-D int64 tensor of global-batch indices for this rank.
+        """
+        assert (
+            workloads.shape[0] == local_batch_size
+        ), "workloads should have the same length as local_batch_size"
+        num_partitions = torch.distributed.get_world_size(pg_group)
+        rank = torch.distributed.get_rank(pg_group)
+        # 1. Allgather the workloads
+        allgather_workloads = gather_along_first_dim(workloads, pg_group)
+        # 2. Partition the workloads
+        partitions_indices = karmarkar_karp(
+            allgather_workloads, num_partitions, equal_size=True
+        )
+        if self._should_print_load_balance():
+            all_wl = (
+                allgather_workloads.tolist()
+                if isinstance(allgather_workloads, torch.Tensor)
+                else list(allgather_workloads)
+            )
+            _log_load_balance(
+                self._batch_counter,
+                all_wl,
+                partitions_indices,
+                local_batch_size,
+                num_partitions,
+            )
+        self._batch_counter += 1
+        indices_this_rank = torch.tensor(
+            partitions_indices[rank],
+            dtype=torch.int64,
+            device=workloads.device,
+        )
+        #! NOTE: This indices tensor always has a size equal to the full batch size,
+        #! including padding indices for incomplete batches. Sorting ensures padding
+        #! indices are stored contiguously at the tensor's end.
+        indices_this_rank, _ = torch.sort(indices_this_rank)
+        return indices_this_rank
+
+    @staticmethod
+    def shuffle_tensor_by_global_indices(
+        tensor: torch.Tensor,
+        global_indices: torch.Tensor,
+        pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+    ) -> torch.Tensor:
+        """AllGather a dense tensor along dim-0, then index-select by global indices.
+
+        Args:
+            tensor: local dense tensor of shape ``[local_batch_size, ...]``.
+            global_indices: global-batch indices for this rank
+                (from :meth:`compute_partition_indices`).
+            pg_group: distributed process group.
+
+        Returns:
+            Tensor of shape ``[len(global_indices), ...]`` containing the
+            rows assigned to this rank after load-balanced redistribution.
+        """
+        allgathered = gather_along_first_dim(tensor, pg_group)
+        return allgathered[global_indices]
+
+    @staticmethod
+    def shuffle_batch_by_global_indices(
+        batch: BaseBatch,
+        global_indices: torch.Tensor,
+        pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+    ) -> BaseBatch:
+        """Phase 2: AllGather the batch, then index-select by pre-computed indices.
+
+        This is the data-redistribution step that depends on ``BaseBatch``.
+
+        Args:
+            batch: local batch to allgather.
+            global_indices: global-batch indices for this rank (from :meth:`compute_partition_indices`).
+            pg_group: distributed process group.
+
+        Returns:
+            A new ``BaseBatch`` containing only the samples assigned to this rank.
+        """
+        allgathered_batch = allgather_batch(batch, pg_group)
+        new_batch = allgathered_batch.index_select(global_indices)
+        new_batch.batch_size = new_batch.batch_size // torch.distributed.get_world_size(
+            pg_group
+        )
+        return new_batch
+
     def shuffle(
         self,
         batch: BaseBatch,
@@ -80,46 +181,11 @@ class BaseTaskBalancedBatchShuffler:
         Tuple[BaseBatch, torch.Tensor, torch.Tensor],
     ]:
         workloads = self.get_workloads(batch, *args, **kwargs)
-        assert (
-            workloads.shape[0] == batch.batch_size
-        ), "workloads should have the same shape as batch_size"
-        num_partitions = torch.distributed.get_world_size(pg_group)
-        rank = torch.distributed.get_rank(pg_group)
-        # 1. Allgather the workloads
-        allgather_workloads = gather_along_first_dim(workloads, pg_group)
-        # 2. Partition the workloads
-        partitions_indices = karmarkar_karp(
-            allgather_workloads, num_partitions, equal_size=True
+        indices_this_rank = self.compute_partition_indices(
+            workloads, batch.batch_size, pg_group
         )
-        if self._should_print_load_balance():
-            all_wl = (
-                allgather_workloads.tolist()
-                if isinstance(allgather_workloads, torch.Tensor)
-                else list[Any](allgather_workloads)
-            )
-            _log_load_balance(
-                self._batch_counter,
-                all_wl,
-                partitions_indices,
-                batch.batch_size,
-                num_partitions,
-            )
-        self._batch_counter += 1
-        indices_this_rank = torch.tensor(
-            partitions_indices[rank],
-            dtype=torch.int64,
-            device=batch.features.lengths().device,
-        )
-        #! NOTE: This indices tensor always has a size equal to the full batch size,
-        #! including padding indices for incomplete batches. Sorting ensures padding
-        #! indices are stored contiguously at the tensor's end.
-        indices_this_rank, _ = torch.sort(indices_this_rank)  #
-        # 3. Allgather the batch, the batchsize is multiplied by the world size.
-        allgathered_batch = allgather_batch(batch, pg_group)
-        # 4. Select the batch
-        new_batch = allgathered_batch.index_select(indices_this_rank)
-        new_batch.batch_size = new_batch.batch_size // torch.distributed.get_world_size(
-            pg_group
+        new_batch = self.shuffle_batch_by_global_indices(
+            batch, indices_this_rank, pg_group
         )
         ret = new_batch
         if return_indices:
