@@ -36,7 +36,7 @@ Here we benchmarked with a synthetic input dataset:
 * Each input request has 256 item candidates for ranking.
 * Generate data for 1, 2, 4 and 8 users to benchmark with different batch size. 
 
-We can achieve **1.4x ~ 2.7x** performance speedup for inference (with batch size ranging from 1 to 8), after utilizing the KV cache and CUDA graph optimization.
+We can achieve **1.3x ~ 2.6x** performance speedup for inference (with batch size ranging from 1 to 8), after utilizing the KV cache and CUDA graph optimization.
 
 Performance results:
 
@@ -46,7 +46,8 @@ Note:
 
 1. The baseline performance is based on our implementation without KVCache support and CUDA Graph optimization.
 2. The end-to-end performance includes the embedding part, which utilizes both native `EmbeddingCollection` from TorchRec and `DynamicEmbedding`.
-3. The number of input sequences from the synthetic dataset increases according to the batch size.
+3. The number of input sequences from the synthetic dataset increases according to the batch size. All test cases have 16 batches in total.
+4. In the test cases with KVCache enabled, the kvcache preparation and onloading/offloading are within time measurement, but they are hidden as asynchronous operations. 
 
 ### 2. HSTU block performance
 

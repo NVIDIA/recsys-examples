@@ -15,7 +15,7 @@ repos:
     -   id: codespell
         args:
         - --skip=".git,corelib/hstu/*,third_party/*"
-        - --ignore-words-list=TE,TBE,tbe,dout,retrival,IndexT
+        - --ignore-words-list=TE,TBE,tbe,dout,retrival,IndexT,ANS,ans
 -   repo: https://github.com/psf/black
     rev: 23.9.1
     hooks:

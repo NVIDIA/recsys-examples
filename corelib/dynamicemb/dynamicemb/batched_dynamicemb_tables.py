@@ -1153,7 +1153,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             meta_json_file = encode_meta_json_file_path(save_dir, table_name)
 
             if isinstance(storage, DynamicEmbeddingTable) and not storage._use_score:
-                dist.barrier()  # sync global timestamp
+                if dist.is_initialized():
+                    dist.barrier()  # sync global timestamp
                 cast(DynamicEmbeddingTable, storage).update_timestamp()
             num_key_files = len(emb_key_files)
             for i in range(num_key_files):

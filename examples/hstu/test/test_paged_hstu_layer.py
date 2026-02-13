@@ -17,7 +17,6 @@ import sys
 from typing import List, Optional
 
 sys.path.append("../commons/utils")
-import flashinfer
 import pytest
 import torch
 import torch.nn.functional as F
@@ -31,6 +30,7 @@ from configs import (
 from hstu_assert_close import assert_hstu_close
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.jagged_data import JaggedData
+from paged_kvcache_ops import KVOffloadHandle, KVOnloadHandle
 from test_paged_hstu_attn_kernel import _hstu_attention_maybe_from_cache
 
 
@@ -460,10 +460,23 @@ def generate_test_input_data(
     ).to(device=device)
 
     total_history_lengths = host_kv_lengths + gpu_kv_lengths + new_history_lengths
-    batch_indices, position = flashinfer.page.get_batch_indices_positions(
-        new_history_offsets.cuda(),
-        total_history_lengths.cuda(),
-        new_history_offsets[-1].item(),
+    batch_indices = torch.cat(
+        [
+            torch.full((new_history_lengths[idx],), idx, dtype=torch.int32)
+            for idx in range(batchsize)
+        ],
+        dim=0,
+    )
+    position = torch.cat(
+        [
+            torch.arange(
+                total_history_lengths[idx] - new_history_lengths[idx],
+                total_history_lengths[idx],
+                dtype=torch.int32,
+            )
+            for idx in range(batchsize)
+        ],
+        dim=0,
     )
     total_history_offsets = get_offsets_from_lengths(total_history_lengths)
 
@@ -498,6 +511,8 @@ def generate_test_input_data(
         new_history_nnz_cuda=torch.tensor(
             [new_history_offsets[-1].item()], dtype=torch.int32, device=device
         ),
+        kv_onload_handle=KVOnloadHandle(num_layers),
+        kv_offload_handle=KVOffloadHandle(),
     )
 
     return (
@@ -572,18 +587,11 @@ class TestModule:
         self.static_kvcache_metadata = get_kvcache_metadata_buffer(
             hstu_config, self.kvcache_config
         )
-        self.static_kvcache_metadata.onload_history_kv_buffer = [
-            self.kvcache_tables[layer_idx][
-                self.kvcache_config.blocks_in_primary_pool :, ...
-            ]
-            for layer_idx in range(self.num_layers)
-        ]
-        self.static_kvcache_metadata.onload_history_kv_events = [
-            torch.cuda.Event() for _ in range(self.num_layers)
-        ]
         self.static_kvcache_metadata.kv_cache_table = [
             self.kvcache_tables[layer_idx] for layer_idx in range(self.num_layers)
         ]
+        self.static_kvcache_metadata.kv_onload_handle = KVOnloadHandle(self.num_layers)
+        self.static_kvcache_metadata.kv_offload_handle = KVOffloadHandle()
 
         self.hstu_block_inference.set_cudagraph(
             self.max_batchsize,
@@ -602,15 +610,15 @@ class TestModule:
         if onload_num_pages == 0:
             return
         with torch.cuda.stream(self.side_stream):
+            kvcache_metadata.kv_onload_handle.reset()
             for layer_idx in range(self.num_layers):
-                kvcache_metadata.onload_history_kv_buffer[layer_idx][
-                    :onload_num_pages, ...
+                kvcache_metadata.kv_cache_table[layer_idx][
+                    self.kvcache_config.blocks_in_primary_pool : self.kvcache_config.blocks_in_primary_pool
+                    + onload_num_pages
                 ].copy_(
                     host_kv_data[layer_idx, :onload_num_pages, ...], non_blocking=True
                 )
-                kvcache_metadata.onload_history_kv_events[layer_idx].record(
-                    self.side_stream
-                )
+                kvcache_metadata.kv_onload_handle.complete_host(layer_idx)
 
     def get_paged_hstu_output_with_kvcache(
         self,

@@ -413,7 +413,9 @@ class TritonPythonModel:
 
             embeddings = pack_embeddings(hstu_batch, raw_embeddings[0])
 
-            jagged_item_logit = self.hstu_model.forward(hstu_batch, embeddings)
+            jagged_item_logit = self.hstu_model.forward_nokvcache(
+                hstu_batch, embeddings
+            )
 
             inference_response = pb_utils.InferenceResponse(
                 output_tensors=[
