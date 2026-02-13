@@ -8,10 +8,25 @@ TrainerArgs.profile_step_end = 80
 TrainerArgs.max_train_iters = 512
 TrainerArgs.max_eval_iters = 16
 
+# === Random distributions (optional, for BenchmarkDataset) ===
+# Sequence length distribution: Zipf, values in [1, max_sequence_length)
+# high is auto-filled from FeatureArgs.max_sequence_length when omitted
+item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
+item_seqlen_dist/RandomDistribution.alpha = 1.5
+item_seqlen_dist/RandomDistribution.low = 1
+
+# Item-ID value distribution: Zipf (long-tail), values in [0, +inf)
+item_value_dist/RandomDistribution.dist_type = 'zipf'
+item_value_dist/RandomDistribution.alpha = 1.2
+
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
 item_and_action_feature/FeatureArgs.max_sequence_length = 4096
 # if False, the generated sequence length per user is fixed to max_sequence_length
 item_and_action_feature/FeatureArgs.is_jagged = False
+item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
+item_and_action_feature/FeatureArgs.value_dists = {
+    'item': @item_value_dist/RandomDistribution(),
+}
 
 BenchmarkDatasetArgs.feature_args = [
     @item_and_action_feature/FeatureArgs(),

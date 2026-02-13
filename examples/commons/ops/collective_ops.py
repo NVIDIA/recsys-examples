@@ -187,7 +187,10 @@ def _gatherv_along_first_dim(input_, pg: Optional[dist.ProcessGroup] = None):
     torch.distributed.all_gather_into_tensor(
         output_dim0_tensor, input_dim0_tensor.contiguous(), group=pg
     )
-    torch.distributed.barrier(group=pg, device_ids=[torch.cuda.current_device()])
+    # No barrier needed: PyTorch's ProcessGroupNCCL already synchronizes the
+    # default CUDA stream with the NCCL stream via cudaStreamWaitEvent after
+    # each non-async collective.  The subsequent .cpu() (which runs on the
+    # default stream) will therefore wait for all_gather_into_tensor to finish.
     variable_dim0 = output_dim0_tensor.cpu()
     dim_size = list(input_.size())
     tensor_list = []
@@ -501,13 +504,143 @@ def jagged_tensor_allgather(
     return JaggedTensor(values=values, lengths=lengths)
 
 
+def keyed_jagged_tensor_list_allgather(
+    kjt_list: List[KeyedJaggedTensor],
+    pg: Optional[dist.ProcessGroup] = None,
+) -> List[KeyedJaggedTensor]:
+    """
+    Fused AllGather for a **list** of KeyedJaggedTensors.
+
+    All KJTs' lengths and values are concatenated before communication so that
+    the entire list is gathered with only **2 NCCL calls** (1 AllGather for
+    lengths, 1 AllGather for values) regardless of how many KJTs or keys
+    there are. After gathering, the layout is transposed from rank-major
+    [W, K_total, B] to key-major [K_total, W, B] using
+    ``keyed_jagged_index_select_dim1``, then the result is split back into
+    individual KJTs.
+
+    Requirements:
+      - All KJTs must share the same ``batch_size`` (stride).
+      - All KJTs must share the same ``values`` dtype.
+
+    Note: this api is not differentiable.
+
+    Args:
+        kjt_list: List of KeyedJaggedTensors to AllGather.
+        pg: Process group for distributed operations.
+
+    Returns:
+        List of AllGathered KeyedJaggedTensors, one per input KJT.
+    """
+    world_size = dist.get_world_size(pg)
+    if world_size == 1:
+        return list(kjt_list)
+
+    if not kjt_list:
+        return []
+
+    W = world_size
+    device = kjt_list[0].lengths().device
+
+    # --- Collect per-KJT metadata ---
+    keys_list = [list(kjt.keys()) for kjt in kjt_list]
+    K_list = [len(keys) for keys in keys_list]
+    K_total = sum(K_list)
+    B = kjt_list[0].lengths().numel() // K_list[0]
+
+    # --- Concatenate all lengths and values across KJTs ---
+    all_local_lengths = torch.cat([kjt.lengths() for kjt in kjt_list])  # [K_total * B]
+    all_local_values = torch.cat([kjt.values() for kjt in kjt_list])  # [T_total_local]
+
+    # === Step 1: Fused communication (2 NCCL calls for the entire list) ===
+    # 1a. AllGather all lengths in one shot
+    all_lengths = gather_along_first_dim(all_local_lengths, pg)  # [W * K_total * B]
+
+    # 1b. AllGather all values — derive per-rank counts from gathered lengths
+    #     to skip the redundant dim0 AllGather inside _gatherv_along_first_dim.
+    per_rank_num_values = (
+        all_lengths.view(W, K_total * B).to(torch.long).sum(dim=1)  # [W] on GPU
+    )
+    per_rank_num_values_cpu = per_rank_num_values.cpu()  # small D2H, [W] ints
+    values_dim_tail = list(all_local_values.shape[1:])
+    recv_buffers = [
+        torch.empty(
+            [cnt.item()] + values_dim_tail,
+            dtype=all_local_values.dtype,
+            device=device,
+        )
+        for cnt in per_rank_num_values_cpu
+    ]
+    dist.all_gather(recv_buffers, all_local_values.contiguous(), group=pg)
+    all_values = torch.cat(recv_buffers).contiguous()  # [sum(T_all_ranks)]
+
+    # === Step 2: Transpose [W, K_total, B] -> [K_total, W, B] ===
+    NB = W * K_total * B  # fake batch size (1 fake key)
+    perm = (
+        torch.arange(NB, device=device)
+        .view(W, K_total, B)
+        .permute(1, 0, 2)
+        .contiguous()
+        .view(-1)
+    )
+
+    # === Step 3: Reorder via keyed_jagged_index_select_dim1 ===
+    all_offsets = torch.zeros(NB + 1, dtype=all_lengths.dtype, device=device)
+    all_offsets[1:] = all_lengths.cumsum(0)
+
+    output = torch.ops.fbgemm.keyed_jagged_index_select_dim1(
+        all_values,
+        all_lengths,
+        all_offsets,
+        perm,
+        NB,
+    )
+    reordered_values = output[0]
+    reordered_lengths = output[1]
+
+    # === Step 4: Split back into individual KJTs ===
+    # Compute per-KJT value counts on GPU, then bring to CPU in one shot.
+    per_key_value_counts = (
+        reordered_lengths.view(K_total, W * B).to(torch.long).sum(dim=1)
+    )  # [K_total]
+    kjt_value_counts = []
+    key_offset = 0
+    for K in K_list:
+        kjt_value_counts.append(per_key_value_counts[key_offset : key_offset + K].sum())
+        key_offset += K
+    kjt_value_counts_cpu = torch.stack(kjt_value_counts).cpu()  # single D2H
+
+    result_kjts: List[KeyedJaggedTensor] = []
+    lengths_offset = 0
+    values_offset = 0
+    for i, (keys, K) in enumerate(zip(keys_list, K_list)):
+        kjt_num_lengths = K * W * B
+        kjt_lengths = reordered_lengths[
+            lengths_offset : lengths_offset + kjt_num_lengths
+        ]
+        kjt_num_values = kjt_value_counts_cpu[i].item()
+        kjt_values = reordered_values[values_offset : values_offset + kjt_num_values]
+
+        result_kjts.append(
+            KeyedJaggedTensor(
+                keys=keys,
+                values=kjt_values,
+                lengths=kjt_lengths,
+                stride=W * B,
+            )
+        )
+        lengths_offset += kjt_num_lengths
+        values_offset += kjt_num_values
+
+    return result_kjts
+
+
 def keyed_jagged_tensor_allgather(
     kjt: KeyedJaggedTensor,
     pg: Optional[dist.ProcessGroup] = None,
-):
-    # check dtype are all integers
-    input_jt_dict = kjt.to_dict()
-    output_jt_dict = {}
-    for key, value in input_jt_dict.items():
-        output_jt_dict[key] = jagged_tensor_allgather(value, pg)
-    return KeyedJaggedTensor.from_jt_dict(output_jt_dict)
+) -> KeyedJaggedTensor:
+    """
+    AllGather a single KeyedJaggedTensor. Convenience wrapper around
+    :func:`keyed_jagged_tensor_list_allgather`.
+    """
+    return keyed_jagged_tensor_list_allgather([kjt], pg)[0]

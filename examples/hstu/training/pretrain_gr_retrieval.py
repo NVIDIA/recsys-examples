@@ -27,6 +27,7 @@ from commons.distributed.batch_shuffler_factory import BatchShufflerFactory
 from commons.distributed.sharding import make_optimizer_and_shard
 from commons.pipeline import TrainPipelineFactory
 from configs import RetrievalConfig
+from megatron.core import tensor_parallel
 from model import get_retrieval_model
 from modules.metrics import RetrievalTaskMetricWithSampling
 from trainer.training import maybe_load_ckpts, train_with_pipeline
@@ -92,6 +93,12 @@ def main():
 
     hstu_config = create_hstu_config(network_args, tp_args)
     task_config = create_retrieval_config(dataset_args, network_args, embedding_args)
+    # We need to create the dataloader before model initialization in case the dataset is random.
+    # In our scenario, the dataset across tp rank should be different. We need to fork the state
+    with tensor_parallel.get_cuda_rng_tracker().fork():
+        train_dataloader, test_dataloader = get_data_loader(
+            "retrieval", dataset_args, trainer_args, 0
+        )
     model = get_retrieval_model(hstu_config=hstu_config, task_config=task_config)
 
     dynamic_options_dict = create_dynamic_optitons_dict(
@@ -113,9 +120,6 @@ def main():
     )
     stateful_metric_module = RetrievalTaskMetricWithSampling(
         metric_types=task_config.eval_metrics, MAX_K=500
-    )
-    train_dataloader, test_dataloader = get_data_loader(
-        "retrieval", dataset_args, trainer_args, 0
     )
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
 

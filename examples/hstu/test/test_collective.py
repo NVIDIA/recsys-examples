@@ -20,9 +20,12 @@ from commons.ops.collective_ops import (
     gather_along_first_dim,
     gatherv_along_first_dim,
     grouped_allgatherv_tensor_list,
+    jagged_tensor_allgather,
+    keyed_jagged_tensor_allgather,
 )
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from megatron.core import parallel_state, tensor_parallel
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 def get_source_and_ref_tensor(shape=(128, 1), dtype=torch.float):
@@ -246,4 +249,83 @@ def test_grouped_allgatherv(
         except:
             init.destroy_global_state()
             raise
+    init.destroy_global_state()
+
+
+@pytest.mark.parametrize("num_keys", [1, 3, 5])
+@pytest.mark.parametrize("batch_size", [4, 13])
+@pytest.mark.parametrize("max_seqlen", [1, 8])
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_keyed_jagged_tensor_allgather(num_keys, batch_size, max_seqlen, tp):
+    """
+    Verify the fused keyed_jagged_tensor_allgather produces the same result
+    as the naive per-key jagged_tensor_allgather reference.
+    """
+    init.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+    if world_size < tp:
+        pytest.skip(f"no enough GPUs to run tp={tp}")
+    init.initialize_model_parallel(tp)
+    init.set_random_seed(1234)
+
+    tp_pg = parallel_state.get_model_parallel_group()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+    keys = [f"feat_{i}" for i in range(num_keys)]
+
+    # Each rank generates its own random lengths (and thus jagged values).
+    with tensor_parallel.get_cuda_rng_tracker().fork():
+        lengths = torch.randint(
+            0,
+            max_seqlen + 1,
+            (num_keys * batch_size,),
+            device="cuda",
+            dtype=torch.int32,
+        )
+    total_values = lengths.sum().item()
+    # Values are distinguishable per rank: rank * 100000 + local sequential id
+    values = (
+        torch.arange(total_values, device="cuda", dtype=torch.int64) + tp_rank * 100000
+    )
+
+    local_kjt = KeyedJaggedTensor(
+        keys=keys,
+        values=values,
+        lengths=lengths,
+        stride=batch_size,
+    )
+
+    # ---- fused implementation under test ----
+    result_kjt = keyed_jagged_tensor_allgather(local_kjt, tp_pg)
+
+    # ---- per-key reference (old approach) ----
+    input_jt_dict = local_kjt.to_dict()
+    ref_jt_dict = {}
+    for key, jt in input_jt_dict.items():
+        ref_jt_dict[key] = jagged_tensor_allgather(jt, tp_pg)
+    ref_kjt = KeyedJaggedTensor.from_jt_dict(ref_jt_dict)
+
+    # ---- assertions ----
+    try:
+        assert list(result_kjt.keys()) == list(
+            ref_kjt.keys()
+        ), f"Keys mismatch: {result_kjt.keys()} vs {ref_kjt.keys()}"
+        result_dict = result_kjt.to_dict()
+        ref_dict = ref_kjt.to_dict()
+        for key in keys:
+            res_len = result_dict[key].lengths()
+            ref_len = ref_dict[key].lengths()
+            assert torch.equal(
+                res_len, ref_len
+            ), f"[{key}] lengths mismatch:\n  result={res_len}\n  ref   ={ref_len}"
+            res_val = result_dict[key].values()
+            ref_val = ref_dict[key].values()
+            assert torch.equal(res_val, ref_val), (
+                f"[{key}] values mismatch (first 20):\n"
+                f"  result={res_val[:20]}\n  ref   ={ref_val[:20]}"
+            )
+    except Exception:
+        init.destroy_global_state()
+        raise
+
     init.destroy_global_state()
