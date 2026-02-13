@@ -50,6 +50,18 @@ except ImportError:
 from ops.triton_ops.common import triton_autotune
 
 
+@torch.fx.wrap
+def prev_power_of_2(x: int) -> int:
+    if torch.compiler.is_compiling():
+        x_tensor = torch.scalar_tensor(x, dtype=torch.int64)  # type: ignore[arg-type]
+        x_tensor_orig = x_tensor.clone()
+        out = triton.next_power_of_2(x_tensor)  # type: ignore[arg-type]
+        return int(torch.where(torch.lt(x_tensor_orig, out), out // 2, out).item())  # type: ignore[return-value]
+    else:
+        out = triton.next_power_of_2(x)
+        return out // 2 if out > x else out
+
+
 def silu_configs():
     configs = []
     for x_block_size in [256, 512, 1024, 2048]:
@@ -64,13 +76,14 @@ def silu_configs():
 # =============================================================================
 
 
-@triton_autotune(silu_configs(), key=["x_size"])
+@triton_autotune(silu_configs(), key=["autotune_x_size"])
 @triton.jit
 def _silu_mul_forward(
     output_ptr: tl.tensor,
     gate_ptr: tl.tensor,
     up_ptr: tl.tensor,
     x_size: tl.int32,
+    autotune_x_size: tl.constexpr,
     x_block_size: tl.constexpr,
 ):
     """Fused forward: output = silu(gate) * up"""
@@ -88,7 +101,7 @@ def _silu_mul_forward(
     tl.store(output_ptr + x_offset + cols, output, mask=mask)
 
 
-@triton_autotune(silu_configs(), key=["x_size"])
+@triton_autotune(silu_configs(), key=["autotune_x_size"])
 @triton.jit
 def _silu_mul_backward(
     grad_gate_ptr: tl.tensor,
@@ -97,6 +110,7 @@ def _silu_mul_backward(
     gate_ptr: tl.tensor,
     up_ptr: tl.tensor,
     x_size: tl.int32,
+    autotune_x_size: tl.constexpr,
     x_block_size: tl.constexpr,
 ):
     """
@@ -141,6 +155,7 @@ def triton_silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Forward: output = silu(gate) * up"""
     assert gate.shape == up.shape, f"Shape mismatch: gate {gate.shape} vs up {up.shape}"
     x_size = gate.numel()
+    autotune_x_size = max(1, prev_power_of_2(x_size))
 
     with torch.cuda.nvtx.range("gate_contiguous"):
         gate_1d = gate.view(-1).contiguous()
@@ -157,6 +172,7 @@ def triton_silu_mul_fwd(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         gate_1d,
         up_1d,
         x_size,
+        autotune_x_size,
     )
     return output.view(gate.shape)
 
@@ -167,6 +183,7 @@ def triton_silu_mul_bwd(
     """Backward: returns (grad_gate, grad_up)"""
     shape = gate.shape
     x_size = gate.numel()
+    autotune_x_size = max(1, prev_power_of_2(x_size))
     gate_1d = gate.view(-1).contiguous()
     up_1d = up.view(-1).contiguous()
     grad_output_1d = grad_output.view(-1).contiguous()
@@ -183,6 +200,7 @@ def triton_silu_mul_bwd(
         gate_1d,
         up_1d,
         x_size,
+        autotune_x_size,
     )
     return grad_gate.view(shape), grad_up.view(shape)
 
