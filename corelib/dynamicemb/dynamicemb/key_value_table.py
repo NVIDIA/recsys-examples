@@ -263,19 +263,12 @@ class DynamicEmbeddingTable(
             load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
 
             # when load into the table, we always assign the scores from the file.
-            score_args_insert = [
-                ScoreArg(
-                    name=self.score_policy.name,
-                    value=scores,
-                    policy=ScorePolicy.ASSIGN,
-                    is_return=False,
-                )
-            ]
-            indices = torch.zeros(
-                keys.numel(), dtype=key_index_map.index_type, device=keys.device
+            score_arg_insert = ScoreArg(
+                name=self.score_policy.name,
+                value=scores,
+                policy=ScorePolicy.ASSIGN,
             )
-
-            key_index_map.insert(keys, score_args_insert, indices)
+            indices = key_index_map.insert(keys, score_arg_insert)
             store_to_combined_table(
                 dev_table,
                 uvm_table,
@@ -292,9 +285,10 @@ class DynamicEmbeddingTable(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         if unique_keys.dtype != self.key_type():
             unique_keys = unique_keys.to(self.key_type())
 
@@ -312,9 +306,6 @@ class DynamicEmbeddingTable(
         load_dim = unique_embs.size(1)
 
         device = unique_keys.device
-        if founds is None:
-            founds = torch.empty(batch, dtype=torch.bool, device=device)
-        indices = torch.empty(batch, dtype=self.key_index_map.index_type, device=device)
 
         scores = self.create_scores(batch, device, input_scores)
 
@@ -326,20 +317,21 @@ class DynamicEmbeddingTable(
                 torch.empty(batch, dtype=torch.uint64, device=device)
                 if scores is not None
                 else None,
+                torch.empty(batch, dtype=torch.bool, device=device),
+                torch.empty(batch, dtype=torch.int64, device=device),
             )
 
-        score_args_lookup = [
-            ScoreArg(
-                name=self.score_policy.name,
-                value=scores,
-                policy=self.score_policy.policy
-                if self._score_update
-                else ScorePolicy.CONST,
-                is_return=scores is not None,
-            )
-        ]
+        score_arg_lookup = ScoreArg(
+            name=self.score_policy.name,
+            value=scores,
+            policy=self.score_policy.policy
+            if self._score_update
+            else ScorePolicy.CONST,
+        )
 
-        self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
+        score_out, founds, indices = self.key_index_map.lookup(
+            unique_keys, score_arg_lookup
+        )
 
         if load_dim != 0:
             load_from_combined_table(
@@ -362,57 +354,60 @@ class DynamicEmbeddingTable(
 
         h_num_missing = num_missing_0.cpu().item()
 
-        # Handle missing scores: return None if scores is None
-        if scores is not None:
-            missing_scores = scores[missing_indices[:h_num_missing]]
-        else:
-            missing_scores = None
+        missing_scores = (
+            score_out[missing_indices[:h_num_missing]] if scores is not None else None
+        )
 
         return (
             h_num_missing,
             missing_keys[:h_num_missing],
             missing_indices[:h_num_missing],
             missing_scores,
+            founds,
+            score_out,
         )
 
     def find_embeddings(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         # Check shape to prevent misuse of find_embeddings and find
         if unique_embs.dim() == 2 and unique_embs.size(1) != self.embedding_dim():
             raise ValueError(
                 f"find_embeddings expects dim={self.embedding_dim()}, got {unique_embs.size(1)}. "
             )
-        return self.find_impl(unique_keys, unique_embs, founds, input_scores)
+        return self.find_impl(unique_keys, unique_embs, input_scores)
 
     def find_missed_keys(
         self,
         unique_keys: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         # dummy tensor
         unique_embs = torch.empty(
             unique_keys.numel(), 0, device=unique_keys.device, dtype=self._emb_dtype
         )
-        return self.find_impl(unique_keys, unique_embs, founds, None)
+        return self.find_impl(unique_keys, unique_embs, None)
 
     def find(
         self,
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         # Check shape to prevent misuse of find_embeddings and find
         if unique_vals.dim() == 2 and unique_vals.size(1) != self.value_dim():
             raise ValueError(
                 f"find expects dim={self.value_dim()}, got {unique_vals.size(1)}. "
             )
-        return self.find_impl(unique_keys, unique_vals, founds, input_scores)
+        return self.find_impl(unique_keys, unique_vals, input_scores)
 
     def create_scores(
         self,
@@ -468,22 +463,12 @@ class DynamicEmbeddingTable(
             # we assign it to preserve the distribution of score values ​​in the cache.
             policy = ScorePolicy.ASSIGN
 
-        score_args_insert = [
-            ScoreArg(
-                name=self.score_policy.name,
-                value=scores,
-                policy=policy,
-                is_return=False,
-            )
-        ]
-
-        indices = torch.zeros(
-            h_num_unique_keys,
-            dtype=self.key_index_map.index_type,
-            device=unique_keys.device,
+        score_arg_insert = ScoreArg(
+            name=self.score_policy.name,
+            value=scores,
+            policy=policy,
         )
-
-        self.key_index_map.insert(unique_keys, score_args_insert, indices)
+        indices = self.key_index_map.insert(unique_keys, score_arg_insert)
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
@@ -502,19 +487,14 @@ class DynamicEmbeddingTable(
             return 0, None, None
 
         device = keys.device
-        founds = torch.empty(batch, dtype=torch.bool, device=device)
-        indices = torch.empty(batch, dtype=self.key_index_map.index_type, device=device)
 
-        score_args_lookup = [
-            ScoreArg(
-                name=self.score_policy.name,
-                value=None,
-                policy=ScorePolicy.CONST,
-                is_return=False,
-            )
-        ]
+        score_arg_lookup = ScoreArg(
+            name=self.score_policy.name,
+            value=None,
+            policy=ScorePolicy.CONST,
+        )
 
-        self.key_index_map.lookup(keys, score_args_lookup, founds, indices)
+        _, founds, indices = self.key_index_map.lookup(keys, score_arg_lookup)
 
         self.optimizer.fused_update_with_index(
             grads.to(self.value_type()), indices, self.dev_table, self.uvm_table
@@ -828,19 +808,13 @@ class DynamicEmbeddingTable(
 
         # self.insert(keys.to(key_type), values.to(value_type), scores)
 
-        score_args_insert = [
-            ScoreArg(
-                name=self.score_policy.name,
-                value=scores,
-                policy=policy,
-                is_return=False,
-            )
-        ]
-        indices = torch.zeros(
-            keys.numel(), dtype=self.key_index_map.index_type, device=keys.device
+        score_arg_insert = ScoreArg(
+            name=self.score_policy.name,
+            value=scores,
+            policy=policy,
         )
 
-        self.key_index_map.insert(keys, score_args_insert, indices)
+        indices = self.key_index_map.insert(keys, score_arg_insert)
         store_to_combined_table(
             self.dev_table,
             self.uvm_table,
@@ -932,26 +906,19 @@ class DynamicEmbeddingTable(
             scores = torch.empty(batch, device=keys.device, dtype=torch.uint64)
             scores.fill_(self.score)
 
-        score_args_insert = [
-            ScoreArg(
-                name=self.score_policy.name,
-                value=scores,
-                policy=self.score_policy.policy,
-                is_return=False,
-            )
-        ]
-
-        indices = torch.zeros(
-            batch, dtype=self.key_index_map.index_type, device=keys.device
+        score_arg_insert = ScoreArg(
+            name=self.score_policy.name,
+            value=scores,
+            policy=self.score_policy.policy,
         )
 
         (
+            indices,
             num_evicted,
             evicted_keys,
             evicted_indices,
             evicted_scores,
-        ) = self.key_index_map.insert_and_evict(keys, score_args_insert, indices)
-        evicted_scores = evicted_scores[0]
+        ) = self.key_index_map.insert_and_evict(keys, score_arg_insert)
         evicted_values: torch.Tensor = torch.empty(
             num_evicted, values.size(1), device=values.device, dtype=self.value_type()
         )
@@ -1186,38 +1153,24 @@ class DynamicEmbeddingTable(
         for i in range(num_iter):
             valid_mask = keys_t[i] != -1
             valid_keys = keys_t[i][valid_mask].contiguous()
-            score_args_insert = [
-                ScoreArg(
-                    name=self.score_policy.name,
-                    # value=score_t[i] if score_t is not None else None,
-                    value=score_t[i][valid_mask].contiguous().to(torch.uint64)
-                    if score_t is not None
-                    else None,
-                    policy=policy,
-                    is_return=False,
-                )
-            ]
+            score_arg_insert = ScoreArg(
+                name=self.score_policy.name,
+                # value=score_t[i] if score_t is not None else None,
+                value=score_t[i][valid_mask].contiguous().to(torch.uint64)
+                if score_t is not None
+                else None,
+                policy=policy,
+            )
 
-            # self.key_index_map.insert(keys_t[i], score_args_insert)
-            self.key_index_map.insert(valid_keys, score_args_insert, None)
+            # self.key_index_map.insert(keys_t[i], score_arg_insert)
+            self.key_index_map.insert(valid_keys, score_arg_insert)
 
         # 4. lookup the indices in unique_keys' order and store the values.
-        score_args_lookup = [
-            ScoreArg(
-                name=self.score_policy.name,
-                policy=ScorePolicy.CONST,
-                is_return=False,
-            )
-        ]
-        indices = torch.zeros(
-            h_num_unique_keys,
-            dtype=self.key_index_map.index_type,
-            device=unique_keys.device,
+        score_arg_lookup = ScoreArg(
+            name=self.score_policy.name,
+            policy=ScorePolicy.CONST,
         )
-        founds = torch.zeros(
-            h_num_unique_keys, dtype=torch.bool, device=unique_keys.device
-        )
-        self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
+        _, founds, indices = self.key_index_map.lookup(unique_keys, score_arg_lookup)
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
@@ -1228,7 +1181,7 @@ class DynamicEmbeddingTable(
         unique_keys: torch.Tensor,
         unique_values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         self.expand()
 
         # 1.Preprocess
@@ -1283,25 +1236,22 @@ class DynamicEmbeddingTable(
         for i in range(num_iter):
             valid_mask = keys_t[i] != -1
             valid_keys = keys_t[i][valid_mask].contiguous()
-            score_args_insert = [
-                ScoreArg(
-                    name=self.score_policy.name,
-                    # value=score_t[i] if score_t is not None else None,
-                    value=score_t[i][valid_mask].contiguous().to(torch.uint64)
-                    if score_t is not None
-                    else None,
-                    policy=self.score_policy.policy,
-                    is_return=False,
-                )
-            ]
+            score_arg_insert = ScoreArg(
+                name=self.score_policy.name,
+                # value=score_t[i] if score_t is not None else None,
+                value=score_t[i][valid_mask].contiguous().to(torch.uint64)
+                if score_t is not None
+                else None,
+                policy=self.score_policy.policy,
+            )
 
             (
+                _,
                 num_evicted,
                 evicted_keys,
                 evicted_indices,
                 evicted_scores,
-            ) = self.key_index_map.insert_and_evict(valid_keys, score_args_insert, None)
-            evicted_scores = evicted_scores[0]
+            ) = self.key_index_map.insert_and_evict(valid_keys, score_arg_insert)
 
             if num_evicted != 0:
                 evicted_keys_accum[
@@ -1332,22 +1282,11 @@ class DynamicEmbeddingTable(
         )
 
         # 4. lookup the indices in unique_keys' order and store the values.
-        score_args_lookup = [
-            ScoreArg(
-                name=self.score_policy.name,
-                policy=ScorePolicy.CONST,
-                is_return=False,
-            )
-        ]
-        indices = torch.zeros(
-            h_num_unique_keys,
-            dtype=self.key_index_map.index_type,
-            device=unique_keys.device,
+        score_arg_lookup = ScoreArg(
+            name=self.score_policy.name,
+            policy=ScorePolicy.CONST,
         )
-        founds = torch.zeros(
-            h_num_unique_keys, dtype=torch.bool, device=unique_keys.device
-        )
-        self.key_index_map.lookup(unique_keys, score_args_lookup, founds, indices)
+        _, founds, indices = self.key_index_map.lookup(unique_keys, score_arg_lookup)
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
@@ -1371,7 +1310,12 @@ def update_cache(
     missing_scores: Optional[torch.Tensor] = None,
 ):
     # need to update score.
-    num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(
+    (
+        num_evicted,
+        evicted_keys,
+        evicted_values,
+        evicted_scores,
+    ) = cache.insert_and_evict(
         missing_keys,
         missing_values,
         missing_scores,
@@ -1391,7 +1335,7 @@ def admission(
     admit_strategy: AdmissionStrategy,
     admission_counter: Counter,
 ) -> torch.Tensor:
-    freq_for_missing_keys = admission_counter.add(keys, freqs, inplace=True)
+    freq_for_missing_keys = admission_counter.add(keys, freqs)
     admit_mask = admit_strategy.admit(
         keys,
         freq_for_missing_keys,
@@ -1427,16 +1371,16 @@ class KeyValueTableFunction:
             return
 
         # 1. find in storage
-        founds = torch.empty(h_num_toatl, device=unique_keys.device, dtype=torch.bool)
         (
             h_num_missing_in_storage,
             missing_keys_in_storage,
             missing_indices_in_storage,
             missing_scores_in_storage,
+            _,
+            _,
         ) = storage.find_embeddings(
             unique_keys,
             unique_embs,
-            founds=founds,
             input_scores=accumulated_frequency if is_lfu_enabled else None,
         )
 
@@ -1542,8 +1486,7 @@ class KeyValueTableFunction:
         unique_values = torch.empty(
             h_num_toatl, val_dim, device=unique_keys.device, dtype=emb_dtype
         )
-        founds = torch.empty(h_num_toatl, device=unique_keys.device, dtype=torch.bool)
-        _, _, _, _ = storage.find(unique_keys, unique_values, founds=founds)
+        _, _, _, _, founds, _ = storage.find(unique_keys, unique_values)
 
         keys_for_storage = unique_keys[founds].contiguous()
         values_for_storage = unique_values[founds, :].contiguous()
@@ -1588,6 +1531,8 @@ class KeyValueTableCachingFunction:
             missing_keys,
             missing_indices,
             missing_scores,
+            _,
+            _,
         ) = cache.find_embeddings(
             unique_keys,
             unique_embs,
@@ -1598,10 +1543,6 @@ class KeyValueTableCachingFunction:
         keys_for_storage = missing_keys
 
         scores_for_storage = missing_scores
-
-        founds = torch.empty(
-            h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
-        )
 
         # 2. find in storage
         values_for_storage = torch.empty(
@@ -1615,10 +1556,11 @@ class KeyValueTableCachingFunction:
             missing_keys_in_storage,
             missing_indices_in_storage,
             missing_scores_in_storage,
+            founds,
+            scores_for_storage,
         ) = storage.find(
             keys_for_storage,
             values_for_storage,
-            founds=founds,
             input_scores=scores_for_storage,
         )
 
@@ -1741,10 +1683,7 @@ class KeyValueTableCachingFunction:
         values_for_storage = torch.empty(
             h_num_keys_for_storage, val_dim, device=unique_keys.device, dtype=emb_dtype
         )
-        founds = torch.empty(
-            h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
-        )
-        _, _, _, _ = storage.find(keys_for_storage, values_for_storage, founds=founds)
+        _, _, _, _, founds, _ = storage.find(keys_for_storage, values_for_storage)
         keys_for_storage = keys_for_storage[founds].contiguous()
         values_for_storage = values_for_storage[founds, :].contiguous()
         grads_for_storage = grads_for_storage[founds, :].contiguous()
@@ -1767,7 +1706,9 @@ class KeyValueTableCachingFunction:
     ) -> None:
         assert cache is not None, "prefetch is available only when caching is enabled."
         emb_dtype = storage.embedding_dtype()
-        h_num_keys_for_storage, missing_keys, _, _ = cache.find_missed_keys(unique_keys)
+        h_num_keys_for_storage, missing_keys, _, _, _, _ = cache.find_missed_keys(
+            unique_keys
+        )
 
         if h_num_keys_for_storage == 0:
             return
@@ -1778,15 +1719,14 @@ class KeyValueTableCachingFunction:
         values_for_storage = torch.empty(
             h_num_keys_for_storage, val_dim, device=unique_keys.device, dtype=emb_dtype
         )
-        founds = torch.empty(
-            h_num_keys_for_storage, device=unique_keys.device, dtype=torch.bool
-        )
         (
             num_missing_in_storage,
             missing_keys_in_storage,
             missing_indices_in_storage,
             _,
-        ) = storage.find(keys_for_storage, values_for_storage, founds=founds)
+            founds,
+            _,
+        ) = storage.find(keys_for_storage, values_for_storage)
 
         if num_missing_in_storage != 0:
             if training:

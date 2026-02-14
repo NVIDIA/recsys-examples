@@ -137,28 +137,48 @@ class Storage(abc.ABC, Generic[TableOptionType, OptimizerInterface]):
         self,
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         num_missing: torch.Tensor
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        founds: torch.Tensor
+        output_scores: torch.Tensor
+        return (
+            num_missing,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+            founds,
+            output_scores,
+        )
 
     @abc.abstractmethod
     def find_embeddings(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        founds: torch.Tensor
+        output_scores: torch.Tensor
+        return (
+            num_missing,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+            founds,
+            output_scores,
+        )
 
     @abc.abstractmethod
     def insert(
@@ -236,40 +256,70 @@ class Cache(abc.ABC):
         self,
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        founds: torch.Tensor
+        output_scores: torch.Tensor
+        return (
+            num_missing,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+            founds,
+            output_scores,
+        )
 
     @abc.abstractmethod
     def find_embeddings(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        founds: torch.Tensor
+        output_scores: torch.Tensor
+        return (
+            num_missing,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+            founds,
+            output_scores,
+        )
 
     @abc.abstractmethod
     def find_missed_keys(
         self,
         unique_keys: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        founds: torch.Tensor
+        output_scores: torch.Tensor
+        return (
+            num_missing,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+            founds,
+            output_scores,
+        )
 
     @abc.abstractmethod
     def insert_and_evict(
@@ -319,9 +369,7 @@ class Counter(abc.ABC):
     """
 
     @abc.abstractmethod
-    def add(
-        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
-    ) -> torch.Tensor:
+    def add(self, keys: torch.Tensor, frequencies: torch.Tensor) -> torch.Tensor:
         """
         Add keys with frequencies to the `Counter` and get accumulated counter of each key.
         For not existed keys, the frequencies will be assigned directly.
@@ -330,7 +378,6 @@ class Counter(abc.ABC):
         Args:
             keys (torch.Tensor): The input keys, should be unique keys.
             frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
-            inplace: If true then store the accumulated_frequencies to counter.
 
         Returns:
             accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.

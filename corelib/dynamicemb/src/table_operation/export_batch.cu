@@ -21,21 +21,19 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 void table_export_single_score(at::Tensor table_storage,
-                               std::vector<torch::Dtype> dtypes,
                                int64_t bucket_capacity, int64_t batch,
                                int64_t offset, at::Tensor counter,
-                               at::Tensor keys,
-                               std::vector<std::optional<at::Tensor>> scores,
-                               std::optional<std::vector<ScoreType>> thresholds,
-                               std::optional<at::Tensor> indices) {
+                               at::Tensor keys, at::Tensor score,
+                               std::optional<ScoreType> threshold,
+                               at::Tensor indices) {
   auto key_type = get_data_type(keys);
-  auto scores_ = get_pointer<ScoreType>(scores[0]);
-  auto indices_ = get_pointer<IndexType>(indices);
+  auto scores_ = reinterpret_cast<ScoreType *>(score.data_ptr<int64_t>());
+  auto indices_ = indices.data_ptr<IndexType>();
   auto counter_ = get_pointer<CounterType>(counter);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  bool score_pred = thresholds.has_value();
-  ScoreType threshold = score_pred ? thresholds.value()[0] : 0;
+  bool score_pred = threshold.has_value();
+  ScoreType threshold_val = score_pred ? threshold.value() : 0;
 
   int64_t num_total = batch;
 
@@ -63,7 +61,7 @@ void table_export_single_score(at::Tensor table_storage,
     if (num_total % 32 == 0) {
       DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
         using PredFunc = ExportPredFunctor<PredFlag>;
-        PredFunc pred(threshold);
+        PredFunc pred(threshold_val);
         table_export_batch_kernel<Table, PredFunc, 32>
             <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
                stream>>>(table, offset, offset + num_total, counter_, keys_,
@@ -73,7 +71,7 @@ void table_export_single_score(at::Tensor table_storage,
     } else {
       DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
         using PredFunc = ExportPredFunctor<PredFlag>;
-        PredFunc pred(threshold);
+        PredFunc pred(threshold_val);
         table_export_batch_kernel<Table, PredFunc, 1>
             <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
                stream>>>(table, offset, offset + num_total, counter_, keys_,
@@ -84,22 +82,28 @@ void table_export_single_score(at::Tensor table_storage,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void table_export_batch(at::Tensor table_storage,
-                        std::vector<torch::Dtype> dtypes,
-                        int64_t bucket_capacity, int64_t batch, int64_t offset,
-                        at::Tensor counter, at::Tensor keys,
-                        std::vector<std::optional<at::Tensor>> scores,
-                        std::optional<std::vector<ScoreType>> thresholds,
-                        std::optional<at::Tensor> indices) {
-  if (batch == 0)
-    return;
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
+                   int64_t batch, int64_t offset, torch::Dtype key_dtype,
+                   std::optional<ScoreType> threshold) {
+  auto device = table_storage.device();
+  auto key_scalar_type = static_cast<torch::ScalarType>(key_dtype);
 
-  if (scores.size() == 1) {
-    table_export_single_score(table_storage, dtypes, bucket_capacity, batch,
-                              offset, counter, keys, scores, thresholds,
-                              indices);
-  } else {
-    throw std::runtime_error("Not support multi-scores.");
-  }
+  auto counter = torch::zeros(
+      {1}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto keys = torch::empty(
+      {batch}, torch::TensorOptions().dtype(key_scalar_type).device(device));
+  auto score = torch::empty(
+      {batch}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto indices = torch::empty(
+      {batch}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+
+  if (batch == 0)
+    return std::make_tuple(counter, keys, score, indices);
+
+  table_export_single_score(table_storage, bucket_capacity, batch, offset,
+                            counter, keys, score, threshold, indices);
+
+  return std::make_tuple(counter, keys, score, indices);
 }
 } // namespace dyn_emb

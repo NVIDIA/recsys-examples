@@ -368,21 +368,14 @@ def check_counter_table_checkpoint(x, y):
                 freq_name = cnt_tx.table_.score_names_[0]
                 frequencies = named_scores[freq_name]
 
-                score_args_lookup = [
-                    ScoreArg(
-                        name=freq_name,
-                        value=torch.zeros_like(frequencies),
-                        policy=ScorePolicy.CONST,
-                        is_return=True,
-                    )
-                ]
-                founds = torch.empty(
-                    keys.numel(), dtype=torch.bool, device=device
-                ).fill_(False)
+                score_arg_lookup = ScoreArg(
+                    name=freq_name,
+                    value=torch.zeros_like(frequencies),
+                    policy=ScorePolicy.CONST,
+                )
+                _, founds, _ = cnt_ty.lookup(keys, score_arg_lookup)
 
-                cnt_ty.lookup(keys, score_args_lookup, founds)
-
-                assert torch.equal(frequencies, score_args_lookup)
+                assert torch.equal(frequencies, score_arg_lookup)
 
 
 @click.command()

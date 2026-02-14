@@ -21,16 +21,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 void table_count_matched_single_score(at::Tensor table_storage,
-                                      std::vector<torch::Dtype> dtypes,
+                                      torch::Dtype key_dtype,
                                       int64_t bucket_capacity,
-                                      std::vector<ScoreType> thresholds,
+                                      ScoreType threshold,
                                       at::Tensor num_matched) {
 
-  auto key_type = scalartype_to_datatype(toScalarType(dtypes[0]));
+  auto key_type = scalartype_to_datatype(toScalarType(key_dtype));
   auto counter_ = get_pointer<CounterType>(num_matched);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  ScoreType threshold = thresholds[0];
 
   EvalAndCount func(threshold, counter_);
 
@@ -68,17 +67,16 @@ void table_count_matched_single_score(at::Tensor table_storage,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void table_count_matched(at::Tensor table_storage,
-                         std::vector<torch::Dtype> dtypes,
-                         int64_t bucket_capacity,
-                         std::vector<ScoreType> thresholds,
-                         at::Tensor num_matched) {
+at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
+                               int64_t bucket_capacity, ScoreType threshold) {
 
-  if (thresholds.size() == 1) {
-    table_count_matched_single_score(table_storage, dtypes, bucket_capacity,
-                                     thresholds, num_matched);
-  } else {
-    throw std::runtime_error("Not support multi-scores.");
-  }
+  auto device = table_storage.device();
+  auto num_matched = torch::zeros(
+      {1}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+
+  table_count_matched_single_score(table_storage, key_dtype, bucket_capacity,
+                                   threshold, num_matched);
+
+  return num_matched;
 }
 } // namespace dyn_emb

@@ -610,11 +610,9 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
 //   - Each feature is treated as a separate table
 //   - num_tables = num_features = (offsets.size(0) - 1) / local_batch_size
 //
-at::Tensor
-expand_table_ids_cuda(at::Tensor offsets,
-                      c10::optional<at::Tensor> table_offsets_in_feature,
-                      int64_t num_tables, int64_t local_batch_size,
-                      int64_t num_elements) {
+at::Tensor expand_table_ids_cuda(
+    at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
+    int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const auto device = offsets.device();

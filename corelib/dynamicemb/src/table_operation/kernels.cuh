@@ -28,13 +28,17 @@ namespace cg = cooperative_groups;
 namespace dyn_emb {
 
 template <int ThreadBlockDim_, int ProbingGroupSize_, int ReductionGroupSize_,
-          int CompactTileSize_, int NumScorePerThread_>
+          int CompactTileSize_, int NumScorePerThread_,
+          ScorePolicyType PolicyType_ = ScorePolicyType::Const,
+          bool OutputScore_ = false>
 struct InsertKernelTraits {
   static constexpr int ThreadBlockDim = ThreadBlockDim_;
   static constexpr int ProbingGroupSize = ProbingGroupSize_;
   static constexpr int ReductionGroupSize = ReductionGroupSize_;
   static constexpr int CompactTileSize = CompactTileSize_;
   static constexpr int NumScorePerThread = NumScorePerThread_;
+  static constexpr ScorePolicyType PolicyType = PolicyType_;
+  static constexpr bool OutputScore = OutputScore_;
 };
 
 template <bool Pred> struct ExportPredFunctor {
@@ -73,13 +77,13 @@ struct EvalAndCount {
   }
 };
 
-template <typename Table, int ProbingGroupSize>
+template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType>
 __global__ void
 table_lookup_kernel(Table table, int64_t batch,
                     typename Table::KeyType const *__restrict__ input_keys,
                     bool *__restrict__ founds, IndexType *__restrict__ indices,
-                    ScoreType *__restrict__ scores, ScorePolicyType policy_type,
-                    bool return_scores) {
+                    ScoreType *__restrict__ score_input,
+                    int64_t *__restrict__ score_output) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -90,7 +94,7 @@ table_lookup_kernel(Table table, int64_t batch,
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
 
     KeyType key = input_keys[i];
-    ScoreType score = ScorePolicy::get(policy_type, scores, i);
+    ScoreType score = ScorePolicy<PolicyType>::get(score_input, i);
 
     Bucket bucket;
     KeyType hashcode = KeyType();
@@ -109,13 +113,12 @@ table_lookup_kernel(Table table, int64_t batch,
     IndexType index = -1;
     if (found) {
 
-      if (policy_type == ScorePolicyType::Const) {
+      if constexpr (PolicyType == ScorePolicyType::Const) {
         score = *bucket.scores(iter);
       } else {
         KeyType expected_key = key;
         if (bucket.try_lock(iter, expected_key)) {
-          ScorePolicy::update(policy_type, return_scores, bucket.scores(iter),
-                              score);
+          score = ScorePolicy<PolicyType>::update(bucket.scores(iter), score);
           bucket.unlock(iter, key);
         } else {
           found = false; // only one update will succeed for duplicated keys.
@@ -127,7 +130,7 @@ table_lookup_kernel(Table table, int64_t batch,
         index = bucket_id * bucket.capacity() + iter;
       }
     }
-    ScorePolicy::set(return_scores, scores, i, score);
+    score_output[i] = static_cast<int64_t>(score);
     if (founds) {
       founds[i] = found;
     }
@@ -138,14 +141,12 @@ table_lookup_kernel(Table table, int64_t batch,
 }
 
 template <typename Table, typename KernelTraits>
-__global__ void
-table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
-                    typename Table::KeyType const *__restrict__ input_keys,
-                    InsertResult *__restrict__ insert_results,
-                    IndexType *__restrict__ indices,
-                    ScoreType *__restrict__ scores, ScorePolicyType policy_type,
-                    bool return_scores,
-                    typename Table::KeyType **__restrict__ table_key_slots) {
+__global__ void table_insert_kernel(
+    Table table, int *__restrict__ bucket_sizes, int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
+    ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
+    typename Table::KeyType **__restrict__ table_key_slots) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -157,17 +158,19 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
 
   static constexpr int ProbingGroupSize = KernelTraits::ProbingGroupSize;
   static constexpr int ReductionGroupSize = KernelTraits::ReductionGroupSize;
+  static constexpr ScorePolicyType PolicyType = KernelTraits::PolicyType;
+  static constexpr bool OutputScore = KernelTraits::OutputScore;
+
+  using Policy = ScorePolicy<PolicyType>;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
-  // extern __shared__ ScoreType sm_scores[];
-  // cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
 
     KeyType key = input_keys[i];
-    ScoreType score = ScorePolicy::get(policy_type, scores, i);
+    ScoreType score = Policy::get(score_input, i);
 
     InsertResult result = InsertResult::Init;
 
@@ -178,7 +181,6 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
       hashcode = Table::hash(key);
       uint64_t global_idx = static_cast<uint64_t>(hashcode % table.capacity());
       bucket_id = global_idx / table.bucket_capacity();
-      // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
     } else {
       result = InsertResult::Illegal;
@@ -193,10 +195,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
 
         if (bucket.try_lock(iter, expected_key)) {
           result = InsertResult::Assign;
-          // bucket.unlock(iter, key); // will not unlock, to avoid 2 threads
-          // got the same slot.
-        } // else: the key is evicted from the bucket(full), try to reintert by
-          // eviction including reclaimed key.
+        }
         break;
       }
       if (probe_res == ProbeResult::Empty) {
@@ -207,7 +206,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
           atomicAdd(&bucket_sizes[bucket_id], 1);
           result = InsertResult::Insert;
           break;
-        } // else it was locked by another thread.
+        }
       }
 
       if (probe_res == ProbeResult::Failed) {
@@ -219,8 +218,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
     while (result == InsertResult::Init) {
 
       KeyType evict_key;
-      ScoreType evict_score =
-          ScorePolicy::score_for_compare(policy_type, score);
+      ScoreType evict_score = Policy::score_for_compare(score);
 
       bool succeed = bucket.template reduce<ReductionGroupSize, BufferDim>(
           iter, evict_key, evict_score, sm_scores);
@@ -229,7 +227,6 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
 
         if (bucket.try_lock(iter, evict_key)) {
           if (*bucket.scores(iter) != evict_score) {
-            // that means when reduce we got a new key but old score.
             bucket.unlock(iter, evict_key);
           } else {
             *bucket.digests(iter) = Bucket::key_to_digest(key);
@@ -242,7 +239,7 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
             }
             break;
           }
-        } // else it was locked by another thread.
+        }
       } else {
         result = InsertResult::Busy;
         break;
@@ -252,17 +249,15 @@ table_insert_kernel(Table table, int *__restrict__ bucket_sizes, int64_t batch,
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
-      ScorePolicy::update(policy_type, return_scores, bucket.scores(iter),
-                          score);
+      score = Policy::update(bucket.scores(iter), score);
       index = bucket_id * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
     }
-    ScorePolicy::set(return_scores, scores, i, score);
-    // TODO: unlock using index.
-    table_key_slots[i] = table_key_slot;
-    if (indices) {
-      indices[i] = index;
+    if constexpr (OutputScore) {
+      score_output[i] = static_cast<int64_t>(score);
     }
+    table_key_slots[i] = table_key_slot;
+    indices[i] = index;
     if (insert_results) {
       insert_results[i] = result;
     }
@@ -274,11 +269,11 @@ __global__ void table_insert_and_evict_kernel(
     Table table, int *__restrict__ bucket_sizes, int64_t batch,
     typename Table::KeyType const *__restrict__ input_keys,
     InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
-    ScoreType *__restrict__ scores, ScorePolicyType policy_type,
-    bool return_scores, typename Table::KeyType **__restrict__ table_key_slots,
+    ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
+    typename Table::KeyType **__restrict__ table_key_slots,
     CounterType *evicted_counter,
     typename Table::KeyType *__restrict__ evicted_keys,
-    ScoreType *__restrict__ evicted_scores,
+    int64_t *__restrict__ evicted_scores,
     IndexType *__restrict__ evicted_indices) {
 
   using KeyType = typename Table::KeyType;
@@ -291,6 +286,10 @@ __global__ void table_insert_and_evict_kernel(
 
   static constexpr int ProbingGroupSize = KernelTraits::ProbingGroupSize;
   static constexpr int ReductionGroupSize = KernelTraits::ReductionGroupSize;
+  static constexpr ScorePolicyType PolicyType = KernelTraits::PolicyType;
+  static constexpr bool OutputScore = KernelTraits::OutputScore;
+
+  using Policy = ScorePolicy<PolicyType>;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -299,7 +298,7 @@ __global__ void table_insert_and_evict_kernel(
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
 
     KeyType key = input_keys[i];
-    ScoreType score = ScorePolicy::get(policy_type, scores, i);
+    ScoreType score = Policy::get(score_input, i);
 
     InsertResult result = InsertResult::Init;
 
@@ -310,7 +309,6 @@ __global__ void table_insert_and_evict_kernel(
       hashcode = Table::hash(key);
       uint64_t global_idx = static_cast<uint64_t>(hashcode % table.capacity());
       bucket_id = global_idx / table.bucket_capacity();
-      // bucket_id = (hashcode % table.capacity()) / table.bucket_capacity();
       bucket = table[bucket_id];
     } else {
       result = InsertResult::Illegal;
@@ -324,10 +322,7 @@ __global__ void table_insert_and_evict_kernel(
         KeyType expected_key = key;
         if (bucket.try_lock(iter, expected_key)) {
           result = InsertResult::Assign;
-          // bucket.unlock(iter, key); // will not unlock, to avoid 2 threads
-          // got the same slot.
-        } // else: the key is evicted from the bucket(full), try to reintert by
-          // eviction including reclaimed key.
+        }
         break;
       }
       if (probe_res == ProbeResult::Empty) {
@@ -337,7 +332,7 @@ __global__ void table_insert_and_evict_kernel(
           atomicAdd(&bucket_sizes[bucket_id], 1);
           result = InsertResult::Insert;
           break;
-        } // else it was locked by another thread.
+        }
       }
 
       if (probe_res == ProbeResult::Failed) {
@@ -351,7 +346,7 @@ __global__ void table_insert_and_evict_kernel(
 
     while (result == InsertResult::Init) {
 
-      evict_score = ScorePolicy::score_for_compare(policy_type, score);
+      evict_score = Policy::score_for_compare(score);
       bool succeed = bucket.template reduce<ReductionGroupSize, BufferDim>(
           iter, evict_key, evict_score, sm_scores);
 
@@ -359,7 +354,6 @@ __global__ void table_insert_and_evict_kernel(
 
         if (bucket.try_lock(iter, evict_key)) {
           if (*bucket.scores(iter) != evict_score) {
-            // that means when reduce we got a new key but old score.
             bucket.unlock(iter, evict_key);
           } else {
             *bucket.digests(iter) = Bucket::key_to_digest(key);
@@ -372,7 +366,7 @@ __global__ void table_insert_and_evict_kernel(
             }
             break;
           }
-        } // else it was locked by another thread.
+        }
       } else {
         result = InsertResult::Busy;
         evict_key = key;
@@ -401,11 +395,9 @@ __global__ void table_insert_and_evict_kernel(
     if (evicted) {
       evicted_keys[out_id] = evict_key;
       if (evicted_scores) {
-        evicted_scores[out_id] = evict_score;
+        evicted_scores[out_id] = static_cast<int64_t>(evict_score);
       }
       if (evicted_indices) {
-        // if insert failed, save the index in input value buffer as negative
-        // index.
         IndexType index = (result == InsertResult::Evict)
                               ? bucket_id * bucket.capacity() + iter
                               : -static_cast<IndexType>(i + 1);
@@ -416,16 +408,15 @@ __global__ void table_insert_and_evict_kernel(
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
-      ScorePolicy::update(policy_type, return_scores, bucket.scores(iter),
-                          score);
+      score = Policy::update(bucket.scores(iter), score);
       index = bucket_id * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
     }
-    ScorePolicy::set(return_scores, scores, i, score);
-    table_key_slots[i] = table_key_slot;
-    if (indices) {
-      indices[i] = index;
+    if constexpr (OutputScore) {
+      score_output[i] = static_cast<int64_t>(score);
     }
+    table_key_slots[i] = table_key_slot;
+    indices[i] = index;
     if (insert_results) {
       insert_results[i] = result;
     }

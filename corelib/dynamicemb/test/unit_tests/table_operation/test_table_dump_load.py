@@ -118,13 +118,10 @@ def test_table_load(
         score_specs=[ScoreSpec(name="score1", policy=score_policy)],
     )
 
-    score_args_lookup = [
-        ScoreArg(
-            name="score1",
-            policy=ScorePolicy.CONST,
-            is_return=True,
-        )
-    ]
+    score_arg_lookup = ScoreArg(
+        name="score1",
+        policy=ScorePolicy.CONST,
+    )
 
     key_file = "debug_keys"
     score_file = "debug_scores"
@@ -147,18 +144,16 @@ def test_table_load(
 
     assert table.size() == selected_keys.numel()
 
-    founds = torch.empty(selected_keys.numel(), dtype=torch.bool, device=device).fill_(
-        False
-    )
-    score_args_lookup[0].value = torch.zeros(
+    score_arg_lookup.value = torch.zeros(
         selected_keys.numel(), dtype=torch.uint64, device=device
     )
 
-    table.lookup(selected_keys, score_args_lookup, founds)
+    score_out, founds, _ = table.lookup(selected_keys, score_arg_lookup)
 
     assert founds.sum() == selected_keys.numel()
     assert torch.equal(
-        score_args_lookup[0].value, torch.ones_like(selected_keys).to(torch.uint64)
+        score_out.to(torch.uint64),
+        torch.ones_like(selected_keys).to(torch.uint64),
     )
 
     print(
@@ -208,18 +203,13 @@ def test_table_dump_load(
         keys = keys.to(key_type)
         batch_ = keys.numel()
 
-        score_args = [
-            ScoreArg(
-                name="score1", value=get_scores(score_policy, keys), is_return=True
-            )
-        ]
+        score_arg = ScoreArg(name="score1", value=get_scores(score_policy, keys))
 
         insert_results = torch.empty(
             batch_, dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
-        indices = torch.zeros(batch_, dtype=table.index_type, device=device)
 
-        table.insert(keys, score_args, indices, insert_results)
+        table.insert(keys, score_arg, insert_results)
 
         # not assign or busy
         assert (
@@ -262,36 +252,26 @@ def test_table_dump_load(
         keys = keys.to(key_type)
         batch_ = keys.numel()
 
-        score_args0 = [
-            ScoreArg(
-                name="score1",
-                value=get_scores(score_policy, keys),
-                policy=ScorePolicy.CONST,
-                is_return=True,
-            )
-        ]
+        score_arg0 = ScoreArg(
+            name="score1",
+            value=get_scores(score_policy, keys),
+            policy=ScorePolicy.CONST,
+        )
 
-        score_args1 = [
-            ScoreArg(
-                name="score1",
-                value=get_scores(score_policy, keys),
-                policy=ScorePolicy.CONST,
-                is_return=True,
-            )
-        ]
+        score_arg1 = ScoreArg(
+            name="score1",
+            value=get_scores(score_policy, keys),
+            policy=ScorePolicy.CONST,
+        )
 
-        founds0 = torch.empty(batch_, dtype=torch.bool, device=device)
-        founds1 = torch.empty(batch_, dtype=torch.bool, device=device)
-
-        table.lookup(keys, score_args0, founds0, None)
-
-        load_table.lookup(keys, score_args1, founds1)
+        score_out0, founds0, _ = table.lookup(keys, score_arg0)
+        score_out1, founds1, _ = load_table.lookup(keys, score_arg1)
 
         assert torch.equal(founds0, founds1)
         num_total_keys += founds0.sum()
 
-        scores0 = score_args0[0].value.to(torch.int64)[founds0]
-        scores1 = score_args1[0].value.to(torch.int64)[founds1]
+        scores0 = score_out0[founds0]
+        scores1 = score_out1[founds1]
 
         if table.score_specs[0].policy == ScorePolicy.GLOBAL_TIMER:
             # same machine
@@ -308,13 +288,11 @@ def test_table_dump_load(
 
 
 def table_num_matched(table, threshold) -> int:
-    d_num_matched = torch.zeros(1, dtype=torch.int64, device=table.device)
-    table_count_matched(
+    d_num_matched = table_count_matched(
         table.table_storage_,
-        table.fileds_type_,
+        table.fileds_type_[0],
         table.bucket_capacity_,
-        [threshold],
-        d_num_matched,
+        threshold,
     )
     return d_num_matched.cpu().item()
 
@@ -372,14 +350,12 @@ def test_table_incremental_dump(
     )
     masks = keys % world_size == local_rank
     keys = keys[masks]
-    score_args = [
-        ScoreArg(name="score1", value=get_scores(score_policy, keys), is_return=True)
-    ]
+    score_arg = ScoreArg(name="score1", value=get_scores(score_policy, keys))
     insert_results = torch.empty(
         bucket_capacity, dtype=table.result_type, device=device
     ).fill_(InsertResult.INIT.value)
 
-    table.insert(keys, score_args, None, insert_results)
+    table.insert(keys, score_arg, insert_results)
 
     # check 1: count_matched works well
     assert table_num_matched(table, 0) == bucket_capacity
@@ -436,14 +412,14 @@ def test_table_incremental_dump(
             keys = keys[masks]
 
             offset += global_batch
-            score_args[0].value = get_scores(score_policy, keys)
+            score_arg.value = get_scores(score_policy, keys)
             insert_results = torch.empty(
                 batch_size, dtype=table.result_type, device=device
             ).fill_(InsertResult.INIT.value)
 
             old_size = table.size()
-            num_evict, evict_keys, _, evict_named_scores = table.insert_and_evict(
-                keys, score_args, None, insert_results
+            _, num_evict, evict_keys, _, evict_named_scores = table.insert_and_evict(
+                keys, score_arg, insert_results
             )
             new_size = table.size()
 

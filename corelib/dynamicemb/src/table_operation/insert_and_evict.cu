@@ -20,26 +20,66 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
+template <typename Table, ScorePolicyType PolicyTypeV, bool OutputScoreV,
+          int CompactTileSize>
+void launch_table_insert_and_evict_kernel(
+    Table table, int *bucket_sizes_ptr, int64_t num_total,
+    typename Table::KeyType *keys_ptr, InsertResult *insert_results_ptr,
+    IndexType *indices_ptr, ScoreType *score_input_ptr,
+    int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
+    CounterType *evict_counter_ptr, typename Table::KeyType *evicted_keys_ptr,
+    int64_t *evicted_scores_ptr, IndexType *evicted_indices_ptr,
+    cudaStream_t stream) {
+  constexpr int BLOCK_SIZE = 256;
+  using KernelTraits = InsertKernelTraits<BLOCK_SIZE, 1, 1, CompactTileSize, 8,
+                                          PolicyTypeV, OutputScoreV>;
+
+  table_insert_and_evict_kernel<Table, KernelTraits>
+      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+          table, bucket_sizes_ptr, num_total, keys_ptr, insert_results_ptr,
+          indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_ptr,
+          evict_counter_ptr, evicted_keys_ptr, evicted_scores_ptr,
+          evicted_indices_ptr);
+
+  table_unlock_kernel<Table>
+      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+          table, num_total, keys_ptr, table_key_slots_ptr);
+}
+
 void table_insert_and_evict_single_score(
-    at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
-    std::vector<std::optional<at::Tensor>> scores,
-    std::vector<ScorePolicyType> policy_types, std::vector<bool> is_returns,
-    std::optional<at::Tensor> insert_results, std::optional<at::Tensor> indices,
-    at::Tensor num_evicted, at::Tensor evicted_keys, at::Tensor evicted_indices,
-    std::vector<at::Tensor> evicted_scores) {
+    at::Tensor table_storage, int64_t bucket_capacity, at::Tensor bucket_sizes,
+    at::Tensor keys, std::optional<at::Tensor> score_input,
+    ScorePolicyType policy_type, at::Tensor indices,
+    std::optional<at::Tensor> insert_results,
+    std::optional<at::Tensor> score_output, at::Tensor num_evicted,
+    at::Tensor evicted_keys, at::Tensor evicted_indices,
+    at::Tensor evicted_scores) {
 
   auto key_type = get_data_type(keys);
 
-  bool is_return = is_returns[0];
-  ScorePolicyType policy_type = policy_types[0];
-  auto scores_ = get_pointer<ScoreType>(scores[0]);
-  auto indices_ = get_pointer<IndexType>(indices);
-  auto insert_results_ = get_pointer<InsertResult>(insert_results);
+  ScoreType *score_input_ptr = nullptr;
+  at::Tensor score_input_tensor;
+  if (score_input.has_value() && score_input.value().defined()) {
+    at::Tensor in = score_input.value();
+    if (in.scalar_type() == torch::kUInt64) {
+      score_input_ptr = get_pointer<ScoreType>(score_input);
+    } else {
+      score_input_tensor = in.view(torch::kUInt64);
+      score_input_ptr = score_input_tensor.data_ptr<ScoreType>();
+    }
+  }
+
+  int64_t *score_output_ptr = nullptr;
+  if (score_output.has_value() && score_output.value().defined()) {
+    score_output_ptr = score_output.value().data_ptr<int64_t>();
+  }
+
+  auto indices_ptr = indices.data_ptr<IndexType>();
+  auto insert_results_ptr = get_pointer<InsertResult>(insert_results);
   auto bucket_sizes_ = get_pointer<int>(bucket_sizes);
 
   auto evict_counter_ = get_pointer<CounterType>(num_evicted);
-  auto evicted_scores_ = get_pointer<ScoreType>(evicted_scores[0]);
+  auto evicted_scores_ptr = evicted_scores.data_ptr<int64_t>();
   auto evicted_indices_ = get_pointer<IndexType>(evicted_indices);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -49,7 +89,7 @@ void table_insert_and_evict_single_score(
   auto table_key_slots = at::zeros(
       num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
 
-  constexpr int BLOCK_SIZE = 256;
+  bool output_score = (score_output_ptr != nullptr);
 
   DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
     auto keys_ = get_pointer<KeyType>(keys);
@@ -68,52 +108,82 @@ void table_insert_and_evict_single_score(
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
                        num_buckets, bucket_capacity);
 
-    if (num_total % 32 == 0) {
-      using KernelTraits = InsertKernelTraits<BLOCK_SIZE, 1, 1, 32, 8>;
-      table_insert_and_evict_kernel<Table, KernelTraits>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, bucket_sizes_, num_total, keys_, insert_results_,
-                       indices_, scores_, policy_type, is_return,
-                       table_key_slots_, evict_counter_, evicted_keys_,
-                       evicted_scores_, evicted_indices_);
-    } else {
-      using KernelTraits = InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8>;
-      table_insert_and_evict_kernel<Table, KernelTraits>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, bucket_sizes_, num_total, keys_, insert_results_,
-                       indices_, scores_, policy_type, is_return,
-                       table_key_slots_, evict_counter_, evicted_keys_,
-                       evicted_scores_, evicted_indices_);
-    }
-
-    table_unlock_kernel<Table>
-        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            table, num_total, keys_, table_key_slots_);
+    DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
+      if (num_total % 32 == 0) {
+        if (output_score) {
+          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32>(
+              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_,
+              evict_counter_, evicted_keys_, evicted_scores_ptr,
+              evicted_indices_, stream);
+        } else {
+          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32>(
+              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              indices_ptr, score_input_ptr, nullptr, table_key_slots_,
+              evict_counter_, evicted_keys_, evicted_scores_ptr,
+              evicted_indices_, stream);
+        }
+      } else {
+        if (output_score) {
+          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 1>(
+              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_,
+              evict_counter_, evicted_keys_, evicted_scores_ptr,
+              evicted_indices_, stream);
+        } else {
+          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1>(
+              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              indices_ptr, score_input_ptr, nullptr, table_key_slots_,
+              evict_counter_, evicted_keys_, evicted_scores_ptr,
+              evicted_indices_, stream);
+        }
+      }
+    });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void table_insert_and_evict(
-    at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
-    std::vector<std::optional<at::Tensor>> scores,
-    std::vector<ScorePolicyType> policy_types, std::vector<bool> is_returns,
-    std::optional<at::Tensor> insert_results, std::optional<at::Tensor> indices,
-    at::Tensor num_evicted, at::Tensor evicted_keys, at::Tensor evicted_indices,
-    std::vector<at::Tensor> evicted_scores) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_insert_and_evict(at::Tensor table_storage, int64_t bucket_capacity,
+                       at::Tensor bucket_sizes, at::Tensor keys,
+                       std::optional<at::Tensor> score_input,
+                       ScorePolicyType policy_type,
+                       std::optional<at::Tensor> insert_results,
+                       std::optional<at::Tensor> score_output) {
 
   int64_t num_total = keys.size(0);
-  if (num_total == 0)
-    return;
-
-  if (scores.size() == 1) {
-    table_insert_and_evict_single_score(
-        table_storage, dtypes, bucket_capacity, bucket_sizes, keys, scores,
-        policy_types, is_returns, insert_results, indices, num_evicted,
-        evicted_keys, evicted_indices, evicted_scores);
-  } else {
-    throw std::runtime_error("Not support multi-scores.");
+  if (num_total == 0) {
+    at::Tensor indices = torch::empty({0}, keys.options().dtype(torch::kInt64));
+    at::Tensor num_evicted =
+        torch::zeros({1}, keys.options().dtype(torch::kInt64));
+    at::Tensor evicted_keys =
+        torch::empty({0}, keys.options().dtype(keys.scalar_type()));
+    at::Tensor evicted_indices =
+        torch::empty({0}, keys.options().dtype(torch::kInt64));
+    at::Tensor evicted_scores =
+        torch::empty({0}, keys.options().dtype(torch::kInt64));
+    return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
+                           evicted_scores);
   }
+
+  at::Tensor indices =
+      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+  at::Tensor num_evicted =
+      torch::zeros({1}, keys.options().dtype(torch::kInt64));
+  at::Tensor evicted_keys =
+      torch::empty({num_total}, keys.options().dtype(keys.scalar_type()));
+  at::Tensor evicted_indices =
+      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+  at::Tensor evicted_scores =
+      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+
+  table_insert_and_evict_single_score(
+      table_storage, bucket_capacity, bucket_sizes, keys, score_input,
+      policy_type, indices, insert_results, score_output, num_evicted,
+      evicted_keys, evicted_indices, evicted_scores);
+
+  return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
+                         evicted_scores);
 }
 
 } // namespace dyn_emb
