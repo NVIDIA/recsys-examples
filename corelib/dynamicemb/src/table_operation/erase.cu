@@ -20,9 +20,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-void table_erase(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-                 int64_t bucket_capacity, at::Tensor bucket_sizes,
-                 at::Tensor keys, std::optional<at::Tensor> indices) {
+void table_erase(at::Tensor table_storage, int64_t bucket_capacity,
+                 at::Tensor bucket_sizes, at::Tensor keys,
+                 std::optional<at::Tensor> indices) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0)

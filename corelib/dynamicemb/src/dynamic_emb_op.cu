@@ -120,9 +120,9 @@ void gather_embedding_pooled(
   const int *d_D_offsets = nullptr;
   if (D_offsets.has_value()) {
     TORCH_CHECK(D_offsets.value().scalar_type() == at::kInt,
-                "D_offsets must be int32, got ", D_offsets.value().scalar_type());
-    d_D_offsets =
-        reinterpret_cast<const int *>(D_offsets.value().data_ptr());
+                "D_offsets must be int32, got ",
+                D_offsets.value().scalar_type());
+    d_D_offsets = reinterpret_cast<const int *>(D_offsets.value().data_ptr());
   }
   dyn_emb::scatter_combine(
       input.data_ptr(), output.data_ptr(), offsets.data_ptr(), index.data_ptr(),
@@ -144,7 +144,8 @@ generate_gather_ids_pooled_kernel(const offset_t *__restrict__ offsets,
        s += gridDim.x * blockDim.x) {
     int f = s / B;
     int b = s % B;
-    id_t val = static_cast<id_t>(b) * static_cast<id_t>(F) + static_cast<id_t>(f);
+    id_t val =
+        static_cast<id_t>(b) * static_cast<id_t>(F) + static_cast<id_t>(f);
     offset_t start = offsets[s];
     offset_t end = offsets[s + 1];
     for (offset_t j = start; j < end; ++j) {
@@ -158,8 +159,7 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
              int batch_size, int64_t out_dim,
              const std::optional<at::Tensor> &offsets = std::nullopt,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
-             int combiner = -1,
-             int total_D = 0) {
+             int combiner = -1, int total_D = 0) {
   // When D_offsets is provided (multi-dim pooling):
   //   grads is [B, total_D].  Permutation-aware gather_ids are generated,
   //   sorted with reverse_indices, then a multi-dim variant of LocalReduce
@@ -200,7 +200,8 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
     auto &offs = offsets.value();
     int num_slots = static_cast<int>(offs.numel() - 1);
     TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
-    TORCH_CHECK(num_slots % batch_size == 0, "num_slots (", num_slots, ") must be divisible by batch_size (", batch_size, ")");
+    TORCH_CHECK(num_slots % batch_size == 0, "num_slots (", num_slots,
+                ") must be divisible by batch_size (", batch_size, ")");
     int num_features = num_slots / batch_size;
     auto offset_type =
         scalartype_to_datatype(convertTypeMetaToScalarType(offs.dtype()));
@@ -721,9 +722,8 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
-        py::arg("offsets") = py::none(),
-        py::arg("D_offsets") = py::none(), py::arg("combiner") = -1,
-        py::arg("total_D") = 0);
+        py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
+        py::arg("combiner") = -1, py::arg("total_D") = 0);
 
   m.def("gather_embedding", &gather_embedding,
         "Gather embedding based on index.", py::arg("input"), py::arg("output"),

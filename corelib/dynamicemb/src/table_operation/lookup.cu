@@ -21,20 +21,29 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 void table_lookup_single_score(at::Tensor table_storage,
-                               std::vector<torch::Dtype> dtypes,
                                int64_t bucket_capacity, at::Tensor keys,
-                               std::vector<std::optional<at::Tensor>> scores,
-                               std::vector<ScorePolicyType> policy_types,
-                               std::vector<bool> is_returns, at::Tensor founds,
-                               std::optional<at::Tensor> indices) {
+                               std::optional<at::Tensor> score_input,
+                               ScorePolicyType policy_type,
+                               at::Tensor score_output, at::Tensor founds,
+                               at::Tensor indices) {
 
   auto key_type = get_data_type(keys);
 
-  bool is_return = is_returns[0];
-  ScorePolicyType policy_type = policy_types[0];
-  auto scores_ = get_pointer<ScoreType>(scores[0]);
-  auto indices_ = get_pointer<IndexType>(indices);
-  auto founds_ = founds.data_ptr<bool>();
+  ScoreType *score_input_ptr = nullptr;
+  at::Tensor score_input_tensor;
+  if (score_input.has_value() && score_input.value().defined()) {
+    at::Tensor in = score_input.value();
+    if (in.scalar_type() == torch::kUInt64) {
+      score_input_ptr = get_pointer<ScoreType>(score_input);
+    } else {
+      score_input_tensor = in.view(torch::kUInt64);
+      score_input_ptr = score_input_tensor.data_ptr<ScoreType>();
+    }
+  }
+
+  auto score_output_ptr = score_output.data_ptr<int64_t>();
+  auto indices_ptr = indices.data_ptr<IndexType>();
+  auto founds_ptr = founds.data_ptr<bool>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -43,7 +52,7 @@ void table_lookup_single_score(at::Tensor table_storage,
   constexpr int BLOCK_SIZE = 256;
 
   DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
-    auto keys_ = get_pointer<KeyType>(keys);
+    auto keys_ptr = get_pointer<KeyType>(keys);
 
     constexpr int64_t total_size =
         sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
@@ -57,32 +66,41 @@ void table_lookup_single_score(at::Tensor table_storage,
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
                        num_buckets, bucket_capacity);
 
-    table_lookup_kernel<Table, 1>
-        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            table, num_total, keys_, founds_, indices_, scores_, policy_type,
-            is_return);
+    DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
+      table_lookup_kernel<Table, 1, PolicyTypeV>
+          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+             stream>>>(table, num_total, keys_ptr, founds_ptr, indices_ptr,
+                       score_input_ptr, score_output_ptr);
+    });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void table_lookup(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-                  int64_t bucket_capacity, at::Tensor keys,
-                  std::vector<std::optional<at::Tensor>> scores,
-                  std::vector<ScorePolicyType> policy_types,
-                  std::vector<bool> is_returns, at::Tensor founds,
-                  std::optional<at::Tensor> indices) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+table_lookup(at::Tensor table_storage, int64_t bucket_capacity, at::Tensor keys,
+             std::optional<at::Tensor> score_input,
+             ScorePolicyType policy_type) {
 
   int64_t num_total = keys.size(0);
-  if (num_total == 0)
-    return;
-
-  if (scores.size() == 1) {
-    table_lookup_single_score(table_storage, dtypes, bucket_capacity, keys,
-                              scores, policy_types, is_returns, founds,
-                              indices);
-  } else {
-    throw std::runtime_error("Not support multi-scores.");
+  if (num_total == 0) {
+    at::Tensor score_output =
+        torch::empty({0}, keys.options().dtype(torch::kInt64));
+    at::Tensor founds = torch::empty({0}, keys.options().dtype(torch::kBool));
+    at::Tensor indices = torch::empty({0}, keys.options().dtype(torch::kInt64));
+    return std::make_tuple(score_output, founds, indices);
   }
+
+  at::Tensor score_output =
+      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+  at::Tensor founds =
+      torch::empty({num_total}, keys.options().dtype(torch::kBool));
+  at::Tensor indices =
+      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+
+  table_lookup_single_score(table_storage, bucket_capacity, keys, score_input,
+                            policy_type, score_output, founds, indices);
+
+  return std::make_tuple(score_output, founds, indices);
 }
 
 } // namespace dyn_emb

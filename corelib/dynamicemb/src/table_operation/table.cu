@@ -96,40 +96,37 @@ void bind_table_operation(py::module &m) {
         py::arg("dtypes"), py::arg("bucket_capacity"), py::arg("num_buckets"));
 
   m.def("table_lookup", &dyn_emb::table_lookup, "lookup the table",
-        py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
-        py::arg("keys"), py::arg("scores"), py::arg("policy_types"),
-        py::arg("is_returns"), py::arg("founds"), py::arg("indices"));
+        py::arg("table_storage"), py::arg("bucket_capacity"), py::arg("keys"),
+        py::arg("score_input"), py::arg("policy_type"));
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
-        py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
-        py::arg("bucket_sizes"), py::arg("keys"), py::arg("scores"),
-        py::arg("policy_types"), py::arg("is_returns"), py::arg("indices"),
-        py::arg("insert_results"));
+        py::arg("table_storage"), py::arg("bucket_capacity"),
+        py::arg("bucket_sizes"), py::arg("keys"), py::arg("score_input"),
+        py::arg("policy_type"), py::arg("insert_results") = py::none(),
+        py::arg("score_output") = py::none());
 
   m.def("table_insert_and_evict", &dyn_emb::table_insert_and_evict,
-        "insert into the table", py::arg("table_storage"), py::arg("dtypes"),
+        "insert into the table", py::arg("table_storage"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
-        py::arg("scores"), py::arg("policy_types"), py::arg("is_returns"),
-        py::arg("insert_results"), py::arg("indices"), py::arg("num_evicted"),
-        py::arg("evicted_keys"), py::arg("evicted_indices"),
-        py::arg("evicted_scores"));
+        py::arg("score_input"), py::arg("policy_type"),
+        py::arg("insert_results") = py::none(),
+        py::arg("score_output") = py::none());
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
-        py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
+        py::arg("table_storage"), py::arg("bucket_capacity"),
         py::arg("bucket_sizes"), py::arg("keys"),
         py::arg("indices") = py::none());
 
   m.def("table_export_batch", &dyn_emb::table_export_batch,
         "export items[offset, offset + batch) from the table",
-        py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
-        py::arg("batch"), py::arg("offset"), py::arg("counter"),
-        py::arg("keys"), py::arg("scores"), py::arg("thresholds") = py::none(),
-        py::arg("indices") = py::none());
+        py::arg("table_storage"), py::arg("bucket_capacity"), py::arg("batch"),
+        py::arg("offset"), py::arg("key_dtype"),
+        py::arg("threshold") = py::none());
 
   m.def("table_count_matched", &dyn_emb::table_count_matched,
-        "count number of items in the table whose scores >= thresholds",
-        py::arg("table_storage"), py::arg("dtypes"), py::arg("bucket_capacity"),
-        py::arg("thresholds"), py::arg("num_matched"));
+        "count number of items in the table whose scores >= threshold",
+        py::arg("table_storage"), py::arg("key_dtype"),
+        py::arg("bucket_capacity"), py::arg("threshold"));
 
   m.def("bucketize_keys", &dyn_emb::bucketize_keys,
         "bucketize input keys into a dense tensor, and return the output keys, "

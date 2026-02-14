@@ -83,9 +83,15 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         h_unique_keys = unique_keys.cpu()
         lookup_dim = unique_embs.size(1)
         results = []
@@ -110,8 +116,6 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             unique_embs[founds_, :] = torch.cat(
                 [t.unsqueeze(0) for t in results], dim=0
             )
-        if founds is not None:
-            founds[:] = founds_
 
         num_missing = torch.tensor(
             [len(missing_keys)], dtype=torch.long, device=self.device
@@ -130,25 +134,41 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         else:
             missing_scores = torch.empty(0, dtype=torch.uint64, device=self.device)
 
-        return num_missing, missing_keys, missing_indices, missing_scores
+        # output_scores: scores for all keys (0 for missing, input_scores for found)
+        output_scores = torch.zeros(
+            unique_keys.size(0), dtype=torch.int64, device=self.device
+        )
+        if input_scores is not None:
+            output_scores[founds_] = input_scores[founds_].to(torch.int64)
+
+        return (
+            num_missing,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+            founds_,
+            output_scores,
+        )
 
     def find_embeddings(
         self,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.find_impl(unique_keys, unique_embs, founds, input_scores)
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        return self.find_impl(unique_keys, unique_embs, input_scores)
 
     def find(
         self,
         unique_keys: torch.Tensor,
         unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.find_impl(unique_keys, unique_vals, founds, input_scores)
+    ) -> Tuple[
+        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        return self.find_impl(unique_keys, unique_vals, input_scores)
 
     def insert(
         self,

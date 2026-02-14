@@ -85,11 +85,9 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
  *
  * @return table_ids tensor (int32) with same length as num_elements
  */
-at::Tensor
-expand_table_ids_cuda(at::Tensor offsets,
-                      c10::optional<at::Tensor> table_offsets_in_feature,
-                      int64_t num_tables, int64_t local_batch_size,
-                      int64_t num_elements);
+at::Tensor expand_table_ids_cuda(
+    at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
+    int64_t num_tables, int64_t local_batch_size, int64_t num_elements);
 
 /**
  * @brief Compute new lengths and offsets by evenly distributing unique keys.

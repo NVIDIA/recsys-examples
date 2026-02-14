@@ -53,7 +53,7 @@ class KVCounter(Counter):
         self.table_ = None
         self.score_name_ = None
         self.score_specs_ = None
-        self.score_args_ = None
+        self.score_arg_ = None
 
     def create(self, device: torch.device) -> "KVCounter":
         """
@@ -69,7 +69,7 @@ class KVCounter(Counter):
         self.score_specs_ = [
             ScoreSpec(name=self.score_name_, policy=ScorePolicy.ACCUMULATE)
         ]
-        self.score_args_ = [ScoreArg(name=self.score_name_, is_return=True)]
+        self.score_arg_ = ScoreArg(name=self.score_name_)
 
         self.table_ = get_scored_table(
             self.capacity,
@@ -89,9 +89,7 @@ class KVCounter(Counter):
                 "This is normally done by the framework during model sharding."
             )
 
-    def add(
-        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
-    ) -> torch.Tensor:
+    def add(self, keys: torch.Tensor, frequencies: torch.Tensor) -> torch.Tensor:
         """
         Add keys with frequencies to the `Counter` and get accumulated counter of each key.
         For not existed keys, the frequencies will be assigned directly.
@@ -100,17 +98,16 @@ class KVCounter(Counter):
         Args:
             keys (torch.Tensor): The input keys, should be unique keys.
             frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
-            inplace: If true then store the accumulated_frequencies to counter.
 
         Returns:
             accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
         """
         self._ensure_created()
-        assert inplace == True, "Only support inplace=True"
-        self.score_args_[0].value = frequencies
+        self.score_arg_.value = frequencies
 
-        self.table_.insert(keys, self.score_args_)
-        return frequencies
+        scores_out = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
+        self.table_.insert(keys, self.score_arg_, score_out=scores_out)
+        return scores_out
 
     def erase(self, keys) -> None:
         """
