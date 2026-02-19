@@ -6,7 +6,7 @@ import shutil
 import urllib.request
 import warnings
 import zipfile
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -25,6 +25,7 @@ from dynamicemb import (
 )
 from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim
 from dynamicemb.incremental_dump import get_score, incremental_dump
+from dynamicemb.inference import apply_dynamicemb_preprocessing
 from dynamicemb.optimizer import EmbOptimType, convert_optimizer_type
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
@@ -50,9 +51,18 @@ from torchrec.distributed.planner.storage_reservations import (
 )
 from torchrec.distributed.planner.types import ShardingPlan
 from torchrec.distributed.types import ShardingType
+from torchrec.inference.modules import quantize_inference_model, shard_quant_model
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+import torchrec
+from dynamicemb.ir.utils import (
+    decapsulate_ir_modules,
+    encapsulate_ir_modules,
+    mark_dynamic_kjt,
+)
+from torchrec.pt2.utils import register_fake_classes
+register_fake_classes()
 
 # Filter FBGEMM warning, make notebook clean
 warnings.filterwarnings(
@@ -124,6 +134,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="TorchRec MovieLens with dynamicemb")
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--inference", action="store_true")
+    parser.add_argument("--export", action="store_true")
     parser.add_argument("--load", action="store_true")
     parser.add_argument("--dump", action="store_true")
     parser.add_argument("--incremental_dump", action="store_true")
@@ -620,7 +632,8 @@ def apply_dmp(model, args, training):
     return dmp
 
 
-def create_model(args, training=True):
+def create_model(args, mode="train"):
+    assert mode in ["train", "eval", "inference"]
     # Define the configuration parameters for the embedding table,
     # including its name, embedding dimension, total number of embeddings, and feature name.
     eb_configs = [
@@ -682,10 +695,34 @@ def create_model(args, training=True):
         dense_arch_layer_sizes=[1, 1],  # placeholder
         over_arch_layer_sizes=mlp_dims,
     )
-
-    model = apply_dmp(model, args, training)
-
-    return model
+    if mode in ["train", "eval"]:
+        sharded_model = apply_dmp(model, args, mode == "train")
+    else:
+        sharded_model = apply_dynamicemb_preprocessing(
+            model
+        )
+        # quant_model = quantize_inference_model(model)
+        # print("quant_model", quant_model)
+        # sharded_model, _ = shard_quant_model(
+        #     quant_model, compute_device="cuda", sharding_device="cuda"
+        # )
+        # sharded_model = encapsulate_ir_modules(model)
+        print("sharded_model", sharded_model)
+        # print("model after quantize_inference_model", model)
+        # if not has_nvembedding:
+        #     model = apply_dynamicemb_preprocessing(
+        #         model, table_names=["user_id", "movie_id"]
+        #     )
+        #     quantize_embeddings(
+        #         model,
+        #         dtype=torch.qint8,
+        #         inplace=True
+        #     )
+        # else:
+        #     model = apply_nvembedding_inference(
+        #         model, table_names=["user_id", "movie_id"]
+        #     )
+    return sharded_model
 
 
 def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs):
@@ -770,6 +807,169 @@ def train(args):
         test_one_epoch(model, test_loader, criterion, epoch, args.epochs)
 
 
+def eval(args):
+    test_dataset = MovieLensDataset(args.data_path, split="test")
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=False
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4,
+        sampler=test_sampler,
+    )
+
+    model = create_model(args, mode="eval")
+    model.to(device)
+    # load
+    model_checkpoint_path = os.path.join(
+        args.save_dir, f"model_epoch_{args.epochs}_rank0.pt"
+    )
+    if not os.path.exists(model_checkpoint_path):
+        raise FileNotFoundError(
+            f"Model checkpoint not found at {model_checkpoint_path}, please run --dump first"
+        )
+    checkpoint = torch.load(
+        model_checkpoint_path,
+        weights_only=True,
+    )
+    # Must set strict to False, as there is no embedding's weight in model.state_dict()
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+    DynamicEmbLoad(os.path.join(args.save_dir, "dynamicemb"), model, optim=False)
+
+    model.eval()
+    with torch.inference_mode():
+        outputs_sum = 0
+        for features, labels in test_loader:
+            features = features.to(device)
+            labels = labels.to(device)
+
+            outputs = model(features)
+            outputs_sum += outputs.sum()
+        outputs_sum = torch.tensor(outputs_sum, dtype=torch.float32, device=device)
+        torch.distributed.all_reduce(
+            outputs_sum, op=torch.distributed.ReduceOp.SUM, group=dist.GroupMember.WORLD
+        )
+        print(f"Outputs sum: {outputs_sum}")
+
+
+def inference(args):
+    test_dataset = MovieLensDataset(args.data_path, split="test")
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=False
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4,
+        sampler=test_sampler,
+    )
+
+    model = create_model(args, mode="inference")
+    model.to(device)
+    # load
+    model_checkpoint_path = os.path.join(
+        args.save_dir, f"model_epoch_{args.epochs}_rank0.pt"
+    )
+    if not os.path.exists(model_checkpoint_path):
+        raise FileNotFoundError(
+            f"Model checkpoint not found at {model_checkpoint_path}, please run --dump first"
+        )
+    checkpoint = torch.load(
+        model_checkpoint_path,
+        weights_only=True,
+    )
+    # Must set strict to False, as there is no embedding's weight in model.state_dict()
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+    DynamicEmbLoad(os.path.join(args.save_dir, "dynamicemb"), model, optim=False)
+
+    model.eval()
+    with torch.inference_mode():
+        outputs_sum = 0
+        for features, labels in test_loader:
+            features = features.to(device)
+            labels = labels.to(device)
+
+            outputs = model(features)
+            outputs_sum += outputs.sum()
+        outputs_sum = torch.tensor(outputs_sum, dtype=torch.float32, device=device)
+        torch.distributed.all_reduce(
+            outputs_sum, op=torch.distributed.ReduceOp.SUM, group=dist.GroupMember.WORLD
+        )
+        print(f"Outputs sum: {outputs_sum}")
+
+# https://github.com/pytorch/FBGEMM/blob/2e4e4802999c1aa9b4ef1b4371887598446c91cf/fbgemm_gpu/src/sparse_ops/sparse_block_bucketize_features.cu#L664-L915
+import fbgemm_gpu.sparse_ops as sparse_ops
+@torch.library.register_fake("fbgemm::block_bucketize_sparse_features_inference")
+def block_bucketize_sparse_features_inference_fake(
+    lengths: torch.Tensor,
+    indices: torch.Tensor,
+    bucketize_pos: bool,
+    sequence: bool,
+    block_sizes: torch.Tensor,
+    my_size: int,
+    weights: Optional[torch.Tensor],
+    batch_size_per_feature: Optional[torch.Tensor],
+    max_batch_size: int, # Only used in GPU variant
+    block_bucketize_pos: Optional[List[torch.Tensor]],
+    return_bucket_mapping: bool,
+    keep_orig_idx: bool,
+    total_num_blocks: Optional[torch.Tensor] = None,
+    keep_orig_idx_per_feature: Optional[torch.Tensor] = None
+):
+    new_lengths_size = lengths.numel() * my_size
+    new_lengths = torch.empty(new_lengths_size, dtype=lengths.dtype, device=lengths.device)
+    new_indices = torch.empty_like(indices)
+    if weights is not None:
+        new_weights = torch.empty_like(weights)
+        new_pos = torch.empty_like(indices)
+    if sequence:
+        new_unbucketize_permute = torch.empty(indices.numel(), dtype=indices.dtype, device=indices.device)
+    if return_bucket_mapping:
+        new_bucket_mapping = torch.empty(indices.numel(), dtype=indices.dtype, device=indices.device)
+    return (new_lengths, new_indices, new_weights, new_pos, new_unbucketize_permute, new_bucket_mapping)
+
+block_bucketize_sparse_features_inference_fake.__module__ = "fbgemm_gpu.sparse_ops"
+sparse_ops.block_bucketize_sparse_features_inference_fake = block_bucketize_sparse_features_inference_fake
+
+# https://github.com/meta-pytorch/torchrec/blob/1bd8d56a3413abe9f2739faa6d6caadb134ce0a4/torchrec/ir/tests/test_serializer.py#L387
+def export(args):
+    model = create_model(args, mode="inference")
+
+    model.to(device)
+    model.eval()
+
+    example_sparse_features = KeyedJaggedTensor.from_lengths_sync(
+        keys=['user_id', 'movie_id', 'gender', 'age', 'occupation', 'year'],
+        values=torch.randint(0, 1000, (6,), dtype=torch.int64).cuda(),
+        lengths=torch.ones(6, dtype=torch.int64).cuda(),
+    )
+    collection = mark_dynamic_kjt(example_sparse_features)
+    print("collection", collection)
+    # [Optional] Specify the first dimension of the input x as dynamic.
+    exported = torch.export.export(
+        model, 
+        (example_sparse_features, ), 
+        dynamic_shapes=collection.dynamic_shapes(model, (example_sparse_features, )),
+        strict=False,
+    )
+    print("exported", exported)
+    # output_path = torch._inductor.aoti_compile_and_package(
+    #     exported,
+    #     # [Optional] Specify the generated shared library path. If not specified,
+    #     # the generated artifact is stored in your system temp directory.
+    #     package_path=os.path.join(os.getcwd(), "model.pt2"),
+    # )
+
+
 def dump(args):
     os.makedirs(args.save_dir, exist_ok=True)
     train_dataset = MovieLensDataset(args.data_path, split="train")
@@ -835,9 +1035,7 @@ def load(args):
 
     # load
     checkpoint = torch.load(
-        os.path.join(
-            args.save_dir, f"model_epoch_{args.epochs}_rank{dist.get_rank()}.pt"
-        ),
+        os.path.join(args.save_dir, f"model_epoch_{args.epochs}_rank0.pt"),
         weights_only=True,
     )
     # Must set strict to False, as there is no embedding's weight in model.state_dict()
@@ -930,6 +1128,12 @@ def main():
     dist.barrier(device_ids=[local_rank])
     if args.train:
         train(args)
+    if args.eval:
+        eval(args)
+    if args.inference:
+        inference(args)
+    if args.export:
+        export(args)
     if args.dump:
         dump(args)
     if args.load:
