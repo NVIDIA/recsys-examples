@@ -21,7 +21,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 void table_lookup_single_score(at::Tensor table_storage,
+                               at::Tensor table_bucket_offsets,
                                int64_t bucket_capacity, at::Tensor keys,
+                               at::Tensor table_ids,
                                std::optional<at::Tensor> score_input,
                                ScorePolicyType policy_type,
                                at::Tensor score_output, at::Tensor founds,
@@ -44,6 +46,8 @@ void table_lookup_single_score(at::Tensor table_storage,
   auto score_output_ptr = score_output.data_ptr<int64_t>();
   auto indices_ptr = indices.data_ptr<IndexType>();
   auto founds_ptr = founds.data_ptr<bool>();
+  auto table_ids_ptr = table_ids.data_ptr<int64_t>();
+  auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -69,7 +73,9 @@ void table_lookup_single_score(at::Tensor table_storage,
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV>
           <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, num_total, keys_ptr, founds_ptr, indices_ptr,
+             stream>>>(table, table_bucket_offsets_ptr,
+                       num_total, keys_ptr, table_ids_ptr,
+                       founds_ptr, indices_ptr,
                        score_input_ptr, score_output_ptr);
     });
   });
@@ -77,7 +83,9 @@ void table_lookup_single_score(at::Tensor table_storage,
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-table_lookup(at::Tensor table_storage, int64_t bucket_capacity, at::Tensor keys,
+table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+             int64_t bucket_capacity, at::Tensor keys,
+             at::Tensor table_ids,
              std::optional<at::Tensor> score_input,
              ScorePolicyType policy_type) {
 
@@ -97,8 +105,10 @@ table_lookup(at::Tensor table_storage, int64_t bucket_capacity, at::Tensor keys,
   at::Tensor indices =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
 
-  table_lookup_single_score(table_storage, bucket_capacity, keys, score_input,
-                            policy_type, score_output, founds, indices);
+  table_lookup_single_score(table_storage, table_bucket_offsets,
+                            bucket_capacity, keys, table_ids,
+                            score_input, policy_type,
+                            score_output, founds, indices);
 
   return std::make_tuple(score_output, founds, indices);
 }

@@ -111,10 +111,15 @@ class ScoredHashTable(abc.ABC):
     def lookup(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         score: ScoreArg,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Lookup keys in the table.
+        Args:
+            keys: input keys tensor.
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
+            score: score argument.
         Returns:
             (score_out, founds, indices)
         """
@@ -123,12 +128,15 @@ class ScoredHashTable(abc.ABC):
     def insert(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Keys have to be unique.
+        Args:
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
         Returns:
             indices
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
@@ -138,14 +146,19 @@ class ScoredHashTable(abc.ABC):
     def insert_and_evict(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         """
         Keys have to be unique.
+        Args:
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
         Returns:
-            (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores)
+            (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores, evicted_table_ids)
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
 
@@ -153,9 +166,12 @@ class ScoredHashTable(abc.ABC):
     def erase(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
     ) -> None:
         """
         Erase Keys
+        Args:
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
         """
 
     @abc.abstractmethod
@@ -163,6 +179,7 @@ class ScoredHashTable(abc.ABC):
         self,
         key_file: str,
         score_files: Dict[str, str],
+        table_id: Optional[int] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -177,6 +194,7 @@ class ScoredHashTable(abc.ABC):
         self,
         key_file: str,
         score_files: Dict[str, str],
+        table_id: Optional[int] = None,
     ) -> None:
         """
         Dump keys and scores to output file path.
@@ -184,6 +202,7 @@ class ScoredHashTable(abc.ABC):
         Args:
             key_file (str): the file path of keys.
             score_files: Dict[str, str]: Dict from score name to score file path.
+            table_id (Optional[int]): if provided, only dump the specified table.
         """
 
     @abc.abstractmethod
@@ -192,6 +211,7 @@ class ScoredHashTable(abc.ABC):
         score_threshold: Dict[str, int],
         batch_size: int = 65536,
         pg: Optional[dist.ProcessGroup] = None,
+        table_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Dump incremental keys and scores into cpu tensors.
@@ -213,15 +233,15 @@ class ScoredHashTable(abc.ABC):
         """
 
     @abc.abstractmethod
-    def capacity(self) -> int:
+    def capacity(self, table_id: Optional[int] = None) -> int:
         """
-        Return the capacity of the table.
+        Return the capacity of the table, or a specific logical table.
         """
 
     @abc.abstractmethod
-    def size(self) -> int:
+    def size(self, table_id: Optional[int] = None) -> int:
         """
-        Return the size of the table.
+        Return the size of the table, or a specific logical table.
         """
 
     @abc.abstractmethod
@@ -262,12 +282,20 @@ def murmur3_hash_64bits(key: int) -> int:
 class LinearBucketTable(ScoredHashTable):
     def __init__(
         self,
-        capacity: int,
+        capacity: List[int],
         score_specs: List[ScoreSpec],
         key_type: torch.dtype = torch.int64,
         bucket_capacity: Optional[int] = None,
         device: torch.device = None,
     ):
+        """
+        Args:
+            capacity: List of capacities, one per logical table.
+            score_specs: List of ScoreSpec (currently only one is supported).
+            key_type: key data type, torch.int64 or torch.uint64.
+            bucket_capacity: number of slots per bucket (default 128).
+            device: CUDA device.
+        """
         self.device = (
             device
             if device is not None
@@ -306,7 +334,10 @@ class LinearBucketTable(ScoredHashTable):
         if bucket_capacity is None:
             bucket_capacity = 128
 
-        assert capacity > 0 and bucket_capacity > 0 and capacity >= bucket_capacity
+        assert (
+            isinstance(capacity, list) and len(capacity) >= 1
+        ), "capacity must be a non-empty list of ints (one per logical table)."
+
         max_load_bytes = 16
         digest_load_dim = max_load_bytes // dtype_to_bytes(self.digest_type_)
         if bucket_capacity % digest_load_dim == 0:
@@ -326,14 +357,28 @@ class LinearBucketTable(ScoredHashTable):
         self.fileds_type_ = [self.key_type_, self.digest_type_] + self.score_types_
         self.fields_byte_ = [dtype_to_bytes(x) for x in self.fileds_type_]
 
-        # variable part when reserve.
-        self.num_buckets_ = (
-            capacity + self.bucket_capacity_ - 1
-        ) // self.bucket_capacity_
+        # Multi-table: compute per-table bucket counts and offsets
+        self.num_tables_ = len(capacity)
+        self.per_table_num_buckets_: List[int] = []
+        self.per_table_capacity_: List[int] = []
+        bucket_offset_list = [0]
+        for cap in capacity:
+            nb = (cap + self.bucket_capacity_ - 1) // self.bucket_capacity_
+            self.per_table_num_buckets_.append(nb)
+            self.per_table_capacity_.append(nb * self.bucket_capacity_)
+            bucket_offset_list.append(bucket_offset_list[-1] + nb)
+
+        self.num_buckets_ = bucket_offset_list[-1]
         self.capacity_ = self.num_buckets_ * self.bucket_capacity_
-        if self.capacity_ != capacity:
+
+        self.table_bucket_offsets_ = torch.tensor(
+            bucket_offset_list, dtype=torch.int64, device=self.device
+        )
+
+        total_input_capacity = sum(capacity)
+        if self.capacity_ != total_input_capacity:
             warnings.warn(
-                f"Table capacity is rounded from {capacity} to {self.capacity_}.",
+                f"Table total capacity is rounded from {total_input_capacity} to {self.capacity_}.",
                 UserWarning,
             )
 
@@ -413,10 +458,13 @@ class LinearBucketTable(ScoredHashTable):
     def lookup(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         score: ScoreArg,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Lookup keys in the table. Score is optional input for Assign/Accumulate policies.
+        Args:
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
         Returns:
             (score_out, founds, indices): score tensor (int64), found mask, indices.
         """
@@ -424,8 +472,10 @@ class LinearBucketTable(ScoredHashTable):
 
         score_out, founds, indices = table_lookup(
             self.table_storage_,
+            self.table_bucket_offsets_,
             self.bucket_capacity_,
             keys,
+            table_ids,
             score_value,
             policy,
         )
@@ -434,13 +484,15 @@ class LinearBucketTable(ScoredHashTable):
     def insert(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Keys have to be unique.
-        insert_results is optional (default None) for debugging; when provided, filled in-place.
+        Args:
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
         Returns:
             indices
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
@@ -449,9 +501,11 @@ class LinearBucketTable(ScoredHashTable):
 
         indices = table_insert(
             self.table_storage_,
+            self.table_bucket_offsets_,
             self.bucket_capacity_,
             self.bucket_sizes,
             keys,
+            table_ids,
             score_value,
             policy,
             insert_results,
@@ -462,14 +516,19 @@ class LinearBucketTable(ScoredHashTable):
     def insert_and_evict(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         """
         Keys have to be unique.
+        Args:
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
         Returns:
-            (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores)
+            (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores, evicted_table_ids)
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
 
@@ -481,11 +540,14 @@ class LinearBucketTable(ScoredHashTable):
             evicted_keys,
             evicted_indices,
             evicted_scores,
+            evicted_table_ids,
         ) = table_insert_and_evict(
             self.table_storage_,
+            self.table_bucket_offsets_,
             self.bucket_capacity_,
             self.bucket_sizes,
             keys,
+            table_ids,
             score_value,
             policy,
             insert_results,
@@ -499,26 +561,33 @@ class LinearBucketTable(ScoredHashTable):
             evicted_keys[:h_num_evicted],
             evicted_indices[:h_num_evicted],
             evicted_scores[:h_num_evicted],
+            evicted_table_ids[:h_num_evicted],
         )
 
     def erase(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
     ) -> None:
         """
         Erase Keys
+        Args:
+            table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
         """
         table_erase(
             self.table_storage_,
+            self.table_bucket_offsets_,
             self.bucket_capacity_,
             self.bucket_sizes,
             keys,
+            table_ids,
         )
 
     def load(
         self,
         key_file: str,
         score_files: Dict[str, str],
+        table_id: Optional[int] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -526,7 +595,11 @@ class LinearBucketTable(ScoredHashTable):
         Args:
             key_file (str): the file path of keys.
             score_files: Dict[str, str]: Dict from score name to score file path.
+            table_id (Optional[int]): if provided, load keys into the specified logical table.
+                If None, defaults to table 0.
         """
+
+        load_table_id = table_id if table_id is not None else 0
 
         for score_name in self.score_names_:
             if score_name not in score_files or not os.path.exists(
@@ -605,7 +678,10 @@ class LinearBucketTable(ScoredHashTable):
             score_arg = ScoreArg(
                 name=score_name, value=scores, policy=ScorePolicy.ASSIGN
             )
-            self.insert(keys, score_arg)
+            tid = torch.full(
+                (keys.numel(),), load_table_id, dtype=torch.int64, device=device
+            )
+            self.insert(keys, tid, score_arg)
 
         fkey.close()
         for name in fscores.keys():
@@ -618,6 +694,7 @@ class LinearBucketTable(ScoredHashTable):
         thresholds: Optional[List[int]] = None,
         batch_size: int = 65536,
         return_index: bool = False,
+        table_id: Optional[int] = None,
     ) -> Iterator[Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]]:
         """
         export keys, {score_name: scores}, indices
@@ -630,6 +707,7 @@ class LinearBucketTable(ScoredHashTable):
                 only dump scores for score_names.
             batch_size (int): the batch size when scan the table.
             return_index (bool) : whether export indices or not, default to False.
+            table_id (Optional[int]): if provided, only export keys from the specified logical table.
 
         Returns:
             out_keys (torch.Tensor): output tensor of keys
@@ -637,7 +715,14 @@ class LinearBucketTable(ScoredHashTable):
             out_indices (Optional[torch.Tensor]): output tensor of indices
         """
 
-        search_capacity = self.capacity_
+        if table_id is not None:
+            offsets_cpu = self.table_bucket_offsets_.cpu()
+            begin_slot = int(offsets_cpu[table_id].item()) * self.bucket_capacity_
+            end_slot = int(offsets_cpu[table_id + 1].item()) * self.bucket_capacity_
+            search_capacity = end_slot - begin_slot
+        else:
+            begin_slot = 0
+            search_capacity = self.capacity_
 
         offset = 0
 
@@ -661,7 +746,7 @@ class LinearBucketTable(ScoredHashTable):
                 self.table_storage_,
                 self.bucket_capacity_,
                 batch_,
-                offset,
+                begin_slot + offset,
                 key_dtype,
                 threshold_,
             )
@@ -686,6 +771,7 @@ class LinearBucketTable(ScoredHashTable):
         self,
         key_file: str,
         score_files: Dict[str, str],
+        table_id: Optional[int] = None,
     ) -> None:
         """
         Dump keys and scores to output file path.
@@ -693,6 +779,7 @@ class LinearBucketTable(ScoredHashTable):
         Args:
             key_file (str): the file path of keys.
             score_files: Dict[str, str]: Dict from score name to score file path.
+            table_id (Optional[int]): if provided, only dump the specified logical table.
         """
 
         fkey = open(key_file, "wb")
@@ -708,7 +795,7 @@ class LinearBucketTable(ScoredHashTable):
         dump_timestamp = device_timestamp()
 
         for keys, named_scores, _ in self._batched_export_keys_scores(
-            fscores.keys(), self.device
+            fscores.keys(), self.device, table_id=table_id
         ):
             fkey.write(keys.cpu().numpy().tobytes())
             for name, scores in named_scores.items():
@@ -729,6 +816,7 @@ class LinearBucketTable(ScoredHashTable):
         batch_size: int = 65536,
         pg: Optional[dist.ProcessGroup] = None,
         return_index: bool = False,
+        table_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
         """
         Dump incremental keys and scores into cpu tensors.
@@ -738,6 +826,7 @@ class LinearBucketTable(ScoredHashTable):
             batch_size (int): the batch size when scan the table.
             pg (Optional[dist.ProcessGroup]): process group.
             return_index: whether return the index or not.
+            table_id (Optional[int]): if provided, only dump the specified logical table.
 
         Returns:
             out_keys (torch.Tensor): output tensor of keys
@@ -763,11 +852,21 @@ class LinearBucketTable(ScoredHashTable):
 
                 threshold_val = threshold
 
+        # Compute begin/end for count_matched if table_id is specified
+        count_begin = -1
+        count_end = -1
+        if table_id is not None:
+            offsets_cpu = self.table_bucket_offsets_.cpu()
+            count_begin = int(offsets_cpu[table_id].item()) * self.bucket_capacity_
+            count_end = int(offsets_cpu[table_id + 1].item()) * self.bucket_capacity_
+
         d_num_matched = table_count_matched(
             self.table_storage_,
             self.key_type_,
             self.bucket_capacity_,
             threshold_val,
+            count_begin,
+            count_end,
         )
 
         # if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
@@ -786,7 +885,12 @@ class LinearBucketTable(ScoredHashTable):
 
         out_offset = 0
         for keys, named_scores, indices in self._batched_export_keys_scores(
-            scores, self.device, thresholds, batch_size, return_index=return_index
+            scores,
+            self.device,
+            thresholds,
+            batch_size,
+            return_index=return_index,
+            table_id=table_id,
         ):
             h_count = keys.numel()
             out_keys[out_offset : out_offset + h_count].copy_(keys, non_blocking=True)
@@ -813,16 +917,23 @@ class LinearBucketTable(ScoredHashTable):
         """
         self._init_table(self.keys_, self.scores_list, self.digests_)
 
-    def capacity(self) -> int:
+    def capacity(self, table_id: Optional[int] = None) -> int:
         """
-        Return the capacity of the table.
+        Return the capacity of the table, or a specific logical table.
         """
+        if table_id is not None:
+            return self.per_table_capacity_[table_id]
         return self.capacity_
 
-    def size(self) -> int:
+    def size(self, table_id: Optional[int] = None) -> int:
         """
-        Return the size of the table.
+        Return the size of the table, or a specific logical table.
         """
+        if table_id is not None:
+            offsets_cpu = self.table_bucket_offsets_.cpu()
+            bkt_begin = int(offsets_cpu[table_id].item())
+            bkt_end = int(offsets_cpu[table_id + 1].item())
+            return self.bucket_sizes[bkt_begin:bkt_end].sum()
         return self.bucket_sizes.sum()
 
     def load_factor(self) -> float:
@@ -846,16 +957,16 @@ class LinearBucketTable(ScoredHashTable):
     def bucketize_keys(
         self,
         keys,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # bkt_keys = keys[inverse]
+        table_ids,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bkt_keys, offsets, inverse = bucketize_keys(
-            keys, self.bucket_capacity_, self.num_buckets_
+            keys, table_ids, self.table_bucket_offsets_, self.bucket_capacity_
         )
         return bkt_keys, offsets, inverse
 
 
 def get_scored_table(
-    capacity: int,
+    capacity: List[int],
     bucket_capacity: Optional[int] = None,
     key_type: Optional[torch.dtype] = torch.int64,
     score_specs: List[ScoreSpec] = [

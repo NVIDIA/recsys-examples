@@ -72,7 +72,7 @@ class KVCounter(Counter):
         self.score_arg_ = ScoreArg(name=self.score_name_)
 
         self.table_ = get_scored_table(
-            self.capacity,
+            [self.capacity],
             self.bucket_capacity,
             self.key_type,
             self.score_specs_,
@@ -106,7 +106,8 @@ class KVCounter(Counter):
         self.score_arg_.value = frequencies
 
         scores_out = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
-        self.table_.insert(keys, self.score_arg_, score_out=scores_out)
+        table_ids = torch.zeros(keys.numel(), dtype=torch.int64, device=keys.device)
+        self.table_.insert(keys, table_ids, self.score_arg_, score_out=scores_out)
         return scores_out
 
     def erase(self, keys) -> None:
@@ -117,7 +118,8 @@ class KVCounter(Counter):
             keys (torch.Tensor): The input keys to be erased.
         """
         self._ensure_created()
-        self.table_.erase(keys)
+        table_ids = torch.zeros(keys.numel(), dtype=torch.int64, device=keys.device)
+        self.table_.erase(keys, table_ids)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         """

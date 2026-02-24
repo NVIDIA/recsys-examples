@@ -94,27 +94,35 @@ inline int get_size(torch::ScalarType scalar_type) {
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-table_lookup(at::Tensor table_storage, int64_t bucket_capacity, at::Tensor keys,
+table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+             int64_t bucket_capacity, at::Tensor keys,
+             at::Tensor table_ids,
              std::optional<at::Tensor> score_input,
              ScorePolicyType policy_type);
 
-at::Tensor table_insert(at::Tensor table_storage, int64_t bucket_capacity,
+at::Tensor table_insert(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                        int64_t bucket_capacity,
                         at::Tensor bucket_sizes, at::Tensor keys,
+                        at::Tensor table_ids,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt);
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-table_insert_and_evict(at::Tensor table_storage, int64_t bucket_capacity,
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_insert_and_evict(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                       int64_t bucket_capacity,
                        at::Tensor bucket_sizes, at::Tensor keys,
+                       at::Tensor table_ids,
                        std::optional<at::Tensor> score_input,
                        ScorePolicyType policy_type,
                        std::optional<at::Tensor> insert_results = std::nullopt,
                        std::optional<at::Tensor> score_output = std::nullopt);
 
-void table_erase(at::Tensor table_storage, int64_t bucket_capacity,
+void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                 int64_t bucket_capacity,
                  at::Tensor bucket_sizes, at::Tensor keys,
+                 at::Tensor table_ids,
                  std::optional<at::Tensor> indices);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -123,7 +131,8 @@ table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
                    std::optional<ScoreType> threshold = std::nullopt);
 
 at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
-                               int64_t bucket_capacity, ScoreType threshold);
+                               int64_t bucket_capacity, ScoreType threshold,
+                               int64_t begin = -1, int64_t end = -1);
 
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,
@@ -134,7 +143,8 @@ std::vector<at::Tensor> tensor_partition(at::Tensor input,
                                          std::vector<int64_t> byte_range,
                                          std::vector<torch::Dtype> dtypes);
 
-std::vector<at::Tensor> bucketize_keys(at::Tensor keys, int64_t bucket_capacity,
-                                       int64_t num_buckets);
+std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
+                                       at::Tensor table_bucket_offsets,
+                                       int64_t bucket_capacity);
 
 } // namespace dyn_emb
