@@ -165,11 +165,15 @@ def dynamicemb_prefetch(
         begin = h_unique_indices_table_range[i]
         end = h_unique_indices_table_range[i + 1]
         unique_indices_per_table = unique_indices[begin:end]
+        table_ids_i = torch.zeros(
+            end - begin, dtype=torch.int64, device=unique_indices.device
+        )
 
         KeyValueTableCachingFunction.prefetch(
             caches[i],
             storages[i],
             unique_indices_per_table,
+            table_ids_i,
             initializers[i],
             training,
             forward_stream,
@@ -250,6 +254,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
             unique_indices_per_table = unique_indices[begin:end]
+            table_ids_i = torch.zeros(
+                end - begin, dtype=torch.int64, device=indices.device
+            )
             lfu_accumulated_frequency_per_table = (
                 lfu_accumulated_frequency[begin:end]
                 if lfu_accumulated_frequency is not None
@@ -264,6 +271,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     caches[i],
                     storages[i],
                     unique_indices_per_table,
+                    table_ids_i,
                     unique_embs_per_table,
                     initializers[i],
                     enable_prefetch,
@@ -277,6 +285,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 KeyValueTableFunction.lookup(
                     storages[i],
                     unique_indices_per_table,
+                    table_ids_i,
                     unique_embs_per_table,
                     initializers[i],
                     training,
@@ -395,6 +404,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             begin = h_unique_indices_table_range[i]
             end = h_unique_indices_table_range[i + 1]
             unique_indices_per_table = ctx.unique_indices[begin:end]
+            table_ids_i = torch.zeros(
+                end - begin, dtype=torch.int64, device=unique_indices_per_table.device
+            )
 
             # Slice to the actual dim for this table (for uniform-dim,
             # dim_i == max_D so this is a full-row slice — no copy).
@@ -408,6 +420,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     caches[i],
                     storages[i],
                     unique_indices_per_table,
+                    table_ids_i,
                     unique_grads_per_table,
                     optimizer,
                 )
@@ -415,6 +428,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 KeyValueTableFunction.update(
                     storages[i],
                     unique_indices_per_table,
+                    table_ids_i,
                     unique_grads_per_table,
                     optimizer,
                 )

@@ -90,7 +90,7 @@ template <typename KeyType_,
                                       sizeof(KeyType_) == 8>>
 struct LinearBucket {
 
-  __forceinline__ __device__ LinearBucket(uint8_t *storage, uint32_t capacity)
+  __forceinline__ __device__ LinearBucket(uint8_t *storage, int64_t capacity)
       : storage_(storage), capacity_(capacity) {}
 
   __forceinline__ __device__ LinearBucket() : LinearBucket(nullptr, 0) {}
@@ -98,12 +98,12 @@ struct LinearBucket {
   /*
   Iterator:
   */
-  using Iterator = uint32_t;
+  using Iterator = int64_t;
 
-  template <uint32_t AlignSize>
-  static __forceinline__ __device__ int align(Iterator &iter) {
+  template <int64_t AlignSize>
+  static __forceinline__ __device__ Iterator align(Iterator &iter) {
     // iter - (iter % AlignSize)
-    constexpr uint32_t MASK = 0xffffffffU - (AlignSize - 1);
+    constexpr int64_t MASK = ~(AlignSize - 1);
     return iter & MASK;
   }
 
@@ -119,14 +119,14 @@ struct LinearBucket {
 
   static constexpr uint64_t ReserveKeyMask = UINT64_C(0xFFFFFFFFFFFFFFFC);
 
-  static __device__ __forceinline__ uint64_t hash(uint64_t key) {
+  static __device__ __forceinline__ int64_t hash(uint64_t key) {
     uint64_t k = key;
     k ^= k >> 33;
     k *= UINT64_C(0xff51afd7ed558ccd);
     k ^= k >> 33;
     k *= UINT64_C(0xc4ceb9fe1a85ec53);
     k ^= k >> 33;
-    return static_cast<uint64_t>(k);
+    return static_cast<int64_t>(k & INT64_MAX); // avoid overflow
   }
 
   static __device__ __forceinline__ KeyType empty_key() { return EmptyKey; }
@@ -204,7 +204,7 @@ struct LinearBucket {
   };
 
   static __device__ __forceinline__ DigestType
-  hashcode_to_digest(uint64_t hashcode) {
+  hashcode_to_digest(int64_t hashcode) {
     return static_cast<DigestType>(hashcode >> 32);
   }
 
@@ -243,11 +243,11 @@ struct LinearBucket {
   static constexpr int ScoreOffset = DigestOffset + sizeof(DigestType);
   static constexpr int BucketBytes = ScoreOffset + sizeof(ScoreType);
 
-  static __device__ __forceinline__ uint64_t memory_usage(int size) {
+  static __device__ __forceinline__ uint64_t memory_usage(int64_t size) {
     return BucketBytes * size;
   }
 
-  __forceinline__ __device__ uint32_t capacity() const { return capacity_; }
+  __forceinline__ __device__ int64_t capacity() const { return capacity_; }
 
   __forceinline__ __device__ KeyType *keys(const Iterator &iter) const {
     return reinterpret_cast<KeyType *>(storage_ + KeyOffset * capacity_) + iter;
@@ -277,7 +277,7 @@ struct LinearBucket {
   */
   template <int GroupSize = 1>
   __forceinline__ __device__ ProbeResult probe(KeyType key, Iterator &iter,
-                                               int &step) const {
+                                               int64_t &step) const {
     static_assert(GroupSize == 1);
     if (storage_ == nullptr or capacity_ == 0) {
       step = capacity_;
@@ -434,7 +434,7 @@ struct LinearBucket {
   }
 
   uint8_t *__restrict__ storage_;
-  uint32_t capacity_;
+  int64_t capacity_;
 };
 
 template <typename BucketType_> struct LinearBucketTable {
@@ -442,11 +442,11 @@ template <typename BucketType_> struct LinearBucketTable {
   using KeyType = typename BucketType::KeyType;
 
   LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
-                    uint32_t bucket_capacity)
+                    int64_t bucket_capacity)
       : storage_(storage), num_buckets_(num_buckets),
         bucket_capacity_(bucket_capacity) {}
 
-  static __device__ __forceinline__ uint64_t hash(uint64_t key) {
+  static __device__ __forceinline__ int64_t hash(uint64_t key) {
     return BucketType::hash(key);
   }
 
@@ -461,7 +461,7 @@ template <typename BucketType_> struct LinearBucketTable {
     return num_buckets_ * bucket_capacity_;
   }
 
-  __device__ __forceinline__ uint32_t bucket_capacity() const {
+  __device__ __forceinline__ int64_t bucket_capacity() const {
     return bucket_capacity_;
   }
 
@@ -475,7 +475,7 @@ template <typename BucketType_> struct LinearBucketTable {
 
   uint8_t *__restrict__ storage_;
   uint64_t num_buckets_;
-  uint32_t bucket_capacity_;
+  int64_t bucket_capacity_;
 };
 
 } // namespace dyn_emb

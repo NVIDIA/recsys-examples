@@ -23,12 +23,15 @@ namespace dyn_emb {
 template <typename Table, ScorePolicyType PolicyTypeV, bool OutputScoreV,
           int CompactTileSize>
 void launch_table_insert_and_evict_kernel(
-    Table table, int *bucket_sizes_ptr, int64_t num_total,
-    typename Table::KeyType *keys_ptr, InsertResult *insert_results_ptr,
+    Table table, int64_t *table_bucket_offsets_ptr,
+    int *bucket_sizes_ptr, int64_t num_total,
+    typename Table::KeyType *keys_ptr, int64_t *table_ids_ptr,
+    InsertResult *insert_results_ptr,
     IndexType *indices_ptr, ScoreType *score_input_ptr,
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
     CounterType *evict_counter_ptr, typename Table::KeyType *evicted_keys_ptr,
     int64_t *evicted_scores_ptr, IndexType *evicted_indices_ptr,
+    int64_t *evicted_table_ids_ptr,
     cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits = InsertKernelTraits<BLOCK_SIZE, 1, 1, CompactTileSize, 8,
@@ -36,10 +39,12 @@ void launch_table_insert_and_evict_kernel(
 
   table_insert_and_evict_kernel<Table, KernelTraits>
       <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, bucket_sizes_ptr, num_total, keys_ptr, insert_results_ptr,
+          table, table_bucket_offsets_ptr,
+          bucket_sizes_ptr, num_total, keys_ptr, table_ids_ptr,
+          insert_results_ptr,
           indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_ptr,
           evict_counter_ptr, evicted_keys_ptr, evicted_scores_ptr,
-          evicted_indices_ptr);
+          evicted_indices_ptr, evicted_table_ids_ptr);
 
   table_unlock_kernel<Table>
       <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -47,13 +52,15 @@ void launch_table_insert_and_evict_kernel(
 }
 
 void table_insert_and_evict_single_score(
-    at::Tensor table_storage, int64_t bucket_capacity, at::Tensor bucket_sizes,
-    at::Tensor keys, std::optional<at::Tensor> score_input,
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes,
+    at::Tensor keys, at::Tensor table_ids,
+    std::optional<at::Tensor> score_input,
     ScorePolicyType policy_type, at::Tensor indices,
     std::optional<at::Tensor> insert_results,
     std::optional<at::Tensor> score_output, at::Tensor num_evicted,
     at::Tensor evicted_keys, at::Tensor evicted_indices,
-    at::Tensor evicted_scores) {
+    at::Tensor evicted_scores, at::Tensor evicted_table_ids) {
 
   auto key_type = get_data_type(keys);
 
@@ -81,7 +88,9 @@ void table_insert_and_evict_single_score(
   auto evict_counter_ = get_pointer<CounterType>(num_evicted);
   auto evicted_scores_ptr = evicted_scores.data_ptr<int64_t>();
   auto evicted_indices_ = get_pointer<IndexType>(evicted_indices);
-
+  auto evicted_table_ids_ptr = evicted_table_ids.data_ptr<int64_t>();
+  auto table_ids_ptr = table_ids.data_ptr<int64_t>();
+  auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   int64_t num_total = keys.size(0);
@@ -112,30 +121,38 @@ void table_insert_and_evict_single_score(
       if (num_total % 32 == 0) {
         if (output_score) {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32>(
-              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              table, table_bucket_offsets_ptr,
+              bucket_sizes_, num_total, keys_, table_ids_ptr,
+              insert_results_ptr,
               indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_,
               evict_counter_, evicted_keys_, evicted_scores_ptr,
-              evicted_indices_, stream);
+              evicted_indices_, evicted_table_ids_ptr, stream);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32>(
-              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              table, table_bucket_offsets_ptr,
+              bucket_sizes_, num_total, keys_, table_ids_ptr,
+              insert_results_ptr,
               indices_ptr, score_input_ptr, nullptr, table_key_slots_,
               evict_counter_, evicted_keys_, evicted_scores_ptr,
-              evicted_indices_, stream);
+              evicted_indices_, evicted_table_ids_ptr, stream);
         }
       } else {
         if (output_score) {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 1>(
-              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              table, table_bucket_offsets_ptr,
+              bucket_sizes_, num_total, keys_, table_ids_ptr,
+              insert_results_ptr,
               indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_,
               evict_counter_, evicted_keys_, evicted_scores_ptr,
-              evicted_indices_, stream);
+              evicted_indices_, evicted_table_ids_ptr, stream);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1>(
-              table, bucket_sizes_, num_total, keys_, insert_results_ptr,
+              table, table_bucket_offsets_ptr,
+              bucket_sizes_, num_total, keys_, table_ids_ptr,
+              insert_results_ptr,
               indices_ptr, score_input_ptr, nullptr, table_key_slots_,
               evict_counter_, evicted_keys_, evicted_scores_ptr,
-              evicted_indices_, stream);
+              evicted_indices_, evicted_table_ids_ptr, stream);
         }
       }
     });
@@ -143,9 +160,11 @@ void table_insert_and_evict_single_score(
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-table_insert_and_evict(at::Tensor table_storage, int64_t bucket_capacity,
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_insert_and_evict(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                       int64_t bucket_capacity,
                        at::Tensor bucket_sizes, at::Tensor keys,
+                       at::Tensor table_ids,
                        std::optional<at::Tensor> score_input,
                        ScorePolicyType policy_type,
                        std::optional<at::Tensor> insert_results,
@@ -162,8 +181,10 @@ table_insert_and_evict(at::Tensor table_storage, int64_t bucket_capacity,
         torch::empty({0}, keys.options().dtype(torch::kInt64));
     at::Tensor evicted_scores =
         torch::empty({0}, keys.options().dtype(torch::kInt64));
+    at::Tensor evicted_table_ids =
+        torch::empty({0}, keys.options().dtype(torch::kInt64));
     return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
-                           evicted_scores);
+                           evicted_scores, evicted_table_ids);
   }
 
   at::Tensor indices =
@@ -176,14 +197,18 @@ table_insert_and_evict(at::Tensor table_storage, int64_t bucket_capacity,
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
   at::Tensor evicted_scores =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+  at::Tensor evicted_table_ids =
+      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
 
   table_insert_and_evict_single_score(
-      table_storage, bucket_capacity, bucket_sizes, keys, score_input,
-      policy_type, indices, insert_results, score_output, num_evicted,
-      evicted_keys, evicted_indices, evicted_scores);
+      table_storage, table_bucket_offsets, bucket_capacity,
+      bucket_sizes, keys, table_ids,
+      score_input, policy_type, indices, insert_results, score_output,
+      num_evicted, evicted_keys, evicted_indices, evicted_scores,
+      evicted_table_ids);
 
   return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
-                         evicted_scores);
+                         evicted_scores, evicted_table_ids);
 }
 
 } // namespace dyn_emb

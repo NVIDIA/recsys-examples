@@ -24,7 +24,9 @@ void table_count_matched_single_score(at::Tensor table_storage,
                                       torch::Dtype key_dtype,
                                       int64_t bucket_capacity,
                                       ScoreType threshold,
-                                      at::Tensor num_matched) {
+                                      at::Tensor num_matched,
+                                      int64_t range_begin,
+                                      int64_t range_end) {
 
   auto key_type = scalartype_to_datatype(toScalarType(key_dtype));
   auto counter_ = get_pointer<CounterType>(num_matched);
@@ -48,8 +50,8 @@ void table_count_matched_single_score(at::Tensor table_storage,
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
                        num_buckets, bucket_capacity);
 
-    IndexType begin = 0;
-    IndexType end = num_buckets * bucket_capacity;
+    IndexType begin = (range_begin >= 0) ? range_begin : 0;
+    IndexType end = (range_end >= 0) ? range_end : num_buckets * bucket_capacity;
 
     int64_t num_total = end - begin;
 
@@ -68,14 +70,15 @@ void table_count_matched_single_score(at::Tensor table_storage,
 }
 
 at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
-                               int64_t bucket_capacity, ScoreType threshold) {
+                               int64_t bucket_capacity, ScoreType threshold,
+                               int64_t begin, int64_t end) {
 
   auto device = table_storage.device();
   auto num_matched = torch::zeros(
       {1}, torch::TensorOptions().dtype(torch::kInt64).device(device));
 
   table_count_matched_single_score(table_storage, key_dtype, bucket_capacity,
-                                   threshold, num_matched);
+                                   threshold, num_matched, begin, end);
 
   return num_matched;
 }

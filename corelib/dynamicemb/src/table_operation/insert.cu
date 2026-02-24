@@ -22,8 +22,10 @@ namespace dyn_emb {
 
 template <typename Table, ScorePolicyType PolicyTypeV, bool OutputScoreV>
 void launch_table_insert_kernel(
-    Table table, int *bucket_sizes_ptr, int64_t num_total,
-    typename Table::KeyType *keys_ptr, InsertResult *insert_results_ptr,
+    Table table, int64_t *table_bucket_offsets_ptr,
+    int *bucket_sizes_ptr, int64_t num_total,
+    typename Table::KeyType *keys_ptr, int64_t *table_ids_ptr,
+    InsertResult *insert_results_ptr,
     IndexType *indices_ptr, ScoreType *score_input_ptr,
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
     cudaStream_t stream) {
@@ -33,7 +35,9 @@ void launch_table_insert_kernel(
 
   table_insert_kernel<Table, KernelTraits>
       <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, bucket_sizes_ptr, num_total, keys_ptr, insert_results_ptr,
+          table, table_bucket_offsets_ptr,
+          bucket_sizes_ptr, num_total, keys_ptr, table_ids_ptr,
+          insert_results_ptr,
           indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_ptr);
 
   table_unlock_kernel<Table>
@@ -42,8 +46,9 @@ void launch_table_insert_kernel(
 }
 
 void table_insert_single_score(at::Tensor table_storage,
+                               at::Tensor table_bucket_offsets,
                                int64_t bucket_capacity, at::Tensor bucket_sizes,
-                               at::Tensor keys,
+                               at::Tensor keys, at::Tensor table_ids,
                                std::optional<at::Tensor> score_input,
                                ScorePolicyType policy_type, at::Tensor indices,
                                std::optional<at::Tensor> insert_results,
@@ -71,6 +76,8 @@ void table_insert_single_score(at::Tensor table_storage,
   auto indices_ptr = indices.data_ptr<IndexType>();
   InsertResult *insert_results_ptr = get_pointer<InsertResult>(insert_results);
   auto bucket_sizes_ptr = get_pointer<int>(bucket_sizes);
+  auto table_ids_ptr = table_ids.data_ptr<int64_t>();
+  auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -100,21 +107,28 @@ void table_insert_single_score(at::Tensor table_storage,
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       if (output_score) {
         launch_table_insert_kernel<Table, PolicyTypeV, true>(
-            table, bucket_sizes_ptr, num_total, keys_ptr, insert_results_ptr,
+            table, table_bucket_offsets_ptr,
+            bucket_sizes_ptr, num_total, keys_ptr, table_ids_ptr,
+            insert_results_ptr,
             indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_ptr,
             stream);
       } else {
         launch_table_insert_kernel<Table, PolicyTypeV, false>(
-            table, bucket_sizes_ptr, num_total, keys_ptr, insert_results_ptr,
-            indices_ptr, score_input_ptr, nullptr, table_key_slots_ptr, stream);
+            table, table_bucket_offsets_ptr,
+            bucket_sizes_ptr, num_total, keys_ptr, table_ids_ptr,
+            insert_results_ptr,
+            indices_ptr, score_input_ptr, nullptr, table_key_slots_ptr,
+            stream);
       }
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-at::Tensor table_insert(at::Tensor table_storage, int64_t bucket_capacity,
+at::Tensor table_insert(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                        int64_t bucket_capacity,
                         at::Tensor bucket_sizes, at::Tensor keys,
+                        at::Tensor table_ids,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type,
                         std::optional<at::Tensor> insert_results,
@@ -128,7 +142,8 @@ at::Tensor table_insert(at::Tensor table_storage, int64_t bucket_capacity,
   at::Tensor indices =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
 
-  table_insert_single_score(table_storage, bucket_capacity, bucket_sizes, keys,
+  table_insert_single_score(table_storage, table_bucket_offsets,
+                            bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
                             score_output);
 

@@ -82,6 +82,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def find_impl(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
@@ -153,26 +154,29 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def find_embeddings(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
-        return self.find_impl(unique_keys, unique_embs, input_scores)
+        return self.find_impl(unique_keys, table_ids, unique_embs, input_scores)
 
     def find(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_vals: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
-        return self.find_impl(unique_keys, unique_vals, input_scores)
+        return self.find_impl(unique_keys, table_ids, unique_vals, input_scores)
 
     def insert(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> None:
@@ -185,7 +189,11 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                 self.scores[key] = h_scores[i].item()
 
     def update(
-        self, keys: torch.Tensor, grads: torch.Tensor
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        grads: torch.Tensor,
+        return_missing: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raise ValueError("Can't call update of PyDictStorage")
 
@@ -317,7 +325,8 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                 else:
                     values = embeddings
 
-            self.insert(keys, values, scores)
+            tid = torch.zeros(keys.numel(), dtype=torch.int64, device=keys.device)
+            self.insert(keys, tid, values, scores)
 
         fkey.close()
         fembedding.close()
@@ -422,7 +431,8 @@ def init_embedding_tables(stbe, bdet):
             values[:, :emb_dim] = split
             values[:, emb_dim:val_dim] = table.init_optimizer_state()
             table.set_score(1)
-            table.insert(indices, values)
+            table_ids = torch.zeros(num_emb, dtype=torch.int64, device=split.device)
+            table.insert(indices, table_ids, values)
         elif isinstance(table, PyDictStorage):
             pydict = cast(PyDictStorage, table)
             val_dim = pydict.value_dim()
@@ -432,7 +442,8 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             values[:, emb_dim:val_dim] = pydict.init_optimizer_state()
-            pydict.insert(indices, values)
+            table_ids = torch.zeros(num_emb, dtype=torch.int64, device=split.device)
+            pydict.insert(indices, table_ids, values)
         else:
             raise ValueError("Not support table type")
     # for states_per_table in stbe.split_optimizer_states():

@@ -126,7 +126,7 @@ class DynamicEmbeddingTable(
         self.evict_strategy_ = options.evict_strategy.value
 
         self.key_index_map = get_scored_table(
-            capacity=options.init_capacity,
+            capacity=[options.init_capacity],
             bucket_capacity=options.bucket_capacity,
             key_type=options.index_type,
             score_specs=[self.score_policy],
@@ -197,6 +197,10 @@ class DynamicEmbeddingTable(
         self._use_score = self.evict_strategy_ != EvictStrategy.KLru
         self._timestamp = device_timestamp()
 
+    def _make_table_ids(self, n: int, device: torch.device) -> torch.Tensor:
+        """Create table_ids tensor of zeros (single-table usage)."""
+        return torch.zeros(n, dtype=torch.int64, device=device)
+
     def expand(self):
         if self._capacity == self.options.max_capacity:
             return
@@ -206,7 +210,7 @@ class DynamicEmbeddingTable(
         target_capacity = min(self.options.max_capacity, self._capacity * 2)
 
         key_index_map = get_scored_table(
-            capacity=target_capacity,
+            capacity=[target_capacity],
             bucket_capacity=self.options.bucket_capacity,
             key_type=self.options.index_type,
             score_specs=[self.score_policy],
@@ -269,7 +273,8 @@ class DynamicEmbeddingTable(
                 value=scores,
                 policy=ScorePolicy.ASSIGN,
             )
-            indices = key_index_map.insert(keys, score_arg_insert)
+            tid = self._make_table_ids(keys.numel(), keys.device)
+            indices = key_index_map.insert(keys, tid, score_arg_insert)
             store_to_combined_table(
                 dev_table,
                 uvm_table,
@@ -285,6 +290,7 @@ class DynamicEmbeddingTable(
     def find_impl(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
@@ -331,7 +337,7 @@ class DynamicEmbeddingTable(
         )
 
         score_out, founds, indices = self.key_index_map.lookup(
-            unique_keys, score_arg_lookup
+            unique_keys, table_ids, score_arg_lookup
         )
 
         if load_dim != 0:
@@ -371,6 +377,7 @@ class DynamicEmbeddingTable(
     def find_embeddings(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
@@ -381,11 +388,12 @@ class DynamicEmbeddingTable(
             raise ValueError(
                 f"find_embeddings expects dim={self.embedding_dim()}, got {unique_embs.size(1)}. "
             )
-        return self.find_impl(unique_keys, unique_embs, input_scores)
+        return self.find_impl(unique_keys, table_ids, unique_embs, input_scores)
 
     def find_missed_keys(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
     ) -> Tuple[
         int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
@@ -393,11 +401,12 @@ class DynamicEmbeddingTable(
         unique_embs = torch.empty(
             unique_keys.numel(), 0, device=unique_keys.device, dtype=self._emb_dtype
         )
-        return self.find_impl(unique_keys, unique_embs, None)
+        return self.find_impl(unique_keys, table_ids, unique_embs, None)
 
     def find(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_vals: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
@@ -408,7 +417,7 @@ class DynamicEmbeddingTable(
             raise ValueError(
                 f"find expects dim={self.value_dim()}, got {unique_vals.size(1)}. "
             )
-        return self.find_impl(unique_keys, unique_vals, input_scores)
+        return self.find_impl(unique_keys, table_ids, unique_vals, input_scores)
 
     def create_scores(
         self,
@@ -435,11 +444,14 @@ class DynamicEmbeddingTable(
     def insert(
         self,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> None:
         if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
-            return self.deterministic_insert(unique_keys, unique_values, scores)
+            return self.deterministic_insert(
+                unique_keys, unique_values, table_ids, scores
+            )
 
         self.expand()
 
@@ -469,7 +481,7 @@ class DynamicEmbeddingTable(
             value=scores,
             policy=policy,
         )
-        indices = self.key_index_map.insert(unique_keys, score_arg_insert)
+        indices = self.key_index_map.insert(unique_keys, table_ids, score_arg_insert)
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
@@ -477,6 +489,7 @@ class DynamicEmbeddingTable(
     def update(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         grads: torch.Tensor,
         return_missing: bool = True,
     ) -> Tuple[Optional[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -495,7 +508,9 @@ class DynamicEmbeddingTable(
             policy=ScorePolicy.CONST,
         )
 
-        _, founds, indices = self.key_index_map.lookup(keys, score_arg_lookup)
+        _, founds, indices = self.key_index_map.lookup(
+            keys, table_ids, score_arg_lookup
+        )
 
         self.optimizer.fused_update_with_index(
             grads.to(self.value_type()), indices, self.dev_table, self.uvm_table
@@ -815,7 +830,8 @@ class DynamicEmbeddingTable(
             policy=policy,
         )
 
-        indices = self.key_index_map.insert(keys, score_arg_insert)
+        tid = self._make_table_ids(keys.numel(), keys.device)
+        indices = self.key_index_map.insert(keys, tid, score_arg_insert)
         store_to_combined_table(
             self.dev_table,
             self.uvm_table,
@@ -893,11 +909,12 @@ class DynamicEmbeddingTable(
     def insert_and_evict(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
-            return self.deterministic_insert_and_evict(keys, values, scores)
+            return self.deterministic_insert_and_evict(keys, values, table_ids, scores)
 
         self.expand()
 
@@ -912,14 +929,14 @@ class DynamicEmbeddingTable(
             value=scores,
             policy=self.score_policy.policy,
         )
-
         (
             indices,
             num_evicted,
             evicted_keys,
             evicted_indices,
             evicted_scores,
-        ) = self.key_index_map.insert_and_evict(keys, score_arg_insert)
+            evicted_table_ids,
+        ) = self.key_index_map.insert_and_evict(keys, table_ids, score_arg_insert)
         evicted_values: torch.Tensor = torch.empty(
             num_evicted, values.size(1), device=values.device, dtype=self.value_type()
         )
@@ -942,6 +959,7 @@ class DynamicEmbeddingTable(
         return (
             num_evicted,
             evicted_keys,
+            evicted_table_ids,
             evicted_values,
             evicted_scores,
         )
@@ -968,7 +986,8 @@ class DynamicEmbeddingTable(
             )
 
             load_from_combined_table(self.dev_table, self.uvm_table, indices, values)
-            storage.insert(keys, values, scores)
+            tid = self._make_table_ids(keys.numel(), keys.device)
+            storage.insert(keys, tid, values, scores)
 
     def reset(
         self,
@@ -1097,6 +1116,7 @@ class DynamicEmbeddingTable(
         self,
         unique_keys: torch.Tensor,
         unique_values: torch.Tensor,
+        table_ids: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
     ) -> None:
         self.expand()
@@ -1132,7 +1152,9 @@ class DynamicEmbeddingTable(
         ), "deterministic insert implementation only supports LinearBucketTable as key-index-map."
         bkt_keys, offsets, inverse = cast(
             LinearBucketTable, self.key_index_map
-        ).bucketize_keys(unique_keys)
+        ).bucketize_keys(unique_keys, table_ids)
+
+        bkt_table_ids = table_ids[inverse]
 
         jagged_keys = JaggedTensor(
             values=bkt_keys.to(torch.int64),
@@ -1140,20 +1162,28 @@ class DynamicEmbeddingTable(
             weights=scores.to(torch.int64)[inverse] if scores is not None else None,
         )
 
+        jagged_tids = JaggedTensor(
+            values=bkt_table_ids.to(torch.int64),
+            offsets=offsets,
+        )
+
         # static_cast<int64_t>(double(-1)) will get 0xFFFFFFFFFFFFFFFF, which is EmptyKey for table.
         pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
         pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
+        pad_tids = jagged_tids.to_padded_dense(padding_value=0.0)
 
         keys_t = pad_keys.transpose(0, 1).to(self.key_type()).contiguous()
         score_t = (
             pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
         )
+        tids_t = pad_tids.transpose(0, 1).to(torch.int64).contiguous()
 
         # 3. Insert iteratively
         num_iter = keys_t.size(0)
         for i in range(num_iter):
             valid_mask = keys_t[i] != -1
             valid_keys = keys_t[i][valid_mask].contiguous()
+            valid_tids = tids_t[i][valid_mask].contiguous()
             score_arg_insert = ScoreArg(
                 name=self.score_policy.name,
                 # value=score_t[i] if score_t is not None else None,
@@ -1163,15 +1193,16 @@ class DynamicEmbeddingTable(
                 policy=policy,
             )
 
-            # self.key_index_map.insert(keys_t[i], score_arg_insert)
-            self.key_index_map.insert(valid_keys, score_arg_insert)
+            self.key_index_map.insert(valid_keys, valid_tids, score_arg_insert)
 
         # 4. lookup the indices in unique_keys' order and store the values.
         score_arg_lookup = ScoreArg(
             name=self.score_policy.name,
             policy=ScorePolicy.CONST,
         )
-        _, founds, indices = self.key_index_map.lookup(unique_keys, score_arg_lookup)
+        _, founds, indices = self.key_index_map.lookup(
+            unique_keys, table_ids, score_arg_lookup
+        )
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
@@ -1181,15 +1212,19 @@ class DynamicEmbeddingTable(
         self,
         unique_keys: torch.Tensor,
         unique_values: torch.Tensor,
+        table_ids: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         self.expand()
 
         # 1.Preprocess
         h_num_unique_keys = unique_keys.numel()
 
         if h_num_unique_keys == 0:
-            return 0, None, None, None
+            empty_table_ids = torch.empty(
+                0, dtype=torch.int64, device=unique_keys.device
+            )
+            return 0, None, empty_table_ids, None, None
 
         num_evicted_accum = 0
         evicted_keys_accum = torch.empty_like(unique_keys)
@@ -1200,6 +1235,9 @@ class DynamicEmbeddingTable(
         )
         evicted_scores_accum = torch.empty(
             h_num_unique_keys, dtype=torch.uint64, device=unique_keys.device
+        )
+        evicted_table_ids_accum = torch.empty(
+            h_num_unique_keys, dtype=torch.int64, device=unique_keys.device
         )
         evicted_values_accum: torch.Tensor = torch.empty_like(unique_values)
 
@@ -1215,7 +1253,9 @@ class DynamicEmbeddingTable(
         ), "deterministic insert_and_evict implementation only supports LinearBucketTable as key-index-map."
         bkt_keys, offsets, inverse = cast(
             LinearBucketTable, self.key_index_map
-        ).bucketize_keys(unique_keys)
+        ).bucketize_keys(unique_keys, table_ids)
+
+        bkt_table_ids = table_ids[inverse]
 
         jagged_keys = JaggedTensor(
             values=bkt_keys.to(torch.int64),
@@ -1223,20 +1263,28 @@ class DynamicEmbeddingTable(
             weights=scores.to(torch.int64)[inverse] if scores is not None else None,
         )
 
+        jagged_tids = JaggedTensor(
+            values=bkt_table_ids.to(torch.int64),
+            offsets=offsets,
+        )
+
         # static_cast<int64_t>(double(-1)) will get 0xFFFFFFFFFFFFFFFF, which is EmptyKey for table.
         pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
         pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
+        pad_tids = jagged_tids.to_padded_dense(padding_value=0.0)
 
         keys_t = pad_keys.transpose(0, 1).to(self.key_type()).contiguous()
         score_t = (
             pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
         )
+        tids_t = pad_tids.transpose(0, 1).to(torch.int64).contiguous()
 
         # 3. Insert iteratively
         num_iter = keys_t.size(0)
         for i in range(num_iter):
             valid_mask = keys_t[i] != -1
             valid_keys = keys_t[i][valid_mask].contiguous()
+            valid_tids = tids_t[i][valid_mask].contiguous()
             score_arg_insert = ScoreArg(
                 name=self.score_policy.name,
                 # value=score_t[i] if score_t is not None else None,
@@ -1252,7 +1300,10 @@ class DynamicEmbeddingTable(
                 evicted_keys,
                 evicted_indices,
                 evicted_scores,
-            ) = self.key_index_map.insert_and_evict(valid_keys, score_arg_insert)
+                evicted_table_ids,
+            ) = self.key_index_map.insert_and_evict(
+                valid_keys, valid_tids, score_arg_insert
+            )
 
             if num_evicted != 0:
                 evicted_keys_accum[
@@ -1264,6 +1315,9 @@ class DynamicEmbeddingTable(
                 evicted_scores_accum[
                     num_evicted_accum : num_evicted_accum + num_evicted
                 ].copy_(evicted_scores, non_blocking=True)
+                evicted_table_ids_accum[
+                    num_evicted_accum : num_evicted_accum + num_evicted
+                ].copy_(evicted_table_ids, non_blocking=True)
 
                 num_evicted_accum += num_evicted
 
@@ -1271,6 +1325,7 @@ class DynamicEmbeddingTable(
         evicted_keys_accum = evicted_keys_accum[:num_evicted_accum]
         evicted_indices_accum = evicted_indices_accum[:num_evicted_accum]
         evicted_scores_accum = evicted_scores_accum[:num_evicted_accum]
+        evicted_table_ids_accum = evicted_table_ids_accum[:num_evicted_accum]
         evicted_values_accum = evicted_values_accum[:num_evicted_accum, :]
 
         assert len(set(evicted_indices_accum.tolist())) == num_evicted_accum
@@ -1287,7 +1342,9 @@ class DynamicEmbeddingTable(
             name=self.score_policy.name,
             policy=ScorePolicy.CONST,
         )
-        _, founds, indices = self.key_index_map.lookup(unique_keys, score_arg_lookup)
+        _, founds, indices = self.key_index_map.lookup(
+            unique_keys, table_ids, score_arg_lookup
+        )
         store_to_combined_table(
             self.dev_table, self.uvm_table, indices, unique_values.to(self.value_type())
         )
@@ -1298,6 +1355,7 @@ class DynamicEmbeddingTable(
         return (
             num_evicted_accum,
             evicted_keys_accum,
+            evicted_table_ids_accum,
             evicted_values_accum,
             evicted_scores_accum,
         )
@@ -1307,6 +1365,7 @@ def update_cache(
     cache: Cache,
     storage: Storage,
     missing_keys: torch.Tensor,
+    table_ids: torch.Tensor,
     missing_values: torch.Tensor,
     missing_scores: Optional[torch.Tensor] = None,
 ):
@@ -1314,10 +1373,12 @@ def update_cache(
     (
         num_evicted,
         evicted_keys,
+        evicted_table_ids,
         evicted_values,
         evicted_scores,
     ) = cache.insert_and_evict(
         missing_keys,
+        table_ids,
         missing_values,
         missing_scores,
     )
@@ -1325,6 +1386,7 @@ def update_cache(
     if num_evicted != 0:
         storage.insert(
             evicted_keys,
+            evicted_table_ids,
             evicted_values,
             evicted_scores,
         )
@@ -1352,6 +1414,7 @@ class KeyValueTableFunction:
     def lookup(
         storage: Storage,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         initializer: Callable,
         training: bool,
@@ -1381,6 +1444,7 @@ class KeyValueTableFunction:
             _,
         ) = storage.find_embeddings(
             unique_keys,
+            table_ids,
             unique_embs,
             input_scores=accumulated_frequency if is_lfu_enabled else None,
         )
@@ -1465,6 +1529,7 @@ class KeyValueTableFunction:
             # 3. insert missing values into table.
             storage.insert(
                 keys_to_insert,
+                table_ids,
                 values_to_insert,
                 scores_to_insert,
             )
@@ -1474,11 +1539,12 @@ class KeyValueTableFunction:
     def update(
         storage: Storage,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_grads: torch.Tensor,
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         if storage.enable_update():
-            storage.update(unique_keys, unique_grads, return_missing=False)
+            storage.update(unique_keys, table_ids, unique_grads, return_missing=False)
             return
 
         emb_dtype = storage.embedding_dtype()
@@ -1487,7 +1553,7 @@ class KeyValueTableFunction:
         unique_values = torch.empty(
             h_num_toatl, val_dim, device=unique_keys.device, dtype=emb_dtype
         )
-        _, _, _, _, founds, _ = storage.find(unique_keys, unique_values)
+        _, _, _, _, founds, _ = storage.find(unique_keys, table_ids, unique_values)
 
         keys_for_storage = unique_keys[founds].contiguous()
         values_for_storage = unique_values[founds, :].contiguous()
@@ -1497,7 +1563,7 @@ class KeyValueTableFunction:
             values_for_storage,
         )
 
-        storage.insert(keys_for_storage, values_for_storage)
+        storage.insert(keys_for_storage, table_ids, values_for_storage)
 
         return
 
@@ -1508,6 +1574,7 @@ class KeyValueTableCachingFunction:
         cache: Cache,  # partial emb + optimizer state
         storage: Storage,  # full emb + optimizer state
         unique_keys: torch.Tensor,  # input
+        table_ids: torch.Tensor,
         unique_embs: torch.Tensor,  # output
         initializer: Callable,
         enable_prefetch: bool,
@@ -1536,6 +1603,7 @@ class KeyValueTableCachingFunction:
             _,
         ) = cache.find_embeddings(
             unique_keys,
+            table_ids,
             unique_embs,
             input_scores=accumulated_frequency if is_lfu_enabled else None,
         )
@@ -1561,6 +1629,7 @@ class KeyValueTableCachingFunction:
             scores_for_storage,
         ) = storage.find(
             keys_for_storage,
+            table_ids,
             values_for_storage,
             input_scores=scores_for_storage,
         )
@@ -1656,7 +1725,14 @@ class KeyValueTableCachingFunction:
             values_to_update = found_values_in_storage
             scores_to_update = found_scores_in_storage
 
-        update_cache(cache, storage, keys_to_update, values_to_update, scores_to_update)
+        update_cache(
+            cache,
+            storage,
+            keys_to_update,
+            table_ids,
+            values_to_update,
+            scores_to_update,
+        )
         return
 
     @staticmethod
@@ -1664,11 +1740,12 @@ class KeyValueTableCachingFunction:
         cache: Cache,
         storage: Storage,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         unique_grads: torch.Tensor,
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         h_num_keys_for_storage, missing_keys, missing_indices = cache.update(
-            unique_keys, unique_grads
+            unique_keys, table_ids, unique_grads
         )
         if h_num_keys_for_storage == 0:
             return
@@ -1676,7 +1753,9 @@ class KeyValueTableCachingFunction:
         grads_for_storage = unique_grads[missing_indices, :].contiguous()
 
         if storage.enable_update():
-            storage.update(keys_for_storage, grads_for_storage, return_missing=False)
+            storage.update(
+                keys_for_storage, table_ids, grads_for_storage, return_missing=False
+            )
             return
 
         emb_dtype = storage.embedding_dtype()
@@ -1684,7 +1763,9 @@ class KeyValueTableCachingFunction:
         values_for_storage = torch.empty(
             h_num_keys_for_storage, val_dim, device=unique_keys.device, dtype=emb_dtype
         )
-        _, _, _, _, founds, _ = storage.find(keys_for_storage, values_for_storage)
+        _, _, _, _, founds, _ = storage.find(
+            keys_for_storage, table_ids, values_for_storage
+        )
         keys_for_storage = keys_for_storage[founds].contiguous()
         values_for_storage = values_for_storage[founds, :].contiguous()
         grads_for_storage = grads_for_storage[founds, :].contiguous()
@@ -1693,7 +1774,7 @@ class KeyValueTableCachingFunction:
             values_for_storage,
         )
 
-        storage.insert(keys_for_storage, values_for_storage)
+        storage.insert(keys_for_storage, table_ids, values_for_storage)
         return
 
     @staticmethod
@@ -1701,6 +1782,7 @@ class KeyValueTableCachingFunction:
         cache: Cache,
         storage: Storage,
         unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
         initializer: BaseDynamicEmbInitializer,
         training: bool = True,
         forward_stream: Optional[torch.cuda.Stream] = None,
@@ -1710,7 +1792,7 @@ class KeyValueTableCachingFunction:
             return
         emb_dtype = storage.embedding_dtype()
         h_num_keys_for_storage, missing_keys, _, _, _, _ = cache.find_missed_keys(
-            unique_keys
+            unique_keys, table_ids
         )
 
         if h_num_keys_for_storage == 0:
@@ -1729,7 +1811,7 @@ class KeyValueTableCachingFunction:
             _,
             founds,
             _,
-        ) = storage.find(keys_for_storage, values_for_storage)
+        ) = storage.find(keys_for_storage, table_ids, values_for_storage)
 
         if num_missing_in_storage != 0:
             if training:
@@ -1751,6 +1833,7 @@ class KeyValueTableCachingFunction:
             cache,
             storage,
             keys_for_storage,
+            table_ids,
             values_for_storage,
             None,  # prefetch does not update scores
         )
