@@ -1765,7 +1765,9 @@ class KeyValueTableCachingFunction:
         training: bool = True,
         forward_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        assert cache is not None, "prefetch is available only when caching is enabled."
+        if cache is None:
+            # caching is not enabled, nothing to prefetch
+            return
         emb_dtype = storage.embedding_dtype()
         h_num_keys_for_storage, missing_keys, _, _ = cache.find_missed_keys(unique_keys)
 

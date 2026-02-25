@@ -21,7 +21,7 @@ from rich.logging import RichHandler
 
 # Set up logger with RichHandler if not already configured
 
-console = Console()
+console = Console(soft_wrap=True, width=240)
 _logger = logging.getLogger("rich_rank0")
 
 handler = RichHandler(

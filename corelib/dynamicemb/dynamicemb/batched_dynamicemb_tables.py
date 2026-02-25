@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import enum
-import logging
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -896,7 +895,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     ) -> None:
         assert self._enable_prefetch, "Prefetch is not enabled."
         if not self._caching:
-            logging.warning("Caching is not enabled, prefetch will do nothing.")
+            return
         if self.prefetch_stream is None and forward_stream is not None:
             # Set the prefetch stream to the current stream
             self.prefetch_stream = torch.cuda.current_stream()
