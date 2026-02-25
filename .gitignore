@@ -35,3 +35,6 @@ pcie_lookup_poc/*
 results/
 .docs/*
 .python-version
+**/results/*
+*.nsys-rep
+*.log

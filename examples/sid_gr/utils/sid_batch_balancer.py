@@ -25,6 +25,7 @@ class SIDGRBalancedBatchShuffler(BaseTaskBalancedBatchShuffler):
             num_heads: Number of attention heads
             head_dim: Dimension of each attention head
         """
+        super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.task = SelfAttentionTask()

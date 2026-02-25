@@ -27,6 +27,7 @@ class HASTUBalancedBatchShuffler(BaseTaskBalancedBatchShuffler):
             head_dim: Dimension of each attention head
             action_interleaved: Whether actions are interleaved with items (doubles seqlen)
         """
+        super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.action_interleaved = action_interleaved

@@ -1,6 +1,7 @@
 import os
 from abc import abstractmethod
-from typing import Any, List, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 from commons.ops.collective_ops import gather_along_first_dim
@@ -51,6 +52,21 @@ def _log_load_balance(
 class BaseTaskBalancedBatchShuffler:
     _batch_counter: int = 0
 
+    def __init__(self) -> None:
+        # Single-worker thread pool used exclusively for the CPU-only
+        # Karmarkar-Karp partitioning algorithm so that it can overlap with
+        # GPU forward / backward on the main thread.
+        self._kk_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kk")
+        # Use a dict to track shuffle state per batch (for prefetch pipeline)
+        # Key: batch_counter (self._batch_counter), Value: dict with 'future' and 'meta'
+        # This allows multiple batches to be in shuffle state simultaneously
+        # (important for prefetch pipeline where 3 batches are in-flight)
+        # Using batch_counter instead of id(batch) is more reliable because:
+        # 1. id(batch) may change if _to_device creates a new object
+        # 2. Python object IDs can be reused, leading to collisions
+        # 3. Batch counter provides a stable, monotonically increasing identifier
+        self._kk_states: Dict[int, Dict[str, Any]] = {}
+
     @abstractmethod
     def get_workloads(self, batch: BaseBatch, *args, **kwargs) -> Any:
         raise NotImplementedError
@@ -66,13 +82,164 @@ class BaseTaskBalancedBatchShuffler:
             return False
         return True
 
+    # ------------------------------------------------------------------
+    # Two-phase async shuffle API
+    #
+    # Phase 1 (``start_shuffle_async``):
+    #   Main thread: get workloads → AllGather workloads (NCCL)
+    #   Background thread: run KK algorithm (pure CPU, no GPU/NCCL)
+    #
+    # Phase 2 (``finish_shuffle``):
+    #   Main thread: wait for KK result → AllGather batch (NCCL)
+    #               → index_select (GPU)
+    #
+    # The pipeline calls Phase 1 *before* forward so that KK overlaps
+    # with forward / backward.  Phase 2 is called when the indices are
+    # actually needed.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _run_kk(
+        allgather_workloads: List[int],
+        num_partitions: int,
+    ) -> List[List[int]]:
+        """Pure-CPU Karmarkar-Karp partitioning — safe to run in a thread.
+
+        ``allgather_workloads`` **must** be a plain Python list (not a GPU
+        tensor) to avoid CUDA stream-synchronisation races when called from
+        a background thread.
+        """
+        return karmarkar_karp(allgather_workloads, num_partitions, equal_size=True)
+
+    def start_shuffle_async(
+        self,
+        batch: BaseBatch,
+        pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+        *args,
+        **kwargs,
+    ) -> int:
+        """Phase 1: AllGather workloads (NCCL, main thread) then submit KK
+        to a background thread.
+
+        Returns:
+            batch_counter: A unique identifier for this batch's shuffle state.
+            Pass this to :meth:`finish_shuffle` to retrieve the result.
+
+        The KK future is stored internally per batch (using batch_counter as key);
+        call :meth:`finish_shuffle` with the returned batch_counter to complete
+        the data redistribution.
+        """
+        workloads = self.get_workloads(batch, *args, **kwargs)
+        local_batch_size = batch.batch_size
+        num_partitions = torch.distributed.get_world_size(pg_group)
+
+        assert (
+            workloads.shape[0] == local_batch_size
+        ), "workloads should have the same length as local_batch_size"
+
+        # NCCL collective — must stay on the main thread
+        allgather_workloads = gather_along_first_dim(workloads, pg_group)
+
+        # CRITICAL: Convert GPU tensor to CPU list while still on the main
+        # thread (inside the _memcpy_stream context).  The AllGather result
+        # lives on _memcpy_stream.  If we pass the raw GPU tensor to the
+        # background thread, the thread's .tolist() would issue a D2H copy on
+        # its own *default stream*, which does NOT wait for _memcpy_stream to
+        # finish the AllGather — a classic stream-synchronisation race that
+        # leads to reading incomplete / stale data and non-deterministic KK
+        # partitions.  Converting here forces the D2H onto _memcpy_stream,
+        # which is serialised after the AllGather.
+        allgather_workloads_cpu = allgather_workloads.tolist()
+
+        # Use batch counter as key to track shuffle state per batch
+        # This allows multiple batches to be in shuffle state simultaneously
+        # (important for prefetch pipeline where 3 batches are in-flight)
+        # We use batch_counter instead of id(batch) because:
+        # 1. _to_device may create new objects, changing id(batch)
+        # 2. Python object IDs can be reused, leading to collisions
+        batch_counter = self._batch_counter
+        self._batch_counter += 1
+
+        # Submit KK (pure CPU) to background thread — receives a plain Python
+        # list so no GPU access happens off the main thread.
+        kk_future = self._kk_executor.submit(
+            self._run_kk,
+            allgather_workloads_cpu,
+            num_partitions,
+        )
+        # Stash metadata needed by finish_shuffle
+        self._kk_states[batch_counter] = {
+            "future": kk_future,
+            "meta": {
+                "allgather_workloads": allgather_workloads_cpu,
+                "local_batch_size": local_batch_size,
+                "num_partitions": num_partitions,
+                "rank": torch.distributed.get_rank(pg_group),
+                "device": workloads.device,
+            },
+        }
+        return batch_counter
+
+    def finish_shuffle(
+        self,
+        batch: BaseBatch,
+        batch_counter: int,
+        pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+    ) -> BaseBatch:
+        """Phase 2: Wait for KK result, then AllGather batch + index_select
+        (all on main thread — NCCL safe).
+
+        Args:
+            batch: The batch to shuffle (used for data redistribution).
+            batch_counter: The identifier returned by :meth:`start_shuffle_async`.
+
+        Returns:
+            The load-balanced ``BaseBatch`` for this rank.
+        """
+        assert batch_counter in self._kk_states, (
+            f"start_shuffle_async() must be called before finish_shuffle() "
+            f"for batch_counter {batch_counter}"
+        )
+
+        state = self._kk_states[batch_counter]
+        partitions_indices: List[List[int]] = state["future"].result()
+        meta = state["meta"]
+        # Clean up state after use
+        del self._kk_states[batch_counter]
+
+        # Optional logging (rank 0 only)
+        if self._should_print_load_balance():
+            aw = meta["allgather_workloads"]
+            all_wl = aw.tolist() if isinstance(aw, torch.Tensor) else list(aw)
+            _log_load_balance(
+                self._batch_counter,
+                all_wl,
+                partitions_indices,
+                meta["local_batch_size"],
+                meta["num_partitions"],
+            )
+        self._batch_counter += 1
+
+        indices_this_rank = torch.tensor(
+            partitions_indices[meta["rank"]],
+            dtype=torch.int64,
+            device=meta["device"],
+        )
+        indices_this_rank, _ = torch.sort(indices_this_rank)
+
+        return self.shuffle_batch_by_global_indices(batch, indices_this_rank, pg_group)
+
+    # ------------------------------------------------------------------
+    # Original synchronous API (still available)
+    # ------------------------------------------------------------------
+
     def compute_partition_indices(
         self,
         workloads: torch.Tensor,
         local_batch_size: int,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
     ) -> torch.Tensor:
-        """Phase 1: AllGather workloads → KK partitioning → this-rank indices.
+        """AllGather workloads → KK partitioning → this-rank indices (synchronous).
 
         This is **batch-type agnostic** — it only operates on a 1-D workload
         tensor and returns the global indices assigned to this rank.
@@ -211,7 +378,7 @@ class BaseTaskBalancedBatchShuffler:
 
 class IdentityBalancedBatchShuffler(BaseTaskBalancedBatchShuffler):
     def __init__(self):
-        pass
+        super().__init__()
 
     def get_workloads(self, batch: BaseBatch, *args, **kwargs):
         return 0
