@@ -792,11 +792,11 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                 self.wait_sparse_data_dist(self.contexts[1])
 
         # ---- Shuffle Phase 1 (on _memcpy_stream): AllGather workloads + submit KK ----
-        batch_counter = None
+        shuffle_handle = None
         if raw_batch is not None and not self._is_identity_shuffler:
             with nvtx.annotate("## start_kk_async ##"):
                 with self._stream_context(self._memcpy_stream):
-                    batch_counter = self._batch_shuffler.start_shuffle_async(
+                    shuffle_handle = self._batch_shuffler.start_shuffle_async(
                         raw_batch, parallel_state.get_data_parallel_group()
                     )
 
@@ -808,12 +808,12 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             if raw_batch is not None:
                 if not self._is_identity_shuffler:
                     assert (
-                        batch_counter is not None
-                    ), "batch_counter must be set by start_shuffle_async"
+                        shuffle_handle is not None
+                    ), "shuffle_handle must be set by start_shuffle_async"
                     with self._stream_context(self._memcpy_stream):
                         raw_batch = self._batch_shuffler.finish_shuffle(
                             raw_batch,
-                            batch_counter,
+                            shuffle_handle,
                             parallel_state.get_data_parallel_group(),
                         )
                 self.batches.append(raw_batch)
@@ -932,11 +932,11 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             self._wait_sparse_data_dist()
 
         # ---- Shuffle Phase 1 (on _memcpy_stream): AllGather workloads + submit KK ----
-        batch_counter = None
+        shuffle_handle = None
         if raw_batch is not None and not self._is_identity_shuffler:
             with nvtx.annotate("## start_kk_async ##"):
                 with self._stream_context(self._memcpy_stream):
-                    batch_counter = self._batch_shuffler.start_shuffle_async(
+                    shuffle_handle = self._batch_shuffler.start_shuffle_async(
                         raw_batch, parallel_state.get_data_parallel_group()
                     )
 
@@ -950,12 +950,12 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             if raw_batch is not None:
                 if not self._is_identity_shuffler:
                     assert (
-                        batch_counter is not None
-                    ), "batch_counter must be set by start_shuffle_async"
+                        shuffle_handle is not None
+                    ), "shuffle_handle must be set by start_shuffle_async"
                     with self._stream_context(self._memcpy_stream):
                         self._batch_ip2 = self._batch_shuffler.finish_shuffle(
                             raw_batch,
-                            batch_counter,
+                            shuffle_handle,
                             parallel_state.get_data_parallel_group(),
                         )
                 else:
