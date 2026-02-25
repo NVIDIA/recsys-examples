@@ -16,6 +16,43 @@ _PRINT_LOAD_BALANCE_START = int(os.environ.get("PRINT_LOAD_BALANCE_START", "0"))
 _PRINT_LOAD_BALANCE_STOP = int(os.environ.get("PRINT_LOAD_BALANCE_STOP", "-1"))
 
 
+class ShuffleHandle:
+    """Handle for tracking async shuffle state across start_shuffle_async and finish_shuffle.
+
+    This is an opaque identifier that should not be constructed directly by users.
+    It is returned by start_shuffle_async() and passed to finish_shuffle().
+
+    Using a handle type instead of a raw integer provides:
+    - Type safety: prevents passing arbitrary integers
+    - Clear API: makes it obvious this is an identifier/handle
+    - Future extensibility: can add metadata without breaking API
+    """
+
+    __slots__ = ("_counter",)
+
+    def __init__(self, counter: int) -> None:
+        """Internal constructor. Users should not call this directly."""
+        self._counter = counter
+
+    def __int__(self) -> int:
+        """Allow conversion to int for internal use."""
+        return self._counter
+
+    def __eq__(self, other: object) -> bool:
+        """Equality comparison."""
+        if isinstance(other, ShuffleHandle):
+            return self._counter == other._counter
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        """Hash support for use as dict key."""
+        return hash(self._counter)
+
+    def __repr__(self) -> str:
+        """String representation for debugging."""
+        return f"ShuffleHandle(counter={self._counter})"
+
+
 def _log_load_balance(
     batch_idx: int,
     all_workloads: List[float],
@@ -58,14 +95,21 @@ class BaseTaskBalancedBatchShuffler:
         # GPU forward / backward on the main thread.
         self._kk_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kk")
         # Use a dict to track shuffle state per batch (for prefetch pipeline)
-        # Key: batch_counter (self._batch_counter), Value: dict with 'future' and 'meta'
+        # Key: ShuffleHandle, Value: dict with 'future' and 'meta'
         # This allows multiple batches to be in shuffle state simultaneously
         # (important for prefetch pipeline where 3 batches are in-flight)
-        # Using batch_counter instead of id(batch) is more reliable because:
+        # Using ShuffleHandle instead of id(batch) is more reliable because:
         # 1. id(batch) may change if _to_device creates a new object
         # 2. Python object IDs can be reused, leading to collisions
-        # 3. Batch counter provides a stable, monotonically increasing identifier
-        self._kk_states: Dict[int, Dict[str, Any]] = {}
+        # 3. ShuffleHandle provides a stable, monotonically increasing identifier
+        self._kk_states: Dict[ShuffleHandle, Dict[str, Any]] = {}
+
+    def __del__(self) -> None:
+        """Clean up ThreadPoolExecutor on object destruction."""
+        if hasattr(self, "_kk_executor"):
+            # Shutdown executor, wait=False to avoid blocking during cleanup
+            # The executor will finish current tasks but won't accept new ones
+            self._kk_executor.shutdown(wait=False)
 
     @abstractmethod
     def get_workloads(self, batch: BaseBatch, *args, **kwargs) -> Any:
@@ -117,16 +161,16 @@ class BaseTaskBalancedBatchShuffler:
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
         *args,
         **kwargs,
-    ) -> int:
+    ) -> ShuffleHandle:
         """Phase 1: AllGather workloads (NCCL, main thread) then submit KK
         to a background thread.
 
         Returns:
-            batch_counter: A unique identifier for this batch's shuffle state.
+            ShuffleHandle: A handle for this batch's shuffle state.
             Pass this to :meth:`finish_shuffle` to retrieve the result.
 
-        The KK future is stored internally per batch (using batch_counter as key);
-        call :meth:`finish_shuffle` with the returned batch_counter to complete
+        The KK future is stored internally per batch (using handle as key);
+        call :meth:`finish_shuffle` with the returned handle to complete
         the data redistribution.
         """
         workloads = self.get_workloads(batch, *args, **kwargs)
@@ -151,14 +195,15 @@ class BaseTaskBalancedBatchShuffler:
         # which is serialised after the AllGather.
         allgather_workloads_cpu = allgather_workloads.tolist()
 
-        # Use batch counter as key to track shuffle state per batch
+        # Create handle for this batch's shuffle state
         # This allows multiple batches to be in shuffle state simultaneously
         # (important for prefetch pipeline where 3 batches are in-flight)
-        # We use batch_counter instead of id(batch) because:
+        # We use ShuffleHandle instead of id(batch) because:
         # 1. _to_device may create new objects, changing id(batch)
         # 2. Python object IDs can be reused, leading to collisions
         batch_counter = self._batch_counter
         self._batch_counter += 1
+        handle = ShuffleHandle(batch_counter)
 
         # Submit KK (pure CPU) to background thread — receives a plain Python
         # list so no GPU access happens off the main thread.
@@ -168,7 +213,7 @@ class BaseTaskBalancedBatchShuffler:
             num_partitions,
         )
         # Stash metadata needed by finish_shuffle
-        self._kk_states[batch_counter] = {
+        self._kk_states[handle] = {
             "future": kk_future,
             "meta": {
                 "allgather_workloads": allgather_workloads_cpu,
@@ -178,12 +223,12 @@ class BaseTaskBalancedBatchShuffler:
                 "device": workloads.device,
             },
         }
-        return batch_counter
+        return handle
 
     def finish_shuffle(
         self,
         batch: BaseBatch,
-        batch_counter: int,
+        handle: ShuffleHandle,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
     ) -> BaseBatch:
         """Phase 2: Wait for KK result, then AllGather batch + index_select
@@ -191,35 +236,33 @@ class BaseTaskBalancedBatchShuffler:
 
         Args:
             batch: The batch to shuffle (used for data redistribution).
-            batch_counter: The identifier returned by :meth:`start_shuffle_async`.
+            handle: The handle returned by :meth:`start_shuffle_async`.
 
         Returns:
             The load-balanced ``BaseBatch`` for this rank.
         """
-        assert batch_counter in self._kk_states, (
+        assert handle in self._kk_states, (
             f"start_shuffle_async() must be called before finish_shuffle() "
-            f"for batch_counter {batch_counter}"
+            f"for handle {handle}"
         )
 
-        state = self._kk_states[batch_counter]
+        state = self._kk_states[handle]
         partitions_indices: List[List[int]] = state["future"].result()
         meta = state["meta"]
         # Clean up state after use
-        del self._kk_states[batch_counter]
+        del self._kk_states[handle]
 
         # Optional logging (rank 0 only)
         if self._should_print_load_balance():
             aw = meta["allgather_workloads"]
             all_wl = aw.tolist() if isinstance(aw, torch.Tensor) else list(aw)
             _log_load_balance(
-                self._batch_counter,
+                int(handle),  # Convert to int for logging
                 all_wl,
                 partitions_indices,
                 meta["local_batch_size"],
                 meta["num_partitions"],
             )
-        self._batch_counter += 1
-
         indices_this_rank = torch.tensor(
             partitions_indices[meta["rank"]],
             dtype=torch.int64,
