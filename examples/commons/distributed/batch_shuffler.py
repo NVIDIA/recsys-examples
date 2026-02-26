@@ -9,11 +9,13 @@ from commons.perf_model.partitioner import karmarkar_karp
 from commons.sequence_batch.batch import BaseBatch
 from commons.utils.logger import debug_rank_0
 
-from .batch_allgather import allgather_batch
+from .batch_all2all import _build_dst_rank_local, pad_and_all2all_batch
+from .batch_allgather import pad_and_allgather_batch
 
 _PRINT_LOAD_BALANCE = os.environ.get("PRINT_LOAD_BALANCE", "0") == "1"
 _PRINT_LOAD_BALANCE_START = int(os.environ.get("PRINT_LOAD_BALANCE_START", "0"))
 _PRINT_LOAD_BALANCE_STOP = int(os.environ.get("PRINT_LOAD_BALANCE_STOP", "-1"))
+_SHUFFLE_WITH_ALL2ALL = os.environ.get("SHUFFLE_WITH_ALL2ALL", "0") == "1"
 
 
 class ShuffleHandle:
@@ -53,25 +55,73 @@ class ShuffleHandle:
         return f"ShuffleHandle(counter={self._counter})"
 
 
+def _sort_partitions_padding_last(
+    partitions_indices: torch.Tensor,
+    allgather_wl: torch.Tensor,
+) -> torch.Tensor:
+    """Sort each row of ``partitions_indices`` with real samples first, padding last.
+
+    Within each group (real / padding) the indices are in ascending order.
+    When there is no padding (complete batch) this reduces to a plain
+    ``sort(dim=1)``.
+
+    Args:
+        partitions_indices: ``[W, B]`` **unsorted** global indices from KK.
+        allgather_wl: ``[W*B]`` allgathered workloads; padding has ``wl == 0``.
+
+    Returns:
+        Sorted ``[W, B]`` tensor.
+    """
+    global_batch_size = partitions_indices.numel()
+    is_padding = (allgather_wl[partitions_indices] == 0).long()
+    sort_key = is_padding * (global_batch_size + 1) + partitions_indices
+    return partitions_indices.gather(1, sort_key.argsort(dim=1, stable=True))
+
+
+def _strip_dense_padding(batch: BaseBatch, actual_bs: int) -> BaseBatch:
+    """Remove trailing padding rows from dense tensors, keep KJTs intact.
+
+    Relies on ``_sort_partitions_padding_last`` having placed real samples
+    before padding samples so that a simple ``[:actual_bs]`` slice suffices.
+
+    Args:
+        batch: batch whose dense tensors have ``batch.batch_size`` rows.
+        actual_bs: number of real (non-padding) rows to keep.
+
+    Returns:
+        A new ``BaseBatch`` where each dense tensor has ``actual_bs`` rows
+        and KJT fields are unchanged.
+    """
+    full_bs = batch.batch_size
+
+    def _fn(t: Any) -> Any:
+        if isinstance(t, torch.Tensor):
+            return t.reshape(full_bs, -1)[:actual_bs].reshape(-1)
+        return t
+
+    return batch._apply_to_tensors_or_kjt(_fn, inplace=False)
+
+
 def _log_load_balance(
     batch_idx: int,
     all_workloads: List[float],
-    partitions_indices: List[List[int]],
+    partitions_indices: torch.Tensor,
     local_batch_size: int,
     num_partitions: int,
 ) -> None:
     """Print per-rank math ops before/after load balancing and cross-rank spread.
-    Called only on rank 0; all data is already globally consistent."""
-    # Before balance: rank r originally owned indices [r*B, (r+1)*B)
+    Called only on rank 0; all data is already globally consistent.
+
+    Args:
+        partitions_indices: 2-D int64 tensor ``[W, B]`` (may be on GPU).
+    """
+    wl = torch.tensor(all_workloads, dtype=torch.float64)
+    pi = partitions_indices.cpu()
     before_loads = [
-        sum(all_workloads[r * local_batch_size : (r + 1) * local_batch_size])
+        wl[r * local_batch_size : (r + 1) * local_batch_size].sum().item()
         for r in range(num_partitions)
     ]
-    # After balance: rank r owns partitions_indices[r]
-    after_loads = [
-        sum(all_workloads[idx] for idx in partitions_indices[r])
-        for r in range(num_partitions)
-    ]
+    after_loads = [wl[pi[r]].sum().item() for r in range(num_partitions)]
     before_max, before_min = max(before_loads), min(before_loads)
     after_max, after_min = max(after_loads), min(after_loads)
     before_imb = (before_max - before_min) / before_max * 100 if before_max > 0 else 0.0
@@ -212,11 +262,19 @@ class BaseTaskBalancedBatchShuffler:
             allgather_workloads_cpu,
             num_partitions,
         )
+        # Padding samples sit at the tail of each rank's local chunk, so
+        # checking only the last position of each chunk is sufficient — O(W).
+        has_padding = any(
+            allgather_workloads_cpu[(i + 1) * local_batch_size - 1] == 0
+            for i in range(num_partitions)
+        )
         # Stash metadata needed by finish_shuffle
         self._kk_states[handle] = {
             "future": kk_future,
             "meta": {
-                "allgather_workloads": allgather_workloads_cpu,
+                "allgather_workloads_cpu": allgather_workloads_cpu,
+                "allgather_workloads_gpu": allgather_workloads,
+                "has_padding": has_padding,
                 "local_batch_size": local_batch_size,
                 "num_partitions": num_partitions,
                 "rank": torch.distributed.get_rank(pg_group),
@@ -230,13 +288,17 @@ class BaseTaskBalancedBatchShuffler:
         batch: BaseBatch,
         handle: ShuffleHandle,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+        use_all2all: bool = False,
     ) -> BaseBatch:
-        """Phase 2: Wait for KK result, then AllGather batch + index_select
+        """Phase 2: Wait for KK result, then redistribute batch data
         (all on main thread — NCCL safe).
 
         Args:
             batch: The batch to shuffle (used for data redistribution).
             handle: The handle returned by :meth:`start_shuffle_async`.
+            pg_group: Distributed process group.
+            use_all2all: If True, use All2All communication (more efficient).
+                        If False, use AllGather + index_select (default, more robust).
 
         Returns:
             The load-balanced ``BaseBatch`` for this rank.
@@ -247,30 +309,102 @@ class BaseTaskBalancedBatchShuffler:
         )
 
         state = self._kk_states[handle]
-        partitions_indices: List[List[int]] = state["future"].result()
+        partitions_list: List[List[int]] = state["future"].result()
         meta = state["meta"]
         # Clean up state after use
         del self._kk_states[handle]
 
+        has_padding = meta["has_padding"]
+        allgather_wl = meta["allgather_workloads_gpu"]
+
+        # KK partitions the *global* batch (including padding samples with
+        # workload == 0), so ``partitions_indices`` — and consequently
+        # ``indices_this_rank`` — may reference padding positions.
+        partitions_indices = torch.tensor(
+            partitions_list, dtype=torch.int64, device=meta["device"]
+        )
+        if has_padding:
+            partitions_indices = _sort_partitions_padding_last(
+                partitions_indices,
+                allgather_wl,
+            )
+
         # Optional logging (rank 0 only)
         if self._should_print_load_balance():
-            aw = meta["allgather_workloads"]
-            all_wl = aw.tolist() if isinstance(aw, torch.Tensor) else list(aw)
             _log_load_balance(
-                int(handle),  # Convert to int for logging
-                all_wl,
+                int(handle),
+                meta["allgather_workloads_cpu"],
                 partitions_indices,
                 meta["local_batch_size"],
                 meta["num_partitions"],
             )
-        indices_this_rank = torch.tensor(
-            partitions_indices[meta["rank"]],
-            dtype=torch.int64,
-            device=meta["device"],
-        )
-        indices_this_rank, _ = torch.sort(indices_this_rank)
 
-        return self.shuffle_batch_by_global_indices(batch, indices_this_rank, pg_group)
+        # NOTE: ``indices_this_rank`` has ``local_batch_size`` elements and
+        # may include padding indices (real samples first, padding last
+        # after ``_sort_partitions_padding_last``).  All downstream
+        # operations that consume the *full* indices (allgather path's
+        # ``index_select``, all2all's ``recv_ids``) therefore produce
+        # batches that still contain padding samples; the padding is
+        # stripped from dense tensors at the end of this method.
+        indices_this_rank = partitions_indices[meta["rank"]]
+        actual_bs = (
+            (allgather_wl[indices_this_rank] > 0).sum().item()
+            if has_padding
+            else indices_this_rank.numel()
+        )
+
+        if use_all2all or _SHUFFLE_WITH_ALL2ALL:
+            dst_rank, recv_counts = _build_dst_rank_local(
+                partitions_indices,
+                meta["rank"],
+                meta["local_batch_size"],
+            )
+            # ``indices_this_rank`` (including padding) is passed as
+            # ``recv_ids``; the all2all exchange requires all
+            # ``local_batch_size`` entries to maintain symmetric counts.
+            new_batch = self.shuffle_batch_by_global_indices_all2all(
+                batch,
+                indices_this_rank,
+                pg_group,
+                dst_rank=dst_rank,
+                recv_counts=recv_counts,
+            )
+            # all2all output arrives in ascending global-index order
+            # because the sender uses ``dst_rank.argsort(stable=True)``
+            # to group samples by destination, which preserves ascending
+            # local-index (== global-index) order within each group.
+            #
+            # However ``indices_this_rank`` has been reordered by
+            # ``_sort_partitions_padding_last`` so that real samples come
+            # first and padding samples last.  When padding exists the
+            # two orderings diverge, e.g.:
+            #
+            #   all2all output order (ascending):  [0, 3, 4, 7]
+            #   indices_this_rank   (real-first):  [0, 4, 3, 7]
+            #
+            # ``perm`` maps ascending → real-first so that downstream
+            # code can slice ``[0 : actual_bs]`` to get exactly the real
+            # samples.
+            if has_padding and actual_bs < indices_this_rank.numel():
+                perm = indices_this_rank.sort().indices.argsort()
+                new_batch = new_batch.index_select(perm)
+        else:
+            # ``indices_this_rank`` (including padding) is passed as
+            # ``recv_ids``; the allgather path selects all
+            # ``local_batch_size`` samples so that KJT lengths remain
+            # padded.  Dense padding is stripped below.
+            new_batch = self.shuffle_batch_by_global_indices_allgather(
+                batch,
+                indices_this_rank,
+                pg_group,
+            )
+
+        new_batch.actual_batch_size = actual_bs
+
+        if has_padding and actual_bs < new_batch.batch_size:
+            new_batch = _strip_dense_padding(new_batch, actual_bs)
+
+        return new_batch
 
     # ------------------------------------------------------------------
     # Original synchronous API (still available)
@@ -281,7 +415,7 @@ class BaseTaskBalancedBatchShuffler:
         workloads: torch.Tensor,
         local_batch_size: int,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         """AllGather workloads → KK partitioning → this-rank indices (synchronous).
 
         This is **batch-type agnostic** — it only operates on a 1-D workload
@@ -293,7 +427,10 @@ class BaseTaskBalancedBatchShuffler:
             pg_group: distributed process group.
 
         Returns:
-            Sorted 1-D int64 tensor of global-batch indices for this rank.
+            Tuple of (1-D int64 tensor of global-batch indices for this rank,
+            2-D int64 tensor ``[W, B]`` of KK partitions for all ranks,
+            1-D tensor ``[W*B]`` of allgathered workloads,
+            bool indicating whether padding exists).
         """
         assert (
             workloads.shape[0] == local_batch_size
@@ -302,60 +439,69 @@ class BaseTaskBalancedBatchShuffler:
         rank = torch.distributed.get_rank(pg_group)
         # 1. Allgather the workloads
         allgather_workloads = gather_along_first_dim(workloads, pg_group)
-        # 2. Partition the workloads
-        partitions_indices = karmarkar_karp(
-            allgather_workloads, num_partitions, equal_size=True
+        # KK runs on CPU; .tolist() is needed regardless.
+        allgather_wl_cpu = allgather_workloads.tolist()
+        # Padding sits at the tail of each rank's chunk — O(W) check.
+        has_padding = any(
+            allgather_wl_cpu[(i + 1) * local_batch_size - 1] == 0
+            for i in range(num_partitions)
         )
-        if self._should_print_load_balance():
-            all_wl = (
-                allgather_workloads.tolist()
-                if isinstance(allgather_workloads, torch.Tensor)
-                else list(allgather_workloads)
+        # 2. Partition the workloads.
+        # KK operates on the *global* batch (including padding samples with
+        # workload == 0), so the returned indices may reference padding
+        # positions.  After ``_sort_partitions_padding_last``, each row
+        # has real samples first and padding indices last.
+        partitions_list = karmarkar_karp(
+            allgather_wl_cpu, num_partitions, equal_size=True
+        )
+        partitions_indices = torch.tensor(
+            partitions_list, dtype=torch.int64, device=workloads.device
+        )
+        if has_padding:
+            partitions_indices = _sort_partitions_padding_last(
+                partitions_indices,
+                allgather_workloads,
             )
+        if self._should_print_load_balance():
             _log_load_balance(
                 self._batch_counter,
-                all_wl,
+                allgather_wl_cpu,
                 partitions_indices,
                 local_batch_size,
                 num_partitions,
             )
         self._batch_counter += 1
-        indices_this_rank = torch.tensor(
-            partitions_indices[rank],
-            dtype=torch.int64,
-            device=workloads.device,
-        )
-        #! NOTE: This indices tensor always has a size equal to the full batch size,
-        #! including padding indices for incomplete batches. Sorting ensures padding
-        #! indices are stored contiguously at the tensor's end.
-        indices_this_rank, _ = torch.sort(indices_this_rank)
-        return indices_this_rank
+        # NOTE: ``indices_this_rank`` may contain padding indices (trailing,
+        # with workload == 0).  Callers must use ``has_padding`` and
+        # ``allgather_workloads`` to determine the real sample count.
+        indices_this_rank = partitions_indices[rank]
+        return indices_this_rank, partitions_indices, allgather_workloads, has_padding
 
     @staticmethod
     def shuffle_tensor_by_global_indices(
         tensor: torch.Tensor,
-        global_indices: torch.Tensor,
+        recv_ids: torch.Tensor,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
     ) -> torch.Tensor:
-        """AllGather a dense tensor along dim-0, then index-select by global indices.
+        """AllGather a dense tensor along dim-0, then index-select by recv_ids.
 
         Args:
             tensor: local dense tensor of shape ``[local_batch_size, ...]``.
-            global_indices: global-batch indices for this rank
+            recv_ids: global-batch sample IDs this rank needs to receive
                 (from :meth:`compute_partition_indices`).
             pg_group: distributed process group.
 
         Returns:
-            Tensor of shape ``[len(global_indices), ...]`` containing the
+            Tensor of shape ``[len(recv_ids), ...]`` containing the
             rows assigned to this rank after load-balanced redistribution.
         """
         allgathered = gather_along_first_dim(tensor, pg_group)
-        return allgathered[global_indices]
+        return allgathered[recv_ids]
 
     @staticmethod
-    def shuffle_batch_by_global_indices(
+    def shuffle_batch_by_global_indices_allgather(
         batch: BaseBatch,
-        global_indices: torch.Tensor,
+        recv_ids: torch.Tensor,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
     ) -> BaseBatch:
         """Phase 2: AllGather the batch, then index-select by pre-computed indices.
@@ -364,18 +510,50 @@ class BaseTaskBalancedBatchShuffler:
 
         Args:
             batch: local batch to allgather.
-            global_indices: global-batch indices for this rank (from :meth:`compute_partition_indices`).
+            recv_ids: global-batch sample IDs this rank needs to receive
+                (from :meth:`compute_partition_indices`).  May include
+                padding indices (workload == 0); the caller is responsible
+                for stripping dense padding from the result.
             pg_group: distributed process group.
 
         Returns:
-            A new ``BaseBatch`` containing only the samples assigned to this rank.
+            A new ``BaseBatch`` with ``len(recv_ids)`` samples (including
+            any padding samples referenced by ``recv_ids``).
         """
-        allgathered_batch = allgather_batch(batch, pg_group)
-        new_batch = allgathered_batch.index_select(global_indices)
-        new_batch.batch_size = new_batch.batch_size // torch.distributed.get_world_size(
-            pg_group
-        )
+        allgathered_batch = pad_and_allgather_batch(batch, pg_group)
+        assert isinstance(allgathered_batch, BaseBatch)
+        new_batch = allgathered_batch.index_select(recv_ids)
         return new_batch
+
+    @staticmethod
+    def shuffle_batch_by_global_indices_all2all(
+        batch: BaseBatch,
+        recv_ids: torch.Tensor,
+        pg_group: torch.distributed.ProcessGroup,
+        dst_rank: torch.Tensor,
+        recv_counts: "List[int]",
+    ) -> BaseBatch:
+        """Phase 2: All2All the batch directly to target ranks, avoiding redundant communication.
+
+        This version uses All2All communication instead of AllGather + index_select,
+        reducing communication volume by only sending samples to ranks that need them.
+
+        Args:
+            batch: local batch to redistribute.
+            recv_ids: **sorted** global-batch sample IDs this rank needs to receive
+                (from :meth:`compute_partition_indices`).  May include
+                padding indices (workload == 0); the caller is responsible
+                for stripping dense padding from the result.
+            pg_group: distributed process group.
+            dst_rank: Destination rank for each local sample.  Shape
+                ``(batch.batch_size,)``.
+            recv_counts: Per-source-rank receive counts.
+
+        Returns:
+            A new ``BaseBatch`` with ``len(recv_ids)`` samples (including
+            any padding samples referenced by ``recv_ids``).
+        """
+        return pad_and_all2all_batch(batch, recv_ids, pg_group, dst_rank, recv_counts)
 
     def shuffle(
         self,
@@ -383,6 +561,7 @@ class BaseTaskBalancedBatchShuffler:
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
         return_indices: bool = False,  # indices within global batch
         return_workloads: bool = False,  # for debug
+        use_all2all: bool = False,
         *args,
         **kwargs,
     ) -> Union[
@@ -391,12 +570,58 @@ class BaseTaskBalancedBatchShuffler:
         Tuple[BaseBatch, torch.Tensor, torch.Tensor],
     ]:
         workloads = self.get_workloads(batch, *args, **kwargs)
-        indices_this_rank = self.compute_partition_indices(
-            workloads, batch.batch_size, pg_group
+        # ``indices_this_rank`` may contain padding indices — see
+        # ``compute_partition_indices`` for details.
+        (
+            indices_this_rank,
+            partitions_indices,
+            allgather_wl,
+            has_padding,
+        ) = self.compute_partition_indices(workloads, batch.batch_size, pg_group)
+        actual_bs = (
+            (allgather_wl[indices_this_rank] > 0).sum().item()
+            if has_padding
+            else indices_this_rank.numel()
         )
-        new_batch = self.shuffle_batch_by_global_indices(
-            batch, indices_this_rank, pg_group
-        )
+
+        if use_all2all or _SHUFFLE_WITH_ALL2ALL:
+            rank = torch.distributed.get_rank(pg_group)
+            dst_rank, recv_counts = _build_dst_rank_local(
+                partitions_indices,
+                rank,
+                batch.batch_size,
+            )
+            # ``indices_this_rank`` (including padding) is passed as
+            # ``recv_ids``; the all2all exchange requires all
+            # ``local_batch_size`` entries to maintain symmetric counts.
+            new_batch = self.shuffle_batch_by_global_indices_all2all(
+                batch,
+                indices_this_rank,
+                pg_group,
+                dst_rank=dst_rank,
+                recv_counts=recv_counts,
+            )
+            # See comment in ``finish_shuffle`` — all2all output is in
+            # ascending global-index order, but ``indices_this_rank`` is
+            # real-first; reorder to match when padding exists.
+            if has_padding and actual_bs < indices_this_rank.numel():
+                perm = indices_this_rank.sort().indices.argsort()
+                new_batch = new_batch.index_select(perm)
+        else:
+            # ``indices_this_rank`` (including padding) is passed as
+            # ``recv_ids``; the allgather path selects all
+            # ``local_batch_size`` samples so that KJT lengths remain
+            # padded.  Dense padding is stripped below.
+            new_batch = self.shuffle_batch_by_global_indices_allgather(
+                batch,
+                indices_this_rank,
+                pg_group,
+            )
+
+        new_batch.actual_batch_size = actual_bs
+
+        if has_padding and actual_bs < new_batch.batch_size:
+            new_batch = _strip_dense_padding(new_batch, actual_bs)
 
         ret = new_batch
         if return_indices:
