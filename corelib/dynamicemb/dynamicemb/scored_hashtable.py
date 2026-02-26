@@ -572,7 +572,6 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_capacity_ = (
                 (bucket_capacity + digest_load_dim - 1) // digest_load_dim
             ) * digest_load_dim
-        # self.bucket_capacity_ = _next_power_of_2(self.bucket_capacity_)
 
         if self.bucket_capacity_ != bucket_capacity:
             warnings.warn(
