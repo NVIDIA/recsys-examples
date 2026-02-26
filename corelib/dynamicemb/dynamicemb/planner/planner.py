@@ -52,7 +52,7 @@ from ..batched_dynamicemb_compute_kernel import (
 from ..dynamicemb_config import (
     DynamicEmbKernel,
     DynamicEmbTableOptions,
-    _next_power_of_2,
+    align_to_table_size,
     validate_initializer_args,
 )
 
@@ -142,17 +142,13 @@ def _validate_configs(
         validate_initializer_args(
             tmp_constraint.dynamicemb_options.initializer_args, tmp_config
         )
-        # modify num_embeddings per rank to power of 2
-        num_aligned_embedding_per_rank = int(
-            _next_power_of_2(math.ceil(tmp_config.num_embeddings / world_size))
+        # align num_embeddings per rank via align_to_table_size
+        num_aligned_embedding_per_rank = align_to_table_size(
+            math.ceil(tmp_config.num_embeddings / world_size)
         )
-        if (
-            num_aligned_embedding_per_rank
-            < constraints[config_name].dynamicemb_options.bucket_capacity
-        ):
-            num_aligned_embedding_per_rank = constraints[
-                config_name
-            ].dynamicemb_options.bucket_capacity
+        bucket_cap = constraints[config_name].dynamicemb_options.bucket_capacity
+        if num_aligned_embedding_per_rank < bucket_cap:
+            num_aligned_embedding_per_rank = align_to_table_size(bucket_cap)
 
         # num_aligned_embedding_per_rank = _get_safe_local_capacity(num_aligned_embedding_per_rank, tmp_constraint.dynamicemb_options.bucket_capacity)
         if tmp_config.num_embeddings != int(
@@ -167,9 +163,8 @@ def _dyn_emb_table_size_per_rank(
     dyn_emb_table_config: BaseEmbeddingConfig, world_size: int
 ) -> Tuple[int, int]:
     num_embeddings = dyn_emb_table_config.num_embeddings
-    # TODO: align num_embedding automatic , maybe need user input , and we don't align it.
-    num_embeddings_per_rank = int(
-        _next_power_of_2(math.ceil(num_embeddings / world_size))
+    num_embeddings_per_rank = align_to_table_size(
+        math.ceil(num_embeddings / world_size)
     )
 
     embedding_dim = dyn_emb_table_config.embedding_dim
@@ -197,7 +192,6 @@ def _reserve_storage_for_dyn_emb(
         embedding_dim, num_embeddings_per_rank = _dyn_emb_table_size_per_rank(
             tmp_table_config, world_size
         )
-        # TODO: should HBM align with the power of 2
         HBM_memory_in_bytes_per_rank = _dyn_emb_table_hbm_size_per_rank(
             constraint, world_size
         )
@@ -227,7 +221,7 @@ class DynamicEmbeddingShardingPlanner:
         giving it the ability to plan dynamic embedding tables. The only difference from EmbeddingShardingPlanner
         is that DynamicEmbeddingShardingPlanner has an additional parameter `eb_configs`, which is a list of
         TorchREC BaseEmbeddingConfig. This is because the dynamic embedding table needs to re-plan the number of
-        embedding vectors on each rank to align with the power of 2.
+        embedding vectors on each rank via align_to_table_size().
 
         Parameters
         ----------

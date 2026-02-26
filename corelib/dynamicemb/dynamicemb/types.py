@@ -113,6 +113,7 @@ EMBEDDING_TYPE = torch.float32
 SCORE_TYPE = torch.int64
 OPT_STATE_TYPE = torch.float32
 COUNTER_TYPE = torch.int64
+DEMB_TABLE_ALIGN_SIZE = 16
 
 torch_dtype_to_np_dtype = {
     torch.uint64: np.uint64,

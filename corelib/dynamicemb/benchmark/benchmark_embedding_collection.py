@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import argparse
-import math
 import sys
 import time
 from typing import Dict, List
@@ -28,6 +27,7 @@ from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
+    align_to_table_size,
 )
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
@@ -113,8 +113,8 @@ def get_planner(args, device, eb_configs):
 
         embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
         eb_num_embeddings = eb_config.num_embeddings
-        eb_num_embeddings_next_power_of_2 = 2 ** math.ceil(math.log2(eb_num_embeddings))
-        total_hbm_need = embedding_type_bytes * dim * eb_num_embeddings_next_power_of_2
+        eb_num_embeddings_aligned = align_to_table_size(eb_num_embeddings)
+        total_hbm_need = embedding_type_bytes * dim * eb_num_embeddings_aligned
 
         const = DynamicEmbParameterConstraints(
             sharding_types=[
