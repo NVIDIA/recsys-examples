@@ -526,6 +526,10 @@ def test_forward_train_eval(
     with torch.no_grad():
         bdebt.eval()
         embs_eval = bdebt(indices, offsets)
+
+        # corner case when all keys missed in eval.
+        indices_ne_all = indices + 1024
+        bdebt(indices_ne_all, offsets)
     torch.cuda.synchronize()
 
     # Train and eval should produce identical results for the same keys
