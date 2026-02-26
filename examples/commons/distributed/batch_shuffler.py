@@ -9,6 +9,7 @@ from commons.perf_model.partitioner import karmarkar_karp
 from commons.sequence_batch.batch import BaseBatch
 from commons.utils.logger import debug_rank_0
 
+from .batch_all2all import all2all_batch
 from .batch_allgather import allgather_batch
 
 _PRINT_LOAD_BALANCE = os.environ.get("PRINT_LOAD_BALANCE", "0") == "1"
@@ -230,13 +231,17 @@ class BaseTaskBalancedBatchShuffler:
         batch: BaseBatch,
         handle: ShuffleHandle,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+        use_all2all: bool = False,
     ) -> BaseBatch:
-        """Phase 2: Wait for KK result, then AllGather batch + index_select
+        """Phase 2: Wait for KK result, then redistribute batch data
         (all on main thread — NCCL safe).
 
         Args:
             batch: The batch to shuffle (used for data redistribution).
             handle: The handle returned by :meth:`start_shuffle_async`.
+            pg_group: Distributed process group.
+            use_all2all: If True, use All2All communication (more efficient).
+                        If False, use AllGather + index_select (default, more robust).
 
         Returns:
             The load-balanced ``BaseBatch`` for this rank.
@@ -270,7 +275,14 @@ class BaseTaskBalancedBatchShuffler:
         )
         indices_this_rank, _ = torch.sort(indices_this_rank)
 
-        return self.shuffle_batch_by_global_indices(batch, indices_this_rank, pg_group)
+        if use_all2all:
+            return self.shuffle_batch_by_global_indices_all2all(
+                batch, indices_this_rank, pg_group
+            )
+        else:
+            return self.shuffle_batch_by_global_indices_allgather(
+                batch, indices_this_rank, pg_group
+            )
 
     # ------------------------------------------------------------------
     # Original synchronous API (still available)
@@ -334,28 +346,28 @@ class BaseTaskBalancedBatchShuffler:
     @staticmethod
     def shuffle_tensor_by_global_indices(
         tensor: torch.Tensor,
-        global_indices: torch.Tensor,
+        recv_ids: torch.Tensor,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
     ) -> torch.Tensor:
-        """AllGather a dense tensor along dim-0, then index-select by global indices.
+        """AllGather a dense tensor along dim-0, then index-select by recv_ids.
 
         Args:
             tensor: local dense tensor of shape ``[local_batch_size, ...]``.
-            global_indices: global-batch indices for this rank
+            recv_ids: global-batch sample IDs this rank needs to receive
                 (from :meth:`compute_partition_indices`).
             pg_group: distributed process group.
 
         Returns:
-            Tensor of shape ``[len(global_indices), ...]`` containing the
+            Tensor of shape ``[len(recv_ids), ...]`` containing the
             rows assigned to this rank after load-balanced redistribution.
         """
         allgathered = gather_along_first_dim(tensor, pg_group)
-        return allgathered[global_indices]
+        return allgathered[recv_ids]
 
     @staticmethod
-    def shuffle_batch_by_global_indices(
+    def shuffle_batch_by_global_indices_allgather(
         batch: BaseBatch,
-        global_indices: torch.Tensor,
+        recv_ids: torch.Tensor,
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
     ) -> BaseBatch:
         """Phase 2: AllGather the batch, then index-select by pre-computed indices.
@@ -364,18 +376,42 @@ class BaseTaskBalancedBatchShuffler:
 
         Args:
             batch: local batch to allgather.
-            global_indices: global-batch indices for this rank (from :meth:`compute_partition_indices`).
+            recv_ids: global-batch sample IDs this rank needs to receive
+                (from :meth:`compute_partition_indices`).
             pg_group: distributed process group.
 
         Returns:
             A new ``BaseBatch`` containing only the samples assigned to this rank.
         """
         allgathered_batch = allgather_batch(batch, pg_group)
-        new_batch = allgathered_batch.index_select(global_indices)
+        new_batch = allgathered_batch.index_select(recv_ids)
         new_batch.batch_size = new_batch.batch_size // torch.distributed.get_world_size(
             pg_group
         )
         return new_batch
+
+    @staticmethod
+    def shuffle_batch_by_global_indices_all2all(
+        batch: BaseBatch,
+        recv_ids: torch.Tensor,
+        pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
+    ) -> BaseBatch:
+        """Phase 2: All2All the batch directly to target ranks, avoiding redundant communication.
+
+        This version uses All2All communication instead of AllGather + index_select,
+        reducing communication volume by only sending samples to ranks that need them.
+
+        Args:
+            batch: local batch to redistribute.
+            recv_ids: **sorted** global-batch sample IDs this rank needs to receive
+                (from :meth:`compute_partition_indices`).
+            pg_group: distributed process group.
+
+        Returns:
+            A new ``BaseBatch`` containing only the samples assigned to this rank,
+            in the order specified by recv_ids.
+        """
+        return all2all_batch(batch, recv_ids, pg_group)
 
     def shuffle(
         self,
@@ -383,6 +419,7 @@ class BaseTaskBalancedBatchShuffler:
         pg_group: torch.distributed.ProcessGroup = torch.distributed.group.WORLD,
         return_indices: bool = False,  # indices within global batch
         return_workloads: bool = False,  # for debug
+        use_all2all: bool = False,
         *args,
         **kwargs,
     ) -> Union[
@@ -394,9 +431,14 @@ class BaseTaskBalancedBatchShuffler:
         indices_this_rank = self.compute_partition_indices(
             workloads, batch.batch_size, pg_group
         )
-        new_batch = self.shuffle_batch_by_global_indices(
-            batch, indices_this_rank, pg_group
-        )
+        if use_all2all:
+            new_batch = self.shuffle_batch_by_global_indices_all2all(
+                batch, indices_this_rank, pg_group
+            )
+        else:
+            new_batch = self.shuffle_batch_by_global_indices_allgather(
+                batch, indices_this_rank, pg_group
+            )
         ret = new_batch
         if return_indices:
             ret = (ret, indices_this_rank)
