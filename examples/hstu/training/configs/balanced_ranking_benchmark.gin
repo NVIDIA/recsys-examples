@@ -25,7 +25,7 @@ TrainerArgs.ckpt_save_interval = 999999999
 # === Random distributions (optional, for BenchmarkDataset) ===
 # Sequence length distribution: Zipf, values in [low, max_sequence_length)
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
-item_and_action_feature/FeatureArgs.max_sequence_length = 4097
+item_and_action_feature/FeatureArgs.max_sequence_length = 4096
 item_and_action_feature/FeatureArgs.is_jagged = True
 item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
 item_seqlen_dist/RandomDistribution.alpha = 1.2

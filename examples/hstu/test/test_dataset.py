@@ -230,13 +230,19 @@ def test_hstu_random_dataset_with_distributions(
             assert (
                 vals.min().item() >= value_low
             ), f"feature '{key}': min value {vals.min().item()} < low {value_low}"
-            # high is exclusive for uniform, inclusive-clamp for normal/zipf,
-            # but sample() always clamps to max=high-1, so max value < high.
-            assert (
-                vals.max().item() < value_high
-            ), f"feature '{key}': max value {vals.max().item()} >= high {value_high}"
+            # high is exclusive for uniform [low, high),
+            # but inclusive for normal/zipf/lognormal [low, high].
+            if value_dist_type == DistType.UNIFORM:
+                assert (
+                    vals.max().item() < value_high
+                ), f"feature '{key}': max value {vals.max().item()} >= high {value_high}"
+            else:
+                assert (
+                    vals.max().item() <= value_high
+                ), f"feature '{key}': max value {vals.max().item()} > high {value_high}"
 
-        # Verify seqlen bounds (lengths per feature should be within [seqlen_low, seqlen_high))
+        # Verify seqlen bounds
+        # uniform: [seqlen_low, seqlen_high), others: [seqlen_low, seqlen_high]
         for key in kjt.keys():
             lengths = kjt[key].lengths()
             non_zero_lengths = lengths[lengths > 0]
@@ -245,9 +251,14 @@ def test_hstu_random_dataset_with_distributions(
             assert (
                 non_zero_lengths.min().item() >= seqlen_low
             ), f"feature '{key}': min seqlen {non_zero_lengths.min().item()} < low {seqlen_low}"
-            assert (
-                non_zero_lengths.max().item() < seqlen_high
-            ), f"feature '{key}': max seqlen {non_zero_lengths.max().item()} >= high {seqlen_high}"
+            if seqlen_dist_type == DistType.UNIFORM:
+                assert (
+                    non_zero_lengths.max().item() < seqlen_high
+                ), f"feature '{key}': max seqlen {non_zero_lengths.max().item()} >= high {seqlen_high}"
+            else:
+                assert (
+                    non_zero_lengths.max().item() <= seqlen_high
+                ), f"feature '{key}': max seqlen {non_zero_lengths.max().item()} > high {seqlen_high}"
 
     init.destroy_global_state()
 
