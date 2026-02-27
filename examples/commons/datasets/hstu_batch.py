@@ -128,7 +128,7 @@ class RandomDistribution:
             samples = torch.normal(self.mean, self.std, (size,))
             samples = samples.clamp(min=lo)
             if hi is not None:
-                samples = samples.clamp(max=hi - 1)
+                samples = samples.clamp(max=hi)
             return samples.round().long().to(device)
 
         elif self.dist_type == DistType.LOGNORMAL:
@@ -150,7 +150,7 @@ class RandomDistribution:
             samples = torch.distributions.LogNormal(mu, sigma).sample((size,))
             samples = samples.clamp(min=lo)
             if hi is not None:
-                samples = samples.clamp(max=hi - 1)
+                samples = samples.clamp(max=hi)
             return samples.round().long().to(device)
 
         elif self.dist_type == DistType.ZIPF:
@@ -161,7 +161,7 @@ class RandomDistribution:
             samples = torch.from_numpy(raw).long() + (lo - 1)
             samples = samples.clamp(min=lo)
             if hi is not None:
-                samples = samples.clamp(max=hi - 1)
+                samples = samples.clamp(max=hi)
             return samples.to(device)
 
         else:
