@@ -128,7 +128,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
                    int64_t batch, int64_t offset, torch::Dtype key_dtype,
-                   std::optional<ScoreType> threshold = std::nullopt);
+                   std::optional<ScoreType> threshold = std::nullopt,
+                   int64_t table_begin = 0);
 
 at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
                                int64_t bucket_capacity, ScoreType threshold,

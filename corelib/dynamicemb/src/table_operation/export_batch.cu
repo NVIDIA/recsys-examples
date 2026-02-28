@@ -25,7 +25,8 @@ void table_export_single_score(at::Tensor table_storage,
                                int64_t offset, at::Tensor counter,
                                at::Tensor keys, at::Tensor score,
                                std::optional<ScoreType> threshold,
-                               at::Tensor indices) {
+                               at::Tensor indices,
+                               int64_t table_begin) {
   auto key_type = get_data_type(keys);
   auto scores_ = reinterpret_cast<ScoreType *>(score.data_ptr<int64_t>());
   auto indices_ = indices.data_ptr<IndexType>();
@@ -64,7 +65,8 @@ void table_export_single_score(at::Tensor table_storage,
         PredFunc pred(threshold_val);
         table_export_batch_kernel<Table, PredFunc, 32>
             <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-               stream>>>(table, offset, offset + num_total, counter_, keys_,
+               stream>>>(table, offset, offset + num_total,
+                         static_cast<IndexType>(table_begin), counter_, keys_,
                          scores_, pred, indices_);
       });
 
@@ -74,7 +76,8 @@ void table_export_single_score(at::Tensor table_storage,
         PredFunc pred(threshold_val);
         table_export_batch_kernel<Table, PredFunc, 1>
             <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-               stream>>>(table, offset, offset + num_total, counter_, keys_,
+               stream>>>(table, offset, offset + num_total,
+                         static_cast<IndexType>(table_begin), counter_, keys_,
                          scores_, pred, indices_);
       });
     }
@@ -85,7 +88,8 @@ void table_export_single_score(at::Tensor table_storage,
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
                    int64_t batch, int64_t offset, torch::Dtype key_dtype,
-                   std::optional<ScoreType> threshold) {
+                   std::optional<ScoreType> threshold,
+                   int64_t table_begin) {
   auto device = table_storage.device();
   auto key_scalar_type = static_cast<torch::ScalarType>(key_dtype);
 
@@ -102,7 +106,8 @@ table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
     return std::make_tuple(counter, keys, score, indices);
 
   table_export_single_score(table_storage, bucket_capacity, batch, offset,
-                            counter, keys, score, threshold, indices);
+                            counter, keys, score, threshold, indices,
+                            table_begin);
 
   return std::make_tuple(counter, keys, score, indices);
 }

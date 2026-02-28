@@ -74,66 +74,96 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
   return table_range;
 }
 
-void select(at::Tensor flags, at::Tensor inputs, at::Tensor outputs,
-            at::Tensor num_selected) {
+std::tuple<int64_t, at::Tensor, std::vector<c10::optional<at::Tensor>>>
+flagged_compact(
+    at::Tensor flags,
+    std::vector<c10::optional<at::Tensor>> inputs) {
 
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t num_total = inputs.size(0);
-  auto scalar_type = inputs.dtype().toScalarType();
-  auto key_type = scalartype_to_datatype(scalar_type);
-  auto num_select_iter_type =
-      scalartype_to_datatype(num_selected.dtype().toScalarType());
+    auto device = flags.device();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int64_t num_total = flags.size(0);
+    TORCH_CHECK(flags.dtype() == at::kBool, "flags must be bool");
 
-  if (num_total == 0) {
-    DISPATCH_INTEGER_DATATYPE_FUNCTION(
-        num_select_iter_type, NumSelectedIteratorT, [&] {
-          DEMB_CUDA_CHECK(cudaMemsetAsync(
-              reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()),
-              0, sizeof(NumSelectedIteratorT), stream));
-        });
-    return;
-  }
-  DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
-    DISPATCH_INTEGER_DATATYPE_FUNCTION(
-        num_select_iter_type, NumSelectedIteratorT, [&] {
-          select_async<KeyType, NumSelectedIteratorT>(
-              num_total, flags.data_ptr<bool>(),
-              reinterpret_cast<KeyType *>(inputs.data_ptr()),
-              reinterpret_cast<KeyType *>(outputs.data_ptr()),
-              reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()),
-              inputs.device(), stream);
-        });
-  });
-}
+    std::vector<at::Tensor> real_inputs;
+    std::vector<size_t> real_positions;
+    for (size_t i = 0; i < inputs.size(); i++) {
+        if (inputs[i].has_value()) {
+            auto &t = inputs[i].value();
+            TORCH_CHECK(t.dim() == 1, "all inputs must be 1D");
+            TORCH_CHECK(t.element_size() == 8,
+                         "all inputs must be 8-byte elements (int64/uint64)");
+            TORCH_CHECK(t.size(0) == num_total, "all inputs must match flags length");
+            real_inputs.push_back(t);
+            real_positions.push_back(i);
+        }
+    }
+    size_t num_real = real_inputs.size();
 
-void select_index(at::Tensor flags, at::Tensor output_indices,
-                  at::Tensor num_selected) {
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t num_total = output_indices.size(0);
-  auto scalar_type = output_indices.dtype().toScalarType();
-  auto key_type = scalartype_to_datatype(scalar_type);
-  auto num_select_iter_type =
-      scalartype_to_datatype(num_selected.dtype().toScalarType());
+    if (num_total == 0) {
+        auto empty_idx = at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device));
+        std::vector<c10::optional<at::Tensor>> full_out(inputs.size(), c10::nullopt);
+        for (size_t j = 0; j < num_real; j++) {
+            auto s = real_inputs[j].sizes().vec(); s[0] = 0;
+            full_out[real_positions[j]] = at::empty(s, real_inputs[j].options());
+        }
+        return {0, empty_idx, full_out};
+    }
 
-  if (num_total == 0) {
-    DISPATCH_INTEGER_DATATYPE_FUNCTION(
-        num_select_iter_type, NumSelectedIteratorT, [&] {
-          DEMB_CUDA_CHECK(cudaMemsetAsync(
-              reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()),
-              0, sizeof(NumSelectedIteratorT), stream));
-        });
-    return;
-  }
-  DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, KeyType, [&] {
-    DISPATCH_INTEGER_DATATYPE_FUNCTION(
-        num_select_iter_type, NumSelectedIteratorT, [&] {
-          select_index_async<KeyType, NumSelectedIteratorT>(
-              num_total, flags.data_ptr<bool>(),
-              reinterpret_cast<KeyType *>(output_indices.data_ptr()),
-              reinterpret_cast<NumSelectedIteratorT *>(num_selected.data_ptr()),
-              output_indices.device(), stream);
-        });
-  });
+    auto num_selected = at::empty({1}, at::TensorOptions().dtype(at::kLong).device(device));
+    auto out_indices = at::empty({num_total}, at::TensorOptions().dtype(at::kLong).device(device));
+    std::vector<at::Tensor> real_outputs;
+    real_outputs.reserve(num_real);
+    for (const auto &inp : real_inputs) {
+        real_outputs.push_back(at::empty_like(inp));
+    }
+
+    std::vector<int64_t const *> in_ptrs(num_real);
+    std::vector<int64_t *> out_ptrs(num_real);
+    for (size_t i = 0; i < num_real; i++) {
+        in_ptrs[i] = reinterpret_cast<int64_t const *>(real_inputs[i].data_ptr());
+        out_ptrs[i] = reinterpret_cast<int64_t *>(real_outputs[i].data_ptr());
+    }
+
+    auto *d_flags = flags.data_ptr<bool>();
+    auto *d_out_idx = out_indices.data_ptr<int64_t>();
+    auto *d_num_sel = num_selected.data_ptr<int64_t>();
+
+    switch (num_real) {
+        case 0:
+            select_index_async<int64_t, int64_t>(
+                num_total, d_flags, d_out_idx, d_num_sel, device, stream);
+            break;
+        case 1: flagged_compact_cub<1>(num_total, d_flags,
+                    in_ptrs.data(), out_ptrs.data(), d_out_idx, d_num_sel,
+                    device, stream); break;
+        case 2: flagged_compact_cub<2>(num_total, d_flags,
+                    in_ptrs.data(), out_ptrs.data(), d_out_idx, d_num_sel,
+                    device, stream); break;
+        case 3: flagged_compact_cub<3>(num_total, d_flags,
+                    in_ptrs.data(), out_ptrs.data(), d_out_idx, d_num_sel,
+                    device, stream); break;
+        case 4: flagged_compact_cub<4>(num_total, d_flags,
+                    in_ptrs.data(), out_ptrs.data(), d_out_idx, d_num_sel,
+                    device, stream); break;
+        case 5: flagged_compact_cub<5>(num_total, d_flags,
+                    in_ptrs.data(), out_ptrs.data(), d_out_idx, d_num_sel,
+                    device, stream); break;
+        case 6: flagged_compact_cub<6>(num_total, d_flags,
+                    in_ptrs.data(), out_ptrs.data(), d_out_idx, d_num_sel,
+                    device, stream); break;
+        default:
+            TORCH_CHECK(false, "flagged_compact supports at most 6 non-None input tensors");
+    }
+
+    int64_t h_count = num_selected.cpu().item<int64_t>();
+    auto sliced_indices = out_indices.slice(0, 0, h_count);
+
+    std::vector<c10::optional<at::Tensor>> full_outputs(inputs.size(), c10::nullopt);
+    for (size_t j = 0; j < num_real; j++) {
+        full_outputs[real_positions[j]] = real_outputs[j].slice(0, 0, h_count);
+    }
+
+    return {h_count, sliced_indices, full_outputs};
 }
 
 } // namespace dyn_emb
@@ -143,10 +173,9 @@ void bind_index_calculation_op(py::module &m) {
         "Make offsets from <feature, batch> scope into <table> scope",
         py::arg("offsets"), py::arg("feature_offsets"));
 
-  m.def("select", &dyn_emb::select,
-        "Select items in inputs which flags are true.", py::arg("flags"),
-        py::arg("inputs"), py::arg("outputs"), py::arg("num_selected"));
-  m.def("select_index", &dyn_emb::select_index,
-        "Select items' indices where flags are true.", py::arg("flags"),
-        py::arg("output_indices"), py::arg("num_selected"));
+  m.def("flagged_compact", &dyn_emb::flagged_compact,
+        "CUB stream compaction with zipped iterators. "
+        "Accepts Optional[Tensor] in inputs; None passes through. "
+        "Returns (count, indices[count], [opt_tensors[count]...]).",
+        py::arg("flags"), py::arg("inputs"));
 }

@@ -131,7 +131,8 @@ void bind_table_operation(py::module &m) {
         "export items[offset, offset + batch) from the table",
         py::arg("table_storage"), py::arg("bucket_capacity"), py::arg("batch"),
         py::arg("offset"), py::arg("key_dtype"),
-        py::arg("threshold") = py::none());
+        py::arg("threshold") = py::none(),
+        py::arg("table_begin") = 0);
 
   m.def("table_count_matched", &dyn_emb::table_count_matched,
         "count number of items in the table whose scores >= threshold",

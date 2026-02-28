@@ -14,24 +14,52 @@
 # limitations under the License.
 
 import enum
-import logging
+import os
 import warnings
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import accumulate
-from typing import List, Optional, Tuple, cast
+from typing import Deque, Dict, List, Optional, Tuple
 
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
+    PrefetchState,
+    dynamicemb_eval_forward,
     dynamicemb_prefetch,
 )
-from dynamicemb.dynamicemb_config import *
-from dynamicemb.initializer import *
-from dynamicemb.key_value_table import Cache, DynamicEmbeddingTable, Storage
-from dynamicemb.optimizer import *
+from dynamicemb.dynamicemb_config import (
+    DTYPE_NUM_BYTES,
+    DynamicEmbEvictStrategy,
+    DynamicEmbPoolingMode,
+    DynamicEmbScoreStrategy,
+    DynamicEmbTableOptions,
+    warning_for_cstm_score,
+)
+from dynamicemb.embedding_admission import MultiTableKVCounter
+from dynamicemb.initializer import create_initializer_from_args
+from dynamicemb.key_value_table import (
+    Cache,
+    DynamicEmbCache,
+    DynamicEmbStorage,
+    HybridStorage,
+    Storage,
+    flush_cache,
+    load_from_flat_single_table,
+)
+from dynamicemb.optimizer import (
+    AdaGradDynamicEmbeddingOptimizer,
+    AdamDynamicEmbeddingOptimizer,
+    BaseDynamicEmbeddingOptimizer,
+    EmbOptimType,
+    OptimizerArgs,
+    RowWiseAdaGradDynamicEmbeddingOptimizer,
+    SGDDynamicEmbeddingOptimizer,
+    convert_optimizer_type,
+)
 from dynamicemb.utils import tabulate
 from dynamicemb_extensions import OptimizerType, device_timestamp
 from torch import Tensor, nn  # usort:skip
@@ -278,12 +306,6 @@ def _print_memory_consume(
         else:
             return 0
 
-    DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
-        torch.float32: 4,
-        torch.float16: 2,
-        torch.bfloat16: 2,
-    }
-
     def MB_(x) -> int:
         return x // (1024 * 1024)
 
@@ -513,7 +535,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._eval_initializers = []
         self._create_initializers()
 
-        self._admission_counter = self._create_admission_counters(table_options)
+        self._admission_counter = self._create_admission_counter(table_options)
+        self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -526,9 +549,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
 
     def _create_cache_storage(self) -> None:
-        self._storages: List[Storage] = []
-        self._caches: List[Cache] = []
-        self._caching = self._dynamicemb_options[0].caching
+        self._cache: Optional[Cache] = None
+        self._caching = any(option.caching for option in self._dynamicemb_options)
 
         for option in self._dynamicemb_options:
             if option.training and option.optimizer_type == OptimizerType.Null:
@@ -539,38 +561,87 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "Set OptimizerType to Null as not on training mode.", UserWarning
                 )
 
-            if option.caching and option.training:
-                cache_option = deepcopy(option)
-                cache_option.bucket_capacity = 1024
-                capacity = get_constraint_capacity(
-                    option.local_hbm_for_values,
-                    option.embedding_dtype,
-                    option.dim,
-                    option.optimizer_type,
-                    cache_option.bucket_capacity,
-                )
-                if capacity == 0:
+        value_dims = [
+            option.dim + self._optimizer.get_state_dim(option.dim)
+            for option in self._dynamicemb_options
+        ]
+        total_memory = sum(
+            option.init_capacity * DTYPE_NUM_BYTES[option.embedding_dtype] * value_dim
+            for option, value_dim in zip(self._dynamicemb_options, value_dims)
+        )
+        local_hbm = sum(
+            option.local_hbm_for_values for option in self._dynamicemb_options
+        )
+
+        if total_memory > local_hbm:
+            # Data does not fit entirely in HBM.
+            if self._caching:
+                # Caching mode: HBM cache + host/PS storage
+                if local_hbm <= 0:
                     raise ValueError(
                         "Can't use caching mode as the reserved HBM size is too small."
                     )
 
-                cache_option.max_capacity = capacity
-                cache_option.init_capacity = capacity
-                self._caches.append(
-                    DynamicEmbeddingTable(cache_option, self._optimizer)
-                )
+                cache_options = deepcopy(self._dynamicemb_options)
+                cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
+                for cache_option in cache_options:
+                    cache_option.bucket_capacity = 1024
+                    cap = max(1, int(cache_option.init_capacity * cap_scale))
+                    cache_option.max_capacity = min(cache_option.max_capacity, cap)
+                    cache_option.init_capacity = min(cache_option.init_capacity, cap)
+                self._cache = DynamicEmbCache(cache_options, self._optimizer)
 
-                storage_option = deepcopy(option)
-                storage_option.local_hbm_for_values = 0
-                PS = storage_option.external_storage
-                self._storages.append(
-                    PS(storage_option, self._optimizer)
+                storage_options = deepcopy(self._dynamicemb_options)
+                for storage_option in storage_options:
+                    storage_option.local_hbm_for_values = 0
+                PS = storage_options[0].external_storage
+                self._storage = (
+                    PS(storage_options, self._optimizer)
                     if PS
-                    else DynamicEmbeddingTable(storage_option, self._optimizer)
+                    else DynamicEmbStorage(storage_options, self._optimizer)
                 )
             else:
-                self._caches.append(None)
-                self._storages.append(DynamicEmbeddingTable(option, self._optimizer))
+                # No caching: HybridStorage (HBM tier + host tier)
+                if any(
+                    opt.external_storage is not None for opt in self._dynamicemb_options
+                ):
+                    warnings.warn(
+                        "external_storage is ignored in HybridStorage mode. "
+                        "Set caching=True to use external storage.",
+                        UserWarning,
+                    )
+                cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
+
+                hbm_options = deepcopy(self._dynamicemb_options)
+                for hbm_option in hbm_options:
+                    hbm_option.bucket_capacity = 1024
+                    cap = max(1, int(hbm_option.init_capacity * cap_scale))
+                    hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
+                    hbm_option.init_capacity = min(hbm_option.init_capacity, cap)
+
+                storage_cap_scale = 1.0 - cap_scale
+                host_options = deepcopy(self._dynamicemb_options)
+                for host_option in host_options:
+                    host_option.local_hbm_for_values = 0
+                    cap = max(1, int(host_option.init_capacity * storage_cap_scale))
+                    host_option.max_capacity = min(host_option.max_capacity, cap)
+                    host_option.init_capacity = min(host_option.init_capacity, cap)
+
+                self._storage = HybridStorage(
+                    hbm_options, host_options, self._optimizer
+                )
+        else:
+            # HBM-only: everything fits in GPU memory.
+            if any(
+                opt.external_storage is not None for opt in self._dynamicemb_options
+            ):
+                warnings.warn(
+                    "external_storage is ignored in HBM-only mode "
+                    "(total_memory <= local_hbm_for_values). "
+                    "Reduce local_hbm_for_values to enable external storage.",
+                    UserWarning,
+                )
+            self._storage = DynamicEmbStorage(self._dynamicemb_options, self._optimizer)
 
         _print_memory_consume(
             self._table_names, self._dynamicemb_options, self._optimizer, self.device_id
@@ -585,24 +656,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
             self._eval_initializers.append(eval_initializer)
 
-    def _create_admission_counters(
+    def _create_admission_counter(
         self, table_options: List[DynamicEmbTableOptions]
-    ) -> List[Optional["Counter"]]:
+    ) -> Optional["Counter"]:
         """
-        Create admission counters for each table.
+        Create one fused admission counter for all tables.
         """
-        counters = []
-        device = torch.device(self.device_id)
-
-        for option in table_options:
-            counter = option.admission_counter
-
-            if counter is None:
-                counters.append(None)
-            else:
-                counters.append(counter.create(device=device))
-
-        return counters
+        counters = [option.admission_counter for option in table_options]
+        if all(counter is None for counter in counters):
+            return None
+        assert all(
+            counter is not None for counter in counters
+        ), "All tables must either have or not have an admission counter"
+        return MultiTableKVCounter(
+            counters, device=torch.device(f"cuda:{self.device_id}")
+        )
 
     def _create_optimizer(
         self,
@@ -747,14 +815,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def flush(self) -> None:
         self.num_prefetch_ahead = 0
-        if self._caching:
-            for cache, storage in zip(self._caches, self._storages):
-                cache.flush(storage)
+        if self._caching and self._cache is not None:
+            flush_cache(self._cache, self._storage)
 
     def reset_cache_states(self) -> None:
-        if self._caching:
-            for cache in self._caches:
-                cache.reset()
+        if self._caching and self._cache is not None:
+            self._cache.reset()
 
     @property
     def table_names(self) -> List[str]:
@@ -767,21 +833,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return self._optimizer
 
     @property
-    def tables(self) -> List[DynamicEmbeddingTable]:
-        # if use external PS, the users should not get the DynamicEmbeddingTables
-        # if self._storage_externel:
-        #     raise RuntimeError(
-        #         "Should not get the internal tables when using external storage."
-        #     )
-        return self._storages
+    def tables(self) -> Storage:
+        return self._storage
 
     @property
-    def caches(self) -> List[Cache]:
-        return self._caches
+    def cache(self) -> Optional[Cache]:
+        return self._cache
 
     def set_record_cache_metrics(self, record: bool) -> None:
-        for cache in self._caches:
-            cache.set_record_cache_metrics(record)
+        if self._cache is not None:
+            self._cache.set_record_cache_metrics(record)
 
     def set_learning_rate(self, lr: float) -> None:
         self._optimizer.set_learning_rate(lr)
@@ -814,32 +875,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
-        if any([not o.training for o in self._dynamicemb_options]) and self.training:
-            raise RuntimeError(
-                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
-            )
-
-        scores = []
-        # if self.training:
-        for table_name in self._table_names:
-            if table_name not in self._scores.keys():
-                raise RuntimeError(
-                    f"Must set score for table '{table_name}' whose score_strategy is customized."
-                )
-            scores.append(self._scores[table_name])
-
-        for i, cache in enumerate(self._caches):
-            if isinstance(cache, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, cache)
-                table.score_update = True
-                table.set_score(self._scores[self.table_names[i]])
-        for i, storage in enumerate(self._storages):
-            if isinstance(storage, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, storage)
-                # if not training and not caching, we don't need to update score.
-                table.score_update = self.training or self._caching
-                table.set_score(self._scores[self.table_names[i]])
-
         feature_batch_size = offsets.numel() - 1
         assert feature_batch_size > 0, "feature_batch_size must be greater than 0"
         assert (
@@ -849,20 +884,62 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
 
+        if not self.training:
+            return dynamicemb_eval_forward(
+                indices,
+                offsets,
+                self._cache,
+                self._storage,
+                self.feature_offsets,
+                self.output_dtype,
+                self._eval_initializers,
+                self._evict_strategy,
+                per_sample_weights,
+                self.pooling_mode,
+                self.total_D,
+                batch_size,
+                self.dims,
+                self.max_D,
+                self.D_offsets_t,
+            )
+
+        if any([not o.training for o in self._dynamicemb_options]):
+            raise RuntimeError(
+                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
+            )
+
+        scores = []
+        for table_name in self._table_names:
+            if table_name not in self._scores.keys():
+                raise RuntimeError(
+                    f"Must set score for table '{table_name}' whose score_strategy is customized."
+                )
+            scores.append(self._scores[table_name])
+
+        fused_score = self._reduce_table_scores(scores)
+        if isinstance(self._cache, DynamicEmbCache):
+            self._cache.score_update = True
+            self._cache.set_score(fused_score)
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+            self._storage.score_update = True
+            self._storage.set_score(fused_score)
+
+        prefetch_state = (
+            self._prefetch_states.popleft() if self._prefetch_states else None
+        )
+
         res = DynamicEmbeddingFunction.apply(
             indices,
             offsets,
-            self._caches,
-            self._storages,
+            self._cache,
+            self._storage,
             self.feature_offsets,
             self.output_dtype,
-            self._initializers if self.training else self._eval_initializers,
+            self._initializers,
             self._optimizer,
-            self._enable_prefetch,
-            self.training,
             self._admit_strategy,
             self._evict_strategy,
-            per_sample_weights,  # Pass frequency counters as weights
+            per_sample_weights,
             self._admission_counter,
             self.pooling_mode,
             self.total_D,
@@ -870,20 +947,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self.dims,
             self.max_D,
             self.D_offsets_t,
+            prefetch_state,
             self._empty_tensor,
         )
-        for cache in self._caches:
-            if isinstance(cache, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, cache)
-                table.score_update = False
-        for storage in self._storages:
-            if isinstance(storage, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, storage)
-                table.score_update = False
+        if isinstance(self._cache, DynamicEmbCache):
+            self._cache.score_update = False
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+            self._storage.score_update = False
 
-        # We have to update cache's core in eval mode.
-        if self.training or self._caching:
-            self._update_score()
+        self._update_score()
 
         return res
 
@@ -895,17 +967,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
     ) -> None:
         assert self._enable_prefetch, "Prefetch is not enabled."
-        if not self._caching:
-            logging.warning("Caching is not enabled, prefetch will do nothing.")
+        if not self.training:
+            return
         if self.prefetch_stream is None and forward_stream is not None:
-            # Set the prefetch stream to the current stream
             self.prefetch_stream = torch.cuda.current_stream()
             assert (
                 self.prefetch_stream != forward_stream
             ), "prefetch_stream and forward_stream should not be the same stream"
 
             current_stream = torch.cuda.current_stream()
-            # Record tensors on the current stream
             indices.record_stream(current_stream)
             offsets.record_stream(current_stream)
 
@@ -915,36 +985,34 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         prefetch_scores = self._get_prefetch_score()
 
-        for i, cache in enumerate(self._caches):
-            if isinstance(cache, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, cache)
-                table.score_update = True
-                table.set_score(prefetch_scores[i])
-        for i, storage in enumerate(self._storages):
-            if isinstance(storage, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, storage)
-                table.score_update = True
-                table.set_score(prefetch_scores[i])
+        prefetch_score = self._reduce_table_scores(prefetch_scores)
+        if isinstance(self._cache, DynamicEmbCache):
+            self._cache.score_update = True
+            self._cache.set_score(prefetch_score)
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+            self._storage.score_update = True
+            self._storage.set_score(prefetch_score)
 
-        dynamicemb_prefetch(
-            indices,
-            offsets,
-            self._caches,
-            self._storages,
-            self.feature_offsets,
-            self._initializers if self.training else self._eval_initializers,
-            self.training,
-            forward_stream,
+        self._prefetch_states.append(
+            dynamicemb_prefetch(
+                indices,
+                offsets,
+                self._cache,
+                self._storage,
+                self.feature_offsets,
+                self._initializers,
+                forward_stream,
+                self._evict_strategy,
+                None,
+                self._admit_strategy,
+                self._admission_counter,
+            )
         )
 
-        for cache in self._caches:
-            if isinstance(cache, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, cache)
-                table.score_update = False
-        for storage in self._storages:
-            if isinstance(storage, DynamicEmbeddingTable):
-                table = cast(DynamicEmbeddingTable, storage)
-                table.score_update = False
+        if isinstance(self._cache, DynamicEmbCache):
+            self._cache.score_update = False
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+            self._storage.score_update = False
 
     def set_score(
         self,
@@ -1040,6 +1108,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ret_scores.append(new_score)
         return ret_scores
 
+    def _reduce_table_scores(self, scores: List[int]) -> int:
+        if len(scores) == 0:
+            return 1
+        if len(set(scores)) > 1:
+            warnings.warn(
+                "Found different table scores in fused mode; using the max score.",
+                UserWarning,
+            )
+        return max(scores)
+
     def dump(
         self,
         save_dir: str,
@@ -1058,13 +1136,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         world_size = dist.get_world_size(group=pg)
 
         self.flush()
-        for table_name, storage, counter_table in zip(
-            self._table_names, self._storages, self._admission_counter
-        ):
+
+        counter_table = self._admission_counter
+        for table_id, table_name in enumerate(self._table_names):
             if table_name not in set(table_names):
                 continue
 
             meta_file_path = encode_meta_json_file_path(save_dir, table_name)
+            current_score = (
+                self._scores.get(table_name, None) if hasattr(self, "_scores") else None
+            )
+
             emb_key_path = encode_checkpoint_file_path(
                 save_dir, table_name, rank, world_size, "keys"
             )
@@ -1078,15 +1160,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 save_dir, table_name, rank, world_size, "opt_values"
             )
 
-            if isinstance(storage, DynamicEmbeddingTable) and not storage._use_score:
-                dist.barrier()  # sync global timestamp
-                cast(DynamicEmbeddingTable, storage).update_timestamp()
-
-            current_score = (
-                self._scores.get(table_name, None) if hasattr(self, "_scores") else None
-            )
-
+            storage = self._storage
             storage.dump(
+                table_id,
                 meta_file_path,
                 emb_key_path,
                 emb_value_path,
@@ -1108,7 +1184,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
             if counter_table is not None:
-                counter_table.dump(counter_key_path, counter_frequency_path)
+                counter_table.dump(counter_key_path, counter_frequency_path, table_id)
             else:
                 warnings.warn(
                     f"Counter table is none and will not dump it for table: {table_name}"
@@ -1132,11 +1208,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             rank = dist.get_rank(group=pg)
             world_size = dist.get_world_size(group=pg)
 
-        for table_name, storage, counter_table in zip(
-            self._table_names, self._storages, self._admission_counter
-        ):
+        storage = self._storage
+        counter_table = self._admission_counter
+        for table_id, table_name in enumerate(self._table_names):
             if table_name not in set(table_names):
                 continue
+
+            meta_json_file = encode_meta_json_file_path(save_dir, table_name)
+
             (
                 emb_key_files,
                 emb_value_files,
@@ -1150,15 +1229,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 rank=rank,
                 world_size=world_size,
             )
-            meta_json_file = encode_meta_json_file_path(save_dir, table_name)
+            if len(emb_key_files) == 0:
+                continue
 
-            if isinstance(storage, DynamicEmbeddingTable) and not storage._use_score:
-                if dist.is_initialized():
-                    dist.barrier()  # sync global timestamp
-                cast(DynamicEmbeddingTable, storage).update_timestamp()
             num_key_files = len(emb_key_files)
             for i in range(num_key_files):
                 loaded_score = storage.load(
+                    table_id,
                     meta_json_file,
                     emb_key_files[i],
                     emb_value_files[i],
@@ -1178,36 +1255,25 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
             num_counter_key_files = len(counter_key_files)
             for i in range(num_counter_key_files):
-                counter_table.load(counter_key_files[i], counter_frequency_files[i])
+                counter_table.load(
+                    counter_key_files[i], counter_frequency_files[i], table_id
+                )
 
     def export_keys_values(
         self, table_name: str, device: torch.device, batch_size: int = 65536
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.flush()
+
+        table_id = self._table_names.index(table_name)
         keys_list = []
         values_list = []
-        self.flush()
-        for dynamic_table_name, dynamic_table in zip(self.table_names, self.tables):
-            assert isinstance(
-                dynamic_table, DynamicEmbeddingTable
-            ), "Only DynamicEmbeddingTable is supported for batched export keys and values"
-            if table_name != dynamic_table_name:
-                continue
 
-            local_max_rows = dynamic_table.size()
-            accumulated_counts = 0
+        for keys, embeddings, _, _ in self._storage.export_keys_values(
+            device, batch_size, table_id
+        ):
+            keys_list.append(keys)
+            values_list.append(embeddings)
 
-            for keys, embeddings, _, _ in dynamic_table.export_keys_values(
-                device, batch_size
-            ):
-                keys_list.append(keys)
-                values_list.append(embeddings)
-                accumulated_counts += keys.numel()
-
-            if local_max_rows != accumulated_counts:
-                raise ValueError(
-                    f"Rank {dist.get_rank()} has accumulated count {accumulated_counts} which is different from expected {local_max_rows}, "
-                    f"difference: {accumulated_counts - local_max_rows}"
-                )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
     def incremental_dump(
@@ -1220,22 +1286,43 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         ret_tensors: Dict[str, Tuple[Tensor, Tensor]] = {}
         ret_scores: Dict[str, int] = {}
 
+        storage = self._storage
+        if isinstance(storage, HybridStorage):
+            states_to_dump = storage.tables
+        elif isinstance(storage, DynamicEmbStorage):
+            if self._cache is not None:
+                flush_cache(self._cache, storage)
+            states_to_dump = [storage._state]
+        else:
+            raise RuntimeError("Only DynamicEmbStorage supports incremental dump.")
+
         for table_name, threshold in zip(table_names, table_thresholds):
-            index = self._table_names.index(table_name)
+            table_id = self._table_names.index(table_name)
+            all_keys = []
+            all_values = []
 
-            storage = self._storages[index]
-            if not isinstance(storage, DynamicEmbeddingTable):
-                raise RuntimeError(
-                    "Only DynamicEmbeddingTable support incremental dump."
+            for state in states_to_dump:
+                keys, _, indices = state.key_index_map.incremental_dump(
+                    {state.score_policy.name: threshold},
+                    pg=pg,
+                    return_index=True,
+                    table_id=table_id,
                 )
+                emb_dim = state.table_emb_dims_cpu[table_id]
+                values = load_from_flat_single_table(
+                    state, indices.to(state.device), table_id
+                )
+                value = values[:, :emb_dim].to(dtype=state.emb_dtype).cpu()
+                key = keys.cpu() if keys.is_cuda else keys
+                all_keys.append(key)
+                all_values.append(value)
 
-            cache = self._caches[index]
-            if cache is not None:
-                cache.flush(storage)
-
-            key, value = storage.incremental_dump(threshold, pg)
-
-            ret_tensors[table_name] = (key, value)
+            ret_tensors[table_name] = (
+                torch.cat(all_keys) if all_keys else torch.empty(0, dtype=torch.int64),
+                torch.cat(all_values, dim=0)
+                if all_values
+                else torch.empty(0, dtype=storage.embedding_dtype()),
+            )
             ret_scores[table_name] = self._scores[table_name]
 
         return ret_tensors, ret_scores

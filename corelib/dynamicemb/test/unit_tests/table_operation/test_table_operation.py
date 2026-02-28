@@ -399,7 +399,10 @@ def test_table_basic(
             score_arg.value.to(torch.int64)[valid_mask] < scores_reinsert[valid_mask]
         ).all()
 
-    # Verify cross-table isolation: same key in different tables gets a different index.
+    # Verify cross-table isolation: same key in different tables is found independently.
+    # With local indices, the same key in different tables may map to the same
+    # local index, so we only check that lookup in the wrong table still finds
+    # the key (it was inserted into every table).
     if num_tables > 1 and valid_mask.any():
         wrong_table_ids = (table_ids + 1) % num_tables
         _, wrong_founds, wrong_indices = table.lookup(
@@ -408,8 +411,8 @@ def test_table_basic(
         both_valid = valid_mask & wrong_founds
         if both_valid.any():
             assert (
-                indices[both_valid] != wrong_indices[both_valid]
-            ).all(), "Same key in different tables must map to different indices"
+                wrong_indices[both_valid] >= 0
+            ).all(), "Cross-table lookup should return valid local indices"
 
     table.erase(keys, table_ids)
     _, founds, _ = table.lookup(keys, table_ids, score_arg_lookup)

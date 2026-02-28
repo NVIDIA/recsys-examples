@@ -55,6 +55,8 @@ void table_count_matched_single_score(at::Tensor table_storage,
 
     int64_t num_total = end - begin;
 
+    if (num_total <= 0) return;
+
     if (num_total % 32 == 0) {
       table_traverse_kernel<Table, EvalAndCount, 32>
           <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
