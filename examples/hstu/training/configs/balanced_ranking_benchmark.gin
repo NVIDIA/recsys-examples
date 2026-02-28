@@ -2,18 +2,19 @@
 # ===== Trainer Configuration =====
 TrainerArgs.train_batch_size = 32
 TrainerArgs.eval_batch_size = 32
-TrainerArgs.log_interval = 100
-TrainerArgs.eval_interval = 400
-TrainerArgs.max_train_iters = 1000
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 5000 # not evaluated in this benchmark
+TrainerArgs.max_train_iters = 512
 TrainerArgs.max_eval_iters = 50
 TrainerArgs.seed = 1234
 TrainerArgs.pipeline_type = 'none'
 TrainerArgs.enable_balanced_shuffler = True
 
+
 # Profiling
 TrainerArgs.profile = True
-TrainerArgs.profile_step_start = 10
-TrainerArgs.profile_step_end = 50
+TrainerArgs.profile_step_start = 50
+TrainerArgs.profile_step_end = 80
 
 # Checkpoint
 TrainerArgs.ckpt_save_dir = './checkpoints/'
@@ -127,12 +128,3 @@ OptimizerArgs.adam_eps = 1e-8
 
 # ===== Parallelism =====
 TensorModelParallelArgs.tensor_model_parallel_size = 1  # No TP
-TrainerArgs.train_batch_size = 32
-TrainerArgs.eval_batch_size = 32
-TrainerArgs.log_interval = 50
-TrainerArgs.eval_interval = 5000
-TrainerArgs.profile = True
-TrainerArgs.profile_step_start = 50
-TrainerArgs.profile_step_end = 80
-TrainerArgs.max_train_iters = 512
-TrainerArgs.max_eval_iters = 16
