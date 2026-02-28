@@ -484,15 +484,13 @@ def test_model_load_dump(
         for _, _, sharded_module in find_sharded_modules(model):
             dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
             for dynamic_emb_module in dynamic_emb_modules:
-                for table_name, table, counter_table in zip(
-                    dynamic_emb_module.table_names,
-                    dynamic_emb_module.tables,
-                    dynamic_emb_module._admission_counter,
-                ):
+                storage = dynamic_emb_module.tables
+                counter = dynamic_emb_module._admission_counter
+                for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
                     key_to_score = {}
                     visited_keys = set({})
-                    for batched_key, _, _, batched_score in table.export_keys_values(
-                        torch.device(f"cpu")
+                    for batched_key, _, _, batched_score in storage.export_keys_values(
+                        torch.device("cpu"), table_id=table_idx
                     ):
                         for key, score in zip(
                             batched_key.tolist(), batched_score.tolist()
@@ -503,8 +501,8 @@ def test_model_load_dump(
                         keys,
                         named_scores,
                         _,
-                    ) in counter_table.table_._batched_export_keys_scores(
-                        counter_table.table_.score_names_, torch.device(f"cpu")
+                    ) in counter.table_._batched_export_keys_scores(
+                        counter.table_.score_names_, torch.device("cpu")
                     ):
                         if keys.numel() == 0:
                             continue

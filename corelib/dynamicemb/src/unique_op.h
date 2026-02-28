@@ -34,7 +34,7 @@ namespace dyn_emb {
  * NOTE: This function is fully asynchronous with no GPU-CPU synchronization.
  *
  * @param keys Input keys tensor (int64 or uint64)
- * @param table_ids Table ID for each key (int32, same length as keys,
+ * @param table_ids Table ID for each key (int64, same length as keys,
  *                  must be in ascending order)
  * @param num_tables Total number of tables
  * @param input_frequencies Controls frequency counting behavior:
@@ -83,7 +83,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
  * @param local_batch_size Batch size per feature
  * @param num_elements Total number of elements (keys)
  *
- * @return table_ids tensor (int32) with same length as num_elements
+ * @return table_ids tensor (int64) with same length as num_elements
  */
 at::Tensor expand_table_ids_cuda(
     at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,

@@ -24,7 +24,7 @@ namespace dyn_emb {
 // Unified pooled-gather descriptor.
 // When D_offsets_ptr is non-null (multi-dim), each feature f has dim
 // D_offsets_ptr[f+1]-D_offsets_ptr[f] and the destination column start is
-// D_offsets_ptr[f].  Source rows use ev_size (= max_D) as stride.
+// D_offsets_ptr[f].  Source rows use src_stride as the row stride.
 // When D_offsets_ptr is null (uniform-dim), every feature has dim ev_size and
 // the destination column start is accum_D + f * ev_size.
 template <typename SrcType, typename DstType, typename offset_t>
@@ -48,7 +48,7 @@ struct ForwardMultiToOneFMLayoutDesc {
   }
   HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
     int idx = reverse_idx_ptr[i];
-    return src_ptr + (int64_t)ev_size * idx;
+    return src_ptr + (int64_t)src_stride * idx;
   }
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
     int b = i % batch_size;
@@ -61,7 +61,8 @@ struct ForwardMultiToOneFMLayoutDesc {
 
   int num_vec_;
   int combiner;
-  int ev_size; // uniform: embedding dim; multi-dim: max_D (src row stride)
+  int ev_size; // uniform: embedding dim; multi-dim: max_D (copy width per row)
+  int src_stride; // source row stride (may differ from ev_size when optimizer states are appended)
   const int *__restrict__ D_offsets_ptr; // nullptr → uniform, [F+1] → multi-dim
   const offset_t *__restrict__ offset_ptr;
   const offset_t *__restrict__ reverse_idx_ptr;
@@ -74,9 +75,10 @@ struct ForwardMultiToOneFMLayoutDesc {
 
 void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      void *inverse_idx_ptr, int combiner, int total_D,
-                     int accum_D, int ev_size, int num_vec, int batch_size,
-                     DataType src_type, DataType dst_type, DataType offset_type,
-                     cudaStream_t stream, const int *D_offsets_ptr) {
+                     int accum_D, int ev_size, int src_stride, int num_vec,
+                     int batch_size, DataType src_type, DataType dst_type,
+                     DataType offset_type, cudaStream_t stream,
+                     const int *D_offsets_ptr) {
 
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
@@ -85,6 +87,7 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
         CopyDesc multi_to_one_desc{num_vec,
                                    combiner,
                                    ev_size,
+                                   src_stride,
                                    D_offsets_ptr,
                                    (offset_t *)offset_ptr,
                                    (offset_t *)inverse_idx_ptr,
@@ -110,7 +113,7 @@ struct ForwardSequenceFusedCopyDesc {
   }
   HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
     offset_t idx = reverse_idx_ptr[i];
-    return src_ptr + idx * ev_size;
+    return src_ptr + idx * src_stride;
   }
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
     return dst_ptr + i * ev_size;
@@ -118,20 +121,22 @@ struct ForwardSequenceFusedCopyDesc {
 
   int num_vec_;
   int ev_size;
+  int src_stride;
   const offset_t *__restrict__ reverse_idx_ptr;
   const SrcType *__restrict__ src_ptr;
   DstType *dst_ptr;
 };
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
-                   int num_emb, int ev_size, DataType src_type,
-                   DataType dst_type, DataType offset_type, int device_num_sms,
+                   int num_emb, int ev_size, int src_stride,
+                   DataType src_type, DataType dst_type,
+                   DataType offset_type, int device_num_sms,
                    cudaStream_t stream) {
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
       DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
         using CopyDesc = ForwardSequenceFusedCopyDesc<src_t, dst_t, offset_t>;
-        CopyDesc sequence_copy_desc{num_emb, ev_size,
+        CopyDesc sequence_copy_desc{num_emb, ev_size, src_stride,
                                     (offset_t *)inverse_idx_ptr,
                                     (src_t *)src_ptr, (dst_t *)dst_ptr};
         copy_one_to_one<CopyDesc>(sequence_copy_desc, ev_size, device_num_sms,

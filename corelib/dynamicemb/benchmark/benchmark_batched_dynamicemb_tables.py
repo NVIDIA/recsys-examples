@@ -341,8 +341,14 @@ def create_dynamic_embedding_tables(args, device):
         beta2=args.beta2,
     )
 
+    storage = var.tables
+    max_emb_dim = storage.max_embedding_dim()
+    max_value_dim = storage.max_value_dim()
+
     for table_id in range(table_num):
-        cur_table = var.tables[table_id]
+        emb_dim = storage.embedding_dim(table_id)
+        optstate_dim = storage.value_dim(table_id) - emb_dim
+        initial_accumulator = storage.init_optimizer_state()
 
         num_embeddings = args.num_embeddings_per_feature[table_id]
         fill_batch = 1024 * 1024
@@ -352,36 +358,29 @@ def create_dynamic_embedding_tables(args, device):
             end = min(i + fill_batch, num_embeddings)
             i += fill_batch
             unique_indices = torch.arange(start, end, device=device, dtype=torch.int64)
-            unique_values = torch.rand(
+            embedding_values = torch.rand(
                 unique_indices.numel(),
-                args.embedding_dim,
+                emb_dim,
                 device=device,
                 dtype=torch.float32,
             )
 
-            optstate_dim = cur_table.optim_state_dim()
-            initial_accumulator = cur_table.init_optimizer_state()
-            optstate = (
-                torch.rand(
-                    unique_values.size(0),
-                    optstate_dim,
-                    dtype=unique_values.dtype,
-                    device=unique_values.device,
-                )
-                * initial_accumulator
-            )
-            unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
-            unique_values = unique_values.reshape(-1).view(
-                -1, args.embedding_dim + optstate_dim
-            )
-
             n = unique_indices.shape[0]
+            padded_values = torch.zeros(n, max_value_dim, device=device, dtype=torch.float32)
+            padded_values[:, :emb_dim] = embedding_values
+            if optstate_dim > 0:
+                padded_values[:, max_emb_dim : max_emb_dim + optstate_dim] = (
+                    torch.rand(n, optstate_dim, device=device, dtype=torch.float32)
+                    * initial_accumulator
+                )
+
             scores = (
                 torch.ones(n, dtype=torch.uint64, device=unique_indices.device)
                 if args.cache_algorithm == "lfu"
                 else None
             )
-            cur_table.insert(unique_indices, unique_values, scores)
+            table_ids = torch.full((n,), table_id, dtype=torch.int64, device=device)
+            storage.insert(unique_indices, table_ids, padded_values, scores)
 
     return var
 
@@ -719,7 +718,7 @@ def main():
             ) = benchmark_one_iteration(var, sparse_features[i + j])
             cache_info = ""
             if args.caching:
-                cache_metrics = var.caches[0].cache_metrics
+                cache_metrics = var.cache.cache_metrics
                 unique_num = cache_metrics[0].item()
                 cache_hit = cache_metrics[1].item()
                 cache_miss = unique_num - cache_hit

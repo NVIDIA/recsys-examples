@@ -114,7 +114,9 @@ def test_table_dump_load(
 
         masks = keys % world_size == local_rank
         keys = keys[masks]
-        tid = torch.randint(num_tables, (keys.numel(),), device=device)
+        tid = torch.randint(
+            num_tables, (keys.numel(),), dtype=torch.int64, device=device
+        )
         keys = keys.to(key_type)
         batch_ = keys.numel()
 
@@ -283,7 +285,7 @@ def test_table_incremental_dump(
         bucket_capacity, dtype=table.result_type, device=device
     ).fill_(InsertResult.INIT.value)
 
-    tid = torch.randint(num_tables, (keys.numel(),), device=device)
+    tid = torch.randint(num_tables, (keys.numel(),), dtype=torch.int64, device=device)
     table.insert(keys, tid, score_arg, insert_results)
 
     num_illegal = (insert_results == InsertResult.ILLEGAL.value).sum().item()
@@ -292,14 +294,18 @@ def test_table_incremental_dump(
     # check 1: count_matched works well
     assert table_num_matched(table, 0) == num_initial_inserted
 
-    # check 2: table.incremental_dump is consistent with count_matched
-    dumped_keys, dumped_named_scores, _ = table.incremental_dump({"score1": 0})
-    assert dumped_keys.numel() == num_initial_inserted
+    # check 2: table.incremental_dump is consistent with count_matched (per table)
     inserted_mask = insert_results == InsertResult.INSERT.value
-    assert set(dumped_keys[(dumped_keys % world_size == local_rank)].tolist()) == set(
-        keys[inserted_mask].tolist()
-    )
-    assert (insert_results == InsertResult.INSERT.value).sum() == num_initial_inserted
+    total_dumped = 0
+    for t in range(num_tables):
+        dumped_keys_t, _, _ = table.incremental_dump({"score1": 0}, table_id=t)
+        total_dumped += dumped_keys_t.numel()
+        table_mask = (tid == t) & inserted_mask
+        assert set(
+            dumped_keys_t[dumped_keys_t % world_size == local_rank].tolist()
+        ) == set(keys[table_mask].tolist())
+    assert total_dumped == num_initial_inserted
+    assert inserted_mask.sum() == num_initial_inserted
 
     # insert iteratively
     offset = bucket_capacity * world_size
@@ -315,8 +321,11 @@ def test_table_incremental_dump(
 
         # pre-check: using uninsert score will dump nothing.
         if score_policy != ScorePolicy.ACCUMULATE:
-            dumped_keys, _, _ = table.incremental_dump({"score1": undumped_score})
-            assert dumped_keys.numel() == 0
+            for t in range(num_tables):
+                dumped_keys, _, _ = table.incremental_dump(
+                    {"score1": undumped_score}, table_id=t
+                )
+                assert dumped_keys.numel() == 0
 
         interval_keys = torch.arange(
             offset,
@@ -327,6 +336,9 @@ def test_table_incremental_dump(
         interval_existed_in_table = torch.empty(
             dump_interval * global_batch, device=device, dtype=torch.bool
         ).fill_(False)
+        interval_table_ids = torch.full(
+            (dump_interval * global_batch,), -1, device=device, dtype=torch.int64
+        )
 
         # select local keys
         interval_existed_in_table[local_rank::world_size] = True
@@ -343,7 +355,10 @@ def test_table_incremental_dump(
             )
             masks = keys % world_size == local_rank
             keys = keys[masks]
-            tid = torch.randint(num_tables, (keys.numel(),), device=device)
+            tid = torch.randint(
+                num_tables, (keys.numel(),), dtype=torch.int64, device=device
+            )
+            interval_table_ids[keys - interval_offset] = tid
 
             offset += global_batch
             score_arg.value = get_scores(score_policy, keys)
@@ -394,28 +409,45 @@ def test_table_incremental_dump(
             interval_existed_in_table[illegal_in_interval] = False
             num_remain -= illegal_in_interval.numel()
 
-        # check 3: incremental dump as expected
-        keys, named_scores, _ = table.incremental_dump({"score1": undumped_score})
-        masks = keys % world_size == local_rank
-        keys = keys.to(device)[masks]
-        scores = named_scores["score1"].to(device)[masks]
-        if score_policy != ScorePolicy.ACCUMULATE:
-            assert ((scores - undumped_score) >= 0).all()
-            assert keys.numel() == num_remain
-            ascend_dumped_keys, _ = torch.sort(keys)
-            ascend_interval_keys, _ = torch.sort(
-                interval_keys[interval_existed_in_table]
+        # check 3: incremental dump as expected (per table)
+        all_dumped_keys = []
+        for t in range(num_tables):
+            keys_t, named_scores_t, _ = table.incremental_dump(
+                {"score1": undumped_score}, table_id=t
             )
-            assert torch.equal(ascend_dumped_keys, ascend_interval_keys)
-        else:
-            assert keys.numel() == table.size()
-            assert torch.isin(interval_keys[interval_existed_in_table], keys).all()
+            masks_t = keys_t % world_size == local_rank
+            keys_t = keys_t.to(device)[masks_t]
+            scores_t = named_scores_t["score1"].to(device)[masks_t]
+            all_dumped_keys.append(keys_t)
 
-        # check 4: using min_score to count will get table's size
-        dumped_keys, _, _ = table.incremental_dump({"score1": 0})
-        assert (
-            dumped_keys[dumped_keys % world_size == local_rank].numel() == table.size()
-        )
+            if score_policy != ScorePolicy.ACCUMULATE:
+                assert ((scores_t - undumped_score) >= 0).all()
+                table_mask = interval_existed_in_table & (interval_table_ids == t)
+                expected = torch.sort(interval_keys[table_mask])[0]
+                assert torch.equal(torch.sort(keys_t)[0], expected)
+
+        total_dumped = sum(k.numel() for k in all_dumped_keys)
+        if score_policy != ScorePolicy.ACCUMULATE:
+            assert total_dumped == num_remain
+        else:
+            assert total_dumped == table.size()
+            all_keys = (
+                torch.cat(all_dumped_keys)
+                if all_dumped_keys
+                else torch.tensor([], device=device, dtype=torch.int64)
+            )
+            assert torch.isin(interval_keys[interval_existed_in_table], all_keys).all()
+
+        # check 4: using min_score to count will get table's size (per table)
+        total_size_check = 0
+        for t in range(num_tables):
+            dumped_keys_t, _, _ = table.incremental_dump({"score1": 0}, table_id=t)
+            local_count = dumped_keys_t[
+                dumped_keys_t % world_size == local_rank
+            ].numel()
+            assert local_count == table.size(table_id=t)
+            total_size_check += local_count
+        assert total_size_check == table.size()
 
         # log
         load_factor = table.size() / table.capacity()

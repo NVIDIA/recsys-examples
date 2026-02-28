@@ -182,7 +182,7 @@ table_insert_and_evict(at::Tensor table_storage, at::Tensor table_bucket_offsets
     at::Tensor evicted_scores =
         torch::empty({0}, keys.options().dtype(torch::kInt64));
     at::Tensor evicted_table_ids =
-        torch::empty({0}, keys.options().dtype(torch::kInt64));
+        torch::empty({0}, keys.options().dtype(torch::kLong));
     return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
                            evicted_scores, evicted_table_ids);
   }
@@ -198,7 +198,7 @@ table_insert_and_evict(at::Tensor table_storage, at::Tensor table_bucket_offsets
   at::Tensor evicted_scores =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
   at::Tensor evicted_table_ids =
-      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+      torch::empty({num_total}, keys.options().dtype(torch::kLong));
 
   table_insert_and_evict_single_score(
       table_storage, table_bucket_offsets, bucket_capacity,

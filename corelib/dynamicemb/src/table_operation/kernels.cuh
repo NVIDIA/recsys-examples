@@ -101,11 +101,12 @@ table_lookup_kernel(Table table,
 
     int64_t hashcode = 0;
     int64_t bucket_id = 0;
+    int64_t bkt_begin = 0;
     int64_t table_cap = 0;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       int64_t t_id = table_ids[i];
-      int64_t bkt_begin = table_bucket_offsets[t_id];
+      bkt_begin = table_bucket_offsets[t_id];
       int64_t bkt_end = table_bucket_offsets[t_id + 1];
       table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
       if (table_cap > 0) {
@@ -140,7 +141,7 @@ table_lookup_kernel(Table table,
       }
 
       if (found) {
-        index = bucket_id * bucket.capacity() + iter;
+        index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       }
     }
     score_output[i] = static_cast<int64_t>(score);
@@ -243,7 +244,8 @@ __forceinline__ __device__ void insert(
 
 template <int CompactTileSize, typename Bucket, typename KeyType>
 __forceinline__ __device__ void insert_evict(
-    InsertResult result, int64_t i, int64_t bucket_id, Bucket &bucket,
+    InsertResult result, int64_t i, int64_t bucket_id, int64_t bkt_begin,
+    Bucket &bucket,
     typename Bucket::Iterator iter, KeyType evict_key, ScoreType evict_score,
     int64_t const *__restrict__ table_ids, CounterType *evicted_counter,
     KeyType *__restrict__ evicted_keys, int64_t *__restrict__ evicted_scores,
@@ -268,7 +270,7 @@ __forceinline__ __device__ void insert_evict(
     evicted_keys[out_id] = evict_key;
     evicted_scores[out_id] = static_cast<int64_t>(evict_score);
     IndexType index = (result == InsertResult::Evict)
-                          ? bucket_id * bucket.capacity() + iter
+                          ? (bucket_id - bkt_begin) * bucket.capacity() + iter
                           : -static_cast<IndexType>(i + 1);
     evicted_indices[out_id] = index;
     evicted_table_ids[out_id] = table_ids[i];
@@ -311,11 +313,12 @@ __global__ void table_insert_kernel(
 
     int64_t hashcode = 0;
     int64_t bucket_id = 0;
+    int64_t bkt_begin = 0;
     int64_t table_cap = 0;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       int64_t t_id = table_ids[i];
-      int64_t bkt_begin = table_bucket_offsets[t_id];
+      bkt_begin = table_bucket_offsets[t_id];
       int64_t bkt_end = table_bucket_offsets[t_id + 1];
       table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
       if (table_cap > 0) {
@@ -349,7 +352,7 @@ __global__ void table_insert_kernel(
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
       score = Policy::update(bucket.scores(iter), score);
-      index = bucket_id * bucket.capacity() + iter;
+      index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
     }
     if constexpr (OutputScore) {
@@ -404,11 +407,12 @@ __global__ void table_insert_and_evict_kernel(
 
     int64_t hashcode = 0;
     int64_t bucket_id = 0;
+    int64_t bkt_begin = 0;
     int64_t table_cap = 0;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       int64_t t_id = table_ids[i];
-      int64_t bkt_begin = table_bucket_offsets[t_id];
+      bkt_begin = table_bucket_offsets[t_id];
       int64_t bkt_end = table_bucket_offsets[t_id + 1];
       table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
       if (table_cap > 0) {
@@ -435,15 +439,15 @@ __global__ void table_insert_and_evict_kernel(
     // in tiled_partition<CompactTileSize> sees every warp lane.
     // ILLEGAL threads participate with evicted=false.
     insert_evict<KernelTraits::CompactTileSize>(
-        result, i, bucket_id, bucket, iter, evict_key, evict_score, table_ids,
-        evicted_counter, evicted_keys, evicted_scores, evicted_indices,
-        evicted_table_ids);
+        result, i, bucket_id, bkt_begin, bucket, iter, evict_key, evict_score,
+        table_ids, evicted_counter, evicted_keys, evicted_scores,
+        evicted_indices, evicted_table_ids);
 
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
       score = Policy::update(bucket.scores(iter), score);
-      index = bucket_id * bucket.capacity() + iter;
+      index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
     }
     if constexpr (OutputScore) {
@@ -496,11 +500,12 @@ table_erase_kernel(Table table,
 
     int64_t hashcode = 0;
     int64_t bucket_id = 0;
+    int64_t bkt_begin = 0;
     int64_t table_cap = 0;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       int64_t t_id = table_ids[i];
-      int64_t bkt_begin = table_bucket_offsets[t_id];
+      bkt_begin = table_bucket_offsets[t_id];
       int64_t bkt_end = table_bucket_offsets[t_id + 1];
       table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
       if (table_cap > 0) {
@@ -534,7 +539,7 @@ table_erase_kernel(Table table,
       }
 
       if (found) {
-        index = bucket_id * bucket.capacity() + iter;
+        index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       }
     }
     if (indices) {
@@ -546,6 +551,7 @@ table_erase_kernel(Table table,
 template <typename Table, typename PredFunctor, int TileSize>
 __global__ void
 table_export_batch_kernel(Table table, IndexType begin, IndexType end,
+                          IndexType table_begin,
                           CounterType *__restrict__ counter,
                           typename Table::KeyType *__restrict__ keys,
                           ScoreType *__restrict__ scores, PredFunctor pred,
@@ -568,7 +574,7 @@ table_export_batch_kernel(Table table, IndexType begin, IndexType end,
 
     const KeyType key = *bucket.keys(iter);
     const ScoreType score = *bucket.scores(iter);
-    const IndexType index = i;
+    const IndexType index = i - table_begin;
 
     bool valid = Bucket::is_valid(key);
     bool match = valid and pred.template operator()(score);

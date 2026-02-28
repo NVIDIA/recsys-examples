@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.key_value_table import DynamicEmbeddingTable
+from dynamicemb.key_value_table import Storage
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -450,12 +450,14 @@ class ConstructTwinModule:
 
         tmp_dynamic_emb_module_list = get_dynamic_emb_module(tmp_collection_module)
         table_name_map_hkv_table = {}
+        table_name_map_table_id = {}
         for dynamic_emb_module in tmp_dynamic_emb_module_list:
             tmp_table_names = dynamic_emb_module.table_names
-            tmp_tables = dynamic_emb_module.tables
+            tmp_storage = dynamic_emb_module.tables
 
             for i, tmp_table_name in enumerate(tmp_table_names):
-                table_name_map_hkv_table[tmp_table_name] = tmp_tables[i]
+                table_name_map_hkv_table[tmp_table_name] = tmp_storage
+                table_name_map_table_id[tmp_table_name] = i
 
         # Perform all lookup iterations
         for iter_idx in range(total_iterations):
@@ -540,27 +542,25 @@ class ConstructTwinModule:
             unique_values = chosen_value
 
             tmp_table_name = feature.replace("f_", "t_")
-            cur_hkv_table: DynamicEmbeddingTable = table_name_map_hkv_table[
-                tmp_table_name
-            ]
-            optstate_dim = cur_hkv_table.optim_state_dim()
+            cur_hkv_table: Storage = table_name_map_hkv_table[tmp_table_name]
+            table_id = table_name_map_table_id[tmp_table_name]
+            max_emb_dim = cur_hkv_table.max_embedding_dim()
+            max_value_dim = cur_hkv_table.max_value_dim()
+            optstate_dim = cur_hkv_table.value_dim(table_id) - cur_hkv_table.embedding_dim(table_id)
             initial_accumulator = cur_hkv_table.init_optimizer_state()
-            optstate = (
-                torch.ones(
-                    unique_values.size(0),
-                    optstate_dim,
-                    dtype=unique_values.dtype,
-                    device=unique_values.device,
-                )
-                * initial_accumulator
-            )
-            unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
-            unique_values = unique_values.reshape(-1).view(-1, dim + optstate_dim)
 
-            table_ids = torch.zeros(
-                unique_indices.numel(), dtype=torch.int64, device=unique_indices.device
+            padded_values = torch.zeros(
+                unique_values.size(0), max_value_dim,
+                dtype=unique_values.dtype, device=unique_values.device,
             )
-            cur_hkv_table.insert(unique_indices, table_ids, unique_values)
+            padded_values[:, :dim] = unique_values
+            if optstate_dim > 0:
+                padded_values[:, max_emb_dim : max_emb_dim + optstate_dim] = initial_accumulator
+
+            table_ids = torch.full(
+                (unique_indices.numel(),), table_id, dtype=torch.int64, device=unique_indices.device,
+            )
+            cur_hkv_table.insert(unique_indices, table_ids, padded_values)
         # In TorchREC, once a forward lookup occurs, the iteration in the module gets updated(even you don't do backward).
         # This makes it difficult to accurately test ADAM since the iteration count affects the optimizer's behavior.
         # So we reset the optimizer_step in here

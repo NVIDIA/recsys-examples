@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from dynamicemb.initializer import create_initializer_from_args
@@ -32,9 +32,12 @@ from dynamicemb.types import (
 )
 
 
-class KVCounter(Counter):
-    """
-    Interface of a counter table which maps a key to a counter.
+class KVCounter:
+    """Per-table counter configuration.
+
+    Users specify one ``KVCounter`` per logical table. At runtime, the
+    framework wraps a list of them into a single ``MultiTableKVCounter``
+    that manages a fused multi-table scored hash table.
     """
 
     def __init__(
@@ -43,115 +46,62 @@ class KVCounter(Counter):
         bucket_capacity: int = 1024,
         key_type: torch.dtype = torch.int64,
     ):
-        # Store configuration only, do not create the table yet
         self.capacity = capacity
         self.bucket_capacity = bucket_capacity
         self.key_type = key_type
 
-        # Will be initialized in create()
-        self._is_created = False
-        self.table_ = None
-        self.score_name_ = None
-        self.score_specs_ = None
-        self.score_arg_ = None
 
-    def create(self, device: torch.device) -> "KVCounter":
-        """
-        Create the actual counter table on the specified device.
+class MultiTableKVCounter(Counter):
+    """Multi-table counter backed by a single fused ``ScoredHashTable``.
 
-        Args:
-            device (torch.device): The device to create the counter table on.
-        """
-        if self._is_created:
-            return self  # Idempotent: multiple calls won't recreate
+    Accepts a list of per-table ``KVCounter`` configs and creates one hash
+    table whose capacity list maps to the individual counters.
+    """
 
+    def __init__(
+        self,
+        kv_counters: List[KVCounter],
+        device: torch.device,
+    ):
+        if not kv_counters:
+            raise ValueError("kv_counters must be non-empty")
+
+        capacities = [kv.capacity for kv in kv_counters]
         self.score_name_ = "counter"
         self.score_specs_ = [
             ScoreSpec(name=self.score_name_, policy=ScorePolicy.ACCUMULATE)
         ]
         self.score_arg_ = ScoreArg(name=self.score_name_)
-
         self.table_ = get_scored_table(
-            [self.capacity],
-            self.bucket_capacity,
-            self.key_type,
+            capacities,
+            kv_counters[0].bucket_capacity,
+            kv_counters[0].key_type,
             self.score_specs_,
             device,
         )
-        self._is_created = True
-        return self
 
-    def _ensure_created(self) -> None:
-        """Raise error if create() has not been called."""
-        if not self._is_created:
-            raise RuntimeError(
-                "KVCounter.create() must be called before use. "
-                "This is normally done by the framework during model sharding."
-            )
-
-    def add(self, keys: torch.Tensor, frequencies: torch.Tensor) -> torch.Tensor:
-        """
-        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
-        For not existed keys, the frequencies will be assigned directly.
-        For existing keys, the frequencies will be accumulated.
-
-        Args:
-            keys (torch.Tensor): The input keys, should be unique keys.
-            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
-
-        Returns:
-            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
-        """
-        self._ensure_created()
+    def add(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> torch.Tensor:
         self.score_arg_.value = frequencies
-
         scores_out = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
-        table_ids = torch.zeros(keys.numel(), dtype=torch.int64, device=keys.device)
         self.table_.insert(keys, table_ids, self.score_arg_, score_out=scores_out)
         return scores_out
 
-    def erase(self, keys) -> None:
-        """
-        Erase keys form the `Counter`.
-
-        Args:
-            keys (torch.Tensor): The input keys to be erased.
-        """
-        self._ensure_created()
-        table_ids = torch.zeros(keys.numel(), dtype=torch.int64, device=keys.device)
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
         self.table_.erase(keys, table_ids)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
-        """
-        Get the consumption of a specific memory type.
-
-        Args:
-            mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
-        """
-        self._ensure_created()
         return self.table_.memory_usage(mem_type)
 
-    def load(self, key_file, counter_file) -> None:
-        """
-        Load keys and frequencies from input file path.
+    def load(self, key_file, counter_file, table_id: int) -> None:
+        self.table_.load(key_file, {self.score_name_: counter_file}, table_id=table_id)
 
-        Args:
-            key_file (str): the file path of keys.
-            counter_file (str): the file path of frequencies.
-        """
-        self._ensure_created()
-        self.table_.load(key_file, {self.score_name_: counter_file})
-
-    def dump(self, key_file, counter_file) -> None:
-        """
-        Dump keys and frequencies to output file path.
-
-        Args:
-            key_file (str): the file path of keys.
-            counter_file (str): the file path of frequencies.
-        """
-        self._ensure_created()
-        self.table_.dump(key_file, {self.score_name_: counter_file})
+    def dump(self, key_file, counter_file, table_id: int) -> None:
+        self.table_.dump(key_file, {self.score_name_: counter_file}, table_id=table_id)
 
 
 class FrequencyAdmissionStrategy(AdmissionStrategy):

@@ -135,10 +135,9 @@ def get_table_keys(
 
         for dynamic_emb_module in dynamic_emb_modules:
             dynamic_emb_module.flush()
+            storage = dynamic_emb_module.tables
 
-            for table_name, table in zip(
-                dynamic_emb_module.table_names, dynamic_emb_module.tables
-            ):
+            for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
                 if table_names is not None and table_name not in set(
                     table_names[collection_name]
                 ):
@@ -146,7 +145,9 @@ def get_table_keys(
 
                 table_keys = set()
 
-                for keys, _, _, _ in table.export_keys_values(device, batch_size):
+                for keys, _, _, _ in storage.export_keys_values(
+                    device, batch_size, table_id=table_idx
+                ):
                     for key in keys:
                         table_keys.add(int(key))
 
