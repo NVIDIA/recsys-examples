@@ -546,19 +546,28 @@ class ConstructTwinModule:
             table_id = table_name_map_table_id[tmp_table_name]
             max_emb_dim = cur_hkv_table.max_embedding_dim()
             max_value_dim = cur_hkv_table.max_value_dim()
-            optstate_dim = cur_hkv_table.value_dim(table_id) - cur_hkv_table.embedding_dim(table_id)
+            optstate_dim = cur_hkv_table.value_dim(
+                table_id
+            ) - cur_hkv_table.embedding_dim(table_id)
             initial_accumulator = cur_hkv_table.init_optimizer_state()
 
             padded_values = torch.zeros(
-                unique_values.size(0), max_value_dim,
-                dtype=unique_values.dtype, device=unique_values.device,
+                unique_values.size(0),
+                max_value_dim,
+                dtype=unique_values.dtype,
+                device=unique_values.device,
             )
             padded_values[:, :dim] = unique_values
             if optstate_dim > 0:
-                padded_values[:, max_emb_dim : max_emb_dim + optstate_dim] = initial_accumulator
+                padded_values[
+                    :, max_emb_dim : max_emb_dim + optstate_dim
+                ] = initial_accumulator
 
             table_ids = torch.full(
-                (unique_indices.numel(),), table_id, dtype=torch.int64, device=unique_indices.device,
+                (unique_indices.numel(),),
+                table_id,
+                dtype=torch.int64,
+                device=unique_indices.device,
             )
             cur_hkv_table.insert(unique_indices, table_ids, padded_values)
         # In TorchREC, once a forward lookup occurs, the iteration in the module gets updated(even you don't do backward).

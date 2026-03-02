@@ -29,8 +29,8 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage, Storage
-from dynamicemb.types import CopyMode
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.types import CopyMode
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
@@ -209,7 +209,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         )
 
         return (
-            num_missing.item() if isinstance(num_missing, torch.Tensor) else num_missing,
+            num_missing.item()
+            if isinstance(num_missing, torch.Tensor)
+            else num_missing,
             missing_keys,
             missing_indices,
             missing_table_ids,
@@ -499,9 +501,9 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             if opt_state_dim > 0:
-                values[:, max_emb_dim : max_emb_dim + opt_state_dim] = (
-                    storage.init_optimizer_state()
-                )
+                values[
+                    :, max_emb_dim : max_emb_dim + opt_state_dim
+                ] = storage.init_optimizer_state()
             storage.set_score(1)
             storage.insert(indices, table_ids, values)
         elif isinstance(storage, PyDictStorage):
@@ -520,7 +522,7 @@ def init_embedding_tables(stbe, bdet):
 @pytest.mark.parametrize(
     "opt_type,opt_params",
     [
-        # (EmbOptimType.SGD, {"learning_rate": 0.3}),
+        (EmbOptimType.SGD, {"learning_rate": 0.3}),
         (
             EmbOptimType.ADAM,
             {
@@ -535,10 +537,7 @@ def init_embedding_tables(stbe, bdet):
 )
 @pytest.mark.parametrize(
     "deterministic",
-    [
-        True,
-        False
-    ],
+    [True, False],
 )
 @pytest.mark.parametrize(
     "caching, PS, local_hbm_for_values",
@@ -996,7 +995,6 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     # 2. Test prefetch works when Cache empty
     with torch.cuda.stream(pretch_stream):
         bdeb.prefetch(indicesA, offsetsA, forward_stream)
-        assert bdeb.num_prefetch_ahead == 1
         assert list(bdeb.get_score().values()) == [1] * len(dims)
 
     with torch.cuda.stream(forward_stream):
@@ -1028,7 +1026,6 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     with torch.cuda.stream(pretch_stream):
         bdeb.prefetch(indicesA, offsetsA, forward_stream)
         bdeb.prefetch(indicesB, offsetsB, forward_stream)
-        assert bdeb.num_prefetch_ahead == 2
         assert list(bdeb.get_score().values()) == [2] * len(dims)
 
     with torch.cuda.stream(forward_stream):

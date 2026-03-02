@@ -366,7 +366,9 @@ def create_dynamic_embedding_tables(args, device):
             )
 
             n = unique_indices.shape[0]
-            padded_values = torch.zeros(n, max_value_dim, device=device, dtype=torch.float32)
+            padded_values = torch.zeros(
+                n, max_value_dim, device=device, dtype=torch.float32
+            )
             padded_values[:, :emb_dim] = embedding_values
             if optstate_dim > 0:
                 padded_values[:, max_emb_dim : max_emb_dim + optstate_dim] = (

@@ -251,36 +251,20 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
 
 class Cache(abc.ABC):
     @abc.abstractmethod
-    def find(
+    def lookup(
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        int,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
-        founds: torch.Tensor
-        output_scores: torch.Tensor
-        indices: torch.Tensor
-        return (
-            num_missing,
-            missing_keys,
-            missing_indices,
-            missing_scores,
-            founds,
-            output_scores,
-            indices,
-        )
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lookup with overflow fallback.
+
+        Returns:
+            score_out: Output scores.
+            founds: Boolean tensor indicating which keys were found.
+            indices: Slot indices (``-1`` for keys not found).
+        """
+        ...
 
     @abc.abstractmethod
     def insert_and_evict(
@@ -291,20 +275,13 @@ class Cache(abc.ABC):
     ) -> Tuple[
         torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
-        indices: torch.Tensor
-        num_evicted: int
-        evicted_keys: torch.Tensor
-        evicted_table_ids: torch.Tensor
-        evicted_indices: torch.Tensor
-        evicted_scores: torch.Tensor
-        return (
-            indices,
-            num_evicted,
-            evicted_keys,
-            evicted_table_ids,
-            evicted_indices,
-            evicted_scores,
-        )
+        """Insert with counter-aware eviction and overflow fallback.
+
+        Returns:
+            indices, num_evicted, evicted_keys, evicted_indices,
+            evicted_scores, evicted_table_ids.
+        """
+        ...
 
     @abc.abstractmethod
     def reset(

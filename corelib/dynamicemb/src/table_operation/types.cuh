@@ -366,9 +366,11 @@ struct LinearBucket {
   }
 
   template <int GroupSize, int BufferDim>
-  __forceinline__ __device__ bool reduce(Iterator &dst_iter, KeyType &dst_key,
-                                         ScoreType &dst_score,
-                                         ScoreType *sm_buffers) const {
+  __forceinline__ __device__ bool reduce(
+      Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
+      ScoreType *sm_buffers,
+      int32_t const *__restrict__ counter,
+      int64_t counter_offset) const {
 
     static_assert(GroupSize == 1);
     bool succeed = false;
@@ -383,13 +385,6 @@ struct LinearBucket {
 
     Iterator iter = 0;
     int rank = threadIdx.x;
-
-    // ScoreType* sm_buffers =
-    // (ScoreType*)__cvta_generic_to_shared(sm_buffers_); sm_buffers =
-    // reinterpret_cast<ScoreType
-    // *>(__cvta_generic_to_shared((void*)sm_buffers));
-
-    // asm("cvta.to.shared.u64 %0, %1;" : "=l"(sm_buffers) : "l"(sm_buffers));
 
     async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
                                                 scores(iter));
@@ -421,6 +416,9 @@ struct LinearBucket {
                 temp_key_slot->load(cuda::std::memory_order_relaxed);
 
             if (temp_key != LockedKey && temp_key != EmptyKey) {
+              int64_t flat_idx = counter_offset + iter + k + j;
+              if (counter[flat_idx] > 0) continue;
+
               dst_iter = iter + k + j;
               dst_key = temp_key;
               dst_score = temp_score;
@@ -440,6 +438,9 @@ struct LinearBucket {
 template <typename BucketType_> struct LinearBucketTable {
   using BucketType = BucketType_;
   using KeyType = typename BucketType::KeyType;
+
+  LinearBucketTable()
+      : storage_(nullptr), num_buckets_(0), bucket_capacity_(0) {}
 
   LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
                     int64_t bucket_capacity)

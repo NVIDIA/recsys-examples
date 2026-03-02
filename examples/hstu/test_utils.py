@@ -575,7 +575,7 @@ def create_model(
         config=hstu_config,
         dynamicemb_options_dict={
             "item": DynamicEmbTableOptions(
-                global_hbm_for_values=1024 * 1024,  # 1M HBM (maybe cached)
+                global_hbm_for_values=1024 * 1024 * 8,  # 4M HBM (maybe cached)
                 score_strategy=DynamicEmbScoreStrategy.STEP,
                 caching=pipeline_type
                 == "prefetch",  # when prefetch is enabled, we must enable caching

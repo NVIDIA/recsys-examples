@@ -71,12 +71,85 @@ void table_lookup_single_score(at::Tensor table_storage,
                        num_buckets, bucket_capacity);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      table_lookup_kernel<Table, 1, PolicyTypeV>
+      table_lookup_kernel<Table, 1, PolicyTypeV, false>
           <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
              stream>>>(table, table_bucket_offsets_ptr,
                        num_total, keys_ptr, table_ids_ptr,
                        founds_ptr, indices_ptr,
-                       score_input_ptr, score_output_ptr);
+                       score_input_ptr, score_output_ptr,
+                       Table(), nullptr);
+    });
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static void table_lookup_with_overflow_single_score(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor keys,
+    at::Tensor table_ids,
+    std::optional<at::Tensor> score_input,
+    ScorePolicyType policy_type,
+    at::Tensor score_output, at::Tensor founds, at::Tensor indices,
+    at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
+    at::Tensor ovf_output_offsets) {
+
+  auto key_type = get_data_type(keys);
+
+  ScoreType *score_input_ptr = nullptr;
+  at::Tensor score_input_tensor;
+  if (score_input.has_value() && score_input.value().defined()) {
+    at::Tensor in = score_input.value();
+    if (in.scalar_type() == torch::kUInt64) {
+      score_input_ptr = get_pointer<ScoreType>(score_input);
+    } else {
+      score_input_tensor = in.view(torch::kUInt64);
+      score_input_ptr = score_input_tensor.data_ptr<ScoreType>();
+    }
+  }
+
+  auto score_output_ptr = score_output.data_ptr<int64_t>();
+  auto indices_ptr = indices.data_ptr<IndexType>();
+  auto founds_ptr = founds.data_ptr<bool>();
+  auto table_ids_ptr = table_ids.data_ptr<int64_t>();
+  auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
+  auto ovf_output_offsets_ptr = ovf_output_offsets.data_ptr<int64_t>();
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  int64_t num_total = keys.size(0);
+
+  constexpr int BLOCK_SIZE = 256;
+
+  DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
+    auto keys_ptr = get_pointer<KeyType>(keys);
+
+    constexpr int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t bucket_bytes = bucket_capacity * total_size;
+    int64_t num_buckets =
+        table_storage.numel() * table_storage.element_size() / bucket_bytes;
+
+    using Bucket = LinearBucket<KeyType>;
+    using Table = LinearBucketTable<Bucket>;
+
+    auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
+                       num_buckets, bucket_capacity);
+
+    int64_t ovf_bucket_bytes = ovf_bucket_capacity * total_size;
+    int64_t ovf_num_buckets =
+        ovf_storage.numel() * ovf_storage.element_size() / ovf_bucket_bytes;
+
+    auto ovf_table = Table(reinterpret_cast<uint8_t *>(ovf_storage.data_ptr()),
+                           ovf_num_buckets, ovf_bucket_capacity);
+
+    DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
+      table_lookup_kernel<Table, 1, PolicyTypeV, true>
+          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+             stream>>>(table, table_bucket_offsets_ptr,
+                       num_total, keys_ptr, table_ids_ptr,
+                       founds_ptr, indices_ptr,
+                       score_input_ptr, score_output_ptr,
+                       ovf_table, ovf_output_offsets_ptr);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -87,7 +160,10 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys,
              at::Tensor table_ids,
              std::optional<at::Tensor> score_input,
-             ScorePolicyType policy_type) {
+             ScorePolicyType policy_type,
+             std::optional<at::Tensor> ovf_storage,
+             int64_t ovf_bucket_capacity,
+             std::optional<at::Tensor> ovf_output_offsets) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -105,10 +181,21 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
   at::Tensor indices =
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
 
-  table_lookup_single_score(table_storage, table_bucket_offsets,
-                            bucket_capacity, keys, table_ids,
-                            score_input, policy_type,
-                            score_output, founds, indices);
+  bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
+
+  if (use_overflow) {
+    table_lookup_with_overflow_single_score(
+        table_storage, table_bucket_offsets, bucket_capacity,
+        keys, table_ids, score_input, policy_type,
+        score_output, founds, indices,
+        ovf_storage.value(), ovf_bucket_capacity,
+        ovf_output_offsets.value());
+  } else {
+    table_lookup_single_score(table_storage, table_bucket_offsets,
+                              bucket_capacity, keys, table_ids,
+                              score_input, policy_type,
+                              score_output, founds, indices);
+  }
 
   return std::make_tuple(score_output, founds, indices);
 }

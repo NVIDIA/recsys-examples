@@ -502,7 +502,7 @@ def test_model_load_dump(
                         named_scores,
                         _,
                     ) in counter.table_._batched_export_keys_scores(
-                        counter.table_.score_names_, torch.device("cpu")
+                        counter.table_.score_names_, torch.device("cpu"), table_id=table_idx
                     ):
                         if keys.numel() == 0:
                             continue

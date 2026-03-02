@@ -36,6 +36,7 @@ from dynamicemb_extensions import (
     table_insert_and_evict,
     table_lookup,
     table_partition,
+    table_update_counter,
 )
 
 
@@ -288,6 +289,7 @@ class LinearBucketTable(ScoredHashTable):
         key_type: torch.dtype = torch.int64,
         bucket_capacity: Optional[int] = None,
         device: torch.device = None,
+        enable_overflow: bool = False,
     ):
         """
         Args:
@@ -296,6 +298,8 @@ class LinearBucketTable(ScoredHashTable):
             key_type: key data type, torch.int64 or torch.uint64.
             bucket_capacity: number of slots per bucket (default 128).
             device: CUDA device.
+            enable_overflow: when True, allocate a per-table overflow buffer
+                (capacity = 3 * bucket_capacity) and a per-slot reference counter.
         """
         self.device = (
             device
@@ -403,6 +407,56 @@ class LinearBucketTable(ScoredHashTable):
             self.num_buckets_, dtype=torch.int32, device=self.device
         )
 
+        # Overflow buffer & counter
+        self.enable_overflow_ = enable_overflow
+        if self.enable_overflow_:
+            self.overflow_bucket_capacity_ = 3 * self.bucket_capacity_
+            self.overflow_num_buckets_ = self.num_tables_
+
+            ovf_storage_bytes = (
+                sum(self.fields_byte_)
+                * self.overflow_bucket_capacity_
+                * self.overflow_num_buckets_
+            )
+            self.overflow_table_storage_ = torch.empty(
+                ovf_storage_bytes, dtype=torch.uint8, device=self.device
+            )
+
+            ovf_keys, ovf_digests, *ovf_scores = table_partition(
+                self.overflow_table_storage_,
+                self.fileds_type_,
+                self.overflow_bucket_capacity_,
+                self.overflow_num_buckets_,
+            )
+            self._init_table(ovf_keys, ovf_scores, ovf_digests)
+
+            self.overflow_bucket_sizes = torch.zeros(
+                self.overflow_num_buckets_, dtype=torch.int32, device=self.device
+            )
+
+            ovf_offsets = [self.per_table_capacity_[i] for i in range(self.num_tables_)]
+            self.overflow_output_offsets_ = torch.tensor(
+                ovf_offsets, dtype=torch.int64, device=self.device
+            )
+
+            total_counter_slots = (
+                self.capacity_ + self.overflow_bucket_capacity_ * self.num_tables_
+            )
+            self._ref_counter = torch.zeros(
+                total_counter_slots, dtype=torch.int32, device=self.device
+            )
+            self._ovf_counter = self._ref_counter[self.capacity_ :]
+        else:
+            self.overflow_bucket_capacity_ = 0
+            self.overflow_num_buckets_ = 0
+            self.overflow_table_storage_ = None
+            self.overflow_bucket_sizes = None
+            self.overflow_output_offsets_ = None
+            self._ref_counter = torch.zeros(
+                self.capacity_, dtype=torch.int32, device=self.device
+            )
+            self._ovf_counter = None
+
     def _init_table(
         self,
         keys,
@@ -501,6 +555,9 @@ class LinearBucketTable(ScoredHashTable):
         """
         score_value, policy = self._parse_score(score)
 
+        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            return self._deterministic_insert(keys, table_ids, score_value, policy)
+
         indices = table_insert(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -510,6 +567,7 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             score_value,
             policy,
+            self._ref_counter,
             insert_results,
             score_out,
         )
@@ -536,6 +594,11 @@ class LinearBucketTable(ScoredHashTable):
 
         score_value, policy = self._parse_score(score)
 
+        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            return self._deterministic_insert_and_evict(
+                keys, table_ids, score_value, policy
+            )
+
         (
             indices,
             num_evicted,
@@ -552,8 +615,106 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             score_value,
             policy,
+            self._ref_counter,
             insert_results,
             score_out,
+        )
+
+        h_num_evicted = num_evicted.cpu().item()
+        return (
+            indices,
+            h_num_evicted,
+            evicted_keys[:h_num_evicted],
+            evicted_indices[:h_num_evicted],
+            evicted_scores[:h_num_evicted],
+            evicted_table_ids[:h_num_evicted],
+        )
+
+    def increment_counter(self, slot_indices: torch.Tensor) -> None:
+        """Atomically increment ref-counter at given slot indices."""
+        table_update_counter(
+            self._ref_counter, self._ref_counter.numel(), slot_indices, 1
+        )
+
+    def decrement_counter(self, slot_indices: torch.Tensor) -> None:
+        """Atomically decrement ref-counter at given slot indices."""
+        table_update_counter(
+            self._ref_counter, self._ref_counter.numel(), slot_indices, -1
+        )
+
+    def lookup_with_overflow(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score: ScoreArg,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lookup with overflow buffer fallback. Indices for overflow entries
+        are offset by the per-table main capacity."""
+        assert (
+            self.enable_overflow_
+        ), "lookup_with_overflow requires enable_overflow=True"
+        score_value, policy = self._parse_score(score)
+
+        score_out, founds, indices = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            ovf_storage=self.overflow_table_storage_,
+            ovf_bucket_capacity=self.overflow_bucket_capacity_,
+            ovf_output_offsets=self.overflow_output_offsets_,
+        )
+        return score_out, founds, indices
+
+    def insert_and_evict_with_counter_and_overflow(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score: ScoreArg,
+        insert_results: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Insert with counter-aware eviction and overflow fallback.
+        Returns same tuple as insert_and_evict."""
+        assert (
+            self.enable_overflow_
+        ), "insert_and_evict_with_counter_and_overflow requires enable_overflow=True"
+        score_value, policy = self._parse_score(score)
+
+        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            return self._deterministic_insert_and_evict_with_overflow(
+                keys, table_ids, score_value, policy
+            )
+
+        (
+            indices,
+            num_evicted,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+            evicted_table_ids,
+        ) = table_insert_and_evict(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            self._ref_counter,
+            insert_results=insert_results,
+            score_output=score_out,
+            ovf_storage=self.overflow_table_storage_,
+            ovf_bucket_capacity=self.overflow_bucket_capacity_,
+            ovf_bucket_sizes=self.overflow_bucket_sizes,
+            ovf_counter=self._ovf_counter,
+            ovf_output_offsets=self.overflow_output_offsets_,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -770,6 +931,43 @@ class LinearBucketTable(ScoredHashTable):
                 )
             offset += batch_size
 
+        if self.enable_overflow_:
+            ovf_cap = self.overflow_bucket_capacity_
+            ovf_begin = table_id * ovf_cap
+            ovf_offset = 0
+            while ovf_offset < ovf_cap:
+                ovf_batch = min(batch_size, ovf_cap - ovf_offset)
+                d_counter, keys, score, indices = table_export_batch(
+                    self.overflow_table_storage_,
+                    self.overflow_bucket_capacity_,
+                    ovf_batch,
+                    ovf_begin + ovf_offset,
+                    key_dtype,
+                    threshold_,
+                    ovf_begin,
+                )
+                actual_length = d_counter.item()
+                if actual_length > 0:
+                    named_scores: Dict[str, torch.Tensor] = {}
+                    for score_name in score_names:
+                        if score_name in self.score_names_:
+                            named_scores[score_name] = (
+                                score[:actual_length].to(SCORE_TYPE).to(target_device)
+                            )
+                    ovf_out_offset = (
+                        int(self.overflow_output_offsets_[table_id].item())
+                        if return_index
+                        else 0
+                    )
+                    yield (
+                        keys[:actual_length].to(KEY_TYPE).to(target_device),
+                        named_scores,
+                        (indices[:actual_length] + ovf_out_offset).to(target_device)
+                        if return_index
+                        else None,
+                    )
+                ovf_offset += batch_size
+
     def dump(
         self,
         key_file: str,
@@ -921,24 +1119,54 @@ class LinearBucketTable(ScoredHashTable):
         Reset the table.
         """
         self._init_table(self.keys_, self.scores_list, self.digests_)
+        self.bucket_sizes.zero_()
+        self._ref_counter.zero_()
+
+        if self.enable_overflow_:
+            ovf_keys, ovf_digests, *ovf_scores = table_partition(
+                self.overflow_table_storage_,
+                self.fileds_type_,
+                self.overflow_bucket_capacity_,
+                self.overflow_num_buckets_,
+            )
+            self._init_table(ovf_keys, ovf_scores, ovf_digests)
+            self.overflow_bucket_sizes.zero_()
 
     def capacity(self, table_id: Optional[int] = None) -> int:
         """
-        Return the capacity of the table, or a specific logical table.
+        Return the capacity (main + overflow) of the table, or a specific logical table.
         """
+        if table_id is not None:
+            cap = self.per_table_capacity_[table_id]
+            if self.enable_overflow_:
+                cap += self.overflow_bucket_capacity_
+            return cap
+        total = self.capacity_
+        if self.enable_overflow_:
+            total += self.overflow_bucket_capacity_ * self.num_tables_
+        return total
+
+    def main_capacity(self, table_id: Optional[int] = None) -> int:
+        """Return the main-table capacity (excluding overflow)."""
         if table_id is not None:
             return self.per_table_capacity_[table_id]
         return self.capacity_
 
     def size(self, table_id: Optional[int] = None) -> int:
         """
-        Return the size of the table, or a specific logical table.
+        Return the size (main + overflow) of the table, or a specific logical table.
         """
         if table_id is not None:
             bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
             bkt_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
-            return self.bucket_sizes[bkt_begin:bkt_end].sum()
-        return self.bucket_sizes.sum()
+            s = self.bucket_sizes[bkt_begin:bkt_end].sum()
+            if self.enable_overflow_:
+                s += self.overflow_bucket_sizes[table_id]
+            return s
+        s = self.bucket_sizes.sum()
+        if self.enable_overflow_:
+            s += self.overflow_bucket_sizes.sum()
+        return s
 
     def load_factor(self) -> float:
         """
@@ -968,6 +1196,292 @@ class LinearBucketTable(ScoredHashTable):
         )
         return bkt_keys, offsets, inverse
 
+    # ------------------------------------------------------------------
+    # Deterministic insert helpers
+    # ------------------------------------------------------------------
+
+    def _bucketize_and_pad(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Bucketize keys and pad into waves of non-conflicting inserts.
+
+        Returns ``(keys_t, tids_t, scores_t)`` each shaped
+        ``[max_bucket_len, num_buckets]``.  Each row ("wave") contains at most
+        one key per bucket so that sequential per-wave inserts are
+        deterministic.  Padding uses -1 for keys and 0 for tids/scores.
+        """
+        bkt_keys, offsets, inverse = self.bucketize_keys(keys, table_ids)
+        bkt_tids = table_ids[inverse]
+        # uint64 doesn't support index_cuda; reinterpret as int64 for gather/scatter
+        if score_value is not None:
+            bkt_scores = score_value.view(torch.int64)[inverse].view(torch.uint64)
+        else:
+            bkt_scores = None
+
+        num_buckets = offsets.numel() - 1
+        lengths = offsets[1:] - offsets[:-1]
+        max_len = int(lengths.max().item()) if num_buckets > 0 else 0
+
+        if max_len == 0:
+            empty_k = torch.empty(
+                (0, num_buckets), dtype=keys.dtype, device=keys.device
+            )
+            empty_t = torch.empty(
+                (0, num_buckets), dtype=torch.int64, device=keys.device
+            )
+            return empty_k, empty_t, None
+
+        device = keys.device
+        bucket_idx = torch.repeat_interleave(
+            torch.arange(num_buckets, device=device), lengths
+        )
+        starts = torch.repeat_interleave(offsets[:-1], lengths)
+        positions = torch.arange(bkt_keys.numel(), device=device) - starts
+
+        pad_keys = torch.full(
+            (num_buckets, max_len), -1, dtype=keys.dtype, device=device
+        )
+        pad_tids = torch.zeros((num_buckets, max_len), dtype=torch.int64, device=device)
+        pad_keys[bucket_idx, positions] = bkt_keys
+        pad_tids[bucket_idx, positions] = bkt_tids
+
+        pad_scores = None
+        if bkt_scores is not None:
+            pad_scores = torch.zeros(
+                (num_buckets, max_len), dtype=torch.int64, device=device
+            )
+            pad_scores[bucket_idx, positions] = bkt_scores.view(torch.int64)
+
+        keys_t = pad_keys.transpose(0, 1).contiguous()
+        tids_t = pad_tids.transpose(0, 1).contiguous()
+        scores_t = (
+            pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
+        )
+        return keys_t, tids_t, scores_t
+
+    def _deterministic_insert(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+        policy: ScorePolicy,
+    ) -> torch.Tensor:
+        """Deterministic insert: bucketize, insert one wave at a time, then
+        lookup to get final indices."""
+        if keys.numel() == 0:
+            return torch.empty(0, dtype=torch.int64, device=keys.device)
+
+        keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
+        for i in range(keys_t.size(0)):
+            valid = keys_t[i] != -1
+            if not valid.any():
+                continue
+            vk = keys_t[i][valid].contiguous()
+            vt = tids_t[i][valid].contiguous()
+            vs = (
+                scores_t[i][valid].contiguous().to(torch.uint64)
+                if scores_t is not None
+                else None
+            )
+            table_insert(
+                self.table_storage_,
+                self.table_bucket_offsets_,
+                self.bucket_capacity_,
+                self.bucket_sizes,
+                vk,
+                vt,
+                vs,
+                policy,
+                self._ref_counter,
+            )
+
+        _, _, indices = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            None,
+            ScorePolicy.CONST,
+        )
+        return indices
+
+    def _deterministic_insert_and_evict(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+        policy: ScorePolicy,
+    ) -> Tuple[
+        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Deterministic insert_and_evict: bucketize, insert-and-evict one wave
+        at a time, accumulate evicted data, then lookup for final indices.
+        Returns ``(indices, num_evicted, evicted_keys, evicted_indices,
+        evicted_scores, evicted_table_ids)``."""
+        n = keys.numel()
+        device = keys.device
+        if n == 0:
+            e = torch.empty(0, dtype=torch.int64, device=device)
+            return e, 0, torch.empty_like(keys[:0]), e.clone(), e.clone(), e.clone()
+
+        evicted_keys_buf = torch.empty_like(keys)
+        evicted_indices_buf = torch.zeros(n, dtype=torch.int64, device=device)
+        evicted_scores_buf = torch.empty(n, dtype=torch.uint64, device=device)
+        evicted_tids_buf = torch.empty(n, dtype=torch.int64, device=device)
+        num_evicted_accum = 0
+
+        keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
+        for i in range(keys_t.size(0)):
+            valid = keys_t[i] != -1
+            if not valid.any():
+                continue
+            vk = keys_t[i][valid].contiguous()
+            vt = tids_t[i][valid].contiguous()
+            vs = (
+                scores_t[i][valid].contiguous().to(torch.uint64)
+                if scores_t is not None
+                else None
+            )
+            (
+                _wave_idx,
+                num_ev,
+                ev_keys,
+                ev_indices,
+                ev_scores,
+                ev_tids,
+            ) = table_insert_and_evict(
+                self.table_storage_,
+                self.table_bucket_offsets_,
+                self.bucket_capacity_,
+                self.bucket_sizes,
+                vk,
+                vt,
+                vs,
+                policy,
+                self._ref_counter,
+            )
+            h_num_ev = num_ev.cpu().item()
+            if h_num_ev > 0:
+                s = num_evicted_accum
+                e = s + h_num_ev
+                evicted_keys_buf[s:e].copy_(ev_keys[:h_num_ev], non_blocking=True)
+                evicted_indices_buf[s:e].copy_(ev_indices[:h_num_ev], non_blocking=True)
+                evicted_scores_buf[s:e].copy_(ev_scores[:h_num_ev], non_blocking=True)
+                evicted_tids_buf[s:e].copy_(ev_tids[:h_num_ev], non_blocking=True)
+                num_evicted_accum = e
+
+        _, _, indices = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            None,
+            ScorePolicy.CONST,
+        )
+        return (
+            indices,
+            num_evicted_accum,
+            evicted_keys_buf[:num_evicted_accum],
+            evicted_indices_buf[:num_evicted_accum],
+            evicted_scores_buf[:num_evicted_accum],
+            evicted_tids_buf[:num_evicted_accum],
+        )
+
+    def _deterministic_insert_and_evict_with_overflow(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+        policy: ScorePolicy,
+    ) -> Tuple[
+        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Like ``_deterministic_insert_and_evict`` but passes overflow
+        parameters to ``table_insert_and_evict`` and uses
+        ``lookup_with_overflow``-style lookup for final indices."""
+        n = keys.numel()
+        device = keys.device
+        if n == 0:
+            e = torch.empty(0, dtype=torch.int64, device=device)
+            return e, 0, torch.empty_like(keys[:0]), e.clone(), e.clone(), e.clone()
+
+        evicted_keys_buf = torch.empty_like(keys)
+        evicted_indices_buf = torch.zeros(n, dtype=torch.int64, device=device)
+        evicted_scores_buf = torch.empty(n, dtype=torch.uint64, device=device)
+        evicted_tids_buf = torch.empty(n, dtype=torch.int64, device=device)
+        num_evicted_accum = 0
+
+        keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
+        for i in range(keys_t.size(0)):
+            valid = keys_t[i] != -1
+            if not valid.any():
+                continue
+            vk = keys_t[i][valid].contiguous()
+            vt = tids_t[i][valid].contiguous()
+            vs = (
+                scores_t[i][valid].contiguous().to(torch.uint64)
+                if scores_t is not None
+                else None
+            )
+            (
+                _wave_idx,
+                num_ev,
+                ev_keys,
+                ev_indices,
+                ev_scores,
+                ev_tids,
+            ) = table_insert_and_evict(
+                self.table_storage_,
+                self.table_bucket_offsets_,
+                self.bucket_capacity_,
+                self.bucket_sizes,
+                vk,
+                vt,
+                vs,
+                policy,
+                self._ref_counter,
+                ovf_storage=self.overflow_table_storage_,
+                ovf_bucket_capacity=self.overflow_bucket_capacity_,
+                ovf_bucket_sizes=self.overflow_bucket_sizes,
+                ovf_counter=self._ovf_counter,
+                ovf_output_offsets=self.overflow_output_offsets_,
+            )
+            h_num_ev = num_ev.cpu().item()
+            if h_num_ev > 0:
+                s = num_evicted_accum
+                e = s + h_num_ev
+                evicted_keys_buf[s:e].copy_(ev_keys[:h_num_ev], non_blocking=True)
+                evicted_indices_buf[s:e].copy_(ev_indices[:h_num_ev], non_blocking=True)
+                evicted_scores_buf[s:e].copy_(ev_scores[:h_num_ev], non_blocking=True)
+                evicted_tids_buf[s:e].copy_(ev_tids[:h_num_ev], non_blocking=True)
+                num_evicted_accum = e
+
+        _, _, indices = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            None,
+            ScorePolicy.CONST,
+            ovf_storage=self.overflow_table_storage_,
+            ovf_bucket_capacity=self.overflow_bucket_capacity_,
+            ovf_output_offsets=self.overflow_output_offsets_,
+        )
+        return (
+            indices,
+            num_evicted_accum,
+            evicted_keys_buf[:num_evicted_accum],
+            evicted_indices_buf[:num_evicted_accum],
+            evicted_scores_buf[:num_evicted_accum],
+            evicted_tids_buf[:num_evicted_accum],
+        )
+
 
 def get_scored_table(
     capacity: List[int],
@@ -980,6 +1494,7 @@ def get_scored_table(
     probing_type=ProbingType.LINEAR,
     reduction_type=ReductionType.LINEAR,
     bucket_load_factor=0.5,  # used when probing_type=ProbingType.CHAINED
+    enable_overflow: bool = False,
 ) -> ScoredHashTable:
     if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
         return LinearBucketTable(
@@ -988,6 +1503,7 @@ def get_scored_table(
             key_type=key_type,
             bucket_capacity=bucket_capacity,
             device=device,
+            enable_overflow=enable_overflow,
         )
     else:
         raise NotImplementedError

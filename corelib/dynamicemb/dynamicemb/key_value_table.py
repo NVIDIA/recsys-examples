@@ -16,7 +16,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch  # usort:skip
@@ -24,7 +24,6 @@ import torch.distributed as dist
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
-    LinearBucketTable,
     ScoreArg,
     ScorePolicy,
     ScoreSpec,
@@ -48,7 +47,6 @@ from dynamicemb_extensions import select_insert_failed_values
 from dynamicemb_extensions import store_to_flat_table_contiguous as _store_contiguous
 from dynamicemb_extensions import store_to_flat_table_value as _store_value
 from torch import Tensor, nn  # usort:skip
-from torchrec import JaggedTensor
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -128,11 +126,15 @@ class DynamicEmbTableState:
     score: Optional[int] = None
     score_update: bool = False
     timestamp: int = 0
+    # Overflow region fields (per-table, only set when overflow is enabled)
+    overflow_caps: Optional[List[int]] = None
+    overflow_offsets: Optional[List[int]] = None
 
 
 def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
+    enable_overflow: bool = False,
 ) -> DynamicEmbTableState:
     if not options:
         raise ValueError("options must be non-empty")
@@ -152,6 +154,7 @@ def create_table_state(
         key_type=base_opt.index_type,
         score_specs=[score_policy],
         device=device,
+        enable_overflow=enable_overflow,
     )
     capacity = key_index_map.capacity()
 
@@ -172,9 +175,20 @@ def create_table_state(
 
     actual_caps = key_index_map.per_table_capacity_
 
+    overflow_caps_list: Optional[List[int]] = None
+    overflow_offsets_list: Optional[List[int]] = None
+
+    if enable_overflow:
+        ovf_cap = key_index_map.overflow_bucket_capacity_
+        overflow_caps_list = [ovf_cap] * num_tables
+        overflow_offsets_list = list(actual_caps)
+
     tables: List[torch.Tensor] = []
-    for cap, vd in zip(actual_caps, value_dims):
-        size = cap * vd
+    for i, (cap, vd) in enumerate(zip(actual_caps, value_dims)):
+        total_cap = cap
+        if enable_overflow:
+            total_cap += overflow_caps_list[i]
+        size = total_cap * vd
         if base_opt.local_hbm_for_values == 0:
             tables.append(get_uvm_tensor(size, dtype=emb_dtype, device=device))
         else:
@@ -216,6 +230,8 @@ def create_table_state(
         score=None,
         score_update=False,
         timestamp=device_timestamp(),
+        overflow_caps=overflow_caps_list,
+        overflow_offsets=overflow_offsets_list,
     )
 
 
@@ -440,15 +456,6 @@ def _insert_key_values(
     unique_values: torch.Tensor,
     scores: Optional[torch.Tensor] = None,
 ) -> None:
-    if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
-        return _deterministic_insert(
-            state,
-            unique_keys,
-            unique_values,
-            table_ids,
-            scores,
-        )
-
     score_arg = _prepare_insert_score_arg(
         state, scores, unique_keys.numel(), unique_keys.device
     )
@@ -465,9 +472,6 @@ def _insert_and_evict_keys(
     """Key-only insert_and_evict. Returns (indices, num_evicted, evicted_keys,
     evicted_table_ids, evicted_indices, evicted_scores).
     Caller is responsible for loading evicted values and storing new values."""
-    if os.environ.get("DEMB_DETERMINISM_MODE", None) is not None:
-        return _deterministic_insert_and_evict_keys(state, keys, table_ids, scores)
-
     batch = keys.numel()
 
     if state.use_score and scores is None:
@@ -495,223 +499,6 @@ def _insert_and_evict_keys(
         evicted_table_ids,
         evicted_indices,
         evicted_scores,
-    )
-
-
-def _deterministic_insert(
-    state: DynamicEmbTableState,
-    unique_keys: torch.Tensor,
-    unique_values: torch.Tensor,
-    table_ids: torch.Tensor,
-    scores: Optional[torch.Tensor] = None,
-) -> None:
-    h_num_unique_keys = unique_keys.numel()
-
-    if h_num_unique_keys == 0:
-        return
-
-    if state.use_score and scores is None:
-        scores = torch.empty(
-            h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
-        )
-        scores.fill_(state.score)
-
-    policy = state.score_policy.policy
-
-    if state.score_policy.policy == ScorePolicy.ACCUMULATE:
-        policy = ScorePolicy.ASSIGN
-
-    if not state.use_score and scores is not None:
-        policy = ScorePolicy.ASSIGN
-
-    assert isinstance(
-        state.key_index_map, LinearBucketTable
-    ), "deterministic insert implementation only supports LinearBucketTable as key-index-map."
-    bkt_keys, offsets, inverse = cast(
-        LinearBucketTable, state.key_index_map
-    ).bucketize_keys(unique_keys, table_ids)
-
-    bkt_table_ids = table_ids[inverse]
-
-    jagged_keys = JaggedTensor(
-        values=bkt_keys.to(torch.int64),
-        offsets=offsets,
-        weights=scores.to(torch.int64)[inverse] if scores is not None else None,
-    )
-
-    jagged_tids = JaggedTensor(
-        values=bkt_table_ids.to(torch.int64),
-        offsets=offsets,
-    )
-
-    pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
-    pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
-    pad_tids = jagged_tids.to_padded_dense(padding_value=0.0)
-
-    keys_t = pad_keys.transpose(0, 1).to(state.key_index_map.key_type).contiguous()
-    score_t = (
-        pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
-    )
-    tids_t = pad_tids.transpose(0, 1).to(torch.int64).contiguous()
-
-    num_iter = keys_t.size(0)
-    for i in range(num_iter):
-        valid_mask = keys_t[i] != -1
-        valid_keys = keys_t[i][valid_mask].contiguous()
-        valid_tids = tids_t[i][valid_mask].contiguous()
-        score_arg_insert = ScoreArg(
-            name=state.score_policy.name,
-            value=score_t[i][valid_mask].contiguous().to(torch.uint64)
-            if score_t is not None
-            else None,
-            policy=policy,
-        )
-        state.key_index_map.insert(valid_keys, valid_tids, score_arg_insert)
-
-    score_arg_lookup = ScoreArg(
-        name=state.score_policy.name,
-        policy=ScorePolicy.CONST,
-    )
-    _, founds, indices = state.key_index_map.lookup(
-        unique_keys, table_ids, score_arg_lookup
-    )
-    store_to_flat(state, indices, table_ids, unique_values)
-
-
-def _deterministic_insert_and_evict_keys(
-    state: DynamicEmbTableState,
-    unique_keys: torch.Tensor,
-    table_ids: torch.Tensor,
-    scores: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Key-only deterministic insert_and_evict. Returns (indices, num_evicted_accum,
-    evicted_keys, evicted_table_ids, evicted_indices, evicted_scores)."""
-    h_num_unique_keys = unique_keys.numel()
-
-    if h_num_unique_keys == 0:
-        empty_idx = torch.empty(0, dtype=torch.int64, device=unique_keys.device)
-        empty_tids = torch.empty(0, dtype=torch.int64, device=unique_keys.device)
-        return (
-            empty_idx,
-            0,
-            torch.empty_like(unique_keys[:0]),
-            empty_tids,
-            empty_idx,
-            empty_idx,
-        )
-
-    num_evicted_accum = 0
-    evicted_keys_accum = torch.empty_like(unique_keys)
-    evicted_indices_accum = torch.zeros(
-        h_num_unique_keys,
-        dtype=state.key_index_map.index_type,
-        device=unique_keys.device,
-    )
-    evicted_scores_accum = torch.empty(
-        h_num_unique_keys, dtype=torch.uint64, device=unique_keys.device
-    )
-    evicted_table_ids_accum = torch.empty(
-        h_num_unique_keys, dtype=torch.int64, device=unique_keys.device
-    )
-
-    if state.use_score and scores is None:
-        scores = torch.empty(
-            h_num_unique_keys, device=unique_keys.device, dtype=torch.uint64
-        )
-        scores.fill_(state.score)
-
-    assert isinstance(
-        state.key_index_map, LinearBucketTable
-    ), "deterministic insert_and_evict implementation only supports LinearBucketTable as key-index-map."
-    bkt_keys, offsets, inverse = cast(
-        LinearBucketTable, state.key_index_map
-    ).bucketize_keys(unique_keys, table_ids)
-
-    bkt_table_ids = table_ids[inverse]
-
-    jagged_keys = JaggedTensor(
-        values=bkt_keys.to(torch.int64),
-        offsets=offsets,
-        weights=scores.to(torch.int64)[inverse] if scores is not None else None,
-    )
-
-    jagged_tids = JaggedTensor(
-        values=bkt_table_ids.to(torch.int64),
-        offsets=offsets,
-    )
-
-    pad_keys = jagged_keys.to_padded_dense(padding_value=-1.0)
-    pad_scores = jagged_keys.to_padded_dense_weights(padding_value=0.0)
-    pad_tids = jagged_tids.to_padded_dense(padding_value=0.0)
-
-    keys_t = pad_keys.transpose(0, 1).to(state.key_index_map.key_type).contiguous()
-    score_t = (
-        pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
-    )
-    tids_t = pad_tids.transpose(0, 1).to(torch.int64).contiguous()
-
-    num_iter = keys_t.size(0)
-    for i in range(num_iter):
-        valid_mask = keys_t[i] != -1
-        valid_keys = keys_t[i][valid_mask].contiguous()
-        valid_tids = tids_t[i][valid_mask].contiguous()
-        score_arg_insert = ScoreArg(
-            name=state.score_policy.name,
-            value=score_t[i][valid_mask].contiguous().to(torch.uint64)
-            if score_t is not None
-            else None,
-            policy=state.score_policy.policy,
-        )
-
-        (
-            _,
-            num_evicted,
-            evicted_keys,
-            evicted_indices,
-            evicted_scores,
-            evicted_table_ids,
-        ) = state.key_index_map.insert_and_evict(
-            valid_keys, valid_tids, score_arg_insert
-        )
-
-        if num_evicted != 0:
-            evicted_keys_accum[
-                num_evicted_accum : num_evicted_accum + num_evicted
-            ].copy_(evicted_keys, non_blocking=True)
-            evicted_indices_accum[
-                num_evicted_accum : num_evicted_accum + num_evicted
-            ].copy_(evicted_indices, non_blocking=True)
-            evicted_scores_accum[
-                num_evicted_accum : num_evicted_accum + num_evicted
-            ].copy_(evicted_scores, non_blocking=True)
-            evicted_table_ids_accum[
-                num_evicted_accum : num_evicted_accum + num_evicted
-            ].copy_(evicted_table_ids, non_blocking=True)
-
-            num_evicted_accum += num_evicted
-
-    evicted_keys_accum = evicted_keys_accum[:num_evicted_accum]
-    evicted_indices_accum = evicted_indices_accum[:num_evicted_accum]
-    evicted_scores_accum = evicted_scores_accum[:num_evicted_accum]
-    evicted_table_ids_accum = evicted_table_ids_accum[:num_evicted_accum]
-
-    assert len(set(evicted_indices_accum.tolist())) == num_evicted_accum
-
-    score_arg_lookup = ScoreArg(
-        name=state.score_policy.name,
-        policy=ScorePolicy.CONST,
-    )
-    _, founds, indices = state.key_index_map.lookup(
-        unique_keys, table_ids, score_arg_lookup
-    )
-
-    return (
-        indices,
-        num_evicted_accum,
-        evicted_keys_accum,
-        evicted_table_ids_accum,
-        evicted_indices_accum,
-        evicted_scores_accum,
     )
 
 
@@ -1088,32 +875,42 @@ class DynamicEmbCache(Cache):
         options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
-        self._state = create_table_state(options, optimizer)
+        self._state = create_table_state(options, optimizer, enable_overflow=True)
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
 
     # -- Cache interface --
 
-    def find(
+    def increment_counter(self, slot_indices: torch.Tensor) -> None:
+        self._state.key_index_map.increment_counter(slot_indices)
+
+    def decrement_counter(self, slot_indices: torch.Tensor) -> None:
+        self._state.key_index_map.decrement_counter(slot_indices)
+
+    def lookup(
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        int,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        result = _find_keys(self._state, unique_keys, table_ids, input_scores)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lookup with overflow fallback. Returns (score_out, founds, indices)."""
+        state = self._state
+        scores = create_scores(
+            state, unique_keys.size(0), unique_keys.device, input_scores
+        )
+        score_arg = ScoreArg(
+            name=state.score_policy.name,
+            value=scores,
+            policy=state.score_policy.policy
+            if state.score_update
+            else ScorePolicy.CONST,
+        )
+        result = state.key_index_map.lookup_with_overflow(
+            unique_keys, table_ids, score_arg
+        )
         if self._record_cache_metrics:
-            batch = unique_keys.size(0)
-            self._cache_metrics[0] = batch
-            founds = result[5]
+            self._cache_metrics[0] = unique_keys.size(0)
+            founds = result[1]
             self._cache_metrics[1] = founds.sum().item()
         return result
 
@@ -1125,7 +922,20 @@ class DynamicEmbCache(Cache):
     ) -> Tuple[
         torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
-        result = _insert_and_evict_keys(self._state, keys, table_ids, scores)
+        """Insert with counter-aware eviction and overflow fallback."""
+        state = self._state
+        batch = keys.numel()
+        if state.use_score and scores is None:
+            scores = torch.empty(batch, device=keys.device, dtype=torch.uint64)
+            scores.fill_(state.score)
+        score_arg = ScoreArg(
+            name=state.score_policy.name,
+            value=scores,
+            policy=state.score_policy.policy,
+        )
+        result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
+            keys, table_ids, score_arg
+        )
         if self._record_cache_metrics:
             self._cache_metrics[2] = keys.numel()
             self._cache_metrics[3] = result[1]  # num_evicted
@@ -1191,6 +1001,10 @@ class DynamicEmbCache(Cache):
     def size(self) -> int:
         return self._state.key_index_map.size()
 
+    @property
+    def key_index_map(self):
+        return self._state.key_index_map
+
 
 # ---------------------------------------------------------------------------
 # DynamicEmbStorage – Storage interface (find with values, insert, dump, load)
@@ -1203,7 +1017,16 @@ class DynamicEmbStorage(Storage):
         options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
-        self._state = create_table_state(options, optimizer)
+        is_hbm = options[0].local_hbm_for_values > 0
+        self._state = create_table_state(
+            options,
+            optimizer,
+            enable_overflow=is_hbm,
+        )
+
+    @property
+    def key_index_map(self):
+        return self._state.key_index_map
 
     # -- Storage interface --
 
@@ -1227,6 +1050,12 @@ class DynamicEmbStorage(Storage):
         indices = result[-1]
         values = load_from_flat(self._state, indices, table_ids, copy_mode=copy_mode)
         return (*result[:-1], values)
+
+    def increment_counter(self, slot_indices: torch.Tensor) -> None:
+        self._state.key_index_map.increment_counter(slot_indices)
+
+    def decrement_counter(self, slot_indices: torch.Tensor) -> None:
+        self._state.key_index_map.decrement_counter(slot_indices)
 
     def insert(
         self,
@@ -1300,7 +1129,9 @@ class DynamicEmbStorage(Storage):
         device: torch.device,
         batch_size: int = 65536,
         table_id: int = 0,
-    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
+    ) -> Iterator[
+        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+    ]:
         yield from export_keys_values_iter(self._state, device, batch_size, table_id)
 
     # -- Property accessors --
@@ -1771,26 +1602,18 @@ def _eval_lookup_cached(
     table_ids: torch.Tensor,
     initializer: Callable,
 ) -> torch.Tensor:
-    (
-        h_num_keys_for_storage,
-        missing_keys,
-        missing_indices,
-        missing_table_ids,
-        _,
-        _,
-        _,
-        cache_indices,
-    ) = cache.find(
-        keys,
-        table_ids,
-        input_scores=None,
-    )
+    _, founds, cache_indices = cache.lookup(keys, table_ids, input_scores=None)
 
     embs = load_from_flat(
         cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
     )
 
-    if h_num_keys_for_storage == 0:
+    missing_mask = ~founds
+    h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact(
+        missing_mask, [keys, table_ids]
+    )
+
+    if h_num_miss == 0:
         return embs
 
     (
@@ -1812,7 +1635,7 @@ def _eval_lookup_cached(
     if h_num_missing_in_storage > 0:
         initializer(storage_embs, missing_indices_in_storage, missing_keys)
 
-    embs[missing_indices, :] = storage_embs
+    embs[miss_compact_idx, :] = storage_embs
 
     return embs
 
