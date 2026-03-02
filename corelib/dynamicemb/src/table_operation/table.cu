@@ -99,7 +99,10 @@ void bind_table_operation(py::module &m) {
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("keys"),
         py::arg("table_ids"),
-        py::arg("score_input"), py::arg("policy_type"));
+        py::arg("score_input"), py::arg("policy_type"),
+        py::arg("ovf_storage") = py::none(),
+        py::arg("ovf_bucket_capacity") = 0,
+        py::arg("ovf_output_offsets") = py::none());
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
@@ -107,6 +110,7 @@ void bind_table_operation(py::module &m) {
         py::arg("bucket_sizes"), py::arg("keys"),
         py::arg("table_ids"),
         py::arg("score_input"), py::arg("policy_type"),
+        py::arg("counter"),
         py::arg("insert_results") = py::none(),
         py::arg("score_output") = py::none());
 
@@ -117,8 +121,14 @@ void bind_table_operation(py::module &m) {
         py::arg("bucket_sizes"), py::arg("keys"),
         py::arg("table_ids"),
         py::arg("score_input"), py::arg("policy_type"),
+        py::arg("counter"),
         py::arg("insert_results") = py::none(),
-        py::arg("score_output") = py::none());
+        py::arg("score_output") = py::none(),
+        py::arg("ovf_storage") = py::none(),
+        py::arg("ovf_bucket_capacity") = 0,
+        py::arg("ovf_bucket_sizes") = py::none(),
+        py::arg("ovf_counter") = py::none(),
+        py::arg("ovf_output_offsets") = py::none());
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
@@ -145,6 +155,12 @@ void bind_table_operation(py::module &m) {
         "buckets offset, inverse indices.",
         py::arg("keys"), py::arg("table_ids"),
         py::arg("table_bucket_offsets"), py::arg("bucket_capacity"));
+
+
+  m.def("table_update_counter", &dyn_emb::table_update_counter,
+        "atomically update counters at slot indices",
+        py::arg("counter"), py::arg("capacity"),
+        py::arg("slot_indices"), py::arg("delta"));
 
   py::enum_<dyn_emb::ScorePolicyType>(m, "ScorePolicy")
       .value("CONST", dyn_emb::ScorePolicyType::Const)

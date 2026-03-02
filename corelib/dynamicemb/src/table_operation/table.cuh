@@ -98,7 +98,10 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys,
              at::Tensor table_ids,
              std::optional<at::Tensor> score_input,
-             ScorePolicyType policy_type);
+             ScorePolicyType policy_type,
+             std::optional<at::Tensor> ovf_storage = std::nullopt,
+             int64_t ovf_bucket_capacity = 0,
+             std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
 
 at::Tensor table_insert(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                         int64_t bucket_capacity,
@@ -106,6 +109,7 @@ at::Tensor table_insert(at::Tensor table_storage, at::Tensor table_bucket_offset
                         at::Tensor table_ids,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type,
+                        at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt);
 
@@ -116,8 +120,14 @@ table_insert_and_evict(at::Tensor table_storage, at::Tensor table_bucket_offsets
                        at::Tensor table_ids,
                        std::optional<at::Tensor> score_input,
                        ScorePolicyType policy_type,
+                       at::Tensor counter,
                        std::optional<at::Tensor> insert_results = std::nullopt,
-                       std::optional<at::Tensor> score_output = std::nullopt);
+                       std::optional<at::Tensor> score_output = std::nullopt,
+                       std::optional<at::Tensor> ovf_storage = std::nullopt,
+                       int64_t ovf_bucket_capacity = 0,
+                       std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
+                       std::optional<at::Tensor> ovf_counter = std::nullopt,
+                       std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity,
@@ -147,5 +157,10 @@ std::vector<at::Tensor> tensor_partition(at::Tensor input,
 std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
                                        int64_t bucket_capacity);
+
+
+void table_update_counter(
+    at::Tensor counter, int64_t capacity,
+    at::Tensor slot_indices, int32_t delta);
 
 } // namespace dyn_emb

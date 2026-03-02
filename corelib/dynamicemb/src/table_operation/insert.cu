@@ -28,6 +28,7 @@ void launch_table_insert_kernel(
     InsertResult *insert_results_ptr,
     IndexType *indices_ptr, ScoreType *score_input_ptr,
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
+    int32_t *counter_ptr,
     cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits =
@@ -38,7 +39,8 @@ void launch_table_insert_kernel(
           table, table_bucket_offsets_ptr,
           bucket_sizes_ptr, num_total, keys_ptr, table_ids_ptr,
           insert_results_ptr,
-          indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_ptr);
+          indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_ptr,
+          counter_ptr);
 
   table_unlock_kernel<Table>
       <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -52,7 +54,8 @@ void table_insert_single_score(at::Tensor table_storage,
                                std::optional<at::Tensor> score_input,
                                ScorePolicyType policy_type, at::Tensor indices,
                                std::optional<at::Tensor> insert_results,
-                               std::optional<at::Tensor> score_output) {
+                               std::optional<at::Tensor> score_output,
+                               at::Tensor counter) {
 
   auto key_type = get_data_type(keys);
 
@@ -78,6 +81,7 @@ void table_insert_single_score(at::Tensor table_storage,
   auto bucket_sizes_ptr = get_pointer<int>(bucket_sizes);
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
+  auto counter_ptr = counter.data_ptr<int32_t>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -111,14 +115,14 @@ void table_insert_single_score(at::Tensor table_storage,
             bucket_sizes_ptr, num_total, keys_ptr, table_ids_ptr,
             insert_results_ptr,
             indices_ptr, score_input_ptr, score_output_ptr, table_key_slots_ptr,
-            stream);
+            counter_ptr, stream);
       } else {
         launch_table_insert_kernel<Table, PolicyTypeV, false>(
             table, table_bucket_offsets_ptr,
             bucket_sizes_ptr, num_total, keys_ptr, table_ids_ptr,
             insert_results_ptr,
             indices_ptr, score_input_ptr, nullptr, table_key_slots_ptr,
-            stream);
+            counter_ptr, stream);
       }
     });
   });
@@ -131,6 +135,7 @@ at::Tensor table_insert(at::Tensor table_storage, at::Tensor table_bucket_offset
                         at::Tensor table_ids,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type,
+                        at::Tensor counter,
                         std::optional<at::Tensor> insert_results,
                         std::optional<at::Tensor> score_output) {
 
@@ -145,7 +150,7 @@ at::Tensor table_insert(at::Tensor table_storage, at::Tensor table_bucket_offset
   table_insert_single_score(table_storage, table_bucket_offsets,
                             bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
-                            score_output);
+                            score_output, counter);
 
   return indices;
 }

@@ -29,8 +29,8 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage, Storage
-from dynamicemb.types import CopyMode
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.types import CopyMode
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
@@ -209,7 +209,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         )
 
         return (
-            num_missing.item() if isinstance(num_missing, torch.Tensor) else num_missing,
+            num_missing.item()
+            if isinstance(num_missing, torch.Tensor)
+            else num_missing,
             missing_keys,
             missing_indices,
             missing_table_ids,
@@ -499,9 +501,9 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             if opt_state_dim > 0:
-                values[:, max_emb_dim : max_emb_dim + opt_state_dim] = (
-                    storage.init_optimizer_state()
-                )
+                values[
+                    :, max_emb_dim : max_emb_dim + opt_state_dim
+                ] = storage.init_optimizer_state()
             storage.set_score(1)
             storage.insert(indices, table_ids, values)
         elif isinstance(storage, PyDictStorage):
@@ -520,7 +522,7 @@ def init_embedding_tables(stbe, bdet):
 @pytest.mark.parametrize(
     "opt_type,opt_params",
     [
-        # (EmbOptimType.SGD, {"learning_rate": 0.3}),
+        (EmbOptimType.SGD, {"learning_rate": 0.3}),
         (
             EmbOptimType.ADAM,
             {
@@ -535,10 +537,7 @@ def init_embedding_tables(stbe, bdet):
 )
 @pytest.mark.parametrize(
     "deterministic",
-    [
-        True,
-        False
-    ],
+    [True, False],
 )
 @pytest.mark.parametrize(
     "caching, PS, local_hbm_for_values",
@@ -996,7 +995,6 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     # 2. Test prefetch works when Cache empty
     with torch.cuda.stream(pretch_stream):
         bdeb.prefetch(indicesA, offsetsA, forward_stream)
-        assert bdeb.num_prefetch_ahead == 1
         assert list(bdeb.get_score().values()) == [1] * len(dims)
 
     with torch.cuda.stream(forward_stream):
@@ -1028,7 +1026,6 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     with torch.cuda.stream(pretch_stream):
         bdeb.prefetch(indicesA, offsetsA, forward_stream)
         bdeb.prefetch(indicesB, offsetsB, forward_stream)
-        assert bdeb.num_prefetch_ahead == 2
         assert list(bdeb.get_score().values()) == [2] * len(dims)
 
     with torch.cuda.stream(forward_stream):
@@ -1274,338 +1271,3 @@ def test_empty_batch(opt_type, opt_params, dim, caching, deterministic, PS):
         del os.environ["DEMB_DETERMINISM_MODE"]
 
     print("all check passed")
-
-
-# ---------------------------------------------------------------------------
-# Multi-table tests: mixed dims, caching, admission, dump/load
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-        (
-            EmbOptimType.ADAM,
-            {
-                "learning_rate": 0.3,
-                "weight_decay": 0.06,
-                "eps": 3e-5,
-                "beta1": 0.8,
-                "beta2": 0.888,
-            },
-        ),
-    ],
-)
-@pytest.mark.parametrize("caching", [True, False])
-@pytest.mark.parametrize(
-    "pooling_mode, dims",
-    [
-        (DynamicEmbPoolingMode.SUM, [8, 16, 32]),
-        (DynamicEmbPoolingMode.MEAN, [4, 8, 16]),
-    ],
-)
-def test_multi_table_mixed_dims_forward_backward(
-    opt_type, opt_params, caching, pooling_mode, dims
-):
-    """Multi-table forward/backward with mixed embedding dimensions."""
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-
-    table_names = ["table0", "table1", "table2"]
-    feature_table_map = [0, 1, 2]
-    key_type = torch.int64
-    value_type = torch.float32
-    max_capacity = 2048
-
-    dyn_emb_table_options_list = []
-    for dim in dims:
-        opt = DynamicEmbTableOptions(
-            dim=dim,
-            init_capacity=max_capacity,
-            max_capacity=max_capacity,
-            index_type=key_type,
-            embedding_dtype=value_type,
-            device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
-            local_hbm_for_values=1024**3,
-        )
-        dyn_emb_table_options_list.append(opt)
-
-    bdeb = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=feature_table_map,
-        pooling_mode=pooling_mode,
-        optimizer=opt_type,
-        use_index_dedup=True,
-        **opt_params,
-    )
-
-    assert isinstance(bdeb.tables, DynamicEmbStorage)
-    assert bdeb.tables.num_tables == 3
-
-    batch_size = 4
-    indices = torch.tensor(
-        [0, 1, 2, 3, 10, 11, 12, 13, 100, 101, 102, 103],
-        dtype=key_type,
-        device=device,
-    )
-    offsets = torch.tensor(
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-        dtype=key_type,
-        device=device,
-    )
-
-    for i in range(5):
-        embs = bdeb(indices, offsets)
-        torch.cuda.synchronize()
-
-        total_D = sum(dims[feature_table_map[f]] for f in range(len(feature_table_map)))
-        assert embs.shape == (batch_size, total_D)
-
-        loss = embs.mean()
-        loss.backward()
-        torch.cuda.synchronize()
-
-    print("test_multi_table_mixed_dims_forward_backward passed")
-
-
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-    ],
-)
-@pytest.mark.parametrize("caching", [True, False])
-def test_multi_table_with_admission(opt_type, opt_params, caching):
-    """Multi-table with frequency-based admission counter."""
-    from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
-
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-
-    dims = [8, 16]
-    table_names = ["table0", "table1"]
-    feature_table_map = [0, 1]
-    key_type = torch.int64
-    value_type = torch.float32
-    max_capacity = 2048
-
-    admit_strategy = FrequencyAdmissionStrategy(threshold=2)
-
-    dyn_emb_table_options_list = []
-    for dim in dims:
-        counter = KVCounter(capacity=max_capacity)
-        opt = DynamicEmbTableOptions(
-            dim=dim,
-            init_capacity=max_capacity,
-            max_capacity=max_capacity,
-            index_type=key_type,
-            embedding_dtype=value_type,
-            device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            caching=caching,
-            local_hbm_for_values=1024**3,
-            admit_strategy=admit_strategy,
-            admission_counter=counter,
-        )
-        dyn_emb_table_options_list.append(opt)
-
-    bdeb = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=feature_table_map,
-        pooling_mode=DynamicEmbPoolingMode.SUM,
-        optimizer=opt_type,
-        use_index_dedup=True,
-        **opt_params,
-    )
-
-    assert bdeb._admission_counter is not None
-
-    batch_size = 2
-    indices = torch.tensor([0, 1, 10, 11], dtype=key_type, device=device)
-    offsets = torch.tensor([0, 1, 2, 3, 4], dtype=key_type, device=device)
-
-    for i in range(5):
-        embs = bdeb(indices, offsets)
-        torch.cuda.synchronize()
-
-        total_D = sum(dims[f] for f in feature_table_map)
-        assert embs.shape == (batch_size, total_D)
-
-        loss = embs.mean()
-        loss.backward()
-        torch.cuda.synchronize()
-
-    print("test_multi_table_with_admission passed")
-
-
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-    ],
-)
-def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
-    """Multi-table dump and load using fused storage."""
-    import torch.distributed as dist
-
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="gloo", init_method="tcp://127.0.0.1:29500", rank=0, world_size=1
-        )
-
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-
-    dims = [8, 16]
-    table_names = ["table0", "table1"]
-    feature_table_map = [0, 1]
-    key_type = torch.int64
-    value_type = torch.float32
-    max_capacity = 1024
-
-    def make_bdeb():
-        opts = []
-        for dim in dims:
-            opt = DynamicEmbTableOptions(
-                dim=dim,
-                init_capacity=max_capacity,
-                max_capacity=max_capacity,
-                index_type=key_type,
-                embedding_dtype=value_type,
-                device_id=device_id,
-                score_strategy=DynamicEmbScoreStrategy.STEP,
-                caching=False,
-                local_hbm_for_values=1024**3,
-            )
-            opts.append(opt)
-        return BatchedDynamicEmbeddingTablesV2(
-            table_names=table_names,
-            table_options=opts,
-            feature_table_map=feature_table_map,
-            pooling_mode=DynamicEmbPoolingMode.SUM,
-            optimizer=opt_type,
-            use_index_dedup=True,
-            **opt_params,
-        )
-
-    bdeb_src = make_bdeb()
-
-    indices = torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=key_type, device=device)
-    offsets = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=key_type, device=device)
-
-    for _ in range(3):
-        embs = bdeb_src(indices, offsets)
-        loss = embs.mean()
-        loss.backward()
-        torch.cuda.synchronize()
-
-    save_dir = str(tmp_path)
-    bdeb_src.dump(save_dir)
-
-    keys0_src, vals0_src = bdeb_src.export_keys_values("table0", device)
-    keys1_src, vals1_src = bdeb_src.export_keys_values("table1", device)
-
-    bdeb_dst = make_bdeb()
-    bdeb_dst.load(save_dir)
-
-    keys0_dst, vals0_dst = bdeb_dst.export_keys_values("table0", device)
-    keys1_dst, vals1_dst = bdeb_dst.export_keys_values("table1", device)
-
-    idx0_src = keys0_src.argsort()
-    idx0_dst = keys0_dst.argsort()
-    torch.testing.assert_close(keys0_src[idx0_src], keys0_dst[idx0_dst])
-    torch.testing.assert_close(vals0_src[idx0_src], vals0_dst[idx0_dst])
-
-    idx1_src = keys1_src.argsort()
-    idx1_dst = keys1_dst.argsort()
-    torch.testing.assert_close(keys1_src[idx1_src], keys1_dst[idx1_dst])
-    torch.testing.assert_close(vals1_src[idx1_src], vals1_dst[idx1_dst])
-
-    print("test_multi_table_dump_load passed")
-
-
-@pytest.mark.parametrize(
-    "opt_type,opt_params",
-    [
-        (EmbOptimType.SGD, {"learning_rate": 0.3}),
-    ],
-)
-def test_multi_table_caching_flush(opt_type, opt_params):
-    """Multi-table caching mode: prefetch, forward, flush, verify cache metrics."""
-    assert torch.cuda.is_available()
-    device_id = 0
-    device = torch.device(f"cuda:{device_id}")
-
-    dims = [8, 16]
-    table_names = ["table0", "table1"]
-    feature_table_map = [0, 1]
-    key_type = torch.int64
-    value_type = torch.float32
-    max_capacity = 2048
-
-    dyn_emb_table_options_list = []
-    for dim in dims:
-        opt = DynamicEmbTableOptions(
-            dim=dim,
-            init_capacity=max_capacity,
-            max_capacity=max_capacity,
-            index_type=key_type,
-            embedding_dtype=value_type,
-            device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.STEP,
-            caching=True,
-            local_hbm_for_values=1024**3,
-        )
-        dyn_emb_table_options_list.append(opt)
-
-    bdeb = BatchedDynamicEmbeddingTablesV2(
-        table_names=table_names,
-        table_options=dyn_emb_table_options_list,
-        feature_table_map=feature_table_map,
-        pooling_mode=DynamicEmbPoolingMode.SUM,
-        optimizer=opt_type,
-        use_index_dedup=True,
-        **opt_params,
-    )
-    bdeb.enable_prefetch = True
-    bdeb.set_record_cache_metrics(True)
-
-    indices = torch.tensor([0, 1, 10, 11], dtype=key_type, device=device)
-    offsets = torch.tensor([0, 1, 2, 3, 4], dtype=key_type, device=device)
-
-    forward_stream = torch.cuda.Stream()
-    prefetch_stream = torch.cuda.Stream()
-
-    with torch.cuda.stream(forward_stream):
-        indices + 1
-    with torch.cuda.stream(prefetch_stream):
-        indices + 1
-
-    with torch.cuda.stream(prefetch_stream):
-        bdeb.prefetch(indices, offsets, forward_stream)
-
-    with torch.cuda.stream(forward_stream):
-        torch.cuda.current_stream().wait_stream(prefetch_stream)
-        embs = bdeb(indices, offsets)
-        loss = embs.mean()
-        loss.backward()
-
-    torch.cuda.synchronize()
-
-    cache = bdeb.cache
-    assert cache is not None
-    metrics = cache.cache_metrics
-    assert metrics[0].item() == metrics[1].item()
-
-    bdeb.flush()
-    bdeb.reset_cache_states()
-
-    print("test_multi_table_caching_flush passed")

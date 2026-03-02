@@ -433,7 +433,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.use_index_dedup = use_index_dedup
         self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
-        self.num_prefetch_ahead = 0
+        self._prefetch_outstanding_keys = torch.tensor(0, dtype=torch.int64)
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
@@ -814,7 +814,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return splits
 
     def flush(self) -> None:
-        self.num_prefetch_ahead = 0
+        self._prefetch_outstanding_keys.zero_()
         if self._caching and self._cache is not None:
             flush_cache(self._cache, self._storage)
 
@@ -856,7 +856,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     @enable_prefetch.setter
     def enable_prefetch(self, value: bool):
         self._enable_prefetch = value
-        self.num_prefetch_ahead = 0
+        self._prefetch_outstanding_keys.zero_()
 
     def forward(
         self,
@@ -869,11 +869,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
     ) -> List[Tensor]:
-        if self._enable_prefetch:
-            self.num_prefetch_ahead -= 1
-
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
+
+        scores = []
+        for table_name in self._table_names:
+            if table_name not in self._scores.keys():
+                raise RuntimeError(
+                    f"Must set score for table '{table_name}' whose score_strategy is customized."
+                )
+            scores.append(self._scores[table_name])
+
+        fused_score = self._reduce_table_scores(scores)
+        if isinstance(self._cache, DynamicEmbCache):
+            self._cache.score_update = self.training
+            self._cache.set_score(fused_score)
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+            self._storage.score_update = self.training
+            self._storage.set_score(fused_score)
 
         feature_batch_size = offsets.numel() - 1
         assert feature_batch_size > 0, "feature_batch_size must be greater than 0"
@@ -908,38 +921,20 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
             )
 
-        scores = []
-        for table_name in self._table_names:
-            if table_name not in self._scores.keys():
-                raise RuntimeError(
-                    f"Must set score for table '{table_name}' whose score_strategy is customized."
-                )
-            scores.append(self._scores[table_name])
-
-        fused_score = self._reduce_table_scores(scores)
-        if isinstance(self._cache, DynamicEmbCache):
-            self._cache.score_update = True
-            self._cache.set_score(fused_score)
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
-            self._storage.score_update = True
-            self._storage.set_score(fused_score)
-
-        prefetch_state = (
-            self._prefetch_states.popleft() if self._prefetch_states else None
-        )
+        if not self._prefetch_states:
+            self.prefetch(indices, offsets)
+        prefetch_state = self._prefetch_states.popleft()
 
         res = DynamicEmbeddingFunction.apply(
-            indices,
+            prefetch_state,
             offsets,
             self._cache,
             self._storage,
-            self.feature_offsets,
             self.output_dtype,
             self._initializers,
             self._optimizer,
             self._admit_strategy,
             self._evict_strategy,
-            per_sample_weights,
             self._admission_counter,
             self.pooling_mode,
             self.total_D,
@@ -947,7 +942,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self.dims,
             self.max_D,
             self.D_offsets_t,
-            prefetch_state,
             self._empty_tensor,
         )
         if isinstance(self._cache, DynamicEmbCache):
@@ -966,7 +960,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         forward_stream: Optional[torch.cuda.Stream] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
     ) -> None:
-        assert self._enable_prefetch, "Prefetch is not enabled."
         if not self.training:
             return
         if self.prefetch_stream is None and forward_stream is not None:
@@ -979,19 +972,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             indices.record_stream(current_stream)
             offsets.record_stream(current_stream)
 
-        if self._enable_prefetch:
-            self.num_prefetch_ahead += 1
-            assert self.num_prefetch_ahead >= 1, "Prefetch context mismatches."
-
-        prefetch_scores = self._get_prefetch_score()
-
-        prefetch_score = self._reduce_table_scores(prefetch_scores)
+        scores = [self._scores[name] for name in self._table_names]
+        fused_score = self._reduce_table_scores(scores)
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.score_update = True
-            self._cache.set_score(prefetch_score)
+            self._cache.set_score(fused_score)
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
             self._storage.score_update = True
-            self._storage.set_score(prefetch_score)
+            self._storage.set_score(fused_score)
 
         self._prefetch_states.append(
             dynamicemb_prefetch(
@@ -1006,6 +994,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 None,
                 self._admit_strategy,
                 self._admission_counter,
+                outstanding_keys_ref=self._prefetch_outstanding_keys
+                if self._cache is not None
+                else None,
             )
         )
 
@@ -1083,30 +1074,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._scores[table_name] = new_score
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
                 self._scores[table_name] = 1
-
-    def _get_prefetch_score(
-        self,
-    ):
-        ret_scores = []
-        for table_name, option in zip(self._table_names, self._dynamicemb_options):
-            cur_score = self._scores[table_name]
-            if (
-                self.enable_prefetch
-                and option.score_strategy == DynamicEmbScoreStrategy.STEP
-            ):
-                max_uint64 = (2**64) - 1
-                new_score = cur_score + self.num_prefetch_ahead - 1
-                if new_score > max_uint64:
-                    warnings.warn(
-                        f"Table '{table_name}' 's score({new_score}) is out of range, reset to 0.",
-                        UserWarning,
-                    )
-                    new_score = 0
-            else:
-                new_score = cur_score
-
-            ret_scores.append(new_score)
-        return ret_scores
 
     def _reduce_table_scores(self, scores: List[int]) -> int:
         if len(scores) == 0:
