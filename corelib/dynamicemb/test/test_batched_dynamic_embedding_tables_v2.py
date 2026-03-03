@@ -198,7 +198,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             missing_scores,
             founds,
             output_scores,
-        ) = self.find_impl(unique_keys, table_ids, unique_vals, lfu_accumulated_frequency)
+        ) = self.find_impl(
+            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency
+        )
 
         h_table_ids = table_ids.cpu()
         missing_table_ids_list = []

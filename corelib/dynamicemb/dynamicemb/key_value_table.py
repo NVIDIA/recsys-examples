@@ -497,9 +497,7 @@ def _insert_and_evict_keys(
     """Key-only insert_and_evict. Returns (indices, num_evicted, evicted_keys,
     evicted_table_ids, evicted_indices, evicted_scores).
     Caller is responsible for loading evicted values and storing new values."""
-    score_arg = get_insert_score_arg(
-        state, keys.numel(), keys.device, scores
-    )
+    score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
     (
         indices,
         num_evicted,
@@ -934,9 +932,7 @@ class DynamicEmbCache(Cache):
     ]:
         """Insert with counter-aware eviction and overflow fallback."""
         state = self._state
-        score_arg = get_insert_score_arg(
-            state, keys.numel(), keys.device, scores
-        )
+        score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
         result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
             keys, table_ids, score_arg
         )
@@ -1296,7 +1292,10 @@ class HybridStorage(Storage):
             )
 
         result_host = _find_keys(
-            self._host, missing_keys_hbm, missing_table_ids_hbm, missing_scores_hbm,
+            self._host,
+            missing_keys_hbm,
+            missing_table_ids_hbm,
+            missing_scores_hbm,
         )
         (
             h_num_missing_both,

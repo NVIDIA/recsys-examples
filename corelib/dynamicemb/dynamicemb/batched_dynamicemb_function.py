@@ -333,9 +333,7 @@ def _prefetch_cache_path(
             new_tids_sub = miss_tids[new_miss_indices]
 
             freq_for_admission = (
-                miss_lfu_freq[new_miss_indices]
-                if miss_lfu_freq is not None
-                else None
+                miss_lfu_freq[new_miss_indices] if miss_lfu_freq is not None else None
             )
             counters = (
                 freq_for_admission
@@ -545,9 +543,7 @@ def _prefetch_hbm_direct_path(
             if val_dim != emb_dim:
                 init_values[:, emb_dim:] = state.initial_optim_state
 
-            score_arg = get_insert_score_arg(
-                state, n_admitted, device, admitted_scores
-            )
+            score_arg = get_insert_score_arg(state, n_admitted, device, admitted_scores)
             new_indices = state.key_index_map.insert(
                 admitted_keys,
                 admitted_tids,
