@@ -15,6 +15,7 @@ from .batch_allgather import allgather_batch
 _PRINT_LOAD_BALANCE = os.environ.get("PRINT_LOAD_BALANCE", "0") == "1"
 _PRINT_LOAD_BALANCE_START = int(os.environ.get("PRINT_LOAD_BALANCE_START", "0"))
 _PRINT_LOAD_BALANCE_STOP = int(os.environ.get("PRINT_LOAD_BALANCE_STOP", "-1"))
+_SHUFFLE_WITH_ALL2ALL = os.environ.get("SHUFFLE_WITH_ALL2ALL", "0") == "1"
 
 
 class ShuffleHandle:
@@ -275,7 +276,7 @@ class BaseTaskBalancedBatchShuffler:
         )
         indices_this_rank, _ = torch.sort(indices_this_rank)
 
-        if use_all2all:
+        if use_all2all or _SHUFFLE_WITH_ALL2ALL:
             return self.shuffle_batch_by_global_indices_all2all(
                 batch, indices_this_rank, pg_group
             )
@@ -431,7 +432,7 @@ class BaseTaskBalancedBatchShuffler:
         indices_this_rank = self.compute_partition_indices(
             workloads, batch.batch_size, pg_group
         )
-        if use_all2all:
+        if use_all2all or _SHUFFLE_WITH_ALL2ALL:
             new_batch = self.shuffle_batch_by_global_indices_all2all(
                 batch, indices_this_rank, pg_group
             )

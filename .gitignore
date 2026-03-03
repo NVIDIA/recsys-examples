@@ -35,3 +35,9 @@ pcie_lookup_poc/*
 **/results/*
 *.nsys-rep
 *.log
+**/.triton/**/[0-9]*
+results/
+*-zh*.md
+*.pdf
+.docs/
+.SKILLS/
