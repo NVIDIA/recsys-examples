@@ -173,7 +173,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        input_scores: Optional[torch.Tensor] = None,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -198,7 +198,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             missing_scores,
             founds,
             output_scores,
-        ) = self.find_impl(unique_keys, table_ids, unique_vals, input_scores)
+        ) = self.find_impl(unique_keys, table_ids, unique_vals, lfu_accumulated_frequency)
 
         h_table_ids = table_ids.cpu()
         missing_table_ids_list = []
@@ -227,6 +227,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         table_ids: torch.Tensor,
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
     ) -> None:
         h_keys = keys.cpu()
         h_table_ids = table_ids.cpu()

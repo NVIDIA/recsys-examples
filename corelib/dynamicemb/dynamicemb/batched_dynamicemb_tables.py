@@ -872,22 +872,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
-        scores = []
         for table_name in self._table_names:
             if table_name not in self._scores.keys():
                 raise RuntimeError(
                     f"Must set score for table '{table_name}' whose score_strategy is customized."
                 )
-            scores.append(self._scores[table_name])
-
-        fused_score = self._reduce_table_scores(scores)
-        if isinstance(self._cache, DynamicEmbCache):
-            self._cache.score_update = self.training
-            self._cache.set_score(fused_score)
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
-            self._storage.score_update = self.training
-            self._storage.set_score(fused_score)
-
+     
         feature_batch_size = offsets.numel() - 1
         assert feature_batch_size > 0, "feature_batch_size must be greater than 0"
         assert (
@@ -898,6 +888,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
 
         if not self.training:
+            scores = [self._scores[name] for name in self._table_names]
+            fused_score = self._reduce_table_scores(scores)
+            if isinstance(self._cache, DynamicEmbCache):
+                self._cache.training = False
+                self._cache.set_score(fused_score)
+            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+                self._storage.training = False
+                self._storage.set_score(fused_score)
             return dynamicemb_eval_forward(
                 indices,
                 offsets,
@@ -922,7 +920,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
         if not self._prefetch_states:
-            self.prefetch(indices, offsets)
+            self.prefetch(indices, offsets, frequency_counters=per_sample_weights)
         prefetch_state = self._prefetch_states.popleft()
 
         res = DynamicEmbeddingFunction.apply(
@@ -945,9 +943,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._empty_tensor,
         )
         if isinstance(self._cache, DynamicEmbCache):
-            self._cache.score_update = False
+            self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
-            self._storage.score_update = False
+            self._storage.training = False
 
         self._update_score()
 
@@ -959,6 +957,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         offsets: Tensor,
         forward_stream: Optional[torch.cuda.Stream] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
+        frequency_counters: Optional[Tensor] = None,
     ) -> None:
         if not self.training:
             return
@@ -975,10 +974,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(scores)
         if isinstance(self._cache, DynamicEmbCache):
-            self._cache.score_update = True
+            self._cache.training = True
             self._cache.set_score(fused_score)
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
-            self._storage.score_update = True
+            self._storage.training = True
             self._storage.set_score(fused_score)
 
         self._prefetch_states.append(
@@ -991,7 +990,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._initializers,
                 forward_stream,
                 self._evict_strategy,
-                None,
+                frequency_counters,
                 self._admit_strategy,
                 self._admission_counter,
                 outstanding_keys_ref=self._prefetch_outstanding_keys
@@ -999,11 +998,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 else None,
             )
         )
-
-        if isinstance(self._cache, DynamicEmbCache):
-            self._cache.score_update = False
-        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
-            self._storage.score_update = False
 
     def set_score(
         self,

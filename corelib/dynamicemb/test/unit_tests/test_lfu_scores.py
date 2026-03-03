@@ -215,6 +215,11 @@ def validate_lfu_scores(
     default=0.5,
     help="Cache capacity as ratio of storage capacity (only used when --caching is enabled)",
 )
+@click.option(
+    "--use-index-dedup/--no-use-index-dedup",
+    default=True,
+    help="Enable/disable index deduplication",
+)
 def test_lfu_score_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -226,6 +231,7 @@ def test_lfu_score_validation(
     tolerance: float,
     caching: bool,
     cache_capacity_ratio: float,
+    use_index_dedup: bool,
 ):
     """Test LFU score correctness by comparing with naive frequency counting.
 
@@ -236,7 +242,6 @@ def test_lfu_score_validation(
 
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
-    use_index_dedup = True
 
     if not caching:
         for num_embedding, multi_hot_size in zip(num_embeddings, multi_hot_sizes):
