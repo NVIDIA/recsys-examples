@@ -370,7 +370,6 @@ def all2all_batch(
     for name, kjt_out in kjt_result_map.items():
         setattr(new_batch, name, kjt_out)
 
-    new_batch.batch_size = recv_ids.numel()
-    new_batch.actual_batch_size = new_batch.batch_size
+    new_batch.actual_batch_size = recv_ids.numel()
 
     return new_batch
