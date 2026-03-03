@@ -877,7 +877,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 raise RuntimeError(
                     f"Must set score for table '{table_name}' whose score_strategy is customized."
                 )
-     
+
         feature_batch_size = offsets.numel() - 1
         assert feature_batch_size > 0, "feature_batch_size must be greater than 0"
         assert (
