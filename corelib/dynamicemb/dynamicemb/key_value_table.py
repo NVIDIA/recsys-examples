@@ -39,7 +39,7 @@ from dynamicemb.types import (
     Storage,
     torch_dtype_to_np_dtype,
 )
-from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
+from dynamicemb_extensions import EvictStrategy, flagged_compact
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
@@ -124,7 +124,6 @@ class DynamicEmbTableState:
     threads_in_wave: int
     score: Optional[int] = None
     training: bool = False
-    timestamp: int = 0
     # Overflow region fields (per-table, only set when overflow is enabled)
     overflow_caps: Optional[List[int]] = None
     overflow_offsets: Optional[List[int]] = None
@@ -225,7 +224,6 @@ def create_table_state(
         threads_in_wave=threads_in_wave,
         score=None,
         training=False,
-        timestamp=device_timestamp(),
         overflow_caps=overflow_caps_list,
         overflow_offsets=overflow_offsets_list,
     )
@@ -352,8 +350,10 @@ def get_find_score_arg(
             name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
         )
 
-    if lfu_accumulated_frequency is not None:
-        assert state.evict_strategy == EvictStrategy.KLfu
+    if (
+        lfu_accumulated_frequency is not None
+        and state.evict_strategy == EvictStrategy.KLfu
+    ):
         scores = lfu_accumulated_frequency
     elif state.evict_strategy == EvictStrategy.KLfu:
         scores = torch.ones(num_keys, device=device, dtype=torch.long)
@@ -566,6 +566,7 @@ def _dump_table(
     opt_file_path: str,
     include_optim: bool,
     include_meta: bool,
+    timestamp: int,
     current_score: Optional[int] = None,
     append: bool = False,
 ) -> None:
@@ -592,7 +593,7 @@ def _dump_table(
         fkey.write(keys.cpu().numpy().tobytes())
         fembedding.write(embeddings.cpu().numpy().tobytes())
         if state.evict_strategy == EvictStrategy.KLru:
-            scores = state.timestamp - scores
+            scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
         if fopt_states and opt_states_batch is not None:
             fopt_states.write(opt_states_batch.cpu().numpy().tobytes())
@@ -789,6 +790,7 @@ def _load_table(
     score_file_path: Optional[str],
     opt_file_path: Optional[str],
     include_optim: bool,
+    timestamp: int,
 ) -> Optional[int]:
     params = _validate_load_meta(
         state,
@@ -812,7 +814,7 @@ def _load_table(
         device,
     ):
         if scores is not None and state.evict_strategy == EvictStrategy.KLru:
-            scores = torch.clamp(state.timestamp - scores, min=0)
+            scores = torch.clamp(timestamp - scores, min=0)
         _load_key_values(state, keys, embeddings, scores, opt_states, table_id=table_id)
 
     return params.meta_data.get("step_score", None)
@@ -1080,12 +1082,8 @@ class DynamicEmbStorage(Storage):
         include_optim: bool = True,
         include_meta: bool = True,
         current_score: Optional[int] = None,
+        timestamp: int = 0,
     ) -> None:
-        if self._state.evict_strategy == EvictStrategy.KLru:
-            if dist.is_initialized():
-                dist.barrier()
-            self._state.timestamp = device_timestamp()
-
         _dump_table(
             self._state,
             table_id,
@@ -1096,7 +1094,8 @@ class DynamicEmbStorage(Storage):
             opt_file_path,
             include_optim,
             include_meta,
-            current_score,
+            timestamp=timestamp,
+            current_score=current_score,
         )
 
     def load(
@@ -1108,12 +1107,8 @@ class DynamicEmbStorage(Storage):
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
         include_optim: bool = True,
+        timestamp: int = 0,
     ) -> Optional[int]:
-        if self._state.evict_strategy == EvictStrategy.KLru:
-            if dist.is_initialized():
-                dist.barrier()
-            self._state.timestamp = device_timestamp()
-
         return _load_table(
             self._state,
             table_id,
@@ -1123,6 +1118,7 @@ class DynamicEmbStorage(Storage):
             score_file_path,
             opt_file_path,
             include_optim,
+            timestamp=timestamp,
         )
 
     # -- Export --
@@ -1380,18 +1376,8 @@ class HybridStorage(Storage):
         include_optim: bool = True,
         include_meta: bool = True,
         current_score: Optional[int] = None,
+        timestamp: int = 0,
     ) -> None:
-        is_lru_hbm = self._hbm.evict_strategy == EvictStrategy.KLru
-        is_lru_host = self._host.evict_strategy == EvictStrategy.KLru
-        if is_lru_hbm or is_lru_host:
-            if dist.is_initialized():
-                dist.barrier()
-            ts = device_timestamp()
-            if is_lru_host:
-                self._host.timestamp = ts
-            if is_lru_hbm:
-                self._hbm.timestamp = ts
-
         _dump_table(
             self._host,
             table_id,
@@ -1402,6 +1388,7 @@ class HybridStorage(Storage):
             opt_file_path,
             include_optim=include_optim,
             include_meta=include_meta,
+            timestamp=timestamp,
             current_score=current_score,
         )
 
@@ -1415,6 +1402,7 @@ class HybridStorage(Storage):
             opt_file_path,
             include_optim=include_optim,
             include_meta=False,
+            timestamp=timestamp,
             append=True,
         )
 
@@ -1429,6 +1417,7 @@ class HybridStorage(Storage):
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
         include_optim: bool = True,
+        timestamp: int = 0,
     ) -> Optional[int]:
         params = _validate_load_meta(
             self._hbm,
@@ -1440,15 +1429,6 @@ class HybridStorage(Storage):
             opt_file_path,
             include_optim,
         )
-
-        is_lru_hbm = self._hbm.evict_strategy == EvictStrategy.KLru
-        is_lru_host = self._host.evict_strategy == EvictStrategy.KLru
-        if is_lru_hbm or is_lru_host:
-            ts = device_timestamp()
-            if is_lru_hbm:
-                self._hbm.timestamp = ts
-            if is_lru_host:
-                self._host.timestamp = ts
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
