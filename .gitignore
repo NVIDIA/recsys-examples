@@ -38,3 +38,7 @@ results/
 **/results/*
 *.nsys-rep
 *.log
+**/.triton/**/[0-9]*
+*-zh*.md
+*.pdf
+.SKILLS/
