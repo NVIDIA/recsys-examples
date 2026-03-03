@@ -264,6 +264,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         opt_file_path: Optional[str],
         include_optim: bool = False,
         include_meta: bool = False,
+        timestamp: int = 0,
     ) -> None:
         if include_meta:
             meta_data = {}
@@ -302,6 +303,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
         include_optim: bool = False,
+        timestamp: int = 0,
     ) -> None:
         if meta_file_path and os.path.exists(meta_file_path):
             with open(meta_file_path, "r") as f:

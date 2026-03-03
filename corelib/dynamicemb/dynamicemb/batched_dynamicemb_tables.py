@@ -1122,6 +1122,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
             storage = self._storage
+            if dist.is_initialized():
+                dist.barrier()
+            ts = device_timestamp()
             storage.dump(
                 table_id,
                 meta_file_path,
@@ -1132,6 +1135,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 include_optim=optim,
                 include_meta=(rank == 0),
                 current_score=current_score,
+                timestamp=ts,
             )
 
             if not counter:
@@ -1194,6 +1198,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
 
             num_key_files = len(emb_key_files)
+            if dist.is_initialized():
+                dist.barrier()
+            ts = device_timestamp()
             for i in range(num_key_files):
                 loaded_score = storage.load(
                     table_id,
@@ -1203,6 +1210,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     emb_score_files[i] if len(emb_score_files) > 0 else None,
                     opt_value_files[i] if len(opt_value_files) > 0 else None,
                     include_optim=optim,
+                    timestamp=ts,
                 )
                 if loaded_score is not None and table_name in self._scores:
                     self._scores[table_name] = loaded_score
