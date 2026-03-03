@@ -141,10 +141,9 @@ def local_DynamicEmbDump(
 
         for dynamic_emb_module in dynamic_emb_modules:
             dynamic_emb_module.flush()
+            storage = dynamic_emb_module.tables
 
-            for table_name, table in zip(
-                dynamic_emb_module.table_names, dynamic_emb_module.tables
-            ):
+            for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
                 if table_names is not None and table_name not in set(
                     table_names[collection_name]
                 ):
@@ -152,7 +151,9 @@ def local_DynamicEmbDump(
 
                 table_key_scores = {}
 
-                for keys, _, _, scores in table.export_keys_values(device, batch_size):
+                for keys, _, _, scores in storage.export_keys_values(
+                    device, batch_size, table_id=table_idx
+                ):
                     for key, score in zip(keys, scores):
                         table_key_scores[int(key)] = int(score)
 
@@ -214,6 +215,11 @@ def validate_lfu_scores(
     default=0.5,
     help="Cache capacity as ratio of storage capacity (only used when --caching is enabled)",
 )
+@click.option(
+    "--use-index-dedup/--no-use-index-dedup",
+    default=True,
+    help="Enable/disable index deduplication",
+)
 def test_lfu_score_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -225,6 +231,7 @@ def test_lfu_score_validation(
     tolerance: float,
     caching: bool,
     cache_capacity_ratio: float,
+    use_index_dedup: bool,
 ):
     """Test LFU score correctness by comparing with naive frequency counting.
 
@@ -235,7 +242,6 @@ def test_lfu_score_validation(
 
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
-    use_index_dedup = True
 
     if not caching:
         for num_embedding, multi_hot_size in zip(num_embeddings, multi_hot_sizes):
