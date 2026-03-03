@@ -26,8 +26,8 @@ from dynamicemb.key_value_table import (
     DynamicEmbStorage,
     Storage,
     _find_keys,
-    _prepare_insert_score_arg,
     eval_lookup,
+    get_insert_score_arg,
     load_from_flat,
     store_to_flat,
 )
@@ -277,13 +277,11 @@ def _prefetch_cache_path(
             empty = torch.empty(0, dtype=torch.int64, device=device)
             return empty, empty.clone(), None
 
-        is_lfu_enabled = evict_strategy == EvictStrategy.KLfu
-
         # 1. Lookup with overflow fallback
         _, founds, cache_indices = cache.lookup(
             unique_keys,
             unique_table_ids,
-            input_scores=accumulated_frequency if is_lfu_enabled else None,
+            lfu_accumulated_frequency=accumulated_frequency,
         )
 
         slot_indices = cache_indices.clone()
@@ -301,7 +299,7 @@ def _prefetch_cache_path(
         if h_num_miss == 0:
             return slot_indices, slot_indices.clone(), None
 
-        miss_scores_lfu = (
+        miss_lfu_freq = (
             accumulated_frequency[miss_compact_idx]
             if accumulated_frequency is not None
             else None
@@ -315,13 +313,13 @@ def _prefetch_cache_path(
             new_table_ids,
             _,
             storage_founds,
-            _,
+            storage_score_out,
             storage_values,
         ) = storage.find(
             miss_keys,
             miss_tids,
             copy_mode=CopyMode.VALUE,
-            input_scores=miss_scores_lfu,
+            lfu_accumulated_frequency=miss_lfu_freq,
         )
 
         # 4. Determine which new keys (not in storage) are admitted
@@ -335,8 +333,8 @@ def _prefetch_cache_path(
             new_tids_sub = miss_tids[new_miss_indices]
 
             freq_for_admission = (
-                miss_scores_lfu[new_miss_indices]
-                if miss_scores_lfu is not None
+                miss_lfu_freq[new_miss_indices]
+                if miss_lfu_freq is not None
                 else None
             )
             counters = (
@@ -371,9 +369,11 @@ def _prefetch_cache_path(
         _, insert_to_miss, (insert_keys, insert_tids) = flagged_compact(
             keys_to_insert_mask, [miss_keys, miss_tids]
         )
-        insert_scores = (
-            miss_scores_lfu[insert_to_miss] if miss_scores_lfu is not None else None
-        )
+        if miss_lfu_freq is not None:
+            miss_lfu_freq[storage_founds] = storage_score_out[storage_founds]
+            insert_scores = miss_lfu_freq[insert_to_miss]
+        else:
+            insert_scores = None
 
         (
             cache_insert_indices,
@@ -471,8 +471,6 @@ def _prefetch_hbm_direct_path(
             empty = torch.empty(0, dtype=torch.int64, device=device)
             return empty, empty.clone(), None
 
-        is_lfu_enabled = evict_strategy == EvictStrategy.KLfu
-
         (
             h_num_missing,
             missing_keys,
@@ -486,7 +484,7 @@ def _prefetch_hbm_direct_path(
             state,
             unique_keys,
             unique_table_ids,
-            input_scores=accumulated_frequency if is_lfu_enabled else None,
+            lfu_accumulated_frequency=accumulated_frequency,
         )
 
         found_mask = indices >= 0
@@ -547,8 +545,8 @@ def _prefetch_hbm_direct_path(
             if val_dim != emb_dim:
                 init_values[:, emb_dim:] = state.initial_optim_state
 
-            score_arg = _prepare_insert_score_arg(
-                state, admitted_scores, n_admitted, device
+            score_arg = get_insert_score_arg(
+                state, n_admitted, device, admitted_scores
             )
             new_indices = state.key_index_map.insert(
                 admitted_keys,
@@ -603,7 +601,7 @@ def dynamicemb_prefetch(
         caching = cache is not None
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
-
+        # todo: double check
         frequency_counts_int64 = None
         if frequency_counters is not None:
             frequency_counts_int64 = frequency_counters.long()
@@ -729,7 +727,6 @@ def dynamicemb_eval_forward(
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
         emb_dtype = storage.embedding_dtype()
-        storage.max_embedding_dim()
 
         is_pooling = pooling_mode != DynamicEmbPoolingMode.NONE
 
@@ -834,7 +831,6 @@ def _generic_forward_path(
         device = unique_keys.device
         unique_keys.numel()
 
-        is_lfu_enabled = evict_strategy == EvictStrategy.KLfu
         (
             h_num_missing,
             missing_keys,
@@ -848,7 +844,7 @@ def _generic_forward_path(
             unique_keys,
             unique_table_ids,
             copy_mode=CopyMode.VALUE,
-            input_scores=accumulated_frequency if is_lfu_enabled else None,
+            lfu_accumulated_frequency=accumulated_frequency,
         )
 
         if h_num_missing == 0:
@@ -1101,7 +1097,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         ctx.emb_dim,
                         ctx.value_dim,
                     )
-                    storage.insert(ctx.unique_keys, unique_table_ids, ctx.unique_values)
+                    storage.insert(
+                        ctx.unique_keys,
+                        unique_table_ids,
+                        ctx.unique_values,
+                        preserve_existing=True,
+                    )
 
             if ctx.outstanding_keys_ref is not None:
                 ctx.outstanding_keys_ref -= ctx.num_prefetched_keys

@@ -119,12 +119,11 @@ class DynamicEmbTableState:
     value_dim: int
     emb_dtype: torch.dtype
     all_dims_vec4: bool
-    use_score: bool
     optimizer: BaseDynamicEmbeddingOptimizer
     initial_optim_state: float
     threads_in_wave: int
     score: Optional[int] = None
-    score_update: bool = False
+    training: bool = False
     timestamp: int = 0
     # Overflow region fields (per-table, only set when overflow is enabled)
     overflow_caps: Optional[List[int]] = None
@@ -197,8 +196,6 @@ def create_table_state(
         [t.data_ptr() for t in tables], dtype=torch.int64, device=device
     )
 
-    use_score = evict_strategy != EvictStrategy.KLru
-
     props = torch.cuda.get_device_properties(device_idx)
     threads_in_wave = (
         props.multi_processor_count * props.max_threads_per_multi_processor
@@ -223,12 +220,11 @@ def create_table_state(
         value_dim=value_dim,
         emb_dtype=emb_dtype,
         all_dims_vec4=all_dims_vec4,
-        use_score=use_score,
         optimizer=optimizer,
         initial_optim_state=optimizer.get_initial_optim_states(),
         threads_in_wave=threads_in_wave,
         score=None,
-        score_update=False,
+        training=False,
         timestamp=device_timestamp(),
         overflow_caps=overflow_caps_list,
         overflow_offsets=overflow_offsets_list,
@@ -335,46 +331,79 @@ def store_to_flat_single_table(
     )
 
 
-def create_scores(
+def get_find_score_arg(
     state: DynamicEmbTableState,
-    h_num_total: int,
-    device: torch.device,
-    lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    if (
-        lfu_accumulated_frequency is not None
-        and state.evict_strategy == EvictStrategy.KLfu
-    ):
-        return lfu_accumulated_frequency
-    elif state.evict_strategy == EvictStrategy.KLfu:
-        return torch.ones(h_num_total, device=device, dtype=torch.long)
-    elif state.evict_strategy == EvictStrategy.KCustomized:
-        scores = torch.empty(h_num_total, device=device, dtype=torch.long)
-        scores.fill_(state.score)
-        return scores
-    else:
-        return None
-
-
-def _prepare_insert_score_arg(
-    state: DynamicEmbTableState,
-    scores: Optional[torch.Tensor],
     num_keys: int,
     device: torch.device,
+    lfu_accumulated_frequency: Optional[torch.Tensor] = None,
 ) -> ScoreArg:
-    """Prepare ScoreArg for insert operations.
+    """Build a ScoreArg for find/lookup operations.
 
-    Fills default scores when ``state.use_score`` is set but *scores* is None,
-    and resolves the effective score policy (ACCUMULATE -> ASSIGN for inserts).
+    When ``state.training`` is False (eval), returns CONST policy so that
+    existing scores in the hash table are never modified.
+
+    When ``state.training`` is True:
+      - LFU: ACCUMULATE with provided or default (ones) frequency.
+      - LRU (GLOBAL_TIMER): no explicit value needed.
+      - CUSTOMIZED / STEP: ASSIGN with ``state.score``.
     """
-    if state.use_score and scores is None:
+    if not state.training:
+        return ScoreArg(
+            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+        )
+
+    if lfu_accumulated_frequency is not None:
+        assert state.evict_strategy == EvictStrategy.KLfu
+        scores = lfu_accumulated_frequency
+    elif state.evict_strategy == EvictStrategy.KLfu:
+        scores = torch.ones(num_keys, device=device, dtype=torch.long)
+    elif state.evict_strategy == EvictStrategy.KCustomized:
+        scores = torch.empty(num_keys, device=device, dtype=torch.long)
+        scores.fill_(state.score)
+    else:
+        scores = None
+
+    return ScoreArg(
+        name=state.score_policy.name,
+        value=scores,
+        policy=state.score_policy.policy,
+    )
+
+
+def get_insert_score_arg(
+    state: DynamicEmbTableState,
+    num_keys: int,
+    device: torch.device,
+    scores: Optional[torch.Tensor] = None,
+    preserve_existing: bool = False,
+) -> ScoreArg:
+    """Build a ScoreArg for insert operations (new keys).
+
+    *preserve_existing* should be True when re-inserting keys that already
+    exist in the table (e.g. backward embedding update) so that their scores
+    are not overwritten.  This fixes the bug where backward re-inserts
+    incorrectly assigned new scores.
+
+    When *preserve_existing* is False (the common case for genuinely new keys):
+      - LRU: GLOBAL_TIMER (no explicit value).
+      - LFU / CUSTOMIZED / STEP: ASSIGN with provided *scores* or
+        ``state.score`` as default.
+      - ACCUMULATE policy is converted to ASSIGN for inserts.
+    """
+    if preserve_existing:
+        return ScoreArg(
+            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+        )
+
+    is_lru = state.evict_strategy == EvictStrategy.KLru
+    if not is_lru and scores is None:
         scores = torch.empty(num_keys, device=device, dtype=torch.uint64)
         scores.fill_(state.score)
 
     policy = state.score_policy.policy
     if policy == ScorePolicy.ACCUMULATE:
         policy = ScorePolicy.ASSIGN
-    if not state.use_score and scores is not None:
+    if is_lru and scores is not None:
         policy = ScorePolicy.ASSIGN
 
     return ScoreArg(name=state.score_policy.name, value=scores, policy=policy)
@@ -384,7 +413,7 @@ def _find_keys(
     state: DynamicEmbTableState,
     unique_keys: torch.Tensor,
     table_ids: torch.Tensor,
-    input_scores: Optional[torch.Tensor] = None,
+    lfu_accumulated_frequency: Optional[torch.Tensor] = None,
 ) -> Tuple[
     int,
     torch.Tensor,
@@ -402,7 +431,7 @@ def _find_keys(
     batch = unique_keys.size(0)
     device = unique_keys.device
 
-    scores = create_scores(state, batch, device, input_scores)
+    score_arg = get_find_score_arg(state, batch, device, lfu_accumulated_frequency)
 
     if batch == 0:
         return (
@@ -411,21 +440,15 @@ def _find_keys(
             torch.empty(batch, dtype=torch.long, device=device),
             torch.empty_like(table_ids),
             torch.empty(batch, dtype=torch.uint64, device=device)
-            if scores is not None
+            if score_arg.value is not None
             else None,
             torch.empty(batch, dtype=torch.bool, device=device),
             torch.empty(batch, dtype=torch.int64, device=device),
             torch.empty(batch, dtype=torch.int64, device=device),
         )
 
-    score_arg_lookup = ScoreArg(
-        name=state.score_policy.name,
-        value=scores,
-        policy=state.score_policy.policy if state.score_update else ScorePolicy.CONST,
-    )
-
     score_out, founds, indices = state.key_index_map.lookup(
-        unique_keys, table_ids, score_arg_lookup
+        unique_keys, table_ids, score_arg
     )
 
     missing = torch.logical_not(founds)
@@ -434,7 +457,8 @@ def _find_keys(
         missing_indices,
         (missing_keys, missing_table_ids, missing_scores),
     ) = flagged_compact(
-        missing, [unique_keys, table_ids, score_out if scores is not None else None]
+        missing,
+        [unique_keys, table_ids, score_arg.value],
     )
 
     return (
@@ -455,9 +479,10 @@ def _insert_key_values(
     table_ids: torch.Tensor,
     unique_values: torch.Tensor,
     scores: Optional[torch.Tensor] = None,
+    preserve_existing: bool = False,
 ) -> None:
-    score_arg = _prepare_insert_score_arg(
-        state, scores, unique_keys.numel(), unique_keys.device
+    score_arg = get_insert_score_arg(
+        state, unique_keys.numel(), unique_keys.device, scores, preserve_existing
     )
     indices = state.key_index_map.insert(unique_keys, table_ids, score_arg)
     store_to_flat(state, indices, table_ids, unique_values)
@@ -472,16 +497,8 @@ def _insert_and_evict_keys(
     """Key-only insert_and_evict. Returns (indices, num_evicted, evicted_keys,
     evicted_table_ids, evicted_indices, evicted_scores).
     Caller is responsible for loading evicted values and storing new values."""
-    batch = keys.numel()
-
-    if state.use_score and scores is None:
-        scores = torch.empty(batch, device=keys.device, dtype=torch.uint64)
-        scores.fill_(state.score)
-
-    score_arg_insert = ScoreArg(
-        name=state.score_policy.name,
-        value=scores,
-        policy=state.score_policy.policy,
+    score_arg = get_insert_score_arg(
+        state, keys.numel(), keys.device, scores
     )
     (
         indices,
@@ -490,7 +507,7 @@ def _insert_and_evict_keys(
         evicted_indices,
         evicted_scores,
         evicted_table_ids,
-    ) = state.key_index_map.insert_and_evict(keys, table_ids, score_arg_insert)
+    ) = state.key_index_map.insert_and_evict(keys, table_ids, score_arg)
 
     return (
         indices,
@@ -891,19 +908,12 @@ class DynamicEmbCache(Cache):
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
-        input_scores: Optional[torch.Tensor] = None,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Lookup with overflow fallback. Returns (score_out, founds, indices)."""
         state = self._state
-        scores = create_scores(
-            state, unique_keys.size(0), unique_keys.device, input_scores
-        )
-        score_arg = ScoreArg(
-            name=state.score_policy.name,
-            value=scores,
-            policy=state.score_policy.policy
-            if state.score_update
-            else ScorePolicy.CONST,
+        score_arg = get_find_score_arg(
+            state, unique_keys.size(0), unique_keys.device, lfu_accumulated_frequency
         )
         result = state.key_index_map.lookup_with_overflow(
             unique_keys, table_ids, score_arg
@@ -924,14 +934,8 @@ class DynamicEmbCache(Cache):
     ]:
         """Insert with counter-aware eviction and overflow fallback."""
         state = self._state
-        batch = keys.numel()
-        if state.use_score and scores is None:
-            scores = torch.empty(batch, device=keys.device, dtype=torch.uint64)
-            scores.fill_(state.score)
-        score_arg = ScoreArg(
-            name=state.score_policy.name,
-            value=scores,
-            policy=state.score_policy.policy,
+        score_arg = get_insert_score_arg(
+            state, keys.numel(), keys.device, scores
         )
         result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
             keys, table_ids, score_arg
@@ -957,15 +961,12 @@ class DynamicEmbCache(Cache):
         self._state.score = score
 
     @property
-    def score_update(self) -> bool:
-        return self._state.score_update
+    def training(self) -> bool:
+        return self._state.training
 
-    @score_update.setter
-    def score_update(self, value: bool) -> None:
-        self._state.score_update = value
-
-    def update_timestamp(self) -> None:
-        self._state.timestamp = device_timestamp()
+    @training.setter
+    def training(self, value: bool) -> None:
+        self._state.training = value
 
     # -- Convenience accessors --
 
@@ -993,10 +994,6 @@ class DynamicEmbCache(Cache):
 
     def evict_strategy(self) -> EvictStrategy:
         return self._state.evict_strategy
-
-    @property
-    def _use_score(self) -> bool:
-        return self._state.use_score
 
     def size(self) -> int:
         return self._state.key_index_map.size()
@@ -1035,7 +1032,7 @@ class DynamicEmbStorage(Storage):
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        input_scores: Optional[torch.Tensor] = None,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -1046,7 +1043,9 @@ class DynamicEmbStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        result = _find_keys(self._state, unique_keys, table_ids, input_scores)
+        result = _find_keys(
+            self._state, unique_keys, table_ids, lfu_accumulated_frequency
+        )
         indices = result[-1]
         values = load_from_flat(self._state, indices, table_ids, copy_mode=copy_mode)
         return (*result[:-1], values)
@@ -1063,8 +1062,16 @@ class DynamicEmbStorage(Storage):
         table_ids: torch.Tensor,
         unique_values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
     ) -> None:
-        _insert_key_values(self._state, unique_keys, table_ids, unique_values, scores)
+        _insert_key_values(
+            self._state,
+            unique_keys,
+            table_ids,
+            unique_values,
+            scores,
+            preserve_existing,
+        )
 
     def dump(
         self,
@@ -1078,7 +1085,7 @@ class DynamicEmbStorage(Storage):
         include_meta: bool = True,
         current_score: Optional[int] = None,
     ) -> None:
-        if not self._state.use_score:
+        if self._state.evict_strategy == EvictStrategy.KLru:
             if dist.is_initialized():
                 dist.barrier()
             self._state.timestamp = device_timestamp()
@@ -1106,7 +1113,7 @@ class DynamicEmbStorage(Storage):
         opt_file_path: Optional[str],
         include_optim: bool = True,
     ) -> Optional[int]:
-        if not self._state.use_score:
+        if self._state.evict_strategy == EvictStrategy.KLru:
             if dist.is_initialized():
                 dist.barrier()
             self._state.timestamp = device_timestamp()
@@ -1160,22 +1167,15 @@ class DynamicEmbStorage(Storage):
         self._state.score = score
 
     @property
-    def score_update(self) -> bool:
-        return self._state.score_update
+    def training(self) -> bool:
+        return self._state.training
 
-    @score_update.setter
-    def score_update(self, value: bool) -> None:
-        self._state.score_update = value
-
-    def update_timestamp(self) -> None:
-        self._state.timestamp = device_timestamp()
+    @training.setter
+    def training(self, value: bool) -> None:
+        self._state.training = value
 
     def evict_strategy(self) -> EvictStrategy:
         return self._state.evict_strategy
-
-    @property
-    def _use_score(self) -> bool:
-        return self._state.use_score
 
     @property
     def num_tables(self) -> int:
@@ -1210,25 +1210,17 @@ class HybridStorage(Storage):
     # -- Score management --
 
     @property
-    def _use_score(self) -> bool:
-        return self._hbm.use_score
+    def training(self) -> bool:
+        return self._hbm.training
 
-    @property
-    def score_update(self) -> bool:
-        return self._hbm.score_update
-
-    @score_update.setter
-    def score_update(self, value: bool) -> None:
-        self._hbm.score_update = value
-        self._host.score_update = value
+    @training.setter
+    def training(self, value: bool) -> None:
+        self._hbm.training = value
+        self._host.training = value
 
     def set_score(self, score: int) -> None:
         self._hbm.score = score
         self._host.score = score
-
-    def update_timestamp(self) -> None:
-        self._hbm.timestamp = device_timestamp()
-        self._host.timestamp = device_timestamp()
 
     def evict_strategy(self) -> EvictStrategy:
         return self._hbm.evict_strategy
@@ -1264,7 +1256,7 @@ class HybridStorage(Storage):
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        input_scores: Optional[torch.Tensor] = None,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -1275,7 +1267,9 @@ class HybridStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        result_hbm = _find_keys(self._hbm, unique_keys, table_ids, input_scores)
+        result_hbm = _find_keys(
+            self._hbm, unique_keys, table_ids, lfu_accumulated_frequency
+        )
         (
             h_num_missing_hbm,
             missing_keys_hbm,
@@ -1302,7 +1296,7 @@ class HybridStorage(Storage):
             )
 
         result_host = _find_keys(
-            self._host, missing_keys_hbm, missing_table_ids_hbm, missing_scores_hbm
+            self._host, missing_keys_hbm, missing_table_ids_hbm, missing_scores_hbm,
         )
         (
             h_num_missing_both,
@@ -1348,6 +1342,7 @@ class HybridStorage(Storage):
         table_ids: torch.Tensor,
         unique_values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
     ) -> None:
         (
             indices,
@@ -1387,13 +1382,15 @@ class HybridStorage(Storage):
         include_meta: bool = True,
         current_score: Optional[int] = None,
     ) -> None:
-        if not self._hbm.use_score or not self._host.use_score:
+        is_lru_hbm = self._hbm.evict_strategy == EvictStrategy.KLru
+        is_lru_host = self._host.evict_strategy == EvictStrategy.KLru
+        if is_lru_hbm or is_lru_host:
             if dist.is_initialized():
                 dist.barrier()
             ts = device_timestamp()
-            if not self._host.use_score:
+            if is_lru_host:
                 self._host.timestamp = ts
-            if not self._hbm.use_score:
+            if is_lru_hbm:
                 self._hbm.timestamp = ts
 
         _dump_table(
@@ -1445,11 +1442,13 @@ class HybridStorage(Storage):
             include_optim,
         )
 
-        if not self._hbm.use_score or not self._host.use_score:
+        is_lru_hbm = self._hbm.evict_strategy == EvictStrategy.KLru
+        is_lru_host = self._host.evict_strategy == EvictStrategy.KLru
+        if is_lru_hbm or is_lru_host:
             ts = device_timestamp()
-            if not self._hbm.use_score:
+            if is_lru_hbm:
                 self._hbm.timestamp = ts
-            if not self._host.use_score:
+            if is_lru_host:
                 self._host.timestamp = ts
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -1586,7 +1585,6 @@ def _eval_lookup_storage(
         keys,
         table_ids,
         copy_mode=CopyMode.EMBEDDING,
-        input_scores=None,
     )
 
     if h_num_missing > 0:
@@ -1602,7 +1600,7 @@ def _eval_lookup_cached(
     table_ids: torch.Tensor,
     initializer: Callable,
 ) -> torch.Tensor:
-    _, founds, cache_indices = cache.lookup(keys, table_ids, input_scores=None)
+    _, founds, cache_indices = cache.lookup(keys, table_ids)
 
     embs = load_from_flat(
         cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
@@ -1629,7 +1627,6 @@ def _eval_lookup_cached(
         missing_keys,
         missing_table_ids,
         copy_mode=CopyMode.EMBEDDING,
-        input_scores=None,
     )
 
     if h_num_missing_in_storage > 0:
