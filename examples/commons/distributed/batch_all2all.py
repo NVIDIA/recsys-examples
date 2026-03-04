@@ -3,69 +3,55 @@ from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from commons.sequence_batch.batch import BaseBatch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
-def _build_dst_rank(
-    recv_ids: torch.Tensor,
+def _build_dst_rank_local(
+    partitions_indices: torch.Tensor,
+    rank: int,
     local_batch_size: int,
-    world_size: int,
-    pg_group: dist.ProcessGroup,
 ) -> tuple:
-    """Build ``dst_rank`` and ``recv_counts`` via all-to-all of requested indices.
+    """Build ``dst_rank`` and ``recv_counts`` locally from KK partitions.
 
-    1. **Count exchange** – each rank tells every source rank how many
-       samples it needs (``all_to_all_single`` on counts).
-    2. **Index exchange** – each rank sends the specific local-sample
-       indices it needs to the source rank; the source rank receives
-       which of its local samples each destination rank wants.
-
-    From the received indices, ``dst_rank[s] = destination_rank`` is trivially built.
+    When every rank holds the same ``partitions_indices`` (produced by KK
+    on AllGathered workloads with ``equal_size=True``), ``dst_rank`` can be
+    derived without any communication.
 
     Args:
-        recv_ids: **Sorted** global batch indices this rank needs.
-        local_batch_size: Uniform local batch size on every rank.
-        world_size: Total number of ranks.
-        pg_group: Process group.
+        partitions_indices: 2-D int64 tensor of shape ``[W, B]`` where
+            ``partitions_indices[r]`` contains the global indices assigned
+            to rank ``r``.
+        rank: This rank's index.
+        local_batch_size: ``B`` — samples per rank before shuffling.
 
     Returns:
         ``(dst_rank, recv_counts)`` where
 
         * ``dst_rank`` – ``LongTensor(local_batch_size,)`` mapping each
           local sample to its destination rank.
-        * ``recv_counts`` – ``List[int]`` of length ``world_size``;
+        * ``recv_counts`` – ``List[int]`` of length ``W``;
           ``recv_counts[r]`` = number of samples this rank receives from
-          source rank ``r`` in the data all-to-all.
+          source rank ``r``.
     """
-    device = recv_ids.device
+    num_partitions = partitions_indices.shape[0]
+    device = partitions_indices.device
+    global_batch_size = local_batch_size * num_partitions
 
-    # recv_counts[r] = how many samples this rank needs from source rank r
-    source_ranks = recv_ids // local_batch_size
-    recv_counts = torch.bincount(source_ranks, minlength=world_size).tolist()
+    rank_ids = (
+        torch.arange(num_partitions, device=device)
+        .unsqueeze(1)
+        .expand_as(partitions_indices)
+    )
+    global_to_rank = torch.empty(global_batch_size, dtype=torch.long, device=device)
+    global_to_rank[partitions_indices.reshape(-1)] = rank_ids.reshape(-1)
 
-    # For each source rank, figure out WHICH local indices we need
-    local_indices_needed = (recv_ids % local_batch_size).long()
-    # recv_ids is sorted ⇒ source_ranks is non-decreasing ⇒ split is correct
-    send_idx_list = list(local_indices_needed.split(recv_counts))
+    my_offset = rank * local_batch_size
+    dst_rank = global_to_rank[my_offset : my_offset + local_batch_size].contiguous()
 
-    # 1) Exchange counts: our recv_counts (data) = send counts for the INDEX a2a
-    send_counts_t = torch.tensor(recv_counts, dtype=torch.long, device=device)
-    recv_counts_t = torch.empty(world_size, dtype=torch.long, device=device)
-    dist.all_to_all_single(recv_counts_t, send_counts_t, group=pg_group)
-
-    # 2) Exchange indices: tell each source rank which local samples we need
-    recv_idx_list = [
-        torch.empty(int(recv_counts_t[r].item()), dtype=torch.long, device=device)
-        for r in range(world_size)
-    ]
-    dist.all_to_all(recv_idx_list, send_idx_list, group=pg_group)
-
-    # Build dst_rank from received indices
-    dst_rank = torch.empty(local_batch_size, dtype=torch.long, device=device)
-    for r in range(world_size):
-        if recv_idx_list[r].numel() > 0:
-            dst_rank[recv_idx_list[r]] = r
+    source_ranks = partitions_indices[rank] // local_batch_size
+    recv_counts = torch.bincount(source_ranks, minlength=num_partitions).tolist()
 
     return dst_rank, recv_counts
 
@@ -152,7 +138,7 @@ def _all2all_kjt(
            via a vectorized block-transpose permutation.
 
     When ``recv_ids`` is sorted on every rank (required by
-    ``all2all_batch``), the output samples within each key are already
+    ``pad_and_all2all_batch``), the output samples within each key are already
     in ascending global-index order — no extra reordering is needed.
 
     Args:
@@ -283,10 +269,123 @@ def _all2all_kjt(
     )
 
 
-def all2all_batch(
+def _all2all_kjt_list(
+    kjt_list: List[KeyedJaggedTensor],
+    dst_rank: torch.Tensor,
+    recv_counts: List[int],
+    world_size: int,
+    pg_group: dist.ProcessGroup,
+) -> List[KeyedJaggedTensor]:
+    """Fused all-to-all for a **list** of KeyedJaggedTensors.
+
+    All KJTs are concatenated into a single mega-KJT before communication so
+    that the entire list is exchanged with only **2–3 NCCL calls** (lengths,
+    values, [weights]) regardless of how many KJTs there are.  After
+    receiving, the result is split back into individual KJTs.
+
+    Requirements:
+      - All KJTs must share the same ``batch_size`` (stride).
+      - All KJTs must share the same ``values`` dtype.
+
+    Args:
+        kjt_list: List of KJTs to redistribute.
+        dst_rank: Shape ``(batch_size,)``.  ``dst_rank[s]`` = destination rank.
+        recv_counts: ``recv_counts[r]`` = samples to receive from rank ``r``.
+        world_size: Total number of ranks.
+        pg_group: Process group.
+
+    Returns:
+        List of redistributed KJTs, one per input KJT.
+    """
+    if not kjt_list:
+        return []
+    if len(kjt_list) == 1:
+        return [_all2all_kjt(kjt_list[0], dst_rank, recv_counts, world_size, pg_group)]
+
+    # Check weight configuration — fall back to per-KJT calls if mixed
+    has_weights = [kjt.weights_or_none() is not None for kjt in kjt_list]
+    if any(has_weights) and not all(has_weights):
+        return [
+            _all2all_kjt(kjt, dst_rank, recv_counts, world_size, pg_group)
+            for kjt in kjt_list
+        ]
+
+    keys_list = [list(kjt.keys()) for kjt in kjt_list]
+    K_list = [len(keys) for keys in keys_list]
+    all_keys = [key for keys in keys_list for key in keys]
+
+    # Merge into a single mega-KJT
+    all_lengths = torch.cat([kjt.lengths() for kjt in kjt_list])
+    all_values = torch.cat([kjt.values() for kjt in kjt_list])
+    all_weights = (
+        torch.cat([kjt.weights() for kjt in kjt_list]) if all(has_weights) else None
+    )
+    merged_kjt = KeyedJaggedTensor(
+        keys=all_keys,
+        values=all_values,
+        lengths=all_lengths,
+        weights=all_weights,
+    )
+
+    # Fused all-to-all (2–3 NCCL calls instead of K × (2–3))
+    merged_result = _all2all_kjt(
+        merged_kjt, dst_rank, recv_counts, world_size, pg_group
+    )
+
+    # Split back into individual KJTs
+    K_total = sum(K_list)
+    recv_total = sum(recv_counts)
+    result_lengths = merged_result.lengths()
+    result_values = merged_result.values()
+    result_weights = merged_result.weights_or_none()
+
+    per_key_value_counts = (
+        result_lengths.view(K_total, recv_total).to(torch.long).sum(dim=1)
+    )
+    kjt_value_counts = []
+    key_offset = 0
+    for K in K_list:
+        kjt_value_counts.append(per_key_value_counts[key_offset : key_offset + K].sum())
+        key_offset += K
+    kjt_value_counts_cpu = torch.stack(kjt_value_counts).cpu()
+
+    result_kjts: List[KeyedJaggedTensor] = []
+    lengths_offset = 0
+    values_offset = 0
+    weights_offset = 0
+    for i, (keys, K) in enumerate(zip(keys_list, K_list)):
+        kjt_num_lengths = K * recv_total
+        kjt_lengths = result_lengths[lengths_offset : lengths_offset + kjt_num_lengths]
+        kjt_num_values = kjt_value_counts_cpu[i].item()
+        kjt_values = result_values[values_offset : values_offset + kjt_num_values]
+
+        kjt_weights_i = None
+        if result_weights is not None:
+            kjt_weights_i = result_weights[
+                weights_offset : weights_offset + kjt_num_values
+            ]
+            weights_offset += kjt_num_values
+
+        result_kjts.append(
+            KeyedJaggedTensor(
+                keys=keys,
+                values=kjt_values,
+                lengths=kjt_lengths,
+                weights=kjt_weights_i,
+            )
+        )
+        lengths_offset += kjt_num_lengths
+        values_offset += kjt_num_values
+
+    return result_kjts
+
+
+def pad_and_all2all_batch(
     batch: BaseBatch,
     recv_ids: torch.Tensor,
-    pg_group: dist.ProcessGroup = dist.group.WORLD,
+    pg_group: dist.ProcessGroup,
+    dst_rank: torch.Tensor,
+    recv_counts: List[int],
 ) -> BaseBatch:
     """Redistribute a batch across ranks via all-to-all based on global indices.
 
@@ -301,8 +400,7 @@ def all2all_batch(
       * More efficient when each rank needs a small subset of global samples.
 
     Communication cost:
-      * 2 ``all_to_all`` calls to build ``dst_rank`` (counts + indices)
-      * Per KJT field: 2–3 ``all_to_all`` calls (lengths, values, [weights])
+      * All KJT fields fused: 2 ``all_to_all`` calls total (lengths, values)
       * Per dense field: 1 ``all_to_all`` call
 
     Args:
@@ -311,6 +409,11 @@ def all2all_batch(
             All ranks' ``recv_ids`` must form a partition of
             ``[0, global_batch_size)``.
         pg_group: Process group for distributed operations.
+        dst_rank: Destination rank for each local sample.  Shape
+            ``(batch.batch_size,)``.  Typically produced by
+            :func:`_build_dst_rank_local`.
+        recv_counts: Per-source-rank receive counts.  ``recv_counts[r]``
+            = number of samples this rank receives from rank ``r``.
 
     Returns:
         A new ``BaseBatch`` containing only the samples specified by
@@ -322,12 +425,7 @@ def all2all_batch(
     if world_size == 1:
         return batch
 
-    # ---- Phase 0: Build dst_rank and recv_counts via all-to-all ----
-    dst_rank, recv_counts = _build_dst_rank(
-        recv_ids, local_batch_size, world_size, pg_group
-    )
-
-    # ---- Phase 1: KJT fields — all-to-all via _all2all_kjt ----
+    # ---- Phase 1: KJT fields — fused all-to-all via _all2all_kjt_list ----
     kjt_field_names: List[str] = []
     kjt_inputs: List[KeyedJaggedTensor] = []
     for f in fields(batch):
@@ -336,25 +434,36 @@ def all2all_batch(
             kjt_field_names.append(f.name)
             kjt_inputs.append(val)
 
-    kjt_outputs: List[KeyedJaggedTensor] = []
-    for kjt in kjt_inputs:
-        kjt_outputs.append(
-            _all2all_kjt(kjt, dst_rank, recv_counts, world_size, pg_group)
-        )
+    kjt_outputs = _all2all_kjt_list(
+        kjt_inputs, dst_rank, recv_counts, world_size, pg_group
+    )
 
     kjt_result_map: Dict[str, KeyedJaggedTensor] = dict(
         zip(kjt_field_names, kjt_outputs)
     )
 
     # ---- Phase 2: Dense tensor fields — all-to-all via _all2all_dense_tensor ----
+    # When actual_batch_size < batch_size, dense tensors have fewer rows
+    # than local_batch_size.  Pad them to local_batch_size before sending
+    # so that _all2all_dense_tensor's reshape is valid and padding samples
+    # (assigned by KK) carry zero values.
+    pad_dense = batch.actual_batch_size < local_batch_size
+
     def all2all_field(
         tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor],
     ) -> Union[torch.Tensor, KeyedJaggedTensor]:
         if isinstance(tensor_or_kjt, KeyedJaggedTensor):
             return tensor_or_kjt  # already handled in Phase 1
         elif isinstance(tensor_or_kjt, torch.Tensor):
+            t = tensor_or_kjt
+            if pad_dense:
+                pad_size = (
+                    local_batch_size * (t.numel() // batch.actual_batch_size)
+                    - t.numel()
+                )
+                t = F.pad(t, (0, pad_size))
             return _all2all_dense_tensor(
-                tensor_or_kjt,
+                t,
                 dst_rank,
                 recv_counts,
                 local_batch_size,
