@@ -218,7 +218,7 @@ def apply_dmp(
                     if caching
                     else eb_config.num_embeddings
                 )
-                emb_num_embeddings_round_to_16 =  (int(emb_num_embeddings) + 15) // 16 * 16
+                emb_num_embeddings_round_to_16 =  _round_to_16(int(emb_num_embeddings))
 
                 # Calculate optimizer state dimension
                 from dynamicemb.dynamicemb_config import (

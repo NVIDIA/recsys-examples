@@ -113,7 +113,7 @@ def get_planner(args, device, eb_configs):
 
         embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
         eb_num_embeddings = eb_config.num_embeddings
-        eb_num_embeddings_round_to_16 = ((eb_num_embeddings + 15) // 16) * 16
+        eb_num_embeddings_round_to_16 = _round_to_16(eb_num_embeddings)
         total_hbm_need = embedding_type_bytes * dim * eb_num_embeddings_round_to_16
 
         const = DynamicEmbParameterConstraints(
