@@ -264,7 +264,7 @@ def apply_dmp(
                         mode=DynamicEmbInitializerMode.CONSTANT,
                         value=1e-1,
                     ),
-                    bucket_capacity=128,
+                    bucket_capacity=emb_num_embeddings_aligned,
                     max_capacity=emb_num_embeddings_aligned,
                     caching=caching,
                     local_hbm_for_values=1024**3,
