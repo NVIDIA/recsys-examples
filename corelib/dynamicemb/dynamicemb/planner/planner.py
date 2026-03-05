@@ -53,6 +53,7 @@ from ..dynamicemb_config import (
     DynamicEmbKernel,
     DynamicEmbTableOptions,
     _next_power_of_2,
+    _round_to_16,
     validate_initializer_args,
 )
 
@@ -142,9 +143,9 @@ def _validate_configs(
         validate_initializer_args(
             tmp_constraint.dynamicemb_options.initializer_args, tmp_config
         )
-        # modify num_embeddings per rank to power of 2
+        # modify num_embeddings per rank to multiple of 16
         num_aligned_embedding_per_rank = int(
-            _next_power_of_2(math.ceil(tmp_config.num_embeddings / world_size))
+            _round_to_16(math.ceil(tmp_config.num_embeddings / world_size))
         )
         if (
             num_aligned_embedding_per_rank
@@ -169,7 +170,7 @@ def _dyn_emb_table_size_per_rank(
     num_embeddings = dyn_emb_table_config.num_embeddings
     # TODO: align num_embedding automatic , maybe need user input , and we don't align it.
     num_embeddings_per_rank = int(
-        _next_power_of_2(math.ceil(num_embeddings / world_size))
+        _round_to_16(math.ceil(num_embeddings / world_size))
     )
 
     embedding_dim = dyn_emb_table_config.embedding_dim

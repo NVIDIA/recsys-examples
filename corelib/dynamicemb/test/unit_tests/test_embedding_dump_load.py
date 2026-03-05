@@ -218,7 +218,7 @@ def apply_dmp(
                     if caching
                     else eb_config.num_embeddings
                 )
-                emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
+                emb_num_embeddings_round_to_16 = 2 ** math.ceil(
                     math.log2(emb_num_embeddings)
                 )  # HKV need embedding vector num is power of 2
 
@@ -253,11 +253,11 @@ def apply_dmp(
                 total_hbm_need = (
                     embedding_type_bytes
                     * (dim + optimizer_state_dim)
-                    * emb_num_embeddings_next_power_of_2
+                    * emb_num_embeddings_round_to_16
                 )
 
                 admission_counter = KVCounter(
-                    max(1024 * 1024, emb_num_embeddings_next_power_of_2 // 4)
+                    max(1024 * 1024, emb_num_embeddings_round_to_16 // 4)
                 )
                 dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
                     global_hbm_for_values=total_hbm_need,
@@ -266,8 +266,8 @@ def apply_dmp(
                         mode=DynamicEmbInitializerMode.CONSTANT,
                         value=1e-1,
                     ),
-                    bucket_capacity=emb_num_embeddings_next_power_of_2,
-                    max_capacity=emb_num_embeddings_next_power_of_2,
+                    bucket_capacity=emb_num_embeddings_round_to_16,
+                    max_capacity=emb_num_embeddings_round_to_16,
                     caching=caching,
                     local_hbm_for_values=1024**3,
                     admit_strategy=admit_strategy,
