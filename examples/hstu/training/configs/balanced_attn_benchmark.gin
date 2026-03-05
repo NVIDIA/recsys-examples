@@ -1,0 +1,36 @@
+# ============================================================================
+# Balanced Attention Benchmark Configuration
+# Used by: benchmark_hstu_attn_balanced.py
+#
+# This config is self-contained.  Alternatively, you can point the benchmark
+# at your production gin config (e.g. balanced_benchmark.gin) and add the
+# AttnBalancedBenchmarkArgs bindings via --gin-bindings.
+# ============================================================================
+
+# ===== Seqlen Distribution =====
+# Lognormal produces right-skewed sequence lengths (many short, few long),
+# which is a realistic proxy for user history lengths.
+# Actual mean = 512, CV = 0.5 (default), so ~80% of seqlens fall in [250, 1050].
+seqlen_dist/RandomDistribution.dist_type = 'zipf'
+seqlen_dist/RandomDistribution.alpha = 1.2
+seqlen_dist/RandomDistribution.low = 1
+
+# ===== Benchmark Args =====
+AttnBalancedBenchmarkArgs.batch_size = 32
+AttnBalancedBenchmarkArgs.max_seqlen = 4097
+AttnBalancedBenchmarkArgs.seqlen_dist = @seqlen_dist/RandomDistribution()
+AttnBalancedBenchmarkArgs.warmup_iters = 10
+AttnBalancedBenchmarkArgs.bench_iters = 50
+AttnBalancedBenchmarkArgs.seed = 1234
+
+# ===== Network Configuration =====
+# Only attention-relevant fields are needed for this benchmark.
+# num_layers and hidden_size are required by NetworkArgs but not used.
+NetworkArgs.num_layers = 10
+NetworkArgs.hidden_size = 1024
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.kv_channels = 256
+NetworkArgs.kernel_backend = 'cutlass'
+NetworkArgs.is_causal = True
+NetworkArgs.dtype_str = 'bfloat16'
+NetworkArgs.scaling_seqlen = -1
