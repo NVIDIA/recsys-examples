@@ -218,9 +218,7 @@ def apply_dmp(
                     if caching
                     else eb_config.num_embeddings
                 )
-                emb_num_embeddings_round_to_16 = 2 ** math.ceil(
-                    math.log2(emb_num_embeddings)
-                )  # HKV need embedding vector num is power of 2
+                emb_num_embeddings_round_to_16 =  (int(emb_num_embeddings) + 15) // 16 * 16
 
                 # Calculate optimizer state dimension
                 from dynamicemb.dynamicemb_config import (
