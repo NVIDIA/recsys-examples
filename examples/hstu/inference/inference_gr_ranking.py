@@ -29,20 +29,24 @@ from configs import (
     InferenceEmbeddingConfig,
     PositionEncodingConfig,
     RankingConfig,
+    get_hstu_config,
     get_inference_hstu_config,
     get_kvcache_config,
 )
 from modules.metrics import get_multi_event_metric_module
+from modules.inference_dense_module import get_inference_dense_model_v2
+from modules.inference_embedding import InferenceEmbedding
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
 sys.path.append("./model/")
-from inference_ranking_gr import get_inference_ranking_gr
+from inference_ranking_gr import get_inference_ranking_gr, InferenceRankingGR
 
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
     SIMULATE = "simulate"
+    SNAP = "snap"
 
     def __str__(self):
         return self.value
@@ -195,6 +199,74 @@ def get_inference_hstu_model(
     elif hstu_config.fp16:
         model.half()
     model.load_checkpoint(checkpoint_dir)
+    model.eval()
+
+    return model
+
+
+def get_inference_dense_with_fused_hstu(
+    emb_configs,
+    max_batch_size,
+    num_contextual_features,
+    total_max_seqlen,
+    checkpoint_dir,
+):
+    network_args = NetworkArgs()
+    if network_args.dtype_str == "bfloat16":
+        inference_dtype = torch.bfloat16
+    # elif network_args.dtype_str == "float16":
+    #     inference_dtype = torch.float16
+    else:
+        raise ValueError(
+            f"Inference data type {network_args.dtype_str} is not supported"
+        )
+
+    position_encoding_config = PositionEncodingConfig(
+        num_position_buckets=8192,
+        num_time_buckets=2048,
+        use_time_encoding=False,
+        static_max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
+    )
+
+    hstu_config = get_hstu_config(
+        hidden_size=network_args.hidden_size,
+        kv_channels=network_args.kv_channels,
+        num_attention_heads=network_args.num_attention_heads,
+        num_layers=network_args.num_layers,
+        dtype=inference_dtype,
+        learnable_input_layernorm = False,
+        learnable_output_layernorm = False,
+        is_inference = True,
+    )
+
+    ranking_args = RankingArgs()
+    task_config = RankingConfig(
+        embedding_configs=emb_configs,
+        prediction_head_arch=ranking_args.prediction_head_arch,
+        prediction_head_act_type=ranking_args.prediction_head_act_type,
+        prediction_head_bias=ranking_args.prediction_head_bias,
+        num_tasks=ranking_args.num_tasks,
+        eval_metrics=ranking_args.eval_metrics,
+    )
+
+    dense_module = get_inference_dense_model_v2(
+        hstu_config,
+        task_config
+    )
+    if hstu_config.bf16:
+        dense_module.bfloat16()
+    elif hstu_config.fp16:
+        dense_module.half()
+    dense_module.eval()
+
+    model = InferenceRankingGR(
+        InferenceEmbedding(emb_configs),
+        dense_module,
+    )
+    if hstu_config.bf16:
+        model.bfloat16()
+    elif hstu_config.fp16:
+        model.half()
     model.eval()
 
     return model
@@ -414,6 +486,103 @@ def run_ranking_gr_evaluate(
         )
 
 
+def run_inference_with_fused_hstu_block(
+    checkpoint_dir: str,
+    disable_contextual_features: bool = False,
+):
+    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
+        disable_contextual_features
+    )
+
+    dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
+    num_contextual_features = (
+        len(dataproc._contextual_feature_names)
+        if not disable_contextual_features
+        else 0
+    )
+
+    max_batch_size = 1
+    total_max_seqlen = (
+        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
+    ) * 2 + num_contextual_features
+    print("total_max_seqlen", total_max_seqlen)
+
+    def strip_padding_batch(batch, unpadded_batch_size):
+        batch.batch_size = unpadded_batch_size
+        kjt_dict = batch.features.to_dict()
+        for k in kjt_dict:
+            kjt_dict[k] = JaggedTensor.from_dense_lengths(
+                kjt_dict[k].to_padded_dense()[: batch.batch_size],
+                kjt_dict[k].lengths()[: batch.batch_size].long(),
+            )
+        batch.features = KeyedJaggedTensor.from_jt_dict(kjt_dict)
+        batch.num_candidates = batch.num_candidates[: batch.batch_size]
+        return batch
+
+    with torch.inference_mode():
+        model = get_inference_dense_with_fused_hstu(
+            emb_configs,
+            max_batch_size,
+            num_contextual_features,
+            total_max_seqlen,
+            checkpoint_dir,
+        )
+
+        eval_module = get_multi_event_metric_module(
+            num_classes=model.get_num_class(),
+            num_tasks=model.get_num_tasks(),
+            metric_types=model.get_metric_types(),
+        )
+
+        _, eval_dataset = get_dataset(
+            dataset_name=dataset_args.dataset_name,
+            dataset_path=dataset_args.dataset_path,
+            max_history_seqlen=dataset_args.max_history_seqlen,
+            max_num_candidates=dataset_args.max_num_candidates,
+            num_tasks=model.get_num_tasks(),
+            batch_size=max_batch_size,
+            rank=0,
+            world_size=1,
+            shuffle=False,
+            random_seed=0,
+            eval_batch_size=max_batch_size,
+            load_candidate_action=False,
+        )
+
+        dataloader = get_data_loader(dataset=eval_dataset)
+        dataloader_iter = iter(dataloader)
+
+        # torch.cuda.profiler.start()
+        while True:
+            try:
+                batch = next(dataloader_iter)
+
+                batch = batch.to(device=torch.cuda.current_device())
+                d = batch.features.to_dict()
+                user_ids = d["user_id"].values().cpu().long()
+                if user_ids.shape[0] != batch.batch_size:
+                    batch = strip_padding_batch(batch, user_ids.shape[0])
+                total_history_lengths = (
+                    torch.sum(
+                        batch.features.lengths().view(-1, batch.batch_size), 0
+                    ).view(-1)
+                    - batch.num_candidates
+                )
+                total_history_lengths = total_history_lengths.cpu()
+
+                logits = model.forward_nokvcache(batch)
+                eval_module(logits, batch.labels.values())
+            except StopIteration:
+                break
+        # torch.cuda.profiler.stop()
+
+        eval_metric_dict = eval_module.compute()
+        print(
+            f"[eval]:\n    "
+            + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
@@ -446,5 +615,10 @@ if __name__ == "__main__":
             disable_contextual_features=args.disable_context,
             disable_kvcache=args.disable_kvcache,
             max_bs=args.max_bs,
+        )
+    elif args.mode == RunningMode.SNAP:
+        run_inference_with_fused_hstu_block(
+            checkpoint_dir=args.checkpoint_dir,
+            disable_contextual_features=args.disable_context,
         )
     print("Finished.")
