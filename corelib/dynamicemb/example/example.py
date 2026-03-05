@@ -467,8 +467,7 @@ def get_planner(
 
         embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
         emb_num_embeddings = eb_config.num_embeddings
-        emb_num_embeddings_round_to_16 = ((emb_num_embeddings + 15) // 16) * 16
-        )  # hash table needs embedding vector num to be multiple of 16
+        emb_num_embeddings_round_to_16 = ((emb_num_embeddings + 15) // 16) * 16  # hash table needs embedding vector num to be multiple of 16
         threshold = (bucket_capacity * world_size) / cache_ratio
         threshold_int = math.ceil(threshold)
         if emb_num_embeddings_round_to_16 < threshold_int:

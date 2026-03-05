@@ -52,7 +52,6 @@ from ..batched_dynamicemb_compute_kernel import (
 from ..dynamicemb_config import (
     DynamicEmbKernel,
     DynamicEmbTableOptions,
-    _next_power_of_2,
     _round_to_16,
     validate_initializer_args,
 )
