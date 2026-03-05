@@ -38,6 +38,7 @@ from dynamicemb.dump_load import (
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    _round_to_16,
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner

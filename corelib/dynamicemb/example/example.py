@@ -23,7 +23,7 @@ from dynamicemb import (
     FrequencyAdmissionStrategy,
     KVCounter,
 )
-from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim
+from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim, _round_to_16
 from dynamicemb.incremental_dump import get_score, incremental_dump
 from dynamicemb.optimizer import EmbOptimType, convert_optimizer_type
 from dynamicemb.planner import (
@@ -53,6 +53,8 @@ from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+from ..dynamicemb_config import _round_to_16
 
 # Filter FBGEMM warning, make notebook clean
 warnings.filterwarnings(
