@@ -54,8 +54,6 @@ from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from ..dynamicemb_config import _round_to_16
-
 # Filter FBGEMM warning, make notebook clean
 warnings.filterwarnings(
     "ignore", message=".*torch.library.impl_abstract.*", category=FutureWarning

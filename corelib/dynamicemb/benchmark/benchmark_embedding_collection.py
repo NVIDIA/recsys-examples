@@ -28,8 +28,9 @@ from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
-    _round_to_16,
 )
+from dynamicemb.dynamicemb_config import _round_to_16
+
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -58,8 +59,6 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
-
-from ..dynamicemb_config import _round_to_16
 
 def str2bool(v):
     if isinstance(v, bool):
