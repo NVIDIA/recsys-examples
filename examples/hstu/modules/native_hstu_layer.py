@@ -288,18 +288,4 @@ class HSTULayer(MegatronModule):
 
             if self._residual:
                 output = output + x
-        return JaggedData(
-            values=output,
-            seqlen=jd.seqlen,
-            seqlen_offsets=jd.seqlen_offsets,
-            padding_length=jd.padding_length,  # inherit from the input jagged data
-            max_seqlen=jd.max_seqlen,
-            max_num_candidates=jd.max_num_candidates,
-            num_candidates=jd.num_candidates,
-            num_candidates_offsets=jd.num_candidates_offsets,
-            contextual_max_seqlen=jd.contextual_max_seqlen,
-            contextual_seqlen=jd.contextual_seqlen,
-            contextual_seqlen_offsets=jd.contextual_seqlen_offsets,
-            has_interleaved_action=jd.has_interleaved_action,
-            scaling_seqlen=jd.scaling_seqlen,
-        )
+        return jd.copy_others_but_set_values(values=output)

@@ -34,7 +34,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from commons.datasets.hstu_batch import HSTUBatch
+from commons.datasets.hstu_batch import HSTUBatch, compute_split_lengths_for_jagged
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.logger import print_rank_0
 from torch.utils.data.dataset import IterableDataset
@@ -371,6 +371,10 @@ class HSTUSequenceDataset(IterableDataset[HSTUBatch]):
                 labels=label_kjt,
                 actual_batch_size=actual_batch_size,
             )
+            batch_for_compute = HSTUBatch(**batch_kwargs)
+            total_candidates = compute_split_lengths_for_jagged(batch_for_compute)
+            if total_candidates is not None:
+                batch_kwargs["total_candidates_seq_len"] = total_candidates
             yield HSTUBatch(**batch_kwargs)
 
     def _shuffle_batch(self):

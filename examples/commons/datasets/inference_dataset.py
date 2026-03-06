@@ -34,7 +34,7 @@ from typing import Dict, Iterator, List, Optional
 import numpy as np
 import pandas as pd
 import torch
-from commons.datasets.hstu_batch import HSTUBatch
+from commons.datasets.hstu_batch import HSTUBatch, compute_split_lengths_for_jagged
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -329,5 +329,9 @@ class InferenceDataset(IterableDataset[HSTUBatch]):
             if self._max_num_candidates > 0
             else None,
         )
+        batch_for_compute = HSTUBatch(**batch_kwargs)
+        total_candidates = compute_split_lengths_for_jagged(batch_for_compute)
+        if total_candidates is not None:
+            batch_kwargs["total_candidates_seq_len"] = total_candidates
         labels = labels if with_ranking_labels else None
         return HSTUBatch(labels=labels, **batch_kwargs)
