@@ -23,7 +23,7 @@ from dynamicemb import (
     FrequencyAdmissionStrategy,
     KVCounter,
 )
-from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim
+from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim, _round_to_16
 from dynamicemb.incremental_dump import get_score, incremental_dump
 from dynamicemb.optimizer import EmbOptimType, convert_optimizer_type
 from dynamicemb.planner import (
@@ -467,22 +467,18 @@ def get_planner(
 
         embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
         emb_num_embeddings = eb_config.num_embeddings
-        emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
-            math.log2(emb_num_embeddings)
-        )  # hash table needs embedding vector num to be power of 2
+        emb_num_embeddings_round_to_16 = _round_to_16(emb_num_embeddings)  # hash table needs embedding vector num to be multiple of 16
         threshold = (bucket_capacity * world_size) / cache_ratio
         threshold_int = math.ceil(threshold)
-        if emb_num_embeddings_next_power_of_2 < threshold_int:
-            emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
-                math.log2(threshold_int)
-            )
+        if emb_num_embeddings_round_to_16 < threshold_int:
+            emb_num_embeddings_round_to_16 = _round_to_16(threshold_int)
 
         # e.g. for adam, its `x`` embedding + `2x`` optimizer states
         total_dim = dim + get_optimizer_state_dim(
             convert_optimizer_type(optimizer_type), dim, data_type_to_dtype(tmp_type)
         )
         total_hbm_need = (
-            embedding_type_bytes * total_dim * emb_num_embeddings_next_power_of_2
+            embedding_type_bytes * total_dim * emb_num_embeddings_round_to_16
         )
 
         # Setup admission strategy if threshold > 0
@@ -494,7 +490,7 @@ def get_planner(
             )
             # Create counter config (actual table will be created during sharding)
             admission_counter = KVCounter(
-                capacity=emb_num_embeddings_next_power_of_2,
+                capacity=emb_num_embeddings_round_to_16,
                 bucket_capacity=bucket_capacity,
                 key_type=torch.int64,
             )

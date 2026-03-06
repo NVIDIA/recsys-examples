@@ -93,6 +93,11 @@ class Platform:
             self.intra_host_bw = 450e9
             self.inter_host_bw = 450e9
             self.hbm_cap = 140 * 1024 * 1024 * 1024
+        elif "A6000" in gpu_name:
+            self.platform = "a6000"
+            self.intra_host_bw = 300e9
+            self.inter_host_bw = 25e9
+            self.hbm_cap = 48 * 1024 * 1024 * 1024
         else:
             raise RuntimeError(f"Not plan for {gpu_name}")
 

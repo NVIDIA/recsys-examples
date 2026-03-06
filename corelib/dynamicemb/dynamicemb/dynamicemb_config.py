@@ -317,7 +317,7 @@ class DynamicEmbTableOptions(_ContextOptions):
         ), "eval_initializer_args must be constant initialization"
 
         if self.init_capacity is not None:
-            target_init_capacity = _next_power_of_2(self.init_capacity)
+            target_init_capacity = _round_to_16(self.init_capacity)
             if self.init_capacity != target_init_capacity:
                 warnings.warn(
                     f"init_capacity is changed to {target_init_capacity} from {self.init_capacity}"
@@ -536,3 +536,10 @@ def _next_power_of_2(n):
     n |= n >> 16
     n |= n >> 32  # This line is necessary for 64-bit integers
     return n + 1
+
+def _round_to_16(n):
+    """Round up to nearest multiple of 16."""
+    if n == 0:
+        return 16
+    return ((n + 15) // 16) * 16
+

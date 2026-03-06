@@ -29,6 +29,8 @@ from dynamicemb import (
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
 )
+from dynamicemb.dynamicemb_config import _round_to_16
+
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -57,7 +59,6 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
-
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -113,8 +114,8 @@ def get_planner(args, device, eb_configs):
 
         embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
         eb_num_embeddings = eb_config.num_embeddings
-        eb_num_embeddings_next_power_of_2 = 2 ** math.ceil(math.log2(eb_num_embeddings))
-        total_hbm_need = embedding_type_bytes * dim * eb_num_embeddings_next_power_of_2
+        eb_num_embeddings_round_to_16 = _round_to_16(eb_num_embeddings)
+        total_hbm_need = embedding_type_bytes * dim * eb_num_embeddings_round_to_16
 
         const = DynamicEmbParameterConstraints(
             sharding_types=[
