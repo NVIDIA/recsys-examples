@@ -512,6 +512,11 @@ def get_constraint_capacity(
     bucket_size_in_bytes = bucket_capacity * byte_consume_per_vector
     # If reserved HBM is less than one bucket, round up to one bucket
     if memory_bytes < bucket_size_in_bytes:
+        warnings.warn(
+            f"Reserved HBM ({memory_bytes} bytes) is less than one bucket "
+            f"({bucket_size_in_bytes} bytes). Rounding up to one bucket.",
+            UserWarning,
+        )
         memory_bytes = bucket_size_in_bytes
     capacity = memory_bytes // byte_consume_per_vector  # at least one bucket
     return (capacity // bucket_capacity) * bucket_capacity
@@ -520,7 +525,7 @@ def get_constraint_capacity(
 def align_to_table_size(n: int) -> int:
     """Round up n to a multiple of DEMB_TABLE_ALIGN_SIZE.
 
-    Requires n >= 0. Returns at least DEMB_TABLE_ALIGN_SIZE when n is 0 or negative
+    Non-positive values are treated as 0 and rounded up to DEMB_TABLE_ALIGN_SIZE
     to avoid zero capacity in planners/tables.
     """
     n = int(n)
