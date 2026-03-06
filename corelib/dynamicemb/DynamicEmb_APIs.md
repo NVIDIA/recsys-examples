@@ -112,7 +112,7 @@ Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic em
         giving it the ability to plan dynamic embedding tables. The only difference from EmbeddingShardingPlanner
         is that DynamicEmbeddingShardingPlanner has an additional parameter `eb_configs`, which is a list of
         TorchREC BaseEmbeddingConfig. This is because the dynamic embedding table needs to re-plan the number of
-        embedding vectors on each rank to align with the power of 2.
+        embedding vectors on each rank to align with DEMB_TABLE_ALIGN_SIZE.
 
         Parameters
         ----------
@@ -395,7 +395,7 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
         init_capacity : Optional[int], optional
             The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
             If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
-            If set, it will be rounded up to the power of 2.
+            If set, it will be rounded up to a multiple of DEMB_TABLE_ALIGN_SIZE.
             As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
             Rehash will be done implicitly.
             Note: This is the setting for a single table at each rank.

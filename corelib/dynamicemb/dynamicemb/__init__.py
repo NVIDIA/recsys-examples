@@ -21,6 +21,7 @@ from .dynamicemb_config import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    align_to_table_size,
     data_type_to_dtype,
     data_type_to_dyn_emb,
     dyn_emb_to_torch,
@@ -30,6 +31,7 @@ from .dynamicemb_config import (
 from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (
+    DEMB_TABLE_ALIGN_SIZE,
     AdmissionStrategy,
     Counter,
     DynamicEmbInitializerArgs,
@@ -38,6 +40,8 @@ from .types import (
 
 __all__ = [
     "AdmissionStrategy",
+    "DEMB_TABLE_ALIGN_SIZE",
+    "align_to_table_size",
     "FrequencyAdmissionStrategy",
     "Counter",
     "KVCounter",
