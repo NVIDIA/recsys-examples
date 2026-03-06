@@ -401,10 +401,10 @@ class ShardedEmbedding(torch.nn.Module):
                 dp_embeddings = self._data_parallel_embedding_collection(kjt)
         if self._model_parallel_embedding_collection is not None:
             mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
-            embeddings = {**embeddings, ​**(mp_embeddings_awaitables.wait())}
+            embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
         if dp_embeddings is not None:
             torch.cuda.current_stream().wait_stream(self._side_stream)
-            embeddings = {**embeddings, ​**dp_embeddings}
+            embeddings = {**embeddings, **dp_embeddings}
         return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
