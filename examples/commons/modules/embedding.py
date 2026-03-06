@@ -396,6 +396,7 @@ class ShardedEmbedding(torch.nn.Module):
         embeddings: Dict[str, JaggedTensor] = {}
         dp_embeddings = None
         if self._data_parallel_embedding_collection is not None:
+            self._side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._side_stream):
                 dp_embeddings = self._data_parallel_embedding_collection(kjt)
         if self._model_parallel_embedding_collection is not None:
