@@ -50,6 +50,11 @@ def dmp_batch_to_tp(batch: Any, exclude_features: bool = True) -> Any:
         output_batch.num_candidates = gather_along_first_dim(
             batch.num_candidates, tp_pg
         )
+    if (
+        hasattr(output_batch, "total_candidates_seq_len")
+        and output_batch.total_candidates_seq_len is not None
+    ):
+        output_batch.total_candidates_seq_len *= tp_size
 
     if hasattr(batch, "labels") and batch.labels is not None:
         output_batch.labels = gatherv_along_first_dim(batch.labels, tp_pg)
