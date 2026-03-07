@@ -65,6 +65,10 @@ class HSTUBatch(BaseBatch):
     action_feature_name: Optional[str] = None
     max_num_candidates: int = 0
     num_candidates: Optional[torch.Tensor] = None
+    # Precomputed in dataset/collate (CPU) to avoid D2H sync in forward.
+    # In pre-interleave space; preprocess doubles it when action interleave is applied.
+    # See compute_split_lengths_for_jagged().
+    total_candidates_seq_len: Optional[int] = None
 
     def __post_init__(self):
         # Call parent __post_init__ first
@@ -180,7 +184,7 @@ class HSTUBatch(BaseBatch):
             )
         else:
             labels = None
-        return HSTUBatch(
+        batch = HSTUBatch(
             features=KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
                 values=torch.concat(values).to(device),
@@ -198,6 +202,35 @@ class HSTUBatch(BaseBatch):
             labels=labels,
             actual_batch_size=actual_batch_size,
         )
+        total_candidates = compute_split_lengths_for_jagged(batch)
+        if total_candidates is not None:
+            batch.total_candidates_seq_len = total_candidates
+        return batch
+
+
+def compute_split_lengths_for_jagged(
+    batch: "HSTUBatch",
+) -> Optional[int]:
+    """
+    Compute total_candidates_seq_len from batch on CPU to avoid D2H sync in forward.
+    Only total_candidates_seq_len is stored; total_prefix_seq_len is derived at use time
+    as total_seq - total_candidates_seq_len.
+
+    The value is in *pre-interleave* space: ``num_candidates.sum()`` for the candidates
+    branch, or ``item_lengths.sum()`` for the contextual-only branch.
+    Preprocess doubles it when action interleave is applied.
+
+    Returns:
+        total_candidates_seq_len, or None when no split is used.
+    """
+    if batch.num_candidates is not None:
+        return int(batch.num_candidates.sum().item())
+
+    if len(batch.contextual_feature_names) > 0:
+        item_lengths = batch.features[batch.item_feature_name].lengths()
+        return int(item_lengths.sum().item())
+
+    return None
 
 
 def is_batch_valid(
