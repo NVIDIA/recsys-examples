@@ -98,6 +98,16 @@ class BaseBatch(Pipelineable):
     def pin_memory(self) -> "BaseBatch":
         return self._apply_to_tensors_or_kjt(lambda t: t.pin_memory(), inplace=False)
 
+    def _on_samples_redistributed(self) -> None:
+        """Hook called after sample redistribution (e.g. balanced shuffler).
+
+        Subclasses should override this to invalidate or recompute any
+        derived scalar fields that aggregate over the batch dimension
+        (e.g. ``total_candidates_seq_len``).  These fields are plain
+        Python scalars that ``_apply_to_tensors_or_kjt`` copies verbatim,
+        so they become stale when the underlying samples change.
+        """
+
     # select along the batch dimension
     # keyed_jagged_index_select_dim1(values, lengths, offsets, indices, batch_size, weights=None, selected_lengths_sum=None)
     # refer to https://github.com/pytorch/FBGEMM/blob/ca965328/fbgemm_gpu/fbgemm_gpu/docs/sparse_ops.py#L252-L260

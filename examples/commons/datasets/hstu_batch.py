@@ -86,6 +86,11 @@ class HSTUBatch(BaseBatch):
         ), "max_num_candidates must be an int"
 
     # to(), pin_memory(), record_stream() are inherited from BaseBatch
+
+    def _on_samples_redistributed(self) -> None:
+        total_candidates = compute_split_lengths_for_jagged(self)
+        self.total_candidates_seq_len = total_candidates
+
     @staticmethod
     def random(
         batch_size: int,
