@@ -371,11 +371,11 @@ class HSTUSequenceDataset(IterableDataset[HSTUBatch]):
                 labels=label_kjt,
                 actual_batch_size=actual_batch_size,
             )
-            batch_for_compute = HSTUBatch(**batch_kwargs)
-            total_candidates = compute_split_lengths_for_jagged(batch_for_compute)
+            batch = HSTUBatch(**batch_kwargs)
+            total_candidates = compute_split_lengths_for_jagged(batch)
             if total_candidates is not None:
-                batch_kwargs["total_candidates_seq_len"] = total_candidates
-            yield HSTUBatch(**batch_kwargs)
+                batch.total_candidates_seq_len = total_candidates
+            yield batch
 
     def _shuffle_batch(self):
         """

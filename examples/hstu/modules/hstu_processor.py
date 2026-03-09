@@ -398,10 +398,16 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             jd = unpad_jd_values(jd)
         # Derive seq_len_a/b from total_candidates_seq_len to avoid D2H sync.
         # After SP gather + unpad, values.shape[0] is the true total; precomputed length still valid.
-        if jd.total_candidates_seq_len is not None:
+        # Disabled for inference: total_candidates_seq_len may not account for
+        # action lengths, and inference is not latency-sensitive to a single D2H sync.
+        if jd.total_candidates_seq_len is not None and not self._is_inference:
             total_seq = jd.values.shape[0]
             precomputed_b = jd.total_candidates_seq_len
             precomputed_a = total_seq - jd.total_candidates_seq_len
+            assert precomputed_a >= 0, (
+                f"precomputed_a is negative ({precomputed_a}): total_seq={total_seq}, "
+                f"total_candidates_seq_len={jd.total_candidates_seq_len}"
+            )
         else:
             precomputed_a = None
             precomputed_b = None

@@ -1128,8 +1128,9 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         else:
             assert offsets_a is not None and offsets_b is not None
             B = offsets_a.shape[0] - 1
-            if seq_len_a is None or seq_len_b is None:
+            if seq_len_a is None:
                 seq_len_a = int(offsets_a[-1].item())
+            if seq_len_b is None:
                 seq_len_b = int(offsets_b[-1].item())
         _, D = values.shape
         BLOCK_D = triton.next_power_of_2(D)

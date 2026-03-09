@@ -329,9 +329,9 @@ class InferenceDataset(IterableDataset[HSTUBatch]):
             if self._max_num_candidates > 0
             else None,
         )
-        batch_for_compute = HSTUBatch(**batch_kwargs)
-        total_candidates = compute_split_lengths_for_jagged(batch_for_compute)
-        if total_candidates is not None:
-            batch_kwargs["total_candidates_seq_len"] = total_candidates
         labels = labels if with_ranking_labels else None
-        return HSTUBatch(labels=labels, **batch_kwargs)
+        batch = HSTUBatch(labels=labels, **batch_kwargs)
+        total_candidates = compute_split_lengths_for_jagged(batch)
+        if total_candidates is not None:
+            batch.total_candidates_seq_len = total_candidates
+        return batch
