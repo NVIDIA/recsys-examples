@@ -1,0 +1,280 @@
+[
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1940159.813,
+    "dur": 62.048,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(504, 1, 1)",
+      "block": "(256, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1956278.314,
+    "dur": 118.336,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1956397.418,
+    "dur": 119.36,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1956517.546,
+    "dur": 117.92,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1956636.266,
+    "dur": 118.848,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1956755.818,
+    "dur": 118.592,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1956875.146,
+    "dur": 119.84,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1956995.69,
+    "dur": 120.0,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1957116.394,
+    "dur": 119.136,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1957236.266,
+    "dur": 119.585,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1957356.523,
+    "dur": 119.52,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1959803.531,
+    "dur": 118.144,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1959923.051,
+    "dur": 118.912,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 14)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1962400.236,
+    "dur": 128.704,
+    "pid": 0,
+    "tid": 14,
+    "args": {
+      "stream": 14,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1962508.268,
+    "dur": 127.04,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 7)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1965009.293,
+    "dur": 132.384,
+    "pid": 0,
+    "tid": 7,
+    "args": {
+      "stream": 7,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Kernel (Stream 14)",
+    "cat": "GPU",
+    "ph": "X",
+    "ts": 1965117.293,
+    "dur": 126.08,
+    "pid": 0,
+    "tid": 14,
+    "args": {
+      "stream": 14,
+      "grid": "(9766, 1, 1)",
+      "block": "(128, 1, 1)"
+    }
+  },
+  {
+    "name": "Serial Execution",
+    "cat": "NVTX",
+    "ph": "X",
+    "ts": 1957607.647,
+    "dur": 2454.58,
+    "pid": 1,
+    "tid": 100,
+    "cname": "rail_load"
+  },
+  {
+    "name": "ShardedEmbedding forward",
+    "cat": "NVTX",
+    "ph": "X",
+    "ts": 1960075.513,
+    "dur": 2564.441,
+    "pid": 1,
+    "tid": 100,
+    "cname": "rail_load"
+  },
+  {
+    "name": "DP Embedding",
+    "cat": "NVTX",
+    "ph": "X",
+    "ts": 1960076.947,
+    "dur": 260.225,
+    "pid": 1,
+    "tid": 100,
+    "cname": "rail_load"
+  },
+  {
+    "name": "MP Embedding",
+    "cat": "NVTX",
+    "ph": "X",
+    "ts": 1960340.452,
+    "dur": 25.066,
+    "pid": 1,
+    "tid": 100,
+    "cname": "rail_load"
+  }
+]
