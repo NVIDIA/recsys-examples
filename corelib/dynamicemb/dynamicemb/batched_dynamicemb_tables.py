@@ -1027,7 +1027,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._scores[table_name] = table_score
 
     def get_score(self) -> Dict[str, int]:
-        return self._scores.copy()
+        """Return current score per table. For TIMESTAMP score strategy, returns device_timestamp(); otherwise returns the stored score."""
+        result: Dict[str, int] = {}
+        ts: Optional[int] = None
+        for table_name, option in zip(self._table_names, self._dynamicemb_options):
+            if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
+                if ts is None:
+                    ts = device_timestamp()
+                result[table_name] = ts
+            else:
+                result[table_name] = self._scores[table_name]
+        return result
 
     def _create_score(self):
         self._scores: Dict[str, int] = {}
@@ -1040,6 +1050,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._scores[table_name] = 1
             elif option.score_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
+                self._scores[table_name] = 0
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
                 option.evict_strategy = DynamicEmbEvictStrategy.LFU
                 self._scores[table_name] = 1
@@ -1261,6 +1272,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         else:
             raise RuntimeError("Only DynamicEmbStorage supports incremental dump.")
 
+        ts: Optional[int] = None
         for table_name, threshold in zip(table_names, table_thresholds):
             table_id = self._table_names.index(table_name)
             all_keys = []
@@ -1288,6 +1300,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 if all_values
                 else torch.empty(0, dtype=storage.embedding_dtype()),
             )
-            ret_scores[table_name] = self._scores[table_name]
+            option = self._dynamicemb_options[table_id]
+            if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
+                if ts is None:
+                    ts = device_timestamp()
+                ret_scores[table_name] = ts
+            else:
+                ret_scores[table_name] = self._scores[table_name]
 
         return ret_tensors, ret_scores
