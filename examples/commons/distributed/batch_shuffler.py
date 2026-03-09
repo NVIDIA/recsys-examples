@@ -56,6 +56,9 @@ class BaseTaskBalancedBatchShuffler:
             pg_group
         )
 
+        # NOTE: _on_samples_redistributed may trigger a D2H sync
+        # (num_candidates.sum().item()) on the GPU batch.  This is acceptable
+        # because the shuffler already blocks on the allgather collective above.
         new_batch._on_samples_redistributed()
 
         ret = new_batch
