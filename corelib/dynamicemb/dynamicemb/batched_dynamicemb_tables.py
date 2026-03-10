@@ -1252,6 +1252,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         pg: Optional[dist.ProcessGroup] = None,
     ) -> Tuple[Dict[str, Tuple[Tensor, Tensor]], Dict[str, int]]:
         storage = self._storage
+        if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
+            raise TypeError(
+                f"incremental_dump requires DynamicEmbStorage or HybridStorage, "
+                f"got {type(storage).__name__}"
+            )
         if self._cache is not None and isinstance(storage, DynamicEmbStorage):
             flush_cache(self._cache, storage)
         ret_tensors: Dict[str, Tuple[Tensor, Tensor]] = {}
