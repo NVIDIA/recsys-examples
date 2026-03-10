@@ -146,7 +146,6 @@ class RwPooledEmbeddingDist(
         super().__init__()
         self._pg = pg
         self._embedding_dims = embedding_dims
-        self._qcomm_codecs_registry = qcomm_codecs_registry
         
         self._dist: Optional[
             Union[
