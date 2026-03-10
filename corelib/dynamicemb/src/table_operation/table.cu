@@ -157,10 +157,15 @@ void bind_table_operation(py::module &m) {
         py::arg("table_bucket_offsets"), py::arg("bucket_capacity"));
 
 
-  m.def("table_update_counter", &dyn_emb::table_update_counter,
-        "atomically update counters at slot indices",
-        py::arg("counter"), py::arg("capacity"),
-        py::arg("slot_indices"), py::arg("delta"));
+  m.def("table_update_counter_with_layout",
+        &dyn_emb::table_update_counter_with_layout,
+        "update counters at per-table slot indices (conversion done in kernel)",
+        py::arg("counter"), py::arg("slot_indices"), py::arg("delta"),
+        py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
+        py::arg("main_capacity"), py::arg("num_tables"),
+        py::arg("table_ids") = py::none(),
+        py::arg("overflow_output_offsets") = py::none(),
+        py::arg("overflow_bucket_capacity") = 0);
 
   py::enum_<dyn_emb::ScorePolicyType>(m, "ScorePolicy")
       .value("CONST", dyn_emb::ScorePolicyType::Const)

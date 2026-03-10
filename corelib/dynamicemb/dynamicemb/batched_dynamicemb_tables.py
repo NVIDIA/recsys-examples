@@ -947,8 +947,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
             self._storage.training = False
 
-        self._update_score()
-
         return res
 
     def prefetch(
@@ -998,6 +996,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 else None,
             )
         )
+        self._update_score()
 
     def set_score(
         self,
@@ -1034,7 +1033,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
             if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
                 option.evict_strategy = DynamicEmbEvictStrategy.LRU
-                self._scores[table_name] = device_timestamp()
+                self._scores[table_name] = 0
             elif option.score_strategy == DynamicEmbScoreStrategy.STEP:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 1
@@ -1045,29 +1044,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._scores[table_name] = 1
 
     def _update_score(self):
+        """Only STEP mode updates score; TIMESTAMP/LFU are not used by the underlying table or are constant."""
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
+            if option.score_strategy != DynamicEmbScoreStrategy.STEP:
+                continue
             old_score = self._scores[table_name]
-            if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
-                new_score = device_timestamp()
-                if new_score < old_score:
-                    warnings.warn(
-                        f"Table '{table_name}' 's score({new_score}) is less than old one({old_score}).",
-                        UserWarning,
-                    )
+            max_uint64 = (2**64) - 1
+            new_score = old_score + 1
+            if new_score > max_uint64:
+                warnings.warn(
+                    f"Table '{table_name}' 's score({new_score}) is out of range, reset to 0.",
+                    UserWarning,
+                )
+                self._scores[table_name] = 0
+            else:
                 self._scores[table_name] = new_score
-            elif option.score_strategy == DynamicEmbScoreStrategy.STEP:
-                max_uint64 = (2**64) - 1
-                new_score = old_score + 1
-                if new_score > max_uint64:
-                    warnings.warn(
-                        f"Table '{table_name}' 's score({new_score}) is out of range, reset to 0.",
-                        UserWarning,
-                    )
-                    self._scores[table_name] = 0
-                else:
-                    self._scores[table_name] = new_score
-            elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
-                self._scores[table_name] = 1
 
     def _reduce_table_scores(self, scores: List[int]) -> int:
         if len(scores) == 0:

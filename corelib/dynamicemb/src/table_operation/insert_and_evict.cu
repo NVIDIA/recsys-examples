@@ -20,14 +20,38 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-__global__ void update_counter_kernel(
-    int32_t *__restrict__ counter, int64_t capacity,
-    int64_t const *__restrict__ slot_indices, int64_t n, int32_t delta) {
+// Converts per-table slot_indices (and optional table_ids) to flat counter
+// index inside the kernel and adds delta. No atomic: caller guarantees no
+// two threads write the same counter element (e.g. slot_indices from unique keys).
+__global__ void update_counter_with_layout_kernel(
+    int32_t *__restrict__ counter, int64_t total_capacity,
+    int64_t const *__restrict__ slot_indices, int64_t n, int32_t delta,
+    int64_t const *__restrict__ table_ids, int64_t const *__restrict__ table_bucket_offsets,
+    int64_t bucket_capacity, int64_t main_capacity,
+    int64_t const *__restrict__ overflow_output_offsets, int64_t overflow_bucket_capacity,
+    int64_t num_tables) {
   int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
   int64_t slot = slot_indices[i];
-  if (slot >= 0 && slot < capacity) {
-    ::atomicAdd(&counter[slot], delta);
+  if (slot < 0) return;
+  int64_t tid = (table_ids != nullptr) ? table_ids[i] : 0;
+  int64_t flat = -1;
+  if (overflow_output_offsets != nullptr) {
+    int64_t per_table_cap = overflow_output_offsets[tid];
+    if (slot < per_table_cap) {
+      flat = table_bucket_offsets[tid] * bucket_capacity + slot;
+    } else {
+      flat = main_capacity + tid * overflow_bucket_capacity + (slot - per_table_cap);
+    }
+  } else {
+    if (table_bucket_offsets != nullptr && num_tables > 1) {
+      flat = table_bucket_offsets[tid] * bucket_capacity + slot;
+    } else {
+      flat = slot;
+    }
+  }
+  if (flat >= 0 && flat < total_capacity) {
+    counter[flat] += delta;
   }
 }
 
@@ -399,21 +423,34 @@ table_insert_and_evict(at::Tensor table_storage, at::Tensor table_bucket_offsets
                          evicted_scores, evicted_table_ids);
 }
 
-void table_update_counter(
-    at::Tensor counter, int64_t capacity,
-    at::Tensor slot_indices, int32_t delta) {
+void table_update_counter_with_layout(
+    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
+    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
+    int64_t main_capacity, int64_t num_tables,
+    c10::optional<at::Tensor> table_ids,
+    c10::optional<at::Tensor> overflow_output_offsets,
+    int64_t overflow_bucket_capacity) {
 
   int64_t n = slot_indices.size(0);
   if (n == 0) return;
 
+  int64_t total_capacity = counter.numel();
   auto counter_ptr = counter.data_ptr<int32_t>();
   auto slot_indices_ptr = slot_indices.data_ptr<int64_t>();
+  auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
+  int64_t const *table_ids_ptr = (table_ids.has_value() && table_ids->defined())
+      ? table_ids->data_ptr<int64_t>() : nullptr;
+  int64_t const *overflow_output_offsets_ptr =
+      (overflow_output_offsets.has_value() && overflow_output_offsets->defined())
+      ? overflow_output_offsets->data_ptr<int64_t>() : nullptr;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   constexpr int BLOCK_SIZE = 256;
-  update_counter_kernel
+  update_counter_with_layout_kernel
       <<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          counter_ptr, capacity, slot_indices_ptr, n, delta);
+          counter_ptr, total_capacity, slot_indices_ptr, n, delta,
+          table_ids_ptr, table_bucket_offsets_ptr, bucket_capacity, main_capacity,
+          overflow_output_offsets_ptr, overflow_bucket_capacity, num_tables);
 
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
