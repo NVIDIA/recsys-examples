@@ -54,6 +54,7 @@ from ..input_dist import RwSparseFeaturesDist
 
 from ..output_dist import RwSequenceEmbeddingDist, RwPooledEmbeddingDist
 
+
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
     def _create_embedding_kernel(
         self,
@@ -153,8 +154,8 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         )
 
     def create_output_dist(
-            self, device: Optional[torch.device] = None
-        ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
+        self, device: Optional[torch.device] = None
+    ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
         """
         Creates output distribution for sequence embeddings.
         Uses customized RwSequenceEmbeddingDist for DynamicEmb, which can be 
