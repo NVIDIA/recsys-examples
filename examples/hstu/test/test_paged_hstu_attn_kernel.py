@@ -21,7 +21,14 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from hstu_assert_close import assert_hstu_close
-from hstu_attn import hstu_attn_varlen_func
+
+try:
+    from hstu import hstu_attn_varlen_func as _new_func
+    from modules.hstu_attention import _make_new_hstu_compat
+
+    hstu_attn_varlen_func = _make_new_hstu_compat(_new_func)
+except ImportError:
+    from hstu_attn import hstu_attn_varlen_func  # type: ignore[no-redef]
 
 
 def pad_input(unpadded_input, cu_seqlen, batch, seqlen):

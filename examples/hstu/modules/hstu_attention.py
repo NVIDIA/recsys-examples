@@ -13,11 +13,90 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+from functools import wraps
 from typing import Optional, Union
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import KernelBackend
+
+
+def _make_new_hstu_compat(new_func):
+    """Wrap new hstu.hstu_attn_varlen_func to match the legacy calling convention.
+
+    The new unified API (fbgemm_gpu_hstu) adds ``seqused_q`` / ``seqused_k``
+    positional args and promotes ``scaling_seqlen``, ``num_contexts``,
+    ``num_targets`` from keyword to positional.  This wrapper allows callers
+    written against the legacy signature to work unchanged.
+
+    Cannot be replaced by ``functools.partial`` because it needs to:
+    1. Insert positional args (seqused_q/k=None) between cu_seqlens_k and max_seqlen_q
+    2. Compute a dynamic default (scaling_seqlen defaults to max_seqlen_q)
+    3. Strip unsupported kwargs (cu_seqlens_t)
+    """
+
+    @wraps(new_func)
+    def _compat(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=(-1, -1),
+        alpha=1.0,
+        rab=None,
+        has_drab=False,
+        func=None,
+        quant_mode=-1,
+        scaling_seqlen=-1,
+        **kwargs,
+    ):
+        if scaling_seqlen == -1:
+            scaling_seqlen = max_seqlen_q
+        kwargs.pop("cu_seqlens_t", None)
+        return new_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,  # seqused_q
+            None,  # seqused_k
+            max_seqlen_q,
+            max_seqlen_k,
+            scaling_seqlen,
+            num_contexts,
+            num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            alpha=alpha,
+            rab=rab,
+            has_drab=has_drab,
+            func=func,
+            quant_mode=quant_mode,
+            **kwargs,
+        )
+
+    return _compat
+
+
+def _import_hstu_attn_func(legacy_module="hstu_attn"):
+    """Import hstu_attn_varlen_func, preferring new fbgemm_gpu_hstu package."""
+    try:
+        from hstu import hstu_attn_varlen_func as _new_func
+
+        return _make_new_hstu_compat(_new_func)
+    except ImportError:
+        if legacy_module == "hopper":
+            from hopper.hstu_attn_interface import hstu_attn_varlen_func
+        else:
+            from hstu_attn import hstu_attn_varlen_func
+        return hstu_attn_varlen_func
 
 
 class HSTUAttention(torch.nn.Module):
@@ -239,9 +318,7 @@ class FusedHSTUAttention(HSTUAttention):
         is_causal: bool,
     ):
         super().__init__()
-        from hstu_attn import hstu_attn_varlen_func
-
-        self._hstu_attn_varlen_func = hstu_attn_varlen_func
+        self._hstu_attn_varlen_func = _import_hstu_attn_func("hstu_attn")
         self.num_heads = num_heads
         self.attention_dim = attention_dim
         self.linear_dim = linear_dim
@@ -334,9 +411,7 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         is_causal: bool,
     ):
         super().__init__()
-        from hopper.hstu_attn_interface import hstu_attn_varlen_func
-
-        self._hstu_attn_varlen_func = hstu_attn_varlen_func
+        self._hstu_attn_varlen_func = _import_hstu_attn_func("hopper")
         self.num_heads = num_heads
         self.attention_dim = attention_dim
         self.linear_dim = linear_dim

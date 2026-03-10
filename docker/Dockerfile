@@ -69,6 +69,27 @@ RUN rm -rf /workspace/recsys-examples/*
 FROM ${DEVEL_IMAGE} AS build
 ARG TRITONSERVER_BUILD
 
+
+# TODO, remove it after test
+RUN pip uninstall hstu_attn --break-system-packages
+
+# TODO , move it under devel after test
+# Install new unified FBGEMM HSTU (package: fbgemm_gpu_hstu, import: hstu)
+# Coexists with legacy hstu_attn / hopper packages above
+RUN cd /workspace/deps && \
+    git clone -b fix-hstu_standalone_building https://github.com/jiayus-nvidia/FBGEMM.git fbgemm_hstu && \
+    cd fbgemm_hstu && git submodule update --init external/cutlass && \
+    cd fbgemm_gpu/experimental/hstu && \
+    HSTU_DISABLE_86OR89=FALSE \
+    HSTU_DISABLE_ARBITRARY=TRUE \
+    HSTU_DISABLE_LOCAL=TRUE \
+    HSTU_DISABLE_RAB=TRUE \
+    HSTU_DISABLE_DRAB=TRUE \
+    HSTU_DISABLE_FP16=TRUE \
+    HSTU_ARCH_LIST="8.0 9.0 10.0" \
+    pip install . && \
+    rm -rf /workspace/deps/fbgemm_hstu
+
 WORKDIR /workspace/recsys-examples
 # to remove the pre-installed hstu packages of the previous build
 RUN rm -rf /workspace/recsys-examples/*

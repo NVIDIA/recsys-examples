@@ -2,8 +2,18 @@ import fbgemm_gpu  # noqa: F401
 import pytest  # noqa: F401
 import torch
 from commons.utils.hstu_assert_close import assert_hstu_close
-from hopper.hstu_attn_interface import hstu_attn_varlen_func as hopper_attn_func
-from hstu_attn import hstu_attn_varlen_func as ampere_attn_func
+from modules.hstu_attention import _import_hstu_attn_func
+
+try:
+    hopper_attn_func = _import_hstu_attn_func("hopper")
+except ImportError:
+    hopper_attn_func = None
+
+try:
+    ampere_attn_func = _import_hstu_attn_func("hstu_attn")
+except ImportError:
+    ampere_attn_func = None
+
 from ops.pt_ops.pt_hstu_attention import pytorch_hstu_mha as pytorch_hstu_mha
 from ops.triton_ops.triton_hstu_attention import triton_hstu_mha as triton_hstu_mha
 

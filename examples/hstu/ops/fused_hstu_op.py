@@ -16,6 +16,9 @@
 from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
+flash_attn_cuda_ampere = None
+flash_attn_cuda_hopper = None
+
 try:
     import hstu_attn_2_cuda as flash_attn_cuda_ampere
 except ImportError:
@@ -25,6 +28,238 @@ try:
     import hstu_hopper_cuda as flash_attn_cuda_hopper
 except ImportError:
     pass
+
+if flash_attn_cuda_ampere is None or flash_attn_cuda_hopper is None:
+    try:
+        import hstu as _hstu_new  # noqa: F401 – registers torch.ops.fbgemm.*
+
+        class _NewHSTUAmpereCompat:
+            """Adapts torch.ops.fbgemm.hstu_varlen_{fwd,bwd}_80 to the legacy
+            hstu_attn_2_cuda.varlen_{fwd,bwd} positional-arg convention."""
+
+            @staticmethod
+            def varlen_fwd(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                max_q,
+                max_k,
+                scale_len,
+                ctx,
+                tgt,
+                tgs,
+                wsl,
+                wsr,
+                alpha,
+                rab,
+                func_param,
+                *paged_kv_args,
+            ):
+                import torch as _torch
+
+                return _torch.ops.fbgemm.hstu_varlen_fwd_80(
+                    q,
+                    k,
+                    v,
+                    cu_q,
+                    cu_k,
+                    None,
+                    None,
+                    max_q,
+                    max_k,
+                    scale_len,
+                    ctx,
+                    tgt,
+                    tgs,
+                    wsl,
+                    wsr,
+                    alpha,
+                    rab,
+                    func_param,
+                    *paged_kv_args,
+                )
+
+            @staticmethod
+            def varlen_bwd(
+                dout,
+                q,
+                k,
+                v,
+                dq,
+                dk,
+                dv,
+                cu_q,
+                cu_k,
+                max_q,
+                max_k,
+                scale_len,
+                ctx,
+                tgt,
+                tgs,
+                wsl,
+                wsr,
+                alpha,
+                rab,
+                has_drab,
+                func_param,
+                det,
+            ):
+                import torch as _torch
+
+                return _torch.ops.fbgemm.hstu_varlen_bwd_80(
+                    dout,
+                    q,
+                    k,
+                    v,
+                    cu_q,
+                    cu_k,
+                    None,
+                    None,
+                    max_q,
+                    max_k,
+                    scale_len,
+                    dq,
+                    dk,
+                    dv,
+                    ctx,
+                    tgt,
+                    tgs,
+                    wsl,
+                    wsr,
+                    alpha,
+                    rab,
+                    has_drab,
+                    func_param,
+                    det,
+                )
+
+        class _NewHSTUHopperCompat:
+            """Adapts torch.ops.fbgemm.hstu_varlen_{fwd,bwd}_90 to the legacy
+            hstu_hopper_cuda.varlen_{fwd,bwd} positional-arg convention."""
+
+            @staticmethod
+            def varlen_fwd(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                max_q,
+                max_k,
+                scale_len,
+                ctx,
+                tgt,
+                tgs,
+                wsl,
+                wsr,
+                alpha,
+                rab,
+                func_param,
+                quant_mode=-1,
+                *fp8_args,
+            ):
+                import torch as _torch
+
+                output_dtype = 0 if q.dtype == _torch.bfloat16 else 1
+                return _torch.ops.fbgemm.hstu_varlen_fwd_90(
+                    q,
+                    k,
+                    v,
+                    cu_q,
+                    cu_k,
+                    None,
+                    None,
+                    max_q,
+                    max_k,
+                    scale_len,
+                    ctx,
+                    tgt,
+                    tgs,
+                    wsl,
+                    wsr,
+                    alpha,
+                    rab,
+                    func_param,
+                    quant_mode,
+                    output_dtype,
+                    *fp8_args,
+                )
+
+            @staticmethod
+            def varlen_bwd(
+                dout,
+                dout_t,
+                q,
+                q_t,
+                k,
+                k_t,
+                v,
+                dq,
+                dk,
+                dv,
+                cu_q,
+                cu_k,
+                max_q,
+                max_k,
+                scale_len,
+                ctx,
+                tgt,
+                tgs,
+                wsl,
+                wsr,
+                alpha,
+                quant_mode,
+                rab,
+                has_drab,
+                func_param,
+                *args,
+            ):
+                import torch as _torch
+
+                fp8_args = args[:-1]
+                deterministic = args[-1]
+                output_dtype = 0 if dout.dtype == _torch.bfloat16 else 1
+                return _torch.ops.fbgemm.hstu_varlen_bwd_90(
+                    dout,
+                    dout_t,
+                    q,
+                    q_t,
+                    k,
+                    k_t,
+                    v,
+                    cu_q,
+                    cu_k,
+                    None,
+                    None,
+                    max_q,
+                    max_k,
+                    scale_len,
+                    dq,
+                    dk,
+                    dv,
+                    ctx,
+                    tgt,
+                    tgs,
+                    wsl,
+                    wsr,
+                    alpha,
+                    quant_mode,
+                    rab,
+                    has_drab,
+                    func_param,
+                    *fp8_args,
+                    output_dtype,
+                    deterministic,
+                )
+
+        if flash_attn_cuda_ampere is None:
+            flash_attn_cuda_ampere = _NewHSTUAmpereCompat()
+        if flash_attn_cuda_hopper is None:
+            flash_attn_cuda_hopper = _NewHSTUHopperCompat()
+    except ImportError:
+        pass
 import nvtx
 import torch
 from commons.utils.clear_tensor_data import clear_tensor_data
