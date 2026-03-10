@@ -27,7 +27,9 @@ from torchrec.distributed.embedding_lookup import (
     GroupedPooledEmbeddingsLookup as _GroupedPooledEmbeddingsLookup,
 )
 from torchrec.distributed.embedding_sharding import (
+    BaseEmbeddingDist,
     BaseSparseFeaturesDist,
+    EmbeddingShardingContext,
     EmbeddingShardingInfo,
 )
 from torchrec.distributed.embedding_types import (
@@ -39,6 +41,7 @@ from torchrec.distributed.embedding_types import (
 from torchrec.distributed.sharding.rw_sequence_sharding import (
     RwSequenceEmbeddingSharding,
 )
+from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.sharding.rw_sharding import RwPooledEmbeddingSharding
 from torchrec.distributed.types import QuantizedCommCodecs, ShardingEnv, ShardingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -262,7 +265,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
 
     def create_output_dist(
             self, device: Optional[torch.device] = None,
-        ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
+        ) -> BaseEmbeddingDist[EmbeddingShardingContext, torch.Tensor, torch.Tensor]:
         """
         Creates output distribution for pooled embeddings.        
         Uses customized RwPooledEmbeddingDist for DynamicEmb.
