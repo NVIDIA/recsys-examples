@@ -148,7 +148,10 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             pg=self._pg,
             device=device if device is not None else self._device,
         )
-    def create_output_dist(self, device: Optional[torch.device] = None):
+
+    def create_output_dist(
+            self, device: Optional[torch.device] = None
+        ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
         """
         Creates output distribution for sequence embeddings.
         Uses customized RwSequenceEmbeddingDist for DynamicEmb, which can be 
@@ -257,7 +260,9 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             sharding_type=ShardingType.ROW_WISE,
         )
 
-    def create_output_dist(self, device: Optional[torch.device] = None,):
+    def create_output_dist(
+            self, device: Optional[torch.device] = None,
+        ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
         """
         Creates output distribution for pooled embeddings.        
         Uses customized RwPooledEmbeddingDist for DynamicEmb.

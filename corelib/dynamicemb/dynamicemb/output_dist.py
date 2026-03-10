@@ -217,7 +217,6 @@ class RwPooledEmbeddingDist(
             self._dist_type = "normal"
 
     def _validate_sharding_ctx_consistency(self, sharding_ctx):
-
         if self._dist_type is None:
             return
     
