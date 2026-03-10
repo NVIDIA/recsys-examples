@@ -49,6 +49,7 @@ from ..batched_dynamicemb_compute_kernel import (
 )
 from ..input_dist import RwSparseFeaturesDist
 
+from ..output_dist import RwSequenceEmbeddingDist, RwPooledEmbeddingDist
 
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
     def _create_embedding_kernel(
@@ -147,6 +148,18 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             pg=self._pg,
             device=device if device is not None else self._device,
         )
+    def create_output_dist(self, device: Optional[torch.device] = None,):
+        """
+        Creates output distribution for sequence embeddings.
+        Uses customized RwSequenceEmbeddingDist for DynamicEmb, which can be 
+        optimized for non-contiguous distribution patterns (e.g., round-robin).
+        """
+        return RwSequenceEmbeddingDist(
+            self._pg,
+            self._get_num_features(),
+            device if device is not None else self._device,
+            qcomm_codecs_registry=self.qcomm_codecs_registry,
+        )
 
 
 class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
@@ -242,4 +255,14 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             device=device if device is not None else self._device,
             feature_processor=feature_processor,
             sharding_type=ShardingType.ROW_WISE,
+        )
+    def create_output_dist(self, device: Optional[torch.device] = None,):
+        """
+        Creates output distribution for pooled embeddings.        
+        Uses customized RwPooledEmbeddingDist for DynamicEmb.
+        """
+        return RwPooledEmbeddingDist(
+            self._pg,
+            self._get_embedding_dims(),
+            qcomm_codecs_registry=self.qcomm_codecs_registry,
         )

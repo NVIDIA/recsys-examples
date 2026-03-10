@@ -35,6 +35,7 @@ from .types import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
+from .output_dist import RwSequenceEmbeddingDist, RwPooledEmbeddingDist
 
 __all__ = [
     "AdmissionStrategy",
