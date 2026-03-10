@@ -100,7 +100,10 @@ class RwSequenceEmbeddingDist(
         Returns:
             torch.Tensor: sequence embeddings after distribution.
         """
-        assert sharding_ctx is not None
+        if sharding_ctx is None:
+            raise ValueError(
+                "RwSequenceEmbeddingDist.forward requires a non-None sharding_ctx."
+            )
         
         # TODO: Optimize unbucketize_permute operation here
         # The unbucketize_permute_tensor is used in SequenceEmbeddingsAwaitable

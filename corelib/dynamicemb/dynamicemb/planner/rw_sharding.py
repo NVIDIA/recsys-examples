@@ -148,7 +148,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             pg=self._pg,
             device=device if device is not None else self._device,
         )
-    def create_output_dist(self, device: Optional[torch.device] = None,):
+    def create_output_dist(self, device: Optional[torch.device] = None):
         """
         Creates output distribution for sequence embeddings.
         Uses customized RwSequenceEmbeddingDist for DynamicEmb, which can be 
