@@ -59,9 +59,6 @@ class HSTUBatch(BaseBatch):
       max_num_candidates (int): The maximum number of candidate items (ranking only).
       num_candidates (Optional[torch.Tensor]): Per-sample candidate count (ranking only;
           retrieval asserts ``max_num_candidates == 0`` so this is always None there).
-      total_candidates_seq_len (Optional[int]): Must be non-None **iff**
-          ``num_candidates`` is non-None.  Invariant enforced by
-          ``compute_split_lengths_for_jagged`` and validated in ``is_batch_valid``.
     """
 
     # HSTU-specific fields (BaseBatch fields are inherited)
@@ -70,11 +67,6 @@ class HSTUBatch(BaseBatch):
     # Ranking only: retrieval enforces max_num_candidates == 0.
     max_num_candidates: int = 0
     num_candidates: Optional[torch.Tensor] = None
-    # Precomputed in dataset/collate (CPU) to avoid D2H sync in forward.
-    # In pre-interleave space; preprocess doubles it when action interleave is applied.
-    # Must be non-None iff num_candidates is non-None.
-    # See compute_split_lengths_for_jagged().
-    total_candidates_seq_len: Optional[int] = None
 
     def __post_init__(self):
         # Call parent __post_init__ first
@@ -92,10 +84,6 @@ class HSTUBatch(BaseBatch):
         ), "max_num_candidates must be an int"
 
     # to(), pin_memory(), record_stream() are inherited from BaseBatch
-
-    def _on_samples_redistributed(self) -> None:
-        total_candidates = compute_split_lengths_for_jagged(self)
-        self.total_candidates_seq_len = total_candidates
 
     @staticmethod
     def random(
@@ -213,31 +201,7 @@ class HSTUBatch(BaseBatch):
             labels=labels,
             actual_batch_size=actual_batch_size,
         )
-        total_candidates = compute_split_lengths_for_jagged(batch)
-        if total_candidates is not None:
-            batch.total_candidates_seq_len = total_candidates
         return batch
-
-
-def compute_split_lengths_for_jagged(
-    batch: "HSTUBatch",
-) -> Optional[int]:
-    """
-    Compute total_candidates_seq_len from batch on CPU to avoid D2H sync in forward.
-    Only total_candidates_seq_len is stored; total_prefix_seq_len is derived at use time
-    as total_seq - total_candidates_seq_len.
-
-    The value is in *pre-interleave* space: ``num_candidates.sum()``.
-    Preprocess doubles it when action interleave is applied.
-
-    Returns non-None **only** when ``num_candidates`` is set (ranking task).
-    Retrieval and contextual-only paths fall back to the D2H-sync path in
-    ``_Split2DJaggedFunction``.
-    """
-    if batch.num_candidates is not None:
-        return int(batch.num_candidates.sum().item())
-
-    return None
 
 
 def is_batch_valid(
@@ -273,14 +237,6 @@ def is_batch_valid(
             batch.features[batch.item_feature_name].lengths(),
             batch.features[batch.action_feature_name].lengths(),
         ), "item_feature and action_feature shape should equal"
-
-    # Invariant: total_candidates_seq_len and num_candidates must be both
-    # None or both non-None (num_candidates is ranking-only).
-    assert (batch.num_candidates is None) == (batch.total_candidates_seq_len is None), (
-        f"num_candidates and total_candidates_seq_len must be both None or both "
-        f"non-None, got num_candidates={'set' if batch.num_candidates is not None else 'None'}, "
-        f"total_candidates_seq_len={batch.total_candidates_seq_len}"
-    )
 
     if batch.num_candidates is not None:
         assert (

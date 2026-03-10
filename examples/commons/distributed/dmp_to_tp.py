@@ -50,17 +50,6 @@ def dmp_batch_to_tp(batch: Any, exclude_features: bool = True) -> Any:
         output_batch.num_candidates = gather_along_first_dim(
             batch.num_candidates, tp_pg
         )
-    # Invariant: total_candidates_seq_len is non-None iff num_candidates is
-    # non-None (ranking only).  After gather, recompute from the gathered
-    # num_candidates to get the correct global total.
-    if (
-        hasattr(output_batch, "total_candidates_seq_len")
-        and output_batch.total_candidates_seq_len is not None
-    ):
-        output_batch.total_candidates_seq_len = int(
-            output_batch.num_candidates.sum().item()
-        )
-
     if hasattr(batch, "labels") and batch.labels is not None:
         output_batch.labels = gatherv_along_first_dim(batch.labels, tp_pg)
     # reduce max seqlen

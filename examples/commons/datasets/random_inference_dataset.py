@@ -18,7 +18,7 @@ import torch
 from torch.utils.data.dataset import IterableDataset
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
-from .hstu_batch import FeatureConfig, HSTUBatch, compute_split_lengths_for_jagged
+from .hstu_batch import FeatureConfig, HSTUBatch
 
 
 class RandomInferenceDataset(
@@ -146,9 +146,6 @@ class RandomInferenceDataset(
                     max_num_candidates=self._max_num_candidates,
                     num_candidates=num_candidates,
                 )
-                total_candidates = compute_split_lengths_for_jagged(batch)
-                if total_candidates is not None:
-                    batch.total_candidates_seq_len = total_candidates
                 batch = batch.to(device=torch.cuda.current_device())
                 self._cached_batch.append(
                     tuple([batch, torch.tensor(user_ids).long(), total_history_lengths])

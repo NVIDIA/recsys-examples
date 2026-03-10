@@ -194,14 +194,15 @@ def hstu_preprocess_embeddings(
         if num_candidates is not None
         else None
     )
-    # batch.total_candidates_seq_len is in pre-interleave space; double when action interleaved.
-    total_candidates_seq_len = batch.total_candidates_seq_len
-    if (
-        batch.action_feature_name is not None
-        and not is_inference
-        and total_candidates_seq_len is not None
-    ):
-        total_candidates_seq_len = total_candidates_seq_len * 2
+    # Compute total_candidates_seq_len here instead of carrying it through Batch
+    total_candidates_seq_len = None
+    if not is_inference:
+        if num_candidates is not None:
+            total_candidates_seq_len = int(num_candidates.sum().item())
+        elif contextual_seqlen is not None:
+            total_candidates_seq_len = int(
+                (sequence_embeddings_lengths.sum() - contextual_seqlen.sum()).item()
+            )
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
@@ -398,9 +399,8 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             jd = unpad_jd_values(jd)
         # Derive seq_len_a/b from total_candidates_seq_len to avoid D2H sync.
         # After SP gather + unpad, values.shape[0] is the true total; precomputed length still valid.
-        # Disabled for inference: total_candidates_seq_len may not account for
-        # action lengths, and inference is not latency-sensitive to a single D2H sync.
-        if jd.total_candidates_seq_len is not None and not self._is_inference:
+        # total_candidates_seq_len is None for inference (set in hstu_preprocess_embeddings).
+        if jd.total_candidates_seq_len is not None:
             total_seq = jd.values.shape[0]
             precomputed_b = jd.total_candidates_seq_len
             precomputed_a = total_seq - jd.total_candidates_seq_len
