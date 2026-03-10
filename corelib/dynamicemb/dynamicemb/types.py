@@ -251,23 +251,6 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
     ]:
         pass
 
-    @abc.abstractmethod
-    def incremental_dump(
-        self,
-        table_id: int,
-        threshold: int,
-        pg: Optional[object],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Dump keys and embeddings for one table (score >= threshold).
-
-        When pg is set and world_size > 1, gathers all ranks' results so that
-        returned tensors are the concatenation of all ranks (in rank order).
-
-        Returns:
-            (keys_cpu, values_cpu) for the given table_id.
-        """
-        ...
-
 
 class Cache(abc.ABC):
     @abc.abstractmethod
