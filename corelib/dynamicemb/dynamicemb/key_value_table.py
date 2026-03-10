@@ -53,6 +53,50 @@ from torch import Tensor, nn  # usort:skip
 # ---------------------------------------------------------------------------
 
 
+def _all_gather_dumped_keys_values(
+    keys: Tensor,
+    values: Tensor,
+    pg: dist.ProcessGroup,
+) -> Tuple[Tensor, Tensor]:
+    """Gather (keys, values) from all ranks into concatenated CPU tensors.
+
+    keys: (N,) int64 on device; values: (N, D) on device.
+    Returns (out_keys_cpu, out_values_cpu) with all ranks' data in rank order.
+    """
+    device = keys.device
+    world_size = dist.get_world_size(group=pg)
+    n = keys.numel()
+    d_count = torch.tensor([n], dtype=torch.long, device=device)
+    gathered_counts = [torch.empty_like(d_count) for _ in range(world_size)]
+    dist.all_gather(gathered_counts, d_count, group=pg)
+    max_n = max(c.item() for c in gathered_counts)
+    emb_dim = values.shape[1]
+    dtype_val = values.dtype
+    keys_pad = torch.zeros(max_n, dtype=torch.int64, device=device)
+    values_pad = torch.zeros(max_n, emb_dim, dtype=dtype_val, device=device)
+    if n > 0:
+        keys_pad[:n] = keys
+        values_pad[:n, :] = values
+    gathered_keys = [torch.empty_like(keys_pad) for _ in range(world_size)]
+    gathered_values = [torch.empty_like(values_pad) for _ in range(world_size)]
+    dist.all_gather(gathered_keys, keys_pad, group=pg)
+    dist.all_gather(gathered_values, values_pad, group=pg)
+    out_keys = torch.cat(
+        [gathered_keys[i][: gathered_counts[i].item()] for i in range(world_size)],
+        dim=0,
+    ).cpu()
+    out_values = torch.cat(
+        [gathered_values[i][: gathered_counts[i].item()] for i in range(world_size)],
+        dim=0,
+    ).cpu()
+    return out_keys, out_values
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers (continued)
+# ---------------------------------------------------------------------------
+
+
 def save_to_json(data: Dict[str, Any], file_path: str) -> None:
     try:
         with open(file_path, "w") as json_file:
@@ -1141,6 +1185,63 @@ class DynamicEmbStorage(Storage):
             timestamp=timestamp,
         )
 
+    def incremental_dump(
+        self,
+        table_id: int,
+        threshold: int,
+        pg: Optional[dist.ProcessGroup],
+    ) -> Tuple[Tensor, Tensor]:
+        """Dump keys and embeddings for one table (score >= threshold). Multi-rank: all_gather so result is concatenated from all ranks."""
+        state = self._state
+        states_to_dump = [state]
+        do_multi_rank_gather = (
+            pg is not None
+            and dist.is_initialized()
+            and dist.get_world_size(group=pg) > 1
+        )
+        all_keys: List[Tensor] = []
+        all_values: List[Tensor] = []
+        for s in states_to_dump:
+            keys, _, indices = s.key_index_map.incremental_dump(
+                {s.score_policy.name: threshold},
+                pg=pg,
+                return_index=True,
+                table_id=table_id,
+            )
+            emb_dim = s.table_emb_dims_cpu[table_id]
+            values = load_from_flat_single_table(s, indices.to(s.device), table_id)
+            value = values[:, :emb_dim].to(dtype=s.emb_dtype)
+            key = keys.to(s.device) if keys.device.type != "cuda" else keys
+            if not do_multi_rank_gather:
+                value = value.cpu()
+                key = key.cpu() if key.is_cuda else key
+            all_keys.append(key)
+            all_values.append(value)
+        device_for_gather = state.device
+        emb_dim_t = state.table_emb_dims_cpu[table_id]
+        if all_keys:
+            keys_cat = torch.cat(all_keys)
+            values_cat = torch.cat(all_values, dim=0)
+        else:
+            if do_multi_rank_gather:
+                keys_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
+                values_cat = torch.empty(
+                    0, emb_dim_t, dtype=state.emb_dtype, device=device_for_gather
+                )
+            else:
+                keys_cat = torch.empty(0, dtype=torch.int64, device="cpu")
+                values_cat = torch.empty(0, emb_dim_t, dtype=state.emb_dtype)
+        if do_multi_rank_gather:
+            keys_cat = keys_cat.to(device_for_gather)
+            values_cat = values_cat.to(device_for_gather)
+            keys_cat, values_cat = _all_gather_dumped_keys_values(
+                keys_cat, values_cat, pg
+            )
+        elif keys_cat.device.type == "cuda":
+            keys_cat = keys_cat.cpu()
+            values_cat = values_cat.cpu()
+        return keys_cat, values_cat
+
     # -- Export --
 
     def export_keys_values(
@@ -1382,6 +1483,62 @@ class HybridStorage(Storage):
                 evicted_values,
                 evicted_scores,
             )
+
+    def incremental_dump(
+        self,
+        table_id: int,
+        threshold: int,
+        pg: Optional[dist.ProcessGroup],
+    ) -> Tuple[Tensor, Tensor]:
+        """Dump keys and embeddings for one table (score >= threshold). Multi-rank: all_gather so result is concatenated from all ranks."""
+        states_to_dump = self.tables
+        do_multi_rank_gather = (
+            pg is not None
+            and dist.is_initialized()
+            and dist.get_world_size(group=pg) > 1
+        )
+        all_keys = []
+        all_values = []
+        for s in states_to_dump:
+            keys, _, indices = s.key_index_map.incremental_dump(
+                {s.score_policy.name: threshold},
+                pg=pg,
+                return_index=True,
+                table_id=table_id,
+            )
+            emb_dim = s.table_emb_dims_cpu[table_id]
+            values = load_from_flat_single_table(s, indices.to(s.device), table_id)
+            value = values[:, :emb_dim].to(dtype=s.emb_dtype)
+            key = keys.to(s.device) if keys.device.type != "cuda" else keys
+            if not do_multi_rank_gather:
+                value = value.cpu()
+                key = key.cpu() if key.is_cuda else key
+            all_keys.append(key)
+            all_values.append(value)
+        device_for_gather = states_to_dump[0].device
+        emb_dim_t = states_to_dump[0].table_emb_dims_cpu[table_id]
+        if all_keys:
+            keys_cat = torch.cat(all_keys)
+            values_cat = torch.cat(all_values, dim=0)
+        else:
+            if do_multi_rank_gather:
+                keys_cat = torch.empty(0, dtype=torch.int64, device=device_for_gather)
+                values_cat = torch.empty(
+                    0, emb_dim_t, dtype=self.embedding_dtype(), device=device_for_gather
+                )
+            else:
+                keys_cat = torch.empty(0, dtype=torch.int64, device="cpu")
+                values_cat = torch.empty(0, emb_dim_t, dtype=self.embedding_dtype())
+        if do_multi_rank_gather:
+            keys_cat = keys_cat.to(device_for_gather)
+            values_cat = values_cat.to(device_for_gather)
+            keys_cat, values_cat = _all_gather_dumped_keys_values(
+                keys_cat, values_cat, pg
+            )
+        elif keys_cat.device.type == "cuda":
+            keys_cat = keys_cat.cpu()
+            values_cat = values_cat.cpu()
+        return keys_cat, values_cat
 
     # -- Dump: write host first, then append HBM --
 

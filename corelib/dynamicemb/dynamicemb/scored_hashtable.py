@@ -1131,6 +1131,19 @@ class LinearBucketTable(ScoredHashTable):
         # if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
         total_matched = d_num_matched.cpu().item()
 
+        if self.enable_overflow_:
+            ovf_begin = table_id * self.overflow_bucket_capacity_
+            ovf_end = (table_id + 1) * self.overflow_bucket_capacity_
+            d_ovf_matched = table_count_matched(
+                self.overflow_table_storage_,
+                self.key_type_,
+                self.overflow_bucket_capacity_,
+                threshold_val,
+                ovf_begin,
+                ovf_end,
+            )
+            total_matched += d_ovf_matched.cpu().item()
+
         out_keys = torch.empty(total_matched, dtype=KEY_TYPE, device="cpu")
         out_indices = (
             torch.empty(total_matched, dtype=self.index_type, device="cpu")

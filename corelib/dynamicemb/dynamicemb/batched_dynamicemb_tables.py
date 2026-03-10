@@ -48,7 +48,6 @@ from dynamicemb.key_value_table import (
     HybridStorage,
     Storage,
     flush_cache,
-    load_from_flat_single_table,
 )
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
@@ -1252,49 +1251,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         named_thresholds: Dict[str, int] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ) -> Tuple[Dict[str, Tuple[Tensor, Tensor]], Dict[str, int]]:
-        table_names: List[str] = named_thresholds.keys()
-        table_thresholds: List[int] = named_thresholds.values()
+        storage = self._storage
+        if self._cache is not None and isinstance(storage, DynamicEmbStorage):
+            flush_cache(self._cache, storage)
         ret_tensors: Dict[str, Tuple[Tensor, Tensor]] = {}
         ret_scores: Dict[str, int] = {}
-
-        storage = self._storage
-        if isinstance(storage, HybridStorage):
-            states_to_dump = storage.tables
-        elif isinstance(storage, DynamicEmbStorage):
-            if self._cache is not None:
-                flush_cache(self._cache, storage)
-            states_to_dump = [storage._state]
-        else:
-            raise RuntimeError("Only DynamicEmbStorage supports incremental dump.")
-
         ts: Optional[int] = None
-        for table_name, threshold in zip(table_names, table_thresholds):
+        for table_name, threshold in named_thresholds.items():
+            if table_name not in self._table_names:
+                warnings.warn(
+                    f"incremental_dump: table_name '{table_name}' is not in this "
+                    f"module (available: {self._table_names}); skipping.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
             table_id = self._table_names.index(table_name)
-            all_keys = []
-            all_values = []
-
-            for state in states_to_dump:
-                keys, _, indices = state.key_index_map.incremental_dump(
-                    {state.score_policy.name: threshold},
-                    pg=pg,
-                    return_index=True,
-                    table_id=table_id,
-                )
-                emb_dim = state.table_emb_dims_cpu[table_id]
-                values = load_from_flat_single_table(
-                    state, indices.to(state.device), table_id
-                )
-                value = values[:, :emb_dim].to(dtype=state.emb_dtype).cpu()
-                key = keys.cpu() if keys.is_cuda else keys
-                all_keys.append(key)
-                all_values.append(value)
-
-            ret_tensors[table_name] = (
-                torch.cat(all_keys) if all_keys else torch.empty(0, dtype=torch.int64),
-                torch.cat(all_values, dim=0)
-                if all_values
-                else torch.empty(0, dtype=storage.embedding_dtype()),
-            )
+            keys_cat, values_cat = storage.incremental_dump(table_id, threshold, pg)
+            ret_tensors[table_name] = (keys_cat, values_cat)
             option = self._dynamicemb_options[table_id]
             if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
                 if ts is None:
@@ -1302,5 +1276,4 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 ret_scores[table_name] = ts
             else:
                 ret_scores[table_name] = self._scores[table_name]
-
         return ret_tensors, ret_scores
