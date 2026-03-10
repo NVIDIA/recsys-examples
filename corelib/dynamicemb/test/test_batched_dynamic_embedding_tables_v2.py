@@ -999,8 +999,9 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
 
     # 2. Test prefetch works when Cache empty
     with torch.cuda.stream(pretch_stream):
-        bdeb.prefetch(indicesA, offsetsA, forward_stream)
         assert list(bdeb.get_score().values()) == [1] * len(dims)
+        bdeb.prefetch(indicesA, offsetsA, forward_stream)
+        assert list(bdeb.get_score().values()) == [2] * len(dims)
 
     with torch.cuda.stream(forward_stream):
         torch.cuda.current_stream().wait_stream(pretch_stream)
@@ -1030,8 +1031,9 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     # 3. Test prefetch works when Cache not empty
     with torch.cuda.stream(pretch_stream):
         bdeb.prefetch(indicesA, offsetsA, forward_stream)
+        assert list(bdeb.get_score().values()) == [3] * len(dims)
         bdeb.prefetch(indicesB, offsetsB, forward_stream)
-        assert list(bdeb.get_score().values()) == [2] * len(dims)
+        assert list(bdeb.get_score().values()) == [4] * len(dims)
 
     with torch.cuda.stream(forward_stream):
         torch.cuda.current_stream().wait_stream(pretch_stream)

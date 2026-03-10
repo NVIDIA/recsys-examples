@@ -159,8 +159,12 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        int64_t bucket_capacity);
 
 
-void table_update_counter(
-    at::Tensor counter, int64_t capacity,
-    at::Tensor slot_indices, int32_t delta);
+void table_update_counter_with_layout(
+    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
+    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
+    int64_t main_capacity, int64_t num_tables,
+    c10::optional<at::Tensor> table_ids,
+    c10::optional<at::Tensor> overflow_output_offsets,
+    int64_t overflow_bucket_capacity);
 
 } // namespace dyn_emb

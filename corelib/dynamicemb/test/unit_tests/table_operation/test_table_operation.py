@@ -763,7 +763,8 @@ def test_overflow_with_counter(key_type, table_config):
             break
 
         succ_indices = indices[success_mask]
-        table.increment_counter(succ_indices)
+        succ_tids = batch_tids[success_mask]
+        table.increment_counter(succ_indices, succ_tids)
         fill_keys_list.append(batch_keys[success_mask])
         fill_tids_list.append(batch_tids[success_mask])
         fill_indices_list.append(succ_indices)
@@ -784,11 +785,15 @@ def test_overflow_with_counter(key_type, table_config):
     # ------------------------------------------------------------------
     # Phase 3: Verify counters on filled slots (already locked in Phase 2)
     # ------------------------------------------------------------------
+    # fill_indices are per-table; _ref_counter is flat (table0 slots, table1, ...)
+    flat_indices = (
+        table.table_bucket_offsets_[fill_tids] * table.bucket_capacity_ + fill_indices
+    )
     counter_cpu = table._ref_counter.cpu()
-    for idx in fill_indices.cpu().tolist():
+    for flat in flat_indices.cpu().tolist():
         assert (
-            counter_cpu[idx].item() >= 1
-        ), f"Counter at slot {idx} should be >= 1 after increment"
+            counter_cpu[flat].item() >= 1
+        ), f"Counter at flat slot {flat} should be >= 1 after increment"
 
     print("Phase 3 passed: all filled slots locked")
 
@@ -860,11 +865,9 @@ def test_overflow_with_counter(key_type, table_config):
         ovf_mask = round_indices >= per_key_main
 
         successful_indices = round_indices[success_mask]
+        successful_tids = round_tids[success_mask]
         if successful_indices.numel() > 0:
-            counter_idx = to_counter_indices(
-                successful_indices, round_tids[success_mask]
-            )
-            table.increment_counter(counter_idx)
+            table.increment_counter(successful_indices, successful_tids)
 
         all_ovf_indices.append(round_indices)
         all_ovf_keys.append(round_keys)
@@ -956,9 +959,10 @@ def test_overflow_with_counter(key_type, table_config):
     # ------------------------------------------------------------------
     # Phase 6: Decrement counters + verify eviction is possible
     # ------------------------------------------------------------------
-    table.decrement_counter(fill_indices)
+    table.decrement_counter(fill_indices, fill_tids)
 
-    ovf_successful_all = []
+    ovf_success_indices_list = []
+    ovf_success_tids_list = []
     for r_idx, r_tids, r_results in zip(all_ovf_indices, all_ovf_tids, all_ovf_results):
         r_success = (
             (r_results == InsertResult.INSERT.value)
@@ -966,11 +970,13 @@ def test_overflow_with_counter(key_type, table_config):
             | (r_results == InsertResult.ASSIGN.value)
         )
         if r_success.any():
-            ovf_successful_all.append(
-                to_counter_indices(r_idx[r_success], r_tids[r_success])
-            )
-    if ovf_successful_all:
-        table.decrement_counter(torch.cat(ovf_successful_all))
+            ovf_success_indices_list.append(r_idx[r_success])
+            ovf_success_tids_list.append(r_tids[r_success])
+    if ovf_success_indices_list:
+        table.decrement_counter(
+            torch.cat(ovf_success_indices_list),
+            torch.cat(ovf_success_tids_list),
+        )
 
     assert (
         table._ref_counter == 0

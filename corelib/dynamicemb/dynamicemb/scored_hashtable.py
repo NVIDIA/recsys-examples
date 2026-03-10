@@ -36,7 +36,7 @@ from dynamicemb_extensions import (
     table_insert_and_evict,
     table_lookup,
     table_partition,
-    table_update_counter,
+    table_update_counter_with_layout,
 )
 
 
@@ -630,16 +630,72 @@ class LinearBucketTable(ScoredHashTable):
             evicted_table_ids[:h_num_evicted],
         )
 
-    def increment_counter(self, slot_indices: torch.Tensor) -> None:
-        """Atomically increment ref-counter at given slot indices."""
-        table_update_counter(
-            self._ref_counter, self._ref_counter.numel(), slot_indices, 1
+    def increment_counter(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        """Increment ref-counter at given per-table slot indices.
+
+        table_ids: Must be provided and aligned with slot_indices (same length).
+        slot_indices are 0-based within each table; table_ids[i] identifies which
+        table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
+        to the flat _ref_counter index.
+
+        The kernel uses non-atomic addition: the caller must ensure no two
+        (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
+        index (e.g. slot_indices from unique_keys lookup), so no two threads
+        write the same counter element.
+        """
+        table_update_counter_with_layout(
+            self._ref_counter,
+            slot_indices,
+            1,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.capacity_,
+            self.num_tables_,
+            table_ids=table_ids,
+            overflow_output_offsets=(
+                self.overflow_output_offsets_ if self.enable_overflow_ else None
+            ),
+            overflow_bucket_capacity=(
+                self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
+            ),
         )
 
-    def decrement_counter(self, slot_indices: torch.Tensor) -> None:
-        """Atomically decrement ref-counter at given slot indices."""
-        table_update_counter(
-            self._ref_counter, self._ref_counter.numel(), slot_indices, -1
+    def decrement_counter(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        """Decrement ref-counter at given per-table slot indices.
+
+        table_ids: Must be provided and aligned with slot_indices (same length).
+        slot_indices are 0-based within each table; table_ids[i] identifies which
+        table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
+        to the flat _ref_counter index.
+
+        The kernel uses non-atomic addition: the caller must ensure no two
+        (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
+        index (e.g. slot_indices from unique_keys lookup), so no two threads
+        write the same counter element.
+        """
+        table_update_counter_with_layout(
+            self._ref_counter,
+            slot_indices,
+            -1,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.capacity_,
+            self.num_tables_,
+            table_ids=table_ids,
+            overflow_output_offsets=(
+                self.overflow_output_offsets_ if self.enable_overflow_ else None
+            ),
+            overflow_bucket_capacity=(
+                self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
+            ),
         )
 
     def lookup_with_overflow(
