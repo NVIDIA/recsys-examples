@@ -218,8 +218,8 @@ if flash_attn_cuda_ampere is None or flash_attn_cuda_hopper is None:
             ):
                 import torch as _torch
 
-                fp8_args = args[:-1]
-                deterministic = args[-1]
+                fp8_args = args[:-1] if args else ()
+                deterministic = args[-1] if args else False
                 output_dtype = 0 if dout.dtype == _torch.bfloat16 else 1
                 return _torch.ops.fbgemm.hstu_varlen_bwd_90(
                     dout,
@@ -260,6 +260,7 @@ if flash_attn_cuda_ampere is None or flash_attn_cuda_hopper is None:
             flash_attn_cuda_hopper = _NewHSTUHopperCompat()
     except ImportError:
         pass
+
 import nvtx
 import torch
 from commons.utils.clear_tensor_data import clear_tensor_data

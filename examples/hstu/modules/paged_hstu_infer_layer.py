@@ -15,11 +15,11 @@
 try:
     import types
 
-    import hstu as _new_hstu
+    from hstu import hstu_attn_varlen_func as _new_hstu_func
     from modules.hstu_attention import _make_new_hstu_compat
 
     hstu_attn = types.SimpleNamespace(
-        hstu_attn_varlen_func=_make_new_hstu_compat(_new_hstu.hstu_attn_varlen_func)
+        hstu_attn_varlen_func=_make_new_hstu_compat(_new_hstu_func)
     )
 except ImportError:
     import hstu_attn  # type: ignore[no-redef]

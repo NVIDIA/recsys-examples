@@ -59,6 +59,14 @@ def _make_new_hstu_compat(new_func):
         if scaling_seqlen == -1:
             scaling_seqlen = max_seqlen_q
         kwargs.pop("cu_seqlens_t", None)
+        _paged_kv_keys = ("kv_cache", "page_offsets", "page_ids", "last_page_lens")
+        paged_vals = {k: kwargs.pop(k, None) for k in _paged_kv_keys}
+        if any(v is not None for v in paged_vals.values()):
+            raise NotImplementedError(
+                "Paged KV-cache is not yet verified with fbgemm_gpu_hstu. "
+                "Uninstall fbgemm_gpu_hstu to fall back to legacy hstu_attn "
+                "for paged inference, or verify compatibility first."
+            )
         return new_func(
             q,
             k,

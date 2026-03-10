@@ -57,6 +57,8 @@ def test_hstn_fwd_bwd(
         hstu_attn_func = hopper_attn_func
     else:
         raise ValueError(f"Unsupported SM major version: {arch_sm}")
+    if hstu_attn_func is None:
+        pytest.skip("No HSTU kernel available for this architecture")
     device = torch.device("cuda")
     lengths = torch.randint(
         low=2,
