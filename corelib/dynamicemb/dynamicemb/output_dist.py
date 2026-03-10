@@ -27,7 +27,7 @@ in the original TorchRec implementation, especially for non-contiguous
 distribution patterns (e.g., round-robin).
 """
 
-from typing import Awaitable, Dict, List, Optional, cast
+from typing import Dict, List, Optional, Union, cast
 import torch
 from torch import distributed as dist
 from torchrec.distributed.types import CommOp
@@ -165,6 +165,7 @@ class RwPooledEmbeddingDist(
             if qcomm_codecs_registry
             else None
         )
+        self._dist_type: Optional[str] = None
 
     def forward(
         self,
@@ -184,6 +185,8 @@ class RwPooledEmbeddingDist(
         """
         if self._dist is None:
             self._create_output_dist_module(sharding_ctx)
+
+        self._validate_sharding_ctx_consistency(sharding_ctx)
         
         if sharding_ctx is None:
             return cast(PooledEmbeddingsReduceScatter, self._dist)(local_embs)
@@ -208,8 +211,36 @@ class RwPooledEmbeddingDist(
                 pg=self._pg,
                 codecs=self._codecs,
             )
+            self._dist_type = "variable_batch"
         else:
             self._dist = PooledEmbeddingsReduceScatter(
                 pg=self._pg,
                 codecs=self._codecs,
             )
+            self._dist_type = "normal"
+    def _validate_sharding_ctx_consistency(self, sharding_ctx):
+        """
+        验证当前调用的 sharding_ctx 与已初始化的 dist 类型是否一致
+    
+        如果不一致，抛出 RuntimeError 防止静默错误
+        """
+        if self._dist_type is None:
+            return  # 还未初始化，无需验证
+    
+        current_is_variable_batch = (
+            sharding_ctx is not None and sharding_ctx.variable_batch_per_feature
+        )
+    
+        if self._dist_type == "variable_batch" and not current_is_variable_batch:
+            raise RuntimeError(
+                "RwPooledEmbeddingDist was initialized for variable batch mode, "
+                "but current call is not using variable batch. This indicates "
+                "inconsistent usage of the output distribution module."
+            )
+        elif self._dist_type == "normal" and current_is_variable_batch:
+            raise RuntimeError(
+                "RwPooledEmbeddingDist was initialized for normal batch mode, "
+                "but current call is using variable batch. This indicates "
+                "inconsistent usage of the output distribution module."
+            )
+
