@@ -189,12 +189,22 @@ def hstu_preprocess_embeddings(
             )
             sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
 
+    # After balanced shuffler, dense tensors (num_candidates) are stripped to
+    # actual_batch_size while KJTs retain batch_size entries (see BaseBatch
+    # invariants).  Re-pad num_candidates with zeros so it stays aligned with
+    # the KJT-derived sequence_embeddings_lengths.
+    if num_candidates is not None:
+        bs_kjt = sequence_embeddings_lengths.size(0)
+        if num_candidates.size(0) < bs_kjt:
+            num_candidates = torch.nn.functional.pad(
+                num_candidates, (0, bs_kjt - num_candidates.size(0))
+            )
+
     num_candidates_offsets = (
         length_to_complete_offsets(num_candidates).to(torch.int32)
         if num_candidates is not None
         else None
     )
-    # Compute total_candidates_seq_len here instead of carrying it through Batch
     total_candidates_seq_len = None
     if not is_inference:
         if num_candidates is not None:
