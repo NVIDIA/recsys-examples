@@ -256,6 +256,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             feature_processor=feature_processor,
             sharding_type=ShardingType.ROW_WISE,
         )
+
     def create_output_dist(self, device: Optional[torch.device] = None,):
         """
         Creates output distribution for pooled embeddings.        

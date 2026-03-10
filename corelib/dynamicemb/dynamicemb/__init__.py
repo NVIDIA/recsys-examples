@@ -59,4 +59,6 @@ __all__ = [
     "DynamicEmbLoad",
     "EmbOptimType",
     "OptimizerArgs",
+    "RwSequenceEmbeddingDist",
+    "RwPooledEmbeddingDist",
 ]

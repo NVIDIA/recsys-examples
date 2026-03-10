@@ -83,9 +83,6 @@ class RwSequenceEmbeddingDist(
                 else None
             ),
         )
-        
-        # Store unbucketize_permute_tensor for potential optimization
-        self._unbucketize_permute_tensor: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -104,9 +101,6 @@ class RwSequenceEmbeddingDist(
             torch.Tensor: sequence embeddings after distribution.
         """
         assert sharding_ctx is not None
-        
-        # Store unbucketize_permute_tensor for potential optimization
-        self._unbucketize_permute_tensor = sharding_ctx.unbucketize_permute_tensor
         
         # TODO: Optimize unbucketize_permute operation here
         # The unbucketize_permute_tensor is used in SequenceEmbeddingsAwaitable
@@ -218,14 +212,11 @@ class RwPooledEmbeddingDist(
                 codecs=self._codecs,
             )
             self._dist_type = "normal"
+
     def _validate_sharding_ctx_consistency(self, sharding_ctx):
-        """
-        验证当前调用的 sharding_ctx 与已初始化的 dist 类型是否一致
-    
-        如果不一致，抛出 RuntimeError 防止静默错误
-        """
+
         if self._dist_type is None:
-            return  # 还未初始化，无需验证
+            return
     
         current_is_variable_batch = (
             sharding_ctx is not None and sharding_ctx.variable_batch_per_feature
