@@ -43,3 +43,4 @@ results/
 *.pdf
 .SKILLS/
 examples/hstu/inference/cpp_runtime_demo/build*
+**/torch_binding_build/**

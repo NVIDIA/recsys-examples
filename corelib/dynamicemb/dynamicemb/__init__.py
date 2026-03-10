@@ -31,6 +31,8 @@ from .dynamicemb_config import (
 )
 from .utils import torch_to_dyn_emb
 from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
+from . import index_range_meta
+from . import lookup_meta
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (
     BUCKET_ALIGNMENT,

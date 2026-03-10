@@ -119,4 +119,6 @@ at::Tensor segmented_sum_cuda(at::Tensor data, at::Tensor offsets);
 
 } // namespace dyn_emb
 
+#ifdef DEMB_USE_PYBIND11
 void bind_index_calculation_op(py::module &m);
+#endif

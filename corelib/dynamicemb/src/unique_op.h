@@ -18,7 +18,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include <ATen/ATen.h>
+#ifdef DEMB_USE_PYBIND11
 #include <pybind11/pybind11.h>
+#endif
 #include <tuple>
 
 namespace dyn_emb {
@@ -113,4 +115,6 @@ std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
 } // namespace dyn_emb
 
 // Python binding
+#ifdef DEMB_USE_PYBIND11
 void bind_unique_op(pybind11::module &m);
+#endif
