@@ -27,6 +27,12 @@ Before running examples, build and install libs under corelib following instruct
 - [HSTU attention documentation](.../../../corelib/hstu/README.md)
 - [Dynamic Embeddings documentation](.../../../corelib/dynamicemb/README.md)
 
+> **Note:** The `corelib/hstu` HSTU attention kernels have been migrated to the
+> [`fbgemm_gpu/experimental/hstu`](https://github.com/jiayus-nvidia/FBGEMM/tree/fix-hstu_standalone_building/fbgemm_gpu/experimental/hstu)
+> package. For new installations, please install `fbgemm_gpu_hstu` instead — see
+> [corelib/hstu/README.md](.../../../corelib/hstu/README.md) for migration instructions.
+> The codebase will automatically prefer the new package when available.
+
 On top of those two core libs, Megatron-Core along with other libs are required. You can install them via pypi package:
 
 ```bash
