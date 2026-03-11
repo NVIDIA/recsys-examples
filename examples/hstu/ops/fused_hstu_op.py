@@ -681,8 +681,19 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     None,
                     False,
                     None,  # rab, has_drab, func
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,  # fp8 descale: q/qt/k/kt/v/do/dot/cu_qt/cu_kt/cu_q_block/cu_kv_block
                     output_dtype,
-                    False,  # output_dtype, deterministic
+                    False,  # deterministic
                 )
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")
