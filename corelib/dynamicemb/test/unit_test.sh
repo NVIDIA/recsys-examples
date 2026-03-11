@@ -7,6 +7,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_sequence_embedding.sh"
     "test/unit_tests/test_pooled_embedding.sh"
     "test/unit_tests/test_twin_module.sh"
+    "test/unit_tests/test_alignment.py"
 )
 
 LOAD_DUMP_TEST_FILES=(

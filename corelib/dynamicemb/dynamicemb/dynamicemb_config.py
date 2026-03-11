@@ -148,7 +148,7 @@ class _ContextOptions:
         max_capacity : Optional[int], optional
                 The maximum capacity of the shard of the embedding table on a single GPU. Automatically set in the shared planner.
                 It is not configurable, but it's important for the total memory consumption.
-                It will be automatically inferred from EmbeddingConfig.num_embeddings and the world size, rounded up to DEMB_TABLE_ALIGN_SIZE，
+                It will be automatically inferred from EmbeddingConfig.num_embeddings and the world size, rounded up to a multiple of DEMB_TABLE_ALIGN_SIZE，
                     and minimized to the size of bucket capacity of the hash table.
                 If init_capacity is set, max_capacity will not be smaller than init_capacity.
         evict_strategy : DynamicEmbEvictStrategy
