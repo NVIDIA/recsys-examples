@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.fx
 import torch.nn as nn
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
@@ -394,17 +395,27 @@ class ShardedEmbedding(torch.nn.Module):
             and self._data_parallel_embedding_collection is None
         ), "either model_parallel_embedding_collection or data_parallel_embedding_collection must be not None"
         embeddings: Dict[str, JaggedTensor] = {}
-        dp_embeddings = None
-        if self._data_parallel_embedding_collection is not None:
-            self._side_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._side_stream):
-                dp_embeddings = self._data_parallel_embedding_collection(kjt)
+
+        mp_result = None
         if self._model_parallel_embedding_collection is not None:
-            mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
-            embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
-        if dp_embeddings is not None:
+            mp_result = self._model_parallel_embedding_collection(kjt)
+
+        dp_result = None
+        if self._data_parallel_embedding_collection is not None:
+            with torch.cuda.stream(self._side_stream):
+                dp_result = self._data_parallel_embedding_collection(kjt)
+
+        if mp_result is not None:
+            nvtx.range_push("MP Embedding")
+            embeddings = {**embeddings, **mp_result.wait()}
+            nvtx.range_pop()
+        
+        if dp_result is not None:
+            nvtx.range_push("DP Embedding")
             torch.cuda.current_stream().wait_stream(self._side_stream)
-            embeddings = {**embeddings, **dp_embeddings}
+            embeddings = {**embeddings, **dp_result}
+            nvtx.range_pop()
+
         return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
