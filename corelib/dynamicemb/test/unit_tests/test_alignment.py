@@ -296,15 +296,6 @@ def _apply_dmp_with_global_hbm(
     if global_hbm_for_values <= 0:
         global_hbm_for_values = total_hbm_need
 
-    opt_type = optimizer_kwargs.get("optimizer", EmbOptimType.ADAM)
-    opt_type_map = {
-        EmbOptimType.SGD: OptimizerType.SGD,
-        EmbOptimType.ADAM: OptimizerType.Adam,
-        EmbOptimType.EXACT_ADAGRAD: OptimizerType.AdaGrad,
-        EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimizerType.RowWiseAdaGrad,
-    }
-    opt_type_map.get(opt_type, OptimizerType.Adam)
-
     dynamicemb_options_dict = {
         name: DynamicEmbTableOptions(
             global_hbm_for_values=global_hbm_for_values,
@@ -372,14 +363,16 @@ def _compare_actual_vs_theoretical(
 ) -> Tuple[bool, str]:
     """
     Build DMP model, read actual config, compare with compute_memory_stats theoretical values.
+    When bucket floor applies, planner may set local_hbm_for_values above ceil(global_hbm/W);
+    we compare effective HBM = min(actual local_hbm, total_memory) to theory.
     Returns (match_ok, message).
     """
     (
-        total_per_rank,
+        _,
         hbm_per_rank,
-        dram_per_rank,
+        _,
         aligned_cap_expected,
-        total_all,
+        _,
     ) = compute_memory_stats(num_embeddings, global_hbm_for_values, caching, world_size)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     with warnings.catch_warnings():
@@ -397,9 +390,14 @@ def _compare_actual_vs_theoretical(
         return False, "get_dynamic_emb_module returned no table options"
     actual = actual_list[0]
     cap_ok = actual["max_capacity"] == aligned_cap_expected
-    # Non-cache: local_hbm must match theory; cache: actual HBM is cache size, may be >= theory due to bucket rounding
+    # Non-cache: effective HBM is min(actual, total); planner may set actual > theory when bucket floor adds capacity.
+    # Cache: actual HBM is cache size, may be >= theory due to bucket rounding.
+    total_per_rank = aligned_cap_expected * _byte_per_vector()
     if not caching:
-        hbm_ok = actual["local_hbm_for_values"] == hbm_per_rank
+        effective_actual_hbm = min(
+            actual["local_hbm_for_values"], total_per_rank
+        )
+        hbm_ok = effective_actual_hbm == hbm_per_rank
     else:
         hbm_ok = actual["local_hbm_for_values"] >= 0
     caching_ok = actual["caching"] == caching
@@ -462,10 +460,12 @@ class TestAlignmentMemoryStats:
         self, num_embeddings_list, global_hbm_modes, world_sizes
     ):
         """When global_hbm is non-zero, HBM under caching is determined by cache capacity."""
+        min_cap = align_to_table_size(BUCKET_CAPACITY_NORMAL)
         for num_emb in num_embeddings_list:
             for world_size in world_sizes:
                 num_per_rank = math.ceil(num_emb / world_size)
                 aligned = align_to_table_size(num_per_rank)
+                aligned = max(aligned, min_cap)
                 total_mem_global = aligned * _byte_per_vector() * world_size
                 for gmode in ["half", "full"]:
                     global_hbm = (
