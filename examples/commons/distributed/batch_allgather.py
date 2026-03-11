@@ -82,6 +82,10 @@ def pad_and_allgather_batch(
         setattr(new_batch, name, kjt_out)
 
     new_batch.batch_size = global_batch_size
+    # NOTE: actual_batch_size is set to global_batch_size (including padding
+    # rows) because computing the true sum would require an extra collective.
+    # Callers that need the correct actual count (e.g. finish_shuffle) must
+    # recompute it from the partition indices.
     new_batch.actual_batch_size = global_batch_size
 
     if not return_padding_flag:

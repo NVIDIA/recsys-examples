@@ -709,7 +709,6 @@ def _compute_attn_fwd_flops(
     offsets: torch.Tensor,
     num_heads: int,
     attn_dim: int,
-    linear_dim: int,
     is_causal: bool,
     num_candidates: Optional[torch.Tensor],
     num_contextuals: Optional[Union[int, torch.Tensor]],
@@ -717,7 +716,8 @@ def _compute_attn_fwd_flops(
     """Compute **forward-only** attention FLOPs for one layer.
 
     Uses the same formula as ``cal_flops_single_rank`` in trainer/utils.py but
-    restricted to the attention component (QK + PV).
+    restricted to the attention component (QK + PV).  Linear-projection FLOPs
+    are intentionally excluded — this measures kernel-level attention only.
     """
     with torch.inference_mode():
         seqlens = (offsets[1:] - offsets[:-1]).float()  # (B,)

@@ -1,7 +1,7 @@
 import os
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from commons.ops.collective_ops import gather_along_first_dim
@@ -137,9 +137,8 @@ def _log_load_balance(
 
 
 class BaseTaskBalancedBatchShuffler:
-    _batch_counter: int = 0
-
     def __init__(self) -> None:
+        self._batch_counter: int = 0
         # Single-worker thread pool used exclusively for the CPU-only
         # Karmarkar-Karp partitioning algorithm so that it can overlap with
         # GPU forward / backward on the main thread.
@@ -165,11 +164,20 @@ class BaseTaskBalancedBatchShuffler:
     def get_workloads(self, batch: BaseBatch, *args, **kwargs) -> Any:
         raise NotImplementedError
 
-    def _should_print_load_balance(self) -> bool:
-        """Check if load balance info should be printed for the current batch."""
+    def _should_print_load_balance(self, idx: Optional[int] = None) -> bool:
+        """Check if load balance info should be printed for the given batch.
+
+        Args:
+            idx: Batch index to check. Defaults to ``self._batch_counter``
+                 (appropriate for the synchronous path). The async path should
+                 pass the handle value explicitly to avoid off-by-one errors
+                 caused by ``_batch_counter`` being incremented eagerly in
+                 ``start_shuffle_async``.
+        """
         if not _PRINT_LOAD_BALANCE:
             return False
-        idx = self._batch_counter
+        if idx is None:
+            idx = self._batch_counter
         if idx < _PRINT_LOAD_BALANCE_START:
             return False
         if _PRINT_LOAD_BALANCE_STOP >= 0 and idx >= _PRINT_LOAD_BALANCE_STOP:
@@ -330,7 +338,7 @@ class BaseTaskBalancedBatchShuffler:
             )
 
         # Optional logging (rank 0 only)
-        if self._should_print_load_balance():
+        if self._should_print_load_balance(idx=int(handle)):
             _log_load_balance(
                 int(handle),
                 meta["allgather_workloads_cpu"],

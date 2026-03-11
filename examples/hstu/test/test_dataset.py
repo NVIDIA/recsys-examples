@@ -221,10 +221,6 @@ def test_hstu_random_dataset_with_distributions(
         kjt = batch.features
         for key in kjt.keys():
             vals = kjt[key].values()
-            if seqlen_dist_type == DistType.ZIPF:
-                import pdb
-
-                pdb.set_trace()
             if vals.numel() == 0:
                 continue
             assert (

@@ -542,11 +542,22 @@ def keyed_jagged_tensor_list_allgather(
     W = world_size
     device = kjt_list[0].lengths().device
 
-    # --- Collect per-KJT metadata ---
+    # --- Collect per-KJT metadata and validate ---
     keys_list = [list(kjt.keys()) for kjt in kjt_list]
     K_list = [len(keys) for keys in keys_list]
     K_total = sum(K_list)
     B = kjt_list[0].lengths().numel() // K_list[0]
+
+    values_dtype = kjt_list[0].values().dtype
+    for i, kjt in enumerate(kjt_list[1:], 1):
+        assert kjt.lengths().numel() // K_list[i] == B, (
+            f"KJT {i} has batch_size {kjt.lengths().numel() // K_list[i]}, "
+            f"expected {B} (same as KJT 0)"
+        )
+        assert kjt.values().dtype == values_dtype, (
+            f"KJT {i} has values dtype {kjt.values().dtype}, "
+            f"expected {values_dtype} (same as KJT 0)"
+        )
 
     # --- Concatenate all lengths and values across KJTs ---
     all_local_lengths = torch.cat([kjt.lengths() for kjt in kjt_list])  # [K_total * B]

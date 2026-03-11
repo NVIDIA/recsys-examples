@@ -388,6 +388,6 @@ def create_hstu_attention(
     if PRINT_HSTU_PERF:
         from commons.utils.hooks import register_perf_hooks
 
-        register_perf_hooks(attn, num_heads, attention_dim, linear_dim, is_causal)
+        register_perf_hooks(attn, num_heads, attention_dim, is_causal)
 
     return attn
