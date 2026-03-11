@@ -71,7 +71,7 @@ ARG TRITONSERVER_BUILD
 
 
 # TODO, remove it after test
-RUN pip uninstall hstu_attn --break-system-packages
+RUN pip uninstall -y hstu_attn --break-system-packages
 
 # TODO , move it under devel after test
 # Install new unified FBGEMM HSTU (package: fbgemm_gpu_hstu, import: hstu)
