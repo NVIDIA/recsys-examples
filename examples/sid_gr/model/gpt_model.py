@@ -37,6 +37,8 @@ from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 from .attention_mask import (
+    build_incremental_append_arbitrary_func,
+    build_incremental_append_dense_mask,
     padded_causal_mask_with_optional_bos,
     padded_target_aware_causal_mask,
 )
@@ -773,6 +775,215 @@ class SIDGRModel(MegatronModule):
             # 5. filter the topk candidates, update the generated_sids and log_probs for the next step
             self.beam_search.propagate(probs_this_step)
         # only for debugging purpose
+        generated_sids = self.beam_search.get_sids()
+        log_probs = self.beam_search.get_log_probs()
+        return generated_sids, log_probs
+
+    @torch.no_grad
+    def generate_method_a(self, batch: GPTSIDBatch) -> torch.Tensor:
+        """
+        Generate using Method A (Incremental Append) token layout.
+
+        Sequence layout at step i:
+          [history+BOS, step0_beams, step1_beams, ..., step_{i-1}_beams]
+
+        Tokens are appended in generation order. The attention mask is a
+        tree-shaped arbitrary mask: each beam token sees all history plus
+        its ancestor chain, but not tokens from other beam branches.
+
+        This method uses the existing dense-mask + pad-to-dense decoder path
+        for correctness validation. The arbitrary_func tensor is also built
+        for future use with jagged Flash Attention.
+        """
+        # 0. prepare history+BOS embeddings (identical to generate())
+        (
+            history_embeddings,
+            input_offsets,
+            input_max_seqlen,
+        ) = self._prepare_embeddings(
+            batch, add_bos_to_history=False, is_generation=True
+        )
+        batch_size = batch.actual_batch_size
+        input_offsets = input_offsets[: batch_size + 1]
+        history_seqlens = torch.diff(input_offsets)  # [B]
+
+        self.beam_search.reset()
+
+        # physical_step_codes[s] stores the codes selected at step s
+        # shape: [batch_size, beam_widths[s]]
+        physical_step_codes: List[torch.Tensor] = []
+
+        for i in range(self._num_hierarchies):
+            # 1. Build the Method A sequence
+            if i == 0:
+                # No generated tokens yet; sequence is just [history+BOS]
+                cated_hidden_states = history_embeddings
+                cated_offsets = input_offsets
+                cated_max_seqlen = input_max_seqlen
+                topk_prev_step = 1
+            else:
+                # Embed all previous steps' codes in Method A order:
+                #   [step0_beam0, step0_beam1, ..., step1_beam0, ...]
+                all_gen_codes = torch.cat(
+                    [sc.view(-1) for sc in physical_step_codes]
+                )  # [total_gen_tokens]
+                total_gen_per_sample = sum(
+                    self.beam_search.beam_widths[s] for s in range(i)
+                )
+
+                gen_sids_kjt = KeyedJaggedTensor.from_lengths_sync(
+                    keys=[
+                        batch.candidate_feature_name,
+                        batch.history_feature_name,
+                    ],
+                    values=all_gen_codes,
+                    lengths=torch.cat(
+                        [
+                            torch.full(
+                                (batch_size,),
+                                total_gen_per_sample,
+                                device=all_gen_codes.device,
+                                dtype=torch.long,
+                            ),
+                            torch.zeros(
+                                (batch_size,),
+                                device=all_gen_codes.device,
+                                dtype=torch.long,
+                            ),
+                        ]
+                    ),
+                )
+                gen_embeddings = (
+                    self._codebooks_collection(gen_sids_kjt)[
+                        batch.candidate_feature_name
+                    ]
+                    .values()
+                    .to(self._training_dtype)
+                )  # [batch_size * total_gen_per_sample, D]
+
+                gen_offsets = torch.arange(
+                    0,
+                    batch_size + 1,
+                    device=input_offsets.device,
+                    dtype=input_offsets.dtype,
+                ) * total_gen_per_sample
+
+                (
+                    cated_hidden_states,
+                    cated_offsets,
+                    cated_max_seqlen,
+                ) = self._concat_jagged(
+                    [history_embeddings, gen_embeddings],
+                    [input_offsets, gen_offsets],
+                    [input_max_seqlen, total_gen_per_sample],
+                )
+                topk_prev_step = self.beam_search.beam_widths[i - 1]
+
+            # 2. Build the Method A attention mask.
+            # ancestor_positions covers the beams from the latest propagate.
+            # At step i, the sequence has tokens from steps 0..i-1.
+            # ancestor_positions has shape [B, topk, i] covering steps 0..i-1.
+            # None when i == 0 (no beams exist yet).
+            ancestor_positions = self.beam_search.get_ancestor_positions(
+                history_seqlens
+            )
+
+            dense_mask = build_incremental_append_dense_mask(
+                history_seqlens,
+                input_max_seqlen,
+                current_step=i,
+                beam_widths=self.beam_search.beam_widths,
+                ancestor_positions=ancestor_positions,
+            )
+            attention_mask = ~dense_mask.unsqueeze(1)  # [B, 1, N, N]
+
+            # Also build arbitrary_func for future jagged FA integration
+            _arbitrary_func = build_incremental_append_arbitrary_func(
+                history_seqlens,
+                input_max_seqlen,
+                current_step=i,
+                beam_widths=self.beam_search.beam_widths,
+                ancestor_positions=ancestor_positions,
+            )  # stored for debugging / future use
+
+            # 3. Decoder step (pad-to-dense path)
+            jagged_output_hidden_states = self.decoder_step(
+                cated_hidden_states,
+                cated_offsets,
+                cated_max_seqlen,
+                attention_mask=attention_mask,
+                padding_to_dense=True,
+                add_bos_to_history=False,
+            )
+
+            # 4. Extract the logit-producing tokens from the output.
+            # At step 0: the last 1 token per sample (BOS).
+            # At step i > 0: the last beam_widths[i-1] tokens (step i-1 beams).
+            if i == 0:
+                # BOS is the last token in history; extract 1 per sample
+                bos_offsets = torch.arange(
+                    0,
+                    batch_size + 1,
+                    device=input_offsets.device,
+                    dtype=input_offsets.dtype,
+                ).clamp(max=batch_size)
+                _, candidate_hidden_states = triton_split_2D_jagged(
+                    jagged_output_hidden_states,
+                    max_seq_len=cated_max_seqlen,
+                    offsets_a=cated_offsets - bos_offsets,
+                    offsets_b=bos_offsets,
+                )
+                candidate_hidden_states = candidate_hidden_states.view(
+                    batch_size, 1, self.embedding_dim
+                )
+            else:
+                # Last beam_widths[i-1] tokens per sample
+                logit_token_count = topk_prev_step
+                logit_offsets = torch.arange(
+                    0,
+                    batch_size + 1,
+                    device=input_offsets.device,
+                    dtype=input_offsets.dtype,
+                ) * logit_token_count
+
+                _, candidate_hidden_states = triton_split_2D_jagged(
+                    jagged_output_hidden_states,
+                    max_seq_len=cated_max_seqlen,
+                    offsets_a=cated_offsets - logit_offsets,
+                    offsets_b=logit_offsets,
+                )
+                candidate_hidden_states = candidate_hidden_states.view(
+                    batch_size, topk_prev_step, self.embedding_dim
+                )
+
+            # 5. MLP projection → logits → log_softmax
+            mlp = (
+                self._decoder_mlp[i]
+                if not self.share_lm_head_across_hierarchies
+                else self._decoder_mlp
+            )
+            tuple_or_tensor: Union[
+                Tuple[torch.Tensor, torch.Tensor], torch.Tensor
+            ] = mlp(candidate_hidden_states)
+            candidates_logits = (
+                tuple_or_tensor[0]
+                if isinstance(tuple_or_tensor, tuple)
+                else tuple_or_tensor
+            )
+            probs_this_step: torch.Tensor = torch.nn.functional.log_softmax(
+                candidates_logits.float(), dim=-1
+            )
+
+            # 6. Beam search propagate
+            self.beam_search.propagate(probs_this_step)
+
+            # 7. Record the physical step codes for the next iteration.
+            # history_topk_sids[i][:, :, i] gives the codes selected at step i
+            # for the beams that survived step i's top-k.
+            physical_step_codes.append(
+                self.beam_search.history_topk_sids[-1][:, :, i]
+            )
+
         generated_sids = self.beam_search.get_sids()
         log_probs = self.beam_search.get_log_probs()
         return generated_sids, log_probs

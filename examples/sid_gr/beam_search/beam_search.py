@@ -45,6 +45,9 @@ class BeamSearch:
         self.history_topk_sids: List[torch.Tensor] = []
         self.history_accumulate_topk_probs: List[torch.Tensor] = []
         self.history_probs: List[torch.Tensor] = []
+
+        # parent beam indices per step for Method A ancestor tracking
+        self.parent_indices: List[torch.Tensor] = []
         self.reset()
 
     def propagate(
@@ -113,6 +116,7 @@ class BeamSearch:
             self.history_topk_sids.append(generated_sids)
             self.history_accumulate_topk_probs.append(torch.exp(topk_probs))
             self.history_probs.append(torch.exp(log_probs_this_step))
+        self.parent_indices.append(last_step_indices)
         self.generated_sids = generated_sids
         self.accumulated_log_probs = topk_probs
         self.step += 1
@@ -126,6 +130,7 @@ class BeamSearch:
         self.history_topk_sids = []
         self.history_accumulate_topk_probs = []
         self.history_probs = []
+        self.parent_indices = []
 
     def get_sids(
         self,
@@ -142,6 +147,80 @@ class BeamSearch:
             return self.generated_sids[:, :, step]
         else:
             raise ValueError(f"Step {step} is not valid, current step is {self.step}")
+
+    def get_ancestor_positions(
+        self,
+        hist_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute physical positions of each current beam's ancestors in a
+        Method A (Incremental Append) sequence layout.
+
+        In Method A, the sequence is laid out as:
+          [history..., step0_beam0, step0_beam1, ..., step1_beam0, step1_beam1, ...]
+
+        The physical position of the token generated at step s for beam b is:
+          hist_len + sum(beam_widths[:s]) + b
+
+        This method traces back through parent_indices to find, for each
+        current beam, its ancestor beam index at every previous step.
+
+        Args:
+            hist_len: [B] or scalar, the history length per sample (including BOS).
+
+        Returns:
+            ancestor_positions: [B, topk_current, step] int64 tensor.
+              ancestor_positions[b, k, s] = physical position of beam k's
+              ancestor at step s in the Method A sequence.
+              Returns None if step == 0 (no ancestors yet).
+        """
+        if self.step == 0:
+            return None
+
+        batch_size = self.parent_indices[0].shape[0]
+        topk_current = self.parent_indices[-1].shape[1]
+        device = self.parent_indices[0].device
+
+        # beam_index_at_step[s] has shape [B, topk_current]:
+        # the beam index that each current beam occupied at step s
+        beam_index_at_step: List[torch.Tensor] = [None] * self.step
+
+        # Start from the current beams and trace backwards
+        current_beam_idx = torch.arange(
+            topk_current, device=device
+        ).unsqueeze(0).expand(batch_size, -1)
+        beam_index_at_step[self.step - 1] = current_beam_idx
+
+        for s in range(self.step - 1, 0, -1):
+            parent_idx = self.parent_indices[s]  # [B, topk_at_step_s]
+            current_beam_idx = torch.gather(
+                parent_idx, dim=1, index=current_beam_idx
+            )
+            beam_index_at_step[s - 1] = current_beam_idx
+
+        # Convert beam indices to physical positions
+        # physical_pos(step=s, beam=b) = hist_len + sum(beam_widths[:s]) + b
+        if not isinstance(hist_len, torch.Tensor):
+            hist_len = torch.tensor(
+                [hist_len] * batch_size, device=device, dtype=torch.long
+            )
+        hist_len = hist_len.unsqueeze(1)  # [B, 1]
+
+        step_offsets = []
+        cumulative = 0
+        for s in range(self.step):
+            step_offsets.append(cumulative)
+            cumulative += self.beam_widths[s]
+
+        ancestor_positions = torch.stack(
+            [
+                hist_len + step_offsets[s] + beam_index_at_step[s]
+                for s in range(self.step)
+            ],
+            dim=-1,
+        )  # [B, topk_current, step]
+
+        return ancestor_positions
 
     def generate_valid_mask(self) -> torch.Tensor:
         """
