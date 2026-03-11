@@ -20,9 +20,11 @@ New package:
   - hstu.hstu_attn_varlen_func  (unified, auto-dispatch by GPU arch)
 """
 
-import fbgemm_gpu  # noqa: F401
 import pytest
 import torch
+
+fbgemm_gpu = pytest.importorskip("fbgemm_gpu")  # noqa: F401
+hstu = pytest.importorskip("hstu")
 from hstu import hstu_attn_varlen_func as new_hstu_attn_func
 
 

@@ -1,6 +1,8 @@
-import fbgemm_gpu  # noqa: F401
-import pytest  # noqa: F401
+import pytest
 import torch
+
+fbgemm_gpu = pytest.importorskip("fbgemm_gpu")  # noqa: F401
+hstu = pytest.importorskip("hstu")
 from commons.utils.hstu_assert_close import assert_hstu_close
 from hstu import hstu_attn_varlen_func
 from ops.pt_ops.pt_hstu_attention import pytorch_hstu_mha as pytorch_hstu_mha

@@ -20,6 +20,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+
+hstu = pytest.importorskip("hstu")
 from hstu import hstu_attn_varlen_func
 from hstu_assert_close import assert_hstu_close
 
