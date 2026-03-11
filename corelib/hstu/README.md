@@ -8,26 +8,16 @@
 > provides a single build for both Ampere and Hopper, with additional features
 > such as `seqused_q`/`seqused_k`, FP8 block-scale quantization, and Blackwell (sm100) support.
 >
-> **Please install the new package instead.** Installation example (from Dockerfile):
+> **Please install the new package instead.** The source is included as a git
+> submodule at `third_party/FBGEMM`:
 >
 > ```bash
-> git clone -b fix-hstu_standalone_building https://github.com/jiayus-nvidia/FBGEMM.git fbgemm_hstu
-> cd fbgemm_hstu && git submodule update --init external/cutlass
-> cd fbgemm_gpu/experimental/hstu
-> HSTU_DISABLE_86OR89=FALSE \
-> HSTU_DISABLE_ARBITRARY=TRUE \
-> HSTU_DISABLE_LOCAL=TRUE \
-> HSTU_DISABLE_RAB=TRUE \
-> HSTU_DISABLE_DRAB=TRUE \
-> HSTU_DISABLE_FP16=TRUE \
-> HSTU_ARCH_LIST="8.0 9.0 10.0" \
-> pip install .
+> # from the repo root
+> git submodule update --init --recursive
+> cd third_party/FBGEMM/fbgemm_gpu/experimental/hstu && pip install .
 > ```
 >
 > After installation, use `from hstu import hstu_attn_varlen_func` in Python.
->
-> The existing `corelib/hstu` packages (`hstu_attn`, `hopper`) are kept
-> temporarily for backward compatibility and will be removed in a future release.
 
 HSTU is a high-performance attention implementation for different NVIDIA GPU architectures:
 - **HSTU-2**: Runs on Ampere and Ada GPUs (A100, L20...)

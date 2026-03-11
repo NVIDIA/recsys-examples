@@ -16,251 +16,7 @@
 from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
-flash_attn_cuda_ampere = None
-flash_attn_cuda_hopper = None
-
-try:
-    import hstu_attn_2_cuda as flash_attn_cuda_ampere
-except ImportError:
-    pass
-
-try:
-    import hstu_hopper_cuda as flash_attn_cuda_hopper
-except ImportError:
-    pass
-
-if flash_attn_cuda_ampere is None or flash_attn_cuda_hopper is None:
-    try:
-        import hstu as _hstu_new  # noqa: F401 – registers torch.ops.fbgemm.*
-
-        class _NewHSTUAmpereCompat:
-            """Adapts torch.ops.fbgemm.hstu_varlen_{fwd,bwd}_80 to the legacy
-            hstu_attn_2_cuda.varlen_{fwd,bwd} positional-arg convention."""
-
-            @staticmethod
-            def varlen_fwd(
-                q,
-                k,
-                v,
-                cu_q,
-                cu_k,
-                max_q,
-                max_k,
-                scale_len,
-                ctx,
-                tgt,
-                tgs,
-                wsl,
-                wsr,
-                alpha,
-                rab,
-                func_param,
-                *paged_kv_args,
-            ):
-                import torch as _torch
-
-                return _torch.ops.fbgemm.hstu_varlen_fwd_80(
-                    q,
-                    k,
-                    v,
-                    cu_q,
-                    cu_k,
-                    None,
-                    None,
-                    max_q,
-                    max_k,
-                    scale_len,
-                    ctx,
-                    tgt,
-                    tgs,
-                    wsl,
-                    wsr,
-                    alpha,
-                    rab,
-                    func_param,
-                    *paged_kv_args,
-                )
-
-            @staticmethod
-            def varlen_bwd(
-                dout,
-                q,
-                k,
-                v,
-                dq,
-                dk,
-                dv,
-                cu_q,
-                cu_k,
-                max_q,
-                max_k,
-                scale_len,
-                ctx,
-                tgt,
-                tgs,
-                wsl,
-                wsr,
-                alpha,
-                rab,
-                has_drab,
-                func_param,
-                det,
-            ):
-                import torch as _torch
-
-                return _torch.ops.fbgemm.hstu_varlen_bwd_80(
-                    dout,
-                    q,
-                    k,
-                    v,
-                    cu_q,
-                    cu_k,
-                    None,
-                    None,
-                    max_q,
-                    max_k,
-                    scale_len,
-                    dq,
-                    dk,
-                    dv,
-                    ctx,
-                    tgt,
-                    tgs,
-                    wsl,
-                    wsr,
-                    alpha,
-                    rab,
-                    has_drab,
-                    func_param,
-                    det,
-                )
-
-        class _NewHSTUHopperCompat:
-            """Adapts torch.ops.fbgemm.hstu_varlen_{fwd,bwd}_90 to the legacy
-            hstu_hopper_cuda.varlen_{fwd,bwd} positional-arg convention."""
-
-            @staticmethod
-            def varlen_fwd(
-                q,
-                k,
-                v,
-                cu_q,
-                cu_k,
-                max_q,
-                max_k,
-                scale_len,
-                ctx,
-                tgt,
-                tgs,
-                wsl,
-                wsr,
-                alpha,
-                rab,
-                func_param,
-                quant_mode=-1,
-                *fp8_args,
-            ):
-                import torch as _torch
-
-                output_dtype = 0 if q.dtype == _torch.bfloat16 else 1
-                return _torch.ops.fbgemm.hstu_varlen_fwd_90(
-                    q,
-                    k,
-                    v,
-                    cu_q,
-                    cu_k,
-                    None,
-                    None,
-                    max_q,
-                    max_k,
-                    scale_len,
-                    ctx,
-                    tgt,
-                    tgs,
-                    wsl,
-                    wsr,
-                    alpha,
-                    rab,
-                    func_param,
-                    quant_mode,
-                    output_dtype,
-                    *fp8_args,
-                )
-
-            @staticmethod
-            def varlen_bwd(
-                dout,
-                dout_t,
-                q,
-                q_t,
-                k,
-                k_t,
-                v,
-                dq,
-                dk,
-                dv,
-                cu_q,
-                cu_k,
-                max_q,
-                max_k,
-                scale_len,
-                ctx,
-                tgt,
-                tgs,
-                wsl,
-                wsr,
-                alpha,
-                quant_mode,
-                rab,
-                has_drab,
-                func_param,
-                *args,
-            ):
-                import torch as _torch
-
-                fp8_args = args[:-1] if args else ()
-                deterministic = args[-1] if args else False
-                output_dtype = 0 if dout.dtype == _torch.bfloat16 else 1
-                return _torch.ops.fbgemm.hstu_varlen_bwd_90(
-                    dout,
-                    dout_t,
-                    q,
-                    q_t,
-                    k,
-                    k_t,
-                    v,
-                    cu_q,
-                    cu_k,
-                    None,
-                    None,
-                    max_q,
-                    max_k,
-                    scale_len,
-                    dq,
-                    dk,
-                    dv,
-                    ctx,
-                    tgt,
-                    tgs,
-                    wsl,
-                    wsr,
-                    alpha,
-                    quant_mode,
-                    rab,
-                    has_drab,
-                    func_param,
-                    *fp8_args,
-                    output_dtype,
-                    deterministic,
-                )
-
-        if flash_attn_cuda_ampere is None:
-            flash_attn_cuda_ampere = _NewHSTUAmpereCompat()
-        if flash_attn_cuda_hopper is None:
-            flash_attn_cuda_hopper = _NewHSTUHopperCompat()
-    except ImportError:
-        pass
-
+import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
 import nvtx
 import torch
 from commons.utils.clear_tensor_data import clear_tensor_data
@@ -520,18 +276,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             alpha,
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
-            extension_args = ()
-            if sm_major_version == 8:
-                cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
-                ampere_paged_kv_args = (None, None, None, None, None)
-                extension_args = ampere_paged_kv_args
-            elif sm_major_version == 9:
-                cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
-                hopper_fp8_args = (-1, None, None, None, None, None, None, None, None)
-                extension_args = hopper_fp8_args
-
-            else:
-                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
             assert q.dim() == 3, "q shape should be (L, num_heads, head_dim)"
             assert k.dim() == 3, "k shape should be (L, num_heads, head_dim)"
             assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
@@ -542,25 +286,53 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             num_targets = (
                 num_targets.to(torch.int32) if num_targets is not None else None
             )
-            jagged_attn_output, _ = cutlass_hstu_varlen_fwd(
-                q,
-                k,
-                v,
-                seq_offsets_q,
-                seq_offsets_q,
-                max_seqlen_q,
-                max_seqlen_q,
-                scaling_seqlen,
-                num_contexts,
-                num_targets,
-                target_group_size,
-                -1,  # window_size_left
-                0,  # window_size_right
-                alpha,
-                None,  # rab
-                None,  # func
-                *extension_args,
-            )
+            if sm_major_version == 8:
+                jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
+                    q,
+                    k,
+                    v,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    scaling_seqlen,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    -1,
+                    0,
+                    alpha,
+                    None,
+                    None,  # rab, func
+                )
+            elif sm_major_version == 9:
+                output_dtype = 0 if q.dtype == torch.bfloat16 else 1
+                jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
+                    q,
+                    k,
+                    v,
+                    seq_offsets_q,
+                    seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
+                    max_seqlen_q,
+                    max_seqlen_q,
+                    scaling_seqlen,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    -1,
+                    0,
+                    alpha,
+                    None,
+                    None,  # rab, func
+                    -1,
+                    output_dtype,  # quant_mode, output_dtype
+                )
+            else:
+                raise ValueError(f"Unsupported SM major version: {sm_major_version}")
             # in case of padding
             P = jagged_attn_output[:, :, :linear_dim_per_head].reshape(
                 -1, num_heads * linear_dim_per_head
@@ -853,48 +625,52 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             sm_major_version = torch.cuda.get_device_properties(0).major
             assert dout.dim() == 3
             if sm_major_version == 8:
-                dq, dk, dv, _ = flash_attn_cuda_ampere.varlen_bwd(
+                dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_80(
                     dout,
                     q,
                     k,
                     v,
-                    dq,
-                    dk,
-                    dv,
                     seq_offsets_q,
                     seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
                     max_seqlen_q,
                     max_seqlen_q,
                     scaling_seqlen,
+                    dq,
+                    dk,
+                    dv,
                     num_contexts,
                     num_targets,
                     target_group_size,
                     window_size_left,
                     window_size_right,
                     alpha,
-                    None,  # rab_padded
-                    False,  # has_drab
-                    None,  # func
-                    False,  # deterministic
+                    None,
+                    False,
+                    None,
+                    False,  # rab, has_drab, func, deterministic
                 )
             elif sm_major_version == 9:
-                fp8_args = (None,) * 11
-                dq, dk, dv, _ = flash_attn_cuda_hopper.varlen_bwd(
+                output_dtype = 0 if dout.dtype == torch.bfloat16 else 1
+                dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_90(
                     dout,
-                    None,
+                    None,  # dout_t
                     q,
-                    None,
+                    None,  # q_t
                     k,
-                    None,
+                    None,  # k_t
                     v,
-                    dq,
-                    dk,
-                    dv,
                     seq_offsets_q,
                     seq_offsets_q,
+                    None,
+                    None,  # seqused_q, seqused_k
                     max_seqlen_q,
                     max_seqlen_q,
                     scaling_seqlen,
+                    dq,
+                    dk,
+                    dv,
                     num_contexts,
                     num_targets,
                     target_group_size,
@@ -902,11 +678,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     window_size_right,
                     alpha,
                     -1,  # quant_mode
-                    None,  # rab_padded
-                    False,  # has_drab
-                    None,  # func
-                    *fp8_args,
-                    False,  # deterministic
+                    None,
+                    False,
+                    None,  # rab, has_drab, func
+                    output_dtype,
+                    False,  # output_dtype, deterministic
                 )
             else:
                 raise ValueError(f"Unsupported SM major version: {sm_major_version}")

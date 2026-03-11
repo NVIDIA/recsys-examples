@@ -13,98 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
-from functools import wraps
 from typing import Optional, Union
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import KernelBackend
-
-
-def _make_new_hstu_compat(new_func):
-    """Wrap new hstu.hstu_attn_varlen_func to match the legacy calling convention.
-
-    The new unified API (fbgemm_gpu_hstu) adds ``seqused_q`` / ``seqused_k``
-    positional args and promotes ``scaling_seqlen``, ``num_contexts``,
-    ``num_targets`` from keyword to positional.  This wrapper allows callers
-    written against the legacy signature to work unchanged.
-
-    Cannot be replaced by ``functools.partial`` because it needs to:
-    1. Insert positional args (seqused_q/k=None) between cu_seqlens_k and max_seqlen_q
-    2. Compute a dynamic default (scaling_seqlen defaults to max_seqlen_q)
-    3. Strip unsupported kwargs (cu_seqlens_t)
-    """
-
-    @wraps(new_func)
-    def _compat(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        num_contexts=None,
-        num_targets=None,
-        target_group_size=1,
-        window_size=(-1, -1),
-        alpha=1.0,
-        rab=None,
-        has_drab=False,
-        func=None,
-        quant_mode=-1,
-        scaling_seqlen=-1,
-        **kwargs,
-    ):
-        if scaling_seqlen == -1:
-            scaling_seqlen = max_seqlen_q
-        kwargs.pop("cu_seqlens_t", None)
-        _paged_kv_keys = ("kv_cache", "page_offsets", "page_ids", "last_page_lens")
-        paged_vals = {k: kwargs.pop(k, None) for k in _paged_kv_keys}
-        if any(v is not None for v in paged_vals.values()):
-            raise NotImplementedError(
-                "Paged KV-cache is not yet verified with fbgemm_gpu_hstu. "
-                "Uninstall fbgemm_gpu_hstu to fall back to legacy hstu_attn "
-                "for paged inference, or verify compatibility first."
-            )
-        return new_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            None,  # seqused_q
-            None,  # seqused_k
-            max_seqlen_q,
-            max_seqlen_k,
-            scaling_seqlen,
-            num_contexts,
-            num_targets,
-            target_group_size=target_group_size,
-            window_size=window_size,
-            alpha=alpha,
-            rab=rab,
-            has_drab=has_drab,
-            func=func,
-            quant_mode=quant_mode,
-            **kwargs,
-        )
-
-    return _compat
-
-
-def _import_hstu_attn_func(legacy_module="hstu_attn"):
-    """Import hstu_attn_varlen_func, preferring new fbgemm_gpu_hstu package."""
-    try:
-        from hstu import hstu_attn_varlen_func as _new_func
-
-        return _make_new_hstu_compat(_new_func)
-    except ImportError:
-        if legacy_module == "hopper":
-            from hopper.hstu_attn_interface import hstu_attn_varlen_func
-        else:
-            from hstu_attn import hstu_attn_varlen_func
-        return hstu_attn_varlen_func
+from hstu import hstu_attn_varlen_func
 
 
 class HSTUAttention(torch.nn.Module):
@@ -326,7 +240,6 @@ class FusedHSTUAttention(HSTUAttention):
         is_causal: bool,
     ):
         super().__init__()
-        self._hstu_attn_varlen_func = _import_hstu_attn_func("hstu_attn")
         self.num_heads = num_heads
         self.attention_dim = attention_dim
         self.linear_dim = linear_dim
@@ -364,11 +277,9 @@ class FusedHSTUAttention(HSTUAttention):
         Returns:
             torch.Tensor: Output tensor.
         """
-        # TODO: remove once cutlass backend is ready
         assert (
             self.is_causal or num_contextuals is None
         ), "Only causal attention is supported when max_num_contextuals > 0 in cutlass backend"
-        # (b * ~s, nh * hh)
         if isinstance(num_contextuals, torch.Tensor):
             num_contextuals = num_contextuals.to(torch.int32)
         elif isinstance(num_contextuals, int):
@@ -378,24 +289,27 @@ class FusedHSTUAttention(HSTUAttention):
                 .expand(offsets.size(0) - 1)
                 .contiguous()
             )
+        if scaling_seqlen == -1:
+            scaling_seqlen = max_seqlen
 
-        return self._hstu_attn_varlen_func(
-            q=tq.view(-1, self.num_heads, self.attention_dim),
-            k=tk.view(-1, self.num_heads, self.attention_dim),
-            v=tv.view(-1, self.num_heads, self.linear_dim),
-            cu_seqlens_q=offsets.to(torch.int32),
-            cu_seqlens_k=offsets.to(torch.int32),
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            num_contexts=num_contextuals,
-            num_targets=num_candidates.to(torch.int32)
+        return hstu_attn_varlen_func(
+            tq.view(-1, self.num_heads, self.attention_dim),
+            tk.view(-1, self.num_heads, self.attention_dim),
+            tv.view(-1, self.num_heads, self.linear_dim),
+            offsets.to(torch.int32),
+            offsets.to(torch.int32),
+            None,  # seqused_q
+            None,  # seqused_k
+            max_seqlen,
+            max_seqlen,
+            scaling_seqlen,
+            num_contextuals,
+            num_candidates.to(torch.int32)
             if isinstance(num_candidates, torch.Tensor)
             else None,
             target_group_size=target_group_size,
             window_size=(-1, 0) if self.is_causal else (-1, -1),
-            rab=None,
             alpha=1.0 / (self.attention_dim**0.5),
-            scaling_seqlen=scaling_seqlen,
         ).view(-1, self.num_heads * self.linear_dim)
 
 
@@ -419,7 +333,6 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         is_causal: bool,
     ):
         super().__init__()
-        self._hstu_attn_varlen_func = _import_hstu_attn_func("hopper")
         self.num_heads = num_heads
         self.attention_dim = attention_dim
         self.linear_dim = linear_dim
@@ -457,11 +370,9 @@ class FusedHSTUAttentionHopper(HSTUAttention):
         Returns:
             torch.Tensor: Output tensor.
         """
-        # TODO: remove once cutlass backend is ready
         assert (
             self.is_causal or num_contextuals is None
         ), "Only causal attention is supported when max_num_contextuals > 0 in cutlass backend"
-        # (b * ~s, nh * hh)
         if isinstance(num_contextuals, torch.Tensor):
             num_contextuals = num_contextuals.to(torch.int32)
         elif isinstance(num_contextuals, int):
@@ -471,23 +382,27 @@ class FusedHSTUAttentionHopper(HSTUAttention):
                 .expand(offsets.size(0) - 1)
                 .contiguous()
             )
-        return self._hstu_attn_varlen_func(
-            q=tq.view(-1, self.num_heads, self.attention_dim),
-            k=tk.view(-1, self.num_heads, self.attention_dim),
-            v=tv.view(-1, self.num_heads, self.linear_dim),
-            cu_seqlens_q=offsets.to(torch.int32),
-            cu_seqlens_k=offsets.to(torch.int32),
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            num_contexts=num_contextuals,
-            num_targets=num_candidates.to(torch.int32)
+        if scaling_seqlen == -1:
+            scaling_seqlen = max_seqlen
+
+        return hstu_attn_varlen_func(
+            tq.view(-1, self.num_heads, self.attention_dim),
+            tk.view(-1, self.num_heads, self.attention_dim),
+            tv.view(-1, self.num_heads, self.linear_dim),
+            offsets.to(torch.int32),
+            offsets.to(torch.int32),
+            None,  # seqused_q
+            None,  # seqused_k
+            max_seqlen,
+            max_seqlen,
+            scaling_seqlen,
+            num_contextuals,
+            num_candidates.to(torch.int32)
             if isinstance(num_candidates, torch.Tensor)
             else None,
             target_group_size=target_group_size,
             window_size=(-1, 0) if self.is_causal else (-1, -1),
-            rab=None,
             alpha=1.0 / (self.attention_dim**0.5),
-            scaling_seqlen=scaling_seqlen,
         ).view(-1, self.num_heads * self.linear_dim)
 
 

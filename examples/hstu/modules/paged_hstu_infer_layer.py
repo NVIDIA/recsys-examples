@@ -12,22 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import types
-
-    from hstu import hstu_attn_varlen_func as _new_hstu_func
-    from modules.hstu_attention import _make_new_hstu_compat
-
-    hstu_attn = types.SimpleNamespace(
-        hstu_attn_varlen_func=_make_new_hstu_compat(_new_hstu_func)
-    )
-except ImportError:
-    import hstu_attn  # type: ignore[no-redef]
-
 import paged_kvcache_ops
 import torch
 import torch.nn.functional as F
 from configs import InferenceHSTUConfig, KVCacheConfig
+from hstu import hstu_attn_varlen_func
 from modules.jagged_data import JaggedData
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
 from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
@@ -41,7 +30,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
     """
     x = ln(x)
     u,v,q,k = silu(linear_bias(x))
-    attn_output = hstu_attn.hstu_attn_varlen_func(q,k,v,offsets,max_seqlen)
+    attn_output = hstu.hstu_attn_varlen_func(q,k,v,offsets,max_seqlen)
     normed_out = ln_mul_dropout(attn_output)
     out = linear_residual(normed_out)
 
@@ -316,45 +305,44 @@ class PagedHSTUInferLayer(torch.nn.Module):
 
             kv_cache_metadata.kv_onload_handle.wait_host(self.layer_idx)
             kv_cache_metadata.kv_offload_handle.mark_ready(self.layer_idx)
-            jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
+            jagged_attn_output = hstu_attn_varlen_func(
                 query,
                 key,
                 value,
                 jd.seqlen_offsets[: batch_size + 1],
                 kv_cache_metadata.total_history_offsets[: batch_size + 1],
+                None,
+                None,  # seqused_q, seqused_k
                 jd.max_seqlen,
                 jd.max_seqlen,
-                num_contexts=None,
-                num_targets=jd.num_candidates[:batch_size],
+                jd.scaling_seqlen,
+                None,  # num_contexts
+                jd.num_candidates[:batch_size],
                 target_group_size=1,
                 window_size=(-1, 0),
                 alpha=self._alpha,
-                rab=None,
-                has_drab=False,
                 kv_cache=kv_cache_table,
                 page_offsets=kv_cache_metadata.kv_indptr,
                 page_ids=kv_cache_metadata.kv_indices,
                 last_page_lens=kv_cache_metadata.kv_last_page_len,
-                cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1],
-                scaling_seqlen=jd.scaling_seqlen,
             )
         else:
-            jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
+            jagged_attn_output = hstu_attn_varlen_func(
                 query,
                 key,
                 value,
                 jd.seqlen_offsets[: batch_size + 1],
                 jd.seqlen_offsets[: batch_size + 1],
+                None,
+                None,  # seqused_q, seqused_k
                 jd.max_seqlen,
                 jd.max_seqlen,
-                num_contexts=None,
-                num_targets=jd.num_candidates[:batch_size],
+                jd.scaling_seqlen,
+                None,  # num_contexts
+                jd.num_candidates[:batch_size],
                 target_group_size=1,
                 window_size=(-1, 0),
                 alpha=self._alpha,
-                rab=None,
-                has_drab=False,
-                scaling_seqlen=jd.scaling_seqlen,
             )
 
         jagged_attn_output = jagged_attn_output.view(
@@ -445,7 +433,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
         kv_cache_table = (
             kv_cache_metadata.kv_cache_table[self.layer_idx] if use_kvcache else None
         )
-        jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
+        jagged_attn_output = hstu_attn_varlen_func(
             query,
             key,
             value,
@@ -453,23 +441,20 @@ class PagedHSTUInferLayer(torch.nn.Module):
             kv_cache_metadata.total_history_offsets[: batch_size + 1]
             if use_kvcache
             else jd.seqlen_offsets[: batch_size + 1],
+            None,
+            None,  # seqused_q, seqused_k
             self._max_seqlen,
             self._max_seqlen,
-            num_contexts=None,
-            num_targets=jd.num_candidates[:batch_size],
+            self._max_seqlen,  # scaling_seqlen
+            None,  # num_contexts
+            jd.num_candidates[:batch_size],
             target_group_size=1,
             window_size=(-1, 0),
             alpha=self._alpha,
-            rab=None,
-            has_drab=False,
             kv_cache=kv_cache_table,
             page_offsets=kv_cache_metadata.kv_indptr if use_kvcache else None,
             page_ids=kv_cache_metadata.kv_indices if use_kvcache else None,
             last_page_lens=kv_cache_metadata.kv_last_page_len if use_kvcache else None,
-            cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1]
-            if use_kvcache
-            else None,
-            scaling_seqlen=self._max_seqlen,
         )
 
         jagged_attn_output = jagged_attn_output.view(
