@@ -403,6 +403,13 @@ def pad_and_all2all_batch(
       * All KJT fields fused: 2 ``all_to_all`` calls total (lengths, values)
       * Per dense field: 1 ``all_to_all`` call
 
+    **world_size == 1 fast-path**: When the process group contains only
+    one rank, no collective communication is performed.  Dense tensors
+    are still zero-padded to ``batch_size`` when ``actual_batch_size <
+    batch_size`` (incomplete batch) and ``actual_batch_size`` is set to
+    ``recv_ids.numel()`` for consistency with the multi-rank code path.
+    KJT fields are returned as-is.
+
     Args:
         batch: Local batch to redistribute.
         recv_ids: **Sorted** global batch indices this rank needs.
@@ -423,7 +430,29 @@ def pad_and_all2all_batch(
     local_batch_size = batch.batch_size
 
     if world_size == 1:
-        return batch
+        if batch.actual_batch_size >= local_batch_size:
+            return batch
+
+        # Still need to pad dense tensors for incomplete batches so that
+        # downstream reshape(batch_size, -1) is valid — same as allgather path.
+        def _pad_dense(
+            tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor],
+        ) -> Union[torch.Tensor, KeyedJaggedTensor]:
+            if isinstance(tensor_or_kjt, KeyedJaggedTensor):
+                return tensor_or_kjt
+            elif isinstance(tensor_or_kjt, torch.Tensor):
+                t = tensor_or_kjt
+                pad_size = (
+                    local_batch_size * (t.numel() // batch.actual_batch_size)
+                    - t.numel()
+                )
+                return F.pad(t, (0, pad_size)) if pad_size > 0 else t
+            else:
+                raise ValueError(f"Unsupported type: {type(tensor_or_kjt)}")
+
+        new_batch = batch._apply_to_tensors_or_kjt(_pad_dense, inplace=False)
+        new_batch.actual_batch_size = recv_ids.numel()
+        return new_batch
 
     # ---- Phase 1: KJT fields — fused all-to-all via _all2all_kjt_list ----
     kjt_field_names: List[str] = []
