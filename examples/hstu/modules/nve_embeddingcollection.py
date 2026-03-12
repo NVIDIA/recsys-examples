@@ -25,7 +25,7 @@ try:
     from pynve.torch.nve_layers import CacheType, NVEmbedding
 
     def get_nve_local_ps(vocab_size, embedding_dim, torch_dtype):
-        return nve_ps.NVLocalParameterServer(vocab_size, embedding_dim, torch_dtype)
+        return nve_ps.NVEParameterServer(vocab_size, embedding_dim, torch_dtype)
 
     class InferenceNVEEmbeddingCollection(torch.nn.Module):
         def __init__(
