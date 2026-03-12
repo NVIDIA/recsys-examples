@@ -32,3 +32,6 @@ embedding_checkpoint/
 *.xlsx
 pcie_lookup_poc/*
 **/triton/**/[0-9]*
+results/
+.docs/*
+.python-version

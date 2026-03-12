@@ -1,9 +1,10 @@
-import fbgemm_gpu  # noqa: F401
-import pytest  # noqa: F401
+import pytest
 import torch
+
+fbgemm_gpu = pytest.importorskip("fbgemm_gpu")  # noqa: F401
+hstu = pytest.importorskip("hstu")
 from commons.utils.hstu_assert_close import assert_hstu_close
-from hopper.hstu_attn_interface import hstu_attn_varlen_func as hopper_attn_func
-from hstu_attn import hstu_attn_varlen_func as ampere_attn_func
+from hstu import hstu_attn_varlen_func
 from ops.pt_ops.pt_hstu_attention import pytorch_hstu_mha as pytorch_hstu_mha
 from ops.triton_ops.triton_hstu_attention import triton_hstu_mha as triton_hstu_mha
 
@@ -41,12 +42,8 @@ def test_hstn_fwd_bwd(
     max_num_contextuals,
 ):
     arch_sm = get_arch_sm()
-    if arch_sm[0] == "8":
-        hstu_attn_func = ampere_attn_func
-    elif arch_sm[0] == "9":
-        hstu_attn_func = hopper_attn_func
-    else:
-        raise ValueError(f"Unsupported SM major version: {arch_sm}")
+    if arch_sm[0] not in ("8", "9"):
+        pytest.skip(f"Unsupported SM major version: {arch_sm}")
     device = torch.device("cuda")
     lengths = torch.randint(
         low=2,
@@ -105,20 +102,22 @@ def test_hstn_fwd_bwd(
     max_seqlen_q = max_seqlen
     max_seqlen_k = max_seqlen
 
-    out = hstu_attn_func(
+    out = hstu_attn_varlen_func(
         q,
         k,
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        None,
+        None,  # seqused_q, seqused_k
         max_seqlen_q,
         max_seqlen_k,
+        max_seqlen,  # scaling_seqlen
         num_contextuals,
         num_targets,
-        rab=None,
-        alpha=1.0 / (head_dim**0.5),
         target_group_size=1,
         window_size=(-1, 0),
+        alpha=1.0 / (head_dim**0.5),
     )
 
     ref_q = q.detach().clone().requires_grad_(True)

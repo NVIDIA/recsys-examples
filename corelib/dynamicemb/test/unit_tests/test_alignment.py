@@ -394,9 +394,7 @@ def _compare_actual_vs_theoretical(
     # Cache: actual HBM is cache size, may be >= theory due to bucket rounding.
     total_per_rank = aligned_cap_expected * _byte_per_vector()
     if not caching:
-        effective_actual_hbm = min(
-            actual["local_hbm_for_values"], total_per_rank
-        )
+        effective_actual_hbm = min(actual["local_hbm_for_values"], total_per_rank)
         hbm_ok = effective_actual_hbm == hbm_per_rank
     else:
         hbm_ok = actual["local_hbm_for_values"] >= 0
