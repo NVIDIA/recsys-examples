@@ -30,7 +30,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
     """
     x = ln(x)
     u,v,q,k = silu(linear_bias(x))
-    attn_output = hstu.hstu_attn_varlen_func(q,k,v,offsets,max_seqlen)
+    attn_output = hstu_attn_varlen_func(q,k,v,offsets,max_seqlen)
     normed_out = ln_mul_dropout(attn_output)
     out = linear_residual(normed_out)
 

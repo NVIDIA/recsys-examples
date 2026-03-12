@@ -308,6 +308,10 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     None,  # rab, func
                 )
             elif sm_major_version == 9:
+                assert q.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ), f"Hopper fwd expects bfloat16 or float16, got {q.dtype}"
                 output_dtype = 0 if q.dtype == torch.bfloat16 else 1
                 jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
                     q,
@@ -652,6 +656,10 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     False,  # rab, has_drab, func, deterministic
                 )
             elif sm_major_version == 9:
+                assert dout.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ), f"Hopper bwd expects bfloat16 or float16, got {dout.dtype}"
                 output_dtype = 0 if dout.dtype == torch.bfloat16 else 1
                 dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_90(
                     dout,

@@ -22,8 +22,15 @@ import torch.nn.functional as F
 from einops import rearrange
 
 hstu = pytest.importorskip("hstu")
+import inspect as _inspect
+
 from hstu import hstu_attn_varlen_func
 from hstu_assert_close import assert_hstu_close
+
+assert "kv_cache" in _inspect.signature(hstu_attn_varlen_func).parameters, (
+    "Installed hstu does not support paged KV-cache kwargs (kv_cache). "
+    "Please update to a version that supports paged KV-cache."
+)
 
 
 def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
