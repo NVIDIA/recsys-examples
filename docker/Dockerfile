@@ -69,13 +69,14 @@ ARG TRITONSERVER_BUILD
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
+    MAX_JOBS=2 \
     HSTU_DISABLE_86OR89=FALSE \
     HSTU_DISABLE_ARBITRARY=TRUE \
     HSTU_DISABLE_LOCAL=TRUE \
     HSTU_DISABLE_RAB=TRUE \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
-    HSTU_ARCH_LIST="8.0 9.0 10.0" \
+    HSTU_ARCH_LIST="8.0 9.0" \
     pip install . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
