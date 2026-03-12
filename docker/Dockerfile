@@ -56,9 +56,6 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
-WORKDIR /workspace/recsys-examples
-COPY . .
-
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
@@ -71,8 +68,6 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_ARCH_LIST="8.0 9.0" \
     pip install . && \
     rm -rf /workspace/deps/fbgemm_hstu
-
-RUN rm -rf /workspace/recsys-examples/*
 
 FROM ${DEVEL_IMAGE} AS build
 ARG TRITONSERVER_BUILD
