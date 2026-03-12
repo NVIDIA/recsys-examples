@@ -21,8 +21,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "utils.h"
 #include <cstdint>
 #include <cub/cub.cuh>
-#include <thrust/iterator/zip_iterator.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
 #include <thrust/tuple.h>
 #include <utility>
 
@@ -79,43 +79,43 @@ void select_index_async(int64_t num_items, bool const *d_flags, T *d_output,
 }
 
 template <size_t... Is>
-void flagged_compact_impl(
-    int64_t num_items, bool const *d_flags,
-    int64_t const *const *d_inputs,
-    int64_t *const *d_outputs,
-    int64_t *d_out_indices,
-    int64_t *d_num_selected,
-    at::Device const &device, cudaStream_t const &stream,
-    std::index_sequence<Is...>) {
+void flagged_compact_impl(int64_t num_items, bool const *d_flags,
+                          int64_t const *const *d_inputs,
+                          int64_t *const *d_outputs, int64_t *d_out_indices,
+                          int64_t *d_num_selected, at::Device const &device,
+                          cudaStream_t const &stream,
+                          std::index_sequence<Is...>) {
 
-    auto in_zip = thrust::make_zip_iterator(thrust::make_tuple(
-        thrust::counting_iterator<int64_t>(0), d_inputs[Is]...));
-    auto out_zip = thrust::make_zip_iterator(thrust::make_tuple(
-        d_out_indices, d_outputs[Is]...));
+  auto in_zip = thrust::make_zip_iterator(thrust::make_tuple(
+      thrust::counting_iterator<int64_t>(0), d_inputs[Is]...));
+  auto out_zip = thrust::make_zip_iterator(
+      thrust::make_tuple(d_out_indices, d_outputs[Is]...));
 
-    void *d_temp = nullptr;
-    size_t temp_bytes = 0;
-    cub::DeviceSelect::Flagged(d_temp, temp_bytes,
-        in_zip, d_flags, out_zip, d_num_selected, num_items, stream);
-    d_temp = at::empty({static_cast<int64_t>(temp_bytes)},
-        at::TensorOptions().dtype(at::kByte).device(device)).data_ptr();
-    cub::DeviceSelect::Flagged(d_temp, temp_bytes,
-        in_zip, d_flags, out_zip, d_num_selected, num_items, stream);
+  void *d_temp = nullptr;
+  size_t temp_bytes = 0;
+  cub::DeviceSelect::Flagged(d_temp, temp_bytes, in_zip, d_flags, out_zip,
+                             d_num_selected, num_items, stream);
+  d_temp = at::empty({static_cast<int64_t>(temp_bytes)},
+                     at::TensorOptions().dtype(at::kByte).device(device))
+               .data_ptr();
+  cub::DeviceSelect::Flagged(d_temp, temp_bytes, in_zip, d_flags, out_zip,
+                             d_num_selected, num_items, stream);
 }
 
 template <size_t N>
-void flagged_compact_cub(
-    int64_t num_items, bool const *d_flags,
-    int64_t const *const *d_inputs,
-    int64_t *const *d_outputs,
-    int64_t *d_out_indices,
-    int64_t *d_num_selected,
-    at::Device const &device, cudaStream_t const &stream) {
-    flagged_compact_impl(
-        num_items, d_flags, d_inputs, d_outputs,
-        d_out_indices, d_num_selected, device, stream,
-        std::make_index_sequence<N>{});
+void flagged_compact_cub(int64_t num_items, bool const *d_flags,
+                         int64_t const *const *d_inputs,
+                         int64_t *const *d_outputs, int64_t *d_out_indices,
+                         int64_t *d_num_selected, at::Device const &device,
+                         cudaStream_t const &stream) {
+  flagged_compact_impl(num_items, d_flags, d_inputs, d_outputs, d_out_indices,
+                       d_num_selected, device, stream,
+                       std::make_index_sequence<N>{});
 }
+
+/** Segmented sum: for each segment i, output[i] = sum(data[offsets[i] :
+ * offsets[i+1]]). Async. */
+at::Tensor segmented_sum_cuda(at::Tensor data, at::Tensor offsets);
 
 } // namespace dyn_emb
 

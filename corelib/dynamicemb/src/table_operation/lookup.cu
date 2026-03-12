@@ -20,14 +20,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-void table_lookup_single_score(at::Tensor table_storage,
-                               at::Tensor table_bucket_offsets,
-                               int64_t bucket_capacity, at::Tensor keys,
-                               at::Tensor table_ids,
-                               std::optional<at::Tensor> score_input,
-                               ScorePolicyType policy_type,
-                               at::Tensor score_output, at::Tensor founds,
-                               at::Tensor indices) {
+void table_lookup_single_score(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
+    std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
+    at::Tensor score_output, at::Tensor founds, at::Tensor indices) {
 
   auto key_type = get_data_type(keys);
 
@@ -73,11 +70,9 @@ void table_lookup_single_score(at::Tensor table_storage,
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV, false>
           <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, table_bucket_offsets_ptr,
-                       num_total, keys_ptr, table_ids_ptr,
-                       founds_ptr, indices_ptr,
-                       score_input_ptr, score_output_ptr,
-                       Table(), nullptr);
+             stream>>>(table, table_bucket_offsets_ptr, num_total, keys_ptr,
+                       table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
+                       score_output_ptr, Table(), nullptr);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -85,10 +80,8 @@ void table_lookup_single_score(at::Tensor table_storage,
 
 static void table_lookup_with_overflow_single_score(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
-    int64_t bucket_capacity, at::Tensor keys,
-    at::Tensor table_ids,
-    std::optional<at::Tensor> score_input,
-    ScorePolicyType policy_type,
+    int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
+    std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_output_offsets) {
@@ -145,11 +138,9 @@ static void table_lookup_with_overflow_single_score(
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV, true>
           <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, table_bucket_offsets_ptr,
-                       num_total, keys_ptr, table_ids_ptr,
-                       founds_ptr, indices_ptr,
-                       score_input_ptr, score_output_ptr,
-                       ovf_table, ovf_output_offsets_ptr);
+             stream>>>(table, table_bucket_offsets_ptr, num_total, keys_ptr,
+                       table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
+                       score_output_ptr, ovf_table, ovf_output_offsets_ptr);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -157,12 +148,9 @@ static void table_lookup_with_overflow_single_score(
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
-             int64_t bucket_capacity, at::Tensor keys,
-             at::Tensor table_ids,
-             std::optional<at::Tensor> score_input,
-             ScorePolicyType policy_type,
-             std::optional<at::Tensor> ovf_storage,
-             int64_t ovf_bucket_capacity,
+             int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
+             std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
+             std::optional<at::Tensor> ovf_storage, int64_t ovf_bucket_capacity,
              std::optional<at::Tensor> ovf_output_offsets) {
 
   int64_t num_total = keys.size(0);
@@ -185,16 +173,13 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
 
   if (use_overflow) {
     table_lookup_with_overflow_single_score(
-        table_storage, table_bucket_offsets, bucket_capacity,
-        keys, table_ids, score_input, policy_type,
-        score_output, founds, indices,
-        ovf_storage.value(), ovf_bucket_capacity,
-        ovf_output_offsets.value());
+        table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
+        score_input, policy_type, score_output, founds, indices,
+        ovf_storage.value(), ovf_bucket_capacity, ovf_output_offsets.value());
   } else {
     table_lookup_single_score(table_storage, table_bucket_offsets,
-                              bucket_capacity, keys, table_ids,
-                              score_input, policy_type,
-                              score_output, founds, indices);
+                              bucket_capacity, keys, table_ids, score_input,
+                              policy_type, score_output, founds, indices);
   }
 
   return std::make_tuple(score_output, founds, indices);

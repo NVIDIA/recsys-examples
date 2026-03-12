@@ -402,8 +402,7 @@ template <typename wgrad_t, typename weight_t, typename index_t,
 __global__ void update4_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
     const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
-    const int64_t *table_ids,
-    const int64_t *table_value_dims,
+    const int64_t *table_ids, const int64_t *table_value_dims,
     const int64_t *table_emb_dims, OptimizerFunc optimizer) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
@@ -419,7 +418,8 @@ __global__ void update4_with_index_flat_table_kernel(
     int64_t vdim = table_value_dims[table_id];
     int64_t edim = table_emb_dims[table_id];
 
-    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) + static_cast<int64_t>(index) * vdim;
+    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
+                           static_cast<int64_t>(index) * vdim;
     const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
@@ -433,8 +433,7 @@ template <typename wgrad_t, typename weight_t, typename index_t,
 __global__ void update_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
     const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
-    const int64_t *table_ids,
-    const int64_t *table_value_dims,
+    const int64_t *table_ids, const int64_t *table_value_dims,
     const int64_t *table_emb_dims, OptimizerFunc optimizer) {
 
   for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
@@ -446,7 +445,8 @@ __global__ void update_with_index_flat_table_kernel(
     int64_t vdim = table_value_dims[table_id];
     int64_t edim = table_emb_dims[table_id];
 
-    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) + static_cast<int64_t>(index) * vdim;
+    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
+                           static_cast<int64_t>(index) * vdim;
     const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
@@ -456,10 +456,11 @@ __global__ void update_with_index_flat_table_kernel(
 }
 
 template <typename wgrad_t, typename weight_t, typename OptimizerFunc>
-__global__ void update4_padded_buffer_kernel(
-    const uint32_t num_rows, const uint32_t grad_stride,
-    const uint32_t value_stride, const wgrad_t *grads, weight_t *values,
-    OptimizerFunc optimizer) {
+__global__ void
+update4_padded_buffer_kernel(const uint32_t num_rows,
+                             const uint32_t grad_stride,
+                             const uint32_t value_stride, const wgrad_t *grads,
+                             weight_t *values, OptimizerFunc optimizer) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
   const int warp_id_in_block = threadIdx.x / kWarpSize;
@@ -474,10 +475,10 @@ __global__ void update4_padded_buffer_kernel(
 }
 
 template <typename wgrad_t, typename weight_t, typename OptimizerFunc>
-__global__ void update_padded_buffer_kernel(
-    const uint32_t num_rows, const uint32_t grad_stride,
-    const uint32_t value_stride, const wgrad_t *grads, weight_t *values,
-    OptimizerFunc optimizer) {
+__global__ void
+update_padded_buffer_kernel(const uint32_t num_rows, const uint32_t grad_stride,
+                            const uint32_t value_stride, const wgrad_t *grads,
+                            weight_t *values, OptimizerFunc optimizer) {
   for (uint32_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
     weight_t *weight_ptr = values + row * value_stride;
     const wgrad_t *grad_ptr = grads + row * grad_stride;

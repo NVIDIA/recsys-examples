@@ -410,8 +410,8 @@ __global__ void expand_table_ids_kernel(const int64_t *offsets,
 
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_elements;
        idx += stride) {
-    table_ids[idx] = find_table_for_index(
-        table_offsets_in_feature, offsets, num_tables, local_batch_size, idx);
+    table_ids[idx] = find_table_for_index(table_offsets_in_feature, offsets,
+                                          num_tables, local_batch_size, idx);
   }
 }
 

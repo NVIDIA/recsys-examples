@@ -21,9 +21,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
-                 int64_t bucket_capacity,
-                 at::Tensor bucket_sizes, at::Tensor keys,
-                 at::Tensor table_ids,
+                 int64_t bucket_capacity, at::Tensor bucket_sizes,
+                 at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices) {
 
   int64_t num_total = keys.size(0);
@@ -57,8 +56,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
 
     table_erase_kernel<Table, 1>
         <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            table, table_bucket_offsets_ptr,
-            bucket_sizes_, num_total, keys_, table_ids_ptr, indices_);
+            table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
+            table_ids_ptr, indices_);
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

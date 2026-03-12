@@ -47,8 +47,8 @@ struct BucketizeFunctor {
       return static_cast<IndexType>(bkt_begin);
     }
     // Use unsigned modulo to avoid negative results from signed hash values
-    int64_t local_idx = static_cast<int64_t>(
-        static_cast<uint64_t>(hashcode) % static_cast<uint64_t>(table_cap));
+    int64_t local_idx = static_cast<int64_t>(static_cast<uint64_t>(hashcode) %
+                                             static_cast<uint64_t>(table_cap));
     int64_t bucket_id = bkt_begin + local_idx / bucket_capacity;
     return static_cast<IndexType>(bucket_id);
   }

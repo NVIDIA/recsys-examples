@@ -627,6 +627,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     host_option.max_capacity = min(host_option.max_capacity, cap)
                     host_option.init_capacity = min(host_option.init_capacity, cap)
 
+                # NO_EVICTION mode: HBM uses TIMESTAMP, host uses NO_EVICTION
+                if (
+                    self._dynamicemb_options[0].score_strategy
+                    == DynamicEmbScoreStrategy.NO_EVICTION
+                ):
+                    for hbm_option in hbm_options:
+                        hbm_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+
                 self._storage = HybridStorage(
                     hbm_options, host_options, self._optimizer
                 )
@@ -1053,6 +1061,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
                 option.evict_strategy = DynamicEmbEvictStrategy.LFU
                 self._scores[table_name] = 1
+            elif option.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+                option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
+                self._scores[table_name] = 0
 
     def _update_score(self):
         """Only STEP mode updates score; TIMESTAMP/LFU are not used by the underlying table or are constant."""

@@ -33,9 +33,8 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      const int *D_offsets_ptr = nullptr);
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
-                   int num_emb, int ev_size, int src_stride,
-                   DataType src_type, DataType dst_type,
-                   DataType offset_type, int device_num_sms,
+                   int num_emb, int ev_size, int src_stride, DataType src_type,
+                   DataType dst_type, DataType offset_type, int device_num_sms,
                    cudaStream_t stream);
 
 void get_new_length_and_offsets(uint64_t *d_unique_offsets,

@@ -366,11 +366,10 @@ struct LinearBucket {
   }
 
   template <int GroupSize, int BufferDim>
-  __forceinline__ __device__ bool reduce(
-      Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
-      ScoreType *sm_buffers,
-      int32_t const *__restrict__ counter,
-      int64_t counter_offset) const {
+  __forceinline__ __device__ bool
+  reduce(Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
+         ScoreType *sm_buffers, int32_t const *__restrict__ counter,
+         int64_t counter_offset) const {
 
     static_assert(GroupSize == 1);
     bool succeed = false;
@@ -417,7 +416,8 @@ struct LinearBucket {
 
             if (temp_key != LockedKey && temp_key != EmptyKey) {
               int64_t flat_idx = counter_offset + iter + k + j;
-              if (counter[flat_idx] > 0) continue;
+              if (counter[flat_idx] > 0)
+                continue;
 
               dst_iter = iter + k + j;
               dst_key = temp_key;

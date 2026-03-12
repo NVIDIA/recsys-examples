@@ -33,11 +33,9 @@ template <typename GradType, typename WeightType, typename IndexType,
           typename OptimizerType>
 void launch_update_kernel_for_flat_table(
     GradType *grads, int64_t *table_ptrs, IndexType *indices,
-    int64_t *table_ids,
-    int64_t *table_value_dims,
-    int64_t *table_emb_dims, OptimizerType opt, int64_t const ev_nums,
-    uint32_t const grad_stride, uint32_t const max_emb_dim, bool all_dims_vec4,
-    int device_id,
+    int64_t *table_ids, int64_t *table_value_dims, int64_t *table_emb_dims,
+    OptimizerType opt, int64_t const ev_nums, uint32_t const grad_stride,
+    uint32_t const max_emb_dim, bool all_dims_vec4, int device_id,
     std::function<float(int)> smem_size_f = [](int block_size) { return 0; }) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(device_id);
@@ -56,25 +54,22 @@ void launch_update_kernel_for_flat_table(
       grid_size = max_grid_size;
     }
 
-    auto kernel = update4_with_index_flat_table_kernel<GradType, WeightType,
-                                                       IndexType,
-                                                       OptimizerType>;
+    auto kernel =
+        update4_with_index_flat_table_kernel<GradType, WeightType, IndexType,
+                                             OptimizerType>;
     kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
         ev_nums, grad_stride, grads, table_ptrs, indices, table_ids,
-        table_value_dims,
-        table_emb_dims, opt);
+        table_value_dims, table_emb_dims, opt);
   } else {
     int block_size =
         max_emb_dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : max_emb_dim;
     int grid_size = ev_nums;
 
     auto kernel = update_with_index_flat_table_kernel<GradType, WeightType,
-                                                      IndexType,
-                                                      OptimizerType>;
+                                                      IndexType, OptimizerType>;
     kernel<<<grid_size, block_size, smem_size_f(block_size), stream>>>(
         ev_nums, grad_stride, grads, table_ptrs, indices, table_ids,
-        table_value_dims,
-        table_emb_dims, opt);
+        table_value_dims, table_emb_dims, opt);
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -82,9 +77,8 @@ void launch_update_kernel_for_flat_table(
 void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                at::Tensor table_ptrs, at::Tensor table_ids,
                                at::Tensor table_value_dims,
-                               at::Tensor table_emb_dims,
-                               int64_t max_emb_dim, bool all_dims_vec4,
-                               float const lr,
+                               at::Tensor table_emb_dims, int64_t max_emb_dim,
+                               bool all_dims_vec4, float const lr,
                                int64_t table_dtype) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
@@ -113,9 +107,8 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         SgdVecOptimizer<g_t, w_t> opt{lr};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr,
-            ted_ptr, opt, ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4,
-            device_id);
+            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
       });
     });
   });
@@ -127,9 +120,8 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 at::Tensor table_emb_dims, const float lr,
                                 const float beta1, const float beta2,
                                 const float eps, const float weight_decay,
-                                const uint32_t iter_num,
-                                int64_t max_emb_dim, bool all_dims_vec4,
-                                int64_t table_dtype) {
+                                const uint32_t iter_num, int64_t max_emb_dim,
+                                bool all_dims_vec4, int64_t table_dtype) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -158,22 +150,19 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                        eps, weight_decay, iter_num};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr,
-            ted_ptr, opt, ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4,
-            device_id);
+            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
       });
     });
   });
 }
 
 void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                   at::Tensor table_ptrs,
-                                   at::Tensor table_ids,
+                                   at::Tensor table_ptrs, at::Tensor table_ids,
                                    at::Tensor table_value_dims,
                                    at::Tensor table_emb_dims, const float lr,
-                                   const float eps,
-                                   int64_t max_emb_dim, bool all_dims_vec4,
-                                   int64_t table_dtype) {
+                                   const float eps, int64_t max_emb_dim,
+                                   bool all_dims_vec4, int64_t table_dtype) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -201,22 +190,19 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         AdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr,
-            ted_ptr, opt, ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4,
-            device_id);
+            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
       });
     });
   });
 }
 
 void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                    at::Tensor table_ptrs,
-                                    at::Tensor table_ids,
+                                    at::Tensor table_ptrs, at::Tensor table_ids,
                                     at::Tensor table_value_dims,
                                     at::Tensor table_emb_dims, const float lr,
-                                    const float eps,
-                                    int64_t max_emb_dim, bool all_dims_vec4,
-                                    int64_t table_dtype) {
+                                    const float eps, int64_t max_emb_dim,
+                                    bool all_dims_vec4, int64_t table_dtype) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -244,9 +230,8 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
         RowWiseAdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr,
-            ted_ptr, opt, ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4,
-            device_id,
+            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
             [](int block_size) { return block_size * sizeof(float); });
       });
     });
@@ -315,10 +300,9 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
 }
 
 void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                   int64_t emb_dim, int64_t value_dim,
-                                   float lr, float beta1, float beta2,
-                                   float eps, float weight_decay,
-                                   uint32_t iter_num) {
+                                   int64_t emb_dim, int64_t value_dim, float lr,
+                                   float beta1, float beta2, float eps,
+                                   float weight_decay, uint32_t iter_num) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -333,8 +317,8 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   int device_id = grads.device().index();
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
-      AdamVecOptimizer<g_t, w_t> opt{lr, beta1, beta2, eps, weight_decay,
-                                     iter_num};
+      AdamVecOptimizer<g_t, w_t> opt{lr,  beta1,        beta2,
+                                     eps, weight_decay, iter_num};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id);
@@ -405,27 +389,27 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_dtype"));
 
   m.def("adam_update_for_flat_table", &dyn_emb::adam_update_for_flat_table,
-        "Adam optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
-        py::arg("indices"), py::arg("table_ptrs"), py::arg("table_ids"),
-        py::arg("table_value_dims"), py::arg("table_emb_dims"), py::arg("lr"),
-        py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
-        py::arg("weight_decay"), py::arg("iter_num"), py::arg("max_emb_dim"),
-        py::arg("all_dims_vec4"), py::arg("table_dtype"));
-
-  m.def("adagrad_update_for_flat_table",
-        &dyn_emb::adagrad_update_for_flat_table,
-        "Adagrad optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
-        py::arg("indices"), py::arg("table_ptrs"), py::arg("table_ids"),
-        py::arg("table_value_dims"), py::arg("table_emb_dims"), py::arg("lr"),
-        py::arg("eps"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
+        "Adam optimizer for multi-table buffer via table_ptrs",
+        py::arg("grads"), py::arg("indices"), py::arg("table_ptrs"),
+        py::arg("table_ids"), py::arg("table_value_dims"),
+        py::arg("table_emb_dims"), py::arg("lr"), py::arg("beta1"),
+        py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"),
+        py::arg("iter_num"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
         py::arg("table_dtype"));
+
+  m.def(
+      "adagrad_update_for_flat_table", &dyn_emb::adagrad_update_for_flat_table,
+      "Adagrad optimizer for multi-table buffer via table_ptrs",
+      py::arg("grads"), py::arg("indices"), py::arg("table_ptrs"),
+      py::arg("table_ids"), py::arg("table_value_dims"),
+      py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
+      py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("table_dtype"));
 
   m.def("rowwise_adagrad_for_flat_table",
         &dyn_emb::rowwise_adagrad_for_flat_table,
         "Row Wise Adagrad optimizer for multi-table buffer via table_ptrs",
         py::arg("grads"), py::arg("indices"), py::arg("table_ptrs"),
-        py::arg("table_ids"),
-        py::arg("table_value_dims"),
+        py::arg("table_ids"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
         py::arg("table_dtype"));

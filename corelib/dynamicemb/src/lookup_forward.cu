@@ -62,7 +62,8 @@ struct ForwardMultiToOneFMLayoutDesc {
   int num_vec_;
   int combiner;
   int ev_size; // uniform: embedding dim; multi-dim: max_D (copy width per row)
-  int src_stride; // source row stride (may differ from ev_size when optimizer states are appended)
+  int src_stride; // source row stride (may differ from ev_size when optimizer
+                  // states are appended)
   const int *__restrict__ D_offsets_ptr; // nullptr → uniform, [F+1] → multi-dim
   const offset_t *__restrict__ offset_ptr;
   const offset_t *__restrict__ reverse_idx_ptr;
@@ -128,17 +129,17 @@ struct ForwardSequenceFusedCopyDesc {
 };
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
-                   int num_emb, int ev_size, int src_stride,
-                   DataType src_type, DataType dst_type,
-                   DataType offset_type, int device_num_sms,
+                   int num_emb, int ev_size, int src_stride, DataType src_type,
+                   DataType dst_type, DataType offset_type, int device_num_sms,
                    cudaStream_t stream) {
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
       DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
         using CopyDesc = ForwardSequenceFusedCopyDesc<src_t, dst_t, offset_t>;
-        CopyDesc sequence_copy_desc{num_emb, ev_size, src_stride,
-                                    (offset_t *)inverse_idx_ptr,
-                                    (src_t *)src_ptr, (dst_t *)dst_ptr};
+        CopyDesc sequence_copy_desc{
+            num_emb,          ev_size,
+            src_stride,       (offset_t *)inverse_idx_ptr,
+            (src_t *)src_ptr, (dst_t *)dst_ptr};
         copy_one_to_one<CopyDesc>(sequence_copy_desc, ev_size, device_num_sms,
                                   stream);
       });

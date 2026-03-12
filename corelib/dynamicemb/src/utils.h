@@ -172,6 +172,7 @@ public:
   int max_thread_per_sm;
   int max_thread_per_block;
   int total_threads;
+  int64_t totalGlobalMem;
 
 private:
   explicit DeviceProp(int device_id);

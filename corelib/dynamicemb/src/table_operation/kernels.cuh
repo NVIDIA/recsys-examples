@@ -30,8 +30,7 @@ namespace dyn_emb {
 template <int ThreadBlockDim_, int ProbingGroupSize_, int ReductionGroupSize_,
           int CompactTileSize_, int NumScorePerThread_,
           ScorePolicyType PolicyType_ = ScorePolicyType::Const,
-          bool OutputScore_ = false,
-          bool EnableOverflow_ = false>
+          bool OutputScore_ = false, bool EnableOverflow_ = false>
 struct InsertKernelTraits {
   static constexpr int ThreadBlockDim = ThreadBlockDim_;
   static constexpr int ProbingGroupSize = ProbingGroupSize_;
@@ -81,17 +80,13 @@ struct EvalAndCount {
 
 template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType,
           bool EnableOverflow = false>
-__global__ void
-table_lookup_kernel(Table table,
-                    int64_t const *__restrict__ table_bucket_offsets,
-                    int64_t batch,
-                    typename Table::KeyType const *__restrict__ input_keys,
-                    int64_t const *__restrict__ table_ids,
-                    bool *__restrict__ founds, IndexType *__restrict__ indices,
-                    ScoreType *__restrict__ score_input,
-                    int64_t *__restrict__ score_output,
-                    Table ovf_table,
-                    int64_t const *__restrict__ ovf_output_offsets) {
+__global__ void table_lookup_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int64_t batch, typename Table::KeyType const *__restrict__ input_keys,
+    int64_t const *__restrict__ table_ids, bool *__restrict__ founds,
+    IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
+    int64_t *__restrict__ score_output, Table ovf_table,
+    int64_t const *__restrict__ ovf_output_offsets) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -156,9 +151,8 @@ table_lookup_kernel(Table table,
         Bucket ovf_bucket = ovf_table[t_id];
         Iter ovf_iter = Iter(hashcode % ovf_bucket.capacity());
         Iter ovf_out_iter;
-        bool ovf_found = overflow_find(ovf_bucket, key,
-                                       ovf_output_offsets[t_id],
-                                       ovf_iter, &ovf_out_iter);
+        bool ovf_found = overflow_find(
+            ovf_bucket, key, ovf_output_offsets[t_id], ovf_iter, &ovf_out_iter);
         if (ovf_found) {
           found = true;
           index = ovf_out_iter;
@@ -177,10 +171,10 @@ table_lookup_kernel(Table table,
 }
 
 template <int ProbingGroupSize, typename Bucket, typename KeyType>
-__forceinline__ __device__ void insert_probe(
-    Bucket &bucket, KeyType key, int *__restrict__ bucket_sizes, int64_t bucket_id,
-    typename Bucket::Iterator iter_in,
-    typename Bucket::Iterator *iter_out, InsertResult *result_out) {
+__forceinline__ __device__ void
+insert_probe(Bucket &bucket, KeyType key, int *__restrict__ bucket_sizes,
+             int64_t bucket_id, typename Bucket::Iterator iter_in,
+             typename Bucket::Iterator *iter_out, InsertResult *result_out) {
   auto iter = iter_in;
   auto result = InsertResult::Init;
   using ProbeResult = typename Bucket::ProbeResult;
@@ -215,15 +209,14 @@ __forceinline__ __device__ void insert_probe(
 
 template <int ReductionGroupSize, int BufferDim, typename Policy,
           typename Bucket, typename KeyType>
-__forceinline__ __device__ void insert(
-    Bucket &bucket, KeyType key, ScoreType score,
-    int *__restrict__ bucket_sizes, int64_t bucket_id,
-    typename Bucket::Iterator iter_in, ScoreType *sm_scores,
-    InsertResult result_in, typename Bucket::Iterator *iter_out,
-    InsertResult *result_out, KeyType *evict_key_out,
-    ScoreType *evict_score_out,
-    int32_t *__restrict__ counter,
-    int64_t counter_offset) {
+__forceinline__ __device__ void
+insert(Bucket &bucket, KeyType key, ScoreType score,
+       int *__restrict__ bucket_sizes, int64_t bucket_id,
+       typename Bucket::Iterator iter_in, ScoreType *sm_scores,
+       InsertResult result_in, typename Bucket::Iterator *iter_out,
+       InsertResult *result_out, KeyType *evict_key_out,
+       ScoreType *evict_score_out, int32_t *__restrict__ counter,
+       int64_t counter_offset) {
   auto iter = iter_in;
   auto result = result_in;
   while (result == InsertResult::Init) {
@@ -253,15 +246,19 @@ __forceinline__ __device__ void insert(
             *bucket.scores(iter) = ScoreType();
             result = InsertResult::Evict;
           }
-          if (evict_key_out) *evict_key_out = evict_key;
-          if (evict_score_out) *evict_score_out = evict_score;
+          if (evict_key_out)
+            *evict_key_out = evict_key;
+          if (evict_score_out)
+            *evict_score_out = evict_score;
           break;
         }
       }
     } else {
       result = InsertResult::Busy;
-      if (evict_key_out) *evict_key_out = key;
-      if (evict_score_out) *evict_score_out = score;
+      if (evict_key_out)
+        *evict_key_out = key;
+      if (evict_score_out)
+        *evict_score_out = score;
       break;
     }
   }
@@ -271,8 +268,7 @@ __forceinline__ __device__ void insert(
 
 template <typename Table, typename KernelTraits>
 __global__ void table_insert_kernel(
-    Table table,
-    int64_t const *__restrict__ table_bucket_offsets,
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
     int *__restrict__ bucket_sizes, int64_t batch,
     typename Table::KeyType const *__restrict__ input_keys,
     int64_t const *__restrict__ table_ids,
@@ -334,14 +330,13 @@ __global__ void table_insert_kernel(
     InsertResult result;
     Bucket bucket = table[bucket_id];
     Iter iter = Iter(hashcode % table.bucket_capacity());
-    insert_probe<ProbingGroupSize>(
-        bucket, key, bucket_sizes, bucket_id, iter, &iter, &result);
+    insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
+                                   &iter, &result);
     int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
     insert<ReductionGroupSize, BufferDim, Policy>(
         bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores, result,
         &iter, &result, static_cast<KeyType *>(nullptr),
-        static_cast<ScoreType *>(nullptr),
-        counter, counter_offset);
+        static_cast<ScoreType *>(nullptr), counter, counter_offset);
 
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
@@ -363,8 +358,7 @@ __global__ void table_insert_kernel(
 
 template <typename Table, typename KernelTraits>
 __global__ void table_insert_and_evict_kernel(
-    Table table,
-    int64_t const *__restrict__ table_bucket_offsets,
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
     int *__restrict__ bucket_sizes, int64_t batch,
     typename Table::KeyType const *__restrict__ input_keys,
     int64_t const *__restrict__ table_ids,
@@ -375,10 +369,8 @@ __global__ void table_insert_and_evict_kernel(
     typename Table::KeyType *__restrict__ evicted_keys,
     int64_t *__restrict__ evicted_scores,
     IndexType *__restrict__ evicted_indices,
-    int64_t *__restrict__ evicted_table_ids,
-    int32_t *__restrict__ counter,
-    Table ovf_table,
-    int *__restrict__ ovf_bucket_sizes,
+    int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
+    Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
     int64_t const *__restrict__ ovf_output_offsets) {
 
@@ -430,15 +422,15 @@ __global__ void table_insert_and_evict_kernel(
 
     if (table_cap > 0) {
       iter = Iter(hashcode % table.bucket_capacity());
-      insert_probe<ProbingGroupSize>(
-          bucket, key, bucket_sizes, bucket_id, iter, &iter, &result);
+      insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
+                                     &iter, &result);
 
       {
         int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
         insert<ReductionGroupSize, BufferDim, Policy>(
             bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores,
-            result, &iter, &result, &evict_key, &evict_score,
-            counter, counter_offset);
+            result, &iter, &result, &evict_key, &evict_score, counter,
+            counter_offset);
       }
     }
 
@@ -464,10 +456,10 @@ __global__ void table_insert_and_evict_kernel(
         InsertResult ovf_result = InsertResult::Init;
         KeyType ovf_evict_key = KeyType();
         int32_t *ovf_counter_table = ovf_counter + t_id * ovf_bucket_capacity;
-        overflow_insert_and_evict(
-            ovf_bucket, key, ovf_bucket_sizes, t_id,
-            ovf_counter_table, ovf_output_offsets[t_id],
-            ovf_iter, &ovf_iter, &ovf_result, &ovf_evict_key);
+        overflow_insert_and_evict(ovf_bucket, key, ovf_bucket_sizes, t_id,
+                                  ovf_counter_table, ovf_output_offsets[t_id],
+                                  ovf_iter, &ovf_iter, &ovf_result,
+                                  &ovf_evict_key);
 
         if (isInsertSuccess(ovf_result)) {
           index = ovf_iter;
@@ -496,9 +488,8 @@ __global__ void table_insert_and_evict_kernel(
           cg::this_thread_block());
 
       InsertResult cmp_result = UseOverflow ? final_result : result;
-      bool evicted =
-          (cmp_result == InsertResult::Evict ||
-           cmp_result == InsertResult::Busy);
+      bool evicted = (cmp_result == InsertResult::Evict ||
+                      cmp_result == InsertResult::Busy);
       uint32_t vote = g.ballot(evicted);
       int group_cnt = __popc(vote);
       CounterType group_offset = 0;
@@ -517,9 +508,10 @@ __global__ void table_insert_and_evict_kernel(
         } else {
           evicted_keys[out_id] = evict_key;
           evicted_scores[out_id] = static_cast<int64_t>(evict_score);
-          IndexType evict_idx = (result == InsertResult::Evict)
-              ? (bucket_id - bkt_begin) * bucket.capacity() + iter
-              : -static_cast<IndexType>(i + 1);
+          IndexType evict_idx =
+              (result == InsertResult::Evict)
+                  ? (bucket_id - bkt_begin) * bucket.capacity() + iter
+                  : -static_cast<IndexType>(i + 1);
           evicted_indices[out_id] = evict_idx;
         }
         evicted_table_ids[out_id] = table_ids[i];
@@ -556,13 +548,11 @@ table_unlock_kernel(Table table, int64_t batch,
 }
 
 template <typename Table, int ProbingGroupSize>
-__global__ void
-table_erase_kernel(Table table,
-                   int64_t const *__restrict__ table_bucket_offsets,
-                   int *__restrict__ bucket_sizes, int64_t batch,
-                   typename Table::KeyType const *__restrict__ input_keys,
-                   int64_t const *__restrict__ table_ids,
-                   IndexType *__restrict__ indices) {
+__global__ void table_erase_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int *__restrict__ bucket_sizes, int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    int64_t const *__restrict__ table_ids, IndexType *__restrict__ indices) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -625,13 +615,11 @@ table_erase_kernel(Table table,
 }
 
 template <typename Table, typename PredFunctor, int TileSize>
-__global__ void
-table_export_batch_kernel(Table table, IndexType begin, IndexType end,
-                          IndexType table_begin,
-                          CounterType *__restrict__ counter,
-                          typename Table::KeyType *__restrict__ keys,
-                          ScoreType *__restrict__ scores, PredFunctor pred,
-                          IndexType *__restrict__ indices) {
+__global__ void table_export_batch_kernel(
+    Table table, IndexType begin, IndexType end, IndexType table_begin,
+    CounterType *__restrict__ counter,
+    typename Table::KeyType *__restrict__ keys, ScoreType *__restrict__ scores,
+    PredFunctor pred, IndexType *__restrict__ indices) {
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
@@ -678,16 +666,15 @@ table_export_batch_kernel(Table table, IndexType begin, IndexType end,
   }
 }
 
-
 // ---------------------------------------------------------------------------
 // Overflow buffer: find a key by linear scan.
 // Returns true if found, sets *iter_out = local_pos + output_offset.
 // ---------------------------------------------------------------------------
 template <typename Bucket, typename KeyType>
-__forceinline__ __device__ bool overflow_find(
-    Bucket &ovf_bucket, KeyType key, int64_t output_offset,
-    typename Bucket::Iterator start_iter,
-    typename Bucket::Iterator *iter_out) {
+__forceinline__ __device__ bool
+overflow_find(Bucket &ovf_bucket, KeyType key, int64_t output_offset,
+              typename Bucket::Iterator start_iter,
+              typename Bucket::Iterator *iter_out) {
   for (int64_t scan = 0; scan < ovf_bucket.capacity(); scan++) {
     auto pos = (start_iter + scan) % ovf_bucket.capacity();
 
@@ -713,13 +700,10 @@ __forceinline__ __device__ bool overflow_find(
 // ---------------------------------------------------------------------------
 template <typename Bucket, typename KeyType>
 __forceinline__ __device__ void overflow_insert_and_evict(
-    Bucket &bucket, KeyType key,
-    int *__restrict__ bucket_sizes, int64_t bucket_id,
-    int32_t *__restrict__ counter,
-    int64_t output_offset,
-    typename Bucket::Iterator start_iter,
-    typename Bucket::Iterator *iter_out, InsertResult *result_out,
-    KeyType *evict_key_out) {
+    Bucket &bucket, KeyType key, int *__restrict__ bucket_sizes,
+    int64_t bucket_id, int32_t *__restrict__ counter, int64_t output_offset,
+    typename Bucket::Iterator start_iter, typename Bucket::Iterator *iter_out,
+    InsertResult *result_out, KeyType *evict_key_out) {
 
   for (int64_t scan = 0; scan < bucket.capacity(); scan++) {
     auto pos = (start_iter + scan) % bucket.capacity();
@@ -752,7 +736,8 @@ __forceinline__ __device__ void overflow_insert_and_evict(
       continue;
     }
 
-    if (k == Bucket::LockedKey || k == Bucket::reclaimed_key()) continue;
+    if (k == Bucket::LockedKey || k == Bucket::reclaimed_key())
+      continue;
 
     if (counter[pos] == 0) {
       if (bucket.try_lock(pos, k)) {

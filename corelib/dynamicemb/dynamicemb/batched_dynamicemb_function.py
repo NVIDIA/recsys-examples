@@ -28,6 +28,7 @@ from dynamicemb.key_value_table import (
     _find_keys,
     eval_lookup,
     get_insert_score_arg,
+    get_table_ptrs,
     load_from_flat,
     store_to_flat,
 )
@@ -50,7 +51,7 @@ def segmented_unique(
     segment_range: torch.Tensor,
     evict_strategy: Optional[EvictStrategy] = None,
     frequency_counts: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform segmented unique operation on keys with segment_range.
 
@@ -66,7 +67,10 @@ def segmented_unique(
 
     Returns:
         Tuple of (unique_keys, reverse_indices, unique_keys_table_range,
-                  output_scores)
+                  output_scores, unique_size_per_table).
+        unique_size_per_table is a CPU tensor of shape (num_tables,) with
+        per-table unique counts; total unique count is its sum or
+        unique_keys_table_range[-1].
     """
     with torch.cuda.nvtx.range("segmented_unique"):
         num_keys = keys.size(0)
@@ -79,11 +83,15 @@ def segmented_unique(
             d_table_range = torch.zeros(
                 num_tables + 1, dtype=torch.int64, device=device
             )
+            unique_size_per_table = torch.zeros(
+                num_tables, dtype=torch.int64, device="cpu"
+            )
             return (
                 empty_keys,
                 empty_reverse_indices,
                 d_table_range,
                 None,
+                unique_size_per_table,
             )
 
         is_lfu_enabled = (
@@ -106,14 +114,19 @@ def segmented_unique(
             input_frequencies = torch.empty(0, dtype=torch.int64, device=device)
 
         (
-            num_uniques,
+            _num_uniques,
             unique_keys,
             reverse_indices,
             table_offsets,
             freq_counters,
         ) = segmented_unique_cuda(keys, table_ids, num_tables, input_frequencies)
 
-        total_unique = num_uniques.item()
+        table_offsets_cpu = table_offsets.cpu()
+        total_unique = table_offsets_cpu[num_tables].item()
+        unique_size_per_table = (
+            table_offsets_cpu[1 : num_tables + 1] - table_offsets_cpu[0:num_tables]
+        )
+
         unique_keys_out = unique_keys[:total_unique]
 
         output_scores = None
@@ -125,6 +138,7 @@ def segmented_unique(
             reverse_indices,
             table_offsets,
             output_scores,
+            unique_size_per_table,
         )
 
 
@@ -153,7 +167,13 @@ class PrefetchState:
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
-    return isinstance(storage, DynamicEmbStorage) and storage._state.tables[0].is_cuda
+    """True if values live in GPU device memory (HBM). Use buffer type, not
+    tensor.is_cuda: host memory registered to CUDA address space can report is_cuda True.
+    """
+    return (
+        isinstance(storage, DynamicEmbStorage)
+        and storage._state.tables[0].is_device_buffer()
+    )
 
 
 def _apply_admission(
@@ -543,11 +563,18 @@ def _prefetch_hbm_direct_path(
             if val_dim != emb_dim:
                 init_values[:, emb_dim:] = state.initial_optim_state
 
-            score_arg = get_insert_score_arg(state, n_admitted, device, admitted_scores)
+            score_arg = get_insert_score_arg(
+                state, n_admitted, device, admitted_scores, table_ids=admitted_tids
+            )
             new_indices = state.key_index_map.insert(
                 admitted_keys,
                 admitted_tids,
                 score_arg,
+            )
+            new_indices = (
+                score_arg.value
+                if state.no_eviction_next_index is not None
+                else new_indices
             )
             store_to_flat(state, new_indices, admitted_tids, init_values)
 
@@ -605,12 +632,16 @@ def dynamicemb_prefetch(
         if frequency_counters is not None:
             frequency_counts_int64 = frequency_counters.long()
 
+        if hasattr(storage, "collect_table_sizes"):
+            storage.collect_table_sizes(non_blocking=True)
+
         indices_table_range = get_table_range(offsets, feature_offsets)
         (
             unique_keys,
             reverse_indices,
             unique_indices_table_range,
             lfu_accumulated_frequency,
+            unique_size_per_table,
         ) = segmented_unique(
             indices,
             indices_table_range,
@@ -619,6 +650,9 @@ def dynamicemb_prefetch(
         )
 
         num_prefetched_keys = unique_keys.numel()
+
+        if hasattr(storage, "expand_if_need"):
+            storage.expand_if_need(unique_size_per_table)
 
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
@@ -764,6 +798,7 @@ def dynamicemb_eval_forward(
             reverse_indices,
             unique_indices_table_range,
             lfu_accumulated_frequency,
+            unique_size_per_table,
         ) = segmented_unique(
             indices,
             indices_table_range,
@@ -1083,7 +1118,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     optimizer.fused_update_for_flat_table(
                         unique_grads.to(ctx.emb_dtype),
                         ctx.update_slot_indices,
-                        state.table_ptrs,
+                        get_table_ptrs(state),
                         unique_table_ids,
                         state.table_value_dims,
                         state.table_emb_dims,

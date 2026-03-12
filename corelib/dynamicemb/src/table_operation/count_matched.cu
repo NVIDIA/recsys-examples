@@ -25,8 +25,7 @@ void table_count_matched_single_score(at::Tensor table_storage,
                                       int64_t bucket_capacity,
                                       ScoreType threshold,
                                       at::Tensor num_matched,
-                                      int64_t range_begin,
-                                      int64_t range_end) {
+                                      int64_t range_begin, int64_t range_end) {
 
   auto key_type = scalartype_to_datatype(toScalarType(key_dtype));
   auto counter_ = get_pointer<CounterType>(num_matched);
@@ -51,11 +50,13 @@ void table_count_matched_single_score(at::Tensor table_storage,
                        num_buckets, bucket_capacity);
 
     IndexType begin = (range_begin >= 0) ? range_begin : 0;
-    IndexType end = (range_end >= 0) ? range_end : num_buckets * bucket_capacity;
+    IndexType end =
+        (range_end >= 0) ? range_end : num_buckets * bucket_capacity;
 
     int64_t num_total = end - begin;
 
-    if (num_total <= 0) return;
+    if (num_total <= 0)
+      return;
 
     if (num_total % 32 == 0) {
       table_traverse_kernel<Table, EvalAndCount, 32>

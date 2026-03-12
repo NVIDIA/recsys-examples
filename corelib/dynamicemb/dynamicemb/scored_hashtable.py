@@ -1201,6 +1201,54 @@ class LinearBucketTable(ScoredHashTable):
             self._init_table(ovf_keys, ovf_scores, ovf_digests)
             self.overflow_bucket_sizes.zero_()
 
+    def copy_table_from(self, other: "LinearBucketTable", table_id: int) -> None:
+        """Copy one logical table's data from another table. Both must have the same
+        capacity for that table_id (e.g. when this table did not expand)."""
+        assert (
+            self.per_table_capacity_[table_id] == other.per_table_capacity_[table_id]
+        ), "copy_table_from requires same per-table capacity"
+        b_start = int(self.table_bucket_offsets_cpu_[table_id].item())
+        b_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
+        o_b_start = int(other.table_bucket_offsets_cpu_[table_id].item())
+        o_b_end = int(other.table_bucket_offsets_cpu_[table_id + 1].item())
+        assert (b_end - b_start) == (o_b_end - o_b_start)
+        # Main table: keys, digests, scores, bucket_sizes, ref_counter
+        self.keys_[b_start:b_end, :].copy_(other.keys_[o_b_start:o_b_end, :])
+        self.digests_[b_start:b_end, :].copy_(other.digests_[o_b_start:o_b_end, :])
+        for s, o in zip(self.scores_list, other.scores_list):
+            s[b_start:b_end, :].copy_(o[o_b_start:o_b_end, :])
+        self.bucket_sizes[b_start:b_end].copy_(other.bucket_sizes[o_b_start:o_b_end])
+        slot_start = b_start * self.bucket_capacity_
+        slot_end = b_end * self.bucket_capacity_
+        o_slot_start = o_b_start * other.bucket_capacity_
+        o_slot_end = o_b_end * other.bucket_capacity_
+        self._ref_counter[slot_start:slot_end].copy_(
+            other._ref_counter[o_slot_start:o_slot_end]
+        )
+        if self.enable_overflow_:
+            assert other.enable_overflow_
+            bytes_per_ovf_bucket = self.overflow_bucket_capacity_ * sum(
+                self.fields_byte_
+            )
+            off = table_id * bytes_per_ovf_bucket
+            self.overflow_table_storage_[off : off + bytes_per_ovf_bucket].copy_(
+                other.overflow_table_storage_[off : off + bytes_per_ovf_bucket]
+            )
+            self.overflow_bucket_sizes[table_id].copy_(
+                other.overflow_bucket_sizes[table_id]
+            )
+            ovf_slot_start = self.capacity_ + table_id * self.overflow_bucket_capacity_
+            ovf_slot_end = ovf_slot_start + self.overflow_bucket_capacity_
+            o_ovf_slot_start = (
+                other.capacity_ + table_id * other.overflow_bucket_capacity_
+            )
+            self._ref_counter[ovf_slot_start:ovf_slot_end].copy_(
+                other._ref_counter[
+                    o_ovf_slot_start : o_ovf_slot_start
+                    + other.overflow_bucket_capacity_
+                ]
+            )
+
     def capacity(self, table_id: Optional[int] = None) -> int:
         """
         Return the capacity (main + overflow) of the table, or a specific logical table.

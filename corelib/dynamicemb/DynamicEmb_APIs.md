@@ -303,11 +303,18 @@ dynamicemb provides the following strategies to set the score.
         CUSTOMIZED:
             Each embedding table's score are managed by users.
             Users have to set the score before every forward pass using `set_score` interface.
+        LFU:
+            If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+        NO_EVICTION:
+            The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
+            When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
         """
 
         TIMESTAMP = 0
         STEP = 1
         CUSTOMIZED = 2
+        LFU = 3
+        NO_EVICTION = 4
     ```
 
     Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
@@ -401,6 +408,7 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
             Note: This is the setting for a single table at each rank.
         max_load_factor : float
             The maximum load factor before rehashing occurs. Default is 0.5.
+            In NO_EVICTION mode, this option is ignored: the implementation uses a fixed effective max load factor of 0.5 for the key_index_map (initial sizing and expansion). See the "Table expansion" section for NO_EVICTION trigger conditions.
         score_strategy(DynamicEmbScoreStrategy):
             dynamicemb gives each key-value pair a score to represent its importance.
             Once there is insufficient space, the key-value pair will be evicted based on the score.
@@ -815,7 +823,17 @@ Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embeddi
 
 ## Table expansion
 
-Users can specify the initial capacity of a table on a single GPU. When the specified load factor is reached, the capacity of the table will double until the limit is reached. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions` for more information.
+Users can specify the initial capacity of a table on a single GPU. When the table needs more space, the implementation may double the key_index_map and embedding table capacity (per table, only for tables that need it) before insert. Expansion is triggered in these paths so that insert does not fail for lack of capacity:
+
+- **Prefetch HBM direct**: before inserting admitted keys into `DynamicEmbStorage`.
+- **Cache write-back**: before writing evicted keys back to storage (only `DynamicEmbStorage` uses cache mode; `HybridStorage` does not).
+- **Generic forward (DEFAULT mode)**: before `storage.insert()` when using `DynamicEmbStorage` or `HybridStorage` (for the latter, only the host tier is expanded).
+- **HybridStorage.load**: before inserting keys evicted from HBM into the host tier.
+
+**Trigger conditions:**
+
+- **Non–NO_EVICTION**: When `max_load_factor` would be exceeded or (if set) at `max_capacity`, the table(s) that need it are doubled. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions`.
+- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map is sized and expanded with a fixed effective max load factor of **0.5** (key_index_map capacity = ceil(init_capacity/0.5) at creation; expansion when `needed > table_rows` or `needed > key_index_map.capacity(table_id)`). Both the key_index_map and the embedding buffer are doubled for the affected table(s).
 
 
 ## Dump/Load and Incremental dump

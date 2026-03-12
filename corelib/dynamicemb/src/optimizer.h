@@ -38,9 +38,8 @@ namespace dyn_emb {
 void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                at::Tensor table_ptrs, at::Tensor table_ids,
                                at::Tensor table_value_dims,
-                               at::Tensor table_emb_dims,
-                               int64_t max_emb_dim, bool all_dims_vec4,
-                               float const lr,
+                               at::Tensor table_emb_dims, int64_t max_emb_dim,
+                               bool all_dims_vec4, float const lr,
                                int64_t table_dtype);
 
 void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
@@ -49,37 +48,30 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 at::Tensor table_emb_dims, const float lr,
                                 const float beta1, const float beta2,
                                 const float eps, const float weight_decay,
-                                const uint32_t iter_num,
-                                int64_t max_emb_dim, bool all_dims_vec4,
-                                int64_t table_dtype);
+                                const uint32_t iter_num, int64_t max_emb_dim,
+                                bool all_dims_vec4, int64_t table_dtype);
 
 void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                   at::Tensor table_ptrs,
-                                   at::Tensor table_ids,
+                                   at::Tensor table_ptrs, at::Tensor table_ids,
                                    at::Tensor table_value_dims,
                                    at::Tensor table_emb_dims, const float lr,
-                                   const float eps,
-                                   int64_t max_emb_dim, bool all_dims_vec4,
-                                   int64_t table_dtype);
+                                   const float eps, int64_t max_emb_dim,
+                                   bool all_dims_vec4, int64_t table_dtype);
 
 void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                    at::Tensor table_ptrs,
-                                    at::Tensor table_ids,
+                                    at::Tensor table_ptrs, at::Tensor table_ids,
                                     at::Tensor table_value_dims,
                                     at::Tensor table_emb_dims, const float lr,
-                                    const float eps,
-                                    int64_t max_emb_dim, bool all_dims_vec4,
-                                    int64_t table_dtype);
+                                    const float eps, int64_t max_emb_dim,
+                                    bool all_dims_vec4, int64_t table_dtype);
 
 void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                  int64_t emb_dim, int64_t value_dim,
-                                  float lr);
+                                  int64_t emb_dim, int64_t value_dim, float lr);
 
 void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                   int64_t emb_dim, int64_t value_dim,
-                                   float lr, float beta1, float beta2,
-                                   float eps, float weight_decay,
-                                   uint32_t iter_num);
+                                   int64_t emb_dim, int64_t value_dim, float lr,
+                                   float beta1, float beta2, float eps,
+                                   float weight_decay, uint32_t iter_num);
 
 void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                       int64_t emb_dim, int64_t value_dim,
