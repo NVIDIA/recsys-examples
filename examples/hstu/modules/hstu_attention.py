@@ -337,21 +337,29 @@ def create_hstu_attention(
     Raises:
         ValueError: If the kernel backend is not supported.
     """
+    attn: HSTUAttention
     if kernel_backend == KernelBackend.CUTLASS:
         sm_major_version = torch.cuda.get_device_properties(0).major
         if sm_major_version in (8, 9):
-            return FusedHSTUAttention(
+            attn = FusedHSTUAttention(
                 num_heads,
                 attention_dim,
                 linear_dim,
                 is_causal,
             )
-        print(
-            "CUTLASS backend only support H100, H20 and A100/Ada series, fallback to PyTorch backend"
-        )
+        else:
+            print(
+                "CUTLASS backend only support H100, H20 and A100/Ada series, fallback to PyTorch backend"
+            )
+            attn = TorchHSTUAttention(
+                num_heads,
+                attention_dim,
+                linear_dim,
+                is_causal,
+            )
     elif kernel_backend == KernelBackend.TRITON:
         if is_causal:
-            return TritonHSTUAttention(
+            attn = TritonHSTUAttention(
                 num_heads,
                 attention_dim,
                 linear_dim,
@@ -361,9 +369,25 @@ def create_hstu_attention(
             print(
                 "Triton backend does not support is_causal=False, fallback to PyTorch backend"
             )
-    return TorchHSTUAttention(
-        num_heads,
-        attention_dim,
-        linear_dim,
-        is_causal,
-    )
+            attn = TorchHSTUAttention(
+                num_heads,
+                attention_dim,
+                linear_dim,
+                is_causal,
+            )
+    else:
+        attn = TorchHSTUAttention(
+            num_heads,
+            attention_dim,
+            linear_dim,
+            is_causal,
+        )
+
+    from commons.utils.attn_perf_tracker import PRINT_HSTU_PERF
+
+    if PRINT_HSTU_PERF:
+        from commons.utils.hooks import register_perf_hooks
+
+        register_perf_hooks(attn, num_heads, attention_dim, is_causal)
+
+    return attn

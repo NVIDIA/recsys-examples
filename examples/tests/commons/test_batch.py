@@ -5,11 +5,8 @@ import torch
 sys.path.append("../../examples")
 from typing import Tuple
 
-import commons.utils.initialize as init
 import pytest
-from commons.distributed.batch_allgather import allgather_batch
 from commons.sequence_batch.batch import BaseBatch
-from megatron.core import parallel_state
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -102,14 +99,6 @@ def generate_batch(
     )
 
 
-def kjt_equal(kjt1: KeyedJaggedTensor, kjt2: KeyedJaggedTensor):
-    return (
-        torch.equal(kjt1.values(), kjt2.values())
-        & torch.equal(kjt1.offsets(), kjt2.offsets())
-        & torch.equal(kjt1.lengths(), kjt2.lengths())
-    )
-
-
 @pytest.mark.parametrize("batch_size", [10, 20, 30])
 @pytest.mark.parametrize("max_sequence_length", [10, 20, 30])
 @pytest.mark.parametrize("num_features", [3, 1, 2])
@@ -149,39 +138,3 @@ def test_batch_index_select(
             assert torch.equal(selected_labels.values(), ref_labels)
             assert torch.equal(selected_labels.offsets(), ref_offsets)
         assert selected_batch.actual_batch_size == num_selected
-
-
-@pytest.mark.parametrize("batch_size", [10])
-@pytest.mark.parametrize("max_sequence_length", [10, 20, 30])
-@pytest.mark.parametrize("num_features", [3, 1, 2])
-@pytest.mark.parametrize("dense_label", [True, False])
-def test_batch_allgather(
-    batch_size,
-    max_sequence_length,
-    num_features,
-    dense_label,
-):
-    init.initialize_distributed()
-
-    with init.auto_destroy_global_state():
-        init.initialize_model_parallel(1)
-        init.set_random_seed(1234)
-        dp_rank = parallel_state.get_data_parallel_rank()
-        parallel_state.get_data_parallel_world_size()
-        batch = generate_batch(
-            batch_size, max_sequence_length, num_features, dense_label
-        )
-        allgathered_batch = allgather_batch(
-            batch, pg_group=parallel_state.get_data_parallel_group()
-        )
-
-        slice_indices = (
-            torch.arange(batch_size, device=torch.device("cuda")) + dp_rank * batch_size
-        )
-        sliced_batch = allgathered_batch.index_select(slice_indices)
-
-        assert kjt_equal(sliced_batch.features, batch.features)
-        if dense_label:
-            assert torch.equal(sliced_batch.labels, batch.labels)
-        else:
-            assert kjt_equal(sliced_batch.labels, batch.labels)

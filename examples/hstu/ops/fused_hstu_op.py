@@ -483,6 +483,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     num_targets=num_targets,
                     contextual_seq_len=num_contextuals,
                 )
+
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             # dropout ratio and seed are set in ctx
 
@@ -909,6 +910,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 grad_output = torch.cat(
                     [grad_u, grad_v, grad_q, grad_k], dim=-1
                 ).contiguous()
+
         with nvtx.annotate("ln_linear_silu bwd", color="RED"):
             if ctx.recompute_input_layernorm:
                 (
