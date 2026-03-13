@@ -1,0 +1,22 @@
+{
+  "group": {
+    "default": {
+      "targets": ["recsys-base", "hstu"]
+    }
+  },
+  "target": {
+    "recsys-base": {
+      "context": ".",
+      "dockerfile": "docker/Dockerfile.torch211",
+      "tags": ["recsys-base:latest"]
+    },
+    "hstu": {
+      "context": ".",
+      "dockerfile": "examples/hstu/Dockerfile",
+      "tags": ["recsys-hstu:latest"],
+      "contexts": {
+        "base": "target:recsys-base"
+      }
+    }
+  }
+}
