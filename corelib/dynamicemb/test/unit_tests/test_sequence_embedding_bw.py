@@ -154,7 +154,9 @@ def test(args):
             assert res.dim() == 2
             sample_res = res[:, 0].to("cpu")
 
+            var.eval()
             updated_res = var(indices, sparse_feature.offsets())
+            var.train()
             sample_updated_res = updated_res[:, 0].to("cpu")
 
             diffs = sample_res - sample_updated_res
@@ -182,6 +184,9 @@ def test(args):
                     else:
                         hit_counter += 1
             print(f"Iteration {i} hit rate = ", float(hit_counter) / total_indices)
+            assert (
+                hit_counter == total_indices
+            ), f"correct result count: {hit_counter}, total count: {total_indices}"
 
     dist.barrier()
     dist.destroy_process_group()

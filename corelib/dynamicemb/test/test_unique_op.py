@@ -15,7 +15,11 @@
 
 import pytest
 import torch
-from dynamicemb_extensions import expand_table_ids_cuda, segmented_unique_cuda
+from dynamicemb_extensions import (
+    expand_table_ids_cuda,
+    flagged_compact,
+    segmented_unique_cuda,
+)
 
 
 @pytest.fixture
@@ -46,7 +50,7 @@ def test_segmented_unique_basic(setup_device):
 
     # Generate ascending table_ids (simulate sorted input)
     table_ids = torch.sort(
-        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
     ).values
 
     (
@@ -106,7 +110,7 @@ def test_segmented_unique_overlapping_keys(setup_device):
 
     # Generate ascending table_ids
     table_ids = torch.sort(
-        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
     ).values
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
@@ -150,10 +154,10 @@ def test_segmented_unique_empty_tables(setup_device):
     # Create table_ids that skip some tables (tables 2, 5, 7 will be empty)
     active_tables = [0, 1, 3, 4, 6, 8, 9]
     table_ids_list = torch.randint(
-        0, len(active_tables), (num_keys,), dtype=torch.int32, device=device
+        0, len(active_tables), (num_keys,), dtype=torch.int64, device=device
     )
     # Map to actual table IDs
-    active_tables_tensor = torch.tensor(active_tables, dtype=torch.int32, device=device)
+    active_tables_tensor = torch.tensor(active_tables, dtype=torch.int64, device=device)
     table_ids = torch.sort(active_tables_tensor[table_ids_list]).values
 
     keys = torch.randint(0, 10000, (num_keys,), dtype=torch.int64, device=device)
@@ -198,7 +202,7 @@ def test_segmented_unique_empty_input(setup_device):
     torch.cuda.get_device_properties(device).multi_processor_count
 
     keys = torch.tensor([], dtype=torch.int64, device=device)
-    table_ids = torch.tensor([], dtype=torch.int32, device=device)
+    table_ids = torch.tensor([], dtype=torch.int64, device=device)
     num_tables = 3
 
     (
@@ -235,7 +239,7 @@ def test_segmented_unique_random(setup_device):
 
     # Generate ascending table_ids (simulate sorted input)
     table_ids = torch.sort(
-        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
     ).values
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
@@ -277,7 +281,7 @@ def test_segmented_unique_stress(setup_device):
 
     # Generate ascending table_ids
     table_ids = torch.sort(
-        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
     ).values
 
     # Warmup
@@ -320,7 +324,7 @@ def test_segmented_unique_with_frequency_counters(setup_device):
     # Generate keys with known frequencies
     keys = torch.randint(0, 1000, (num_keys,), dtype=torch.int64, device=device)
     table_ids = torch.sort(
-        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
     ).values
 
     # Enable frequency counting by passing an empty tensor (numel==0)
@@ -374,7 +378,7 @@ def test_segmented_unique_with_custom_frequencies(setup_device):
     # Generate keys with duplicates
     keys = torch.randint(0, 100, (num_keys,), dtype=torch.int64, device=device)
     table_ids = torch.sort(
-        torch.randint(0, num_tables, (num_keys,), dtype=torch.int32, device=device)
+        torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
     ).values
 
     # Custom frequencies: each key occurrence has frequency 2
@@ -469,7 +473,7 @@ def test_expand_table_ids(setup_device):
     assert (
         table_ids.numel() == num_elements
     ), f"Expected {num_elements} table_ids, got {table_ids.numel()}"
-    assert table_ids.dtype == torch.int32, "table_ids should be int32"
+    assert table_ids.dtype == torch.int64, "table_ids should be int64"
 
     # Verify table_ids are correct
     # Table 0 has features 0 and 1: elements 0-9 (6 + 4 = 10 elements)
@@ -488,6 +492,76 @@ def test_expand_table_ids(setup_device):
     ), f"Second table elements should have table_id=1, got {table_ids_cpu[table0_end:]}"
 
     print(f"expand_table_ids test passed: {num_elements} elements, {num_tables} tables")
+
+
+# ============================================================================
+# Flagged Compact Tests
+# ============================================================================
+
+
+def _flagged_compact_reference(flags, inputs):
+    """Pure-PyTorch reference for flagged_compact."""
+    idx = torch.where(flags)[0]
+    h_count = idx.numel()
+    outputs = []
+    for t in inputs:
+        if t is None:
+            outputs.append(None)
+        else:
+            outputs.append(t[idx])
+    return h_count, idx, outputs
+
+
+@pytest.mark.parametrize(
+    "N, flag_mode, input_spec",
+    [
+        pytest.param(1000, "random", ["t", "t"], id="basic"),
+        pytest.param(512, "all_true", ["t"], id="all_true"),
+        pytest.param(512, "all_false", ["t"], id="all_false"),
+        pytest.param(0, "random", ["t"], id="empty_input"),
+        pytest.param(256, "random", [], id="no_inputs"),
+        pytest.param(500, "random", ["t", None], id="optional_none"),
+        pytest.param(300, "random", [None, "t", None, "t"], id="multiple_none"),
+        pytest.param(4_000_000, "random", ["t", "t", "t"], id="large"),
+        pytest.param(1000, "random", ["t"] * 6, id="max_inputs"),
+        pytest.param(100, "all_true", ["t"], id="preserves_dtype"),
+    ],
+)
+def test_flagged_compact(setup_device, N, flag_mode, input_spec):
+    device = setup_device
+
+    if N == 0:
+        flags = torch.empty(0, dtype=torch.bool, device=device)
+    elif flag_mode == "all_true":
+        flags = torch.ones(N, dtype=torch.bool, device=device)
+    elif flag_mode == "all_false":
+        flags = torch.zeros(N, dtype=torch.bool, device=device)
+    else:
+        flags = torch.randint(0, 2, (N,), dtype=torch.bool, device=device)
+
+    inputs = []
+    for spec in input_spec:
+        if spec is None:
+            inputs.append(None)
+        elif N == 0:
+            inputs.append(torch.empty(0, dtype=torch.int64, device=device))
+        else:
+            inputs.append(
+                torch.randint(0, 2**60, (N,), dtype=torch.int64, device=device)
+            )
+
+    h_count, indices, outputs = flagged_compact(flags, inputs)
+    ref_count, ref_idx, ref_outputs = _flagged_compact_reference(flags, inputs)
+
+    assert h_count == ref_count, f"count mismatch: {h_count} vs {ref_count}"
+    assert torch.equal(indices, ref_idx), "indices mismatch"
+    assert len(outputs) == len(ref_outputs)
+    for i, (out, ref) in enumerate(zip(outputs, ref_outputs)):
+        if ref is None:
+            assert out is None, f"output {i} should be None"
+        else:
+            assert torch.equal(out, ref), f"output {i} mismatch"
+            assert out.dtype == torch.int64, f"output {i} dtype mismatch"
 
 
 if __name__ == "__main__":

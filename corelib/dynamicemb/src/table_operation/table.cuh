@@ -20,6 +20,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "types.cuh"
 
 #include <iostream>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -92,48 +93,57 @@ inline int get_size(torch::ScalarType scalar_type) {
   }
 }
 
-void table_lookup(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-                  int64_t bucket_capacity, at::Tensor keys,
-                  std::vector<std::optional<at::Tensor>> scores,
-                  std::vector<ScorePolicyType> policy_types,
-                  std::vector<bool> is_returns, at::Tensor founds,
-                  std::optional<at::Tensor> indices);
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+             int64_t bucket_capacity, at::Tensor keys,
+             at::Tensor table_ids,
+             std::optional<at::Tensor> score_input,
+             ScorePolicyType policy_type,
+             std::optional<at::Tensor> ovf_storage = std::nullopt,
+             int64_t ovf_bucket_capacity = 0,
+             std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
 
-void table_insert(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-                  int64_t bucket_capacity, at::Tensor bucket_sizes,
-                  at::Tensor keys,
-                  std::vector<std::optional<at::Tensor>> scores,
-                  std::vector<ScorePolicyType> policy_types,
-                  std::vector<bool> is_returns,
-                  std::optional<at::Tensor> indices,
-                  std::optional<at::Tensor> insert_results);
+at::Tensor table_insert(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                        int64_t bucket_capacity,
+                        at::Tensor bucket_sizes, at::Tensor keys,
+                        at::Tensor table_ids,
+                        std::optional<at::Tensor> score_input,
+                        ScorePolicyType policy_type,
+                        at::Tensor counter,
+                        std::optional<at::Tensor> insert_results = std::nullopt,
+                        std::optional<at::Tensor> score_output = std::nullopt);
 
-void table_insert_and_evict(
-    at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
-    std::vector<std::optional<at::Tensor>> scores,
-    std::vector<ScorePolicyType> policy_types, std::vector<bool> is_returns,
-    std::optional<at::Tensor> insert_results, std::optional<at::Tensor> indices,
-    at::Tensor num_evicted, at::Tensor evicted_keys, at::Tensor evicted_indices,
-    std::vector<at::Tensor> evicted_scores);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_insert_and_evict(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                       int64_t bucket_capacity,
+                       at::Tensor bucket_sizes, at::Tensor keys,
+                       at::Tensor table_ids,
+                       std::optional<at::Tensor> score_input,
+                       ScorePolicyType policy_type,
+                       at::Tensor counter,
+                       std::optional<at::Tensor> insert_results = std::nullopt,
+                       std::optional<at::Tensor> score_output = std::nullopt,
+                       std::optional<at::Tensor> ovf_storage = std::nullopt,
+                       int64_t ovf_bucket_capacity = 0,
+                       std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
+                       std::optional<at::Tensor> ovf_counter = std::nullopt,
+                       std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
 
-void table_erase(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-                 int64_t bucket_capacity, at::Tensor bucket_sizes,
-                 at::Tensor keys, std::optional<at::Tensor> indices);
+void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                 int64_t bucket_capacity,
+                 at::Tensor bucket_sizes, at::Tensor keys,
+                 at::Tensor table_ids,
+                 std::optional<at::Tensor> indices);
 
-void table_export_batch(at::Tensor table_storage,
-                        std::vector<torch::Dtype> dtypes,
-                        int64_t bucket_capacity, int64_t batch, int64_t offset,
-                        at::Tensor counter, at::Tensor keys,
-                        std::vector<std::optional<at::Tensor>> scores,
-                        std::optional<std::vector<ScoreType>> thresholds,
-                        std::optional<at::Tensor> indices);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
+                   int64_t batch, int64_t offset, torch::Dtype key_dtype,
+                   std::optional<ScoreType> threshold = std::nullopt,
+                   int64_t table_begin = 0);
 
-void table_count_matched(at::Tensor table_storage,
-                         std::vector<torch::Dtype> dtypes,
-                         int64_t bucket_capacity,
-                         std::vector<ScoreType> thresholds,
-                         at::Tensor num_matched);
+at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
+                               int64_t bucket_capacity, ScoreType threshold,
+                               int64_t begin = -1, int64_t end = -1);
 
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,
@@ -144,7 +154,17 @@ std::vector<at::Tensor> tensor_partition(at::Tensor input,
                                          std::vector<int64_t> byte_range,
                                          std::vector<torch::Dtype> dtypes);
 
-std::vector<at::Tensor> bucketize_keys(at::Tensor keys, int64_t bucket_capacity,
-                                       int64_t num_buckets);
+std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
+                                       at::Tensor table_bucket_offsets,
+                                       int64_t bucket_capacity);
+
+
+void table_update_counter_with_layout(
+    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
+    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
+    int64_t main_capacity, int64_t num_tables,
+    c10::optional<at::Tensor> table_ids,
+    c10::optional<at::Tensor> overflow_output_offsets,
+    int64_t overflow_bucket_capacity);
 
 } // namespace dyn_emb

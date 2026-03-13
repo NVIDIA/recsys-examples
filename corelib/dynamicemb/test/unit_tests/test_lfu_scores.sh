@@ -17,51 +17,57 @@ CACHING_MODES=("False" "True")
 CACHE_CAPACITY_RATIO=0.3  # 30% cache capacity to trigger evictions
 
 
-for num_gpus in ${NUM_GPUS[@]}; do
-  for optimizer_type in ${OPTIMIZER_TYPE[@]}; do
-    echo ""
-    echo "----------------------------------------"
-    echo "Test: Storage-Only | GPUs: $num_gpus | Optimizer: $optimizer_type"
-    echo "----------------------------------------"
-    torchrun \
-      --nnodes 1 \
-      --nproc_per_node $num_gpus \
-      ./test/unit_tests/test_lfu_scores.py \
-      --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
-      --num-embeddings $NUM_EMBEDDINGS \
-      --multi-hot-sizes $MULTI_HOT_SIZES \
-      --embedding-dim $EMBEDDING_DIM \
-      --optimizer-type ${optimizer_type} \
-      --batch-size $BATCH_SIZE \
-      --num-iterations $NUM_ITERATIONS \
-      --tolerance $TOLERANCE || exit 1
+DEDUP_FLAGS=("--use-index-dedup" "--no-use-index-dedup")
+
+for dedup_flag in "${DEDUP_FLAGS[@]}"; do
+  dedup_label=$( [ "$dedup_flag" = "--use-index-dedup" ] && echo "dedup" || echo "no-dedup" )
+
+  for num_gpus in ${NUM_GPUS[@]}; do
+    for optimizer_type in ${OPTIMIZER_TYPE[@]}; do
+      echo ""
+      echo "----------------------------------------"
+      echo "Test: Storage-Only ($dedup_label) | GPUs: $num_gpus | Optimizer: $optimizer_type"
+      echo "----------------------------------------"
+      torchrun \
+        --nnodes 1 \
+        --nproc_per_node $num_gpus \
+        ./test/unit_tests/test_lfu_scores.py \
+        --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+        --num-embeddings $NUM_EMBEDDINGS \
+        --multi-hot-sizes $MULTI_HOT_SIZES \
+        --embedding-dim $EMBEDDING_DIM \
+        --optimizer-type ${optimizer_type} \
+        --batch-size $BATCH_SIZE \
+        --num-iterations $NUM_ITERATIONS \
+        --tolerance $TOLERANCE \
+        $dedup_flag || exit 1
+    done
+  done
+
+  for num_gpus in ${NUM_GPUS[@]}; do
+    for optimizer_type in ${OPTIMIZER_TYPE[@]}; do
+      echo ""
+      echo "----------------------------------------"
+      echo "Test: Cache+Storage ($dedup_label) | GPUs: $num_gpus | Optimizer: $optimizer_type | Cache Ratio: $CACHE_CAPACITY_RATIO"
+      echo "----------------------------------------"
+      torchrun \
+        --nnodes 1 \
+        --nproc_per_node $num_gpus \
+        ./test/unit_tests/test_lfu_scores.py \
+        --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+        --num-embeddings $NUM_EMBEDDINGS \
+        --multi-hot-sizes $MULTI_HOT_SIZES \
+        --embedding-dim $EMBEDDING_DIM \
+        --optimizer-type ${optimizer_type} \
+        --batch-size $BATCH_SIZE \
+        --num-iterations $NUM_ITERATIONS \
+        --tolerance $TOLERANCE \
+        --caching \
+        --cache-capacity-ratio $CACHE_CAPACITY_RATIO \
+        $dedup_flag || exit 1
+    done
   done
 done
-
-
-for num_gpus in ${NUM_GPUS[@]}; do
-  for optimizer_type in ${OPTIMIZER_TYPE[@]}; do
-    echo ""
-    echo "----------------------------------------"
-    echo "Test: Cache+Storage | GPUs: $num_gpus | Optimizer: $optimizer_type | Cache Ratio: $CACHE_CAPACITY_RATIO"
-    echo "----------------------------------------"
-    torchrun \
-      --nnodes 1 \
-      --nproc_per_node $num_gpus \
-      ./test/unit_tests/test_lfu_scores.py \
-      --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
-      --num-embeddings $NUM_EMBEDDINGS \
-      --multi-hot-sizes $MULTI_HOT_SIZES \
-      --embedding-dim $EMBEDDING_DIM \
-      --optimizer-type ${optimizer_type} \
-      --batch-size $BATCH_SIZE \
-      --num-iterations $NUM_ITERATIONS \
-      --tolerance $TOLERANCE \
-      --caching \
-      --cache-capacity-ratio $CACHE_CAPACITY_RATIO || exit 1
-  done
-done
-
 
 
 # High-frequency test: more iterations to test frequency accumulation
@@ -102,7 +108,6 @@ for caching_mode in "without-cache" "with-cache"; do
       --cache-capacity-ratio 0.4 || exit 1
   fi
 done
-
 
 
 EVICTION_CACHE_RATIO_1=0.08  # 2% - Very small cache

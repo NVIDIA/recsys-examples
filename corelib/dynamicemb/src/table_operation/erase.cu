@@ -20,9 +20,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-void table_erase(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
-                 int64_t bucket_capacity, at::Tensor bucket_sizes,
-                 at::Tensor keys, std::optional<at::Tensor> indices) {
+void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
+                 int64_t bucket_capacity,
+                 at::Tensor bucket_sizes, at::Tensor keys,
+                 at::Tensor table_ids,
+                 std::optional<at::Tensor> indices) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0)
@@ -31,6 +33,8 @@ void table_erase(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
   auto key_type = get_data_type(keys);
   auto bucket_sizes_ = get_pointer<int>(bucket_sizes);
   auto indices_ = get_pointer<IndexType>(indices);
+  auto table_ids_ptr = table_ids.data_ptr<int64_t>();
+  auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -53,7 +57,8 @@ void table_erase(at::Tensor table_storage, std::vector<torch::Dtype> dtypes,
 
     table_erase_kernel<Table, 1>
         <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            table, bucket_sizes_, num_total, keys_, indices_);
+            table, table_bucket_offsets_ptr,
+            bucket_sizes_, num_total, keys_, table_ids_ptr, indices_);
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

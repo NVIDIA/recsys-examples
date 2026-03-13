@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import random
 import shutil
 
 import pytest
@@ -27,7 +26,6 @@ from dynamicemb_extensions import (
     device_timestamp,
     table_count_matched,
 )
-from ordered_set import OrderedSet
 
 score_step = 0
 
@@ -62,110 +60,6 @@ def backend_session():
     dist.destroy_process_group()
 
 
-def generate_files_for_accumulate(
-    batch_size: int,
-    # rank: int,
-    # world_size: int,
-    seed: int = 42,
-):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    total_keys = OrderedSet()
-    # select_keys = OrderedSet()
-    while len(total_keys) < batch_size:
-        x = random.randint(0, (1 << 63) - 1)
-        total_keys.add(x)
-
-        # if x % world_size == rank:
-        #     select_keys.add(x)
-
-    keys = torch.tensor(list(total_keys), dtype=torch.int64).cuda()
-    scores = torch.ones_like(keys)
-    return keys, scores
-
-
-@pytest.mark.parametrize("key_type", [torch.int64])
-@pytest.mark.parametrize("bucket_capacity", [128, 1024])
-@pytest.mark.parametrize("num_buckets", [8192])
-@pytest.mark.parametrize("batch_size", [128 * 4096])
-@pytest.mark.parametrize(
-    "score_policy",
-    [ScorePolicy.ACCUMULATE],
-)
-def test_table_load(
-    key_type,
-    bucket_capacity,
-    num_buckets,
-    batch_size,
-    score_policy,
-    backend_session,
-):
-    print("--------------------------------------------------------")
-    assert torch.cuda.is_available()
-    device = torch.cuda.current_device()
-    rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-
-    device = torch.cuda.current_device()
-
-    table = get_scored_table(
-        capacity=num_buckets * bucket_capacity,
-        bucket_capacity=bucket_capacity,
-        key_type=key_type,
-        score_specs=[ScoreSpec(name="score1", policy=score_policy)],
-    )
-
-    score_args_lookup = [
-        ScoreArg(
-            name="score1",
-            policy=ScorePolicy.CONST,
-            is_return=True,
-        )
-    ]
-
-    key_file = "debug_keys"
-    score_file = "debug_scores"
-    keys, scores = generate_files_for_accumulate(batch_size)
-
-    if rank == 0:
-        fkey = open(key_file, "wb")
-        fscore = open(score_file, "wb")
-        fkey.write(keys.cpu().numpy().tobytes())
-        fscore.write(scores.cpu().numpy().tobytes())
-        fkey.close()
-        fscore.close()
-
-    dist.barrier()
-
-    table.load(key_file, {"score1": score_file})
-
-    masks = keys % world_size == rank
-    selected_keys = keys[masks]
-
-    assert table.size() == selected_keys.numel()
-
-    founds = torch.empty(selected_keys.numel(), dtype=torch.bool, device=device).fill_(
-        False
-    )
-    score_args_lookup[0].value = torch.zeros(
-        selected_keys.numel(), dtype=torch.uint64, device=device
-    )
-
-    table.lookup(selected_keys, score_args_lookup, founds)
-
-    assert founds.sum() == selected_keys.numel()
-    assert torch.equal(
-        score_args_lookup[0].value, torch.ones_like(selected_keys).to(torch.uint64)
-    )
-
-    print(
-        f"Table load passed when world size={world_size} and bucket capacity={bucket_capacity})"
-    )
-
-
 @pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("bucket_capacity", [128])
 @pytest.mark.parametrize("num_buckets", [2047, 8192])
@@ -174,12 +68,24 @@ def test_table_load(
     "score_policy",
     [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE, ScorePolicy.GLOBAL_TIMER],
 )
+@pytest.mark.parametrize(
+    "capacity_multipliers",
+    [
+        pytest.param([1], id="1table"),
+        pytest.param([1, 2], id="2tables"),
+        pytest.param([1, 2, 3, 4], id="4tables"),
+        pytest.param([2, 0], id="2tables-zero-last"),
+        pytest.param([0, 3], id="2tables-zero-first"),
+        pytest.param([2, 0, 3, 0], id="4tables-mixed"),
+    ],
+)
 def test_table_dump_load(
     key_type,
     num_buckets,
     bucket_capacity,
     batch_size,
     score_policy,
+    capacity_multipliers,
     backend_session,
 ):
     assert torch.cuda.is_available()
@@ -189,132 +95,121 @@ def test_table_dump_load(
 
     batch_size = batch_size * world_size
 
+    num_tables = len(capacity_multipliers)
+    capacity = [m * num_buckets * bucket_capacity for m in capacity_multipliers]
+
     table = get_scored_table(
-        capacity=num_buckets * bucket_capacity,
+        capacity=capacity,
         bucket_capacity=bucket_capacity,
         key_type=key_type,
         score_specs=[ScoreSpec(name="score1", policy=score_policy)],
         device=device,
     )
 
-    offset = 0
     max_step = 20
-    step = 0
-    while step < max_step:
+    inserted_batches = []
+    offset = 0
+    for step in range(max_step):
         keys = torch.randperm(batch_size, device=device, dtype=torch.int64) + offset
 
         masks = keys % world_size == local_rank
         keys = keys[masks]
+        tid = torch.randint(
+            num_tables, (keys.numel(),), dtype=torch.int64, device=device
+        )
         keys = keys.to(key_type)
         batch_ = keys.numel()
 
-        score_args = [
-            ScoreArg(
-                name="score1", value=get_scores(score_policy, keys), is_return=True
-            )
-        ]
+        inserted_batches.append((keys.clone(), tid.clone()))
+
+        score_arg = ScoreArg(name="score1", value=get_scores(score_policy, keys))
 
         insert_results = torch.empty(
             batch_, dtype=table.result_type, device=device
         ).fill_(InsertResult.INIT.value)
-        indices = torch.zeros(batch_, dtype=table.index_type, device=device)
 
-        table.insert(keys, score_args, indices, insert_results)
+        table.insert(keys, tid, score_arg, insert_results)
 
-        # not assign or busy
         assert (
             (insert_results == InsertResult.INSERT.value)
             | (insert_results == InsertResult.EVICT.value)
+            | (insert_results == InsertResult.ILLEGAL.value)
         ).all()
 
         offset += batch_size
-        step += 1
 
-    key_file = f"keys_rank{local_rank}"
-    score_file = f"score1_rank{local_rank}"
+    for t in range(num_tables):
+        if capacity_multipliers[t] == 0:
+            assert table.size(table_id=t) == 0
 
-    shutil.rmtree(key_file, ignore_errors=True)
-    shutil.rmtree(score_file, ignore_errors=True)
-
-    table.dump(key_file, {"score1": score_file})
+    key_files = []
+    score_files = []
+    for t in range(num_tables):
+        kf = f"keys_rank{local_rank}_table{t}"
+        sf = f"score1_rank{local_rank}_table{t}"
+        shutil.rmtree(kf, ignore_errors=True)
+        shutil.rmtree(sf, ignore_errors=True)
+        table.dump(kf, {"score1": sf}, table_id=t)
+        key_files.append(kf)
+        score_files.append(sf)
 
     load_table = get_scored_table(
-        capacity=num_buckets * bucket_capacity,
+        capacity=capacity,
         bucket_capacity=bucket_capacity,
         key_type=key_type,
         score_specs=[ScoreSpec(name="score1", policy=score_policy)],
     )
 
-    load_table.load(key_file, {"score1": score_file})
+    for t in range(num_tables):
+        load_table.load(key_files[t], {"score1": score_files[t]}, table_id=t)
 
+    for t in range(num_tables):
+        assert table.size(table_id=t) == load_table.size(table_id=t)
     assert table.size() == load_table.size()
 
-    offset = 0
-    max_step = 20
-    step = 0
-
     num_total_keys = 0
-    while step < max_step:
-        keys = torch.arange(0, batch_size, 1, device=device, dtype=torch.int64) + offset
+    for keys, tid in inserted_batches:
+        score_arg0 = ScoreArg(
+            name="score1",
+            value=get_scores(score_policy, keys),
+            policy=ScorePolicy.CONST,
+        )
 
-        masks = keys % world_size == local_rank
-        keys = keys[masks]
-        keys = keys.to(key_type)
-        batch_ = keys.numel()
+        score_arg1 = ScoreArg(
+            name="score1",
+            value=get_scores(score_policy, keys),
+            policy=ScorePolicy.CONST,
+        )
 
-        score_args0 = [
-            ScoreArg(
-                name="score1",
-                value=get_scores(score_policy, keys),
-                policy=ScorePolicy.CONST,
-                is_return=True,
-            )
-        ]
-
-        score_args1 = [
-            ScoreArg(
-                name="score1",
-                value=get_scores(score_policy, keys),
-                policy=ScorePolicy.CONST,
-                is_return=True,
-            )
-        ]
-
-        founds0 = torch.empty(batch_, dtype=torch.bool, device=device)
-        founds1 = torch.empty(batch_, dtype=torch.bool, device=device)
-
-        table.lookup(keys, score_args0, founds0, None)
-
-        load_table.lookup(keys, score_args1, founds1)
+        score_out0, founds0, _ = table.lookup(keys, tid, score_arg0)
+        score_out1, founds1, _ = load_table.lookup(keys, tid, score_arg1)
 
         assert torch.equal(founds0, founds1)
         num_total_keys += founds0.sum()
 
-        scores0 = score_args0[0].value.to(torch.int64)[founds0]
-        scores1 = score_args1[0].value.to(torch.int64)[founds1]
+        scores0 = score_out0[founds0]
+        scores1 = score_out1[founds1]
 
         if table.score_specs[0].policy == ScorePolicy.GLOBAL_TIMER:
-            # same machine
             scores_bias = scores1 - scores0
-            if scores_bias.numel() > 0:
-                assert (scores_bias == scores_bias[0]).all()
+            found_tids = tid[founds0]
+            for t in range(num_tables):
+                mask = found_tids == t
+                if mask.any():
+                    table_bias = scores_bias[mask]
+                    assert (table_bias == table_bias[0]).all()
         else:
             assert torch.equal(scores0, scores1)
-
-        offset += batch_size
-        step += 1
 
     assert num_total_keys == load_table.size()
 
 
 def table_num_matched(table, threshold) -> int:
-    d_num_matched = torch.zeros(1, dtype=torch.int64, device=table.device)
-    table_count_matched(
+    d_num_matched = table_count_matched(
         table.table_storage_,
-        table.fileds_type_,
+        table.fileds_type_[0],
         table.bucket_capacity_,
-        [threshold],
-        d_num_matched,
+        threshold,
     )
     return d_num_matched.cpu().item()
 
@@ -339,6 +234,15 @@ def table_num_matched(table, threshold) -> int:
     "score_policy",
     [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE, ScorePolicy.GLOBAL_TIMER],
 )
+@pytest.mark.parametrize(
+    "capacity_multipliers",
+    [
+        pytest.param([1], id="1table"),
+        pytest.param([1, 2], id="2tables"),
+        pytest.param([2, 0], id="2tables-zero-last"),
+        pytest.param([2, 0, 3, 0], id="4tables-mixed"),
+    ],
+)
 def test_table_incremental_dump(
     request,
     bucket_capacity,
@@ -347,6 +251,7 @@ def test_table_incremental_dump(
     num_iteration,
     dump_interval,
     score_policy,
+    capacity_multipliers,
     backend_session,
 ):
     print(f"\n{request.node.name}")
@@ -358,8 +263,11 @@ def test_table_incremental_dump(
 
     global_batch = batch_size * world_size
 
+    num_tables = len(capacity_multipliers)
+    capacity = [m * num_buckets * bucket_capacity for m in capacity_multipliers]
+
     table = get_scored_table(
-        capacity=num_buckets * bucket_capacity,
+        capacity=capacity,
         bucket_capacity=bucket_capacity,
         key_type=torch.int64,
         score_specs=[ScoreSpec(name="score1", policy=score_policy)],
@@ -372,25 +280,32 @@ def test_table_incremental_dump(
     )
     masks = keys % world_size == local_rank
     keys = keys[masks]
-    score_args = [
-        ScoreArg(name="score1", value=get_scores(score_policy, keys), is_return=True)
-    ]
+    score_arg = ScoreArg(name="score1", value=get_scores(score_policy, keys))
     insert_results = torch.empty(
         bucket_capacity, dtype=table.result_type, device=device
     ).fill_(InsertResult.INIT.value)
 
-    table.insert(keys, score_args, None, insert_results)
+    tid = torch.randint(num_tables, (keys.numel(),), dtype=torch.int64, device=device)
+    table.insert(keys, tid, score_arg, insert_results)
+
+    num_illegal = (insert_results == InsertResult.ILLEGAL.value).sum().item()
+    num_initial_inserted = bucket_capacity - num_illegal
 
     # check 1: count_matched works well
-    assert table_num_matched(table, 0) == bucket_capacity
+    assert table_num_matched(table, 0) == num_initial_inserted
 
-    # check 2: table.incremental_dump is consistent with count_matched
-    dumped_keys, dumped_named_scores, _ = table.incremental_dump({"score1": 0})
-    assert dumped_keys.numel() == bucket_capacity
-    assert set(dumped_keys[(dumped_keys % world_size == local_rank)].tolist()) == set(
-        keys.tolist()
-    )
-    assert (insert_results == InsertResult.INSERT.value).sum() == bucket_capacity
+    # check 2: table.incremental_dump is consistent with count_matched (per table)
+    inserted_mask = insert_results == InsertResult.INSERT.value
+    total_dumped = 0
+    for t in range(num_tables):
+        dumped_keys_t, _, _ = table.incremental_dump({"score1": 0}, table_id=t)
+        total_dumped += dumped_keys_t.numel()
+        table_mask = (tid == t) & inserted_mask
+        assert set(
+            dumped_keys_t[dumped_keys_t % world_size == local_rank].tolist()
+        ) == set(keys[table_mask].tolist())
+    assert total_dumped == num_initial_inserted
+    assert inserted_mask.sum() == num_initial_inserted
 
     # insert iteratively
     offset = bucket_capacity * world_size
@@ -406,8 +321,11 @@ def test_table_incremental_dump(
 
         # pre-check: using uninsert score will dump nothing.
         if score_policy != ScorePolicy.ACCUMULATE:
-            dumped_keys, _, _ = table.incremental_dump({"score1": undumped_score})
-            assert dumped_keys.numel() == 0
+            for t in range(num_tables):
+                dumped_keys, _, _ = table.incremental_dump(
+                    {"score1": undumped_score}, table_id=t
+                )
+                assert dumped_keys.numel() == 0
 
         interval_keys = torch.arange(
             offset,
@@ -418,6 +336,9 @@ def test_table_incremental_dump(
         interval_existed_in_table = torch.empty(
             dump_interval * global_batch, device=device, dtype=torch.bool
         ).fill_(False)
+        interval_table_ids = torch.full(
+            (dump_interval * global_batch,), -1, device=device, dtype=torch.int64
+        )
 
         # select local keys
         interval_existed_in_table[local_rank::world_size] = True
@@ -434,16 +355,20 @@ def test_table_incremental_dump(
             )
             masks = keys % world_size == local_rank
             keys = keys[masks]
+            tid = torch.randint(
+                num_tables, (keys.numel(),), dtype=torch.int64, device=device
+            )
+            interval_table_ids[keys - interval_offset] = tid
 
             offset += global_batch
-            score_args[0].value = get_scores(score_policy, keys)
+            score_arg.value = get_scores(score_policy, keys)
             insert_results = torch.empty(
                 batch_size, dtype=table.result_type, device=device
             ).fill_(InsertResult.INIT.value)
 
             old_size = table.size()
-            num_evict, evict_keys, _, evict_named_scores = table.insert_and_evict(
-                keys, score_args, None, insert_results
+            _, num_evict, evict_keys, _, evict_named_scores, _ = table.insert_and_evict(
+                keys, tid, score_arg, insert_results
             )
             new_size = table.size()
 
@@ -454,6 +379,7 @@ def test_table_incremental_dump(
                 insert_results == InsertResult.EVICT.value
             ).sum()
             num_insert_failed = (insert_results == InsertResult.BUSY.value).sum()
+            num_illegal = (insert_results == InsertResult.ILLEGAL.value).sum()
 
             assert num_assign == 0
             assert num_reclaim == 0
@@ -461,7 +387,10 @@ def test_table_incremental_dump(
             assert new_size - old_size == num_inserted
             assert num_inserted_by_eviction + num_insert_failed == num_evict
             assert (
-                num_inserted + num_inserted_by_eviction + num_insert_failed
+                num_inserted
+                + num_inserted_by_eviction
+                + num_insert_failed
+                + num_illegal
                 == batch_size
             )
 
@@ -471,31 +400,54 @@ def test_table_incremental_dump(
                 evict_keys[evict_keys_interval_mask] - interval_offset
             )
             interval_existed_in_table[evict_keys_interval_mask] = False
-
             num_remain -= evict_keys_interval_mask.numel()
 
-        # check 3: incremental dump as expected
-        keys, named_scores, _ = table.incremental_dump({"score1": undumped_score})
-        masks = keys % world_size == local_rank
-        keys = keys.to(device)[masks]
-        scores = named_scores["score1"].to(device)[masks]
-        if score_policy != ScorePolicy.ACCUMULATE:
-            assert ((scores - undumped_score) >= 0).all()
-            assert keys.numel() == num_remain
-            ascend_dumped_keys, _ = torch.sort(keys)
-            ascend_interval_keys, _ = torch.sort(
-                interval_keys[interval_existed_in_table]
-            )
-            assert torch.equal(ascend_dumped_keys, ascend_interval_keys)
-        else:
-            assert keys.numel() == table.size()
-            assert torch.isin(interval_keys[interval_existed_in_table], keys).all()
+            # keys targeting zero-capacity tables were never inserted
+            illegal_keys = keys[insert_results == InsertResult.ILLEGAL.value]
+            illegal_interval_mask = (illegal_keys - interval_offset) >= 0
+            illegal_in_interval = illegal_keys[illegal_interval_mask] - interval_offset
+            interval_existed_in_table[illegal_in_interval] = False
+            num_remain -= illegal_in_interval.numel()
 
-        # check 4: using min_score to count will get table's size
-        dumped_keys, _, _ = table.incremental_dump({"score1": 0})
-        assert (
-            dumped_keys[dumped_keys % world_size == local_rank].numel() == table.size()
-        )
+        # check 3: incremental dump as expected (per table)
+        all_dumped_keys = []
+        for t in range(num_tables):
+            keys_t, named_scores_t, _ = table.incremental_dump(
+                {"score1": undumped_score}, table_id=t
+            )
+            masks_t = keys_t % world_size == local_rank
+            keys_t = keys_t.to(device)[masks_t]
+            scores_t = named_scores_t["score1"].to(device)[masks_t]
+            all_dumped_keys.append(keys_t)
+
+            if score_policy != ScorePolicy.ACCUMULATE:
+                assert ((scores_t - undumped_score) >= 0).all()
+                table_mask = interval_existed_in_table & (interval_table_ids == t)
+                expected = torch.sort(interval_keys[table_mask])[0]
+                assert torch.equal(torch.sort(keys_t)[0], expected)
+
+        total_dumped = sum(k.numel() for k in all_dumped_keys)
+        if score_policy != ScorePolicy.ACCUMULATE:
+            assert total_dumped == num_remain
+        else:
+            assert total_dumped == table.size()
+            all_keys = (
+                torch.cat(all_dumped_keys)
+                if all_dumped_keys
+                else torch.tensor([], device=device, dtype=torch.int64)
+            )
+            assert torch.isin(interval_keys[interval_existed_in_table], all_keys).all()
+
+        # check 4: using min_score to count will get table's size (per table)
+        total_size_check = 0
+        for t in range(num_tables):
+            dumped_keys_t, _, _ = table.incremental_dump({"score1": 0}, table_id=t)
+            local_count = dumped_keys_t[
+                dumped_keys_t % world_size == local_rank
+            ].numel()
+            assert local_count == table.size(table_id=t)
+            total_size_check += local_count
+        assert total_size_check == table.size()
 
         # log
         load_factor = table.size() / table.capacity()

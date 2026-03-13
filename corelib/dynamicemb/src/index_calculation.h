@@ -21,6 +21,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "utils.h"
 #include <cstdint>
 #include <cub/cub.cuh>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/tuple.h>
+#include <utility>
 
 namespace dyn_emb {
 
@@ -72,6 +76,45 @@ void select_index_async(int64_t num_items, bool const *d_flags, T *d_output,
   cub::DeviceSelect::Flagged(d_temp_storage, temp_storage_bytes, counting_iter,
                              d_flags, d_output, d_num_select, num_items,
                              stream);
+}
+
+template <size_t... Is>
+void flagged_compact_impl(
+    int64_t num_items, bool const *d_flags,
+    int64_t const *const *d_inputs,
+    int64_t *const *d_outputs,
+    int64_t *d_out_indices,
+    int64_t *d_num_selected,
+    at::Device const &device, cudaStream_t const &stream,
+    std::index_sequence<Is...>) {
+
+    auto in_zip = thrust::make_zip_iterator(thrust::make_tuple(
+        thrust::counting_iterator<int64_t>(0), d_inputs[Is]...));
+    auto out_zip = thrust::make_zip_iterator(thrust::make_tuple(
+        d_out_indices, d_outputs[Is]...));
+
+    void *d_temp = nullptr;
+    size_t temp_bytes = 0;
+    cub::DeviceSelect::Flagged(d_temp, temp_bytes,
+        in_zip, d_flags, out_zip, d_num_selected, num_items, stream);
+    d_temp = at::empty({static_cast<int64_t>(temp_bytes)},
+        at::TensorOptions().dtype(at::kByte).device(device)).data_ptr();
+    cub::DeviceSelect::Flagged(d_temp, temp_bytes,
+        in_zip, d_flags, out_zip, d_num_selected, num_items, stream);
+}
+
+template <size_t N>
+void flagged_compact_cub(
+    int64_t num_items, bool const *d_flags,
+    int64_t const *const *d_inputs,
+    int64_t *const *d_outputs,
+    int64_t *d_out_indices,
+    int64_t *d_num_selected,
+    at::Device const &device, cudaStream_t const &stream) {
+    flagged_compact_impl(
+        num_items, d_flags, d_inputs, d_outputs,
+        d_out_indices, d_num_selected, device, stream,
+        std::make_index_sequence<N>{});
 }
 
 } // namespace dyn_emb
