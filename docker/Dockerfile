@@ -56,20 +56,9 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
-WORKDIR /workspace/recsys-examples
-COPY . .
-
-RUN rm -rf /workspace/recsys-examples/*
-
-FROM ${DEVEL_IMAGE} AS build
-ARG TRITONSERVER_BUILD
-
-
-# TODO, move the compile to devel_latest when third_party/FBGEMM is stable(blackwell + standalone building)
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
-    MAX_JOBS=2 \
     HSTU_DISABLE_86OR89=FALSE \
     HSTU_DISABLE_ARBITRARY=TRUE \
     HSTU_DISABLE_LOCAL=TRUE \
@@ -80,8 +69,10 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     pip install . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
+FROM ${DEVEL_IMAGE} AS build
+ARG TRITONSERVER_BUILD
+
 WORKDIR /workspace/recsys-examples
-RUN rm -rf /workspace/recsys-examples/*
 COPY . .
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
