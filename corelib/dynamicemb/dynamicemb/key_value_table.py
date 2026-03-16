@@ -1370,6 +1370,9 @@ def update_cache(
     missing_values: torch.Tensor,
     missing_scores: Optional[torch.Tensor] = None,
 ):
+    batch = missing_keys.numel()
+    if batch == 0:
+        return
     # need to update score.
     num_evicted, evicted_keys, evicted_values, evicted_scores = cache.insert_and_evict(
         missing_keys,
