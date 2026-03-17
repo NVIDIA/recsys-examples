@@ -31,8 +31,15 @@ RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
       pip install --no-deps -e ./megatron-lm; \
     fi
 
-RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers
-RUN pip install triton==3.6.0
+RUN pip install torchx \
+                gin-config \
+                torchmetrics==1.0.3 \
+                typing-extensions \
+                iopath \
+                pyvers \
+                cloudpickle \
+                triton==3.6.0 \
+                nvidia-cutlass-dsl==4.3.0
 
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
   git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
@@ -43,8 +50,6 @@ RUN pip install --no-deps tensordict orjson && \
   git clone --recursive -b v1.5.0-rc2 https://github.com/pytorch/torchrec.git torchrec && \
   cd torchrec && \
   pip install --no-deps .
-
-RUN pip install nvidia-cutlass-dsl==4.3.0
 
 
 # for dev
@@ -65,6 +70,7 @@ RUN ARCH=$(uname -m) && \
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
+    MAX_JOBS=8 \
     HSTU_DISABLE_86OR89=FALSE \
     HSTU_DISABLE_ARBITRARY=TRUE \
     HSTU_DISABLE_LOCAL=TRUE \
@@ -75,8 +81,6 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
-
-RUN pip install cloudpickle
 
 WORKDIR /workspace/recsys-examples
 
