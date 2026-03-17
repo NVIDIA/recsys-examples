@@ -110,12 +110,12 @@ def hstu_preprocess_embeddings(
                 (
                     torch.cat(
                         [
-                            item_embs[item_offsets[idx] : candidates_indptr[idx]],
-                            action_embs[action_offsets[idx] : action_offsets[idx + 1]],
+                            item_embs[item_offsets[idx].item() : candidates_indptr[idx].item()],
+                            action_embs[action_offsets[idx].item() : action_offsets[idx + 1].item()],
                         ],
                         dim=1,
                     ).view(-1, embedding_dim),
-                    item_embs[candidates_indptr[idx] : item_offsets[idx + 1]],
+                    item_embs[candidates_indptr[idx].item() : item_offsets[idx + 1].item()],
                 )
                 for idx in range(batch.batch_size)
             ]
@@ -160,34 +160,32 @@ def hstu_preprocess_embeddings(
             contextual_jts_offsets,
             contextual_max_seqlens,
         )
-        if torch.sum(contextual_seqlen, dim=0).cpu().item() == 0:
-            contextual_seqlen = None
-        else:
-            if contextual_mlp is not None:
-                contextual_sequence_embeddings = contextual_mlp(
-                    contextual_sequence_embeddings
-                )
-            contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                contextual_seqlen
+        torch._check(torch.sum(contextual_seqlen, dim=0).item() != 0, "contextual_seqlen is 0")
+        if contextual_mlp is not None:
+            contextual_sequence_embeddings = contextual_mlp(
+                contextual_sequence_embeddings
             )
-            contextual_max_seqlen = max(
-                len(batch.contextual_feature_names), sum(contextual_max_seqlens)
-            )
-            (
-                sequence_embeddings,
-                sequence_embeddings_lengths,
-            ) = jagged_2D_tensor_concat(
-                [contextual_sequence_embeddings, sequence_embeddings],
-                [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
-                [contextual_max_seqlen, sequence_max_seqlen],
-            )
+        contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            contextual_seqlen
+        )
+        contextual_max_seqlen = max(
+            len(batch.contextual_feature_names), sum(contextual_max_seqlens)
+        )
+        (
+            sequence_embeddings,
+            sequence_embeddings_lengths,
+        ) = jagged_2D_tensor_concat(
+            [contextual_sequence_embeddings, sequence_embeddings],
+            [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
+            [contextual_max_seqlen, sequence_max_seqlen],
+        )
 
-            sequence_embeddings_lengths_offsets = (
-                torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    sequence_embeddings_lengths
-                )
+        sequence_embeddings_lengths_offsets = (
+            torch.ops.fbgemm.asynchronous_complete_cumsum(
+                sequence_embeddings_lengths
             )
-            sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
+        )
+        sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
 
     # After balanced shuffler, dense tensors (num_candidates) are stripped to
     # actual_batch_size while KJTs retain batch_size entries (see BaseBatch
