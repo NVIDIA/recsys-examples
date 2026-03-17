@@ -345,7 +345,7 @@ def triton_addmm_silu_fwd(
         triton.cdiv(M, meta["BLOCK_M"]),
         triton.cdiv(N, meta["BLOCK_N"]),
     )
-    _addmm_optional_silu_fwd[grid](
+    torch.library.wrap_triton(_addmm_optional_silu_fwd)[grid](
         x,
         w,
         y,

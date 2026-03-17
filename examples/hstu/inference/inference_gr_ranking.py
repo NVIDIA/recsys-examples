@@ -552,9 +552,39 @@ def run_inference_with_fused_hstu_block(
         dataloader = get_data_loader(dataset=eval_dataset)
         dataloader_iter = iter(dataloader)
 
+        # torch.export
+        batch = next(dataloader_iter)
+
+        batch = batch.to(device=torch.cuda.current_device())
+        d = batch.features.to_dict()
+        user_ids = d["user_id"].values().cpu().long()
+        if user_ids.shape[0] != batch.batch_size:
+            batch = strip_padding_batch(batch, user_ids.shape[0])
+
+        from torch.export import Dim, ShapesCollection, export, ExportedProgram
+
+        embeddings = model.sparse_module(batch.features)
+        print(batch)
+        print(embeddings)
+        # breakpoint()
+        sc = ShapesCollection()
+        sc[batch.features.values()] = {0: Dim.DYNAMIC}
+        for config in emb_configs:
+            jt = embeddings[config.table_name]
+            sc[jt.values()] = {0: Dim.DYNAMIC if batch.feature_to_max_seqlen[config.table_name] > 1 else Dim.AUTO}
+        dynamic_shapes = sc.dynamic_shapes(model.dense_module, (batch, embeddings))
+
+        exported_program: ExportedProgram = torch.export.export(
+            model.dense_module, args=(batch, embeddings), dynamic_shapes=dynamic_shapes
+        )
+        print(exported_program)
+
+        # model.dense_module = exported_program.module()
+
         # torch.cuda.profiler.start()
         while True:
             try:
+                print("=== NEW BATCH ===")
                 batch = next(dataloader_iter)
 
                 batch = batch.to(device=torch.cuda.current_device())
@@ -570,7 +600,12 @@ def run_inference_with_fused_hstu_block(
                 )
                 total_history_lengths = total_history_lengths.cpu()
 
-                logits = model.forward_nokvcache(batch)
+                with torch.inference_mode():
+                    torch.cuda.nvtx.range_push("HSTU embedding")
+                    embeddings = model.sparse_module(batch.features)
+                    torch.cuda.nvtx.range_pop()
+                    logits = exported_program.module()(batch, embeddings)
+
                 eval_module(logits, batch.labels.values())
             except StopIteration:
                 break

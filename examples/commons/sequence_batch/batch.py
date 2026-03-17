@@ -33,7 +33,8 @@ class BaseBatch(Pipelineable):
         if len(set(self.features.keys())) != len(list(self.features.keys())):
             raise ValueError(f"duplicate features keys {list(self.features.keys())}")
         assert isinstance(self.contextual_feature_names, list)
-        assert isinstance(self.batch_size, int) and self.batch_size > 0
+        assert isinstance(self.batch_size, int) and self.batch_size > 0 or \
+            isinstance(self.batch_size, torch.export.dynamic_shapes._IntWrapper) and self.batch_size.val > 0
         self.actual_batch_size = (
             self.batch_size
             if self.actual_batch_size is None

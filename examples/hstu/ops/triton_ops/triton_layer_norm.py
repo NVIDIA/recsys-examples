@@ -363,7 +363,7 @@ def triton_weighted_layer_norm_fwd(
         )
     else:
         # pyre-ignore[28]
-        _layer_norm_fwd[(N,)](
+        torch.library.wrap_triton(_layer_norm_fwd)[(N,)](
             x,
             y,
             mean,

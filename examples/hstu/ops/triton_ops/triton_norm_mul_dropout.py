@@ -394,7 +394,7 @@ def triton_layer_norm_mul_dropout_fwd(
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     # pyre-ignore[28]
-    _ln_mul_dropout_fwd[(N,)](
+    torch.library.wrap_triton(_ln_mul_dropout_fwd)[(N,)](
         x,
         u,
         y,
