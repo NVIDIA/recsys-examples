@@ -48,7 +48,7 @@ DEFAULT_WORLD_SIZES = [1, 8]
 EMBEDDING_DIM = 128
 EMBEDDING_DTYPE = torch.float32
 OPTIMIZER_TYPE = OptimizerType.Adam
-# Non-cache table: bucket_capacity fixed at 128; per-rank aligned capacity at least align_to_table_size(128)
+# Non-cache table: bucket_capacity fixed at 128; per-rank aligned capacity at least 128
 BUCKET_CAPACITY_NORMAL = 128
 # Cache mode: cache bucket_capacity=1024, minimum capacity 1024 (round up to 1 bucket if smaller)
 BUCKET_CAPACITY_CACHE = 1024
@@ -80,8 +80,8 @@ def compute_memory_stats(
     Compute per-rank HBM/DRAM stats for a single table (aligned with planner + batched_dynamicemb_tables).
 
     Planner logic:
-    - num_embeddings_per_rank = align_to_table_size(ceil(num_embeddings / world_size))
-    - If num_aligned_embedding_per_rank < bucket_capacity(128), round up to align_to_table_size(128)
+    - num_embeddings_per_rank = align_to_table_size(ceil(num_embeddings / world_size), alignment=bucket_capacity)
+    - If num_aligned_embedding_per_rank < bucket_capacity(128), use bucket_capacity
     - local_hbm_for_values = ceil(global_hbm_for_values / world_size)
     - When caching: cache bucket=1024, min capacity 1024 (get_constraint_capacity rounds up to 1 bucket)
 
@@ -90,10 +90,10 @@ def compute_memory_stats(
     total_bytes_per_rank, hbm_bytes_per_rank, dram_bytes_per_rank, aligned_capacity_per_rank, total_bytes_all_ranks
     """
     num_per_rank = math.ceil(num_embeddings / world_size)
-    aligned_capacity_per_rank = align_to_table_size(num_per_rank)
-    # Align with planner: per-rank capacity at least align_to_table_size(bucket_capacity)=128
-    min_capacity_from_bucket = align_to_table_size(BUCKET_CAPACITY_NORMAL)
-    aligned_capacity_per_rank = max(aligned_capacity_per_rank, min_capacity_from_bucket)
+    aligned_capacity_per_rank = align_to_table_size(
+        num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
+    )
+    aligned_capacity_per_rank = max(aligned_capacity_per_rank, BUCKET_CAPACITY_NORMAL)
     total_memory_per_rank = aligned_capacity_per_rank * _byte_per_vector()
 
     local_hbm = math.ceil(global_hbm_for_values / world_size)
@@ -147,12 +147,13 @@ def run_alignment_memory_report(
     total/hbm/dram are per-rank values.
     """
     rows = []
-    min_cap_bucket = align_to_table_size(BUCKET_CAPACITY_NORMAL)
     for num_emb in num_embeddings_list:
         for world_size in world_sizes:
             num_per_rank = math.ceil(num_emb / world_size)
-            aligned_per_rank = align_to_table_size(num_per_rank)
-            aligned_per_rank = max(aligned_per_rank, min_cap_bucket)
+            aligned_per_rank = align_to_table_size(
+                num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
+            )
+            aligned_per_rank = max(aligned_per_rank, BUCKET_CAPACITY_NORMAL)
             total_mem_per_rank = aligned_per_rank * _byte_per_vector()
             # Global HBM budget (for half/full): based on total table memory across all ranks
             total_mem_global = total_mem_per_rank * world_size
@@ -282,9 +283,8 @@ def _apply_dmp_with_global_hbm(
     )
     model = _SingleTableTestModel(ebc)
 
-    emb_num_aligned = align_to_table_size(num_embeddings)
     bucket_capacity = BUCKET_CAPACITY_CACHE if caching else BUCKET_CAPACITY_NORMAL
-    # Planner will use align_to_table_size(ceil(num_embeddings/world_size)) per rank; placeholder here
+    emb_num_aligned = align_to_table_size(num_embeddings, alignment=bucket_capacity)
     torch_dtype = data_type_to_dtype(DataType.FP32)
     opt_state_dim = get_optimizer_state_dim(
         OptimizerType.Adam, embedding_dim, torch_dtype
@@ -423,8 +423,8 @@ class TestAlignmentMemoryStats:
     def world_sizes(self) -> List[int]:
         return [1, 8]
 
-    def test_align_to_table_size_matches_demb_align_size(self):
-        """Aligned capacity is a multiple of DEMB_TABLE_ALIGN_SIZE."""
+    def test_align_to_table_size_default_alignment(self):
+        """With default alignment, result is a multiple of DEMB_TABLE_ALIGN_SIZE."""
         for n in [0, 1, 15, 16, 17, 32, 100]:
             aligned = align_to_table_size(n)
             assert (
@@ -432,6 +432,19 @@ class TestAlignmentMemoryStats:
             ), f"align_to_table_size({n}) = {aligned} not multiple of {DEMB_TABLE_ALIGN_SIZE}"
             if n > 0:
                 assert aligned >= n, f"align_to_table_size({n}) = {aligned} < {n}"
+
+    def test_align_to_table_size_bucket_capacity(self):
+        """With bucket_capacity alignment, result is a multiple of bucket_capacity."""
+        for bucket_cap in [128, 1024]:
+            for n in [0, 1, 127, 128, 129, 1000, 3125000]:
+                aligned = align_to_table_size(n, alignment=bucket_cap)
+                assert (
+                    aligned % bucket_cap == 0
+                ), f"align_to_table_size({n}, {bucket_cap}) = {aligned} not multiple of {bucket_cap}"
+                if n > 0:
+                    assert (
+                        aligned >= n
+                    ), f"align_to_table_size({n}, {bucket_cap}) = {aligned} < {n}"
 
     def test_memory_stats_total_consistent(
         self, num_embeddings_list, global_hbm_modes, world_sizes
@@ -458,12 +471,13 @@ class TestAlignmentMemoryStats:
         self, num_embeddings_list, global_hbm_modes, world_sizes
     ):
         """When global_hbm is non-zero, HBM under caching is determined by cache capacity."""
-        min_cap = align_to_table_size(BUCKET_CAPACITY_NORMAL)
         for num_emb in num_embeddings_list:
             for world_size in world_sizes:
                 num_per_rank = math.ceil(num_emb / world_size)
-                aligned = align_to_table_size(num_per_rank)
-                aligned = max(aligned, min_cap)
+                aligned = align_to_table_size(
+                    num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
+                )
+                aligned = max(aligned, BUCKET_CAPACITY_NORMAL)
                 total_mem_global = aligned * _byte_per_vector() * world_size
                 for gmode in ["half", "full"]:
                     global_hbm = (
@@ -489,20 +503,25 @@ class TestAlignmentMemoryStats:
             assert r["total_bytes"] > 0
             assert r["hbm_bytes"] >= 0 and r["dram_bytes"] >= 0
             num_per_rank = math.ceil(r["num_embeddings"] / r["world_size"])
-            assert r["aligned_capacity_per_rank"] >= align_to_table_size(num_per_rank)
+            assert r["aligned_capacity_per_rank"] >= align_to_table_size(
+                num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
+            )
 
     def test_multi_rank_reduces_per_rank_memory(self):
         """With world_size=8, per-rank total_bytes should be less than full-table size with world_size=1."""
         num_emb = 10000
-        total_ws1 = align_to_table_size(num_emb) * _byte_per_vector()
+        total_ws1 = (
+            align_to_table_size(num_emb, alignment=BUCKET_CAPACITY_NORMAL)
+            * _byte_per_vector()
+        )
         total_ws8_per_rank, _, _, _, _ = compute_memory_stats(
             num_emb, global_hbm_for_values=0, caching=False, world_size=8
         )
         assert total_ws8_per_rank < total_ws1
 
     def test_num_aligned_embedding_per_rank_bucket_floor(self):
-        """num_aligned_embedding_per_rank is bounded by bucket_capacity: at least align_to_table_size(128)=128."""
-        min_cap = align_to_table_size(BUCKET_CAPACITY_NORMAL)
+        """num_aligned_embedding_per_rank is bounded by bucket_capacity."""
+        min_cap = BUCKET_CAPACITY_NORMAL
         assert min_cap == 128
         for num_emb in [1, 10, 17, 50]:
             for world_size in [1, 8]:
@@ -557,10 +576,11 @@ class TestAlignmentMemoryStats:
         world_size = dist.get_world_size()
         num_embeddings = 1000
         # Global HBM = full (same as "full" in theoretical report; use same bucket floor as compute_memory_stats)
-        aligned_per_rank = align_to_table_size(math.ceil(num_embeddings / world_size))
-        aligned_per_rank = max(
-            aligned_per_rank, align_to_table_size(BUCKET_CAPACITY_NORMAL)
+        aligned_per_rank = align_to_table_size(
+            math.ceil(num_embeddings / world_size),
+            alignment=BUCKET_CAPACITY_NORMAL,
         )
+        aligned_per_rank = max(aligned_per_rank, BUCKET_CAPACITY_NORMAL)
         total_mem_global = aligned_per_rank * _byte_per_vector() * world_size
         global_hbm = total_mem_global
         ok, msg = _compare_actual_vs_theoretical(

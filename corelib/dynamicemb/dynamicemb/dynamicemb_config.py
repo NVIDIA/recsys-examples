@@ -318,7 +318,9 @@ class DynamicEmbTableOptions(_ContextOptions):
         ), "eval_initializer_args must be constant initialization"
 
         if self.init_capacity is not None:
-            target_init_capacity = align_to_table_size(self.init_capacity)
+            target_init_capacity = align_to_table_size(
+                self.init_capacity, alignment=self.bucket_capacity
+            )
             if self.init_capacity != target_init_capacity:
                 warnings.warn(
                     f"init_capacity is changed to {target_init_capacity} from {self.init_capacity}"
@@ -522,18 +524,16 @@ def get_constraint_capacity(
     return (capacity // bucket_capacity) * bucket_capacity
 
 
-def align_to_table_size(n: int) -> int:
-    """Round up n to a multiple of DEMB_TABLE_ALIGN_SIZE.
+def align_to_table_size(n: int, alignment: int = DEMB_TABLE_ALIGN_SIZE) -> int:
+    """Round up n to a multiple of ``alignment``.
 
-    Non-positive values are treated as 0 and rounded up to DEMB_TABLE_ALIGN_SIZE
+    Non-positive values are treated as 0 and rounded up to ``alignment``
     to avoid zero capacity in planners/tables.
     """
     n = int(n)
     if n <= 0:
-        return DEMB_TABLE_ALIGN_SIZE
-    return (
-        (n + DEMB_TABLE_ALIGN_SIZE - 1) // DEMB_TABLE_ALIGN_SIZE * DEMB_TABLE_ALIGN_SIZE
-    )
+        return alignment
+    return (n + alignment - 1) // alignment * alignment
 
 
 def _next_power_of_2(n):

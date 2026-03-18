@@ -142,29 +142,28 @@ def _validate_configs(
         validate_initializer_args(
             tmp_constraint.dynamicemb_options.initializer_args, tmp_config
         )
-        # align num_embeddings per rank via align_to_table_size
-        num_aligned_embedding_per_rank = align_to_table_size(
-            math.ceil(tmp_config.num_embeddings / world_size)
-        )
         bucket_cap = constraints[config_name].dynamicemb_options.bucket_capacity
+        num_aligned_embedding_per_rank = align_to_table_size(
+            math.ceil(tmp_config.num_embeddings / world_size),
+            alignment=bucket_cap,
+        )
         if num_aligned_embedding_per_rank < bucket_cap:
-            num_aligned_embedding_per_rank = align_to_table_size(bucket_cap)
+            num_aligned_embedding_per_rank = bucket_cap
 
-        # num_aligned_embedding_per_rank = _get_safe_local_capacity(num_aligned_embedding_per_rank, tmp_constraint.dynamicemb_options.bucket_capacity)
-        if tmp_config.num_embeddings != int(
-            num_aligned_embedding_per_rank * world_size
-        ):
-            tmp_constraint.dynamicemb_options.num_aligned_embedding_per_rank = (
-                num_aligned_embedding_per_rank
-            )
+        tmp_constraint.dynamicemb_options.num_aligned_embedding_per_rank = (
+            num_aligned_embedding_per_rank
+        )
 
 
 def _dyn_emb_table_size_per_rank(
-    dyn_emb_table_config: BaseEmbeddingConfig, world_size: int
+    dyn_emb_table_config: BaseEmbeddingConfig,
+    world_size: int,
+    bucket_capacity: int = 128,
 ) -> Tuple[int, int]:
     num_embeddings = dyn_emb_table_config.num_embeddings
     num_embeddings_per_rank = align_to_table_size(
-        math.ceil(num_embeddings / world_size)
+        math.ceil(num_embeddings / world_size),
+        alignment=bucket_capacity,
     )
 
     embedding_dim = dyn_emb_table_config.embedding_dim
@@ -190,7 +189,9 @@ def _reserve_storage_for_dyn_emb(
         tmp_table_config = dyn_emb_table_configs[name]
 
         embedding_dim, num_embeddings_per_rank = _dyn_emb_table_size_per_rank(
-            tmp_table_config, world_size
+            tmp_table_config,
+            world_size,
+            bucket_capacity=constraint.dynamicemb_options.bucket_capacity,
         )
         HBM_memory_in_bytes_per_rank = _dyn_emb_table_hbm_size_per_rank(
             constraint, world_size
@@ -321,7 +322,9 @@ class DynamicEmbeddingShardingPlanner:
             )
 
             embedding_dim, num_embeddings_per_rank = _dyn_emb_table_size_per_rank(
-                tmp_table_config, world_size
+                tmp_table_config,
+                world_size,
+                bucket_capacity=dynamicemb_constraint.dynamicemb_options.bucket_capacity,
             )
 
             tmp_para_sharding = DynamicEmbParameterSharding(
