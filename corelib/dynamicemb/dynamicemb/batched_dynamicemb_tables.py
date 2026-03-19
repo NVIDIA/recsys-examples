@@ -1209,7 +1209,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
 
         if len(keys_list) == 0:
-            assert len(values_list) == 0
+            return torch.empty(0, dtype=torch.int64, device=device), torch.empty(0, device=device)
             return torch.empty(0, device=device), torch.empty(0, device=device)
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
