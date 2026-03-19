@@ -327,6 +327,16 @@ class DynamicEmbTableOptions(_ContextOptions):
                 )
                 self.init_capacity = target_init_capacity
 
+        if self.max_capacity is not None:
+            target_max_capacity = align_to_table_size(
+                self.max_capacity, alignment=self.bucket_capacity
+            )
+            if self.max_capacity != target_max_capacity:
+                warnings.warn(
+                    f"max_capacity is changed to {target_max_capacity} from {self.max_capacity}"
+                )
+                self.max_capacity = target_max_capacity
+
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
             return NotImplementedError
