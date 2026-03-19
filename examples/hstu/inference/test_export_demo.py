@@ -16,407 +16,400 @@ Limitations (by design for quick demo):
 - non-pooled output shape: (num_indices, embedding_dim)
 """
 
-from typing import List, Optional
-import torch
 import os
+import shutil
+import tempfile
+from typing import List, Optional
 
-# ── Step 1: Load inference_emb_ops.so BEFORE importing dynamicemb ──────────────
-# dynamicemb's index_range_meta.py and lookup_meta.py attempt to register fake
-# kernels at import time.  Those registrations silently fail with a RuntimeWarning
-# if the operators don't exist yet.  Loading the .so here ensures the dispatcher
-# already knows about INFERENCE_EMB::* before dynamicemb is imported below.
-_SEARCH_PATHS = [
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../corelib/dynamicemb/torch_binding_build/inference_emb_ops.so"
-    ),
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../corelib/dynamicemb/build_inference_ops_check/inference_emb_ops.so"
-    ),
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../corelib/dynamicemb/build/inference_emb_ops.so"
-    ),
-    "inference_emb_ops.so",
-]
+import torch
+import torch.distributed as dist
 
-_ops_loaded: bool = False
-for _path in _SEARCH_PATHS:
-    if os.path.exists(_path):
-        try:
-            torch.ops.load_library(_path)
-            print(f"[INFO] Loaded inference_emb_ops.so from {_path}")
-            _ops_loaded = True
-        except Exception as _e:
-            print(f"[WARN] Failed to load {_path}: {_e}")
-        break  # stop after first found path, whether load succeeded or not
-
-if not _ops_loaded:
-    print("[WARN] Could not find inference_emb_ops.so. Custom ops may not be available.")
-
-# ── Step 2: Import dynamicemb AFTER loading the .so ────────────────────────────
-# Fake-kernel registration in index_range_meta.py / lookup_meta.py now succeeds
-# because the INFERENCE_EMB operators already exist in the dispatcher.
-try:
-    import dynamicemb
-    import dynamicemb.index_range_meta as _index_range_meta
-    import dynamicemb.lookup_meta as _lookup_meta
-    from dynamicemb.scored_hashtable import ScorePolicy
-
-    # If the .so was loaded after a previous (failed) import of dynamicemb
-    # (e.g. from another module), re-trigger fake-kernel registration now.
-    if _ops_loaded:
-        if not _index_range_meta.REGISTERED:
-            _index_range_meta.register_index_range_fake()
-        if not _lookup_meta.REGISTERED:
-            _lookup_meta.register_lookup_fake()
-except ImportError:
-    pass
+from inference_embedding_impl import (
+    AOTI_MODEL_PATH,
+    BatchedDynamicEmbeddingTablesV2,
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
+    DynamicEmbPoolingMode,
+    DynamicEmbScoreStrategy,
+    DynamicEmbTableOptions,
+    InferenceEmbeddingTable,
+    ScorePolicy,
+    _load_inference_emb_ops,
+    encode_checkpoint_file_path,
+    encode_meta_json_file_path,
+)
 
 
-def _load_inference_emb_ops() -> bool:
-    """Return whether inference_emb_ops.so was successfully loaded at module init.
+def _ensure_single_process_group() -> Optional[str]:
+    if dist.is_initialized():
+        return None
 
-    The library is loaded eagerly at module level (before dynamicemb import) so
-    that fake-kernel registration inside dynamicemb succeeds without warnings.
-    This function is kept for use in main() to report the load status.
-    """
-    return _ops_loaded
-
-
-class InferenceLinearBucketTable(torch.nn.Module):
-    """Simple exportable hash table wrapper for inference lookup using custom op.
-    
-    This is a minimal demo version that focuses on lookup-only, non-pooled inference.
-    For the full production version, see LinearBucketTable in scored_hashtable.py.
-    """
-
-    def __init__(
-        self,
-        capacity: List[int],
-        key_type: torch.dtype = torch.int64,
-        bucket_capacity: int = 128,
-        device: Optional[torch.device] = None,
-    ):
-        """Initialize demo hash table.
-        
-        Args:
-            capacity: List of per-table capacities
-            key_type: torch.int64 or torch.uint64
-            bucket_capacity: slots per bucket
-            device: CUDA device (defaults to current)
-        """
-        super().__init__()
-        
-        if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        
-        self.device = device
-        self.key_type_ = key_type
-        self.bucket_capacity_ = bucket_capacity
-        
-        # For this demo: assume single table or fixed small number
-        self.num_tables_ = len(capacity)
-        
-        # Compute bucket layout
-        per_table_num_buckets = []
-        bucket_offset_list = [0]
-        for cap in capacity:
-            nb = (cap + bucket_capacity - 1) // bucket_capacity
-            per_table_num_buckets.append(nb)
-            bucket_offset_list.append(bucket_offset_list[-1] + nb)
-        
-        total_buckets = bucket_offset_list[-1]
-        
-        # For demo: single score type (int64), key, and digest
-        # Storage layout: [key, digest, score] repeated
-        bytes_per_slot = 8 + 1 + 8  # key (int64) + digest (uint8) + score (int64)
-        total_storage_bytes = bytes_per_slot * bucket_capacity * total_buckets
-        
-        # Register as buffers so they move with the module
-        self.register_buffer(
-            "table_storage_",
-            torch.zeros(total_storage_bytes, dtype=torch.uint8, device=device)
-        )
-        self.register_buffer(
-            "table_bucket_offsets_",
-            torch.tensor(bucket_offset_list, dtype=torch.int64, device=device)
-        )
-        
-        # Demo: bucket sizes counter (for tracking)
-        self.register_buffer(
-            "bucket_sizes",
-            torch.zeros(total_buckets, dtype=torch.int32, device=device)
-        )
-        
-        # Note: For a full implementation, would also initialize keys with empty marker,
-        # but for this eval-only demo we assume the table is pre-populated or the
-        # lookup custom op handles empty gracefully.
-    
-    def lookup(
-        self,
-        keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        score_value: Optional[torch.Tensor] = None,
-        score_policy: int = int(ScorePolicy.CONST),
-    ) -> tuple:
-        """Lookup keys in the hash table using the custom operator.
-        
-        Args:
-            keys: (num_keys,) int64 or uint64 keys to lookup
-            table_ids: (num_keys,) int64 table IDs for each key
-            score_value: Optional score input (required for Assign/Accumulate policies)
-            score_policy: ScorePolicy enum as int
-        
-        Returns:
-            (score_out, founds, indices): 
-                - score_out: (num_keys,) int64 output scores
-                - founds: (num_keys,) bool whether key was found
-                - indices: (num_keys,) int64 indices into the table
-        """
-        # Call the custom operator through torch.ops
-        score_out, founds, indices = torch.ops.INFERENCE_EMB.table_lookup(
-            self.table_storage_,
-            self.table_bucket_offsets_,
-            self.bucket_capacity_,
-            keys,
-            table_ids,
-            score_value,
-            score_policy,
-            None,  # ovf_storage
-            0,     # ovf_bucket_capacity
-            None,  # ovf_output_offsets
-        )
-        
-        return score_out, founds, indices
-
-
-class InferenceEmbeddingTable(torch.nn.Module):
-    """Simplified, export-compatible embedding table using custom ops.
-    
-    This demo version:
-    - Supports lookup-only inference (no pooling/averaging)
-    - Uses three INFERENCE_EMB custom operators
-    - Registers all persistent state as buffers for torch.export compatibility
-    - Avoids graph breaks (no .cpu(), .item(), dynamic control flow on tensor values)
-    """
-
-    def __init__(
-        self,
-        feature_offsets: List[int],  # Feature boundaries in table-space
-        num_tables: int = 1,
-        capacity_per_table: int = 1000,
-        key_type: torch.dtype = torch.int64,
-        device: Optional[torch.device] = None,
-    ):
-        """Initialize demo embedding table.
-        
-        Args:
-            feature_offsets: List of offsets marking feature boundaries
-                e.g., [0, 128, 256] means 2 features with sizes 128 and 128
-            num_tables: Number of logical hash tables
-            capacity_per_table: Capacity per table
-            key_type: torch.int64 or torch.uint64
-            device: CUDA device
-        """
-        super().__init__()
-        
-        if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        
-        self.device = device
-        self.num_tables_ = num_tables
-        self.key_type_ = key_type
-        
-        # Feature offsets: boundaries in the embedding space
-        self.register_buffer(
-            "feature_offsets",
-            torch.tensor(feature_offsets, dtype=torch.int64, device=device)
-        )
-        
-        # Create hash tables for each logical table
-        capacities = [capacity_per_table] * num_tables
-        self.hash_table = InferenceLinearBucketTable(
-            capacity=capacities,
-            key_type=key_type,
-            bucket_capacity=128,
-            device=device,
-        )
-        
-        # For demo: linear memory table (simple embedding vectors)
-        # Assume 128-dim embeddings
-        embedding_dim = 128
-        total_embedding_rows = sum(feature_offsets[i + 1] - feature_offsets[i] 
-                                    for i in range(len(feature_offsets) - 1))
-        
-        linear_mem_table = torch.randn(
-            total_embedding_rows, embedding_dim, dtype=torch.float32, device=device
-        )
-        self.register_buffer("linear_mem_table", linear_mem_table)
-    
-    def forward(
-        self,
-        indices: torch.Tensor,  # (batch_size,) indices to lookup
-        offsets: torch.Tensor,  # (num_features + 1,) batch offsets for pooling
-    ) -> torch.Tensor:
-        """Forward pass using INFERENCE_EMB custom operators.
-        
-        This demo does eval-only, lookup-only inference (no pooling).
-        
-        Args:
-            indices: (total_lookups,) int64 feature IDs to lookup
-            offsets: (num_features + 1,) int64 offsets into indices
-        
-        Returns:
-            embeddings: (total_lookups, embedding_dim) float32 embedding vectors
-        """
-        # Step 1: Get table ranges (which table each feature belongs to)
-        # get_table_range(offsets, feature_offsets) -> (num_features, 2)
-        # Each row [start, end] indicates the table-space range for that feature
-        table_ranges = torch.ops.INFERENCE_EMB.get_table_range(
-            offsets, self.feature_offsets
-        )  # (num_features, 2)
-        
-        # Step 2: Expand table IDs from offsets
-        # expand_table_ids(offsets, table_offsets, num_tables, local_batch_size, num_elements)
-        # Returns (num_elements,) int64 table_ids indicating which table each element belongs to
-        num_features = offsets.shape[0] - 1
-        num_elements = indices.shape[0]
-        
-        # Prepare table_offsets_in_feature: where in feature space each table starts
-        table_offsets = torch.arange(
-            num_features + 1, dtype=torch.int64, device=self.device
-        )
-        
-        table_ids = torch.ops.INFERENCE_EMB.expand_table_ids(
-            offsets,
-            table_offsets,
-            self.num_tables_,
-            num_features,
-            num_elements,
-        )  # (num_elements,)
-        
-        # Step 3: Lookup in hash table
-        # table_lookup returns (score, found, indices_in_table)
-        scores, founds, table_indices = self.hash_table.lookup(
-            keys=indices,
-            table_ids=table_ids,
-            score_value=None,
-            score_policy=int(ScorePolicy.CONST),
-        )  # each (num_elements,)
-        
-        # Step 4: Gather embeddings using table indices
-        # For demo: use table_indices as direct row indices in linear_mem_table
-        embeddings = torch.index_select(
-            self.linear_mem_table, 0, table_indices
-        )  # (num_elements, embedding_dim)
-        
-        # For unfound items, zero out the embedding
-        # embeddings = torch.where(
-        #     founds.unsqueeze(-1),  # (num_elements, 1) broadcast
-        #     embeddings,  # (num_elements, embedding_dim)
-        #     torch.zeros_like(embeddings),  # (num_elements, embedding_dim)
-        # )
-        
-        return embeddings
-
-
-def test_eager_forward():
-    """Test forward pass in eager mode."""
-    print("\n=== Test Eager Forward ===")
-    
-    # Create module
-    feature_offsets = [0, 128, 256]
-    table = InferenceEmbeddingTable(
-        feature_offsets=feature_offsets,
-        num_tables=2,
-        capacity_per_table=1000,
+    init_dir = tempfile.mkdtemp(prefix="dynamicemb_pg_")
+    init_method = f"file://{os.path.join(init_dir, 'init')}"
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=0,
+        world_size=1,
     )
-    table.eval()
-    
-    # Create dummy input
-    # indices: (4,) feature IDs
-    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64).cuda()
-    # offsets: (3,) marking 2 features: [0, 2, 4]
-    # meaning feature 0 has 2 items (indices[0:2]), feature 1 has 2 items (indices[2:4])
-    offsets = torch.tensor([0, 2, 4], dtype=torch.int64).cuda()
-    
-    # Forward
-    with torch.no_grad():
-        embeddings = table(indices, offsets)
-    
-    print(f"Input indices shape: {indices.shape}")
-    print(f"Input offsets shape: {offsets.shape}")
-    print(f"Output embeddings shape: {embeddings.shape}")
-    print(f"Output embeddings dtype: {embeddings.dtype}")
-    
-    assert embeddings.shape == (4, 128), f"Expected (4, 128), got {embeddings.shape}"
-    assert embeddings.dtype == torch.float32
-    print("✓ Eager forward test passed")
+    return init_dir
+
+
+def _cleanup_single_process_group(init_dir: Optional[str]) -> None:
+    if init_dir is None:
+        return
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    try:
+        os.rmdir(init_dir)
+    except OSError:
+        pass
+
+
+def _build_e2e_batched_tables(
+    table_names: List[str],
+    capacity_list: List[int],
+    embedding_dim: int,
+    device: torch.device,
+) -> "BatchedDynamicEmbeddingTablesV2":
+    local_hbm_for_values = 1024**3
+    table_options = [
+        DynamicEmbTableOptions(
+            training=False,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            dim=embedding_dim,
+            init_capacity=capacity,
+            max_capacity=capacity,
+            bucket_capacity=128,
+            score_strategy=DynamicEmbScoreStrategy.STEP,
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT,
+                value=0.0,
+            ),
+            local_hbm_for_values=local_hbm_for_values,
+            device_id=device.index,
+        )
+        for capacity in capacity_list
+    ]
+
+    return BatchedDynamicEmbeddingTablesV2(
+        table_options=table_options,
+        table_names=table_names,
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        output_dtype=torch.float32,
+        device=device,
+    )
+
+
+def _make_expected_payload(
+    table_id: int,
+    num_embeddings: int,
+    embedding_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    base_key = (table_id + 1) * 100000
+    keys = torch.arange(base_key, base_key + num_embeddings, device=device).to(torch.int64)
+
+    feature_axis = torch.arange(embedding_dim, device=device, dtype=torch.float32)
+    embeddings = (
+        keys.to(torch.float32).unsqueeze(1) * 0.001
+        + feature_axis.unsqueeze(0) * 0.01
+        + float(table_id)
+    ).contiguous()
+    scores = torch.arange(
+        1000 + table_id * 100,
+        1000 + table_id * 100 + num_embeddings,
+    ).to(dtype=torch.uint64, device=device)
+    return keys, embeddings, scores
+
+
+def _unwrap_single_output(output):
+    if isinstance(output, (tuple, list)):
+        if len(output) != 1:
+            raise RuntimeError(
+                f"Expected a single output from the packaged model, got {len(output)}"
+            )
+        return output[0]
+    return output
+
+
+def _save_tensor_cpp_compatible(tensor: torch.Tensor, path: str) -> None:
+    """Save a tensor in TorchScript zip format loadable by torch::jit::load() in C++.
+
+    ``torch.save(tensor, path)`` uses Python pickle format which is NOT compatible
+    with C++'s ``torch::load(tensor, path)`` / ``torch::serialize::InputArchive``.
+    Wrapping the tensor as a registered buffer in a scripted nn.Module and calling
+    ``torch.jit.save`` produces the TorchScript zip archive that C++ expects.
+    """
+
+    class _TensorHolder(torch.nn.Module):
+        def __init__(self, t: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("tensor", t)
+
+        def forward(self) -> torch.Tensor:
+            return self.tensor  # type: ignore[return-value]
+
+    holder = torch.jit.script(_TensorHolder(tensor.cpu().contiguous()))
+    torch.jit.save(holder, path)
 
 
 def test_torch_export():
-    """Test torch.export compatibility (smoke test)."""
-    print("\n=== Test Torch Export ===")
-    
-    feature_offsets = [0, 128, 256]
-    table = InferenceEmbeddingTable(
-        feature_offsets=feature_offsets,
-        num_tables=2,
-        capacity_per_table=1000,
-    )
-    table.eval()
-    
-    # Create example inputs for export
-    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64).cuda()
-    offsets = torch.tensor([0, 2, 4], dtype=torch.int64).cuda()
-    
-    try:
-        # Attempt to export the model
-        exported = torch.export.export(table, (indices, offsets))
-        print(f"✓ torch.export succeeded")
-        print(f"  Exported module nodes: {len(list(exported.graph.nodes))}")
-        
-        # Verify exported module runs
-        exported_result = exported.module()(indices, offsets)
-        print(f"  Exported forward output shape: {exported_result.shape}")
-        
-    except Exception as e:
-        # Expected for now if custom ops not available or not exportable
-        print(f"⚠ torch.export raised (expected if custom ops unavailable): {type(e).__name__}")
-        if "INFERENCE_EMB" in str(e) or "custom" in str(e).lower():
-            print(f"  Note: This is expected if torch.ops.INFERENCE_EMB is not registered")
-            print(f"  Make sure inference_emb_ops.so is built and loaded")
-        else:
-            print(f"  Error detail: {e}")
+    """Test torch.export + AOTInductor package generation."""
+    if not _load_inference_emb_ops():
+        raise RuntimeError("inference_emb_ops.so must be loaded before running AOTInductor export")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this AOTInductor demo export")
 
+    with torch.no_grad():
+        print("\n=== Test Torch Export ===")
+
+        feature_table_map = [0, 1]
+        table = InferenceEmbeddingTable(
+            table_options=[
+                DynamicEmbTableOptions(init_capacity=128, max_capacity=128, dim=128, embedding_dtype=torch.float32),
+                DynamicEmbTableOptions(init_capacity=128, max_capacity=128, dim=128, embedding_dtype=torch.float32),
+            ],
+            feature_table_map=feature_table_map,
+        )
+        table.eval()
+
+        # Keep the exported shapes fixed so the C++ demo can feed the exact same
+        # size/dtype/stride inputs as recommended by the AOTInductor docs.
+        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device="cuda")
+        offsets = torch.tensor([0, 2, 4], dtype=torch.int64, device="cuda")
+        eager_output = table(indices, offsets)
+
+        os.makedirs(os.path.dirname(AOTI_MODEL_PATH), exist_ok=True)
+        if os.path.exists(AOTI_MODEL_PATH):
+            os.remove(AOTI_MODEL_PATH)
+
+        exported = torch.export.export(table, (indices, offsets), dynamic_shapes={ "indices": {0: torch.export.dynamic_shapes.Dim.AUTO,}, "offsets": {0: torch.export.dynamic_shapes.Dim.AUTO,} })
+        print("✓ torch.export succeeded")
+        print(f"  Exported module nodes: {len(list(exported.graph.nodes))}")
+
+        output_path = torch._inductor.aoti_compile_and_package(
+            exported,
+            package_path=AOTI_MODEL_PATH,
+        )
+        print(f"✓ AOTInductor package generated at: {output_path}")
+
+        compiled_model = torch._inductor.aoti_load_package(output_path)
+        compiled_output = _unwrap_single_output(compiled_model(indices, offsets))
+        torch.testing.assert_close(compiled_output, eager_output)
+        print(f"✓ Loaded packaged model and verified output shape: {compiled_output.shape}")
+
+
+def test_inference_emb():
+    if not _load_inference_emb_ops():
+        raise RuntimeError("inference_emb_ops.so must be loaded before running the E2E load test")
+    if "BatchedDynamicEmbeddingTablesV2" not in globals():
+        raise RuntimeError("dynamicemb imports are unavailable for the E2E load test")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for the E2E load test")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda", torch.cuda.current_device())
+    embedding_dim = 128
+    dump_root_dir = os.path.join(
+        os.path.dirname(__file__),
+        "inference_emb_dump",
+    )
+
+    if os.path.exists(dump_root_dir):
+        if os.path.isdir(dump_root_dir):
+            shutil.rmtree(dump_root_dir)
+        else:
+            os.remove(dump_root_dir)
+    os.makedirs(dump_root_dir, exist_ok=True)
+
+    for num_tables, counts in ((2, [200, 260]), (3, [120, 240, 360])):
+        table_names = [f"table_{i}" for i in range(num_tables)]
+        capacity_list = [512 for _ in range(num_tables)]
+        save_dir = os.path.join(dump_root_dir, f"num_tables_{num_tables}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        batched_tables = _build_e2e_batched_tables(
+            table_names,
+            capacity_list,
+            embedding_dim,
+            device,
+        )
+
+        expected_payloads = []
+        for table_id, num_embeddings in enumerate(counts):
+            keys, embeddings, scores = _make_expected_payload(
+                table_id,
+                num_embeddings,
+                embedding_dim,
+                device,
+            )
+            table_ids = torch.full(
+                (num_embeddings,),
+                table_id,
+                dtype=torch.int64,
+                device=device,
+            )
+            batched_tables.tables.insert(keys, table_ids, embeddings, scores)
+            expected_payloads.append((keys, embeddings, scores))
+
+        feature_table_map = list(range(num_tables))
+
+        pg_init_dir = _ensure_single_process_group()
+        try:
+            batched_tables.dump(
+                save_dir,
+                optim=False,
+                counter=False,
+                table_names=table_names,
+            )
+
+            for table_name in table_names:
+                meta_path = encode_meta_json_file_path(save_dir, table_name)
+                key_path = encode_checkpoint_file_path(
+                    save_dir, table_name, 0, 1, "keys"
+                )
+                value_path = encode_checkpoint_file_path(
+                    save_dir, table_name, 0, 1, "values"
+                )
+                score_path = encode_checkpoint_file_path(
+                    save_dir, table_name, 0, 1, "scores"
+                )
+                assert os.path.exists(meta_path), f"Missing meta file: {meta_path}"
+                assert os.path.exists(key_path), f"Missing key file: {key_path}"
+                assert os.path.exists(value_path), f"Missing value file: {value_path}"
+                assert os.path.exists(score_path), f"Missing score file: {score_path}"
+                assert os.path.getsize(key_path) > 0, f"Empty key file: {key_path}"
+                assert os.path.getsize(value_path) > 0, f"Empty value file: {value_path}"
+                assert os.path.getsize(score_path) > 0, f"Empty score file: {score_path}"
+
+            inference_table = InferenceEmbeddingTable(
+                table_options=[
+                    DynamicEmbTableOptions(
+                        init_capacity=cap,
+                        max_capacity=cap,
+                        dim=embedding_dim,
+                        embedding_dtype=torch.float32,
+                    )
+                    for cap in capacity_list
+                ],
+                table_names=table_names,
+                feature_table_map=feature_table_map,
+                device=device,
+            )
+            inference_table.load(save_dir, table_names=table_names)
+            print("✓ Checkpoint load completed without error")
+
+            lookup_keys = torch.cat(
+                [payload[0] for payload in expected_payloads],
+                dim=0,
+            )
+            expected_lookup_embeddings = torch.cat(
+                [payload[1] for payload in expected_payloads],
+                dim=0,
+            )
+            lookup_offsets_list = [0]
+            for keys, _embeddings, _scores in expected_payloads:
+                lookup_offsets_list.append(lookup_offsets_list[-1] + keys.numel())
+            lookup_offsets = torch.tensor(
+                lookup_offsets_list,
+                dtype=torch.int64,
+                device=device,
+            )
+
+            eager_e2e_output = inference_table(lookup_keys, lookup_offsets)
+            torch.testing.assert_close(eager_e2e_output, expected_lookup_embeddings)
+
+            keys_tensor_path = os.path.join(save_dir, "keys.pt")
+            offsets_tensor_path = os.path.join(save_dir, "offsets.pt")
+            embeddings_tensor_path = os.path.join(save_dir, "embeddings.pt")
+            _save_tensor_cpp_compatible(lookup_keys, keys_tensor_path)
+            _save_tensor_cpp_compatible(lookup_offsets, offsets_tensor_path)
+            _save_tensor_cpp_compatible(expected_lookup_embeddings, embeddings_tensor_path)
+
+            aoti_model_path = os.path.join(save_dir, "model.pt2")
+            if os.path.exists(aoti_model_path):
+                os.remove(aoti_model_path)
+
+            exported = torch.export.export(
+                inference_table,
+                (lookup_keys, lookup_offsets),
+                dynamic_shapes={
+                    "indices": {0: torch.export.dynamic_shapes.Dim.AUTO,},
+                    "offsets": {0: torch.export.dynamic_shapes.Dim.AUTO,},
+                },
+            )
+            aoti_output_path = torch._inductor.aoti_compile_and_package(
+                exported,
+                package_path=aoti_model_path,
+            )
+            compiled_model = torch._inductor.aoti_load_package(aoti_output_path)
+            compiled_output = _unwrap_single_output(
+                compiled_model(lookup_keys, lookup_offsets)
+            )
+            torch.testing.assert_close(compiled_output, expected_lookup_embeddings)
+            print(
+                "✓ AOTInductor package generated and validated for "
+                f"{table_names}: {aoti_output_path}"
+            )
+            print(
+                "✓ Saved C++ comparison tensors: "
+                f"{keys_tensor_path}, {offsets_tensor_path}, {embeddings_tensor_path}"
+            )
+
+            for table_id, table_name in enumerate(table_names):
+                keys, expected_embeddings, expected_scores = expected_payloads[table_id]
+                table_ids = torch.full(
+                    (keys.numel(),),
+                    table_id,
+                    dtype=torch.int64,
+                    device=device,
+                )
+
+                loaded_scores, founds, indices = inference_table.hash_table.lookup(
+                    keys=keys,
+                    table_ids=table_ids,
+                    score_value=None,
+                    score_policy=int(ScorePolicy.CONST),
+                )
+                assert torch.all(founds), f"Missing loaded keys for {table_name}"
+                indices += inference_table.table_offsets_[table_id]  # Adjust indices by table offset
+
+                loaded_embeddings = torch.index_select(
+                    inference_table.linear_mem_table_,
+                    0,
+                    indices.to(torch.int64),
+                )
+                torch.testing.assert_close(loaded_embeddings, expected_embeddings)
+                torch.testing.assert_close(
+                    loaded_scores.to(torch.uint64),
+                    expected_scores,
+                )
+
+                negative_keys = keys + 9000000
+                _, negative_founds, _ = inference_table.hash_table.lookup(
+                    keys=negative_keys,
+                    table_ids=table_ids,
+                    score_value=None,
+                    score_policy=int(ScorePolicy.CONST),
+                )
+                assert not torch.any(
+                    negative_founds
+                ), f"Unexpected lookup hit for unseen keys in {table_name}"
+        finally:
+            _cleanup_single_process_group(pg_init_dir)
+
+    print(f"✓ Kept dumped checkpoint files under: {dump_root_dir}")
+    
 
 def main():
     """Run all tests."""
     print("=" * 60)
     print("Test Export Demo: INFERENCE_EMB Custom Operators")
     print("=" * 60)
-    
-    # Try to load custom operators
-    ops_loaded = _load_inference_emb_ops()
-    if not ops_loaded:
-        print("[WARN] Custom operators not loaded; tests will demonstrate structure only")
-    
-    # Run tests
-    try:
-        test_eager_forward()
-    except Exception as e:
-        print(f"✗ test_eager_forward failed: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    try:
-        test_torch_export()
-    except Exception as e:
-        print(f"✗ test_torch_export failed: {e}")
-        import traceback
-        traceback.print_exc()
+
+    test_inference_emb()
     
     print("\n" + "=" * 60)
     print("Tests completed")
