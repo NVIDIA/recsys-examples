@@ -42,9 +42,6 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from torch import distributed as dist
-from torch.distributed.optim import (
-    _apply_optimizer_in_backward as apply_optimizer_in_backward,
-)
 from torch.optim.optimizer import Optimizer
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
@@ -235,11 +232,6 @@ def apply_dmp(
     data_parallel_embedding_module_names = []
     for k, module in model.named_modules():
         if type(module) in TORCHREC_TYPES:
-            for _, param in module.named_parameters(prefix=k):
-                if param.requires_grad:
-                    apply_optimizer_in_backward(
-                        sparse_opt_cls, [param], sparse_opt_args
-                    )
             eb_configs.extend(module.embedding_configs())
             if DATA_PARALLEL_EMBEDDING_MODULE_NAME in k:
                 data_parallel_embedding_module_names.append(k)
