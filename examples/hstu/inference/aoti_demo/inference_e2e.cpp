@@ -11,20 +11,25 @@
 
 namespace {
 
-bool load_custom_ops_library(const std::string& path) {
+bool load_shared_library(const std::string& label, const std::string& path) {
   void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
   if (handle == nullptr) {
-    std::cerr << "Failed to load custom op library: " << path << std::endl;
+    std::cerr << "Failed to load " << label << ": " << path << std::endl;
     std::cerr << "dlerror(): " << dlerror() << std::endl;
     return false;
   }
-  std::cout << "Loaded custom op library: " << path << std::endl;
+  std::cout << "Loaded " << label << ": " << path << std::endl;
   return true;
 }
 
 std::string infer_default_custom_ops_path(const char* argv0) {
   std::filesystem::path exe_path = std::filesystem::absolute(argv0);
-  return (exe_path.parent_path() / "inference_emb_ops.so").string();
+  return (exe_path.parent_path() / "../lib/inference_emb_ops.so").lexically_normal().string();
+}
+
+std::string infer_default_nve_torch_path(const char* argv0) {
+  std::filesystem::path exe_path = std::filesystem::absolute(argv0);
+  return (exe_path.parent_path() / "../lib/libnve_torch.so").lexically_normal().string();
 }
 
 // Load a tensor saved from Python via _save_tensor_cpp_compatible().
@@ -55,10 +60,15 @@ int main(int argc, char** argv) {
       (argc > 4) ? argv[4] : "embeddings.pt";
   const std::string custom_ops_path =
       (argc > 5) ? argv[5] : infer_default_custom_ops_path(argv[0]);
+  const std::string nve_torch_path =
+      (argc > 6) ? argv[6] : infer_default_nve_torch_path(argv[0]);
 
   try {
-    if (!load_custom_ops_library(custom_ops_path)) {
+    if (!load_shared_library("inference_emb_ops library", custom_ops_path)) {
       return 5;
+    }
+    if (!load_shared_library("nve torch class library", nve_torch_path)) {
+      return 8;
     }
 
     torch::inductor::AOTIModelPackageLoader loader(package_path);
@@ -96,6 +106,7 @@ int main(int argc, char** argv) {
     std::cout << "Loaded keys: " << keys_path << std::endl;
     std::cout << "Loaded offsets: " << offsets_path << std::endl;
     std::cout << "Loaded expected embeddings: " << expected_embeddings_path << std::endl;
+    std::cout << "NVE torch library: " << nve_torch_path << std::endl;
     std::cout << "Output shape: " << output_cpu.sizes() << std::endl;
     std::cout << "First embedding row, first 8 values: "
               << output_cpu[0].slice(/*dim=*/0, /*start=*/0, /*end=*/8) << std::endl;

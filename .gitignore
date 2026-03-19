@@ -44,3 +44,4 @@ results/
 .SKILLS/
 examples/hstu/inference/cpp_runtime_demo/build*
 **/torch_binding_build/**
+examples/hstu/inference/inference_emb_dump/

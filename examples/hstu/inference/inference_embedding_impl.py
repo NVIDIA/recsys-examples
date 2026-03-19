@@ -14,27 +14,25 @@ from typing import List, Optional
 
 import torch
 
+_AOTI_DEMO_LIB_DIR = os.path.join(os.path.dirname(__file__), "aoti_demo", "lib")
+
 _SEARCH_PATHS = [
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../corelib/dynamicemb/torch_binding_build/inference_emb_ops.so",
-    ),
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../corelib/dynamicemb/build_inference_ops_check/inference_emb_ops.so",
-    ),
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../corelib/dynamicemb/build/inference_emb_ops.so",
-    ),
+    os.path.join(_AOTI_DEMO_LIB_DIR, "inference_emb_ops.so"),
+    os.path.join("aoti_demo", "lib", "inference_emb_ops.so"),
     "inference_emb_ops.so",
 ]
 
-AOTI_DEMO_DIR = os.path.join(os.path.dirname(__file__), "aoti_demo")
-AOTI_MODEL_PATH = os.path.join(AOTI_DEMO_DIR, "model.pt2")
+_NVE_TORCH_SEARCH_PATHS = [
+    os.path.join(_AOTI_DEMO_LIB_DIR, "libnve_torch.so"),
+    os.path.join("aoti_demo", "lib", "libnve_torch.so"),
+    "libnve_torch.so",
+]
 
 _ops_loaded: bool = False
 _ops_load_attempted: bool = False
+_nve_torch_loaded: bool = False
+_nve_torch_load_attempted: bool = False
+_nve_fake_class_registered: bool = False
 
 
 def _load_inference_emb_ops() -> bool:
@@ -61,6 +59,75 @@ def _load_inference_emb_ops() -> bool:
         print("[WARN] Could not find inference_emb_ops.so. Custom ops may not be available.")
 
     return _ops_loaded
+
+
+def _register_nve_fake_class() -> None:
+    """Register fake class for nve::LinearUVMEmbedding once."""
+    global _nve_fake_class_registered
+
+    if _nve_fake_class_registered:
+        return
+
+    @torch._library.register_fake_class("nve::LinearUVMEmbedding")
+    class _FakeLinearUVMEmbedding:
+        def __init__(
+            self,
+            weight,
+            embedding_dim,
+            num_embeddings,
+            dtype,
+            gpu_cache_size,
+            use_private_stream,
+            device_id,
+        ):
+            self.weight = weight
+            self.embedding_dim = int(embedding_dim)
+            self.num_embeddings = int(num_embeddings)
+            self.dtype = int(dtype)
+            self.gpu_cache_size = int(gpu_cache_size)
+            self.use_private_stream = bool(use_private_stream)
+            self.device_id = int(device_id)
+
+        @classmethod
+        def __obj_unflatten__(cls, flattened_embedding):
+            return cls(**dict(flattened_embedding))
+
+        def lookup(self, indices):
+            return torch.empty(
+                indices.size(0),
+                self.embedding_dim,
+                dtype=self.weight.dtype,
+                device=indices.device,
+            )
+
+    _nve_fake_class_registered = True
+
+
+def _load_nve_torch_bindings() -> bool:
+    """Load libnve_torch.so once and register fake class for export."""
+    global _nve_torch_loaded, _nve_torch_load_attempted
+
+    if _nve_torch_loaded:
+        return True
+    if _nve_torch_load_attempted:
+        return False
+
+    _nve_torch_load_attempted = True
+    for _path in _NVE_TORCH_SEARCH_PATHS:
+        if os.path.exists(_path):
+            try:
+                torch.classes.load_library(_path)
+                print(f"[INFO] Loaded libnve_torch.so from {_path}")
+                _register_nve_fake_class()
+                _nve_torch_loaded = True
+            except Exception as _e:
+                print(f"[WARN] Failed to load {_path}: {_e}")
+            break
+
+    if not _nve_torch_loaded:
+        print("[WARN] Could not find libnve_torch.so. NVE torch classes are unavailable.")
+
+    return _nve_torch_loaded
 
 
 # Load operators before importing dynamicemb.
@@ -98,8 +165,7 @@ except ImportError:
 
 __all__ = [
     "_load_inference_emb_ops",
-    "AOTI_DEMO_DIR",
-    "AOTI_MODEL_PATH",
+    "_load_nve_torch_bindings",
     "InferenceLinearBucketTable",
     "InferenceEmbeddingTable",
     "DynamicEmbInitializerArgs",
@@ -131,6 +197,37 @@ def _resolve_capacity(opt: "DynamicEmbTableOptions") -> int:
             "Each table option must provide init_capacity or max_capacity > 0"
         )
     return int(cap)
+
+
+def _resolve_embedding_dim(table_options: List["DynamicEmbTableOptions"]) -> int:
+    dims = {int(opt.dim) for opt in table_options if opt.dim is not None}
+    if len(dims) != 1:
+        raise ValueError(
+            "InferenceEmbeddingTable requires exactly one shared embedding dim across all table_options"
+        )
+    emb_dim = dims.pop()
+    if emb_dim <= 0:
+        raise ValueError("Embedding dim must be > 0")
+    return emb_dim
+
+
+def _resolve_gpu_cache_size(
+    table_options: List["DynamicEmbTableOptions"],
+    total_size_bytes: int,
+) -> int:
+    values = {int(opt.global_hbm_for_values or 0) for opt in table_options}
+    if len(values) != 1:
+        raise ValueError(
+            "All table_options must have the same global_hbm_for_values for NVE inference table"
+        )
+    gpu_cache_size = values.pop()
+    if gpu_cache_size <= 0:
+        gpu_cache_size = int(total_size_bytes)
+        print(
+            "[INFO] global_hbm_for_values is 0 for all tables; "
+            f"using fallback gpu_cache_size={gpu_cache_size}"
+        )
+    return gpu_cache_size
 
 
 
@@ -250,12 +347,19 @@ class InferenceEmbeddingTable(torch.nn.Module):
     ):
         super().__init__()
 
+        if not _load_nve_torch_bindings():
+            raise RuntimeError(
+                "libnve_torch.so must be loaded before constructing InferenceEmbeddingTable"
+            )
+
         if not table_options:
             raise ValueError("table_options must be non-empty")
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if key_type not in (torch.int64, torch.uint64):
             raise ValueError(f"unsupported key_type: {key_type}")
+        if output_dtype not in (torch.float32, torch.float16):
+            raise ValueError(f"unsupported output_dtype: {output_dtype}")
 
         capacities = [_resolve_capacity(opt) for opt in table_options]
         num_tables = len(table_options)
@@ -307,11 +411,28 @@ class InferenceEmbeddingTable(torch.nn.Module):
             device=device,
         )
 
-        emb_dim = 128
+        self.emb_dim_ = _resolve_embedding_dim(table_options)
         total_rows = int(self.capacity_list_.sum().item())
-        self.register_buffer(
-            "linear_mem_table_",
-            torch.zeros(total_rows, emb_dim, dtype=torch.float32, device=device),
+        dtype_size = torch.finfo(output_dtype).bits // 8
+        total_size_bytes = total_rows * self.emb_dim_ * dtype_size
+        self.gpu_cache_size_ = _resolve_gpu_cache_size(table_options, total_size_bytes)
+
+        nve_mem_block_ = torch.classes.nve.MemBlock.create_linear_from_size(
+            int(total_size_bytes)
+        )
+        nve_config_ = torch.classes.nve.EmbedLayerConfig()
+        nve_config_.logging_interval = -1
+        nve_config_.kernel_mode = 0
+
+        self.nve_embedding_ = torch.classes.nve.LinearUVMEmbedding(
+            self.emb_dim_,
+            total_rows,
+            output_dtype,
+            nve_mem_block_,
+            int(self.gpu_cache_size_),
+            True,
+            int(device.index if device.index is not None else 0),
+            nve_config_,
         )
 
     def load(
@@ -331,13 +452,14 @@ class InferenceEmbeddingTable(torch.nn.Module):
             table_names = self.table_names_
 
         requested_table_names = set(table_names)
-        dim = self.linear_mem_table_.size(1)
+        dim = self.emb_dim_
         device = self.device
+        weight = self.nve_embedding_.get_weight_tensor()
 
         self.hash_table.table_storage_.zero_()
         self.hash_table.bucket_sizes.zero_()
         self.hash_table._ref_counter.zero_()
-        self.linear_mem_table_.zero_()
+        weight.zero_()
 
         for table_id, table_name in enumerate(self.table_names_):
             if table_name not in requested_table_names:
@@ -423,15 +545,14 @@ class InferenceEmbeddingTable(torch.nn.Module):
                     table_cap = int(self.capacity_list_[table_id].item())
                     if max_index >= table_cap:
                         raise RuntimeError(
-                            f"linear_mem_table_ has insufficient rows ({table_cap}) for loaded index {max_index}."
+                            f"nve_embedding has insufficient rows ({table_cap}) for loaded index {max_index}."
                         )
 
-                    self.linear_mem_table_[
-                        self.table_offsets_[table_id] : self.table_offsets_[table_id + 1]
-                    ].index_copy_(
+                    abs_indices = valid_indices + self.table_offsets_[table_id]
+                    weight.index_copy_(
                         0,
-                        valid_indices,
-                        embeddings[valid_mask].to(self.linear_mem_table_.dtype),
+                        abs_indices.to(torch.int64),
+                        embeddings[valid_mask].to(weight.dtype),
                     )
 
     def forward(
@@ -453,17 +574,9 @@ class InferenceEmbeddingTable(torch.nn.Module):
         )
 
         global_table_offsets = torch.index_select(self.table_offsets_, 0, table_ids)
-        table_indices = table_indices + global_table_offsets
-
-        safe_table_indices = torch.where(
+        table_indices = torch.where(
             _founds,
+            table_indices + global_table_offsets,
             table_indices,
-            torch.zeros_like(table_indices),
         )
-        embeddings = torch.index_select(self.linear_mem_table_, 0, safe_table_indices)
-        embeddings = torch.where(
-            _founds.unsqueeze(-1),
-            embeddings,
-            torch.zeros_like(embeddings),
-        )
-        return embeddings
+        return self.nve_embedding_.lookup(table_indices)

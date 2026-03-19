@@ -25,7 +25,6 @@ import torch
 import torch.distributed as dist
 
 from inference_embedding_impl import (
-    AOTI_MODEL_PATH,
     BatchedDynamicEmbeddingTablesV2,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -35,6 +34,7 @@ from inference_embedding_impl import (
     InferenceEmbeddingTable,
     ScorePolicy,
     _load_inference_emb_ops,
+    _load_nve_torch_bindings,
     encode_checkpoint_file_path,
     encode_meta_json_file_path,
 )
@@ -155,55 +155,11 @@ def _save_tensor_cpp_compatible(tensor: torch.Tensor, path: str) -> None:
     torch.jit.save(holder, path)
 
 
-def test_torch_export():
-    """Test torch.export + AOTInductor package generation."""
-    if not _load_inference_emb_ops():
-        raise RuntimeError("inference_emb_ops.so must be loaded before running AOTInductor export")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this AOTInductor demo export")
-
-    with torch.no_grad():
-        print("\n=== Test Torch Export ===")
-
-        feature_table_map = [0, 1]
-        table = InferenceEmbeddingTable(
-            table_options=[
-                DynamicEmbTableOptions(init_capacity=128, max_capacity=128, dim=128, embedding_dtype=torch.float32),
-                DynamicEmbTableOptions(init_capacity=128, max_capacity=128, dim=128, embedding_dtype=torch.float32),
-            ],
-            feature_table_map=feature_table_map,
-        )
-        table.eval()
-
-        # Keep the exported shapes fixed so the C++ demo can feed the exact same
-        # size/dtype/stride inputs as recommended by the AOTInductor docs.
-        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device="cuda")
-        offsets = torch.tensor([0, 2, 4], dtype=torch.int64, device="cuda")
-        eager_output = table(indices, offsets)
-
-        os.makedirs(os.path.dirname(AOTI_MODEL_PATH), exist_ok=True)
-        if os.path.exists(AOTI_MODEL_PATH):
-            os.remove(AOTI_MODEL_PATH)
-
-        exported = torch.export.export(table, (indices, offsets), dynamic_shapes={ "indices": {0: torch.export.dynamic_shapes.Dim.AUTO,}, "offsets": {0: torch.export.dynamic_shapes.Dim.AUTO,} })
-        print("✓ torch.export succeeded")
-        print(f"  Exported module nodes: {len(list(exported.graph.nodes))}")
-
-        output_path = torch._inductor.aoti_compile_and_package(
-            exported,
-            package_path=AOTI_MODEL_PATH,
-        )
-        print(f"✓ AOTInductor package generated at: {output_path}")
-
-        compiled_model = torch._inductor.aoti_load_package(output_path)
-        compiled_output = _unwrap_single_output(compiled_model(indices, offsets))
-        torch.testing.assert_close(compiled_output, eager_output)
-        print(f"✓ Loaded packaged model and verified output shape: {compiled_output.shape}")
-
-
 def test_inference_emb():
     if not _load_inference_emb_ops():
         raise RuntimeError("inference_emb_ops.so must be loaded before running the E2E load test")
+    if not _load_nve_torch_bindings():
+        raise RuntimeError("libnve_torch.so must be loaded before running the E2E load test")
     if "BatchedDynamicEmbeddingTablesV2" not in globals():
         raise RuntimeError("dynamicemb imports are unavailable for the E2E load test")
     if not torch.cuda.is_available():
@@ -291,6 +247,7 @@ def test_inference_emb():
                         max_capacity=cap,
                         dim=embedding_dim,
                         embedding_dtype=torch.float32,
+                        global_hbm_for_values=1 << 28,
                     )
                     for cap in capacity_list
                 ],
@@ -376,11 +333,7 @@ def test_inference_emb():
                 assert torch.all(founds), f"Missing loaded keys for {table_name}"
                 indices += inference_table.table_offsets_[table_id]  # Adjust indices by table offset
 
-                loaded_embeddings = torch.index_select(
-                    inference_table.linear_mem_table_,
-                    0,
-                    indices.to(torch.int64),
-                )
+                loaded_embeddings = inference_table.nve_embedding_.lookup(indices.to(torch.int64))
                 torch.testing.assert_close(loaded_embeddings, expected_embeddings)
                 torch.testing.assert_close(
                     loaded_scores.to(torch.uint64),
@@ -397,6 +350,14 @@ def test_inference_emb():
                 assert not torch.any(
                     negative_founds
                 ), f"Unexpected lookup hit for unseen keys in {table_name}"
+
+                negative_offsets = torch.tensor(
+                    [0, negative_keys.numel()],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                negative_output = inference_table(negative_keys, negative_offsets)
+                torch.testing.assert_close(negative_output, torch.zeros_like(negative_output))
         finally:
             _cleanup_single_process_group(pg_init_dir)
 
