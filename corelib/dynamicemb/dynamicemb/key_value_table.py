@@ -204,9 +204,6 @@ class DynamicEmbeddingTable(
             return
 
         target_capacity = min(self.options.max_capacity, self._capacity * 2)
-        total_memory_need = (
-            target_capacity * self._value_dim * dtype_to_bytes(self._emb_dtype)
-        )
 
         key_index_map = get_scored_table(
             capacity=target_capacity,
@@ -215,17 +212,21 @@ class DynamicEmbeddingTable(
             score_specs=[self.score_policy],
             device=self.device,
         )
+        actual_capacity = key_index_map.capacity()
+        total_memory_need = (
+            actual_capacity * self._value_dim * dtype_to_bytes(self._emb_dtype)
+        )
 
         dev_table = None
         uvm_table = None
 
         if self.options.local_hbm_for_values == 0:
-            uvm_size = target_capacity * self._value_dim
+            uvm_size = actual_capacity * self._value_dim
             uvm_table = get_uvm_tensor(
                 uvm_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
         elif self.options.local_hbm_for_values >= total_memory_need:
-            dev_size = target_capacity * self._value_dim
+            dev_size = actual_capacity * self._value_dim
             dev_table = torch.empty(
                 dev_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
@@ -236,7 +237,7 @@ class DynamicEmbeddingTable(
                 // (self._value_dim * dtype_to_bytes(self._emb_dtype))
                 * self._value_dim
             )
-            uvm_size = target_capacity * self._value_dim - dev_size
+            uvm_size = actual_capacity * self._value_dim - dev_size
             dev_table = torch.empty(
                 dev_size, dtype=self._emb_dtype, device=self.device
             ).view(-1, self._value_dim)
@@ -286,7 +287,7 @@ class DynamicEmbeddingTable(
         self.key_index_map = key_index_map
         self.dev_table = dev_table
         self.uvm_table = uvm_table
-        self._capacity = target_capacity
+        self._capacity = actual_capacity
 
     def find_impl(
         self,
