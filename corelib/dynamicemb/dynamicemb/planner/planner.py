@@ -147,8 +147,6 @@ def _validate_configs(
             math.ceil(tmp_config.num_embeddings / world_size),
             alignment=bucket_cap,
         )
-        if num_aligned_embedding_per_rank < bucket_cap:
-            num_aligned_embedding_per_rank = bucket_cap
 
         tmp_constraint.dynamicemb_options.num_aligned_embedding_per_rank = (
             num_aligned_embedding_per_rank
