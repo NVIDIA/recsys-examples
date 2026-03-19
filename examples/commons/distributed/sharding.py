@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Any, Dict, Tuple, Type, Union
+from typing import Any, Dict, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -42,7 +42,6 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from torch import distributed as dist
-from torch.optim.optimizer import Optimizer
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
@@ -164,7 +163,6 @@ def apply_dmp(
     pipeline_type: str = "native",
 ):
     enable_prefetch_pipeline = pipeline_type == "prefetch"
-    
     assert (
         sparse_optimizer_param.optimizer_str in _optimizer_str_to_optim_type
     ), f"embedding optimizer only support {list(_optimizer_str_to_optim_type.keys())}"
