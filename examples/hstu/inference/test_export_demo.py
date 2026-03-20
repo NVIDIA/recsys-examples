@@ -13,7 +13,7 @@ Limitations (by design for quick demo):
 - CUDA-only, no CPU path
 - inference-only, no insert/evict
 - lookup-only, no other operations
-- non-pooled output shape: (num_indices, embedding_dim)
+- one AOTI artifact per pooling mode (-1/1/2); separate demos provided for non-pooled and sum-pooling
 """
 
 import os
@@ -96,7 +96,6 @@ def _build_e2e_batched_tables(
     return BatchedDynamicEmbeddingTablesV2(
         table_options=table_options,
         table_names=table_names,
-        pooling_mode=DynamicEmbPoolingMode.NONE,
         output_dtype=torch.float32,
         device=device,
     )
@@ -251,6 +250,7 @@ def test_inference_emb():
                     )
                     for cap in capacity_list
                 ],
+                pooling_mode=-1,
                 table_names=table_names,
                 feature_table_map=feature_table_map,
                 device=device,
@@ -293,7 +293,7 @@ def test_inference_emb():
                 inference_table,
                 (lookup_keys, lookup_offsets),
                 dynamic_shapes={
-                    "indices": {0: torch.export.dynamic_shapes.Dim.AUTO,},
+                    "keys": {0: torch.export.dynamic_shapes.Dim.AUTO,},
                     "offsets": {0: torch.export.dynamic_shapes.Dim.AUTO,},
                 },
             )
@@ -364,6 +364,199 @@ def test_inference_emb():
     print(f"✓ Kept dumped checkpoint files under: {dump_root_dir}")
     
 
+def test_inference_emb_pooled_sum():
+    """Test sum pooling export and AOTI compilation.
+
+    Builds an ``InferenceEmbeddingTable`` with ``pooling_mode=1`` (sum), groups
+    loaded keys into 2-key pooling bags, and verifies:
+
+    1. Eager forward output matches the expected element-wise sum of embedding pairs.
+    2. ``torch.export`` succeeds and records a graph containing ``lookup_with_pooling``.
+    3. The AOTI-compiled artifact produces output identical to the eager run.
+
+    Saved artifacts per ``num_tables`` variant (under ``inference_emb_dump_pooled_sum/num_tables_N/``):
+
+    - ``model_pooled_sum.pt2``   – AOTI packaged model
+    - ``keys.pt``                – flat lookup keys (C++ comparison input)
+    - ``offsets.pt``             – per-table CSR boundaries (C++ comparison input)
+    - ``pooling_offsets.pt``     – per-bag CSR boundaries (C++ comparison input)
+    - ``pooled_embeddings.pt``   – expected sum-pooled output (C++ comparison reference)
+    """
+    if not _load_inference_emb_ops():
+        raise RuntimeError(
+            "inference_emb_ops.so must be loaded before running the pooled export test"
+        )
+    if not _load_nve_torch_bindings():
+        raise RuntimeError(
+            "libnve_torch.so must be loaded before running the pooled export test"
+        )
+    if "BatchedDynamicEmbeddingTablesV2" not in globals():
+        raise RuntimeError(
+            "dynamicemb imports are unavailable for the pooled export test"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for the pooled export test")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda", torch.cuda.current_device())
+    embedding_dim = 128
+    dump_root_dir = os.path.join(
+        os.path.dirname(__file__),
+        "inference_emb_dump_pooled_sum",
+    )
+
+    if os.path.exists(dump_root_dir):
+        if os.path.isdir(dump_root_dir):
+            shutil.rmtree(dump_root_dir)
+        else:
+            os.remove(dump_root_dir)
+    os.makedirs(dump_root_dir, exist_ok=True)
+
+    # Total key counts per case are even so that 2-key bags divide them exactly.
+    for num_tables, counts in ((2, [200, 260]), (3, [120, 240, 360])):
+        table_names = [f"table_{i}" for i in range(num_tables)]
+        capacity_list = [512 for _ in range(num_tables)]
+        save_dir = os.path.join(dump_root_dir, f"num_tables_{num_tables}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        batched_tables = _build_e2e_batched_tables(
+            table_names,
+            capacity_list,
+            embedding_dim,
+            device,
+        )
+
+        expected_payloads = []
+        for table_id, num_embeddings in enumerate(counts):
+            keys, embeddings, scores = _make_expected_payload(
+                table_id,
+                num_embeddings,
+                embedding_dim,
+                device,
+            )
+            table_ids = torch.full(
+                (num_embeddings,),
+                table_id,
+                dtype=torch.int64,
+                device=device,
+            )
+            batched_tables.tables.insert(keys, table_ids, embeddings, scores)
+            expected_payloads.append((keys, embeddings, scores))
+
+        feature_table_map = list(range(num_tables))
+
+        pg_init_dir = _ensure_single_process_group()
+        try:
+            batched_tables.dump(
+                save_dir,
+                optim=False,
+                counter=False,
+                table_names=table_names,
+            )
+
+            inference_table = InferenceEmbeddingTable(
+                table_options=[
+                    DynamicEmbTableOptions(
+                        init_capacity=cap,
+                        max_capacity=cap,
+                        dim=embedding_dim,
+                        embedding_dtype=torch.float32,
+                        global_hbm_for_values=1 << 28,
+                    )
+                    for cap in capacity_list
+                ],
+                pooling_mode=1,
+                table_names=table_names,
+                feature_table_map=feature_table_map,
+                device=device,
+            )
+            inference_table.load(save_dir, table_names=table_names)
+            print("✓ Checkpoint load completed without error (pooled sum test)")
+
+            # Build flat key / per-table offset tensors.
+            lookup_keys = torch.cat(
+                [payload[0] for payload in expected_payloads],
+                dim=0,
+            )
+            lookup_offsets_list = [0]
+            for keys, _embeddings, _scores in expected_payloads:
+                lookup_offsets_list.append(lookup_offsets_list[-1] + keys.numel())
+            lookup_offsets = torch.tensor(
+                lookup_offsets_list,
+                dtype=torch.int64,
+                device=device,
+            )
+
+            total_keys = lookup_keys.numel()
+            assert total_keys % 2 == 0, (
+                f"Expected even total key count for 2-key bags, got {total_keys}"
+            )
+
+            # 2-key pooling bags: bag i covers global_indices[2*i : 2*i+2].
+            lookup_pooling_offsets = torch.arange(
+                0, total_keys + 1, 2, dtype=torch.int64, device=device
+            )
+
+            # Expected output: element-wise sum of consecutive embedding pairs.
+            expected_individual = torch.cat(
+                [payload[1] for payload in expected_payloads], dim=0
+            )
+            expected_pooled = expected_individual[0::2] + expected_individual[1::2]
+
+            # Eager validation.
+            eager_output = inference_table(
+                lookup_keys, lookup_offsets, lookup_pooling_offsets
+            )
+            torch.testing.assert_close(eager_output, expected_pooled)
+            print("✓ Eager sum-pooled forward matches expected output")
+
+            # Save C++-readable comparison tensors.
+            keys_tensor_path = os.path.join(save_dir, "keys.pt")
+            offsets_tensor_path = os.path.join(save_dir, "offsets.pt")
+            pooling_offsets_tensor_path = os.path.join(save_dir, "pooling_offsets.pt")
+            pooled_embeddings_tensor_path = os.path.join(save_dir, "pooled_embeddings.pt")
+            _save_tensor_cpp_compatible(lookup_keys, keys_tensor_path)
+            _save_tensor_cpp_compatible(lookup_offsets, offsets_tensor_path)
+            _save_tensor_cpp_compatible(lookup_pooling_offsets, pooling_offsets_tensor_path)
+            _save_tensor_cpp_compatible(expected_pooled, pooled_embeddings_tensor_path)
+
+            aoti_model_path = os.path.join(save_dir, "model_pooled_sum.pt2")
+            if os.path.exists(aoti_model_path):
+                os.remove(aoti_model_path)
+
+            exported = torch.export.export(
+                inference_table,
+                (lookup_keys, lookup_offsets, lookup_pooling_offsets),
+                dynamic_shapes={
+                    "keys": {0: torch.export.dynamic_shapes.Dim.AUTO},
+                    "offsets": {0: torch.export.dynamic_shapes.Dim.AUTO},
+                    "pooling_offsets": {0: torch.export.dynamic_shapes.Dim.AUTO},
+                },
+            )
+            aoti_output_path = torch._inductor.aoti_compile_and_package(
+                exported,
+                package_path=aoti_model_path,
+            )
+            compiled_model = torch._inductor.aoti_load_package(aoti_output_path)
+            compiled_output = _unwrap_single_output(
+                compiled_model(lookup_keys, lookup_offsets, lookup_pooling_offsets)
+            )
+            torch.testing.assert_close(compiled_output, expected_pooled)
+            print(
+                "✓ AOTInductor sum-pooling package generated and validated for "
+                f"{table_names}: {aoti_output_path}"
+            )
+            print(
+                "✓ Saved C++ comparison tensors: "
+                f"{keys_tensor_path}, {offsets_tensor_path}, "
+                f"{pooling_offsets_tensor_path}, {pooled_embeddings_tensor_path}"
+            )
+        finally:
+            _cleanup_single_process_group(pg_init_dir)
+
+    print(f"✓ Kept dumped checkpoint files under: {dump_root_dir}")
+
+
 def main():
     """Run all tests."""
     print("=" * 60)
@@ -371,7 +564,8 @@ def main():
     print("=" * 60)
 
     test_inference_emb()
-    
+    test_inference_emb_pooled_sum()
+
     print("\n" + "=" * 60)
     print("Tests completed")
     print("=" * 60)

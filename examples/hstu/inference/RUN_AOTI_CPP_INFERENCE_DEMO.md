@@ -2,16 +2,16 @@
 
 This document explains the full workflow:
 
-1. Run the Python export pipeline (`test_inference_emb`) to generate:
-   - dumped embedding checkpoints
-  - AOTInductor packaged models (`num_tables_*/model.pt2`)
-   - C++-readable tensor inputs/expected output (`keys.pt`, `offsets.pt`, `embeddings.pt`)
+1. Run the Python export pipeline to generate:
+  - Dumped embedding checkpoints
+  - `test_inference_emb` → packages `num_tables_*/model.pt2` and tensors `keys.pt`, `offsets.pt`, `embeddings.pt`
+  - `test_inference_emb_pooled_sum` → packages `num_tables_*/model_pooled_sum.pt2` and tensors `keys.pt`, `offsets.pt`, `pooling_offsets.pt`, `pooled_embeddings.pt`
 2. Build required shared libraries:
   - `inference_emb_ops.so` (dynamicemb custom ops)
   - `libnve_torch.so` (NVE torch custom classes)
-3. Build the C++ inference demos.
+3. Build the C++ inference demos (non-pooled **and** sum-pooled).
 4. Manually copy the two `.so` files into `examples/hstu/inference/aoti_demo/lib/`.
-5. Run the C++ E2E demo and compare output numerically.
+5. Run the C++ E2E demos and compare output numerically.
 
 ---
 
@@ -96,21 +96,30 @@ cd {RECSYS_DIR}
 python examples/hstu/inference/test_export_demo.py
 ```
 
-This runs `test_inference_emb()` and creates output under:
+This runs both `test_inference_emb()` and `test_inference_emb_pooled_sum()`.
 
-- `examples/hstu/inference/inference_emb_dump/num_tables_2/`
-- `examples/hstu/inference/inference_emb_dump/num_tables_3/`
+**Non-pooled** artifacts (under `examples/hstu/inference/inference_emb_dump/num_tables_{N}/`):
 
-Each folder contains at least:
+| File | Description |
+|------|-------------|
+| `model.pt2` | AOTInductor packaged model (`pooling_mode=-1`) |
+| `keys.pt` | Flat lookup keys |
+| `offsets.pt` | Per-table CSR boundaries |
+| `embeddings.pt` | Expected per-row embeddings |
 
-- `model.pt2`
-- `keys.pt`
-- `offsets.pt`
-- `embeddings.pt`
+**Sum-pooled** artifacts (under `examples/hstu/inference/inference_emb_dump_pooled_sum/num_tables_{N}/`):
+
+| File | Description |
+|------|-------------|
+| `model_pooled_sum.pt2` | AOTInductor packaged model (`pooling_mode=1`, sum) |
+| `keys.pt` | Flat lookup keys |
+| `offsets.pt` | Per-table CSR boundaries |
+| `pooling_offsets.pt` | Per-bag CSR boundaries (2-key bags) |
+| `pooled_embeddings.pt` | Expected sum-pooled output, shape `(B, D)` |
 
 ---
 
-## 5) Build C++ inference demo
+## 5) Build C++ inference demos
 
 ```bash
 cd {RECSYS_EXAMPLES_DIR}/aoti_demo
@@ -121,9 +130,12 @@ CMAKE_PREFIX_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dir
 cmake --build . --config Release -j
 ```
 
-This builds:
+This builds two binaries:
 
-- `inference_embedding_aoti_e2e_demo`
+| Binary | Source | Description |
+|--------|--------|-------------|
+| `inference_embedding_aoti_e2e_demo` | `inference_e2e.cpp` | Non-pooled lookup (`pooling_mode=-1`) |
+| `inference_embedding_aoti_e2e_pooled_demo` | `inference_e2e_pooled.cpp` | Sum/mean pooling (`pooling_mode=1/2`) |
 
 > Note: CMake no longer auto-copies shared libraries.
 
@@ -149,9 +161,11 @@ ls -l ./inference_emb_ops.so ./libnve_torch.so
 
 ---
 
-## 7) Run C++ E2E demo (recommended)
+## 7) Run C++ E2E demos (recommended)
 
-### Run for `num_tables_2`
+### Non-pooled demo
+
+#### Run for `num_tables_2`
 
 ```bash
 cd {AOTI_DEMO_BUILD_DIR}
@@ -163,7 +177,7 @@ cd {AOTI_DEMO_BUILD_DIR}
   {RECSYS_EXAMPLES_DIR}/inference_emb_dump/num_tables_2/embeddings.pt
 ```
 
-### Run for `num_tables_3`
+#### Run for `num_tables_3`
 
 ```bash
 cd {AOTI_DEMO_BUILD_DIR}
@@ -175,14 +189,56 @@ cd {AOTI_DEMO_BUILD_DIR}
   {RECSYS_EXAMPLES_DIR}/inference_emb_dump/num_tables_3/embeddings.pt
 ```
 
-> The C++ binaries load `inference_emb_ops.so` and `libnve_torch.so` from `../lib` relative to the executable by default.
-> Keep both files in `{AOTI_DEMO_LIB_DIR}`.
-
 Expected successful ending message:
 
 ```text
 E2E comparison passed.
 ```
+
+### Sum-pooled demo
+
+The pooled demo takes one additional positional argument — `pooling_offsets_path` — between `offsets_path` and `expected_pooled_embeddings_path`:
+
+```
+inference_embedding_aoti_e2e_pooled_demo \
+  <package_path> <keys_path> <offsets_path> <pooling_offsets_path> \
+  <expected_pooled_embeddings_path> [<custom_ops_path>] [<nve_torch_path>]
+```
+
+#### Run for `num_tables_2`
+
+```bash
+cd {AOTI_DEMO_BUILD_DIR}
+
+./inference_embedding_aoti_e2e_pooled_demo \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_2/model_pooled_sum.pt2 \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_2/keys.pt \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_2/offsets.pt \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_2/pooling_offsets.pt \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_2/pooled_embeddings.pt
+```
+
+#### Run for `num_tables_3`
+
+```bash
+cd {AOTI_DEMO_BUILD_DIR}
+
+./inference_embedding_aoti_e2e_pooled_demo \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_3/model_pooled_sum.pt2 \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_3/keys.pt \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_3/offsets.pt \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_3/pooling_offsets.pt \
+  {RECSYS_EXAMPLES_DIR}/inference_emb_dump_pooled_sum/num_tables_3/pooled_embeddings.pt
+```
+
+Expected successful ending message:
+
+```text
+Pooled E2E comparison passed.
+```
+
+> The C++ binaries load `inference_emb_ops.so` and `libnve_torch.so` from `../lib` relative to the executable by default.
+> Keep both files in `{AOTI_DEMO_LIB_DIR}`.
 
 ---
 
