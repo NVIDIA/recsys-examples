@@ -361,6 +361,20 @@ def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
     return segmented_sum_cuda(km.bucket_sizes, km.table_bucket_offsets_)
 
 
+def collect_table_sizes_for_state(
+    state: DynamicEmbTableState, non_blocking: bool = True
+) -> None:
+    """Copy device table sizes into ``state.estimated_table_sizes`` when flag is set."""
+    if state.no_eviction_next_index is not None:
+        state.no_eviction_next_index.copy_(
+            state.no_eviction_next_index_dev, non_blocking=non_blocking
+        )
+    if not state.collect_table_sizes_flag:
+        return
+    table_sizes = collect_table_sizes_to_device(state)
+    state.estimated_table_sizes.copy_(table_sizes, non_blocking=non_blocking)
+
+
 # ---------------------------------------------------------------------------
 # Storage expansion (expand before insert when needed)
 # Used in: prefetch HBM direct, cache write-back, generic forward, HybridStorage.load
@@ -548,14 +562,13 @@ def get_expand_info(
 def expand_if_need_impl(
     state: DynamicEmbTableState,
     unique_size_per_table: torch.Tensor,
-    collect_table_sizes_fn: Callable[[bool], None],
 ) -> None:
     """Accumulate per-table unique counts, optionally collect size and expand.
 
     unique_size_per_table is the CPU tensor from segmented_unique (shape
     (num_tables,) with per-table unique counts).
-    collect_table_sizes_fn(non_blocking) is invoked to copy real sizes into
-    state.estimated_table_sizes when needed (e.g. storage.collect_table_sizes).
+    When a second opinion on table sizes is needed, calls
+    :func:`collect_table_sizes_for_state` with ``non_blocking=False``.
     """
     assert (
         unique_size_per_table.device.type == "cpu"
@@ -573,9 +586,9 @@ def expand_if_need_impl(
             state.estimated_table_sizes.add_(unique_size_per_table)
             state.collect_table_sizes_flag = False
             return
-        
+
         state.collect_table_sizes_flag = True
-        collect_table_sizes_fn(False)
+        collect_table_sizes_for_state(state, non_blocking=False)
         expand_results, target_capacities = get_expand_info(
             state, state.estimated_table_sizes, unique_size_per_table
         )
@@ -584,7 +597,7 @@ def expand_if_need_impl(
             state.collect_table_sizes_flag = False
         state.estimated_table_sizes.add_(unique_size_per_table)
         return
-    
+
     if state.collect_table_sizes_flag:
         state.collect_table_sizes_flag = False
     state.estimated_table_sizes.add_(unique_size_per_table)
@@ -712,13 +725,16 @@ def get_find_score_arg(
             name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
         )
 
-    if (
-        lfu_accumulated_frequency is not None
-        and state.evict_strategy == EvictStrategy.KLfu
-    ):
-        scores = lfu_accumulated_frequency
-    elif state.evict_strategy == EvictStrategy.KLfu:
-        scores = torch.ones(num_keys, device=device, dtype=torch.long)
+    # LFU: use provided frequency for ACCUMULATE; must have length num_keys for lookup.
+    if state.evict_strategy == EvictStrategy.KLfu:
+        if (
+            lfu_accumulated_frequency is not None
+            and lfu_accumulated_frequency.numel() == num_keys
+        ):
+            scores = lfu_accumulated_frequency.contiguous()
+        else:
+            # Fallback: each key counts as 1 so score accumulates by 1 per lookup
+            scores = torch.ones(num_keys, device=device, dtype=torch.long)
     elif state.evict_strategy == EvictStrategy.KCustomized:
         scores = torch.empty(num_keys, device=device, dtype=torch.long)
         scores.fill_(state.score)
@@ -884,12 +900,22 @@ def _insert_and_evict_keys(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     scores: Optional[torch.Tensor] = None,
+    preserve_existing: bool = False,
 ) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Key-only insert_and_evict. Returns (indices, num_evicted, evicted_keys,
     evicted_table_ids, evicted_indices, evicted_scores).
-    Caller is responsible for loading evicted values and storing new values."""
+    Caller is responsible for loading evicted values and storing new values.
+
+    *preserve_existing* is forwarded to :func:`get_insert_score_arg` (e.g. backward
+    re-insert should use True so existing slot scores are not overwritten).
+    """
     score_arg = get_insert_score_arg(
-        state, keys.numel(), keys.device, scores, table_ids=table_ids
+        state,
+        keys.numel(),
+        keys.device,
+        scores,
+        preserve_existing,
+        table_ids=table_ids,
     )
     (
         indices,
@@ -1398,23 +1424,11 @@ class DynamicEmbStorage(Storage):
 
     def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
         """Accumulate per-table unique counts, optionally collect size and expand."""
-        expand_if_need_impl(
-            self._state,
-            unique_size_per_table,
-            lambda non_blocking: self.collect_table_sizes(non_blocking=non_blocking),
-        )
+        expand_if_need_impl(self._state, unique_size_per_table)
 
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (async copy)."""
-        st = self._state
-        if st.no_eviction_next_index is not None:
-            st.no_eviction_next_index.copy_(
-                st.no_eviction_next_index_dev, non_blocking=non_blocking
-            )
-        if not st.collect_table_sizes_flag:
-            return
-        table_sizes = collect_table_sizes_to_device(st)
-        st.estimated_table_sizes.copy_(table_sizes, non_blocking=non_blocking)
+        collect_table_sizes_for_state(self._state, non_blocking=non_blocking)
 
     # -- Storage interface --
 
@@ -1524,7 +1538,7 @@ class DynamicEmbStorage(Storage):
         )
 
         self._state.collect_table_sizes_flag = True
-        self._state.collect_table_sizes(non_blocking=False)
+        collect_table_sizes_for_state(self._state, non_blocking=False)
         unique_size_per_table = torch.zeros(
             self._state.num_tables, dtype=torch.int64, device=torch.device("cpu")
         )
@@ -1732,23 +1746,11 @@ class HybridStorage(Storage):
 
     def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
         """Accumulate per-table unique counts (on host), optionally collect size and expand."""
-        expand_if_need_impl(
-            self._host,
-            unique_size_per_table,
-            lambda non_blocking: self.collect_table_sizes(non_blocking=non_blocking),
-        )
+        expand_if_need_impl(self._host, unique_size_per_table)
 
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (host tier only, async copy)."""
-        st = self._host
-        if st.no_eviction_next_index is not None:
-            st.no_eviction_next_index.copy_(
-                st.no_eviction_next_index_dev, non_blocking=non_blocking
-            )
-        if not st.collect_table_sizes_flag:
-            return
-        table_sizes = collect_table_sizes_to_device(st)
-        st.estimated_table_sizes.copy_(table_sizes, non_blocking=non_blocking)
+        collect_table_sizes_for_state(self._host, non_blocking=non_blocking)
 
     # -- Two-tier find (with values) --
 
@@ -1827,10 +1829,30 @@ class HybridStorage(Storage):
         # Merge host-tier scores into output: for keys found in _host, return scores_host
         # so caller sees correct score (scores_hbm has no valid value for those positions).
         output_scores = scores_hbm.clone()
-        output_scores[missing_indices_hbm[host_found_mask]] = scores_host[host_found_mask]
+        output_scores[missing_indices_hbm[host_found_mask]] = scores_host[
+            host_found_mask
+        ]
 
         global_missing_indices = missing_indices_hbm[missing_indices_both]
         global_missing_scores = missing_scores_both
+
+        if (
+            self._hbm.evict_strategy == EvictStrategy.KLfu
+            and self._host.evict_strategy == EvictStrategy.KLfu
+            and lfu_accumulated_frequency is not None
+        ):
+            if global_missing_indices.numel() == 0:
+                assert (
+                    global_missing_scores is None or global_missing_scores.numel() == 0
+                )
+            else:
+                assert global_missing_scores is not None
+                assert global_missing_scores.numel() == global_missing_indices.numel()
+                expected = lfu_accumulated_frequency[global_missing_indices]
+                assert torch.equal(
+                    global_missing_scores.long(),
+                    expected.long(),
+                )
 
         return (
             h_num_missing_both,
@@ -1853,6 +1875,14 @@ class HybridStorage(Storage):
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
     ) -> None:
+        """Insert or update rows.
+
+        When ``preserve_existing=True`` (e.g. autograd backward refresh on
+        :class:`DynamicEmbeddingFunction`), the HBM tier uses CONST score policy:
+        existing keys keep their scores; only value slots are updated. New keys
+        still insert normally. Evictions to the host tier carry the evicted keys'
+        scores unchanged.
+        """
         (
             indices,
             num_evicted,
@@ -1860,7 +1890,13 @@ class HybridStorage(Storage):
             evicted_table_ids,
             evicted_indices,
             evicted_scores,
-        ) = _insert_and_evict_keys(self._hbm, unique_keys, table_ids, scores)
+        ) = _insert_and_evict_keys(
+            self._hbm,
+            unique_keys,
+            table_ids,
+            scores,
+            preserve_existing=preserve_existing,
+        )
 
         evicted_values = load_from_flat(
             self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
@@ -2000,10 +2036,10 @@ class HybridStorage(Storage):
             include_optim,
         )
         self._hbm.collect_table_sizes_flag = True
-        self._hbm.collect_table_sizes(non_blocking=False)
+        collect_table_sizes_for_state(self._hbm, non_blocking=False)
 
         self._host.collect_table_sizes_flag = True
-        self._host.collect_table_sizes(non_blocking=False)
+        collect_table_sizes_for_state(self._host, non_blocking=False)
 
         unique_size_per_table = torch.zeros(
             self._host.num_tables, dtype=torch.int64, device=torch.device("cpu")

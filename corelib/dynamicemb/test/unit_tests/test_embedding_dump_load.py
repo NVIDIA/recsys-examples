@@ -41,6 +41,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
+from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.types import AdmissionStrategy
@@ -82,6 +83,43 @@ def get_score_strategy(score_strategy_str: str) -> DynamicEmbScoreStrategy:
         return DynamicEmbScoreStrategy.LFU
     else:
         raise ValueError(f"Invalid score strategy: {score_strategy_str}")
+
+
+def assert_batched_dynamicemb_storage_class(
+    model,
+    *,
+    caching: bool,
+    global_hbm_budget_scale: float = 1.0,
+) -> None:
+    """Check ``BatchedDynamicEmbeddingTablesV2`` backing storage type.
+
+    - Must be :class:`DynamicEmbStorage` or :class:`HybridStorage`.
+    - With ``--caching``: expect ``DynamicEmbStorage`` (backing store under cache).
+    - No cache and ``global_hbm_budget_scale < 1``: expect ``HybridStorage``
+      (StorageMode DEFAULT / two-tier).
+    - No cache and full budget: expect single-tier ``DynamicEmbStorage``.
+    """
+    for _, _, sharded_module in find_sharded_modules(model, ""):
+        for emb in get_dynamic_emb_module(sharded_module):
+            storage = emb.tables
+            assert isinstance(storage, (DynamicEmbStorage, HybridStorage)), (
+                "BatchedDynamicEmbedding storage must be DynamicEmbStorage or "
+                f"HybridStorage, got {type(storage)}"
+            )
+            if caching:
+                assert isinstance(
+                    storage, DynamicEmbStorage
+                ), f"With --caching, expected DynamicEmbStorage, got {type(storage)}"
+            elif global_hbm_budget_scale < 1.0:
+                assert isinstance(storage, HybridStorage), (
+                    f"With global_hbm_budget_scale={global_hbm_budget_scale} (no cache), "
+                    f"expected HybridStorage, got {type(storage)}"
+                )
+            else:
+                assert isinstance(storage, DynamicEmbStorage), (
+                    "Full HBM budget without cache: expected DynamicEmbStorage, "
+                    f"got {type(storage)}"
+                )
 
 
 def update_scores(
@@ -202,6 +240,7 @@ def apply_dmp(
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
+    global_hbm_budget_scale: float = 1.0,
 ):
     eb_configs = []
     dynamicemb_options_dict = {}
@@ -253,6 +292,10 @@ def apply_dmp(
                     * (dim + optimizer_state_dim)
                     * emb_num_embeddings_aligned
                 )
+                if global_hbm_budget_scale != 1.0:
+                    total_hbm_need = max(
+                        1, int(total_hbm_need * global_hbm_budget_scale)
+                    )
 
                 admission_counter = KVCounter(
                     max(1024 * 1024, emb_num_embeddings_aligned // 4)
@@ -309,6 +352,7 @@ def create_model(
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
+    global_hbm_budget_scale: float = 1.0,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -345,6 +389,7 @@ def create_model(
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
+        global_hbm_budget_scale=global_hbm_budget_scale,
     )
     return model
 

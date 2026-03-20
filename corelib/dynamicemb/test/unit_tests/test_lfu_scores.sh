@@ -12,6 +12,9 @@ BATCH_SIZE=32
 NUM_ITERATIONS=10
 TOLERANCE=0.0
 
+# HybridStorage + StorageMode DEFAULT (no cache); see test_embedding_admission.sh
+GLOBAL_HBM_BUDGET_SCALE_DEFAULT=0.25
+
 # Cache configurations
 CACHING_MODES=("False" "True")
 CACHE_CAPACITY_RATIO=0.3  # 30% cache capacity to trigger evictions
@@ -40,6 +43,29 @@ for dedup_flag in "${DEDUP_FLAGS[@]}"; do
         --batch-size $BATCH_SIZE \
         --num-iterations $NUM_ITERATIONS \
         --tolerance $TOLERANCE \
+        $dedup_flag || exit 1
+    done
+  done
+
+  for num_gpus in ${NUM_GPUS[@]}; do
+    for optimizer_type in ${OPTIMIZER_TYPE[@]}; do
+      echo ""
+      echo "----------------------------------------"
+      echo "Test: StorageMode DEFAULT / Hybrid ($dedup_label) | GPUs: $num_gpus | Optimizer: $optimizer_type | HBM scale: $GLOBAL_HBM_BUDGET_SCALE_DEFAULT"
+      echo "----------------------------------------"
+      torchrun \
+        --nnodes 1 \
+        --nproc_per_node $num_gpus \
+        ./test/unit_tests/test_lfu_scores.py \
+        --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+        --num-embeddings $NUM_EMBEDDINGS \
+        --multi-hot-sizes $MULTI_HOT_SIZES \
+        --embedding-dim $EMBEDDING_DIM \
+        --optimizer-type ${optimizer_type} \
+        --batch-size $BATCH_SIZE \
+        --num-iterations $NUM_ITERATIONS \
+        --tolerance $TOLERANCE \
+        --global-hbm-budget-scale $GLOBAL_HBM_BUDGET_SCALE_DEFAULT \
         $dedup_flag || exit 1
     done
   done
