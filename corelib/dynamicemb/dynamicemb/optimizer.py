@@ -167,6 +167,14 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
     def set_opt_args(self, args: Dict[str, Any]) -> None:
         ...
 
+    def need_gradient_clipping(self) -> bool:
+        return self._opt_args.gradient_clipping
+
+    def clip_gradient(self, grads) -> None:
+        grads.clamp_(
+            min=-1 * self._opt_args.max_gradient, max=self._opt_args.max_gradient
+        )
+
 
 class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def __init__(
