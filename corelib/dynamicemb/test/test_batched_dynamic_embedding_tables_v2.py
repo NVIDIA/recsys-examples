@@ -1143,3 +1143,36 @@ def test_empty_batch(opt_type, opt_params, dim, caching, deterministic, PS):
         del os.environ["DEMB_DETERMINISM_MODE"]
 
     print("all check passed")
+
+
+def test_export_keys_values_empty_table():
+    """export_keys_values() on a never-used table must return empty tensors
+    (not crash on torch.cat([])) -- covers the empty keys_list guard."""
+    assert torch.cuda.is_available()
+    device = torch.device("cuda:0")
+
+    opt = DynamicEmbTableOptions(
+        dim=8,
+        init_capacity=1024,
+        max_capacity=1024,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        caching=False,
+        local_hbm_for_values=1024**3,
+    )
+    bdebt = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[opt],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.1,
+    )
+
+    keys, values = bdebt.export_keys_values("t0", device)
+
+    assert keys.shape == (0,)
+    assert keys.dtype == torch.int64
+    assert values.shape[0] == 0

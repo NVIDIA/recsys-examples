@@ -1207,6 +1207,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     f"Rank {dist.get_rank()} has accumulated count {accumulated_counts} which is different from expected {local_max_rows}, "
                     f"difference: {accumulated_counts - local_max_rows}"
                 )
+
+        if len(keys_list) == 0:
+            return torch.empty(0, dtype=torch.int64, device=device), torch.empty(
+                0, 0, device=device
+            )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
     def incremental_dump(
