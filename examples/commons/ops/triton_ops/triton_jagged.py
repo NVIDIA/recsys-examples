@@ -1129,15 +1129,15 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             assert offsets_a is not None and offsets_b is not None
             B = offsets_a.shape[0] - 1
             if seq_len_a is None:
-                seq_len_a = int(offsets_a[-1].item())
+                seq_len_a = offsets_a[-1].item()
             if seq_len_b is None:
-                seq_len_b = int(offsets_b[-1].item())
+                seq_len_b = offsets_b[-1].item()
         _, D = values.shape
         BLOCK_D = triton.next_power_of_2(D)
         values_a = torch.empty((seq_len_a, D), device=values.device, dtype=values.dtype)
         values_b = torch.empty((seq_len_b, D), device=values.device, dtype=values.dtype)
         if n_prefix_to_right == 0:
-            split_2D_jagged[(max_seq_len, B)](
+            torch.library.wrap_triton(split_2D_jagged)[(max_seq_len, B)](
                 JaggedIn=values,
                 DenseSize=dense_size,
                 OffsetsA=offsets_a,
@@ -1154,7 +1154,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 IS_REPLACE=False,  # pyre-ignore[6]
             )
         else:
-            split_2D_jagged_jagged_w_prefix[(max_seq_len, B)](
+            torch.library.wrap_triton(split_2D_jagged_jagged_w_prefix)[(max_seq_len, B)](
                 JaggedIn=values,
                 OffsetsA=offsets_a,
                 OffsetsB=offsets_b,

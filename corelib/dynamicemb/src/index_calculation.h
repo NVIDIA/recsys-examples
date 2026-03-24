@@ -21,6 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "utils.h"
 #include <cstdint>
 #include <cub/cub.cuh>
+#include <thrust/iterator/counting_iterator.h>
 
 namespace dyn_emb {
 
@@ -55,7 +56,7 @@ void select_index_async(int64_t num_items, bool const *d_flags, T *d_output,
                         at::Device const &device, cudaStream_t const &stream) {
   void *d_temp_storage = nullptr;
   size_t temp_storage_bytes = 0;
-  cub::CountingInputIterator<T> counting_iter(0);
+  thrust::counting_iterator<T> counting_iter(0);
 
   // 1. get the size of temp storage.
   cub::DeviceSelect::Flagged(d_temp_storage, temp_storage_bytes, counting_iter,
