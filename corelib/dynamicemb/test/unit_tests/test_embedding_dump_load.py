@@ -27,7 +27,6 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
-    align_to_table_size,
 )
 from dynamicemb.dump_load import (
     DynamicEmbDump,
@@ -38,13 +37,15 @@ from dynamicemb.dump_load import (
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    get_sharded_table_shape,
+    get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from dynamicemb.types import AdmissionStrategy
+from dynamicemb.types import MAX_BUCKET_CAPACITY, AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType
@@ -224,13 +225,6 @@ class TestModel(nn.Module):
         return torch.cat(embeddings, dim=0)
 
 
-DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
-    DataType.FP32: 32,
-    DataType.FP16: 16,
-    DataType.BF16: 16,
-}
-
-
 def apply_dmp(
     model: torch.nn.Module,
     optimizer_kwargs: Dict[str, Any],
@@ -242,78 +236,47 @@ def apply_dmp(
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
 ):
-    eb_configs = []
-    dynamicemb_options_dict = {}
-    for n, m in model.named_modules():
+    eb_configs: List[EmbeddingConfig] = []
+    for _, m in model.named_modules():
         if type(m) in TORCHREC_TYPES:
             eb_configs.extend(m.embedding_configs())
-            for eb_config in eb_configs:
-                dim = eb_config.embedding_dim
-                tmp_type = eb_config.data_type
 
-                embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-                emb_num_embeddings = (
-                    eb_config.num_embeddings * cache_capacity_ratio
-                    if caching
-                    else eb_config.num_embeddings
-                )
-                emb_num_embeddings_aligned = align_to_table_size(emb_num_embeddings)
+    world_size = dist.get_world_size()
+    dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    for eb_config in eb_configs:
+        num_buckets, bucket_capacity_rows = get_sharded_table_shape(
+            eb_config, world_size, MAX_BUCKET_CAPACITY
+        )
+        per_rank_capacity = num_buckets * bucket_capacity_rows
 
-                # Calculate optimizer state dimension
-                from dynamicemb.dynamicemb_config import (
-                    data_type_to_dtype,
-                    get_optimizer_state_dim,
-                )
-                from dynamicemb_extensions import OptimizerType
+        emb_opt_type = (
+            optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
+        ) or EmbOptimType.SGD
 
-                # Map fbgemm EmbOptimType to dynamicemb OptimizerType
-                emb_opt_type = (
-                    optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
-                )
-                opt_type_map = {
-                    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimizerType.RowWiseAdaGrad,
-                    EmbOptimType.SGD: OptimizerType.SGD,
-                    EmbOptimType.EXACT_SGD: OptimizerType.SGD,
-                    EmbOptimType.ADAM: OptimizerType.Adam,
-                    EmbOptimType.EXACT_ADAGRAD: OptimizerType.AdaGrad,
-                }
-                opt_type = opt_type_map.get(emb_opt_type) if emb_opt_type else None
-                # Convert torchrec DataType to torch.dtype
-                torch_dtype = data_type_to_dtype(tmp_type)
-                optimizer_state_dim = (
-                    get_optimizer_state_dim(opt_type, dim, torch_dtype)
-                    if opt_type
-                    else 0
-                )
+        value_bytes = get_table_value_bytes(
+            eb_config,
+            emb_opt_type,
+            world_size,
+            MAX_BUCKET_CAPACITY,
+        )
+        if caching:
+            global_hbm = int(value_bytes * cache_capacity_ratio)
+        else:
+            global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-                # Include optimizer state in HBM calculation
-                total_hbm_need = (
-                    embedding_type_bytes
-                    * (dim + optimizer_state_dim)
-                    * emb_num_embeddings_aligned
-                )
-                if global_hbm_budget_scale != 1.0:
-                    total_hbm_need = max(
-                        1, int(total_hbm_need * global_hbm_budget_scale)
-                    )
-
-                admission_counter = KVCounter(
-                    max(1024 * 1024, emb_num_embeddings_aligned // 4)
-                )
-                dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
-                    global_hbm_for_values=total_hbm_need,
-                    score_strategy=score_strategy,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.CONSTANT,
-                        value=1e-1,
-                    ),
-                    bucket_capacity=emb_num_embeddings_aligned,
-                    max_capacity=emb_num_embeddings_aligned,
-                    caching=caching,
-                    local_hbm_for_values=1024**3,
-                    admit_strategy=admit_strategy,
-                    admission_counter=admission_counter,
-                )
+        admission_counter = KVCounter(max(1024 * 1024, per_rank_capacity // 4))
+        dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+            global_hbm_for_values=global_hbm,
+            score_strategy=score_strategy,
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT,
+                value=1e-1,
+            ),
+            bucket_capacity=bucket_capacity_rows,
+            caching=caching,
+            admit_strategy=admit_strategy,
+            admission_counter=admission_counter,
+        )
     planner = get_planner(
         eb_configs,
         {},

@@ -819,14 +819,6 @@ void bind_dyn_emb_op(py::module &m) {
       .value("KCustomized", dyn_emb::EvictStrategy::kCustomized)
       .export_values();
 
-  py::enum_<dyn_emb::OptimizerType>(m, "OptimizerType")
-      .value("Null", dyn_emb::OptimizerType::Null)
-      .value("SGD", dyn_emb::OptimizerType::SGD)
-      .value("Adam", dyn_emb::OptimizerType::Adam)
-      .value("AdaGrad", dyn_emb::OptimizerType::AdaGrad)
-      .value("RowWiseAdaGrad", dyn_emb::OptimizerType::RowWiseAdaGrad)
-      .export_values();
-
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),

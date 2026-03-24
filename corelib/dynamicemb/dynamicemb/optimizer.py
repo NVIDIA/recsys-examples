@@ -15,14 +15,12 @@
 
 import abc
 import copy
-import enum
 from dataclasses import dataclass
 from typing import Any, Dict
 
 import torch  # usort:skip
-from dynamicemb.dynamicemb_config import DTYPE_NUM_BYTES, torch_to_dyn_emb
+from dynamicemb.dynamicemb_config import get_optimizer_state_dim, torch_to_dyn_emb
 from dynamicemb_extensions import (
-    OptimizerType,
     adagrad_update_for_flat_table,
     adagrad_update_for_padded_buffer,
     adam_update_for_flat_table,
@@ -32,6 +30,7 @@ from dynamicemb_extensions import (
     sgd_update_for_flat_table,
     sgd_update_for_padded_buffer,
 )
+from fbgemm_gpu.split_embedding_configs import EmbOptimType
 
 
 @dataclass
@@ -62,31 +61,6 @@ class OptimizerArgs:
     regularization_mode: int = 0
 
 
-@enum.unique
-class EmbOptimType(enum.Enum):
-    SGD = "sgd"  # uses non-deterministic updates (atomicAdd(..)) with duplicate ids
-    EXACT_SGD = (
-        "exact_sgd"  # uses deterministic updates (via sorting + segment reduction)
-    )
-    LAMB = "lamb"
-    ADAM = "adam"
-    # exact/dedup: gradients to the same row are applied with coalesce then apply
-    # together, instead of applied in sequence (approx).
-    EXACT_ADAGRAD = "exact_adagrad"
-    EXACT_ROWWISE_ADAGRAD = "exact_row_wise_adagrad"
-    LARS_SGD = "lars_sgd"
-    PARTIAL_ROWWISE_ADAM = "partial_row_wise_adam"
-    PARTIAL_ROWWISE_LAMB = "partial_row_wise_lamb"
-    ROWWISE_ADAGRAD = "row_wise_adagrad"
-    SHAMPOO = "shampoo"  # not currently supported for sparse embedding tables
-    MADGRAD = "madgrad"
-    EXACT_ROWWISE_WEIGHTED_ADAGRAD = "exact_row_wise_weighted_adagrad"
-    NONE = "none"
-
-    def __str__(self) -> str:
-        return self.value
-
-
 def string_to_opt_type(optimizer_str: str) -> EmbOptimType:
     try:
         return EmbOptimType(optimizer_str)
@@ -100,21 +74,6 @@ def get_required_arg(args: Dict[str, Any], key: str) -> Any:
             f"Input args does not contain required optimizer argument: {key}"
         )
     return args[key]
-
-
-def convert_optimizer_type(optimizer: EmbOptimType) -> OptimizerType:
-    if optimizer == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-        return OptimizerType.RowWiseAdaGrad
-    elif optimizer == EmbOptimType.SGD or optimizer == EmbOptimType.EXACT_SGD:
-        return OptimizerType.SGD
-    elif optimizer == EmbOptimType.ADAM:
-        return OptimizerType.Adam
-    elif optimizer == EmbOptimType.EXACT_ADAGRAD:
-        return OptimizerType.AdaGrad
-    else:
-        raise ValueError(
-            f"Not supported optimizer type ,optimizer type = {optimizer} {type(optimizer)} {optimizer.value}."
-        )
 
 
 class BaseDynamicEmbeddingOptimizer(abc.ABC):
@@ -245,10 +204,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return
 
     def get_state_dim(self, emb_dim: int) -> int:
-        """
-        Get the state dim.
-        """
-        return 0
+        return get_optimizer_state_dim(EmbOptimType.SGD, emb_dim)
 
 
 class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
@@ -334,10 +290,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return
 
     def get_state_dim(self, emb_dim: int) -> int:
-        """
-        Get the state dim.
-        """
-        return emb_dim * 2
+        return get_optimizer_state_dim(EmbOptimType.ADAM, emb_dim)
 
 
 class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
@@ -406,10 +359,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return
 
     def get_state_dim(self, emb_dim: int) -> int:
-        """
-        Get the state dim.
-        """
-        return emb_dim
+        return get_optimizer_state_dim(EmbOptimType.EXACT_ADAGRAD, emb_dim)
 
 
 class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
@@ -419,8 +369,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dtype: torch.dtype,
     ) -> None:
         super().__init__(opt_args)
-
-        self._optim_state_dim = 16 // DTYPE_NUM_BYTES[emb_dtype]
+        self._emb_dtype = emb_dtype
 
     def update_for_padded_buffer(
         self,
@@ -481,7 +430,6 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return
 
     def get_state_dim(self, emb_dim: int) -> int:
-        """
-        Get the state dim.
-        """
-        return self._optim_state_dim
+        return get_optimizer_state_dim(
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD, emb_dim, self._emb_dtype
+        )

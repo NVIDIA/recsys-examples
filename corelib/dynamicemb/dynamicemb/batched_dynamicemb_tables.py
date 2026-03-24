@@ -13,13 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import enum
 import os
-import logging
 import warnings
 from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass, field
 from functools import partial
 from itertools import accumulate
 from typing import Deque, Dict, List, Optional, Tuple
@@ -38,6 +35,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    get_optimizer_state_dim,
     warning_for_cstm_score,
 )
 from dynamicemb.embedding_admission import MultiTableKVCounter
@@ -58,85 +56,16 @@ from dynamicemb.optimizer import (
     OptimizerArgs,
     RowWiseAdaGradDynamicEmbeddingOptimizer,
     SGDDynamicEmbeddingOptimizer,
-    convert_optimizer_type,
 )
 from dynamicemb.utils import tabulate
-from dynamicemb_extensions import OptimizerType, device_timestamp
+from dynamicemb_extensions import device_timestamp
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    BoundsCheckMode,
+    CounterBasedRegularizationDefinition,
+    CowClipDefinition,
+    WeightDecayMode,
+)
 from torch import Tensor, nn  # usort:skip
-
-
-@enum.unique
-class SparseType(enum.Enum):
-    FP32 = "fp32"
-    FP16 = "fp16"
-    FP8 = "fp8"
-    INT8 = "int8"
-    INT4 = "int4"
-    INT2 = "int2"
-    BF16 = "bf16"
-
-
-class BoundsCheckMode(enum.IntEnum):
-    # Raise an exception (CPU) or device-side assert (CUDA)
-    FATAL = 0
-    # Log the first out-of-bounds instance per kernel, and set to zero.
-    WARNING = 1
-    # Set to zero.
-    IGNORE = 2
-    # No bounds checks.
-    NONE = 3
-
-
-class WeightDecayMode(enum.IntEnum):
-    NONE = 0
-    L2 = 1
-    DECOUPLE = 2
-    COUNTER = 3
-    COWCLIP = 4
-
-
-class CounterWeightDecayMode(enum.IntEnum):
-    NONE = 0
-    L2 = 1
-    DECOUPLE = 2
-
-
-class LearningRateMode(enum.IntEnum):
-    EQUAL = -1
-    TAIL_ID_LR_INCREASE = 0
-    TAIL_ID_LR_DECREASE = 1
-    COUNTER_SGD = 2
-
-
-class GradSumDecay(enum.IntEnum):
-    NO_DECAY = -1
-    CTR_DECAY = 0
-
-
-@dataclass
-class TailIdThreshold:
-    val: float = 0
-    is_ratio: bool = False
-
-
-@dataclass
-class CounterBasedRegularizationDefinition:
-    counter_weight_decay_mode: CounterWeightDecayMode = CounterWeightDecayMode.NONE
-    counter_halflife: int = -1
-    adjustment_iter: int = -1
-    adjustment_ub: float = 1.0
-    learning_rate_mode: LearningRateMode = LearningRateMode.EQUAL
-    grad_sum_decay: GradSumDecay = GradSumDecay.NO_DECAY
-    tail_id_threshold: TailIdThreshold = field(default_factory=TailIdThreshold)
-    max_counter_update_freq: int = 1000
-
-
-@dataclass
-class CowClipDefinition:
-    counter_weight_decay_mode: CounterWeightDecayMode = CounterWeightDecayMode.NONE
-    counter_halflife: int = -1
-    weight_norm_coefficient: float = 0.0
-    lower_bound: float = 0.0
 
 
 def encode_meta_json_file_path(root_path: str, table_name: str) -> str:
@@ -279,7 +208,11 @@ def get_loading_files(
 
 
 def _print_memory_consume(
-    table_names, dynamicemb_options, optimizer, device_id
+    table_names,
+    dynamicemb_options,
+    optimizer,
+    device_id,
+    emb_optimizer_type: EmbOptimType,
 ) -> None:
     subtitle = [
         "",
@@ -296,16 +229,6 @@ def _print_memory_consume(
     table_consume = []
     table_consume.append(subtitle)
 
-    def _get_optimizer_state_dim(optimizer_type, dim, element_size):
-        if optimizer_type == OptimizerType.RowWiseAdaGrad:
-            return 16 // element_size
-        elif optimizer_type == OptimizerType.Adam:
-            return dim * 2
-        elif optimizer_type == OptimizerType.AdaGrad:
-            return dim
-        else:
-            return 0
-
     def MB_(x) -> int:
         return x // (1024 * 1024)
 
@@ -320,8 +243,8 @@ def _print_memory_consume(
         if optimizer is not None:
             optim_state_dim = optimizer.get_state_dim(emb_dim)
         else:
-            optim_state_dim = _get_optimizer_state_dim(
-                table_option.optimizer_type, emb_dim, element_size
+            optim_state_dim = get_optimizer_state_dim(
+                emb_optimizer_type, emb_dim, table_option.embedding_dtype
             )
         total_dim = emb_dim + optim_state_dim
         total_memory = table_option.max_capacity * element_size * total_dim
@@ -553,20 +476,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._caching = any(option.caching for option in self._dynamicemb_options)
 
         for option in self._dynamicemb_options:
-            if option.training and option.optimizer_type == OptimizerType.Null:
-                option.optimizer_type = convert_optimizer_type(self._optimizer_type)
-            elif not option.training and option.optimizer_type != OptimizerType.Null:
-                option.optimizer_type = OptimizerType.Null
-                warnings.warn(
-                    "Set OptimizerType to Null as not on training mode.", UserWarning
-                )
+            if option.training:
+                assert (
+                    self._optimizer_type != EmbOptimType.NONE
+                ), "Optimizer type must be set for training mode."
+            else:
+                if self._optimizer_type != EmbOptimType.NONE:
+                    self._optimizer_type = EmbOptimType.NONE
+                    warnings.warn(
+                        "Set optimizer type to NONE as not on training mode.",
+                        UserWarning,
+                    )
 
         value_dims = [
             option.dim + self._optimizer.get_state_dim(option.dim)
             for option in self._dynamicemb_options
         ]
         total_memory = sum(
-            option.init_capacity * DTYPE_NUM_BYTES[option.embedding_dtype] * value_dim
+            option.max_capacity * DTYPE_NUM_BYTES[option.embedding_dtype] * value_dim
             for option, value_dim in zip(self._dynamicemb_options, value_dims)
         )
         local_hbm = sum(
@@ -586,9 +513,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
                 for cache_option in cache_options:
                     cache_option.bucket_capacity = 1024
-                    cap = max(1, int(cache_option.init_capacity * cap_scale))
+                    cap = max(1, int(cache_option.max_capacity * cap_scale))
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
-                    cache_option.init_capacity = min(cache_option.init_capacity, cap)
+                    cache_option.init_capacity = min(cache_option.max_capacity, cap)
                 self._cache = DynamicEmbCache(cache_options, self._optimizer)
 
                 storage_options = deepcopy(self._dynamicemb_options)
@@ -652,7 +579,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._storage = DynamicEmbStorage(self._dynamicemb_options, self._optimizer)
 
         _print_memory_consume(
-            self._table_names, self._dynamicemb_options, self._optimizer, self.device_id
+            self._table_names,
+            self._dynamicemb_options,
+            self._optimizer,
+            self.device_id,
+            self._optimizer_type,
         )
 
     def _create_initializers(self) -> None:

@@ -20,23 +20,24 @@ import pytest
 import torch
 import torch.distributed as dist
 from dynamicemb import (
+    MAX_BUCKET_CAPACITY,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EmbOptimType,
-    align_to_table_size,
+    get_sharded_table_shape,
+    get_table_value_bytes,
 )
 from dynamicemb.dynamicemb_config import (
-    DTYPE_NUM_BYTES,
     DynamicEmbEvictStrategy,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
-    get_optimizer_state_dim,
 )
 from dynamicemb.key_value_table import HybridStorage
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.types import CopyMode
-from dynamicemb_extensions import OptimizerType
 from test_lfu_scores import validate_lfu_scores
+from torchrec import DataType
+from torchrec.modules.embedding_configs import EmbeddingConfig
 
 TABLE_NAME = "t0"
 
@@ -68,16 +69,6 @@ def _session_dist_init():
     yield
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
-def _total_value_bytes_per_row(embedding_dim: int, optimizer_type: EmbOptimType) -> int:
-    ot_cvt = {
-        EmbOptimType.SGD: OptimizerType.SGD,
-        EmbOptimType.EXACT_SGD: OptimizerType.SGD,
-    }.get(optimizer_type, OptimizerType.Null)
-    state_dim = get_optimizer_state_dim(ot_cvt, embedding_dim, torch.float32)
-    value_dim = embedding_dim + state_dim
-    return value_dim * DTYPE_NUM_BYTES[torch.float32]
 
 
 def _make_sgd_optimizer(lr: float = 1e-3) -> SGDDynamicEmbeddingOptimizer:
@@ -112,11 +103,28 @@ def _full_table_options(
 ) -> DynamicEmbTableOptions:
     """Full-table footprint; local_hbm_for_values is set to total table bytes (matches Batched total_memory).
 
-    Here init_capacity == max_capacity == bucket_capacity == aligned (already bucket-aligned).
+    Per-rank capacity and bucket width come from :func:`get_sharded_table_shape` with
+    ``MAX_BUCKET_CAPACITY`` (one bucket per rank). Byte count uses :func:`get_table_value_bytes`
+    (all ranks, embedding + optimizer state).
     """
-    aligned = align_to_table_size(num_embeddings)
-    per_row = _total_value_bytes_per_row(embedding_dim, optimizer_type)
-    total_memory = max(1, aligned * per_row)
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    eb_config = EmbeddingConfig(
+        name=TABLE_NAME,
+        embedding_dim=embedding_dim,
+        num_embeddings=num_embeddings,
+        feature_names=["f0"],
+        data_type=DataType.FP32,
+    )
+    num_buckets, bucket_cap = get_sharded_table_shape(
+        eb_config, world_size, MAX_BUCKET_CAPACITY
+    )
+    per_rank_rows = num_buckets * bucket_cap
+    total_memory = max(
+        1,
+        get_table_value_bytes(
+            eb_config, optimizer_type, world_size, MAX_BUCKET_CAPACITY
+        ),
+    )
     if score_strategy == DynamicEmbScoreStrategy.LFU:
         evict_strategy = DynamicEmbEvictStrategy.LFU
     elif score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
@@ -127,9 +135,9 @@ def _full_table_options(
         dim=embedding_dim,
         embedding_dtype=torch.float32,
         index_type=torch.int64,
-        init_capacity=aligned,
-        max_capacity=aligned,
-        bucket_capacity=aligned,
+        init_capacity=per_rank_rows,
+        max_capacity=per_rank_rows,
+        bucket_capacity=bucket_cap,
         score_strategy=score_strategy,
         evict_strategy=evict_strategy,
         caching=False,
@@ -152,9 +160,7 @@ def _build_storage(
     full = _full_table_options(
         num_embeddings, embedding_dim, score_strategy, optimizer_type
     )
-    aligned = full.init_capacity
-    per_row = _total_value_bytes_per_row(embedding_dim, optimizer_type)
-    total_memory = max(1, aligned * per_row)
+    total_memory = max(1, int(full.local_hbm_for_values))
     scaled_local_hbm = max(1, int(total_memory * local_hbm_budget_scale))
     full.local_hbm_for_values = scaled_local_hbm
 
@@ -163,7 +169,6 @@ def _build_storage(
     cap_scale = scaled_local_hbm / total_memory if total_memory > 0 else 1.0
     hbm_options = deepcopy([full])
     for hbm_option in hbm_options:
-        hbm_option.bucket_capacity = 1024
         cap = max(1, int(hbm_option.init_capacity * cap_scale))
         hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
         hbm_option.init_capacity = min(hbm_option.init_capacity, cap)

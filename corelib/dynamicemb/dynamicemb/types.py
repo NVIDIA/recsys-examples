@@ -112,6 +112,14 @@ OPT_STATE_TYPE = torch.float32
 COUNTER_TYPE = torch.int64
 DEMB_TABLE_ALIGN_SIZE = 16
 
+# Per-bucket row alignment for hashtable backends (same as :data:`DEMB_TABLE_ALIGN_SIZE`).
+BUCKET_ALIGNMENT: int = DEMB_TABLE_ALIGN_SIZE
+
+# Sentinel ``bucket_capacity``: treat the whole per-rank table as one bucket; see
+# :func:`dynamicemb.dynamicemb_config.get_sharded_table_shape` (returns ``(num_buckets, bucket_capacity)``;
+# per-rank rows = ``num_buckets * bucket_capacity``).
+MAX_BUCKET_CAPACITY: int = 2**63 - 1
+
 torch_dtype_to_np_dtype = {
     torch.uint64: np.uint64,
     torch.int64: np.int64,

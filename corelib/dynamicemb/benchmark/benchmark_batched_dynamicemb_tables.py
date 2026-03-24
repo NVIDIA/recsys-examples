@@ -32,7 +32,6 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from fbgemm_gpu.runtime_monitor import StdLogStatsReporterConfig
-from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -211,15 +210,15 @@ def get_dynamicemb_optimizer(optimizer_type):
 
 def get_fbgemm_optimizer(optimizer_type):
     if optimizer_type == "sgd":
-        return OptimType.EXACT_SGD
+        return EmbOptimType.EXACT_SGD
     elif optimizer_type == "exact_sgd":
-        return OptimType.EXACT_SGD
+        return EmbOptimType.EXACT_SGD
     elif optimizer_type == "adam":
-        return OptimType.ADAM
+        return EmbOptimType.ADAM
     elif optimizer_type == "exact_adagrad":
-        return OptimType.EXACT_ADAGRAD
+        return EmbOptimType.EXACT_ADAGRAD
     elif optimizer_type == "exact_row_wise_adagrad":
-        return OptimType.EXACT_ROWWISE_ADAGRAD
+        return EmbOptimType.EXACT_ROWWISE_ADAGRAD
     else:
         raise ValueError("unknown optimizer type")
 

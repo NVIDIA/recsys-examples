@@ -31,7 +31,6 @@ from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage, Storage
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import CopyMode
-from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -48,12 +47,14 @@ POOLING_MODE: Dict[DynamicEmbPoolingMode, PoolingMode] = {
     DynamicEmbPoolingMode.MEAN: PoolingMode.MEAN,
     DynamicEmbPoolingMode.SUM: PoolingMode.SUM,
 }
-OPTIM_TYPE: Dict[EmbOptimType, OptimType] = {
-    EmbOptimType.SGD: OptimType.EXACT_SGD,
-    EmbOptimType.ADAM: OptimType.ADAM,
-    EmbOptimType.EXACT_ADAGRAD: OptimType.EXACT_ADAGRAD,
-    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimType.EXACT_ROWWISE_ADAGRAD,
-}
+
+
+def _split_table_batched_optimizer_for_compare(opt_type: EmbOptimType) -> EmbOptimType:
+    """Optimizer passed to SplitTableBatchedEmbeddingBagsCodegen for TorchREC comparison.
+
+    DynamicEmb may use ``SGD``; STBE uses ``EXACT_SGD`` so updates match for the test.
+    All other optimizers match ``opt_type``."""
+    return EmbOptimType.EXACT_SGD if opt_type == EmbOptimType.SGD else opt_type
 
 
 class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizer]):
@@ -805,7 +806,7 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, determinist
         stbe = create_split_table_batched_embedding(
             table_names,
             feature_table_map,
-            OPTIM_TYPE[opt_type],
+            _split_table_batched_optimizer_for_compare(opt_type),
             opt_params,
             dims,
             num_embs,
@@ -949,7 +950,7 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
     stbe = create_split_table_batched_embedding(
         table_names,
         feature_table_map,
-        OPTIM_TYPE[opt_type],
+        _split_table_batched_optimizer_for_compare(opt_type),
         opt_params,
         dims,
         num_embs,

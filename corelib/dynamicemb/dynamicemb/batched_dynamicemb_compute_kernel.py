@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -20,15 +21,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.dynamicemb_config import (
-    DEFAULT_INDEX_TYPE,
-    DTYPE_NUM_BYTES,
-    DynamicEmbPoolingMode,
-    DynamicEmbTableOptions,
-    get_optimizer_state_dim,
-)
-from dynamicemb.optimizer import convert_optimizer_type, string_to_opt_type
-from dynamicemb_extensions import OptimizerType
+from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, DynamicEmbTableOptions
+from dynamicemb.planner import DynamicEmbParameterSharding
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn
 from torchrec.distributed.batched_embedding_kernel import (
@@ -211,15 +205,10 @@ class DynamicEmbeddingFusedOptimizer(FusedOptimizer):
         return
 
 
-def _clean_grouped_fused_params(fused_params: Dict[str, Any]):
-    for f in {
-        "customized_compute_kernel",
-        # "ComputeKernel",
-        "dist_type",
-        # "Distributor",
-        "dynamicemb_options",
-    }:
-        fused_params.pop(f)
+def _prepare_fused_params(fused_params: Dict[str, Any]) -> None:
+    """Strip planner-only keys and normalize TorchREC ``fused_params`` for ``BatchedDynamicEmbeddingTablesV2``."""
+
+    DynamicEmbParameterSharding.pop_additional_fused_params(fused_params)
 
     if "output_dtype" in fused_params:
         # Convert SparseType in fbgemm_gpu to torch.dtype
@@ -231,58 +220,40 @@ def _clean_grouped_fused_params(fused_params: Dict[str, Any]):
         fused_params["beta1"] = beta1
         fused_params["beta2"] = beta2
 
-    # TODO: need to discuss if we need this?
-    if "optimizer" in fused_params:
-        dyn_emb_opt_type = string_to_opt_type(fused_params["optimizer"].value)
-        fused_params["optimizer"] = dyn_emb_opt_type
-
 
 def _get_dynamicemb_options_per_table(
-    local_row,
-    local_col,
+    local_row: int,
+    local_col: int,
     data_type: DataType,
-    optimizer: OptimizerType,
     table: ShardedEmbeddingTable,
 ) -> DynamicEmbTableOptions:
-    # User-configured
-    dynamicemb_options = table.fused_params["dynamicemb_options"]
+    """Check TorchREC shard metadata vs ``DynamicEmbTableOptions`` (filled by planner)."""
+    o = table.fused_params["dynamicemb_options"]
+    expected_dtype = data_type_to_dtype(data_type)
 
-    # Internal-configured
-    if dynamicemb_options.index_type is None:
-        dynamicemb_options.index_type = DEFAULT_INDEX_TYPE
-    if dynamicemb_options.embedding_dtype is None:
-        dynamicemb_options.embedding_dtype = data_type_to_dtype(data_type)
-    if dynamicemb_options.training:
-        dynamicemb_options.optimizer_type = optimizer
-    else:
-        dynamicemb_options.optimizer_type = OptimizerType.Null
-    dynamicemb_options.dim = local_col
-    # Make capacity aligned and improve the HBM budget.
-    if dynamicemb_options.num_aligned_embedding_per_rank is not None:
-        dynamicemb_options.max_capacity = (
-            dynamicemb_options.num_aligned_embedding_per_rank
-        )
-        dynamicemb_options.local_hbm_for_values += (
-            (dynamicemb_options.num_aligned_embedding_per_rank - local_row)
-            * (
-                local_col
-                + get_optimizer_state_dim(
-                    dynamicemb_options.optimizer_type,
-                    local_col,
-                    dynamicemb_options.embedding_dtype,
-                )
-            )
-            * DTYPE_NUM_BYTES[dynamicemb_options.embedding_dtype]
-        )
-    else:
-        dynamicemb_options.max_capacity = local_row
-
-    if dynamicemb_options.init_capacity is not None:
-        dynamicemb_options.max_capacity = max(
-            dynamicemb_options.max_capacity, dynamicemb_options.init_capacity
+    if o.embedding_dtype is not None and o.embedding_dtype != expected_dtype:
+        warnings.warn(
+            f"Table {table.name!r}: embedding_dtype {o.embedding_dtype} != "
+            f"grouped config data_type ({expected_dtype}).",
+            UserWarning,
+            stacklevel=2,
         )
 
-    return dynamicemb_options
+    if o.dim is not None and local_col != o.dim:
+        warnings.warn(
+            f"Table {table.name!r}: local_cols={local_col} != dynamicemb_options.dim={o.dim}.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if o.max_capacity is not None and local_row != o.max_capacity:
+        warnings.warn(
+            f"Table {table.name!r}: local_rows={local_row} != max_capacity={o.max_capacity}.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    return o
 
 
 class BatchedDynamicEmbeddingBag(
@@ -297,13 +268,7 @@ class BatchedDynamicEmbeddingBag(
     ) -> None:
         super().__init__(config, pg, device)
 
-        # for table in config.embedding_tables:
-        #    assert table.local_cols % 4 == 0, (
-        #        f"table {table.name} has local_cols={table.local_cols} "
-        #        "not divisible by 4. "
-        #    )
-
-        _clean_grouped_fused_params(config.fused_params)
+        _prepare_fused_params(config.fused_params)
 
         dynamicemb_options_list: List[Dict[str, Any]] = []
         for local_row, local_col, table in zip(
@@ -314,9 +279,6 @@ class BatchedDynamicEmbeddingBag(
                     local_row,
                     local_col,
                     config.data_type,
-                    convert_optimizer_type(config.fused_params["optimizer"])
-                    if "optimizer" in config.fused_params
-                    else OptimizerType.Null,
                     table,
                 )
             )
@@ -418,7 +380,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
     ) -> None:
         super().__init__(config, pg, device)
 
-        _clean_grouped_fused_params(config.fused_params)
+        _prepare_fused_params(config.fused_params)
 
         dynamicemb_options_list: List[Dict[str, Any]] = []
         for local_row, local_col, table in zip(
@@ -429,9 +391,6 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
                     local_row,
                     local_col,
                     config.data_type,
-                    convert_optimizer_type(config.fused_params["optimizer"])
-                    if "optimizer" in config.fused_params
-                    else OptimizerType.Null,
                     table,
                 )
             )
