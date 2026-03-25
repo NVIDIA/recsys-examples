@@ -52,7 +52,11 @@ class ExtendableBuffer(abc.ABC):
 
     @abc.abstractmethod
     def num_bytes(self) -> int:
-        """Return current buffer size in bytes."""
+        """Logical buffer size in bytes (user-visible tensor storage)."""
+
+    @abc.abstractmethod
+    def allocated_bytes(self) -> int:
+        """Bytes actually mapped/backed by the native buffer (page-aligned, >= num_bytes())."""
 
     @abc.abstractmethod
     def extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
@@ -105,6 +109,9 @@ class DeviceExtendableBuffer(ExtendableBuffer):
     def num_bytes(self) -> int:
         return self.vmm_tensor.data().numel() * self.element_size
 
+    def allocated_bytes(self) -> int:
+        return int(self.vmm_tensor.allocated_bytes())
+
     @property
     def shape(self) -> Tuple[int, ...]:
         return self._shape
@@ -154,6 +161,9 @@ class HostExtendableBuffer(ExtendableBuffer):
 
     def num_bytes(self) -> int:
         return self.vmm_tensor.data().numel() * self.element_size
+
+    def allocated_bytes(self) -> int:
+        return int(self.vmm_tensor.allocated_bytes())
 
     @property
     def shape(self) -> Tuple[int, ...]:

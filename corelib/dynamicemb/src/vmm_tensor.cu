@@ -184,6 +184,9 @@ public:
     return m_size / dtype_bytes;
   }
 
+  /// Bytes actually mapped / backed (page-aligned); >= logical size in bytes.
+  std::size_t allocated_bytes() const { return m_size; }
+
   ~VMMTensor() {
     if (m_size > 0) {
       cuMemUnmap(m_addr, m_size);
@@ -391,6 +394,9 @@ public:
     return m_size / dtype_bytes;
   }
 
+  /// Bytes actually locked + registered (page-aligned); >= logical size in bytes.
+  std::size_t allocated_bytes() const { return m_size; }
+
   ~HostVMMTensor() {
 
     if (m_size > 0) {
@@ -429,7 +435,9 @@ void bind_vmm_op(py::module &m) {
       .def("logical_numel", &dyn_emb::VMMTensor::logical_numel,
            "Logical element count (user-visible size).")
       .def("allocated_numel", &dyn_emb::VMMTensor::allocated_numel,
-           "Allocated element count (may be larger due to alignment).");
+           "Allocated element count (may be larger due to alignment).")
+      .def("allocated_bytes", &dyn_emb::VMMTensor::allocated_bytes,
+           "Bytes actually mapped (page-aligned); >= logical bytes.");
 
   py::class_<dyn_emb::HostVMMTensor>(m, "HostVMMTensor")
       .def(py::init<std::size_t, torch::Dtype, int>(), py::arg("numel"),
@@ -441,5 +449,7 @@ void bind_vmm_op(py::module &m) {
       .def("logical_numel", &dyn_emb::HostVMMTensor::logical_numel,
            "Logical element count (user-visible size).")
       .def("allocated_numel", &dyn_emb::HostVMMTensor::allocated_numel,
-           "Allocated element count (may be larger due to alignment).");
+           "Allocated element count (may be larger due to alignment).")
+      .def("allocated_bytes", &dyn_emb::HostVMMTensor::allocated_bytes,
+           "Bytes actually locked+registered (page-aligned); >= logical bytes.");
 }
