@@ -144,6 +144,32 @@ class Storage(abc.ABC):
         pass
 
 
+class EventQueue:
+    """A simple queue of CUDA events for stream synchronization in async prefetch."""
+
+    def __init__(self):
+        self._events = []
+
+    def produce(self) -> torch.cuda.Event:
+        """Create and record a new CUDA event, add it to the queue, and return it."""
+        event = torch.cuda.Event()
+        self._events.append(event)
+        return event
+
+    def consume(self) -> "Optional[torch.cuda.Event]":
+        """Pop and return the oldest CUDA event from the queue, or None if empty."""
+        if self._events:
+            return self._events.pop(0)
+        return None
+
+    def clear(self) -> None:
+        """Clear all events from the queue."""
+        self._events.clear()
+
+    def __len__(self) -> int:
+        return len(self._events)
+
+
 class Cache(abc.ABC):
     @abc.abstractmethod
     def find(

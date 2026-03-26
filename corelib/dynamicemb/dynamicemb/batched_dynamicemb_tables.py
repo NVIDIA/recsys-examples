@@ -2230,3 +2230,4 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ret_tensors[table_name] = (key, value)
             ret_scores[table_name] = self._scores[table_name]
         return ret_tensors, ret_scores
+BatchedDynamicEmbeddingTables = BatchedDynamicEmbeddingTablesV2
