@@ -636,7 +636,6 @@ def admission(
 class KeyValueTableFunction:
     @staticmethod
     def lookup(
-        cache: Optional[Cache],
         storage: Storage,
         unique_keys: torch.Tensor,
         unique_embs: torch.Tensor,

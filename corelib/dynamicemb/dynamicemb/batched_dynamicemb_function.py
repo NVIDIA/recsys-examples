@@ -549,7 +549,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         enable_prefetch: bool = False,
         input_dist_dedup: bool = False,
         training: bool = True,
+        admit_strategy=None,
+        evict_strategy=None,
         frequency_counters: Optional[torch.Tensor] = None,
+        admission_counter: Optional[List[Counter]] = None,
         *args,
     ):
         table_num = len(storages)
@@ -558,15 +561,9 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         emb_dim = storages[0].embedding_dim()
         caching = caches[0] is not None
 
-        is_lfu_enabled = False
-        if isinstance(storages[0], KeyValueTable):
-            is_lfu_enabled = storages[0].evict_strategy() == EvictStrategy.KLfu
-
         frequency_counts_int64 = None
         if frequency_counters is not None:
             frequency_counts_int64 = frequency_counters.long()
-
-        # TODO: Use frequency_counts_uint64 for LFU strategy in pooled embeddings
 
         lfu_accumulated_frequency = None
         indices_table_range = get_table_range(offsets, feature_offsets)
@@ -581,7 +578,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                 indices,
                 indices_table_range,
                 unique_op,
-                is_lfu_enabled,
+                EvictStrategy(evict_strategy.value) if evict_strategy else None,
                 frequency_counts_int64,
             )
             # TODO: only return device unique_indices_table_range
@@ -616,7 +613,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     initializers[i],
                     enable_prefetch,
                     training,
+                    EvictStrategy(evict_strategy.value) if evict_strategy else None,
                     lfu_accumulated_frequency_per_table,
+                    admit_strategy,
+                    admission_counter[i] if admission_counter else None,
                 )
             else:
                 KeyValueTableFunction.lookup(
@@ -625,7 +625,10 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
                     unique_embs_per_table,
                     initializers[i],
                     training,
+                    EvictStrategy(evict_strategy.value) if evict_strategy else None,
                     lfu_accumulated_frequency_per_table,
+                    admit_strategy,
+                    admission_counter[i] if admission_counter else None,
                 )
 
         if training or caching:
@@ -669,7 +672,7 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
         caches = ctx.caches
         storages = ctx.storages
         optimizer = ctx.optimizer
-        enable_prefetch = ctx.enable_prefetch
+        caching = caches[0] is not None
 
         input_dist_dedup = ctx.input_dist_dedup
         if input_dist_dedup:
@@ -687,13 +690,21 @@ class DynamicEmbeddingFunctionV2(torch.autograd.Function):
             unique_indices_per_table = unique_indices[begin:end]
             unique_embs_per_table = unique_embs[begin:end, :]
 
-            KeyValueTableFunction.update(
-                caches[i],
-                storages[i],
-                unique_indices_per_table,
-                unique_embs_per_table,
-                optimizer,
-                enable_prefetch,
-            )
+            if caching:
+                KeyValueTableCachingFunction.update(
+                    caches[i],
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    optimizer,
+                    ctx.enable_prefetch,
+                )
+            else:
+                KeyValueTableFunction.update(
+                    storages[i],
+                    unique_indices_per_table,
+                    unique_embs_per_table,
+                    optimizer,
+                )
 
-        return (None,) * 14
+        return (None,) * 17
