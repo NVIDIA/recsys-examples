@@ -503,10 +503,11 @@ def test_optimizer(
                 weight_decay=opt_args.weight_decay,
             )
         )
-    hashtables_for_dynamicemb = [
-        module.tables[0] for module in batched_dynamicemb_tables
+    hashtables_for_dynamicemb = initialize_hashtables(num_tables, table_options)
+    opt_for_dynamicemb = [
+        dynamicemb_optimizer_class(opt_args, [table_options[i]], [hashtables_for_dynamicemb[i]])
+        for i in range(num_tables)
     ]
-    opt_for_dynamicemb = [module.optimizer for module in batched_dynamicemb_tables]
 
     for test_num in range(num_tests):
         print(f"Running test {test_num + 1}/{num_tests}")
