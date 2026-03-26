@@ -16,6 +16,7 @@
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -91,9 +92,10 @@ root_path: Path = Path(__file__).resolve().parent
 def get_extensions():
     extra_link_args = []
     extra_compile_args = {
-        "cxx": ["-O3", "-fdiagnostics-color=always", "-w"],
+        "cxx": ["-O3", "-std=c++17", "-fdiagnostics-color=always", "-w"],
         "nvcc": [
             "-O3",
+            "-std=c++17",
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "--use_fast_math",
