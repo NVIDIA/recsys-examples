@@ -508,6 +508,11 @@ class BaseDynamicEmbeddingOptimizerV2(abc.ABC):
         )
 
 
+# Register V2 as a virtual subclass so isinstance(..., BaseDynamicEmbeddingOptimizer)
+# returns True for V2 instances (e.g. when existing callers check against the V1 base).
+BaseDynamicEmbeddingOptimizer.register(BaseDynamicEmbeddingOptimizerV2)
+
+
 class SGDDynamicEmbeddingOptimizerV2(BaseDynamicEmbeddingOptimizerV2):
     def __init__(
         self,

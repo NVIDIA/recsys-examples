@@ -397,7 +397,10 @@ def data_type_to_dtype(data_type: DataType) -> torch.dtype:
         raise ValueError(f"DataType {data_type} cannot be converted to torch.dtype")
 
 
-def dyn_emb_to_torch(data_type: DynamicEmbDataType) -> torch.dtype:
+def dyn_emb_to_torch(data_type) -> torch.dtype:
+    # If already a torch dtype (e.g. from KeyValueTable.key_type()), return as-is.
+    if isinstance(data_type, torch.dtype):
+        return data_type
     if data_type == DynamicEmbDataType.Float32:
         return torch.float32
     elif data_type == DynamicEmbDataType.BFloat16:
@@ -548,6 +551,51 @@ def get_constraint_capacity(
         memory_bytes // byte_consume_per_vector
     )  # maybe zero, we need at least one bucket
     return (capacity // bucket_capacity) * bucket_capacity
+
+
+def _unwrap_table(table):
+    """Return the underlying DynamicEmbTable, unwrapping KeyValueTable if needed."""
+    # Avoid a circular import — import inline.
+    from dynamicemb.key_value_table import KeyValueTable
+
+    if isinstance(table, KeyValueTable):
+        return table.table
+    return table
+
+
+def dyn_emb_cols(table) -> int:
+    """Number of embedding columns (embedding_dim). Accepts DynamicEmbTable or KeyValueTable."""
+    from dynamicemb_extensions import dyn_emb_cols as _dyn_emb_cols
+
+    return _dyn_emb_cols(_unwrap_table(table))
+
+
+def dyn_emb_rows(table) -> int:
+    """Number of occupied rows. Accepts DynamicEmbTable or KeyValueTable."""
+    from dynamicemb_extensions import dyn_emb_rows as _dyn_emb_rows
+
+    return _dyn_emb_rows(_unwrap_table(table))
+
+
+def dyn_emb_capacity(table) -> int:
+    """Table capacity. Accepts DynamicEmbTable or KeyValueTable."""
+    from dynamicemb_extensions import dyn_emb_capacity as _dyn_emb_capacity
+
+    return _dyn_emb_capacity(_unwrap_table(table))
+
+
+def insert_or_assign(table, n, keys, values, scores):
+    """insert_or_assign wrapper — accepts DynamicEmbTable or KeyValueTable."""
+    from dynamicemb_extensions import insert_or_assign as _insert_or_assign
+
+    _insert_or_assign(_unwrap_table(table), n, keys, values, scores)
+
+
+def export_batch(table, batch_size, offset, d_counter, keys, values, scores):
+    """export_batch wrapper — accepts DynamicEmbTable or KeyValueTable."""
+    from dynamicemb_extensions import export_batch as _export_batch
+
+    _export_batch(_unwrap_table(table), batch_size, offset, d_counter, keys, values, scores)
 
 
 def _next_power_of_2(n):

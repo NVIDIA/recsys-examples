@@ -766,6 +766,13 @@ class KeyValueTable(
     def optim_state_dim(self) -> int:
         return self.value_dim() - self.embedding_dim()
 
+    # Backward-compat aliases
+    def optstate_dim(self) -> int:
+        return self.optim_state_dim()
+
+    def get_initial_optstate(self) -> float:
+        return self.table.get_initial_optstate()
+
     def size(self) -> int:
         return dyn_emb_rows(self.table)
 
