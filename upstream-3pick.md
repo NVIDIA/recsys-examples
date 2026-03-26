@@ -108,4 +108,29 @@ The cherry-picked Python files (from `bbd7afb`) were mismatched with the f5b608e
 
 Test suite: 11 scripts/files in `test/unit_test.sh`.
 
-Currently **running** — on `test_embedding_admission.sh` (first of 11). No failures so far in this run. Previous run confirmed `test_embedding_admission.sh` and `table_operation/test_table_operation.sh` passed (only failure was missing `test_lfu_scores.sh`, now fixed).
+All 11 tests **passed** ✅
+
+| # | Test | Result |
+|---|------|--------|
+| 1 | `test_embedding_admission.sh` | ✅ |
+| 2 | `table_operation/test_table_operation.sh` | ✅ |
+| 3 | `test_lfu_scores.sh` | ✅ |
+| 4 | `test/test_batched_dynamic_embedding_tables_v2.py` | ✅ 26 passed |
+| 5 | `test/test_optimizer.py` | ✅ 12 passed |
+| 6 | `test/test_unique_op.py` | ✅ 3 passed |
+| 7 | `test_sequence_embedding.sh` | ✅ |
+| 8 | `test_pooled_embedding.sh` | ✅ |
+| 9 | `test_embedding_dump_load.sh` | ✅ |
+| 10 | `incremental_dump/test_incremental_dump.sh` | ✅ 15 passed |
+| 11 | `test_twin_module.sh` | ✅ 48 passed |
+
+Additional fixes applied during test loop:
+
+| Issue | Fix |
+|-------|-----|
+| `test_lfu_scores.sh/py` missing | Restored from f5b608e |
+| All test scripts used 4–8 GPUs; machine has 2 | Changed `NUM_GPUS=(1 4)` → `(1 2)` and `--nproc_per_node 4/8` → `2` in all `.sh` files |
+| Port 29500 conflict when running tests in parallel | Added `--master-port 2960x` (29601–29604) per script |
+| GPU count and master port hardcoded | Replaced with `DYNAMICEMB_NUM_GPUS` and `DYNAMICEMB_MASTER_PORT` env vars (default 2 / per-script port) |
+| `BatchedDynamicEmbeddingTables` ImportError | Added backward-compat alias in `batched_dynamicemb_tables.py` |
+| `test_optimizer.py`: `find()` TypeError, optimizer API mismatch | Use `initialize_hashtables()` + old-style optimizer constructor directly |
