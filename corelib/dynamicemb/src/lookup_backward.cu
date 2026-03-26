@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -557,11 +557,10 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
 }
 
 template <typename Key_t, typename Value_t>
-__global__ void
-wgrad_reduction_kernel(const Key_t *unique_indices,
-                       const Key_t *inverse_indices, const Key_t *biased_offset,
-                       const Value_t *grads, Value_t *unique_buffer, int dim,
-                       int batch_size, int feature_num, int num_key, int combiner) {
+__global__ void wgrad_reduction_kernel(
+    const Key_t *unique_indices, const Key_t *inverse_indices,
+    const Key_t *biased_offset, const Value_t *grads, Value_t *unique_buffer,
+    int dim, int batch_size, int feature_num, int num_key, int combiner) {
   const int warpsize = 32;
   int tid = threadIdx.x;
 
@@ -572,7 +571,8 @@ wgrad_reduction_kernel(const Key_t *unique_indices,
         biased_offset, batch_size * feature_num + 1, (Key_t)i_ev);
     Value_t pooling_factor = 1.0f;
     if (combiner == 1) {
-      pooling_factor = Value_t(static_cast<float>(biased_offset[src_id + 1] - biased_offset[src_id]));
+      pooling_factor = Value_t(static_cast<float>(biased_offset[src_id + 1] -
+                                                  biased_offset[src_id]));
     }
 
     const Value_t *src_ptr = grads + src_id * dim;
@@ -587,8 +587,9 @@ wgrad_reduction_kernel(const Key_t *unique_indices,
 
 void backward(void *grads, void *unique_buffer, void *unique_indices,
               void *inverse_indices, void *biased_offset, const int dim,
-              const int batch_size, const int feature_num, const int num_key, int combiner,
-              DataType key_type, DataType value_type, cudaStream_t stream) {
+              const int batch_size, const int feature_num, const int num_key,
+              int combiner, DataType key_type, DataType value_type,
+              cudaStream_t stream) {
   DISPATCH_INTEGER_DATATYPE_FUNCTION(key_type, key_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, value_t, [&] {
       int block_size = 64;

@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -162,7 +162,9 @@ public:
   void unique(const KeyType *d_key, const uint64_t len,
               CounterType *d_output_index, KeyType *d_unique_key,
               CounterType *d_output_counter, cudaStream_t stream,
-              CounterType *offset_ptr = nullptr);
+              CounterType *offset_ptr = nullptr,
+              CounterType *d_frequency_counters = nullptr,
+              const CounterType *d_input_frequencies = nullptr);
 
   void reset_capacity(KeyType *keys, CounterType *vals, const size_t capacity,
                       cudaStream_t stream);

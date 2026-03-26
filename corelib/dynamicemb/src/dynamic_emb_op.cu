@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
-//#include <torch/python.h>
+// #include <torch/python.h>
 
 #include "ATen/ATen.h"
 #include "ATen/AccumulateType.h"
@@ -33,12 +33,12 @@
 #include "unique_op.h"
 #include "utils.h"
 #include <c10/cuda/CUDAGuard.h>
-#include <cstdlib>
+#include <cooperative_groups.h>
 #include <cstdint>
+#include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <torch/torch.h>
-#include <cooperative_groups.h>
-#include <optional>
 
 namespace py = pybind11;
 using namespace dyn_emb;
@@ -126,40 +126,73 @@ void insert_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
 }
 
 // If don't need input scores, `scores` can be set to std::nullopt.
-void insert_and_evict(
-    std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-    const size_t n,
-    const at::Tensor keys,
-    const at::Tensor values,
-    const std::optional<uint64_t> score,
-    at::Tensor evicted_keys,
-    at::Tensor evicted_values,
-    at::Tensor evicted_score,
-    at::Tensor d_evicted_counter,
-    bool unique_key = true,
-    bool ignore_evict_strategy = false) {
+void insert_and_evict(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+                      const size_t n, const at::Tensor keys,
+                      const at::Tensor values,
+                      const std::optional<uint64_t> score,
+                      at::Tensor evicted_keys, at::Tensor evicted_values,
+                      at::Tensor evicted_score, at::Tensor d_evicted_counter,
+                      bool unique_key = true,
+                      bool ignore_evict_strategy = false) {
 
-  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
-    throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
+  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized ||
+                     table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument(
+        "Must specify the score when evict strategy is customized or LFU.");
   }
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
-    auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
+  if (table->evict_strategy() == EvictStrategy::kCustomized ||
+      table->evict_strategy() == EvictStrategy::kLfu) {
+    auto &&option =
+        at::TensorOptions().dtype(at::kUInt64).device(keys.device());
     // broadcast scores
     at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
     bc_scores.fill_(score.value());
     table->insert_and_evict(
-      n, keys.data_ptr(), values.data_ptr(), bc_scores.data_ptr(),
-      evicted_keys.data_ptr(), evicted_values.data_ptr(), evicted_score.data_ptr(),
-      reinterpret_cast<uint64_t*>(d_evicted_counter.data_ptr()), stream, unique_key, ignore_evict_strategy);
+        n, keys.data_ptr(), values.data_ptr(), bc_scores.data_ptr(),
+        evicted_keys.data_ptr(), evicted_values.data_ptr(),
+        evicted_score.data_ptr(),
+        reinterpret_cast<uint64_t *>(d_evicted_counter.data_ptr()), stream,
+        unique_key, ignore_evict_strategy);
   } else {
     table->insert_and_evict(
-      n, keys.data_ptr(), values.data_ptr(), nullptr, 
-      evicted_keys.data_ptr(), evicted_values.data_ptr(), evicted_score.data_ptr(),
-      reinterpret_cast<uint64_t*>(d_evicted_counter.data_ptr()), stream, unique_key, ignore_evict_strategy);
+        n, keys.data_ptr(), values.data_ptr(), nullptr, evicted_keys.data_ptr(),
+        evicted_values.data_ptr(), evicted_score.data_ptr(),
+        reinterpret_cast<uint64_t *>(d_evicted_counter.data_ptr()), stream,
+        unique_key, ignore_evict_strategy);
   }
 }
+void insert_and_evict_with_scores(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
+    const at::Tensor keys, const at::Tensor values, at::Tensor evicted_keys,
+    at::Tensor evicted_values, at::Tensor evicted_score,
+    at::Tensor d_evicted_counter, bool unique_key = true,
+    bool ignore_evict_strategy = false,
+    const std::optional<at::Tensor> scores = std::nullopt) {
 
+  if (not scores.has_value() and
+      (table->evict_strategy() == EvictStrategy::kCustomized ||
+       table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument(
+        "Must specify the score when evict strategy is customized or LFU.");
+  }
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  if (table->evict_strategy() == EvictStrategy::kCustomized ||
+      table->evict_strategy() == EvictStrategy::kLfu) {
+    table->insert_and_evict(
+        n, keys.data_ptr(), values.data_ptr(), scores.value().data_ptr(),
+        evicted_keys.data_ptr(), evicted_values.data_ptr(),
+        evicted_score.data_ptr(),
+        reinterpret_cast<uint64_t *>(d_evicted_counter.data_ptr()), stream,
+        unique_key, ignore_evict_strategy);
+  } else {
+    table->insert_and_evict(
+        n, keys.data_ptr(), values.data_ptr(), nullptr, evicted_keys.data_ptr(),
+        evicted_values.data_ptr(), evicted_score.data_ptr(),
+        reinterpret_cast<uint64_t *>(d_evicted_counter.data_ptr()), stream,
+        unique_key, ignore_evict_strategy);
+  }
+}
 void accum_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
                      const size_t n, const at::Tensor keys,
                      const at::Tensor value_or_deltas,
@@ -180,109 +213,166 @@ void accum_or_assign(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
   }
 }
 
-void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-                  const size_t n,
-                  const at::Tensor keys,
-                  const at::Tensor values,
-                  const std::optional<uint64_t> score = std::nullopt,
-                  bool unique_key = true,
-                  bool ignore_evict_strategy = false
-                  )
-{
-  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
-    throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
-  }
-  if (n == 0) return;
+void find_and_initialize(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+                         const size_t n, const at::Tensor keys,
+                         const at::Tensor values,
+                         std::optional<InitializerArgs> initializer_args) {
+
+  if (n == 0)
+    return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  at::Tensor new_tensor = at::empty({static_cast<int64_t>(n)},
-                                    at::TensorOptions().dtype(at::kLong).device(values.device()));
+  at::Tensor vals_ptr_tensor =
+      at::empty({static_cast<int64_t>(n)},
+                at::TensorOptions().dtype(at::kLong).device(values.device()));
+  auto vals_ptr =
+      reinterpret_cast<void **>(vals_ptr_tensor.data_ptr<int64_t>());
+  at::Tensor founds_tensor =
+      at::empty({static_cast<int64_t>(n)},
+                at::TensorOptions().dtype(at::kBool).device(keys.device()));
+  auto founds = founds_tensor.data_ptr<bool>();
 
-  auto new_tensor_data_ptr = reinterpret_cast<void**>(new_tensor.data_ptr<int64_t>());
+  table->find_and_initialize(n, keys.data_ptr(), vals_ptr, values.data_ptr(),
+                             founds, initializer_args, stream);
+}
 
-  at::Tensor found_tensor = at::empty({static_cast<int64_t>(n)},
-                                      at::TensorOptions().dtype(at::kBool).device(keys.device()));
+void find_or_insert(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+                    const size_t n, const at::Tensor keys,
+                    const at::Tensor values,
+                    const std::optional<uint64_t> score = std::nullopt,
+                    bool unique_key = true,
+                    bool ignore_evict_strategy = false) {
+  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized ||
+                     table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument(
+        "Must specify the score when evict strategy is customized or LFU.");
+  }
+  if (n == 0)
+    return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  at::Tensor new_tensor =
+      at::empty({static_cast<int64_t>(n)},
+                at::TensorOptions().dtype(at::kLong).device(values.device()));
+
+  auto new_tensor_data_ptr =
+      reinterpret_cast<void **>(new_tensor.data_ptr<int64_t>());
+
+  at::Tensor found_tensor =
+      at::empty({static_cast<int64_t>(n)},
+                at::TensorOptions().dtype(at::kBool).device(keys.device()));
 
   auto found_tensor_data_ptr = found_tensor.data_ptr<bool>();
 
-  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
-    auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
+  if (table->evict_strategy() == EvictStrategy::kCustomized ||
+      table->evict_strategy() == EvictStrategy::kLfu) {
+    auto &&option =
+        at::TensorOptions().dtype(at::kUInt64).device(keys.device());
     // broadcast scores
     at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
     bc_scores.fill_(score.value());
-    table->find_or_insert(n, keys.data_ptr(), new_tensor_data_ptr, values.data_ptr(), found_tensor_data_ptr,
-                              bc_scores.data_ptr(), stream, unique_key, ignore_evict_strategy);
+    table->find_or_insert(n, keys.data_ptr(), new_tensor_data_ptr,
+                          values.data_ptr(), found_tensor_data_ptr,
+                          bc_scores.data_ptr(), stream, unique_key,
+                          ignore_evict_strategy);
 
   } else {
-    table->find_or_insert(n, keys.data_ptr(), new_tensor_data_ptr, values.data_ptr(), found_tensor_data_ptr, nullptr,
-                              stream, unique_key, ignore_evict_strategy);
+    table->find_or_insert(n, keys.data_ptr(), new_tensor_data_ptr,
+                          values.data_ptr(), found_tensor_data_ptr, nullptr,
+                          stream, unique_key, ignore_evict_strategy);
   }
 }
 
 void find_or_insert_pointers(
-  std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-  const size_t n,
-  const at::Tensor keys,
-  at::Tensor values,
-  at::Tensor founds,
-  const std::optional<uint64_t> score = std::nullopt,
-  bool unique_key = true,
-  bool ignore_evict_strategy = false) {
-  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu)) {
-    throw std::invalid_argument("Must specify the score when evict strategy is customized or LFU.");
+    std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
+    const at::Tensor keys, at::Tensor values, at::Tensor founds,
+    const std::optional<uint64_t> score = std::nullopt, bool unique_key = true,
+    bool ignore_evict_strategy = false) {
+  if (not score and (table->evict_strategy() == EvictStrategy::kCustomized ||
+                     table->evict_strategy() == EvictStrategy::kLfu)) {
+    throw std::invalid_argument(
+        "Must specify the score when evict strategy is customized or LFU.");
   }
-  if (n == 0) return;
+  if (n == 0)
+    return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  auto values_data_ptr = reinterpret_cast<void**>(values.data_ptr<int64_t>());
+  auto values_data_ptr = reinterpret_cast<void **>(values.data_ptr<int64_t>());
   auto found_tensor_data_ptr = founds.data_ptr<bool>();
 
-  if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
-    auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
+  if (table->evict_strategy() == EvictStrategy::kCustomized ||
+      table->evict_strategy() == EvictStrategy::kLfu) {
+    auto &&option =
+        at::TensorOptions().dtype(at::kUInt64).device(keys.device());
     // broadcast scores
     at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
     bc_scores.fill_(score.value());
-    table->find_or_insert_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, 
-      bc_scores.data_ptr(), stream, unique_key, ignore_evict_strategy);
+    table->find_or_insert_pointers(n, keys.data_ptr(), values_data_ptr,
+                                   found_tensor_data_ptr, bc_scores.data_ptr(),
+                                   stream, unique_key, ignore_evict_strategy);
   } else {
-    table->find_or_insert_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, 
-      nullptr, stream, unique_key, ignore_evict_strategy);
+    table->find_or_insert_pointers(n, keys.data_ptr(), values_data_ptr,
+                                   found_tensor_data_ptr, nullptr, stream,
+                                   unique_key, ignore_evict_strategy);
   }
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
-void find_pointers(
-  std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-  const size_t n,
-  const at::Tensor keys,
-  at::Tensor values,
-  at::Tensor founds,
-  const std::optional<uint64_t> score = std::nullopt
-) {
+void find_pointers(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+                   const size_t n, const at::Tensor keys, at::Tensor values,
+                   at::Tensor founds,
+                   const std::optional<uint64_t> score = std::nullopt) {
 
-  if (n == 0) return;
+  if (n == 0)
+    return;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  auto values_data_ptr = reinterpret_cast<void**>(values.data_ptr<int64_t>());
+  auto values_data_ptr = reinterpret_cast<void **>(values.data_ptr<int64_t>());
   auto found_tensor_data_ptr = founds.data_ptr<bool>();
 
-  table->find_pointers(n, keys.data_ptr(), values_data_ptr, found_tensor_data_ptr, 
-      nullptr, stream);
-  
   // update score.
   if (score.has_value()) {
-    at::Tensor locked_ptr = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kLong));
-    at::Tensor success = at::empty({static_cast<int64_t>(n)}, keys.options().dtype(at::kBool));
-    if (table->evict_strategy() == EvictStrategy::kCustomized || table->evict_strategy() == EvictStrategy::kLfu) {
-      auto&& option = at::TensorOptions().dtype(at::kUInt64).device(keys.device());
+    void *score_ptr = nullptr;
+    if (table->evict_strategy() == EvictStrategy::kCustomized ||
+        table->evict_strategy() == EvictStrategy::kLfu) {
+      auto &&option =
+          at::TensorOptions().dtype(at::kUInt64).device(keys.device());
       // broadcast scores
       at::Tensor bc_scores = at::empty({static_cast<int64_t>(n)}, option);
       bc_scores.fill_(score.value());
-      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                  success.data_ptr<bool>(), bc_scores.data_ptr(), stream);
-    } else {
-      table->lock(n, keys.data_ptr(), reinterpret_cast<void**>(locked_ptr.data_ptr()), 
-                  success.data_ptr<bool>(), nullptr, stream);
+      score_ptr = bc_scores.data_ptr();
     }
-    AT_CUDA_CHECK(cudaGetLastError());
-    table->unlock(n, reinterpret_cast<void**>(locked_ptr.data_ptr()), keys.data_ptr(), success.data_ptr<bool>(), stream);
+    table->find_pointers(n, keys.data_ptr(), values_data_ptr,
+                         found_tensor_data_ptr, score_ptr, stream);
+  } else {
+    std::shared_ptr<const dyn_emb::DynamicVariableBase> const_table = table;
+    const_table->find_pointers(n, keys.data_ptr(), values_data_ptr,
+                               found_tensor_data_ptr, nullptr, stream);
+  }
+}
+
+void find_pointers_with_scores(
+    std::shared_ptr<dyn_emb::DynamicVariableBase> table, const size_t n,
+    const at::Tensor keys, at::Tensor values, at::Tensor founds,
+    const std::optional<at::Tensor> &scores = std::nullopt) {
+
+  if (n == 0)
+    return;
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto values_data_ptr = reinterpret_cast<void **>(values.data_ptr<int64_t>());
+  auto found_tensor_data_ptr = founds.data_ptr<bool>();
+
+  // update score.
+  if (scores.has_value()) {
+    if (table->evict_strategy() == EvictStrategy::kCustomized ||
+        table->evict_strategy() == EvictStrategy::kLfu) {
+      table->find_pointers(n, keys.data_ptr(), values_data_ptr,
+                           found_tensor_data_ptr, scores.value().data_ptr(),
+                           stream);
+    } else {
+      table->find_pointers(n, keys.data_ptr(), values_data_ptr,
+                           found_tensor_data_ptr, nullptr, stream);
+    }
+  } else {
+    std::shared_ptr<const dyn_emb::DynamicVariableBase> const_table = table;
+    const_table->find_pointers(n, keys.data_ptr(), values_data_ptr,
+                               found_tensor_data_ptr, nullptr, stream);
   }
 }
 
@@ -354,209 +444,87 @@ void export_batch(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
   }
 }
 
-void count_matched(
-    std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-    const uint64_t threshold,
-    at::Tensor num_matched) {
+void count_matched(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+                   const uint64_t threshold, at::Tensor num_matched) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  table->count_matched(threshold, reinterpret_cast<uint64_t*>(num_matched.data_ptr()), stream);
+  table->count_matched(
+      threshold, reinterpret_cast<uint64_t *>(num_matched.data_ptr()), stream);
 }
 
-void export_batch_matched(
-    std::shared_ptr<dyn_emb::DynamicVariableBase> table,
-    const uint64_t threshold,
-    const uint64_t n,
-    const uint64_t offset,
-    at::Tensor num_matched,
-    at::Tensor keys,
-    at::Tensor values) {
+void export_batch_matched(std::shared_ptr<dyn_emb::DynamicVariableBase> table,
+                          const uint64_t threshold, const uint64_t n,
+                          const uint64_t offset, at::Tensor num_matched,
+                          at::Tensor keys, at::Tensor values) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   table->export_batch_matched(
-    threshold, n, offset, reinterpret_cast<uint64_t*>(num_matched.data_ptr()), 
-    keys.data_ptr(), values.data_ptr(), nullptr, stream);
+      threshold, n, offset,
+      reinterpret_cast<uint64_t *>(num_matched.data_ptr()), keys.data_ptr(),
+      values.data_ptr(), nullptr, stream);
 }
 
-void lookup_forward_dense(
-    std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>> tables,
-    const at::Tensor indices, const at::Tensor offsets, const py::list scores,
-    const std::vector<int> &table_offsets_in_feature, at::Tensor table_offsets,
-    int table_num, int batch_size, int dim, bool use_index_dedup,
-    const at::Tensor unique_idx, const at::Tensor reverse_idx,
-    const at::Tensor h_unique_nums, const at::Tensor d_unique_nums,
-    const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
-    const at::Tensor unique_embs, const at::Tensor output_embs,
-    int device_num_sms, std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
-
-  if (!offsets.is_cuda() || !indices.is_cuda()) {
-    throw std::runtime_error(
-        "offsets or indices tensor must be on CUDA device");
+template <typename scalar_t>
+__global__ void
+compact_offsets(const scalar_t *offsets, scalar_t *features_offsets,
+                const int64_t num_features, const int64_t batch_size) {
+  for (int tid = threadIdx.x + blockIdx.x * blockDim.x; tid < num_features;
+       tid += blockDim.x * gridDim.x) {
+    features_offsets[tid] = offsets[tid * batch_size];
   }
-
-  // Check dtype of h_unique_nums and d_unique_nums
-  if (h_unique_nums.scalar_type() != at::kUInt64 ||
-      d_unique_nums.scalar_type() != at::kUInt64) {
-    throw std::runtime_error(
-        "h_unique_nums and d_unique_nums must have dtype uint64_t");
+  if (threadIdx.x == 0) {
+    features_offsets[num_features] = offsets[num_features * batch_size];
   }
+}
 
+std::vector<int64_t> offsets_to_table_features_offsets(
+    const at::Tensor &offsets, const std::vector<int> &table_offsets_in_feature,
+    const int64_t batch_size, cudaStream_t stream) {
+  int64_t table_num = table_offsets_in_feature.size() - 1;
+  int64_t num_features = (offsets.numel() - 1) / batch_size;
+  at::Tensor h_features_offsets =
+      at::empty({num_features + 1},
+                offsets.options().device(at::kCPU).pinned_memory(true));
+  if (num_features == 0) {
+    return {0, 0};
+  }
+  AT_DISPATCH_INTEGRAL_TYPES(offsets.scalar_type(), "compact_offsets", [&] {
+    compact_offsets<<<num_features / 1024 + 1, 1024, 0, stream>>>(
+        offsets.data_ptr<scalar_t>(), h_features_offsets.data_ptr<scalar_t>(),
+        num_features, batch_size);
+  });
+  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+  std::vector<int64_t> table_features_offsets(table_offsets_in_feature.size(),
+                                              0);
+  for (int i = 0; i < table_offsets_in_feature.size(); ++i) {
+    table_features_offsets[i] =
+        h_features_offsets[table_offsets_in_feature[i]].item<int64_t>();
+  }
+  return table_features_offsets;
+}
+
+void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t indices_shape = indices.size(0);
-  auto unique_num_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_nums.dtype()));
-  auto unique_offset_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(d_unique_offsets.dtype()));
-
-  at::Tensor h_offset =
-      at::empty_like(offsets, offsets.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaMemcpyAsync(h_offset.data_ptr(), offsets.data_ptr(),
-                                offsets.numel() * offsets.element_size(),
-                                cudaMemcpyDeviceToHost, stream));
-
-  size_t unique_op_capacity = unique_op->get_capacity();
-  if (indices_shape * 2 > unique_op_capacity) {
-    at::Tensor new_keys = at::empty({indices_shape * 2}, indices.options());
-    at::Tensor new_vals = at::empty(
-        {indices_shape * 2},
-        at::TensorOptions().dtype(at::kUInt64).device(indices.device()));
-    unique_op->reset_capacity(new_keys, new_vals, indices_shape * 2, stream);
-  }
-
-  std::vector<at::Tensor> tmp_unique_indices(table_num);
-  for (int i = 0; i < table_num; ++i) {
-    tmp_unique_indices[i] = at::empty_like(indices);
-  }
-
-  at::Tensor h_table_offsets =
-      at::empty({table_num + 1}, table_offsets.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  h_table_offsets[0] = 0;
-  for (int i = 0; i < table_num; ++i) {
-    int table_offset_begin = table_offsets_in_feature[i];
-    int table_offset_end = table_offsets_in_feature[i + 1];
-    int offset_begin = table_offset_begin * batch_size;
-    int offset_end = table_offset_end * batch_size;
-
-    int64_t indices_begin = h_offset[offset_begin].item<int64_t>();
-    int64_t indices_end = h_offset[offset_end].item<int64_t>();
-    int64_t indices_length = indices_end - indices_begin;
-    h_table_offsets[i + 1] = indices_end;
-
-    if (indices_length == 0) {
-      DEMB_CUDA_CHECK(cudaMemsetAsync(
-          reinterpret_cast<uint64_t *>(d_unique_nums.data_ptr()) + i, 0,
-          sizeof(uint64_t), stream));
-      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
-                          i, unique_num_type, unique_offset_type, stream);
-    } else {
-      at::Tensor tmp_indices = create_sub_tensor(indices, indices_begin);
-      at::Tensor tmp_reverse_idx =
-          create_sub_tensor(reverse_idx, indices_begin);
-      at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
-
-      at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
-      unique_op->unique(tmp_indices, indices_length, tmp_reverse_idx,
-                        tmp_unique_indices[i], tmp_d_unique_num, stream,
-                        previous_d_unique_num);
-      dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
-                          i, unique_num_type, unique_offset_type, stream);
-    }
-  }
-
-  AT_CUDA_CHECK(
-      cudaMemcpyAsync(h_unique_nums.data_ptr(), d_unique_nums.data_ptr(),
-                      d_unique_nums.numel() * d_unique_nums.element_size(),
-                      cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaMemcpyAsync(
-      h_unique_offsets.data_ptr(), d_unique_offsets.data_ptr(),
-      (d_unique_nums.numel() + 1) * d_unique_nums.element_size(),
-      cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-  AT_CUDA_CHECK(
-      cudaMemcpyAsync(table_offsets.data_ptr(), h_table_offsets.data_ptr(),
-                      table_offsets.numel() * table_offsets.element_size(),
-                      cudaMemcpyHostToDevice, stream));
-
-  int64_t unique_embs_offset = 0;
-  for (int i = 0; i < table_num; ++i) {
-    int64_t tmp_unique_num = h_unique_nums[i].item<int64_t>();
-    if (tmp_unique_num != 0) {
-      at::Tensor tmp_unique_embs =
-          create_sub_tensor(unique_embs, unique_embs_offset * dim);
-      auto score = std::make_optional<uint64_t>(py::cast<uint64_t>(scores[i]));
-      find_or_insert(tables[i], tmp_unique_num, tmp_unique_indices[i],
-                     tmp_unique_embs, score);
-      if (use_index_dedup) {
-        void *dst_ptr = reinterpret_cast<char *>(unique_idx.data_ptr()) +
-                        unique_embs_offset * unique_idx.element_size();
-        void *src_ptr = tmp_unique_indices[i].data_ptr();
-        size_t copy_size = tmp_unique_num * unique_idx.element_size();
-        AT_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size,
-                                      cudaMemcpyDeviceToDevice, stream));
-      }
-    }
-    unique_embs_offset += tmp_unique_num;
-  }
+  auto &device_prop = DeviceProp::getDeviceProp(index.device().index());
+  int num_sms = device_prop.num_sms;
   auto src_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(unique_embs.dtype()));
+      scalartype_to_datatype(convertTypeMetaToScalarType(input.dtype()));
   auto dst_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(output_embs.dtype()));
-  auto offset_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(reverse_idx.dtype()));
+      scalartype_to_datatype(convertTypeMetaToScalarType(output.dtype()));
+  auto index_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(index.dtype()));
 
-  dyn_emb::scatter_fused(unique_embs.data_ptr(), output_embs.data_ptr(),
-                         reverse_idx.data_ptr(), indices_shape, dim, src_type,
-                         dst_type, offset_type, device_num_sms, stream);
-}
-
-void lookup_forward_dense(
-    std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>> tables,
-    const at::Tensor indices, const at::Tensor offsets,
-    const std::vector<int> &table_offsets_in_feature, int table_num,
-    int batch_size, int dim, const at::Tensor h_unique_offsets,
-    const at::Tensor unique_embs, const at::Tensor output_embs) {
-
-  if (!offsets.is_cuda() || !indices.is_cuda()) {
+  int64_t num_total = output.size(0);
+  int64_t dim = output.size(1);
+  if (num_total != index.numel()) {
     throw std::runtime_error(
-        "offsets or indices tensor must be on CUDA device");
+        "Number rows of `output` must match with `index`.");
   }
-
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t indices_shape = indices.size(0);
-  auto scalar_type = unique_embs.dtype().toScalarType();
-  auto emb_dtype = scalartype_to_datatype(scalar_type);
-  scalar_type = output_embs.dtype().toScalarType();
-  auto output_dtype = scalartype_to_datatype(scalar_type);
-  auto &device_prop = DeviceProp::getDeviceProp(indices.device().index());
-
-  at::Tensor h_offset =
-      at::empty_like(offsets, offsets.options().device(at::kCPU));
-  AT_CUDA_CHECK(cudaMemcpyAsync(h_offset.data_ptr(), offsets.data_ptr(),
-                                offsets.numel() * offsets.element_size(),
-                                cudaMemcpyDeviceToHost, stream));
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  h_unique_offsets[0] = 0;
-  for (int i = 0; i < table_num; ++i) {
-    int table_offset_begin = table_offsets_in_feature[i];
-    int table_offset_end = table_offsets_in_feature[i + 1];
-    int offset_begin = table_offset_begin * batch_size;
-    int offset_end = table_offset_end * batch_size;
-
-    int64_t indices_begin = h_offset[offset_begin].item<int64_t>();
-    int64_t indices_end = h_offset[offset_end].item<int64_t>();
-    int64_t indices_length = indices_end - indices_begin;
-    h_unique_offsets[i + 1] = indices_end;
-    at::Tensor tmp_indices = create_sub_tensor(indices, indices_begin);
-    at::Tensor tmp_unique_embs =
-        create_sub_tensor(unique_embs, indices_begin * dim);
-    find_or_insert(tables[i], indices_length, tmp_indices, tmp_unique_embs);
-    at::Tensor tmp_output_embs =
-        create_sub_tensor(output_embs, indices_begin * dim);
-    dyn_emb::batched_vector_copy_device(
-        tmp_unique_embs.data_ptr(), output_embs.data_ptr(), indices_length, dim,
-        emb_dtype, output_dtype, device_prop.num_sms, stream);
+  if (dim != input.size(1)) {
+    throw std::runtime_error(
+        "Number cols of `output` must match with `input`.");
   }
+  dyn_emb::scatter_fused(input.data_ptr(), output.data_ptr(), index.data_ptr(),
+                         num_total, dim, src_type, dst_type, index_type,
+                         num_sms, stream);
 }
 
 void lookup_backward_dense(const at::Tensor indices, const at::Tensor grads,
@@ -610,43 +578,19 @@ void lookup_backward_dense(const at::Tensor indices, const at::Tensor grads,
                              unique_key_ids, stream);
 }
 
-std::tuple<at::Tensor, at::Tensor>
-reduce_grads(at::Tensor indices, at::Tensor grads, at::Tensor segment_range, at::Tensor h_segment_range) {
+std::tuple<at::Tensor, at::Tensor> reduce_grads(at::Tensor indices,
+                                                at::Tensor grads,
+                                                at::Tensor segment_range,
+                                                at::Tensor h_segment_range) {
   int64_t num_total = indices.size(0);
   int64_t dim = grads.size(1);
   int64_t num_segment = h_segment_range.size(0) - 1;
   int64_t num_unique_total = h_segment_range[num_segment].item<int64_t>();
   at::Tensor unique_indices = at::empty(num_unique_total, indices.options());
   at::Tensor unique_grads = at::empty({num_unique_total, dim}, grads.options());
-  lookup_backward_dense(indices, grads, dim, segment_range, unique_indices, unique_grads);
+  lookup_backward_dense(indices, grads, dim, segment_range, unique_indices,
+                        unique_grads);
   return std::make_tuple(unique_indices, unique_grads);
-}
-
-void lookup_backward_dense_dedup(const at::Tensor grads,
-                                 at::Tensor unique_indices,
-                                 at::Tensor reverse_idx, int32_t dim,
-                                 at::Tensor unique_grads,
-                                 int32_t device_num_sms) {
-  // Initialization
-  if (!grads.is_cuda() || !unique_indices.is_cuda() || !reverse_idx.is_cuda() ||
-      !unique_grads.is_cuda()) {
-    throw std::runtime_error("All argument tensors should on device");
-  }
-  auto device_ = unique_indices.device();
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  auto rev_idx_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(reverse_idx.dtype()));
-  auto grad_type =
-      scalartype_to_datatype(convertTypeMetaToScalarType(grads.dtype()));
-  auto idx_type = scalartype_to_datatype(
-      convertTypeMetaToScalarType(unique_indices.dtype()));
-  auto key_num = reverse_idx.size(0);
-  auto unique_key_num = unique_indices.size(0);
-
-  dyn_emb::one_to_one_atomic(grads.data_ptr(), unique_indices.data_ptr(),
-                             reverse_idx.data_ptr(), unique_grads.data_ptr(),
-                             dim, key_num, unique_key_num, rev_idx_type,
-                             grad_type, idx_type, device_num_sms, stream);
 }
 
 void dedup_input_indices(
@@ -658,7 +602,10 @@ void dedup_input_indices(
     const at::Tensor h_unique_offsets, const at::Tensor d_unique_offsets,
     std::vector<at::Tensor> unique_idx, const at::Tensor new_offsets,
     const at::Tensor new_lengths, int device_num_sms,
-    std::shared_ptr<dyn_emb::UniqueOpBase> unique_op) {
+    std::shared_ptr<dyn_emb::UniqueOpBase> unique_op,
+    const c10::optional<std::vector<at::Tensor>> &frequency_counters =
+        c10::nullopt,
+    const c10::optional<at::Tensor> &input_frequencies = c10::nullopt) {
 
   if (!offsets.is_cuda() || !indices.is_cuda()) {
     throw std::runtime_error(
@@ -725,9 +672,15 @@ void dedup_input_indices(
       at::Tensor tmp_d_unique_num = create_sub_tensor(d_unique_nums, i);
       at::Tensor previous_d_unique_num = create_sub_tensor(d_unique_offsets, i);
 
+      // For first stage deduplication, we don't have input frequencies (set to
+      // empty tensor) The unique operation will default each key's frequency to
+      // 1
+      at::Tensor freq_counter = frequency_counters.has_value()
+                                    ? frequency_counters.value()[i]
+                                    : at::Tensor();
       unique_op->unique(tmp_indices, indices_length, tmp_reverse_idx,
                         unique_idx[i], tmp_d_unique_num, stream,
-                        previous_d_unique_num);
+                        previous_d_unique_num, freq_counter);
       dyn_emb::add_offset(d_unique_nums.data_ptr(), d_unique_offsets.data_ptr(),
                           i, unique_num_type, unique_offset_type, stream);
     }
@@ -800,12 +753,10 @@ void lookup_backward(const at::Tensor grad, const at::Tensor unique_buffer,
 }
 
 template <typename T>
-__global__ void load_from_pointers_kernel_vec4(
-    int batch,
-    int emb_dim,
-    T* __restrict__ outputs,
-    T* const * __restrict__ src_ptrs) {
-  
+__global__ void
+load_from_pointers_kernel_vec4(int batch, int emb_dim, T *__restrict__ outputs,
+                               T *const *__restrict__ src_ptrs) {
+
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
   const int warp_num_per_block = blockDim.x / kWarpSize;
@@ -814,9 +765,9 @@ __global__ void load_from_pointers_kernel_vec4(
 
   Vec4T<T> emb;
   for (int emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
-      emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
-    T* const src_ptr = src_ptrs[emb_id];
-    T* dst_ptr = outputs + emb_id * emb_dim;
+       emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
+    T *const src_ptr = src_ptrs[emb_id];
+    T *dst_ptr = outputs + emb_id * emb_dim;
     if (src_ptr != nullptr) {
       for (int i = 0; VecSize * (kWarpSize * i + lane_id) < emb_dim; ++i) {
         int idx4 = VecSize * (kWarpSize * i + lane_id);
@@ -828,15 +779,13 @@ __global__ void load_from_pointers_kernel_vec4(
 }
 
 template <typename T>
-__global__ void load_from_pointers_kernel(
-    int batch,
-    int emb_dim,
-    T* __restrict__ outputs,
-    T* const * __restrict__ src_ptrs) {
+__global__ void load_from_pointers_kernel(int batch, int emb_dim,
+                                          T *__restrict__ outputs,
+                                          T *const *__restrict__ src_ptrs) {
 
   for (int emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
-    T* const src_ptr = src_ptrs[emb_id];
-    T* dst_ptr = outputs + emb_id * emb_dim;
+    T *const src_ptr = src_ptrs[emb_id];
+    T *dst_ptr = outputs + emb_id * emb_dim;
     if (src_ptr != nullptr) {
       for (int i = threadIdx.x; i < emb_dim; i += blockDim.x) {
         dst_ptr[i] = src_ptr[i];
@@ -856,9 +805,8 @@ void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
   constexpr int WARP_PER_BLOCK = BLOCK_SIZE_VEC / kWarpSize;
   auto &device_prop = DeviceProp::getDeviceProp();
   const int max_grid_size =
-      device_prop.num_sms *
-      (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
-  
+      device_prop.num_sms * (device_prop.max_thread_per_sm / BLOCK_SIZE_VEC);
+
   int grid_size = 0;
   if (num_total / WARP_PER_BLOCK < max_grid_size) {
     grid_size = (num_total - 1) / WARP_PER_BLOCK + 1;
@@ -873,18 +821,18 @@ void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
   DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
     if (dim % 4 == 0) {
       load_from_pointers_kernel_vec4<ValueType>
-        <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
-        num_total, dim, reinterpret_cast<ValueType*>(dst.data_ptr()), 
-        reinterpret_cast<ValueType**>(pointers.data_ptr()));
+          <<<grid_size, BLOCK_SIZE_VEC, 0, stream>>>(
+              num_total, dim, reinterpret_cast<ValueType *>(dst.data_ptr()),
+              reinterpret_cast<ValueType **>(pointers.data_ptr()));
     } else {
       int block_size = dim < device_prop.max_thread_per_block
-                          ? dim
-                          : device_prop.max_thread_per_block;
+                           ? dim
+                           : device_prop.max_thread_per_block;
       int grid_size = num_total;
       load_from_pointers_kernel<ValueType>
-        <<<grid_size, block_size, 0, stream>>>(
-        num_total, dim, reinterpret_cast<ValueType*>(dst.data_ptr()), 
-        reinterpret_cast<ValueType**>(pointers.data_ptr()));
+          <<<grid_size, block_size, 0, stream>>>(
+              num_total, dim, reinterpret_cast<ValueType *>(dst.data_ptr()),
+              reinterpret_cast<ValueType **>(pointers.data_ptr()));
     }
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -893,68 +841,71 @@ void load_from_pointers(at::Tensor pointers, at::Tensor dst) {
 // PYTHON WARP
 void bind_dyn_emb_op(py::module &m) {
   py::class_<dyn_emb::InitializerArgs>(m, "InitializerArgs")
-    .def(py::init([] (const std::string& mode, float mean, float std_dev, float lower, float upper, float value) {
-      return dyn_emb::InitializerArgs(mode, mean, std_dev, lower, upper, value);
-    }
-    ))
-    .def(py::pickle(
-      [](const InitializerArgs &p) { // __getstate__
-        return py::make_tuple(p.mode, p.mean, p.std_dev, p.lower, p.upper, p.value);
-      },
-      [](py::tuple t) { // __setstate__
-        if (t.size() != 6)
-          throw std::runtime_error("Invalid number args of InitializerArgs!");
-        InitializerArgs p(
-          t[0].cast<std::string>(),
-          t[1].cast<float>(),
-          t[2].cast<float>(),
-          t[3].cast<float>(),
-          t[4].cast<float>(),
-          t[5].cast<float>());
-        return p;
-      }
-     ));
-    py::class_<dyn_emb::DynamicVariableBase, std::shared_ptr<dyn_emb::DynamicVariableBase>>(m, "DynamicEmbTable")
-        .def(py::init([](dyn_emb::DataType key_type,
-					dyn_emb::DataType value_type, 
-					dyn_emb::EvictStrategy evict_type,
-					int64_t dim = 128,
-					int64_t init_capaity = 1024,
-					int64_t max_capaity = 2048,
-					size_t max_hbm_for_vectors = 0, 
-					size_t max_bucket_size  = 128,
-					float max_load_factor = 0.5,
-					int block_size = 128,
-					int io_block_size = 1024, 
-					int device_id = -1, 
-					bool io_by_cpu = false,
-					bool use_constant_memory = false,
-					int reserved_key_start_bit = 0,
-					size_t num_of_buckets_per_alloc = 1,
-					const dyn_emb::InitializerArgs & initializer_args = dyn_emb::InitializerArgs(),
-          const int safe_check_mode = static_cast<int>(SafeCheckMode::IGNORE),
-          const int optimizer_type = static_cast<int>(OptimizerType::Null)) {
-
+      .def(py::init([](const std::string &mode, float mean, float std_dev,
+                       float lower, float upper, float value) {
+        return dyn_emb::InitializerArgs(mode, mean, std_dev, lower, upper,
+                                        value);
+      }))
+      .def(py::pickle(
+          [](const InitializerArgs &p) { // __getstate__
+            return py::make_tuple(p.mode, p.mean, p.std_dev, p.lower, p.upper,
+                                  p.value);
+          },
+          [](py::tuple t) { // __setstate__
+            if (t.size() != 6)
+              throw std::runtime_error(
+                  "Invalid number args of InitializerArgs!");
+            InitializerArgs p(t[0].cast<std::string>(), t[1].cast<float>(),
+                              t[2].cast<float>(), t[3].cast<float>(),
+                              t[4].cast<float>(), t[5].cast<float>());
+            return p;
+          }));
+  py::class_<dyn_emb::DynamicVariableBase,
+             std::shared_ptr<dyn_emb::DynamicVariableBase>>(m,
+                                                            "DynamicEmbTable")
+      .def(py::init(
+          [](dyn_emb::DataType key_type, dyn_emb::DataType value_type,
+             dyn_emb::EvictStrategy evict_type, int64_t dim = 128,
+             int64_t init_capaity = 1024, int64_t max_capaity = 2048,
+             size_t max_hbm_for_vectors = 0, size_t max_bucket_size = 128,
+             float max_load_factor = 0.5, int block_size = 128,
+             int io_block_size = 1024, int device_id = -1,
+             bool io_by_cpu = false, bool use_constant_memory = false,
+             int reserved_key_start_bit = 0,
+             size_t num_of_buckets_per_alloc = 1,
+             const dyn_emb::InitializerArgs &initializer_args =
+                 dyn_emb::InitializerArgs(),
+             const int safe_check_mode =
+                 static_cast<int>(SafeCheckMode::IGNORE),
+             const int optimizer_type = static_cast<int>(OptimizerType::Null)) {
             int64_t pow2_max_capaity = power2(max_capaity);
             int64_t pow2_init_capaity = power2(init_capaity);
-            auto table = dyn_emb::VariableFactory::create(key_type,value_type,evict_type,dim,init_capaity,max_capaity,max_hbm_for_vectors,max_bucket_size,max_load_factor,
-                                 block_size,io_block_size,device_id,io_by_cpu,use_constant_memory,reserved_key_start_bit,num_of_buckets_per_alloc,initializer_args, 
-                                 static_cast<SafeCheckMode>(safe_check_mode), static_cast<OptimizerType>(optimizer_type));
-            return table; }))
-         .def("key_type", &dyn_emb::DynamicVariableBase::key_type,
-             "Get Dynamic Emb Table key type")
-         .def("value_type", &dyn_emb::DynamicVariableBase::value_type,
-             "Get Dynamic Emb Table value type")
-          .def("evict_strategy", &dyn_emb::DynamicVariableBase::evict_strategy,
-            "Get evict strategy of Dynamic Emb Table.")
-          .def("capacity", &dyn_emb::DynamicVariableBase::capacity,
-            "Get capacity of Dynamic Emb Table.")
-          .def("optstate_dim", &dyn_emb::DynamicVariableBase::optstate_dim,
-            "Get dim of all optimizer states.")
-          .def("set_initial_optstate", &dyn_emb::DynamicVariableBase::set_initial_optstate,
-            "Set initial value of optimizer state.")
-          .def("get_initial_optstate", &dyn_emb::DynamicVariableBase::get_initial_optstate,
-            "Get initial value of optimizer state.");
+            auto table = dyn_emb::VariableFactory::create(
+                key_type, value_type, evict_type, dim, init_capaity,
+                max_capaity, max_hbm_for_vectors, max_bucket_size,
+                max_load_factor, block_size, io_block_size, device_id,
+                io_by_cpu, use_constant_memory, reserved_key_start_bit,
+                num_of_buckets_per_alloc, initializer_args,
+                static_cast<SafeCheckMode>(safe_check_mode),
+                static_cast<OptimizerType>(optimizer_type));
+            return table;
+          }))
+      .def("key_type", &dyn_emb::DynamicVariableBase::key_type,
+           "Get Dynamic Emb Table key type")
+      .def("value_type", &dyn_emb::DynamicVariableBase::value_type,
+           "Get Dynamic Emb Table value type")
+      .def("evict_strategy", &dyn_emb::DynamicVariableBase::evict_strategy,
+           "Get evict strategy of Dynamic Emb Table.")
+      .def("capacity", &dyn_emb::DynamicVariableBase::capacity,
+           "Get capacity of Dynamic Emb Table.")
+      .def("optstate_dim", &dyn_emb::DynamicVariableBase::optstate_dim,
+           "Get dim of all optimizer states.")
+      .def("set_initial_optstate",
+           &dyn_emb::DynamicVariableBase::set_initial_optstate,
+           "Set initial value of optimizer state.")
+      .def("get_initial_optstate",
+           &dyn_emb::DynamicVariableBase::get_initial_optstate,
+           "Get initial value of optimizer state.");
 
   m.def("dyn_emb_rows", &dyn_emb_rows, "Get the number of rows in the table",
         py::arg("table"));
@@ -977,32 +928,48 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("evicted_keys"), py::arg("evicted_values"),
         py::arg("evicted_score"), py::arg("d_evicted_counter"),
         py::arg("unique_key") = true, py::arg("ignore_evict_strategy") = false);
-
+  m.def("insert_and_evict_with_scores", &insert_and_evict_with_scores,
+        "Insert keys and values, evicting if necessary", py::arg("table"),
+        py::arg("n"), py::arg("keys"), py::arg("values"),
+        py::arg("evicted_keys"), py::arg("evicted_values"),
+        py::arg("evicted_score"), py::arg("d_evicted_counter"),
+        py::arg("unique_key") = true, py::arg("ignore_evict_strategy") = false,
+        py::arg("scores") = py::none());
   m.def("accum_or_assign", &accum_or_assign,
         "Accumulate or assign values to the table", py::arg("table"),
         py::arg("n"), py::arg("keys"), py::arg("value_or_deltas"),
         py::arg("accum_or_assigns"), py::arg("score") = c10::nullopt,
         py::arg("ignore_evict_strategy") = false);
 
+  m.def("find_and_initialize", &find_and_initialize,
+        "Find and initialize a key-value pair in the table", py::arg("table"),
+        py::arg("n"), py::arg("keys"), py::arg("values"),
+        py::arg("initializer_args") = py::none());
+
   m.def("find_or_insert", &find_or_insert,
         "Find or insert a key-value pair in the table", py::arg("table"),
         py::arg("n"), py::arg("keys"), py::arg("values"),
-        py::arg("score") = py::none(), py::arg("unique_key") = true, 
+        py::arg("score") = py::none(), py::arg("unique_key") = true,
         py::arg("ignore_evict_strategy") = false);
 
   m.def("find_or_insert_pointers", &find_or_insert_pointers,
         "Find or insert a key-value pair in the table , and return every "
         "value's ptr",
-        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"), py::arg("founds"),
-        py::arg("score") = py::none(), py::arg("unique_key") = true, 
-        py::arg("ignore_evict_strategy") = false);
+        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
+        py::arg("founds"), py::arg("score") = py::none(),
+        py::arg("unique_key") = true, py::arg("ignore_evict_strategy") = false);
 
   m.def("find_pointers", &find_pointers,
         "Find a key-value pair in the table , and return every "
         "value's ptr",
-        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"), py::arg("founds"),
-        py::arg("score") = py::none());
+        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
+        py::arg("founds"), py::arg("score") = py::none());
 
+  m.def("find_pointers_with_scores", &find_pointers_with_scores,
+        "Find a key-value pair in the table , and return every "
+        "value's ptr",
+        py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
+        py::arg("founds"), py::arg("scores") = py::none());
   m.def("assign", &assign, "Assign values to the table based on keys",
         py::arg("table"), py::arg("n"), py::arg("keys"), py::arg("values"),
         py::arg("score") = c10::nullopt, py::arg("unique_key") = true);
@@ -1017,7 +984,6 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("reserve", &reserve, "reserve hash table capacity", py::arg("table"),
         py::arg("new_capacity"));
 
-
   py::enum_<dyn_emb::DataType>(m, "DynamicEmbDataType")
       .value("Float32", dyn_emb::DataType::Float32)
       .value("BFloat16", dyn_emb::DataType::BFloat16)
@@ -1028,40 +994,23 @@ void bind_dyn_emb_op(py::module &m) {
       .value("UInt32", dyn_emb::DataType::UInt32)
       .value("Size_t", dyn_emb::DataType::Size_t)
       .export_values();
-    m.def("clear", &clear,
-          "Clear all keys in the table",
-          py::arg("table"));
+  m.def("clear", &clear, "Clear all keys in the table", py::arg("table"));
 
-    m.def("reserve", &reserve,
-          "reserve hash table capacity",
-          py::arg("table"),
-          py::arg("new_capacity"));
+  m.def("reserve", &reserve, "reserve hash table capacity", py::arg("table"),
+        py::arg("new_capacity"));
 
-    m.def("export_batch", &export_batch,
-          "export key value from table",
-          py::arg("table"),
-          py::arg("n"),
-          py::arg("offset"),
-          py::arg("d_counter"),
-          py::arg("keys"),
-          py::arg("values"),
-          py::arg("score") = c10::nullopt);
-    
-    m.def("count_matched", &count_matched, 
-      "Count the KV-pairs whose score > threshold in the whole table.",
-      py::arg("table"),
-      py::arg("threshold"),
-      py::arg("num_matched"));
+  m.def("export_batch", &export_batch, "export key value from table",
+        py::arg("table"), py::arg("n"), py::arg("offset"), py::arg("d_counter"),
+        py::arg("keys"), py::arg("values"), py::arg("score") = c10::nullopt);
 
-    m.def("export_batch_matched", &export_batch_matched,
-      "Export KV-pairs within [offset, offset + n) whose score > threshold",
-      py::arg("table"),
-      py::arg("threshold"),
-      py::arg("n"),
-      py::arg("offset"),
-      py::arg("num_matched"),
-      py::arg("keys"),
-      py::arg("values"));
+  m.def("count_matched", &count_matched,
+        "Count the KV-pairs whose score > threshold in the whole table.",
+        py::arg("table"), py::arg("threshold"), py::arg("num_matched"));
+
+  m.def("export_batch_matched", &export_batch_matched,
+        "Export KV-pairs within [offset, offset + n) whose score > threshold",
+        py::arg("table"), py::arg("threshold"), py::arg("n"), py::arg("offset"),
+        py::arg("num_matched"), py::arg("keys"), py::arg("values"));
 
   py::enum_<dyn_emb::EvictStrategy>(m, "EvictStrategy")
       .value("KLru", dyn_emb::EvictStrategy::kLru)
@@ -1072,12 +1021,12 @@ void bind_dyn_emb_op(py::module &m) {
       .export_values();
 
   py::enum_<dyn_emb::OptimizerType>(m, "OptimizerType")
-    .value("Null", dyn_emb::OptimizerType::Null)
-    .value("SGD", dyn_emb::OptimizerType::SGD)
-    .value("Adam", dyn_emb::OptimizerType::Adam)
-    .value("AdaGrad", dyn_emb::OptimizerType::AdaGrad)
-    .value("RowWiseAdaGrad", dyn_emb::OptimizerType::RowWiseAdaGrad)
-    .export_values();
+      .value("Null", dyn_emb::OptimizerType::Null)
+      .value("SGD", dyn_emb::OptimizerType::SGD)
+      .value("Adam", dyn_emb::OptimizerType::Adam)
+      .value("AdaGrad", dyn_emb::OptimizerType::AdaGrad)
+      .value("RowWiseAdaGrad", dyn_emb::OptimizerType::RowWiseAdaGrad)
+      .export_values();
 
   m.def("lookup_forward", &lookup_forward, "scatter and combine",
         py::arg("src"), py::arg("dst"), py::arg("offset"),
@@ -1091,50 +1040,6 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("tables_num"), py::arg("batch_size"), py::arg("num_feature"),
         py::arg("num_key"), py::arg("combiner"));
 
-  m.def("lookup_forward_dense",
-        (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,
-                  const at::Tensor, const at::Tensor, const py::list, 
-                  const std::vector<int> &,
-                  at::Tensor, int, int, int, bool, const at::Tensor,
-                  const at::Tensor, const at::Tensor, const at::Tensor,
-                  const at::Tensor, const at::Tensor, const at::Tensor,
-                  const at::Tensor, int,
-                  std::shared_ptr<dyn_emb::UniqueOpBase>)) &
-            lookup_forward_dense,
-        "lookup forward dense for duplicated keys", py::arg("tables"),
-        py::arg("indices"), py::arg("offsets"), py::arg("scores"),
-        py::arg("table_offsets_in_feature"), py::arg("table_offsets"),
-        py::arg("table_num"), py::arg("batch_size"), py::arg("dim"),
-        py::arg("use_index_dedup"), py::arg("unique_idx"),
-        py::arg("reverse_idx"), py::arg("h_unique_nums"),
-        py::arg("d_unique_nums"), py::arg("h_unique_offsets"),
-        py::arg("d_unique_offsets"), py::arg("unique_embs"),
-        py::arg("output_embs"), py::arg("device_num_sms"),
-        py::arg("unique_op"));
-
-  m.def("lookup_forward_dense",
-        (void (*)(std::vector<std::shared_ptr<dyn_emb::DynamicVariableBase>>,
-                  const at::Tensor, const at::Tensor, const std::vector<int> &,
-                  int, int, int, const at::Tensor, const at::Tensor,
-                  const at::Tensor)) &
-            lookup_forward_dense,
-        "lookup forward dense for globally deduplicated keys",
-        py::arg("tables"), py::arg("indices"), py::arg("offsets"),
-        py::arg("table_offsets_in_feature"), py::arg("table_num"),
-        py::arg("batch_size"), py::arg("dim"), py::arg("h_unique_offsets"),
-        py::arg("unique_embs"), py::arg("output_embs"));
-
-  m.def("lookup_backward_dense", &lookup_backward_dense,
-        "lookup backward for dense/sequence", py::arg("indices"),
-        py::arg("grads"), py::arg("dim"), py::arg("table_offsets"),
-        py::arg("unique_indices"), py::arg("unique_grads"));
-
-
-  m.def("lookup_backward_dense_dedup", &lookup_backward_dense_dedup,
-        "lookup backward for dedup dense/sequence", py::arg("grads"),
-        py::arg("unique_indices"), py::arg("reverse_idx"), py::arg("dim"),
-        py::arg("unique_grads"), py::arg("device_num_sms"));
-
   m.def("dedup_input_indices", &dedup_input_indices,
         "duplicate indices from a given list or array of indices",
         py::arg("indices"), py::arg("offset"),
@@ -1144,13 +1049,17 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("h_unique_nums"), py::arg("d_unique_nums"),
         py::arg("h_unique_offsets"), py::arg("d_unique_offsets"),
         py::arg("unique_idx"), py::arg("new_offsets"), py::arg("new_lengths"),
-        py::arg("device_num_sms"), py::arg("unique_op"));
+        py::arg("device_num_sms"), py::arg("unique_op"),
+        py::arg("frequency_counters") = c10::nullopt,
+        py::arg("input_frequencies") = c10::nullopt);
 
-  m.def("reduce_grads", &reduce_grads,
-    "reduce grads", py::arg("indices"), py::arg("grads"), py::arg("segment_range"), py::arg("h_segment_range")
-  );
+  m.def("reduce_grads", &reduce_grads, "reduce grads", py::arg("indices"),
+        py::arg("grads"), py::arg("segment_range"), py::arg("h_segment_range"));
 
-  m.def("load_from_pointers", &load_from_pointers,
-    "load from pointers to dst.", py::arg("pointers"), py::arg("dst")
-  );
+  m.def("load_from_pointers", &load_from_pointers, "load from pointers to dst.",
+        py::arg("pointers"), py::arg("dst"));
+
+  m.def("gather_embedding", &gather_embedding,
+        "Gather embedding based on index.", py::arg("input"), py::arg("output"),
+        py::arg("index"));
 }
