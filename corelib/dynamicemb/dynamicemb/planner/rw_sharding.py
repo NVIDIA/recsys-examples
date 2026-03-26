@@ -63,6 +63,7 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
             """
             return super()._create_embedding_kernel(config=config, pg=pg, device=device)
         else:
+            self._need_prefetch = True
             return BatchedDynamicEmbedding(
                 config=config,
                 pg=pg,

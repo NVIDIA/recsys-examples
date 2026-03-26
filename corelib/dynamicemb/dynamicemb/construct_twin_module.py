@@ -25,6 +25,7 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+from dynamicemb.key_value_table import KeyValueTable
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -34,7 +35,6 @@ from dynamicemb.shard import (
     DynamicEmbeddingBagCollectionSharder,
     DynamicEmbeddingCollectionSharder,
 )
-from dynamicemb_extensions import insert_or_assign
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torch import nn
 from torchrec import EmbeddingBagCollection, EmbeddingCollection
@@ -526,9 +526,9 @@ class ConstructTwinModule:
             unique_values = filtered_values[unique_inverse_indices, :]
 
             tmp_table_name = feature.replace("f_", "t_")
-            cur_hkv_table = table_name_map_hkv_table[tmp_table_name]
-            optstate_dim = cur_hkv_table.optstate_dim()
-            initial_accumulator = cur_hkv_table.get_initial_optstate()
+            cur_hkv_table: KeyValueTable = table_name_map_hkv_table[tmp_table_name]
+            optstate_dim = cur_hkv_table.optim_state_dim()
+            initial_accumulator = cur_hkv_table.init_optimizer_state()
             optstate = (
                 torch.ones(
                     unique_values.size(0),
@@ -541,9 +541,7 @@ class ConstructTwinModule:
             unique_values = torch.cat((unique_values, optstate), dim=1).contiguous()
             unique_values = unique_values.reshape(-1)
 
-            n = unique_indices.shape[0]
-
-            insert_or_assign(cur_hkv_table, n, unique_indices, unique_values)
+            cur_hkv_table.insert(unique_indices, unique_values)
         # In TorchREC, once a forward lookup occurs, the iteration in the module gets updated(even you don't do backward).
         # This makes it difficult to accurately test ADAM since the iteration count affects the optimizer's behavior.
         # So we reset the optimizer_step in here
