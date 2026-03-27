@@ -160,7 +160,7 @@ class TimedBuildExtension(BuildExtension):
 
 setup(
     name=library_name,
-    version="0.0.1",
+    version="0.0.4",
     author="NVIDIA Corporation.",
     maintainer="zehuanw",
     maintainer_email="zehuanw@nvidia.com",
