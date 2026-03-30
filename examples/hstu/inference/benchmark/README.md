@@ -28,6 +28,8 @@ HSTU Setup for benchmark:
 | Max Per Sequence Length     | 4096  |
 | Per Sequence Targets Number | 256   |
 
+Notice: This config is for all following benchmarks (unless otherwise specified).
+
 ### 1. End-to-end inference performance
 
 Here we benchmarked with a synthetic input dataset:
@@ -67,4 +69,4 @@ Notice: In the L20 benchmark, the page size of KVCache is 32-token. The head dim
 
 When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3.3 ~ 7.7x** with extra 256 candidates for each sequence (for batch size = 1 and 8 respectively).
 
-Notice: In the B200 benchmark, the page size of KVCache is 128-token. The head dim of hstu attention kernel is 128. This is limited by currently kernel implementations.
+Notice: In the B200 benchmark, the page size of KVCache is 128-token. The head dim of hstu attention kernel is 128. This is limited by current kernel implementations.
