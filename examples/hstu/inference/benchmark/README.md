@@ -51,9 +51,20 @@ Note:
 
 ### 2. HSTU block performance
 
-Performance Results:
+* **Performance Results on L20:**
 
 ![Local Image](hstu_inference_l20_batch1.png)
 ![Local Image](hstu_inference_l20_batch8.png)
 
-When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3x ~ 20x** without candidate items, and a speedup of **3x ~ 8x** with extra 256 candidates for each sequence. (for batch size = 1 and 8 respectively).
+When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3x ~ 20x** without candidate items, and a speedup of **3x ~ 8x** with extra 256 candidates for each sequence (for batch size = 1 and 8 respectively).
+
+Notice: In the L20 benchmark, the page size of KVCache is 32-token. The head dim of hstu attention kernel is 256. 
+
+* **Performance Results on B200 (using HSTU Blackwell CuteDSL kernel):**
+
+![Local Image](hstu_inference_b200_batch1.png)
+![Local Image](hstu_inference_b200_batch8.png)
+
+When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3.3 ~ 7.7x** with extra 256 candidates for each sequence (for batch size = 1 and 8 respectively).
+
+Notice: In the B200 benchmark, the page size of KVCache is 128-token. The head dim of hstu attention kernel is 128. This is limited by currently kernel implementations.
