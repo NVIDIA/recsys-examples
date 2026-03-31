@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List
-
 import torch
 
 
@@ -209,177 +207,79 @@ def padded_target_aware_causal_mask(
     return ~valid_attn_mask
 
 
-def build_incremental_append_arbitrary_func(
-    history_seqlens: torch.Tensor,
-    max_history_seqlen: int,
-    current_step: int,
-    beam_widths: List[int],
-    ancestor_positions: torch.Tensor,
+def dense_mask_to_arbitrary_func(
+    valid_mask: torch.Tensor,
+    seqlen: int,
+    padding: int = 256,
 ) -> torch.Tensor:
     """
-    Build an arbitrary_func tensor for the Method A (Incremental Append) beam
-    search layout, compatible with flash_attn's interval-based mask encoding.
+    Convert a dense bool attention mask to flash_attn's interval-based
+    arbitrary_func tensor.
 
-    Method A sequence layout (at the time of predicting step ``current_step``):
-      [history..., step0_beams, step1_beams, ..., step_{current_step-1}_beams]
-
-    Mask semantics:
-      - History tokens: causal within history (token i sees [0, i+1))
-      - Generated token at (step s, beam b): sees
-          [0, hist_len)                       (all history)
-        plus its ancestor chain encoded via ancestor_positions.
-      - The last step's tokens (step current_step-1) use precise tree mask.
-      - Earlier steps' tokens use a causal-like approximation.
+    For each query position q, the arbitrary_func encodes visible key
+    positions as a union of intervals:
+        visible(q) = [0, F0) ∪ [F1, F2) ∪ [F3, F4) ∪ ...
 
     Args:
-        history_seqlens: [B] per-sample history lengths.
-        max_history_seqlen: max history length (for padding).
-        current_step: the hierarchy step being predicted (0-based).
-            The sequence contains tokens from steps 0..current_step-1.
-        beam_widths: list of beam widths per step.
-        ancestor_positions: [B, topk_current, current_step] physical positions
-            of each beam's ancestors at steps 0..current_step-1.
-            None if current_step == 0.
+        valid_mask: [B, N, N] or [B, 1, N, N] bool tensor (True = can attend).
+        seqlen: sequence length N.
+        padding: extra padding on last dim (FA convention, default 256).
 
     Returns:
-        arbitrary_func: [B, 1, n_func, total_seqlen + 256] int32 tensor.
+        arbitrary_func: [B, 1, n_func, seqlen + padding] int32 tensor.
     """
-    device = history_seqlens.device
-    B = history_seqlens.shape[0]
-    total_generated = sum(beam_widths[:current_step])
-    total_seqlen = max_history_seqlen + total_generated
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    assert valid_mask.dim() == 3, f"Expected [B, N, N], got {valid_mask.shape}"
 
-    if current_step == 0:
-        # Pure causal mask over history, n_func=1
-        af = torch.zeros(
-            B, 1, 1, total_seqlen + 256, dtype=torch.int32, device=device
-        )
-        hist_positions = torch.arange(max_history_seqlen, device=device)
-        hist_f0 = (hist_positions + 1).unsqueeze(0).expand(B, -1)
-        hist_f0 = torch.min(
-            hist_f0, history_seqlens.unsqueeze(1).expand_as(hist_f0)
-        )
-        af[:, 0, 0, :max_history_seqlen] = hist_f0.to(torch.int32)
-        return af
+    B, N, _ = valid_mask.shape
+    device = valid_mask.device
 
-    topk_current = beam_widths[current_step - 1]
+    # Detect interval boundaries via transitions
+    shifted = torch.zeros_like(valid_mask)
+    shifted[:, :, 1:] = valid_mask[:, :, :-1]
+    starts = valid_mask & ~shifted  # start of each True run
+    max_intervals = int(starts.sum(dim=-1).max().item())
+    n_func = max(2 * max_intervals - 1, 1)
+    if n_func % 2 == 0:
+        n_func += 1
 
-    # n_func must be odd. The last-step tokens need at most
-    # (current_step + 1) intervals: 1 (history) + current_step (ancestors incl self).
-    max_intervals = current_step + 1
-    n_func = max(2 * max_intervals - 1, 3)
+    # When first interval doesn't start at 0, it needs an extra slot.
+    # Recount: base interval [0, F0) is free only if first run starts at 0.
+    # Worst case: all intervals need explicit [F_start, F_end) pairs.
+    # n_func = 2*max_intervals + 1 covers all cases.
+    n_func = 2 * max_intervals + 1
+    if n_func % 2 == 0:
+        n_func += 1
 
-    af = torch.zeros(
-        B, 1, n_func, total_seqlen + 256, dtype=torch.int32, device=device
-    )
+    af = torch.zeros(B, 1, n_func, seqlen + padding, dtype=torch.int32, device=device)
 
-    # --- History tokens: causal mask, F0 = pos + 1 ---
-    hist_positions = torch.arange(max_history_seqlen, device=device)
-    hist_f0 = (hist_positions + 1).unsqueeze(0).expand(B, -1)
-    hist_f0 = torch.min(
-        hist_f0, history_seqlens.unsqueeze(1).expand_as(hist_f0)
-    )
-    af[:, 0, 0, :max_history_seqlen] = hist_f0.to(torch.int32)
+    ends_shifted = torch.zeros_like(valid_mask)
+    ends_shifted[:, :, :-1] = valid_mask[:, :, 1:]
+    ends = valid_mask & ~ends_shifted  # last True position in each run
 
-    # --- Generated tokens ---
-    gen_offset = 0
-    for s in range(current_step):
-        bw_s = beam_widths[s]
-        gen_start = max_history_seqlen + gen_offset
-        is_last_step = s == current_step - 1
+    for b in range(B):
+        for q in range(N):
+            row = valid_mask[b, q]
+            if not row.any():
+                continue
+            start_pos = starts[b, q].nonzero(as_tuple=False).squeeze(-1)
+            end_pos = ends[b, q].nonzero(as_tuple=False).squeeze(-1) + 1
 
-        for b in range(bw_s):
-            pos = gen_start + b
-
-            # F0: base interval = [0, hist_len) — see all history
-            af[:, 0, 0, pos] = history_seqlens.to(torch.int32)
-
-            if is_last_step and ancestor_positions is not None:
-                # Tree mask: precise ancestor intervals from ancestor_positions.
-                # ancestor_positions[:, b, :] has positions at steps 0..current_step-1.
-                # Steps 0..current_step-2 are true ancestors; step current_step-1 is self.
-                for anc_idx in range(current_step):
-                    anc_pos = ancestor_positions[:, b, anc_idx]  # [B]
-                    af[:, 0, 2 * anc_idx + 1, pos] = anc_pos.to(torch.int32)
-                    af[:, 0, 2 * anc_idx + 2, pos] = (anc_pos + 1).to(
-                        torch.int32
-                    )
-            else:
-                # Earlier steps' tokens: causal over [hist_len, pos+1)
-                af[:, 0, 1, pos] = max_history_seqlen
-                af[:, 0, 2, pos] = pos + 1
-
-        gen_offset += bw_s
+            # F0 encodes [0, F0). If first interval starts at 0, use F0.
+            # Otherwise F0 stays 0 (empty base interval) and all intervals
+            # go into the extra slots.
+            extra_idx = 0
+            for iv in range(len(start_pos)):
+                s, e = start_pos[iv].item(), end_pos[iv].item()
+                if iv == 0 and s == 0:
+                    af[b, 0, 0, q] = e
+                else:
+                    af[b, 0, 2 * extra_idx + 1, q] = s
+                    af[b, 0, 2 * extra_idx + 2, q] = e
+                    extra_idx += 1
 
     return af
-
-
-def build_incremental_append_dense_mask(
-    history_seqlens: torch.Tensor,
-    max_history_seqlen: int,
-    current_step: int,
-    beam_widths: List[int],
-    ancestor_positions: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Build a dense [B, N, N] bool mask for Method A layout — for testing and
-    validation against arbitrary_func encoding.
-
-    Args:
-        current_step: the hierarchy step being predicted (0-based).
-            The sequence contains tokens from steps 0..current_step-1.
-        ancestor_positions: [B, topk, current_step] or None.
-            Covers steps 0..current_step-1. The last entry is the self position.
-
-    Returns:
-        mask: [B, N, N] bool tensor where True = can attend.
-    """
-    device = history_seqlens.device
-    B = history_seqlens.shape[0]
-    total_generated = sum(beam_widths[:current_step])
-    N = max_history_seqlen + total_generated
-
-    mask = torch.zeros(B, N, N, dtype=torch.bool, device=device)
-
-    # History region: causal
-    for b_idx in range(B):
-        hl = history_seqlens[b_idx].item()
-        for i in range(hl):
-            mask[b_idx, i, : i + 1] = True
-
-    if current_step == 0:
-        return mask
-
-    topk_current = beam_widths[current_step - 1]
-
-    # Generated tokens from earlier steps (steps 0..current_step-2): causal
-    gen_offset = 0
-    for s in range(current_step - 1):
-        bw_s = beam_widths[s]
-        gen_start = max_history_seqlen + gen_offset
-        for b in range(bw_s):
-            pos = gen_start + b
-            for b_idx in range(B):
-                hl = history_seqlens[b_idx].item()
-                mask[b_idx, pos, :hl] = True
-                mask[b_idx, pos, max_history_seqlen : pos + 1] = True
-        gen_offset += bw_s
-
-    # Last step tokens (step current_step-1): precise tree mask
-    gen_start = max_history_seqlen + gen_offset
-    for b in range(topk_current):
-        pos = gen_start + b
-        for b_idx in range(B):
-            hl = history_seqlens[b_idx].item()
-            mask[b_idx, pos, :hl] = True  # history
-            if ancestor_positions is not None:
-                for anc_step in range(current_step):
-                    anc_pos = ancestor_positions[b_idx, b, anc_step].item()
-                    mask[b_idx, pos, anc_pos] = True
-            else:
-                mask[b_idx, pos, pos] = True  # self only
-
-    return mask
 
 
 if __name__ == "__main__":

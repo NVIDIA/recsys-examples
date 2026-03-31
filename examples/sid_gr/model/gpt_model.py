@@ -37,12 +37,9 @@ from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 from .attention_mask import (
-    build_incremental_append_arbitrary_func,
-    build_incremental_append_dense_mask,
     padded_causal_mask_with_optional_bos,
     padded_target_aware_causal_mask,
 )
-from .jagged_flash_attn_block import JaggedFlashAttnBlock
 
 
 def _padding_to_dense_and_transpose(
@@ -518,59 +515,113 @@ class SIDGRModel(MegatronModule):
         attention_mask: Optional[torch.Tensor] = None,
         padding_to_dense: bool = True,
         add_bos_to_history: bool = False,
+        use_flash_attn: bool = False,
     ) -> torch.Tensor:
         """
         Input and Output are both jagged.
         attention_mask is used only when padding_to_dense is True.
         When attention mask is None, we will construct a causal attention mask if padding_to_dense is True.
 
-        We now only support dense input.
+        When use_flash_attn is True, uses JaggedFlashAttnBlock with jiayus's
+        Flash Attention + arbitrary_func mask encoding instead of Megatron's
+        TransformerBlock. The dense attention_mask is automatically converted
+        to arbitrary_func format.
         """
         if add_bos_to_history:
             assert (
                 attention_mask is None
             ), "attention mask should be None when adding bos to history"
-        # TODO, remove the padding.
         input_offsets[-1].item()
-        if padding_to_dense:
-            decoder_input_hidden_states = _padding_to_dense_and_transpose(
-                input_hidden_states,
+        batch_size = input_offsets.size(0) - 1
+
+        # Build attention_mask if not provided (needed by both paths)
+        if attention_mask is None and padding_to_dense:
+            attention_mask = padded_causal_mask_with_optional_bos(
                 input_offsets,
                 input_max_seqlen,
+                add_bos_to_history=add_bos_to_history,
+                bos_interval=self._num_hierarchies,
             )
-            packed_seq_params = None
-            if attention_mask is None:
-                attention_mask = padded_causal_mask_with_optional_bos(
+
+        if use_flash_attn:
+            from .attention_mask import dense_mask_to_arbitrary_func
+            from .jagged_flash_attn_block import JaggedFlashAttnBlock
+
+            # Lazy-init the FA decoder block
+            if not hasattr(self, "_jagged_fa_decoder"):
+                self._jagged_fa_decoder = JaggedFlashAttnBlock(
+                    num_layers=self.config.num_layers,
+                    hidden_size=self.embedding_dim,
+                    num_attention_heads=self.config.num_attention_heads,
+                    ffn_hidden_size=self.config.ffn_hidden_size,
+                    layernorm_epsilon=getattr(
+                        self.config, "layernorm_epsilon", 1e-5
+                    ),
+                ).to(
+                    device=input_hidden_states.device,
+                    dtype=self._training_dtype,
+                )
+
+            # Pad jagged → dense [B, S, D]
+            padded_input = (
+                torch.ops.fbgemm.jagged_to_padded_dense(
+                    values=input_hidden_states,
+                    offsets=[input_offsets],
+                    max_lengths=[input_max_seqlen],
+                    padding_value=0.0,
+                )
+                .view(batch_size, input_max_seqlen, -1)
+                .to(self._training_dtype)
+            )
+
+            # Convert dense mask → arbitrary_func
+            # attention_mask convention: True = masked out → invert for valid mask
+            valid_mask = ~attention_mask  # [B, 1, N, N]
+            arbitrary_func = dense_mask_to_arbitrary_func(
+                valid_mask, input_max_seqlen
+            )
+
+            padded_output = self._jagged_fa_decoder(
+                padded_input,
+                arbitrary_func=arbitrary_func,
+                seqlen=input_max_seqlen,
+            )
+
+            # Unpad dense → jagged
+            output_hidden_states = torch.ops.fbgemm.dense_to_jagged(
+                padded_output, [input_offsets]
+            )[0]
+        else:
+            # Original Megatron path
+            if padding_to_dense:
+                decoder_input_hidden_states = _padding_to_dense_and_transpose(
+                    input_hidden_states,
                     input_offsets,
                     input_max_seqlen,
-                    add_bos_to_history=add_bos_to_history,
-                    bos_interval=self._num_hierarchies,
                 )
-        else:
-            # THD still needs batch dimension
-            # we need to unsqueeze the hidden states to [T, 1, hidden_size] and unsqueeze back after decoder
-            assert input_hidden_states.dim() == 2, "input_hidden_states should be 2D"
-            decoder_input_hidden_states = input_hidden_states.unsqueeze(1)
-            attention_mask = None
-            packed_seq_params = to_packed_seq_params(
-                input_offsets,
-                input_max_seqlen,
+                packed_seq_params = None
+            else:
+                assert input_hidden_states.dim() == 2, "input_hidden_states should be 2D"
+                decoder_input_hidden_states = input_hidden_states.unsqueeze(1)
+                attention_mask = None
+                packed_seq_params = to_packed_seq_params(
+                    input_offsets,
+                    input_max_seqlen,
+                )
+            decoder_output_hidden_states = self.decoder(
+                hidden_states=decoder_input_hidden_states,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
             )
-        decoder_output_hidden_states = self.decoder(
-            hidden_states=decoder_input_hidden_states,  # input_hidden_states,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,  # we now enforce arbitrary attention mask + dense padding
-        )
 
-        if padding_to_dense:
-            output_hidden_states = _transpose_dense_to_jagged(
-                decoder_output_hidden_states,
-                input_offsets,
-                input_max_seqlen,
-            )
-        else:
-            # remove batch dim if THD
-            output_hidden_states = decoder_output_hidden_states.squeeze(1)
+            if padding_to_dense:
+                output_hidden_states = _transpose_dense_to_jagged(
+                    decoder_output_hidden_states,
+                    input_offsets,
+                    input_max_seqlen,
+                )
+            else:
+                output_hidden_states = decoder_output_hidden_states.squeeze(1)
         return output_hidden_states
 
     def forward(
@@ -780,221 +831,3 @@ class SIDGRModel(MegatronModule):
         log_probs = self.beam_search.get_log_probs()
         return generated_sids, log_probs
 
-    @torch.no_grad
-    def generate_method_a(self, batch: GPTSIDBatch) -> torch.Tensor:
-        """
-        Generate using Method A (Incremental Append) token layout.
-
-        Sequence layout at step i:
-          [history+BOS, step0_beams, step1_beams, ..., step_{i-1}_beams]
-
-        Tokens are appended in generation order. The attention mask is a
-        tree-shaped arbitrary mask: each beam token sees all history plus
-        its ancestor chain, but not tokens from other beam branches.
-
-        This method uses JaggedFlashAttnBlock with arbitrary_func mask encoding
-        and jiayus's Flash Attention kernel.
-        """
-        # 0. prepare history+BOS embeddings (identical to generate())
-        (
-            history_embeddings,
-            input_offsets,
-            input_max_seqlen,
-        ) = self._prepare_embeddings(
-            batch, add_bos_to_history=False, is_generation=True
-        )
-        batch_size = batch.actual_batch_size
-        input_offsets = input_offsets[: batch_size + 1]
-        history_seqlens = torch.diff(input_offsets)  # [B]
-
-        # Lazy-init the JaggedFlashAttnBlock (owns its own weights)
-        if not hasattr(self, "_jagged_fa_decoder"):
-            self._jagged_fa_decoder = JaggedFlashAttnBlock(
-                num_layers=self.config.num_layers,
-                hidden_size=self.embedding_dim,
-                num_attention_heads=self.config.num_attention_heads,
-                ffn_hidden_size=self.config.ffn_hidden_size,
-                layernorm_epsilon=getattr(
-                    self.config, "layernorm_epsilon", 1e-5
-                ),
-            ).to(
-                device=history_embeddings.device,
-                dtype=self._training_dtype,
-            )
-
-        self.beam_search.reset()
-
-        # physical_step_codes[s] stores the codes selected at step s
-        # shape: [batch_size, beam_widths[s]]
-        physical_step_codes: List[torch.Tensor] = []
-
-        for i in range(self._num_hierarchies):
-            # 1. Build the Method A sequence
-            if i == 0:
-                # No generated tokens yet; sequence is just [history+BOS]
-                cated_hidden_states = history_embeddings
-                cated_offsets = input_offsets
-                cated_max_seqlen = input_max_seqlen
-                topk_prev_step = 1
-            else:
-                # Embed all previous steps' codes in Method A order:
-                #   [step0_beam0, step0_beam1, ..., step1_beam0, ...]
-                all_gen_codes = torch.cat(
-                    [sc.view(-1) for sc in physical_step_codes]
-                )  # [total_gen_tokens]
-                total_gen_per_sample = sum(
-                    self.beam_search.beam_widths[s] for s in range(i)
-                )
-
-                gen_sids_kjt = KeyedJaggedTensor.from_lengths_sync(
-                    keys=[
-                        batch.candidate_feature_name,
-                        batch.history_feature_name,
-                    ],
-                    values=all_gen_codes,
-                    lengths=torch.cat(
-                        [
-                            torch.full(
-                                (batch_size,),
-                                total_gen_per_sample,
-                                device=all_gen_codes.device,
-                                dtype=torch.long,
-                            ),
-                            torch.zeros(
-                                (batch_size,),
-                                device=all_gen_codes.device,
-                                dtype=torch.long,
-                            ),
-                        ]
-                    ),
-                )
-                gen_embeddings = (
-                    self._codebooks_collection(gen_sids_kjt)[
-                        batch.candidate_feature_name
-                    ]
-                    .values()
-                    .to(self._training_dtype)
-                )  # [batch_size * total_gen_per_sample, D]
-
-                gen_offsets = torch.arange(
-                    0,
-                    batch_size + 1,
-                    device=input_offsets.device,
-                    dtype=input_offsets.dtype,
-                ) * total_gen_per_sample
-
-                (
-                    cated_hidden_states,
-                    cated_offsets,
-                    cated_max_seqlen,
-                ) = self._concat_jagged(
-                    [history_embeddings, gen_embeddings],
-                    [input_offsets, gen_offsets],
-                    [input_max_seqlen, total_gen_per_sample],
-                )
-                topk_prev_step = self.beam_search.beam_widths[i - 1]
-
-            # 2. Build the arbitrary_func mask for Method A layout.
-            ancestor_positions = self.beam_search.get_ancestor_positions(
-                history_seqlens
-            )
-            arbitrary_func = build_incremental_append_arbitrary_func(
-                history_seqlens,
-                input_max_seqlen,
-                current_step=i,
-                beam_widths=self.beam_search.beam_widths,
-                ancestor_positions=ancestor_positions,
-            )
-
-            # 3. Pad jagged → dense [B, S, D], run through JaggedFlashAttnBlock
-            padded_input = (
-                torch.ops.fbgemm.jagged_to_padded_dense(
-                    values=cated_hidden_states,
-                    offsets=[cated_offsets],
-                    max_lengths=[cated_max_seqlen],
-                    padding_value=0.0,
-                )
-                .view(batch_size, cated_max_seqlen, -1)
-                .to(self._training_dtype)
-            )  # [B, S, D]
-
-            padded_output = self._jagged_fa_decoder(
-                padded_input,
-                arbitrary_func=arbitrary_func if i > 0 else None,
-                seqlen=cated_max_seqlen,
-            )  # [B, S, D]
-
-            # Unpad dense → jagged
-            jagged_output_hidden_states = torch.ops.fbgemm.dense_to_jagged(
-                padded_output, [cated_offsets]
-            )[0]
-
-            # 4. Extract the logit-producing tokens from the output.
-            # At step 0: the last 1 token per sample (BOS).
-            # At step i > 0: the last beam_widths[i-1] tokens (step i-1 beams).
-            if i == 0:
-                bos_offsets = torch.arange(
-                    0,
-                    batch_size + 1,
-                    device=input_offsets.device,
-                    dtype=input_offsets.dtype,
-                ).clamp(max=batch_size)
-                _, candidate_hidden_states = triton_split_2D_jagged(
-                    jagged_output_hidden_states,
-                    max_seq_len=cated_max_seqlen,
-                    offsets_a=cated_offsets - bos_offsets,
-                    offsets_b=bos_offsets,
-                )
-                candidate_hidden_states = candidate_hidden_states.view(
-                    batch_size, 1, self.embedding_dim
-                )
-            else:
-                logit_token_count = topk_prev_step
-                logit_offsets = torch.arange(
-                    0,
-                    batch_size + 1,
-                    device=input_offsets.device,
-                    dtype=input_offsets.dtype,
-                ) * logit_token_count
-
-                _, candidate_hidden_states = triton_split_2D_jagged(
-                    jagged_output_hidden_states,
-                    max_seq_len=cated_max_seqlen,
-                    offsets_a=cated_offsets - logit_offsets,
-                    offsets_b=logit_offsets,
-                )
-                candidate_hidden_states = candidate_hidden_states.view(
-                    batch_size, topk_prev_step, self.embedding_dim
-                )
-
-            # 5. MLP projection → logits → log_softmax
-            mlp = (
-                self._decoder_mlp[i]
-                if not self.share_lm_head_across_hierarchies
-                else self._decoder_mlp
-            )
-            tuple_or_tensor: Union[
-                Tuple[torch.Tensor, torch.Tensor], torch.Tensor
-            ] = mlp(candidate_hidden_states)
-            candidates_logits = (
-                tuple_or_tensor[0]
-                if isinstance(tuple_or_tensor, tuple)
-                else tuple_or_tensor
-            )
-            probs_this_step: torch.Tensor = torch.nn.functional.log_softmax(
-                candidates_logits.float(), dim=-1
-            )
-
-            # 6. Beam search propagate
-            self.beam_search.propagate(probs_this_step)
-
-            # 7. Record the physical step codes for the next iteration.
-            # history_topk_sids[i][:, :, i] gives the codes selected at step i
-            # for the beams that survived step i's top-k.
-            physical_step_codes.append(
-                self.beam_search.history_topk_sids[-1][:, :, i]
-            )
-
-        generated_sids = self.beam_search.get_sids()
-        log_probs = self.beam_search.get_log_probs()
-        return generated_sids, log_probs
