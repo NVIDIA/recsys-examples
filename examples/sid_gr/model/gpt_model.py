@@ -42,6 +42,7 @@ from .attention_mask import (
     padded_causal_mask_with_optional_bos,
     padded_target_aware_causal_mask,
 )
+from .jagged_flash_attn_block import JaggedFlashAttnBlock
 
 
 def _padding_to_dense_and_transpose(
@@ -791,9 +792,8 @@ class SIDGRModel(MegatronModule):
         tree-shaped arbitrary mask: each beam token sees all history plus
         its ancestor chain, but not tokens from other beam branches.
 
-        This method uses the existing dense-mask + pad-to-dense decoder path
-        for correctness validation. The arbitrary_func tensor is also built
-        for future use with jagged Flash Attention.
+        This method uses JaggedFlashAttnBlock with arbitrary_func mask encoding
+        and jiayus's Flash Attention kernel.
         """
         # 0. prepare history+BOS embeddings (identical to generate())
         (
@@ -806,6 +806,21 @@ class SIDGRModel(MegatronModule):
         batch_size = batch.actual_batch_size
         input_offsets = input_offsets[: batch_size + 1]
         history_seqlens = torch.diff(input_offsets)  # [B]
+
+        # Lazy-init the JaggedFlashAttnBlock (owns its own weights)
+        if not hasattr(self, "_jagged_fa_decoder"):
+            self._jagged_fa_decoder = JaggedFlashAttnBlock(
+                num_layers=self.config.num_layers,
+                hidden_size=self.embedding_dim,
+                num_attention_heads=self.config.num_attention_heads,
+                ffn_hidden_size=self.config.ffn_hidden_size,
+                layernorm_epsilon=getattr(
+                    self.config, "layernorm_epsilon", 1e-5
+                ),
+            ).to(
+                device=history_embeddings.device,
+                dtype=self._training_dtype,
+            )
 
         self.beam_search.reset()
 
@@ -879,48 +894,45 @@ class SIDGRModel(MegatronModule):
                 )
                 topk_prev_step = self.beam_search.beam_widths[i - 1]
 
-            # 2. Build the Method A attention mask.
-            # ancestor_positions covers the beams from the latest propagate.
-            # At step i, the sequence has tokens from steps 0..i-1.
-            # ancestor_positions has shape [B, topk, i] covering steps 0..i-1.
-            # None when i == 0 (no beams exist yet).
+            # 2. Build the arbitrary_func mask for Method A layout.
             ancestor_positions = self.beam_search.get_ancestor_positions(
                 history_seqlens
             )
-
-            dense_mask = build_incremental_append_dense_mask(
+            arbitrary_func = build_incremental_append_arbitrary_func(
                 history_seqlens,
                 input_max_seqlen,
                 current_step=i,
                 beam_widths=self.beam_search.beam_widths,
                 ancestor_positions=ancestor_positions,
             )
-            attention_mask = ~dense_mask.unsqueeze(1)  # [B, 1, N, N]
 
-            # Also build arbitrary_func for future jagged FA integration
-            _arbitrary_func = build_incremental_append_arbitrary_func(
-                history_seqlens,
-                input_max_seqlen,
-                current_step=i,
-                beam_widths=self.beam_search.beam_widths,
-                ancestor_positions=ancestor_positions,
-            )  # stored for debugging / future use
+            # 3. Pad jagged → dense [B, S, D], run through JaggedFlashAttnBlock
+            padded_input = (
+                torch.ops.fbgemm.jagged_to_padded_dense(
+                    values=cated_hidden_states,
+                    offsets=[cated_offsets],
+                    max_lengths=[cated_max_seqlen],
+                    padding_value=0.0,
+                )
+                .view(batch_size, cated_max_seqlen, -1)
+                .to(self._training_dtype)
+            )  # [B, S, D]
 
-            # 3. Decoder step (pad-to-dense path)
-            jagged_output_hidden_states = self.decoder_step(
-                cated_hidden_states,
-                cated_offsets,
-                cated_max_seqlen,
-                attention_mask=attention_mask,
-                padding_to_dense=True,
-                add_bos_to_history=False,
-            )
+            padded_output = self._jagged_fa_decoder(
+                padded_input,
+                arbitrary_func=arbitrary_func if i > 0 else None,
+                seqlen=cated_max_seqlen,
+            )  # [B, S, D]
+
+            # Unpad dense → jagged
+            jagged_output_hidden_states = torch.ops.fbgemm.dense_to_jagged(
+                padded_output, [cated_offsets]
+            )[0]
 
             # 4. Extract the logit-producing tokens from the output.
             # At step 0: the last 1 token per sample (BOS).
             # At step i > 0: the last beam_widths[i-1] tokens (step i-1 beams).
             if i == 0:
-                # BOS is the last token in history; extract 1 per sample
                 bos_offsets = torch.arange(
                     0,
                     batch_size + 1,
@@ -937,7 +949,6 @@ class SIDGRModel(MegatronModule):
                     batch_size, 1, self.embedding_dim
                 )
             else:
-                # Last beam_widths[i-1] tokens per sample
                 logit_token_count = topk_prev_step
                 logit_offsets = torch.arange(
                     0,
