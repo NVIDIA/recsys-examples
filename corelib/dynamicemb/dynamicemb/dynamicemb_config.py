@@ -553,51 +553,6 @@ def get_constraint_capacity(
     return (capacity // bucket_capacity) * bucket_capacity
 
 
-def _unwrap_table(table):
-    """Return the underlying DynamicEmbTable, unwrapping KeyValueTable if needed."""
-    # Avoid a circular import — import inline.
-    from dynamicemb.key_value_table import KeyValueTable
-
-    if isinstance(table, KeyValueTable):
-        return table.table
-    return table
-
-
-def dyn_emb_cols(table) -> int:
-    """Number of embedding columns (embedding_dim). Accepts DynamicEmbTable or KeyValueTable."""
-    from dynamicemb_extensions import dyn_emb_cols as _dyn_emb_cols
-
-    return _dyn_emb_cols(_unwrap_table(table))
-
-
-def dyn_emb_rows(table) -> int:
-    """Number of occupied rows. Accepts DynamicEmbTable or KeyValueTable."""
-    from dynamicemb_extensions import dyn_emb_rows as _dyn_emb_rows
-
-    return _dyn_emb_rows(_unwrap_table(table))
-
-
-def dyn_emb_capacity(table) -> int:
-    """Table capacity. Accepts DynamicEmbTable or KeyValueTable."""
-    from dynamicemb_extensions import dyn_emb_capacity as _dyn_emb_capacity
-
-    return _dyn_emb_capacity(_unwrap_table(table))
-
-
-def insert_or_assign(table, n, keys, values, scores):
-    """insert_or_assign wrapper — accepts DynamicEmbTable or KeyValueTable."""
-    from dynamicemb_extensions import insert_or_assign as _insert_or_assign
-
-    _insert_or_assign(_unwrap_table(table), n, keys, values, scores)
-
-
-def export_batch(table, batch_size, offset, d_counter, keys, values, scores):
-    """export_batch wrapper — accepts DynamicEmbTable or KeyValueTable."""
-    from dynamicemb_extensions import export_batch as _export_batch
-
-    _export_batch(_unwrap_table(table), batch_size, offset, d_counter, keys, values, scores)
-
-
 def _next_power_of_2(n):
     # Handle the case where n is 0
     if n == 0:
