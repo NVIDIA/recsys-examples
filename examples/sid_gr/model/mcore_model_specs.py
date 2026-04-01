@@ -76,7 +76,6 @@ except ImportError:
     warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
 
-
 def _get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -375,6 +374,7 @@ def get_gpt_decoder_block_spec(
         ), "arbitrary attention mask is only supported with Megatron-Core modules"
 
     # Layer specs.
+    # 
     dense_layer_spec = (
         _get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
