@@ -129,9 +129,7 @@ class SIDGRDecoder(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 num_attention_heads=self.config.num_attention_heads,
                 ffn_hidden_size=self.config.ffn_hidden_size,
-                layernorm_epsilon=getattr(
-                    self.config, "layernorm_epsilon", 1e-5
-                ),
+                layernorm_epsilon=getattr(self.config, "layernorm_epsilon", 1e-5),
             )
         else:
             self.decoder = TransformerBlock(
@@ -156,9 +154,8 @@ class SIDGRDecoder(MegatronModule):
             )
         else:
             # mcore path: expects dense [S, B, D] input
-            padded = _padding_to_dense_and_transpose(
-                hidden_states, offsets, max_seqlen
-            )
+            assert offsets is not None and max_seqlen is not None
+            padded = _padding_to_dense_and_transpose(hidden_states, offsets, max_seqlen)
             output = self.decoder(
                 hidden_states=padded,
                 attention_mask=attention_mask,
@@ -542,17 +539,17 @@ class SIDGRModel(MegatronModule):
         * mcore path: pass *attention_mask* (dense ``[B, 1, N, N]``).
         """
         if self.decoder.use_jagged_flash_attn:
-            assert arbitrary_func is not None, (
-                "FA path requires arbitrary_func; caller should build it"
-            )
+            assert (
+                arbitrary_func is not None
+            ), "FA path requires arbitrary_func; caller should build it"
             return self.decoder(
                 hidden_states=input_hidden_states,
                 arbitrary_func=arbitrary_func,
             )
         else:
-            assert attention_mask is not None, (
-                "mcore path requires attention_mask; caller should build it"
-            )
+            assert (
+                attention_mask is not None
+            ), "mcore path requires attention_mask; caller should build it"
             return self.decoder(
                 hidden_states=input_hidden_states,
                 attention_mask=attention_mask,
@@ -642,7 +639,6 @@ class SIDGRModel(MegatronModule):
           torch.Tensor: The generated sids.
         """
 
-        attention_mask: Optional[torch.Tensor] = None
         # 0. prepare history and bos embeddings. Note that we do not append bos to history.
         (
             history_embeddings,
@@ -765,4 +761,3 @@ class SIDGRModel(MegatronModule):
         generated_sids = self.beam_search.get_sids()
         log_probs = self.beam_search.get_log_probs()
         return generated_sids, log_probs
-

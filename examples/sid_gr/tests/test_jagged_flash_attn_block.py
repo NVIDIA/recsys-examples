@@ -26,24 +26,27 @@ Tests:
   - Backward: gradients flow correctly
 """
 
+import os
+import sys
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import sys
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
+from attention_mask import build_jagged_causal_arbitrary_func
 from jagged_flash_attn_block import (
     JaggedFlashAttnBlock,
     JaggedGPTLayer,
     JaggedTransformerBlock,
 )
-from attention_mask import build_jagged_causal_arbitrary_func
+
 sys.path.pop(0)
 
 try:
     from flash_attn.cute.interface import flash_attn_func  # noqa: F401
+
     HAS_FLASH_ATTN = True
 except ImportError:
     HAS_FLASH_ATTN = False
@@ -130,12 +133,16 @@ class TestJaggedGPTLayerSmoke:
 
     def test_block_forward_shape(self):
         """JaggedFlashAttnBlock stacks layers correctly."""
-        block = JaggedFlashAttnBlock(
-            num_layers=2,
-            hidden_size=256,
-            num_attention_heads=4,
-            ffn_hidden_size=1024,
-        ).cuda().bfloat16()
+        block = (
+            JaggedFlashAttnBlock(
+                num_layers=2,
+                hidden_size=256,
+                num_attention_heads=4,
+                ffn_hidden_size=1024,
+            )
+            .cuda()
+            .bfloat16()
+        )
 
         x = torch.randn(2, 32, 256, device="cuda", dtype=torch.bfloat16)
         out = block(x)
@@ -157,13 +164,19 @@ class TestJaggedGPTLayerCorrectness:
         ffn_size = hidden_size * 4
         torch.manual_seed(42)
 
-        ref_layer = ReferenceGPTLayer(hidden_size, num_heads, ffn_size).cuda().bfloat16()
-        test_layer = JaggedGPTLayer(
-            hidden_size=hidden_size,
-            num_attention_heads=num_heads,
-            ffn_hidden_size=ffn_size,
-            hidden_dropout=0.0,
-        ).cuda().bfloat16()
+        ref_layer = (
+            ReferenceGPTLayer(hidden_size, num_heads, ffn_size).cuda().bfloat16()
+        )
+        test_layer = (
+            JaggedGPTLayer(
+                hidden_size=hidden_size,
+                num_attention_heads=num_heads,
+                ffn_hidden_size=ffn_size,
+                hidden_dropout=0.0,
+            )
+            .cuda()
+            .bfloat16()
+        )
 
         test_layer.load_state_dict(ref_layer.state_dict())
 
@@ -185,12 +198,16 @@ class TestJaggedGPTLayerCorrectness:
         ffn_size = hidden_size * 4
         torch.manual_seed(42)
 
-        layer = JaggedGPTLayer(
-            hidden_size=hidden_size,
-            num_attention_heads=num_heads,
-            ffn_hidden_size=ffn_size,
-            hidden_dropout=0.0,
-        ).cuda().bfloat16()
+        layer = (
+            JaggedGPTLayer(
+                hidden_size=hidden_size,
+                num_attention_heads=num_heads,
+                ffn_hidden_size=ffn_size,
+                hidden_dropout=0.0,
+            )
+            .cuda()
+            .bfloat16()
+        )
 
         x = torch.randn(B, S, hidden_size, device="cuda", dtype=torch.bfloat16)
 
@@ -213,14 +230,20 @@ class TestJaggedGPTLayerBackward:
 
     def test_backward_runs(self):
         """Forward + backward should not error."""
-        layer = JaggedGPTLayer(
-            hidden_size=256,
-            num_attention_heads=4,
-            ffn_hidden_size=1024,
-            hidden_dropout=0.0,
-        ).cuda().bfloat16()
+        layer = (
+            JaggedGPTLayer(
+                hidden_size=256,
+                num_attention_heads=4,
+                ffn_hidden_size=1024,
+                hidden_dropout=0.0,
+            )
+            .cuda()
+            .bfloat16()
+        )
 
-        x = torch.randn(2, 16, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        x = torch.randn(
+            2, 16, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
         out = layer(x)
         loss = out.sum()
         loss.backward()
@@ -237,16 +260,24 @@ class TestJaggedGPTLayerBackward:
         B, S = 2, 16
         torch.manual_seed(42)
 
-        ref_layer = ReferenceGPTLayer(hidden_size, num_heads, ffn_size).cuda().bfloat16()
-        test_layer = JaggedGPTLayer(
-            hidden_size=hidden_size,
-            num_attention_heads=num_heads,
-            ffn_hidden_size=ffn_size,
-            hidden_dropout=0.0,
-        ).cuda().bfloat16()
+        ref_layer = (
+            ReferenceGPTLayer(hidden_size, num_heads, ffn_size).cuda().bfloat16()
+        )
+        test_layer = (
+            JaggedGPTLayer(
+                hidden_size=hidden_size,
+                num_attention_heads=num_heads,
+                ffn_hidden_size=ffn_size,
+                hidden_dropout=0.0,
+            )
+            .cuda()
+            .bfloat16()
+        )
         test_layer.load_state_dict(ref_layer.state_dict())
 
-        x_ref = torch.randn(B, S, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        x_ref = torch.randn(
+            B, S, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
         x_test = x_ref.detach().clone().requires_grad_(True)
 
         ref_out = ref_layer(x_ref, is_causal=True)
@@ -256,9 +287,7 @@ class TestJaggedGPTLayerBackward:
         ref_out.backward(dout)
         test_out.backward(dout)
 
-        torch.testing.assert_close(
-            x_test.grad, x_ref.grad, atol=5e-2, rtol=5e-2
-        )
+        torch.testing.assert_close(x_test.grad, x_ref.grad, atol=5e-2, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -270,8 +299,10 @@ class ReferenceBlock(nn.Module):
     def __init__(self, num_layers, hidden_size, num_heads, ffn_hidden_size, eps=1e-5):
         super().__init__()
         self.layers = nn.ModuleList(
-            [ReferenceGPTLayer(hidden_size, num_heads, ffn_hidden_size, eps)
-             for _ in range(num_layers)]
+            [
+                ReferenceGPTLayer(hidden_size, num_heads, ffn_hidden_size, eps)
+                for _ in range(num_layers)
+            ]
         )
         self.final_layernorm = nn.LayerNorm(hidden_size, eps=eps)
 
@@ -320,26 +351,26 @@ class TestJaggedTransformerBlockVsPadded:
         torch.manual_seed(123)
 
         ref_block = ReferenceBlock(num_layers, H, NH, FFN).cuda().bfloat16()
-        test_block = JaggedTransformerBlock(
-            num_layers=num_layers,
-            hidden_size=H,
-            num_attention_heads=NH,
-            ffn_hidden_size=FFN,
-        ).cuda().bfloat16()
+        test_block = (
+            JaggedTransformerBlock(
+                num_layers=num_layers,
+                hidden_size=H,
+                num_attention_heads=NH,
+                ffn_hidden_size=FFN,
+            )
+            .cuda()
+            .bfloat16()
+        )
 
         # Copy weights: test_block.block.layers[i] ↔ ref_block.layers[i]
         for i in range(num_layers):
-            test_block.block.layers[i].load_state_dict(
-                ref_block.layers[i].state_dict()
-            )
+            test_block.block.layers[i].load_state_dict(ref_block.layers[i].state_dict())
         test_block.block.final_layernorm.load_state_dict(
             ref_block.final_layernorm.state_dict()
         )
 
         # Build jagged input [total_tokens, H]
-        jagged_input = torch.randn(
-            total_tokens, H, device="cuda", dtype=torch.bfloat16
-        )
+        jagged_input = torch.randn(total_tokens, H, device="cuda", dtype=torch.bfloat16)
 
         # --- FA path: flatten to B=1, build arbitrary_func ---
         arbitrary_func = build_jagged_causal_arbitrary_func(offsets, total_tokens)
@@ -354,12 +385,15 @@ class TestJaggedTransformerBlockVsPadded:
                 padded_in = torch.zeros(
                     1, max_seqlen, H, device="cuda", dtype=torch.bfloat16
                 )
-                padded_in[0, :sl] = jagged_input[s:s + sl]
+                padded_in[0, :sl] = jagged_input[s : s + sl]
                 ref_out = ref_block(padded_in, is_causal=True)
-                fa_seq = fa_output[s:s + sl]
+                fa_seq = fa_output[s : s + sl]
                 ref_seq = ref_out[0, :sl]
                 torch.testing.assert_close(
-                    fa_seq, ref_seq, atol=5e-2, rtol=5e-2,
+                    fa_seq,
+                    ref_seq,
+                    atol=5e-2,
+                    rtol=5e-2,
                     msg=f"Mismatch in batch element {b}",
                 )
 
@@ -369,10 +403,16 @@ class TestJaggedTransformerBlockVsPadded:
         offsets = torch.tensor([0, 4, 9], device="cuda")
         total = 9
 
-        block = JaggedTransformerBlock(
-            num_layers=1, hidden_size=H,
-            num_attention_heads=NH, ffn_hidden_size=FFN,
-        ).cuda().bfloat16()
+        block = (
+            JaggedTransformerBlock(
+                num_layers=1,
+                hidden_size=H,
+                num_attention_heads=NH,
+                ffn_hidden_size=FFN,
+            )
+            .cuda()
+            .bfloat16()
+        )
 
         x = torch.randn(total, H, device="cuda", dtype=torch.bfloat16)
         af = build_jagged_causal_arbitrary_func(offsets, total)
@@ -391,10 +431,16 @@ class TestJaggedTransformerBlockVsPadded:
         H, NH, FFN = 256, 4, 1024
         torch.manual_seed(77)
 
-        block = JaggedTransformerBlock(
-            num_layers=1, hidden_size=H,
-            num_attention_heads=NH, ffn_hidden_size=FFN,
-        ).cuda().bfloat16()
+        block = (
+            JaggedTransformerBlock(
+                num_layers=1,
+                hidden_size=H,
+                num_attention_heads=NH,
+                ffn_hidden_size=FFN,
+            )
+            .cuda()
+            .bfloat16()
+        )
 
         seq_a = torch.randn(5, H, device="cuda", dtype=torch.bfloat16)
         seq_b = torch.randn(7, H, device="cuda", dtype=torch.bfloat16)

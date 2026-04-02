@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
 from attention_mask import (
     build_jagged_causal_arbitrary_func,
     dense_mask_to_arbitrary_func,
-    padded_causal_mask_with_optional_bos,
     padded_target_aware_causal_mask,
 )
+
 sys.path.pop(0)
 
 
@@ -138,9 +138,10 @@ class TestDenseMaskToArbitraryFunc:
     @pytest.mark.parametrize("beam_width", [2, 3])
     @pytest.mark.parametrize("candidate_len", [1, 3])
     def test_target_aware_causal_mask(self, beam_width, candidate_len):
-        B = 2
         hist_lens = torch.tensor([6, 4], device="cuda")
-        inverted = padded_target_aware_causal_mask(hist_lens, 6, beam_width, candidate_len)
+        inverted = padded_target_aware_causal_mask(
+            hist_lens, 6, beam_width, candidate_len
+        )
         valid = ~inverted
         N = valid.shape[-1]
         af = dense_mask_to_arbitrary_func(valid, N)
@@ -184,7 +185,9 @@ class TestJaggedFlattenedArbitraryFunc:
         B = offsets.size(0) - 1
         for b in range(B):
             s, e = offsets[b].item(), offsets[b + 1].item()
-            block = torch.tril(torch.ones(e - s, e - s, dtype=torch.bool, device=device))
+            block = torch.tril(
+                torch.ones(e - s, e - s, dtype=torch.bool, device=device)
+            )
             expected[s:e, s:e] = block
         return expected
 
@@ -217,7 +220,9 @@ class TestJaggedFlattenedArbitraryFunc:
         offsets = torch.tensor([0, 3, 7], device="cuda")
         B, total = 2, 7
         max_seqlen = 4
-        per_batch = torch.zeros(B, max_seqlen, max_seqlen, dtype=torch.bool, device="cuda")
+        per_batch = torch.zeros(
+            B, max_seqlen, max_seqlen, dtype=torch.bool, device="cuda"
+        )
         for b in range(B):
             sl = (offsets[b + 1] - offsets[b]).item()
             per_batch[b, :sl, :sl] = torch.tril(
@@ -235,12 +240,14 @@ class TestJaggedFlattenedArbitraryFunc:
         B = 2
         hist_lens = torch.tensor([5, 3], device="cuda")
         max_hist = 5
-        inverted = padded_target_aware_causal_mask(hist_lens, max_hist, beam_width, candidate_len)
+        inverted = padded_target_aware_causal_mask(
+            hist_lens, max_hist, beam_width, candidate_len
+        )
         valid = ~inverted  # [B, 1, N, N]
-        N = valid.shape[-1]
+        valid.shape[-1]
         total_per_batch = (hist_lens + beam_width * candidate_len).tolist()
         offsets = torch.tensor(
-            [0] + [sum(total_per_batch[:i + 1]) for i in range(B)],
+            [0] + [sum(total_per_batch[: i + 1]) for i in range(B)],
             device="cuda",
         )
         total = offsets[-1].item()
@@ -253,6 +260,6 @@ class TestJaggedFlattenedArbitraryFunc:
         for b in range(B):
             s = offsets[b].item()
             sl = total_per_batch[b]
-            expected[s:s + sl, s:s + sl] = valid_3d[b, :sl, :sl]
+            expected[s : s + sl, s : s + sl] = valid_3d[b, :sl, :sl]
 
         assert torch.equal(expected, recon)

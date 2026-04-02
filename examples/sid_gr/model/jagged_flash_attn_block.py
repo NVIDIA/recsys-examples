@@ -26,7 +26,7 @@ Architecture per layer (standard pre-norm GPT):
 
 Reference: examples/hstu/modules/native_hstu_layer.py
 """
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -52,7 +52,7 @@ def build_block_sparsity(
     try:
         import create_block_mask_cuda
         from flash_attn.cute.block_sparsity import LinearBlockSparseTensorsTorch
-        from flash_attn.utils.tile_size import get_tile_sizes_by_backend, get_arch
+        from flash_attn.utils.tile_size import get_arch, get_tile_sizes_by_backend
     except ImportError:
         return None, None
 
@@ -76,15 +76,20 @@ def build_block_sparsity(
         is_arbitrary=True,
     )
 
-    (k_cnt, k_off, k_idx, k_fcnt, k_foff, k_fidx) = (
-        create_block_mask_cuda.create_q2k_csr_sparse_from_func(
-            arbitrary_func,
-            seqlen_q,
-            seqlen_k,
-            Q_BLOCK_SIZE=fwd_q_block,
-            KV_BLOCK_SIZE=fwd_kv_block,
-            check_q_boundary=True,
-        )
+    (
+        k_cnt,
+        k_off,
+        k_idx,
+        k_fcnt,
+        k_foff,
+        k_fidx,
+    ) = create_block_mask_cuda.create_q2k_csr_sparse_from_func(
+        arbitrary_func,
+        seqlen_q,
+        seqlen_k,
+        Q_BLOCK_SIZE=fwd_q_block,
+        KV_BLOCK_SIZE=fwd_kv_block,
+        check_q_boundary=True,
     )
     linear_k = LinearBlockSparseTensorsTorch(
         mask_block_cnt=k_cnt,
@@ -95,14 +100,19 @@ def build_block_sparsity(
         full_block_idx=k_fidx,
     )
 
-    (q_cnt, q_off, q_idx, q_fcnt, q_foff, q_fidx) = (
-        create_block_mask_cuda.create_k2q_csr_sparse_from_func(
-            arbitrary_func,
-            seqlen_q,
-            seqlen_k,
-            Q_BLOCK_SIZE=bwd_q_block,
-            KV_BLOCK_SIZE=bwd_kv_block,
-        )
+    (
+        q_cnt,
+        q_off,
+        q_idx,
+        q_fcnt,
+        q_foff,
+        q_fidx,
+    ) = create_block_mask_cuda.create_k2q_csr_sparse_from_func(
+        arbitrary_func,
+        seqlen_q,
+        seqlen_k,
+        Q_BLOCK_SIZE=bwd_q_block,
+        KV_BLOCK_SIZE=bwd_kv_block,
     )
     linear_q = LinearBlockSparseTensorsTorch(
         mask_block_cnt=q_cnt,
@@ -145,9 +155,7 @@ class JaggedGPTLayer(nn.Module):
         self.ffn_hidden_size = ffn_hidden_size
 
         # --- Attention sub-layers ---
-        self.input_layernorm = nn.LayerNorm(
-            hidden_size, eps=layernorm_epsilon
-        )
+        self.input_layernorm = nn.LayerNorm(hidden_size, eps=layernorm_epsilon)
         # Fused QKV projection: hidden_size → 3 * hidden_size
         self.linear_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         # Output projection after attention
@@ -155,9 +163,7 @@ class JaggedGPTLayer(nn.Module):
         self.attn_dropout = nn.Dropout(hidden_dropout)
 
         # --- FFN sub-layers ---
-        self.pre_mlp_layernorm = nn.LayerNorm(
-            hidden_size, eps=layernorm_epsilon
-        )
+        self.pre_mlp_layernorm = nn.LayerNorm(hidden_size, eps=layernorm_epsilon)
         self.mlp_fc1 = nn.Linear(hidden_size, ffn_hidden_size, bias=False)
         self.mlp_fc2 = nn.Linear(ffn_hidden_size, hidden_size, bias=False)
         self.mlp_dropout = nn.Dropout(hidden_dropout)
@@ -293,9 +299,7 @@ class JaggedFlashAttnBlock(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.final_layernorm = nn.LayerNorm(
-            hidden_size, eps=layernorm_epsilon
-        )
+        self.final_layernorm = nn.LayerNorm(hidden_size, eps=layernorm_epsilon)
 
     def forward(
         self,
