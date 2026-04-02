@@ -1037,6 +1037,34 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 result[table_name] = self._scores[table_name]
         return result
 
+    def fill_tables(
+        self,
+        load_factor: float = 0.95,
+        tolerance: float = 1e-5,
+    ) -> None:
+        """
+        Raise ``key_index_map`` occupancy toward the given load factor using random keys.
+
+        Default ``load_factor`` is ``0.95``; values above ``0.95`` are clamped (see
+        :meth:`DynamicEmbStorage.fill_tables`).
+
+        Only supported when backend storage is :class:`DynamicEmbStorage` (not
+        ``HybridStorage`` or external PS). Keys are sampled uniformly from
+        ``[0, 2**63 - 2]`` (``torch.randint`` cannot use ``high = 2**63``). Only
+        the hash map is updated; embedding / optimizer
+        slots are not written (typically still zeros from allocation).
+
+        See :meth:`DynamicEmbStorage.fill_tables` for ``tolerance``.
+        """
+        if not isinstance(self._storage, DynamicEmbStorage):
+            raise TypeError(
+                "fill_tables requires DynamicEmbStorage; "
+                f"got {type(self._storage).__name__}"
+            )
+        fused_score = max(self.get_score().values())
+        self._storage.set_score(fused_score)
+        self._storage.fill_tables(load_factor, tolerance)
+
     def _create_score(self):
         self._scores: Dict[str, int] = {}
         for table_name, option in zip(self._table_names, self._dynamicemb_options):

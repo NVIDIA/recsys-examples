@@ -1077,6 +1077,131 @@ class DynamicEmbStorage(Storage):
     def key_index_map(self):
         return self._state.key_index_map
 
+    def fill_tables(
+        self,
+        load_factor: float = 0.95,
+        tolerance: float = 1e-5,
+    ) -> None:
+        """
+        Insert random keys into ``key_index_map`` until each logical table reaches
+        ``min(capacity, int(load_factor * capacity))`` entries.
+
+        Default ``load_factor`` is ``0.95``; any value above ``0.95`` is clamped
+        to ``0.95``.
+
+        After each successful insert batch (and before filling a table), the
+        per-table load factor ``size(table_id) / capacity(table_id)`` is compared
+        to ``load_factor``. When ``abs(actual - load_factor) <= tolerance`` (default
+        ``1e-5``), that table is treated as done even if the integer entry target
+        is not reached. Pass ``tolerance=0`` to disable this early exit.
+
+        Keys are uniform in ``[0, torch.iinfo(torch.int64).max - 1]`` (i.e.
+        ``[0, 2**63 - 2]``). ``torch.randint`` cannot use ``high = 2**63`` (the
+        bound overflows in the C++ API), so ``2**63 - 1`` is never sampled.
+        Only the hash map is updated;
+        value buffers are not written. Call :meth:`set_score` first if inserts
+        require a valid score (e.g. non-LRU strategies).
+        """
+        if load_factor < 0.0:
+            raise ValueError(f"load_factor must be non-negative, got {load_factor}")
+        load_factor = min(load_factor, 0.95)
+        if tolerance < 0.0:
+            raise ValueError(f"tolerance must be non-negative, got {tolerance}")
+
+        state = self._state
+        km = state.key_index_map
+        device = state.device
+        key_dtype = km.key_type
+        batch_cap = 262144
+        max_stale_tries = 1000
+
+        def _as_int(sz: Any) -> int:
+            if isinstance(sz, torch.Tensor):
+                return int(sz.item())
+            return int(sz)
+
+        for table_id in range(state.num_tables):
+            cap = km.capacity(table_id)
+            if cap == 0:
+                continue
+            target = min(cap, int(load_factor * cap))
+            remaining = max(0, target - _as_int(km.size(table_id)))
+            stale_tries = 0
+
+            def _lf_within_tol() -> bool:
+                if tolerance <= 0.0:
+                    return False
+                actual = float(_as_int(km.size(table_id))) / float(cap)
+                return abs(actual - load_factor) <= tolerance
+
+            if remaining == 0:
+                continue
+
+            while remaining > 0:
+                batch_size = min(batch_cap, max(4096, remaining * 4))
+                n_gen = min(batch_size, remaining * 8 + 1024)
+                # [low, high) with high = iinfo.max (2**63-1) -> values in [0, 2**63-2].
+                # high = 2**63 overflows in the randint binding; no bit-packing needed.
+                keys = torch.randint(
+                    0,
+                    torch.iinfo(torch.int64).max,
+                    (n_gen,),
+                    device=device,
+                    dtype=torch.int64,
+                ).to(key_dtype)
+                keys, uniq_counts = torch.unique(keys, return_counts=True)
+                lfu_freq = uniq_counts.to(dtype=torch.long)
+                if keys.numel() == 0:
+                    stale_tries += 1
+                    if stale_tries > max_stale_tries:
+                        raise RuntimeError(f"fill_tables: stalled on table {table_id}")
+                    continue
+
+                table_ids = torch.full(
+                    (keys.numel(),),
+                    table_id,
+                    device=device,
+                    dtype=torch.int64,
+                )
+                score_find = get_find_score_arg(
+                    state,
+                    keys.numel(),
+                    device,
+                    lfu_accumulated_frequency=lfu_freq,
+                )
+                _, founds, _ = km.lookup(keys, table_ids, score_find)
+                missing = torch.logical_not(founds)
+                new_keys = keys[missing]
+                new_lfu_freq = lfu_freq[missing]
+                if new_keys.numel() == 0:
+                    stale_tries += 1
+                    if stale_tries > max_stale_tries:
+                        raise RuntimeError(f"fill_tables: stalled on table {table_id}")
+                    continue
+
+                stale_tries = 0
+                take = min(int(new_keys.numel()), remaining)
+                insert_keys = new_keys[:take]
+                insert_lfu = new_lfu_freq[:take]
+                insert_tids = torch.full(
+                    (take,),
+                    table_id,
+                    device=device,
+                    dtype=torch.int64,
+                )
+                insert_scores = (
+                    insert_lfu.to(dtype=torch.uint64)
+                    if state.evict_strategy == EvictStrategy.KLfu
+                    else None
+                )
+                score_ins = get_insert_score_arg(
+                    state, take, device, scores=insert_scores
+                )
+                km.insert(insert_keys, insert_tids, score_ins)
+                remaining -= take
+                if _lf_within_tol():
+                    break
+
     # -- Storage interface --
 
     def find(
