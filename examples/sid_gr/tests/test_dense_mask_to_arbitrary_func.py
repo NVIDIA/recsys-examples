@@ -26,10 +26,69 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
 from attention_mask import (
     build_jagged_causal_arbitrary_func,
     dense_mask_to_arbitrary_func,
-    dense_mask_to_jagged_arbitrary_func,
+    padded_causal_mask_with_optional_bos,
     padded_target_aware_causal_mask,
 )
 sys.path.pop(0)
+
+
+def dense_mask_to_jagged_arbitrary_func(
+    valid_mask: torch.Tensor,
+    offsets: torch.Tensor,
+    total_tokens: int,
+    padding: int = 256,
+) -> torch.Tensor:
+    """
+    Test utility: convert per-batch dense mask [B, N, N] to a flattened
+    (B=1) arbitrary_func [1, 1, n_func, total_tokens + padding].
+
+    Maps each row from per-batch padded coordinates to global (flattened)
+    coordinates.  Used in tests to build arbitrary_func from dense masks
+    so the FA path can be compared against the mcore/reference path.
+    """
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    assert valid_mask.dim() == 3, f"Expected [B, N, N], got {valid_mask.shape}"
+
+    B, N, _ = valid_mask.shape
+    device = valid_mask.device
+
+    shifted = torch.zeros_like(valid_mask)
+    shifted[:, :, 1:] = valid_mask[:, :, :-1]
+    starts = valid_mask & ~shifted
+
+    ends_shifted = torch.zeros_like(valid_mask)
+    ends_shifted[:, :, :-1] = valid_mask[:, :, 1:]
+    ends = valid_mask & ~ends_shifted
+
+    max_intervals = int(starts.sum(dim=-1).max().item())
+    n_func = max(2 * max_intervals + 1, 3)
+    if n_func % 2 == 0:
+        n_func += 1
+
+    af = torch.zeros(
+        1, 1, n_func, total_tokens + padding, dtype=torch.int32, device=device
+    )
+
+    for b in range(B):
+        batch_start = offsets[b].item()
+        batch_end = offsets[b + 1].item()
+        seq_len = batch_end - batch_start
+
+        for local_q in range(seq_len):
+            global_q = batch_start + local_q
+            row = valid_mask[b, local_q, :seq_len]
+            if not row.any():
+                continue
+            start_pos = starts[b, local_q, :seq_len].nonzero(as_tuple=False).squeeze(-1)
+            end_pos = ends[b, local_q, :seq_len].nonzero(as_tuple=False).squeeze(-1) + 1
+            for iv in range(len(start_pos)):
+                s = start_pos[iv].item() + batch_start
+                e = end_pos[iv].item() + batch_start
+                af[0, 0, 2 * iv + 1, global_q] = s
+                af[0, 0, 2 * iv + 2, global_q] = e
+
+    return af
 
 
 def arbitrary_func_to_dense(af, seqlen_q, seqlen_k):

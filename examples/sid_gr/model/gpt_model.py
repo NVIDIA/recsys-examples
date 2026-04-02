@@ -35,12 +35,6 @@ from modules.eval_metrics import SIDRetrievalEvaluator
 from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
-from .attention_mask import (
-    build_jagged_causal_arbitrary_func,
-    dense_mask_to_jagged_arbitrary_func,
-    padded_causal_mask_with_optional_bos,
-    padded_target_aware_causal_mask,
-)
 from .jagged_flash_attn_block import JaggedTransformerBlock
 
 
@@ -538,104 +532,39 @@ class SIDGRModel(MegatronModule):
         input_offsets: torch.Tensor,
         input_max_seqlen: int,
         attention_mask: Optional[torch.Tensor] = None,
-        add_bos_to_history: bool = False,
+        arbitrary_func: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Input and Output are both jagged.
+        Input and Output are both jagged.  This method only routes — the
+        caller is responsible for building the mask / arbitrary_func.
 
-        Routes to either the JaggedFlashAttn path (B=1 flatten +
-        arbitrary_func) or the mcore path (pad-to-dense + dense mask)
-        depending on ``self.decoder.use_jagged_flash_attn``.
+        * FA path:    pass *arbitrary_func* (caller-built).
+        * mcore path: pass *attention_mask* (dense ``[B, 1, N, N]``).
         """
-        if add_bos_to_history:
-            assert (
-                attention_mask is None
-            ), "attention mask should be None when adding bos to history"
-        input_offsets[-1].item()
-
         if self.decoder.use_jagged_flash_attn:
-            return self._decoder_step_jagged_fa(
-                input_hidden_states,
-                input_offsets,
-                input_max_seqlen,
-                attention_mask,
-                add_bos_to_history,
+            assert arbitrary_func is not None, (
+                "FA path requires arbitrary_func; caller should build it"
+            )
+            return self.decoder(
+                hidden_states=input_hidden_states,
+                arbitrary_func=arbitrary_func,
             )
         else:
-            return self._decoder_step_mcore(
-                input_hidden_states,
-                input_offsets,
-                input_max_seqlen,
-                attention_mask,
-                add_bos_to_history,
+            assert attention_mask is not None, (
+                "mcore path requires attention_mask; caller should build it"
             )
-
-    def _decoder_step_jagged_fa(
-        self,
-        input_hidden_states: torch.Tensor,
-        input_offsets: torch.Tensor,
-        input_max_seqlen: int,
-        attention_mask: Optional[torch.Tensor],
-        add_bos_to_history: bool,
-    ) -> torch.Tensor:
-        """Flatten to B=1, build arbitrary_func, forward through FA block."""
-        total_tokens = int(input_offsets[-1].item())
-
-        if attention_mask is not None:
-            valid_mask = ~attention_mask
-            arbitrary_func = dense_mask_to_jagged_arbitrary_func(
-                valid_mask, input_offsets, total_tokens
+            return self.decoder(
+                hidden_states=input_hidden_states,
+                attention_mask=attention_mask,
+                offsets=input_offsets,
+                max_seqlen=input_max_seqlen,
             )
-        elif add_bos_to_history:
-            # TODO: build flattened arbitrary_func directly from offsets
-            # to avoid materialising the dense mask.
-            dense_mask = padded_causal_mask_with_optional_bos(
-                input_offsets,
-                input_max_seqlen,
-                add_bos_to_history=True,
-                bos_interval=self._num_hierarchies,
-            )
-            valid_mask = ~dense_mask
-            arbitrary_func = dense_mask_to_jagged_arbitrary_func(
-                valid_mask, input_offsets, total_tokens
-            )
-        else:
-            arbitrary_func = build_jagged_causal_arbitrary_func(
-                input_offsets, total_tokens
-            )
-
-        return self.decoder(
-            hidden_states=input_hidden_states,
-            arbitrary_func=arbitrary_func,
-        )
-
-    def _decoder_step_mcore(
-        self,
-        input_hidden_states: torch.Tensor,
-        input_offsets: torch.Tensor,
-        input_max_seqlen: int,
-        attention_mask: Optional[torch.Tensor],
-        add_bos_to_history: bool,
-    ) -> torch.Tensor:
-        """Pad to dense, build dense mask, forward through mcore block."""
-        if attention_mask is None:
-            attention_mask = padded_causal_mask_with_optional_bos(
-                input_offsets,
-                input_max_seqlen,
-                add_bos_to_history=add_bos_to_history,
-                bos_interval=self._num_hierarchies,
-            )
-
-        return self.decoder(
-            hidden_states=input_hidden_states,
-            attention_mask=attention_mask,
-            offsets=input_offsets,
-            max_seqlen=input_max_seqlen,
-        )
 
     def forward(
         self,
         batch: GPTSIDBatch,
+        attention_mask: Optional[torch.Tensor] = None,
+        arbitrary_func: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. prepare embeddings: embedding lookup + history, bos and candidate concat
         (
@@ -649,13 +578,13 @@ class SIDGRModel(MegatronModule):
         )
         history_offsets = batch.features[batch.history_feature_name].offsets()
 
-        # 2. decoder step
+        # 2. decoder step — caller provides the mask / arbitrary_func
         jagged_output_hidden_states = self.decoder_step(
             input_hidden_states,
             input_offsets,
             input_max_seqlen,
-            attention_mask=None,
-            add_bos_to_history=self.add_bos_to_history_for_training,
+            attention_mask=attention_mask,
+            arbitrary_func=arbitrary_func,
         )
         # 3. postprocess: only keep the candidate hidden states
         candidate_hidden_states = self._postprocess_output(
@@ -699,7 +628,12 @@ class SIDGRModel(MegatronModule):
         return merged_losses, merged_logits
 
     @torch.no_grad
-    def generate(self, batch: GPTSIDBatch) -> torch.Tensor:
+    def generate(
+        self,
+        batch: GPTSIDBatch,
+        attention_mask: Optional[torch.Tensor] = None,
+        arbitrary_func: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Generate the output sids for the given batch. The generation will autogressively generate the output sids with a constrained fixed-width beam search strategy.
         Args:
@@ -789,20 +723,13 @@ class SIDGRModel(MegatronModule):
                     dtype=input_offsets.dtype,
                 )
 
-            # 2. prepare the attention mask
-            attention_mask = padded_target_aware_causal_mask(
-                torch.diff(input_offsets),
-                input_max_seqlen,
-                0 if i == 0 else topk_prev_step,
-                candidate_length,
-            )
-            # 3. we need a decoder step with the concatenated hidden states and offsets. Note that we do not add bos to history for generation.
+            # 2. decoder step — caller provides attention_mask or arbitrary_func
             jagged_output_hidden_states = self.decoder_step(
                 cated_hidden_states,
                 cated_offsets,
                 cated_max_seqlen,
                 attention_mask=attention_mask,
-                add_bos_to_history=False,
+                arbitrary_func=arbitrary_func,
             )
             # remove history[batchsize * topk_last_step * max(1,i), embedding_dim]
             _, candidate_hidden_states = triton_split_2D_jagged(
