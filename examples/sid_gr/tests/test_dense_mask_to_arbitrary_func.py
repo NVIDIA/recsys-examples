@@ -24,7 +24,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
 from attention_mask import (
+    build_jagged_causal_arbitrary_func,
     dense_mask_to_arbitrary_func,
+    dense_mask_to_jagged_arbitrary_func,
     padded_target_aware_causal_mask,
 )
 sys.path.pop(0)
@@ -109,3 +111,89 @@ class TestDenseMaskToArbitraryFunc:
         recon = arbitrary_func_to_dense(af, N, N)
         assert torch.equal(valid[0], recon[0])
         assert torch.equal(valid[1], recon[1])
+
+
+class TestJaggedFlattenedArbitraryFunc:
+    """Tests for the B=1 flattened arbitrary_func builders."""
+
+    @staticmethod
+    def _build_expected_jagged_causal(offsets):
+        """Build the expected [1, total, total] causal block-diagonal mask."""
+        total = offsets[-1].item()
+        device = offsets.device
+        expected = torch.zeros(total, total, dtype=torch.bool, device=device)
+        B = offsets.size(0) - 1
+        for b in range(B):
+            s, e = offsets[b].item(), offsets[b + 1].item()
+            block = torch.tril(torch.ones(e - s, e - s, dtype=torch.bool, device=device))
+            expected[s:e, s:e] = block
+        return expected
+
+    def test_jagged_causal_basic(self):
+        offsets = torch.tensor([0, 4, 7, 10], device="cuda")
+        total = 10
+        af = build_jagged_causal_arbitrary_func(offsets, total)
+        recon = arbitrary_func_to_dense(af, total, total).squeeze(0)
+        expected = self._build_expected_jagged_causal(offsets)
+        assert torch.equal(expected, recon)
+
+    def test_jagged_causal_single_batch(self):
+        offsets = torch.tensor([0, 6], device="cuda")
+        total = 6
+        af = build_jagged_causal_arbitrary_func(offsets, total)
+        recon = arbitrary_func_to_dense(af, total, total).squeeze(0)
+        expected = torch.tril(torch.ones(6, 6, dtype=torch.bool, device="cuda"))
+        assert torch.equal(expected, recon)
+
+    def test_jagged_causal_uneven_lengths(self):
+        offsets = torch.tensor([0, 2, 8, 9], device="cuda")
+        total = 9
+        af = build_jagged_causal_arbitrary_func(offsets, total)
+        recon = arbitrary_func_to_dense(af, total, total).squeeze(0)
+        expected = self._build_expected_jagged_causal(offsets)
+        assert torch.equal(expected, recon)
+
+    def test_dense_to_jagged_causal(self):
+        """dense_mask_to_jagged_arbitrary_func should match build_jagged_causal for causal masks."""
+        offsets = torch.tensor([0, 3, 7], device="cuda")
+        B, total = 2, 7
+        max_seqlen = 4
+        per_batch = torch.zeros(B, max_seqlen, max_seqlen, dtype=torch.bool, device="cuda")
+        for b in range(B):
+            sl = (offsets[b + 1] - offsets[b]).item()
+            per_batch[b, :sl, :sl] = torch.tril(
+                torch.ones(sl, sl, dtype=torch.bool, device="cuda")
+            )
+        af = dense_mask_to_jagged_arbitrary_func(per_batch, offsets, total)
+        recon = arbitrary_func_to_dense(af, total, total).squeeze(0)
+        expected = self._build_expected_jagged_causal(offsets)
+        assert torch.equal(expected, recon)
+
+    @pytest.mark.parametrize("beam_width", [2, 3])
+    @pytest.mark.parametrize("candidate_len", [1, 3])
+    def test_dense_to_jagged_target_grouped(self, beam_width, candidate_len):
+        """Verify target-grouped masks survive the jagged conversion roundtrip."""
+        B = 2
+        hist_lens = torch.tensor([5, 3], device="cuda")
+        max_hist = 5
+        inverted = padded_target_aware_causal_mask(hist_lens, max_hist, beam_width, candidate_len)
+        valid = ~inverted  # [B, 1, N, N]
+        N = valid.shape[-1]
+        total_per_batch = (hist_lens + beam_width * candidate_len).tolist()
+        offsets = torch.tensor(
+            [0] + [sum(total_per_batch[:i + 1]) for i in range(B)],
+            device="cuda",
+        )
+        total = offsets[-1].item()
+        af = dense_mask_to_jagged_arbitrary_func(valid, offsets, total)
+        recon = arbitrary_func_to_dense(af, total, total).squeeze(0)
+
+        # Build expected flattened mask from per-batch dense mask
+        expected = torch.zeros(total, total, dtype=torch.bool, device="cuda")
+        valid_3d = valid.squeeze(1)
+        for b in range(B):
+            s = offsets[b].item()
+            sl = total_per_batch[b]
+            expected[s:s + sl, s:s + sl] = valid_3d[b, :sl, :sl]
+
+        assert torch.equal(expected, recon)

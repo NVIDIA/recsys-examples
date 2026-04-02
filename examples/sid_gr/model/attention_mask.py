@@ -282,6 +282,125 @@ def dense_mask_to_arbitrary_func(
     return af
 
 
+def build_jagged_causal_arbitrary_func(
+    offsets: torch.Tensor,
+    total_tokens: int,
+    padding: int = 256,
+) -> torch.Tensor:
+    """
+    Build arbitrary_func for flattened jagged causal attention (B=1).
+
+    All batch sequences are concatenated into a single sequence of length
+    *total_tokens*.  Each query at global position *q* in batch element *b*
+    can attend to keys in ``[offset[b], q+1)`` — standard causal within its
+    own sequence, invisible to other sequences.
+
+    Args:
+        offsets: [B+1] cumulative sequence-length offsets.
+        total_tokens: ``offsets[-1].item()`` — total number of tokens.
+        padding: FA convention padding on the last dim (default 256).
+
+    Returns:
+        arbitrary_func: [1, 1, 3, total_tokens + padding] int32 tensor.
+    """
+    device = offsets.device
+    n_func = 3  # F0=0, single interval [F1, F2)
+
+    af = torch.zeros(
+        1, 1, n_func, total_tokens + padding, dtype=torch.int32, device=device
+    )
+
+    positions = torch.arange(total_tokens, device=device)
+    batch_ids = torch.searchsorted(offsets[1:], positions, right=True)
+    batch_starts = offsets[batch_ids]
+
+    # visible(q) = [0, 0) ∪ [batch_start, q+1)
+    af[0, 0, 1, :total_tokens] = batch_starts.to(torch.int32)
+    af[0, 0, 2, :total_tokens] = (positions + 1).to(torch.int32)
+
+    return af
+
+
+def dense_mask_to_jagged_arbitrary_func(
+    valid_mask: torch.Tensor,
+    offsets: torch.Tensor,
+    total_tokens: int,
+    padding: int = 256,
+) -> torch.Tensor:
+    """
+    Convert per-batch dense bool mask to a flattened (B=1) arbitrary_func.
+
+    The dense mask is in per-batch padded coordinates ``[B, N, N]``.  This
+    function maps each row to global (flattened) coordinates and encodes the
+    visible intervals into a single arbitrary_func tensor of shape
+    ``[1, 1, n_func, total_tokens + padding]``.
+
+    Use this when a pre-built dense mask is available (e.g. from
+    ``padded_target_aware_causal_mask``).  For pure causal masks prefer
+    :func:`build_jagged_causal_arbitrary_func` which avoids the dense mask
+    entirely.
+
+    Args:
+        valid_mask: [B, N, N] or [B, 1, N, N] bool (True = can attend).
+        offsets: [B+1] cumulative offsets.
+        total_tokens: ``offsets[-1].item()``.
+        padding: FA convention padding (default 256).
+
+    Returns:
+        arbitrary_func: [1, 1, n_func, total_tokens + padding] int32 tensor.
+    """
+    if valid_mask.dim() == 4:
+        valid_mask = valid_mask.squeeze(1)
+    assert valid_mask.dim() == 3, f"Expected [B, N, N], got {valid_mask.shape}"
+
+    B, N, _ = valid_mask.shape
+    device = valid_mask.device
+
+    # Detect interval boundaries
+    shifted = torch.zeros_like(valid_mask)
+    shifted[:, :, 1:] = valid_mask[:, :, :-1]
+    starts = valid_mask & ~shifted
+
+    ends_shifted = torch.zeros_like(valid_mask)
+    ends_shifted[:, :, :-1] = valid_mask[:, :, 1:]
+    ends = valid_mask & ~ends_shifted
+
+    max_intervals = int(starts.sum(dim=-1).max().item())
+    n_func = max(2 * max_intervals + 1, 3)
+    if n_func % 2 == 0:
+        n_func += 1
+
+    af = torch.zeros(
+        1, 1, n_func, total_tokens + padding, dtype=torch.int32, device=device
+    )
+
+    for b in range(B):
+        batch_start = offsets[b].item()
+        batch_end = offsets[b + 1].item()
+        seq_len = batch_end - batch_start
+
+        for local_q in range(seq_len):
+            global_q = batch_start + local_q
+            row = valid_mask[b, local_q, :seq_len]
+
+            if not row.any():
+                continue
+
+            start_pos = starts[b, local_q, :seq_len].nonzero(as_tuple=False).squeeze(-1)
+            end_pos = ends[b, local_q, :seq_len].nonzero(as_tuple=False).squeeze(-1) + 1
+
+            # In flattened coordinates, the first visible key is at
+            # batch_start (not 0), so F0 is always 0.  All intervals go
+            # into the explicit (F1,F2), (F3,F4), ... slots.
+            for iv in range(len(start_pos)):
+                s = start_pos[iv].item() + batch_start
+                e = end_pos[iv].item() + batch_start
+                af[0, 0, 2 * iv + 1, global_q] = s
+                af[0, 0, 2 * iv + 2, global_q] = e
+
+    return af
+
+
 if __name__ == "__main__":
     history_seqlen = torch.tensor([4, 3]).cuda()
     max_history_seqlen = 6

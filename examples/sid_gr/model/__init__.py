@@ -18,6 +18,7 @@ def get_sid_gr_model(
     top_k_for_generation: int = 10,
     eval_metrics: Tuple[str, ...] = (),
     share_lm_head_across_hierarchies: bool = True,
+    use_jagged_flash_attn: bool = True,
 ) -> SIDGRModel:
     sid_gr_model = SIDGRModel(
         decoder_config=decoder_config,
@@ -25,7 +26,6 @@ def get_sid_gr_model(
         codebook_sizes=codebook_sizes,
         num_hierarchies=num_hierarchies,
         transformer_decoder_layer_spec=get_gpt_decoder_block_spec(
-            # padding + arbitrary attention mask + Megatron-Core
             decoder_config,
             use_transformer_engine=False,
             arbitrary_attention_mask=True,
@@ -35,6 +35,7 @@ def get_sid_gr_model(
         top_k_for_generation=top_k_for_generation,
         eval_metrics=eval_metrics,
         share_lm_head_across_hierarchies=share_lm_head_across_hierarchies,
+        use_jagged_flash_attn=use_jagged_flash_attn,
     )
 
     return sid_gr_model

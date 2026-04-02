@@ -338,18 +338,21 @@ class JaggedFlashAttnBlock(nn.Module):
 
 class JaggedTransformerBlock(nn.Module):
     """
-    Wrapper that accepts jagged (variable-length) hidden states and either a
-    dense attention mask or a pre-built arbitrary_func tensor.
+    Wrapper that accepts jagged (variable-length) hidden states and a
+    pre-built arbitrary_func tensor in the flattened (B=1) coordinate space.
 
-    Internally handles:
-      1. dense_mask → arbitrary_func conversion (when dense mask is provided)
-      2. jagged → padded-dense conversion
-      3. forward through JaggedFlashAttnBlock (FA with arbitrary mask)
-      4. padded-dense → jagged conversion
+    All batch sequences are concatenated into a single sequence of length
+    *total_tokens* (no padding).  The arbitrary_func encodes both the
+    block-diagonal batch isolation and the desired attention pattern
+    (causal, target-grouped, etc.).
+
+    Internally:
+      1. Reshape jagged [total_tokens, D] → [1, total_tokens, D]
+      2. Forward through JaggedFlashAttnBlock (FA with arbitrary mask)
+      3. Reshape [1, total_tokens, D] → [total_tokens, D]
 
     This is intended to replace Megatron-Core's TransformerBlock in
-    SIDGRDecoder so that all padding / mask-format logic is encapsulated
-    in a single module initialised at construction time.
+    SIDGRDecoder.
     """
 
     def __init__(
@@ -376,43 +379,26 @@ class JaggedTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        offsets: torch.Tensor,
-        max_seqlen: int,
-        attention_mask: Optional[torch.Tensor] = None,
-        arbitrary_func: Optional[torch.Tensor] = None,
+        arbitrary_func: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: jagged [total_tokens, hidden_size].
-            offsets: [B+1] cumulative sequence-length offsets.
-            max_seqlen: maximum sequence length in the batch.
-            attention_mask: optional [B, 1, N, N] bool tensor where
-                True = masked-out (Megatron convention). Ignored when
-                *arbitrary_func* is provided.
-            arbitrary_func: optional [B, 1, n_func, N+pad] int32 tensor
-                in flash_attn interval encoding.  Takes precedence over
-                *attention_mask* when both are supplied.
+            arbitrary_func: [1, 1, n_func, total_tokens + pad] int32 tensor
+                in flattened (B=1) coordinate space, encoding both batch
+                isolation and the attention pattern.
 
         Returns:
             jagged output [total_tokens, hidden_size].
         """
-        from .attention_mask import dense_mask_to_arbitrary_func
+        total_tokens = hidden_states.shape[0]
 
-        batch_size = offsets.size(0) - 1
-
-        if arbitrary_func is None and attention_mask is not None:
-            valid_mask = ~attention_mask  # Megatron: True=masked → invert
-            arbitrary_func = dense_mask_to_arbitrary_func(valid_mask, max_seqlen)
-
-        padded = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=hidden_states,
-            offsets=[offsets],
-            max_lengths=[max_seqlen],
-            padding_value=0.0,
-        ).view(batch_size, max_seqlen, -1)
+        # [total_tokens, D] → [1, total_tokens, D]
+        flat_input = hidden_states.unsqueeze(0)
 
         output = self.block(
-            padded, arbitrary_func=arbitrary_func, seqlen=max_seqlen
+            flat_input, arbitrary_func=arbitrary_func, seqlen=total_tokens
         )
 
-        return torch.ops.fbgemm.dense_to_jagged(output, [offsets])[0]
+        # [1, total_tokens, D] → [total_tokens, D]
+        return output.squeeze(0)
