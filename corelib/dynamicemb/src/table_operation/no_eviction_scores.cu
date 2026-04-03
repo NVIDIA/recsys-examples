@@ -83,19 +83,19 @@ at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
   constexpr int BLOCK = 256;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  if (num_tables > 0 && num_tables <= kMaxNumTablesShm) {
-    size_t shm_size = 2 * static_cast<size_t>(num_tables) * sizeof(int64_t);
-    no_eviction_assign_scores_kernel_shm<<<(n + BLOCK - 1) / BLOCK, BLOCK,
-                                           shm_size, stream>>>(
-        no_eviction_next_index_dev.data_ptr<int64_t>(),
-        table_ids.data_ptr<int64_t>(), scores.data_ptr<uint64_t>(), n,
-        num_tables);
-  } else {
+  // if (num_tables > 0 && num_tables <= kMaxNumTablesShm) {
+  //   size_t shm_size = 2 * static_cast<size_t>(num_tables) * sizeof(int64_t);
+  //   no_eviction_assign_scores_kernel_shm<<<(n + BLOCK - 1) / BLOCK, BLOCK,
+  //                                          shm_size, stream>>>(
+  //       no_eviction_next_index_dev.data_ptr<int64_t>(),
+  //       table_ids.data_ptr<int64_t>(), scores.data_ptr<uint64_t>(), n,
+  //       num_tables);
+  // } else {
     no_eviction_assign_scores_kernel_global<<<(n + BLOCK - 1) / BLOCK, BLOCK, 0,
                                               stream>>>(
         no_eviction_next_index_dev.data_ptr<int64_t>(),
         table_ids.data_ptr<int64_t>(), scores.data_ptr<uint64_t>(), n);
-  }
+  // }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   return scores;
 }

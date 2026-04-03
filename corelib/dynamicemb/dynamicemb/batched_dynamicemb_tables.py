@@ -516,6 +516,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     cap = max(1, int(cache_option.max_capacity * cap_scale))
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
+
+                # NO_EVICTION is incompatible with cache overflow (see create_table_state).
+                # Match HybridStorage: GPU cache uses TIMESTAMP/LRU; backing keeps NO_EVICTION.
+                if (
+                    self._dynamicemb_options[0].score_strategy
+                    == DynamicEmbScoreStrategy.NO_EVICTION
+                ):
+                    for cache_option in cache_options:
+                        cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+                        cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
+
                 self._cache = DynamicEmbCache(cache_options, self._optimizer)
 
                 storage_options = deepcopy(self._dynamicemb_options)
@@ -542,15 +553,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 hbm_options = deepcopy(self._dynamicemb_options)
                 for hbm_option in hbm_options:
                     hbm_option.bucket_capacity = 1024
-                    cap = max(1, int(hbm_option.init_capacity * cap_scale))
+                    cap = max(1, int(hbm_option.max_capacity * cap_scale))
                     hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
-                    hbm_option.init_capacity = min(hbm_option.init_capacity, cap)
+                    hbm_option.init_capacity = hbm_option.max_capacity
 
                 storage_cap_scale = 1.0 - cap_scale
                 host_options = deepcopy(self._dynamicemb_options)
                 for host_option in host_options:
                     host_option.local_hbm_for_values = 0
-                    cap = max(1, int(host_option.init_capacity * storage_cap_scale))
+                    cap = max(1, int(host_option.max_capacity * storage_cap_scale))
                     host_option.max_capacity = min(host_option.max_capacity, cap)
                     host_option.init_capacity = min(host_option.init_capacity, cap)
 

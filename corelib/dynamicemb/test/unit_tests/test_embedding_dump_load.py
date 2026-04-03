@@ -244,7 +244,7 @@ def apply_dmp(
     world_size = dist.get_world_size()
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
     for eb_config in eb_configs:
-        num_buckets, bucket_capacity_rows = get_sharded_table_shape(
+        num_buckets, bucket_capacity_rows = get_sharded_table_shape( # default 128 get_sharded_table_capacity #TODO:remove
             eb_config, world_size, MAX_BUCKET_CAPACITY
         )
         per_rank_capacity = num_buckets * bucket_capacity_rows
@@ -257,14 +257,14 @@ def apply_dmp(
             eb_config,
             emb_opt_type,
             world_size,
-            MAX_BUCKET_CAPACITY,
+            MAX_BUCKET_CAPACITY, # default 128
         )
         if caching:
             global_hbm = int(value_bytes * cache_capacity_ratio)
         else:
             global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-        admission_counter = KVCounter(max(1024 * 1024, per_rank_capacity // 4))
+        admission_counter = KVCounter(max(1024 * 1024, per_rank_capacity // 4)) # confirm align bucket capacity., use num_embeddings / (4 * world_size)  as capacity
         dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
             global_hbm_for_values=global_hbm,
             score_strategy=score_strategy,
@@ -272,7 +272,7 @@ def apply_dmp(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=1e-1,
             ),
-            bucket_capacity=bucket_capacity_rows,
+            bucket_capacity=bucket_capacity_rows, # default 128
             caching=caching,
             admit_strategy=admit_strategy,
             admission_counter=admission_counter,

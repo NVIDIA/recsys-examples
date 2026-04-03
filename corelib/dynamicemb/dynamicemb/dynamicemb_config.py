@@ -39,6 +39,8 @@ from torchrec.types import DataType
 DEFAULT_INDEX_TYPE = torch.int64
 DYNAMICEMB_CSTM_SCORE_CHECK = "DYNAMICEMB_CSTM_SCORE_CHECK"
 BATCH_SIZE_PER_DUMP = 65536
+# Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
+DEBUG_EMB_INITIALIZER_MOD = 100_000
 
 
 def warning_for_cstm_score() -> None:
