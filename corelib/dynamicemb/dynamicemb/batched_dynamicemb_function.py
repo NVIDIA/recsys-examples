@@ -928,10 +928,11 @@ def _generic_forward_path(
     Does storage.find + admission + init + insert
     in a single pass with no PrefetchState.
 
-    Returns (unique_values, key_persisted_mask). The mask is True for rows whose
-    keys are stored in ``storage`` after this forward (lookup hit or admitted
-    insert). Used in backward to avoid ``storage.insert`` creating rows for
-    keys that were never admitted (preserve_existing only skips score overwrite).
+    Returns (unique_values, persisted_unique_indices). The latter is an int64
+    vector of row indices into the unique-key tensors for keys that are stored
+    in ``storage`` after this forward (lookup hit or admitted insert). Used in
+    backward to ``storage.insert(..., preserve_existing=True)`` only for those
+    rows, without compacting via a boolean mask again.
     """
     with torch.cuda.nvtx.range("_generic_forward_path"):
         device = unique_keys.device
@@ -956,7 +957,16 @@ def _generic_forward_path(
         key_persisted = founds.clone()
 
         if h_num_missing == 0:
-            return unique_values, key_persisted
+            n = unique_keys.numel()
+            if n == 0:
+                persisted_unique_indices = torch.empty(
+                    0, dtype=torch.int64, device=device
+                )
+            else:
+                persisted_unique_indices = torch.arange(
+                    n, device=device, dtype=torch.int64
+                )
+            return unique_values, persisted_unique_indices
 
         freq_for_admission = (
             accumulated_frequency[missing_indices]
@@ -997,7 +1007,10 @@ def _generic_forward_path(
             scores_to_insert,
         )
         key_persisted[positions_in_unique] = True
-        return unique_values, key_persisted
+        _, persisted_unique_indices, _ = flagged_compact(
+            key_persisted, [unique_keys]
+        )
+        return unique_values, persisted_unique_indices
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
@@ -1055,13 +1068,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         prefetch_state.unique_keys,
                     )
                 unique_values = None
-                key_persisted_mask = None
+                persisted_unique_indices = None
             else:
                 assert prefetch_state.storage_mode == StorageMode.DEFAULT
                 evict_strat = (
                     EvictStrategy(evict_strategy.value) if evict_strategy else None
                 )
-                unique_values, key_persisted_mask = _generic_forward_path(
+                unique_values, persisted_unique_indices = _generic_forward_path(
                     storage,
                     prefetch_state.unique_keys,
                     prefetch_state.unique_table_ids,
@@ -1134,7 +1147,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             )
             ctx.use_counter = use_counter
             ctx.unique_values = unique_values
-            ctx.key_persisted_mask = key_persisted_mask if not use_counter else None
+            ctx.persisted_unique_indices = persisted_unique_indices
             ctx.outstanding_keys_ref = prefetch_state.outstanding_keys_ref
             ctx.num_prefetched_keys = prefetch_state.num_prefetched_keys
 
@@ -1213,21 +1226,18 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
-                    #TODO: get sel_idx in prefetch
                     optimizer.update_for_padded_buffer(
                         unique_grads,
                         ctx.unique_values,
                         ctx.emb_dim,
                         ctx.value_dim,
                     )
-                    kpm = ctx.key_persisted_mask
-                    assert kpm is not None
-                    if kpm.any():
-                        _, sel_idx, (keys_c, tids_c) = flagged_compact(
-                            kpm,
-                            [ctx.unique_keys, unique_table_ids],
-                        )
-                        vals_c = ctx.unique_values[sel_idx]
+                    pui = ctx.persisted_unique_indices
+                    assert pui is not None
+                    if pui.numel() > 0:
+                        keys_c = ctx.unique_keys[pui]
+                        tids_c = unique_table_ids[pui]
+                        vals_c = ctx.unique_values[pui]
                         # preserve_existing=True → CONST score policy on insert:
                         # refresh embedding/optimizer buffers only; do not overwrite
                         # table scores (LFU / timestamp / etc.). For HybridStorage,

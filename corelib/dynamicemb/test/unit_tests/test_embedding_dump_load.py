@@ -244,10 +244,6 @@ def apply_dmp(
     world_size = dist.get_world_size()
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
     for eb_config in eb_configs:
-        num_buckets, bucket_capacity_rows = get_sharded_table_shape( # default 128 get_sharded_table_capacity #TODO:remove
-            eb_config, world_size, MAX_BUCKET_CAPACITY
-        )
-        per_rank_capacity = num_buckets * bucket_capacity_rows
 
         emb_opt_type = (
             optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
@@ -257,14 +253,14 @@ def apply_dmp(
             eb_config,
             emb_opt_type,
             world_size,
-            MAX_BUCKET_CAPACITY, # default 128
+            MAX_BUCKET_CAPACITY,
         )
         if caching:
             global_hbm = int(value_bytes * cache_capacity_ratio)
         else:
             global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-        admission_counter = KVCounter(max(1024 * 1024, per_rank_capacity // 4)) # confirm align bucket capacity., use num_embeddings / (4 * world_size)  as capacity
+        admission_counter = KVCounter(max(1024 * 1024, eb_config.num_embeddings // (4 * world_size)))
         dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
             global_hbm_for_values=global_hbm,
             score_strategy=score_strategy,
@@ -272,7 +268,7 @@ def apply_dmp(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=1e-1,
             ),
-            bucket_capacity=bucket_capacity_rows, # default 128
+            bucket_capacity=MAX_BUCKET_CAPACITY, # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
             admission_counter=admission_counter,

@@ -24,11 +24,9 @@ import torch.cuda
 import torch.distributed as dist
 import torchrec
 from dynamicemb import (
-    MAX_BUCKET_CAPACITY,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
-    get_sharded_table_shape,
     get_table_value_bytes,
 )
 from dynamicemb.planner import (
@@ -121,14 +119,10 @@ def get_planner(args, device, eb_configs):
         eb_config = eb_configs[0]
         world_size = dist.get_world_size()
         emb_opt_type = _fbgemm_optimizer_type_for_hbm(args)
-        num_buckets, bucket_capacity_rows = get_sharded_table_shape(
-            eb_config, world_size, MAX_BUCKET_CAPACITY
-        )
         total_hbm_need = get_table_value_bytes(
             eb_config,
             emb_opt_type,
             world_size,
-            MAX_BUCKET_CAPACITY,
         )
 
         const = DynamicEmbParameterConstraints(
@@ -143,7 +137,6 @@ def get_planner(args, device, eb_configs):
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
-                bucket_capacity=bucket_capacity_rows,
             ),
         )
 

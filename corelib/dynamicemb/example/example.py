@@ -21,7 +21,6 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
     KVCounter,
-    get_sharded_table_shape,
     get_table_value_bytes,
 )
 from dynamicemb.incremental_dump import get_score, incremental_dump
@@ -458,10 +457,6 @@ def get_planner(
     dict_const = {}
 
     for eb_config in eb_configs:
-        num_buckets, effective_bucket = get_sharded_table_shape(
-            eb_config, world_size, bucket_capacity
-        )
-        per_rank_row_capacity = num_buckets * effective_bucket
 
         value_bytes = get_table_value_bytes(
             eb_config,
@@ -483,7 +478,7 @@ def get_planner(
             )
             # Create counter config (actual table will be created during sharding)
             admission_counter = KVCounter(
-                capacity=per_rank_row_capacity,
+                capacity=eb_config.num_embeddings // world_size,
                 bucket_capacity=kv_counter_bucket_capacity,
                 key_type=torch.int64,
             )

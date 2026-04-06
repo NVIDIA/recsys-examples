@@ -41,6 +41,9 @@ DYNAMICEMB_CSTM_SCORE_CHECK = "DYNAMICEMB_CSTM_SCORE_CHECK"
 BATCH_SIZE_PER_DUMP = 65536
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
 DEBUG_EMB_INITIALIZER_MOD = 100_000
+# Default hashtable bucket width in rows; keep in sync with
+# :class:`DynamicEmbTableOptions` and :func:`get_table_value_bytes`.
+DEFAULT_BUCKET_CAPACITY = 128
 
 
 def warning_for_cstm_score() -> None:
@@ -284,7 +287,7 @@ class DynamicEmbTableOptions:
     ] = None  # if not set then set to max_capcacity after sharded
     max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
-    bucket_capacity: int = 128
+    bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
     safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
@@ -608,7 +611,7 @@ def get_table_value_bytes(
     embedding_config: BaseEmbeddingConfig,
     optimizer_type: EmbOptimType,
     world_size: int,
-    bucket_capacity: int,
+    bucket_capacity: int = DEFAULT_BUCKET_CAPACITY,
 ) -> int:
     """Return how many bytes one DynamicEmb table needs for stored values across all ranks.
 
@@ -627,7 +630,8 @@ def get_table_value_bytes(
         Number of ranks, as in distributed planning.
     bucket_capacity
         Hashtable bucket width in rows, consistent with :func:`get_sharded_table_shape`
-        and ``DynamicEmbTableOptions.bucket_capacity`` (including the ``MAX_BUCKET_CAPACITY``
+        and ``DynamicEmbTableOptions.bucket_capacity`` (default
+        :data:`DEFAULT_BUCKET_CAPACITY`; including the ``MAX_BUCKET_CAPACITY``
         sentinel when applicable).
     """
     num_buckets, bucket_cap = get_sharded_table_shape(
