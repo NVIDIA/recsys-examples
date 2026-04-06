@@ -226,6 +226,7 @@ def test_bucketize_keys(
         dtype=torch.int64,
         device=device,
     )
+    num_buckets = sum(num_buckets_per_table)
     keys = torch.randint(
         1, batch_size * 10, (batch_size,), device=device, dtype=torch.int64
     ).to(key_type)
@@ -234,7 +235,7 @@ def test_bucketize_keys(
     )
 
     bkt_keys, offsets, inverse = bucketize_keys(
-        keys, table_ids, table_bucket_offsets, bucket_capacity
+        keys, table_ids, table_bucket_offsets, num_buckets, bucket_capacity
     )
 
     assert bkt_keys.numel() == batch_size
@@ -262,7 +263,7 @@ def test_bucketize_keys(
     perm_table_ids = table_ids[perm]
 
     bkt_keys2, offsets2, inverse2 = bucketize_keys(
-        perm_keys, perm_table_ids, table_bucket_offsets, bucket_capacity
+        perm_keys, perm_table_ids, table_bucket_offsets, num_buckets, bucket_capacity
     )
 
     # The sorted keys and offsets should be the same regardless of input order

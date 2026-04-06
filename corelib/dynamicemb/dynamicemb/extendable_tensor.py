@@ -35,12 +35,14 @@ def _merge_extend_shape(
     added_numel: int,
 ) -> Tuple[int, ...]:
     """Return new shape after extending. Prefer multidimensional when extend_shape matches trailing dims."""
+    # Normalize to tuple so list vs tuple does not break equality (e.g. [D] != (D,)).
+    ext = tuple(int(d) for d in extend_shape)
     if (
-        len(extend_shape) == len(current_shape)
+        len(ext) == len(current_shape)
         and len(current_shape) >= 1
-        and extend_shape[1:] == current_shape[1:]
+        and ext[1:] == current_shape[1:]
     ):
-        return (current_shape[0] + extend_shape[0], *current_shape[1:])
+        return (current_shape[0] + ext[0], *current_shape[1:])
     total_numel = _shape_to_numel(current_shape) + added_numel
     return (total_numel,)
 

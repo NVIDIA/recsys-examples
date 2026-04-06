@@ -1309,7 +1309,11 @@ class LinearBucketTable(ScoredHashTable):
         table_ids,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bkt_keys, offsets, inverse = bucketize_keys(
-            keys, table_ids, self.table_bucket_offsets_, self.bucket_capacity_
+            keys,
+            table_ids,
+            self.table_bucket_offsets_,
+            self.num_buckets_,
+            self.bucket_capacity_,
         )
         return bkt_keys, offsets, inverse
 

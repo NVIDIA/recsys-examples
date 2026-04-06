@@ -117,10 +117,11 @@ namespace dyn_emb {
 
 std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
+                                       int64_t num_buckets,
                                        int64_t bucket_capacity) {
 
   int64_t num_total = keys.size(0);
-  int64_t num_buckets = table_bucket_offsets[-1].item<int64_t>();
+  TORCH_CHECK(num_buckets >= 0, "num_buckets must be non-negative");
 
   std::vector<at::Tensor> result;
   result.reserve(3);

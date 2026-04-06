@@ -2350,7 +2350,14 @@ def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
     ],
 )
 def test_multi_table_caching_flush(opt_type, opt_params):
-    """Multi-table caching mode: prefetch, forward, flush, verify cache metrics."""
+    """Multi-table caching mode: prefetch, forward, flush, verify cache metrics.
+
+    ``DynamicEmbCache`` updates ``cache_metrics[0]`` (last lookup unique count) and
+    ``[1]`` (last lookup hit count) only inside ``lookup()``, overwriting prior values.
+    Prefetch calls ``lookup``; training forward with cache loads from flat via
+    ``slot_indices`` and does not call ``lookup`` again. The first prefetch is thus
+    cold (all misses); a second prefetch on the same keys should record all hits.
+    """
     assert torch.cuda.is_available()
     device_id = 0
     device = torch.device(f"cuda:{device_id}")
@@ -2361,6 +2368,11 @@ def test_multi_table_caching_flush(opt_type, opt_params):
     key_type = torch.int64
     value_type = torch.float32
     max_capacity = 2048
+
+    # Caching tier + backing storage is only created when total value bytes exceed
+    # the summed per-table local_hbm_for_values (see _create_cache_storage).
+    # Keep HBM budget below table footprint so DynamicEmbCache is instantiated.
+    local_hbm_per_table = 64 * 1024  # 64 KiB each -> 128 KiB total < ~192 KiB data
 
     dyn_emb_table_options_list = []
     for dim in dims:
@@ -2373,7 +2385,7 @@ def test_multi_table_caching_flush(opt_type, opt_params):
             device_id=device_id,
             score_strategy=DynamicEmbScoreStrategy.STEP,
             caching=True,
-            local_hbm_for_values=1024**3,
+            local_hbm_for_values=local_hbm_per_table,
         )
         dyn_emb_table_options_list.append(opt)
 
@@ -2414,7 +2426,19 @@ def test_multi_table_caching_flush(opt_type, opt_params):
     cache = bdeb.cache
     assert cache is not None
     metrics = cache.cache_metrics
-    assert metrics[0].item() == metrics[1].item()
+    assert metrics[0].item() == 4
+    assert metrics[1].item() == 0
+
+    with torch.cuda.stream(prefetch_stream):
+        bdeb.prefetch(indices, offsets, forward_stream)
+
+    with torch.cuda.stream(forward_stream):
+        torch.cuda.current_stream().wait_stream(prefetch_stream)
+        embs2 = bdeb(indices, offsets)
+        _ = embs2.mean()
+
+    torch.cuda.synchronize()
+    assert metrics[0].item() == metrics[1].item() == 4
 
     bdeb.flush()
     bdeb.reset_cache_states()

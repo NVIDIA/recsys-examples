@@ -96,6 +96,19 @@ def test_extend_updates_numel_and_shape_2d(buffer_cls):
 
 @requires_cuda
 @pytest.mark.parametrize("buffer_cls", _EXTENDABLE_BUFFER_PARAMS)
+def test_extend_2d_with_list_extend_shape(buffer_cls):
+    """extend_shape as list must match tuple trailing dims (list != tuple in ==)."""
+    device = _cuda_device()
+    dtype = torch.float32
+    buf = buffer_cls((32, 8), dtype, device)
+    buf.extend([16, 8])
+    torch.cuda.synchronize()
+    assert buf.numel() == 384
+    assert buf.shape == (48, 8)
+
+
+@requires_cuda
+@pytest.mark.parametrize("buffer_cls", _EXTENDABLE_BUFFER_PARAMS)
 def test_extend_mismatched_trailing_dims_flattens_shape(buffer_cls):
     """When extend_shape trailing dims do not match, fall back to 1-D total numel."""
     device = _cuda_device()

@@ -118,6 +118,7 @@ std::vector<at::Tensor> tensor_partition(at::Tensor input,
 
 std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
+                                       int64_t num_buckets,
                                        int64_t bucket_capacity);
 
 void table_update_counter_with_layout(

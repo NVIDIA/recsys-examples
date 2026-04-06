@@ -30,16 +30,37 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <sys/resource.h> // Used to set memory lock limits
 #include <unistd.h>
 
+/// Total installed RAM in bytes (Linux). Used to size the host VMM reservation.
+/// Tries MemTotal from /proc/meminfo (see meminfo(5), value is kB), then
+/// sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE). Throws if neither works,
+/// so callers never get 0 (mmap(…, 0, …) would fail).
 std::size_t getTotalPhysicalMemory() {
   std::ifstream meminfo("/proc/meminfo");
-  std::string key, unit;
-  std::size_t value = 0; // kB
-  while (meminfo >> key >> value >> unit) {
-    if (key == "MemTotal:") {
-      return value * 1024; // 转成字节
+  if (meminfo) {
+    std::string key, unit;
+    std::size_t value_kb = 0;
+    while (meminfo >> key >> value_kb >> unit) {
+      if (key == "MemTotal:") {
+        std::size_t bytes = value_kb * 1024;
+        if (bytes > 0) {
+          return bytes;
+        }
+        break;
+      }
     }
   }
-  return 0;
+
+  long phys_pages = sysconf(_SC_PHYS_PAGES);
+  long page_size = sysconf(_SC_PAGE_SIZE);
+  if (phys_pages > 0 && page_size > 0) {
+    return static_cast<std::size_t>(phys_pages) *
+           static_cast<std::size_t>(page_size);
+  }
+
+  throw std::runtime_error(
+      "Could not determine total physical memory: MemTotal not found or zero "
+      "in /proc/meminfo, and sysconf(_SC_PHYS_PAGES / _SC_PAGE_SIZE) is "
+      "unavailable or invalid");
 }
 
 #include <pybind11/pybind11.h>
@@ -238,6 +259,9 @@ public:
     std::size_t required_bytes = numel * dtype_bytes;
 
     m_reserved = getTotalPhysicalMemory();
+    if (required_bytes > m_reserved) {
+      throw std::runtime_error("Requested HostVMMTensor size exceeds total physical memory");
+    }
 
     int canMap = 0;
     CUDA_CHECK(
@@ -345,10 +369,17 @@ public:
                            cudaHostRegisterMapped | cudaHostRegisterPortable));
     } catch (const std::runtime_error &e) {
       munlock((void *)append_start, delta);
-      /// TODO: but what will happened if it failed?
-      CUDA_CHECK(cudaHostRegister(
-          m_addr_h, m_size, cudaHostRegisterMapped | cudaHostRegisterPortable));
-
+      try {
+        CUDA_CHECK(cudaHostRegister(
+            m_addr_h, m_size, cudaHostRegisterMapped | cudaHostRegisterPortable));
+      } catch (const std::runtime_error &e2) {
+        throw std::runtime_error(
+            std::string(
+                "cudaHostRegister failed for the expanded buffer size; "
+                "fallback cudaHostRegister with the previous size also failed. "
+                "Expand error: ") +
+            e.what() + "; fallback error: " + e2.what());
+      }
       throw;
     }
 
@@ -365,8 +396,17 @@ public:
     } catch (const std::runtime_error &e) {
       munlock((void *)append_start, delta);
       CUDA_CHECK(cudaHostUnregister(m_addr_h));
-      CUDA_CHECK(cudaHostRegister(
-          m_addr_h, m_size, cudaHostRegisterMapped | cudaHostRegisterPortable));
+      try {
+        CUDA_CHECK(cudaHostRegister(
+            m_addr_h, m_size, cudaHostRegisterMapped | cudaHostRegisterPortable));
+      } catch (const std::runtime_error &e2) {
+        throw std::runtime_error(
+            std::string(
+                "cudaHostGetDevicePointer failed after expanding the registered "
+                "buffer; cudaHostRegister with the previous size also failed. "
+                "Prior error: ") +
+            e.what() + "; fallback error: " + e2.what());
+      }
       throw;
     }
   }

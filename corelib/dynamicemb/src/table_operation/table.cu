@@ -140,9 +140,10 @@ void bind_table_operation(py::module &m) {
 
   m.def("bucketize_keys", &dyn_emb::bucketize_keys,
         "bucketize input keys into a dense tensor, and return the output keys, "
-        "buckets offset, inverse indices.",
+        "buckets offset, inverse indices. num_buckets must equal "
+        "table_bucket_offsets[-1] (total bucket count across tables).",
         py::arg("keys"), py::arg("table_ids"), py::arg("table_bucket_offsets"),
-        py::arg("bucket_capacity"));
+        py::arg("num_buckets"), py::arg("bucket_capacity"));
 
   m.def("table_update_counter_with_layout",
         &dyn_emb::table_update_counter_with_layout,
