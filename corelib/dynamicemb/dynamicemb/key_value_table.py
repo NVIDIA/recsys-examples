@@ -488,19 +488,6 @@ def _expand_tables_impl(
 
         for dst_indices, table_id, values_batch in dst_values_list:
             store_to_flat_single_table(state, dst_indices, table_id, values_batch)
-            # tid_tensor = torch.full(
-            #     (keys_batch.numel(),),
-            #     table_id,
-            #     dtype=torch.int64,
-            #     device=device,
-            # )
-            # _assert_debug_flat_write_roundtrip_key_mod(
-            #     state,
-            #     keys_batch,
-            #     tid_tensor,
-            #     dst_indices,
-            #     "DynamicEmbStorage._expand_tables_impl after store_to_flat_single_table",
-            # )
 
     state.key_index_map = new_key_index_map
     state.capacity = new_key_index_map.capacity()
@@ -699,24 +686,6 @@ def store_to_flat(
 ) -> None:
     if values.dim() == 1:
         values = values.unsqueeze(1)
-    # if indices.numel() > 0:
-    #     n = indices.numel()
-    #     idx_flat = indices.detach().reshape(-1).to(torch.int64)
-    #     vmin = int(idx_flat.min().item())
-    #     vmax = int(idx_flat.max().item())
-    #     k = min(32, n)
-    #     head = idx_flat[:k].detach().cpu().tolist()
-    #     msg = (
-    #         f"store_to_flat indices: shape={tuple(indices.shape)} dtype={indices.dtype} "
-    #         f"n={n} min={vmin} max={vmax} head={head}"
-    #     )
-    #     if table_ids.numel() == n:
-    #         tid_flat = table_ids.detach().reshape(-1)
-    #         msg += f" table_ids_head={tid_flat[:k].detach().cpu().tolist()}"
-    #     if state.no_eviction_next_index is not None:
-    #         phys = [int(state.tables[t].tensor().size(0)) for t in range(state.num_tables)]
-    #         msg += f" table_phys_rows={phys}"
-    #     print(msg, flush=True)
     _store_value(
         get_table_ptrs(state),
         indices,
@@ -988,20 +957,7 @@ def _insert_key_values(
     indices = state.key_index_map.insert(
         unique_keys, table_ids, score_arg, score_out=score_out_flat
     )
-    if state.no_eviction_next_index is not None:
-        # assert score_out_flat is not None
-        # # Prefer insert kernel output scores: they match KIM after insert. Deterministic
-        # # insert path does not fill score_out; keep pre-assigned scores / prior logic.
-        # if os.environ.get("DEMB_DETERMINISM_MODE") is None:
-        #     flat_indices = score_out_flat
-        # else:
-        #     flat_indices = (
-        #         score_arg.value
-        #         if score_arg.value is not None
-        #         else score_out_flat
-        #     )
-        # assert torch.equal(score_out_flat, score_arg.value)
-        
+    if state.no_eviction_next_index is not None:        
         
         flat_indices = (
             score_arg.value
@@ -1011,13 +967,6 @@ def _insert_key_values(
     else:
         flat_indices = indices
     store_to_flat(state, flat_indices, table_ids, unique_values)
-    # _assert_debug_flat_write_roundtrip_key_mod(
-    #     state,
-    #     unique_keys,
-    #     table_ids,
-    #     flat_indices,
-    #     "DynamicEmbStorage._insert_key_values after store_to_flat",
-    # )
 
 
 def _insert_and_evict_keys(
@@ -1401,18 +1350,7 @@ def _load_key_values(
     )
     if state.no_eviction_next_index is not None:
         indices = score_arg_insert.value
-        # if os.environ.get("DEMB_DETERMINISM_MODE") is None:
-        #     indices = score_out_flat
-        # else:
-        #     indices = score_arg_insert.value
     store_to_flat_single_table(state, indices, table_id, values)
-    # _assert_debug_flat_write_roundtrip_key_mod(
-    #     state,
-    #     keys,
-    #     tid_tensor,
-    #     indices,
-    #     "DynamicEmbStorage._load_key_values after store_to_flat_single_table",
-    # )
 
 
 # ---------------------------------------------------------------------------
@@ -1551,49 +1489,6 @@ class DynamicEmbCache(Cache):
 # DynamicEmbStorage – Storage interface (find with values, insert, dump, load)
 # ---------------------------------------------------------------------------
 
-# _ENV_DEBUG_STORAGE_LOAD_FACTOR = "DYNAMICEMB_DEBUG_STORAGE_LOAD_FACTOR"
-
-
-# def _log_dynamicemb_storage_load_factor(
-#     state: DynamicEmbTableState,
-#     tag: str,
-#     *,
-#     force: bool = False,
-# ) -> None:
-#     """Print per-table occupancy: keys / key_index_map cap, option max_load_factor, and NO_EVICTION value rows."""
-#     if not force and os.environ.get(_ENV_DEBUG_STORAGE_LOAD_FACTOR, "").strip() != "1":
-#         return
-#     if state.device.type == "cuda":
-#         torch.cuda.synchronize(device=state.device)
-#     if state.no_eviction_next_index is not None and state.no_eviction_next_index_dev is not None:
-#         state.no_eviction_next_index.copy_(
-#             state.no_eviction_next_index_dev.detach().cpu(),
-#             non_blocking=False,
-#         )
-#     km = state.key_index_map
-#     parts: List[str] = []
-#     for t in range(state.num_tables):
-#         n_t = km.size(t)
-#         n = int(n_t.item() if isinstance(n_t, torch.Tensor) else n_t)
-#         cap = int(km.capacity(t))
-#         kim_lf = (n / cap) if cap else 0.0
-#         opt = state.options_list[t]
-#         piece = (
-#             f"t{t}:keys={n},kim_cap={cap},kim_load_factor={kim_lf:.6f},"
-#             f"option_max_load_factor={opt.max_load_factor}"
-#         )
-#         if state.no_eviction_next_index is not None:
-#             ni = int(state.no_eviction_next_index[t].item())
-#             phys = int(state.tables[t].tensor().size(0))
-#             vlf = (ni / phys) if phys else 0.0
-#             piece += (
-#                 f",no_eviction_next_index={ni},value_phys_rows={phys},"
-#                 f"value_load_factor={vlf:.6f}"
-#             )
-#         parts.append(piece)
-#     print(f"DynamicEmbStorage load_factor [{tag}] " + " | ".join(parts), flush=True)
-
-
 class DynamicEmbStorage(Storage):
     def __init__(
         self,
@@ -1604,37 +1499,6 @@ class DynamicEmbStorage(Storage):
             options,
             optimizer,
         )
-    #     # (table_id, key) -> embedding[0] recorded on each :meth:`insert`; :meth:`find` checks hits.
-    #     self._insert_seen_keys_dict: Dict[Tuple[int, int], float] = {}
-
-    # def _assert_find_values_emb0_matches_insert_dict(
-    #     self,
-    #     unique_keys: torch.Tensor,
-    #     table_ids: torch.Tensor,
-    #     founds: torch.Tensor,
-    #     values: torch.Tensor,
-    #     *,
-    #     context: str,
-    # ) -> None:
-    #     d = self._insert_seen_keys_dict
-    #     n = int(unique_keys.numel())
-    #     if n == 0 or values.numel() == 0:
-    #         return
-    #     for i in range(n):
-    #         if not bool(founds[i].item()):
-    #             continue
-    #         tid_i = int(table_ids[i].item())
-    #         k_i = int(unique_keys[i].item())
-    #         p = (tid_i, k_i)
-    #         if p not in d:
-    #             continue
-    #         expected = d[p]
-    #         actual = float(values[i, 0].detach().cpu().item())
-    #         if not math.isclose(actual, expected, rel_tol=1e-5, abs_tol=1e-6):
-    #             raise AssertionError(
-    #                 f"{context}: (table_id,key)={p} insert_dict_emb0={expected} "
-    #                 f"find_values[0]={actual}"
-    #             )
 
     @property
     def key_index_map(self):
@@ -1772,11 +1636,6 @@ class DynamicEmbStorage(Storage):
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (async copy)."""
         collect_table_sizes_for_state(self._state, non_blocking=non_blocking)
-    #     _log_dynamicemb_storage_load_factor(self._state, tag="collect_table_sizes", force=False)
-
-    # def log_load_factor(self, tag: str = "manual") -> None:
-    #     """Print per-table key_index_map / value-buffer load metrics (forces GPU sync)."""
-    #     _log_dynamicemb_storage_load_factor(self._state, tag=tag, force=True)
 
     # -- Storage interface --
 
@@ -1786,8 +1645,6 @@ class DynamicEmbStorage(Storage):
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-        # *,
-        # find_debug_context: Optional[str] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -1815,21 +1672,7 @@ class DynamicEmbStorage(Storage):
             self._state, founds, score_out, indices
         )
         values = load_from_flat(self._state, flat_rows, table_ids, copy_mode=copy_mode)
-        # self._assert_find_values_emb0_matches_insert_dict(
-        #     unique_keys,
-        #     table_ids,
-        #     founds,
-        #     values,
-        #     context=find_debug_context or "DynamicEmbStorage.find",
-        # )
-        # _assert_debug_prefetch_storage_find_hits_key_mod(
-        #     self,
-        #     unique_keys,
-        #     table_ids,
-        #     founds,
-        #     values,
-        #     debug_context=find_debug_context or "DynamicEmbStorage.find",
-        # )
+
         return (
             h_num_missing,
             missing_keys,
@@ -1865,20 +1708,6 @@ class DynamicEmbStorage(Storage):
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
     ) -> None:
-        # n = int(unique_keys.numel())
-        # batch_pair_list: List[Tuple[int, int]] = []
-        # batch_already_in_tracked_dict = 0
-        # if n > 0:
-        #     keys_list = unique_keys.detach().cpu().reshape(-1).tolist()
-        #     tids_list = table_ids.detach().cpu().reshape(-1).tolist()
-        #     batch_pair_list = list(zip(tids_list, keys_list))
-        #     batch_already_in_tracked_dict = sum(
-        #         1 for p in batch_pair_list if p in self._insert_seen_keys_dict
-        #     )
-
-        # _assert_debug_key_embedding_relation_on_storage_write(
-        #     self._state, unique_keys, table_ids, unique_values
-        # )
         _insert_key_values(
             self._state,
             unique_keys,
@@ -1887,38 +1716,6 @@ class DynamicEmbStorage(Storage):
             scores,
             preserve_existing,
         )
-
-        # for i, p in enumerate(batch_pair_list):
-        #     self._insert_seen_keys_dict[p] = float(
-        #         unique_values[i, 0].detach().cpu().item()
-        #     )
-        #     assert p[1] == int(self._insert_seen_keys_dict[p])
-
-        # print(
-        #     "DynamicEmbStorage.insert: "
-        #     f"tracked_dict_size={len(self._insert_seen_keys_dict)} "
-        #     f"batch_already_in_tracked_dict={batch_already_in_tracked_dict} "
-        #     f"batch_num_keys={n} preserve_existing={preserve_existing}",
-        #     flush=True,
-        # )
-
-        # (
-        #     h_num_missing,
-        #     missing_keys,
-        #     missing_indices,
-        #     missing_table_ids,
-        #     missing_scores,
-        #     founds,
-        #     score_out,
-        #     values,
-        # ) = self.find(unique_keys, table_ids, CopyMode.VALUE)
-
-        # assert founds.all(), "Some keys are not found in storage after insert"
-
-        # print("Recheck storage.find after insert", flush=True)
-        # _assert_debug_key_embedding_relation_on_storage_write(
-        #     self._state, unique_keys, table_ids, values
-        # )
 
     def dump(
         self,
@@ -2194,8 +1991,6 @@ class HybridStorage(Storage):
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-        # *,
-        # find_debug_context: Optional[str] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -2206,7 +2001,6 @@ class HybridStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        # _ = find_debug_context  # two-tier find does not run DEBUG assert here
         result_hbm = _find_keys(
             self._hbm, unique_keys, table_ids, lfu_accumulated_frequency
         )
@@ -2351,13 +2145,6 @@ class HybridStorage(Storage):
                     table_ids[founds_hbm],
                     unique_values[founds_hbm],
                 )
-                # _assert_debug_flat_write_roundtrip_key_mod(
-                #     self._hbm,
-                #     unique_keys[founds_hbm],
-                #     table_ids[founds_hbm],
-                #     flat_hbm[founds_hbm],
-                #     "HybridStorage.insert preserve_existing HBM after store_to_flat",
-                # )
             if h_num_missing_hbm > 0:
                 (
                     _h_num_missing_both,
@@ -2385,18 +2172,8 @@ class HybridStorage(Storage):
                         missing_table_ids_hbm[founds_host],
                         unique_values[orig_rows],
                     )
-                    # _assert_debug_flat_write_roundtrip_key_mod(
-                    #     self._host,
-                    #     unique_keys[orig_rows],
-                    #     missing_table_ids_hbm[founds_host],
-                    #     flat_host[founds_host],
-                    #     "HybridStorage.insert preserve_existing host after store_to_flat",
-                    # )
             return
 
-        # _assert_debug_key_embedding_relation_on_storage_write(
-        #     self._hbm, unique_keys, table_ids, unique_values
-        # )
         (
             indices,
             num_evicted,
@@ -2417,13 +2194,6 @@ class HybridStorage(Storage):
         )
         select_insert_failed_values(evicted_indices, unique_values, evicted_values)
         store_to_flat(self._hbm, indices, table_ids, unique_values)
-        # _assert_debug_flat_write_roundtrip_key_mod(
-        #     self._hbm,
-        #     unique_keys,
-        #     table_ids,
-        #     indices,
-        #     "HybridStorage.insert after HBM store_to_flat",
-        # )
 
         if num_evicted != 0:
             _insert_key_values(
@@ -2632,13 +2402,6 @@ class HybridStorage(Storage):
             )
             select_insert_failed_values(evicted_indices, values, evicted_values)
             store_to_flat_single_table(self._hbm, ins_indices, table_id, values)
-            # _assert_debug_flat_write_roundtrip_key_mod(
-            #     self._hbm,
-            #     keys,
-            #     tids,
-            #     ins_indices,
-            #     "HybridStorage.load after store_to_flat_single_table",
-            # )
 
             if num_evicted != 0:
                 _insert_key_values(
@@ -2782,410 +2545,6 @@ def _expand_storage_for_cache_flush_if_needed(
     collect_table_sizes_for_state(st, non_blocking=False)
 
 
-# def _sync_and_verify_cache_flush_slice(
-#     state: DynamicEmbTableState,
-#     table_id: int,
-#     keys: torch.Tensor,
-#     indices: torch.Tensor,
-#     values: torch.Tensor,
-# ) -> None:
-#     """Before backing insert from cache, sync device and assert key↔slot↔embedding consistency."""
-#     if keys.numel() == 0:
-#         return
-#     if state.device.type == "cuda":
-#         torch.cuda.synchronize(state.device)
-#     tid = torch.full((keys.numel(),), table_id, dtype=torch.int64, device=keys.device)
-#     (
-#         h_num_missing,
-#         _,
-#         _,
-#         _,
-#         _,
-#         founds,
-#         _,
-#         lookup_slot_indices,
-#     ) = _find_keys(state, keys, tid, None, const_lookup=True)
-#     assert h_num_missing == 0, "flush_cache: exported keys must still resolve in cache"
-#     assert bool(founds.all()), "flush_cache: lookup must find every exported key"
-#     assert torch.equal(
-#         indices, lookup_slot_indices
-#     ), "flush_cache: export indices must match cache lookup (key↔slot)"
-#     emb_t = state.table_emb_dims_cpu[table_id]
-#     emb_prefix = values[:, :emb_t]
-#     emb_reload = load_from_flat(
-#         state, indices, tid, copy_mode=CopyMode.EMBEDDING
-#     )
-#     assert torch.equal(
-#         emb_prefix, emb_reload
-#     ), "flush_cache: VALUE row embedding prefix must match flat EMBEDDING reload"
-
-#     if state.options_list[table_id].initializer_args.mode == DynamicEmbInitializerMode.DEBUG:
-#         mod = torch.tensor(
-#             float(DEBUG_EMB_INITIALIZER_MOD),
-#             device=emb_prefix.device,
-#             dtype=emb_prefix.dtype,
-#         )
-#         kf = keys.to(device=emb_prefix.device, dtype=emb_prefix.dtype)
-#         expected = (kf % mod).unsqueeze(1).expand_as(emb_prefix)
-#         assert torch.equal(
-#             emb_prefix, expected
-#         ), (
-#             "flush_cache: DEBUG initializer invariant embedding[i,d] == key[i] % "
-#             f"{DEBUG_EMB_INITIALIZER_MOD}"
-#         )
-
-
-# def _assert_debug_key_embedding_relation_on_storage_write(
-#     state: DynamicEmbTableState,
-#     keys: torch.Tensor,
-#     table_ids: torch.Tensor,
-#     values: torch.Tensor,
-# ) -> None:
-#     """When DEBUG initializer is configured, enforce emb == key % mod for the written rows."""
-#     if keys.numel() == 0:
-#         return
-
-#     # Skip if no table uses DEBUG init.
-#     if not any(
-#         opt.initializer_args.mode == DynamicEmbInitializerMode.DEBUG
-#         for opt in state.options_list
-#     ):
-#         return
-
-#     for tid in range(state.num_tables):
-#         if state.options_list[tid].initializer_args.mode != DynamicEmbInitializerMode.DEBUG:
-#             continue
-#         mask = table_ids == tid
-#         if not bool(mask.any()):
-#             continue
-#         emb_t = state.table_emb_dims_cpu[tid]
-#         emb_prefix = values[mask, :emb_t]
-#         mod = torch.tensor(
-#             float(DEBUG_EMB_INITIALIZER_MOD),
-#             device=emb_prefix.device,
-#             dtype=emb_prefix.dtype,
-#         )
-#         kf = keys[mask].to(device=emb_prefix.device, dtype=emb_prefix.dtype)
-#         expected = (kf % mod).unsqueeze(1).expand_as(emb_prefix)
-#         assert torch.equal(
-#             emb_prefix, expected
-#         ), (
-#             "DynamicEmbStorage write DEBUG check failed: embedding[i,d] must equal key[i] % "
-#             f"{DEBUG_EMB_INITIALIZER_MOD}"
-#         )
-
-
-# def _assert_debug_aligned_keys_value_rows_key_mod(
-#     state: DynamicEmbTableState,
-#     keys: torch.Tensor,
-#     table_ids: torch.Tensor,
-#     values_row_major: torch.Tensor,
-#     context: str,
-# ) -> None:
-#     """``values_row_major[i]`` is VALUE-layout for ``keys[i]``; DEBUG tables: emb prefix == key % mod."""
-#     if keys.numel() == 0:
-#         return
-#     if not any(
-#         opt.initializer_args.mode == DynamicEmbInitializerMode.DEBUG
-#         for opt in state.options_list
-#     ):
-#         return
-#     assert keys.numel() == values_row_major.size(0)
-#     assert table_ids.numel() == keys.numel()
-
-#     for tid in range(state.num_tables):
-#         if state.options_list[tid].initializer_args.mode != DynamicEmbInitializerMode.DEBUG:
-#             continue
-#         mask = table_ids == tid
-#         if not bool(mask.any()):
-#             continue
-#         emb_t = state.table_emb_dims_cpu[tid]
-#         vals = values_row_major[mask, :emb_t]
-#         mod = torch.tensor(
-#             float(DEBUG_EMB_INITIALIZER_MOD),
-#             device=vals.device,
-#             dtype=vals.dtype,
-#         )
-#         kf = keys[mask].to(device=vals.device, dtype=vals.dtype)
-#         expected = (kf % mod).unsqueeze(1).expand_as(vals)
-#         assert torch.equal(vals, expected), (
-#             f"{context}: DEBUG embedding prefix != key % {DEBUG_EMB_INITIALIZER_MOD} "
-#             f"(table_id={tid})"
-#         )
-#     print(f"Jiashu, Passed {context}")
-
-
-# def _assert_debug_flat_write_roundtrip_key_mod(
-#     state: DynamicEmbTableState,
-#     keys: torch.Tensor,
-#     table_ids: torch.Tensor,
-#     flat_row_indices: torch.Tensor,
-#     context: str,
-# ) -> None:
-#     """After ``store_to_flat`` / ``store_to_flat_single_table``, reload rows and check DEBUG ``key % mod``.
-
-#     Catches wrong flat-row indices (e.g. slot vs logical row) while still writing plausible tensors.
-#     """
-#     if keys.numel() == 0:
-#         return
-#     if not any(
-#         opt.initializer_args.mode == DynamicEmbInitializerMode.DEBUG
-#         for opt in state.options_list
-#     ):
-#         return
-#     assert keys.shape[0] == table_ids.shape[0] == flat_row_indices.shape[0]
-#     # NO_EVICTION flat rows may live in uint64 score tensors; CUDA has no compare op for uint64.
-#     flat_i64 = flat_row_indices.to(dtype=torch.int64)
-#     ok = flat_i64 >= 0
-#     if not bool(ok.any()):
-#         return
-#     if not bool(ok.all()):
-#         print(f"check flat_write_roundtrip_key_mod: some keys are not ok: cache insert_and_evict existed failed")
-#         keys = keys[ok]
-#         table_ids = table_ids[ok]
-#         flat_i64 = flat_i64[ok]
-#     loaded = load_from_flat(state, flat_i64, table_ids, copy_mode=CopyMode.VALUE)
-#     _assert_debug_aligned_keys_value_rows_key_mod(
-#         state, keys, table_ids, loaded, context
-#     )
-
-
-# def _assert_debug_prefetch_storage_find_hits_key_mod(
-#     storage: Storage,
-#     miss_keys: torch.Tensor,
-#     miss_tids: torch.Tensor,
-#     storage_founds: torch.Tensor,
-#     storage_values: torch.Tensor,
-#     *,
-#     debug_context: str = "prefetch storage.find",
-# ) -> None:
-#     """After ``storage.find``: DEBUG tables must have embedding prefix ``== key % mod`` where ``storage_founds`` is true.
-
-#     Used from prefetch (cache-miss subset) and :meth:`DynamicEmbStorage.find` (full batch).
-#     """
-#     if not storage_founds.any():
-#         return
-
-#     if isinstance(storage, DynamicEmbStorage):
-#         st = storage._state
-#     elif isinstance(storage, HybridStorage):
-#         st = storage._hbm
-#     else:
-#         return
-
-#     if not any(
-#         opt.initializer_args.mode == DynamicEmbInitializerMode.DEBUG
-#         for opt in st.options_list
-#     ):
-#         return
-
-#     for tid in range(st.num_tables):
-#         if st.options_list[tid].initializer_args.mode != DynamicEmbInitializerMode.DEBUG:
-#             continue
-#         mask = storage_founds & (miss_tids == tid)
-#         if not bool(mask.any()):
-#             continue
-#         emb_t = st.table_emb_dims_cpu[tid]
-#         vals = storage_values[mask, :emb_t]
-#         mod = torch.tensor(
-#             float(DEBUG_EMB_INITIALIZER_MOD),
-#             device=vals.device,
-#             dtype=vals.dtype,
-#         )
-#         kf = miss_keys[mask].to(device=vals.device, dtype=vals.dtype)
-#         expected = (kf % mod).unsqueeze(1).expand_as(vals)
-#         rtol = 1e-5
-#         atol = 1e-6
-#         if emb_t == 0:
-#             row_ok = torch.ones(vals.shape[0], dtype=torch.bool, device=vals.device)
-#         else:
-#             close = torch.isclose(vals, expected, rtol=rtol, atol=atol)
-#             row_ok = close.all(dim=1)
-#         if not bool(row_ok.all()):
-#             bad = ~row_ok
-#             keys_bad = miss_keys[mask][bad].detach().cpu()
-#             vals_bad = vals[bad]
-#             exp_bad = expected[bad]
-#             diff = (vals_bad - exp_bad).abs()
-#             max_diff = diff.amax(dim=1).detach().cpu()
-#             mean_diff = diff.mean(dim=1).detach().cpu()
-#             n_bad = int(bad.sum().item())
-#             n_show = min(16, n_bad)
-#             for i in range(n_show):
-#                 k_int = int(keys_bad[i].item())
-#                 print(
-#                     f"{debug_context} DEBUG mismatch table_id={tid} "
-#                     f"key={k_int} max_abs_diff={float(max_diff[i]):.6g} "
-#                     f"mean_abs_diff={float(mean_diff[i]):.6g} "
-#                     f"emb_prefix={vals_bad[i, : min(4, emb_t)].detach().cpu().tolist()} "
-#                     f"expected_prefix={exp_bad[i, : min(4, emb_t)].detach().cpu().tolist()}",
-#                     flush=True,
-#                 )
-#             if n_bad > n_show:
-#                 print(
-#                     f"... and {n_bad - n_show} more mismatched rows (table_id={tid})",
-#                     flush=True,
-#                 )
-#         assert torch.allclose(
-#             vals, expected, rtol=rtol, atol=atol
-#         ), (
-#             f"{debug_context}: DEBUG embedding prefix not allclose to key % "
-#             f"{DEBUG_EMB_INITIALIZER_MOD} (table_id={tid}) on storage hit "
-#             f"(n_mismatch={int((~row_ok).sum().item()) if emb_t > 0 else 0})"
-#         )
-
-
-# def _assert_debug_prefetch_evicted_before_storage_insert(
-#     state: DynamicEmbTableState,
-#     evicted_keys: torch.Tensor,
-#     evicted_indices: torch.Tensor,
-#     evicted_table_ids: torch.Tensor,
-#     evicted_values: torch.Tensor,
-# ) -> None:
-#     """Narrow ``storage.insert`` DEBUG failures: evicted payload comes from cache ``load_from_flat``.
-
-#     If ``CopyMode.VALUE`` vs ``CopyMode.EMBEDDING`` disagree on the same slot, the bug is in
-#     ``load_from_flat`` / layout. If they agree but differ from ``key % mod``, the bug is
-#     key/slot pairing or stale cache before write-back.
-#     """
-#     if evicted_keys.numel() == 0:
-#         return
-#     if not any(
-#         opt.initializer_args.mode == DynamicEmbInitializerMode.DEBUG
-#         for opt in state.options_list
-#     ):
-#         return
-
-#     for tid in range(state.num_tables):
-#         if state.options_list[tid].initializer_args.mode != DynamicEmbInitializerMode.DEBUG:
-#             continue
-#         mask = evicted_table_ids == tid
-#         if not bool(mask.any()):
-#             continue
-#         emb_t = state.table_emb_dims_cpu[tid]
-#         idx = evicted_indices[mask]
-#         tids = evicted_table_ids[mask]
-#         vals_v = evicted_values[mask, :emb_t]
-#         vals_e = load_from_flat(state, idx, tids, copy_mode=CopyMode.EMBEDDING)
-#         vals_e = vals_e[:, :emb_t]
-#         assert torch.equal(
-#             vals_v, vals_e
-#         ), (
-#             "prefetch evicted: CopyMode.VALUE != EMBEDDING on same cache slots before "
-#             f"storage.insert (table_id={tid}); load_from_flat paths inconsistent"
-#         )
-#         mod = torch.tensor(
-#             float(DEBUG_EMB_INITIALIZER_MOD),
-#             device=vals_v.device,
-#             dtype=vals_v.dtype,
-#         )
-#         kf = evicted_keys[mask].to(device=vals_v.device, dtype=vals_v.dtype)
-#         expected = (kf % mod).unsqueeze(1).expand_as(vals_v)
-#         assert torch.equal(
-#             vals_v, expected
-#         ), (
-#             "prefetch evicted: cache embedding prefix != key % "
-#             f"{DEBUG_EMB_INITIALIZER_MOD} (table_id={tid}); "
-#             "evicted_keys may not match slot contents or cache not initialized"
-#         )
-
-
-# def _sync_and_verify_storage_backing_before_cache_flush(storage: DynamicEmbStorage) -> None:
-#     """Before draining cache into backing, verify current ``DynamicEmbStorage`` rows are self-consistent.
-
-#     For each export batch on the backing ``key_index_map``, checks the same invariants as
-#     :func:`_sync_and_verify_cache_flush_slice`: VALUE embedding prefix vs ``EMBEDDING`` load,
-#     read-only ``find`` slot indices match export indices, flat reload uses slot or stored score
-#     per NO_EVICTION (see :func:`_flat_row_indices_from_slots_and_scores`), optional DEBUG
-#     ``key % mod`` pattern.
-#     """
-#     st = storage._state
-#     if st.device.type == "cuda":
-#         torch.cuda.synchronize(st.device)
-#     saved_training = st.training
-#     storage.training = False
-#     batch_size = st.threads_in_wave
-#     try:
-#         for table_id in range(st.num_tables):
-#             emb_t = st.table_emb_dims_cpu[table_id]
-#             debug_table = (
-#                 st.options_list[table_id].initializer_args.mode
-#                 == DynamicEmbInitializerMode.DEBUG
-#             )
-#             for (
-#                 keys,
-#                 named_scores,
-#                 indices,
-#             ) in st.key_index_map._batched_export_keys_scores(
-#                 [st.score_policy.name],
-#                 st.device,
-#                 batch_size=batch_size,
-#                 return_index=True,
-#                 table_id=table_id,
-#             ):
-#                 if keys.numel() == 0:
-#                     continue
-#                 tid = torch.full(
-#                     (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
-#                 )
-
-#                 (
-#                     h_num_missing,
-#                     _,
-#                     _,
-#                     _,
-#                     _,
-#                     founds,
-#                     _,
-#                     lookup_slot_indices,
-#                 ) = _find_keys(st, keys, tid, None, const_lookup=True)
-#                 assert h_num_missing == 0, (
-#                     "flush_cache: exported backing keys must resolve via read-only lookup"
-#                 )
-#                 assert bool(founds.all()), (
-#                     "flush_cache: read-only backing lookup must find every exported key"
-#                 )
-#                 assert torch.equal(
-#                     indices, lookup_slot_indices
-#                 ), (
-#                     "flush_cache: backing export indices must match read-only lookup "
-#                     "(key↔slot)"
-#                 )
-
-#                 scores_batch = named_scores[st.score_policy.name]
-#                 flat_rows = _flat_row_indices_from_slots_and_scores(
-#                     st, indices, scores_batch
-#                 )
-#                 values = load_from_flat(st, flat_rows, tid, copy_mode=CopyMode.VALUE)
-#                 emb_prefix = values[:, :emb_t]
-#                 emb_reload = load_from_flat(
-#                     st, flat_rows, tid, copy_mode=CopyMode.EMBEDDING
-#                 )
-#                 assert torch.equal(
-#                     emb_prefix, emb_reload
-#                 ), (
-#                     "flush_cache: backing VALUE embedding prefix must match "
-#                     "flat EMBEDDING reload at flat row indices"
-#                 )
-
-#                 if debug_table:
-#                     mod = torch.tensor(
-#                         float(DEBUG_EMB_INITIALIZER_MOD),
-#                         device=emb_prefix.device,
-#                         dtype=emb_prefix.dtype,
-#                     )
-#                     kf = keys.to(device=emb_prefix.device, dtype=emb_prefix.dtype)
-#                     expected = (kf % mod).unsqueeze(1).expand_as(emb_prefix)
-#                     assert torch.equal(
-#                         emb_prefix, expected
-#                     ), (
-#                         "flush_cache: backing DEBUG invariant embedding[i,d] == key[i] % "
-#                         f"{DEBUG_EMB_INITIALIZER_MOD}"
-#                     )
-#     finally:
-#         storage.training = saved_training
-
-
 def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
     if isinstance(storage, DynamicEmbStorage):
         _expand_storage_for_cache_flush_if_needed(storage, cache)
@@ -3193,9 +2552,6 @@ def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
     state = cache._state
     batch_size = state.threads_in_wave
     state.value_dim
-
-    # if isinstance(storage, DynamicEmbStorage):
-    #     _sync_and_verify_storage_backing_before_cache_flush(storage)
 
     for t in range(state.num_tables):
         for (
@@ -3212,7 +2568,6 @@ def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
             scores = named_scores[state.score_policy.name]
             tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
             values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
-            # _sync_and_verify_cache_flush_slice(state, t, keys, indices, values)
             if isinstance(storage, DynamicEmbStorage) and (
                 storage._state.no_eviction_next_index is not None
             ):

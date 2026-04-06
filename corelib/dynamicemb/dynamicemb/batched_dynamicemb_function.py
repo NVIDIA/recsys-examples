@@ -26,10 +26,6 @@ from dynamicemb.key_value_table import (
     DynamicEmbCache,
     DynamicEmbStorage,
     Storage,
-    # _assert_debug_aligned_keys_value_rows_key_mod,
-    # _assert_debug_flat_write_roundtrip_key_mod,
-    # _assert_debug_prefetch_evicted_before_storage_insert,
-    # _assert_debug_prefetch_storage_find_hits_key_mod,
     _find_keys,
     eval_lookup,
     get_insert_score_arg,
@@ -196,50 +192,6 @@ def _storage_find_scores_are_logical_row_indices(storage: Storage) -> bool:
     return False
 
 
-# _ENV_DEBUG_PREFETCH_EXPAND_FIND_COMPARE = "DYNAMICEMB_DEBUG_PREFETCH_EXPAND_FIND_COMPARE"
-
-
-# def _debug_prefetch_expand_find_compare_before_expand(
-#     storage: Storage,
-#     miss_keys: torch.Tensor,
-#     miss_tids: torch.Tensor,
-#     miss_lfu_freq: Optional[torch.Tensor],
-# ) -> None:
-#     """Optional diagnostic: ``storage.find`` + DEBUG initializer check on miss_keys *before* expand.
-
-#     Set ``DYNAMICEMB_DEBUG_PREFETCH_EXPAND_FIND_COMPARE=1`` to enable. If pre-expand prints PASS and
-#     post-expand assert fails, the regression likely correlates with :meth:`expand_if_need`.
-
-#     ``DynamicEmbStorage.find`` already runs the DEBUG assert internally; ``HybridStorage.find`` does not,
-#     so we call :func:`_assert_debug_prefetch_storage_find_hits_key_mod` after a successful find.
-#     """
-#     try:
-#         result = storage.find(
-#             miss_keys,
-#             miss_tids,
-#             copy_mode=CopyMode.VALUE,
-#             lfu_accumulated_frequency=miss_lfu_freq,
-#             find_debug_context="prefetch expand-compare: miss_keys pre-expand",
-#         )
-#         _, _, _, _, _, pre_founds, _, pre_values = result
-#         _assert_debug_prefetch_storage_find_hits_key_mod(
-#             storage,
-#             miss_keys,
-#             miss_tids,
-#             pre_founds,
-#             pre_values,
-#             debug_context="prefetch expand-compare: miss_keys pre-expand",
-#         )
-#         msg = "PASS"
-#     except AssertionError as e:
-#         msg = f"FAIL ({e})"
-#     print(
-#         f"[{_ENV_DEBUG_PREFETCH_EXPAND_FIND_COMPARE}] pre-expand "
-#         f"storage.find+DEBUG on miss_keys (n={miss_keys.numel()}): {msg}",
-#         flush=True,
-#     )
-
-
 def _apply_admission(
     missing_keys: torch.Tensor,
     missing_indices: torch.Tensor,
@@ -357,22 +309,6 @@ def _prefetch_cache_path(
         state = cache._state
         h_num_total = unique_keys.numel()
 
-        # _cache_debug_no_evict_backing = (
-        #     _storage_find_scores_are_logical_row_indices(storage)
-        #     and any(
-        #         opt.initializer_args.mode == DynamicEmbInitializerMode.DEBUG
-        #         for opt in state.options_list
-        #     )
-        # )
-        # _storage_debug_no_eviction = (
-        #     isinstance(storage, DynamicEmbStorage)
-        #     and _storage_find_scores_are_logical_row_indices(storage)
-        #     and any(
-        #         opt.initializer_args.mode == DynamicEmbInitializerMode.DEBUG
-        #         for opt in storage._state.options_list
-        #     )
-        # )
-
         if h_num_total == 0:
             empty = torch.empty(0, dtype=torch.int64, device=device)
             return empty, empty.clone(), None
@@ -385,20 +321,6 @@ def _prefetch_cache_path(
         )
 
         slot_indices = cache_indices.clone()
-
-        # # 1b. DEBUG: V2+caching uses TIMESTAMP cache (slot == value row); backing may be NO_EVICTION.
-        # if _cache_debug_no_evict_backing and bool(founds.any()):
-        #     fk = unique_keys[founds]
-        #     ft = unique_table_ids[founds]
-        #     fslots = cache_indices[founds]
-        #     hit_vals = load_from_flat(state, fslots, ft, copy_mode=CopyMode.VALUE)
-        #     _assert_debug_aligned_keys_value_rows_key_mod(
-        #         state,
-        #         fk,
-        #         ft,
-        #         hit_vals,
-        #         "prefetch cache (TIMESTAMP) + NO_EVICTION backing: cache.lookup hit",
-        #     )
 
         # 2. Increment counter for found keys
         found_slots = cache_indices[founds]
@@ -419,17 +341,6 @@ def _prefetch_cache_path(
             else None
         )
 
-        # if hasattr(storage, "expand_if_need"):
-        #     if (
-        #         os.environ.get(_ENV_DEBUG_PREFETCH_EXPAND_FIND_COMPARE, "").strip()
-        #         == "1"
-        #         and _storage_debug_no_eviction
-        #     ):
-        #         _debug_prefetch_expand_find_compare_before_expand(
-        #             storage, miss_keys, miss_tids, miss_lfu_freq
-        #         )
-        #     storage.expand_if_need(unique_size_per_table)
-
         # 3. Storage lookup for cache-miss keys
         (
             h_num_new,
@@ -445,27 +356,7 @@ def _prefetch_cache_path(
             miss_tids,
             copy_mode=CopyMode.VALUE,
             lfu_accumulated_frequency=miss_lfu_freq,
-            # find_debug_context="prefetch _ cache_path: step3 storage.find(miss_keys)",
         )
-
-        # try:
-        #     _assert_debug_prefetch_storage_find_hits_key_mod(
-        #         storage,
-        #         miss_keys,
-        #         miss_tids,
-        #         storage_founds,
-        #         storage_values,
-        #         debug_context="prefetch_cache_path: step3 storage.find(miss_keys)",
-        #     )
-        # except AssertionError as e:
-        #     if (
-        #         _storage_debug_no_eviction
-        #     ):
-        #         print(
-        #             f"storage.find+DEBUG on miss_keys (n={h_num_miss}): FAIL\n{e}",
-        #             flush=True,
-        #         )
-        #     raise
 
         # 4. Determine which new keys (not in storage) are admitted
         new_in_miss = ~storage_founds
@@ -533,15 +424,6 @@ def _prefetch_cache_path(
         evicted_values = load_from_flat(
             state, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
         )
-        # if num_evicted > 0:
-        #     print(f"check evicted values from cache before storage insert")
-        #     _assert_debug_prefetch_evicted_before_storage_insert(
-        #         state,
-        #         evicted_keys,
-        #         evicted_indices,
-        #         evicted_table_ids,
-        #         evicted_values,
-        #     )
 
         # 7. Store storage-found values to their cache slots
         is_sf_in_insert = storage_founds[insert_to_miss]
@@ -552,13 +434,6 @@ def _prefetch_cache_path(
                 insert_tids[is_sf_in_insert],
                 storage_values[insert_to_miss[is_sf_in_insert]],
             )
-            # _assert_debug_flat_write_roundtrip_key_mod(
-            #     state,
-            #     insert_keys[is_sf_in_insert],
-            #     insert_tids[is_sf_in_insert],
-            #     cache_insert_indices[is_sf_in_insert],
-            #     "prefetch cache: after store storage-hit -> cache",
-            # )
 
         # 8. Initialize admitted-new keys in their cache slots
         is_new_in_insert = ~is_sf_in_insert
@@ -582,27 +457,9 @@ def _prefetch_cache_path(
                 insert_tids[is_new_in_insert],
                 init_vals,
             )
-            # _assert_debug_flat_write_roundtrip_key_mod(
-            #     state,
-            #     insert_keys[is_new_in_insert],
-            #     insert_tids[is_new_in_insert],
-            #     cache_insert_indices[is_new_in_insert],
-            #     "prefetch cache: after store newly admitted -> cache",
-            # )
 
         # 9. Write back evicted to storage
         if num_evicted > 0:
-            # _assert_debug_aligned_keys_value_rows_key_mod(
-            #     state,
-            #     evicted_keys,
-            #     evicted_table_ids,
-            #     evicted_values,
-            #     "check evicted values from cache before storage insert",
-            # )
-            # print(f"- evict {num_evicted} keys from cache to storage")
-            # _debug_evict_prefetch = True #True
-            
-            
             # NO_EVICTION backing: keys already in storage must update the *same* logical
             # flat row (preserve_existing). New-to-storage keys need atomic row assignment.
             ev_st = storage._state
@@ -618,48 +475,7 @@ def _prefetch_cache_path(
                     _so_ev,
                     _ix_ev,
                 ) = _find_keys(ev_st, evicted_keys, evicted_table_ids)
-                # if _debug_evict_prefetch:
-                #     _r2 = _find_keys(ev_st, evicted_keys, evicted_table_ids)
-                #     ev_chk = _r2[5]
-                #     if not torch.equal(ev_in_storage, ev_chk):
-                #         raise AssertionError(
-                #             "DYNAMICEMB_DEBUG_EVICT_PREFETCH: ev_in_storage != immediate "
-                #             f"second _find_keys (in_storage counts {int(ev_in_storage.sum())} "
-                #             f"vs {int(ev_chk.sum())})"
-                #         )
-                #     try:
-                #         (
-                #             _,
-                #             _,
-                #             _,
-                #             _,
-                #             _,
-                #             find_founds_pre,
-                #             _,
-                #             _,
-                #         ) = storage.find(
-                #             evicted_keys,
-                #             evicted_table_ids,
-                #             copy_mode=CopyMode.VALUE,
-                #             lfu_accumulated_frequency=None,
-                #             find_debug_context=(
-                #                 "prefetch_cache_path: step9 DYNAMICEMB_DEBUG_EVICT_PREFETCH "
-                #                 "pre-insert storage.find(evicted_keys)"
-                #             ),
-                #         )
-                #     except AssertionError as e:
-                #         raise AssertionError(
-                #             "DYNAMICEMB_DEBUG_EVICT_PREFETCH: storage.find failed BEFORE "
-                #             "step-9 insert (backing value/debug inconsistent for evicted keys)"
-                #         ) from e
-                #     if not torch.equal(ev_in_storage, find_founds_pre):
-                #         raise AssertionError(
-                #             "DYNAMICEMB_DEBUG_EVICT_PREFETCH: ev_in_storage mask != "
-                #             f"storage.find founds (counts {int(ev_in_storage.sum())} vs "
-                #             f"{int(find_founds_pre.sum())})"
-                #         )
                 if bool(ev_in_storage.all()):
-                    # print(f"- evict {num_evicted} keys from cache to storage, all in storage")
                     storage.insert(
                         evicted_keys,
                         evicted_table_ids,
@@ -667,8 +483,6 @@ def _prefetch_cache_path(
                         preserve_existing=True,
                     )
                 elif bool((~ev_in_storage).all()):
-                    # print(f"- evict {num_evicted} keys from cache to storage, all not in storage")
-                    
                     storage.insert(
                         evicted_keys,
                         evicted_table_ids,
@@ -680,24 +494,13 @@ def _prefetch_cache_path(
                     ex_m = ev_in_storage
                     nw_m = ~ev_in_storage
                     if ex_m.any():
-                        # print(f"- evict {num_evicted} keys from cache to storage, after preserve_existing=True, subset insert, keys marked existing-in-storage ({ex_m.sum()}) are already found in backing, so no insert")
                         storage.insert(
                             evicted_keys[ex_m],
                             evicted_table_ids[ex_m],
                             evicted_values[ex_m],
                             preserve_existing=True,
                         )
-                    # if _debug_evict_prefetch and ex_m.any() and nw_m.any():
-                    #     _r_mid = _find_keys(ev_st, evicted_keys, evicted_table_ids)
-                    #     ev_after_preserve = _r_mid[5]
-                    #     if bool(ev_after_preserve[nw_m].any()):
-                    #         raise AssertionError(
-                    #             "DYNAMICEMB_DEBUG_EVICT_PREFETCH: after preserve_existing=True "
-                    #             "subset insert, keys marked new-to-storage (nw_m) are already "
-                    #             "found in backing — possible mis-classification or side effect"
-                    #         )
                     if nw_m.any():
-                        # print(f"- evict {num_evicted} keys from cache to storage, after preserve_existing=False, subset insert, keys marked new-to-storage ({nw_m.sum()}) are not found in backing")
                         storage.insert(
                             evicted_keys[nw_m],
                             evicted_table_ids[nw_m],
@@ -709,41 +512,6 @@ def _prefetch_cache_path(
                 storage.insert(
                     evicted_keys, evicted_table_ids, evicted_values, evicted_scores
                 )
-            # if _storage_debug_no_eviction:
-            #     (
-            #         h_miss_ev,
-            #         _,
-            #         _,
-            #         _,
-            #         _,
-            #         ev_sb_founds,
-            #         _,
-            #         ev_sb_vals,
-            #     ) = storage.find(
-            #         evicted_keys,
-            #         evicted_table_ids,
-            #         copy_mode=CopyMode.VALUE,
-            #         lfu_accumulated_frequency=None,
-            #         find_debug_context=(
-            #             "prefetch_cache_path: step9 post-insert storage.find(evicted_keys)"
-            #         ),
-            #     )
-            #     assert h_miss_ev == 0, (
-            #         "prefetch cache+NO_EVICTION: storage.insert(evicted) must leave no missing keys"
-            #     )
-            #     assert bool(ev_sb_founds.all()), (
-            #         "prefetch cache+NO_EVICTION: all evicted keys must hit storage after write-back"
-            #     )
-            #     _assert_debug_prefetch_storage_find_hits_key_mod(
-            #         storage,
-            #         evicted_keys,
-            #         evicted_table_ids,
-            #         ev_sb_founds,
-            #         ev_sb_vals,
-            #         debug_context=(
-            #             "prefetch_cache_path: step9 post-insert storage.find(evicted_keys)"
-            #         ),
-            #     )
 
         # 10. Counter & slot mapping
         cache.increment_counter(cache_insert_indices, insert_tids)
@@ -876,13 +644,6 @@ def _prefetch_hbm_direct_path(
                 else new_indices
             )
             store_to_flat(state, new_indices, admitted_tids, init_values)
-            # _assert_debug_flat_write_roundtrip_key_mod(
-            #     state,
-            #     admitted_keys,
-            #     admitted_tids,
-            #     new_indices,
-            #     "prefetch HBM-direct: after store_to_flat for admitted keys",
-            # )
 
             inserted_mask = new_indices >= 0
             if inserted_mask.any():
@@ -1190,7 +951,6 @@ def _generic_forward_path(
             unique_table_ids,
             copy_mode=CopyMode.VALUE,
             lfu_accumulated_frequency=accumulated_frequency,
-            # find_debug_context="_generic_forward_path: storage.find(unique_keys)",
         )
 
         key_persisted = founds.clone()
