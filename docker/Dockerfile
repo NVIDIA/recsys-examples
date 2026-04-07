@@ -21,9 +21,9 @@ RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
 RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
     rm -rf /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1 && \
     if [ ${ARCH} = "aarch64" ]; then \
-      ln -s /usr/local/cuda-13.1/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      ln -s /usr/local/cuda-13/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     else \
-      ln -s /usr/local/cuda-13.1/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      ln -s /usr/local/cuda-13/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     fi
 
 RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
@@ -39,7 +39,7 @@ RUN pip install nvidia-cutlass-dsl==4.3.0
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
   git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
   cd fbgemm/fbgemm_gpu && \
-  python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0a"
+  python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
 
 RUN pip install --no-deps tensordict orjson && \
   git clone --recursive -b v1.5.0-rc2 https://github.com/pytorch/torchrec.git torchrec && \
@@ -56,6 +56,10 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
+RUN ARCH=$(uname -m) && \
+    ln -sf /usr/local/cuda-13/targets/${ARCH}-linux/include/cccl/cuda \
+    /usr/local/cuda/include/cuda
+
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
@@ -66,7 +70,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
     HSTU_ARCH_LIST="8.0 9.0" \
-    pip install . && \
+    pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
 FROM ${DEVEL_IMAGE} AS build
