@@ -46,6 +46,10 @@ RUN pip install --no-deps tensordict orjson && \
 
 RUN pip install nvidia-cutlass-dsl==4.3.0
 
+RUN git clone -b arbitrary_mask https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
+  cd flash-attention && \
+  pip install --no-deps -e .
+
 
 # for dev
 RUN apt update -y --fix-missing && \
