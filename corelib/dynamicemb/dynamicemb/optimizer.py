@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 import torch  # usort:skip
-from dynamicemb.dynamicemb_config import get_optimizer_state_dim, torch_to_dyn_emb
+from dynamicemb.dynamicemb_config import (
+    get_optimizer_ckpt_state_dim,
+    get_optimizer_state_dim,
+    torch_to_dyn_emb,
+)
 from dynamicemb_extensions import (
     adagrad_update_for_flat_table,
     adagrad_update_for_padded_buffer,
@@ -121,6 +125,10 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         """
         Get the state dim.
         """
+
+    def get_ckpt_state_dim(self, emb_dim: int) -> int:
+        """Optimizer state width in checkpoint files (may be smaller than runtime)."""
+        return self.get_state_dim(emb_dim)
 
     def set_learning_rate(self, new_lr) -> None:
         self._opt_args.learning_rate = new_lr
@@ -431,5 +439,10 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def get_state_dim(self, emb_dim: int) -> int:
         return get_optimizer_state_dim(
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD, emb_dim, self._emb_dtype
+        )
+
+    def get_ckpt_state_dim(self, emb_dim: int) -> int:
+        return get_optimizer_ckpt_state_dim(
             EmbOptimType.EXACT_ROWWISE_ADAGRAD, emb_dim, self._emb_dtype
         )

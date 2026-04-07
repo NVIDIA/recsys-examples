@@ -474,6 +474,22 @@ def get_optimizer_state_dim(
     return 0
 
 
+def get_optimizer_ckpt_state_dim(
+    optimizer_type: EmbOptimType,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> int:
+    """Optimizer state elements per row stored in checkpoint files.
+
+    Rowwise Adagrad keeps a wider fused layout at runtime (see
+    :func:`get_optimizer_state_dim`) but only one accumulator scalar per row is
+    needed in checkpoints; load pads back to the runtime width.
+    """
+    if optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+        return 1
+    return get_optimizer_state_dim(optimizer_type, dim, dtype)
+
+
 def complete_initializer_args(
     initializer_args: DynamicEmbInitializerArgs,
     *,

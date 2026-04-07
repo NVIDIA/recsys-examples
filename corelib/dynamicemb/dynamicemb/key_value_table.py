@@ -68,6 +68,52 @@ from torch import Tensor, nn  # usort:skip
 # ---------------------------------------------------------------------------
 
 
+def truncate_optimizer_states_for_checkpoint(
+    optimizer: BaseDynamicEmbeddingOptimizer,
+    emb_dim: int,
+    opt_states_runtime: torch.Tensor,
+) -> torch.Tensor:
+    """Slice runtime optimizer states to the width written in checkpoint files."""
+    ckpt_dim = optimizer.get_ckpt_state_dim(emb_dim)
+    if ckpt_dim == 0:
+        return opt_states_runtime
+    n = opt_states_runtime.size(1)
+    if n == ckpt_dim:
+        return opt_states_runtime
+    if n < ckpt_dim:
+        raise ValueError(
+            f"Runtime optimizer state width {n} is less than checkpoint width {ckpt_dim}."
+        )
+    return opt_states_runtime[:, :ckpt_dim].contiguous()
+
+
+def pad_optimizer_states_from_checkpoint(
+    optimizer: BaseDynamicEmbeddingOptimizer,
+    emb_dim: int,
+    opt_states_from_file: torch.Tensor,
+    initial_accumulator_value: float,
+    values_dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Expand checkpoint optimizer states to the runtime fused value width."""
+    runtime_dim = optimizer.get_state_dim(emb_dim)
+    file_dim = opt_states_from_file.size(1)
+    if runtime_dim == 0:
+        return opt_states_from_file
+    if file_dim == runtime_dim:
+        return opt_states_from_file.to(dtype=values_dtype)
+    if file_dim > runtime_dim:
+        return opt_states_from_file[:, :runtime_dim].contiguous().to(dtype=values_dtype)
+    out = torch.full(
+        (opt_states_from_file.size(0), runtime_dim),
+        initial_accumulator_value,
+        dtype=values_dtype,
+        device=device,
+    )
+    out[:, :file_dim] = opt_states_from_file.to(dtype=values_dtype)
+    return out
+
+
 def _all_gather_dumped_keys_values(
     keys: Tensor,
     values: Tensor,
@@ -1094,7 +1140,12 @@ def _dump_table(
             scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
         if fopt_states and opt_states_batch is not None:
-            fopt_states.write(opt_states_batch.cpu().numpy().tobytes())
+            to_write = truncate_optimizer_states_for_checkpoint(
+                state.optimizer,
+                state.table_emb_dims_cpu[table_id],
+                opt_states_batch,
+            )
+            fopt_states.write(to_write.cpu().numpy().tobytes())
 
     fkey.close()
     fembedding.close()
@@ -1195,7 +1246,8 @@ def _iter_batches_from_files(
 class _LoadParams:
     meta_data: Dict[str, Any]
     dim: int
-    optstate_dim: int
+    runtime_optstate_dim: int
+    file_optstate_dim: int
     include_optim: bool
     num_keys: int
 
@@ -1241,9 +1293,9 @@ def _validate_load_meta(
         )
 
     dim = state.table_emb_dims_cpu[table_id]
-    optstate_dim = state.table_value_dims_cpu[table_id] - dim
+    runtime_optstate_dim = state.optimizer.get_state_dim(dim)
 
-    if optstate_dim == 0:
+    if runtime_optstate_dim == 0:
         include_optim = False
 
     if include_optim:
@@ -1263,19 +1315,35 @@ def _validate_load_meta(
             raise ValueError(
                 f"The number of keys in {emb_key_path} does not match with number of scores in {score_file_path}."
             )
-    if include_optim and opt_file_path:
-        num_opt_states = (
-            os.path.getsize(opt_file_path) // OPT_STATE_TYPE.itemsize // optstate_dim
-        )
-        if num_keys != num_opt_states:
-            raise ValueError(
-                f"The number of keys in {emb_key_path} does not match with number of opt_states in {opt_file_path}."
-            )
+
+    file_optstate_dim = 0
+    if include_optim and opt_file_path and os.path.exists(opt_file_path):
+        file_bytes = os.path.getsize(opt_file_path)
+        if num_keys == 0:
+            if file_bytes != 0:
+                raise ValueError(
+                    f"Optimizer state file {opt_file_path} is non-empty but key file has no keys."
+                )
+        else:
+            row_block = num_keys * OPT_STATE_TYPE.itemsize
+            if file_bytes % row_block != 0:
+                raise ValueError(
+                    f"Optimizer state file {opt_file_path} size {file_bytes} is not divisible by "
+                    f"{row_block} (num_keys={num_keys}, dtype itemsize={OPT_STATE_TYPE.itemsize})."
+                )
+            file_optstate_dim = file_bytes // row_block
+            ckpt_dim = state.optimizer.get_ckpt_state_dim(dim)
+            if file_optstate_dim != ckpt_dim:
+                raise ValueError(
+                    f"Optimizer state width in checkpoint is {file_optstate_dim}; expected "
+                    f"{ckpt_dim}."
+                )
 
     return _LoadParams(
         meta_data=meta_data,
         dim=dim,
-        optstate_dim=optstate_dim,
+        runtime_optstate_dim=runtime_optstate_dim,
+        file_optstate_dim=file_optstate_dim,
         include_optim=include_optim,
         num_keys=num_keys,
     )
@@ -1290,9 +1358,8 @@ def _load_key_values(
     table_id: int = 0,
 ) -> None:
     dim = embeddings.size(1)
-    optstate_dim = (
-        state.table_value_dims_cpu[table_id] - state.table_emb_dims_cpu[table_id]
-    )
+    emb_dim_cfg = state.table_emb_dims_cpu[table_id]
+    runtime_optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
     if not keys.is_cuda:
         raise RuntimeError("Keys must be on GPU")
     if not embeddings.is_cuda:
@@ -1302,19 +1369,31 @@ def _load_key_values(
     if opt_states is not None and not opt_states.is_cuda:
         raise RuntimeError("Opt states must be on GPU")
 
-    if opt_states is None and optstate_dim > 0:
+    if opt_states is None and runtime_optstate_dim > 0:
         opt_states = (
             torch.ones(
                 keys.numel(),
-                optstate_dim,
+                runtime_optstate_dim,
                 dtype=state.emb_dtype,
                 device=embeddings.device,
             )
             * state.initial_optim_state
         )
+    elif opt_states is not None and runtime_optstate_dim > 0:
+        opt_states = pad_optimizer_states_from_checkpoint(
+            state.optimizer,
+            emb_dim_cfg,
+            opt_states,
+            state.initial_optim_state,
+            state.emb_dtype,
+            embeddings.device,
+        )
 
     values = (
-        torch.cat([embeddings.view(-1, dim), opt_states.view(-1, optstate_dim)], dim=-1)
+        torch.cat(
+            [embeddings.view(-1, dim), opt_states.view(-1, runtime_optstate_dim)],
+            dim=-1,
+        )
         if opt_states is not None
         else embeddings
     )
@@ -1786,7 +1865,7 @@ class DynamicEmbStorage(Storage):
             score_file_path,
             opt_file_path if params.include_optim else None,
             params.dim,
-            params.optstate_dim,
+            params.file_optstate_dim,
             device,
         ):
             if scores is not None and self._state.evict_strategy == EvictStrategy.KLru:
@@ -2354,21 +2433,30 @@ class HybridStorage(Storage):
             score_file_path,
             opt_file_path if params.include_optim else None,
             params.dim,
-            params.optstate_dim,
+            params.file_optstate_dim,
             device,
         ):
             if keys.numel() == 0:
                 continue
 
-            if opt_states is None and params.optstate_dim > 0:
+            if opt_states is None and params.runtime_optstate_dim > 0:
                 opt_states = (
                     torch.ones(
                         keys.numel(),
-                        params.optstate_dim,
+                        params.runtime_optstate_dim,
                         dtype=self._hbm.emb_dtype,
                         device=device,
                     )
                     * self._hbm.initial_optim_state
+                )
+            elif opt_states is not None and params.runtime_optstate_dim > 0:
+                opt_states = pad_optimizer_states_from_checkpoint(
+                    self._hbm.optimizer,
+                    self._hbm.table_emb_dims_cpu[table_id],
+                    opt_states,
+                    self._hbm.initial_optim_state,
+                    self._hbm.emb_dtype,
+                    device,
                 )
 
             vtype = self._hbm.emb_dtype
