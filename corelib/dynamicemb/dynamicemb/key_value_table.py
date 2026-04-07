@@ -33,7 +33,11 @@ from dynamicemb.extendable_tensor import (
     ExtendableBuffer,
     HostExtendableBuffer,
 )
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.optimizer import (
+    BaseDynamicEmbeddingOptimizer,
+    pad_optimizer_states_from_checkpoint,
+    truncate_optimizer_states_for_checkpoint,
+)
 from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScorePolicy,
@@ -66,52 +70,6 @@ from torch import Tensor, nn  # usort:skip
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-
-
-def truncate_optimizer_states_for_checkpoint(
-    optimizer: BaseDynamicEmbeddingOptimizer,
-    emb_dim: int,
-    opt_states_runtime: torch.Tensor,
-) -> torch.Tensor:
-    """Slice runtime optimizer states to the width written in checkpoint files."""
-    ckpt_dim = optimizer.get_ckpt_state_dim(emb_dim)
-    if ckpt_dim == 0:
-        return opt_states_runtime
-    n = opt_states_runtime.size(1)
-    if n == ckpt_dim:
-        return opt_states_runtime
-    if n < ckpt_dim:
-        raise ValueError(
-            f"Runtime optimizer state width {n} is less than checkpoint width {ckpt_dim}."
-        )
-    return opt_states_runtime[:, :ckpt_dim].contiguous()
-
-
-def pad_optimizer_states_from_checkpoint(
-    optimizer: BaseDynamicEmbeddingOptimizer,
-    emb_dim: int,
-    opt_states_from_file: torch.Tensor,
-    initial_accumulator_value: float,
-    values_dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Expand checkpoint optimizer states to the runtime fused value width."""
-    runtime_dim = optimizer.get_state_dim(emb_dim)
-    file_dim = opt_states_from_file.size(1)
-    if runtime_dim == 0:
-        return opt_states_from_file
-    if file_dim == runtime_dim:
-        return opt_states_from_file.to(dtype=values_dtype)
-    if file_dim > runtime_dim:
-        return opt_states_from_file[:, :runtime_dim].contiguous().to(dtype=values_dtype)
-    out = torch.full(
-        (opt_states_from_file.size(0), runtime_dim),
-        initial_accumulator_value,
-        dtype=values_dtype,
-        device=device,
-    )
-    out[:, :file_dim] = opt_states_from_file.to(dtype=values_dtype)
-    return out
 
 
 def _all_gather_dumped_keys_values(

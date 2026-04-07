@@ -19,7 +19,7 @@ import os
 import warnings
 from dataclasses import dataclass, field, replace
 from math import sqrt
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from dynamicemb.types import (
@@ -31,6 +31,7 @@ from dynamicemb.types import (
     DynamicEmbInitializerMode,
     Storage,
 )
+from dynamicemb.optimizer import get_optimizer_state_dim
 from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
@@ -388,25 +389,6 @@ def dyn_emb_to_torch(data_type: DynamicEmbDataType) -> torch.dtype:
         raise ValueError(f"Unsupported DynamicEmbDataType: {data_type}")
 
 
-def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:
-    if torch_dtype == torch.float32:
-        return DynamicEmbDataType.Float32
-    elif torch_dtype == torch.bfloat16:
-        return DynamicEmbDataType.BFloat16
-    elif torch_dtype == torch.float16:
-        return DynamicEmbDataType.Float16
-    elif torch_dtype == torch.int64:
-        return DynamicEmbDataType.Int64
-    elif torch_dtype == torch.uint64:
-        return DynamicEmbDataType.UInt64
-    elif torch_dtype == torch.int32:
-        return DynamicEmbDataType.Int32
-    elif torch_dtype == torch.uint32:
-        return DynamicEmbDataType.UInt32
-    else:
-        raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
-
-
 def dtype_to_bytes(dtype: torch.dtype) -> int:
     dtype_size_map = {
         torch.float16: 2,
@@ -441,53 +423,6 @@ def string_to_evict_strategy(strategy_str: str) -> EvictStrategy:
         return EvictStrategy.KCustomized
     else:
         raise ValueError(f"Invalid EvictStrategy string: {strategy_str}")
-
-
-DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
-    torch.float32: 4,
-    torch.float16: 2,
-    torch.bfloat16: 2,
-}
-
-
-def get_optimizer_state_dim(
-    optimizer_type: EmbOptimType,
-    dim: int,
-    dtype: Optional[torch.dtype] = None,
-) -> int:
-    """Optimizer state elements per row (same rules as FBGEMM fused table value layout).
-
-    ``dtype`` is only required for ``EXACT_ROWWISE_ADAGRAD`` (fixed 16-byte rowwise state
-    in embedding dtype units). Callers that know the embedding dtype may pass it for any
-    optimizer; it is ignored except for rowwise Adagrad.
-    """
-    if optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-        if dtype is None:
-            raise ValueError(
-                "dtype is required when optimizer_type is EmbOptimType.EXACT_ROWWISE_ADAGRAD."
-            )
-        return 16 // DTYPE_NUM_BYTES[dtype]
-    if optimizer_type == EmbOptimType.ADAM:
-        return dim * 2
-    if optimizer_type == EmbOptimType.EXACT_ADAGRAD:
-        return dim
-    return 0
-
-
-def get_optimizer_ckpt_state_dim(
-    optimizer_type: EmbOptimType,
-    dim: int,
-    dtype: Optional[torch.dtype] = None,
-) -> int:
-    """Optimizer state elements per row stored in checkpoint files.
-
-    Rowwise Adagrad keeps a wider fused layout at runtime (see
-    :func:`get_optimizer_state_dim`) but only one accumulator scalar per row is
-    needed in checkpoints; load pads back to the runtime width.
-    """
-    if optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-        return 1
-    return get_optimizer_state_dim(optimizer_type, dim, dtype)
 
 
 def complete_initializer_args(
@@ -641,7 +576,7 @@ def get_table_value_bytes(
     embedding_config
         Table shape and dtype from TorchREC (``num_embeddings``, ``embedding_dim``, ``data_type``).
     optimizer_type
-        FBGEMM ``EmbOptimType``; see :func:`get_optimizer_state_dim` for per-optimizer state size.
+        FBGEMM ``EmbOptimType``; see :func:`dynamicemb.optimizer.get_optimizer_state_dim`.
     world_size
         Number of ranks, as in distributed planning.
     bucket_capacity
@@ -660,23 +595,3 @@ def get_table_value_bytes(
     element_size = dtype_to_bytes(torch_dtype)
     optimizer_state_dim = get_optimizer_state_dim(optimizer_type, dim, torch_dtype)
     return int(element_size * (dim + optimizer_state_dim) * total_rows)
-
-
-def _next_power_of_2(n):
-    # Handle the case where n is 0
-    if n == 0:
-        return 1
-
-    # If n is already a power of 2, return n
-    if (n & (n - 1)) == 0:
-        return n
-
-    # Find the next power of 2
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32  # This line is necessary for 64-bit integers
-    return n + 1

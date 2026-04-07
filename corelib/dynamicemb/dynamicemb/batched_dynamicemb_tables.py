@@ -30,14 +30,14 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_prefetch,
 )
 from dynamicemb.dynamicemb_config import (
-    DTYPE_NUM_BYTES,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
-    get_optimizer_state_dim,
     warning_for_cstm_score,
 )
+from dynamicemb.utils import DTYPE_NUM_BYTES
+from dynamicemb.optimizer import get_optimizer_state_dim
 from dynamicemb.embedding_admission import MultiTableKVCounter
 from dynamicemb.initializer import create_initializer_from_args
 from dynamicemb.key_value_table import (

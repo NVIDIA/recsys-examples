@@ -16,14 +16,10 @@
 import abc
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch  # usort:skip
-from dynamicemb.dynamicemb_config import (
-    get_optimizer_ckpt_state_dim,
-    get_optimizer_state_dim,
-    torch_to_dyn_emb,
-)
+from dynamicemb.utils import DTYPE_NUM_BYTES, torch_to_dyn_emb
 from dynamicemb_extensions import (
     adagrad_update_for_flat_table,
     adagrad_update_for_padded_buffer,
@@ -35,6 +31,46 @@ from dynamicemb_extensions import (
     sgd_update_for_padded_buffer,
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
+
+
+def get_optimizer_state_dim(
+    optimizer_type: EmbOptimType,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> int:
+    """Optimizer state elements per row (same rules as FBGEMM fused table value layout).
+
+    ``dtype`` is only required for ``EXACT_ROWWISE_ADAGRAD`` (fixed 16-byte rowwise state
+    in embedding dtype units). Callers that know the embedding dtype may pass it for any
+    optimizer; it is ignored except for rowwise Adagrad.
+    """
+    if optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+        if dtype is None:
+            raise ValueError(
+                "dtype is required when optimizer_type is EmbOptimType.EXACT_ROWWISE_ADAGRAD."
+            )
+        return 16 // DTYPE_NUM_BYTES[dtype]
+    if optimizer_type == EmbOptimType.ADAM:
+        return dim * 2
+    if optimizer_type == EmbOptimType.EXACT_ADAGRAD:
+        return dim
+    return 0
+
+
+def get_optimizer_ckpt_state_dim(
+    optimizer_type: EmbOptimType,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> int:
+    """Optimizer state elements per row stored in checkpoint files.
+
+    Rowwise Adagrad keeps a wider fused layout at runtime (see
+    :func:`get_optimizer_state_dim`) but only one accumulator scalar per row is
+    needed in checkpoints; load pads back to the runtime width.
+    """
+    if optimizer_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+        return 1
+    return get_optimizer_state_dim(optimizer_type, dim, dtype)
 
 
 @dataclass
@@ -446,3 +482,49 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         return get_optimizer_ckpt_state_dim(
             EmbOptimType.EXACT_ROWWISE_ADAGRAD, emb_dim, self._emb_dtype
         )
+
+
+def truncate_optimizer_states_for_checkpoint(
+    optimizer: BaseDynamicEmbeddingOptimizer,
+    emb_dim: int,
+    opt_states_runtime: torch.Tensor,
+) -> torch.Tensor:
+    """Slice runtime optimizer states to the width written in checkpoint files."""
+    ckpt_dim = optimizer.get_ckpt_state_dim(emb_dim)
+    if ckpt_dim == 0:
+        return opt_states_runtime
+    n = opt_states_runtime.size(1)
+    if n == ckpt_dim:
+        return opt_states_runtime
+    if n < ckpt_dim:
+        raise ValueError(
+            f"Runtime optimizer state width {n} is less than checkpoint width {ckpt_dim}."
+        )
+    return opt_states_runtime[:, :ckpt_dim].contiguous()
+
+
+def pad_optimizer_states_from_checkpoint(
+    optimizer: BaseDynamicEmbeddingOptimizer,
+    emb_dim: int,
+    opt_states_from_file: torch.Tensor,
+    initial_accumulator_value: float,
+    values_dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Expand checkpoint optimizer states to the runtime fused value width."""
+    runtime_dim = optimizer.get_state_dim(emb_dim)
+    file_dim = opt_states_from_file.size(1)
+    if runtime_dim == 0:
+        return opt_states_from_file
+    if file_dim == runtime_dim:
+        return opt_states_from_file.to(dtype=values_dtype)
+    if file_dim > runtime_dim:
+        return opt_states_from_file[:, :runtime_dim].contiguous().to(dtype=values_dtype)
+    out = torch.full(
+        (opt_states_from_file.size(0), runtime_dim),
+        initial_accumulator_value,
+        dtype=values_dtype,
+        device=device,
+    )
+    out[:, :file_dim] = opt_states_from_file.to(dtype=values_dtype)
+    return out

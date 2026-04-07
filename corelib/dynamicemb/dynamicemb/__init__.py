@@ -28,8 +28,8 @@ from .dynamicemb_config import (
     get_sharded_table_shape,
     get_table_value_bytes,
     string_to_evict_strategy,
-    torch_to_dyn_emb,
 )
+from .utils import torch_to_dyn_emb
 from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (

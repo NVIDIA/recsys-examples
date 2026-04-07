@@ -28,10 +28,9 @@ from dynamicemb.dynamicemb_config import (
     data_type_to_dtype,
     dtype_to_bytes,
     get_constraint_capacity,
-    get_optimizer_state_dim,
 )
 from dynamicemb.get_planner import get_planner
-from dynamicemb.optimizer import EmbOptimType
+from dynamicemb.optimizer import EmbOptimType, get_optimizer_state_dim
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.types import DEMB_TABLE_ALIGN_SIZE
 from fbgemm_gpu.split_embedding_configs import SparseType

@@ -32,7 +32,7 @@ from dynamicemb import (
     get_sharded_table_shape,
     get_table_value_bytes,
 )
-from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD, get_optimizer_ckpt_state_dim
+from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,
@@ -47,10 +47,13 @@ from dynamicemb.key_value_table import (
     export_keys_values_iter,
     load_from_flat,
     load_from_flat_single_table,
+)
+from dynamicemb.optimizer import (
+    BaseDynamicEmbeddingOptimizer,
+    get_optimizer_ckpt_state_dim,
     pad_optimizer_states_from_checkpoint,
     truncate_optimizer_states_for_checkpoint,
 )
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import KEY_TYPE, OPT_STATE_TYPE, CopyMode, EMBEDDING_TYPE
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
