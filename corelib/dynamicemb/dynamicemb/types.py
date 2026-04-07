@@ -16,7 +16,7 @@
 import abc
 import enum
 from dataclasses import dataclass
-from typing import Generic, Optional, Tuple, TypeVar
+from typing import Generic, Iterator, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
@@ -105,15 +105,20 @@ class DynamicEmbInitializerArgs:
         return not (self == other)
 
 
-TableOptionType = TypeVar("TableOptionType")
-OptimizerInterface = TypeVar("OptimizerInterface")
-
 KEY_TYPE = torch.int64
 EMBEDDING_TYPE = torch.float32
 SCORE_TYPE = torch.int64
 OPT_STATE_TYPE = torch.float32
 COUNTER_TYPE = torch.int64
 DEMB_TABLE_ALIGN_SIZE = 16
+
+# Per-bucket row alignment for hashtable backends (same as :data:`DEMB_TABLE_ALIGN_SIZE`).
+BUCKET_ALIGNMENT: int = DEMB_TABLE_ALIGN_SIZE
+
+# Sentinel ``bucket_capacity``: treat the whole per-rank table as one bucket; see
+# :func:`dynamicemb.dynamicemb_config.get_sharded_table_shape` (returns ``(num_buckets, bucket_capacity)``;
+# per-rank rows = ``num_buckets * bucket_capacity``).
+MAX_BUCKET_CAPACITY: int = 2**63 - 1
 
 torch_dtype_to_np_dtype = {
     torch.uint64: np.uint64,
@@ -122,86 +127,96 @@ torch_dtype_to_np_dtype = {
 }
 
 
-# make it standalone to avoid recursive references.
-class Storage(abc.ABC, Generic[TableOptionType, OptimizerInterface]):
-    @abc.abstractmethod
-    def __init__(
-        self,
-        options: TableOptionType,
-        optimizer: OptimizerInterface,
-    ):
-        pass
+OptionsT = TypeVar("OptionsT")
+OptimizerT = TypeVar("OptimizerT")
 
+
+class CopyMode(enum.Enum):
+    """Copy mode for load_from_flat / store_to_flat.
+
+    EMBEDDING -- 1-region copy: copies only the embedding portion per row,
+                 padded to max_emb_dim. Output: [N, max_emb_dim].
+    VALUE     -- 2-region padded copy: emb padded to max_emb_dim, then opt
+                 states padded to (max_value_dim - max_emb_dim).
+                 Output: [N, max_value_dim].
+                 values[:, :max_emb_dim] gives embeddings,
+                 values[:, max_emb_dim:] gives optimizer states.
+    """
+
+    EMBEDDING = "embedding"
+    VALUE = "value"
+
+
+# make it standalone to avoid recursive references.
+class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
     @abc.abstractmethod
     def find(
         self,
         unique_keys: torch.Tensor,
-        unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-        input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
-
-    @abc.abstractmethod
-    def find_embeddings(
-        self,
-        unique_keys: torch.Tensor,
-        unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-        input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
         missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        founds: torch.Tensor
+        output_scores: torch.Tensor
+        values: torch.Tensor
+        return (
+            num_missing,
+            missing_keys,
+            missing_indices,
+            missing_scores,
+            founds,
+            output_scores,
+            values,
+        )
 
     @abc.abstractmethod
     def insert(
         self,
         keys: torch.Tensor,
+        table_ids: torch.Tensor,
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
     ) -> None:
         pass
 
     @abc.abstractmethod
-    def update(
-        self, keys: torch.Tensor, grads: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: torch.Tensor
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def enable_update(self) -> bool:
-        ...
-
-    @abc.abstractmethod
     def dump(
         self,
+        table_id: int,
         meta_file_path: str,
         emb_key_path: str,
         embedding_file_path: str,
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
+        timestamp: int,
     ) -> None:
         pass
 
     @abc.abstractmethod
     def load(
         self,
+        table_id: int,
         meta_file_path: str,
         emb_file_path: str,
         embedding_file_path: str,
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
         include_optim: bool,
+        timestamp: int,
     ) -> None:
         pass
 
@@ -212,15 +227,19 @@ class Storage(abc.ABC, Generic[TableOptionType, OptimizerInterface]):
         pass
 
     @abc.abstractmethod
-    def embedding_dim(
-        self,
-    ) -> int:
+    def embedding_dim(self, table_id: int) -> int:
         pass
 
     @abc.abstractmethod
-    def value_dim(
-        self,
-    ) -> int:
+    def value_dim(self, table_id: int) -> int:
+        pass
+
+    @abc.abstractmethod
+    def max_embedding_dim(self) -> int:
+        pass
+
+    @abc.abstractmethod
+    def max_value_dim(self) -> int:
         pass
 
     @abc.abstractmethod
@@ -229,72 +248,51 @@ class Storage(abc.ABC, Generic[TableOptionType, OptimizerInterface]):
     ) -> float:
         pass
 
+    @abc.abstractmethod
+    def export_keys_values(
+        self,
+        device: torch.device,
+        batch_size: int = 65536,
+        table_id: int = 0,
+    ) -> Iterator[
+        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+    ]:
+        pass
+
 
 class Cache(abc.ABC):
     @abc.abstractmethod
-    def find(
+    def lookup(
         self,
         unique_keys: torch.Tensor,
-        unique_vals: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-        input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        table_ids: torch.Tensor,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lookup with overflow fallback.
 
-    @abc.abstractmethod
-    def find_embeddings(
-        self,
-        unique_keys: torch.Tensor,
-        unique_embs: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-        input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
-
-    @abc.abstractmethod
-    def find_missed_keys(
-        self,
-        unique_keys: torch.Tensor,
-        founds: Optional[torch.Tensor] = None,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
-        return num_missing, missing_keys, missing_indices, missing_scores
+        Returns:
+            score_out: Output scores.
+            founds: Boolean tensor indicating which keys were found.
+            indices: Slot indices (``-1`` for keys not found).
+        """
+        ...
 
     @abc.abstractmethod
     def insert_and_evict(
         self,
         keys: torch.Tensor,
-        values: torch.Tensor,
-    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_evicted: int
-        evicted_keys: torch.Tensor
-        evicted_values: torch.Tensor
-        evicted_scores: torch.Tensor
-        return num_evicted, evicted_keys, evicted_values, evicted_scores
+        table_ids: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Insert with counter-aware eviction and overflow fallback.
 
-    @abc.abstractmethod
-    def update(
-        self, keys: torch.Tensor, grads: torch.Tensor
-    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        num_missing: int
-        missing_keys: torch.Tensor
-        missing_indices: torch.Tensor
-        return num_missing, missing_keys, missing_indices
-
-    @abc.abstractmethod
-    def flush(self, storage: Storage) -> None:
-        pass
+        Returns:
+            indices, num_evicted, evicted_keys, evicted_indices,
+            evicted_scores, evicted_table_ids.
+        """
+        ...
 
     @abc.abstractmethod
     def reset(
@@ -316,35 +314,37 @@ class Cache(abc.ABC):
 class Counter(abc.ABC):
     """
     Interface of a counter table which maps a key to a counter.
+    Supports multi-table via table_ids parameter.
     """
 
     @abc.abstractmethod
     def add(
-        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: torch.Tensor,
     ) -> torch.Tensor:
         """
         Add keys with frequencies to the `Counter` and get accumulated counter of each key.
-        For not existed keys, the frequencies will be assigned directly.
-        For existing keys, the frequencies will be accumulated.
 
         Args:
             keys (torch.Tensor): The input keys, should be unique keys.
-            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
-            inplace: If true then store the accumulated_frequencies to counter.
+            table_ids (torch.Tensor): The table id for each key.
+            frequencies (torch.Tensor): The input frequencies.
 
         Returns:
-            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
+            accumulated_frequencies (torch.Tensor): the frequencies' state for the input keys.
         """
-        accumulated_frequencies: torch.Tensor
-        return accumulated_frequencies
+        ...
 
     @abc.abstractmethod
-    def erase(self, keys) -> None:
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
         """
-        Erase keys form the `Counter`.
+        Erase keys from the `Counter`.
 
         Args:
             keys (torch.Tensor): The input keys to be erased.
+            table_ids (torch.Tensor): The table id for each key.
         """
 
     @abc.abstractmethod
@@ -357,29 +357,25 @@ class Counter(abc.ABC):
         """
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file) -> None:
+    def load(self, key_file, counter_file, table_id: int) -> None:
         """
         Load keys and frequencies from input file path.
 
         Args:
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
+            table_id (int): the logical table to load into.
         """
 
     @abc.abstractmethod
-    def dump(self, key_file, counter_file) -> None:
+    def dump(self, key_file, counter_file, table_id: int) -> None:
         """
         Dump keys and frequencies to output file path.
 
         Args:
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
-        """
-
-    @abc.abstractmethod
-    def create(self, device: torch.device) -> "Counter":
-        """
-        Create the counter table on the specified device.
+            table_id (int): the logical table to dump from.
         """
 
 

@@ -31,10 +31,10 @@ from dynamicemb.dynamicemb_config import (
     get_optimizer_state_dim,
 )
 from dynamicemb.get_planner import get_planner
+from dynamicemb.optimizer import EmbOptimType
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.types import DEMB_TABLE_ALIGN_SIZE
-from dynamicemb_extensions import OptimizerType
-from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
+from fbgemm_gpu.split_embedding_configs import SparseType
 from torchrec import DataType
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -47,7 +47,7 @@ DEFAULT_WORLD_SIZES = [1, 8]
 # Fixed table params (aligned with planner / batched_dynamicemb_tables)
 EMBEDDING_DIM = 128
 EMBEDDING_DTYPE = torch.float32
-OPTIMIZER_TYPE = OptimizerType.Adam
+OPTIMIZER_TYPE = EmbOptimType.ADAM
 # Non-cache table: bucket_capacity fixed at 128; per-rank aligned capacity at least 128
 BUCKET_CAPACITY_NORMAL = 128
 # Cache mode: cache bucket_capacity=1024, minimum capacity 1024 (round up to 1 bucket if smaller)
@@ -81,7 +81,7 @@ def compute_memory_stats(
 
     Planner logic:
     - num_embeddings_per_rank = align_to_table_size(ceil(num_embeddings / world_size), alignment=bucket_capacity)
-    - If num_aligned_embedding_per_rank < bucket_capacity(128), use bucket_capacity
+    - If per-rank aligned capacity < bucket_capacity(128), use bucket_capacity (matches planner max_capacity floor)
     - local_hbm_for_values = ceil(global_hbm_for_values / world_size)
     - When caching: cache bucket=1024, min capacity 1024 (get_constraint_capacity rounds up to 1 bucket)
 
@@ -287,7 +287,7 @@ def _apply_dmp_with_global_hbm(
     emb_num_aligned = align_to_table_size(num_embeddings, alignment=bucket_capacity)
     torch_dtype = data_type_to_dtype(DataType.FP32)
     opt_state_dim = get_optimizer_state_dim(
-        OptimizerType.Adam, embedding_dim, torch_dtype
+        EmbOptimType.ADAM, embedding_dim, torch_dtype
     )
     total_hbm_need = (
         (embedding_dim + opt_state_dim) * dtype_to_bytes(torch_dtype) * emb_num_aligned
@@ -519,8 +519,8 @@ class TestAlignmentMemoryStats:
         )
         assert total_ws8_per_rank < total_ws1
 
-    def test_num_aligned_embedding_per_rank_bucket_floor(self):
-        """num_aligned_embedding_per_rank is bounded by bucket_capacity."""
+    def test_max_capacity_bucket_floor(self):
+        """Per-rank aligned capacity (planner max_capacity) is at least bucket_capacity."""
         min_cap = BUCKET_CAPACITY_NORMAL
         assert min_cap == 128
         for num_emb in [1, 10, 17, 50]:

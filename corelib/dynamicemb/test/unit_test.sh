@@ -1,6 +1,7 @@
 set -e
 FWD_BWD_TEST_FILES=(
     "test/unit_tests/table_operation/test_table_operation.sh"
+    "test/unit_tests/test_hybrid_storage_export.sh"
     "test/unit_tests/test_lfu_scores.sh"
     "test/test_batched_dynamic_embedding_tables_v2.py"
     "test/test_unique_op.py"
@@ -8,6 +9,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_pooled_embedding.sh"
     "test/unit_tests/test_twin_module.sh"
     "test/unit_tests/test_alignment.py"
+    "test/unit_tests/test_hybrid_storage_export.sh"
+    "test/unit_tests/test_vmm_tensor.py"
 )
 
 LOAD_DUMP_TEST_FILES=(

@@ -27,12 +27,13 @@ namespace dyn_emb {
 // When D_offsets_ptr is null, uniform-dim mode: ev_size is the embedding dim.
 void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      void *inverse_idx_ptr, int combiner, int total_D,
-                     int accum_D, int ev_size, int num_vec, int batch_size,
-                     DataType src_type, DataType dst_type, DataType offset_type,
-                     cudaStream_t stream, const int *D_offsets_ptr = nullptr);
+                     int accum_D, int ev_size, int src_stride, int num_vec,
+                     int batch_size, DataType src_type, DataType dst_type,
+                     DataType offset_type, cudaStream_t stream,
+                     const int *D_offsets_ptr = nullptr);
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
-                   int num_emb, int ev_size, DataType src_type,
+                   int num_emb, int ev_size, int src_stride, DataType src_type,
                    DataType dst_type, DataType offset_type, int device_num_sms,
                    cudaStream_t stream);
 

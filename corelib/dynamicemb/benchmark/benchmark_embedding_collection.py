@@ -16,7 +16,7 @@
 import argparse
 import sys
 import time
-from typing import Dict, List
+from typing import List
 
 import numpy as np
 import torch
@@ -27,7 +27,7 @@ from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
-    align_to_table_size,
+    get_table_value_bytes,
 )
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
@@ -40,7 +40,6 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
-from torchrec import DataType
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.fbgemm_qcomm_codec import (
@@ -70,15 +69,25 @@ def str2bool(v):
         raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
-DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
-    DataType.FP32: 32,
-    DataType.FP16: 16,
-    DataType.BF16: 16,
-    DataType.INT8: 8,
-    DataType.UINT8: 8,
-    DataType.INT4: 4,
-    DataType.INT2: 2,
-}
+def _fbgemm_optimizer_type_for_hbm(args: argparse.Namespace) -> EmbOptimType:
+    """FBGEMM ``EmbOptimType`` for :func:`get_table_value_bytes` (matches sharder fused layout)."""
+    if args.use_torch_opt:
+        if args.optimizer_type == "sgd":
+            return EmbOptimType.EXACT_SGD
+        if args.optimizer_type == "adam":
+            return EmbOptimType.ADAM
+        raise ValueError("unknown optimizer type")
+    if args.optimizer_type == "sgd":
+        return EmbOptimType.EXACT_SGD
+    if args.optimizer_type == "exact_sgd":
+        return EmbOptimType.EXACT_SGD
+    if args.optimizer_type == "adam":
+        return EmbOptimType.ADAM
+    if args.optimizer_type == "exact_adagrad":
+        return EmbOptimType.EXACT_ADAGRAD
+    if args.optimizer_type == "exact_row_wise_adagrad":
+        return EmbOptimType.EXACT_ROWWISE_ADAGRAD
+    raise ValueError("unknown optimizer type")
 
 
 def table_idx_to_name(i):
@@ -108,13 +117,13 @@ def get_planner(args, device, eb_configs):
     use_dynamicemb = True if args.num_dyn_emb_table > 0 else False
     if use_dynamicemb:
         eb_config = eb_configs[0]
-        dim = eb_config.embedding_dim
-        tmp_type = eb_config.data_type
-
-        embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-        eb_num_embeddings = eb_config.num_embeddings
-        eb_num_embeddings_aligned = align_to_table_size(eb_num_embeddings)
-        total_hbm_need = embedding_type_bytes * dim * eb_num_embeddings_aligned
+        world_size = dist.get_world_size()
+        emb_opt_type = _fbgemm_optimizer_type_for_hbm(args)
+        total_hbm_need = get_table_value_bytes(
+            eb_config,
+            emb_opt_type,
+            world_size,
+        )
 
         const = DynamicEmbParameterConstraints(
             sharding_types=[

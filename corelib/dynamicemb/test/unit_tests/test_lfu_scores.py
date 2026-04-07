@@ -24,7 +24,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from test_embedding_dump_load import create_model, get_optimizer_kwargs, idx_to_name
+from test_embedding_dump_load import (
+    assert_batched_dynamicemb_storage_class,
+    create_model,
+    get_optimizer_kwargs,
+    idx_to_name,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -141,10 +146,9 @@ def local_DynamicEmbDump(
 
         for dynamic_emb_module in dynamic_emb_modules:
             dynamic_emb_module.flush()
+            storage = dynamic_emb_module.tables
 
-            for table_name, table in zip(
-                dynamic_emb_module.table_names, dynamic_emb_module.tables
-            ):
+            for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
                 if table_names is not None and table_name not in set(
                     table_names[collection_name]
                 ):
@@ -152,7 +156,9 @@ def local_DynamicEmbDump(
 
                 table_key_scores = {}
 
-                for keys, _, _, scores in table.export_keys_values(device, batch_size):
+                for keys, _, _, scores in storage.export_keys_values(
+                    device, batch_size, table_id=table_idx
+                ):
                     for key, score in zip(keys, scores):
                         table_key_scores[int(key)] = int(score)
 
@@ -214,6 +220,20 @@ def validate_lfu_scores(
     default=0.5,
     help="Cache capacity as ratio of storage capacity (only used when --caching is enabled)",
 )
+@click.option(
+    "--use-index-dedup/--no-use-index-dedup",
+    default=True,
+    help="Enable/disable index deduplication",
+)
+@click.option(
+    "--global-hbm-budget-scale",
+    type=float,
+    default=1.0,
+    help=(
+        "Scale DynamicEmb HBM byte budget vs full table. Values < 1.0 force "
+        "HybridStorage and prefetch StorageMode DEFAULT (_generic_forward_path)."
+    ),
+)
 def test_lfu_score_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -225,17 +245,19 @@ def test_lfu_score_validation(
     tolerance: float,
     caching: bool,
     cache_capacity_ratio: float,
+    use_index_dedup: bool,
+    global_hbm_budget_scale: float,
 ):
     """Test LFU score correctness by comparing with naive frequency counting.
 
-    This test supports two modes:
-    - Storage-only (default): Tests LFU scores in storage directly
-    - Cache + Storage (--caching): Tests LFU score propagation through cache to storage
+    This test supports:
+    - Storage-only (default): HBM-only storage when budget fits (HBM_DIRECT path)
+    - StorageMode DEFAULT: --global-hbm-budget-scale < 1 → HybridStorage
+    - Cache + Storage (--caching): LFU through cache to storage
     """
 
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
-    use_index_dedup = True
 
     if not caching:
         for num_embedding, multi_hot_size in zip(num_embeddings, multi_hot_sizes):
@@ -260,6 +282,9 @@ def test_lfu_score_validation(
         print(f"  - Cache capacity ratio: {cache_capacity_ratio}")
     else:
         print(f"  - Caching: DISABLED")
+    print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
+    if not caching and global_hbm_budget_scale < 1.0:
+        print(f"  - Storage path: expect HybridStorage (StorageMode DEFAULT)")
 
     # Create model
     optimizer_kwargs = get_optimizer_kwargs(optimizer_type)
@@ -272,7 +297,17 @@ def test_lfu_score_validation(
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
+        global_hbm_budget_scale=global_hbm_budget_scale,
     )
+    assert_batched_dynamicemb_storage_class(
+        model,
+        caching=caching,
+        global_hbm_budget_scale=global_hbm_budget_scale,
+    )
+    if dist.get_rank() == 0:
+        for _, _, sm in find_sharded_modules(model, ""):
+            for emb in get_dynamic_emb_module(sm):
+                print(f"  - Storage class: {type(emb.tables).__name__}")
 
     # Generate features with frequency tracking
     (
