@@ -19,13 +19,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "index_calculation.h"
 #include "utils.h"
 #include <torch/extension.h>
+#include <thrust/iterator/transform_iterator.h>
 
 namespace dyn_emb {
 
 namespace {
 
 struct CastI32ToI64 {
-  __device__ __forceinline__ int64_t operator()(int32_t x) const {
+  __host__ __device__ __forceinline__ int64_t operator()(int32_t x) const {
     return static_cast<int64_t>(x);
   }
 };
@@ -52,9 +53,7 @@ at::Tensor segmented_sum_cuda(at::Tensor data, at::Tensor offsets) {
   const int32_t *d_data = data.data_ptr<int32_t>();
   int64_t *d_out = output.data_ptr<int64_t>();
 
-  CastI32ToI64 cast_op;
-  cub::TransformInputIterator<int64_t, CastI32ToI64, const int32_t *> cast_iter(
-      d_data, cast_op);
+  auto cast_iter = thrust::make_transform_iterator(d_data, CastI32ToI64{});
 
   size_t temp_storage_bytes = 0;
   cub::DeviceSegmentedReduce::Sum(nullptr, temp_storage_bytes, cast_iter, d_out,

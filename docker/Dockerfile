@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE} AS devel
@@ -15,15 +15,15 @@ RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
 
 RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
       pip3 install pandas rich cloudpickle psutil && \
-      pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129; \
+      pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu131; \
     fi
 
 RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
     rm -rf /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1 && \
     if [ ${ARCH} = "aarch64" ]; then \
-      ln -s /usr/local/cuda-12.9/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      ln -s /usr/local/cuda-13.1/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     else \
-      ln -s /usr/local/cuda-12.9/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
+      ln -s /usr/local/cuda-13.1/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     fi
 
 RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
@@ -32,19 +32,19 @@ RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
     fi
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers
+RUN pip install cloudpickle
 RUN pip install triton==3.6.0
+RUN pip install nvidia-cutlass-dsl==4.3.0
 
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
-  git clone --recursive -b v1.2.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
+  git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
   cd fbgemm/fbgemm_gpu && \
-  python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 9.0"
+  python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0a"
 
 RUN pip install --no-deps tensordict orjson && \
-  git clone --recursive -b v1.2.0 https://github.com/pytorch/torchrec.git torchrec && \
+  git clone --recursive -b v1.5.0-rc2 https://github.com/pytorch/torchrec.git torchrec && \
   cd torchrec && \
   pip install --no-deps .
-
-RUN pip install nvidia-cutlass-dsl==4.3.0
 
 
 # for dev
@@ -85,4 +85,4 @@ RUN cd /workspace/deps && rm -rf nvcomp && \
     rm  nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz 
   
 RUN cd /workspace/recsys-examples/examples/commons && \
-    TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 9.0" python3 setup.py install
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install
