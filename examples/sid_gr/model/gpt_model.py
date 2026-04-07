@@ -105,7 +105,7 @@ class SIDGRDecoder(MegatronModule):
         ] = "learned_absolute",
         relative_attention_num_buckets: int = 32,
         relative_attention_max_distance: int = 128,
-        use_jagged_flash_attn: bool = True,
+        use_jagged_flash_attn: bool = False,
     ):
         super().__init__(config=decoder_config)
 
@@ -185,7 +185,7 @@ class SIDGRModel(MegatronModule):
         top_k_for_generation: int = 10,  # this is used for eval
         eval_metrics: Tuple[str, ...] = (),  # this is used for eval
         share_lm_head_across_hierarchies: bool = True,
-        use_jagged_flash_attn: bool = True,
+        use_jagged_flash_attn: bool = False,
     ):
         super(SIDGRModel, self).__init__(config=decoder_config)
         assert (

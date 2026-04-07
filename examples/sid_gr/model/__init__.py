@@ -18,7 +18,7 @@ def get_sid_gr_model(
     top_k_for_generation: int = 10,
     eval_metrics: Tuple[str, ...] = (),
     share_lm_head_across_hierarchies: bool = True,
-    use_jagged_flash_attn: bool = True,
+    use_jagged_flash_attn: bool = False,
 ) -> SIDGRModel:
     sid_gr_model = SIDGRModel(
         decoder_config=decoder_config,
