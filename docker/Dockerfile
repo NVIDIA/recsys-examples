@@ -56,8 +56,14 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
-RUN ARCH=$(uname -m) && \
-    ln -sf /usr/local/cuda-13/targets/${ARCH}-linux/include/cccl/cuda \
+RUN if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then \
+      CUDA_TARGET_ARCH=sbsa; \
+    elif [ "${TARGETPLATFORM}" = "linux/amd64" ]; then \
+      CUDA_TARGET_ARCH=x86_64; \
+    else \
+      CUDA_TARGET_ARCH=$(uname -m); \
+    fi && \
+    ln -sf /usr/local/cuda-13/targets/${CUDA_TARGET_ARCH}-linux/include/cccl/cuda \
     /usr/local/cuda/include/cuda
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
