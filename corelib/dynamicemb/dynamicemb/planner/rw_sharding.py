@@ -16,8 +16,10 @@
 # pyre-strict
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+from packaging.version import Version
 
 import torch
+import torchrec
 from torch import distributed as dist
 from torchrec.distributed.embedding_kernel import BaseEmbedding
 from torchrec.distributed.embedding_lookup import (
@@ -56,12 +58,15 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
         config: GroupedEmbeddingConfig,
         pg: Optional[dist.ProcessGroup],
         device: Optional[torch.device],
+        env: Optional[ShardingEnv] = None,
     ) -> BaseEmbedding:
         if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
             """
             fallback to base class
             """
-            return super()._create_embedding_kernel(config=config, pg=pg, device=device)
+            if Version(torchrec.__version__) < Version('1.5.0'):
+                return super()._create_embedding_kernel(config=config, pg=pg, device=device)
+            return super()._create_embedding_kernel(config=config, pg=pg, device=device, env=env)
         else:
             self._need_prefetch = True
             return BatchedDynamicEmbedding(
@@ -156,12 +161,15 @@ class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
         device: Optional[torch.device],
         pg: Optional[dist.ProcessGroup],
         sharding_type: Optional[ShardingType],
+        env: Optional[ShardingEnv] = None,
     ) -> BaseEmbedding:
         if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
             """
             fallback to base class
             """
-            return super()._create_embedding_kernel(config, device, pg, sharding_type)
+            if Version(torchrec.__version__) < Version('1.5.0'):
+                return super()._create_embedding_kernel(config, device, pg, sharding_type)
+            return super()._create_embedding_kernel(config, device, pg, sharding_type, env)
         else:
             return BatchedDynamicEmbeddingBag(
                 config=config,
