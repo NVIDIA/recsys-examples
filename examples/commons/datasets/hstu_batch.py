@@ -379,7 +379,6 @@ class HSTUBatch(BaseBatch):
         )
         return batch
 
-torch.export.register_dataclass(HSTUBatch)
 
 def is_batch_valid(
     batch: HSTUBatch,

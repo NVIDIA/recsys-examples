@@ -1,0 +1,63 @@
+cmake_minimum_required(VERSION 3.18)
+project(dense_module_aoti_demo LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};$ENV{Torch_DIR}")
+
+find_package(Torch REQUIRED)
+
+# Try to find fbgemm_gpu - optional but recommended
+find_library(FBGEMM_GPU_LIB fbgemm_gpu_py PATHS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib lib64 NO_DEFAULT_PATH)
+
+# Try to find experimental HSTU FBGEMM ops library
+find_library(FBGEMM_HSTU_EXPERIMENTAL_LIB fbgemm_gpu_experimental_hstu
+  PATHS /usr/local/lib/python3.12/dist-packages/hstu ${CMAKE_PREFIX_PATH}
+  PATH_SUFFIXES lib lib64
+  NO_DEFAULT_PATH)
+
+# Build a dedicated HSTU CUDA ops runtime library for C++ demos.
+# This avoids loading CPython extension modules from a pure C++ process.
+add_library(hstu_cuda_ops_runtime SHARED
+  hstu_cuda_ops_runtime.cpp
+  ../../../commons/ops/cuda_ops/csrc/jagged_tensor_op_kernel.cu
+)
+target_link_libraries(hstu_cuda_ops_runtime PRIVATE ${TORCH_LIBRARIES})
+target_compile_features(hstu_cuda_ops_runtime PRIVATE cxx_std_17)
+set_target_properties(hstu_cuda_ops_runtime PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_executable(dense_module_aoti_demo dense_module_aoti_demo.cpp)
+
+# Link against PyTorch
+target_link_libraries(dense_module_aoti_demo PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(dense_module_aoti_demo PRIVATE hstu_cuda_ops_runtime)
+target_compile_definitions(dense_module_aoti_demo PRIVATE HSTU_CUDA_OPS_AVAILABLE=1)
+
+# If fbgemm_gpu is found, link against it to register fbgemm operators
+if(FBGEMM_GPU_LIB)
+  message(STATUS "Found fbgemm_gpu library: ${FBGEMM_GPU_LIB}")
+  target_link_libraries(dense_module_aoti_demo PRIVATE ${FBGEMM_GPU_LIB})
+  target_compile_definitions(dense_module_aoti_demo PRIVATE FBGEMM_GPU_AVAILABLE=1)
+else()
+  message(STATUS "fbgemm_gpu library not found. FBGEMM operators may not work.")
+  message(STATUS "To use FBGEMM operators, install fbgemm_gpu and set appropriate CMake paths.")
+endif()
+
+if(FBGEMM_HSTU_EXPERIMENTAL_LIB)
+  message(STATUS "Found fbgemm experimental hstu library: ${FBGEMM_HSTU_EXPERIMENTAL_LIB}")
+  target_link_libraries(dense_module_aoti_demo PRIVATE ${FBGEMM_HSTU_EXPERIMENTAL_LIB})
+else()
+  message(STATUS "fbgemm experimental hstu library not found. Will rely on runtime dlopen path.")
+endif()
+
+target_compile_features(dense_module_aoti_demo PRIVATE cxx_std_17)
+
+if(MSVC)
+  target_compile_options(dense_module_aoti_demo PRIVATE /W4)
+else()
+  target_compile_options(dense_module_aoti_demo PRIVATE -Wall -Wextra -Wpedantic)
+endif()

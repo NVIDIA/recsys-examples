@@ -158,11 +158,13 @@ class InferenceDenseModuleV2(torch.nn.Module):
         )
 
         from commons.ops.triton_ops.common import (
+            set_static_max_seq_lens,
             set_use_runtime_max_seq_len,
         )
 
-        set_use_runtime_max_seq_len(True)
-        self._scaling_seqlen = hstu_config.scaling_seqlen
+        max_seq_len = int(os.getenv("HSTU_MAX_SEQ_LEN", 8192))
+        set_use_runtime_max_seq_len(False)
+        set_static_max_seq_lens(max_seq_len, max_seq_len)
 
     def bfloat16(self):
         """
@@ -217,24 +219,11 @@ class InferenceDenseModuleV2(torch.nn.Module):
                 continue
 
             is_transposed = False
-            if k.endswith("_linear_uvqk_weight"):
-                newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
-                is_transposed = True
-            elif k.endswith("_linear_uvqk_bias"):
-                newk = k.removesuffix("_linear_uvqk_bias") + "_linear_uvqk.bias"
-            elif k.endswith("_linear_proj_weight"):
-                newk = k.removesuffix("_linear_proj_weight") + "_linear_proj.weight"
-                is_transposed = True
-            else:
-                newk = k
-            new_state_dict[newk] = (
+            new_state_dict[k] = (
                 model_state_dict[k] if not is_transposed else model_state_dict[k].T
             )
 
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
-        for hstu_layer in self._hstu_block._attention_layers:
-            hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
-            hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
 
         assert unloaded_modules.missing_keys == []
         assert unloaded_modules.unexpected_keys == []
@@ -255,19 +244,8 @@ class InferenceDenseModuleV2(torch.nn.Module):
             torch.Tensor: Item logits for ranking.
         """
         with torch.inference_mode():
-            # Preprocess: Get embeddings as jagged tensor
-            jagged_data = self._hstu_block._preprocessor(
-                embeddings=embeddings,
-                batch=batch,
-            )
-            jagged_data.scaling_seqlen = self._scaling_seqlen
-
             # Forward through HSTU block
-            # Note: HSTUBlock.forward() returns (JaggedData, metadata_tuple)
-            jd_output, _ = self._hstu_block.forward(embeddings, batch)
-
-            # Postprocess
-            jd_output = self._hstu_block._postprocessor(jd_output)
+            jd_output, _ = self._hstu_block(embeddings, batch)
 
             # Prediction head
             logits = self._mlp(jd_output.values)

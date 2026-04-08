@@ -344,7 +344,7 @@ def triton_weighted_layer_norm_fwd(
         return y, mean, rstd, BLOCK_D, num_warps
     if learnable:
         # pyre-ignore[28]
-        _weighted_layer_norm_fwd[(N,)](
+        torch.library.wrap_triton(_weighted_layer_norm_fwd)[(N,)](
             x,
             y,
             weight,

@@ -48,6 +48,7 @@ def hstu_preprocess_embeddings(
     contextual_mlp: Optional[MLP] = None,
     dtype: Optional[torch.dtype] = None,
     scaling_seqlen: int = -1,
+    is_exportable: bool = False,
 ) -> JaggedData:
     """
     Preprocesses the embeddings for use in the HSTU architecture.
@@ -106,23 +107,42 @@ def hstu_preprocess_embeddings(
 
             item_embs = item_jt.values().to(dtype)
             action_embs = action_jt.values().to(dtype)
-            interleaved_embeddings = [
-                (
-                    torch.cat(
-                        [
-                            item_embs[item_offsets[idx].item() : candidates_indptr[idx].item()],
-                            action_embs[action_offsets[idx].item() : action_offsets[idx + 1].item()],
-                        ],
-                        dim=1,
-                    ).view(-1, embedding_dim),
-                    item_embs[candidates_indptr[idx].item() : item_offsets[idx + 1].item()],
+            if not is_exportable:
+                interleaved_embeddings = [
+                    (
+                        torch.cat(
+                            [
+                                item_embs[item_offsets[idx].item() : candidates_indptr[idx].item()],
+                                action_embs[action_offsets[idx].item() : action_offsets[idx + 1].item()],
+                            ],
+                            dim=1,
+                        ).view(-1, embedding_dim),
+                        item_embs[candidates_indptr[idx].item() : item_offsets[idx + 1].item()],
+                    )
+                    for idx in range(batch.batch_size)
+                ]
+                interleaved_embeddings = list(itertools.chain(*interleaved_embeddings))
+                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
+                    -1, embedding_dim
                 )
-                for idx in range(batch.batch_size)
-            ]
-            interleaved_embeddings = list(itertools.chain(*interleaved_embeddings))
-            sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
-                -1, embedding_dim
-            )
+            else:
+                interleaved_embeddings = list()
+                for idx in range(batch.batch_size):
+                    interleaved_embeddings.append(
+                        torch.cat(
+                            [
+                                item_embs[torch.arange(item_offsets[idx], candidates_indptr[idx])],
+                                action_embs[torch.arange(action_offsets[idx], action_offsets[idx + 1])],
+                            ],
+                            dim=1,
+                        ).view(-1, embedding_dim)
+                    )
+                    interleaved_embeddings.append(
+                        item_embs[torch.arange(candidates_indptr[idx], item_offsets[idx + 1])]
+                    )
+                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
+                    -1, embedding_dim
+                )
             sequence_embeddings_lengths = item_jt.lengths() + action_jt.lengths()
             sequence_embeddings_lengths_offsets = (
                 item_jt.offsets() + action_jt.offsets()
@@ -160,7 +180,7 @@ def hstu_preprocess_embeddings(
             contextual_jts_offsets,
             contextual_max_seqlens,
         )
-        torch._check(torch.sum(contextual_seqlen, dim=0).item() != 0, "contextual_seqlen is 0")
+        # torch._check_tensor_all(torch.sum(contextual_seqlen, dim=0) != 0, "contextual_seqlen is 0")
         if contextual_mlp is not None:
             contextual_sequence_embeddings = contextual_mlp(
                 contextual_sequence_embeddings
@@ -204,13 +224,13 @@ def hstu_preprocess_embeddings(
         else None
     )
     total_candidates_seq_len = None
-    if not is_inference:
+    if is_exportable:
+        total_candidates_seq_len = torch.tensor(total_candidates_seq_len, dtype=torch.int32) if total_candidates_seq_len is not None else None
+    elif not is_inference:
         if num_candidates is not None:
-            total_candidates_seq_len = int(num_candidates.sum().item())
+            total_candidates_seq_len = num_candidates.sum()
         elif contextual_seqlen is not None:
-            total_candidates_seq_len = int(
-                (sequence_embeddings_lengths.sum() - contextual_seqlen.sum()).item()
-            )
+            total_candidates_seq_len = sequence_embeddings_lengths.sum() - contextual_seqlen.sum()
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
@@ -304,12 +324,14 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             self._dropout_ratio = config.hidden_dropout
         self._scaling_seqlen = config.scaling_seqlen
 
+        self._is_exportable = True
+
     @output_nvtx_hook(nvtx_tag="HSTUBlock preprocess", hook_key_or_attr_name="values")
     def forward(
         self,
         embeddings: Dict[str, JaggedTensor],
         batch: HSTUBatch,
-        seq_start_position: torch.Tensor = None,
+        seq_start_position: Optional[torch.Tensor] = None,
     ) -> JaggedData:
         """
         Preprocesses the embeddings for use in the HSTU architecture.
@@ -338,6 +360,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             contextual_mlp=self._contextual_mlp,
             dtype=self._training_dtype,
             scaling_seqlen=self._scaling_seqlen,
+            is_exportable=self._is_exportable,
         )
         if self._sequence_parallel:
             jd = pad_jd_values(jd, self._tp_size)
@@ -380,6 +403,7 @@ class HSTUBlockPostprocessor(torch.nn.Module):
 
         if self._is_inference:
             self._sequence_parallel = False
+        self._is_exportable = True
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock postprocess", hook_key_or_attr_name="values")
     def forward(self, jd: JaggedData) -> JaggedData:

@@ -42,3 +42,4 @@ results/
 *-zh*.md
 *.pdf
 .SKILLS/
+examples/hstu/inference/cpp_runtime_demo/build*

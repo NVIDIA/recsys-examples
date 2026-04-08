@@ -232,7 +232,7 @@ class _AddPositionEmbeddingsFunction(torch.autograd.Function):
             triton.cdiv(max_seq_len, meta["BLOCK_N"]),
         )
         BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
-        _add_position_embeddings_kernel[grid](
+        torch.library.wrap_triton(_add_position_embeddings_kernel)[grid](
             Jagged=jagged,
             seq_offsets=jagged_offsets,
             high_inds=high_inds,

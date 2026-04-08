@@ -1105,8 +1105,8 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         offsets_b: Optional[torch.Tensor] = None,
         dense_size: int = 0,
         n_prefix_to_right: int = 0,
-        seq_len_a: Optional[int] = None,
-        seq_len_b: Optional[int] = None,
+        seq_len_a: Optional[torch.Tensor] = None,
+        seq_len_b: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         values = switch_to_contiguous_if_needed(values)
         is_dense_a: bool = offsets_a is None
@@ -1329,8 +1329,8 @@ def triton_split_2D_jagged(
     offsets_b: Optional[torch.Tensor] = None,
     dense_size: int = 0,
     n_prefix_to_right: int = 0,
-    seq_len_a: Optional[int] = None,
-    seq_len_b: Optional[int] = None,
+    seq_len_a: Optional[torch.Tensor] = None,
+    seq_len_b: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _Split2DJaggedFunction.apply(
         values,
