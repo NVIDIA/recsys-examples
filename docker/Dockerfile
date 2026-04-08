@@ -42,7 +42,7 @@ RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
   python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
 
 RUN pip install --no-deps tensordict orjson && \
-  git clone --recursive -b v1.5.0-rc2 https://github.com/pytorch/torchrec.git torchrec && \
+  git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec && \
   cd torchrec && \
   pip install --no-deps .
 

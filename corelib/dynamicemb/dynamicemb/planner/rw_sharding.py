@@ -16,6 +16,7 @@
 # pyre-strict
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+from packaging.version import Version
 
 import torch
 import torchrec
@@ -63,7 +64,7 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
             """
             fallback to base class
             """
-            if torchrec.__version__.startswith('1.2.0'):
+            if Version(torchrec.__version__) < Version('1.5.0'):
                 return super()._create_embedding_kernel(config=config, pg=pg, device=device)
             return super()._create_embedding_kernel(config=config, pg=pg, device=device, env=env)
         else:
@@ -166,7 +167,7 @@ class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
             """
             fallback to base class
             """
-            if torchrec.__version__.startswith('1.2.0'):
+            if Version(torchrec.__version__) < Version('1.5.0'):
                 return super()._create_embedding_kernel(config, device, pg, sharding_type)
             return super()._create_embedding_kernel(config, device, pg, sharding_type, env)
         else:
