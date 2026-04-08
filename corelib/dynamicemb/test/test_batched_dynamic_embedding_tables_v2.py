@@ -33,7 +33,10 @@ from dynamicemb import (
     get_table_value_bytes,
 )
 from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.batched_dynamicemb_tables import (
+    BatchedDynamicEmbeddingTablesV2,
+    encode_checkpoint_file_path,
+)
 from dynamicemb.key_value_table import (
     DynamicEmbCache,
     DynamicEmbStorage,
@@ -45,8 +48,13 @@ from dynamicemb.key_value_table import (
     load_from_flat,
     load_from_flat_single_table,
 )
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.types import CopyMode, EMBEDDING_TYPE
+from dynamicemb.optimizer import (
+    BaseDynamicEmbeddingOptimizer,
+    get_optimizer_ckpt_state_dim,
+    pad_optimizer_states_from_checkpoint,
+    truncate_optimizer_states_for_checkpoint,
+)
+from dynamicemb.types import KEY_TYPE, OPT_STATE_TYPE, CopyMode, EMBEDDING_TYPE
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -1059,7 +1067,12 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                 fscore.write(scores_out.cpu().numpy().tobytes())
             fembedding.write(embeddings.cpu().numpy().tobytes())
             if fopt_states is not None and opt_states is not None:
-                fopt_states.write(opt_states.cpu().numpy().tobytes())
+                to_write = truncate_optimizer_states_for_checkpoint(
+                    self.optimizer,
+                    self._emb_dims[table_id],
+                    opt_states,
+                )
+                fopt_states.write(to_write.cpu().numpy().tobytes())
 
         fkey.close()
         fembedding.close()
@@ -1095,10 +1108,34 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             include_optim = False
 
         dim = self._emb_dims[table_id]
-        optstate_dim = self._optstate_dims[table_id]
+        runtime_optstate_dim = self._optstate_dims[table_id]
         value_dim = self._value_dims[table_id]
+        ckpt_dim = self.optimizer.get_ckpt_state_dim(dim)
 
         num_keys = os.path.getsize(emb_key_path) // 8  # int64
+
+        file_opt_dim = 0
+        if (
+            include_optim
+            and opt_file_path
+            and os.path.exists(opt_file_path)
+            and runtime_optstate_dim > 0
+        ):
+            if num_keys == 0:
+                if os.path.getsize(opt_file_path) != 0:
+                    raise ValueError("Non-empty optimizer file but zero keys.")
+            else:
+                opt_sz = os.path.getsize(opt_file_path)
+                row_block = 4 * num_keys
+                if opt_sz % row_block != 0:
+                    raise ValueError(
+                        f"Optimizer file size {opt_sz} not divisible by {row_block}."
+                    )
+                file_opt_dim = opt_sz // row_block
+                if file_opt_dim != ckpt_dim:
+                    raise ValueError(
+                        f"Checkpoint optimizer width {file_opt_dim}; expected {ckpt_dim}."
+                    )
 
         fkey = open(emb_key_path, "rb")
         fembedding = open(embedding_file_path, "rb")
@@ -1128,13 +1165,21 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             ).view(-1, dim)
 
             opt_states = None
-            if fopt_states and optstate_dim > 0:
-                opt_bytes = fopt_states.read(4 * optstate_dim * n)
+            if fopt_states is not None and file_opt_dim > 0 and n > 0:
+                opt_bytes = fopt_states.read(4 * file_opt_dim * n)
                 opt_states = torch.tensor(
                     np.frombuffer(opt_bytes, dtype=np.float32).copy(),
                     dtype=torch.float32,
                     device=self.device,
-                ).view(-1, optstate_dim)
+                ).view(-1, file_opt_dim)
+                opt_states = pad_optimizer_states_from_checkpoint(
+                    self.optimizer,
+                    dim,
+                    opt_states,
+                    self._initial_optim_state,
+                    torch.float32,
+                    self.device,
+                )
 
             scores = None
             if fscore:
@@ -2266,13 +2311,17 @@ def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
     """Multi-table dump and load using fused storage."""
     import torch.distributed as dist
 
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="gloo", init_method="tcp://127.0.0.1:29500", rank=0, world_size=1
-        )
-
     assert torch.cuda.is_available()
     device_id = 0
+    torch.cuda.set_device(device_id)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+        )
+
     device = torch.device(f"cuda:{device_id}")
 
     dims = [8, 16]
@@ -2341,6 +2390,178 @@ def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
     torch.testing.assert_close(vals1_src[idx1_src], vals1_dst[idx1_dst])
 
     print("test_multi_table_dump_load passed")
+
+
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return int(torch.empty(0, dtype=dtype).element_size())
+
+
+def _assert_opt_values_ckpt_row_width(
+    save_dir: str,
+    table_name: str,
+    emb_dim: int,
+    value_type: torch.dtype,
+    opt_type: EmbOptimType,
+) -> None:
+    """``opt_values`` checkpoint uses ``get_ckpt_state_dim`` elements per key row."""
+    import torch.distributed as dist
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    keys_path = encode_checkpoint_file_path(
+        save_dir, table_name, rank, world_size, "keys"
+    )
+    opt_path = encode_checkpoint_file_path(
+        save_dir, table_name, rank, world_size, "opt_values"
+    )
+    key_el = _dtype_element_size(KEY_TYPE)
+    opt_el = _dtype_element_size(OPT_STATE_TYPE)
+    num_keys = os.path.getsize(keys_path) // key_el
+    opt_sz = os.path.getsize(opt_path)
+    ckpt_elems = get_optimizer_ckpt_state_dim(opt_type, emb_dim, value_type)
+
+    if opt_type == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+        assert ckpt_elems == 1
+    elif opt_type == EmbOptimType.EXACT_ADAGRAD:
+        assert ckpt_elems == emb_dim
+    elif opt_type == EmbOptimType.ADAM:
+        assert ckpt_elems == emb_dim * 2
+    elif opt_type == EmbOptimType.SGD:
+        assert ckpt_elems == 0
+    else:
+        raise AssertionError(f"unexpected optimizer type: {opt_type}")
+
+    if ckpt_elems == 0:
+        assert opt_sz == 0, (
+            f"{table_name}: SGD has no optimizer state in checkpoint; "
+            f"expected empty opt_values, got {opt_sz} bytes"
+        )
+    else:
+        assert opt_sz == num_keys * opt_el * ckpt_elems, (
+            f"{table_name}: opt_values size={opt_sz}, num_keys={num_keys}, "
+            f"expected {num_keys * opt_el * ckpt_elems} (ckpt_elems={ckpt_elems})"
+        )
+
+
+@pytest.mark.parametrize("multi_table", [False, True], ids=["single_table", "multi_table"])
+@pytest.mark.parametrize("emb_dim", [1, 16, 1023], ids=lambda d: f"dim_{d}")
+@pytest.mark.parametrize(
+    "opt_type,opt_params",
+    [
+        (
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            {"learning_rate": 0.01, "eps": 1e-8, "initial_accumulator_value": 0.0},
+        ),
+        (
+            EmbOptimType.EXACT_ADAGRAD,
+            {"learning_rate": 0.01, "eps": 1e-8, "initial_accumulator_value": 0.0},
+        ),
+        (
+            EmbOptimType.ADAM,
+            {
+                "learning_rate": 0.01,
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "eps": 1e-8,
+                "weight_decay": 0.0,
+            },
+        ),
+        (EmbOptimType.SGD, {"learning_rate": 0.01}),
+    ],
+    ids=["rowwise_adagrad", "adagrad", "adam", "sgd"],
+)
+def test_dump_optimizer_states_ckpt_width(
+    tmp_path,
+    multi_table: bool,
+    emb_dim: int,
+    opt_type: EmbOptimType,
+    opt_params: Dict[str, Any],
+) -> None:
+    """After train + dump(optim=True), ``opt_values`` row width matches checkpoint layout."""
+    import torch.distributed as dist
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    device_id = 0
+    torch.cuda.set_device(device_id)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+        )
+
+    device = torch.device(f"cuda:{device_id}")
+    key_type = torch.int64
+    value_type = torch.float32
+    max_capacity = 8192
+
+    if multi_table:
+        table_names = ["table0", "table1"]
+        feature_table_map = [0, 1]
+        dims = [emb_dim, emb_dim]
+        indices = torch.tensor(
+            [0, 1, 2, 3, 10, 11, 12, 13], dtype=key_type, device=device
+        )
+        offsets = torch.tensor(
+            [0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=key_type, device=device
+        )
+    else:
+        table_names = ["table0"]
+        feature_table_map = [0, 0]
+        dims = [emb_dim]
+        indices = torch.tensor(
+            [0, 1, 12, 64, 8, 12, 15, 2], dtype=key_type, device=device
+        )
+        offsets = torch.tensor([0, 2, 4, 6, 8], dtype=key_type, device=device)
+
+    opts: List[DynamicEmbTableOptions] = []
+    for dim in dims:
+        opts.append(
+            DynamicEmbTableOptions(
+                dim=dim,
+                init_capacity=max_capacity,
+                max_capacity=max_capacity,
+                index_type=key_type,
+                embedding_dtype=value_type,
+                device_id=device_id,
+                score_strategy=DynamicEmbScoreStrategy.STEP,
+                caching=False,
+                local_hbm_for_values=1024**3,
+            )
+        )
+
+    bdebt = BatchedDynamicEmbeddingTablesV2(
+        table_names=table_names,
+        table_options=opts,
+        feature_table_map=feature_table_map,
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        optimizer=opt_type,
+        use_index_dedup=True,
+        **opt_params,
+    )
+
+    torch.manual_seed(emb_dim + (1001 if multi_table else 0))
+    for _ in range(4):
+        embs = bdebt(indices, offsets)
+        loss = embs.mean()
+        loss.backward()
+        torch.cuda.synchronize()
+
+    save_dir = str(tmp_path)
+    bdebt.dump(save_dir, optim=True)
+
+    for tid, name in enumerate(table_names):
+        _assert_opt_values_ckpt_row_width(
+            save_dir, name, dims[tid], value_type, opt_type
+        )
+
+    print(
+        f"test_dump_optimizer_states_ckpt_width passed "
+        f"(multi_table={multi_table}, emb_dim={emb_dim}, opt={opt_type})"
+    )
 
 
 @pytest.mark.parametrize(
