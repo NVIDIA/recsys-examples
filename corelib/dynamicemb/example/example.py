@@ -1,12 +1,11 @@
 import argparse
 import builtins
-import math
 import os
 import shutil
 import urllib.request
 import warnings
 import zipfile
-from typing import Dict, List
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -22,10 +21,10 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
     KVCounter,
+    get_table_value_bytes,
 )
-from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim
 from dynamicemb.incremental_dump import get_score, incremental_dump
-from dynamicemb.optimizer import EmbOptimType, convert_optimizer_type
+from dynamicemb.optimizer import EmbOptimType
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -446,44 +445,29 @@ def get_sharder(args, optimizer_type):
 def get_planner(
     device, eb_configs, batch_size, optimizer_type, training, caching, args
 ):
-    DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
-        DataType.FP32: 32,
-        DataType.FP16: 16,
-        DataType.BF16: 16,
-    }
-
     hbm_cap = 80 * 1024 * 1024 * 1024  # H100's HBM bytes per GPU
     ddr_cap = 512 * 1024 * 1024 * 1024  # Assume a Node have 512GB memory
     intra_host_bw = 450e9  # Nvlink bandwidth
     inter_host_bw = 25e9  # NIC bandwidth
-    bucket_capacity = 1024 if caching else 128
+    world_size = dist.get_world_size()
+    bucket_capacity = 128
+    # KVCounter hash bucket width (not ``DynamicEmbTableOptions.bucket_capacity``).
+    kv_counter_bucket_capacity = 1024
 
     dict_const = {}
 
     for eb_config in eb_configs:
-        # For HVK  embedding table, need to calculate how many bytes of embedding vector store in GPU HBM
-        dim = eb_config.embedding_dim
-        tmp_type = eb_config.data_type
 
-        embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-        emb_num_embeddings = eb_config.num_embeddings
-        emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
-            math.log2(emb_num_embeddings)
-        )  # hash table needs embedding vector num to be power of 2
-        threshold = (bucket_capacity * world_size) / cache_ratio
-        threshold_int = math.ceil(threshold)
-        if emb_num_embeddings_next_power_of_2 < threshold_int:
-            emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
-                math.log2(threshold_int)
-            )
-
-        # e.g. for adam, its `x`` embedding + `2x`` optimizer states
-        total_dim = dim + get_optimizer_state_dim(
-            convert_optimizer_type(optimizer_type), dim, data_type_to_dtype(tmp_type)
+        value_bytes = get_table_value_bytes(
+            eb_config,
+            optimizer_type,
+            world_size,
+            bucket_capacity,
         )
-        total_hbm_need = (
-            embedding_type_bytes * total_dim * emb_num_embeddings_next_power_of_2
-        )
+        if caching:
+            global_hbm_for_values = int(value_bytes * cache_ratio)
+        else:
+            global_hbm_for_values = int(value_bytes)
 
         # Setup admission strategy if threshold > 0
         admit_strategy = None
@@ -494,8 +478,8 @@ def get_planner(
             )
             # Create counter config (actual table will be created during sharding)
             admission_counter = KVCounter(
-                capacity=emb_num_embeddings_next_power_of_2,
-                bucket_capacity=bucket_capacity,
+                capacity=eb_config.num_embeddings // world_size,
+                bucket_capacity=kv_counter_bucket_capacity,
                 key_type=torch.int64,
             )
 
@@ -514,15 +498,14 @@ def get_planner(
             ],
             use_dynamicemb=True,  # indicate using dynamicemb, and will fallback to raw ParameterConstraints when Fale.
             dynamicemb_options=DynamicEmbTableOptions(
-                global_hbm_for_values=total_hbm_need * cache_ratio
-                if caching
-                else total_hbm_need,
+                global_hbm_for_values=global_hbm_for_values,
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
                 score_strategy=DynamicEmbScoreStrategy.STEP,
                 caching=caching,
                 training=training,
+                bucket_capacity=bucket_capacity,
                 admit_strategy=admit_strategy,
                 admission_counter=admission_counter,
             ),

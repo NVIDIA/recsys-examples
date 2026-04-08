@@ -371,7 +371,8 @@ class HSTUSequenceDataset(IterableDataset[HSTUBatch]):
                 labels=label_kjt,
                 actual_batch_size=actual_batch_size,
             )
-            yield HSTUBatch(**batch_kwargs)
+            batch = HSTUBatch(**batch_kwargs)
+            yield batch
 
     def _shuffle_batch(self):
         """

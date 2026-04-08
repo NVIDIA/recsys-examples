@@ -20,8 +20,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+
+hstu = pytest.importorskip("hstu")
+import inspect as _inspect
+
+from hstu import hstu_attn_varlen_func
 from hstu_assert_close import assert_hstu_close
-from hstu_attn import hstu_attn_varlen_func
+
+assert "kv_cache" in _inspect.signature(hstu_attn_varlen_func).parameters, (
+    "Installed hstu does not support paged KV-cache kwargs (kv_cache). "
+    "Please update to a version that supports paged KV-cache."
+)
 
 
 def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
@@ -423,15 +432,16 @@ def test_paged_hstu_attn_kernel(
             value,
             seqlen_offsets.cuda(),
             kvdata_seqlen_offsets.cuda() + num_candidates_offsets.cuda(),
+            None,
+            None,  # seqused_q, seqused_k
             global_max_seqlen,
             global_max_seqlen,
-            num_contexts=None,
-            num_targets=num_candidates.cuda(),
+            scaling_seqlen,
+            None,  # num_contexts
+            num_candidates.cuda(),
             target_group_size=1,
             window_size=(-1, 0),
             alpha=1.0 / (head_dim**0.5),
-            rab=None,
-            has_drab=False,
             kv_cache=kvcache_table,
             page_offsets=torch.tensor(
                 kv_raw_metadata[1], dtype=torch.int32, device=device
@@ -440,8 +450,6 @@ def test_paged_hstu_attn_kernel(
             last_page_lens=torch.tensor(
                 kv_raw_metadata[2], dtype=torch.int32, device=device
             ),
-            cu_seqlens_t=num_candidates_offsets.cuda(),
-            scaling_seqlen=scaling_seqlen,
         )
         torch.cuda.synchronize()
 

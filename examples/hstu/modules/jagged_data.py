@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import dataclasses
 import pprint
 from typing import Optional
@@ -60,24 +59,25 @@ class JaggedData:
     padding_length: int = (
         0  # the padded length of the values tensor, this is used when SP is on
     )
+    # Precomputed total candidates length for triton_split_2D_jagged to avoid D2H sync.
+    # total_prefix_seq_len is derived as: values.shape[0] - total_candidates_seq_len.
+    total_candidates_seq_len: Optional[int] = None
 
     def copy_others_but_set_values(self, values: Optional[torch.Tensor] = None):
         """
-        copy all other fields but set values to the given tensor
+        Shallow-copy all metadata fields and set values to the given tensor.
+
+        Uses dataclasses.replace so that newly added fields are automatically
+        carried over, avoiding the "forgotten field" bug that plagues explicit
+        constructor calls.  Metadata tensors (seqlen, offsets, …) are shared
+        by reference — the same semantics as constructing a new JaggedData with
+        ``seqlen=self.seqlen`` — which keeps the autograd graph intact.
         """
-        new_instance = self.__class__.__new__(self.__class__)
-        for key, value in self.__dict__.items():
-            if key == "values":
-                new_instance.values = (
-                    values
-                    if values is not None
-                    else torch.tensor(
-                        [], device=self.values.device, dtype=self.values.dtype
-                    )
-                )
-            else:
-                setattr(new_instance, key, copy.deepcopy(value))
-        return new_instance
+        if values is None:
+            values = torch.tensor(
+                [], device=self.values.device, dtype=self.values.dtype
+            )
+        return dataclasses.replace(self, values=values)
 
     def __post_init__(self):
         if self.max_num_candidates == 0:
@@ -264,6 +264,7 @@ class JaggedData:
             else self.contextual_seqlen_offsets,
             has_interleaved_action=self.has_interleaved_action,
             scaling_seqlen=self.scaling_seqlen,
+            total_candidates_seq_len=self.total_candidates_seq_len,
         )
 
 

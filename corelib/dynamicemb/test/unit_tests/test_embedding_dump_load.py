@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import os
 import random
 import shutil
@@ -38,12 +37,15 @@ from dynamicemb.dump_load import (
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    get_sharded_table_shape,
+    get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
+from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from dynamicemb.types import AdmissionStrategy
+from dynamicemb.types import MAX_BUCKET_CAPACITY, AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType
@@ -82,6 +84,43 @@ def get_score_strategy(score_strategy_str: str) -> DynamicEmbScoreStrategy:
         return DynamicEmbScoreStrategy.LFU
     else:
         raise ValueError(f"Invalid score strategy: {score_strategy_str}")
+
+
+def assert_batched_dynamicemb_storage_class(
+    model,
+    *,
+    caching: bool,
+    global_hbm_budget_scale: float = 1.0,
+) -> None:
+    """Check ``BatchedDynamicEmbeddingTablesV2`` backing storage type.
+
+    - Must be :class:`DynamicEmbStorage` or :class:`HybridStorage`.
+    - With ``--caching``: expect ``DynamicEmbStorage`` (backing store under cache).
+    - No cache and ``global_hbm_budget_scale < 1``: expect ``HybridStorage``
+      (StorageMode DEFAULT / two-tier).
+    - No cache and full budget: expect single-tier ``DynamicEmbStorage``.
+    """
+    for _, _, sharded_module in find_sharded_modules(model, ""):
+        for emb in get_dynamic_emb_module(sharded_module):
+            storage = emb.tables
+            assert isinstance(storage, (DynamicEmbStorage, HybridStorage)), (
+                "BatchedDynamicEmbedding storage must be DynamicEmbStorage or "
+                f"HybridStorage, got {type(storage)}"
+            )
+            if caching:
+                assert isinstance(
+                    storage, DynamicEmbStorage
+                ), f"With --caching, expected DynamicEmbStorage, got {type(storage)}"
+            elif global_hbm_budget_scale < 1.0:
+                assert isinstance(storage, HybridStorage), (
+                    f"With global_hbm_budget_scale={global_hbm_budget_scale} (no cache), "
+                    f"expected HybridStorage, got {type(storage)}"
+                )
+            else:
+                assert isinstance(storage, DynamicEmbStorage), (
+                    "Full HBM budget without cache: expected DynamicEmbStorage, "
+                    f"got {type(storage)}"
+                )
 
 
 def update_scores(
@@ -186,13 +225,6 @@ class TestModel(nn.Module):
         return torch.cat(embeddings, dim=0)
 
 
-DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
-    DataType.FP32: 32,
-    DataType.FP16: 16,
-    DataType.BF16: 16,
-}
-
-
 def apply_dmp(
     model: torch.nn.Module,
     optimizer_kwargs: Dict[str, Any],
@@ -202,77 +234,45 @@ def apply_dmp(
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
+    global_hbm_budget_scale: float = 1.0,
 ):
-    eb_configs = []
-    dynamicemb_options_dict = {}
-    for n, m in model.named_modules():
+    eb_configs: List[EmbeddingConfig] = []
+    for _, m in model.named_modules():
         if type(m) in TORCHREC_TYPES:
             eb_configs.extend(m.embedding_configs())
-            for eb_config in eb_configs:
-                dim = eb_config.embedding_dim
-                tmp_type = eb_config.data_type
 
-                embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-                emb_num_embeddings = (
-                    eb_config.num_embeddings * cache_capacity_ratio
-                    if caching
-                    else eb_config.num_embeddings
-                )
-                emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
-                    math.log2(emb_num_embeddings)
-                )  # HKV need embedding vector num is power of 2
+    world_size = dist.get_world_size()
+    dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    for eb_config in eb_configs:
 
-                # Calculate optimizer state dimension
-                from dynamicemb.dynamicemb_config import (
-                    data_type_to_dtype,
-                    get_optimizer_state_dim,
-                )
-                from dynamicemb_extensions import OptimizerType
+        emb_opt_type = (
+            optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
+        ) or EmbOptimType.SGD
 
-                # Map fbgemm EmbOptimType to dynamicemb OptimizerType
-                emb_opt_type = (
-                    optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
-                )
-                opt_type_map = {
-                    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimizerType.RowWiseAdaGrad,
-                    EmbOptimType.SGD: OptimizerType.SGD,
-                    EmbOptimType.EXACT_SGD: OptimizerType.SGD,
-                    EmbOptimType.ADAM: OptimizerType.Adam,
-                    EmbOptimType.EXACT_ADAGRAD: OptimizerType.AdaGrad,
-                }
-                opt_type = opt_type_map.get(emb_opt_type) if emb_opt_type else None
-                # Convert torchrec DataType to torch.dtype
-                torch_dtype = data_type_to_dtype(tmp_type)
-                optimizer_state_dim = (
-                    get_optimizer_state_dim(opt_type, dim, torch_dtype)
-                    if opt_type
-                    else 0
-                )
+        value_bytes = get_table_value_bytes(
+            eb_config,
+            emb_opt_type,
+            world_size,
+            MAX_BUCKET_CAPACITY,
+        )
+        if caching:
+            global_hbm = int(value_bytes * cache_capacity_ratio)
+        else:
+            global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-                # Include optimizer state in HBM calculation
-                total_hbm_need = (
-                    embedding_type_bytes
-                    * (dim + optimizer_state_dim)
-                    * emb_num_embeddings_next_power_of_2
-                )
-
-                admission_counter = KVCounter(
-                    max(1024 * 1024, emb_num_embeddings_next_power_of_2 // 4)
-                )
-                dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
-                    global_hbm_for_values=total_hbm_need,
-                    score_strategy=score_strategy,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.CONSTANT,
-                        value=1e-1,
-                    ),
-                    bucket_capacity=emb_num_embeddings_next_power_of_2,
-                    max_capacity=emb_num_embeddings_next_power_of_2,
-                    caching=caching,
-                    local_hbm_for_values=1024**3,
-                    admit_strategy=admit_strategy,
-                    admission_counter=admission_counter,
-                )
+        admission_counter = KVCounter(max(1024 * 1024, eb_config.num_embeddings // (4 * world_size)))
+        dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+            global_hbm_for_values=global_hbm,
+            score_strategy=score_strategy,
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT,
+                value=1e-1,
+            ),
+            bucket_capacity=MAX_BUCKET_CAPACITY, # keep same to the bucket capacity from get_table_value_bytes
+            caching=caching,
+            admit_strategy=admit_strategy,
+            admission_counter=admission_counter,
+        )
     planner = get_planner(
         eb_configs,
         {},
@@ -311,6 +311,7 @@ def create_model(
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
+    global_hbm_budget_scale: float = 1.0,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -347,6 +348,7 @@ def create_model(
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
+        global_hbm_budget_scale=global_hbm_budget_scale,
     )
     return model
 
@@ -370,21 +372,14 @@ def check_counter_table_checkpoint(x, y):
                 freq_name = cnt_tx.table_.score_names_[0]
                 frequencies = named_scores[freq_name]
 
-                score_args_lookup = [
-                    ScoreArg(
-                        name=freq_name,
-                        value=torch.zeros_like(frequencies),
-                        policy=ScorePolicy.CONST,
-                        is_return=True,
-                    )
-                ]
-                founds = torch.empty(
-                    keys.numel(), dtype=torch.bool, device=device
-                ).fill_(False)
+                score_arg_lookup = ScoreArg(
+                    name=freq_name,
+                    value=torch.zeros_like(frequencies),
+                    policy=ScorePolicy.CONST,
+                )
+                _, founds, _ = cnt_ty.lookup(keys, score_arg_lookup)
 
-                cnt_ty.lookup(keys, score_args_lookup, founds)
-
-                assert torch.equal(frequencies, score_args_lookup)
+                assert torch.equal(frequencies, score_arg_lookup)
 
 
 @click.command()
@@ -493,15 +488,13 @@ def test_model_load_dump(
         for _, _, sharded_module in find_sharded_modules(model):
             dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
             for dynamic_emb_module in dynamic_emb_modules:
-                for table_name, table, counter_table in zip(
-                    dynamic_emb_module.table_names,
-                    dynamic_emb_module.tables,
-                    dynamic_emb_module._admission_counter,
-                ):
+                storage = dynamic_emb_module.tables
+                counter = dynamic_emb_module._admission_counter
+                for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
                     key_to_score = {}
                     visited_keys = set({})
-                    for batched_key, _, _, batched_score in table.export_keys_values(
-                        torch.device(f"cpu")
+                    for batched_key, _, _, batched_score in storage.export_keys_values(
+                        torch.device("cpu"), table_id=table_idx
                     ):
                         for key, score in zip(
                             batched_key.tolist(), batched_score.tolist()
@@ -512,8 +505,10 @@ def test_model_load_dump(
                         keys,
                         named_scores,
                         _,
-                    ) in counter_table.table_._batched_export_keys_scores(
-                        counter_table.table_.score_names_, torch.device(f"cpu")
+                    ) in counter.table_._batched_export_keys_scores(
+                        counter.table_.score_names_,
+                        torch.device("cpu"),
+                        table_id=table_idx,
                     ):
                         if keys.numel() == 0:
                             continue

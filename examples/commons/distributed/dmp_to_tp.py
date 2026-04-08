@@ -50,7 +50,6 @@ def dmp_batch_to_tp(batch: Any, exclude_features: bool = True) -> Any:
         output_batch.num_candidates = gather_along_first_dim(
             batch.num_candidates, tp_pg
         )
-
     if hasattr(batch, "labels") and batch.labels is not None:
         output_batch.labels = gatherv_along_first_dim(batch.labels, tp_pg)
     # reduce max seqlen

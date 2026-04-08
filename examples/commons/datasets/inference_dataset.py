@@ -330,4 +330,5 @@ class InferenceDataset(IterableDataset[HSTUBatch]):
             else None,
         )
         labels = labels if with_ranking_labels else None
-        return HSTUBatch(labels=labels, **batch_kwargs)
+        batch = HSTUBatch(labels=labels, **batch_kwargs)
+        return batch

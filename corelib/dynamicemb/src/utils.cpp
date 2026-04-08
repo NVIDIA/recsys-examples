@@ -32,6 +32,7 @@ DeviceProp::DeviceProp(int device_id) {
   this->max_thread_per_sm = device_prop.maxThreadsPerMultiProcessor;
   this->max_thread_per_block = device_prop.maxThreadsPerBlock;
   this->total_threads = this->num_sms * this->max_thread_per_sm;
+  this->totalGlobalMem = device_prop.totalGlobalMem;
 }
 
 } // namespace dyn_emb

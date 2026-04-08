@@ -34,16 +34,13 @@ enum class ScorePolicyType : uint8_t {
   GlobalTimer = 3,
 };
 
-struct ScorePolicy {
+template <ScorePolicyType PolicyType> struct ScorePolicy {
 
-  static __device__ __forceinline__ ScoreType get(ScorePolicyType policy_type,
-                                                  ScoreType *scores,
+  static __device__ __forceinline__ ScoreType get(ScoreType *scores,
                                                   int64_t index) {
-
-    if (policy_type == ScorePolicyType::Const) {
+    if constexpr (PolicyType == ScorePolicyType::Const) {
       return ScoreType();
-    }
-    if (policy_type == ScorePolicyType::GlobalTimer) {
+    } else if constexpr (PolicyType == ScorePolicyType::GlobalTimer) {
       ScoreType score;
       asm volatile("mov.u64 %0,%%globaltimer;" : "=l"(score));
       return score;
@@ -53,33 +50,22 @@ struct ScorePolicy {
   }
 
   static __device__ __forceinline__ ScoreType
-  score_for_compare(ScorePolicyType policy_type, ScoreType score) {
+  score_for_compare(ScoreType score) {
     return UINT64_MAX;
   }
 
-  static __device__ __forceinline__ void update(ScorePolicyType policy_type,
-                                                bool is_return,
-                                                ScoreType *table_score,
-                                                ScoreType &score) {
-
-    if (policy_type == ScorePolicyType::Const) {
-      if (is_return) {
-        score = *table_score;
-      }
-      return;
-    }
-    if (policy_type == ScorePolicyType::Accumulate) {
+  // Updates table slot and returns the output score.
+  static __device__ __forceinline__ ScoreType update(ScoreType *table_score,
+                                                     ScoreType score) {
+    if constexpr (PolicyType == ScorePolicyType::Const) {
+      return *table_score;
+    } else if constexpr (PolicyType == ScorePolicyType::Accumulate) {
       score += *table_score;
       *table_score = score;
+      return score;
     } else {
       *table_score = score;
-    }
-  }
-
-  static __device__ __forceinline__ void set(bool is_return, ScoreType *scores,
-                                             int64_t index, ScoreType score) {
-    if (is_return) {
-      scores[index] = score;
+      return score;
     }
   }
 };

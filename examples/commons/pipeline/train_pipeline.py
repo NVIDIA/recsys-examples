@@ -687,6 +687,16 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
 
 class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
+    """Native pipeline with 2-phase async KK load-balancing.
+
+    When the balanced shuffler is enabled, the Karmarkar-Karp (KK) algorithm
+    — which is **pure CPU** — is submitted to a background thread so it can
+    overlap with the current iteration's forward / backward.  All NCCL
+    collectives (AllGather workloads, AllGather batch, loss AllReduce, DDP
+    AllReduce …) remain on the **main thread**, guaranteeing a deterministic
+    per-rank enqueue order on each NCCL communicator and avoiding deadlocks.
+    """
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -712,6 +722,9 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd,
             batch_shuffler=batch_shuffler,
         )
+        self._is_identity_shuffler = isinstance(
+            batch_shuffler, IdentityBalancedBatchShuffler
+        )
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
@@ -719,6 +732,15 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt (expecting input_dist)
             batches[1]: next batch, for input_dist (expecting copied to device)
             batches[2]: i+2 batch, for copy_batch_to_gpu_and_shuffle (expecting non-exhausted dataloader iter)
+
+        Stream discipline for balanced shuffler NCCL safety:
+        ALL shuffle NCCL / GPU ops run on ``_memcpy_stream`` so that
+        ``_start_sparse_data_dist``'s built-in ``_wait_for_batch(batch,
+        _memcpy_stream)`` automatically ensures the shuffled data is visible
+        to ``_data_dist_stream``.  Phase 1's AllGather is placed AFTER
+        ``wait_sparse_data_dist`` to guarantee ``_data_dist_stream`` is idle
+        — preventing two streams from submitting to the same NCCL
+        communicator concurrently.
         """
 
         # attach the model just in case the user forgets to call it, especially when the user
@@ -752,12 +774,60 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                 # invoke splits all_to_all comms (first part of input_dist)
                 self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
-        # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
-        with nvtx.annotate("## enqueue_batch ##"):
-            self.enqueue_batch(dataloader_iter)
-        # forward
+        # ---- H2D for next batch (on _memcpy_stream, no NCCL) ----
+        with nvtx.annotate("## copy_batch_to_gpu ##"):
+            enqueue_context = self._create_context()
+            raw_batch = self._next_batch(dataloader_iter)
+            if raw_batch is not None:
+                with self._stream_context(self._memcpy_stream):
+                    raw_batch = _to_device(raw_batch, self._device, non_blocking=True)
+            self._enqueue_context = enqueue_context
+
+        # ---- wait_sparse_data_dist: ensures _data_dist_stream is idle ----
+        # This MUST happen before any shuffle NCCL on _memcpy_stream to
+        # prevent two streams from concurrently submitting to the same
+        # NCCL communicator (DP group).
+        if len(self.batches) >= 2:
+            with nvtx.annotate("## wait_sparse_data_dist ##"):
+                self.wait_sparse_data_dist(self.contexts[1])
+
+        # ---- Shuffle Phase 1 (on _memcpy_stream): AllGather workloads + submit KK ----
+        shuffle_handle = None
+        if raw_batch is not None and not self._is_identity_shuffler:
+            with nvtx.annotate("## start_kk_async ##"):
+                with self._stream_context(self._memcpy_stream):
+                    shuffle_handle = self._batch_shuffler.start_shuffle_async(
+                        raw_batch, parallel_state.get_data_parallel_group()
+                    )
+
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self.batches[0])
+
+        # ---- Shuffle Phase 2 (on _memcpy_stream): wait KK + AllGather batch + index_select ----
+        with nvtx.annotate("## finish_shuffle ##"):
+            if raw_batch is not None:
+                if not self._is_identity_shuffler:
+                    assert (
+                        shuffle_handle is not None
+                    ), "shuffle_handle must be set by start_shuffle_async"
+                    with self._stream_context(self._memcpy_stream):
+                        raw_batch = self._batch_shuffler.finish_shuffle(
+                            raw_batch,
+                            shuffle_handle,
+                            parallel_state.get_data_parallel_group(),
+                        )
+                self.batches.append(raw_batch)
+                self.contexts.append(self._enqueue_context)
+
+        # NCCL communicator ordering guard (see prefetch variant for details):
+        # _memcpy_stream has AllGather × 2 (shuffle), default stream has
+        # loss AllReduce + DDP AllReduce — all on DP-group comm.
+        # Without wait_stream, cross-rank NCCL op ordering may diverge → deadlock.
+        if not self._is_identity_shuffler and self._memcpy_stream is not None:
+            torch.get_device_module(self._device).current_stream().wait_stream(
+                self._memcpy_stream
+            )
+
         with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()
@@ -766,10 +836,6 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             torch.distributed.all_reduce(
                 reporting_loss, group=parallel_state.get_data_parallel_group()
             )
-        if len(self.batches) >= 2:
-            # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
-            with nvtx.annotate("## wait_sparse_data_dist ##"):
-                self.wait_sparse_data_dist(self.contexts[1])
 
         if self._model.training:
             # backward
@@ -792,6 +858,14 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 class JaggedMegatronPrefetchTrainPipelineSparseDist(
     PrefetchTrainPipelineSparseDist[In, Out]
 ):
+    """Prefetch pipeline with 2-phase async KK load-balancing.
+
+    Same principle as ``JaggedMegatronTrainPipelineSparseDist``: the
+    CPU-only KK algorithm runs in a background thread while forward /
+    backward execute on the main thread.  All NCCL collectives stay on the
+    main thread.
+    """
+
     def __init__(
         self,
         model: torch.nn.Module,  # might be wrapped by DistributedModelParallel
@@ -815,8 +889,24 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             custom_model_fwd,
             batch_shuffler,
         )
+        self._is_identity_shuffler = isinstance(
+            batch_shuffler, IdentityBalancedBatchShuffler
+        )
 
     def progress(self, dataloader_iter: Iterator[In]) -> Tuple[torch.Tensor, Out]:
+        """Prefetch pipeline with 2-phase async KK.
+
+        Stream discipline (same principle as the native variant):
+
+        * All shuffle NCCL / GPU work → ``_memcpy_stream``
+        * Phase 1 AllGather placed **after** ``_wait_sparse_data_dist`` so
+          ``_data_dist_stream`` is idle → no concurrent NCCL on same comm.
+        * ``default_stream.wait_stream(_memcpy_stream)`` before loss
+          AllReduce → NCCL ordering on DP comm is deterministic.
+        * ``_start_sparse_data_dist`` internally does
+          ``_data_dist_stream.wait_stream(_memcpy_stream)`` → shuffled
+          batch data is visible before input_dist reads it.
+        """
         self._fill_pipeline(dataloader_iter)
 
         if self._model.training:
@@ -828,14 +918,67 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         with nvtx.annotate("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
 
-        with nvtx.annotate("## copy_batch_to_gpu_and_shuffle ##"):
-            self._batch_ip2 = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
+        # ---- H2D for next batch (on _memcpy_stream, no NCCL) ----
+        with nvtx.annotate("## copy_batch_to_gpu ##"):
+            raw_batch = self._next_batch(dataloader_iter)
+            if raw_batch is not None:
+                with self._stream_context(self._memcpy_stream):
+                    raw_batch = _to_device(raw_batch, self._device, non_blocking=True)
+            elif not self._execute_all_batches:
+                raise StopIteration
+
+        # ---- wait_sparse_data_dist: ensures _data_dist_stream is idle ----
         with nvtx.annotate("## wait_sparse_data_dist ##"):
             self._wait_sparse_data_dist()
+
+        # ---- Shuffle Phase 1 (on _memcpy_stream): AllGather workloads + submit KK ----
+        shuffle_handle = None
+        if raw_batch is not None and not self._is_identity_shuffler:
+            with nvtx.annotate("## start_kk_async ##"):
+                with self._stream_context(self._memcpy_stream):
+                    shuffle_handle = self._batch_shuffler.start_shuffle_async(
+                        raw_batch, parallel_state.get_data_parallel_group()
+                    )
+
         # forward
         reporting_loss = None
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self._batch_i)
+
+        # ---- Shuffle Phase 2 (on _memcpy_stream): wait KK + AllGather batch + index_select ----
+        with nvtx.annotate("## finish_shuffle ##"):
+            if raw_batch is not None:
+                if not self._is_identity_shuffler:
+                    assert (
+                        shuffle_handle is not None
+                    ), "shuffle_handle must be set by start_shuffle_async"
+                    with self._stream_context(self._memcpy_stream):
+                        self._batch_ip2 = self._batch_shuffler.finish_shuffle(
+                            raw_batch,
+                            shuffle_handle,
+                            parallel_state.get_data_parallel_group(),
+                        )
+                else:
+                    self._batch_ip2 = raw_batch
+            else:
+                self._batch_ip2 = None
+
+        # NCCL communicator ordering guard:
+        # _memcpy_stream has: [AllGather workloads] → [AllGather batch]
+        # default stream has: [forward] → [loss AllReduce] → [DDP AllReduce]
+        # Both use the same DP-group NCCL communicator.  Without this
+        # wait_stream, the two streams race independently and different
+        # ranks may interleave ops in different orders, e.g.:
+        #   Rank 0 (KK slow, fwd fast): AllReduce arrives at NCCL first
+        #   Rank 1 (KK fast, fwd slow): AllGather arrives at NCCL first
+        # → cross-rank ordering mismatch on the same communicator → deadlock.
+        # wait_stream forces:  AllGather × 2  ─before─▶  AllReduce
+        # making the NCCL order globally consistent across all ranks.
+        if not self._is_identity_shuffler and self._memcpy_stream is not None:
+            torch.get_device_module(self._device).current_stream().wait_stream(
+                self._memcpy_stream
+            )
+
         with nvtx.annotate("## loss postprocess ##"):
             collective_assert(not torch.isnan(losses).any(), "loss has nan value")
             local_tokens = torch.tensor(losses.size(0), device=self._device).float()

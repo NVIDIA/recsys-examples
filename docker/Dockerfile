@@ -60,23 +60,23 @@ RUN apt update -y --fix-missing && \
 
 RUN pip install --no-cache pre-commit
 
-WORKDIR /workspace/recsys-examples
-COPY . .
-
-RUN cd /workspace/recsys-examples/corelib/hstu && \
-    HSTU_DISABLE_86OR89=FALSE HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DRAB=TRUE pip install . && \
-    cd hopper && \
-    HSTU_DISABLE_ARBITRARY=TRUE HSTU_DISABLE_SM8x=TRUE HSTU_DISABLE_LOCAL=TRUE HSTU_DISABLE_RAB=TRUE HSTU_DISABLE_DELTA_Q=FALSE HSTU_DISABLE_DRAB=TRUE pip install .
-
-RUN rm -rf /workspace/recsys-examples/*
+# Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule
+COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
+RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
+    HSTU_DISABLE_86OR89=FALSE \
+    HSTU_DISABLE_ARBITRARY=TRUE \
+    HSTU_DISABLE_LOCAL=TRUE \
+    HSTU_DISABLE_RAB=TRUE \
+    HSTU_DISABLE_DRAB=TRUE \
+    HSTU_DISABLE_FP16=TRUE \
+    HSTU_ARCH_LIST="8.0 9.0" \
+    pip install . && \
+    rm -rf /workspace/deps/fbgemm_hstu
 
 FROM ${DEVEL_IMAGE} AS build
 ARG TRITONSERVER_BUILD
 
 WORKDIR /workspace/recsys-examples
-# to remove the pre-installed hstu packages of the previous build
-RUN rm -rf /workspace/recsys-examples/*
-# COPY the new cloned repo into workdir
 COPY . .
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \

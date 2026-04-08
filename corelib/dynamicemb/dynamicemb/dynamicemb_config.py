@@ -14,27 +14,37 @@
 # limitations under the License.
 
 import enum
+import math
 import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import sqrt
-from typing import Dict, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from dynamicemb.types import (
+    BUCKET_ALIGNMENT,
+    DEMB_TABLE_ALIGN_SIZE,
+    MAX_BUCKET_CAPACITY,
     AdmissionStrategy,
-    Counter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     Storage,
 )
-from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy, OptimizerType
+from dynamicemb.optimizer import get_optimizer_state_dim
+from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
+from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 
 DEFAULT_INDEX_TYPE = torch.int64
 DYNAMICEMB_CSTM_SCORE_CHECK = "DYNAMICEMB_CSTM_SCORE_CHECK"
 BATCH_SIZE_PER_DUMP = 65536
+# Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
+DEBUG_EMB_INITIALIZER_MOD = 100_000
+# Default hashtable bucket width in rows; keep in sync with
+# :class:`DynamicEmbTableOptions` and :func:`get_table_value_bytes`.
+DEFAULT_BUCKET_CAPACITY = 128
 
 
 def warning_for_cstm_score() -> None:
@@ -120,106 +130,69 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     CUSTOMIZED:
         Each embedding table's score are managed by users.
         Users have to set the score before every forward pass using `set_score` interface.
+    LFU:
+        If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+    NO_EVICTION:
+        The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
+        When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
     """
 
     TIMESTAMP = 0
     STEP = 1
     CUSTOMIZED = 2
     LFU = 3
-
-
-# TODO: jiashuy, reorganize it
-@dataclass
-class _ContextOptions:
-    """
-    Parameters in InternalConfigs is not configurable when using dynamicemb by DistributedModelParallel.
-    Internal Configurations that including three parts:
-
-    1. Fixed
-        score_type : torch.dtype
-            Score represents how important an embedding item is. This specifies the type of the score.
-
-    2. Inferred from the context: from params already defined in torchrec, or from the runtime env, e.g. world size.
-        embedding_dtype : Optional[torch.dtype], optional
-            Data (weight) type of dynamic embedding table.
-        dim : Optional[int], optional
-            The dimensionality of the value vectors. Default is -1, indicating it should be set explicitly.
-        max_capacity : Optional[int], optional
-                The maximum capacity of the shard of the embedding table on a single GPU. Automatically set in the shared planner.
-                It is not configurable, but it's important for the total memory consumption.
-                It will be automatically inferred from EmbeddingConfig.num_embeddings and the world size, rounded up to a power of 2，
-                    and minimized to the size of bucket capacity of the hash table.
-                If init_capacity is set, max_capacity will not be smaller than init_capacity.
-        evict_strategy : DynamicEmbEvictStrategy
-            Strategy used for evicting entries when the table exceeds its capacity. Default is DynamicEmbEvictStrategy.LRU.
-        local_hbm_for_values : int
-            High-bandwidth memory allocated for local values, in bytes. Default is 0.
-        num_aligned_embedding_per_rank: int
-                Number of aligned embedding per rank when the `num_embeddings` does not meet our alignment requirements, default to None.
-        device_id : Optional[int], optional
-                CUDA device index.
-        optimizer_type: OptimizerType, used internally to determine how much memory optimizer states will consume,
-            and default to `OptimizerType.Null`.
-
-    3. Will be removed in the feature.
-        block_size : int
-            The size of blocks used during operations. Default is 128.
-        io_block_size : int
-            The size of input/output blocks during data transfer operations. Default is 1024.
-        io_by_cpu : bool
-            Flag indicating whether to use CPU for handling IO operations. Default is False.
-        use_constant_memory : bool
-            Flag to indicate if constant memory should be utilized. Default is False.
-        reserved_key_start_bit : int
-            Bit offset for reserved keys in the key space. Default is 0.
-        num_of_buckets_per_alloc : int
-            Number of buckets allocated per memory allocation request. Default is 1.
-
-    """
-
-    # Fixed:
-    score_type: torch.dtype = torch.uint64
-
-    # Inferred from the context.
-    embedding_dtype: Optional[torch.dtype] = None
-    dim: Optional[int] = None
-    max_capacity: Optional[int] = None
-    evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
-    local_hbm_for_values: int = 0  # in bytes
-    num_aligned_embedding_per_rank: int = None
-    device_id: Optional[int] = None
-    optimizer_type: OptimizerType = OptimizerType.Null
-
-    # Will be removed in the future, please ignore them
-    block_size: int = 128
-    io_block_size: int = 1024
-    io_by_cpu: bool = False  # use cpu to deal with the value copy.
-    use_constant_memory: bool = False
-    reserved_key_start_bit: int = 0
-    num_of_buckets_per_alloc: int = 1
+    NO_EVICTION = 4
 
 
 @dataclass
-class DynamicEmbTableOptions(_ContextOptions):
+class DynamicEmbTableOptions:
     """
     Encapsulates the configuration options for dynamic embedding table.
 
-    This class include parameters that control the behavior and performance of embedding lookup module, specifically tailored for dynamic embeddings.
+    This class includes parameters that control the behavior and performance of the embedding lookup module, specifically tailored for dynamic embeddings.
     `get_grouped_key` will return fields used to group dynamic embedding tables.
+
+    Fields listed first (through ``device_id``) are often filled by the planner or runtime rather than
+    being the main user configuration knobs. Score handling for the hash table follows score
+    policies and kernels, not a separate score-dtype field on this dataclass.
 
     Parameters
     ----------
+    embedding_dtype : Optional[torch.dtype], optional
+        Data (weight) type of dynamic embedding table.
+    dim : Optional[int], optional
+        Value vector dimension. With ``DynamicEmbeddingShardingPlanner``, ``_prepare_dynemb_table_options``
+        sets it from ``BaseEmbeddingConfig.embedding_dim``. The embedding kernel only warns if it
+        differs from the sharded ``local_cols`` (see ``_get_dynamicemb_options_per_table``).
+    max_capacity : Optional[int], optional
+        Per-shard maximum table rows on one GPU. With ``DynamicEmbeddingShardingPlanner``,
+        ``_prepare_dynemb_table_options`` sets ``max_capacity`` to
+        ``num_buckets * bucket_capacity`` from :func:`get_sharded_table_shape`.
+        If ``init_capacity`` is unset it becomes ``max_capacity``; if set and aligned,
+        it is clamped to at most ``max_capacity``.
+        The embedding kernel checks consistency with TorchREC shard metadata (see
+        ``_get_dynamicemb_options_per_table``).
+    evict_strategy : DynamicEmbEvictStrategy
+        Strategy used for evicting entries when the table exceeds its capacity.
+        Default is :attr:`DynamicEmbEvictStrategy.LRU`.
+    local_hbm_for_values : int
+        High-bandwidth memory allocated for local values, in bytes. Default is 0.
+        With ``DynamicEmbeddingShardingPlanner``, this is set to
+        ``ceil(global_hbm_for_values / world_size)`` per rank.
+    device_id : Optional[int], optional
+        CUDA device index.
     training: bool
         Flag to indicate dynamic embedding tables is working on training mode or evaluation mode, default to `True`.
-        If in training mode. **dyanmicemb** store embeddings and optimizer states together in the underlying key-value table. e.g.
+        If in training mode. **dynamicemb** stores embeddings and optimizer states together in the underlying key-value table. e.g.
         ```python
         key:torch.int64
         value = torch.concat(embedding, opt_states, dim=1)
         ```
-        Therefore, if `training=True` dynamicemb will allocate memory for optimizer states whose consumption is decided by the `optimizer_type` which got from `fused_params`.
+        Therefore, if `training=True` the module allocates memory for optimizer states; the per-row state size follows the ``optimizer`` entry in ``fused_params`` (FBGEMM ``EmbOptimType``), as used by :class:`~dynamicemb.batched_dynamicemb_tables.BatchedDynamicEmbeddingTablesV2`.
     initializer_args : DynamicEmbInitializerArgs
         Arguments for initializing dynamic embedding vector values when training, and default using uniform distribution.
-        For `UNIFORM` and `TRUNCATED_NORMAL`, the `lower` and `upper` will set to $\pm {1 \over \sqrt{EmbeddingConfig.num\_embeddings}}$.
+        For ``UNIFORM`` and ``TRUNCATED_NORMAL``, ``lower`` and ``upper`` default to
+        ``±1/sqrt(N)`` where ``N`` is ``EmbeddingConfig.num_embeddings``.
     eval_initializer_args: DynamicEmbInitializerArgs
         The initializer args for evaluation mode, and will return torch.zeros(...) as embedding by default if index/sparse feature is missing.
     caching: bool
@@ -241,12 +214,16 @@ class DynamicEmbTableOptions(_ContextOptions):
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
         If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
-        If set, it will be rounded up to the power of 2.
+        With :class:`~dynamicemb.planner.planner.DynamicEmbeddingShardingPlanner`, it is rounded up
+        to a multiple of the effective ``bucket_capacity`` in ``_prepare_dynemb_table_options``,
+        then capped at ``max_capacity`` if the aligned value is larger.
         As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
         Rehash will be done implicitly.
         Note: This is the setting for a single table at each rank.
     max_load_factor : float
         The maximum load factor before rehashing occurs. Default is 0.5.
+        In NO_EVICTION mode, this option is ignored; the implementation uses
+        a fixed effective max load factor of 0.5 for the key_index_map.
     score_strategy(DynamicEmbScoreStrategy):
         dynamicemb gives each key-value pair a score to represent its importance.
         Once there is insufficient space, the key-value pair will be evicted based on the score.
@@ -284,8 +261,16 @@ class DynamicEmbTableOptions(_ContextOptions):
         Default is None (no counter is used).
     Notes
     -----
-    For detailed descriptions and additional context on each parameter, please refer to the documentation in this repository.
+    The ``DynamicEmb_APIs.md`` file in the ``dynamicemb`` package mirrors this class and related planner
+    behavior (e.g. :class:`~dynamicemb.planner.planner.DynamicEmbeddingShardingPlanner`).
     """
+
+    embedding_dtype: Optional[torch.dtype] = None
+    dim: Optional[int] = None
+    max_capacity: Optional[int] = None
+    evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
+    local_hbm_for_values: int = 0  # in bytes
+    device_id: Optional[int] = None
 
     training: bool = True
     initializer_args: DynamicEmbInitializerArgs = field(
@@ -303,26 +288,18 @@ class DynamicEmbTableOptions(_ContextOptions):
     ] = None  # if not set then set to max_capcacity after sharded
     max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
-    bucket_capacity: int = 128
+    bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
     safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
     admit_strategy: Optional[AdmissionStrategy] = None
-    admission_counter: Optional[Counter] = None
+    admission_counter: Optional[Any] = None
 
     def __post_init__(self):
         assert (
             self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
         ), "eval_initializer_args must be constant initialization"
-
-        if self.init_capacity is not None:
-            target_init_capacity = _next_power_of_2(self.init_capacity)
-            if self.init_capacity != target_init_capacity:
-                warnings.warn(
-                    f"init_capacity is changed to {target_init_capacity} from {self.init_capacity}"
-                )
-                self.init_capacity = target_init_capacity
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
@@ -412,25 +389,6 @@ def dyn_emb_to_torch(data_type: DynamicEmbDataType) -> torch.dtype:
         raise ValueError(f"Unsupported DynamicEmbDataType: {data_type}")
 
 
-def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:
-    if torch_dtype == torch.float32:
-        return DynamicEmbDataType.Float32
-    elif torch_dtype == torch.bfloat16:
-        return DynamicEmbDataType.BFloat16
-    elif torch_dtype == torch.float16:
-        return DynamicEmbDataType.Float16
-    elif torch_dtype == torch.int64:
-        return DynamicEmbDataType.Int64
-    elif torch_dtype == torch.uint64:
-        return DynamicEmbDataType.UInt64
-    elif torch_dtype == torch.int32:
-        return DynamicEmbDataType.Int32
-    elif torch_dtype == torch.uint32:
-        return DynamicEmbDataType.UInt32
-    else:
-        raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
-
-
 def dtype_to_bytes(dtype: torch.dtype) -> int:
     dtype_size_map = {
         torch.float16: 2,
@@ -467,72 +425,173 @@ def string_to_evict_strategy(strategy_str: str) -> EvictStrategy:
         raise ValueError(f"Invalid EvictStrategy string: {strategy_str}")
 
 
-DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
-    torch.float32: 4,
-    torch.float16: 2,
-    torch.bfloat16: 2,
-}
+def complete_initializer_args(
+    initializer_args: DynamicEmbInitializerArgs,
+    *,
+    embedding_config: Optional[BaseEmbeddingConfig] = None,
+) -> DynamicEmbInitializerArgs:
+    """Complete missing UNIFORM ``lower`` / ``upper`` from ``embedding_config`` (or defaults).
 
+    Does not mutate ``initializer_args``. If defaults are applied, returns a new
+    :class:`~dynamicemb.types.DynamicEmbInitializerArgs`; otherwise returns the
+    same instance unchanged.
 
-def get_optimizer_state_dim(optimizer_type, dim, dtype):
-    if optimizer_type == OptimizerType.RowWiseAdaGrad:
-        return 16 // DTYPE_NUM_BYTES[dtype]
-    elif optimizer_type == OptimizerType.Adam:
-        return dim * 2
-    elif optimizer_type == OptimizerType.AdaGrad:
-        return dim
+    Parameters
+    ----------
+    initializer_args
+        Requested initializer; only ``UNIFORM`` mode may get ``lower`` / ``upper`` filled.
+    embedding_config
+        Used to set default bounds as ``±sqrt(1 / num_embeddings)`` when the
+        corresponding bound is ``None``. If omitted, defaults are ``0.0`` and ``1.0``.
+    """
+    if initializer_args.mode != DynamicEmbInitializerMode.UNIFORM:
+        return initializer_args
+
+    needs_lower = initializer_args.lower is None
+    needs_upper = initializer_args.upper is None
+    if not needs_lower and not needs_upper:
+        return initializer_args
+
+    if embedding_config is not None:
+        scale = sqrt(1.0 / float(embedding_config.num_embeddings))
+        default_lower = -scale
+        default_upper = scale
     else:
-        return 0
+        default_lower = 0.0
+        default_upper = 1.0
 
-
-# TODO: sync with table
-def validate_initializer_args(
-    initializer_args: DynamicEmbInitializerArgs, eb_config: BaseEmbeddingConfig = None
-) -> None:
-    if initializer_args.mode == DynamicEmbInitializerMode.UNIFORM:
-        default_lower = -sqrt(1 / eb_config.num_embeddings) if eb_config else 0.0
-        default_upper = sqrt(1 / eb_config.num_embeddings) if eb_config else 1.0
-        if initializer_args.lower is None:
-            initializer_args.lower = default_lower
-        if initializer_args.upper is None:
-            initializer_args.upper = default_upper
+    return replace(
+        initializer_args,
+        lower=default_lower if needs_lower else initializer_args.lower,
+        upper=default_upper if needs_upper else initializer_args.upper,
+    )
 
 
 def get_constraint_capacity(
     memory_bytes,
     dtype,
     dim,
-    optimizer_type,
+    optimizer_type: EmbOptimType,
     bucket_capacity,
 ) -> int:
     byte_consume_per_vector = (
         dim + get_optimizer_state_dim(optimizer_type, dim, dtype)
     ) * dtype_to_bytes(dtype)
     bucket_size_in_bytes = bucket_capacity * byte_consume_per_vector
-    assert (
-        memory_bytes >= bucket_size_in_bytes
-    ), f"reserved HBM bytes {memory_bytes} on rank {torch.distributed.get_rank()} is less than one bucket {bucket_size_in_bytes}"
-    capacity = (
-        memory_bytes // byte_consume_per_vector
-    )  # maybe zero, we need at least one bucket
+    # If reserved HBM is less than one bucket, round up to one bucket
+    if memory_bytes < bucket_size_in_bytes:
+        warnings.warn(
+            f"Reserved HBM ({memory_bytes} bytes) is less than one bucket "
+            f"({bucket_size_in_bytes} bytes). Rounding up to one bucket.",
+            UserWarning,
+        )
+        memory_bytes = bucket_size_in_bytes
+    capacity = memory_bytes // byte_consume_per_vector  # at least one bucket
     return (capacity // bucket_capacity) * bucket_capacity
 
 
-def _next_power_of_2(n):
-    # Handle the case where n is 0
-    if n == 0:
-        return 1
+def align_to_table_size(n: int, alignment: int = DEMB_TABLE_ALIGN_SIZE) -> int:
+    """Round up n to a multiple of ``alignment``.
 
-    # If n is already a power of 2, return n
-    if (n & (n - 1)) == 0:
-        return n
+    Non-positive values are treated as 0 and rounded up to ``alignment``
+    to avoid zero capacity in planners/tables.
+    """
+    n = int(n)
+    if n <= 0:
+        return alignment
+    return (n + alignment - 1) // alignment * alignment
 
-    # Find the next power of 2
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32  # This line is necessary for 64-bit integers
-    return n + 1
+
+def get_sharded_table_shape(
+    embedding_config: BaseEmbeddingConfig,
+    world_size: int,
+    bucket_capacity: int,
+) -> Tuple[int, int]:
+    """Per-rank hashtable bucket layout: number of buckets and bucket width (rows per bucket).
+
+    Per-rank row capacity is ``num_buckets * bucket_capacity``. Same rules as the embedding
+    sharding planner when filling ``max_capacity`` (via that product) and ``bucket_capacity``.
+
+    Parameters
+    ----------
+    embedding_config
+        TorchREC embedding table config (e.g. :class:`~torchrec.modules.embedding_configs.EmbeddingConfig`);
+        uses :attr:`~torchrec.modules.embedding_configs.BaseEmbeddingConfig.num_embeddings`.
+    world_size
+        Number of ranks (must be positive).
+    bucket_capacity
+        Requested bucket size in rows. If set to :data:`dynamicemb.types.MAX_BUCKET_CAPACITY`
+        (``2**63 - 1``), returns ``(1, effective_bucket_rows)`` where the bucket spans the
+        full per-rank table (aligned to :data:`BUCKET_ALIGNMENT`). Otherwise ``bucket_capacity``
+        must be a positive multiple of :data:`BUCKET_ALIGNMENT`.
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(num_buckets, bucket_capacity)`` for one rank. The first value is **not** per-rank table
+        capacity in rows; callers must use ``num_buckets * bucket_capacity`` whenever they need
+        row capacity (e.g. to match per-rank ``max_capacity`` set by the planner).
+    """
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+
+    num_global = int(embedding_config.num_embeddings)
+    shard_rows = math.ceil(num_global / world_size)
+
+    if bucket_capacity == MAX_BUCKET_CAPACITY:
+        effective_bucket = align_to_table_size(shard_rows, BUCKET_ALIGNMENT)
+        return 1, effective_bucket
+
+    if bucket_capacity <= 0:
+        raise ValueError(
+            f"bucket_capacity must be positive when not MAX_BUCKET_CAPACITY, "
+            f"got {bucket_capacity}"
+        )
+    if bucket_capacity % BUCKET_ALIGNMENT != 0:
+        raise ValueError(
+            f"bucket_capacity ({bucket_capacity}) must be a multiple of "
+            f"BUCKET_ALIGNMENT ({BUCKET_ALIGNMENT}) when not using MAX_BUCKET_CAPACITY."
+        )
+
+    table_capacity = align_to_table_size(shard_rows, bucket_capacity)
+    num_buckets = table_capacity // bucket_capacity
+    return num_buckets, bucket_capacity
+
+
+def get_table_value_bytes(
+    embedding_config: BaseEmbeddingConfig,
+    optimizer_type: EmbOptimType,
+    world_size: int,
+    bucket_capacity: int = DEFAULT_BUCKET_CAPACITY,
+) -> int:
+    """Return how many bytes one DynamicEmb table needs for stored values across all ranks.
+
+    This counts embedding plus optimizer-state storage. Per-rank rows are
+    ``num_buckets * bucket_capacity`` from :func:`get_sharded_table_shape`; multiply by
+    ``world_size`` for total rows, then by ``element_size * (dim + optimizer_state_dim)`` per row.
+    The result uses the same rules as table construction with the sharding planner.
+
+    Parameters
+    ----------
+    embedding_config
+        Table shape and dtype from TorchREC (``num_embeddings``, ``embedding_dim``, ``data_type``).
+    optimizer_type
+        FBGEMM ``EmbOptimType``; see :func:`dynamicemb.optimizer.get_optimizer_state_dim`.
+    world_size
+        Number of ranks, as in distributed planning.
+    bucket_capacity
+        Hashtable bucket width in rows, consistent with :func:`get_sharded_table_shape`
+        and ``DynamicEmbTableOptions.bucket_capacity`` (default
+        :data:`DEFAULT_BUCKET_CAPACITY`; including the ``MAX_BUCKET_CAPACITY``
+        sentinel when applicable).
+    """
+    num_buckets, bucket_cap = get_sharded_table_shape(
+        embedding_config, world_size, bucket_capacity
+    )
+    table_capacity_per_rank = num_buckets * bucket_cap
+    total_rows = table_capacity_per_rank * world_size
+    dim = embedding_config.embedding_dim
+    torch_dtype = data_type_to_dtype(embedding_config.data_type)
+    element_size = dtype_to_bytes(torch_dtype)
+    optimizer_state_dim = get_optimizer_state_dim(optimizer_type, dim, torch_dtype)
+    return int(element_size * (dim + optimizer_state_dim) * total_rows)

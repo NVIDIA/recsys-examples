@@ -1,10 +1,29 @@
 # HSTU
 
+> **⚠️ DEPRECATED — This package is legacy code.**
+>
+> The HSTU attention kernels have been migrated to the unified
+> [`fbgemm_gpu/experimental/hstu`](https://github.com/jiayus-nvidia/FBGEMM/tree/fix-hstu_standalone_building/fbgemm_gpu/experimental/hstu)
+> package under FBGEMM. The new package (`fbgemm_gpu_hstu`, import name: `hstu`)
+> provides a single build for both Ampere and Hopper, with additional features
+> such as `seqused_q`/`seqused_k`, FP8 block-scale quantization, and Blackwell (sm100) support.
+>
+> **Please install the new package instead.** The source is included as a git
+> submodule at `third_party/FBGEMM`:
+>
+> ```bash
+> # from the repo root
+> git submodule update --init --recursive
+> cd third_party/FBGEMM/fbgemm_gpu/experimental/hstu && pip install .
+> ```
+>
+> After installation, use `from hstu import hstu_attn_varlen_func` in Python.
+
 HSTU is a high-performance attention implementation for different NVIDIA GPU architectures:
 - **HSTU-2**: Runs on Ampere and Ada GPUs (A100, L20...)
 - **HSTU-3**: Optimized for Hopper GPUs (H100, H20...)
 
-## Installation
+## Installation (Legacy)
 
 ### HSTU-2
 ```sh

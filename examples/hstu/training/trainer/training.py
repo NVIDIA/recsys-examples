@@ -49,14 +49,21 @@ def evaluate(
     torch.cuda.nvtx.range_push(f"#evaluate")
     max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
     max_eval_iters = min(max_eval_iters, len(eval_loader))
-    # make a copy of eval_loader to avoid modifying the original loader
-    iterated_eval_loader = islice(eval_loader, len(eval_loader))
+    # Limit the iterator to exactly max_eval_iters elements so that it
+    # exhausts before (or together with) the loop.  This lets the
+    # prefetch pipeline drain its internal batch queue naturally via
+    # its _execute_all_batches / StopIteration mechanism — avoiding
+    # stale eval batches leaking into the next training slice.
+    iterated_eval_loader = islice(eval_loader, max_eval_iters)
     with torch.no_grad():
-        for i in range(max_eval_iters):
+        while True:
+            try:
+                reporting_loss, (_, logits, labels, _) = pipeline.progress(
+                    iterated_eval_loader
+                )
+            except StopIteration:
+                break
             eval_iter += 1
-            reporting_loss, (_, logits, labels, _) = pipeline.progress(
-                iterated_eval_loader
-            )
             stateful_metric_module(logits, labels)
         # compute will reset the states
         if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):
@@ -206,8 +213,13 @@ def train_with_pipeline(
                 ddp_seqlens = []
                 ddp_num_contextuals = []
                 ddp_num_candidates = []
-        # TODO CHECK if train pipeline is flushed
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
+            # The training slice's batched_iterator is already exhausted
+            # at this point, so the pipeline has drained naturally
+            # (batch_i=None, batch_ip1=None).  evaluate() now uses an
+            # islice-limited iterator + StopIteration-driven loop, so
+            # the pipeline also drains after eval — no stale batches
+            # leak between train and eval.
             pipeline._model.eval()
             evaluate(
                 pipeline,

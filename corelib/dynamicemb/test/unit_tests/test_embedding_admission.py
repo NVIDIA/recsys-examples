@@ -16,6 +16,7 @@ from dynamicemb.types import DynamicEmbInitializerArgs
 
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import (
+    assert_batched_dynamicemb_storage_class,
     create_model,
     get_optimizer_kwargs,
     get_score_strategy,
@@ -135,10 +136,9 @@ def get_table_keys(
 
         for dynamic_emb_module in dynamic_emb_modules:
             dynamic_emb_module.flush()
+            storage = dynamic_emb_module.tables
 
-            for table_name, table in zip(
-                dynamic_emb_module.table_names, dynamic_emb_module.tables
-            ):
+            for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
                 if table_names is not None and table_name not in set(
                     table_names[collection_name]
                 ):
@@ -146,7 +146,9 @@ def get_table_keys(
 
                 table_keys = set()
 
-                for keys, _, _, _ in table.export_keys_values(device, batch_size):
+                for keys, _, _, _ in storage.export_keys_values(
+                    device, batch_size, table_id=table_idx
+                ):
                     for key in keys:
                         table_keys.add(int(key))
 
@@ -242,6 +244,16 @@ def validate_admission_keys(
     default="timestamp",
     help="Score strategy",
 )
+@click.option(
+    "--global-hbm-budget-scale",
+    type=float,
+    default=1.0,
+    help=(
+        "Scale DynamicEmb HBM byte budget vs full table (after planner: per-rank "
+        "local_hbm). Values < 1.0 force HybridStorage and prefetch StorageMode "
+        "DEFAULT (_generic_forward_path), not HBM_DIRECT."
+    ),
+)
 def test_admission_strategy_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -254,13 +266,15 @@ def test_admission_strategy_validation(
     caching: bool,
     cache_capacity_ratio: float,
     score_strategy: str,
+    global_hbm_budget_scale: float,
 ):
     """Test admission strategy correctness by comparing with naive frequency counting.
 
     This test validates that only keys with frequency >= threshold are stored in tables.
-    It supports two modes:
-    - Storage-only (default): Tests admission in storage directly
-    - Cache + Storage (--caching): Tests admission through cache to storage
+    It supports:
+    - Storage-only (default): HBM-only DynamicEmbStorage when budget fits (HBM_DIRECT)
+    - StorageMode DEFAULT: pass --global-hbm-budget-scale < 1 to use HybridStorage
+    - Cache + Storage (--caching): admission through cache to storage
     """
 
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
@@ -291,6 +305,9 @@ def test_admission_strategy_validation(
         print(f"  - Cache capacity ratio: {cache_capacity_ratio}")
     else:
         print(f"  - Caching: DISABLED")
+    print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
+    if not caching and global_hbm_budget_scale < 1.0:
+        print(f"  - Storage path: expect HybridStorage (prefetch StorageMode DEFAULT)")
 
     # Create admission strategy
     admission_strategy = FrequencyAdmissionStrategy(
@@ -314,7 +331,17 @@ def test_admission_strategy_validation(
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
         admit_strategy=admission_strategy,  # Pass admission strategy
+        global_hbm_budget_scale=global_hbm_budget_scale,
     )
+    assert_batched_dynamicemb_storage_class(
+        model,
+        caching=caching,
+        global_hbm_budget_scale=global_hbm_budget_scale,
+    )
+    if dist.get_rank() == 0:
+        for _, _, sm in find_sharded_modules(model, ""):
+            for emb in get_dynamic_emb_module(sm):
+                print(f"  - Storage class: {type(emb.tables).__name__}")
 
     # Generate features with frequency tracking
     (

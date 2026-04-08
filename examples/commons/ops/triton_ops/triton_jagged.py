@@ -1105,6 +1105,8 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         offsets_b: Optional[torch.Tensor] = None,
         dense_size: int = 0,
         n_prefix_to_right: int = 0,
+        seq_len_a: Optional[int] = None,
+        seq_len_b: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         values = switch_to_contiguous_if_needed(values)
         is_dense_a: bool = offsets_a is None
@@ -1126,8 +1128,10 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         else:
             assert offsets_a is not None and offsets_b is not None
             B = offsets_a.shape[0] - 1
-            seq_len_a = int(offsets_a[-1].item())
-            seq_len_b = int(offsets_b[-1].item())
+            if seq_len_a is None:
+                seq_len_a = int(offsets_a[-1].item())
+            if seq_len_b is None:
+                seq_len_b = int(offsets_b[-1].item())
         _, D = values.shape
         BLOCK_D = triton.next_power_of_2(D)
         values_a = torch.empty((seq_len_a, D), device=values.device, dtype=values.dtype)
@@ -1180,7 +1184,9 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         return values_a, values_b
 
     @staticmethod
-    def backward(ctx, *d_values) -> Tuple[torch.Tensor, None, None, None, None, None]:
+    def backward(
+        ctx, *d_values
+    ) -> Tuple[torch.Tensor, None, None, None, None, None, None, None]:
         offsets_a, offsets_b = ctx.saved_tensors
         is_dense_a, is_dense_b = ctx.is_dense_a, ctx.is_dense_b
         values_a, values_b = d_values
@@ -1230,7 +1236,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 BLOCK_D=BLOCK_D,
             )
 
-        return dvalues, None, None, None, None, None
+        return dvalues, None, None, None, None, None, None, None
 
 
 @torch.fx.wrap
@@ -1323,6 +1329,8 @@ def triton_split_2D_jagged(
     offsets_b: Optional[torch.Tensor] = None,
     dense_size: int = 0,
     n_prefix_to_right: int = 0,
+    seq_len_a: Optional[int] = None,
+    seq_len_b: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _Split2DJaggedFunction.apply(
         values,
@@ -1331,6 +1339,8 @@ def triton_split_2D_jagged(
         offsets_b,
         dense_size,
         n_prefix_to_right,
+        seq_len_a,
+        seq_len_b,
     )
 
 

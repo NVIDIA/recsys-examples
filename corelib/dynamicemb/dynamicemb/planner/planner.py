@@ -16,10 +16,9 @@
 import math
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
-import torchrec
 from torch import distributed as dist
 from torch import nn
 from torchrec.distributed.comm import get_local_size
@@ -43,17 +42,15 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
-from torchrec.modules.embedding_configs import BaseEmbeddingConfig
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
 
-from ..batched_dynamicemb_compute_kernel import (
-    BatchedDynamicEmbedding,
-    BatchedDynamicEmbeddingBag,
-)
 from ..dynamicemb_config import (
+    DEFAULT_INDEX_TYPE,
     DynamicEmbKernel,
     DynamicEmbTableOptions,
-    _next_power_of_2,
-    validate_initializer_args,
+    align_to_table_size,
+    complete_initializer_args,
+    get_sharded_table_shape,
 )
 
 HBM_CAP: int = 32 * 1024 * 1024 * 1024
@@ -87,7 +84,10 @@ class DynamicEmbParameterSharding(ParameterSharding):
     DynamicEmb-specific parameter constraints that extend ParameterSharding.
     """
 
+    # provide a default value for compute_kernel
     compute_kernel: str = EmbeddingComputeKernel.CUSTOMIZED_KERNEL
+
+    # introduced fields by DynamicEmbParameterSharding
     customized_compute_kernel: Optional[str] = DynamicEmbKernel
     dist_type: str = "continuous"
     dynamicemb_options: Optional[DynamicEmbTableOptions] = field(
@@ -105,11 +105,36 @@ class DynamicEmbParameterSharding(ParameterSharding):
             k: v for k, v in all_fields.items() if k not in parameter_sharding_fields
         }
 
+    @staticmethod
+    def pop_additional_fused_params(fused_params: Dict[str, Any]) -> None:
+        """Remove DynamicEmb-only keys from ``GroupedEmbeddingConfig.fused_params`` before
+        :class:`~dynamicemb.batched_dynamicemb_tables.BatchedDynamicEmbeddingTablesV2`.
 
-def _validate_configs(
+        These entries are used for planning / per-table options and are not valid ``**fused_params``
+        for that module.
+        """
+        for f in (
+            "customized_compute_kernel",
+            "dist_type",
+            "dynamicemb_options",
+        ):
+            fused_params.pop(f, None)
+
+
+def _prepare_dynemb_table_options(
     constraints: Dict[str, DynamicEmbParameterConstraints],
     eb_configs: List[BaseEmbeddingConfig],
 ):
+    """Check ``constraints`` ↔ ``eb_configs`` naming, then fill per-table DynamicEmb options.
+
+    For each DynamicEmb table: ``complete_initializer_args``, then
+    ``get_sharded_table_shape`` (sets ``bucket_capacity`` and per-rank row count
+    ``num_buckets * bucket_capacity`` written into ``max_capacity``), then ``local_hbm_for_values`` from
+    ``global_hbm_for_values`` and world size; then default ``index_type`` / ``embedding_dtype``,
+    align ``init_capacity`` to the effective ``bucket_capacity`` when set; if aligned
+    ``init_capacity`` exceeds ``max_capacity``, clamp it to ``max_capacity``; if ``init_capacity``
+    was unset, set it to ``max_capacity``; set ``dim`` from ``BaseEmbeddingConfig.embedding_dim``.
+    """
     world_size = dist.get_world_size()
     if constraints is None or eb_configs is None:
         raise ValueError("Constraints and eb_configs must not be None")
@@ -138,73 +163,52 @@ def _validate_configs(
         tmp_constraint = constraints[config_name]
         if not tmp_constraint.use_dynamicemb:
             continue
+
         tmp_config = eb_configs[i]
-        validate_initializer_args(
-            tmp_constraint.dynamicemb_options.initializer_args, tmp_config
-        )
-        # modify num_embeddings per rank to power of 2
-        num_aligned_embedding_per_rank = int(
-            _next_power_of_2(math.ceil(tmp_config.num_embeddings / world_size))
-        )
-        if (
-            num_aligned_embedding_per_rank
-            < constraints[config_name].dynamicemb_options.bucket_capacity
-        ):
-            num_aligned_embedding_per_rank = constraints[
-                config_name
-            ].dynamicemb_options.bucket_capacity
+        opts = tmp_constraint.dynamicemb_options
 
-        # num_aligned_embedding_per_rank = _get_safe_local_capacity(num_aligned_embedding_per_rank, tmp_constraint.dynamicemb_options.bucket_capacity)
-        if tmp_config.num_embeddings != int(
-            num_aligned_embedding_per_rank * world_size
-        ):
-            tmp_constraint.dynamicemb_options.num_aligned_embedding_per_rank = (
-                num_aligned_embedding_per_rank
+        opts.initializer_args = complete_initializer_args(
+            opts.initializer_args,
+            embedding_config=tmp_config,
+        )
+        num_buckets, effective_bucket_capacity = get_sharded_table_shape(
+            tmp_config,
+            world_size,
+            opts.bucket_capacity,
+        )
+        opts.bucket_capacity = effective_bucket_capacity
+        # Per-rank table rows: get_sharded_table_shape returns buckets, not row capacity.
+        aligned_per_rank_rows = num_buckets * effective_bucket_capacity
+        opts.max_capacity = aligned_per_rank_rows
+        opts.local_hbm_for_values = math.ceil(opts.global_hbm_for_values / world_size)
+
+        if opts.init_capacity is not None:
+            aligned_init = align_to_table_size(
+                opts.init_capacity, effective_bucket_capacity
             )
+            if aligned_init != opts.init_capacity:
+                warnings.warn(
+                    f"init_capacity is aligned to {aligned_init} from {opts.init_capacity} "
+                    f"(bucket_capacity={effective_bucket_capacity})",
+                    UserWarning,
+                )
+            opts.init_capacity = aligned_init
+            if opts.init_capacity > opts.max_capacity:
+                warnings.warn(
+                    f"init_capacity {opts.init_capacity} exceeds max_capacity {opts.max_capacity}; "
+                    f"clamping init_capacity to max_capacity",
+                    UserWarning,
+                )
+                opts.init_capacity = opts.max_capacity
+        else:
+            opts.init_capacity = opts.max_capacity
 
+        opts.dim = tmp_config.embedding_dim
 
-def _dyn_emb_table_size_per_rank(
-    dyn_emb_table_config: BaseEmbeddingConfig, world_size: int
-) -> Tuple[int, int]:
-    num_embeddings = dyn_emb_table_config.num_embeddings
-    # TODO: align num_embedding automatic , maybe need user input , and we don't align it.
-    num_embeddings_per_rank = int(
-        _next_power_of_2(math.ceil(num_embeddings / world_size))
-    )
-
-    embedding_dim = dyn_emb_table_config.embedding_dim
-    return embedding_dim, num_embeddings_per_rank
-
-
-def _dyn_emb_table_hbm_size_per_rank(
-    dyn_emb_table_const: DynamicEmbParameterConstraints, world_size: int
-) -> int:
-    HBM_memory_in_byte_per_rank = math.ceil(
-        dyn_emb_table_const.dynamicemb_options.global_hbm_for_values / world_size
-    )
-    return HBM_memory_in_byte_per_rank
-
-
-def _reserve_storage_for_dyn_emb(
-    topology: Topology,
-    dyn_emb_table_const: Dict[str, DynamicEmbParameterConstraints],
-    dyn_emb_table_configs: Dict[str, BaseEmbeddingConfig],
-) -> None:
-    world_size = dist.get_world_size()
-    for name, constraint in dyn_emb_table_const.items():
-        tmp_table_config = dyn_emb_table_configs[name]
-
-        embedding_dim, num_embeddings_per_rank = _dyn_emb_table_size_per_rank(
-            tmp_table_config, world_size
-        )
-        # TODO: should HBM align with the power of 2
-        HBM_memory_in_bytes_per_rank = _dyn_emb_table_hbm_size_per_rank(
-            constraint, world_size
-        )
-
-        constraint.dynamicemb_options.local_hbm_for_values = (
-            HBM_memory_in_bytes_per_rank
-        )
+        if opts.index_type is None:
+            opts.index_type = DEFAULT_INDEX_TYPE
+        if opts.embedding_dtype is None:
+            opts.embedding_dtype = data_type_to_dtype(tmp_config.data_type)
 
 
 class DynamicEmbeddingShardingPlanner:
@@ -226,8 +230,8 @@ class DynamicEmbeddingShardingPlanner:
         DynamicEmbeddingShardingPlanner wraps the API of EmbeddingShardingPlanner from the Torchrec repo,
         giving it the ability to plan dynamic embedding tables. The only difference from EmbeddingShardingPlanner
         is that DynamicEmbeddingShardingPlanner has an additional parameter `eb_configs`, which is a list of
-        TorchREC BaseEmbeddingConfig. This is because the dynamic embedding table needs to re-plan the number of
-        embedding vectors on each rank to align with the power of 2.
+        TorchREC BaseEmbeddingConfig. Per-rank table options are filled in ``_prepare_dynemb_table_options``
+        (initializer bounds, sharded table shape via ``get_sharded_table_shape``, and per-rank HBM budget).
 
         Parameters
         ----------
@@ -264,7 +268,8 @@ class DynamicEmbeddingShardingPlanner:
         """
 
         super(DynamicEmbeddingShardingPlanner, self).__init__()
-        _validate_configs(constraints, eb_configs)
+
+        _prepare_dynemb_table_options(constraints, eb_configs)
 
         dyn_emb_table_consts = {
             key: constraint
@@ -297,9 +302,6 @@ class DynamicEmbeddingShardingPlanner:
                 hbm_cap=HBM_CAP,
                 ddr_cap=DDR_CAP,
             )
-        _reserve_storage_for_dyn_emb(
-            topology, dyn_emb_table_consts, dyn_emb_table_eb_configs
-        )
         self._torchrec_planner = EmbeddingShardingPlanner(
             topology=topology,
             batch_size=batch_size,
@@ -319,16 +321,9 @@ class DynamicEmbeddingShardingPlanner:
 
         self._dyn_emb_plan = {}
         for dyn_emb_name, dynamicemb_constraint in dyn_emb_table_consts.items():
-            tmp_table_config = dyn_emb_table_eb_configs[dyn_emb_name]
-
-            is_pooled = isinstance(tmp_table_config, torchrec.EmbeddingBagConfig)
-            compute_kernel = (
-                BatchedDynamicEmbeddingBag if is_pooled else BatchedDynamicEmbedding
-            )
-
-            embedding_dim, num_embeddings_per_rank = _dyn_emb_table_size_per_rank(
-                tmp_table_config, world_size
-            )
+            opts = dynamicemb_constraint.dynamicemb_options
+            num_embeddings_per_rank = opts.max_capacity
+            embedding_dim = dyn_emb_table_eb_configs[dyn_emb_name].embedding_dim
 
             tmp_para_sharding = DynamicEmbParameterSharding(
                 sharding_spec=(
@@ -350,7 +345,7 @@ class DynamicEmbeddingShardingPlanner:
                 compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
                 customized_compute_kernel=DynamicEmbKernel,
                 dist_type="roundrobin",
-                dynamicemb_options=dynamicemb_constraint.dynamicemb_options,
+                dynamicemb_options=opts,
             )
             self._dyn_emb_plan[dyn_emb_name] = tmp_para_sharding
 

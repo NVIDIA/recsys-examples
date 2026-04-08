@@ -97,7 +97,10 @@ def get_version():
 
 
 def get_extensions():
-    extra_link_args = []
+    extra_link_args = [
+        "-Wl,--no-as-needed",
+        "-lcuda",  # CUDA drive API
+    ]
     extra_compile_args = {
         "cxx": ["-O3", "-fdiagnostics-color=always", "-w"],
         "nvcc": [
@@ -166,9 +169,8 @@ class NinjaBuildExtension(BuildExtension):
             free_memory_gb = psutil.virtual_memory().available / (
                 1024**3
             )  # free memory in GB
-            max_num_jobs_memory = int(
-                free_memory_gb / 9
-            )  # each JOB peak memory cost is ~8-9GB when threads = 4
+            # each JOB peak can exceed 9GB with 4-arch nvcc; use 12GB to reduce OOM/bad_alloc
+            max_num_jobs_memory = int(free_memory_gb / 12)
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))

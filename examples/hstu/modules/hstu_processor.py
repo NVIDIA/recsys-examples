@@ -189,6 +189,30 @@ def hstu_preprocess_embeddings(
             )
             sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
 
+    # After balanced shuffler, dense tensors (num_candidates) are stripped to
+    # actual_batch_size while KJTs retain batch_size entries (see BaseBatch
+    # invariants).  Re-pad num_candidates with zeros so it stays aligned with
+    # the KJT-derived sequence_embeddings_lengths.
+    if num_candidates is not None:
+        bs_kjt = sequence_embeddings_lengths.size(0)
+        if num_candidates.size(0) < bs_kjt:
+            num_candidates = torch.nn.functional.pad(
+                num_candidates, (0, bs_kjt - num_candidates.size(0))
+            )
+
+    num_candidates_offsets = (
+        length_to_complete_offsets(num_candidates).to(torch.int32)
+        if num_candidates is not None
+        else None
+    )
+    total_candidates_seq_len = None
+    if not is_inference:
+        if num_candidates is not None:
+            total_candidates_seq_len = int(num_candidates.sum().item())
+        elif contextual_seqlen is not None:
+            total_candidates_seq_len = int(
+                (sequence_embeddings_lengths.sum() - contextual_seqlen.sum()).item()
+            )
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
@@ -200,11 +224,7 @@ def hstu_preprocess_embeddings(
         num_candidates=num_candidates.to(torch.int32)
         if num_candidates is not None
         else None,
-        num_candidates_offsets=length_to_complete_offsets(num_candidates).to(
-            torch.int32
-        )
-        if num_candidates is not None
-        else None,
+        num_candidates_offsets=num_candidates_offsets,
         contextual_max_seqlen=contextual_max_seqlen,
         contextual_seqlen=contextual_seqlen.to(torch.int32)
         if contextual_seqlen is not None
@@ -214,6 +234,7 @@ def hstu_preprocess_embeddings(
         else None,
         has_interleaved_action=batch.action_feature_name is not None,
         scaling_seqlen=scaling_seqlen,
+        total_candidates_seq_len=total_candidates_seq_len,
     )
 
 
@@ -386,6 +407,20 @@ class HSTUBlockPostprocessor(torch.nn.Module):
                 jd.values, False
             )  # False -> output grad not RS but S
             jd = unpad_jd_values(jd)
+        # Derive seq_len_a/b from total_candidates_seq_len to avoid D2H sync.
+        # After SP gather + unpad, values.shape[0] is the true total; precomputed length still valid.
+        # total_candidates_seq_len is None for inference (set in hstu_preprocess_embeddings).
+        if jd.total_candidates_seq_len is not None:
+            total_seq = jd.values.shape[0]
+            precomputed_b = jd.total_candidates_seq_len
+            precomputed_a = total_seq - jd.total_candidates_seq_len
+            assert precomputed_a >= 0, (
+                f"precomputed_a is negative ({precomputed_a}): total_seq={total_seq}, "
+                f"total_candidates_seq_len={jd.total_candidates_seq_len}"
+            )
+        else:
+            precomputed_a = None
+            precomputed_b = None
         if jd.max_num_candidates > 0:
             seqlen_offsets = jd.num_candidates_offsets
             max_seqlen = jd.max_num_candidates
@@ -394,6 +429,8 @@ class HSTUBlockPostprocessor(torch.nn.Module):
                 jd.max_seqlen,
                 offsets_a=jd.seqlen_offsets - jd.num_candidates_offsets,
                 offsets_b=seqlen_offsets,
+                seq_len_a=precomputed_a,
+                seq_len_b=precomputed_b,
             )
         elif jd.contextual_max_seqlen > 0:
             seqlen_offsets = jd.seqlen_offsets - jd.contextual_seqlen_offsets
@@ -403,6 +440,8 @@ class HSTUBlockPostprocessor(torch.nn.Module):
                 jd.max_seqlen,
                 offsets_a=jd.contextual_seqlen_offsets,
                 offsets_b=seqlen_offsets,
+                seq_len_a=precomputed_a,
+                seq_len_b=precomputed_b,
             )
         else:
             sequence_embeddings = jd.values

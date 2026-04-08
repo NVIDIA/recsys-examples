@@ -145,7 +145,8 @@ class RandomInferenceDataset(
                     action_feature_name=self._action_fea_name,
                     max_num_candidates=self._max_num_candidates,
                     num_candidates=num_candidates,
-                ).to(device=torch.cuda.current_device())
+                )
+                batch = batch.to(device=torch.cuda.current_device())
                 self._cached_batch.append(
                     tuple([batch, torch.tensor(user_ids).long(), total_history_lengths])
                 )

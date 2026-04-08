@@ -18,6 +18,7 @@ from typing import Optional, Union
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import KernelBackend
+from hstu import hstu_attn_varlen_func
 
 
 class HSTUAttention(torch.nn.Module):
@@ -222,7 +223,8 @@ class TritonHSTUAttention(HSTUAttention):
 # TODO, support packed qkv attention
 class FusedHSTUAttention(HSTUAttention):
     """
-    Cutlass-based HUST implementations. This is the default implementation on pre hopper GPU.
+    Cutlass-based HSTU implementation. Auto-dispatches to SM-specific kernels (Ampere/Hopper)
+    via the unified hstu_attn_varlen_func API.
 
     Args:
         num_heads (int): Number of attention heads.
@@ -239,9 +241,6 @@ class FusedHSTUAttention(HSTUAttention):
         is_causal: bool,
     ):
         super().__init__()
-        from hstu_attn import hstu_attn_varlen_func
-
-        self._hstu_attn_varlen_func = hstu_attn_varlen_func
         self.num_heads = num_heads
         self.attention_dim = attention_dim
         self.linear_dim = linear_dim
@@ -279,11 +278,9 @@ class FusedHSTUAttention(HSTUAttention):
         Returns:
             torch.Tensor: Output tensor.
         """
-        # TODO: remove once cutlass backend is ready
         assert (
             self.is_causal or num_contextuals is None
         ), "Only causal attention is supported when max_num_contextuals > 0 in cutlass backend"
-        # (b * ~s, nh * hh)
         if isinstance(num_contextuals, torch.Tensor):
             num_contextuals = num_contextuals.to(torch.int32)
         elif isinstance(num_contextuals, int):
@@ -293,118 +290,27 @@ class FusedHSTUAttention(HSTUAttention):
                 .expand(offsets.size(0) - 1)
                 .contiguous()
             )
+        if scaling_seqlen == -1:
+            scaling_seqlen = max_seqlen
 
-        return self._hstu_attn_varlen_func(
-            q=tq.view(-1, self.num_heads, self.attention_dim),
-            k=tk.view(-1, self.num_heads, self.attention_dim),
-            v=tv.view(-1, self.num_heads, self.linear_dim),
-            cu_seqlens_q=offsets.to(torch.int32),
-            cu_seqlens_k=offsets.to(torch.int32),
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            num_contexts=num_contextuals,
-            num_targets=num_candidates.to(torch.int32)
+        return hstu_attn_varlen_func(
+            tq.view(-1, self.num_heads, self.attention_dim),
+            tk.view(-1, self.num_heads, self.attention_dim),
+            tv.view(-1, self.num_heads, self.linear_dim),
+            offsets.to(torch.int32),
+            offsets.to(torch.int32),
+            None,  # seqused_q
+            None,  # seqused_k
+            max_seqlen,
+            max_seqlen,
+            scaling_seqlen,
+            num_contextuals,
+            num_candidates.to(torch.int32)
             if isinstance(num_candidates, torch.Tensor)
             else None,
             target_group_size=target_group_size,
             window_size=(-1, 0) if self.is_causal else (-1, -1),
-            rab=None,
             alpha=1.0 / (self.attention_dim**0.5),
-            scaling_seqlen=scaling_seqlen,
-        ).view(-1, self.num_heads * self.linear_dim)
-
-
-# TODO, support packed qkv attention
-class FusedHSTUAttentionHopper(HSTUAttention):
-    """
-    Cutlass-based HUST implementation. This is the specialized implementation on hopper.
-
-    Args:
-        num_heads (int): Number of attention heads.
-        attention_dim (int): Dimension of the attention.
-        linear_dim (int): Dimension of the linear layer.
-        is_causal (bool): Whether the attention is causal.
-    """
-
-    def __init__(
-        self,
-        num_heads: int,
-        attention_dim: int,
-        linear_dim: int,
-        is_causal: bool,
-    ):
-        super().__init__()
-        from hopper.hstu_attn_interface import hstu_attn_varlen_func
-
-        self._hstu_attn_varlen_func = hstu_attn_varlen_func
-        self.num_heads = num_heads
-        self.attention_dim = attention_dim
-        self.linear_dim = linear_dim
-        self.is_causal = is_causal
-        assert (
-            self.linear_dim == self.attention_dim
-        ), "only support linear_dim and attention_dim"
-
-    @output_nvtx_hook(nvtx_tag="FusedHSTUAttnHopper")
-    def forward(
-        self,
-        tq: torch.Tensor,  # (T, d)
-        tk: torch.Tensor,  # (T, d)
-        tv: torch.Tensor,  # (T, d)
-        offsets: torch.Tensor,  # (batch_size + 1,)
-        max_seqlen: int,
-        scaling_seqlen: int = -1,
-        target_group_size: int = 1,  # target == candidates
-        num_candidates: Optional[torch.Tensor] = None,
-        num_contextuals: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass of the FusedHSTUAttentionHopper module.
-
-        Args:
-            tq (torch.Tensor): Query tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the query.
-            tk (torch.Tensor): Key tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the key.
-            tv (torch.Tensor): Value tensor of shape (T, d), where T is the total sequence length across all batches and d is the dimensionality of the value.
-            offsets (torch.Tensor): Offsets tensor of shape (batch_size + 1,), indicating the start position of each sequence in the batch, with a terminal offset at the end.
-            max_seqlen (int): The maximum sequence length across all batches.
-            target_group_size (int): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
-            num_candidates (torch.Tensor): Tensor containing the number of candidates for each sequence.
-            num_contextuals (int | torch.Tensor | None): The number of contextuals for each sequence, could be a single integer or a tensor of shape (batch_size,) when different sequences have different number of contextuals.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-        # TODO: remove once cutlass backend is ready
-        assert (
-            self.is_causal or num_contextuals is None
-        ), "Only causal attention is supported when max_num_contextuals > 0 in cutlass backend"
-        # (b * ~s, nh * hh)
-        if isinstance(num_contextuals, torch.Tensor):
-            num_contextuals = num_contextuals.to(torch.int32)
-        elif isinstance(num_contextuals, int):
-            num_contextuals = (
-                torch.tensor([num_contextuals], dtype=torch.int32, device=tq.device)
-                .view(1)
-                .expand(offsets.size(0) - 1)
-                .contiguous()
-            )
-        return self._hstu_attn_varlen_func(
-            q=tq.view(-1, self.num_heads, self.attention_dim),
-            k=tk.view(-1, self.num_heads, self.attention_dim),
-            v=tv.view(-1, self.num_heads, self.linear_dim),
-            cu_seqlens_q=offsets.to(torch.int32),
-            cu_seqlens_k=offsets.to(torch.int32),
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            num_contexts=num_contextuals,
-            num_targets=num_candidates.to(torch.int32)
-            if isinstance(num_candidates, torch.Tensor)
-            else None,
-            target_group_size=target_group_size,
-            window_size=(-1, 0) if self.is_causal else (-1, -1),
-            rab=None,
-            alpha=1.0 / (self.attention_dim**0.5),
-            scaling_seqlen=scaling_seqlen,
         ).view(-1, self.num_heads * self.linear_dim)
 
 
@@ -431,29 +337,29 @@ def create_hstu_attention(
     Raises:
         ValueError: If the kernel backend is not supported.
     """
+    attn: HSTUAttention
     if kernel_backend == KernelBackend.CUTLASS:
         sm_major_version = torch.cuda.get_device_properties(0).major
-        sm_minor_version = torch.cuda.get_device_properties(0).minor
-        if sm_major_version == 9 and sm_minor_version == 0:
-            return FusedHSTUAttentionHopper(
+        if sm_major_version in (8, 9):
+            attn = FusedHSTUAttention(
                 num_heads,
                 attention_dim,
                 linear_dim,
                 is_causal,
             )
-        elif sm_major_version == 8:
-            return FusedHSTUAttention(
+        else:
+            print(
+                "CUTLASS backend only support H100, H20 and A100/Ada series, fallback to PyTorch backend"
+            )
+            attn = TorchHSTUAttention(
                 num_heads,
                 attention_dim,
                 linear_dim,
                 is_causal,
             )
-        print(
-            "CUTLASS backend only support H100, H20 and A100/Ada series, fallback to PyTorch backend"
-        )
     elif kernel_backend == KernelBackend.TRITON:
         if is_causal:
-            return TritonHSTUAttention(
+            attn = TritonHSTUAttention(
                 num_heads,
                 attention_dim,
                 linear_dim,
@@ -463,9 +369,25 @@ def create_hstu_attention(
             print(
                 "Triton backend does not support is_causal=False, fallback to PyTorch backend"
             )
-    return TorchHSTUAttention(
-        num_heads,
-        attention_dim,
-        linear_dim,
-        is_causal,
-    )
+            attn = TorchHSTUAttention(
+                num_heads,
+                attention_dim,
+                linear_dim,
+                is_causal,
+            )
+    else:
+        attn = TorchHSTUAttention(
+            num_heads,
+            attention_dim,
+            linear_dim,
+            is_causal,
+        )
+
+    from commons.utils.attn_perf_tracker import PRINT_HSTU_PERF
+
+    if PRINT_HSTU_PERF:
+        from commons.utils.hooks import register_perf_hooks
+
+        register_perf_hooks(attn, num_heads, attention_dim, is_causal)
+
+    return attn

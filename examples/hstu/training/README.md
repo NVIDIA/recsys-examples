@@ -11,21 +11,30 @@ This integration ensures efficient training by coordinating sparse (embedding) a
 ### Start from dockerfile
 
 We provide [dockerfile](../../../docker/Dockerfile) for users to build environment. 
-```
-git clone https://github.com/NVIDIA/recsys-examples.git && cd recsys-examples
+```bash
+git clone --recursive https://github.com/NVIDIA/recsys-examples.git && cd recsys-examples
 docker build -f docker/Dockerfile --platform linux/amd64 -t recsys-examples:latest .
 ```
 If you want to build image for Grace, you can use 
-```
-git clone https://github.com/NVIDIA/recsys-examples.git && cd recsys-examples
+```bash
+git clone --recursive https://github.com/NVIDIA/recsys-examples.git && cd recsys-examples
 docker build -f docker/Dockerfile --platform linux/arm64 -t recsys-examples:latest .
 ```
+> **Note:** The `--recursive` flag is required to fetch submodules (e.g. `third_party/FBGEMM` for HSTU attention kernels).
+> If you already cloned without it, run `git submodule update --init --recursive`.
 You can also set your own base image with args `--build-arg <BASE_IMAGE>`.
 
 ### Start from source file
-Before running examples, build and install libs under corelib following instruction in documentation:
-- [HSTU attention documentation](.../../../corelib/hstu/README.md)
+Before running examples, build and install libs following the instructions below:
 - [Dynamic Embeddings documentation](.../../../corelib/dynamicemb/README.md)
+
+**HSTU attention kernels** are provided by the `fbgemm_gpu_hstu` package (import name: `hstu`),
+included as a git submodule at `third_party/FBGEMM`. Install it from source:
+
+```bash
+git submodule update --init --recursive
+cd third_party/FBGEMM/fbgemm_gpu/experimental/hstu && pip install .
+```
 
 On top of those two core libs, Megatron-Core along with other libs are required. You can install them via pypi package:
 

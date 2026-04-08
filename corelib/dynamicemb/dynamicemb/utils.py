@@ -14,9 +14,10 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import List, Optional, Set, Type, Union, cast
+from typing import Dict, List, Optional, Set, Type, Union, cast
 
 import torch
+from dynamicemb_extensions import DynamicEmbDataType
 
 # from torchrec.distributed import ModuleShardingPlan
 from torchrec.modules.embedding_modules import (
@@ -28,6 +29,32 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
     EmbeddingBagCollection,
     EmbeddingCollection,
 }
+
+# Element sizes for common embedding dtypes (aligned with FBGEMM / table value layout).
+DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+}
+
+
+def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:
+    if torch_dtype == torch.float32:
+        return DynamicEmbDataType.Float32
+    elif torch_dtype == torch.bfloat16:
+        return DynamicEmbDataType.BFloat16
+    elif torch_dtype == torch.float16:
+        return DynamicEmbDataType.Float16
+    elif torch_dtype == torch.int64:
+        return DynamicEmbDataType.Int64
+    elif torch_dtype == torch.uint64:
+        return DynamicEmbDataType.UInt64
+    elif torch_dtype == torch.int32:
+        return DynamicEmbDataType.Int32
+    elif torch_dtype == torch.uint32:
+        return DynamicEmbDataType.UInt32
+    else:
+        raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
 
 
 def tabulate(

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Any, Dict, Tuple, Type, Union
+from typing import Any, Dict, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -42,10 +42,6 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from torch import distributed as dist
-from torch.distributed.optim import (
-    _apply_optimizer_in_backward as apply_optimizer_in_backward,
-)
-from torch.optim.optimizer import Optimizer
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
@@ -158,41 +154,6 @@ _optimizer_str_to_optim_type = {
 }
 
 
-def sparse_optimizer_factory_and_class(
-    optimizer_name: str,
-    betas: Tuple[float, float],
-    eps: float,
-    weight_decay: float,
-    momentum: float,
-    learning_rate: float,
-) -> Tuple[Type[Optimizer], Dict[str, Any]]:
-    kwargs: Dict[str, Any] = {"lr": learning_rate}
-    if optimizer_name == "adam":
-        optimizer_cls = torchrec.optim.Adam
-        beta1, beta2 = betas
-        kwargs.update(
-            {"beta1": beta1, "beta2": beta2, "eps": eps, "weight_decay": weight_decay}
-        )
-    elif optimizer_name == "sgd":
-        optimizer_cls = torchrec.optim.SGD
-        kwargs.update({"weight_decay": weight_decay, "momentum": momentum})
-    elif optimizer_name == "row_wise_adagrad":
-        optimizer_cls = torchrec.optim.RowWiseAdagrad
-        beta1, beta2 = betas
-        kwargs.update(
-            {
-                "eps": eps,
-                "beta1": beta1,
-                "beta2": beta2,
-                "weight_decay": weight_decay,
-            }
-        )
-    else:
-        raise Exception("Unsupported optimizer!")
-
-    return optimizer_cls, kwargs
-
-
 def apply_dmp(
     model: torch.nn.Module,
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
@@ -202,17 +163,6 @@ def apply_dmp(
     pipeline_type: str = "native",
 ):
     enable_prefetch_pipeline = pipeline_type == "prefetch"
-    (
-        sparse_opt_cls,
-        sparse_opt_args,
-    ) = sparse_optimizer_factory_and_class(
-        optimizer_name=sparse_optimizer_param.optimizer_str,
-        betas=(sparse_optimizer_param.adam_beta1, sparse_optimizer_param.adam_beta2),
-        eps=sparse_optimizer_param.adam_eps,
-        weight_decay=0.0,
-        momentum=0.0,
-        learning_rate=sparse_optimizer_param.learning_rate,
-    )
     assert (
         sparse_optimizer_param.optimizer_str in _optimizer_str_to_optim_type
     ), f"embedding optimizer only support {list(_optimizer_str_to_optim_type.keys())}"
@@ -235,11 +185,6 @@ def apply_dmp(
     data_parallel_embedding_module_names = []
     for k, module in model.named_modules():
         if type(module) in TORCHREC_TYPES:
-            for _, param in module.named_parameters(prefix=k):
-                if param.requires_grad:
-                    apply_optimizer_in_backward(
-                        sparse_opt_cls, [param], sparse_opt_args
-                    )
             eb_configs.extend(module.embedding_configs())
             if DATA_PARALLEL_EMBEDDING_MODULE_NAME in k:
                 data_parallel_embedding_module_names.append(k)
