@@ -222,6 +222,7 @@ def test_model_decoder_step(
                 input_hidden_states.view(-1, hidden_size),
                 input_offsets,
                 input_max_seqlen,
+                default_mask_add_bos_to_history=False,
             ).view(batch_size, input_max_seqlen, -1)
             candidates_logits = output.view(batch_size, input_max_seqlen, -1)[
                 :, history_max_seqlen:, :
@@ -264,6 +265,7 @@ def test_model_decoder_step(
                     prefix_input_hidden_states.view(-1, hidden_size),
                     prefix_input_offsets,
                     prefix_input_max_seqlen,
+                    default_mask_add_bos_to_history=False,
                 ).view(batch_size, prefix_input_max_seqlen, -1)
                 prefix_candidates_logits = prefix_output.view(
                     batch_size, prefix_input_max_seqlen, -1

@@ -35,6 +35,10 @@ from modules.eval_metrics import SIDRetrievalEvaluator
 from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
+from .attention_mask import (
+    build_jagged_causal_arbitrary_func,
+    padded_causal_mask_with_optional_bos,
+)
 from .jagged_flash_attn_block import JaggedTransformerBlock
 
 
@@ -530,32 +534,55 @@ class SIDGRModel(MegatronModule):
         input_max_seqlen: int,
         attention_mask: Optional[torch.Tensor] = None,
         arbitrary_func: Optional[torch.Tensor] = None,
+        *,
+        default_mask_add_bos_to_history: Optional[bool] = None,
     ) -> torch.Tensor:
         """
-        Input and Output are both jagged.  This method only routes — the
-        caller is responsible for building the mask / arbitrary_func.
+        Jagged in/out. Routes Megatron-Core vs jagged Flash Attention.
 
-        * FA path:    pass *arbitrary_func* (caller-built).
-        * mcore path: pass *attention_mask* (dense ``[B, 1, N, N]``).
+        If both ``attention_mask`` and ``arbitrary_func`` are omitted, builds
+        the usual causal mask for the active backend (same behavior as before
+        the explicit-mask refactor). Pass either tensor to override.
+
+        * FA path:    ``arbitrary_func`` (B=1 flattened arbitrary mask).
+        * mcore path: ``attention_mask`` (dense ``[B, 1, N, N]``).
+
+        ``default_mask_add_bos_to_history`` controls optional-BOS layout for the
+        built mcore mask: ``None`` uses ``self.add_bos_to_history_for_training``
+        (training-style); ``generate`` passes ``False``.
         """
+        if attention_mask is None and arbitrary_func is None:
+            if self.decoder.use_jagged_flash_attn:
+                total_tokens = int(input_offsets[-1].item())
+                arbitrary_func = build_jagged_causal_arbitrary_func(
+                    input_offsets, total_tokens
+                )
+            else:
+                add_bos = (
+                    self.add_bos_to_history_for_training
+                    if default_mask_add_bos_to_history is None
+                    else default_mask_add_bos_to_history
+                )
+                attention_mask = padded_causal_mask_with_optional_bos(
+                    input_offsets,
+                    input_max_seqlen,
+                    add_bos_to_history=add_bos,
+                    bos_interval=self._num_hierarchies,
+                )
+
         if self.decoder.use_jagged_flash_attn:
-            assert (
-                arbitrary_func is not None
-            ), "FA path requires arbitrary_func; caller should build it"
+            assert arbitrary_func is not None
             return self.decoder(
                 hidden_states=input_hidden_states,
                 arbitrary_func=arbitrary_func,
             )
-        else:
-            assert (
-                attention_mask is not None
-            ), "mcore path requires attention_mask; caller should build it"
-            return self.decoder(
-                hidden_states=input_hidden_states,
-                attention_mask=attention_mask,
-                offsets=input_offsets,
-                max_seqlen=input_max_seqlen,
-            )
+        assert attention_mask is not None
+        return self.decoder(
+            hidden_states=input_hidden_states,
+            attention_mask=attention_mask,
+            offsets=input_offsets,
+            max_seqlen=input_max_seqlen,
+        )
 
     def forward(
         self,
@@ -575,7 +602,6 @@ class SIDGRModel(MegatronModule):
         )
         history_offsets = batch.features[batch.history_feature_name].offsets()
 
-        # 2. decoder step — caller provides the mask / arbitrary_func
         jagged_output_hidden_states = self.decoder_step(
             input_hidden_states,
             input_offsets,
@@ -719,13 +745,14 @@ class SIDGRModel(MegatronModule):
                     dtype=input_offsets.dtype,
                 )
 
-            # 2. decoder step — caller provides attention_mask or arbitrary_func
+            # 2. decoder (mask built in decoder_step when not overridden)
             jagged_output_hidden_states = self.decoder_step(
                 cated_hidden_states,
                 cated_offsets,
                 cated_max_seqlen,
                 attention_mask=attention_mask,
                 arbitrary_func=arbitrary_func,
+                default_mask_add_bos_to_history=False,
             )
             # remove history[batchsize * topk_last_step * max(1,i), embedding_dim]
             _, candidate_hidden_states = triton_split_2D_jagged(
