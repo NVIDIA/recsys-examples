@@ -116,8 +116,7 @@ DEMB_TABLE_ALIGN_SIZE = 16
 BUCKET_ALIGNMENT: int = DEMB_TABLE_ALIGN_SIZE
 
 # Sentinel ``bucket_capacity``: treat the whole per-rank table as one bucket; see
-# :func:`dynamicemb.dynamicemb_config.get_sharded_table_shape` (returns ``(num_buckets, bucket_capacity)``;
-# per-rank rows = ``num_buckets * bucket_capacity``).
+# :func:`dynamicemb.dynamicemb_config.get_sharded_table_capacity` (per-rank row count).
 MAX_BUCKET_CAPACITY: int = 2**63 - 1
 
 torch_dtype_to_np_dtype = {

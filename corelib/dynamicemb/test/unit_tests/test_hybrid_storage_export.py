@@ -24,13 +24,14 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EmbOptimType,
-    get_sharded_table_shape,
+    get_sharded_table_capacity,
     get_table_value_bytes,
 )
 from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    _sharded_table_bucket_layout,
 )
 from dynamicemb.key_value_table import HybridStorage
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
@@ -103,9 +104,9 @@ def _full_table_options(
 ) -> DynamicEmbTableOptions:
     """Full-table footprint; local_hbm_for_values is set to total table bytes (matches Batched total_memory).
 
-    Per-rank capacity and bucket width come from :func:`get_sharded_table_shape` with
-    ``MAX_BUCKET_CAPACITY`` (one bucket per rank). Byte count uses :func:`get_table_value_bytes`
-    (all ranks, embedding + optimizer state).
+    Per-rank row count uses :func:`get_sharded_table_capacity` with ``MAX_BUCKET_CAPACITY``;
+    effective ``bucket_capacity`` matches :func:`_sharded_table_bucket_layout`. Byte count uses
+    :func:`get_table_value_bytes` (all ranks, embedding + optimizer state).
     """
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     eb_config = EmbeddingConfig(
@@ -115,10 +116,12 @@ def _full_table_options(
         feature_names=["f0"],
         data_type=DataType.FP32,
     )
-    num_buckets, bucket_cap = get_sharded_table_shape(
+    _, bucket_cap = _sharded_table_bucket_layout(
         eb_config, world_size, MAX_BUCKET_CAPACITY
     )
-    per_rank_rows = num_buckets * bucket_cap
+    per_rank_rows = get_sharded_table_capacity(
+        eb_config, world_size, MAX_BUCKET_CAPACITY
+    )
     total_memory = max(
         1,
         get_table_value_bytes(

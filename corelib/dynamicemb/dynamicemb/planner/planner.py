@@ -48,9 +48,9 @@ from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DynamicEmbKernel,
     DynamicEmbTableOptions,
+    _sharded_table_bucket_layout,
     align_to_table_size,
     complete_initializer_args,
-    get_sharded_table_shape,
 )
 
 HBM_CAP: int = 32 * 1024 * 1024 * 1024
@@ -128,8 +128,8 @@ def _prepare_dynemb_table_options(
     """Check ``constraints`` ↔ ``eb_configs`` naming, then fill per-table DynamicEmb options.
 
     For each DynamicEmb table: ``complete_initializer_args``, then
-    ``get_sharded_table_shape`` (sets ``bucket_capacity`` and per-rank row count
-    ``num_buckets * bucket_capacity`` written into ``max_capacity``), then ``local_hbm_for_values`` from
+    ``_sharded_table_bucket_layout`` (sets effective ``bucket_capacity`` and per-rank
+    ``max_capacity``), then ``local_hbm_for_values`` from
     ``global_hbm_for_values`` and world size; then default ``index_type`` / ``embedding_dtype``,
     align ``init_capacity`` to the effective ``bucket_capacity`` when set; if aligned
     ``init_capacity`` exceeds ``max_capacity``, clamp it to ``max_capacity``; if ``init_capacity``
@@ -171,13 +171,12 @@ def _prepare_dynemb_table_options(
             opts.initializer_args,
             embedding_config=tmp_config,
         )
-        num_buckets, effective_bucket_capacity = get_sharded_table_shape(
+        num_buckets, effective_bucket_capacity = _sharded_table_bucket_layout(
             tmp_config,
             world_size,
             opts.bucket_capacity,
         )
         opts.bucket_capacity = effective_bucket_capacity
-        # Per-rank table rows: get_sharded_table_shape returns buckets, not row capacity.
         aligned_per_rank_rows = num_buckets * effective_bucket_capacity
         opts.max_capacity = aligned_per_rank_rows
         opts.local_hbm_for_values = math.ceil(opts.global_hbm_for_values / world_size)
@@ -231,7 +230,7 @@ class DynamicEmbeddingShardingPlanner:
         giving it the ability to plan dynamic embedding tables. The only difference from EmbeddingShardingPlanner
         is that DynamicEmbeddingShardingPlanner has an additional parameter `eb_configs`, which is a list of
         TorchREC BaseEmbeddingConfig. Per-rank table options are filled in ``_prepare_dynemb_table_options``
-        (initializer bounds, sharded table shape via ``get_sharded_table_shape``, and per-rank HBM budget).
+        (initializer bounds, sharded table capacity via ``_sharded_table_bucket_layout``, and per-rank HBM budget).
 
         Parameters
         ----------

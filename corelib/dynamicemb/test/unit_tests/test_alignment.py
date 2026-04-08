@@ -1,247 +1,96 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Unit test: Memory stats for varying EmbeddingConfig.num_embeddings and global_hbm_for_values,
-# with caching on/off.
-#
-# Also compares with actual DMP model config: EmbeddingConfig -> EmbeddingCollection -> apply_dmp,
-# then read max_capacity / local_hbm_for_values from _dynamicemb_options and compare to theoretical.
 
-import math
+# Parametric tests: EmbeddingCollection + per-table ``global_hbm_for_values`` from
+# ``get_table_value_bytes * hbm_ratio``, planner + DMP, then per-table checks that
+# ``max_capacity`` matches ``get_sharded_table_capacity``, ``local_hbm_for_values``
+# matches ``ceil(global/world_size)``, and cache/storage value tensors match
+# hashtable ``per_table_capacity_`` (+ cache overflow slots when applicable).
+#
+# Run (from ``corelib/dynamicemb``)::
+#   torchrun --nnodes 1 --nproc_per_node 1 -m pytest test/unit_tests/test_alignment.py -q
+# ``world_size`` is ``int(os.environ.get("WORLD_SIZE", "1"))``; it must match
+# ``dist.get_world_size()`` after init (``torchrun`` sets ``WORLD_SIZE``; default is 1).
+# Set ``DYNAMICEMB_ALIGNMENT_FULL=1`` to add extra single-table ``num_embeddings`` values.
+# ``bucket_capacity`` is parametrized over ``DEFAULT_BUCKET_CAPACITY``, ``1024``, and
+# ``MAX_BUCKET_CAPACITY``.
+
+from __future__ import annotations
+
 import os
-import sys
 import warnings
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from dynamicemb import DynamicEmbScoreStrategy
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-
-# Run from dynamicemb package root or with PYTHONPATH including corelib/dynamicemb
 from dynamicemb.dynamicemb_config import (
+    DEFAULT_BUCKET_CAPACITY,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
-    align_to_table_size,
-    data_type_to_dtype,
-    dtype_to_bytes,
-    get_constraint_capacity,
+    get_sharded_table_capacity,
+    get_table_value_bytes,
 )
 from dynamicemb.get_planner import get_planner
-from dynamicemb.optimizer import EmbOptimType, get_optimizer_state_dim
+from dynamicemb.key_value_table import DynamicEmbCache, DynamicEmbStorage, HybridStorage
+from dynamicemb.optimizer import get_optimizer_state_dim
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from dynamicemb.types import DEMB_TABLE_ALIGN_SIZE
-from fbgemm_gpu.split_embedding_configs import SparseType
+from dynamicemb.types import MAX_BUCKET_CAPACITY
+from dynamicemb.utils import DTYPE_NUM_BYTES
+from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-# Default world sizes for report (aligned with planner: per-rank capacity and per-rank HBM)
-DEFAULT_WORLD_SIZES = [1, 8]
 
-# Fixed table params (aligned with planner / batched_dynamicemb_tables)
-EMBEDDING_DIM = 128
-EMBEDDING_DTYPE = torch.float32
-OPTIMIZER_TYPE = EmbOptimType.ADAM
-# Non-cache table: bucket_capacity fixed at 128; per-rank aligned capacity at least 128
-BUCKET_CAPACITY_NORMAL = 128
-# Cache mode: cache bucket_capacity=1024, minimum capacity 1024 (round up to 1 bucket if smaller)
-BUCKET_CAPACITY_CACHE = 1024
+def _alignment_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
 
 
-def _element_size() -> int:
-    return dtype_to_bytes(EMBEDDING_DTYPE)
+def _num_embeddings_per_table_params() -> List[Tuple[int, ...]]:
+    singles = [(n,) for n in (7, 13, 127, 1001)]
+    return singles + [(17, 99)]
 
 
-def _optim_state_dim() -> int:
-    return get_optimizer_state_dim(OPTIMIZER_TYPE, EMBEDDING_DIM, EMBEDDING_DTYPE)
-
-
-def _total_dim() -> int:
-    return EMBEDDING_DIM + _optim_state_dim()
-
-
-def _byte_per_vector() -> int:
-    return _element_size() * _total_dim()
-
-
-def compute_memory_stats(
-    num_embeddings: int,
-    global_hbm_for_values: int,
-    caching: bool,
-    world_size: int = 1,
-) -> Tuple[int, int, int, int, int]:
-    """
-    Compute per-rank HBM/DRAM stats for a single table (aligned with planner + batched_dynamicemb_tables).
-
-    Planner logic:
-    - num_embeddings_per_rank = align_to_table_size(ceil(num_embeddings / world_size), alignment=bucket_capacity)
-    - If per-rank aligned capacity < bucket_capacity(128), use bucket_capacity (matches planner max_capacity floor)
-    - local_hbm_for_values = ceil(global_hbm_for_values / world_size)
-    - When caching: cache bucket=1024, min capacity 1024 (get_constraint_capacity rounds up to 1 bucket)
-
-    Returns
-    -------
-    total_bytes_per_rank, hbm_bytes_per_rank, dram_bytes_per_rank, aligned_capacity_per_rank, total_bytes_all_ranks
-    """
-    num_per_rank = math.ceil(num_embeddings / world_size)
-    aligned_capacity_per_rank = align_to_table_size(
-        num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
-    )
-    aligned_capacity_per_rank = max(aligned_capacity_per_rank, BUCKET_CAPACITY_NORMAL)
-    total_memory_per_rank = aligned_capacity_per_rank * _byte_per_vector()
-
-    local_hbm = math.ceil(global_hbm_for_values / world_size)
-    local_hbm = min(local_hbm, total_memory_per_rank)
-
-    if caching:
-        bucket_cap = BUCKET_CAPACITY_CACHE  # 1024
-        cache_capacity = get_constraint_capacity(
-            local_hbm,
-            EMBEDDING_DTYPE,
-            EMBEDDING_DIM,
-            OPTIMIZER_TYPE,
-            bucket_cap,
+def _require_cuda_dist() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if not dist.is_initialized():
+        pytest.skip(
+            "Distributed not initialized; run with e.g.\n"
+            "  torchrun --nnodes 1 --nproc_per_node 1 -m pytest "
+            "test/unit_tests/test_alignment.py -v"
         )
-        # Cache min capacity 1024 (get_constraint_capacity already rounds up to 1 bucket if needed)
-        cache_capacity = max(cache_capacity, BUCKET_CAPACITY_CACHE)
-        hbm_bytes_per_rank = cache_capacity * _byte_per_vector()
-        # Storage holds full table shard for this rank, all in DRAM
-        dram_bytes_per_rank = total_memory_per_rank
-    else:
-        hbm_bytes_per_rank = local_hbm
-        dram_bytes_per_rank = total_memory_per_rank - local_hbm
-
-    total_bytes_all_ranks = total_memory_per_rank * world_size
-    return (
-        total_memory_per_rank,
-        hbm_bytes_per_rank,
-        dram_bytes_per_rank,
-        aligned_capacity_per_rank,
-        total_bytes_all_ranks,
-    )
 
 
-def _mb(x: int) -> float:
-    return x / (1024 * 1024)
+@pytest.fixture(scope="session", autouse=True)
+def _session_dist_init() -> None:
+    if not torch.cuda.is_available():
+        yield
+        return
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29531")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    yield
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
-def _format_mb(x: int) -> str:
-    return f"{_mb(x):.2f} MB"
-
-
-def run_alignment_memory_report(
-    num_embeddings_list: List[int],
-    global_hbm_modes: List[str],
-    world_sizes: List[int],
-    include_caching: bool = True,
-) -> List[dict]:
-    """
-    Build memory report for (num_embeddings, global_hbm_for_values, caching, world_size) combinations.
-    global_hbm_modes: ["0", "half", "full"] = HBM budget 0 / half of total need / full (all global).
-    total/hbm/dram are per-rank values.
-    """
-    rows = []
-    for num_emb in num_embeddings_list:
-        for world_size in world_sizes:
-            num_per_rank = math.ceil(num_emb / world_size)
-            aligned_per_rank = align_to_table_size(
-                num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
-            )
-            aligned_per_rank = max(aligned_per_rank, BUCKET_CAPACITY_NORMAL)
-            total_mem_per_rank = aligned_per_rank * _byte_per_vector()
-            # Global HBM budget (for half/full): based on total table memory across all ranks
-            total_mem_global = total_mem_per_rank * world_size
-
-            for gmode in global_hbm_modes:
-                if gmode == "0":
-                    global_hbm = 0
-                elif gmode == "half":
-                    global_hbm = total_mem_global // 2
-                elif gmode == "full":
-                    global_hbm = total_mem_global
-                else:
-                    raise ValueError(f"Unknown global_hbm mode: {gmode}")
-
-                for caching in [False, True] if include_caching else [False]:
-                    (
-                        total_bytes,
-                        hbm_bytes,
-                        dram_bytes,
-                        aligned_cap,
-                        total_all_ranks,
-                    ) = compute_memory_stats(num_emb, global_hbm, caching, world_size)
-                    rows.append(
-                        {
-                            "num_embeddings": num_emb,
-                            "world_size": world_size,
-                            "aligned_capacity_per_rank": aligned_cap,
-                            "global_hbm_mode": gmode,
-                            "global_hbm_bytes": global_hbm,
-                            "caching": caching,
-                            "total_bytes": total_bytes,
-                            "hbm_bytes": hbm_bytes,
-                            "dram_bytes": dram_bytes,
-                            "total_bytes_all_ranks": total_all_ranks,
-                        }
-                    )
-    return rows
-
-
-def print_report(rows: List[dict], show_all_ranks: bool = False) -> None:
-    """Print memory consumption table. total/HBM/DRAM are per rank; optionally show all_ranks column."""
-    sep = " | "
-    headers = [
-        "num_emb",
-        "W",
-        "aligned/r",
-        "global_hbm",
-        "caching",
-        "total(MB)/r",
-        "HBM(MB)/r",
-        "DRAM(MB)/r",
-    ]
-    if show_all_ranks:
-        headers.append("total(MB)*W")
-    col_widths = [10, 4, 10, 8, 8, 12, 12, 12]
-    if show_all_ranks:
-        col_widths.append(12)
-    line = sep.join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
-    print(line)
-    print("-" * len(line))
-
-    for r in rows:
-        total_mb = _format_mb(r["total_bytes"])
-        hbm_mb = _format_mb(r["hbm_bytes"])
-        dram_mb = _format_mb(r["dram_bytes"])
-        global_hbm_str = r["global_hbm_mode"]
-        row = [
-            str(r["num_embeddings"]).ljust(col_widths[0]),
-            str(r["world_size"]).ljust(col_widths[1]),
-            str(r["aligned_capacity_per_rank"]).ljust(col_widths[2]),
-            global_hbm_str.ljust(col_widths[3]),
-            str(r["caching"]).ljust(col_widths[4]),
-            total_mb.ljust(col_widths[5]),
-            hbm_mb.ljust(col_widths[6]),
-            dram_mb.ljust(col_widths[7]),
-        ]
-        if show_all_ranks:
-            row.append(_format_mb(r["total_bytes_all_ranks"]).ljust(col_widths[8]))
-        print(sep.join(row))
-    print()
-
-
-# --------------- Compare with actual DMP model config ---------------
-
-
-class _SingleTableTestModel(nn.Module):
-    """Single EmbeddingCollection, single table; used to read actual config after apply_dmp."""
-
-    def __init__(self, embedding_module: EmbeddingCollection):
+class _EmbeddingCollectionWrapper(nn.Module):
+    def __init__(self, embedding_module: EmbeddingCollection) -> None:
         super().__init__()
         self.embedding_modules = nn.ModuleList([embedding_module])
 
@@ -254,366 +103,243 @@ class _SingleTableTestModel(nn.Module):
         return torch.cat(out, dim=0)
 
 
-def _apply_dmp_with_global_hbm(
-    num_embeddings: int,
-    embedding_dim: int,
-    global_hbm_for_values: int,
+def build_dmp_for_alignment_test(
+    eb_configs: List[EmbeddingConfig],
+    optimizer_type: EmbOptimType,
+    bucket_capacity: int,
+    hbm_ratio: float,
     caching: bool,
+    training: bool,
     device: torch.device,
-    optimizer_kwargs: Dict[str, Any],
-) -> nn.Module:
-    """
-    Create single-table EmbeddingConfig -> EmbeddingCollection -> apply_dmp; return DMP model.
-    global_hbm_for_values is global HBM budget in bytes; planner splits by world_size per rank.
-    """
-    from dynamicemb import DynamicEmbScoreStrategy
-
-    name = "emb_0"
-    eb_config = EmbeddingConfig(
-        name=name,
-        embedding_dim=embedding_dim,
-        num_embeddings=num_embeddings,
-        feature_names=["f0"],
-        data_type=DataType.FP32,
-    )
-    ebc = EmbeddingCollection(
-        device=torch.device("meta"),
-        tables=[eb_config],
-    )
-    model = _SingleTableTestModel(ebc)
-
-    bucket_capacity = BUCKET_CAPACITY_CACHE if caching else BUCKET_CAPACITY_NORMAL
-    emb_num_aligned = align_to_table_size(num_embeddings, alignment=bucket_capacity)
-    torch_dtype = data_type_to_dtype(DataType.FP32)
-    opt_state_dim = get_optimizer_state_dim(
-        EmbOptimType.ADAM, embedding_dim, torch_dtype
-    )
-    total_hbm_need = (
-        (embedding_dim + opt_state_dim) * dtype_to_bytes(torch_dtype) * emb_num_aligned
-    )
-    # If global_hbm not set, use full need
-    if global_hbm_for_values <= 0:
-        global_hbm_for_values = total_hbm_need
-
-    dynamicemb_options_dict = {
-        name: DynamicEmbTableOptions(
-            global_hbm_for_values=global_hbm_for_values,
+) -> DistributedModelParallel:
+    world_size = dist.get_world_size()
+    bc = int(bucket_capacity)
+    dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    for ec in eb_configs:
+        total_bytes = get_table_value_bytes(ec, optimizer_type, world_size, bc)
+        global_hbm = int(hbm_ratio * total_bytes)
+        dynamicemb_options_dict[ec.name] = DynamicEmbTableOptions(
+            global_hbm_for_values=global_hbm,
+            caching=caching,
+            training=training,
+            bucket_capacity=bc,
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
             initializer_args=DynamicEmbInitializerArgs(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=0.1,
             ),
-            bucket_capacity=bucket_capacity,
-            max_capacity=emb_num_aligned,
-            caching=caching,
         )
-    }
-    eb_configs = list(ebc.embedding_configs())
+    ebc = EmbeddingCollection(
+        device=torch.device("meta"),
+        tables=list(eb_configs),
+    )
+    model = _EmbeddingCollectionWrapper(ebc)
+    eb_configs_list = list(ebc.embedding_configs())
     planner = get_planner(
-        eb_configs,
+        eb_configs_list,
         set(),
         dynamicemb_options_dict,
         device,
     )
     fused_params = {
         "output_dtype": SparseType.FP32,
-        **optimizer_kwargs,
+        "optimizer": optimizer_type,
+        "learning_rate": 1e-3,
     }
     sharder = DynamicEmbeddingCollectionSharder(
         fused_params=fused_params,
         use_index_dedup=False,
     )
-    plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
-    dmp = DistributedModelParallel(
-        module=model,
-        device=device,
-        sharders=[sharder],
-        plan=plan,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
+        dmp = DistributedModelParallel(
+            module=model,
+            device=device,
+            sharders=[sharder],
+            plan=plan,
+        )
     return dmp
 
 
-def get_actual_table_options_from_model(model: nn.Module) -> List[Dict[str, Any]]:
-    """
-    Collect actual config (max_capacity, local_hbm_for_values, caching) for all
-    BatchedDynamicEmbeddingTablesV2 in the model after apply_dmp.
-    Uses find_sharded_modules to get ShardedEmbeddingCollection, then get_dynamic_emb_module on it.
-    """
-    result = []
-    for _path, _name, sharded_module in find_sharded_modules(model):
-        emb_modules = get_dynamic_emb_module(sharded_module)
-        for mod in emb_modules:
-            for opt in mod._dynamicemb_options:
-                result.append(
-                    {
-                        "max_capacity": opt.max_capacity,
-                        "local_hbm_for_values": opt.local_hbm_for_values,
-                        "caching": opt.caching,
-                    }
-                )
-    return result
+def _overflow_rows_for_cache(bucket_capacity: int) -> int:
+    # dynamicemb.scored_hashtable: overflow_bucket_capacity_ = 3 * bucket_capacity_
+    return 3 * int(bucket_capacity)
 
 
-def _compare_actual_vs_theoretical(
-    num_embeddings: int,
-    global_hbm_for_values: int,
-    caching: bool,
-    world_size: int,
-) -> Tuple[bool, str]:
-    """
-    Build DMP model, read actual config, compare with compute_memory_stats theoretical values.
-    When bucket floor applies, planner may set local_hbm_for_values above ceil(global_hbm/W);
-    we compare effective HBM = min(actual local_hbm, total_memory) to theory.
-    Returns (match_ok, message).
-    """
-    (
-        _,
-        hbm_per_rank,
-        _,
-        aligned_cap_expected,
-        _,
-    ) = compute_memory_stats(num_embeddings, global_hbm_for_values, caching, world_size)
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        dmp = _apply_dmp_with_global_hbm(
-            num_embeddings=num_embeddings,
-            embedding_dim=EMBEDDING_DIM,
-            global_hbm_for_values=global_hbm_for_values,
-            caching=caching,
-            device=device,
-            optimizer_kwargs={"optimizer": EmbOptimType.ADAM, "lr": 1e-3},
+def _assert_value_buffer_matches_hashtable(
+    state: object,
+    table_id: int,
+    *,
+    include_overflow: bool,
+) -> None:
+    """Value tensor rows must match hashtable main capacity plus optional overflow slots."""
+    km = state.key_index_map
+    main = int(km.per_table_capacity_[table_id])
+    ovf = int(km.overflow_bucket_capacity_) if include_overflow else 0
+    if include_overflow:
+        bc = int(state.options_list[0].bucket_capacity)
+        assert ovf == _overflow_rows_for_cache(bc), (
+            f"table {table_id}: overflow_bucket_capacity_={ovf} != 3 * bucket ({bc})"
         )
-    actual_list = get_actual_table_options_from_model(dmp)
-    if not actual_list:
-        return False, "get_dynamic_emb_module returned no table options"
-    actual = actual_list[0]
-    cap_ok = actual["max_capacity"] == aligned_cap_expected
-    # Non-cache: effective HBM is min(actual, total); planner may set actual > theory when bucket floor adds capacity.
-    # Cache: actual HBM is cache size, may be >= theory due to bucket rounding.
-    total_per_rank = aligned_cap_expected * _byte_per_vector()
-    if not caching:
-        effective_actual_hbm = min(actual["local_hbm_for_values"], total_per_rank)
-        hbm_ok = effective_actual_hbm == hbm_per_rank
-    else:
-        hbm_ok = actual["local_hbm_for_values"] >= 0
-    caching_ok = actual["caching"] == caching
-    msg = (
-        f"num_emb={num_embeddings} W={world_size} caching={caching} "
-        f"expected_cap={aligned_cap_expected} actual_cap={actual['max_capacity']} "
-        f"expected_hbm={hbm_per_rank} actual_hbm={actual['local_hbm_for_values']}"
+    expected_rows = main + ovf
+    t = state.tables[table_id].tensor()
+    vd = int(state.table_value_dims_cpu[table_id])
+    assert t.shape == (expected_rows, vd), (
+        f"table {table_id}: value buffer shape {tuple(t.shape)} != "
+        f"expected ({expected_rows}, {vd}) (main={main}, overflow_extra={ovf})"
     )
-    return cap_ok and caching_ok and hbm_ok, msg
 
 
-class TestAlignmentMemoryStats:
-    """Tests for memory stats under varying num_embeddings / global_hbm_for_values / caching / world_size."""
+def assert_cache_and_storage_shapes(
+    batched: BatchedDynamicEmbeddingTablesV2,
+    eb_configs_by_name: Dict[str, EmbeddingConfig],
+    bucket_capacity: int,
+) -> None:
+    """Planner capacities vs ``get_sharded_table_capacity``; value buffers vs hashtable metadata."""
+    options = list(batched._dynamicemb_options)
+    names = list(batched.table_names)
+    world_size = dist.get_world_size()
+    bc = int(bucket_capacity)
 
-    @pytest.fixture
-    def num_embeddings_list(self) -> List[int]:
-        # Cover alignment boundaries: below 16, equal 16, non-multiple of 16, larger
-        return [10, 16, 17, 32, 100, 1000, 10000]
-
-    @pytest.fixture
-    def global_hbm_modes(self) -> List[str]:
-        return ["0", "half", "full"]
-
-    @pytest.fixture
-    def world_sizes(self) -> List[int]:
-        return [1, 8]
-
-    def test_align_to_table_size_default_alignment(self):
-        """With default alignment, result is a multiple of DEMB_TABLE_ALIGN_SIZE."""
-        for n in [0, 1, 15, 16, 17, 32, 100]:
-            aligned = align_to_table_size(n)
-            assert (
-                aligned % DEMB_TABLE_ALIGN_SIZE == 0
-            ), f"align_to_table_size({n}) = {aligned} not multiple of {DEMB_TABLE_ALIGN_SIZE}"
-            if n > 0:
-                assert aligned >= n, f"align_to_table_size({n}) = {aligned} < {n}"
-
-    def test_align_to_table_size_bucket_capacity(self):
-        """With bucket_capacity alignment, result is a multiple of bucket_capacity."""
-        for bucket_cap in [128, 1024]:
-            for n in [0, 1, 127, 128, 129, 1000, 3125000]:
-                aligned = align_to_table_size(n, alignment=bucket_cap)
-                assert (
-                    aligned % bucket_cap == 0
-                ), f"align_to_table_size({n}, {bucket_cap}) = {aligned} not multiple of {bucket_cap}"
-                if n > 0:
-                    assert (
-                        aligned >= n
-                    ), f"align_to_table_size({n}, {bucket_cap}) = {aligned} < {n}"
-
-    def test_memory_stats_total_consistent(
-        self, num_embeddings_list, global_hbm_modes, world_sizes
-    ):
-        """Per-rank total matches aligned_capacity_per_rank; non-caching: HBM+DRAM=total; caching: DRAM=total."""
-        rows = run_alignment_memory_report(
-            num_embeddings_list, global_hbm_modes, world_sizes, include_caching=True
+    for opt, name in zip(options, names):
+        ec = eb_configs_by_name[name]
+        expected_cap = get_sharded_table_capacity(ec, world_size, bc)
+        assert int(opt.max_capacity) == expected_cap, (
+            f"{name}: max_capacity={opt.max_capacity} != get_sharded_table_capacity "
+            f"{expected_cap} (bucket_capacity={bc})"
         )
-        for r in rows:
-            expected_total = r["aligned_capacity_per_rank"] * _byte_per_vector()
-            assert (
-                r["total_bytes"] == expected_total
-            ), f"total_bytes mismatch: {r['total_bytes']} vs {expected_total}"
-            if not r["caching"]:
-                assert (
-                    r["hbm_bytes"] + r["dram_bytes"] == r["total_bytes"]
-                ), f"non-caching: hbm + dram != total: {r}"
-            else:
-                assert (
-                    r["dram_bytes"] == r["total_bytes"]
-                ), f"caching: dram should equal total (storage): {r}"
+        gh = int(opt.global_hbm_for_values)
+        assert int(opt.local_hbm_for_values) == (gh + world_size - 1) // world_size
 
-    def test_caching_increases_hbm_when_global_hbm_nonzero(
-        self, num_embeddings_list, global_hbm_modes, world_sizes
-    ):
-        """When global_hbm is non-zero, HBM under caching is determined by cache capacity."""
-        for num_emb in num_embeddings_list:
-            for world_size in world_sizes:
-                num_per_rank = math.ceil(num_emb / world_size)
-                aligned = align_to_table_size(
-                    num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
-                )
-                aligned = max(aligned, BUCKET_CAPACITY_NORMAL)
-                total_mem_global = aligned * _byte_per_vector() * world_size
-                for gmode in ["half", "full"]:
-                    global_hbm = (
-                        total_mem_global // 2 if gmode == "half" else total_mem_global
-                    )
-                    _, hbm_no_cache, _, _, _ = compute_memory_stats(
-                        num_emb, global_hbm, caching=False, world_size=world_size
-                    )
-                    _, hbm_cache, _, _, _ = compute_memory_stats(
-                        num_emb, global_hbm, caching=True, world_size=world_size
-                    )
-                    assert hbm_cache >= 0 and hbm_no_cache >= 0
+    value_dims = [
+        int(opt.dim) + int(batched._optimizer.get_state_dim(int(opt.dim)))
+        for opt in options
+    ]
+    total_memory = sum(
+        int(opt.max_capacity) * int(DTYPE_NUM_BYTES[opt.embedding_dtype]) * vd
+        for opt, vd in zip(options, value_dims)
+    )
+    local_hbm = sum(int(opt.local_hbm_for_values) for opt in options)
 
-    def test_alignment_memory_report_runs(
-        self, num_embeddings_list, global_hbm_modes, world_sizes
-    ):
-        """Run full report and assert every row has valid values."""
-        rows = run_alignment_memory_report(
-            num_embeddings_list, global_hbm_modes, world_sizes, include_caching=True
-        )
-        assert len(rows) > 0
-        for r in rows:
-            assert r["total_bytes"] > 0
-            assert r["hbm_bytes"] >= 0 and r["dram_bytes"] >= 0
-            num_per_rank = math.ceil(r["num_embeddings"] / r["world_size"])
-            assert r["aligned_capacity_per_rank"] >= align_to_table_size(
-                num_per_rank, alignment=BUCKET_CAPACITY_NORMAL
+    if batched._caching and total_memory > local_hbm:
+        assert batched._cache is not None
+        assert isinstance(batched._cache, DynamicEmbCache)
+        cstate = batched._cache._state
+        for tid in range(len(names)):
+            _assert_value_buffer_matches_hashtable(
+                cstate, tid, include_overflow=True
             )
+    else:
+        assert batched._cache is None
 
-    def test_multi_rank_reduces_per_rank_memory(self):
-        """With world_size=8, per-rank total_bytes should be less than full-table size with world_size=1."""
-        num_emb = 10000
-        total_ws1 = (
-            align_to_table_size(num_emb, alignment=BUCKET_CAPACITY_NORMAL)
-            * _byte_per_vector()
-        )
-        total_ws8_per_rank, _, _, _, _ = compute_memory_stats(
-            num_emb, global_hbm_for_values=0, caching=False, world_size=8
-        )
-        assert total_ws8_per_rank < total_ws1
+    storage = batched._storage
+    if isinstance(storage, DynamicEmbStorage):
+        for tid in range(len(names)):
+            _assert_value_buffer_matches_hashtable(
+                storage._state, tid, include_overflow=False
+            )
+    elif isinstance(storage, HybridStorage):
+        assert not batched._caching
+        assert total_memory > local_hbm
+        for tid in range(len(names)):
+            _assert_value_buffer_matches_hashtable(
+                storage._hbm, tid, include_overflow=False
+            )
+            _assert_value_buffer_matches_hashtable(
+                storage._host, tid, include_overflow=False
+            )
+    else:
+        raise AssertionError(f"Unexpected storage type {type(storage)}")
 
-    def test_max_capacity_bucket_floor(self):
-        """Per-rank aligned capacity (planner max_capacity) is at least bucket_capacity."""
-        min_cap = BUCKET_CAPACITY_NORMAL
-        assert min_cap == 128
-        for num_emb in [1, 10, 17, 50]:
-            for world_size in [1, 8]:
-                _, _, _, aligned_cap, _ = compute_memory_stats(
-                    num_emb,
-                    global_hbm_for_values=0,
-                    caching=False,
-                    world_size=world_size,
-                )
-                assert (
-                    aligned_cap >= min_cap
-                ), f"num_emb={num_emb} world_size={world_size} aligned_cap={aligned_cap} < {min_cap}"
 
-    def test_cache_min_capacity_1024(self):
-        """When caching is on, cache min capacity is 1024 (round up to 1 bucket if smaller)."""
-        for num_emb in [10, 100, 1000]:
-            for world_size in [1, 8]:
-                _, hbm_bytes, _, _, _ = compute_memory_stats(
-                    num_emb,
-                    global_hbm_for_values=0,
-                    caching=True,
-                    world_size=world_size,
-                )
-                cache_capacity_rows = hbm_bytes // _byte_per_vector()
-                assert (
-                    cache_capacity_rows >= BUCKET_CAPACITY_CACHE
-                ), f"num_emb={num_emb} W={world_size} cache_capacity_rows={cache_capacity_rows} < 1024"
-
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(),
-        reason="CUDA required for DMP model creation",
+@pytest.mark.parametrize("caching", [False, True])
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize(
+    "bucket_capacity",
+    [DEFAULT_BUCKET_CAPACITY, 1024, MAX_BUCKET_CAPACITY],
+)
+@pytest.mark.parametrize(
+    "optimizer_type",
+    [
+        EmbOptimType.SGD,
+        EmbOptimType.ADAM,
+        EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+    ],
+)
+@pytest.mark.parametrize("hbm_ratio", [0.0, 0.25, 1.0])
+@pytest.mark.parametrize("embedding_dim", [16, 128])
+@pytest.mark.parametrize("num_embeddings_per_table", _num_embeddings_per_table_params())
+def test_alignment_cache_storage_shapes(
+    caching: bool,
+    training: bool,
+    bucket_capacity: int,
+    optimizer_type: EmbOptimType,
+    hbm_ratio: float,
+    embedding_dim: int,
+    num_embeddings_per_table: Tuple[int, ...],
+) -> None:
+    if caching and hbm_ratio == 0.0:
+        pytest.skip("caching with zero global HBM is invalid")
+    world_size = _alignment_world_size()
+    _require_cuda_dist()
+    assert dist.get_world_size() == world_size, (
+        f"dist.world_size={dist.get_world_size()} != WORLD_SIZE={world_size}"
     )
-    def test_actual_capacity_matches_theoretical(self):
-        """
-        Compare with actual DMP model config: create EmbeddingConfig -> EmbeddingCollection ->
-        DynamicEmbTableOptions -> apply_dmp to get model, read actual max_capacity / local_hbm_for_values
-        from model and assert they match compute_memory_stats theoretical values.
-        Run with torchrun to init dist and perform comparison.
-        """
-        if not dist.is_initialized():
-            if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-                dist.init_process_group(
-                    backend="gloo" if not torch.cuda.is_available() else "nccl",
-                    init_method="env://",
-                )
-            else:
-                pytest.skip(
-                    "Distributed not initialized; run with torchrun to compare actual vs theoretical."
-                )
-        if not dist.is_initialized():
-            pytest.skip("Failed to init process group")
-        world_size = dist.get_world_size()
-        num_embeddings = 1000
-        # Global HBM = full (same as "full" in theoretical report; use same bucket floor as compute_memory_stats)
-        aligned_per_rank = align_to_table_size(
-            math.ceil(num_embeddings / world_size),
-            alignment=BUCKET_CAPACITY_NORMAL,
+
+    tables: List[EmbeddingConfig] = []
+    for i, nemb in enumerate(num_embeddings_per_table):
+        name = f"t{i}"
+        tables.append(
+            EmbeddingConfig(
+                name=name,
+                embedding_dim=embedding_dim,
+                num_embeddings=nemb,
+                feature_names=[f"f{i}"],
+                data_type=DataType.FP32,
+            )
         )
-        aligned_per_rank = max(aligned_per_rank, BUCKET_CAPACITY_NORMAL)
-        total_mem_global = aligned_per_rank * _byte_per_vector() * world_size
-        global_hbm = total_mem_global
-        ok, msg = _compare_actual_vs_theoretical(
-            num_embeddings=num_embeddings,
-            global_hbm_for_values=global_hbm,
-            caching=False,
-            world_size=world_size,
+    by_name = {t.name: t for t in tables}
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            dmp = build_dmp_for_alignment_test(
+                tables,
+                optimizer_type,
+                bucket_capacity,
+                hbm_ratio,
+                caching,
+                training,
+                device,
+            )
+    except ValueError as e:
+        pytest.fail(f"DMP build failed: {e}")
+
+    emb_modules: List[nn.Module] = []
+    for _, _, sharded in find_sharded_modules(dmp):
+        emb_modules.extend(get_dynamic_emb_module(sharded))
+    assert emb_modules, "no BatchedDynamicEmbeddingTablesV2 under DMP"
+    batched = emb_modules[0]
+    assert isinstance(batched, BatchedDynamicEmbeddingTablesV2)
+    assert batched._caching == caching
+
+    assert_cache_and_storage_shapes(batched, by_name, bucket_capacity)
+
+    if training:
+        torch_dtype = batched._dynamicemb_options[0].embedding_dtype
+        assert torch_dtype is not None
+        st_dim = get_optimizer_state_dim(
+            optimizer_type, embedding_dim, torch_dtype
         )
-        assert ok, msg
-
-
-def main():
-    """CLI entry: print memory stats for varying num_embeddings / global_hbm_for_values / caching / world_size."""
-    num_embeddings_list = [10, 16, 17, 32, 100, 1000, 10000]
-    global_hbm_modes = ["0", "half", "full"]
-    world_sizes = DEFAULT_WORLD_SIZES  # e.g. [1, 8]
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-
-        print("Alignment & HBM memory report (per rank; dim=128, Adam)")
-        print("DEMB_TABLE_ALIGN_SIZE =", DEMB_TABLE_ALIGN_SIZE)
-        print(
-            "W = world_size; aligned/r = aligned capacity per rank; global_hbm = global budget"
-        )
-        print("total/HBM/DRAM = per rank (total(MB)*W = all ranks total table memory)")
-        print()
-
-        rows = run_alignment_memory_report(
-            num_embeddings_list, global_hbm_modes, world_sizes, include_caching=True
-        )
-    print_report(rows, show_all_ranks=True)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        if isinstance(batched._storage, HybridStorage):
+            vd_state = batched._storage._hbm
+        else:
+            vd_state = batched._storage._state
+        for tid, name in enumerate(batched.table_names):
+            ec = by_name[name]
+            assert int(batched._dynamicemb_options[tid].dim) == ec.embedding_dim
+            assert vd_state.table_value_dims_cpu[tid] == int(ec.embedding_dim) + int(
+                st_dim
+            )
