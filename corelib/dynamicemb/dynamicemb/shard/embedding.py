@@ -195,6 +195,21 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 offsets = input_feature.offsets().to(torch.int64)
                 num_elements = indices.numel()
 
+                # Handle empty input
+                if num_elements == 0:
+                    dedup_features = KeyedJaggedTensor(
+                        keys=input_feature.keys(),
+                        lengths=input_feature.lengths(),
+                        offsets=input_feature.offsets(),
+                        values=indices,
+                    )
+                    ctx.input_features.append(input_feature)
+                    ctx.reverse_indices.append(
+                        torch.empty(0, dtype=torch.int64, device=self._device)
+                    )
+                    features_by_shards.append(dedup_features)
+                    continue
+
                 # Generate table_ids from jagged offsets (fully on GPU, no sync)
                 table_ids = expand_table_ids_cuda(
                     offsets,

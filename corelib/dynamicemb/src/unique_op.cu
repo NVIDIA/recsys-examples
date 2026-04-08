@@ -679,13 +679,13 @@ std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
   // Handle empty case
   if (new_lengths_size == 0) {
     return std::make_tuple(
-        at::empty({0}, at::TensorOptions().dtype(at::kInt).device(device)),
+        at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
         at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)));
   }
 
   // Allocate output tensors
   at::Tensor new_lengths = at::empty(
-      {new_lengths_size}, at::TensorOptions().dtype(at::kInt).device(device));
+      {new_lengths_size}, at::TensorOptions().dtype(at::kLong).device(device));
   at::Tensor new_offsets =
       at::empty({new_lengths_size + 1},
                 at::TensorOptions().dtype(at::kLong).device(device));
@@ -695,8 +695,8 @@ std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
   get_new_length_and_offsets(
       reinterpret_cast<uint64_t *>(get_pointer<int64_t>(unique_offsets)),
       get_pointer<int64_t>(table_offsets_in_feature), num_tables,
-      new_lengths_size, local_batch_size, DataType::Int32, DataType::Int64,
-      get_pointer<int64_t>(new_offsets), get_pointer<int32_t>(new_lengths),
+      new_lengths_size, local_batch_size, DataType::Int64, DataType::Int64,
+      get_pointer<int64_t>(new_offsets), get_pointer<int64_t>(new_lengths),
       stream);
 
   return std::make_tuple(new_lengths, new_offsets);
@@ -816,7 +816,7 @@ Args:
 
 Returns:
     Tuple of (new_lengths, new_offsets)
-    - new_lengths: Length for each bucket (int32)
+    - new_lengths: Length for each bucket (int64)
     - new_offsets: Offset for each bucket (int64)
 )doc",
       py::arg("unique_offsets"), py::arg("table_offsets_in_feature"),
