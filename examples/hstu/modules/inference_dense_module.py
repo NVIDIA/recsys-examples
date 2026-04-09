@@ -14,11 +14,15 @@
 # limitations under the License.
 import math
 import os
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Union
 
 import paged_kvcache_ops
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
+from commons.ops.triton_ops.common import (
+    set_static_max_seq_lens,
+    set_use_runtime_max_seq_len,
+)
 from configs import (
     HSTUConfig,
     InferenceHSTUConfig,
@@ -103,163 +107,6 @@ def copy_jagged_metadata(dst_metadata, src_metata):
     dst_metadata.scaling_seqlen = src_metata.scaling_seqlen
 
 
-class InferenceDenseModuleV2(torch.nn.Module):
-    """
-    Simplified ranking model inference without KV cache and CUDA graph optimizations.
-    
-    This is a lightweight alternative to InferenceDenseModule for scenarios where
-    KV caching and CUDA graph optimizations are not needed.
-    
-    Args:
-        hstu_config (HSTUConfig): The HSTU configuration.
-        task_config (RankingConfig): The ranking task configuration.
-    
-    Recommended for:
-    - Simple inference scenarios without KV cache
-    - Memory-constrained environments
-    - Single-batch or low-throughput use cases
-    """
-
-    def __init__(
-        self,
-        hstu_config: HSTUConfig,
-        task_config: RankingConfig,
-    ):
-        super().__init__()
-        self._device = torch.cuda.current_device()
-        self._hstu_config = hstu_config
-        self._task_config = task_config
-
-        self._embedding_dim = hstu_config.hidden_size
-        for ebc_config in task_config.embedding_configs:
-            assert (
-                ebc_config.dim == self._embedding_dim
-            ), "hstu layer hidden size should equal to embedding dim"
-
-        # Use HSTUBlock instead of HSTUBlockInference
-        self._hstu_block = HSTUBlock(hstu_config)
-        self._mlp = MLP(
-            self._embedding_dim,
-            task_config.prediction_head_arch,
-            task_config.prediction_head_act_type,
-            task_config.prediction_head_bias,
-            device=self._device,
-        )
-
-        self._hstu_block = self._hstu_block.cuda()
-        self._mlp = self._mlp.cuda()
-
-        dtype = (
-            torch.bfloat16
-            if hstu_config.bf16
-            else torch.float16
-            if hstu_config.fp16
-            else torch.float32
-        )
-
-        from commons.ops.triton_ops.common import (
-            set_static_max_seq_lens,
-            set_use_runtime_max_seq_len,
-        )
-
-        max_seq_len = int(os.getenv("HSTU_MAX_SEQ_LEN", 8192))
-        set_use_runtime_max_seq_len(False)
-        set_static_max_seq_lens(max_seq_len, max_seq_len)
-
-    def bfloat16(self):
-        """
-        Convert the model to use bfloat16 precision.
-
-        Returns:
-            InferenceDenseModuleV2: The model with bfloat16 precision.
-        """
-        self._hstu_block.bfloat16()
-        self._mlp.bfloat16()
-        return self
-
-    def half(self):
-        """
-        Convert the model to use half precision.
-
-        Returns:
-            InferenceDenseModuleV2: The model with half precision.
-        """
-        self._hstu_block.half()
-        self._mlp.half()
-        return self
-
-    def get_num_class(self):
-        return self._task_config.prediction_head_arch[-1]
-
-    def get_num_tasks(self):
-        return self._task_config.num_tasks
-
-    def get_metric_types(self):
-        return self._task_config.eval_metrics
-
-    def load_checkpoint(self, checkpoint_dir):
-        if checkpoint_dir is None:
-            return
-
-        model_state_dict_path = os.path.join(
-            checkpoint_dir, "torch_module", "model.0.pth"
-        )
-        model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
-        self.load_state_dict(model_state_dict, strict=False)
-
-    def load_state_dict(self, model_state_dict, *args, **kwargs):
-        new_state_dict = {}
-        for k in model_state_dict:
-            if (
-                k.startswith(
-                    "_embedding_collection._data_parallel_embedding_collection.embeddings."
-                )
-                or "_model_parallel_embedding_collection" in k
-            ):
-                continue
-
-            is_transposed = False
-            new_state_dict[k] = (
-                model_state_dict[k] if not is_transposed else model_state_dict[k].T
-            )
-
-        unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
-
-        assert unloaded_modules.missing_keys == []
-        assert unloaded_modules.unexpected_keys == []
-
-    def forward(
-        self,
-        batch: HSTUBatch,
-        embeddings: Dict[str, JaggedTensor],
-    ):
-        """
-        Forward pass for inference without KV cache.
-        
-        Args:
-            batch (HSTUBatch): The input batch.
-            embeddings (Dict[str, JaggedTensor]): The input embeddings.
-        
-        Returns:
-            torch.Tensor: Item logits for ranking.
-        """
-        with torch.inference_mode():
-            # Forward through HSTU block
-            jd_output, _ = self._hstu_block(embeddings, batch)
-
-            # Prediction head
-            logits = self._mlp(jd_output.values)
-
-            return logits
-    
-    def forward_nokvcache(
-        self,
-        batch: HSTUBatch,
-        embeddings: Dict[str, JaggedTensor],
-    ):
-        return self.forward(batch, embeddings)
-
-
 class InferenceDenseModule(torch.nn.Module):
     """
     A class representing the ranking model inference.
@@ -271,16 +118,20 @@ class InferenceDenseModule(torch.nn.Module):
 
     def __init__(
         self,
-        hstu_config: InferenceHSTUConfig,
-        kvcache_config: KVCacheConfig,
+        hstu_config: Union[HSTUConfig, InferenceHSTUConfig],
+        kvcache_config: Optional[KVCacheConfig],
         task_config: RankingConfig,
         use_cudagraph=False,
         cudagraph_configs=None,
+        use_exportable: bool = False,
     ):
         super().__init__()
         self._device = torch.cuda.current_device()
         self._hstu_config = hstu_config
         self._task_config = task_config
+        self._use_exportable = use_exportable
+        if self._use_exportable:
+            assert isinstance(hstu_config, HSTUConfig), "Exportable module is only supported for HSTUConfig"
 
         self._embedding_dim = hstu_config.hidden_size
         for ebc_config in task_config.embedding_configs:
@@ -288,7 +139,7 @@ class InferenceDenseModule(torch.nn.Module):
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
 
-        self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
+        self._hstu_block = HSTUBlock(hstu_config) if self._use_exportable else HSTUBlockInference(hstu_config, kvcache_config)
         self._mlp = MLP(
             self._embedding_dim,
             task_config.prediction_head_arch,
@@ -308,18 +159,22 @@ class InferenceDenseModule(torch.nn.Module):
             else torch.float32
         )
 
+        if isinstance(hstu_config, InferenceHSTUConfig):
+            max_seq_len = hstu_config.max_seq_len
+        else:
+            max_seq_len = int(os.getenv("HSTU_MAX_SEQ_LEN", 8192))
+        set_use_runtime_max_seq_len(False)
+        set_static_max_seq_lens(max_seq_len, max_seq_len)
+
+        if not self._use_exportable:
+            self._scaling_seqlen = hstu_config.scaling_seqlen
+            self.setup_for_kvcache(hstu_config, kvcache_config)
+            self.setup_for_cudagraph(hstu_config, use_cudagraph, cudagraph_configs)
+    
+    def setup_for_kvcache(self, hstu_config, kvcache_config):
         max_batch_size = hstu_config.max_batch_size
         max_seq_len = hstu_config.max_seq_len
         hidden_dim = hstu_config.hidden_size
-
-        from commons.ops.triton_ops.common import (
-            set_static_max_seq_lens,
-            set_use_runtime_max_seq_len,
-        )
-
-        set_use_runtime_max_seq_len(False)
-        set_static_max_seq_lens(max_seq_len, max_seq_len)
-        self._scaling_seqlen = hstu_config.scaling_seqlen
 
         self._hidden_states = torch.randn(
             (max_batch_size * max_seq_len, hidden_dim), dtype=dtype, device=self._device
@@ -360,6 +215,7 @@ class InferenceDenseModule(torch.nn.Module):
                 kvcache_config.enable_nvcomp,
             )
 
+    def setup_for_cudagraph(self, hstu_config, use_cudagraph, cudagraph_configs):
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
         if use_cudagraph:
@@ -439,29 +295,32 @@ class InferenceDenseModule(torch.nn.Module):
                 continue
 
             is_transposed = False
-            if k.endswith("_linear_uvqk_weight"):
-                newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
-                is_transposed = True
-            elif k.endswith("_linear_uvqk_bias"):
-                newk = k.removesuffix("_linear_uvqk_bias") + "_linear_uvqk.bias"
-            elif k.endswith("_linear_proj_weight"):
-                newk = k.removesuffix("_linear_proj_weight") + "_linear_proj.weight"
-                is_transposed = True
-            else:
-                newk = k
+
+            newk = k
+            if not self._use_exportable:
+                if k.endswith("_linear_uvqk_weight"):
+                    newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
+                    is_transposed = True
+                elif k.endswith("_linear_uvqk_bias"):
+                    newk = k.removesuffix("_linear_uvqk_bias") + "_linear_uvqk.bias"
+                elif k.endswith("_linear_proj_weight"):
+                    newk = k.removesuffix("_linear_proj_weight") + "_linear_proj.weight"
+                    is_transposed = True
+
             new_state_dict[newk] = (
                 model_state_dict[k] if not is_transposed else model_state_dict[k].T
             )
 
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
-        for hstu_layer in self._hstu_block._attention_layers:
-            hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
-            hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
+        if not self._use_exportable:
+            for hstu_layer in self._hstu_block._attention_layers:
+                hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
+                hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
 
         assert unloaded_modules.missing_keys == []
         assert unloaded_modules.unexpected_keys == []
 
-    def forward(
+    def forward_with_kvcache(
         self,
         batch: HSTUBatch,
         embeddings: Dict[str, JaggedTensor],
@@ -573,14 +432,27 @@ class InferenceDenseModule(torch.nn.Module):
             jagged_item_logit = self._mlp(jagged_data.values)
 
         return jagged_item_logit
+    
+    def forward(
+        self,
+        batch: HSTUBatch,
+        embeddings: Dict[str, JaggedTensor],
+    ):
+        with torch.inference_mode():
+            # Forward through HSTU block
+            jd_output, _ = self._hstu_block(embeddings, batch)
+            # Prediction head
+            logits = self._mlp(jd_output.values)
+            return logits
 
 
 def get_inference_dense_model(
     hstu_config: InferenceHSTUConfig,
     kvcache_config: KVCacheConfig,
     task_config: RankingConfig,
-    use_cudagraph=False,
-    cudagraph_configs=None,
+    use_cudagraph: bool = False,
+    cudagraph_configs: Dict[int, Any] = None,
+    use_exportable: bool = False,
 ):
     return InferenceDenseModule(
         hstu_config,
@@ -588,37 +460,5 @@ def get_inference_dense_model(
         task_config,
         use_cudagraph,
         cudagraph_configs,
-    )
-
-
-def get_inference_dense_model_v2(
-    hstu_config: HSTUConfig,
-    task_config: RankingConfig,
-):
-    """
-    Get simplified inference dense model without KV cache and CUDA graph optimizations.
-    
-    Use this factory function when you need a lightweight inference module
-    without KV caching and CUDA graph optimizations.
-    
-    Args:
-        hstu_config (HSTUConfig): HSTU configuration
-        task_config (RankingConfig): Ranking task configuration
-        
-    Returns:
-        InferenceDenseModuleV2: Simplified inference module
-        
-    Recommended for:
-    - Simple inference scenarios
-    - Memory-constrained environments  
-    - Single-batch or low-throughput use cases
-    
-    Use get_inference_dense_model() instead if you need:
-    - KV cache support for batching
-    - CUDA graph optimizations
-    - High-throughput inference
-    """
-    return InferenceDenseModuleV2(
-        hstu_config,
-        task_config,
+        use_exportable,
     )

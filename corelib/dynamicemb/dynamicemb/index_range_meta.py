@@ -27,6 +27,7 @@ def _get_table_range_fake(
 
 def _expand_table_ids_fake(
     offsets: torch.Tensor,
+    indices: torch.Tensor,
     table_offsets_in_feature: Optional[torch.Tensor] = None,
     num_tables: int = 0,
     local_batch_size: int = 1,
@@ -49,7 +50,7 @@ def _expand_table_ids_fake(
             "INFERENCE_EMB::expand_table_ids expects num_elements >= 0"
         )
 
-    return offsets.new_empty((num_elements,), dtype=torch.int64)
+    return offsets.new_empty((indices.size(0),), dtype=torch.int64)
 
 
 def register_index_range_fake() -> bool:

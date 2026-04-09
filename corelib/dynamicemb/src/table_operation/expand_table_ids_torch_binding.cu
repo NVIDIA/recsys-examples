@@ -4,13 +4,13 @@
 #include "unique_op.h"
 
 TORCH_LIBRARY_FRAGMENT(INFERENCE_EMB, m) {
-    m.def("expand_table_ids(Tensor offsets, Tensor? table_offsets_in_feature=None, int num_tables=0, int local_batch_size=1, int num_elements=0) -> Tensor");
+    m.def("expand_table_ids(Tensor offsets, Tensor indices, Tensor? table_offsets_in_feature=None, int num_tables=0, int local_batch_size=1, int num_elements=0) -> Tensor");
 }
 
 namespace dyn_emb {
 
 at::Tensor expand_table_ids_cuda_impl(
-    at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
+    at::Tensor offsets, at::Tensor indices, c10::optional<at::Tensor> table_offsets_in_feature,
     int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
     TORCH_CHECK(offsets.is_cuda(), "INFERENCE_EMB::expand_table_ids expects CUDA offsets.");
     if (table_offsets_in_feature.has_value() &&
@@ -25,7 +25,7 @@ at::Tensor expand_table_ids_cuda_impl(
 }
 
 at::Tensor expand_table_ids_cpu_impl(
-    at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
+    at::Tensor offsets, at::Tensor indices, c10::optional<at::Tensor> table_offsets_in_feature,
     int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
     TORCH_WARN_ONCE(
         "INFERENCE_EMB::expand_table_ids has no CPU kernel. "

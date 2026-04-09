@@ -79,8 +79,8 @@ class InferenceRankingGR(torch.nn.Module):
 
         self.sparse_module.load_checkpoint(checkpoint_dir, model_state_dict)
         self.dense_module.load_state_dict(model_state_dict, strict=False)
-
-    def forward(
+    
+    def forward_with_kvcache(
         self,
         batch: HSTUBatch,
         user_ids: torch.Tensor,
@@ -112,7 +112,7 @@ class InferenceRankingGR(torch.nn.Module):
             torch.cuda.nvtx.range_pop()
 
             prepare_kvcache_result = [old_cached_lengths] + prepare_kvcache_result[1:]
-            logits = self.dense_module(
+            logits = self.dense_module.forward_with_kvcache(
                 striped_batch,
                 embeddings,
                 user_ids,
@@ -132,6 +132,17 @@ class InferenceRankingGR(torch.nn.Module):
             torch.cuda.nvtx.range_pop()
             logits = self.dense_module.forward_nokvcache(batch, embeddings)
 
+        return logits
+    
+    def forward(
+        self,
+        batch: HSTUBatch,
+    ):
+        with torch.inference_mode():
+            torch.cuda.nvtx.range_push("HSTU embedding")
+            embeddings = self.sparse_module(batch.features)
+            torch.cuda.nvtx.range_pop()
+            logits = self.dense_module(batch, embeddings)
         return logits
 
 

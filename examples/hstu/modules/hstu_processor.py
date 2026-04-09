@@ -48,7 +48,6 @@ def hstu_preprocess_embeddings(
     contextual_mlp: Optional[MLP] = None,
     dtype: Optional[torch.dtype] = None,
     scaling_seqlen: int = -1,
-    is_exportable: bool = False,
 ) -> JaggedData:
     """
     Preprocesses the embeddings for use in the HSTU architecture.
@@ -107,7 +106,7 @@ def hstu_preprocess_embeddings(
 
             item_embs = item_jt.values().to(dtype)
             action_embs = action_jt.values().to(dtype)
-            if not is_exportable:
+            if not torch.compiler.is_compiling():
                 interleaved_embeddings = [
                     (
                         torch.cat(
@@ -224,13 +223,14 @@ def hstu_preprocess_embeddings(
         else None
     )
     total_candidates_seq_len = None
-    if is_exportable:
-        total_candidates_seq_len = torch.tensor(total_candidates_seq_len, dtype=torch.int32) if total_candidates_seq_len is not None else None
-    elif not is_inference:
+    if not is_inference:
         if num_candidates is not None:
             total_candidates_seq_len = num_candidates.sum()
         elif contextual_seqlen is not None:
             total_candidates_seq_len = sequence_embeddings_lengths.sum() - contextual_seqlen.sum()
+    elif torch.compiler.is_compiling():
+        assert num_candidates is not None, "num_candidates should be None during inference when compiling"
+        total_candidates_seq_len = num_candidates.sum()
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
@@ -324,8 +324,6 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             self._dropout_ratio = config.hidden_dropout
         self._scaling_seqlen = config.scaling_seqlen
 
-        self._is_exportable = True
-
     @output_nvtx_hook(nvtx_tag="HSTUBlock preprocess", hook_key_or_attr_name="values")
     def forward(
         self,
@@ -360,7 +358,6 @@ class HSTUBlockPreprocessor(torch.nn.Module):
             contextual_mlp=self._contextual_mlp,
             dtype=self._training_dtype,
             scaling_seqlen=self._scaling_seqlen,
-            is_exportable=self._is_exportable,
         )
         if self._sequence_parallel:
             jd = pad_jd_values(jd, self._tp_size)
@@ -403,7 +400,6 @@ class HSTUBlockPostprocessor(torch.nn.Module):
 
         if self._is_inference:
             self._sequence_parallel = False
-        self._is_exportable = True
 
     @output_nvtx_hook(nvtx_tag="HSTUBlock postprocess", hook_key_or_attr_name="values")
     def forward(self, jd: JaggedData) -> JaggedData:
@@ -436,10 +432,11 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             total_seq = jd.values.shape[0]
             precomputed_b = jd.total_candidates_seq_len
             precomputed_a = total_seq - jd.total_candidates_seq_len
-            assert precomputed_a >= 0, (
-                f"precomputed_a is negative ({precomputed_a}): total_seq={total_seq}, "
-                f"total_candidates_seq_len={jd.total_candidates_seq_len}"
-            )
+            if not torch.compiler.is_compiling():
+                assert precomputed_a >= 0, (
+                    f"precomputed_a is negative ({precomputed_a}): total_seq={total_seq}, "
+                    f"total_candidates_seq_len={jd.total_candidates_seq_len}"
+                )
         else:
             precomputed_a = None
             precomputed_b = None

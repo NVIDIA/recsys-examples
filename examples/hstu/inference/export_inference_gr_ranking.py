@@ -17,13 +17,12 @@ import enum
 import math
 import os
 import sys
-import time
+import warnings
 
 import gin
 import torch
 from commons.datasets import get_data_loader
 from commons.datasets.hstu_sequence_dataset import get_dataset
-from commons.datasets.inference_dataset import InferenceDataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from configs import (
@@ -31,34 +30,37 @@ from configs import (
     PositionEncodingConfig,
     RankingConfig,
     get_hstu_config,
-    get_inference_hstu_config,
-    get_kvcache_config,
 )
 from modules.metrics import get_multi_event_metric_module
-from modules.inference_dense_module import get_inference_dense_model_v2
-from modules.inference_embedding import InferenceEmbedding
+from modules.inference_dense_module import get_inference_dense_model
+from modules.exportable_embedding import ExportableEmbedding
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
 sys.path.append("./model/")
-from inference_ranking_gr import get_inference_ranking_gr, InferenceRankingGR
-from model import get_ranking_model
+from inference_ranking_gr import InferenceRankingGR
+from torch.export import Dim, ExportedProgram, ShapesCollection
+
+
+# Reduce warning spam: show each UserWarning once per source location.
+warnings.filterwarnings("default", category=UserWarning)
+torch.set_warn_always(False)
 
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
     SIMULATE = "simulate"
-    SNAP = "snap"
+    EXPORT = "export"
 
     def __str__(self):
         return self.value
 
 
-def debug_print_flattened_export_args(batch, embeddings) -> None:
+def debug_print_flattened_export_args(batch, embeddings = None) -> None:
     from torch.utils import _pytree as pytree
 
     print("\n===== FLATTENED EXPORT ARGS DEBUG =====")
-    export_args = (batch, embeddings)
+    export_args = (batch, )
     flat_leaves, tree_spec = pytree.tree_flatten(export_args)
     print(f"Total flattened tensors: {len(flat_leaves)}")
     print(f"Tree spec: {tree_spec}\n")
@@ -72,15 +74,15 @@ def debug_print_flattened_export_args(batch, embeddings) -> None:
         else:
             print(f"    [{i}] {type(leaf).__name__}: {leaf}")
 
-    print(f"\nEmbeddings dict keys (order): {list(embeddings.keys())}")
-    print(f"Embeddings flattened count: {len(flat_leaves) - len(batch_flat)}")
-    embeddings_flat, _ = pytree.tree_flatten(embeddings)
-    for i, leaf in enumerate(embeddings_flat):
-        if isinstance(leaf, torch.Tensor):
-            print(f"    [{i}] Tensor: shape={leaf.shape}, dtype={leaf.dtype}")
-        else:
-            print(f"    [{i}] {type(leaf).__name__}: {leaf}")
-    print("===== END FLATTENED DEBUG =====\n")
+    # print(f"\nEmbeddings dict keys (order): {list(embeddings.keys())}")
+    # print(f"Embeddings flattened count: {len(flat_leaves) - len(batch_flat)}")
+    # embeddings_flat, _ = pytree.tree_flatten(embeddings)
+    # for i, leaf in enumerate(embeddings_flat):
+    #     if isinstance(leaf, torch.Tensor):
+    #         print(f"    [{i}] Tensor: shape={leaf.shape}, dtype={leaf.dtype}")
+    #     else:
+    #         print(f"    [{i}] {type(leaf).__name__}: {leaf}")
+    # print("===== END FLATTENED DEBUG =====\n")
 
 
 def get_inference_dataset_and_embedding_configs(
@@ -88,7 +90,7 @@ def get_inference_dataset_and_embedding_configs(
 ):
     dataset_args = DatasetArgs()
     embedding_dim = NetworkArgs().hidden_size
-    HASH_SIZE = 1000_000
+    HASH_SIZE = 1000_064
     if dataset_args.dataset_name == "kuairand-1k":
         embedding_configs = [
             InferenceEmbeddingConfig(
@@ -143,7 +145,7 @@ def get_inference_dataset_and_embedding_configs(
             InferenceEmbeddingConfig(
                 feature_names=["action_weights"],
                 table_name="action_weights",
-                vocab_size=233,
+                vocab_size=256,
                 dim=embedding_dim,
                 use_dynamicemb=False,
             ),
@@ -158,84 +160,7 @@ def get_inference_dataset_and_embedding_configs(
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
 
-def get_inference_hstu_model(
-    emb_configs,
-    max_batch_size,
-    num_contextual_features,
-    total_max_seqlen,
-    checkpoint_dir,
-    use_kvcache,
-):
-    network_args = NetworkArgs()
-    if network_args.dtype_str == "bfloat16":
-        inference_dtype = torch.bfloat16
-    # elif network_args.dtype_str == "float16":
-    #     inference_dtype = torch.float16
-    else:
-        raise ValueError(
-            f"Inference data type {network_args.dtype_str} is not supported"
-        )
-
-    position_encoding_config = PositionEncodingConfig(
-        num_position_buckets=8192,
-        num_time_buckets=2048,
-        use_time_encoding=False,
-        static_max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
-    )
-
-    hstu_config = get_inference_hstu_config(
-        hidden_size=network_args.hidden_size,
-        num_layers=network_args.num_layers,
-        num_attention_heads=network_args.num_attention_heads,
-        head_dim=network_args.kv_channels,
-        max_batch_size=max_batch_size,
-        max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
-        scaling_seqlen=total_max_seqlen,
-        dtype=inference_dtype,
-        position_encoding_config=position_encoding_config,
-        contextual_max_seqlen=num_contextual_features,
-    )
-
-    kvcache_args = {
-        "blocks_in_primary_pool": 10240,
-        "page_size": 32,
-        "offload_chunksize": 1024,
-    }
-    kv_cache_config = get_kvcache_config(**kvcache_args)
-
-    ranking_args = RankingArgs()
-    task_config = RankingConfig(
-        embedding_configs=emb_configs,
-        prediction_head_arch=ranking_args.prediction_head_arch,
-        prediction_head_act_type=ranking_args.prediction_head_act_type,
-        prediction_head_bias=ranking_args.prediction_head_bias,
-        num_tasks=ranking_args.num_tasks,
-        eval_metrics=ranking_args.eval_metrics,
-    )
-
-    hstu_cudagraph_configs = {
-        "batch_size": [1],
-        "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
-    }
-
-    model = get_inference_ranking_gr(
-        hstu_config=hstu_config,
-        kvcache_config=kv_cache_config if use_kvcache else None,
-        task_config=task_config,
-        use_cudagraph=False,
-        cudagraph_configs=hstu_cudagraph_configs,
-    )
-    if hstu_config.bf16:
-        model.bfloat16()
-    elif hstu_config.fp16:
-        model.half()
-    model.load_checkpoint(checkpoint_dir)
-    model.eval()
-
-    return model
-
-
-def get_inference_dense_with_fused_hstu(
+def get_inference_export_model(
     emb_configs,
     max_batch_size,
     num_contextual_features,
@@ -281,9 +206,15 @@ def get_inference_dense_with_fused_hstu(
         eval_metrics=ranking_args.eval_metrics,
     )
 
-    dense_module = get_inference_dense_model_v2(
+
+    sparse_module = ExportableEmbedding(emb_configs)
+    sparse_module.eval()
+
+    dense_module = get_inference_dense_model(
         hstu_config,
-        task_config
+        None,  # kvcache_config is not needed for export
+        task_config,
+        use_exportable=True,
     )
     if hstu_config.bf16:
         dense_module.bfloat16()
@@ -292,7 +223,7 @@ def get_inference_dense_with_fused_hstu(
     dense_module.eval()
 
     model = InferenceRankingGR(
-        InferenceEmbedding(emb_configs),
+        sparse_module,
         dense_module,
     )
     if hstu_config.bf16:
@@ -356,16 +287,27 @@ def export_inference_gr_ranking(
     max_bs: int = 1,
     debug_flattened_inputs: bool = False,
 ):
+    def _save_tensor_cpp_compatible(tensor: torch.Tensor, path: str) -> None:
+        """Save a tensor in a format compatible with C++ torch::load().
+        
+        torch::load() expects TorchScript ZIP format, not pickle format.
+        This wraps the tensor in a scripted module before saving.
+        """
+        class _TensorWrapper(torch.nn.Module):
+            def __init__(self, t):
+                super().__init__()
+                self.register_buffer("tensor", t)
+        
+        wrapper = _TensorWrapper(tensor)
+        torch.jit.script(wrapper).save(path)
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
     num_contextual_features = len(dataproc._contextual_feature_names)
 
     max_batch_size = max_bs
-    total_max_seqlen = (
-        dataset_args.max_num_candidates + dataset_args.max_history_seqlen
-    ) * 2 + num_contextual_features
-    print("total_max_seqlen", total_max_seqlen)
+    total_max_seqlen = dataset_args.max_num_candidates + dataset_args.max_history_seqlen * 2 + num_contextual_features
+    print(f"[INFO] Total max sequence length: {total_max_seqlen}")
 
     def strip_padding_batch(batch, unpadded_batch_size):
         batch.batch_size = unpadded_batch_size
@@ -386,71 +328,11 @@ def export_inference_gr_ranking(
     )
     
 
-    # with torch.inference_mode():
-        
-    #     meta_model = get_ranking_model(hstu_config=hstu_config, task_config=task_config)
-    #     meta_hstu_block = meta_model._hstu_block
-
-    #     _, eval_dataset = get_dataset(
-    #         dataset_name=dataset_args.dataset_name,
-    #         dataset_path=dataset_args.dataset_path,
-    #         max_history_seqlen=dataset_args.max_history_seqlen,
-    #         max_num_candidates=dataset_args.max_num_candidates,
-    #         num_tasks=meta_model.get_num_tasks(),
-    #         batch_size=max_batch_size,
-    #         rank=0,
-    #         world_size=1,
-    #         shuffle=False,
-    #         random_seed=0,
-    #         eval_batch_size=max_batch_size,
-    #         load_candidate_action=False,
-    #     )
-
-    #     dataloader = get_data_loader(dataset=eval_dataset)
-    #     dataloader_iter = iter(dataloader)
-
-    #     batch = next(dataloader_iter)
-
-    #     # batch = batch.to(device=torch.cuda.current_device())
-    #     # d = batch.features.to_dict()
-    #     # user_ids = d["user_id"].values().cpu().long()
-    #     # if user_ids.shape[0] != batch.batch_size:
-    #     #     batch = strip_padding_batch(batch, user_ids.shape[0])
-
-    #     # from torch.export import Dim, ShapesCollection, export, ExportedProgram
-
-    #     # embeddings = model.sparse_module(batch.features)
-    #     # # print(batch)
-    #     # # print(embeddings)
-    #     # # breakpoint()
-    #     # sc = ShapesCollection()
-    #     # sc[batch.features.values()] = {0: Dim.DYNAMIC}
-    #     # for config in emb_configs:
-    #     #     jt = embeddings[config.table_name]
-    #     #     sc[jt.values()] = {0: Dim.DYNAMIC if batch.feature_to_max_seqlen[config.table_name] > 1 else Dim.AUTO}
-    #     # dynamic_shapes = sc.dynamic_shapes(model.dense_module, (batch, embeddings))
-    #     # print("=====")
-    #     # print()
-    #     # print(dynamic_shapes['batch'])
-    #     # print()
-    #     # print(dynamic_shapes['embeddings'])
-    #     # print("=====")
-
-
-    #     # exported_program: ExportedProgram = torch.export.export(
-    #     #     model.dense_module, args=(batch, embeddings), dynamic_shapes=dynamic_shapes
-    #     # )
-    #     # # print(exported_program)
-    #     # print("+++++")
-    
-    # print("Ended")
-    # exit()
-
     with torch.inference_mode():
         from register_hstubatch_pytree_example import register_hstu_export_pytrees
         register_hstu_export_pytrees()
 
-        model = get_inference_dense_with_fused_hstu(
+        model = get_inference_export_model(
             emb_configs,
             max_batch_size,
             num_contextual_features,
@@ -482,82 +364,63 @@ def export_inference_gr_ranking(
         dataloader = get_data_loader(dataset=eval_dataset)
         dataloader_iter = iter(dataloader)
 
-        # warmup
+        def strip_padding_batch(b):
+            b = b.to(device=torch.cuda.current_device())
+            d = b.features.to_dict()
+            user_ids = d["user_id"].values().cpu().long()
+            if user_ids.shape[0] != b.batch_size:
+                b = strip_padding_batch(b, user_ids.shape[0])
+            return b
+
+        # === Warmup ===
         batch = next(dataloader_iter)
-        batch = batch.to(device=torch.cuda.current_device())
-        d = batch.features.to_dict()
-        user_ids = d["user_id"].values().cpu().long()
-        if user_ids.shape[0] != batch.batch_size:
-            batch = strip_padding_batch(batch, user_ids.shape[0])
+        batch = strip_padding_batch(batch)
+        logits = model(batch)
 
-        from torch.export import Dim, ShapesCollection, export, ExportedProgram
-
-        embeddings = model.sparse_module(batch.features)
-        logits = model.dense_module(batch, embeddings)
-
-        # torch.export
+        # === Export and Package ===
         batch = next(dataloader_iter)
-        batch = batch.to(device=torch.cuda.current_device())
-        d = batch.features.to_dict()
-        user_ids = d["user_id"].values().cpu().long()
-        if user_ids.shape[0] != batch.batch_size:
-            batch = strip_padding_batch(batch, user_ids.shape[0])
-        # batch.labels = None
-        embeddings = model.sparse_module(batch.features)
-        embeddings["user_id"] = JaggedTensor(
-            values=embeddings["user_id"].values(),
-            lengths=embeddings["user_id"].lengths(),
-        )
-        embeddings["video_id"] = JaggedTensor(
-            values=embeddings["video_id"].values(),
-            lengths=embeddings["video_id"].lengths(),
-        )
-        # logits = model.dense_module(batch, embeddings)
+        batch = strip_padding_batch(batch)
 
-        # from torch.utils import _pytree as pytree
-        # export_args = (batch, embeddings)
-        # flat_leaves, _ = pytree.tree_flatten(export_args)
-        # for leaf in flat_leaves:
-        #     print(leaf)
-        #     if isinstance(leaf, torch.Tensor) and leaf.dim() > 0:
-        #         print(leaf.shape)
-        #     print("-----")
-        # print(batch)
-        # print(embeddings)
-        # breakpoint()
+        # preprocess batch to make it export-friendly (remove unnecessary tensors, and remove stateful tensors in KJT or JT)
+        batch.features = KeyedJaggedTensor.from_lengths_sync(
+            keys=batch.features.keys(),
+            values=batch.features.values(),
+            lengths=batch.features.lengths(),
+        )
+        batch.labels = None
+        
+        # get dynamic shapes
         sc = ShapesCollection()
-        sc[batch.features.values()] = {0: Dim.DYNAMIC}
-        # sc[batch.num_candidates] = {0: Dim("batch", min=1, max=32)}
-        # sc[batch.num_candidates] = {0: Dim.STATIC}
-        for config in emb_configs:
-            jt = embeddings[config.table_name]
-            sc[jt.values()] = {0: Dim.DYNAMIC if batch.feature_to_max_seqlen[config.table_name] > 1 else Dim.AUTO}
-        dynamic_shapes = sc.dynamic_shapes(model.dense_module, (batch, embeddings))
-        print("=====")
-        print()
-        print(dynamic_shapes['batch'])
-        print()
-        print(dynamic_shapes['embeddings'])
-        print("=====")
+        # dim_batch = Dim("batch", min=8 , max=4 * 8)
+
+        sc[batch.features.values()] = {0: Dim.AUTO}
+        sc[batch.features.lengths()] = {0: Dim.AUTO}
+        sc[batch.num_candidates] = {0: Dim.AUTO}
+        dynamic_shapes = sc.dynamic_shapes(model, (batch,))
+        print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
         if debug_flattened_inputs:
             debug_print_flattened_export_args(batch, embeddings)
 
+        # export & aoti_compile_and_package
         exported_program: ExportedProgram = torch.export.export(
-            model.dense_module, args=(batch, embeddings), dynamic_shapes=dynamic_shapes
-        )
+            model, args=(batch,), dynamic_shapes=dynamic_shapes,
+        )   
         _ = torch._inductor.aoti_compile_and_package(
             exported_program,
-            package_path=os.path.join(os.getcwd(), "dense_module.pt2")
+            package_path=os.path.join(os.getcwd(), "hstu_gr_ranking_model.pt2")
         )
-        
-        print("+++++")
-        print(batch.features.values().shape)
-        print("+++++")
+        print(f"[INFO] Exported and packaged the model to {os.path.join(os.getcwd(), 'hstu_gr_ranking_model.pt2')}.")
 
-        # model.dense_module = exported_program.module()
+
+        # === Test Exported Model ===
+        dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
+        os.makedirs(dump_dir, exist_ok=True)
+        feature_keys_dumped = False
+        dump_idx = 0
 
         # torch.cuda.profiler.start()
+        print(batch.features.values().shape)
         while True:
             try:
                 batch = next(dataloader_iter)
@@ -567,17 +430,50 @@ def export_inference_gr_ranking(
                 user_ids = d["user_id"].values().cpu().long()
                 if user_ids.shape[0] != batch.batch_size:
                     batch = strip_padding_batch(batch, user_ids.shape[0])
+                if batch.features.values().size(0) != total_max_seqlen:
+                    continue
 
                 with torch.inference_mode():
                     torch.cuda.nvtx.range_push("HSTU embedding")
-                    embeddings = model.sparse_module(batch.features)
+                    # embeddings = model.sparse_module(batch.features)
                     torch.cuda.nvtx.range_pop()
-                    logits = exported_program.module()(batch, embeddings)
+                    logits = exported_program.module()(batch)
+
+                    ref_logits = model(batch)
+
+                    if not feature_keys_dumped:
+                        torch.save(
+                            list(batch.features.keys()),
+                            os.path.join(dump_dir, "feature_keys.pt"),
+                        )
+                        feature_keys_dumped = True
+
+                    _save_tensor_cpp_compatible(
+                        batch.features.values().detach().cpu(),
+                        os.path.join(dump_dir, f"batch_{dump_idx:06d}_values.pt"),
+                    )
+                    _save_tensor_cpp_compatible(
+                        batch.features.lengths().detach().cpu(),
+                        os.path.join(dump_dir, f"batch_{dump_idx:06d}_lengths.pt"),
+                    )
+                    _save_tensor_cpp_compatible(
+                        batch.num_candidates.detach().cpu(),
+                        os.path.join(dump_dir, f"batch_{dump_idx:06d}_num_candidates.pt"),
+                    )
+                    _save_tensor_cpp_compatible(
+                        ref_logits.detach().cpu(),
+                        os.path.join(dump_dir, f"batch_{dump_idx:06d}_ref_logits.pt"),
+                    )
+                    dump_idx += 1
+
+                    print(f"[Batch {dump_idx}] Check equal:", torch.allclose(logits, ref_logits))
 
                 eval_module(logits, batch.labels.values())
             except StopIteration:
                 break
         # torch.cuda.profiler.stop()
+
+        print(f"[INFO] Dumped {dump_idx} test batches to {dump_dir}.")
 
         eval_metric_dict = eval_module.compute()
         print(
@@ -587,6 +483,12 @@ def export_inference_gr_ranking(
 
 
 if __name__ == "__main__":
+    # lib load
+    import importlib
+    pname = os.path.join(os.path.dirname(__file__), "splitops_demo", "build", "libsplitops_cpu.so")
+    torch.ops.load_library(pname)
+    importlib.import_module("splitops_demo.fake_splitops")
+
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)

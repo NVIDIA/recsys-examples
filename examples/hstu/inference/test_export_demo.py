@@ -24,7 +24,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
-from inference_embedding_impl import (
+from modules.inference_embedding_impl import (
     BatchedDynamicEmbeddingTablesV2,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,

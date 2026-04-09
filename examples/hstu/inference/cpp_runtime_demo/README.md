@@ -1,10 +1,14 @@
-# Dense module PT2 C++ demo
+# Dense/full-sparse PT2 C++ demos
 
-This demo loads the packaged AOTInductor archive `dense_module.pt2` with the torch C++ runtime and runs one inference with random CUDA inputs.
+This folder now contains:
+
+- `dense_module_aoti_demo`: loads `dense_module.pt2` and runs one inference with random CUDA inputs.
+- `inferece_hstu_gr_ranking_exported_model`: loads `hstu_gr_ranking_model.pt2`, reads dumped tensors from `export_inference_gr_ranking.py`, runs runtime inference, and compares with dumped `ref_logits` using `torch::allclose`.
 
 ## Files
 
 - [dense_module_aoti_demo.cpp](dense_module_aoti_demo.cpp)
+- [inferece_hstu_gr_ranking_exported_model.cpp](inferece_hstu_gr_ranking_exported_model.cpp)
 - [CMakeLists.txt](CMakeLists.txt)
 
 ## Important limitation
@@ -147,6 +151,32 @@ Example:
 ```bash
 ./build-release/dense_module_aoti_demo /abs/path/to/dense_module.pt2 model 0 1 64 10 512
 ```
+
+### Full sparse runtime demo
+
+Run all dumped batches:
+
+```bash
+./build-release/inferece_hstu_gr_ranking_exported_model /abs/path/to/hstu_gr_ranking_model.pt2 /abs/path/to/export_test_dump
+```
+
+Run a specific dumped batch index (e.g. `0`):
+
+```bash
+./build-release/inferece_hstu_gr_ranking_exported_model /abs/path/to/hstu_gr_ranking_model.pt2 /abs/path/to/export_test_dump model 0 0
+```
+
+Arguments:
+
+1. `hstu_gr_ranking_model.pt2` path
+2. dump folder path (contains `batch_XXXXXX_values.pt`, `lengths.pt`, `num_candidates.pt`, `ref_logits.pt`)
+3. model name, default `model`
+4. CUDA device index, default `0`
+5. batch index, default `-1` (run all batches)
+6. `inference_emb_ops.so` path (optional override)
+7. `libnve_torch.so` path (optional override)
+8. `libsplitops_cpu.so` path (optional override)
+9. `libhstu_cuda_ops_runtime.so` path (optional override)
 
 ## Notes
 

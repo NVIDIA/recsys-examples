@@ -19,12 +19,14 @@ _AOTI_DEMO_LIB_DIR = os.path.join(os.path.dirname(__file__), "aoti_demo", "lib")
 _SEARCH_PATHS = [
     os.path.join(_AOTI_DEMO_LIB_DIR, "inference_emb_ops.so"),
     os.path.join("aoti_demo", "lib", "inference_emb_ops.so"),
+    os.path.join("inference", "aoti_demo", "lib", "inference_emb_ops.so"),
     "inference_emb_ops.so",
 ]
 
 _NVE_TORCH_SEARCH_PATHS = [
     os.path.join(_AOTI_DEMO_LIB_DIR, "libnve_torch.so"),
     os.path.join("aoti_demo", "lib", "libnve_torch.so"),
+    os.path.join("inference", "aoti_demo", "lib", "libnve_torch.so"),
     "libnve_torch.so",
 ]
 
@@ -228,7 +230,9 @@ try:
             _index_range_meta.register_index_range_fake()
         if not _lookup_meta.REGISTERED:
             _lookup_meta.register_lookup_fake()
+    print("[INFO] dynamicemb imports succeeded.")
 except ImportError:
+    print("[WARN] not all dynamicemb imports are available. InferenceEmbeddingTable will not be available.")
     pass
 
 
@@ -378,12 +382,14 @@ class InferenceLinearBucketTable(torch.nn.Module):
             torch.zeros(self.capacity_, dtype=torch.int32, device=self.device),
         )
 
+        self.score_policy = int(ScorePolicy.CONST)
+
     def lookup(
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         score_value: Optional[torch.Tensor] = None,
-        score_policy: int = int(ScorePolicy.CONST),
+        score_policy: int = 0,
     ) -> tuple:
         """Lookup keys in the hash table using the custom operator."""
         score_out, founds, indices = torch.ops.INFERENCE_EMB.table_lookup(
@@ -393,7 +399,7 @@ class InferenceLinearBucketTable(torch.nn.Module):
             keys,
             table_ids,
             score_value,
-            score_policy,
+            self.score_policy,
             None,
             0,
             None,
@@ -469,7 +475,8 @@ class InferenceEmbeddingTable(torch.nn.Module):
         self.num_tables_ = num_tables
         self.table_names_ = table_names
         self.pooling_mode_ = pooling_mode  # plain Python int – compile-time constant for torch.export
-
+        self.score_policy = int(ScorePolicy.CONST)  # plain Python int – compile-time constant for torch.export
+ 
         self.register_buffer(
             "feature_table_map_",
             torch.tensor(feature_table_map, dtype=torch.int64, device=device),
@@ -486,7 +493,12 @@ class InferenceEmbeddingTable(torch.nn.Module):
             "table_offsets_",
             torch.zeros(num_tables + 1, dtype=torch.int64, device=device),
         )
-        torch.cumsum(self.capacity_list_, dim=0, out=self.table_offsets_[1:])
+        self.capacity_list_ += 1 # reserve the first row of each section for "not found" entries
+        torch.cumsum(
+            torch.cat([ torch.ones((1,) , device=device), self.capacity_list_ ]), 
+            dim=0, 
+            out=self.table_offsets_
+        )
 
         self.hash_table = InferenceLinearBucketTable(
             capacity=capacities,
@@ -497,6 +509,7 @@ class InferenceEmbeddingTable(torch.nn.Module):
 
         self.emb_dim_ = _resolve_embedding_dim(table_options)
         total_rows = int(self.capacity_list_.sum().item())
+        print(f"[INFO] Total embedding rows: {total_rows}, embedding dim: {self.emb_dim_}")
         dtype_size = torch.finfo(output_dtype).bits // 8
         total_size_bytes = total_rows * self.emb_dim_ * dtype_size
         self.gpu_cache_size_ = _resolve_gpu_cache_size(table_options, total_size_bytes)
@@ -668,7 +681,7 @@ class InferenceEmbeddingTable(torch.nn.Module):
 
         # Derive per-key table id from the table-segment offsets.
         table_ids = torch.ops.INFERENCE_EMB.expand_table_ids(
-            offsets, None, self.num_tables_, 1, num_elements
+            offsets, keys, None, self.num_tables_, 1, num_elements
         )
 
         # Hash-table lookup: keys → per-table row indices.
@@ -676,16 +689,12 @@ class InferenceEmbeddingTable(torch.nn.Module):
             keys=keys,
             table_ids=table_ids,
             score_value=None,
-            score_policy=int(ScorePolicy.CONST),
+            score_policy=self.score_policy,
         )
 
         # Convert per-table indices to absolute embedding row ids.
         global_table_offsets = torch.index_select(self.table_offsets_, 0, table_ids)
-        global_indices = torch.where(
-            _founds,
-            table_indices + global_table_offsets,
-            table_indices,
-        )
+        global_indices = table_indices + global_table_offsets
 
         # self.pooling_mode_ is a plain Python int attribute – a compile-time
         # constant for torch.export.  The branch below is statically resolved

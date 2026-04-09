@@ -31,17 +31,24 @@ set_target_properties(hstu_cuda_ops_runtime PROPERTIES
 )
 
 add_executable(dense_module_aoti_demo dense_module_aoti_demo.cpp)
+add_executable(inferece_hstu_gr_ranking_exported_model inferece_hstu_gr_ranking_exported_model.cpp)
 
 # Link against PyTorch
 target_link_libraries(dense_module_aoti_demo PRIVATE ${TORCH_LIBRARIES})
 target_link_libraries(dense_module_aoti_demo PRIVATE hstu_cuda_ops_runtime)
+target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE hstu_cuda_ops_runtime)
+target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${CMAKE_DL_LIBS})
 target_compile_definitions(dense_module_aoti_demo PRIVATE HSTU_CUDA_OPS_AVAILABLE=1)
+target_compile_definitions(inferece_hstu_gr_ranking_exported_model PRIVATE HSTU_CUDA_OPS_AVAILABLE=1)
 
 # If fbgemm_gpu is found, link against it to register fbgemm operators
 if(FBGEMM_GPU_LIB)
   message(STATUS "Found fbgemm_gpu library: ${FBGEMM_GPU_LIB}")
   target_link_libraries(dense_module_aoti_demo PRIVATE ${FBGEMM_GPU_LIB})
+  target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_GPU_LIB})
   target_compile_definitions(dense_module_aoti_demo PRIVATE FBGEMM_GPU_AVAILABLE=1)
+  target_compile_definitions(inferece_hstu_gr_ranking_exported_model PRIVATE FBGEMM_GPU_AVAILABLE=1)
 else()
   message(STATUS "fbgemm_gpu library not found. FBGEMM operators may not work.")
   message(STATUS "To use FBGEMM operators, install fbgemm_gpu and set appropriate CMake paths.")
@@ -50,14 +57,18 @@ endif()
 if(FBGEMM_HSTU_EXPERIMENTAL_LIB)
   message(STATUS "Found fbgemm experimental hstu library: ${FBGEMM_HSTU_EXPERIMENTAL_LIB}")
   target_link_libraries(dense_module_aoti_demo PRIVATE ${FBGEMM_HSTU_EXPERIMENTAL_LIB})
+  target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_HSTU_EXPERIMENTAL_LIB})
 else()
   message(STATUS "fbgemm experimental hstu library not found. Will rely on runtime dlopen path.")
 endif()
 
 target_compile_features(dense_module_aoti_demo PRIVATE cxx_std_17)
+target_compile_features(inferece_hstu_gr_ranking_exported_model PRIVATE cxx_std_17)
 
 if(MSVC)
   target_compile_options(dense_module_aoti_demo PRIVATE /W4)
+  target_compile_options(inferece_hstu_gr_ranking_exported_model PRIVATE /W4)
 else()
   target_compile_options(dense_module_aoti_demo PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(inferece_hstu_gr_ranking_exported_model PRIVATE -Wall -Wextra -Wpedantic)
 endif()

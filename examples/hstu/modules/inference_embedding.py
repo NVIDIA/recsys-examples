@@ -147,10 +147,11 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
 
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         with torch.no_grad():
-            features_split = features.split(self._features_split_sizes)
-            features = KeyedJaggedTensor.concat(
-                [features_split[idx] for idx in self._features_split_indices]
-            )
+            if len(self._features_split_indices) > 0:
+                features_split = features.split(self._features_split_sizes)
+                features = KeyedJaggedTensor.concat(
+                    [features_split[idx] for idx in self._features_split_indices]
+                )
             embeddings = self._embedding_tables(features.values(), features.offsets())
         embeddings_kjt = KeyedJaggedTensor(
             values=embeddings,
@@ -290,7 +291,47 @@ class InferenceEmbedding(torch.nn.Module):
                 checkpoint_dir, "torch_module", "model.0.pth"
             )
             model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
-        self.load_state_dict(model_state_dict, strict=False)
+        
+        if len(self.static_embedding_configs) > 0:
+            self.load_state_dict(model_state_dict, strict=False)
+        else:
+            for k in model_state_dict:
+                if k.startswith(
+                    "_embedding_collection._data_parallel_embedding_collection.embeddings."
+                ):
+                    emb_table_names = k.split(".")[-1].removesuffix("_weights").split("/")
+                    old_emb_table_weights = model_state_dict[k].view(
+                        -1, self.dynamic_embedding_configs[0].dim
+                    )
+                    weight_offset = 0
+                    # TODO(junyiq): Use a more flexible way to skip contextual features.
+                    for name in emb_table_names:
+                        table_id = -1
+                        for idx, emb_config in enumerate(self.dynamic_embedding_configs):
+                            if name == emb_config.table_name:
+                                emb_table_size = emb_config.vocab_size
+                                table_id = idx
+                        assert table_id != -1, f"Cannot find embedding config for table {name}"
+
+                        keys = torch.arange(0, emb_table_size, device=torch.cuda.current_device(), dtype=torch.int64)
+                        table_ids = torch.full(
+                            (emb_table_size,), table_id,
+                            dtype=torch.int64, device=torch.cuda.current_device(),
+                        )
+                        embeddings = old_emb_table_weights[
+                            weight_offset : weight_offset + emb_table_size
+                        ]
+                        scores = torch.zeros_like(keys, dtype=torch.uint64)
+
+                        self._dynamic_embedding_collection._embedding_tables.tables.insert(
+                            keys,
+                            table_ids,
+                            embeddings,
+                            scores
+                        )
+
+                        weight_offset += emb_table_size
+
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
         new_state_dict = {}

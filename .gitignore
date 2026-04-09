@@ -45,3 +45,5 @@ results/
 examples/hstu/inference/cpp_runtime_demo/build*
 **/torch_binding_build/**
 examples/hstu/inference/inference_emb_dump*/
+examples/hstu/inference/export_test_dump*/
+splitops_demo
