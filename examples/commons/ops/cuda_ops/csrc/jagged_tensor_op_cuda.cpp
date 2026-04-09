@@ -1,6 +1,8 @@
+#ifdef WITH_PYBIND11
 #include <pybind11/pybind11.h>
-#include <vector>
 #include <torch/extension.h>
+#endif
+#include <vector>
 #include <torch/library.h>
 #include <ATen/ATen.h>
 
@@ -17,17 +19,17 @@ void concat_2D_jagged_tensors_cuda_forward (
     at::Tensor merged_offsets);
 
 void concat_2D_jagged_tensors_cuda_backward(
-    torch::Tensor grad_output,
-    torch::Tensor grad_lengths,
+    at::Tensor grad_output,
+    at::Tensor grad_lengths,
     int seqlen_per_block,
     int max_seqlen,
     int total_blocks,
     int blocks,
     int threads,
-    torch::Tensor workload_offset,
-    const std::vector<torch::Tensor>& grad_inputs,
-    const std::vector<torch::Tensor>& offsets_list,
-    torch::Tensor merged_offsets);
+    at::Tensor workload_offset,
+    const std::vector<at::Tensor>& grad_inputs,
+    const std::vector<at::Tensor>& offsets_list,
+    at::Tensor merged_offsets);
 
 void compute_block_workloads_cuda(
     const std::vector<at::Tensor>& offsets_list,
@@ -64,17 +66,17 @@ void concat_2D_jagged_tensors_forward (
 }
 
 void concat_2D_jagged_tensors_backward(
-    torch::Tensor grad_output,
-    torch::Tensor grad_lengths,
+    at::Tensor grad_output,
+    at::Tensor grad_lengths,
     int64_t seqlen_per_block,
     int64_t max_seqlen,
     int64_t total_blocks,
     int64_t blocks,
     int64_t threads,
-    torch::Tensor workload_offset,
-    std::vector<torch::Tensor> grad_inputs,
-    const std::vector<torch::Tensor>& offsets_list,
-    torch::Tensor merged_offsets) {
+    at::Tensor workload_offset,
+    std::vector<at::Tensor> grad_inputs,
+    const std::vector<at::Tensor>& offsets_list,
+    at::Tensor merged_offsets) {
     concat_2D_jagged_tensors_cuda_backward(
         grad_output,
         grad_lengths,
@@ -101,7 +103,7 @@ void compute_block_workloads(
         block_workloads);
 }
 
-TORCH_LIBRARY(hstu_cuda_ops, m) {
+TORCH_LIBRARY_FRAGMENT(hstu_cuda_ops, m) {
     m.def("concat_2D_jagged_tensors_forward(Tensor[] values_list, Tensor[] offsets_list, int seqlen_per_block, int max_seqlen, int total_blocks, int blocks, int threads, Tensor workload_offset, Tensor(a!) merged_values, Tensor(b!) merged_offsets) -> ()");
     m.def("concat_2D_jagged_tensors_backward(Tensor grad_output, Tensor grad_lengths, int seqlen_per_block, int max_seqlen, int total_blocks, int blocks, int threads, Tensor workload_offset, Tensor(a!)[] grad_inputs, Tensor[] offsets_list, Tensor merged_offsets) -> ()");
     m.def("compute_block_workloads(Tensor[] offsets_list, int seqlen_per_block, int max_seqlen, Tensor(a!) block_workloads) -> ()");
@@ -115,4 +117,6 @@ TORCH_LIBRARY_IMPL(hstu_cuda_ops, CUDA, m) {
 
 // Keep a minimal pybind11 module so `import hstu_cuda_ops` continues to work
 // as the mechanism to load this shared library and trigger TORCH_LIBRARY registration.
+#ifdef WITH_PYBIND11
 PYBIND11_MODULE(hstu_cuda_ops, m) {}
+#endif

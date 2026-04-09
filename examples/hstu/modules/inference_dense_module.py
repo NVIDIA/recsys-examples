@@ -151,7 +151,7 @@ class InferenceDenseModule(torch.nn.Module):
         self._hstu_block = self._hstu_block.cuda()
         self._mlp = self._mlp.cuda()
 
-        dtype = (
+        self._dtype = (
             torch.bfloat16
             if hstu_config.bf16
             else torch.float16
@@ -169,7 +169,7 @@ class InferenceDenseModule(torch.nn.Module):
         if not self._use_exportable:
             self._scaling_seqlen = hstu_config.scaling_seqlen
             self.setup_for_kvcache(hstu_config, kvcache_config)
-            self.setup_for_cudagraph(hstu_config, use_cudagraph, cudagraph_configs)
+            self.setup_for_cudagraph(hstu_config, kvcache_config, use_cudagraph, cudagraph_configs)
     
     def setup_for_kvcache(self, hstu_config, kvcache_config):
         max_batch_size = hstu_config.max_batch_size
@@ -177,7 +177,7 @@ class InferenceDenseModule(torch.nn.Module):
         hidden_dim = hstu_config.hidden_size
 
         self._hidden_states = torch.randn(
-            (max_batch_size * max_seq_len, hidden_dim), dtype=dtype, device=self._device
+            (max_batch_size * max_seq_len, hidden_dim), dtype=self._dtype, device=self._device
         )
         self._jagged_metadata = get_jagged_metadata_buffer(
             max_batch_size, max_seq_len, hstu_config.contextual_max_seqlen
@@ -215,7 +215,7 @@ class InferenceDenseModule(torch.nn.Module):
                 kvcache_config.enable_nvcomp,
             )
 
-    def setup_for_cudagraph(self, hstu_config, use_cudagraph, cudagraph_configs):
+    def setup_for_cudagraph(self, hstu_config, kvcache_config, use_cudagraph, cudagraph_configs):
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
         if use_cudagraph:
@@ -234,8 +234,8 @@ class InferenceDenseModule(torch.nn.Module):
                     paged_kvcache_ops.KVOffloadHandle()
                 )
             self._hstu_block.set_cudagraph(
-                max_batch_size,
-                max_seq_len,
+                hstu_config.max_batch_size,
+                hstu_config.max_seq_len,
                 self._hidden_states,
                 self._jagged_metadata,
                 self._kvcache_metadata,

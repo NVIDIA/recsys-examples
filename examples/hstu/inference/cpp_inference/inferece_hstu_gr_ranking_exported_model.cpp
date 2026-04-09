@@ -46,13 +46,6 @@ std::string infer_default_nve_torch_path(const char* argv0) {
       .string();
 }
 
-std::string infer_default_splitops_path(const char* argv0) {
-  std::filesystem::path exe_path = std::filesystem::absolute(argv0);
-  return (exe_path.parent_path() / "../../splitops_demo/build/libsplitops_cpu.so")
-      .lexically_normal()
-      .string();
-}
-
 std::string infer_default_hstu_runtime_ops_path(const char* argv0) {
   std::filesystem::path exe_path = std::filesystem::absolute(argv0);
   return (exe_path.parent_path() / "libhstu_cuda_ops_runtime.so")
@@ -120,7 +113,6 @@ struct DemoConfig {
   int batch_index = -1;  // -1 means run all dumped batches.
   std::string inference_emb_ops_path;
   std::string nve_torch_path;
-  std::string splitops_path;
   std::string hstu_runtime_ops_path;
 };
 
@@ -129,7 +121,7 @@ DemoConfig parse_args(int argc, char** argv) {
     throw std::invalid_argument(
         "Usage: inferece_hstu_gr_ranking_exported_model <hstu_gr_ranking_model.pt2> <dump_dir> "
         "[model_name] [device_index] [batch_index] "
-        "[inference_emb_ops.so] [libnve_torch.so] [libsplitops_cpu.so] [libhstu_cuda_ops_runtime.so]");
+        "[inference_emb_ops.so] [libnve_torch.so] [libhstu_cuda_ops_runtime.so]");
   }
 
   DemoConfig cfg;
@@ -150,10 +142,8 @@ DemoConfig parse_args(int argc, char** argv) {
       (argc > 6) ? argv[6] : infer_default_inference_emb_ops_path(argv[0]);
   cfg.nve_torch_path =
       (argc > 7) ? argv[7] : infer_default_nve_torch_path(argv[0]);
-  cfg.splitops_path =
-      (argc > 8) ? argv[8] : infer_default_splitops_path(argv[0]);
   cfg.hstu_runtime_ops_path =
-      (argc > 9) ? argv[9] : infer_default_hstu_runtime_ops_path(argv[0]);
+      (argc > 8) ? argv[8] : infer_default_hstu_runtime_ops_path(argv[0]);
 
   if (cfg.package_path.empty() || cfg.dump_dir.empty()) {
     throw std::invalid_argument("package_path and dump_dir must not be empty");
@@ -258,9 +248,9 @@ void load_required_libraries(const DemoConfig& cfg) {
   TORCH_CHECK(
       load_shared_library("libnve_torch", cfg.nve_torch_path),
       "libnve_torch is required.");
-  TORCH_CHECK(
-      load_shared_library("splitops", cfg.splitops_path),
-      "splitops custom op library is required.");
+  // TORCH_CHECK(
+  //     load_shared_library("splitops", cfg.splitops_path),
+  //     "splitops custom op library is required.");
   TORCH_CHECK(
       load_shared_library("hstu_cuda_ops_runtime", cfg.hstu_runtime_ops_path),
       "hstu_cuda_ops_runtime is required.");

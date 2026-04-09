@@ -142,7 +142,7 @@ def run_ranking_gr_inference(disable_kvcache: bool):
         ts_start.record()
         for batch, user_ids, total_history_lengths in dataloader:
             if not disable_kvcache:
-                model_predict.forward(batch, user_ids, total_history_lengths)
+                model_predict.forward_with_kvcache(batch, user_ids, total_history_lengths)
             else:
                 model_predict.forward_nokvcache(batch)
         ts_end.record()

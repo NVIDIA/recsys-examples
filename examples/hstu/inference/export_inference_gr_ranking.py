@@ -483,12 +483,6 @@ def export_inference_gr_ranking(
 
 
 if __name__ == "__main__":
-    # lib load
-    import importlib
-    pname = os.path.join(os.path.dirname(__file__), "splitops_demo", "build", "libsplitops_cpu.so")
-    torch.ops.load_library(pname)
-    importlib.import_module("splitops_demo.fake_splitops")
-
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)

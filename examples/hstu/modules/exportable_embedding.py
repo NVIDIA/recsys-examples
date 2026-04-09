@@ -70,6 +70,9 @@ _load_inference_emb_ops()
 import dynamicemb.index_range_meta as _index_range_meta
 import dynamicemb.lookup_meta as _lookup_meta
 
+import hstu_cuda_ops
+import commons.ops.cuda_ops.fake_hstu_cuda_ops
+
 
 # ---------------------------------------------------------------------------
 # ExportableEmbedding Module
@@ -165,12 +168,12 @@ class ExportableEmbedding(torch.nn.Module):
             `Dict[str, JaggedTensor <https://pytorch.org/torchrec/concepts.html#jaggedtensor>]`: The output embeddings.
         """
 
-        reduce_lengths = torch.ops.splitops.lengths_reduce_dim1(kjt.lengths(), self.num_features)
+        reduce_lengths = torch.ops.hstu_cuda_ops.lengths_reduce_dim1(kjt.lengths(), self.num_features)
         offsets = torch.zeros((reduce_lengths.shape[0] + 1,), dtype=reduce_lengths.dtype, device=reduce_lengths.device)
         offsets[1:] = torch.cumsum(reduce_lengths, dim=0)
         total_embeddings = self._embedding_table(kjt.values(), offsets)
-        split_embeddings = torch.ops.splitops.split_by_lengths(total_embeddings, reduce_lengths, self.num_features)
-        split_lengths = torch.ops.splitops.lengths_splits(kjt.lengths(), self.num_features)
+        split_embeddings = torch.ops.hstu_cuda_ops.split_by_lengths(total_embeddings, reduce_lengths, self.num_features)
+        split_lengths = torch.ops.hstu_cuda_ops.lengths_splits(kjt.lengths(), self.num_features)
         embeddings = {}
         for k in kjt.keys():
             embeddings[k] = JaggedTensor(values=split_embeddings[self.feature_to_index[k]], lengths=split_lengths[self.feature_to_index[k]])
