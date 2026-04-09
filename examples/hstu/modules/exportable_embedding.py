@@ -20,6 +20,62 @@ import warnings
 from typing import Dict, List, Optional
 
 import torch
+
+
+# ---------------------------------------------------------------------------
+# Load exportable ops for dynamicemb
+# ---------------------------------------------------------------------------
+
+
+_AOTI_DEMO_LIB_DIR = os.path.join(os.path.dirname(__file__), "aoti_demo", "lib")
+
+_SEARCH_PATHS = [
+    os.path.join(_AOTI_DEMO_LIB_DIR, "inference_emb_ops.so"),
+    os.path.join("aoti_demo", "lib", "inference_emb_ops.so"),
+    os.path.join("inference", "aoti_demo", "lib", "inference_emb_ops.so"),
+    "inference_emb_ops.so",
+]
+
+
+_ops_loaded: bool = False
+_ops_load_attempted: bool = False
+
+
+def _load_inference_emb_ops() -> bool:
+    """Load `inference_emb_ops.so` once and return whether it succeeded."""
+    global _ops_loaded, _ops_load_attempted
+
+    if _ops_loaded:
+        return True
+    if _ops_load_attempted:
+        return False
+
+    _ops_load_attempted = True
+    _DYNAMICEMB_OPS_LIB_DIR = os.getenv("DYNAMICEMB_OPS_LIB_DIR", "")
+    lib_path = os.path.join(_DYNAMICEMB_OPS_LIB_DIR, "inference_emb_ops.so")
+    try:
+        torch.ops.load_library(lib_path)
+        print(f"[INFO] Loaded inference_emb_ops.so from {lib_path}")
+        _ops_loaded = True
+    except Exception as _e:
+        if not os.path.exists(lib_path):
+            print(f"[ERROR] inference_emb_ops.so not found at {_DYNAMICEMB_OPS_LIB_DIR}.")
+        raise RuntimeError(f"[WARN] Failed to load {lib_path}: {_e}")
+
+    return _ops_loaded
+
+
+# Load operators before register fake ops.
+_load_inference_emb_ops()
+import dynamicemb.index_range_meta as _index_range_meta
+import dynamicemb.lookup_meta as _lookup_meta
+
+
+# ---------------------------------------------------------------------------
+# ExportableEmbedding Module
+# ---------------------------------------------------------------------------
+
+
 from configs import EmbeddingBackend, InferenceEmbeddingConfig
 from dynamicemb import (
     DynamicEmbInitializerArgs,
@@ -27,11 +83,9 @@ from dynamicemb import (
     DynamicEmbPoolingMode,
     DynamicEmbTableOptions,
 )
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
-from torchrec.modules.embedding_modules import EmbeddingCollection
+from dynamicemb.exportable_tables import InferenceEmbeddingTable
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-from modules.inference_embedding_impl import InferenceEmbeddingTable
+
 
 class ExportableEmbedding(torch.nn.Module):
     """

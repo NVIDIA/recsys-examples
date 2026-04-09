@@ -408,9 +408,9 @@ def export_inference_gr_ranking(
         )   
         _ = torch._inductor.aoti_compile_and_package(
             exported_program,
-            package_path=os.path.join(os.getcwd(), "hstu_gr_ranking_model.pt2")
+            package_path=os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model.pt2")
         )
-        print(f"[INFO] Exported and packaged the model to {os.path.join(os.getcwd(), 'hstu_gr_ranking_model.pt2')}.")
+        print(f"[INFO] Exported and packaged the model to {os.path.join(os.path.dirname(__file__), 'hstu_gr_ranking_model.pt2')}.")
 
 
         # === Test Exported Model ===

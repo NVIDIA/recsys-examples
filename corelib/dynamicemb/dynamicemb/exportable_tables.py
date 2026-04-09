@@ -14,53 +14,15 @@ from typing import List, Optional
 
 import torch
 
-_AOTI_DEMO_LIB_DIR = os.path.join(os.path.dirname(__file__), "aoti_demo", "lib")
 
-_SEARCH_PATHS = [
-    os.path.join(_AOTI_DEMO_LIB_DIR, "inference_emb_ops.so"),
-    os.path.join("aoti_demo", "lib", "inference_emb_ops.so"),
-    os.path.join("inference", "aoti_demo", "lib", "inference_emb_ops.so"),
-    "inference_emb_ops.so",
-]
+# ---------------------------------------------------------------------------
+# Helpers for loading inference embedding operators and dynamicemb imports
+# ---------------------------------------------------------------------------
 
-_NVE_TORCH_SEARCH_PATHS = [
-    os.path.join(_AOTI_DEMO_LIB_DIR, "libnve_torch.so"),
-    os.path.join("aoti_demo", "lib", "libnve_torch.so"),
-    os.path.join("inference", "aoti_demo", "lib", "libnve_torch.so"),
-    "libnve_torch.so",
-]
 
-_ops_loaded: bool = False
-_ops_load_attempted: bool = False
 _nve_torch_loaded: bool = False
 _nve_torch_load_attempted: bool = False
 _nve_fake_class_registered: bool = False
-
-
-def _load_inference_emb_ops() -> bool:
-    """Load `inference_emb_ops.so` once and return whether it succeeded."""
-    global _ops_loaded, _ops_load_attempted
-
-    if _ops_loaded:
-        return True
-    if _ops_load_attempted:
-        return False
-
-    _ops_load_attempted = True
-    for _path in _SEARCH_PATHS:
-        if os.path.exists(_path):
-            try:
-                torch.ops.load_library(_path)
-                print(f"[INFO] Loaded inference_emb_ops.so from {_path}")
-                _ops_loaded = True
-            except Exception as _e:
-                print(f"[WARN] Failed to load {_path}: {_e}")
-            break
-
-    if not _ops_loaded:
-        print("[WARN] Could not find inference_emb_ops.so. Custom ops may not be available.")
-
-    return _ops_loaded
 
 
 def _register_nve_fake_class() -> None:
@@ -184,73 +146,37 @@ def _load_nve_torch_bindings() -> bool:
         return False
 
     _nve_torch_load_attempted = True
-    for _path in _NVE_TORCH_SEARCH_PATHS:
-        if os.path.exists(_path):
-            try:
-                torch.classes.load_library(_path)
-                print(f"[INFO] Loaded libnve_torch.so from {_path}")
-                _register_nve_fake_class()
-                _nve_torch_loaded = True
-            except Exception as _e:
-                print(f"[WARN] Failed to load {_path}: {_e}")
-            break
-
-    if not _nve_torch_loaded:
-        print("[WARN] Could not find libnve_torch.so. NVE torch classes are unavailable.")
+    _NVE_TORCH_LIB_DIR = os.getenv("NVE_TORCH_LIB_DIR", "")
+    lib_path = os.path.join(_NVE_TORCH_LIB_DIR, "libnve_torch.so")
+    try:
+        torch.classes.load_library(lib_path)
+        print(f"[INFO] Loaded libnve_torch.so from {lib_path}")
+        _register_nve_fake_class()
+        _nve_torch_loaded = True
+    except Exception as _e:
+        if not os.path.exists(lib_path):
+            print(f"[ERROR] libnve_torch.so not found at {_NVE_TORCH_LIB_DIR}.")    
+        raise RuntimeError(f"[WARN] Failed to load {lib_path}: {_e}")
 
     return _nve_torch_loaded
 
 
-# Load operators before importing dynamicemb.
-_load_inference_emb_ops()
-
-try:
-    import dynamicemb
-    import dynamicemb.index_range_meta as _index_range_meta
-    import dynamicemb.lookup_meta as _lookup_meta
-    from dynamicemb import (
-        DynamicEmbInitializerArgs,
-        DynamicEmbInitializerMode,
-        DynamicEmbPoolingMode,
-        DynamicEmbScoreStrategy,
-        DynamicEmbTableOptions,
-    )
-    from dynamicemb.batched_dynamicemb_tables import (
-        BatchedDynamicEmbeddingTablesV2,
-        encode_checkpoint_file_path,
-        encode_meta_json_file_path,
-        get_loading_files,
-    )
-    from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
-    from dynamicemb.scored_hashtable import ScorePolicy
-    from dynamicemb_extensions import table_insert, expand_table_ids_cuda
-
-    if _ops_loaded:
-        if not _index_range_meta.REGISTERED:
-            _index_range_meta.register_index_range_fake()
-        if not _lookup_meta.REGISTERED:
-            _lookup_meta.register_lookup_fake()
-    print("[INFO] dynamicemb imports succeeded.")
-except ImportError:
-    print("[WARN] not all dynamicemb imports are available. InferenceEmbeddingTable will not be available.")
-    pass
-
-
-__all__ = [
-    "_load_inference_emb_ops",
-    "_load_nve_torch_bindings",
-    "InferenceLinearBucketTable",
-    "InferenceEmbeddingTable",
-    "DynamicEmbInitializerArgs",
-    "DynamicEmbInitializerMode",
-    "DynamicEmbPoolingMode",
-    "DynamicEmbScoreStrategy",
-    "DynamicEmbTableOptions",
-    "BatchedDynamicEmbeddingTablesV2",
-    "encode_checkpoint_file_path",
-    "encode_meta_json_file_path",
-    "ScorePolicy",
-]
+from dynamicemb import (
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
+    DynamicEmbPoolingMode,
+    DynamicEmbScoreStrategy,
+    DynamicEmbTableOptions,
+)
+from dynamicemb.batched_dynamicemb_tables import (
+    BatchedDynamicEmbeddingTablesV2,
+    encode_checkpoint_file_path,
+    encode_meta_json_file_path,
+    get_loading_files,
+)
+from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
+from dynamicemb.scored_hashtable import ScorePolicy
+from dynamicemb_extensions import table_insert, expand_table_ids_cuda
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +244,11 @@ def _derive_grouped_offsets(feature_table_map: List[int]) -> List[int]:
             prev = tid
     offsets.append(len(feature_table_map))
     return offsets
+
+
+# ---------------------------------------------------------------------------
+# Modules for InferenceEmbeddingTable and its hash table
+# ---------------------------------------------------------------------------
 
 
 class InferenceLinearBucketTable(torch.nn.Module):
