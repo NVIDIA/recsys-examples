@@ -102,6 +102,6 @@ RUN if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       mkdir -p torch_binding_build && cd torch_binding_build && \
       cmake .. && make -j && \
       cd /workspace/recsys-examples/examples/hstu/inference/cpp_inference && \
-      CMAKE_PREFIX_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')" cmake -S . -B build && \
+      CMAKE_PREFIX_PATH=/usr/local/lib/python3.12/dist-packages/torch/share/cmake cmake -S . -B build && \
       cmake --build build --config Release -j \
     fi
