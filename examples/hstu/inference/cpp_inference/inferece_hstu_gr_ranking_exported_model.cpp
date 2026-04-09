@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "python/pynve/torch_bindings/nve_loader.hpp"
+
 namespace {
 
 bool load_shared_library(const std::string& label, const std::string& path) {
@@ -35,13 +37,6 @@ bool load_shared_library(const std::string& label, const std::string& path) {
 std::string infer_default_inference_emb_ops_path(const char* argv0) {
   std::filesystem::path exe_path = std::filesystem::absolute(argv0);
   return (exe_path.parent_path() / "../../aoti_demo/lib/inference_emb_ops.so")
-      .lexically_normal()
-      .string();
-}
-
-std::string infer_default_nve_torch_path(const char* argv0) {
-  std::filesystem::path exe_path = std::filesystem::absolute(argv0);
-  return (exe_path.parent_path() / "../../aoti_demo/lib/libnve_torch.so")
       .lexically_normal()
       .string();
 }
@@ -112,7 +107,6 @@ struct DemoConfig {
   int device_index = 0;
   int batch_index = -1;  // -1 means run all dumped batches.
   std::string inference_emb_ops_path;
-  std::string nve_torch_path;
   std::string hstu_runtime_ops_path;
 };
 
@@ -121,7 +115,7 @@ DemoConfig parse_args(int argc, char** argv) {
     throw std::invalid_argument(
         "Usage: inferece_hstu_gr_ranking_exported_model <hstu_gr_ranking_model.pt2> <dump_dir> "
         "[model_name] [device_index] [batch_index] "
-        "[inference_emb_ops.so] [libnve_torch.so] [libhstu_cuda_ops_runtime.so]");
+        "[inference_emb_ops.so] [libhstu_cuda_ops_runtime.so]");
   }
 
   DemoConfig cfg;
@@ -140,10 +134,8 @@ DemoConfig parse_args(int argc, char** argv) {
 
   cfg.inference_emb_ops_path =
       (argc > 6) ? argv[6] : infer_default_inference_emb_ops_path(argv[0]);
-  cfg.nve_torch_path =
-      (argc > 7) ? argv[7] : infer_default_nve_torch_path(argv[0]);
   cfg.hstu_runtime_ops_path =
-      (argc > 8) ? argv[8] : infer_default_hstu_runtime_ops_path(argv[0]);
+      (argc > 7) ? argv[7] : infer_default_hstu_runtime_ops_path(argv[0]);
 
   if (cfg.package_path.empty() || cfg.dump_dir.empty()) {
     throw std::invalid_argument("package_path and dump_dir must not be empty");
@@ -246,12 +238,6 @@ void load_required_libraries(const DemoConfig& cfg) {
       load_shared_library("inference_emb_ops", cfg.inference_emb_ops_path),
       "inference_emb_ops is required.");
   TORCH_CHECK(
-      load_shared_library("libnve_torch", cfg.nve_torch_path),
-      "libnve_torch is required.");
-  // TORCH_CHECK(
-  //     load_shared_library("splitops", cfg.splitops_path),
-  //     "splitops custom op library is required.");
-  TORCH_CHECK(
       load_shared_library("hstu_cuda_ops_runtime", cfg.hstu_runtime_ops_path),
       "hstu_cuda_ops_runtime is required.");
 }
@@ -272,8 +258,14 @@ int main(int argc, char** argv) {
 
     load_required_libraries(cfg);
 
+    std::cout << std::endl;
+    std::cout << "Loading NVE layers from " << cfg.package_path << std::endl;
+    nve::LayerDirectory dir(cfg.package_path, cfg.device_index);
+    std::cout << "  Loaded " << dir.size() << " layer(s)" << std::endl;
+    std::cout << std::endl;
+
     torch::inductor::AOTIModelPackageLoader loader(
-        cfg.package_path,
+        cfg.package_path + "/model.pt2",
         cfg.model_name,
         /*run_single_threaded=*/false,
         /*num_runners=*/1,

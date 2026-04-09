@@ -14,153 +14,6 @@ from typing import List, Optional
 
 import torch
 
-
-# ---------------------------------------------------------------------------
-# Helpers for loading inference embedding operators and dynamicemb imports
-# ---------------------------------------------------------------------------
-
-
-_nve_torch_loaded: bool = False
-_nve_torch_load_attempted: bool = False
-_nve_fake_class_registered: bool = False
-
-
-def _register_nve_fake_class() -> None:
-    """Register fake class for nve::LinearUVMEmbedding once."""
-    global _nve_fake_class_registered
-
-    if _nve_fake_class_registered:
-        return
-
-    @torch._library.register_fake_class("nve::LinearUVMEmbedding")
-    class FakeLinearUVMEmbedding:
-        """
-        Fake class for LinearUVMEmbedding to support torch.export.
-
-        This class mirrors the state and behavior of the C++ TorchLinearUVMEmbedding
-        class, allowing torch.export to trace through code that uses NVE embeddings.
-        """
-
-        def __init__(self, weight, embedding_dim, num_embeddings, dtype,
-                    gpu_cache_size, use_private_stream, device_id):
-            """
-            Initialize from flattened state.
-
-            Args:
-                weight: The embedding weight tensor
-                embedding_dim: Embedding dimension
-                num_embeddings: Number of embeddings
-                dtype: Data type
-                gpu_cache_size: GPU cache size in bytes
-                use_private_stream: Whether to use private CUDA stream
-                device_id: CUDA device ID
-            """
-            print(f"FAKE LINEAR UVM EMBEDDING CTOR MOOOOOOOOOOOO")
-            self.weight = weight
-            self.embedding_dim = embedding_dim
-            self.num_embeddings = num_embeddings
-            self.dtype = dtype
-            self.gpu_cache_size = gpu_cache_size
-            self.use_private_stream = use_private_stream
-            self.device_id = device_id
-
-        @classmethod
-        def __obj_unflatten__(cls, flattened_embedding):
-            """
-            Reconstruct the fake object from flattened state.
-
-            This method is called by torch.export to create a fake instance
-            from the state returned by C++ __obj_flatten__.
-
-            Args:
-                flattened_embedding: Tuple of (name, value) pairs from __obj_flatten__
-
-            Returns:
-                FakeLinearUVMEmbedding instance
-            """
-            # Convert list of tuples to dict
-            state_dict = dict(flattened_embedding)
-            return cls(**state_dict)
-
-        def lookup(self, indices):
-            """
-            Fake implementation of lookup operation.
-
-            Args:
-                indices: (N,) int64 tensor of absolute embedding row ids.
-
-            Returns:
-                (N, D) embedding tensor.
-            """
-            return torch.empty(
-                indices.size(0),
-                self.embedding_dim,
-                dtype=self.weight.dtype,  # follow weight dtype, not hardcoded
-                device=indices.device,    # follow input device, not hardcoded
-            )
-
-        def lookup_with_pooling(self, keys, offsets, weights, pooling_mode):
-            """
-            Fake implementation of pooled lookup.
-
-            Args:
-                keys:         (N,) int64 – absolute embedding row ids.
-                offsets:      (B+1,) int64 – CSR bag boundaries.
-                weights:      optional (N,) float – per-key weights (may be None).
-                pooling_mode: int – 1=sum, 2=mean.
-
-            Returns:
-                (B, D) pooled embedding tensor.
-            """
-            batch_size = offsets.size(0) - 1
-            return torch.empty(
-                batch_size,
-                self.embedding_dim,
-                dtype=self.weight.dtype,  # follow weight dtype
-                device=keys.device,       # follow input device
-            )
-
-        def get_weight_tensor(self):
-            """Return the weight tensor."""
-            return self.weight
-
-        def state_dict(self):
-            """Return state dictionary."""
-            return {"weight": self.weight}
-
-        def load_state_dict(self, state):
-            """Load from state dictionary."""
-            self.weight = state["weight"]
-
-
-    _nve_fake_class_registered = True
-
-
-def _load_nve_torch_bindings() -> bool:
-    """Load libnve_torch.so once and register fake class for export."""
-    global _nve_torch_loaded, _nve_torch_load_attempted
-
-    if _nve_torch_loaded:
-        return True
-    if _nve_torch_load_attempted:
-        return False
-
-    _nve_torch_load_attempted = True
-    _NVE_TORCH_LIB_DIR = os.getenv("NVE_TORCH_LIB_DIR", "")
-    lib_path = os.path.join(_NVE_TORCH_LIB_DIR, "libnve_torch.so")
-    try:
-        torch.classes.load_library(lib_path)
-        print(f"[INFO] Loaded libnve_torch.so from {lib_path}")
-        _register_nve_fake_class()
-        _nve_torch_loaded = True
-    except Exception as _e:
-        if not os.path.exists(lib_path):
-            print(f"[ERROR] libnve_torch.so not found at {_NVE_TORCH_LIB_DIR}.")    
-        raise RuntimeError(f"[WARN] Failed to load {lib_path}: {_e}")
-
-    return _nve_torch_loaded
-
-
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -177,6 +30,9 @@ from dynamicemb.batched_dynamicemb_tables import (
 from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
 from dynamicemb.scored_hashtable import ScorePolicy
 from dynamicemb_extensions import table_insert, expand_table_ids_cuda
+
+import pynve.torch.nve_layers as nve_layers
+from pynve.torch.nve_export import export_aot
 
 
 # ---------------------------------------------------------------------------
@@ -362,11 +218,6 @@ class InferenceEmbeddingTable(torch.nn.Module):
     ):
         super().__init__()
 
-        if not _load_nve_torch_bindings():
-            raise RuntimeError(
-                "libnve_torch.so must be loaded before constructing InferenceEmbeddingTable"
-            )
-
         if pooling_mode not in (-1, 1, 2):
             raise ValueError(
                 f"pooling_mode must be -1 (no pooling), 1 (sum), or 2 (mean), "
@@ -445,23 +296,31 @@ class InferenceEmbeddingTable(torch.nn.Module):
         total_size_bytes = total_rows * self.emb_dim_ * dtype_size
         self.gpu_cache_size_ = _resolve_gpu_cache_size(table_options, total_size_bytes)
 
-        nve_mem_block_ = torch.classes.nve.MemBlock.create_linear_from_size(
-            int(total_size_bytes)
-        )
-        nve_config_ = torch.classes.nve.EmbedLayerConfig()
-        nve_config_.logging_interval = -1
-        nve_config_.kernel_mode = 0
-
-        self.nve_embedding_ = torch.classes.nve.LinearUVMEmbedding(
-            self.emb_dim_,
-            total_rows,
-            output_dtype,
-            nve_mem_block_,
-            int(self.gpu_cache_size_),
-            True,
-            int(device.index if device.index is not None else 0),
-            nve_config_,
-        )
+        if self.pooling_mode_ == -1:
+            self.nve_embedding_ = nve_layers.NVEmbedding(
+                num_embeddings=total_rows,
+                embedding_size=self.emb_dim_,
+                data_type=output_dtype,
+                cache_type=nve_layers.CacheType.LinearUVM,
+                gpu_cache_size=int(self.gpu_cache_size_),
+                optimize_for_training=False,
+                device=device,
+            )
+        else:
+            if self.pooling_mode_ == 1:
+                mode = "sum"
+            elif self.pooling_mode_ == 2:
+                mode = "mean"
+            self.nve_embedding_ = nve_layers.NVEmbeddingBag(
+                num_embeddings=total_rows,
+                embedding_size=self.emb_dim_,
+                data_type=output_dtype,
+                cache_type=nve_layers.CacheType.LinearUVM,
+                mode=mode,
+                gpu_cache_size=int(self.gpu_cache_size_),
+                optimize_for_training=False,
+                device=device,
+            )
 
     def load(
         self,
@@ -482,7 +341,7 @@ class InferenceEmbeddingTable(torch.nn.Module):
         requested_table_names = set(table_names)
         dim = self.emb_dim_
         device = self.device
-        weight = self.nve_embedding_.get_weight_tensor()
+        weight = self.nve_embedding_.weight.data
 
         self.hash_table.table_storage_.zero_()
         self.hash_table.bucket_sizes.zero_()
@@ -588,6 +447,7 @@ class InferenceEmbeddingTable(torch.nn.Module):
         keys: torch.Tensor,
         offsets: torch.Tensor,
         pooling_offsets: Optional[torch.Tensor] = None,
+        per_sample_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run embedding lookup with optional pooling.
 
@@ -632,12 +492,11 @@ class InferenceEmbeddingTable(torch.nn.Module):
         # during tracing: only one code path is included in the exported graph.
         if self.pooling_mode_ < 0:
             # Non-pooled path: return one embedding vector per key.
-            return self.nve_embedding_.lookup(global_indices)
+            return self.nve_embedding_(global_indices)
         else:
             # Pooled path: reduce each bag of keys to one embedding vector.
-            return self.nve_embedding_.lookup_with_pooling(
+            return self.nve_embedding_(
                 global_indices,         # (N,) – absolute row ids
                 pooling_offsets,        # (B+1,) – CSR bag boundaries
-                None,                   # optional per-key weights
-                self.pooling_mode_,     # 1=sum, 2=mean (compile-time constant)
+                per_sample_weights,     # optional per-key weights
             )

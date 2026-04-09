@@ -37,12 +37,12 @@ from modules.exportable_embedding import ExportableEmbedding
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
+from torch.export import Dim, ExportedProgram, ShapesCollection
+from pynve.torch.nve_export import export_aot
+
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
-from torch.export import Dim, ExportedProgram, ShapesCollection
 
-
-# Reduce warning spam: show each UserWarning once per source location.
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
 
@@ -403,15 +403,13 @@ def export_inference_gr_ranking(
             debug_print_flattened_export_args(batch, embeddings)
 
         # export & aoti_compile_and_package
-        exported_program: ExportedProgram = torch.export.export(
-            model, args=(batch,), dynamic_shapes=dynamic_shapes,
-        )   
-        _ = torch._inductor.aoti_compile_and_package(
-            exported_program,
-            package_path=os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model.pt2")
-        )
-        print(f"[INFO] Exported and packaged the model to {os.path.join(os.path.dirname(__file__), 'hstu_gr_ranking_model.pt2')}.")
-
+        export_dir = os.path.join(os.path.dirname(__file__), 'hstu_gr_ranking_model')
+        exported_program = export_aot(model, (batch,), export_dir, dynamic_shapes=dynamic_shapes)
+        print(f"[INFO] Exported and packaged the model to:")
+        print(f"       {export_dir}/")
+        print( "       ├── model.pt2                  # AOT-compiled model package for AOTIModelPackageLoader")
+        print( "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)")
+        print( "       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
 
         # === Test Exported Model ===
         dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
@@ -420,7 +418,6 @@ def export_inference_gr_ranking(
         dump_idx = 0
 
         # torch.cuda.profiler.start()
-        print(batch.features.values().shape)
         while True:
             try:
                 batch = next(dataloader_iter)
