@@ -36,7 +36,7 @@ bool load_shared_library(const std::string& label, const std::string& path) {
 
 std::string infer_default_inference_emb_ops_path(const char* argv0) {
   std::filesystem::path exe_path = std::filesystem::absolute(argv0);
-  return (exe_path.parent_path() / "../../aoti_demo/lib/inference_emb_ops.so")
+  return (exe_path.parent_path() / "../../../../../corelib/dynamicemb/torch_binding_build/inference_emb_ops.so")
       .lexically_normal()
       .string();
 }
