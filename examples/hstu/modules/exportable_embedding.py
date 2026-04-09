@@ -27,16 +27,6 @@ import torch
 # ---------------------------------------------------------------------------
 
 
-_AOTI_DEMO_LIB_DIR = os.path.join(os.path.dirname(__file__), "aoti_demo", "lib")
-
-_SEARCH_PATHS = [
-    os.path.join(_AOTI_DEMO_LIB_DIR, "inference_emb_ops.so"),
-    os.path.join("aoti_demo", "lib", "inference_emb_ops.so"),
-    os.path.join("inference", "aoti_demo", "lib", "inference_emb_ops.so"),
-    "inference_emb_ops.so",
-]
-
-
 _ops_loaded: bool = False
 _ops_load_attempted: bool = False
 
@@ -140,7 +130,7 @@ class ExportableEmbedding(torch.nn.Module):
             self.pooling_mode,
             self.table_names,
             self.feature_table_map,
-            device=torch.device("cuda:0"),
+            device=torch.device("cuda"),
         )
 
     def load_checkpoint(self, checkpoint_dir, model_state_dict=None):

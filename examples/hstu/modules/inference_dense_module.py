@@ -121,8 +121,8 @@ class InferenceDenseModule(torch.nn.Module):
         hstu_config: Union[HSTUConfig, InferenceHSTUConfig],
         kvcache_config: Optional[KVCacheConfig],
         task_config: RankingConfig,
-        use_cudagraph=False,
-        cudagraph_configs=None,
+        use_cudagraph: bool = False,
+        cudagraph_configs: Optional[Dict[int, Any]] = None,
         use_exportable: bool = False,
     ):
         super().__init__()
@@ -447,11 +447,11 @@ class InferenceDenseModule(torch.nn.Module):
 
 
 def get_inference_dense_model(
-    hstu_config: InferenceHSTUConfig,
-    kvcache_config: KVCacheConfig,
+    hstu_config: Union[HSTUConfig, InferenceHSTUConfig],
+    kvcache_config: Optional[KVCacheConfig],
     task_config: RankingConfig,
     use_cudagraph: bool = False,
-    cudagraph_configs: Dict[int, Any] = None,
+    cudagraph_configs: Optional[Dict[int, Any]] = None,
     use_exportable: bool = False,
 ):
     return InferenceDenseModule(

@@ -364,7 +364,7 @@ def export_inference_gr_ranking(
         dataloader = get_data_loader(dataset=eval_dataset)
         dataloader_iter = iter(dataloader)
 
-        def strip_padding_batch(b):
+        def prepare_on_gpu(b):
             b = b.to(device=torch.cuda.current_device())
             d = b.features.to_dict()
             user_ids = d["user_id"].values().cpu().long()
@@ -374,12 +374,12 @@ def export_inference_gr_ranking(
 
         # === Warmup ===
         batch = next(dataloader_iter)
-        batch = strip_padding_batch(batch)
+        batch = prepare_on_gpu(batch)
         logits = model(batch)
 
         # === Export and Package ===
         batch = next(dataloader_iter)
-        batch = strip_padding_batch(batch)
+        batch = prepare_on_gpu(batch)
 
         # preprocess batch to make it export-friendly (remove unnecessary tensors, and remove stateful tensors in KJT or JT)
         batch.features = KeyedJaggedTensor.from_lengths_sync(
@@ -400,6 +400,7 @@ def export_inference_gr_ranking(
         print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
         if debug_flattened_inputs:
+            embeddings = None  # Placeholder for embeddings
             debug_print_flattened_export_args(batch, embeddings)
 
         # export & aoti_compile_and_package
@@ -426,7 +427,7 @@ def export_inference_gr_ranking(
                 d = batch.features.to_dict()
                 user_ids = d["user_id"].values().cpu().long()
                 if user_ids.shape[0] != batch.batch_size:
-                    batch = strip_padding_batch(batch, user_ids.shape[0])
+                    batch = prepare_on_gpu(batch, user_ids.shape[0])
                 if batch.features.values().size(0) != total_max_seqlen:
                     continue
 

@@ -1,5 +1,6 @@
 #include <ATen/ATen.h>
 #include <torch/library.h>
+#include <vector>
 
 namespace {
 

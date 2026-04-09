@@ -79,7 +79,6 @@ python3 ./inference/export_inference_gr_ranking.py --gin_config_file ./inference
 
 ```bash
 cd {RECSYS_INFERENCE_DIR}/cpp_inference
-mkdir -p build
 CMAKE_PREFIX_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')" cmake -S . -B build
 cmake --build build --config Release -j
 ```
@@ -87,7 +86,7 @@ cmake --build build --config Release -j
 Expected output:
 
 - Output library: `libhstu_cuda_ops_runtime.so`
-- C++ Inference Executable: `inferece_hstu_gr_ranking_exported_model`
+- C++ Inference Executable: `inference_hstu_gr_ranking_exported_model`
 
 ---
 
@@ -96,7 +95,7 @@ Expected output:
 ```bash
 cd {RECSYS_INFERENCE_DIR}/cpp_inference
 
-./build/inferece_hstu_gr_ranking_exported_model \
+./build/inference_hstu_gr_ranking_exported_model \
   {RECSYS_INFERENCE_DIR}/hstu_gr_ranking_model \
   {RECSYS_INFERENCE_DIR}/export_test_dump
 ```

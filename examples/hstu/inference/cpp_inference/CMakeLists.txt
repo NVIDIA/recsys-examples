@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(inferece_hstu_gr_ranking_exported_model LANGUAGES CXX CUDA)
+project(inference_hstu_gr_ranking_exported_model LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,27 +42,27 @@ set_target_properties(hstu_cuda_ops_runtime PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-add_executable(inferece_hstu_gr_ranking_exported_model inferece_hstu_gr_ranking_exported_model.cpp)
-set_source_files_properties(inferece_hstu_gr_ranking_exported_model.cpp PROPERTIES LANGUAGE CUDA)
+add_executable(inference_hstu_gr_ranking_exported_model inference_hstu_gr_ranking_exported_model.cpp)
+set_source_files_properties(inference_hstu_gr_ranking_exported_model.cpp PROPERTIES LANGUAGE CUDA)
 
-target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE CUDA::cudart)
-target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${TORCH_LIBRARIES})
-target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE hstu_cuda_ops_runtime)
-target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${CMAKE_DL_LIBS})
-target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${NVE_TORCH_OPS_LIB} ${NVE_COMMON_LIB})
-target_compile_definitions(inferece_hstu_gr_ranking_exported_model PRIVATE HSTU_CUDA_OPS_AVAILABLE=1)
+target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE CUDA::cudart)
+target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE hstu_cuda_ops_runtime)
+target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${NVE_TORCH_OPS_LIB} ${NVE_COMMON_LIB})
+target_compile_definitions(inference_hstu_gr_ranking_exported_model PRIVATE HSTU_CUDA_OPS_AVAILABLE=1)
 
-target_include_directories(inferece_hstu_gr_ranking_exported_model PRIVATE
+target_include_directories(inference_hstu_gr_ranking_exported_model PRIVATE
     ${TORCH_INCLUDE_DIRS}
-    /home/junyiq/newscratch/spring26/trt-recsys/
-    /home/junyiq/newscratch/spring26/trt-recsys/include
+    /workspace/nve
+    /workspace/nve/include
 )
 
 # If fbgemm_gpu is found, link against it to register fbgemm operators
 if(FBGEMM_GPU_LIB)
   message(STATUS "Found fbgemm_gpu library: ${FBGEMM_GPU_LIB}")
-  target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_GPU_LIB})
-  target_compile_definitions(inferece_hstu_gr_ranking_exported_model PRIVATE FBGEMM_GPU_AVAILABLE=1)
+  target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_GPU_LIB})
+  target_compile_definitions(inference_hstu_gr_ranking_exported_model PRIVATE FBGEMM_GPU_AVAILABLE=1)
 else()
   message(STATUS "fbgemm_gpu library not found. FBGEMM operators may not work.")
   message(STATUS "To use FBGEMM operators, install fbgemm_gpu and set appropriate CMake paths.")
@@ -70,13 +70,13 @@ endif()
 
 if(FBGEMM_HSTU_EXPERIMENTAL_LIB)
   message(STATUS "Found fbgemm experimental hstu library: ${FBGEMM_HSTU_EXPERIMENTAL_LIB}")
-  target_link_libraries(inferece_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_HSTU_EXPERIMENTAL_LIB})
+  target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_HSTU_EXPERIMENTAL_LIB})
 else()
   message(STATUS "fbgemm experimental hstu library not found. Will rely on runtime dlopen path.")
 endif()
 
-target_compile_features(inferece_hstu_gr_ranking_exported_model PRIVATE cxx_std_17)
-target_compile_options(inferece_hstu_gr_ranking_exported_model PRIVATE -w)
+target_compile_features(inference_hstu_gr_ranking_exported_model PRIVATE cxx_std_17)
+target_compile_options(inference_hstu_gr_ranking_exported_model PRIVATE -w)
 
 if(NOT NVE_CACHE_LINE_SIZE)
   if (WIN32)
@@ -90,7 +90,7 @@ if(NOT NVE_CACHE_LINE_SIZE)
   endif()
 endif()
 
-target_compile_options(inferece_hstu_gr_ranking_exported_model PRIVATE 
+target_compile_options(inference_hstu_gr_ranking_exported_model PRIVATE 
   -DNVE_FEATURE_HT_PART_FNV1A=1
   -DNVE_FEATURE_HT_PART_MURMUR=1
   -DNVE_FEATURE_HT_PART_RRXMRRXMSX0=1
