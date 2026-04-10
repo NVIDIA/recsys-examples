@@ -1370,6 +1370,7 @@ def init_embedding_tables(stbe, bdet):
         (True, PyDictStorage, 1024),  # Caching + PS backend
         (False, None, 1024**3),  # HBM-only
         (False, None, 1024),  # HybridStorage
+        (False, None, 0),  # No HBM budget, no cache -> DynamicEmbStorage (host-only)
     ],
 )
 @pytest.mark.parametrize(
@@ -1447,6 +1448,11 @@ def test_forward_train_eval(
         assert isinstance(
             bdebt._storage, DynamicEmbStorage
         ), f"Expected DynamicEmbStorage, got {type(bdebt._storage)}"
+    elif local_hbm_for_values == 0:
+        assert bdebt._cache is None, "Host-only mode should have no cache"
+        assert isinstance(
+            bdebt._storage, DynamicEmbStorage
+        ), f"Expected DynamicEmbStorage when local_hbm=0 without cache, got {type(bdebt._storage)}"
     else:
         assert bdebt._cache is None, "HybridStorage mode should have no cache"
         assert isinstance(

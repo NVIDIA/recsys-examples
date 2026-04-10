@@ -539,43 +539,55 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     else DynamicEmbStorage(storage_options, self._optimizer)
                 )
             else:
-                # No caching: HybridStorage (HBM tier + host tier)
-                if any(
-                    opt.external_storage is not None for opt in self._dynamicemb_options
-                ):
-                    warnings.warn(
-                        "external_storage is ignored in HybridStorage mode. "
-                        "Set caching=True to use external storage.",
-                        UserWarning,
+                # No caching and no HBM budget for values: single-tier host/PS storage.
+                if local_hbm <= 0:
+                    storage_options = deepcopy(self._dynamicemb_options)
+                    for storage_option in storage_options:
+                        storage_option.local_hbm_for_values = 0
+                    PS = storage_options[0].external_storage
+                    self._storage = (
+                        PS(storage_options, self._optimizer)
+                        if PS
+                        else DynamicEmbStorage(storage_options, self._optimizer)
                     )
-                cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
+                else:
+                    # No caching: HybridStorage (HBM tier + host tier)
+                    if any(
+                        opt.external_storage is not None for opt in self._dynamicemb_options
+                    ):
+                        warnings.warn(
+                            "external_storage is ignored in HybridStorage mode. "
+                            "Set caching=True to use external storage.",
+                            UserWarning,
+                        )
+                    cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
 
-                hbm_options = deepcopy(self._dynamicemb_options)
-                for hbm_option in hbm_options:
-                    hbm_option.bucket_capacity = 1024
-                    cap = max(1, int(hbm_option.max_capacity * cap_scale))
-                    hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
-                    hbm_option.init_capacity = hbm_option.max_capacity
-
-                storage_cap_scale = 1.0 - cap_scale
-                host_options = deepcopy(self._dynamicemb_options)
-                for host_option in host_options:
-                    host_option.local_hbm_for_values = 0
-                    cap = max(1, int(host_option.max_capacity * storage_cap_scale))
-                    host_option.max_capacity = min(host_option.max_capacity, cap)
-                    host_option.init_capacity = min(host_option.init_capacity, cap)
-
-                # NO_EVICTION mode: HBM uses TIMESTAMP, host uses NO_EVICTION
-                if (
-                    self._dynamicemb_options[0].score_strategy
-                    == DynamicEmbScoreStrategy.NO_EVICTION
-                ):
+                    hbm_options = deepcopy(self._dynamicemb_options)
                     for hbm_option in hbm_options:
-                        hbm_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+                        hbm_option.bucket_capacity = 1024
+                        cap = max(1, int(hbm_option.max_capacity * cap_scale))
+                        hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
+                        hbm_option.init_capacity = hbm_option.max_capacity
 
-                self._storage = HybridStorage(
-                    hbm_options, host_options, self._optimizer
-                )
+                    storage_cap_scale = 1.0 - cap_scale
+                    host_options = deepcopy(self._dynamicemb_options)
+                    for host_option in host_options:
+                        host_option.local_hbm_for_values = 0
+                        cap = max(1, int(host_option.max_capacity * storage_cap_scale))
+                        host_option.max_capacity = min(host_option.max_capacity, cap)
+                        host_option.init_capacity = min(host_option.init_capacity, cap)
+
+                    # NO_EVICTION mode: HBM uses TIMESTAMP, host uses NO_EVICTION
+                    if (
+                        self._dynamicemb_options[0].score_strategy
+                        == DynamicEmbScoreStrategy.NO_EVICTION
+                    ):
+                        for hbm_option in hbm_options:
+                            hbm_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+
+                    self._storage = HybridStorage(
+                        hbm_options, host_options, self._optimizer
+                    )
         else:
             # HBM-only: everything fits in GPU memory.
             if any(
