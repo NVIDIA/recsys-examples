@@ -14,12 +14,17 @@
 # limitations under the License.
 import math
 import os
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Union
 
 import paged_kvcache_ops
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
+from commons.ops.triton_ops.common import (
+    set_static_max_seq_lens,
+    set_use_runtime_max_seq_len,
+)
 from configs import (
+    HSTUConfig,
     InferenceHSTUConfig,
     KVCacheConfig,
     RankingConfig,
@@ -27,6 +32,7 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from modules.hstu_block_inference import HSTUBlockInference
+from modules.hstu_block import HSTUBlock
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
 from torchrec.sparse.jagged_tensor import JaggedTensor
@@ -112,16 +118,20 @@ class InferenceDenseModule(torch.nn.Module):
 
     def __init__(
         self,
-        hstu_config: InferenceHSTUConfig,
-        kvcache_config: KVCacheConfig,
+        hstu_config: Union[HSTUConfig, InferenceHSTUConfig],
+        kvcache_config: Optional[KVCacheConfig],
         task_config: RankingConfig,
-        use_cudagraph=False,
-        cudagraph_configs=None,
+        use_cudagraph: bool = False,
+        cudagraph_configs: Optional[Dict[int, Any]] = None,
+        use_exportable: bool = False,
     ):
         super().__init__()
         self._device = torch.cuda.current_device()
         self._hstu_config = hstu_config
         self._task_config = task_config
+        self._use_exportable = use_exportable
+        if self._use_exportable:
+            assert isinstance(hstu_config, HSTUConfig), "Exportable module is only supported for HSTUConfig"
 
         self._embedding_dim = hstu_config.hidden_size
         for ebc_config in task_config.embedding_configs:
@@ -129,7 +139,7 @@ class InferenceDenseModule(torch.nn.Module):
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
 
-        self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
+        self._hstu_block = HSTUBlock(hstu_config) if self._use_exportable else HSTUBlockInference(hstu_config, kvcache_config)
         self._mlp = MLP(
             self._embedding_dim,
             task_config.prediction_head_arch,
@@ -141,7 +151,7 @@ class InferenceDenseModule(torch.nn.Module):
         self._hstu_block = self._hstu_block.cuda()
         self._mlp = self._mlp.cuda()
 
-        dtype = (
+        self._dtype = (
             torch.bfloat16
             if hstu_config.bf16
             else torch.float16
@@ -149,21 +159,25 @@ class InferenceDenseModule(torch.nn.Module):
             else torch.float32
         )
 
+        if isinstance(hstu_config, InferenceHSTUConfig):
+            max_seq_len = hstu_config.max_seq_len
+        else:
+            max_seq_len = int(os.getenv("HSTU_MAX_SEQ_LEN", 8192))
+        set_use_runtime_max_seq_len(False)
+        set_static_max_seq_lens(max_seq_len, max_seq_len)
+
+        if not self._use_exportable:
+            self._scaling_seqlen = hstu_config.scaling_seqlen
+            self.setup_for_kvcache(hstu_config, kvcache_config)
+            self.setup_for_cudagraph(hstu_config, kvcache_config, use_cudagraph, cudagraph_configs)
+    
+    def setup_for_kvcache(self, hstu_config, kvcache_config):
         max_batch_size = hstu_config.max_batch_size
         max_seq_len = hstu_config.max_seq_len
         hidden_dim = hstu_config.hidden_size
 
-        from commons.ops.triton_ops.common import (
-            set_static_max_seq_lens,
-            set_use_runtime_max_seq_len,
-        )
-
-        set_use_runtime_max_seq_len(False)
-        set_static_max_seq_lens(max_seq_len, max_seq_len)
-        self._scaling_seqlen = hstu_config.scaling_seqlen
-
         self._hidden_states = torch.randn(
-            (max_batch_size * max_seq_len, hidden_dim), dtype=dtype, device=self._device
+            (max_batch_size * max_seq_len, hidden_dim), dtype=self._dtype, device=self._device
         )
         self._jagged_metadata = get_jagged_metadata_buffer(
             max_batch_size, max_seq_len, hstu_config.contextual_max_seqlen
@@ -201,6 +215,7 @@ class InferenceDenseModule(torch.nn.Module):
                 kvcache_config.enable_nvcomp,
             )
 
+    def setup_for_cudagraph(self, hstu_config, kvcache_config, use_cudagraph, cudagraph_configs):
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
         if use_cudagraph:
@@ -219,8 +234,8 @@ class InferenceDenseModule(torch.nn.Module):
                     paged_kvcache_ops.KVOffloadHandle()
                 )
             self._hstu_block.set_cudagraph(
-                max_batch_size,
-                max_seq_len,
+                hstu_config.max_batch_size,
+                hstu_config.max_seq_len,
                 self._hidden_states,
                 self._jagged_metadata,
                 self._kvcache_metadata,
@@ -280,29 +295,32 @@ class InferenceDenseModule(torch.nn.Module):
                 continue
 
             is_transposed = False
-            if k.endswith("_linear_uvqk_weight"):
-                newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
-                is_transposed = True
-            elif k.endswith("_linear_uvqk_bias"):
-                newk = k.removesuffix("_linear_uvqk_bias") + "_linear_uvqk.bias"
-            elif k.endswith("_linear_proj_weight"):
-                newk = k.removesuffix("_linear_proj_weight") + "_linear_proj.weight"
-                is_transposed = True
-            else:
-                newk = k
+
+            newk = k
+            if not self._use_exportable:
+                if k.endswith("_linear_uvqk_weight"):
+                    newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
+                    is_transposed = True
+                elif k.endswith("_linear_uvqk_bias"):
+                    newk = k.removesuffix("_linear_uvqk_bias") + "_linear_uvqk.bias"
+                elif k.endswith("_linear_proj_weight"):
+                    newk = k.removesuffix("_linear_proj_weight") + "_linear_proj.weight"
+                    is_transposed = True
+
             new_state_dict[newk] = (
                 model_state_dict[k] if not is_transposed else model_state_dict[k].T
             )
 
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
-        for hstu_layer in self._hstu_block._attention_layers:
-            hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
-            hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
+        if not self._use_exportable:
+            for hstu_layer in self._hstu_block._attention_layers:
+                hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
+                hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
 
         assert unloaded_modules.missing_keys == []
         assert unloaded_modules.unexpected_keys == []
 
-    def forward(
+    def forward_with_kvcache(
         self,
         batch: HSTUBatch,
         embeddings: Dict[str, JaggedTensor],
@@ -414,14 +432,27 @@ class InferenceDenseModule(torch.nn.Module):
             jagged_item_logit = self._mlp(jagged_data.values)
 
         return jagged_item_logit
+    
+    def forward(
+        self,
+        batch: HSTUBatch,
+        embeddings: Dict[str, JaggedTensor],
+    ):
+        with torch.inference_mode():
+            # Forward through HSTU block
+            jd_output, _ = self._hstu_block(embeddings, batch)
+            # Prediction head
+            logits = self._mlp(jd_output.values)
+            return logits
 
 
 def get_inference_dense_model(
-    hstu_config: InferenceHSTUConfig,
-    kvcache_config: KVCacheConfig,
+    hstu_config: Union[HSTUConfig, InferenceHSTUConfig],
+    kvcache_config: Optional[KVCacheConfig],
     task_config: RankingConfig,
-    use_cudagraph=False,
-    cudagraph_configs=None,
+    use_cudagraph: bool = False,
+    cudagraph_configs: Optional[Dict[int, Any]] = None,
+    use_exportable: bool = False,
 ):
     return InferenceDenseModule(
         hstu_config,
@@ -429,4 +460,5 @@ def get_inference_dense_model(
         task_config,
         use_cudagraph,
         cudagraph_configs,
+        use_exportable,
     )

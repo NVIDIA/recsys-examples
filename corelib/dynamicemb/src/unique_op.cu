@@ -23,13 +23,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/cub.cuh>
+#ifdef DEMB_USE_PYBIND11
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
+#endif
 
 #include <cassert>
 #include <limits>
 
+#ifdef DEMB_USE_PYBIND11
 namespace py = pybind11;
+#endif
 
 namespace dyn_emb {
 
@@ -705,6 +709,7 @@ std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
 } // namespace dyn_emb
 
 // Python bindings
+#ifdef DEMB_USE_PYBIND11
 void bind_unique_op(py::module &m) {
   m.def(
       "segmented_unique_cuda",
@@ -823,3 +828,4 @@ Returns:
       py::arg("num_tables"), py::arg("local_batch_size"),
       py::arg("new_lengths_size"));
 }
+#endif

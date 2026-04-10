@@ -244,7 +244,7 @@ class HSTUBatch(BaseBatch):
             self.action_feature_name, str
         ), "action_feature_name must be None or a string"
         assert isinstance(
-            self.max_num_candidates, int
+            self.max_num_candidates, (int, torch.export.dynamic_shapes._IntWrapper)
         ), "max_num_candidates must be an int"
 
     # to(), pin_memory(), record_stream() are inherited from BaseBatch

@@ -26,11 +26,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cuda/std/tuple>
 
+#ifdef DEMB_USE_PYBIND11
 #include <torch/extension.h>
+#endif
 #include <torch/torch.h>
 
+#ifdef DEMB_USE_PYBIND11
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#endif
 
 #define DISPATCH_KEY_TYPE(DATA_TYPE, HINT, ...)                                \
   switch (DATA_TYPE) {                                                         \

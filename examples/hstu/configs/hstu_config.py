@@ -197,7 +197,7 @@ def get_hstu_config(
     else:
         async_wgrad_stream = None
         async_wgrad_event = None
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size() if not is_inference else 1
     if tp_size == 1:
         warnings.warn("TP size is 1, setting sequence parallel to False")
         sequence_parallel = False
