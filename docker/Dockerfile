@@ -98,7 +98,7 @@ RUN cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install
 
 RUN if [ "${INFERENCEBUILD}" == "1" ]; then \
-      rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 && ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/x86_64-linux-gnu/libcuda.so.1 ; \
+      rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 && ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/x86_64-linux-gnu/libcuda.so.1 && \
       cd /workspace/recsys-examples/corelib/dynamicemb && \
       mkdir -p torch_binding_build && cd torch_binding_build && \
       cmake .. && make -j && \
