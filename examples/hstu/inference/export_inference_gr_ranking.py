@@ -422,12 +422,7 @@ def export_inference_gr_ranking(
         while True:
             try:
                 batch = next(dataloader_iter)
-
-                batch = batch.to(device=torch.cuda.current_device())
-                d = batch.features.to_dict()
-                user_ids = d["user_id"].values().cpu().long()
-                if user_ids.shape[0] != batch.batch_size:
-                    batch = prepare_on_gpu(batch, user_ids.shape[0])
+                batch = prepare_on_gpu(batch)
                 if batch.features.values().size(0) != total_max_seqlen:
                     continue
 

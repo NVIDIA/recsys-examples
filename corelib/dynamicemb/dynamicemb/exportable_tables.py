@@ -248,6 +248,11 @@ class InferenceEmbeddingTable(torch.nn.Module):
             raise ValueError(
                 f"feature_table_map contains out-of-range table id (must be in [0, {num_tables}))"
             )
+        for i in range(1, len(feature_table_map)):
+            if feature_table_map[i] < feature_table_map[i - 1]:
+                raise ValueError(
+                    "feature_table_map must be non-decreasing (features for the same table must be contiguous)"
+                )
 
         feature_offsets = _derive_grouped_offsets(feature_table_map)
 

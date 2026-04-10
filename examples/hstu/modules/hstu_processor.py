@@ -229,7 +229,7 @@ def hstu_preprocess_embeddings(
         elif contextual_seqlen is not None:
             total_candidates_seq_len = sequence_embeddings_lengths.sum() - contextual_seqlen.sum()
     elif torch.compiler.is_compiling():
-        assert num_candidates is not None, "num_candidates should be None during inference when compiling"
+        assert num_candidates is not None, "num_candidates should not be None during inference when compiling"
         total_candidates_seq_len = num_candidates.sum()
     return JaggedData(
         values=sequence_embeddings,
