@@ -29,10 +29,10 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EmbOptimType,
-    get_sharded_table_shape,
+    get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD
+from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD, _sharded_table_bucket_layout
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,
@@ -2736,10 +2736,10 @@ def test_table_expansion_capacity_growth(
     user_max_by_table: List[int] = []
     dims_list: List[int] = []
     for ec in emb_cfgs:
-        num_buckets, bucket_cap = get_sharded_table_shape(
+        _, bucket_cap = _sharded_table_bucket_layout(
             ec, _WORLD_SIZE, _BUCKET_CAPACITY_EXP
         )
-        max_capacity = num_buckets * bucket_cap
+        max_capacity = get_sharded_table_capacity(ec, _WORLD_SIZE, _BUCKET_CAPACITY_EXP)
         user_max_by_table.append(max_capacity)
         dims_list.append(_EMB_DIM_EXPANSION)
         init_capacity = _init_capacity_strict(max_capacity, bucket_cap)

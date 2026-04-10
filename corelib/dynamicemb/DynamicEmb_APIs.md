@@ -157,7 +157,7 @@ When you construct `DynamicEmbeddingShardingPlanner`, the implementation first v
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
-| 2 | `bucket_capacity`, `max_capacity` | **`get_sharded_table_shape(embedding_config, world_size, bucket_capacity)`** returns **`(num_buckets, bucket_capacity)`** per rank: bucket width in rows (after `MAX_BUCKET_CAPACITY` / alignment rules) and the bucket count. **`max_capacity`** is set to **`num_buckets * bucket_capacity`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** returns `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
+| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
 | 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / world_size)`** so each rank gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). |
 
 **User-supplied values that should be set before planning** (typical DMP path) include at least:
@@ -171,8 +171,8 @@ When you construct `DynamicEmbeddingShardingPlanner`, the implementation first v
 **Public helpers** (same rules as the planner):
 
 - `from dynamicemb.dynamicemb_config import complete_initializer_args` (initializer completion; not re-exported from `dynamicemb` top-level today)
-- `from dynamicemb import get_sharded_table_shape` — returns `(num_buckets, bucket_capacity)` per rank; **per-rank row capacity is `num_buckets * bucket_capacity`**, not the first element alone. With **`MAX_BUCKET_CAPACITY`**, the second value is the **effective** bucket width in rows (one bucket per rank after alignment).
-- `from dynamicemb import get_table_value_bytes` — total bytes for **all ranks**’ value storage (embedding + optimizer state rows), using the same row layout as `get_sharded_table_shape` for the given `bucket_capacity` (including **`MAX_BUCKET_CAPACITY`**). Use this to size **`global_hbm_for_values`** before planning; apply your own **caching** fraction or **HBM budget scale** on top if needed (as in benchmarks / examples).
+- `from dynamicemb import get_sharded_table_capacity` — returns **per-rank row capacity** after sharding and bucket alignment (``num_buckets * effective_bucket_width``), matching **`max_capacity`** set by the planner. With **`MAX_BUCKET_CAPACITY`**, the table is one bucket per rank whose width is the aligned shard row count.
+- `from dynamicemb import get_table_value_bytes` — total bytes for **all ranks**’ value storage (embedding + optimizer state rows), using the same row layout as `get_sharded_table_capacity` for the given `bucket_capacity` (including **`MAX_BUCKET_CAPACITY`**). Use this to size **`global_hbm_for_values`** before planning; apply your own **caching** fraction or **HBM budget scale** on top if needed (as in benchmarks / examples).
 - `from dynamicemb import BUCKET_ALIGNMENT, MAX_BUCKET_CAPACITY`
 
 ## DynamicEmbeddingCollectionSharder
@@ -382,7 +382,7 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
 
 Per-table configuration for dynamic embedding, passed into `DynamicEmbParameterConstraints` as `dynamicemb_options`. The authoritative definition lives in `dynamicemb.dynamicemb_config.DynamicEmbTableOptions` (this section mirrors its docstring).
 
-Fields declared first (through `device_id`) are **planner/runtime-heavy**: `DynamicEmbeddingShardingPlanner` fills them via `_prepare_dynemb_table_options` together with `get_sharded_table_shape`. User-facing knobs such as `training`, `bucket_capacity`, `global_hbm_for_values`, and `initializer_args` follow. Hash-table **scores** are driven by `score_strategy` and kernels, not by a separate score-dtype field on this dataclass.
+Fields declared first (through `device_id`) are **planner/runtime-heavy**: `DynamicEmbeddingShardingPlanner` fills them via `_prepare_dynemb_table_options` together with internal `_sharded_table_bucket_layout` (and thus the same per-rank row count as `get_sharded_table_capacity`). User-facing knobs such as `training`, `bucket_capacity`, `global_hbm_for_values`, and `initializer_args` follow. Hash-table **scores** are driven by `score_strategy` and kernels, not by a separate score-dtype field on this dataclass.
 
     ```python
     #How to import
@@ -412,7 +412,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         max_capacity : Optional[int], optional
             Per-shard maximum table rows on one GPU. With ``DynamicEmbeddingShardingPlanner``,
             ``_prepare_dynemb_table_options`` sets ``max_capacity`` to
-            ``num_buckets * bucket_capacity`` from ``get_sharded_table_shape``.
+            per-rank row count from ``get_sharded_table_capacity``.
             You may omit ``max_capacity`` on ``DynamicEmbTableOptions`` before planning and let the planner set it.
             If ``init_capacity`` is unset it becomes ``max_capacity``; if set and aligned,
             it is clamped to at most ``max_capacity``.
@@ -491,7 +491,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 When `caching=True`, it decides the table capacity of the GPU table.
             To match planner row counts and optimizer state width, size the **global** budget with
             ``get_table_value_bytes(embedding_config, EmbOptimType, world_size, bucket_capacity)``
-            (same ``bucket_capacity`` you pass into ``get_sharded_table_shape``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
+            (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
             then multiply by a cache ratio or scale if desired. The planner overwrites **per-rank**
             ``local_hbm_for_values`` to ``ceil(global_hbm_for_values / world_size)``.
         external_storage: Storage

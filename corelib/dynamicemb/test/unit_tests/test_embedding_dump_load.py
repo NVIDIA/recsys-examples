@@ -37,7 +37,6 @@ from dynamicemb.dump_load import (
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
-    get_sharded_table_shape,
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter

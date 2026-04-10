@@ -167,7 +167,7 @@ class DynamicEmbTableOptions:
     max_capacity : Optional[int], optional
         Per-shard maximum table rows on one GPU. With ``DynamicEmbeddingShardingPlanner``,
         ``_prepare_dynemb_table_options`` sets ``max_capacity`` to
-        ``num_buckets * bucket_capacity`` from :func:`get_sharded_table_shape`.
+        per-rank row count from :func:`get_sharded_table_capacity`.
         If ``init_capacity`` is unset it becomes ``max_capacity``; if set and aligned,
         it is clamped to at most ``max_capacity``.
         The embedding kernel checks consistency with TorchREC shard metadata (see
@@ -502,35 +502,16 @@ def align_to_table_size(n: int, alignment: int = DEMB_TABLE_ALIGN_SIZE) -> int:
     return (n + alignment - 1) // alignment * alignment
 
 
-def get_sharded_table_shape(
+def _sharded_table_bucket_layout(
     embedding_config: BaseEmbeddingConfig,
     world_size: int,
     bucket_capacity: int,
 ) -> Tuple[int, int]:
-    """Per-rank hashtable bucket layout: number of buckets and bucket width (rows per bucket).
+    """Per-rank hashtable layout: ``(num_buckets, effective_bucket_width)`` in rows.
 
-    Per-rank row capacity is ``num_buckets * bucket_capacity``. Same rules as the embedding
-    sharding planner when filling ``max_capacity`` (via that product) and ``bucket_capacity``.
-
-    Parameters
-    ----------
-    embedding_config
-        TorchREC embedding table config (e.g. :class:`~torchrec.modules.embedding_configs.EmbeddingConfig`);
-        uses :attr:`~torchrec.modules.embedding_configs.BaseEmbeddingConfig.num_embeddings`.
-    world_size
-        Number of ranks (must be positive).
-    bucket_capacity
-        Requested bucket size in rows. If set to :data:`dynamicemb.types.MAX_BUCKET_CAPACITY`
-        (``2**63 - 1``), returns ``(1, effective_bucket_rows)`` where the bucket spans the
-        full per-rank table (aligned to :data:`BUCKET_ALIGNMENT`). Otherwise ``bucket_capacity``
-        must be a positive multiple of :data:`BUCKET_ALIGNMENT`.
-
-    Returns
-    -------
-    tuple[int, int]
-        ``(num_buckets, bucket_capacity)`` for one rank. The first value is **not** per-rank table
-        capacity in rows; callers must use ``num_buckets * bucket_capacity`` whenever they need
-        row capacity (e.g. to match per-rank ``max_capacity`` set by the planner).
+    Used by the sharding planner to set ``DynamicEmbTableOptions.bucket_capacity`` and
+    ``max_capacity`` (the latter equals ``num_buckets * effective_bucket_width``).
+    Prefer :func:`get_sharded_table_capacity` when only the per-rank row capacity is needed.
     """
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}")
@@ -558,6 +539,41 @@ def get_sharded_table_shape(
     return num_buckets, bucket_capacity
 
 
+def get_sharded_table_capacity(
+    embedding_config: BaseEmbeddingConfig,
+    world_size: int,
+    bucket_capacity: int,
+) -> int:
+    """Per-rank dynamic embedding table row capacity after sharding and bucket alignment.
+
+    Returns ``num_buckets * effective_bucket_width`` — the same value the sharding planner
+    writes to ``DynamicEmbTableOptions.max_capacity``. Rules match
+    :func:`_sharded_table_bucket_layout` (and thus ``bucket_capacity`` handling including
+    :data:`MAX_BUCKET_CAPACITY`).
+
+    Parameters
+    ----------
+    embedding_config
+        TorchREC embedding table config (e.g. :class:`~torchrec.modules.embedding_configs.EmbeddingConfig`);
+        uses :attr:`~torchrec.modules.embedding_configs.BaseEmbeddingConfig.num_embeddings`.
+    world_size
+        Number of ranks (must be positive).
+    bucket_capacity
+        Requested bucket size in rows, or :data:`dynamicemb.types.MAX_BUCKET_CAPACITY` for one
+        bucket spanning the full per-rank shard (width aligned to :data:`BUCKET_ALIGNMENT`).
+        Otherwise must be a positive multiple of :data:`BUCKET_ALIGNMENT`.
+
+    Returns
+    -------
+    int
+        Per-rank row capacity (``num_buckets * bucket_capacity`` in the non-sentinel case).
+    """
+    num_buckets, effective_bucket = _sharded_table_bucket_layout(
+        embedding_config, world_size, bucket_capacity
+    )
+    return int(num_buckets * effective_bucket)
+
+
 def get_table_value_bytes(
     embedding_config: BaseEmbeddingConfig,
     optimizer_type: EmbOptimType,
@@ -566,9 +582,9 @@ def get_table_value_bytes(
 ) -> int:
     """Return how many bytes one DynamicEmb table needs for stored values across all ranks.
 
-    This counts embedding plus optimizer-state storage. Per-rank rows are
-    ``num_buckets * bucket_capacity`` from :func:`get_sharded_table_shape`; multiply by
-    ``world_size`` for total rows, then by ``element_size * (dim + optimizer_state_dim)`` per row.
+    This counts embedding plus optimizer-state storage. Per-rank rows are given by
+    :func:`get_sharded_table_capacity`; multiply by ``world_size`` for total rows, then by
+    ``element_size * (dim + optimizer_state_dim)`` per row.
     The result uses the same rules as table construction with the sharding planner.
 
     Parameters
@@ -580,15 +596,14 @@ def get_table_value_bytes(
     world_size
         Number of ranks, as in distributed planning.
     bucket_capacity
-        Hashtable bucket width in rows, consistent with :func:`get_sharded_table_shape`
-        and ``DynamicEmbTableOptions.bucket_capacity`` (default
+        Same ``bucket_capacity`` as for :func:`get_sharded_table_capacity` and
+        ``DynamicEmbTableOptions.bucket_capacity`` (default
         :data:`DEFAULT_BUCKET_CAPACITY`; including the ``MAX_BUCKET_CAPACITY``
         sentinel when applicable).
     """
-    num_buckets, bucket_cap = get_sharded_table_shape(
+    table_capacity_per_rank = get_sharded_table_capacity(
         embedding_config, world_size, bucket_capacity
     )
-    table_capacity_per_rank = num_buckets * bucket_cap
     total_rows = table_capacity_per_rank * world_size
     dim = embedding_config.embedding_dim
     torch_dtype = data_type_to_dtype(embedding_config.data_type)

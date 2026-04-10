@@ -21,6 +21,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
     KVCounter,
+    get_sharded_table_capacity,
     get_table_value_bytes,
 )
 from dynamicemb.incremental_dump import get_score, incremental_dump
@@ -478,7 +479,9 @@ def get_planner(
             )
             # Create counter config (actual table will be created during sharding)
             admission_counter = KVCounter(
-                capacity=eb_config.num_embeddings // world_size,
+                capacity=get_sharded_table_capacity(
+                    eb_config, world_size, bucket_capacity
+                ),
                 bucket_capacity=kv_counter_bucket_capacity,
                 key_type=torch.int64,
             )
@@ -728,7 +731,7 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=train_sampler,
     )
 
@@ -737,7 +740,7 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=test_sampler,
     )
 
@@ -766,7 +769,7 @@ def dump(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=train_sampler,
     )
 
@@ -806,7 +809,7 @@ def load(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=test_sampler,
     )
 
@@ -854,7 +857,7 @@ def inc_dump(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=train_sampler,
     )
 
