@@ -731,7 +731,7 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=train_sampler,
     )
 
@@ -740,7 +740,7 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=test_sampler,
     )
 
@@ -769,7 +769,7 @@ def dump(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=train_sampler,
     )
 
@@ -809,7 +809,7 @@ def load(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=test_sampler,
     )
 
@@ -857,7 +857,7 @@ def inc_dump(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=0,
         sampler=train_sampler,
     )
 
