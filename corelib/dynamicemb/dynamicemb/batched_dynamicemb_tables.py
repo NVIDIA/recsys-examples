@@ -776,13 +776,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return splits
 
     def flush(self) -> None:
-        self._prefetch_outstanding_keys.zero_()
         if self._caching and self._cache is not None:
             flush_cache(self._cache, self._storage)
 
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
             self._cache.reset()
+            self._prefetch_outstanding_keys.zero_()
 
     @property
     def table_names(self) -> List[str]:
@@ -818,7 +818,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     @enable_prefetch.setter
     def enable_prefetch(self, value: bool):
         self._enable_prefetch = value
-        self._prefetch_outstanding_keys.zero_()
 
     def forward(
         self,
