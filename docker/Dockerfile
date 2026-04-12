@@ -26,10 +26,8 @@ RUN ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x8
       ln -s /usr/local/cuda-13/targets/${ARCH}-linux/lib/stubs/libnvidia-ml.so  /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1; \
     fi
 
-RUN if [ "${INFERENCEBUILD}" != "1" ]; then \
-      git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
-      pip install --no-deps -e ./megatron-lm; \
-    fi
+RUN git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+    pip install --no-deps -e ./megatron-lm
 
 RUN pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers
 RUN pip install cloudpickle
@@ -97,12 +95,13 @@ RUN cd /workspace/deps && rm -rf nvcomp && \
 RUN cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install
 
-RUN if [ "${INFERENCEBUILD}" == "1" ]; then \
-      rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 && ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/x86_64-linux-gnu/libcuda.so.1 && \
+RUN if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
+      rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 && \ 
+      ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/x86_64-linux-gnu/libcuda.so.1; \
+    fi
+
+RUN if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       cd /workspace/recsys-examples/corelib/dynamicemb && \
       mkdir -p torch_binding_build && cd torch_binding_build && \
-      cmake .. && make -j && \
-      cd /workspace/recsys-examples/examples/hstu/inference/cpp_inference && \
-      CMAKE_PREFIX_PATH=/usr/local/lib/python3.12/dist-packages/torch/share/cmake cmake -S . -B build && \
-      cmake --build build --config Release -j ; \
+      cmake .. && make -j; \
     fi
