@@ -214,20 +214,19 @@ class CudaMemoryWatchdog:
         if frag_ratio > self.frag_threshold or free_mb < self.min_free_mb:
             torch.cuda.empty_cache()
             self._defrag_count += 1
-            if os.environ.get("MEM_DEBUG", "0") == "1":
-                new_free, _ = torch.cuda.mem_get_info()
-                rank = (
-                    torch.distributed.get_rank()
-                    if torch.distributed.is_initialized()
-                    else 0
-                )
-                print(
-                    f"[rank{rank}] [WATCHDOG] empty_cache triggered "
-                    f"(frag={frag_ratio:.2%}, free={free_mb}MB -> "
-                    f"{new_free // 1024 // 1024}MB, "
-                    f"total defrag count={self._defrag_count})",
-                    flush=True,
-                )
+            new_free, _ = torch.cuda.mem_get_info()
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            print(
+                f"[rank{rank}] [WATCHDOG] empty_cache triggered "
+                f"(frag={frag_ratio:.2%}, free={free_mb}MB -> "
+                f"{new_free // 1024 // 1024}MB, "
+                f"total defrag count={self._defrag_count})",
+                flush=True,
+            )
 
 
 _cuda_mem_watchdog: Optional[CudaMemoryWatchdog] = None
