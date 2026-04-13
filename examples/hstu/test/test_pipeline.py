@@ -117,12 +117,16 @@ def test_pipeline(
     iter_history_batches = iter(history_batches)
     no_pipeline_batches = iter(history_batches)
     for i, batch in enumerate(history_batches):
-        reporting_loss, (_, logits, _, _) = no_pipeline.progress(no_pipeline_batches)
-        pipelined_reporting_loss, (
+        reporting_loss, _, (_, logits, _, _) = no_pipeline.progress(no_pipeline_batches)
+        (
+            pipelined_reporting_loss,
             _,
-            pipelined_logits,
-            _,
-            _,
+            (
+                _,
+                pipelined_logits,
+                _,
+                _,
+            ),
         ) = target_pipeline.progress(iter_history_batches)
         collective_assert(
             torch.allclose(pipelined_reporting_loss, reporting_loss),
