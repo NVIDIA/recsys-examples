@@ -457,6 +457,7 @@ def _expand_tables_impl(
                     state.tables[i].extend((add_rows, vd))
             else:
                 state.tables[i].extend(state.tables[i].shape)
+    state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, device))
 
     old_key_index_map = state.key_index_map
     for table_id in range(state.num_tables):
@@ -504,7 +505,6 @@ def _expand_tables_impl(
 
     state.key_index_map = new_key_index_map
     state.capacity = new_key_index_map.capacity()
-    state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, device))
 
 
 def get_expand_info(
