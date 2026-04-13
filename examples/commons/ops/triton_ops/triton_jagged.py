@@ -1154,7 +1154,9 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 IS_REPLACE=False,  # pyre-ignore[6]
             )
         else:
-            torch.library.wrap_triton(split_2D_jagged_jagged_w_prefix)[(max_seq_len, B)](
+            torch.library.wrap_triton(split_2D_jagged_jagged_w_prefix)[
+                (max_seq_len, B)
+            ](
                 JaggedIn=values,
                 OffsetsA=offsets_a,
                 OffsetsB=offsets_b,

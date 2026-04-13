@@ -35,7 +35,8 @@ class HSTUBlock(MegatronModule):
             self._training_dtype = torch.float16
 
         self._preprocessor = HSTUBlockPreprocessor(
-            config, is_inference=config.is_inference,
+            config,
+            is_inference=config.is_inference,
         )  # sequence parallel is from config
         self._postprocessor = HSTUBlockPostprocessor(
             is_inference=config.is_inference, sequence_parallel=config.sequence_parallel

@@ -291,7 +291,7 @@ class InferenceEmbedding(torch.nn.Module):
                 checkpoint_dir, "torch_module", "model.0.pth"
             )
             model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
-        
+
         if len(self.static_embedding_configs) > 0:
             self.load_state_dict(model_state_dict, strict=False)
         else:
@@ -299,7 +299,9 @@ class InferenceEmbedding(torch.nn.Module):
                 if k.startswith(
                     "_embedding_collection._data_parallel_embedding_collection.embeddings."
                 ):
-                    emb_table_names = k.split(".")[-1].removesuffix("_weights").split("/")
+                    emb_table_names = (
+                        k.split(".")[-1].removesuffix("_weights").split("/")
+                    )
                     old_emb_table_weights = model_state_dict[k].view(
                         -1, self.dynamic_embedding_configs[0].dim
                     )
@@ -307,16 +309,27 @@ class InferenceEmbedding(torch.nn.Module):
                     # TODO(junyiq): Use a more flexible way to skip contextual features.
                     for name in emb_table_names:
                         table_id = -1
-                        for idx, emb_config in enumerate(self.dynamic_embedding_configs):
+                        for idx, emb_config in enumerate(
+                            self.dynamic_embedding_configs
+                        ):
                             if name == emb_config.table_name:
                                 emb_table_size = emb_config.vocab_size
                                 table_id = idx
-                        assert table_id != -1, f"Cannot find embedding config for table {name}"
+                        assert (
+                            table_id != -1
+                        ), f"Cannot find embedding config for table {name}"
 
-                        keys = torch.arange(0, emb_table_size, device=torch.cuda.current_device(), dtype=torch.int64)
+                        keys = torch.arange(
+                            0,
+                            emb_table_size,
+                            device=torch.cuda.current_device(),
+                            dtype=torch.int64,
+                        )
                         table_ids = torch.full(
-                            (emb_table_size,), table_id,
-                            dtype=torch.int64, device=torch.cuda.current_device(),
+                            (emb_table_size,),
+                            table_id,
+                            dtype=torch.int64,
+                            device=torch.cuda.current_device(),
                         )
                         embeddings = old_emb_table_weights[
                             weight_offset : weight_offset + emb_table_size
@@ -324,14 +337,10 @@ class InferenceEmbedding(torch.nn.Module):
                         scores = torch.zeros_like(keys, dtype=torch.uint64)
 
                         self._dynamic_embedding_collection._embedding_tables.tables.insert(
-                            keys,
-                            table_ids,
-                            embeddings,
-                            scores
+                            keys, table_ids, embeddings, scores
                         )
 
                         weight_offset += emb_table_size
-
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
         new_state_dict = {}

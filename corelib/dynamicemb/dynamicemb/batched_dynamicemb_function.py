@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Optional, Tuple
@@ -37,7 +36,6 @@ from dynamicemb.types import (
     AdmissionStrategy,
     CopyMode,
     Counter,
-    DynamicEmbInitializerMode,
 )
 from dynamicemb_extensions import (
     EvictStrategy,
@@ -504,7 +502,9 @@ def _prefetch_cache_path(
                             evicted_keys[nw_m],
                             evicted_table_ids[nw_m],
                             evicted_values[nw_m],
-                            evicted_scores[nw_m] if evicted_scores is not None else None,
+                            evicted_scores[nw_m]
+                            if evicted_scores is not None
+                            else None,
                             preserve_existing=False,
                         )
             else:
@@ -1006,9 +1006,7 @@ def _generic_forward_path(
             scores_to_insert,
         )
         key_persisted[positions_in_unique] = True
-        _, persisted_unique_indices, _ = flagged_compact(
-            key_persisted, [unique_keys]
-        )
+        _, persisted_unique_indices, _ = flagged_compact(key_persisted, [unique_keys])
         return unique_values, persisted_unique_indices
 
 

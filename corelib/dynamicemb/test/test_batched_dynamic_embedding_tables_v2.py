@@ -32,10 +32,13 @@ from dynamicemb import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD, _sharded_table_bucket_layout
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,
+)
+from dynamicemb.dynamicemb_config import (
+    DEBUG_EMB_INITIALIZER_MOD,
+    _sharded_table_bucket_layout,
 )
 from dynamicemb.key_value_table import (
     DynamicEmbCache,
@@ -54,7 +57,7 @@ from dynamicemb.optimizer import (
     pad_optimizer_states_from_checkpoint,
     truncate_optimizer_states_for_checkpoint,
 )
-from dynamicemb.types import KEY_TYPE, OPT_STATE_TYPE, CopyMode, EMBEDDING_TYPE
+from dynamicemb.types import EMBEDDING_TYPE, KEY_TYPE, OPT_STATE_TYPE, CopyMode
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -145,6 +148,7 @@ def _iter_dynamic_emb_table_states(
         out.append(("host", st.tables[1]))
     return out
 
+
 def _lfu_per_sample_weights(
     indices: torch.Tensor, device: torch.device
 ) -> torch.Tensor:
@@ -155,7 +159,9 @@ def _lfu_per_sample_weights(
 _EXPANSION_STBE_TRAIN_BATCH = _BUCKET_CAPACITY_EXP
 
 
-def _init_stbe_debug_embedding_weights(stbe: SplitTableBatchedEmbeddingBagsCodegen) -> None:
+def _init_stbe_debug_embedding_weights(
+    stbe: SplitTableBatchedEmbeddingBagsCodegen,
+) -> None:
     """Match DynamicEmb ``DEBUG`` init: row ``i`` is filled with ``i % _DEBUG_EMB_MOD`` in every dim."""
     with torch.no_grad():
         for w in stbe.split_embedding_weights():
@@ -163,7 +169,8 @@ def _init_stbe_debug_embedding_weights(stbe: SplitTableBatchedEmbeddingBagsCodeg
             if n == 0:
                 continue
             vals = (
-                torch.arange(n, device=w.device, dtype=torch.float32) % float(_DEBUG_EMB_MOD)
+                torch.arange(n, device=w.device, dtype=torch.float32)
+                % float(_DEBUG_EMB_MOD)
             ).view(n, 1)
             w.copy_(vals.expand(-1, d))
 
@@ -214,7 +221,9 @@ def _iter_compare_batches_multi_three(
     c0, c1, c2 = cmp_caps[0], cmp_caps[1], cmp_caps[2]
     min_c = min(cmp_caps)
 
-    def pack_triples(rows: List[Tuple[int, int, int]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def pack_triples(
+        rows: List[Tuple[int, int, int]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Pack one micro-batch: rows are (key_table0, key_table1, key_table2) per sample."""
         n = len(rows)
         if n == 0:
@@ -271,9 +280,7 @@ def _print_hybrid_hbm_host_sizes(
     hbm_state, host_state = storage.tables
     kim_h, kim_o = hbm_state.key_index_map, host_state.key_index_map
     indices = (
-        [only_table_id]
-        if only_table_id is not None
-        else list(range(len(table_names)))
+        [only_table_id] if only_table_id is not None else list(range(len(table_names)))
     )
     for tid in indices:
         if tid < 0 or tid >= len(table_names):
@@ -290,7 +297,9 @@ def _print_hybrid_hbm_host_sizes(
         )
 
 
-def _bdebt_storage_entry_count_for_table(storage: Storage, table_id: int) -> Tuple[int, str]:
+def _bdebt_storage_entry_count_for_table(
+    storage: Storage, table_id: int
+) -> Tuple[int, str]:
     """Count occupied slots and capacity in backing storage for one logical table (post-flush)."""
     if isinstance(storage, HybridStorage):
         hbm_state, host_state = storage.tables
@@ -353,9 +362,9 @@ def _print_test_expansion_storage_cache_sizes_after_train_step(
         hbm, host = storage.tables
         hkm, okm = hbm.key_index_map, host.key_index_map
         nt_h, nt_o = hbm.num_tables, host.num_tables
-        hs, os_ = _kim_occupied_sizes_per_table(hkm, nt_h), _kim_occupied_sizes_per_table(
-            okm, nt_o
-        )
+        hs, os_ = _kim_occupied_sizes_per_table(
+            hkm, nt_h
+        ), _kim_occupied_sizes_per_table(okm, nt_o)
         hc, oc = _kim_capacities_per_table(hkm, nt_h), _kim_capacities_per_table(
             okm, nt_o
         )
@@ -427,7 +436,10 @@ def _dump_bde_stbe_embedding_samples(
         stbe_row = w_stbe[k].tolist()
         if k in by_key:
             bde_row = by_key[k].tolist()
-            print(f"  key={k}\n    BDE export: {bde_row}\n    STBE row:   {stbe_row}", flush=True)
+            print(
+                f"  key={k}\n    BDE export: {bde_row}\n    STBE row:   {stbe_row}",
+                flush=True,
+            )
         else:
             print(
                 f"  key={k}\n    BDE export: <missing>\n    STBE row:   {stbe_row}",
@@ -463,9 +475,9 @@ def _assert_cache_export_matches_lookup_embeddings(
                     (keys.numel(),), tid, dtype=torch.int64, device=keys.device
                 )
                 _, founds, indices = cache.lookup(keys, tids, None)
-                assert bool(founds.all()), (
-                    f"cache table_id={tid}: every exported key must be found via lookup"
-                )
+                assert bool(
+                    founds.all()
+                ), f"cache table_id={tid}: every exported key must be found via lookup"
                 emb_slots = load_from_flat(
                     state, indices, tids, copy_mode=CopyMode.EMBEDDING
                 )
@@ -528,9 +540,9 @@ def _assert_storage_export_matches_find_embeddings(
                     f"storage table_id={tid}: find reports {h_miss} missing keys "
                     "that export still lists"
                 )
-                assert bool(founds.all()), (
-                    f"storage table_id={tid}: find must locate every exported key"
-                )
+                assert bool(
+                    founds.all()
+                ), f"storage table_id={tid}: find must locate every exported key"
                 expected_dbg: Optional[torch.Tensor] = None
                 if debug_table:
                     mod = torch.tensor(
@@ -661,7 +673,9 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
     """
     storage = bdebt.tables
     cache = bdebt.cache
-    if not isinstance(storage, DynamicEmbStorage) or not isinstance(cache, DynamicEmbCache):
+    if not isinstance(storage, DynamicEmbStorage) or not isinstance(
+        cache, DynamicEmbCache
+    ):
         return
 
     saved_st = storage.training
@@ -682,7 +696,9 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
             torch.testing.assert_close(merged[k], v, rtol=1e-5, atol=1e-5)
         for k, v in storage_dict.items():
             if k in cache_dict:
-                torch.testing.assert_close(merged[k], cache_dict[k], rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(
+                    merged[k], cache_dict[k], rtol=1e-5, atol=1e-5
+                )
             else:
                 torch.testing.assert_close(merged[k], v, rtol=1e-5, atol=1e-5)
 
@@ -704,7 +720,10 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 emb_live = torch.empty_like(ref)
                 if bool(founds_c.any()):
                     emb_live[founds_c] = load_from_flat(
-                        ca, ix_c[founds_c], tid_t[founds_c], copy_mode=CopyMode.EMBEDDING
+                        ca,
+                        ix_c[founds_c],
+                        tid_t[founds_c],
+                        copy_mode=CopyMode.EMBEDDING,
                     )
                 miss = ~founds_c
                 if bool(miss.any()):
@@ -726,9 +745,9 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                         f"table_id={tid}: storage.find reports {h_miss} missing "
                         f"among keys not in cache"
                     )
-                    assert bool(sf.all()), (
-                        f"table_id={tid}: storage.find must hit all keys absent from cache"
-                    )
+                    assert bool(
+                        sf.all()
+                    ), f"table_id={tid}: storage.find must hit all keys absent from cache"
                     emb_live[miss] = sv
                 torch.testing.assert_close(ref, emb_live, rtol=1e-5, atol=1e-5)
     finally:
@@ -752,7 +771,9 @@ def _compare_bdebt_export_to_stbe_weights(
     _assert_cache_export_matches_lookup_embeddings(bdebt, device, batch_size=65536)
     _assert_storage_export_matches_find_embeddings(bdebt, device, batch_size=65536)
     _print_hybrid_hbm_host_sizes(
-        bdebt.tables, table_names, phase="Hybrid tier sizes (after flush, before export)"
+        bdebt.tables,
+        table_names,
+        phase="Hybrid tier sizes (after flush, before export)",
     )
     for tid, name in enumerate(table_names):
         _, st_detail = _bdebt_storage_entry_count_for_table(bdebt.tables, tid)
@@ -2454,7 +2475,9 @@ def _assert_opt_values_ckpt_row_width(
         )
 
 
-@pytest.mark.parametrize("multi_table", [False, True], ids=["single_table", "multi_table"])
+@pytest.mark.parametrize(
+    "multi_table", [False, True], ids=["single_table", "multi_table"]
+)
 @pytest.mark.parametrize("emb_dim", [1, 16, 1023], ids=lambda d: f"dim_{d}")
 @pytest.mark.parametrize(
     "opt_type,opt_params",
@@ -2727,15 +2750,16 @@ def test_table_expansion_capacity_growth(
     """
     pytest.importorskip("torchrec")
 
-
     assert torch.cuda.is_available()
     device_id = torch.cuda.current_device()
     device = torch.device(f"cuda:{device_id}")
     key_type = torch.int64
 
-    emb_cfgs, table_names, feature_table_map = _embedding_configs_for_strict_expansion_test(
-        multi_table
-    )
+    (
+        emb_cfgs,
+        table_names,
+        feature_table_map,
+    ) = _embedding_configs_for_strict_expansion_test(multi_table)
     memory_ratio = _CACHE_RATIO if caching else float(hbm_budget_ratio)
 
     table_options: List[DynamicEmbTableOptions] = []
@@ -2868,9 +2892,11 @@ def test_table_expansion_capacity_growth(
     # we need to do backward to unlock the keys in the cache, otherwise overflow buffer will be also full.
     for i in range(2):
         if not multi_table:
-            for j, (idx, off) in enumerate(_iter_compare_batches_single(
-                cmp_caps[0], _EXPANSION_STBE_TRAIN_BATCH, device, key_type
-            )):
+            for j, (idx, off) in enumerate(
+                _iter_compare_batches_single(
+                    cmp_caps[0], _EXPANSION_STBE_TRAIN_BATCH, device, key_type
+                )
+            ):
                 res_b = _bdebt_forward_maybe_lfu(
                     bdebt, score_strategy, idx, off, device
                 )

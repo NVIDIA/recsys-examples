@@ -14,11 +14,11 @@ How to use:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from commons.datasets.hstu_batch import HSTUBatch
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torch.utils import _pytree as pytree
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 def _flatten_hstu_batch(batch: HSTUBatch) -> Tuple[List[Any], Dict[str, Any]]:
@@ -38,7 +38,9 @@ def _flatten_hstu_batch(batch: HSTUBatch) -> Tuple[List[Any], Dict[str, Any]]:
         "feature_to_max_seqlen": dict(batch.feature_to_max_seqlen),
         "contextual_feature_names": list(batch.contextual_feature_names),
         "actual_batch_size": (
-            int(batch.actual_batch_size) if batch.actual_batch_size is not None else None
+            int(batch.actual_batch_size)
+            if batch.actual_batch_size is not None
+            else None
         ),
         # HSTUBatch fields
         "item_feature_name": batch.item_feature_name,

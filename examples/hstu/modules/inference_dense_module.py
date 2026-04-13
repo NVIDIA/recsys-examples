@@ -32,6 +32,7 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from modules.hstu_block_inference import HSTUBlockInference
+
 if int(os.getenv("HSTU_INFERENCE_ONLY", 0)) != 1:
     from modules.hstu_block import HSTUBlock
 else:
@@ -135,7 +136,9 @@ class InferenceDenseModule(torch.nn.Module):
         self._task_config = task_config
         self._use_exportable = use_exportable
         if self._use_exportable:
-            assert isinstance(hstu_config, HSTUConfig), "Exportable module is only supported for HSTUConfig"
+            assert isinstance(
+                hstu_config, HSTUConfig
+            ), "Exportable module is only supported for HSTUConfig"
 
         self._embedding_dim = hstu_config.hidden_size
         for ebc_config in task_config.embedding_configs:
@@ -143,7 +146,11 @@ class InferenceDenseModule(torch.nn.Module):
                 ebc_config.dim == self._embedding_dim
             ), "hstu layer hidden size should equal to embedding dim"
 
-        self._hstu_block = HSTUBlock(hstu_config) if self._use_exportable else HSTUBlockInference(hstu_config, kvcache_config)
+        self._hstu_block = (
+            HSTUBlock(hstu_config)
+            if self._use_exportable
+            else HSTUBlockInference(hstu_config, kvcache_config)
+        )
         self._mlp = MLP(
             self._embedding_dim,
             task_config.prediction_head_arch,
@@ -173,15 +180,19 @@ class InferenceDenseModule(torch.nn.Module):
         if not self._use_exportable:
             self._scaling_seqlen = hstu_config.scaling_seqlen
             self.setup_for_kvcache(hstu_config, kvcache_config)
-            self.setup_for_cudagraph(hstu_config, kvcache_config, use_cudagraph, cudagraph_configs)
-    
+            self.setup_for_cudagraph(
+                hstu_config, kvcache_config, use_cudagraph, cudagraph_configs
+            )
+
     def setup_for_kvcache(self, hstu_config, kvcache_config):
         max_batch_size = hstu_config.max_batch_size
         max_seq_len = hstu_config.max_seq_len
         hidden_dim = hstu_config.hidden_size
 
         self._hidden_states = torch.randn(
-            (max_batch_size * max_seq_len, hidden_dim), dtype=self._dtype, device=self._device
+            (max_batch_size * max_seq_len, hidden_dim),
+            dtype=self._dtype,
+            device=self._device,
         )
         self._jagged_metadata = get_jagged_metadata_buffer(
             max_batch_size, max_seq_len, hstu_config.contextual_max_seqlen
@@ -219,7 +230,9 @@ class InferenceDenseModule(torch.nn.Module):
                 kvcache_config.enable_nvcomp,
             )
 
-    def setup_for_cudagraph(self, hstu_config, kvcache_config, use_cudagraph, cudagraph_configs):
+    def setup_for_cudagraph(
+        self, hstu_config, kvcache_config, use_cudagraph, cudagraph_configs
+    ):
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
         if use_cudagraph:
@@ -436,7 +449,7 @@ class InferenceDenseModule(torch.nn.Module):
             jagged_item_logit = self._mlp(jagged_data.values)
 
         return jagged_item_logit
-    
+
     def forward(
         self,
         batch: HSTUBatch,

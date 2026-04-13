@@ -458,7 +458,6 @@ def get_planner(
     dict_const = {}
 
     for eb_config in eb_configs:
-
         value_bytes = get_table_value_bytes(
             eb_config,
             optimizer_type,

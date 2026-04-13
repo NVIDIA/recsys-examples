@@ -28,7 +28,13 @@ def _table_lookup_fake(
     ovf_bucket_capacity: int = 0,
     ovf_output_offsets: Optional[torch.Tensor] = None,
 ):
-    del table_storage, table_bucket_offsets, bucket_capacity, policy_type, ovf_bucket_capacity
+    del (
+        table_storage,
+        table_bucket_offsets,
+        bucket_capacity,
+        policy_type,
+        ovf_bucket_capacity,
+    )
 
     _validate_1d("keys", keys)
     _validate_1d("table_ids", table_ids)

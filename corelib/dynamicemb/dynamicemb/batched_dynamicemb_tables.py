@@ -36,8 +36,6 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     warning_for_cstm_score,
 )
-from dynamicemb.utils import DTYPE_NUM_BYTES
-from dynamicemb.optimizer import get_optimizer_state_dim
 from dynamicemb.embedding_admission import MultiTableKVCounter
 from dynamicemb.initializer import create_initializer_from_args
 from dynamicemb.key_value_table import (
@@ -56,8 +54,9 @@ from dynamicemb.optimizer import (
     OptimizerArgs,
     RowWiseAdaGradDynamicEmbeddingOptimizer,
     SGDDynamicEmbeddingOptimizer,
+    get_optimizer_state_dim,
 )
-from dynamicemb.utils import tabulate
+from dynamicemb.utils import DTYPE_NUM_BYTES, tabulate
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,
@@ -553,7 +552,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 else:
                     # No caching: HybridStorage (HBM tier + host tier)
                     if any(
-                        opt.external_storage is not None for opt in self._dynamicemb_options
+                        opt.external_storage is not None
+                        for opt in self._dynamicemb_options
                     ):
                         warnings.warn(
                             "external_storage is ignored in HybridStorage mode. "
@@ -583,7 +583,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         == DynamicEmbScoreStrategy.NO_EVICTION
                     ):
                         for hbm_option in hbm_options:
-                            hbm_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+                            hbm_option.score_strategy = (
+                                DynamicEmbScoreStrategy.TIMESTAMP
+                            )
 
                     self._storage = HybridStorage(
                         hbm_options, host_options, self._optimizer

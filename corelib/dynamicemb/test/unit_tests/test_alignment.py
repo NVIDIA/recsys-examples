@@ -179,9 +179,9 @@ def _assert_value_buffer_matches_hashtable(
     ovf = int(km.overflow_bucket_capacity_) if include_overflow else 0
     if include_overflow:
         bc = int(state.options_list[0].bucket_capacity)
-        assert ovf == _overflow_rows_for_cache(bc), (
-            f"table {table_id}: overflow_bucket_capacity_={ovf} != 3 * bucket ({bc})"
-        )
+        assert ovf == _overflow_rows_for_cache(
+            bc
+        ), f"table {table_id}: overflow_bucket_capacity_={ovf} != 3 * bucket ({bc})"
     expected_rows = main + ovf
     t = state.tables[table_id].tensor()
     vd = int(state.table_value_dims_cpu[table_id])
@@ -227,9 +227,7 @@ def assert_cache_and_storage_shapes(
         assert isinstance(batched._cache, DynamicEmbCache)
         cstate = batched._cache._state
         for tid in range(len(names)):
-            _assert_value_buffer_matches_hashtable(
-                cstate, tid, include_overflow=True
-            )
+            _assert_value_buffer_matches_hashtable(cstate, tid, include_overflow=True)
     else:
         assert batched._cache is None
 
@@ -283,9 +281,9 @@ def test_alignment_cache_storage_shapes(
         pytest.skip("caching with zero global HBM is invalid")
     world_size = _alignment_world_size()
     _require_cuda_dist()
-    assert dist.get_world_size() == world_size, (
-        f"dist.world_size={dist.get_world_size()} != WORLD_SIZE={world_size}"
-    )
+    assert (
+        dist.get_world_size() == world_size
+    ), f"dist.world_size={dist.get_world_size()} != WORLD_SIZE={world_size}"
 
     tables: List[EmbeddingConfig] = []
     for i, nemb in enumerate(num_embeddings_per_table):
@@ -330,9 +328,7 @@ def test_alignment_cache_storage_shapes(
     if training:
         torch_dtype = batched._dynamicemb_options[0].embedding_dtype
         assert torch_dtype is not None
-        st_dim = get_optimizer_state_dim(
-            optimizer_type, embedding_dim, torch_dtype
-        )
+        st_dim = get_optimizer_state_dim(optimizer_type, embedding_dim, torch_dtype)
         if isinstance(batched._storage, HybridStorage):
             vd_state = batched._storage._hbm
         else:

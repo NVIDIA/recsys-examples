@@ -12,28 +12,18 @@ This module owns:
 import os
 from typing import List, Optional
 
+import pynve.torch.nve_layers as nve_layers
 import torch
-
 from dynamicemb import (
-    DynamicEmbInitializerArgs,
-    DynamicEmbInitializerMode,
-    DynamicEmbPoolingMode,
-    DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTablesV2,
-    encode_checkpoint_file_path,
     encode_meta_json_file_path,
     get_loading_files,
 )
 from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
 from dynamicemb.scored_hashtable import ScorePolicy
-from dynamicemb_extensions import table_insert, expand_table_ids_cuda
-
-import pynve.torch.nve_layers as nve_layers
-from pynve.torch.nve_export import export_aot
-
+from dynamicemb_extensions import table_insert
 
 # ---------------------------------------------------------------------------
 # Helpers for InferenceEmbeddingTable construction
@@ -83,7 +73,6 @@ def _resolve_gpu_cache_size(
             f"using fallback gpu_cache_size={gpu_cache_size}"
         )
     return gpu_cache_size
-
 
 
 def _derive_grouped_offsets(feature_table_map: List[int]) -> List[int]:
@@ -261,9 +250,13 @@ class InferenceEmbeddingTable(torch.nn.Module):
         self.key_type_ = key_type
         self.num_tables_ = num_tables
         self.table_names_ = table_names
-        self.pooling_mode_ = pooling_mode  # plain Python int – compile-time constant for torch.export
-        self.score_policy = int(ScorePolicy.CONST)  # plain Python int – compile-time constant for torch.export
- 
+        self.pooling_mode_ = (
+            pooling_mode  # plain Python int – compile-time constant for torch.export
+        )
+        self.score_policy = int(
+            ScorePolicy.CONST
+        )  # plain Python int – compile-time constant for torch.export
+
         self.register_buffer(
             "feature_table_map_",
             torch.tensor(feature_table_map, dtype=torch.int64, device=device),
@@ -280,11 +273,13 @@ class InferenceEmbeddingTable(torch.nn.Module):
             "table_offsets_",
             torch.zeros(num_tables + 1, dtype=torch.int64, device=device),
         )
-        self.capacity_list_ += 1 # reserve the first row of each section for "not found" entries
+        self.capacity_list_ += (
+            1  # reserve the first row of each section for "not found" entries
+        )
         torch.cumsum(
-            torch.cat([ torch.ones((1,) , device=device), self.capacity_list_ ]), 
-            dim=0, 
-            out=self.table_offsets_
+            torch.cat([torch.ones((1,), device=device), self.capacity_list_]),
+            dim=0,
+            out=self.table_offsets_,
         )
 
         self.hash_table = InferenceLinearBucketTable(
@@ -296,7 +291,9 @@ class InferenceEmbeddingTable(torch.nn.Module):
 
         self.emb_dim_ = _resolve_embedding_dim(table_options)
         total_rows = int(self.capacity_list_.sum().item())
-        print(f"[INFO] Total embedding rows: {total_rows}, embedding dim: {self.emb_dim_}")
+        print(
+            f"[INFO] Total embedding rows: {total_rows}, embedding dim: {self.emb_dim_}"
+        )
         dtype_size = torch.finfo(output_dtype).bits // 8
         total_size_bytes = total_rows * self.emb_dim_ * dtype_size
         self.gpu_cache_size_ = _resolve_gpu_cache_size(table_options, total_size_bytes)
@@ -335,7 +332,10 @@ class InferenceEmbeddingTable(torch.nn.Module):
         if not os.path.exists(save_dir):
             raise RuntimeError(f"Save directory does not exist: {save_dir}")
 
-        if "get_loading_files" not in globals() or "_iter_batches_from_files" not in globals():
+        if (
+            "get_loading_files" not in globals()
+            or "_iter_batches_from_files" not in globals()
+        ):
             raise RuntimeError(
                 "dynamicemb load helpers are unavailable. Ensure dynamicemb and inference operators are importable."
             )
@@ -501,7 +501,7 @@ class InferenceEmbeddingTable(torch.nn.Module):
         else:
             # Pooled path: reduce each bag of keys to one embedding vector.
             return self.nve_embedding_(
-                global_indices,         # (N,) – absolute row ids
-                pooling_offsets,        # (B+1,) – CSR bag boundaries
-                per_sample_weights,     # optional per-key weights
+                global_indices,  # (N,) – absolute row ids
+                pooling_offsets,  # (B+1,) – CSR bag boundaries
+                per_sample_weights,  # optional per-key weights
             )

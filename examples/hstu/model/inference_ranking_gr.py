@@ -79,7 +79,7 @@ class InferenceRankingGR(torch.nn.Module):
 
         self.sparse_module.load_checkpoint(checkpoint_dir, model_state_dict)
         self.dense_module.load_state_dict(model_state_dict, strict=False)
-    
+
     def forward_with_kvcache(
         self,
         batch: HSTUBatch,
@@ -133,7 +133,7 @@ class InferenceRankingGR(torch.nn.Module):
             logits = self.dense_module.forward_nokvcache(batch, embeddings)
 
         return logits
-    
+
     def forward(
         self,
         batch: HSTUBatch,

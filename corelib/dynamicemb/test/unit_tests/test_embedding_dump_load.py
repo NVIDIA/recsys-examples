@@ -243,7 +243,6 @@ def apply_dmp(
     world_size = dist.get_world_size()
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
     for eb_config in eb_configs:
-
         emb_opt_type = (
             optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
         ) or EmbOptimType.SGD
@@ -259,7 +258,9 @@ def apply_dmp(
         else:
             global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-        admission_counter = KVCounter(max(1024 * 1024, eb_config.num_embeddings // (4 * world_size)))
+        admission_counter = KVCounter(
+            max(1024 * 1024, eb_config.num_embeddings // (4 * world_size))
+        )
         dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
             global_hbm_for_values=global_hbm,
             score_strategy=score_strategy,
@@ -267,7 +268,7 @@ def apply_dmp(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=1e-1,
             ),
-            bucket_capacity=MAX_BUCKET_CAPACITY, # keep same to the bucket capacity from get_table_value_bytes
+            bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
             admission_counter=admission_counter,

@@ -111,12 +111,22 @@ def hstu_preprocess_embeddings(
                     (
                         torch.cat(
                             [
-                                item_embs[item_offsets[idx].item() : candidates_indptr[idx].item()],
-                                action_embs[action_offsets[idx].item() : action_offsets[idx + 1].item()],
+                                item_embs[
+                                    item_offsets[idx]
+                                    .item() : candidates_indptr[idx]
+                                    .item()
+                                ],
+                                action_embs[
+                                    action_offsets[idx]
+                                    .item() : action_offsets[idx + 1]
+                                    .item()
+                                ],
                             ],
                             dim=1,
                         ).view(-1, embedding_dim),
-                        item_embs[candidates_indptr[idx].item() : item_offsets[idx + 1].item()],
+                        item_embs[
+                            candidates_indptr[idx].item() : item_offsets[idx + 1].item()
+                        ],
                     )
                     for idx in range(batch.batch_size)
                 ]
@@ -130,14 +140,24 @@ def hstu_preprocess_embeddings(
                     interleaved_embeddings.append(
                         torch.cat(
                             [
-                                item_embs[torch.arange(item_offsets[idx], candidates_indptr[idx])],
-                                action_embs[torch.arange(action_offsets[idx], action_offsets[idx + 1])],
+                                item_embs[
+                                    torch.arange(
+                                        item_offsets[idx], candidates_indptr[idx]
+                                    )
+                                ],
+                                action_embs[
+                                    torch.arange(
+                                        action_offsets[idx], action_offsets[idx + 1]
+                                    )
+                                ],
                             ],
                             dim=1,
                         ).view(-1, embedding_dim)
                     )
                     interleaved_embeddings.append(
-                        item_embs[torch.arange(candidates_indptr[idx], item_offsets[idx + 1])]
+                        item_embs[
+                            torch.arange(candidates_indptr[idx], item_offsets[idx + 1])
+                        ]
                     )
                 sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
                     -1, embedding_dim
@@ -200,9 +220,7 @@ def hstu_preprocess_embeddings(
         )
 
         sequence_embeddings_lengths_offsets = (
-            torch.ops.fbgemm.asynchronous_complete_cumsum(
-                sequence_embeddings_lengths
-            )
+            torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
         )
         sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
 
@@ -227,9 +245,13 @@ def hstu_preprocess_embeddings(
         if num_candidates is not None:
             total_candidates_seq_len = num_candidates.sum()
         elif contextual_seqlen is not None:
-            total_candidates_seq_len = sequence_embeddings_lengths.sum() - contextual_seqlen.sum()
+            total_candidates_seq_len = (
+                sequence_embeddings_lengths.sum() - contextual_seqlen.sum()
+            )
     elif torch.compiler.is_compiling():
-        assert num_candidates is not None, "num_candidates should not be None during inference when compiling"
+        assert (
+            num_candidates is not None
+        ), "num_candidates should not be None during inference when compiling"
         total_candidates_seq_len = num_candidates.sum()
     return JaggedData(
         values=sequence_embeddings,
