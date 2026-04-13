@@ -1,3 +1,4 @@
+import math
 from dataclasses import fields
 from typing import Dict, List, Tuple, Union
 
@@ -9,6 +10,17 @@ from commons.ops.collective_ops import (
 )
 from commons.sequence_batch.batch import BaseBatch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+
+def _elems_per_sample(t: torch.Tensor, actual_batch_size: int) -> int:
+    """Return the number of flat elements per sample in *t*.
+
+    When *actual_batch_size* > 0 we can simply divide; when the batch is
+    empty we fall back to the product of all dimensions after dim-0.
+    """
+    if actual_batch_size > 0:
+        return t.numel() // actual_batch_size
+    return math.prod(t.shape[1:]) if t.dim() > 1 else 1
 
 
 def pad_and_allgather_batch(
@@ -62,9 +74,8 @@ def pad_and_allgather_batch(
                     return tensor_or_kjt
                 elif isinstance(tensor_or_kjt, torch.Tensor):
                     t = tensor_or_kjt
-                    pad_size = (
-                        batch.batch_size * (t.numel() // orig_actual_bs) - t.numel()
-                    )
+                    eps = _elems_per_sample(t, orig_actual_bs)
+                    pad_size = batch.batch_size * eps - t.numel()
                     return F.pad(t, (0, pad_size)) if pad_size > 0 else t
                 else:
                     raise ValueError(f"Unsupported type: {type(tensor_or_kjt)}")
@@ -103,11 +114,8 @@ def pad_and_allgather_batch(
             return tensor_or_kjt
         elif isinstance(tensor_or_kjt, torch.Tensor):
             if pad_dense:
-                pad_size = (
-                    batch.batch_size
-                    * (tensor_or_kjt.numel() // batch.actual_batch_size)
-                    - tensor_or_kjt.numel()
-                )
+                eps = _elems_per_sample(tensor_or_kjt, batch.actual_batch_size)
+                pad_size = batch.batch_size * eps - tensor_or_kjt.numel()
                 padded = F.pad(tensor_or_kjt, (0, pad_size))
                 return gather_along_first_dim(padded, pg_group)
             return gather_along_first_dim(tensor_or_kjt, pg_group)
