@@ -4,22 +4,21 @@
 
 ### End-to-End Training Performance
 
-Progressive benchmark measuring end-to-end MFU as optimizations are incrementally enabled (CUTLASS attention, DynamicEmb caching, selective recompute, workload-balanced shuffler, tensor parallel).
+Progressive benchmark measuring end-to-end MFU as optimizations are incrementally enabled (workload-balanced shuffler, CUTLASS attention, selective recompute, tensor parallel).
 
 **[E2E Benchmark Documentation](./E2E_BENCHMARK.md)**
 
-#### Results (2× H100-SXM5-80GB nodes, 16 GPUs)
+#### Results (2× H100-SXM5-80GB nodes, 16 GPUs, Zipf α=1.05)
 
-| Exp | Name | MFU (%) | Speedup |
-|-----|------|---------|---------|
-| 0 | Baseline (Triton, DP-only) | 5.84 | 1.00× |
-| 1 | +CUTLASS Attention | 13.49 | 2.31× |
-| 2 | +DynamicEmb Caching | 15.57 | 2.67× |
-| 3 | +Selective Recompute | 15.40 | 2.64× |
-| 4 | **+Workload-Balanced Shuffler** | **22.19** | **3.80×** |
-| 5 | +Tensor Parallel (TP=2) | 16.54 | 2.83× |
+| Exp | Name | TFLOPS | MFU (%) | Speedup |
+|-----|------|--------|---------|---------|
+| 0 | Baseline (Triton, DP-only) | 1092 | 6.38 | 1.00× |
+| 1 | +Shuffler | 1667 | 9.73 | 1.53× |
+| 2 | **+CUTLASS Attention** | **3933** | **22.96** | **3.60×** |
+| 3 | +Selective Recompute | 3919 | 22.88 | 3.59× |
+| 4 | +Tensor Parallel (TP=2) | 2880 | 16.81 | 2.64× |
 
-CUTLASS attention (2.3×) and workload-balanced shuffler (3.8×) are the two largest contributors. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
+CUTLASS attention (3.6×) is the largest single contributor, reflecting the attention-bound nature of HSTU. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
 
 ### HSTU CUTLASS Attention MFU Heatmap
 

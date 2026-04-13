@@ -30,6 +30,7 @@ from commons.utils.gpu_timer import GPUTimer
 from commons.utils.logger import print_rank_0
 from commons.utils.stringify import stringify_dict
 from configs.sid_gin_config_args import TrainerArgs
+from megatron.core import parallel_state
 from model.gpt_model import SIDGRModel
 
 try:
@@ -132,8 +133,9 @@ def train_with_pipeline(
     gpu_timer.start()
     last_td = 0
 
-    # using a tensor on gpu to avoid d2h copy
+    # using tensors on gpu to avoid d2h copy
     tokens_logged = torch.zeros(1).cuda().float()
+    loss_logged = torch.zeros(1).cuda().float()
     # limit the number of iters to max_train_iters
     # we support max_train_iters > n_batches, i.e. multiple epochs
     train_loader_iter = islice(cycle(iter(train_loader)), max_train_iters)
@@ -179,20 +181,27 @@ def train_with_pipeline(
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
                 torch.cuda.nvtx.range_push(f"step {train_iter}")
-                reporting_loss, _, logits = pipeline.progress(
+                local_loss_sum, global_tokens, logits = pipeline.progress(
                     batched_iterator
                 )  # Exception raised here
-                tokens_logged += reporting_loss[1]
+                tokens_logged += global_tokens
+                loss_logged += local_loss_sum
                 if (
                     train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0
                 ) or trainer_args.log_interval == 1:
                     gpu_timer.stop()
                     cur_td = gpu_timer.elapsed_time() - last_td
+                    torch.distributed.all_reduce(
+                        loss_logged,
+                        group=parallel_state.get_data_parallel_group(),
+                    )
+                    avg_loss = loss_logged.item() / tokens_logged.item()
                     print_rank_0(
-                        f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {reporting_loss[0] / reporting_loss[1]:.6f}"
+                        f"[train] [iter {train_iter}, tokens {int(tokens_logged.item())}, elapsed_time {cur_td:.2f} ms]: loss {avg_loss:.6f}"
                     )
                     last_td = cur_td + last_td
                     tokens_logged.zero_()
+                    loss_logged.zero_()
                 # evaluate the model
                 if (
                     train_iter > 0 and train_iter % trainer_args.eval_interval == 0

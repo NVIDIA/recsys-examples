@@ -67,25 +67,21 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 
 | Exp | Name | TFLOPS | MFU (%) | Speedup vs Baseline | Notes |
 |-----|------|--------|---------|---------------------|-------|
-| 0 | Baseline | — | — | 1.00× | Triton attention, DP-only |
-| 1 | +Shuffler | — | — | —× | Eliminates attention skew from Zipf distribution |
-| 2 | +CUTLASS | — | — | —× | Attention kernel swap |
-| 3 | +Recompute | — | — | —× | Saves memory with negligible throughput cost |
-| 4 | +TP=2 | — | — | —× | Trades communication for per-GPU memory savings |
-
-> Results will be updated after the next benchmark run.
-
-<img src="figs/comparison.png" width="100%" />
+| 0 | Baseline | 1092 | 6.38 | 1.00× | Triton attention, DP-only |
+| 1 | +Shuffler | 1667 | 9.73 | 1.53× | Eliminates attention skew from Zipf distribution |
+| 2 | **+CUTLASS** | **3933** | **22.96** | **3.60×** | Attention kernel swap — largest single-step gain |
+| 3 | +Recompute | 3919 | 22.88 | 3.59× | Saves memory with negligible throughput cost |
+| 4 | +TP=2 | 2880 | 16.81 | 2.64× | Trades communication for per-GPU memory savings |
 
 ### Key Takeaways
 
-1. **CUTLASS attention is the foundation**: Replacing the Triton kernel with CUTLASS yields significant speedup, reflecting the attention-bound nature of HSTU.
+1. **CUTLASS attention is the foundation**: Replacing the Triton kernel with CUTLASS yields a 3.6× speedup (6.38% → 22.96% MFU) — by far the most impactful single optimization, reflecting the attention-bound nature of HSTU.
 
-2. **Workload-balanced shuffler eliminates load imbalance**: Zipf-distributed sequence lengths cause severe load imbalance with O(n²) attention. Redistributing sequences to equalize per-GPU FLOPs eliminates idle time.
+2. **Workload-balanced shuffler delivers 1.53× speedup**: Zipf-distributed sequence lengths cause severe load imbalance with O(n²) attention. Redistributing sequences to equalize per-GPU FLOPs eliminates idle time (6.38% → 9.73% MFU).
 
-3. **Selective recompute is memory-oriented**: Recompute LayerNorm activations during backward saves activation memory with negligible throughput cost.
+3. **Selective recompute is memory-oriented**: Recompute LayerNorm activations during backward saves activation memory with negligible throughput cost (22.96% → 22.88% MFU).
 
-4. **Tensor Parallel introduces communication overhead**: TP=2 reduces per-GPU weight memory by half but adds AllReduce synchronization after each HSTU layer. Most beneficial when model size exceeds single-GPU memory capacity.
+4. **Tensor Parallel introduces communication overhead**: TP=2 reduces per-GPU weight memory by half but adds AllReduce/AllGather synchronization after each HSTU layer. The net effect is 16.81% MFU — better than baseline but lower than CUTLASS alone, suggesting TP is most beneficial when model size exceeds single-GPU memory capacity.
 
 ---
 
