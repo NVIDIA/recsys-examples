@@ -8,10 +8,6 @@
 #   --kernel_backend [triton|cutlass]   (default: triton)
 #   --recompute_layernorm               (default: False)
 #   --balanced_shuffler                 (default: False)
-#   --caching                           (default: False)
-#   --ratio FLOAT                       (default: 0, auto-set to 0.1 when caching enabled)
-#   --evict [lru|lfu]                   (default: lru)
-#   --pipeline_type [none|prefetch]     (default: none)
 #   --tp_size INT                       (default: 1)
 
 exp0_baseline,--value_dist zipf --value_dist_alpha 1.05
