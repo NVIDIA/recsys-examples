@@ -14,9 +14,7 @@ from typing import List, Optional
 
 import pynve.torch.nve_layers as nve_layers
 import torch
-from dynamicemb import (
-    DynamicEmbTableOptions,
-)
+from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.batched_dynamicemb_tables import (
     encode_meta_json_file_path,
     get_loading_files,

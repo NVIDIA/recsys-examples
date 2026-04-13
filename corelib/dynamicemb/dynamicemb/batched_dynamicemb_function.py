@@ -32,11 +32,7 @@ from dynamicemb.key_value_table import (
     store_to_flat,
 )
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.types import (
-    AdmissionStrategy,
-    CopyMode,
-    Counter,
-)
+from dynamicemb.types import AdmissionStrategy, CopyMode, Counter
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
