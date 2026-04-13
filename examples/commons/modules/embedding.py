@@ -267,41 +267,84 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
         self,
         input_feature_names: List[str],
     ) -> None:
-        self._features_order: List[int] = []
+        features_order: List[int] = []
         for f in self._feature_names:
-            self._features_order.append(input_feature_names.index(f))
-        self._features_order = (
-            []
-            if self._features_order == list(range(len(self._features_order)))
-            else self._features_order
-        )
+            features_order.append(input_feature_names.index(f))
+        self._features_order = features_order
         self.register_buffer(
             "_features_order_tensor",
-            torch.tensor(self._features_order, device=self._device, dtype=torch.int32),
+            torch.tensor(features_order, device=self._device, dtype=torch.int32),
             persistent=False,
         )
-        self._feature_splits = [len(self._feature_names)]
+        self._num_dp_features = len(self._feature_names)
 
-    # return Tensor! Not awaitable!
-    def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
+    def compute_dp_length_per_key(
+        self, features: KeyedJaggedTensor
+    ) -> Optional[List[int]]:
+        """Extract per-DP-feature value counts from the input KJT.
+
+        The input KJT (built via ``from_lengths_sync``) already has
+        ``length_per_key`` cached — this is pure Python list indexing with
+        zero GPU work and zero D2H.
+
+        Returns ``None`` when there is only one DP feature (no split needed).
+        """
+        if self._has_uninitialized_input_dist:
+            self._create_input_dist(input_feature_names=features.keys())
+            self._has_uninitialized_input_dist = False
+        if self._num_dp_features <= 1:
+            return None
+        input_lpk = features.length_per_key()
+        return [input_lpk[i] for i in self._features_order]
+
+    @output_nvtx_hook(nvtx_tag="DataParallelEmbeddingCollection")
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+        _length_per_key: Optional[List[int]] = None,
+    ) -> Dict[str, JaggedTensor]:
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys())
             self._has_uninitialized_input_dist = False
         with torch.no_grad():
-            if self._features_order:
-                features = features.permute(
-                    self._features_order,
-                    self._features_order_tensor,
-                )
-            features = features.split(self._feature_splits)[0]
+            features = features.permute(
+                self._features_order,
+                self._features_order_tensor,
+            )
         embeddings = self._dp_lookups[0](features).view(-1, self._embedding_dim)
-        kjt = KeyedJaggedTensor(
-            values=embeddings,
-            keys=features.keys(),
-            lengths=features.lengths(),
-            offsets=features.offsets(),
-        )
-        return kjt.to_dict()
+        return self._build_output_dict(embeddings, features, _length_per_key)
+
+    def _build_output_dict(
+        self,
+        embeddings: torch.Tensor,
+        features: KeyedJaggedTensor,
+        length_per_key: Optional[List[int]] = None,
+    ) -> Dict[str, JaggedTensor]:
+        """Build ``Dict[str, JaggedTensor]`` without D2H sync.
+
+        When *length_per_key* is pre-supplied (from
+        :meth:`compute_dp_length_per_key`) no device-to-host transfer is
+        needed — all slicing uses Python-int stride arithmetic.
+        """
+        keys = features.keys()
+        num_keys = len(keys)
+        stride = features.stride()
+        all_lengths = features.lengths()
+
+        if num_keys == 1:
+            return {keys[0]: JaggedTensor(values=embeddings, lengths=all_lengths)}
+
+        if length_per_key is None:
+            length_per_key = all_lengths.view(num_keys, stride).sum(dim=1).tolist()
+
+        value_splits = torch.split(embeddings, length_per_key, dim=0)
+        return {
+            keys[i]: JaggedTensor(
+                values=value_splits[i],
+                lengths=all_lengths[i * stride : (i + 1) * stride],
+            )
+            for i in range(num_keys)
+        }
 
 
 class ShardedEmbedding(torch.nn.Module):
@@ -358,6 +401,7 @@ class ShardedEmbedding(torch.nn.Module):
             self._data_parallel_embedding_collection = None
             self._side_stream = None
         self.freeze_embedding = os.environ.get("FREEZE_EMBEDDING", "0")
+        self._overlap_dp_mp = os.environ.get("OVERLAP_DP_MP", "1") == "1"
         # for nvtx setting, we need to get the tensor from the output dict and set it back to the output dict
         register_setter_and_getter_for_nvtx(
             ShardedEmbedding.forward,
@@ -394,14 +438,31 @@ class ShardedEmbedding(torch.nn.Module):
             and self._data_parallel_embedding_collection is None
         ), "either model_parallel_embedding_collection or data_parallel_embedding_collection must be not None"
         embeddings: Dict[str, JaggedTensor] = {}
-        if self._model_parallel_embedding_collection is not None:
-            mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
-            embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
-        if self._data_parallel_embedding_collection is not None:
+
+        if self._overlap_dp_mp and self._data_parallel_embedding_collection is not None:
+            dp_lpk = self._data_parallel_embedding_collection.compute_dp_length_per_key(
+                kjt
+            )
             with torch.cuda.stream(self._side_stream):
-                dp_embeddings = self._data_parallel_embedding_collection(kjt)
+                dp_embeddings = self._data_parallel_embedding_collection(
+                    kjt, _length_per_key=dp_lpk
+                )
+            if self._model_parallel_embedding_collection is not None:
+                mp_embeddings_awaitables = self._model_parallel_embedding_collection(
+                    kjt
+                )
+                embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
             torch.cuda.current_stream().wait_stream(self._side_stream)
             embeddings = {**embeddings, **dp_embeddings}
+        else:
+            if self._model_parallel_embedding_collection is not None:
+                mp_embeddings_awaitables = self._model_parallel_embedding_collection(
+                    kjt
+                )
+                embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
+            if self._data_parallel_embedding_collection is not None:
+                dp_embeddings = self._data_parallel_embedding_collection(kjt)
+                embeddings = {**embeddings, **dp_embeddings}
         return embeddings
 
     def export_local_embedding(self, table_name: str) -> Tuple[np.ndarray, np.ndarray]:
