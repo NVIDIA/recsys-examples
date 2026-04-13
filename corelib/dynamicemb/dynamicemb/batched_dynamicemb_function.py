@@ -29,7 +29,6 @@ from dynamicemb.key_value_table import (
     _find_keys,
     eval_lookup,
     get_insert_score_arg,
-    get_table_ptrs,
     load_from_flat,
     store_to_flat,
 )
@@ -1208,7 +1207,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     optimizer.fused_update_for_flat_table(
                         unique_grads.to(ctx.emb_dtype),
                         ctx.update_slot_indices,
-                        get_table_ptrs(state),
+                        state.table_ptrs_dev,
                         unique_table_ids,
                         state.table_value_dims,
                         state.table_emb_dims,

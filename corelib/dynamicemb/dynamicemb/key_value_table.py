@@ -159,13 +159,19 @@ def get_uvm_tensor(dim, dtype, device, is_managed=False):
     )
 
 
-def get_table_ptrs(state: "DynamicEmbTableState") -> torch.Tensor:
-    """Return current data pointers of table buffers from state.tables (ExtendableBuffer).
-    Uses buffer.tensor() so pointers stay valid after ExtendableBuffer.extend()."""
+def get_table_ptrs(
+    tables: List[ExtendableBuffer], device: torch.device
+) -> torch.Tensor:
+    """Build a device tensor of current value-buffer base pointers for *tables*.
+
+    Uses ``buffer.tensor().data_ptr()`` so results stay valid until the next
+    ``ExtendableBuffer.extend()``; after extend, rebuild into ``table_ptrs_dev``
+    (or another buffer) via this function.
+    """
     return torch.tensor(
-        [b.tensor().data_ptr() for b in state.tables],
+        [b.tensor().data_ptr() for b in tables],
         dtype=torch.int64,
-        device=state.device,
+        device=device,
     )
 
 
@@ -184,6 +190,8 @@ class DynamicEmbTableState:
     key_index_map: Any
     capacity: int
     tables: List[ExtendableBuffer]
+    # Per-table value buffer base pointers on ``device``; refreshed on init and expand.
+    table_ptrs_dev: torch.Tensor
     table_emb_dims: torch.Tensor
     table_value_dims: torch.Tensor
     table_emb_dims_cpu: List[int]
@@ -322,6 +330,7 @@ def create_table_state(
         key_index_map=key_index_map,
         capacity=capacity,
         tables=tables,
+        table_ptrs_dev=get_table_ptrs(tables, device),
         table_emb_dims=table_emb_dims,
         table_value_dims=table_value_dims,
         table_emb_dims_cpu=dims,
@@ -448,6 +457,7 @@ def _expand_tables_impl(
                     state.tables[i].extend((add_rows, vd))
             else:
                 state.tables[i].extend(state.tables[i].shape)
+    state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, device))
 
     old_key_index_map = state.key_index_map
     for table_id in range(state.num_tables):
@@ -670,7 +680,7 @@ def load_from_flat(
     output = torch.empty(N, max_dim, dtype=state.emb_dtype, device=state.device)
     if N > 0:
         _load(
-            get_table_ptrs(state),
+            state.table_ptrs_dev,
             indices,
             table_ids,
             output,
@@ -691,7 +701,7 @@ def store_to_flat(
     if values.dim() == 1:
         values = values.unsqueeze(1)
     _store_value(
-        get_table_ptrs(state),
+        state.table_ptrs_dev,
         indices,
         table_ids,
         values.to(state.emb_dtype),
@@ -713,7 +723,7 @@ def load_from_flat_single_table(
     output = torch.empty(N, vdim, dtype=state.emb_dtype, device=state.device)
     if N > 0:
         _load_contiguous(
-            get_table_ptrs(state),
+            state.table_ptrs_dev,
             indices,
             table_id,
             output,
@@ -738,7 +748,7 @@ def store_to_flat_single_table(
     if values.dim() == 1:
         values = values.unsqueeze(1)
     _store_contiguous(
-        get_table_ptrs(state),
+        state.table_ptrs_dev,
         indices,
         table_id,
         values.to(state.emb_dtype),
