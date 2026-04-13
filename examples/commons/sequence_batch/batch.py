@@ -45,6 +45,17 @@ class BaseBatch(Pipelineable):
             else self.actual_batch_size
         )
 
+    def num_loss_tokens(self) -> torch.Tensor:
+        """Per-rank loss token count as a scalar float tensor.
+
+        Subclasses should override this with a task-specific implementation.
+        Default: returns the total number of label values if labels exist,
+        otherwise returns batch_size as a fallback.
+        """
+        if self.labels is not None:
+            return torch.tensor(self.labels.values().numel(), dtype=torch.float)
+        return torch.tensor(self.batch_size, dtype=torch.float)
+
     def _apply_to_tensors_or_kjt(
         self, tensor_fn: Callable, *args, inplace: bool = False, **kwargs
     ) -> "BaseBatch":

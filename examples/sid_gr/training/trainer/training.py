@@ -179,7 +179,7 @@ def train_with_pipeline(
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
                 torch.cuda.nvtx.range_push(f"step {train_iter}")
-                reporting_loss, logits = pipeline.progress(
+                reporting_loss, _, logits = pipeline.progress(
                     batched_iterator
                 )  # Exception raised here
                 tokens_logged += reporting_loss[1]
