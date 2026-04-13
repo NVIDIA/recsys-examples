@@ -134,6 +134,7 @@ export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 export FILL_DYNAMICEMB_TABLES=1
 export MEM_DEBUG=${MEM_DEBUG:-0}
 export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0}
+export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5}
 export CACHE_DEBUG=${CACHE_DEBUG:-0}
 
 # Optional: CUDA_LAUNCH_BLOCKING for debugging (set via env var)
@@ -244,6 +245,7 @@ WRAPPER_EOF
             export DISABLE_RICH=1 && \
             export MEM_DEBUG=${MEM_DEBUG:-0} && \
             export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && \
+            export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && \
             export CACHE_DEBUG=${CACHE_DEBUG:-0} && \
             ${LAUNCH_BLOCKING_ENV} \
             ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
@@ -270,7 +272,7 @@ else
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
         2>&1 | tee -a ${LOG_FILE}
     
     EXIT_CODE=${PIPESTATUS[0]}
