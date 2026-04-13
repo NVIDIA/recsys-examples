@@ -5,4 +5,5 @@ exclude = [
   "examples/hstu/ops/fused_hstu_op.py",
   "corelib/*",
   "examples/commons/pipeline/*",
+  "examples/hstu/training/benchmark/results/*",
 ]

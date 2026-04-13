@@ -1,0 +1,21 @@
+# HSTU E2E Benchmark Experiment List
+# Format: exp_name,generate_gin_config_options
+#
+# Progressive optimization: each experiment enables one additional optimization
+# on top of the previous experiment.
+#
+# Available options:
+#   --kernel_backend [triton|cutlass]   (default: triton)
+#   --recompute_layernorm               (default: False)
+#   --balanced_shuffler                 (default: False)
+#   --caching                           (default: False)
+#   --ratio FLOAT                       (default: 0, auto-set to 0.1 when caching enabled)
+#   --evict [lru|lfu]                   (default: lru)
+#   --pipeline_type [none|prefetch]     (default: none)
+#   --tp_size INT                       (default: 1)
+
+exp0_baseline,--value_dist zipf --value_dist_alpha 1.05
+exp1_shuffler,--balanced_shuffler --value_dist zipf --value_dist_alpha 1.05
+exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.05
+exp3_recompute,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --value_dist zipf --value_dist_alpha 1.05
+exp4_tp,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --tp_size 2 --value_dist zipf --value_dist_alpha 1.05

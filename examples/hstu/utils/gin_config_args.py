@@ -164,6 +164,7 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
 
     # the precedence is `global_hbm_for_values` > `item_vocab_gpu_capacity` > `item_vocab_gpu_capacity_ratio`
     # without optimizer consideration
+    # when caching is True, global_hbm_for_values gives the cache size
     global_hbm_for_values: Optional[int] = None
     item_vocab_gpu_capacity: Optional[float] = None
     item_vocab_gpu_capacity_ratio: Optional[float] = None
@@ -307,6 +308,7 @@ class BenchmarkDatasetArgs:
         contextual_feature_names (List[str]): **Required**. List of contextual feature names.
         action_feature_name (Optional[str]): Action feature name. Default: None.
         max_num_candidates (int): Maximum number of candidates. Default: 0.
+        num_generated_batches (int): Number of random batches to pre-generate. Default: 100.
     """
 
     feature_args: List[FeatureArgs]
@@ -315,6 +317,7 @@ class BenchmarkDatasetArgs:
     contextual_feature_names: List[str]
     action_feature_name: Optional[str] = None
     max_num_candidates: int = 0
+    num_generated_batches: int = 100
 
 
 @gin.configurable
@@ -450,6 +453,13 @@ class RankingArgs:
                 "relu",
                 "gelu",
             ], "prediction_head_act_type should be in ['relu', 'gelu']"
+        self.eval_metrics = tuple(metric.upper() for metric in self.eval_metrics)
+        for metric in self.eval_metrics:
+            assert metric in [
+                "AUC",
+                "NDCG",
+                "HR",
+            ], "eval_metrics should be in ['AUC', 'NDCG', 'HR']"
 
 
 @gin.configurable

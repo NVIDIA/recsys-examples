@@ -1,74 +1,97 @@
-# HSTU layer benchmark
+# HSTU Training Benchmark
 
-In hstu example, we have provided a set of performance optimization guidelines for single HSTU layer, including
-1. Fast and memory-efficient hstu attention integration.
-2. Kernel fusions: layer norm + multiplication + dropout 
-3. Seletive forward recompute.
+## Benchmarks
 
-You can run script `run_hstu_benchmark.sh` to see the performance over the base implementation. The baseline is from [Meta's open source HSTU implementation](https://github.com/meta-recsys/generative-recommenders/tree/bb389f9539b054e7268528efcd35457a6ad52439), which features in:
+### End-to-End Training Performance
 
-1. Triton-based HSTU attention kernels with the remaining operations using PyTorch ops.
-2. No kernel fusions.
-3. No recompute.
+Progressive benchmark measuring end-to-end MFU as optimizations are incrementally enabled (CUTLASS attention, DynamicEmb caching, selective recompute, workload-balanced shuffler, tensor parallel).
 
-## How to run
+**[E2E Benchmark Documentation](./E2E_BENCHMARK.md)**
 
-The test entry is `python ./training/benchmark/hstu_layer_benchmark.py run`, you can type `python ./training/benchmark/hstu_layer_benchmark.py run --help` to get the input arguments. 4 important arguments are :
+#### Results (2× H100-SXM5-80GB nodes, 16 GPUs)
 
-1. --kernel-backend: select the hstu mha backend. Could be `triton` or `cutlass`.
-2. --fuse-norm-mul-dropout: knob of  `layer norm + multiplication + dropout ` fusion. Could be `False` or `True`
-3. --recompute-input-silu: knob of silu recompute. Could be `False` or `True`
-4. --recompute-input-layernorm: knob of input layer norm recompute. Could be `False` or `True`
+| Exp | Name | MFU (%) | Speedup |
+|-----|------|---------|---------|
+| 0 | Baseline (Triton, DP-only) | 5.84 | 1.00× |
+| 1 | +CUTLASS Attention | 13.49 | 2.31× |
+| 2 | +DynamicEmb Caching | 15.57 | 2.67× |
+| 3 | +Selective Recompute | 15.40 | 2.64× |
+| 4 | **+Workload-Balanced Shuffler** | **22.19** | **3.80×** |
+| 5 | +Tensor Parallel (TP=2) | 16.54 | 2.83× |
 
-Our baseline cmd example (1K): 
+CUTLASS attention (2.3×) and workload-balanced shuffler (3.8×) are the two largest contributors. See the [full benchmark document](./E2E_BENCHMARK.md) for analysis.
 
-```bash
+### HSTU CUTLASS Attention MFU Heatmap
 
-cd recsys-examples/examples/hstu
-python ./training/benchmark/hstu_layer_benchmark.py run \
-  --iters 100 \
-  --warmup-iters 50 \
-  --layer-type native \
-  --kernel-backend triton \
-  --dim-per-head 256 \
-  --num-heads 4 \
-  --num-layers 1 \
-  --dtype bfloat16 \
-  --max-seqlen 1024 \
-  --full-sequence True \
-  --batchsize 32 
-```
-
-You can also run a set of arguments with run.sh:
+Standalone benchmark for the **CUTLASS-based HSTU attention kernel**. Sweeps batch sizes and sequence lengths on non-jagged (full-length) inputs and outputs TFLOPS/MFU heatmaps as PNG files.
 
 ```bash
 cd recsys-examples/examples/hstu
-bash ./training/benchmark/run_hstu_layer_benchmark.sh <num_layers>
+python ./training/benchmark/scripts/benchmark_hstu_attn_mfu.py \
+    --gin-config-file training/configs/benchmark_ranking.gin \
+    --batch-sizes 4 8 16 32 64 \
+    --seqlens 512 1024 2048 4096
 ```
 
-After one run is done, a memory snapshot file in current working directory is generated, you can trace the memory usage with the file. Please refer to [PyTorch docs](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html) on how to visualize the memory trace.
+#### Results (single H100-SXM5-80GB)
 
-## Benchmark results
+<p align="center"><img src="figs/hstu_attn_mfu.png" width="60%" /></p>
 
-We cover sequence from 1k~8k, other hyper-params are as followed:
-| Item          | Value |
-| ------------- | ----- |
-| Batchsize     | 32    |
-| dim per head  | 256   |
-| num_heads     | 4     |
-| embedding dim | 1024  |
+The CUTLASS attention kernel achieves peak MFU at large batch × seqlen products, where the GPU compute units are fully saturated. OOM (grey cells) occurs at the largest configurations.
 
-All results are conducted on single H100-SXM5-80G
+### HSTU Layer Benchmark
 
-### Throughput
+Single HSTU layer micro-benchmark covering attention kernels, kernel fusions, and selective recompute.
 
-![hstu_layer_perf](./hstu_layer_perf.png)
+The baseline is [Meta's open source HSTU implementation](https://github.com/meta-recsys/generative-recommenders/tree/bb389f9539b054e7268528efcd35457a6ad52439): Triton attention, no kernel fusions, no recompute.
 
-The columns other than the first column are incrementally tested based on the previous column.
+Key arguments:
 
-### Peak memory
+| Argument | Values | Description |
+|----------|--------|-------------|
+| `--kernel-backend` | `triton` / `cutlass` | Attention backend |
+| `--fuse-norm-mul-dropout` | `True` / `False` | LayerNorm + Mul + Dropout fusion |
+| `--recompute-input-silu` | `True` / `False` | SiLU activation recompute |
+| `--recompute-input-layernorm` | `True` / `False` | LayerNorm activation recompute |
 
-We trace the peak memory with the help of torch memory snapshot. To better identify the boundary forward and backward process, we have run 3 HSTU layers.
-Below are the memory usage for seqlen=4K:
+```bash
+cd recsys-examples/examples/hstu
 
-![image](./memory_snapshot.png)
+# Single run (baseline, seqlen=1K)
+python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
+    --iters 100 --warmup-iters 50 \
+    --layer-type native --kernel-backend triton \
+    --dim-per-head 256 --num-heads 4 --num-layers 1 \
+    --dtype bfloat16 --max-seqlen 1024 --full-sequence True --batchsize 32
+
+# Sweep across configurations
+bash ./training/benchmark/scripts/run_hstu_layer_benchmark.sh <num_layers>
+```
+
+Each run also produces a memory snapshot file. Visualize it with [PyTorch memory tools](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html).
+
+#### Results (single H100-SXM5-80GB)
+
+Sequence lengths 1K–8K, batchsize=32, dim_per_head=256, num_heads=4, embedding_dim=1024.
+
+**Throughput** (columns are incrementally applied):
+
+![hstu_layer_perf](figs/hstu_layer_perf.png)
+
+**Peak memory** (3 HSTU layers, seqlen=4K):
+
+![memory_snapshot](figs/memory_snapshot.png)
+
+### Memory Estimation
+
+CPU-only script that estimates parameter, activation, and optimizer memory. Supports two modes:
+
+```bash
+# From gin config (batch_size, max_seq_len, etc. are read from the config)
+python ./training/benchmark/scripts/estimate_memory.py \
+    --gin_config training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+
+# From command-line arguments (no gin file needed)
+python ./training/benchmark/scripts/estimate_memory.py \
+    --batch_size 32 --max_seq_len 4096 --hidden_size 1024 --num_layers 8
+```
