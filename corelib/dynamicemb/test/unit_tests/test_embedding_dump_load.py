@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
 )
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -120,6 +121,54 @@ def assert_batched_dynamicemb_storage_class(
                     "Full HBM budget without cache: expected DynamicEmbStorage, "
                     f"got {type(storage)}"
                 )
+
+
+def assert_get_dynamic_emb_module_finds_submodules(model) -> None:
+    """Verify get_dynamic_emb_module discovers BatchedDynamicEmbeddingTablesV2.
+
+    Tests two paths:
+      1. Via find_sharded_modules + get_dynamic_emb_module (existing usage)
+      2. Via get_dynamic_emb_module directly on the DMP model (requires
+         children() traversal through wrapper modules, the fix for #353)
+
+    Both must return the same set of modules.
+    """
+    # Path 1: existing approach - find sharded modules first, then search each
+    via_sharded = []
+    for _, _, sharded_module in find_sharded_modules(model, ""):
+        via_sharded.extend(get_dynamic_emb_module(sharded_module))
+
+    # Path 2: search directly on the DMP wrapper (requires children() traversal)
+    via_dmp = get_dynamic_emb_module(model)
+
+    assert (
+        len(via_sharded) > 0
+    ), "find_sharded_modules + get_dynamic_emb_module found no modules"
+    assert (
+        len(via_dmp) > 0
+    ), "get_dynamic_emb_module on DMP model found no modules (children() traversal broken)"
+
+    # Every module found via either path must be BatchedDynamicEmbeddingTablesV2
+    for m in via_sharded:
+        assert isinstance(
+            m, BatchedDynamicEmbeddingTablesV2
+        ), f"Expected BatchedDynamicEmbeddingTablesV2, got {type(m)}"
+    for m in via_dmp:
+        assert isinstance(
+            m, BatchedDynamicEmbeddingTablesV2
+        ), f"Expected BatchedDynamicEmbeddingTablesV2, got {type(m)}"
+
+    # Both paths must discover the exact same set of modules (by identity)
+    ids_sharded = set(id(m) for m in via_sharded)
+    ids_dmp = set(id(m) for m in via_dmp)
+    assert ids_sharded == ids_dmp, (
+        f"Module sets differ: via_sharded has {len(ids_sharded)} modules, "
+        f"via_dmp has {len(ids_dmp)} modules"
+    )
+
+    # No duplicates in either result
+    assert len(via_sharded) == len(ids_sharded), "Duplicates in via_sharded path"
+    assert len(via_dmp) == len(ids_dmp), "Duplicates in via_dmp path"
 
 
 def update_scores(
@@ -440,6 +489,8 @@ def test_model_load_dump(
             threshold=2 if counter else 1,
         ),
     )
+
+    assert_get_dynamic_emb_module_finds_submodules(ref_model)
 
     expect_scores_collection: Dict[str, Dict[int, int]] = {}
     kjts, feature_names, all_kjts = generate_sparse_feature(
