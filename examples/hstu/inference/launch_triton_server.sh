@@ -24,4 +24,4 @@ cp ./inference/triton/hstu_sparse/model.py ./inference/triton/hstu_sparse/1/
 echo $'parameters [\n  {\n    key: "HSTU_CHECKPOINT_DIR"\n    value: {\n      string_value: "'${CKPT_DIR}$'"\n    }\n  }\n]' >> ./inference/triton/hstu_sparse/config.pbtxt 
 
 # launch
-PYTHONPATH=${PYTHONPATH}:$(realpath ../) tritonserver --model-repository ./inference/triton/
+HSTU_INFERENCE_ONLY=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) tritonserver --model-repository ./inference/triton/

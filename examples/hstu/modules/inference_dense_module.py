@@ -32,7 +32,11 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from modules.hstu_block_inference import HSTUBlockInference
-from modules.hstu_block import HSTUBlock
+if int(os.getenv("HSTU_INFERENCE_ONLY", 0)) != 1:
+    from modules.hstu_block import HSTUBlock
+else:
+    HSTUBlock = None
+    print("[INFO] HSTU inference only mode (HSTU_INFERENCE_ONLY) is on. No training support.")
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
 from torchrec.sparse.jagged_tensor import JaggedTensor
