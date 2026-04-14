@@ -4,12 +4,18 @@
 NVIDIA RecSys Examples is a collection of optimized recommender models and components. 
 
 The project includes:
-- Examples for large-scale HSTU ranking and retrieval models through [TorchRec](https://github.com/pytorch/torchrec) and [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) integration
+- Examples for large-scale HSTU ranking and retrieval training through [TorchRec](https://github.com/pytorch/torchrec) and [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) integration
+- HSTU inference with paged KV cache, [Triton Inference Server](https://github.com/triton-inference-server/server) integration, CUDA graph usage, and C++ deployment with AOTInductor ([guide](./examples/hstu/inference/README.md))
 - Examples for semantic-id based retrieval model through [TorchRec](https://github.com/pytorch/torchrec) and [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) integration
-- HSTU (Hierarchical Sequential Transduction Unit) attention operator support
-- Dynamic Embeddings with GPU acceleration
+- DynamicEmb for model-parallel dynamic embedding tables with zero-collision hashing, eviction, admission control, table fusion, and TorchRec integration ([documentation](./corelib/dynamicemb/README.md))
 
 # What's New
+- **[2026/4/14]** 🎉v26.03 released!
+  - We added Torch export and AOTInductor packaging for end-to-end HSTU C++ inference. See the [HSTU inference overview](./examples/hstu/inference/README.md) and the [C++ inference guide](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md).
+  - We improved DynamicEmb with table fusion and expansion, relaxed embedding-table alignment (no longer power-of-two), and capacity sizing aligned to `bucket_capacity`. See [DynamicEmb](./corelib/dynamicemb/README.md).
+  - We added an HSTU end-to-end training benchmark suite with progressive optimizations. See the [HSTU training benchmark](./examples/hstu/training/benchmark/README.md) and [E2E benchmark notes](./examples/hstu/training/benchmark/E2E_BENCHMARK.md).
+  - We published HSTU inference benchmark results on B200 in the [HSTU inference benchmark](./examples/hstu/inference/benchmark/README.md).
+  - We migrated HSTU attention to `fbgemm_gpu_hstu`, removed the legacy compatibility layer, and improved the training stack (fewer device-to-host syncs in jagged tensor handling, balancer tuning, and debug logging). See [HSTU training setup](./examples/hstu/training/README.md).
 - **[2026/2/13]** 🎉v26.01 released!
   - We optimized HSTU KVCacheManager, moving Python-based KV cache management to optimized C++ implementation with asynchronous onload/offload operation and compression support. [Benchmark](https://github.com/NVIDIA/recsys-examples/tree/main/examples/hstu/inference/benchmark#1-end-to-end-inference-performance) shows onload and offload latency can be fully hidden under HSTU inference.
   - We introduced a HSTU training optimization with workload-balanced batch shuffling for data parallel training.
@@ -52,12 +58,19 @@ The project includes:
   - Fusion of operations like layernorm and dropout in the HSTU layer, resulting in about 1.2x end-to-end speedup.
   - Fix convergence issues on the Kuairand dataset.
 </details>
-For more detailed release notes, please refer our [releases](https://github.com/NVIDIA/recsys-examples/releases).
+
+For more detailed release notes, please refer to our [releases][releases].
 
 # Get Started
 The examples we supported:
 - [HSTU recommender examples](./examples/hstu/README.md)
+- [HSTU inference](./examples/hstu/inference/README.md) — KV cache, Triton Inference Server, [C++ AOTInductor](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md)
 - [SID based generative recommender examples](./examples/sid_gr/README.md)
+
+# Benchmarks
+- [HSTU inference](./examples/hstu/inference/benchmark/README.md)
+- [HSTU training](./examples/hstu/training/benchmark/README.md)
+- [Dynamic embedding](./corelib/dynamicemb/benchmark/README.md)
 
 # Contribution Guidelines
 Please see our [contributing guidelines](./CONTRIBUTING.md) for details on how to contribute to this project.
@@ -68,6 +81,7 @@ Please see our [contributing guidelines](./CONTRIBUTING.md) for details on how t
 - [基于CUTLASS 3 的HSTU attention 算子开发与优化](https://www.bilibili.com/video/BV1TsMwzWEzS?buvid=638d217658211387f0a20e730604a780&from_spmid=united.player-video-detail.drama-float.0&is_story_h5=false&mid=V%2FD40L0stVy%2BZTgWdpjtGA%3D%3D&plat_id=116&share_from=ugc&share_medium=iphone&share_plat=ios&share_session_id=2DD6CE30-B189-4EEC-9FD4-8BAD6AEFE720&share_source=WEIXIN&share_tag=s_i&spmid=united.player-video-detail.0.0&timestamp=1749773222&unique_k=Sjcfmgy&up_id=1320140761&vd_source=7372540fd02b24a46851135aa003577c&spm_id_from=333.788.videopod.sections)
 
 ## Blog
+- [NVIDIA Platform Delivers Lowest Token Cost Enabled by Extreme Co-Design](https://developer.nvidia.com/blog/nvidia-extreme-co-design-delivers-new-mlperf-inference-records/)
 - [NVIDIA recsys-examples: 生成式推荐系统大规模训练推理的高效实践（上篇）](https://mp.weixin.qq.com/s/K9xtYC3azAccShpJ3ZxKbg)
 
 # Community
@@ -91,3 +105,5 @@ For more citation information and referenced papers, see [CITATION.md](./CITATIO
 
 # License
 This project is licensed under the Apache License - see the [LICENSE](./LICENSE) file for details.
+
+[releases]: https://github.com/NVIDIA/recsys-examples/releases
