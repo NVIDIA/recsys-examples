@@ -96,8 +96,8 @@ RUN cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install
 
 RUN if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
-      rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 && \ 
-      ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/x86_64-linux-gnu/libcuda.so.1; \
+      rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+      ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1; \
     fi
 
 RUN if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
