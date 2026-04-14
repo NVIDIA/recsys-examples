@@ -82,6 +82,11 @@ def _sort_partitions_padding_last(
 def _strip_dense_padding(batch: BaseBatch, actual_bs: int) -> BaseBatch:
     """Remove trailing padding rows from dense tensors, keep KJTs intact.
 
+    Under the unified dense-padding convention, every dense tensor has
+    ``batch.batch_size`` in dim-0 (stored flat as ``batch_size * eps``
+    elements).  This function reshapes each dense tensor to
+    ``[batch_size, eps]``, slices ``[:actual_bs]``, and flattens back.
+
     Relies on ``_sort_partitions_padding_last`` having placed real samples
     before padding samples so that a simple ``[:actual_bs]`` slice suffices.
 
@@ -91,7 +96,7 @@ def _strip_dense_padding(batch: BaseBatch, actual_bs: int) -> BaseBatch:
 
     Returns:
         A new ``BaseBatch`` where each dense tensor has ``actual_bs`` rows
-        and KJT fields are unchanged.
+        (flat: ``actual_bs * eps`` elements) and KJT fields are unchanged.
     """
     full_bs = batch.batch_size
 
