@@ -7,10 +7,15 @@ The project includes:
 - Examples for large-scale HSTU ranking and retrieval training through [TorchRec](https://github.com/pytorch/torchrec) and [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) integration
 - HSTU inference with paged KV cache, [Triton Inference Server](https://github.com/triton-inference-server/server) integration, CUDA graph usage, and C++ deployment with AOTInductor ([guide](./examples/hstu/inference/README.md))
 - Examples for semantic-id based retrieval model through [TorchRec](https://github.com/pytorch/torchrec) and [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) integration
-- HSTU (Hierarchical Sequential Transduction Unit) attention operator support
-- Dynamic Embeddings with GPU acceleration
+- DynamicEmb for model-parallel dynamic embedding tables with zero-collision hashing, eviction, admission control, table fusion, and TorchRec integration ([documentation](./corelib/dynamicemb/README.md))
 
 # What's New
+- **[2026/4/14]** 🎉v26.03 released!
+  - We added Torch export and AOTInductor packaging for end-to-end HSTU C++ inference. See the [HSTU inference overview](./examples/hstu/inference/README.md) and the [C++ inference guide](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md).
+  - We improved DynamicEmb with table fusion and expansion, relaxed embedding-table alignment (no longer power-of-two), and capacity sizing aligned to `bucket_capacity`. See [DynamicEmb](./corelib/dynamicemb/README.md).
+  - We added an HSTU end-to-end training benchmark suite with progressive optimizations. See the [HSTU training benchmark](./examples/hstu/training/benchmark/README.md) and [E2E benchmark notes](./examples/hstu/training/benchmark/E2E_BENCHMARK.md).
+  - We published HSTU inference benchmark results on B200 in the [HSTU inference benchmark](./examples/hstu/inference/benchmark/README.md).
+  - We migrated HSTU attention to `fbgemm_gpu_hstu`, removed the legacy compatibility layer, and improved the training stack (fewer device-to-host syncs in jagged tensor handling, balancer tuning, and debug logging). See [HSTU training setup](./examples/hstu/training/README.md).
 - **[2026/2/13]** 🎉v26.01 released!
   - We optimized HSTU KVCacheManager, moving Python-based KV cache management to optimized C++ implementation with asynchronous onload/offload operation and compression support. [Benchmark](https://github.com/NVIDIA/recsys-examples/tree/main/examples/hstu/inference/benchmark#1-end-to-end-inference-performance) shows onload and offload latency can be fully hidden under HSTU inference.
   - We introduced a HSTU training optimization with workload-balanced batch shuffling for data parallel training.
