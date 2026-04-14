@@ -33,13 +33,28 @@ class BaseBatch(Pipelineable):
         if len(set(self.features.keys())) != len(list(self.features.keys())):
             raise ValueError(f"duplicate features keys {list(self.features.keys())}")
         assert isinstance(self.contextual_feature_names, list)
-        assert isinstance(self.batch_size, int) and self.batch_size > 0 or \
-            isinstance(self.batch_size, torch.export.dynamic_shapes._IntWrapper) and self.batch_size.val > 0
+        assert (
+            isinstance(self.batch_size, int)
+            and self.batch_size > 0
+            or isinstance(self.batch_size, torch.export.dynamic_shapes._IntWrapper)
+            and self.batch_size.val > 0
+        )
         self.actual_batch_size = (
             self.batch_size
             if self.actual_batch_size is None
             else self.actual_batch_size
         )
+
+    def num_loss_tokens(self) -> torch.Tensor:
+        """Per-rank loss token count as a scalar float tensor.
+
+        Subclasses should override this with a task-specific implementation.
+        Default: returns the total number of label values if labels exist,
+        otherwise returns batch_size as a fallback.
+        """
+        if self.labels is not None:
+            return torch.tensor(self.labels.values().numel(), dtype=torch.float)
+        return torch.tensor(self.batch_size, dtype=torch.float)
 
     def _apply_to_tensors_or_kjt(
         self, tensor_fn: Callable, *args, inplace: bool = False, **kwargs

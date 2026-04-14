@@ -5,6 +5,7 @@ def register_perf_hooks(
     attn_module: torch.nn.Module,
     num_heads: int,
     attention_dim: int,
+    linear_dim: int,
     is_causal: bool,
 ) -> None:
     """Attach forward / backward timing hooks to an ``HSTUAttention`` module.
@@ -33,6 +34,7 @@ def register_perf_hooks(
             offsets,
             num_heads,
             attention_dim,
+            linear_dim,
             is_causal,
             num_candidates,
             num_contextuals,

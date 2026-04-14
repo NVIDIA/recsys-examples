@@ -29,7 +29,6 @@ from .dynamicemb_config import (
     get_table_value_bytes,
     string_to_evict_strategy,
 )
-from .utils import torch_to_dyn_emb
 from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (
@@ -41,6 +40,7 @@ from .types import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
+from .utils import torch_to_dyn_emb
 
 __all__ = [
     "AdmissionStrategy",

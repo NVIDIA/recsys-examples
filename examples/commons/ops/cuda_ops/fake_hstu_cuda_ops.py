@@ -1,5 +1,5 @@
 import torch
-import hstu_cuda_ops
+
 
 @torch.library.register_fake("hstu_cuda_ops::split_by_lengths")
 def _split_by_lengths_fake(values, lengths_1d, num_splits: int):
@@ -26,7 +26,7 @@ def _lengths_splits_fake(lengths_1d, num_splits: int):
     torch._check(num_splits > 0)
 
     # num_splits is static at export time; the second dim is data-dependent.
-    ctx = torch.library.get_ctx()
+    torch.library.get_ctx()
     dyn_batch = lengths_1d.size(0) // num_splits
     out = []
     for _ in range(num_splits):

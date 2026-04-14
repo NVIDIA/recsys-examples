@@ -4,13 +4,12 @@ import torch
 import torch.distributed as dist
 from commons.ops.collective_ops import (
     gather_along_first_dim,
-    gatherv_along_first_dim,
     jagged_tensor_allgather,
     keyed_jagged_tensor_allgather,
 )
 from commons.ops.grad_scaling import grad_scaling
 from megatron.core import parallel_state
-from torchrec.sparse.jagged_tensor import JaggedTensor
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 def jt_dict_grad_scaling_and_allgather(
@@ -50,8 +49,8 @@ def dmp_batch_to_tp(batch: Any, exclude_features: bool = True) -> Any:
         output_batch.num_candidates = gather_along_first_dim(
             batch.num_candidates, tp_pg
         )
-    if hasattr(batch, "labels") and batch.labels is not None:
-        output_batch.labels = gatherv_along_first_dim(batch.labels, tp_pg)
+    if isinstance(batch.labels, KeyedJaggedTensor):
+        output_batch.labels = keyed_jagged_tensor_allgather(batch.labels, tp_pg)
     # reduce max seqlen
     feat_to_seqlen_tensor = torch.tensor(
         list(batch.feature_to_max_seqlen.values()),

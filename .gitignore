@@ -41,9 +41,6 @@ results/
 **/.triton/**/[0-9]*
 *-zh*.md
 *.pdf
+.docs/
 .SKILLS/
-**/torch_binding_build/**
-examples/hstu/inference/cpp_inference/build*
-examples/hstu/inference/inference_emb_dump*/
-examples/hstu/inference/export_test_dump*/
-splitops_demo
+.cursor/

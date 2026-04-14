@@ -16,10 +16,10 @@
 # pyre-strict
 
 from typing import Any, Dict, List, Optional, Tuple, Union
-from packaging.version import Version
 
 import torch
 import torchrec
+from packaging.version import Version
 from torch import distributed as dist
 from torchrec.distributed.embedding_kernel import BaseEmbedding
 from torchrec.distributed.embedding_lookup import (
@@ -64,9 +64,13 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
             """
             fallback to base class
             """
-            if Version(torchrec.__version__) < Version('1.5.0'):
-                return super()._create_embedding_kernel(config=config, pg=pg, device=device)
-            return super()._create_embedding_kernel(config=config, pg=pg, device=device, env=env)
+            if Version(torchrec.__version__) < Version("1.5.0"):
+                return super()._create_embedding_kernel(
+                    config=config, pg=pg, device=device
+                )
+            return super()._create_embedding_kernel(
+                config=config, pg=pg, device=device, env=env
+            )
         else:
             self._need_prefetch = True
             return BatchedDynamicEmbedding(
@@ -167,9 +171,13 @@ class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
             """
             fallback to base class
             """
-            if Version(torchrec.__version__) < Version('1.5.0'):
-                return super()._create_embedding_kernel(config, device, pg, sharding_type)
-            return super()._create_embedding_kernel(config, device, pg, sharding_type, env)
+            if Version(torchrec.__version__) < Version("1.5.0"):
+                return super()._create_embedding_kernel(
+                    config, device, pg, sharding_type
+                )
+            return super()._create_embedding_kernel(
+                config, device, pg, sharding_type, env
+            )
         else:
             return BatchedDynamicEmbeddingBag(
                 config=config,

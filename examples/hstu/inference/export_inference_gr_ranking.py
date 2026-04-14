@@ -31,14 +31,13 @@ from configs import (
     RankingConfig,
     get_hstu_config,
 )
-from modules.metrics import get_multi_event_metric_module
-from modules.inference_dense_module import get_inference_dense_model
 from modules.exportable_embedding import ExportableEmbedding
+from modules.inference_dense_module import get_inference_dense_model
+from modules.metrics import get_multi_event_metric_module
+from pynve.torch.nve_export import export_aot
+from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
-
-from torch.export import Dim, ExportedProgram, ShapesCollection
-from pynve.torch.nve_export import export_aot
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
@@ -56,11 +55,11 @@ class RunningMode(enum.Enum):
         return self.value
 
 
-def debug_print_flattened_export_args(batch, embeddings = None) -> None:
+def debug_print_flattened_export_args(batch, embeddings=None) -> None:
     from torch.utils import _pytree as pytree
 
     print("\n===== FLATTENED EXPORT ARGS DEBUG =====")
-    export_args = (batch, )
+    export_args = (batch,)
     flat_leaves, tree_spec = pytree.tree_flatten(export_args)
     print(f"Total flattened tensors: {len(flat_leaves)}")
     print(f"Tree spec: {tree_spec}\n")
@@ -191,9 +190,9 @@ def get_inference_export_model(
         num_layers=network_args.num_layers,
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
-        learnable_input_layernorm = True,
-        learnable_output_layernorm = False,
-        is_inference = True,
+        learnable_input_layernorm=True,
+        learnable_output_layernorm=False,
+        is_inference=True,
     )
 
     ranking_args = RankingArgs()
@@ -205,7 +204,6 @@ def get_inference_export_model(
         num_tasks=ranking_args.num_tasks,
         eval_metrics=ranking_args.eval_metrics,
     )
-
 
     sparse_module = ExportableEmbedding(emb_configs)
     sparse_module.eval()
@@ -264,9 +262,9 @@ def get_configs(
         num_attention_heads=network_args.num_attention_heads,
         num_layers=network_args.num_layers,
         dtype=inference_dtype,
-        learnable_input_layernorm = False,
-        learnable_output_layernorm = False,
-        is_inference = True,
+        learnable_input_layernorm=False,
+        learnable_output_layernorm=False,
+        is_inference=True,
     )
 
     ranking_args = RankingArgs()
@@ -289,24 +287,30 @@ def export_inference_gr_ranking(
 ):
     def _save_tensor_cpp_compatible(tensor: torch.Tensor, path: str) -> None:
         """Save a tensor in a format compatible with C++ torch::load().
-        
+
         torch::load() expects TorchScript ZIP format, not pickle format.
         This wraps the tensor in a scripted module before saving.
         """
+
         class _TensorWrapper(torch.nn.Module):
             def __init__(self, t):
                 super().__init__()
                 self.register_buffer("tensor", t)
-        
+
         wrapper = _TensorWrapper(tensor)
         torch.jit.script(wrapper).save(path)
+
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
     num_contextual_features = len(dataproc._contextual_feature_names)
 
     max_batch_size = max_bs
-    total_max_seqlen = dataset_args.max_num_candidates + dataset_args.max_history_seqlen * 2 + num_contextual_features
+    total_max_seqlen = (
+        dataset_args.max_num_candidates
+        + dataset_args.max_history_seqlen * 2
+        + num_contextual_features
+    )
     print(f"[INFO] Total max sequence length: {total_max_seqlen}")
 
     def strip_padding_batch(batch, unpadded_batch_size):
@@ -320,16 +324,16 @@ def export_inference_gr_ranking(
         batch.features = KeyedJaggedTensor.from_jt_dict(kjt_dict)
         batch.num_candidates = batch.num_candidates[: batch.batch_size]
         return batch
-    
+
     hstu_config, task_config = get_configs(
         emb_configs,
         num_contextual_features,
         total_max_seqlen,
     )
-    
 
     with torch.inference_mode():
         from register_hstubatch_pytree_example import register_hstu_export_pytrees
+
         register_hstu_export_pytrees()
 
         model = get_inference_export_model(
@@ -388,7 +392,7 @@ def export_inference_gr_ranking(
             lengths=batch.features.lengths(),
         )
         batch.labels = None
-        
+
         # get dynamic shapes
         sc = ShapesCollection()
         # dim_batch = Dim("batch", min=8 , max=4 * 8)
@@ -404,13 +408,19 @@ def export_inference_gr_ranking(
             debug_print_flattened_export_args(batch, embeddings)
 
         # export & aoti_compile_and_package
-        export_dir = os.path.join(os.path.dirname(__file__), 'hstu_gr_ranking_model')
-        exported_program = export_aot(model, (batch,), export_dir, dynamic_shapes=dynamic_shapes)
+        export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
+        exported_program = export_aot(
+            model, (batch,), export_dir, dynamic_shapes=dynamic_shapes
+        )
         print(f"[INFO] Exported and packaged the model to:")
         print(f"       {export_dir}/")
-        print( "       ├── model.pt2                  # AOT-compiled model package for AOTIModelPackageLoader")
-        print( "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)")
-        print( "       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
+        print(
+            "       ├── model.pt2                  # AOT-compiled model package for AOTIModelPackageLoader"
+        )
+        print(
+            "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
+        )
+        print("       └── weights/{emb_layer}.nve    # NVE weight data (LinearUVM)")
 
         # === Test Exported Model ===
         dump_dir = os.path.join(os.path.dirname(__file__), "export_test_dump")
@@ -451,7 +461,9 @@ def export_inference_gr_ranking(
                     )
                     _save_tensor_cpp_compatible(
                         batch.num_candidates.detach().cpu(),
-                        os.path.join(dump_dir, f"batch_{dump_idx:06d}_num_candidates.pt"),
+                        os.path.join(
+                            dump_dir, f"batch_{dump_idx:06d}_num_candidates.pt"
+                        ),
                     )
                     _save_tensor_cpp_compatible(
                         ref_logits.detach().cpu(),
@@ -459,7 +471,10 @@ def export_inference_gr_ranking(
                     )
                     dump_idx += 1
 
-                    print(f"[Batch {dump_idx}] Check equal:", torch.allclose(logits, ref_logits))
+                    print(
+                        f"[Batch {dump_idx}] Check equal:",
+                        torch.allclose(logits, ref_logits),
+                    )
 
                 eval_module(logits, batch.labels.values())
             except StopIteration:

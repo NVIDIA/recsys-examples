@@ -432,12 +432,12 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
             max_ids,
         )
     offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
-    invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+    invalid_mask = invalid_mask | (offs_m_minus_n > 0)
     if HAS_MAX_ATTN_LEN:
-        invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+        invalid_mask = invalid_mask & (offs_m_minus_n <= max_attn_len)
     if HAS_CONTEXTUAL_SEQ_LEN:
-        invalid_mask = invalid_mask or (
-            offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+        invalid_mask = invalid_mask | (
+            (offs_m[:, None] == 0) & (offs_n[None, :] < max_ids)
         )
     scale = tl.where(invalid_mask, (1.0 / scaling_seqlen), 0.0)
     silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
@@ -777,12 +777,12 @@ def _hstu_attn_fwd_compute_main_loop_tlx(  # noqa C901
                 max_ids,
             )
         offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
-        invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+        invalid_mask = invalid_mask | (offs_m_minus_n > 0)
         if HAS_MAX_ATTN_LEN:
-            invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+            invalid_mask = invalid_mask & (offs_m_minus_n <= max_attn_len)
         if HAS_CONTEXTUAL_SEQ_LEN:
-            invalid_mask = invalid_mask or (
-                offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+            invalid_mask = invalid_mask | (
+                (offs_m[:, None] == 0) & (offs_n[None, :] < max_ids)
             )
         scale = tl.where(invalid_mask, (1.0 / scaling_seqlen), 0.0)
         silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
@@ -900,12 +900,12 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
             max_ids,
         )
     offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
-    invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+    invalid_mask = invalid_mask | (offs_m_minus_n > 0)
     if HAS_MAX_ATTN_LEN:
-        invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+        invalid_mask = invalid_mask & (offs_m_minus_n <= max_attn_len)
     if HAS_CONTEXTUAL_SEQ_LEN:
-        invalid_mask = invalid_mask or (
-            offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+        invalid_mask = invalid_mask | (
+            (offs_m[:, None] == 0) & (offs_n[None, :] < max_ids)
         )
     scale = tl.where(invalid_mask, (1.0 / scaling_seqlen), 0.0)
     silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
@@ -962,12 +962,12 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
                 max_ids,
             )
         offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
-        invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+        invalid_mask = invalid_mask | (offs_m_minus_n > 0)
         if HAS_MAX_ATTN_LEN:
-            invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+            invalid_mask = invalid_mask & (offs_m_minus_n <= max_attn_len)
         if HAS_CONTEXTUAL_SEQ_LEN:
-            invalid_mask = invalid_mask or (
-                offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+            invalid_mask = invalid_mask | (
+                (offs_m[:, None] == 0) & (offs_n[None, :] < max_ids)
             )
         scale = tl.where(invalid_mask, (1.0 / scaling_seqlen), 0.0)
         silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
@@ -1889,12 +1889,12 @@ def _hstu_attn_bwd_one_block(  # noqa C901
     sig_trans = fast_dividef(1.0, 1.0 + tl.exp(-qk_trans))
     silu_trans = qk_trans * sig_trans * (1.0 / scaling_seqlen)
     pos_offs_m_minus_n = pos_offs_m[None, :] - pos_offs_n[:, None]
-    invalid_mask_trans = invalid_mask_trans or (pos_offs_m_minus_n > 0)
+    invalid_mask_trans = invalid_mask_trans | (pos_offs_m_minus_n > 0)
     if HAS_MAX_ATTN_LEN:
-        invalid_mask_trans = invalid_mask_trans and pos_offs_m_minus_n <= max_attn_len
+        invalid_mask_trans = invalid_mask_trans & (pos_offs_m_minus_n <= max_attn_len)
     if HAS_CONTEXTUAL_SEQ_LEN:
-        invalid_mask_trans = invalid_mask_trans or (
-            pos_offs_m[None, :] == 0 and pos_offs_n[:, None] < max_ids
+        invalid_mask_trans = invalid_mask_trans | (
+            (pos_offs_m[None, :] == 0) & (pos_offs_n[:, None] < max_ids)
         )
     silu_trans = tl.where(invalid_mask_trans, silu_trans, 0)
     silu_trans = silu_trans.to(k.dtype)

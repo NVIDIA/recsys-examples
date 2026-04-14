@@ -121,6 +121,28 @@ class GPTSIDBatch(BaseBatch):
     _num_hierarchies: int = 4
     user_id: Optional[torch.Tensor] = None
 
+    def num_loss_tokens(self) -> torch.Tensor:
+        """Per-rank loss token count for SID-GR.
+
+        SID-GR is next-token prediction where each item consists of
+        ``_num_hierarchies`` tokens.  Only candidate items produce loss
+        (the first history item has no preceding context).  The total
+        number of loss tokens equals the number of candidate items
+        multiplied by the number of hierarchies.
+
+        When labels are present (normal training), this is simply the
+        total number of label values.  Otherwise we derive it from the
+        candidate feature lengths: each candidate has
+        ``_num_hierarchies`` SID tokens packed contiguously, so the
+        number of candidate items is ``sum(lengths) / _num_hierarchies``,
+        and each item contributes ``_num_hierarchies`` loss tokens.
+        """
+        if self.labels is not None:
+            return torch.tensor(self.labels.values().numel(), dtype=torch.float)
+        # Fallback: candidate lengths already count individual SID tokens
+        cand_lengths = self.features[self.candidate_feature_name].lengths()
+        return cand_lengths.sum().float()
+
     def retain_candidate_hierarchies(
         self,
         remained_hierarchies: int,

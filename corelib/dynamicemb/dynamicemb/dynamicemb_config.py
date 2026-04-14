@@ -22,6 +22,7 @@ from math import sqrt
 from typing import Any, Optional, Tuple
 
 import torch
+from dynamicemb.optimizer import get_optimizer_state_dim
 from dynamicemb.types import (
     BUCKET_ALIGNMENT,
     DEMB_TABLE_ALIGN_SIZE,
@@ -31,7 +32,6 @@ from dynamicemb.types import (
     DynamicEmbInitializerMode,
     Storage,
 )
-from dynamicemb.optimizer import get_optimizer_state_dim
 from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig

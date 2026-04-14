@@ -23,7 +23,6 @@ import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import (
-    DEBUG_EMB_INITIALIZER_MOD,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     align_to_table_size,
@@ -51,7 +50,6 @@ from dynamicemb.types import (
     SCORE_TYPE,
     Cache,
     CopyMode,
-    DynamicEmbInitializerMode,
     Storage,
     torch_dtype_to_np_dtype,
 )
@@ -636,9 +634,9 @@ def _flat_row_indices_for_value_load(
     """
     missing = torch.logical_not(founds)
     if bool(missing.any()):
-        assert bool(torch.all(kim_slot_indices[missing] == -1)), (
-            "KIM lookup: missing keys must have slot index -1"
-        )
+        assert bool(
+            torch.all(kim_slot_indices[missing] == -1)
+        ), "KIM lookup: missing keys must have slot index -1"
 
     if state.no_eviction_next_index_dev is None:
         return kim_slot_indices
@@ -971,12 +969,9 @@ def _insert_key_values(
     indices = state.key_index_map.insert(
         unique_keys, table_ids, score_arg, score_out=score_out_flat
     )
-    if state.no_eviction_next_index is not None:        
-        
+    if state.no_eviction_next_index is not None:
         flat_indices = (
-            score_arg.value
-            if score_arg.value is not None
-            else score_out_flat
+            score_arg.value if score_arg.value is not None else score_out_flat
         )
     else:
         flat_indices = indices
@@ -1536,6 +1531,7 @@ class DynamicEmbCache(Cache):
 # DynamicEmbStorage – Storage interface (find with values, insert, dump, load)
 # ---------------------------------------------------------------------------
 
+
 class DynamicEmbStorage(Storage):
     def __init__(
         self,
@@ -1868,7 +1864,9 @@ class DynamicEmbStorage(Storage):
             )
             emb_dim = s.table_emb_dims_cpu[table_id]
             scores_batch = named_scores[s.score_policy.name]
-            flat_rows = _flat_row_indices_from_slots_and_scores(s, indices, scores_batch)
+            flat_rows = _flat_row_indices_from_slots_and_scores(
+                s, indices, scores_batch
+            )
             values = load_from_flat_single_table(s, flat_rows, table_id)
             value = values[:, :emb_dim].to(dtype=s.emb_dtype)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
@@ -2275,7 +2273,9 @@ class HybridStorage(Storage):
             )
             emb_dim = s.table_emb_dims_cpu[table_id]
             scores_batch = named_scores[s.score_policy.name]
-            flat_rows = _flat_row_indices_from_slots_and_scores(s, indices, scores_batch)
+            flat_rows = _flat_row_indices_from_slots_and_scores(
+                s, indices, scores_batch
+            )
             values = load_from_flat_single_table(s, flat_rows, table_id)
             value = values[:, :emb_dim].to(dtype=s.emb_dtype)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
@@ -2489,9 +2489,7 @@ class HybridStorage(Storage):
         before host export).
         """
         hbm_key_parts: List[torch.Tensor] = []
-        for batch in export_keys_values_iter(
-            self._hbm, device, batch_size, table_id
-        ):
+        for batch in export_keys_values_iter(self._hbm, device, batch_size, table_id):
             keys, embeddings, opt_states, scores = batch
             hbm_key_parts.append(keys.detach())
             yield (keys, embeddings, opt_states, scores)
@@ -2515,9 +2513,7 @@ class HybridStorage(Storage):
                 )
                 self._host.key_index_map.erase(chunk, tids)
 
-        yield from export_keys_values_iter(
-            self._host, device, batch_size, table_id
-        )
+        yield from export_keys_values_iter(self._host, device, batch_size, table_id)
 
 
 # ---------------------------------------------------------------------------
