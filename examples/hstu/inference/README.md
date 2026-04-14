@@ -17,7 +17,7 @@ By using asynchronous data copy on the side CUDA stream, we overlap the host-to-
 
 3. Optimization with CUDA graph
 
-We utilize the graph capture and replay support in Torch for convenient CUDA graph optimization on the HSTU layers. This decreases the overhead for kernel launch, especially for input with a small batch size. The input data (hidden states) fed to HSTU layers needs paddding to pre-determined batch size and sequence length, due to the requirement of static shape in CUDA graph.
+We utilize the graph capture and replay support in Torch for convenient CUDA graph optimization on the HSTU layers. This decreases the overhead for kernel launch, especially for input with a small batch size. The input data (hidden states) fed to HSTU layers needs padding to pre-determined batch size and sequence length, due to the requirement of static shape in CUDA graph.
 
 4. Kernel fusion
 
@@ -26,6 +26,19 @@ We utilize the graph capture and replay support in Torch for convenient CUDA gra
 Currently we use the python backend to load and serve hstu models. The hstu model consists of two parts -- the sparse module and the dense module.
 The sparse module is served as one instance per node, in which we create a set of gpu embedding tables or caches for each gpu sharing the same PS on the local host node or remote. (NVEmbedding backend only. To get access to NVEmbedding project please contact us.)
 The dense module is served as one instance per GPU, and the KV cache is not supported for now.
+
+6. End-to-end C++ inference with Torch Export and AOTInductor
+
+We support end-to-end C++ inference from PyTorch python model based on `torch.export` and `torch._inductor.aoti_compile_and_package`.
+
+For the embedding part, our implementation is based on `InferenceEmbeddingTable` from DynamicEmb, using DynamicEmb ScoredHashTable and NVEmbedding layers. NVEmbedding implements customized `export_and_aot`, which generates layer metadata and dumped embedding table files together with the model `.pt2` archive, in order to avoid multiple copies of embedding table while loading. The structure of the complete exported and packaged model archive is:
+```
+path/to/model_archive
+        ├── model.pt2                              # AOT-compiled model package for AOTIModelPackageLoader
+        ├── metadata.json                          # NVE layer metadata (id, num_embeddings, emb_size, etc.)
+        └── weights/{emb_layer_module_name}.nve    # NVE weight data (LinearUVM)
+```
+Start with the [guide](./GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md) for HSTU Python to C++ inference example.
 
 
 ## KVCache Manager for Inference
@@ -39,7 +52,7 @@ The dense module is served as one instance per GPU, and the KV cache is not supp
 * `offload_kvcache`: to trigger offloading the KV data from GPU KVCache to Host KV storage in background.
 * `evict_kv_cache`: to evict all the KV data in the KVCache Manager.
 
-2. Currently, the KVCache manager need to be access from a single inference stream. No multi-stream support.
+2. Currently, the KVCache manager need to be accessed from a single inference stream. No multi-stream support.
 
 3. The KVCache manager accepts full user history sequence as input. The removal of cached tokens in sequences is completed within inference forward pass.
 
