@@ -1,0 +1,165 @@
+name: GitLab CI Bridge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+# Only one CI bridge run per PR at a time; cancel previous runs
+concurrency:
+  group: ci-bridge-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+env:
+  GITLAB_HOST: gitlab-master.nvidia.com
+  GITLAB_PROJECT_ID: Devtech-Compute/distributed-recommender
+  GITLAB_REF: github_ci
+
+jobs:
+  trigger-and-track:
+    name: GitLab CI
+    runs-on: blossom
+    # For pull_request: check PR author; for issue_comment: check commenter + must be "/ci" on a PR
+    if: >-
+      (github.event_name == 'pull_request'
+       && contains(fromJson('["EmmaQiaoCh","JacoCheung","kanghui0204","jiashuy","shijieliu"]'), github.event.pull_request.user.login))
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request
+          && (github.event.comment.body == '/ci' || github.event.comment.body == '/rerun')
+          && contains(fromJson('["EmmaQiaoCh","JacoCheung","kanghui0204","jiashuy","shijieliu"]'), github.actor))
+    steps:
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head_ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+            echo "head_clone_url=${{ github.event.pull_request.head.repo.clone_url }}" >> "$GITHUB_OUTPUT"
+          else
+            # issue_comment: fetch PR details via API
+            PR_NUMBER=${{ github.event.issue.number }}
+            PR_JSON=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER})
+            HEAD_SHA=$(echo "$PR_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")
+            HEAD_REF=$(echo "$PR_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['head']['ref'])")
+            HEAD_CLONE_URL=$(echo "$PR_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['head']['repo']['clone_url'])")
+            echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "head_ref=${HEAD_REF}" >> "$GITHUB_OUTPUT"
+            echo "head_clone_url=${HEAD_CLONE_URL}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger GitLab pipeline
+        id: trigger
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          PROJECT_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${{ env.GITLAB_PROJECT_ID }}', safe=''))")
+
+          RESPONSE=$(curl -s --fail-with-body \
+            -X POST \
+            -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+            "https://${{ env.GITLAB_HOST }}/api/v4/projects/${PROJECT_ENCODED}/pipeline" \
+            -d "ref=${{ env.GITLAB_REF }}" \
+            -d "variables[TEST_REPO]=${{ steps.pr.outputs.head_clone_url }}" \
+            -d "variables[TEST_BRANCH]=${{ steps.pr.outputs.head_ref }}")
+
+          PIPELINE_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          PIPELINE_URL=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['web_url'])")
+
+          echo "pipeline_id=${PIPELINE_ID}" >> "$GITHUB_OUTPUT"
+          echo "pipeline_url=${PIPELINE_URL}" >> "$GITHUB_OUTPUT"
+          echo "Triggered pipeline: ${PIPELINE_URL}"
+
+      - name: Set commit status to pending
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.head_sha }} \
+            -f state=pending \
+            -f target_url="${{ steps.trigger.outputs.pipeline_url }}" \
+            -f context="GitLab CI" \
+            -f description="Pipeline #${{ steps.trigger.outputs.pipeline_id }} running..."
+
+      - name: Update PR description with pipeline link
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ steps.pr.outputs.number }}
+          CURRENT_BODY=$(gh pr view ${PR_NUMBER} --repo ${{ github.repository }} --json body --jq '.body')
+          PIPELINE_LINK="- Pipeline: ${{ steps.trigger.outputs.pipeline_url }} (commit: ${{ steps.pr.outputs.head_sha }})"
+
+          if echo "$CURRENT_BODY" | grep -q "^## CI"; then
+            # Append to existing CI section
+            UPDATED_BODY=$(echo "$CURRENT_BODY" | sed "/^## CI/a\\
+          ${PIPELINE_LINK}")
+          else
+            # Add CI section
+            UPDATED_BODY="${CURRENT_BODY}
+
+          ## CI
+          ${PIPELINE_LINK}"
+          fi
+
+          gh pr edit ${PR_NUMBER} --repo ${{ github.repository }} --body "$UPDATED_BODY"
+
+      - name: Poll GitLab pipeline status
+        id: poll
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          PROJECT_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${{ env.GITLAB_PROJECT_ID }}', safe=''))")
+          PIPELINE_ID=${{ steps.trigger.outputs.pipeline_id }}
+
+          echo "Polling pipeline #${PIPELINE_ID}..."
+          while true; do
+            RESPONSE=$(curl -s \
+              -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+              "https://${{ env.GITLAB_HOST }}/api/v4/projects/${PROJECT_ENCODED}/pipelines/${PIPELINE_ID}")
+
+            STATUS=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+            echo "$(date '+%H:%M:%S') Pipeline status: ${STATUS}"
+
+            case "$STATUS" in
+              success)
+                echo "result=success" >> "$GITHUB_OUTPUT"
+                echo "description=Pipeline #${PIPELINE_ID} passed" >> "$GITHUB_OUTPUT"
+                break
+                ;;
+              failed)
+                echo "result=failure" >> "$GITHUB_OUTPUT"
+                echo "description=Pipeline #${PIPELINE_ID} failed" >> "$GITHUB_OUTPUT"
+                break
+                ;;
+              canceled)
+                echo "result=error" >> "$GITHUB_OUTPUT"
+                echo "description=Pipeline #${PIPELINE_ID} canceled" >> "$GITHUB_OUTPUT"
+                break
+                ;;
+              skipped)
+                echo "result=error" >> "$GITHUB_OUTPUT"
+                echo "description=Pipeline #${PIPELINE_ID} skipped" >> "$GITHUB_OUTPUT"
+                break
+                ;;
+              *)
+                sleep 60
+                ;;
+            esac
+          done
+
+      - name: Update commit status with result
+        if: always() && steps.trigger.outputs.pipeline_id
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATE="${{ steps.poll.outputs.result || 'error' }}"
+          DESC="${{ steps.poll.outputs.description || 'Pipeline status unknown' }}"
+
+          gh api repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.head_sha }} \
+            -f state="${STATE}" \
+            -f target_url="${{ steps.trigger.outputs.pipeline_url }}" \
+            -f context="GitLab CI" \
+            -f description="${DESC}"
