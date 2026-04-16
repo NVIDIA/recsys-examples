@@ -17,7 +17,6 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
 import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
-import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export
 import nvtx
 import torch
 from commons.utils.clear_tensor_data import clear_tensor_data
