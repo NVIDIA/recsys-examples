@@ -39,7 +39,7 @@ jobs:
     if: |
          contains(fromJson('["EmmaQiaoCh","JacoCheung","kanghui0204","jiashuy","shijieliu"]'), github.actor) &&
          (github.event_name == 'pull_request_target' ||
-          github.event.comment.body == '/build')
+          startsWith(github.event.comment.body, '/build'))
     steps:
       - name: Check if comment is issued by authorized person
         run: blossom-ci
