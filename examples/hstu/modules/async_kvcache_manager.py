@@ -5,9 +5,52 @@ import paged_kvcache_ops
 import torch
 from configs import KVCacheMetadata
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from typing import Any, List, Dict, Optional
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+
+@dataclass
+class KVLookupResult:
+    batch_size: int
+    user_ids: List[int]
+    total_history_lengths: List[int]
+    old_cached_lengths: List[int]
+    new_tokens_upper_bound: int
+    secondary_lookup: Optional[Dict[str, Any]] = None
+
+@dataclass
+class KVPrepareResult:
+    old_cached_lengths: List[int]
+    new_tokens: int
+    offload_uids_buffer: torch.Tensor
+    metadata_host_buffer: torch.Tensor
+    metadata_gpu_buffer: torch.Tensor
+    kvcache_metadata_fut: Any
+    onload_fut: Any
+
+    def to_legacy_list(self):
+        return [
+            self.old_cached_lengths,
+            self.new_tokens,
+            self.offload_uids_buffer,
+            self.metadata_host_buffer,
+            self.metadata_gpu_buffer,
+            self.kvcache_metadata_fut,
+            self.onload_fut,
+        ]
 
 
-class AsyncHSTUKVCacheManager:
+
+class SecondaryKVCacheManagerBase(ABC):
+    @abstractmethod
+    def lookup_kvcache(self, user_ids: List[int], total_history_lengths: List[int]):
+        raise NotImplementedError("Subclasses must implement this method")
+
+class NopSecondaryKVCacheManager(SecondaryKVCacheManagerBase):
+    def lookup_kvcache(self, user_ids: List[int], total_history_lengths: List[int]):
+        return {"backend": "nop", "hit_mask": None}
+
+class KVCacheManager:
     def __init__(
         self,
         num_layers,
@@ -26,6 +69,9 @@ class AsyncHSTUKVCacheManager:
         num_offload_buffer_chunks=8,
         num_memcpy_workers=8,
         enable_nvcomp=False,
+        secondary_kvcache_manager: Optional[SecondaryKVCacheManagerBase] = None,
+        namespace_mode: str = "uid",
+        namespace_base: str = "recsys_hstu"
     ):
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.onload_worker = ThreadPoolExecutor(max_workers=1)
@@ -112,6 +158,19 @@ class AsyncHSTUKVCacheManager:
         self.cache_table_list = [
             self.cache_table[idx] for idx in range(self.num_layers)
         ]
+        self.secondary_kvcache_manager = secondary_kvcache_manager if secondary_kvcache_manager is not None else NopSecondaryKVCacheManager()
+        self.namespace_mode = namespace_mode
+        self.namespace_base = namespace_base
+
+    def _build_namespace(self, uid: int) -> List[str]:
+        """
+        Phase 1 namespace helper.
+        - uid mode:       uid:<uid>
+        - default/fallback: <base>:uid=<uid>
+        """
+        if self.namespace_mode == "uid":
+            return [f"uid:{uid}"]
+        return [f"{self.namespace_base}:uid={uid}"]    
 
     def prepare_kvcache_async(
         self,
@@ -122,58 +181,73 @@ class AsyncHSTUKVCacheManager:
         static_offload_page_ids_gpu_buffer,
         static_metadata_gpu_buffer,
         static_onload_handle,
-    ):
-        origin_cached_lengths = self.gpu_kvcache_mgr.get_total_cache_length(user_ids)
-        new_tokens = sum(
-            [
-                total_history_lengths[idx] - origin_cached_lengths[idx]
-                for idx in range(batch_size)
-            ]
+    ) -> List[Any]:
+        lookup = self.kv_cache_lookup(batch_size, user_ids, total_history_lengths)
+        prepare_result = self.kv_cache_allocate(
+            lookup,
+            static_page_ids_gpu_buffer,
+            static_offload_page_ids_gpu_buffer,
+            static_metadata_gpu_buffer,
+            static_onload_handle,
+        )
+        return prepare_result.to_legacy_list()
+
+    def kv_cache_lookup(self, batch_size, user_ids, total_history_lengths) -> KVLookupResult:
+        old_cached_lengths = self.gpu_kvcache_mgr.get_total_cache_length(user_ids)
+        new_tokens = max(
+            sum(total_history_lengths[i] - old_cached_lengths[i] for i in range(batch_size)),
+            0,
+        )
+        secondary = self.secondary_kvcache_manager.lookup_kvcache(
+            user_ids, total_history_lengths
+        )
+        return KVLookupResult(
+            batch_size=batch_size,
+            user_ids=list(user_ids),
+            total_history_lengths=list(total_history_lengths),
+            old_cached_lengths=list(old_cached_lengths),
+            new_tokens_upper_bound=int(new_tokens),
+            secondary_lookup=secondary,
         )
 
-        offload_uids_buffer = torch.empty(
-            [
-                batch_size,
-            ],
-            dtype=torch.int64,
-        )
-        metadata_host_buffer = torch.empty(
-            [
-                batch_size * 7 + 7,
-            ],
-            dtype=torch.int,
-            pin_memory=True,
-        )
-        # metadata_gpu_buffer = torch.empty([batch_size * 5 + 4 + new_tokens * 2,], dtype=torch.int, device = torch.cuda.current_device())
-
+    def kv_cache_allocate(
+        self,
+        lookup: KVLookupResult,
+        static_page_ids_gpu_buffer,
+        static_offload_page_ids_gpu_buffer,
+        static_metadata_gpu_buffer,
+        static_onload_handle,
+    ) -> KVPrepareResult:
+        offload_uids_buffer = torch.empty([lookup.batch_size], dtype=torch.int64)
+        metadata_host_buffer = torch.empty([lookup.batch_size * 7 + 7], dtype=torch.int, pin_memory=True)
         kvcache_metadata_fut = self.executor.submit(
             paged_kvcache_ops.prepare_kvcache,
             self.gpu_kvcache_mgr,
             self.host_kv_mgr,
-            user_ids,
-            total_history_lengths,
+            lookup.user_ids,
+            lookup.total_history_lengths,
             static_page_ids_gpu_buffer,
             static_offload_page_ids_gpu_buffer,
             offload_uids_buffer,
             metadata_host_buffer,
             static_metadata_gpu_buffer,
         )
-
         static_onload_handle.reset()
         onload_fut = self.onload_worker.submit(
-            self.gpu_kvcache_mgr.onload_kvcache, user_ids, static_onload_handle
+            self.gpu_kvcache_mgr.onload_kvcache,
+            lookup.user_ids,
+            static_onload_handle,
         )
-
-        return [
-            origin_cached_lengths,
-            new_tokens,
-            offload_uids_buffer,
-            metadata_host_buffer,
-            static_metadata_gpu_buffer,
-            kvcache_metadata_fut,
-            onload_fut,
-        ]
-
+        return KVPrepareResult(
+            old_cached_lengths=lookup.old_cached_lengths,
+            new_tokens=lookup.new_tokens_upper_bound,
+            offload_uids_buffer=offload_uids_buffer,
+            metadata_host_buffer=metadata_host_buffer,
+            metadata_gpu_buffer=static_metadata_gpu_buffer,
+            kvcache_metadata_fut=kvcache_metadata_fut,
+            onload_fut=onload_fut,
+        )
+    
     def prepare_kvcache_wait(
         self,
         onload_fut,
@@ -286,7 +360,7 @@ class AsyncHSTUKVCacheManager:
         old_lengths = batch.features.lengths().cpu()
 
         item_offset = num_context * batch.batch_size
-        item_offset + batch.batch_size
+        #item_offset + batch.batch_size （Todo：junyi check this）
 
         new_lengths = torch.zeros_like(old_lengths)
         new_lengths[:item_offset] = torch.where(
@@ -323,3 +397,36 @@ class AsyncHSTUKVCacheManager:
 
         torch.cuda.nvtx.range_pop()
         return batch
+
+    @classmethod
+    def from_config(cls, hstu_config, kvcache_config):
+        if kvcache_config.max_queued_offload_tokens is None:
+            kvcache_config.max_queued_offload_tokens = (
+                4 * hstu_config.max_batch_size * hstu_config.max_seq_len
+            )
+        return cls(
+            hstu_config.num_layers,
+            hstu_config.num_heads,
+            hstu_config.head_dim,
+            kvcache_config.page_size,
+            kvcache_config.blocks_in_primary_pool,
+            math.ceil(
+                hstu_config.max_batch_size
+                * hstu_config.max_seq_len
+                / kvcache_config.page_size
+        ),
+        0,
+        kvcache_config.offload_chunksize,
+        -1,
+        hstu_config.max_seq_len,
+        hstu_config.max_batch_size,
+        kvcache_config.max_queued_offload_tokens,
+        kvcache_config.num_onload_buffer_chunks,
+        kvcache_config.num_offload_buffer_chunks,
+        kvcache_config.num_memcpy_workers,
+        kvcache_config.enable_nvcomp,
+        None,
+        kvcache_config.namespace_mode,
+        kvcache_config.namespace_base,
+    )
+AsyncHSTUKVCacheManager = KVCacheManager

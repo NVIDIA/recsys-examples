@@ -116,6 +116,9 @@ class KVCacheConfig:
     num_offload_buffer_chunks: int = 8
     num_memcpy_workers: int = 4
     enable_nvcomp: bool = False
+    secondary_backend: str = "nop"
+    namespace_mode: str = "uid"
+    namespace_base: str = "recsys_hstu"
 
 
 def get_kvcache_config(
@@ -123,6 +126,9 @@ def get_kvcache_config(
     page_size: int,
     offload_chunksize: int,
     max_attention_window: Optional[int] = None,
+    secondary_backend: str = "nop",
+    namespace_mode: str = "uid",
+    namespace_base: str = "recsys_hstu",
 ) -> KVCacheConfig:
     """
     Create the HSTU KV cache configuration.
@@ -142,6 +148,9 @@ def get_kvcache_config(
         page_size=page_size,
         offload_chunksize=offload_chunksize,
         max_attention_window=max_attention_window,
+        secondary_backend=secondary_backend,
+        namespace_mode=namespace_mode,
+        namespace_base=namespace_base,
     )
 
 

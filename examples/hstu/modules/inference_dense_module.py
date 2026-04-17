@@ -203,13 +203,13 @@ class InferenceDenseModule(torch.nn.Module):
         self._use_kvcache = False
         if kvcache_config is not None:
             self._use_kvcache = True
-            from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
+            from modules.async_kvcache_manager import KVCacheManager
 
             if kvcache_config.max_queued_offload_tokens is None:
                 kvcache_config.max_queued_offload_tokens = (
                     4 * hstu_config.max_batch_size * hstu_config.max_seq_len
                 )
-            self.async_kvcache = AsyncHSTUKVCacheManager(
+            self.async_kvcache = KVCacheManager(
                 hstu_config.num_layers,
                 hstu_config.num_heads,
                 hstu_config.head_dim,
