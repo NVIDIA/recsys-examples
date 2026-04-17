@@ -66,37 +66,65 @@ def _cuda_elapsed_ms(fn: Callable[[], torch.Tensor]) -> float:
 def _profile_forward_timeline(
     model,
     batches: List[Tuple[object, torch.Tensor, torch.Tensor]],
+    warmup_iters: int,
     iters: int,
     enable_nvtx: bool,
 ) -> None:
     kvcache_times_ms = []
     nokvcache_times_ms = []
-    valid_iters = min(iters, len(batches))
-    if valid_iters <= 0:
+    available_batches = len(batches)
+    if available_batches <= 0:
         raise RuntimeError("No profiling batches available for timeline capture.")
+
+    valid_warmup_iters = max(min(warmup_iters, available_batches), 0)
+    remaining_batches = available_batches - valid_warmup_iters
+    valid_iters = min(iters, remaining_batches)
+    if valid_iters <= 0:
+        raise RuntimeError(
+            "No profiling batches available for steady phase after warmup."
+        )
+
+    if valid_warmup_iters < warmup_iters:
+        print(
+            "[timeline] Requested warmup iterations exceed unique batches. "
+            f"Capping warmup iters from {warmup_iters} to {valid_warmup_iters}."
+        )
     if valid_iters < iters:
         print(
             "[timeline] Requested iterations exceed unique batches. "
-            f"Capping iters from {iters} to {valid_iters} to avoid replaying stale KV states."
+            f"Capping steady iters from {iters} to {valid_iters} to avoid replaying stale KV states."
         )
 
-    for idx in range(valid_iters):
-        batch, user_ids, total_history_lengths = batches[idx]
-        nvtx_ctx = _nvtx_range if enable_nvtx else nullcontext
-        with nvtx_ctx(f"forward_with_kvcache_iter_{idx}"):
-            kvcache_times_ms.append(
-                _cuda_elapsed_ms(
-                    lambda: model.forward_with_kvcache(
-                        batch,
-                        user_ids,
-                        total_history_lengths,
+    nvtx_ctx = _nvtx_range if enable_nvtx else nullcontext
+    with nvtx_ctx("warmup_phase"):
+        for idx in range(valid_warmup_iters):
+            batch, user_ids, total_history_lengths = batches[idx]
+            _ = model.forward_with_kvcache(
+                batch,
+                user_ids,
+                total_history_lengths,
+            )
+            _ = model.forward_nokvcache(batch)
+    torch.cuda.synchronize()
+
+    steady_base = valid_warmup_iters
+    with nvtx_ctx("steady_phase"):
+        for idx in range(valid_iters):
+            batch, user_ids, total_history_lengths = batches[steady_base + idx]
+            with nvtx_ctx(f"forward_with_kvcache_iter_{idx}"):
+                kvcache_times_ms.append(
+                    _cuda_elapsed_ms(
+                        lambda: model.forward_with_kvcache(
+                            batch,
+                            user_ids,
+                            total_history_lengths,
+                        )
                     )
                 )
-            )
-        with nvtx_ctx(f"forward_nokvcache_iter_{idx}"):
-            nokvcache_times_ms.append(
-                _cuda_elapsed_ms(lambda: model.forward_nokvcache(batch))
-            )
+            with nvtx_ctx(f"forward_nokvcache_iter_{idx}"):
+                nokvcache_times_ms.append(
+                    _cuda_elapsed_ms(lambda: model.forward_nokvcache(batch))
+                )
 
     avg_kvcache_ms = sum(kvcache_times_ms) / len(kvcache_times_ms)
     avg_nokvcache_ms = sum(nokvcache_times_ms) / len(nokvcache_times_ms)
@@ -106,7 +134,8 @@ def _profile_forward_timeline(
     print(
         "[timeline] avg_forward_with_kvcache_ms="
         f"{avg_kvcache_ms:.3f}, avg_forward_nokvcache_ms={avg_nokvcache_ms:.3f}, "
-        f"kvcache_over_nokv={ratio:.3f}, iters={valid_iters}"
+        f"kvcache_over_nokv={ratio:.3f}, warmup_iters={valid_warmup_iters}, "
+        f"steady_iters={valid_iters}"
     )
 
 
@@ -202,6 +231,9 @@ def test_inference_forward_with_kvcache_smoke():
     try:
         enable_timeline = _env_flag("HSTU_KVCACHE_PROFILE_TIMELINE", default=False)
         enable_nvtx = _env_flag("HSTU_KVCACHE_PROFILE_NVTX", default=False)
+        profile_warmup_iters = max(
+            _env_int("HSTU_KVCACHE_PROFILE_WARMUP_ITERS", default=1), 0
+        )
         profile_iters = max(_env_int("HSTU_KVCACHE_PROFILE_ITERS", default=1), 1)
         batches = list(itertools.islice(iter(dataset), 2))
         assert len(batches) > 0
@@ -227,7 +259,7 @@ def test_inference_forward_with_kvcache_smoke():
             profile_num_batches = max(
                 _env_int(
                     "HSTU_KVCACHE_PROFILE_NUM_BATCHES",
-                    default=max(profile_iters, 2),
+                    default=max(profile_warmup_iters + profile_iters, 2),
                 ),
                 2,
             )
@@ -242,6 +274,7 @@ def test_inference_forward_with_kvcache_smoke():
                     _profile_forward_timeline(
                         model=profile_model,
                         batches=profile_batches,
+                        warmup_iters=profile_warmup_iters,
                         iters=profile_iters,
                         enable_nvtx=enable_nvtx,
                     )
