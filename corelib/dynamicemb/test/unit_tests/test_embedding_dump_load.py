@@ -403,32 +403,46 @@ def create_model(
 
 
 def check_counter_table_checkpoint(x, y):
-    device = torch.cuda.current_device()
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     tables_x = get_dynamic_emb_module(x)
     tables_y = get_dynamic_emb_module(y)
+    assert len(tables_x) == len(tables_y)
 
     for table_x, table_y in zip(tables_x, tables_y):
-        for cnt_tx, cnt_ty in zip(
-            table_x._admission_counter, table_y._admission_counter
-        ):
-            assert cnt_tx.table_.size() == cnt_ty.table_.size()
+        cnt_x = table_x._admission_counter
+        cnt_y = table_y._admission_counter
+        if cnt_x is None:
+            assert cnt_y is None
+            continue
+        assert cnt_x.table_.size() == cnt_y.table_.size()
 
-            for keys, named_scores, _ in cnt_tx._batched_export_keys_scores(
-                cnt_tx.table_.score_names_, torch.device(f"cuda:{device}")
+        freq_name = cnt_x.score_name_
+        for table_id in range(len(table_x._table_names)):
+            for keys, named_scores, _ in cnt_x.table_._batched_export_keys_scores(
+                [freq_name], device, table_id
             ):
                 if keys.numel() == 0:
                     continue
-                freq_name = cnt_tx.table_.score_names_[0]
                 frequencies = named_scores[freq_name]
 
+                lookup_table_ids = torch.full(
+                    (keys.numel(),), table_id, dtype=torch.int64, device=device
+                )
                 score_arg_lookup = ScoreArg(
                     name=freq_name,
                     value=torch.zeros_like(frequencies),
                     policy=ScorePolicy.CONST,
                 )
-                _, founds, _ = cnt_ty.lookup(keys, score_arg_lookup)
-
-                assert torch.equal(frequencies, score_arg_lookup)
+                score_out, founds, _ = cnt_y.table_.lookup(
+                    keys, lookup_table_ids, score_arg_lookup
+                )
+                assert founds.all(), (
+                    f"counter keys missing from loaded table_id={table_id}: "
+                    f"{keys[~founds].tolist()}"
+                )
+                assert torch.equal(
+                    frequencies, score_out
+                ), f"counter frequency mismatch for table_id={table_id}"
 
 
 @click.command()
