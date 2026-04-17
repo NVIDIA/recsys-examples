@@ -343,7 +343,7 @@ class DynamicEmbeddingShardingPlanner:
                 ranks=[i for i in range(world_size)],
                 compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
                 customized_compute_kernel=DynamicEmbKernel,
-                dist_type="roundrobin",
+                dist_type="hash_roundrobin",
                 dynamicemb_options=opts,
             )
             self._dyn_emb_plan[dyn_emb_name] = tmp_para_sharding
