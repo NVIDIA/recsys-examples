@@ -253,7 +253,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
         uindex_t p = 0;
 	if (dist_type == 1) {
 	    p = idx % my_size;
-        } else if (dist_type == 2){
+        } else if (dist_type == 2) {
 	    p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) % my_size;
 	} else {
 	    p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
