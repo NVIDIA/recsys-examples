@@ -159,9 +159,9 @@ def main():
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
 
     if os.environ.get("FILL_DYNAMICEMB_TABLES", "0") == "1":
-        from commons.utils.dynamicemb_utils import find_dynamicemb_modules
+        from dynamicemb.dump_load import get_dynamic_emb_module
 
-        for dyn_module in find_dynamicemb_modules(model_train):
+        for dyn_module in get_dynamic_emb_module(model_train):
             if hasattr(dyn_module, "fill_tables"):
                 try:
                     dyn_module.fill_tables(load_factor=0.95)
