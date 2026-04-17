@@ -33,9 +33,10 @@ jobs:
     outputs:
       args: ${{ env.args }}
 
-    # This job only runs for pull request comments
+    # This job only runs for /build comments
     if: |
-         github.event.comment.body == '/build' && contains(fromJson('["EmmaQiaoCh","JacoCheung","kanghui0204","jiashuy","shijieliu"]'), github.actor)
+         contains(fromJson('["EmmaQiaoCh","JacoCheung","kanghui0204","jiashuy","shijieliu"]'), github.actor) &&
+         startsWith(github.event.comment.body, '/build')
     steps:
       - name: Check if comment is issued by authorized person
         run: blossom-ci

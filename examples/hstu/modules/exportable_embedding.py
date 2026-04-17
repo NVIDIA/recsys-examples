@@ -56,7 +56,22 @@ def _load_inference_emb_ops() -> bool:
 
 
 # Load operators before register fake ops.
-_load_inference_emb_ops()
+# isort: off
+_load_inference_emb_ops()  # registers torch.ops.INFERENCE_EMB.* before import dynamicemb
+import dynamicemb.index_range_meta as _index_range_meta  # noqa: F401 – registers fake impls for torch.export
+import dynamicemb.lookup_meta as _lookup_meta  # noqa: F401 – registers fake impls for torch.export
+
+import hstu_cuda_ops  # noqa: F401 – registers torch.ops.hstu_cuda_ops.*
+import commons.ops.cuda_ops.fake_hstu_cuda_ops  # noqa: F401 – registers fake impls for torch.export
+
+# isort: on
+
+
+# ---------------------------------------------------------------------------
+# ExportableEmbedding Module
+# ---------------------------------------------------------------------------
+
+
 from configs import InferenceEmbeddingConfig
 from dynamicemb import (
     DynamicEmbInitializerArgs,
@@ -65,10 +80,6 @@ from dynamicemb import (
 )
 from dynamicemb.exportable_tables import InferenceEmbeddingTable
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-
-# ---------------------------------------------------------------------------
-# ExportableEmbedding Module
-# ---------------------------------------------------------------------------
 
 
 class ExportableEmbedding(torch.nn.Module):
