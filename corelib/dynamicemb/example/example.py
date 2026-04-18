@@ -84,7 +84,7 @@ def init_runtime() -> RuntimeContext:
     if "WORLD_SIZE" not in os.environ:
         os.environ["WORLD_SIZE"] = "1"
     if "LOCAL_RANK" not in os.environ:
-        os.environ["LOCAL_RANK"] = os.environ.get("RANK", "0")
+        os.environ["LOCAL_RANK"] = "0"
 
     dist.init_process_group(backend=BACKEND)
 
@@ -194,7 +194,7 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
+        default= 0,
         help="DataLoader worker count. Use spawn-based workers when > 0.",
     )
     return parser.parse_args()
