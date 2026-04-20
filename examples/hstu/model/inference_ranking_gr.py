@@ -87,20 +87,24 @@ class InferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
-            prepare_kvcache_result = (
-                self.dense_module.async_kvcache.prepare_kvcache_async(
-                    batch.batch_size,
-                    user_ids.tolist(),
-                    total_history_lengths.tolist(),
-                    self.dense_module.async_kvcache.static_page_ids_gpu_buffer,
-                    self.dense_module.async_kvcache.static_offload_page_ids_gpu_buffer,
-                    self.dense_module.async_kvcache.static_metadata_gpu_buffer,
-                    self.dense_module.async_kvcache.static_onload_handle,
+            lookup_result = self.dense_module.async_kvcache.lookup_kvcache(
+                user_ids, total_history_lengths
+            )
+            self.dense_module.async_kvcache.finish_or_cancel_kvcache_ops(
+                uid_or_uids=user_ids
+            )
+            kv_index_meta, prepare_result = (
+                self.dense_module.async_kvcache.allocate_kvcache(
+                    user_ids,
+                    lookup_result,
                 )
+            )
+            onboard_task_handle = self.dense_module.async_kvcache.onboard_launch_kvcache(
+                user_ids, kv_index_meta, lookup_result
             )
 
             old_cached_lengths = torch.tensor(
-                prepare_kvcache_result[0], dtype=torch.int32
+                lookup_result.old_cached_lengths, dtype=torch.int32
             )
             striped_batch = self.dense_module.async_kvcache.strip_cached_tokens(
                 batch,
@@ -111,13 +115,18 @@ class InferenceRankingGR(torch.nn.Module):
             embeddings = self.sparse_module(striped_batch.features)
             torch.cuda.nvtx.range_pop()
 
-            prepare_kvcache_result = [old_cached_lengths] + prepare_kvcache_result[1:]
             logits = self.dense_module.forward_with_kvcache(
                 striped_batch,
                 embeddings,
                 user_ids,
                 total_history_lengths,
-                prepare_kvcache_result,
+                prepare_result,
+                kv_index_meta,
+                lookup_result,
+                onboard_task_handle,
+            )
+            self.dense_module.async_kvcache.lazy_offload_kvcache(
+                user_ids, kv_index_meta, lookup_result
             )
 
         return logits

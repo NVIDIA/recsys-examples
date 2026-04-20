@@ -345,18 +345,29 @@ class InferenceDenseModule(torch.nn.Module):
         embeddings: Dict[str, JaggedTensor],
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
-        prepare_kvcache_result: List,
+        prepare_kvcache_result: Any,
+        kv_index_meta: Optional[Any] = None,
+        lookup_result: Optional[Any] = None,
+        onboard_task_handle: Optional[Any] = None,
     ):
         with torch.inference_mode():
-            (
-                old_cached_lengths,
-                num_history_tokens,
-                offload_uids_buffer,
-                metadata_host_buffer,
-                metadata_gpu_buffer,  # returned static
-                kvcache_metadata_fut,
-                onload_fut,
-            ) = prepare_kvcache_result
+            if kv_index_meta is not None and lookup_result is not None:
+                self.async_kvcache.onboard_try_wait_kvcache_or_fail(
+                    user_ids,
+                    kv_index_meta,
+                    lookup_result,
+                    onboard_task_handle,
+                )
+
+            old_cached_lengths = torch.tensor(
+                prepare_kvcache_result.old_cached_lengths, dtype=torch.int32
+            )
+            num_history_tokens = prepare_kvcache_result.new_tokens
+            offload_uids_buffer = prepare_kvcache_result.offload_uids_buffer
+            metadata_host_buffer = prepare_kvcache_result.metadata_host_buffer
+            metadata_gpu_buffer = prepare_kvcache_result.metadata_gpu_buffer
+            kvcache_metadata_fut = prepare_kvcache_result.kvcache_metadata_fut
+            onload_fut = prepare_kvcache_result.onload_fut
 
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,

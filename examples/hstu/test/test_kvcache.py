@@ -240,94 +240,62 @@ def test_kvcache_offload_onload():
         finally:
             _shutdown_mgr(async_kvcache_mgr)
 
-#test the correctness of split prepare_kvcache_async
-def test_prepare_kvcache_async_legacy_contract():
-    mgr, _, _ = get_small_test_kvcache_mgr()
-    try:
-        batch_size = 2
-        user_ids = [101, 202]
-        total_history_lengths = [64, 96]
-        result = mgr.prepare_kvcache_async(
-            batch_size,
-            user_ids,
-            total_history_lengths,
-            mgr.static_page_ids_gpu_buffer,
-            mgr.static_offload_page_ids_gpu_buffer,
-            mgr.static_metadata_gpu_buffer,
-            mgr.static_onload_handle,
-        )
-        assert isinstance(result, list)
-        assert len(result) == 7
-        assert isinstance(result[0], list)  # old_cached_lengths
-        assert len(result[0]) == batch_size
-        assert int(result[1]) >= 0  # new_tokens
-        assert hasattr(result[5], "result")  # kvcache_metadata_fut
-        assert hasattr(result[6], "result")  # onload_fut
-        # make sure futures are consumable
-        result[5].result(timeout=30)
-        result[6].result(timeout=30)
-    finally:
-        _shutdown_mgr(mgr)
-
-#test the equivalence of split lookup and allocate with native prepare_kvcache_async
-def test_lookup_allocate_equivalence_with_prepare():
+def test_lookup_allocate_contract():
     mgr_split, _, _ = get_small_test_kvcache_mgr()
-    mgr_prepare, _, _ = get_small_test_kvcache_mgr()
     try:
         batch_size = 2
         user_ids = [301, 302]
         total_history_lengths = [80, 112]
-        lookup = mgr_split.kv_cache_lookup(batch_size, user_ids, total_history_lengths)
-        prepare_obj = mgr_split.kv_cache_allocate(
-            lookup,
-            mgr_split.static_page_ids_gpu_buffer,
-            mgr_split.static_offload_page_ids_gpu_buffer,
-            mgr_split.static_metadata_gpu_buffer,
-            mgr_split.static_onload_handle,
-        )
-        legacy = mgr_prepare.prepare_kvcache_async(
-            batch_size,
+        lookup = mgr_split.lookup_kvcache(user_ids, total_history_lengths)
+        kv_index_meta, prepare_obj = mgr_split.allocate_kvcache(
             user_ids,
-            total_history_lengths,
-            mgr_prepare.static_page_ids_gpu_buffer,
-            mgr_prepare.static_offload_page_ids_gpu_buffer,
-            mgr_prepare.static_metadata_gpu_buffer,
-            mgr_prepare.static_onload_handle,
+            lookup,
+            static_page_ids_gpu_buffer=mgr_split.static_page_ids_gpu_buffer,
+            static_offload_page_ids_gpu_buffer=mgr_split.static_offload_page_ids_gpu_buffer,
+            static_metadata_gpu_buffer=mgr_split.static_metadata_gpu_buffer,
+            static_onload_handle=mgr_split.static_onload_handle,
         )
-        assert lookup.old_cached_lengths == legacy[0]
-        assert int(prepare_obj.new_tokens) == int(legacy[1])
+        assert lookup.batch_size == batch_size
+        assert len(lookup.old_cached_lengths) == batch_size
+        assert kv_index_meta.batch_size == batch_size
+        assert len(kv_index_meta.user_ids) == batch_size
+        assert len(kv_index_meta.seq_start_indices) == batch_size
+        assert len(kv_index_meta.seq_lengths) == batch_size
+        assert int(prepare_obj.new_tokens) >= 0
         prepare_obj.kvcache_metadata_fut.result(timeout=30)
-        legacy[5].result(timeout=30)
+        prepare_obj.onload_fut.result(timeout=30)
     finally:
         _shutdown_mgr(mgr_split)
-        _shutdown_mgr(mgr_prepare)
 
-#test correctness of KVcache metadata after wait
+
 def test_prepare_kvcache_wait_smoke():
     mgr, _, _ = get_small_test_kvcache_mgr()
     try:
         batch_size = 2
         user_ids = [401, 402]
         total_history_lengths = [48, 64]
-        result = mgr.prepare_kvcache_async(
-            batch_size,
+        lookup = mgr.lookup_kvcache(
             user_ids,
             total_history_lengths,
+        )
+        _, prepare_result = mgr.allocate_kvcache(
+            user_ids,
+            lookup,
             mgr.static_page_ids_gpu_buffer,
             mgr.static_offload_page_ids_gpu_buffer,
             mgr.static_metadata_gpu_buffer,
             mgr.static_onload_handle,
         )
         metadata = mgr.prepare_kvcache_wait(
-            result[6],  # onload_fut
-            result[5],  # kvcache_metadata_fut
+            prepare_result.onload_fut,
+            prepare_result.kvcache_metadata_fut,
             batch_size,
-            result[1],  # new_tokens
+            prepare_result.new_tokens,
             mgr.static_page_ids_gpu_buffer,
             mgr.static_offload_page_ids_gpu_buffer,
-            result[2],  # offload_uids_buffer
-            result[3],  # metadata_host_buffer
-            result[4],  # metadata_gpu_buffer
+            prepare_result.offload_uids_buffer,
+            prepare_result.metadata_host_buffer,
+            prepare_result.metadata_gpu_buffer,
             mgr.static_onload_handle,
         )
         assert isinstance(metadata, KVCacheMetadata)
@@ -361,15 +329,12 @@ def test_from_config_smoke_and_nop_secondary():
     try:
         assert mgr.namespace_mode == kv_cfg.namespace_mode
         assert mgr.namespace_base == kv_cfg.namespace_base
-        lookup = mgr.kv_cache_lookup(
-            1,
-            [777],
-            [32],
-        )
+        lookup = mgr.lookup_kvcache([777], [32])
         assert isinstance(lookup.secondary_lookup, dict)
         assert lookup.secondary_lookup.get("backend") == "nop"
     finally:
         _shutdown_mgr(mgr)
+
 if __name__ == "__main__":
     random.seed(1)
     torch.manual_seed(0)

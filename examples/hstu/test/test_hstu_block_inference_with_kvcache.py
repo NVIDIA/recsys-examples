@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# end-to-end test of HSTU block inference with KVcache
+# end-to-end test of HSTU block inference with KVcache and without KVcache
+import copy
 import itertools
 import os
 import sys
-from contextlib import contextmanager, nullcontext
-from typing import Callable, List, Tuple
+from contextlib import contextmanager
+
 import pytest
 import torch
 from commons.datasets.hstu_batch import FeatureConfig
@@ -16,6 +17,9 @@ from configs import (
     get_inference_hstu_config,
     get_kvcache_config,
 )
+
+os.environ.setdefault("HSTU_INFERENCE_ONLY", "1")
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required for inference kvcache smoke test.",
@@ -26,126 +30,41 @@ sys.path.append(os.path.join(_HSTU_DIR, "model"))
 from inference_ranking_gr import get_inference_ranking_gr  # noqa: E402
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-@contextmanager
-def _nvtx_range(name: str):
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
-
-
-def _cuda_elapsed_ms(fn: Callable[[], torch.Tensor]) -> float:
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start.record()
-    _ = fn()
-    end.record()
-    end.synchronize()
-    return float(start.elapsed_time(end))
-
-
-def _profile_forward_timeline(
-    model,
-    batches: List[Tuple[object, torch.Tensor, torch.Tensor]],
-    warmup_iters: int,
-    iters: int,
-    enable_nvtx: bool,
-) -> None:
-    kvcache_times_ms = []
-    nokvcache_times_ms = []
-    available_batches = len(batches)
-    if available_batches <= 0:
-        raise RuntimeError("No profiling batches available for timeline capture.")
-
-    valid_warmup_iters = max(min(warmup_iters, available_batches), 0)
-    remaining_batches = available_batches - valid_warmup_iters
-    valid_iters = min(iters, remaining_batches)
-    if valid_iters <= 0:
-        raise RuntimeError(
-            "No profiling batches available for steady phase after warmup."
-        )
-
-    if valid_warmup_iters < warmup_iters:
-        print(
-            "[timeline] Requested warmup iterations exceed unique batches. "
-            f"Capping warmup iters from {warmup_iters} to {valid_warmup_iters}."
-        )
-    if valid_iters < iters:
-        print(
-            "[timeline] Requested iterations exceed unique batches. "
-            f"Capping steady iters from {iters} to {valid_iters} to avoid replaying stale KV states."
-        )
-
-    nvtx_ctx = _nvtx_range if enable_nvtx else nullcontext
-    with nvtx_ctx("warmup_phase"):
-        for idx in range(valid_warmup_iters):
-            batch, user_ids, total_history_lengths = batches[idx]
-            _ = model.forward_with_kvcache(
-                batch,
-                user_ids,
-                total_history_lengths,
-            )
-            _ = model.forward_nokvcache(batch)
-    torch.cuda.synchronize()
-
-    steady_base = valid_warmup_iters
-    with nvtx_ctx("steady_phase"):
-        for idx in range(valid_iters):
-            batch, user_ids, total_history_lengths = batches[steady_base + idx]
-            with nvtx_ctx(f"forward_with_kvcache_iter_{idx}"):
-                kvcache_times_ms.append(
-                    _cuda_elapsed_ms(
-                        lambda: model.forward_with_kvcache(
-                            batch,
-                            user_ids,
-                            total_history_lengths,
-                        )
-                    )
-                )
-            with nvtx_ctx(f"forward_nokvcache_iter_{idx}"):
-                nokvcache_times_ms.append(
-                    _cuda_elapsed_ms(lambda: model.forward_nokvcache(batch))
-                )
-
-    avg_kvcache_ms = sum(kvcache_times_ms) / len(kvcache_times_ms)
-    avg_nokvcache_ms = sum(nokvcache_times_ms) / len(nokvcache_times_ms)
-    ratio = (
-        avg_kvcache_ms / avg_nokvcache_ms if avg_nokvcache_ms > 0.0 else float("inf")
-    )
-    print(
-        "[timeline] avg_forward_with_kvcache_ms="
-        f"{avg_kvcache_ms:.3f}, avg_forward_nokvcache_ms={avg_nokvcache_ms:.3f}, "
-        f"kvcache_over_nokv={ratio:.3f}, warmup_iters={valid_warmup_iters}, "
-        f"steady_iters={valid_iters}"
-    )
-
-
 def _shutdown_model_kvcache_threads(model) -> None:
     mgr = model.dense_module.async_kvcache
     if hasattr(mgr, "executor"):
         mgr.executor.shutdown(wait=False)
     if hasattr(mgr, "onload_worker"):
         mgr.onload_worker.shutdown(wait=False)
-def _build_model_and_dataset(max_num_cached_batches: int = 2):
+
+
+@contextmanager
+def _capture_hstu_layer_outputs(model):
+    layers = model.dense_module._hstu_block._attention_layers
+    original_methods = []
+    outputs = {}
+
+    for layer_idx, layer in enumerate(layers):
+        original = layer.forward_naive
+        original_methods.append((layer, original))
+
+        def _wrap_forward_naive(batch_size, num_tokens, layer_input, jd, kv_cache_metadata, _orig=original, _idx=layer_idx):
+            layer_output = _orig(
+                batch_size, num_tokens, layer_input, jd, kv_cache_metadata
+            )
+            outputs[_idx] = layer_output.detach().float().cpu().clone()
+            return layer_output
+
+        layer.forward_naive = _wrap_forward_naive
+
+    try:
+        yield outputs
+    finally:
+        for layer, original in original_methods:
+            layer.forward_naive = original
+
+
+def _build_model_and_dataset():
     max_batch_size = 4
     max_history_length = 128
     max_num_candidates = 16
@@ -153,6 +72,7 @@ def _build_model_and_dataset(max_num_cached_batches: int = 2):
     max_seq_len = max_history_length * 2 + max_num_candidates
     item_fea_name, item_vocab_size = "item_feat", 10000
     action_fea_name, action_vocab_size = "act_feat", 128
+
     feature_configs = [
         FeatureConfig(
             feature_names=[item_fea_name, action_fea_name],
@@ -161,6 +81,7 @@ def _build_model_and_dataset(max_num_cached_batches: int = 2):
             is_jagged=False,
         ),
     ]
+
     hidden_dim_size = 128
     num_heads = 2
     head_dim = 64
@@ -212,6 +133,7 @@ def _build_model_and_dataset(max_num_cached_batches: int = 2):
     model.sparse_module._dynamic_embedding_collection.set_feature_splits([1, 1], [0])
     model.bfloat16()
     model.eval()
+
     dataset = RandomInferenceDataset(
         feature_configs=feature_configs,
         item_feature_name=item_fea_name,
@@ -222,63 +144,69 @@ def _build_model_and_dataset(max_num_cached_batches: int = 2):
         max_history_length=max_history_length,
         max_num_candidates=max_num_candidates,
         max_incremental_seqlen=max_incremental_seqlen,
-        max_num_cached_batches=max_num_cached_batches,
+        max_num_cached_batches=2,
         full_mode=True,
     )
     return model, dataset
-def test_inference_forward_with_kvcache_smoke():
-    model, dataset = _build_model_and_dataset(max_num_cached_batches=2)
+
+
+def test_inference_forward_with_kvcache_layerwise_compare():
+    model, dataset = _build_model_and_dataset()
     try:
-        enable_timeline = _env_flag("HSTU_KVCACHE_PROFILE_TIMELINE", default=False)
-        enable_nvtx = _env_flag("HSTU_KVCACHE_PROFILE_NVTX", default=False)
-        profile_warmup_iters = max(
-            _env_int("HSTU_KVCACHE_PROFILE_WARMUP_ITERS", default=1), 0
-        )
-        profile_iters = max(_env_int("HSTU_KVCACHE_PROFILE_ITERS", default=1), 1)
-        batches = list(itertools.islice(iter(dataset), 2))
-        assert len(batches) > 0
+        batches = list(itertools.islice(iter(dataset), 1))
+        assert len(batches) == 1
+        batch, user_ids, total_history_lengths = batches[0]
+
+        # Use identical input batch for both paths to compare per-layer outputs.
+        batch_nokv = copy.deepcopy(batch)
+        batch_kvcache = copy.deepcopy(batch)
+
         with torch.inference_mode():
-            for batch, user_ids, total_history_lengths in batches:
-                logits = model.forward_with_kvcache(
-                    batch,
+            with _capture_hstu_layer_outputs(model) as nokv_layer_outputs:
+                logits_nokv = model.forward_nokvcache(batch_nokv)
+
+            with _capture_hstu_layer_outputs(model) as kvcache_layer_outputs:
+                logits_kvcache = model.forward_with_kvcache(
+                    batch_kvcache,
                     user_ids,
                     total_history_lengths,
                 )
-                assert torch.is_tensor(logits)
-                assert logits.is_cuda
-                assert logits.numel() > 0
-                assert logits.shape[-1] == 1
-            # quick sanity: no-kvcache path also runs
-            batch, _, _ = batches[0]
-            logits_nokv = model.forward_nokvcache(batch)
-            assert torch.is_tensor(logits_nokv)
-            assert logits_nokv.is_cuda
-            assert logits_nokv.numel() > 0
-            assert logits_nokv.shape[-1] == 1
-        if enable_timeline:
-            profile_num_batches = max(
-                _env_int(
-                    "HSTU_KVCACHE_PROFILE_NUM_BATCHES",
-                    default=max(profile_warmup_iters + profile_iters, 2),
-                ),
-                2,
+
+        assert torch.is_tensor(logits_kvcache)
+        assert logits_kvcache.is_cuda
+        assert logits_kvcache.numel() > 0
+        assert logits_kvcache.shape[-1] == 1
+
+        assert torch.is_tensor(logits_nokv)
+        assert logits_nokv.is_cuda
+        assert logits_nokv.numel() > 0
+        assert logits_nokv.shape[-1] == 1
+
+        num_layers = len(model.dense_module._hstu_block._attention_layers)
+        assert len(nokv_layer_outputs) == num_layers
+        assert len(kvcache_layer_outputs) == num_layers
+        a = kvcache_layer_outputs[0].float().cpu()
+        b = nokv_layer_outputs[0].float().cpu()
+        max_abs = (a - b).abs().max().item()
+        torch.testing.assert_close(
+                a, b, rtol=1e-2, atol=1e-2,
+                msg=f"layer={0}, max_abs={max_abs:.6f}",
             )
-            profile_model, profile_dataset = _build_model_and_dataset(
-                max_num_cached_batches=profile_num_batches
-            )
-            try:
-                profile_batches = list(
-                    itertools.islice(iter(profile_dataset), profile_num_batches)
-                )
-                with torch.inference_mode():
-                    _profile_forward_timeline(
-                        model=profile_model,
-                        batches=profile_batches,
-                        warmup_iters=profile_warmup_iters,
-                        iters=profile_iters,
-                        enable_nvtx=enable_nvtx,
-                    )
-            finally:
-                _shutdown_model_kvcache_threads(profile_model)
+        # for layer_idx in range(num_layers):
+        #     a = kvcache_layer_outputs[layer_idx]
+        #     b = nokv_layer_outputs[layer_idx]
+        #     max_abs = (a - b).abs().max().item()
+        #     print(f"[layer {layer_idx}] max_abs={max_abs:.6f}")
+        #     torch.testing.assert_close(
+        #         a, b, rtol=1e-2, atol=1e-2,
+        #         msg=f"layer={layer_idx}, max_abs={max_abs:.6f}",
+        #     )
+
+        torch.testing.assert_close(
+            logits_kvcache.detach().float().cpu(),
+            logits_nokv.detach().float().cpu(),
+            rtol=1e-2,
+            atol=1e-2,
+        )
     finally:
         _shutdown_model_kvcache_threads(model)
