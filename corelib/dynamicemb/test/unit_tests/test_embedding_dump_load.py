@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
 )
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -120,6 +121,54 @@ def assert_batched_dynamicemb_storage_class(
                     "Full HBM budget without cache: expected DynamicEmbStorage, "
                     f"got {type(storage)}"
                 )
+
+
+def assert_get_dynamic_emb_module_finds_submodules(model) -> None:
+    """Verify get_dynamic_emb_module discovers BatchedDynamicEmbeddingTablesV2.
+
+    Tests two paths:
+      1. Via find_sharded_modules + get_dynamic_emb_module (existing usage)
+      2. Via get_dynamic_emb_module directly on the DMP model (requires
+         children() traversal through wrapper modules, the fix for #353)
+
+    Both must return the same set of modules.
+    """
+    # Path 1: existing approach - find sharded modules first, then search each
+    via_sharded = []
+    for _, _, sharded_module in find_sharded_modules(model, ""):
+        via_sharded.extend(get_dynamic_emb_module(sharded_module))
+
+    # Path 2: search directly on the DMP wrapper (requires children() traversal)
+    via_dmp = get_dynamic_emb_module(model)
+
+    assert (
+        len(via_sharded) > 0
+    ), "find_sharded_modules + get_dynamic_emb_module found no modules"
+    assert (
+        len(via_dmp) > 0
+    ), "get_dynamic_emb_module on DMP model found no modules (children() traversal broken)"
+
+    # Every module found via either path must be BatchedDynamicEmbeddingTablesV2
+    for m in via_sharded:
+        assert isinstance(
+            m, BatchedDynamicEmbeddingTablesV2
+        ), f"Expected BatchedDynamicEmbeddingTablesV2, got {type(m)}"
+    for m in via_dmp:
+        assert isinstance(
+            m, BatchedDynamicEmbeddingTablesV2
+        ), f"Expected BatchedDynamicEmbeddingTablesV2, got {type(m)}"
+
+    # Both paths must discover the exact same set of modules (by identity)
+    ids_sharded = set(id(m) for m in via_sharded)
+    ids_dmp = set(id(m) for m in via_dmp)
+    assert ids_sharded == ids_dmp, (
+        f"Module sets differ: via_sharded has {len(ids_sharded)} modules, "
+        f"via_dmp has {len(ids_dmp)} modules"
+    )
+
+    # No duplicates in either result
+    assert len(via_sharded) == len(ids_sharded), "Duplicates in via_sharded path"
+    assert len(via_dmp) == len(ids_dmp), "Duplicates in via_dmp path"
 
 
 def update_scores(
@@ -354,32 +403,46 @@ def create_model(
 
 
 def check_counter_table_checkpoint(x, y):
-    device = torch.cuda.current_device()
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     tables_x = get_dynamic_emb_module(x)
     tables_y = get_dynamic_emb_module(y)
+    assert len(tables_x) == len(tables_y)
 
     for table_x, table_y in zip(tables_x, tables_y):
-        for cnt_tx, cnt_ty in zip(
-            table_x._admission_counter, table_y._admission_counter
-        ):
-            assert cnt_tx.table_.size() == cnt_ty.table_.size()
+        cnt_x = table_x._admission_counter
+        cnt_y = table_y._admission_counter
+        if cnt_x is None:
+            assert cnt_y is None
+            continue
+        assert cnt_x.table_.size() == cnt_y.table_.size()
 
-            for keys, named_scores, _ in cnt_tx._batched_export_keys_scores(
-                cnt_tx.table_.score_names_, torch.device(f"cuda:{device}")
+        freq_name = cnt_x.score_name_
+        for table_id in range(len(table_x._table_names)):
+            for keys, named_scores, _ in cnt_x.table_._batched_export_keys_scores(
+                [freq_name], device, table_id
             ):
                 if keys.numel() == 0:
                     continue
-                freq_name = cnt_tx.table_.score_names_[0]
                 frequencies = named_scores[freq_name]
 
+                lookup_table_ids = torch.full(
+                    (keys.numel(),), table_id, dtype=torch.int64, device=device
+                )
                 score_arg_lookup = ScoreArg(
                     name=freq_name,
                     value=torch.zeros_like(frequencies),
                     policy=ScorePolicy.CONST,
                 )
-                _, founds, _ = cnt_ty.lookup(keys, score_arg_lookup)
-
-                assert torch.equal(frequencies, score_arg_lookup)
+                score_out, founds, _ = cnt_y.table_.lookup(
+                    keys, lookup_table_ids, score_arg_lookup
+                )
+                assert founds.all(), (
+                    f"counter keys missing from loaded table_id={table_id}: "
+                    f"{keys[~founds].tolist()}"
+                )
+                assert torch.equal(
+                    frequencies, score_out
+                ), f"counter frequency mismatch for table_id={table_id}"
 
 
 @click.command()
@@ -440,6 +503,8 @@ def test_model_load_dump(
             threshold=2 if counter else 1,
         ),
     )
+
+    assert_get_dynamic_emb_module_finds_submodules(ref_model)
 
     expect_scores_collection: Dict[str, Dict[int, int]] = {}
     kjts, feature_names, all_kjts = generate_sparse_feature(

@@ -21,7 +21,7 @@ from typing import Any, List
 
 import torch
 import torch.nn as nn
-from commons.utils.dynamicemb_utils import find_dynamicemb_modules
+from dynamicemb.dump_load import get_dynamic_emb_module
 
 
 class _CacheDebugHook:
@@ -64,7 +64,7 @@ def install_cache_debug_hooks(model: nn.Module) -> int:
         Number of hooks installed.
     """
     count = 0
-    modules = find_dynamicemb_modules(model)
+    modules = get_dynamic_emb_module(model)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if rank == 0:
         print(f"[CACHE_DEBUG] Found {len(modules)} DynamicEmb module(s)", flush=True)

@@ -17,7 +17,7 @@ import logging
 import os
 import warnings
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -50,31 +50,42 @@ def find_sharded_modules(
     return sharded_modules
 
 
-def check_emb_collection_modules(module: nn.Module, ret_list: List[nn.Module]):
+def check_emb_collection_modules(
+    module: nn.Module,
+    ret_list: List[nn.Module],
+    visited: Optional[Set[int]] = None,
+):
+    if visited is None:
+        visited = set()
+
+    mid = id(module)
+    if mid in visited:
+        return
+    visited.add(mid)
+
     if isinstance(module, BatchedDynamicEmbeddingTablesV2):
         ret_list.append(module)
-        return ret_list
+        return
 
     if isinstance(module, nn.Module):
-        if hasattr(module, "_emb_module"):
-            check_emb_collection_modules(module._emb_module, ret_list)
-
-        if hasattr(module, "_emb_modules"):
-            check_emb_collection_modules(module._emb_modules, ret_list)
-
-        if hasattr(module, "_lookups"):
-            tmp_module_list = module._lookups
-            for tmp_emb_module in tmp_module_list:
-                check_emb_collection_modules(tmp_emb_module, ret_list)
-
-    if isinstance(module, nn.ModuleList):
-        for i in range(len(module)):
-            tmp_emb_module = module[i]
-
-            if isinstance(tmp_emb_module, nn.Module):
-                check_emb_collection_modules(tmp_emb_module, ret_list)
-            else:
+        # Follow TorchRec/DynamicEmb internal attributes.
+        # _lookups is stored as a plain Python list (not nn.ModuleList) so
+        # nn.Module.children() cannot discover it — traverse it explicitly.
+        for attr in ("_lookups", "_emb_modules", "_emb_module"):
+            child = getattr(module, attr, None)
+            if child is None:
                 continue
+            if isinstance(child, (list, nn.ModuleList)):
+                for item in child:
+                    check_emb_collection_modules(item, ret_list, visited)
+            else:
+                check_emb_collection_modules(child, ret_list, visited)
+
+        # Recurse into nn.Module children so we can traverse through
+        # wrapper modules (DMP / DDP / Float16Module) that are not
+        # covered by the private attributes above.
+        for child in module.children():
+            check_emb_collection_modules(child, ret_list, visited)
 
 
 def get_dynamic_emb_module(model: nn.Module) -> List[nn.Module]:
