@@ -21,13 +21,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#ifdef DEMB_USE_PYBIND11
 #include <torch/extension.h>
+#endif
 #include <torch/torch.h>
 // #include <ATen/cuda/DeviceUtils.cuh>
 #include "ATen/AccumulateType.h"
 #include <c10/core/ScalarType.h>
+#ifdef DEMB_USE_PYBIND11
 #include <pybind11/pybind11.h>
+namespace py = pybind11;
 // #include <torch/python.h>
+#endif
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
@@ -105,4 +110,6 @@ template <typename T> T *get_pointer(const std::optional<at::Tensor> &tensor) {
 } // namespace dyn_emb
 
 // PYTHON WRAP
+#ifdef DEMB_USE_PYBIND11
 void bind_utils(py::module &m);
+#endif

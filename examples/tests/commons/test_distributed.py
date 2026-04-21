@@ -41,10 +41,13 @@ def generate_batch(
 
     feature_values = torch.randint(0, 100000, (feature_lengths.sum().item(),)).cuda()
     if dense_label:
-        labels = (
-            torch.arange(
-                actual_batch_size * num_features, device=torch.device("cuda")
-            ).view(-1)
+        # Dense labels have dim-0 == batch_size (unified convention).
+        # Real samples get meaningful values; padding rows are zeros.
+        labels = torch.zeros(
+            batch_size * num_features, device=torch.device("cuda"), dtype=torch.long
+        )
+        labels[: actual_batch_size * num_features] = (
+            torch.arange(actual_batch_size * num_features, device=torch.device("cuda"))
             // num_features
         )
     else:
@@ -161,8 +164,8 @@ def test_batch_allgather(
                     f"got {stripped.labels.numel()}"
                 )
                 assert torch.equal(
-                    stripped.labels, batch.labels
-                ), "Stripped dense labels should match original unpadded labels"
+                    stripped.labels, batch.labels[: actual_bs * num_features]
+                ), "Stripped dense labels should match original real labels"
 
 
 @pytest.mark.parametrize("batch_size", [128])

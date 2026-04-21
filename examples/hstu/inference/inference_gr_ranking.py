@@ -292,7 +292,7 @@ def run_ranking_gr_simulate(
 
                 if batch is not None:
                     if not disable_kvcache:
-                        logits = model.forward(
+                        logits = model.forward_with_kvcache(
                             batch,
                             uids,
                             total_history_lengths,
@@ -399,7 +399,9 @@ def run_ranking_gr_evaluate(
                 total_history_lengths = total_history_lengths.cpu()
 
                 if not disable_kvcache:
-                    logits = model.forward(batch, user_ids, total_history_lengths)
+                    logits = model.forward_with_kvcache(
+                        batch, user_ids, total_history_lengths
+                    )
                 else:
                     logits = model.forward_nokvcache(batch)
                 eval_module(logits, batch.labels.values())

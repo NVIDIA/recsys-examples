@@ -145,7 +145,9 @@ at::ScalarType toScalarType(torch::Dtype dt) {
 } // namespace dyn_emb
 
 // PYTHON WRAP
+#ifdef DEMB_USE_PYBIND11
 void bind_utils(py::module &m) {
   m.def("device_timestamp", &dyn_emb::device_timestamp,
         "Get device timestamp.");
 }
+#endif

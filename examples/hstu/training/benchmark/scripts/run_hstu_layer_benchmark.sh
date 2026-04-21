@@ -2,7 +2,10 @@
 gpu_arch=$(nvidia-smi -L |head -n 1| cut -d' ' -f4)
 num_layers=${1:-1}
 PROFILE=${PROFILE:-0}
-nsys_cmd='nsys profile -o ./profile/<placeholder> -f true -s none -t cuda,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node '
+export CUBLAS_NVTX_LEVEL=2
+export CUDA_MODULE_LOADING=EAGER
+export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
+nsys_cmd='nsys profile -o ./profile/<placeholder> -f true -s none -t cuda,cublas-verbose,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node '
 
 dim_per_heads=(256)
 num_heads=(4)
@@ -32,7 +35,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
                 fi
                 echo -e "\n\033[32mbaseline hstu layer \033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${baseline_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend triton \
@@ -53,7 +56,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
 
                 echo -e "\n\033[32m +cutlass\033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${cutlass_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend cutlass \
@@ -73,7 +76,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
 
                 echo -e "\n\033[32m +fused\033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${fused_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend cutlass \
@@ -93,7 +96,7 @@ for dim_per_head in "${dim_per_heads[@]}"; do
 
                 echo -e "\n\033[32m + recompute\033[0m:"
                 ${nsys_profile_cmd/<placeholder>/${recompute_profile_name}} \
-                    python ./training/benchmark/hstu_layer_benchmark.py run \
+                    python ./training/benchmark/scripts/hstu_layer_benchmark.py run \
                     --iters 100 \
                     --warmup-iters 50 \
                     --kernel-backend cutlass \

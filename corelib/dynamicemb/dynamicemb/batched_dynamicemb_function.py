@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Optional, Tuple
@@ -29,17 +28,11 @@ from dynamicemb.key_value_table import (
     _find_keys,
     eval_lookup,
     get_insert_score_arg,
-    get_table_ptrs,
     load_from_flat,
     store_to_flat,
 )
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.types import (
-    AdmissionStrategy,
-    CopyMode,
-    Counter,
-    DynamicEmbInitializerMode,
-)
+from dynamicemb.types import AdmissionStrategy, CopyMode, Counter
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
@@ -505,7 +498,9 @@ def _prefetch_cache_path(
                             evicted_keys[nw_m],
                             evicted_table_ids[nw_m],
                             evicted_values[nw_m],
-                            evicted_scores[nw_m] if evicted_scores is not None else None,
+                            evicted_scores[nw_m]
+                            if evicted_scores is not None
+                            else None,
                             preserve_existing=False,
                         )
             else:
@@ -1007,9 +1002,7 @@ def _generic_forward_path(
             scores_to_insert,
         )
         key_persisted[positions_in_unique] = True
-        _, persisted_unique_indices, _ = flagged_compact(
-            key_persisted, [unique_keys]
-        )
+        _, persisted_unique_indices, _ = flagged_compact(key_persisted, [unique_keys])
         return unique_values, persisted_unique_indices
 
 
@@ -1208,7 +1201,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     optimizer.fused_update_for_flat_table(
                         unique_grads.to(ctx.emb_dtype),
                         ctx.update_slot_indices,
-                        get_table_ptrs(state),
+                        state.table_ptrs_dev,
                         unique_table_ids,
                         state.table_value_dims,
                         state.table_emb_dims,

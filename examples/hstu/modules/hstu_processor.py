@@ -106,23 +106,62 @@ def hstu_preprocess_embeddings(
 
             item_embs = item_jt.values().to(dtype)
             action_embs = action_jt.values().to(dtype)
-            interleaved_embeddings = [
-                (
-                    torch.cat(
-                        [
-                            item_embs[item_offsets[idx] : candidates_indptr[idx]],
-                            action_embs[action_offsets[idx] : action_offsets[idx + 1]],
+            if not torch.compiler.is_compiling():
+                interleaved_embeddings = [
+                    (
+                        torch.cat(
+                            [
+                                item_embs[
+                                    item_offsets[idx]
+                                    .item() : candidates_indptr[idx]
+                                    .item()
+                                ],
+                                action_embs[
+                                    action_offsets[idx]
+                                    .item() : action_offsets[idx + 1]
+                                    .item()
+                                ],
+                            ],
+                            dim=1,
+                        ).view(-1, embedding_dim),
+                        item_embs[
+                            candidates_indptr[idx].item() : item_offsets[idx + 1].item()
                         ],
-                        dim=1,
-                    ).view(-1, embedding_dim),
-                    item_embs[candidates_indptr[idx] : item_offsets[idx + 1]],
+                    )
+                    for idx in range(batch.batch_size)
+                ]
+                interleaved_embeddings = list(itertools.chain(*interleaved_embeddings))
+                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
+                    -1, embedding_dim
                 )
-                for idx in range(batch.batch_size)
-            ]
-            interleaved_embeddings = list(itertools.chain(*interleaved_embeddings))
-            sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
-                -1, embedding_dim
-            )
+            else:
+                interleaved_embeddings = list()
+                for idx in range(batch.batch_size):
+                    interleaved_embeddings.append(
+                        torch.cat(
+                            [
+                                item_embs[
+                                    torch.arange(
+                                        item_offsets[idx], candidates_indptr[idx]
+                                    )
+                                ],
+                                action_embs[
+                                    torch.arange(
+                                        action_offsets[idx], action_offsets[idx + 1]
+                                    )
+                                ],
+                            ],
+                            dim=1,
+                        ).view(-1, embedding_dim)
+                    )
+                    interleaved_embeddings.append(
+                        item_embs[
+                            torch.arange(candidates_indptr[idx], item_offsets[idx + 1])
+                        ]
+                    )
+                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
+                    -1, embedding_dim
+                )
             sequence_embeddings_lengths = item_jt.lengths() + action_jt.lengths()
             sequence_embeddings_lengths_offsets = (
                 item_jt.offsets() + action_jt.offsets()
@@ -160,34 +199,30 @@ def hstu_preprocess_embeddings(
             contextual_jts_offsets,
             contextual_max_seqlens,
         )
-        if torch.sum(contextual_seqlen, dim=0).cpu().item() == 0:
-            contextual_seqlen = None
-        else:
-            if contextual_mlp is not None:
-                contextual_sequence_embeddings = contextual_mlp(
-                    contextual_sequence_embeddings
-                )
-            contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                contextual_seqlen
+        # torch._check_tensor_all(torch.sum(contextual_seqlen, dim=0) != 0, "contextual_seqlen is 0")
+        if contextual_mlp is not None:
+            contextual_sequence_embeddings = contextual_mlp(
+                contextual_sequence_embeddings
             )
-            contextual_max_seqlen = max(
-                len(batch.contextual_feature_names), sum(contextual_max_seqlens)
-            )
-            (
-                sequence_embeddings,
-                sequence_embeddings_lengths,
-            ) = jagged_2D_tensor_concat(
-                [contextual_sequence_embeddings, sequence_embeddings],
-                [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
-                [contextual_max_seqlen, sequence_max_seqlen],
-            )
+        contextual_seqlen_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            contextual_seqlen
+        )
+        contextual_max_seqlen = max(
+            len(batch.contextual_feature_names), sum(contextual_max_seqlens)
+        )
+        (
+            sequence_embeddings,
+            sequence_embeddings_lengths,
+        ) = jagged_2D_tensor_concat(
+            [contextual_sequence_embeddings, sequence_embeddings],
+            [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
+            [contextual_max_seqlen, sequence_max_seqlen],
+        )
 
-            sequence_embeddings_lengths_offsets = (
-                torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    sequence_embeddings_lengths
-                )
-            )
-            sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
+        sequence_embeddings_lengths_offsets = (
+            torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
+        )
+        sequence_max_seqlen = sequence_max_seqlen + contextual_max_seqlen
 
     # After balanced shuffler, dense tensors (num_candidates) are stripped to
     # actual_batch_size while KJTs retain batch_size entries (see BaseBatch
@@ -208,11 +243,16 @@ def hstu_preprocess_embeddings(
     total_candidates_seq_len = None
     if not is_inference:
         if num_candidates is not None:
-            total_candidates_seq_len = int(num_candidates.sum().item())
+            total_candidates_seq_len = num_candidates.sum()
         elif contextual_seqlen is not None:
-            total_candidates_seq_len = int(
-                (sequence_embeddings_lengths.sum() - contextual_seqlen.sum()).item()
+            total_candidates_seq_len = (
+                sequence_embeddings_lengths.sum() - contextual_seqlen.sum()
             )
+    elif torch.compiler.is_compiling():
+        assert (
+            num_candidates is not None
+        ), "num_candidates should not be None during inference when compiling"
+        total_candidates_seq_len = num_candidates.sum()
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
@@ -311,7 +351,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
         self,
         embeddings: Dict[str, JaggedTensor],
         batch: HSTUBatch,
-        seq_start_position: torch.Tensor = None,
+        seq_start_position: Optional[torch.Tensor] = None,
     ) -> JaggedData:
         """
         Preprocesses the embeddings for use in the HSTU architecture.
@@ -414,10 +454,11 @@ class HSTUBlockPostprocessor(torch.nn.Module):
             total_seq = jd.values.shape[0]
             precomputed_b = jd.total_candidates_seq_len
             precomputed_a = total_seq - jd.total_candidates_seq_len
-            assert precomputed_a >= 0, (
-                f"precomputed_a is negative ({precomputed_a}): total_seq={total_seq}, "
-                f"total_candidates_seq_len={jd.total_candidates_seq_len}"
-            )
+            if not torch.compiler.is_compiling():
+                assert precomputed_a >= 0, (
+                    f"precomputed_a is negative ({precomputed_a}): total_seq={total_seq}, "
+                    f"total_candidates_seq_len={jd.total_candidates_seq_len}"
+                )
         else:
             precomputed_a = None
             precomputed_b = None

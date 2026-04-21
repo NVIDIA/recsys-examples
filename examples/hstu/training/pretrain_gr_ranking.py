@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import warnings
 
 # Ignore all FutureWarnings
@@ -151,7 +152,24 @@ def main():
         f"model initialization done, start training. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
     )
 
+    from commons.utils.dynamicemb_cache_stats import auto_install
+
+    auto_install(model_train)
+
     maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
+
+    if os.environ.get("FILL_DYNAMICEMB_TABLES", "0") == "1":
+        from dynamicemb.dump_load import get_dynamic_emb_module
+
+        for dyn_module in get_dynamic_emb_module(model_train):
+            if hasattr(dyn_module, "fill_tables"):
+                try:
+                    dyn_module.fill_tables(load_factor=0.95)
+                    print_rank_0(f"fill_tables done for {dyn_module.table_names}")
+                except TypeError:
+                    pass
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
 
     # Map pipeline type string to factory registered name
     pipeline_type_map = {

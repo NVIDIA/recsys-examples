@@ -13,32 +13,49 @@ class BaseBatch(Pipelineable):
 
     Invariants (especially for incomplete / padded batches):
 
-    * ``batch_size`` — full size **including** padding samples.  This is
-      the KJT dimension: ``len(kjt.lengths()) == batch_size * num_keys``.
+    * ``batch_size`` — full size **including** padding samples.  Both KJTs
+      and dense tensors use this dimension:
+      - KJT: ``len(kjt.lengths()) == batch_size * num_keys``
+      - Dense: dim-0 == ``batch_size`` (trailing rows are zero-padding)
     * ``actual_batch_size`` — number of **real** (non-padding) samples.
-      This is the dense-tensor dimension: each dense tensor has
-      ``actual_batch_size`` rows (dim-0).
+      Samples at indices ``[actual_batch_size, batch_size)`` are padding.
     * For complete batches the two values are equal.
     """
 
     features: KeyedJaggedTensor
-    batch_size: int  # KJT dimension (includes padding)
+    batch_size: int  # both KJT and dense dimension (includes padding)
     feature_to_max_seqlen: Dict[str, int]
 
     contextual_feature_names: List[str] = field(default_factory=list)
     labels: Optional[KeyedJaggedTensor] = None
-    actual_batch_size: Optional[int] = None  # dense dimension (real samples only)
+    actual_batch_size: Optional[int] = None  # number of real (non-padding) samples
 
     def __post_init__(self):
         if len(set(self.features.keys())) != len(list(self.features.keys())):
             raise ValueError(f"duplicate features keys {list(self.features.keys())}")
         assert isinstance(self.contextual_feature_names, list)
-        assert isinstance(self.batch_size, int) and self.batch_size > 0
+        assert (
+            isinstance(self.batch_size, int)
+            and self.batch_size > 0
+            or isinstance(self.batch_size, torch.export.dynamic_shapes._IntWrapper)
+            and self.batch_size.val > 0
+        )
         self.actual_batch_size = (
             self.batch_size
             if self.actual_batch_size is None
             else self.actual_batch_size
         )
+
+    def num_loss_tokens(self) -> torch.Tensor:
+        """Per-rank loss token count as a scalar float tensor.
+
+        Subclasses should override this with a task-specific implementation.
+        Default: returns the total number of label values if labels exist,
+        otherwise returns batch_size as a fallback.
+        """
+        if self.labels is not None:
+            return torch.tensor(self.labels.values().numel(), dtype=torch.float)
+        return torch.tensor(self.batch_size, dtype=torch.float)
 
     def _apply_to_tensors_or_kjt(
         self, tensor_fn: Callable, *args, inplace: bool = False, **kwargs
@@ -114,7 +131,7 @@ class BaseBatch(Pipelineable):
             tensor: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:
             return (
-                tensor.reshape(self.actual_batch_size, -1)
+                tensor.reshape(self.batch_size, -1)
                 .index_select(dim=0, index=indices)
                 .reshape(-1)
             )

@@ -17,6 +17,7 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
 import hstu  # noqa: F401 – registers torch.ops.fbgemm.*
+import hstu.hstu_ops_gpu  # noqa: F401 – registers fake impls for torch.export
 import nvtx
 import torch
 from commons.utils.clear_tensor_data import clear_tensor_data
@@ -139,10 +140,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ctx.recompute_input_layernorm = recompute_input_layernorm
         ctx.recompute_input_silu = recompute_input_silu
         saved_tensor_map = OrderedDict()
-        if num_contextuals is None and attn_backend == KernelBackend.TRITON:
-            num_contextuals = 0
         if attn_backend == KernelBackend.TRITON:
-            assert isinstance(num_contextuals, int)
+            if num_contextuals is None:
+                num_contextuals = 0
+            elif not isinstance(num_contextuals, int):
+                num_contextuals = num_contextuals.view(-1)[0].item()
         assert input.dim() == 2, "input tensor must be 2D"
         assert linear_uvqk_bias.dim() == 1, "linear_uvqk_bias must be 1D"
 
@@ -228,7 +230,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             k: torch.Tensor,
             v: torch.Tensor,
             seq_offsets: torch.Tensor,
-            causal: bool,
             num_targets: Optional[torch.Tensor],
             contextual_seq_len: int,
         ):
@@ -255,11 +256,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 k=k,
                 v=v,
                 seq_offsets=seq_offsets,
-                causal=causal,
                 num_targets=num_targets,
                 max_attn_len=0,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
+                enable_tma=False,
             ).reshape(-1, num_heads * attention_dim_per_head)
             return jagged_attn_output
 
@@ -479,7 +480,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     k=tk,
                     v=tv,
                     seq_offsets=seqlen_offsets,
-                    causal=ctx.causal,
                     num_targets=num_targets,
                     contextual_seq_len=num_contextuals,
                 )
@@ -719,7 +719,6 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             N: int,
             scaling_seqlen: int,
             alpha: float,
-            causal: float,
             contextual_seq_len: int,
             dqkv: Optional[torch.Tensor] = None,
         ):
@@ -740,9 +739,9 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 scaling_seqlen=scaling_seqlen,
                 alpha=alpha,
                 max_attn_len=0,
-                causal=causal,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
+                enable_tma=False,
             )
             return dq, dk, dv
 
@@ -900,8 +899,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     N=ctx.N,  # => max_seqlen_q
                     scaling_seqlen=ctx.scaling_seqlen,
                     alpha=ctx.alpha,
-                    causal=ctx.causal,
-                    contextual_seq_len=ctx.contextual_seq_len,  # saved_tensor_map["num_contexts"] == None,
+                    contextual_seq_len=ctx.contextual_seq_len,
                 )
                 grad_q = grad_q.view(-1, ctx.num_heads * ctx.attention_dim_per_head)
                 grad_k = grad_k.view(-1, ctx.num_heads * ctx.attention_dim_per_head)

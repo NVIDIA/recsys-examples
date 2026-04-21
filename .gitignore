@@ -41,4 +41,6 @@ results/
 **/.triton/**/[0-9]*
 *-zh*.md
 *.pdf
+.docs/
 .SKILLS/
+.cursor/

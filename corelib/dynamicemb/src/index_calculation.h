@@ -59,7 +59,7 @@ void select_index_async(int64_t num_items, bool const *d_flags, T *d_output,
                         at::Device const &device, cudaStream_t const &stream) {
   void *d_temp_storage = nullptr;
   size_t temp_storage_bytes = 0;
-  cub::CountingInputIterator<T> counting_iter(0);
+  thrust::counting_iterator<T> counting_iter(0);
 
   // 1. get the size of temp storage.
   cub::DeviceSelect::Flagged(d_temp_storage, temp_storage_bytes, counting_iter,
@@ -119,4 +119,6 @@ at::Tensor segmented_sum_cuda(at::Tensor data, at::Tensor offsets);
 
 } // namespace dyn_emb
 
+#ifdef DEMB_USE_PYBIND11
 void bind_index_calculation_op(py::module &m);
+#endif

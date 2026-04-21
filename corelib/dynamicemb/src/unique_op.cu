@@ -23,13 +23,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/cub.cuh>
+#ifdef DEMB_USE_PYBIND11
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
+#endif
 
 #include <cassert>
 #include <limits>
 
+#ifdef DEMB_USE_PYBIND11
 namespace py = pybind11;
+#endif
 
 namespace dyn_emb {
 
@@ -679,13 +683,13 @@ std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
   // Handle empty case
   if (new_lengths_size == 0) {
     return std::make_tuple(
-        at::empty({0}, at::TensorOptions().dtype(at::kInt).device(device)),
+        at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
         at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)));
   }
 
   // Allocate output tensors
   at::Tensor new_lengths = at::empty(
-      {new_lengths_size}, at::TensorOptions().dtype(at::kInt).device(device));
+      {new_lengths_size}, at::TensorOptions().dtype(at::kLong).device(device));
   at::Tensor new_offsets =
       at::empty({new_lengths_size + 1},
                 at::TensorOptions().dtype(at::kLong).device(device));
@@ -695,8 +699,8 @@ std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
   get_new_length_and_offsets(
       reinterpret_cast<uint64_t *>(get_pointer<int64_t>(unique_offsets)),
       get_pointer<int64_t>(table_offsets_in_feature), num_tables,
-      new_lengths_size, local_batch_size, DataType::Int32, DataType::Int64,
-      get_pointer<int64_t>(new_offsets), get_pointer<int32_t>(new_lengths),
+      new_lengths_size, local_batch_size, DataType::Int64, DataType::Int64,
+      get_pointer<int64_t>(new_offsets), get_pointer<int64_t>(new_lengths),
       stream);
 
   return std::make_tuple(new_lengths, new_offsets);
@@ -705,6 +709,7 @@ std::tuple<at::Tensor, at::Tensor> compute_dedup_lengths_cuda(
 } // namespace dyn_emb
 
 // Python bindings
+#ifdef DEMB_USE_PYBIND11
 void bind_unique_op(py::module &m) {
   m.def(
       "segmented_unique_cuda",
@@ -816,10 +821,11 @@ Args:
 
 Returns:
     Tuple of (new_lengths, new_offsets)
-    - new_lengths: Length for each bucket (int32)
+    - new_lengths: Length for each bucket (int64)
     - new_offsets: Offset for each bucket (int64)
 )doc",
       py::arg("unique_offsets"), py::arg("table_offsets_in_feature"),
       py::arg("num_tables"), py::arg("local_batch_size"),
       py::arg("new_lengths_size"));
 }
+#endif

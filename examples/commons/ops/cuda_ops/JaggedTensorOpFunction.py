@@ -1,6 +1,6 @@
 from typing import List
 
-import hstu_cuda_ops
+import hstu_cuda_ops  # noqa: F401 - load shared library to register torch.ops.hstu_cuda_ops
 import torch
 from commons.ops.length_to_offsets import length_to_complete_offsets
 
@@ -94,14 +94,14 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
             # merged_values is already correctly allocated as empty tensor when total_length == 0
         else:
             with torch.cuda.nvtx.range("calculate blocks workload", color="purple"):
-                hstu_cuda_ops.compute_block_workloads(
+                torch.ops.hstu_cuda_ops.compute_block_workloads(
                     offsets_list, seqlen_per_block, max_seqlen, block_workloads
                 )
             with torch.cuda.nvtx.range("workload offset cumsum", color="orange"):
                 workload_offset = length_to_complete_offsets(block_workloads)
 
             with torch.cuda.nvtx.range("Cpp part forward", color="purple"):
-                hstu_cuda_ops.concat_2D_jagged_tensors_forward(
+                torch.ops.hstu_cuda_ops.concat_2D_jagged_tensors_forward(
                     values_list,
                     offsets_list,
                     seqlen_per_block,
@@ -152,7 +152,7 @@ class _JaggedTensorOpFunction(torch.autograd.Function):
                 grad_input.zero_()
         else:
             with torch.cuda.nvtx.range("CUDA Backward", color="red"):
-                hstu_cuda_ops.concat_2D_jagged_tensors_backward(
+                torch.ops.hstu_cuda_ops.concat_2D_jagged_tensors_backward(
                     grad_output,
                     grad_lengths,
                     seqlen_per_block,

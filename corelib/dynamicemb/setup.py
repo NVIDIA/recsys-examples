@@ -55,7 +55,12 @@ def check_torchrec_version():
         raise RuntimeError("torchrec is not installed.")
 
 
-def find_source_files(directory, extension_pattern, exclude_dirs=[]):
+def find_source_files(
+    directory,
+    extension_pattern,
+    exclude_dirs=[],
+    exclude_files=[],
+):
     source_files = []
     pattern = re.compile(extension_pattern)
     for root, dirs, files in os.walk(directory):
@@ -63,6 +68,8 @@ def find_source_files(directory, extension_pattern, exclude_dirs=[]):
             continue
 
         for file in files:
+            if file in exclude_files:
+                continue
             if pattern.search(file):
                 full_path = os.path.join(root, file)
                 source_files.append(full_path)
@@ -102,14 +109,12 @@ def get_extensions():
         "-lcuda",  # CUDA drive API
     ]
     extra_compile_args = {
-        "cxx": ["-O3", "-fdiagnostics-color=always", "-w"],
+        "cxx": ["-O3", "-fdiagnostics-color=always", "-w", "-DDEMB_USE_PYBIND11"],
         "nvcc": [
             "-O3",
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "--use_fast_math",
-            "-gencode",
-            "arch=compute_70,code=sm_70",
             "-gencode",
             "arch=compute_75,code=sm_75",
             "-gencode",
@@ -121,12 +126,18 @@ def get_extensions():
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-DDEMB_USE_PYBIND11",
         ],
     }
 
     cuda_sources = find_source_files(
         os.path.join(root_path, "src"),
         r".*\.cu$|.*\.cpp$|.*\.c$|.*\.cxx$",
+        exclude_files=[
+            "lookup_torch_binding.cu",
+            "get_table_range_torch_binding.cu",
+            "expand_table_ids_torch_binding.cu",
+        ],
     )
 
     include_dirs = [

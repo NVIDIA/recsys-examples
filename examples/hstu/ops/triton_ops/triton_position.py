@@ -121,7 +121,7 @@ def _add_position_embeddings_kernel(
     out_ptrs = Out + offs_n[:, None] * stride_on + offs_d[None, :]
     dense_ptrs = Dense + clamped_offs_n[:, None] * stride_dk + offs_d[None, :]
     for _d in range(0, D, BLOCK_D):
-        mask = (offs_n[:, None] < seq_len) and offs_d[None, :] < D
+        mask = (offs_n[:, None] < seq_len) & (offs_d[None, :] < D)
         jg = tl.load(Jagged + jagged_ptr_offsets, mask=mask)
         if SCALE_JAGGED:
             jg = jg * scale
@@ -232,7 +232,7 @@ class _AddPositionEmbeddingsFunction(torch.autograd.Function):
             triton.cdiv(max_seq_len, meta["BLOCK_N"]),
         )
         BLOCK_D = triton.next_power_of_2(D) if D < 64 else 64
-        _add_position_embeddings_kernel[grid](
+        torch.library.wrap_triton(_add_position_embeddings_kernel)[grid](
             Jagged=jagged,
             seq_offsets=jagged_offsets,
             high_inds=high_inds,
@@ -389,7 +389,7 @@ def _add_timestamp_position_embeddings_kernel(
     Out += seq_start.to(tl.int64) * stride_on
     out_offsets = Out + offs_n[:, None] * stride_on + offs_d[None, :]
     for _d in range(0, D, BLOCK_D):
-        mask = (offs_n[:, None] < seq_len) and offs_d[None, :] < D
+        mask = (offs_n[:, None] < seq_len) & (offs_d[None, :] < D)
         seq_emb = tl.load(SeqEmb + seq_emb_offsets, mask=mask)
         pos_emb = tl.load(PosEmb + pos_emb_offsets, mask=mask)
         ts_emb = tl.load(TsEmb + ts_emb_offsets, mask=mask)

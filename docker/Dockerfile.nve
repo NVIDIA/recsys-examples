@@ -10,9 +10,6 @@ RUN apt-get update && apt-get install libssl-dev -y
 
 RUN cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX
 
-RUN mkdir build_dir && cd build_dir && \
-    cmake -DDISABLE_TESTS_AND_SAMPLES=1 .. && \
-    make -j && cd - && \
-    CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install .
+RUN PYNVE_WITH_TORCH_BINDINGS=1 PYNVE_DISABLE_AVX512=1 CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install .
 
 WORKDIR /workspace/recsys-examples

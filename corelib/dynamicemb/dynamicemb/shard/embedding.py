@@ -199,13 +199,13 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 if num_elements == 0:
                     dedup_features = KeyedJaggedTensor(
                         keys=input_feature.keys(),
-                        lengths=input_feature.lengths(),
-                        offsets=input_feature.offsets(),
+                        lengths=input_feature.lengths().to(torch.int64),
+                        offsets=offsets,
                         values=indices,
                     )
                     ctx.input_features.append(input_feature)
                     ctx.reverse_indices.append(
-                        torch.empty(0, dtype=torch.uint64, device=self._device)
+                        torch.empty(0, dtype=torch.int64, device=self._device)
                     )
                     features_by_shards.append(dedup_features)
                     continue

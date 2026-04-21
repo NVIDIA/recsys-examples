@@ -1,9 +1,10 @@
 import os
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
+import torch.cuda.nvtx as nvtx
 from commons.ops.collective_ops import gather_along_first_dim
 from commons.perf_model.partitioner import karmarkar_karp
 from commons.sequence_batch.batch import BaseBatch
@@ -81,6 +82,11 @@ def _sort_partitions_padding_last(
 def _strip_dense_padding(batch: BaseBatch, actual_bs: int) -> BaseBatch:
     """Remove trailing padding rows from dense tensors, keep KJTs intact.
 
+    Under the unified dense-padding convention, every dense tensor has
+    ``batch.batch_size`` in dim-0 (stored flat as ``batch_size * eps``
+    elements).  This function reshapes each dense tensor to
+    ``[batch_size, eps]``, slices ``[:actual_bs]``, and flattens back.
+
     Relies on ``_sort_partitions_padding_last`` having placed real samples
     before padding samples so that a simple ``[:actual_bs]`` slice suffices.
 
@@ -90,7 +96,7 @@ def _strip_dense_padding(batch: BaseBatch, actual_bs: int) -> BaseBatch:
 
     Returns:
         A new ``BaseBatch`` where each dense tensor has ``actual_bs`` rows
-        and KJT fields are unchanged.
+        (flat: ``actual_bs * eps`` elements) and KJT fields are unchanged.
     """
     full_bs = batch.batch_size
 
@@ -137,8 +143,9 @@ def _log_load_balance(
 
 
 class BaseTaskBalancedBatchShuffler:
+    _batch_counter: int = 0
+
     def __init__(self) -> None:
-        self._batch_counter: int = 0
         # Single-worker thread pool used exclusively for the CPU-only
         # Karmarkar-Karp partitioning algorithm so that it can overlap with
         # GPU forward / backward on the main thread.
@@ -164,20 +171,11 @@ class BaseTaskBalancedBatchShuffler:
     def get_workloads(self, batch: BaseBatch, *args, **kwargs) -> Any:
         raise NotImplementedError
 
-    def _should_print_load_balance(self, idx: Optional[int] = None) -> bool:
-        """Check if load balance info should be printed for the given batch.
-
-        Args:
-            idx: Batch index to check. Defaults to ``self._batch_counter``
-                 (appropriate for the synchronous path). The async path should
-                 pass the handle value explicitly to avoid off-by-one errors
-                 caused by ``_batch_counter`` being incremented eagerly in
-                 ``start_shuffle_async``.
-        """
+    def _should_print_load_balance(self) -> bool:
+        """Check if load balance info should be printed for the current batch."""
         if not _PRINT_LOAD_BALANCE:
             return False
-        if idx is None:
-            idx = self._batch_counter
+        idx = self._batch_counter
         if idx < _PRINT_LOAD_BALANCE_START:
             return False
         if _PRINT_LOAD_BALANCE_STOP >= 0 and idx >= _PRINT_LOAD_BALANCE_STOP:
@@ -317,7 +315,9 @@ class BaseTaskBalancedBatchShuffler:
         )
 
         state = self._kk_states[handle]
+        nvtx.range_push("kk_future_wait")
         partitions_list: List[List[int]] = state["future"].result()
+        nvtx.range_pop()
         meta = state["meta"]
         # Clean up state after use
         del self._kk_states[handle]
@@ -338,7 +338,7 @@ class BaseTaskBalancedBatchShuffler:
             )
 
         # Optional logging (rank 0 only)
-        if self._should_print_load_balance(idx=int(handle)):
+        if self._should_print_load_balance():
             _log_load_balance(
                 int(handle),
                 meta["allgather_workloads_cpu"],
@@ -599,9 +599,6 @@ class BaseTaskBalancedBatchShuffler:
                 rank,
                 batch.batch_size,
             )
-            # ``indices_this_rank`` (including padding) is passed as
-            # ``recv_ids``; the all2all exchange requires all
-            # ``local_batch_size`` entries to maintain symmetric counts.
             new_batch = self.shuffle_batch_by_global_indices_all2all(
                 batch,
                 indices_this_rank,
@@ -609,17 +606,10 @@ class BaseTaskBalancedBatchShuffler:
                 dst_rank=dst_rank,
                 recv_counts=recv_counts,
             )
-            # See comment in ``finish_shuffle`` — all2all output is in
-            # ascending global-index order, but ``indices_this_rank`` is
-            # real-first; reorder to match when padding exists.
             if has_padding and actual_bs < indices_this_rank.numel():
                 perm = indices_this_rank.sort().indices.argsort()
                 new_batch = new_batch.index_select(perm)
         else:
-            # ``indices_this_rank`` (including padding) is passed as
-            # ``recv_ids``; the allgather path selects all
-            # ``local_batch_size`` samples so that KJT lengths remain
-            # padded.  Dense padding is stripped below.
             new_batch = self.shuffle_batch_by_global_indices_allgather(
                 batch,
                 indices_this_rank,

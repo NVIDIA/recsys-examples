@@ -3,7 +3,6 @@ from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from commons.sequence_batch.batch import BaseBatch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -430,29 +429,9 @@ def pad_and_all2all_batch(
     local_batch_size = batch.batch_size
 
     if world_size == 1:
-        if batch.actual_batch_size >= local_batch_size:
-            return batch
-
-        # Still need to pad dense tensors for incomplete batches so that
-        # downstream reshape(batch_size, -1) is valid — same as allgather path.
-        def _pad_dense(
-            tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor],
-        ) -> Union[torch.Tensor, KeyedJaggedTensor]:
-            if isinstance(tensor_or_kjt, KeyedJaggedTensor):
-                return tensor_or_kjt
-            elif isinstance(tensor_or_kjt, torch.Tensor):
-                t = tensor_or_kjt
-                pad_size = (
-                    local_batch_size * (t.numel() // batch.actual_batch_size)
-                    - t.numel()
-                )
-                return F.pad(t, (0, pad_size)) if pad_size > 0 else t
-            else:
-                raise ValueError(f"Unsupported type: {type(tensor_or_kjt)}")
-
-        new_batch = batch._apply_to_tensors_or_kjt(_pad_dense, inplace=False)
-        new_batch.actual_batch_size = recv_ids.numel()
-        return new_batch
+        # Under the unified convention, dense tensors already have
+        # dim-0 == batch_size, so no padding is needed.
+        return batch
 
     # ---- Phase 1: KJT fields — fused all-to-all via _all2all_kjt_list ----
     kjt_field_names: List[str] = []
@@ -472,27 +451,16 @@ def pad_and_all2all_batch(
     )
 
     # ---- Phase 2: Dense tensor fields — all-to-all via _all2all_dense_tensor ----
-    # When actual_batch_size < batch_size, dense tensors have fewer rows
-    # than local_batch_size.  Pad them to local_batch_size before sending
-    # so that _all2all_dense_tensor's reshape is valid and padding samples
-    # (assigned by KK) carry zero values.
-    pad_dense = batch.actual_batch_size < local_batch_size
-
+    # Under the unified convention, dense tensors already have dim-0 ==
+    # batch_size (== local_batch_size), so no padding is needed.
     def all2all_field(
         tensor_or_kjt: Union[torch.Tensor, KeyedJaggedTensor],
     ) -> Union[torch.Tensor, KeyedJaggedTensor]:
         if isinstance(tensor_or_kjt, KeyedJaggedTensor):
             return tensor_or_kjt  # already handled in Phase 1
         elif isinstance(tensor_or_kjt, torch.Tensor):
-            t = tensor_or_kjt
-            if pad_dense:
-                pad_size = (
-                    local_batch_size * (t.numel() // batch.actual_batch_size)
-                    - t.numel()
-                )
-                t = F.pad(t, (0, pad_size))
             return _all2all_dense_tensor(
-                t,
+                tensor_or_kjt,
                 dst_rank,
                 recv_counts,
                 local_batch_size,

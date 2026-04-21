@@ -156,13 +156,19 @@ class RandomDistribution:
         elif self.dist_type == DistType.ZIPF:
             alpha = self.alpha if self.alpha is not None else 1.5
             assert alpha > 1.0, f"zipf requires alpha > 1.0, got {alpha}"
-            # numpy zipf generates integers >= 1, shift by (lo - 1) so minimum is lo
-            raw = np.random.zipf(alpha, size=size)
-            samples = torch.from_numpy(raw).long() + (lo - 1)
-            samples = samples.clamp(min=lo)
-            if hi is not None:
-                samples = samples.clamp(max=hi)
-            return samples.to(device)
+            max_val = hi if hi is not None else torch.iinfo(torch.long).max
+            try:
+                from dynamicemb.benchmark.dataset_generator import zipf as gpu_zipf
+
+                samples = gpu_zipf(lo, max_val, alpha, size, device)
+            except (ImportError, Exception):
+                raw = np.random.zipf(alpha, size=size)
+                samples = torch.from_numpy(raw).long() + (lo - 1)
+                samples = samples.clamp(min=lo)
+                if hi is not None:
+                    samples = samples.clamp(max=hi)
+                samples = samples.to(device)
+            return samples
 
         else:
             raise ValueError(f"Unknown distribution type: {self.dist_type}")
@@ -244,8 +250,19 @@ class HSTUBatch(BaseBatch):
             self.action_feature_name, str
         ), "action_feature_name must be None or a string"
         assert isinstance(
-            self.max_num_candidates, int
+            self.max_num_candidates, (int, torch.export.dynamic_shapes._IntWrapper)
         ), "max_num_candidates must be an int"
+
+    def num_loss_tokens(self) -> torch.Tensor:
+        """Per-rank loss token count (pre-TP, as a scalar tensor).
+
+        Ranking: number of label values.
+        Retrieval (next-token prediction): sum of max(seqlen - 1, 0) per sample.
+        """
+        if self.labels is not None:
+            return torch.tensor(self.labels.values().numel(), dtype=torch.float)
+        item_lengths = self.features[self.item_feature_name].lengths()
+        return (item_lengths - 1).clamp(min=0).sum().float()
 
     # to(), pin_memory(), record_stream() are inherited from BaseBatch
 

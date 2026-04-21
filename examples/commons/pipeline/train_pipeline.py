@@ -23,6 +23,7 @@
 
 import abc
 import logging
+import os
 from collections import deque
 from typing import (
     Any,
@@ -71,6 +72,10 @@ from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+from commons.utils.logger import log_mem
+from commons.utils.watchdog import get_cuda_mem_watchdog
+
 # This is required to support older torch package export for older models
 try:
     pass
@@ -186,6 +191,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
             custom_model_fwd if custom_model_fwd else model
         )
+        self._assert_nan_loss = os.environ.get("ASSERT_LOSS_HAS_NAN", "0") == "1"
 
         # DEPRECATED FIELDS
         self._batch_i: Optional[In] = None
@@ -758,11 +764,15 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
         self._set_module_context(self.contexts[0])
 
+        global_tokens = None
         if self._model.training:
             with nvtx.annotate("## zero_grad ##"):
                 if hasattr(self._model.module, "zero_grad_buffer"):
                     self._model.module.zero_grad_buffer()
                 self._optimizer.zero_grad()
+            with nvtx.annotate("## global_tokens ##"):
+                global_tokens = self.batches[0].num_loss_tokens().to(self._device)
+                torch.distributed.all_reduce(global_tokens)
 
         # wait for batches[0] being available on device, this should always be completed since
         # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
@@ -829,30 +839,24 @@ class JaggedMegatronTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             )
 
         with nvtx.annotate("## loss postprocess ##"):
-            collective_assert(not torch.isnan(losses).any(), "loss has nan value")
-            local_tokens = torch.tensor(losses.size(0), device=self._device).float()
-            local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
-            reporting_loss = local_loss.clone().detach()
-            torch.distributed.all_reduce(
-                reporting_loss, group=parallel_state.get_data_parallel_group()
-            )
+            if self._assert_nan_loss:
+                collective_assert(not torch.isnan(losses).any(), "loss has nan value")
+            local_loss_sum = torch.sum(losses)
 
         if self._model.training:
-            # backward
+            dp_size = parallel_state.get_data_parallel_world_size()
             with nvtx.annotate("## backward ##"):
-                dp_size = parallel_state.get_data_parallel_world_size()
-                # in case of uneven jagged size across dp ranks.
-                local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
-                local_loss_average.backward()
+                (local_loss_sum * dp_size / global_tokens).backward()
 
             with nvtx.annotate("## finalize_model_grads ##"):
                 if isinstance(self._model.module, DistributedDataParallel):
                     finalize_model_grads([self._model.module], None)
-            # update
             with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
+            log_mem("after optimizer")
+        get_cuda_mem_watchdog().step()
         self.dequeue_batch()
-        return reporting_loss, output
+        return local_loss_sum.detach(), global_tokens, output
 
 
 class JaggedMegatronPrefetchTrainPipelineSparseDist(
@@ -909,11 +913,15 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
         """
         self._fill_pipeline(dataloader_iter)
 
+        global_tokens = None
         if self._model.training:
             with nvtx.annotate("## zero_grad ##"):
                 if hasattr(self._model.module, "zero_grad_buffer"):
                     self._model.module.zero_grad_buffer()
                 self._optimizer.zero_grad()
+            with nvtx.annotate("## global_tokens ##"):
+                global_tokens = self._batch_i.num_loss_tokens().to(self._device)
+                torch.distributed.all_reduce(global_tokens)
 
         with nvtx.annotate("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
@@ -940,8 +948,6 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
                         raw_batch, parallel_state.get_data_parallel_group()
                     )
 
-        # forward
-        reporting_loss = None
         with nvtx.annotate("## forward ##"):
             losses, output = self._model_fwd(self._batch_i)
 
@@ -980,46 +986,33 @@ class JaggedMegatronPrefetchTrainPipelineSparseDist(
             )
 
         with nvtx.annotate("## loss postprocess ##"):
-            collective_assert(not torch.isnan(losses).any(), "loss has nan value")
-            local_tokens = torch.tensor(losses.size(0), device=self._device).float()
-            local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
-            reporting_loss = local_loss.clone().detach()
-            torch.distributed.all_reduce(
-                reporting_loss, group=parallel_state.get_data_parallel_group()
-            )
+            if self._assert_nan_loss:
+                collective_assert(not torch.isnan(losses).any(), "loss has nan value")
+            local_loss_sum = torch.sum(losses)
+
         with nvtx.annotate("## prefetch ##"):
             self._prefetch(self._batch_ip1)
         if self._model.training:
-            # prefetch => Load to cache & might invalidate cache & flush to host
-            # bwd => read & write to cache/host
-            # the cache might be in a dangling state that a key is either not in cache or not in host.
-            # thererfore we enforce a sync: prefetch should be finished to avoid race condition.
             torch.cuda.current_stream().wait_stream(self._prefetch_stream)
-            # backward
+            dp_size = parallel_state.get_data_parallel_world_size()
             with nvtx.annotate("## backward ##"):
-                dp_size = parallel_state.get_data_parallel_world_size()
-                # in case of uneven jagged size across dp ranks.
-                # this cannot solve the issue completely because of the allreduce avg across DP ranks. To solve it completely, we need to perform sum reduce.
-                # see https://github.com/NVIDIA/Megatron-LM/blob/v0.12.0rc3/megatron/core/distributed/distributed_data_parallel.py#L237-L240
-                local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
-                local_loss_average.backward()
+                (local_loss_sum * dp_size / global_tokens).backward()
 
-                # self._model is a DistributedModelParallel
-                # self._model.module could be is a DistributedDataParallel
                 if isinstance(self._model.module, DistributedDataParallel):
                     finalize_model_grads([self._model.module], None)
 
-            # update
             with nvtx.annotate("## optimizer ##"):
                 self._optimizer.step()
+            log_mem("after optimizer")
 
+        get_cuda_mem_watchdog().step()
         with nvtx.annotate("## input_dist ##"):
             self._start_sparse_data_dist(self._batch_ip2)
 
         self._batch_i = self._batch_ip1
         self._batch_ip1 = self._batch_ip2
 
-        return reporting_loss, output
+        return local_loss_sum.detach(), global_tokens, output
 
 
 class JaggedMegatronTrainNonePipeline:
@@ -1034,6 +1027,7 @@ class JaggedMegatronTrainNonePipeline:
         self._optimizer = optimizer
         self._device = device
         self._batch_shuffler = batch_shuffler
+        self._assert_nan_loss = os.environ.get("ASSERT_LOSS_HAS_NAN", "0") == "1"
 
     def _copy_batch_to_gpu_and_shuffle(
         self, dataloader_iter: Iterator[In]
@@ -1046,7 +1040,7 @@ class JaggedMegatronTrainNonePipeline:
             return batch
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
-        dp_size = parallel_state.get_data_parallel_world_size() * 1.0
+        global_tokens = None
         with nvtx.annotate("## zero_grad ##"):
             if hasattr(self._model.module, "zero_grad_buffer"):
                 self._model.module.zero_grad_buffer()
@@ -1054,24 +1048,23 @@ class JaggedMegatronTrainNonePipeline:
 
         # H2D and shuffle
         batch = self._copy_batch_to_gpu_and_shuffle(dataloader_iter)
+        if self._model.training:
+            with nvtx.annotate("## global_tokens ##"):
+                global_tokens = batch.num_loss_tokens().to(self._device)
+                torch.distributed.all_reduce(global_tokens)
+
         with nvtx.annotate("## forward ##"):
             losses, output = self._model(batch)
 
         with nvtx.annotate("## loss postprocess ##"):
-            collective_assert(not torch.isnan(losses).any(), "loss has nan value")
-            local_tokens = torch.tensor(
-                losses.size(0), device=torch.device("cuda", torch.cuda.current_device())
-            ).float()
-            local_loss = torch.cat([torch.sum(losses).view(1), local_tokens.view(1)])
-            reporting_loss = local_loss.clone().detach()
-            # [allreduced_sum_loss, allreduced_sum_tokens]
-            torch.distributed.all_reduce(
-                reporting_loss, group=parallel_state.get_data_parallel_group()
-            )
+            if self._assert_nan_loss:
+                collective_assert(not torch.isnan(losses).any(), "loss has nan value")
+            local_loss_sum = torch.sum(losses)
+
         if self._model.training:
+            dp_size = parallel_state.get_data_parallel_world_size()
             with nvtx.annotate("## backward ##"):
-                local_loss_average = local_loss[0] / reporting_loss[1] * dp_size
-                local_loss_average.backward()
+                (local_loss_sum * dp_size / global_tokens).backward()
 
             with nvtx.annotate("## finalize_model_grads ##"):
                 if isinstance(self._model.module, DistributedDataParallel):
@@ -1079,8 +1072,10 @@ class JaggedMegatronTrainNonePipeline:
 
             with nvtx.annotate("## optimizer step ##"):
                 self._optimizer.step()
+            log_mem("after optimizer")
 
-        return reporting_loss, output
+        get_cuda_mem_watchdog().step()
+        return local_loss_sum.detach(), global_tokens, output
 
 
 from commons.pipeline.train_pipeline_factory import TrainPipelineFactory

@@ -1,6 +1,5 @@
 #include <ATen/Functions.h>
 #include <torch/torch.h>
-#include <torch/extension.h>
 #include <vector>
 #include <cuda.h>
 #include <cuda_runtime.h>

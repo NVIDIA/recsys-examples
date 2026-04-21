@@ -8,7 +8,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_sequence_embedding.sh"
     "test/unit_tests/test_pooled_embedding.sh"
     "test/unit_tests/test_twin_module.sh"
-    "test/unit_tests/test_alignment.py"
+    "test/unit_tests/test_alignment.sh"
     "test/unit_tests/test_hybrid_storage_export.sh"
     "test/unit_tests/test_vmm_tensor.py"
 )

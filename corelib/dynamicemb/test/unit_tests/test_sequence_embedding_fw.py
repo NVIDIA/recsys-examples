@@ -295,13 +295,38 @@ def run(args):
 
     debugger = Debugger()
 
-    for i in range(args.num_iterations):
-        sparse_feature = generate_sparse_feature(
-            feature_num=args.num_embedding_table,
-            num_embeddings_list=args.num_embeddings_per_feature,
-            multi_hot_sizes=args.multi_hot_sizes,
-            local_batch_size=args.batch_size // world_size,
-        )
+    local_batch_size = args.batch_size // world_size
+
+    for i in range(args.num_iterations + 1):
+        if i < args.num_iterations:
+            sparse_feature = generate_sparse_feature(
+                feature_num=args.num_embedding_table,
+                num_embeddings_list=args.num_embeddings_per_feature,
+                multi_hot_sizes=args.multi_hot_sizes,
+                local_batch_size=local_batch_size,
+            )
+        else:
+            # Extra iteration: rank 0 empty indices; other ranks (if any) non-empty.
+            rank = dist.get_rank()
+            if rank == 0:
+                feature_batch = args.num_embedding_table * local_batch_size
+                sparse_feature = torchrec.KeyedJaggedTensor(
+                    keys=[
+                        feature_idx_to_name(feature_idx)
+                        for feature_idx in range(args.num_embedding_table)
+                    ],
+                    values=torch.tensor([], dtype=torch.int64, device=device),
+                    lengths=torch.zeros(
+                        feature_batch, dtype=torch.int64, device=device
+                    ),
+                )
+            else:
+                sparse_feature = generate_sparse_feature(
+                    feature_num=args.num_embedding_table,
+                    num_embeddings_list=args.num_embeddings_per_feature,
+                    multi_hot_sizes=args.multi_hot_sizes,
+                    local_batch_size=local_batch_size,
+                )
         ret = model(sparse_feature)  # => this is awaitable
 
         feature_names = []
