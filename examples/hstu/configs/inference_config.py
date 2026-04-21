@@ -116,6 +116,16 @@ class KVCacheConfig:
     num_offload_buffer_chunks: int = 8
     num_memcpy_workers: int = 4
     enable_nvcomp: bool = False
+    secondary_backend: str = "nop"
+    namespace_mode: str = "uid"
+    namespace_base: str = "recsys_hstu"
+
+    flexkv_mode: str = "direct"
+    secondary_wait_timeout_ms: int = 0
+    secondary_fail_policy: str = "fail_open"
+    offload_mode: str = "lazy"
+    flexkv_server_addr: str = ""
+    flexkv_server_port: int = 0
 
 
 def get_kvcache_config(
@@ -123,6 +133,15 @@ def get_kvcache_config(
     page_size: int,
     offload_chunksize: int,
     max_attention_window: Optional[int] = None,
+    secondary_backend: str = "nop",
+    namespace_mode: str = "uid",
+    namespace_base: str = "recsys_hstu",
+    flexkv_mode: str = "direct",
+    secondary_wait_timeout_ms: int = 0,
+    secondary_fail_policy: str = "fail_open",
+    offload_mode: str = "lazy",
+    flexkv_server_addr: str = "",
+    flexkv_server_port: int = 0,
 ) -> KVCacheConfig:
     """
     Create the HSTU KV cache configuration.
@@ -142,6 +161,15 @@ def get_kvcache_config(
         page_size=page_size,
         offload_chunksize=offload_chunksize,
         max_attention_window=max_attention_window,
+        secondary_backend=secondary_backend,
+        namespace_mode=namespace_mode,
+        namespace_base=namespace_base,
+        flexkv_mode=flexkv_mode,
+        secondary_wait_timeout_ms=secondary_wait_timeout_ms,
+        secondary_fail_policy=secondary_fail_policy,
+        offload_mode=offload_mode,
+        flexkv_server_addr=flexkv_server_addr,
+        flexkv_server_port=flexkv_server_port,
     )
 
 
