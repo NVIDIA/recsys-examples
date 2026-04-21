@@ -64,7 +64,10 @@ def _capture_hstu_layer_outputs(model):
             layer.forward_naive = original
 
 
-def _build_model_and_dataset():
+def _build_model_and_dataset(
+    secondary_backend: str = "nop",
+    flexkv_mode: str = "direct",
+):
     max_batch_size = 4
     max_history_length = 128
     max_num_candidates = 16
@@ -99,7 +102,8 @@ def _build_model_and_dataset():
         blocks_in_primary_pool=512,
         page_size=32,
         offload_chunksize=128,
-        secondary_backend="nop",
+        secondary_backend=secondary_backend,
+        flexkv_mode=flexkv_mode,
         namespace_mode="uid",
         namespace_base="recsys_hstu_test",
     )
@@ -208,5 +212,25 @@ def test_inference_forward_with_kvcache_layerwise_compare():
             rtol=1e-2,
             atol=1e-2,
         )
+    finally:
+        _shutdown_model_kvcache_threads(model)
+
+@pytest.mark.parametrize("secondary_backend,flexkv_mode", [
+    ("nop", "direct"),
+    ("flexkv", "direct"),
+])
+def test_inference_forward_with_kvcache_backend_smoke(secondary_backend, flexkv_mode):
+    model, dataset = _build_model_and_dataset(
+        secondary_backend=secondary_backend,
+        flexkv_mode=flexkv_mode,
+    )
+    try:
+        batch, user_ids, total_history_lengths = next(iter(dataset))
+        with torch.inference_mode():
+            logits = model.forward_with_kvcache(batch, user_ids, total_history_lengths)
+        assert torch.is_tensor(logits)
+        assert logits.is_cuda
+        assert logits.shape[-1] == 1
+        assert logits.numel() > 0
     finally:
         _shutdown_model_kvcache_threads(model)

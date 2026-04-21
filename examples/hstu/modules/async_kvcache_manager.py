@@ -281,6 +281,21 @@ class KVCacheManager:
         self.ongoing_offload_tasks: Dict[str, SecondaryTaskHandle] = {}
         self.request_to_task_handles: Dict[str, Dict[str, Optional[SecondaryTaskHandle]]] = {}
 
+    @staticmethod
+    def _build_secondary_manager_from_config(
+        secondary_backend: str,
+        flexkv_mode: str,
+        flexkv_server_addr: str,
+        flexkv_server_port: int,
+    ) -> SecondaryKVCacheManagerBase:
+        if secondary_backend == "flexkv":
+            return FlexKVSecondaryKVCacheManager(
+                mode=flexkv_mode,
+                server_addr=flexkv_server_addr,
+                server_port=flexkv_server_port,
+            )
+        return NopSecondaryKVCacheManager()
+
     def _build_namespace(self, uid: int) -> List[str]:
         """
         Phase 1 namespace helper.
@@ -379,6 +394,11 @@ class KVCacheManager:
         static_onload_handle: Optional[Any] = None,
     ) -> Tuple[KVIndexMeta, KVPrepareResult]:
         index_meta = self._build_index_meta_from_lookup(lookup_results)
+        secondary = lookup_results.secondary_lookup or {}
+        index_meta.secondary_hit_mask = secondary.get("hit_mask", None)
+        index_meta.restore_slot_mapping = secondary.get("restore_slot_mapping", None)
+        # TODO: append_slot_mapping 后续按真实 page_id/block_id 规则生成
+        index_meta.append_slot_mapping = secondary.get("append_slot_mapping", None)
         page_ids_gpu_buffer = (
             static_page_ids_gpu_buffer
             if static_page_ids_gpu_buffer is not None
@@ -431,6 +451,7 @@ class KVCacheManager:
             onload_fut=onload_fut,
         )
         return index_meta, prepare
+    
     def onboard_launch_kvcache(
         self,
         uid_or_uids,
@@ -444,6 +465,7 @@ class KVCacheManager:
         self.ongoing_onboard_tasks[rid] = task
         self.request_to_task_handles.setdefault(rid, {})["onboard"] = task
         return task
+    
     def onboard_try_wait_kvcache_or_fail(
         self,
         uid_or_uids,
@@ -663,6 +685,13 @@ class KVCacheManager:
             kvcache_config.max_queued_offload_tokens = (
                 4 * hstu_config.max_batch_size * hstu_config.max_seq_len
             )
+
+        secondary_mgr = cls._build_secondary_manager_from_config(
+            secondary_backend=getattr(kvcache_config, "secondary_backend", "nop"),
+            flexkv_mode=getattr(kvcache_config, "flexkv_mode", "direct"),
+            flexkv_server_addr=getattr(kvcache_config, "flexkv_server_addr", ""),
+            flexkv_server_port=getattr(kvcache_config, "flexkv_server_port", 0),
+        )
         return cls(
             hstu_config.num_layers,
             hstu_config.num_heads,
@@ -684,11 +713,237 @@ class KVCacheManager:
         kvcache_config.num_offload_buffer_chunks,
         kvcache_config.num_memcpy_workers,
         kvcache_config.enable_nvcomp,
-        None,
+        secondary_mgr,
         kvcache_config.namespace_mode,
         kvcache_config.namespace_base,
-            getattr(kvcache_config, "offload_mode", "lazy"),
-            getattr(kvcache_config, "secondary_wait_timeout_ms", 0),
-            getattr(kvcache_config, "secondary_fail_policy", "fail_open"),
+        getattr(kvcache_config, "offload_mode", "lazy"),
+        getattr(kvcache_config, "secondary_wait_timeout_ms", 0),
+        getattr(kvcache_config, "secondary_fail_policy", "fail_open"),
     )
+
+
+class FlexKVSecondaryKVCacheManager(SecondaryKVCacheManagerBase):
+    def __init__(self, mode: str = "direct", server_addr: str = "", server_port: int = 0):
+        self.mode = mode
+        self.server_addr = server_addr
+        self.server_port = server_port
+        self._tasks: Dict[str, Dict[str, Any]] = {}
+        self._adapter = FlexKVClientAdapter(mode, server_addr, server_port)
+
+    def _failed_wait_result(self, msg: str, error_code: str = "flexkv_error") -> SecondaryWaitResult:
+        return SecondaryWaitResult(
+            status=SecondaryTaskStatus.FAILED,
+            ready=False,
+            error_code=error_code,
+            message=msg,
+        )
+
+    def lookup_kvcache(self, index_meta: KVIndexMeta) -> Dict[str, Any]:
+        try:
+            match = self._adapter.get_match(index_meta)
+            return {
+                "backend": "flexkv",
+                "hit_mask": match.get("hit_mask"),
+                "restore_slot_mapping": match.get("restore_slot_mapping"),
+                "append_slot_mapping": match.get("append_slot_mapping"),
+            }
+        except Exception as e:
+            return {
+                "backend": "flexkv",
+                "error": str(e),
+                "hit_mask": None,
+                "restore_slot_mapping": None,
+                "append_slot_mapping": None,
+            }
+
+    def onboard_launch_kvcache(self, index_meta: KVIndexMeta, restore_slot_mapping: Optional[torch.Tensor]) -> SecondaryTaskHandle:
+        endpoint = (
+            f"{self.server_addr}:{self.server_port}"
+            if self.mode == "server_client"
+            else "local"
+        )
+        try:
+            raw_handle = self._adapter.launch("onboard", index_meta, restore_slot_mapping)
+            task_key = f"onboard:{index_meta.request_id}"
+            self._tasks[task_key] = {
+                "raw_handle": raw_handle,
+                "ready": False,
+                "error": None,
+                "kind": "onboard",
+                "mode": self.mode,
+                "endpoint": endpoint,
+            }
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                handle={
+                    "task_key": task_key,
+                    "raw_handle": raw_handle,
+                    "kind": "onboard",
+                    "mode": self.mode,
+                    "endpoint": endpoint,
+                },
+                status=SecondaryTaskStatus.LAUNCHED,
+            )
+        except Exception as e:
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                handle=None,
+                status=SecondaryTaskStatus.FAILED,
+                metadata={
+                    "error": str(e),
+                    "kind": "onboard",
+                    "mode": self.mode,
+                    "endpoint": endpoint,
+                },
+            )
+        
+    def onboard_wait_kvcache(self, task_handle: SecondaryTaskHandle) -> SecondaryWaitResult:
+        if task_handle is None or task_handle.handle is None:
+            return SecondaryWaitResult(status=SecondaryTaskStatus.SKIPPED, ready=True)
+        try:
+            task_key = task_handle.handle.get("task_key")
+            state = self._tasks.get(task_key, None) if task_key is not None else None
+            if state is not None and state.get("error"):
+                return SecondaryWaitResult(
+                    status=SecondaryTaskStatus.FAILED,
+                    ready=False,
+                    message=str(state["error"]),
+                )
+            raw = task_handle.handle.get("raw_handle")
+            if raw is None and state is not None:
+                raw = state.get("raw_handle")
+            if raw is None:
+                return self._failed_wait_result("onboard_wait missing raw_handle")
+            result = self._adapter.try_wait(raw)
+            if result.get("ready", False):
+                if state is not None:
+                    state["ready"] = True
+                return SecondaryWaitResult(status=SecondaryTaskStatus.READY, ready=True)
+            return SecondaryWaitResult(status=SecondaryTaskStatus.TIMEOUT, ready=False)
+        except Exception as e:
+            return self._failed_wait_result(f"onboard_wait exception: {e}")
+    
+    def offload_launch_kvcache(
+        self, index_meta: KVIndexMeta, append_slot_mapping: Optional[torch.Tensor]
+    ) -> SecondaryTaskHandle:
+        endpoint = (
+            f"{self.server_addr}:{self.server_port}"
+            if self.mode == "server_client"
+            else "local"
+        )
+       
+        if self.mode == "server_client" and (not self.server_addr or self.server_port <= 0):
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                handle=None,
+                status=SecondaryTaskStatus.FAILED,
+                metadata={
+                    "error": "missing_server_endpoint",
+                    "kind": "offload",
+                    "mode": self.mode,
+                    "endpoint": endpoint,
+                },
+            )
+        try:
+            raw_handle = self._adapter.launch("offload", index_meta, append_slot_mapping)
+            task_key = f"offload:{index_meta.request_id}"
+            self._tasks[task_key] = {
+                "raw_handle": raw_handle,
+                "ready": False,
+                "error": None,
+                "kind": "offload",
+                "mode": self.mode,
+                "endpoint": endpoint,
+                "request_id": index_meta.request_id,
+            }
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                handle={
+                    "task_key": task_key,
+                    "raw_handle": raw_handle,
+                    "kind": "offload",
+                    "mode": self.mode,
+                    "endpoint": endpoint,
+                },
+                status=SecondaryTaskStatus.LAUNCHED,
+                metadata={"request_id": index_meta.request_id},
+            )
+        except Exception as e:
+            return SecondaryTaskHandle(
+                backend="flexkv",
+                handle=None,
+                status=SecondaryTaskStatus.FAILED,
+                metadata={
+                    "error": str(e),
+                    "kind": "offload",
+                    "mode": self.mode,
+                    "endpoint": endpoint,
+                },
+            )
+    def offload_wait_kvcache(self, task_handle: SecondaryTaskHandle) -> SecondaryWaitResult:
+        if task_handle is None or task_handle.handle is None:
+            return SecondaryWaitResult(status=SecondaryTaskStatus.SKIPPED, ready=True)
+        try:
+            task_key = task_handle.handle.get("task_key")
+            state = self._tasks.get(task_key, None) if task_key is not None else None
+          
+            if state is not None and state.get("error"):
+                return SecondaryWaitResult(
+                    status=SecondaryTaskStatus.FAILED,
+                    ready=False,
+                    message=str(state["error"]),
+                )
+            raw_handle = task_handle.handle.get("raw_handle")
+            if raw_handle is None and state is not None:
+                raw_handle = state.get("raw_handle")
+            if raw_handle is None:
+                return self._failed_wait_result("offload_wait missing raw_handle")
+           
+            result = self._adapter.try_wait(raw_handle)
+            if result.get("ready", False):
+                if state is not None:
+                    state["ready"] = True
+                return SecondaryWaitResult(status=SecondaryTaskStatus.READY, ready=True)
+            return SecondaryWaitResult(status=SecondaryTaskStatus.TIMEOUT, ready=False)
+        except Exception as e:
+            return self._failed_wait_result(f"offload_wait exception: {e}")
+    
+    def cancel_task(self, task_handle: SecondaryTaskHandle) -> None:
+        if task_handle is None or task_handle.handle is None:
+            return
+        task_key = task_handle.handle.get("task_key")
+        if task_key in self._tasks:
+            del self._tasks[task_key]
+
+    
+
+class FlexKVClientAdapter:
+    def __init__(self, mode: str, server_addr: str = "", server_port: int = 0):
+        self.mode = mode
+        self.server_addr = server_addr
+        self.server_port = server_port
+        self.client = self._build_client()
+
+    def _build_client(self):
+        # TODO: 替换为真实 FlexKV SDK 初始化
+        # direct: local engine/client
+        # server_client: remote client(addr, port)
+        return None
+
+    def get_match(self, index_meta: KVIndexMeta) -> Dict[str, Any]:
+        # TODO: 对接真实 get_match
+        return {"hit_mask": None, "restore_slot_mapping": None, "append_slot_mapping": None}
+
+    def launch(self, op: str, index_meta: KVIndexMeta, slot_mapping: Optional[torch.Tensor]) -> Any:
+        # TODO: 对接真实 launch，返回原生 handle
+        return {"op": op, "request_id": index_meta.request_id}
+
+    def wait(self, handle: Any, timeout_ms: int = 0) -> Dict[str, Any]:
+        # TODO: 对接真实 wait
+        return {"ready": True}
+
+    def try_wait(self, handle: Any, timeout_ms: int = 0) -> Dict[str, Any]:
+        # TODO: 对接真实 try_wait
+        return {"ready": True}
+
 AsyncHSTUKVCacheManager = KVCacheManager
