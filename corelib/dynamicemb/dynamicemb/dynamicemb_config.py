@@ -40,6 +40,7 @@ from torchrec.types import DataType
 DEFAULT_INDEX_TYPE = torch.int64
 DYNAMICEMB_CSTM_SCORE_CHECK = "DYNAMICEMB_CSTM_SCORE_CHECK"
 BATCH_SIZE_PER_DUMP = 65536
+SUPPORTED_DIST_TYPES = ("continuous", "roundrobin", "hash_roundrobin")
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
 DEBUG_EMB_INITIALIZER_MOD = 100_000
 # Default hashtable bucket width in rows; keep in sync with
@@ -250,6 +251,10 @@ class DynamicEmbTableOptions:
         If not provided, will using DynamicEmbeddingTable as the Storage.
     index_type : Optional[torch.dtype], optional
         Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
+    dist_type : str
+        Input distribution policy for row-wise sharding. Supported values are
+        ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
+        ``roundrobin``.
     admit_strategy : Optional[AdmissionStrategy], optional
         Admission strategy for controlling which keys are allowed to enter the embedding table.
         If provided, only keys that meet the strategy's criteria will be inserted into the table.
@@ -293,6 +298,7 @@ class DynamicEmbTableOptions:
     global_hbm_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
+    dist_type: str = "roundrobin"
     admit_strategy: Optional[AdmissionStrategy] = None
     admission_counter: Optional[Any] = None
 
@@ -300,6 +306,11 @@ class DynamicEmbTableOptions:
         assert (
             self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
         ), "eval_initializer_args must be constant initialization"
+        if self.dist_type not in SUPPORTED_DIST_TYPES:
+            raise ValueError(
+                f"Unsupported dist_type {self.dist_type!r}. "
+                f"Supported values: {SUPPORTED_DIST_TYPES}."
+            )
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
@@ -319,6 +330,7 @@ class DynamicEmbTableOptions:
         grouped_key["caching"] = self.caching
         grouped_key["external_storage"] = self.external_storage
         grouped_key["index_type"] = self.index_type
+        grouped_key["dist_type"] = self.dist_type
         grouped_key["score_strategy"] = self.score_strategy
         grouped_key["admit_strategy"] = self.admit_strategy
         return grouped_key

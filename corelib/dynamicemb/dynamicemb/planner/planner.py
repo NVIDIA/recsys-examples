@@ -89,7 +89,7 @@ class DynamicEmbParameterSharding(ParameterSharding):
 
     # introduced fields by DynamicEmbParameterSharding
     customized_compute_kernel: Optional[str] = DynamicEmbKernel
-    dist_type: str = "continuous"
+    dist_type: str = "roundrobin"
     dynamicemb_options: Optional[DynamicEmbTableOptions] = field(
         default_factory=DynamicEmbTableOptions
     )
@@ -343,7 +343,7 @@ class DynamicEmbeddingShardingPlanner:
                 ranks=[i for i in range(world_size)],
                 compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
                 customized_compute_kernel=DynamicEmbKernel,
-                dist_type="roundrobin",
+                dist_type=opts.dist_type,
                 dynamicemb_options=opts,
             )
             self._dyn_emb_plan[dyn_emb_name] = tmp_para_sharding
