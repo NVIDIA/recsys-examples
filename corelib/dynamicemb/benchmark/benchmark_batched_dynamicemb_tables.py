@@ -307,6 +307,8 @@ def is_hybrid_storage(args):
         return False
     if abs(args.gpu_ratio - 1.0) <= 1e-3:
         return False
+    if abs(args.gpu_ratio - 0.0) <= 1e-3:
+        return False
     return True
 
 def create_dynamic_embedding_tables(args, device):
@@ -731,56 +733,7 @@ def main():
         var.fill_tables()
 
     # placeholder = occupy_gpu_memory()
-    torch.cuda.profiler.start()
-    for i in range(0, args.num_iterations, report_interval):
-        for j in range(report_interval):
-            (
-                forward_latency,
-                backward_latency,
-                iteration_latency,
-            ) = benchmark_one_iteration(var, sparse_features[i + j])
-            cache_info = ""
-            if args.caching:
-                cache_metrics = var.cache.cache_metrics
-                unique_num = cache_metrics[0].item()
-                cache_hit = cache_metrics[1].item()
-                cache_miss = unique_num - cache_hit
-                hit_rate = 1.0 * cache_hit / unique_num
-                cache_info = f"cache_miss:{cache_miss}, unique: {unique_num}, hit_rate: {hit_rate:.8f},"
-            print(
-                f"dynamicemb: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-                f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
-            )
-
-        for j in range(report_interval):
-            (
-                forward_latency,
-                backward_latency,
-                iteration_latency,
-            ) = benchmark_one_iteration(torchrec_emb, sparse_features[i + j])
-            cache_info = ""
-            if args.caching:
-                cache_miss_counter_ = torchrec_emb.get_cache_miss_counter().clone()
-                # table_wise_cache_miss_ = torchrec_emb.get_table_wise_cache_miss().clone()
-                if cache_miss_counter_torchrec is not None:
-                    cache_miss_counter_incerment = (
-                        cache_miss_counter_ - cache_miss_counter_torchrec
-                    )
-                else:
-                    cache_miss_counter_incerment = torch.tensor([0, 0])
-                # if table_wise_cache_miss is not None:
-                #     table_wise_cache_miss_increment = table_wise_cache_miss_ - table_wise_cache_miss
-                # else:
-                #     table_wise_cache_miss_increment = torch.tensor([0])
-                cache_info = f"cache miss: {cache_miss_counter_incerment[1].item()}"
-                cache_miss_counter_torchrec = cache_miss_counter_
-
-            print(
-                f"torchrec: Iteration {i + j}, forward: {forward_latency:.3f} ms,   backward: {backward_latency:.3f} ms,  "
-                f"total: {iteration_latency:.3f} ms, cache info: {cache_info}"
-            )
-
-    print("Benchmark again when cache is not flushed")
+    # torch.cuda.profiler.start()
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):
             (
@@ -842,7 +795,7 @@ def main():
         #     torchrec_emb,
         # )
 
-    # torch.cuda.profiler.start()
+    torch.cuda.profiler.start()
     dynamicemb_res = benchmark_train_eval(var, sparse_features, args)
     torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, args)
     torch.cuda.profiler.stop()
