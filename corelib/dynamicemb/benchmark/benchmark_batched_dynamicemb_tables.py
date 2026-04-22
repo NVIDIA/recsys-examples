@@ -302,6 +302,12 @@ def generate_sequence_sparse_feature(args, device):
             f"Not support distribution {args.feature_distribution} of sparse features."
         )
 
+def is_hybrid_storage(args):
+    if args.caching:
+        return False
+    if abs(args.gpu_ratio - 1.0) <= 1e-3:
+        return False
+    return True
 
 def create_dynamic_embedding_tables(args, device):
     table_options = []
@@ -340,48 +346,49 @@ def create_dynamic_embedding_tables(args, device):
         beta2=args.beta2,
     )
 
-    # storage = var.tables
-    # max_emb_dim = storage.max_embedding_dim()
-    # max_value_dim = storage.max_value_dim()
+    if is_hybrid_storage(args):
+        storage = var.tables
+        max_emb_dim = storage.max_embedding_dim()
+        max_value_dim = storage.max_value_dim()
 
-    # for table_id in range(table_num):
-    #     emb_dim = storage.embedding_dim(table_id)
-    #     optstate_dim = storage.value_dim(table_id) - emb_dim
-    #     initial_accumulator = storage.init_optimizer_state()
+        for table_id in range(table_num):
+            emb_dim = storage.embedding_dim(table_id)
+            optstate_dim = storage.value_dim(table_id) - emb_dim
+            initial_accumulator = storage.init_optimizer_state()
 
-    #     num_embeddings = args.num_embeddings_per_feature[table_id]
-    #     fill_batch = 1024 * 1024
-    #     i = 0
-    #     while i < num_embeddings:
-    #         start = i
-    #         end = min(i + fill_batch, num_embeddings)
-    #         i += fill_batch
-    #         unique_indices = torch.arange(start, end, device=device, dtype=torch.int64)
-    #         embedding_values = torch.rand(
-    #             unique_indices.numel(),
-    #             emb_dim,
-    #             device=device,
-    #             dtype=torch.float32,
-    #         )
+            num_embeddings = args.num_embeddings_per_feature[table_id]
+            fill_batch = 1024 * 1024
+            i = 0
+            while i < num_embeddings:
+                start = i
+                end = min(i + fill_batch, num_embeddings)
+                i += fill_batch
+                unique_indices = torch.arange(start, end, device=device, dtype=torch.int64)
+                embedding_values = torch.rand(
+                    unique_indices.numel(),
+                    emb_dim,
+                    device=device,
+                    dtype=torch.float32,
+                )
 
-    #         n = unique_indices.shape[0]
-    #         padded_values = torch.zeros(
-    #             n, max_value_dim, device=device, dtype=torch.float32
-    #         )
-    #         padded_values[:, :emb_dim] = embedding_values
-    #         if optstate_dim > 0:
-    #             padded_values[:, max_emb_dim : max_emb_dim + optstate_dim] = (
-    #                 torch.rand(n, optstate_dim, device=device, dtype=torch.float32)
-    #                 * initial_accumulator
-    #             )
+                n = unique_indices.shape[0]
+                padded_values = torch.zeros(
+                    n, max_value_dim, device=device, dtype=torch.float32
+                )
+                padded_values[:, :emb_dim] = embedding_values
+                if optstate_dim > 0:
+                    padded_values[:, max_emb_dim : max_emb_dim + optstate_dim] = (
+                        torch.rand(n, optstate_dim, device=device, dtype=torch.float32)
+                        * initial_accumulator
+                    )
 
-    #         scores = (
-    #             torch.ones(n, dtype=torch.uint64, device=unique_indices.device)
-    #             if args.cache_algorithm == "lfu"
-    #             else None
-    #         )
-    #         table_ids = torch.full((n,), table_id, dtype=torch.int64, device=device)
-    #         storage.insert(unique_indices, table_ids, padded_values, scores)
+                scores = (
+                    torch.ones(n, dtype=torch.uint64, device=unique_indices.device)
+                    if args.cache_algorithm == "lfu"
+                    else None
+                )
+                table_ids = torch.full((n,), table_id, dtype=torch.int64, device=device)
+                storage.insert(unique_indices, table_ids, padded_values, scores)
 
     return var
 
@@ -720,7 +727,8 @@ def main():
     # warmup_gpu(device)
     # torch.cuda.empty_cache()
     
-    var.fill_tables()
+    if not is_hybrid_storage(args):
+        var.fill_tables()
 
     # placeholder = occupy_gpu_memory()
     for i in range(0, args.num_iterations, report_interval):
