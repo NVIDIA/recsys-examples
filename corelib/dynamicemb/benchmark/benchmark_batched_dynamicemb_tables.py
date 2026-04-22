@@ -491,34 +491,45 @@ def benchmark_one_iteration(model, sparse_feature):
     return forward_latency, backward_latency, iteration_latency
 
 
-def benchmark_train_eval(model, sparse_features, timer, args):
+def benchmark_train_eval(model, sparse_features, args):
     model.train()
 
-    timer.start()
+    start_event = torch.cuda.Event(enable_timing=True)
+    mid_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    total_forward_ms = 0.0
+    total_backward_ms = 0.0
+    total_iter_ms = 0.0
     for i in range(args.num_iterations):
         sparse_feature = sparse_features[i]
+        start_event.record()
         output = model(sparse_feature.values(), sparse_feature.offsets())
+        mid_event.record()
         grad = torch.empty_like(output)
         output.backward(grad)
-    timer.stop()
-    train_latency = timer.elapsed_time() / args.num_iterations
+        end_event.record()
+        torch.cuda.synchronize()
+        total_forward_ms += start_event.elapsed_time(mid_event)
+        total_backward_ms += mid_event.elapsed_time(end_event)
+        total_iter_ms += start_event.elapsed_time(end_event)
 
-    timer.start()
-    for i in range(args.num_iterations):
-        sparse_feature = sparse_features[i]
-        output = model(sparse_feature.values(), sparse_feature.offsets())
-    timer.stop()
-    train_forward_latency = timer.elapsed_time() / args.num_iterations
-
-    train_backward_latency = train_latency - train_forward_latency
+    train_forward_latency = total_forward_ms / args.num_iterations
+    train_backward_latency = total_backward_ms / args.num_iterations
+    train_latency = total_iter_ms / args.num_iterations
 
     model.eval()
-    timer.start()
+    eval_start = torch.cuda.Event(enable_timing=True)
+    eval_end = torch.cuda.Event(enable_timing=True)
+    total_eval_ms = 0.0
     for i in range(args.num_iterations):
         sparse_feature = sparse_features[i]
+        eval_start.record()
         output = model(sparse_feature.values(), sparse_feature.offsets())
-    timer.stop()
-    eval_latency = timer.elapsed_time() / args.num_iterations
+        eval_end.record()
+        torch.cuda.synchronize()
+        total_eval_ms += eval_start.elapsed_time(eval_end)
+
+    eval_latency = total_eval_ms / args.num_iterations
 
     return train_latency, train_forward_latency, train_backward_latency, eval_latency
 
@@ -772,8 +783,8 @@ def main():
         # )
 
     torch.cuda.profiler.start()
-    dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
-    torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, timer, args)
+    dynamicemb_res = benchmark_train_eval(var, sparse_features, args)
+    torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, args)
     torch.cuda.profiler.stop()
 
     # print(placeholder.numel())
