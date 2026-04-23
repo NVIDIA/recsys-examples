@@ -377,6 +377,12 @@ class InferenceDenseModule(torch.nn.Module):
                 metadata_gpu_buffer,  # returned static
                 self.async_kvcache.static_onload_handle,
             )
+            
+            self.async_kvcache.materialize_append_mapping_from_metadata(
+                kv_index_meta,
+                kvcache_metadata,
+            )
+
             self.async_kvcache.offload_kvcache(kvcache_metadata)
             kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
             kvcache_metadata.total_history_lengths += jagged_data.num_candidates
