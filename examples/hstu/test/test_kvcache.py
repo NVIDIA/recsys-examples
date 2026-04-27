@@ -98,8 +98,6 @@ def get_test_kvcache_mgr(
     return async_kvcache_mgr
 def get_small_test_kvcache_mgr(
     secondary_kvcache_manager: Optional[object] = None,
-    namespace_mode: str = "uid",
-    namespace_base: str = "recsys_hstu",
 ):
     # Lightweight config for fast unit tests
     max_batch_size = 4
@@ -124,8 +122,6 @@ def get_small_test_kvcache_mgr(
         blocks_in_primary_pool=blocks_in_primary_pool,
         page_size=page_size,
         offload_chunksize=offload_chunksize,
-        namespace_mode=namespace_mode,
-        namespace_base=namespace_base,
     )
     mgr = AsyncHSTUKVCacheManager(
         hstu_config.num_layers,
@@ -149,8 +145,6 @@ def get_small_test_kvcache_mgr(
         kv_cache_config.num_memcpy_workers,
         kv_cache_config.enable_nvcomp,
         secondary_kvcache_manager,
-        kv_cache_config.namespace_mode,
-        kv_cache_config.namespace_base,
     )
     return mgr, hstu_config, kv_cache_config
 def get_test_userids_and_metadata(
@@ -248,7 +242,6 @@ def test_lookup_allocate_contract():
         total_history_lengths = [80, 112]
         lookup = mgr_split.lookup_kvcache(user_ids, total_history_lengths)
         kv_index_meta, prepare_obj = mgr_split.allocate_kvcache(
-            user_ids,
             lookup,
             static_page_ids_gpu_buffer=mgr_split.static_page_ids_gpu_buffer,
             static_offload_page_ids_gpu_buffer=mgr_split.static_offload_page_ids_gpu_buffer,
@@ -279,7 +272,6 @@ def test_prepare_kvcache_wait_smoke():
             total_history_lengths,
         )
         _, prepare_result = mgr.allocate_kvcache(
-            user_ids,
             lookup,
             mgr.static_page_ids_gpu_buffer,
             mgr.static_offload_page_ids_gpu_buffer,
@@ -322,13 +314,9 @@ def test_from_config_smoke_and_nop_secondary():
         blocks_in_primary_pool=512,
         page_size=32,
         offload_chunksize=128,
-        namespace_mode="uid",
-        namespace_base="phase1_test",
     )
     mgr = AsyncHSTUKVCacheManager.from_config(hstu_config, kv_cfg)
     try:
-        assert mgr.namespace_mode == kv_cfg.namespace_mode
-        assert mgr.namespace_base == kv_cfg.namespace_base
         lookup = mgr.lookup_kvcache([777], [32])
         assert isinstance(lookup.secondary_lookup, dict)
         assert lookup.secondary_lookup.get("backend") == "nop"
