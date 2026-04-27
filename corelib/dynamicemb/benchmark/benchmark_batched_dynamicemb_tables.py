@@ -189,7 +189,11 @@ class BenchmarkConfig:
     def mode(self):
         if self.caching:
             return "caching"
-        return "gpu" if self.gpu_ratio >= 1.0 else "no_caching"
+        if self.gpu_ratio >= 1.0:
+            return "gpu"
+        if abs(self.gpu_ratio) <= 1e-3:
+            return "no_hbm"
+        return "no_caching"
 
     def label(self):
         caps = "_".join(
@@ -1050,6 +1054,27 @@ def _no_caching_configs():
     ]
 
 
+def _no_hbm_configs():
+    """No HBM, no caching: all embedding data in system memory (UVM)."""
+    hbm = [0] * _NUM_TABLES
+    return [
+        BenchmarkConfig(
+            batch_size=bs,
+            num_embeddings_per_feature=_CAPS,
+            embedding_dim=_DIM,
+            hbm_for_embeddings=hbm,
+            optimizer_type=opt,
+            caching=False,
+            gpu_ratio=0.0,
+            pooling_mode=pool,
+            max_hotness=10,
+        )
+        for bs in _BATCH_SIZES
+        for opt in _OPTIMIZERS
+        for pool in _POOLING_MODES
+    ]
+
+
 # ── Test suites ───────────────────────────────────────────────────────────────
 
 
@@ -1070,5 +1095,12 @@ class TestCaching:
 class TestNoCaching:
     @pytest.mark.parametrize("cfg", _no_caching_configs(), ids=lambda c: c.label())
     def test_no_caching(self, cfg, device, timer, profile_mode):
+        result = run_single_benchmark(cfg, device, timer, profile_mode)
+        assert "error" not in result
+
+
+class TestNoHbm:
+    @pytest.mark.parametrize("cfg", _no_hbm_configs(), ids=lambda c: c.label())
+    def test_no_hbm(self, cfg, device, timer, profile_mode):
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         assert "error" not in result
