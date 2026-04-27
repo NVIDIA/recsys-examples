@@ -1,0 +1,7 @@
+{
+  "warmup_iters": 5,
+  "steady_iters": 1,
+  "avg_forward_with_kvcache_ms": 5.424352169036865,
+  "avg_forward_nokvcache_ms": 4.12659215927124,
+  "kvcache_over_nokv": 1.314487102111591
+}

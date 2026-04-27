@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 import os
 from typing import Any, Dict, List, Optional, Union
 
@@ -203,34 +202,9 @@ class InferenceDenseModule(torch.nn.Module):
         self._use_kvcache = False
         if kvcache_config is not None:
             self._use_kvcache = True
-            from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
+            from modules.async_kvcache_manager import KVCacheManager
 
-            if kvcache_config.max_queued_offload_tokens is None:
-                kvcache_config.max_queued_offload_tokens = (
-                    4 * hstu_config.max_batch_size * hstu_config.max_seq_len
-                )
-            self.async_kvcache = AsyncHSTUKVCacheManager(
-                hstu_config.num_layers,
-                hstu_config.num_heads,
-                hstu_config.head_dim,
-                kvcache_config.page_size,
-                kvcache_config.blocks_in_primary_pool,
-                math.ceil(
-                    hstu_config.max_batch_size
-                    * hstu_config.max_seq_len
-                    / kvcache_config.page_size
-                ),
-                0,
-                kvcache_config.offload_chunksize,
-                -1,
-                hstu_config.max_seq_len,
-                hstu_config.max_batch_size,
-                kvcache_config.max_queued_offload_tokens,
-                kvcache_config.num_onload_buffer_chunks,
-                kvcache_config.num_offload_buffer_chunks,
-                kvcache_config.num_memcpy_workers,
-                kvcache_config.enable_nvcomp,
-            )
+            self.async_kvcache = KVCacheManager.from_config(hstu_config, kvcache_config)
 
     def setup_for_cudagraph(
         self, hstu_config, kvcache_config, use_cudagraph, cudagraph_configs
@@ -345,18 +319,20 @@ class InferenceDenseModule(torch.nn.Module):
         embeddings: Dict[str, JaggedTensor],
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
-        prepare_kvcache_result: List,
+        prepare_kvcache_result: Any,
+        kv_index_meta: Optional[Any] = None,
+        lookup_result: Optional[Any] = None,
     ):
         with torch.inference_mode():
-            (
-                old_cached_lengths,
-                num_history_tokens,
-                offload_uids_buffer,
-                metadata_host_buffer,
-                metadata_gpu_buffer,  # returned static
-                kvcache_metadata_fut,
-                onload_fut,
-            ) = prepare_kvcache_result
+            old_cached_lengths = torch.tensor(
+                prepare_kvcache_result.old_cached_lengths, dtype=torch.int32
+            )
+            num_history_tokens = prepare_kvcache_result.new_tokens
+            offload_uids_buffer = prepare_kvcache_result.offload_uids_buffer
+            metadata_host_buffer = prepare_kvcache_result.metadata_host_buffer
+            metadata_gpu_buffer = prepare_kvcache_result.metadata_gpu_buffer
+            kvcache_metadata_fut = prepare_kvcache_result.kvcache_metadata_fut
+            onload_fut = prepare_kvcache_result.onload_fut
 
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
@@ -377,7 +353,27 @@ class InferenceDenseModule(torch.nn.Module):
                 metadata_gpu_buffer,  # returned static
                 self.async_kvcache.static_onload_handle,
             )
+            # 1) 先基于 prepare 后的真实 kv metadata 生成 restore 映射
+            self.async_kvcache.materialize_restore_mapping_from_metadata(
+                kv_index_meta,
+                kvcache_metadata,
+            )
+            # 2) 再 launch + wait onboard（把命中的 prefix 拉回 GPU）
+            if kv_index_meta is not None and lookup_result is not None:
+                onboard_task_handle_local = self.async_kvcache.onboard_launch_kvcache(
+                    kv_index_meta
+                )
+                self.async_kvcache.onboard_try_wait_kvcache_or_fail(
+                    kv_index_meta,
+                    onboard_task_handle_local,
+                )
+            # 3) onboard 完成后，再做 append 映射和 offload
+            self.async_kvcache.materialize_append_mapping_from_metadata(
+                kv_index_meta,
+                kvcache_metadata,
+            )
             self.async_kvcache.offload_kvcache(kvcache_metadata)
+            
             kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
             kvcache_metadata.total_history_lengths += jagged_data.num_candidates
             kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
