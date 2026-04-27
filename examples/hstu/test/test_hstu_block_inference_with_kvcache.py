@@ -32,6 +32,13 @@ from inference_ranking_gr import get_inference_ranking_gr  # noqa: E402
 
 def _shutdown_model_kvcache_threads(model) -> None:
     mgr = model.dense_module.async_kvcache
+    secondary = getattr(mgr, "secondary_kvcache_manager", None)
+    client = getattr(secondary, "_client", None) if secondary is not None else None
+    if client is not None:
+        try:
+            client.shutdown()
+        except Exception:
+            pass
     if hasattr(mgr, "executor"):
         mgr.executor.shutdown(wait=False)
     if hasattr(mgr, "onload_worker"):
@@ -104,8 +111,6 @@ def _build_model_and_dataset(
         offload_chunksize=128,
         secondary_backend=secondary_backend,
         flexkv_mode=flexkv_mode,
-        namespace_mode="uid",
-        namespace_base="recsys_hstu_test",
     )
     emb_configs = [
         InferenceEmbeddingConfig(
