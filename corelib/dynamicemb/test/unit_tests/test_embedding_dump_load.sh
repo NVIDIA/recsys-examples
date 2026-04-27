@@ -36,6 +36,39 @@ for num_gpus in ${NUM_GPUS[@]}; do
   done
 done
 
+echo "Running hash_roundrobin opt-in smoke"
+torchrun \
+  --nnodes 1 \
+  --nproc_per_node 1 \
+  ./test/unit_tests/test_embedding_dump_load.py \
+  --optimizer-type sgd \
+  --score-strategy step \
+  --dist-type hash_roundrobin \
+  --mode "dump" \
+  --optim False \
+  --counter False \
+  --save-path "debug_weight_hash_roundrobin_smoke" \
+  --num-embedding-collections 1 \
+  --num-embeddings 1000000 \
+  --multi-hot-sizes 10 \
+  --embedding-dim 16 || exit 1
+
+torchrun \
+  --nnodes 1 \
+  --nproc_per_node 1 \
+  ./test/unit_tests/test_embedding_dump_load.py \
+  --optimizer-type sgd \
+  --score-strategy step \
+  --dist-type hash_roundrobin \
+  --mode "load" \
+  --optim False \
+  --counter False \
+  --save-path "debug_weight_hash_roundrobin_smoke" \
+  --num-embedding-collections 1 \
+  --num-embeddings 1000000 \
+  --multi-hot-sizes 10 \
+  --embedding-dim 16 || exit 1
+
 for num_load_gpus in ${NUM_GPUS[@]}; do
   for num_dump_gpus in ${NUM_GPUS[@]}; do
     for optimizer_type in ${OPTIMIZER_TYPE[@]}; do  

@@ -5,7 +5,8 @@ import shutil
 import urllib.request
 import warnings
 import zipfile
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -59,25 +60,7 @@ warnings.filterwarnings(
     "ignore", message=".*torch.library.impl_abstract.*", category=FutureWarning
 )
 
-backend = "nccl"
-dist.init_process_group(backend=backend)
-
-# Set LOCAL_WORLD_SIZE if not available for proper topology configuration
-if "LOCAL_WORLD_SIZE" not in os.environ:
-    os.environ["LOCAL_WORLD_SIZE"] = str(torch.cuda.device_count())
-
-# Set LOCAL_RANK if not available (for consistency)
-if "LOCAL_RANK" not in os.environ:
-    os.environ["LOCAL_RANK"] = str(get_local_rank())
-
-# Set RANK if not available
-if "RANK" not in os.environ:
-    os.environ["RANK"] = str(dist.get_rank())
-
-local_rank = dist.get_rank()  # for one node
-world_size = dist.get_world_size()
-torch.cuda.set_device(local_rank)
-device = torch.device(f"cuda:{local_rank}")
+BACKEND = "nccl"
 # print with rank info
 original_print = builtins.print
 
@@ -89,9 +72,55 @@ def rank_print(*args, **kwargs):
 builtins.print = rank_print
 cache_ratio = 0.5  # assume we will use 50% of the HBM for cache
 
+@dataclass
+class RuntimeContext:
+    backend: str
+    rank: int
+    local_rank: int
+    world_size: int
+    device: torch.device
 
-def download_movielens(data_dir="./ml-1m"):
-    if dist.get_rank() == 0:  # Use global rank for multi-node consistency
+def init_runtime() -> RuntimeContext:
+    # Set LOCAL_WORLD_SIZE if not available for proper topology configuration.
+    if "LOCAL_WORLD_SIZE" not in os.environ:
+        os.environ["LOCAL_WORLD_SIZE"] = str(torch.cuda.device_count())
+
+    # Keep the example usable in non-torchrun single-process runs as well.
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+    if "WORLD_SIZE" not in os.environ:
+        os.environ["WORLD_SIZE"] = "1"
+    if "LOCAL_RANK" not in os.environ:
+        os.environ["LOCAL_RANK"] = os.environ.get("RANK", "0")
+
+    dist.init_process_group(backend=BACKEND)
+
+    rank = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    def rank_print(*args, **kwargs):
+        original_print(f"[RANK {rank}] ", *args, **kwargs)
+
+    builtins.print = rank_print
+    return RuntimeContext(
+        backend=BACKEND,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        device=device,
+    )
+
+def cleanup_runtime(runtime: Optional[RuntimeContext]) -> None:
+    builtins.print = original_print
+    if runtime is not None and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+def download_movielens(runtime: RuntimeContext, data_dir="./ml-1m"):
+    if runtime.rank == 0:  # Use global rank for multi-node consistency
         os.makedirs(data_dir, exist_ok=True)
         if os.path.exists(os.path.join(data_dir, "ratings.dat")):
             print(f"MovieLens in {data_dir}")
@@ -167,6 +196,13 @@ def parse_args():
         type=int,
         default=0,
         help="Frequency threshold for admission strategy (0 disable admission strategy, >0 enable admission strategy and only keys appearing >= threshold will be stored in tables)",
+    )
+    parser.add_argument(
+        "--dist_type",
+        type=str,
+        choices=["continuous", "roundrobin", "hash_roundrobin"],
+        default="roundrobin",
+        help="DynamicEmb row-wise input distribution policy.",
     )
     return parser.parse_args()
 
@@ -415,7 +451,7 @@ def get_sharder(args, optimizer_type):
                 backward_precision=CommType.FP32,
             )
         )
-        if backend == "nccl"
+        if BACKEND == "nccl"
         else None
     )
 
@@ -454,6 +490,8 @@ def get_planner(
     bucket_capacity = 128
     # KVCounter hash bucket width (not ``DynamicEmbTableOptions.bucket_capacity``).
     kv_counter_bucket_capacity = 1024
+
+    print(f"Using DynamicEmb dist_type={args.dist_type}")
 
     dict_const = {}
 
@@ -504,6 +542,7 @@ def get_planner(
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
+                dist_type=args.dist_type,
                 score_strategy=DynamicEmbScoreStrategy.STEP,
                 caching=caching,
                 training=training,
@@ -544,7 +583,7 @@ def get_planner(
     )
 
 
-def apply_dmp(model, args, training):
+def apply_dmp(model, args, runtime: RuntimeContext, training):
     """
     The initialization of embedding lookup module in dynamicemb is almost consistent with torchrec.
         1. Firstly, you should configure the global parameters of an embedding table using `EmbeddingCollection`.
@@ -576,7 +615,7 @@ def apply_dmp(model, args, training):
     The following steps demonstrate how to obtain `DynamicEmbParameterSharding` by `DynamicEmbeddingShardingPlanner`.
     """
     planner = get_planner(
-        device,
+        runtime.device,
         eb_configs,
         args.batch_size,
         optimizer_type=optimizer_type,
@@ -597,7 +636,7 @@ def apply_dmp(model, args, training):
     """
     dmp = DistributedModelParallel(
         module=model,
-        device=device,
+        device=runtime.device,
         # pyre-ignore
         sharders=[sharder],
         plan=plan,
@@ -605,7 +644,7 @@ def apply_dmp(model, args, training):
     return dmp
 
 
-def create_model(args, training=True):
+def create_model(args, runtime: RuntimeContext, training=True):
     # Define the configuration parameters for the embedding table,
     # including its name, embedding dimension, total number of embeddings, and feature name.
     eb_configs = [
@@ -668,18 +707,18 @@ def create_model(args, training=True):
         over_arch_layer_sizes=mlp_dims,
     )
 
-    model = apply_dmp(model, args, training)
+    model = apply_dmp(model, args, runtime, training)
 
     return model
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs):
+def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs, runtime: RuntimeContext):
     model.train()
     total_loss = 0
 
     for batch_idx, (features, labels) in enumerate(train_loader):
-        features = features.to(device)
-        labels = labels.to(device)
+        features = features.to(runtime.device)
+        labels = labels.to(runtime.device)
 
         outputs = model(features)
         loss = loss_fn(outputs, labels)
@@ -699,13 +738,13 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs
     print(f"Epoch {epoch+1}/{total_epochs}, Average Loss: {avg_loss:.4f}")
 
 
-def test_one_epoch(model, test_loader, loss_fn, epoch, total_epochs):
+def test_one_epoch(model, test_loader, loss_fn, epoch, total_epochs, runtime: RuntimeContext):
     model.eval()
     test_loss = 0
     with torch.inference_mode():
         for features, labels in test_loader:
-            features = features.to(device)
-            labels = labels.to(device)
+            features = features.to(runtime.device)
+            labels = labels.to(runtime.device)
 
             outputs = model(features)
             loss = loss_fn(outputs, labels)
@@ -715,14 +754,14 @@ def test_one_epoch(model, test_loader, loss_fn, epoch, total_epochs):
     print(f"Epoch {epoch+1}/{total_epochs}, Test Loss: {avg_test_loss:.4f}")
 
 
-def train(args):
+def train(args, runtime: RuntimeContext):
     train_dataset = MovieLensDataset(args.data_path, split="train")
     test_dataset = MovieLensDataset(args.data_path, split="test")
     train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=True
+        train_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=True
     )
     test_sampler = DistributedSampler(
-        test_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=False
+        test_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=False
     )
 
     train_loader = DataLoader(
@@ -743,24 +782,24 @@ def train(args):
         sampler=test_sampler,
     )
 
-    model = create_model(args)
-    model.to(device)
+    model = create_model(args, runtime)
+    model.to(runtime.device)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs)
-        test_one_epoch(model, test_loader, criterion, epoch, args.epochs)
+        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs, runtime)
+        test_one_epoch(model, test_loader, criterion, epoch, args.epochs, runtime)
 
 
-def dump(args):
+def dump(args, runtime: RuntimeContext):
     os.makedirs(args.save_dir, exist_ok=True)
     train_dataset = MovieLensDataset(args.data_path, split="train")
     # Use global rank for proper data distribution across all processes
     train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=True
+        train_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=True
     )
 
     train_loader = DataLoader(
@@ -772,15 +811,15 @@ def dump(args):
         sampler=train_sampler,
     )
 
-    model = create_model(args)
-    model.to(device)
+    model = create_model(args, runtime)
+    model.to(runtime.device)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs)
+        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs, runtime)
 
         # ShardedDyanmicEmbeddingCollection.state_dict() will return a dummy tensor.
         torch.save(
@@ -789,18 +828,18 @@ def dump(args):
                 "optimizer_state_dict": optimizer.state_dict(),
             },
             os.path.join(
-                args.save_dir, f"model_epoch_{epoch+1}_rank{dist.get_rank()}.pt"
+                args.save_dir, f"model_epoch_{epoch+1}_rank{runtime.rank}.pt"
             ),
         )
     DynamicEmbDump(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
 
 
-def load(args):
+def load(args, runtime: RuntimeContext):
     os.makedirs(args.save_dir, exist_ok=True)
     test_dataset = MovieLensDataset(args.data_path, split="test")
     # Use global rank for proper data distribution across all processes
     test_sampler = DistributedSampler(
-        test_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=False
+        test_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=False
     )
 
     test_loader = DataLoader(
@@ -812,8 +851,8 @@ def load(args):
         sampler=test_sampler,
     )
 
-    model = create_model(args)
-    model.to(device)
+    model = create_model(args, runtime)
+    model.to(runtime.device)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
@@ -821,7 +860,7 @@ def load(args):
     # load
     checkpoint = torch.load(
         os.path.join(
-            args.save_dir, f"model_epoch_{args.epochs}_rank{dist.get_rank()}.pt"
+            args.save_dir, f"model_epoch_{args.epochs}_rank{runtime.rank}.pt"
         ),
         weights_only=True,
     )
@@ -831,24 +870,24 @@ def load(args):
 
     DynamicEmbLoad(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
 
-    test_one_epoch(model, test_loader, criterion, 0, 1)
+    test_one_epoch(model, test_loader, criterion, 0, 1, runtime)
 
-    dist.barrier(device_ids=[local_rank])
+    dist.barrier(device_ids=[runtime.local_rank])
     # Only global rank 0 should clean up, not local rank 0 on each node
-    if dist.get_rank() == 0:
+    if runtime.rank == 0:
         try:
             shutil.rmtree(args.save_dir)
         except Exception as e:
             print(f"Warning: Failed to remove {args.save_dir}: {e}")
-    dist.barrier(device_ids=[local_rank])
+    dist.barrier(device_ids=[runtime.local_rank])
 
 
-def inc_dump(args):
+def inc_dump(args, runtime: RuntimeContext):
     os.makedirs(args.save_dir, exist_ok=True)
     train_dataset = MovieLensDataset(args.data_path, split="train")
     # Use global rank for proper data distribution across all processes
     train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=True
+        train_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=True
     )
 
     train_loader = DataLoader(
@@ -860,8 +899,8 @@ def inc_dump(args):
         sampler=train_sampler,
     )
 
-    model = create_model(args)
-    model.to(device)
+    model = create_model(args, runtime)
+    model.to(runtime.device)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
@@ -874,8 +913,8 @@ def inc_dump(args):
         total_loss = 0
 
         for batch_idx, (features, labels) in enumerate(train_loader):
-            features = features.to(device)
-            labels = labels.to(device)
+            features = features.to(runtime.device)
+            labels = labels.to(runtime.device)
 
             outputs = model(features)
             loss = criterion(outputs, labels)
@@ -908,22 +947,25 @@ def inc_dump(args):
 
 def main():
     args = parse_args()
-    torch.cuda.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    if dist.get_rank() == 0:  # Use global rank for multi-node consistency
-        download_movielens(args.data_path)
-    dist.barrier(device_ids=[local_rank])
-    if args.train:
-        train(args)
-    if args.dump:
-        dump(args)
-    if args.load:
-        load(args)
-    if args.incremental_dump:
-        inc_dump(args)
+    runtime: Optional[RuntimeContext] = None
+    try:
+        runtime = init_runtime()
+        torch.cuda.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        if runtime.rank == 0:  # Use global rank for multi-node consistency
+            download_movielens(runtime, args.data_path)
+        dist.barrier(device_ids=[runtime.local_rank])
+        if args.train:
+            train(args, runtime)
+        if args.dump:
+            dump(args, runtime)
+        if args.load:
+            load(args, runtime)
+        if args.incremental_dump:
+            inc_dump(args, runtime)
+    finally:
+        cleanup_runtime(runtime)
 
 
 if __name__ == "__main__":
     main()
-
-dist.destroy_process_group()

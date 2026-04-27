@@ -278,6 +278,7 @@ def apply_dmp(
     optimizer_kwargs: Dict[str, Any],
     device: torch.device,
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
@@ -313,6 +314,7 @@ def apply_dmp(
         dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
             global_hbm_for_values=global_hbm,
             score_strategy=score_strategy,
+            dist_type=dist_type,
             initializer_args=DynamicEmbInitializerArgs(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=1e-1,
@@ -356,6 +358,7 @@ def create_model(
     embedding_dim: int,
     optimizer_kwargs: Dict[str, Any],
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
@@ -393,6 +396,7 @@ def create_model(
         optimizer_kwargs,
         torch.device(f"cuda:{torch.cuda.current_device()}"),
         score_strategy=score_strategy,
+        dist_type=dist_type,
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
@@ -444,6 +448,27 @@ def check_counter_table_checkpoint(x, y):
                     frequencies, score_out
                 ), f"counter frequency mismatch for table_id={table_id}"
 
+def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
+    seen_sharding = False
+    seen_input_dist = False
+
+    for _, _, sharded_module in find_sharded_modules(model):
+        for sharding in sharded_module._sharding_type_to_sharding.values():
+            if hasattr(sharding, "_dist_type_per_feature"):
+                assert set(sharding._dist_type_per_feature.values()) == {
+                    expected_dist_type
+                }
+                seen_sharding = True
+
+        for input_dist in getattr(sharded_module, "_input_dists", []):
+            if hasattr(input_dist, "_dist_type_per_feature"):
+                assert set(input_dist._dist_type_per_feature.values()) == {
+                    expected_dist_type
+                }
+                seen_input_dist = True
+
+    assert seen_sharding, "Did not find any DynamicEmb sharding carrying dist_type."
+    assert seen_input_dist, "Did not find any input_dist carrying dist_type."
 
 @click.command()
 @click.option("--num-embedding-collections", type=int, required=True)
@@ -462,6 +487,12 @@ def check_counter_table_checkpoint(x, y):
     type=click.Choice(["timestamp", "step", "lfu"]),
     required=True,
 )
+@click.option(
+    "--dist-type",
+    type=click.Choice(["continuous", "roundrobin", "hash_roundrobin"]),
+    default="roundrobin",
+    show_default=True,
+)
 @click.option("--optim", type=bool, required=True)
 @click.option("--counter", type=bool, required=True)
 def test_model_load_dump(
@@ -471,6 +502,7 @@ def test_model_load_dump(
     embedding_dim: int,
     optimizer_type: str,
     score_strategy: str,
+    dist_type: str,
     mode: str,
     save_path: str,
     optim: bool,
@@ -499,6 +531,7 @@ def test_model_load_dump(
         embedding_dim=embedding_dim,
         optimizer_kwargs=optimizer_kwargs,
         score_strategy=score_strategy_,
+        dist_type=dist_type,        
         admit_strategy=FrequencyAdmissionStrategy(
             threshold=2 if counter else 1,
         ),
@@ -518,9 +551,13 @@ def test_model_load_dump(
         score_strategy=score_strategy,
         scores_collection=expect_scores_collection,
     )
-
+    
+    asserted_ref_dist_type = False
     for kjt in kjts:
         ret = ref_model(kjt)
+        if not asserted_ref_dist_type:
+            assert_dist_type_path(ref_model, dist_type)
+            asserted_ref_dist_type = True
         loss = (
             ret.sum() * dist.get_world_size()
         )  # scale the loss by world size to make the gradients consistent between different gpu settings
@@ -538,6 +575,7 @@ def test_model_load_dump(
             embedding_dim=embedding_dim,
             optimizer_kwargs=optimizer_kwargs,
             score_strategy=score_strategy_,
+            dist_type=dist_type,
             admit_strategy=FrequencyAdmissionStrategy(
                 threshold=2 if counter else 1,
             ),
@@ -641,8 +679,12 @@ def test_model_load_dump(
         model = model.eval()
 
         with torch.inference_mode():
+            asserted_loaded_dist_type = False
             for kjt in kjts:
                 ret = model(kjt)
+                if not asserted_loaded_dist_type:
+                    assert_dist_type_path(model, dist_type)
+                    asserted_loaded_dist_type = True
                 ref_ret = ref_model(kjt)
                 assert torch.allclose(ret, ref_ret)
 
