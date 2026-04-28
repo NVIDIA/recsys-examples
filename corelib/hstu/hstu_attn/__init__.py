@@ -13,6 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 __version__ = "1.0"
+from .hstu_attn_cp import (
+    GuardError,
+    gather_global_from_cp_rank,
+    get_batch_on_this_cp_rank_for_hstu,
+    hstu_attn_varlen_cp_func,
+)
 from .hstu_attn_interface import hstu_attn_qkvpacked_func, hstu_attn_varlen_func
 
-__all__ = ["hstu_attn_varlen_func", "hstu_attn_qkvpacked_func"]
+__all__ = [
+    "hstu_attn_varlen_func",
+    "hstu_attn_qkvpacked_func",
+    "hstu_attn_varlen_cp_func",
+    "get_batch_on_this_cp_rank_for_hstu",
+    "gather_global_from_cp_rank",
+    "GuardError",
+]
