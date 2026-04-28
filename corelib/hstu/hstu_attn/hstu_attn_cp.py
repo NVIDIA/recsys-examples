@@ -11,8 +11,9 @@ What this module provides for v0
   Signature mirrors the installed kernel exactly plus four CP arguments.
 - Hard guards rejecting v0+ modes with `ValueError` (per SPEC §2 / plan T3.1).
 - `cp_size == 1` short-circuit: direct delegation to `hstu_attn_varlen_func`,
-  no autograd wrap, no guard cycle. Required to keep cp=1 passthrough
-  perf within plan §Global rule 3 thresholds.
+  no autograd wrap, no comm. Guards still run uniformly per plan T3.1
+  (cost is a few Python conditionals — well within plan §Global rule 3
+  cp=1 perf budget).
 - DualChunkSwap dispatch helper `get_batch_on_this_cp_rank_for_hstu`
   (pure permutation; T3.2) plus testing-only `gather_global_from_cp_rank`.
 - Multi-GPU forward path is implemented (T3.3): single CUDA stream,
@@ -248,7 +249,16 @@ def _enforce_v0_contract(
         raise GuardError(
             f"head_dim={head_dim} not in supported set {_SUPPORTED_HEAD_DIMS} ({_SPEC_REF})"
         )
-    # Divisibility (DualChunkSwap requirement)
+    # Self-attention contract: cu_seqlens_q must equal cu_seqlens_k for any
+    # cp_size (HSTU is self-attention; the in-tree kernel ignores cu_seqlens_k
+    # for true varlen self-attn but the wrapper enforces the contract so a
+    # mismatched call is caught early).
+    if not torch.equal(cu_seqlens_q, cu_seqlens_k):
+        raise GuardError(
+            "cu_seqlens_q must equal cu_seqlens_k (HSTU is self-attention only in v0)"
+        )
+    # DualChunkSwap divisibility — only meaningful when chunking actually
+    # happens (cp_size > 1).
     if cp_size > 1:
         chunks_per_seq = 2 * cp_size
         seqlens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
@@ -258,11 +268,6 @@ def _enforce_v0_contract(
                     f"sample {b}: seqlen {L} not divisible by 2*cp_size={chunks_per_seq} "
                     f"(DualChunkSwap requirement; pre-pad in caller)"
                 )
-        # cu_seqlens_q must equal cu_seqlens_k (HSTU is self-attention).
-        if not torch.equal(cu_seqlens_q, cu_seqlens_k):
-            raise GuardError(
-                "cu_seqlens_q must equal cu_seqlens_k (self-attention only in v0)"
-            )
 
 
 # ----------------------------------------------------------------------------
@@ -639,10 +644,12 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
 #
 # Signature mirrors the installed `hstu_attn_varlen_func` exactly (per
 # `examples/hstu/test/cp/conftest.py::CANONICAL_HSTU_PARAMS`) plus four CP
-# arguments. The body is the exact T3.1 deliverable (plan §T3.1):
-#   1. cp_group is None or cp_size == 1 → direct passthrough (no wrap).
-#   2. Hard guards (13 items).
-#   3. Multi-GPU dispatch via `_HSTUVarlenCPFunc.apply` (currently NotImpl).
+# arguments. Body order:
+#   1. Determine cp_size from cp_group.
+#   2. Run the 13-item hard-guard battery uniformly (cp=1 included).
+#   3. cp_size == 1 ⇒ direct delegation to `hstu_attn_varlen_func`.
+#   4. cp_size > 1 ⇒ dispatch via `_HSTUVarlenCPFunc.apply` (T3.3 forward
+#      + T4.2 backward).
 # ----------------------------------------------------------------------------
 def hstu_attn_varlen_cp_func(
     q: torch.Tensor,
