@@ -205,9 +205,17 @@ for the lower-triangle case) on the smallest non-trivial input.
 
 **Deliverables**:
 - Implement `autograd.Function.backward` in `hstu_attn_varlen_cp_func`.
-- Reverse-direction ring: send to `(rank-1) % cp_size`, recv from `(rank+1) %
-  cp_size`. `dQ` accumulates locally; `dK/dV` produced where KV currently is,
-  ride the reverse ring back, `copy_` on first visit / `add_` after.
+- Reverse-direction P2P delivery: dQ accumulates locally; dK/dV produced
+  where KV currently is must reach the owning rank by traversing the
+  ring **backward**. v0 implements this as `cp_size - 1` independent
+  `batch_isend_irecv` exchanges per backward call: at step `i`, rank
+  sends partial dK/dV to `(rank-i) % cp_size` (the owner whose KV was
+  used at forward step `i`) and receives the matching partials from
+  `(rank+i) % cp_size`. This is functionally equivalent to a one-hop-
+  per-step reverse ring with copy/add semantics; we pick direct
+  point-to-point because it's simpler and lets every rank `add_` into a
+  single fp32 accumulator with no `copy_`-vs-`add_` first-visit branch.
+  (Slice 5 may revisit if perf data favours one-hop ring overlap.)
 - Same per-tile (rank, step) classification as forward; same kernel calls
   but with the bwd entry (`hstu_attn_cuda.varlen_bwd`).
 - For lower-triangle tiles: same K/V zero-padding trick as forward — bwd
