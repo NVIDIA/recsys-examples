@@ -26,6 +26,17 @@ using Tensor = at::Tensor;
 
 namespace dyn_emb {
 
+// Hash function for load-balanced key distribution
+// Uses MurmurHash3 finalizer for good avalanche properties
+__forceinline__ __device__ uint64_t hash_key(uint64_t key) {
+  key ^= key >> 33;
+  key *= 0xff51afd7ed558ccdULL;
+  key ^= key >> 33;
+  key *= 0xc4ceb9fe1a85ec53ULL;
+  key ^= key >> 33;
+  return key;
+}
+
 __forceinline__ __device__ int atomicAdd(int *address, int val) {
   return ::atomicAdd(address, val);
 }
@@ -224,8 +235,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
   const auto stride = gridDim.x * blockDim.y;
   for (auto b_t = bt_start; b_t < lengths_size; b_t += stride) {
     const auto t = length_to_feature_idx ? length_to_feature_idx[b_t] : b_t / B;
-    bool use_roundrobin =
-        dist_type_per_feature ? dist_type_per_feature[t] : false;
+    int32_t dist_type = dist_type_per_feature ? dist_type_per_feature[t] : 0;
     index_t blk_size = block_sizes_data[t];
     offset_t rowstart = (b_t == 0 ? 0 : offsets_data[b_t - 1]);
     offset_t rowend = offsets_data[b_t];
@@ -241,12 +251,13 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
       for (auto i = rowstart + threadIdx.x; i < rowend; i += blockDim.x) {
         uindex_t idx = static_cast<uindex_t>(indices_data[i]);
         uindex_t p = 0;
-        if (use_roundrobin) {
-
-          p = idx % my_size;
-        } else {
-          p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
-        }
+	if (dist_type == 1) {
+	    p = idx % my_size;
+        } else if (dist_type == 2) {
+	    p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) % my_size;
+	} else {
+	    p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
+	}
         atomicAdd(&new_lengths_data[p * lengths_size + b_t], 1);
       }
       return;
@@ -302,8 +313,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
   using uoffset_t = std::make_unsigned_t<offset_t>;
   CUDA_1D_KERNEL_LOOP(b_t, lengths_size) {
     const auto t = length_to_feature_idx ? length_to_feature_idx[b_t] : b_t / B;
-    bool use_roundrobin =
-        dist_type_per_feature ? dist_type_per_feature[t] : false;
+    int32_t dist_type = dist_type_per_feature ? dist_type_per_feature[t] : 0;
     index_t blk_size = block_sizes_data[t];
     offset_t rowstart = (b_t == 0 ? 0 : offsets_data[b_t - 1]);
     offset_t rowend = offsets_data[b_t];
@@ -320,8 +330,11 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
       uindex_t p = 0;
       uindex_t new_idx = 0;
       if (!use_block_bucketize_pos) {
-        if (use_roundrobin) {
+        if (dist_type == 1) {
           p = idx % my_size;
+          new_idx = idx;
+	} else if (dist_type == 2) {
+          p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) % my_size;
           new_idx = idx;
         } else {
           p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
@@ -330,12 +343,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
       } else {
         uindex_t lb = indices_to_lb[i];
         p = lb < my_size ? lb : idx % my_size;
-        new_idx =
-            lb < my_size
-                ? idx -
-                      block_bucketize_pos_concat[lb +
-                                                 block_bucketize_pos_offsets[t]]
-                : idx / my_size;
+        new_idx = lb < my_size ? idx - block_bucketize_pos_concat[lb + block_bucketize_pos_offsets[t]]: idx / my_size;
       }
       uoffset_t pos = new_offsets_data[p * lengths_size + b_t];
       new_indices_data[pos] = new_idx;

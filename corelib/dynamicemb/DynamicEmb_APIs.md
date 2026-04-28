@@ -91,6 +91,14 @@ Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic em
 
 On construction it runs the internal preparation step described under [Sharding planner](#sharding-planner), then builds the TorchREC sub-planner and DynamicEmb shard metadata as before.
 
+For row-wise DynamicEmb sharding, the supported `dist_type` values are:
+
+- `continuous`
+- `roundrobin`
+- `hash_roundrobin`
+
+`hash_roundrobin` hashes the raw key before rank assignment and is intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`. It is an opt-in routing mode; the default remains `roundrobin` for compatibility with existing checkpoints. It should be understood as a routing robustness improvement, not as a general solution to arbitrary hot-key or Zipf-skew load balancing.
+
     ```python
     #How to import
     from dynamicemb.planner import DynamicEmbeddingShardingPlanner

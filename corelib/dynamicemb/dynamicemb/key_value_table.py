@@ -1082,6 +1082,7 @@ def _dump_table(
         meta_data = {}
         meta_data.update(state.optimizer.get_opt_args())
         meta_data["evict_strategy"] = str(state.evict_strategy)
+        meta_data["dist_type"] = state.options_list[table_id].dist_type
 
         if current_score is not None:
             meta_data["step_score"] = current_score
@@ -1242,6 +1243,14 @@ def _validate_load_meta(
     if evict_strategy and str(state.evict_strategy) != evict_strategy:
         raise ValueError(
             f"Evict strategy mismatch: {evict_strategy} != {state.evict_strategy}"
+        )
+    ckpt_dist_type = meta_data.get("dist_type", "roundrobin")
+    runtime_dist_type = state.options_list[table_id].dist_type
+    if runtime_dist_type != ckpt_dist_type:
+        raise ValueError(
+            "Input dist_type mismatch: checkpoint was dumped with "
+            f"{ckpt_dist_type!r}, but runtime table is configured with "
+            f"{runtime_dist_type!r}. Please load with a matching dist_type."
         )
 
     if score_file_path is None:

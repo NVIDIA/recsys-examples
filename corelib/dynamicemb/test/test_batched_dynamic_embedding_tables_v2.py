@@ -35,6 +35,7 @@ from dynamicemb import (
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
     encode_checkpoint_file_path,
+    encode_meta_json_file_path,
 )
 from dynamicemb.dynamicemb_config import (
     DEBUG_EMB_INITIALIZER_MOD,
@@ -1072,6 +1073,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
+            meta_data["dist_type"] = self.options[table_id].dist_type
             with open(meta_file_path, "w") as f:
                 json.dump(meta_data, f)
 
@@ -1122,6 +1124,14 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                 and self.optimizer.get_opt_args().get("opt_type", None) != opt_type
             ):
                 include_optim = False
+            ckpt_dist_type = meta_data.get("dist_type", "roundrobin")
+            runtime_dist_type = self.options[table_id].dist_type
+            if runtime_dist_type != ckpt_dist_type:
+                raise ValueError(
+                    "Input dist_type mismatch: checkpoint was dumped with "
+                    f"{ckpt_dist_type!r}, but runtime table is configured with "
+                    f"{runtime_dist_type!r}. Please load with a matching dist_type."
+                )
             if include_optim:
                 self.optimizer.set_opt_args(meta_data)
 
@@ -2422,6 +2432,256 @@ def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
     torch.testing.assert_close(vals1_src[idx1_src], vals1_dst[idx1_dst])
 
     print("test_multi_table_dump_load passed")
+
+def _make_multi_table_bdeb_for_dump_load(
+    opt_type: EmbOptimType,
+    opt_params: Dict[str, Any],
+    dims: List[int],
+    table_names: List[str],
+    feature_table_map: List[int],
+    max_capacity: int,
+    key_type: torch.dtype,
+    value_type: torch.dtype,
+    device_id: int,
+    dist_type: str = "roundrobin",
+) -> BatchedDynamicEmbeddingTablesV2:
+    opts = []
+    for dim in dims:
+        opts.append(
+            DynamicEmbTableOptions(
+                dim=dim,
+                init_capacity=max_capacity,
+                max_capacity=max_capacity,
+                index_type=key_type,
+                embedding_dtype=value_type,
+                device_id=device_id,
+                score_strategy=DynamicEmbScoreStrategy.STEP,
+                caching=False,
+                local_hbm_for_values=1024**3,
+                dist_type=dist_type,
+            )
+        )
+    return BatchedDynamicEmbeddingTablesV2(
+        table_names=table_names,
+        table_options=opts,
+        feature_table_map=feature_table_map,
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        optimizer=opt_type,
+        use_index_dedup=True,
+        **opt_params,
+    )
+
+
+def _train_multi_table_bdeb_once(
+    bdeb: BatchedDynamicEmbeddingTablesV2,
+    key_type: torch.dtype,
+    device: torch.device,
+) -> None:
+    indices = torch.tensor(
+        [0, 1, 2, 3, 10, 11, 12, 13], dtype=key_type, device=device
+    )
+    offsets = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=key_type, device=device)
+
+    for _ in range(3):
+        embs = bdeb(indices, offsets)
+        loss = embs.mean()
+        loss.backward()
+        torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("dist_type", ["roundrobin", "hash_roundrobin"])
+def test_multi_table_dump_load_preserves_dist_type(dist_type, tmp_path):
+    import torch.distributed as dist
+
+    assert torch.cuda.is_available()
+    device_id = 0
+    torch.cuda.set_device(device_id)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+        )
+
+    device = torch.device(f"cuda:{device_id}")
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+    feature_table_map = [0, 1]
+    key_type = torch.int64
+    value_type = torch.float32
+    max_capacity = 1024
+    opt_type = EmbOptimType.SGD
+    opt_params = {"learning_rate": 0.3}
+
+    bdeb_src = _make_multi_table_bdeb_for_dump_load(
+        opt_type,
+        opt_params,
+        dims,
+        table_names,
+        feature_table_map,
+        max_capacity,
+        key_type,
+        value_type,
+        device_id,
+        dist_type=dist_type,
+    )
+    _train_multi_table_bdeb_once(bdeb_src, key_type, device)
+
+    save_dir = str(tmp_path)
+    bdeb_src.dump(save_dir)
+    meta_path = encode_meta_json_file_path(save_dir, table_names[0])
+    with open(meta_path, "r") as f:
+        meta_data = json.load(f)
+    assert meta_data["dist_type"] == dist_type
+
+    bdeb_dst = _make_multi_table_bdeb_for_dump_load(
+        opt_type,
+        opt_params,
+        dims,
+        table_names,
+        feature_table_map,
+        max_capacity,
+        key_type,
+        value_type,
+        device_id,
+        dist_type=dist_type,
+    )
+    bdeb_dst.load(save_dir)
+
+    keys0_src, vals0_src = bdeb_src.export_keys_values("table0", device)
+    keys0_dst, vals0_dst = bdeb_dst.export_keys_values("table0", device)
+    idx0_src = keys0_src.argsort()
+    idx0_dst = keys0_dst.argsort()
+    torch.testing.assert_close(keys0_src[idx0_src], keys0_dst[idx0_dst])
+    torch.testing.assert_close(vals0_src[idx0_src], vals0_dst[idx0_dst])
+
+
+def test_multi_table_load_rejects_dist_type_mismatch(tmp_path):
+    import torch.distributed as dist
+
+    assert torch.cuda.is_available()
+    device_id = 0
+    torch.cuda.set_device(device_id)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+        )
+
+    device = torch.device(f"cuda:{device_id}")
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+    feature_table_map = [0, 1]
+    key_type = torch.int64
+    value_type = torch.float32
+    max_capacity = 1024
+    opt_type = EmbOptimType.SGD
+    opt_params = {"learning_rate": 0.3}
+
+    bdeb_src = _make_multi_table_bdeb_for_dump_load(
+        opt_type,
+        opt_params,
+        dims,
+        table_names,
+        feature_table_map,
+        max_capacity,
+        key_type,
+        value_type,
+        device_id,
+        dist_type="roundrobin",
+    )
+    _train_multi_table_bdeb_once(bdeb_src, key_type, device)
+
+    save_dir = str(tmp_path)
+    bdeb_src.dump(save_dir)
+
+    bdeb_dst = _make_multi_table_bdeb_for_dump_load(
+        opt_type,
+        opt_params,
+        dims,
+        table_names,
+        feature_table_map,
+        max_capacity,
+        key_type,
+        value_type,
+        device_id,
+        dist_type="hash_roundrobin",
+    )
+    with pytest.raises(ValueError, match="Input dist_type mismatch"):
+        bdeb_dst.load(save_dir)
+
+
+def test_multi_table_load_legacy_metadata_defaults_to_roundrobin(tmp_path):
+    import torch.distributed as dist
+
+    assert torch.cuda.is_available()
+    device_id = 0
+    torch.cuda.set_device(device_id)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            rank=0,
+            world_size=1,
+        )
+
+    device = torch.device(f"cuda:{device_id}")
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+    feature_table_map = [0, 1]
+    key_type = torch.int64
+    value_type = torch.float32
+    max_capacity = 1024
+    opt_type = EmbOptimType.SGD
+    opt_params = {"learning_rate": 0.3}
+
+    bdeb_src = _make_multi_table_bdeb_for_dump_load(
+        opt_type,
+        opt_params,
+        dims,
+        table_names,
+        feature_table_map,
+        max_capacity,
+        key_type,
+        value_type,
+        device_id,
+        dist_type="roundrobin",
+    )
+    _train_multi_table_bdeb_once(bdeb_src, key_type, device)
+
+    save_dir = str(tmp_path)
+    bdeb_src.dump(save_dir)
+    for table_name in table_names:
+        meta_path = encode_meta_json_file_path(save_dir, table_name)
+        with open(meta_path, "r") as f:
+            meta_data = json.load(f)
+        meta_data.pop("dist_type", None)
+        with open(meta_path, "w") as f:
+            json.dump(meta_data, f)
+
+    bdeb_dst = _make_multi_table_bdeb_for_dump_load(
+        opt_type,
+        opt_params,
+        dims,
+        table_names,
+        feature_table_map,
+        max_capacity,
+        key_type,
+        value_type,
+        device_id,
+        dist_type="roundrobin",
+    )
+    bdeb_dst.load(save_dir)
+
+    keys1_src, vals1_src = bdeb_src.export_keys_values("table1", device)
+    keys1_dst, vals1_dst = bdeb_dst.export_keys_values("table1", device)
+    idx1_src = keys1_src.argsort()
+    idx1_dst = keys1_dst.argsort()
+    torch.testing.assert_close(keys1_src[idx1_src], keys1_dst[idx1_dst])
+    torch.testing.assert_close(vals1_src[idx1_src], vals1_dst[idx1_dst])
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:

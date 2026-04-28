@@ -122,6 +122,8 @@ def bucketize_kjt_before_all2all(
             dist_type = 0
         elif dist_type_str == "roundrobin":
             dist_type = 1
+        elif dist_type_str == "hash_roundrobin":
+            dist_type = 2
         else:
             raise ValueError("Not support dist type of ", dist_type_str)
         dist_type_list.append(dist_type)
