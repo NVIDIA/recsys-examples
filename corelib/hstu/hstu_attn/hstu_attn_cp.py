@@ -33,7 +33,7 @@ What this module does NOT do (v0 / SPEC §2)
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -418,7 +418,7 @@ def _ring_send_recv_kv(
     recv_v: torch.Tensor,
     *,
     cp_group: dist.ProcessGroup,
-    cp_global_ranks: list[int],
+    cp_global_ranks: Sequence[int],
     cp_rank: int,
     cp_size: int,
     direction: str = "forward",
@@ -467,7 +467,7 @@ def _multi_gpu_forward(
     scaling_seqlen: int,
     alpha: float,
     cp_group: dist.ProcessGroup,
-    cp_global_ranks: list[int],
+    cp_global_ranks: Sequence[int],
     cp_rank: int,
     cp_size: int,
 ) -> torch.Tensor:
@@ -488,10 +488,12 @@ def _multi_gpu_forward(
     half_max = local_max // 2  # one chunk per sample
     chunk_sizes = _chunk_sizes_from_cu(cu_seqlens_local)
 
-    # Ping-pong KV buffers. Recv buffer must be same shape as send (DualChunkSwap
-    # gives every rank identical local total tokens, even under varlen).
-    cur_k = k_local
-    cur_v = v_local
+    # Ping-pong KV buffers. Critical: clone the initial K/V so subsequent
+    # buffer swaps never mutate the caller's input tensors. Without the clone,
+    # after step 0's swap `recv_k` becomes the original `k_local`, and step 1's
+    # P2P would write peer KV into the user's input — silent data corruption.
+    cur_k = k_local.clone()
+    cur_v = v_local.clone()
     recv_k = torch.empty_like(k_local)
     recv_v = torch.empty_like(v_local)
 
@@ -597,26 +599,32 @@ def _per_tile_partial_grads(
     The wrapping of `hstu_attn_varlen_func` already has its own
     `autograd.Function`, so this is just a thin re-execution that propagates
     `dout_partial` back through it.
+
+    `torch.enable_grad()` is required because we are called from inside
+    `_HSTUVarlenCPFunc.backward`, where torch by default disables grad mode.
+    Without enabling, the `requires_grad_(True)` flag would be ignored and
+    `torch.autograd.grad` would error out on a graph-less output.
     """
-    q_in = q_input.detach().clone().requires_grad_(True)
-    k_in = k_input.detach().clone().requires_grad_(True)
-    v_in = v_input.detach().clone().requires_grad_(True)
-    out = hstu_attn_varlen_func(
-        q=q_in,
-        k=k_in,
-        v=v_in,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_seqlen_q=max_q,
-        max_seqlen_k=max_k,
-        scaling_seqlen=scaling_seqlen,
-        num_contexts=None,
-        num_targets=None,
-        target_group_size=1,
-        window_size=window_size,
-        alpha=alpha,
-    )
-    dq, dk, dv = torch.autograd.grad(out, (q_in, k_in, v_in), dout_partial)
+    with torch.enable_grad():
+        q_in = q_input.detach().clone().requires_grad_(True)
+        k_in = k_input.detach().clone().requires_grad_(True)
+        v_in = v_input.detach().clone().requires_grad_(True)
+        out = hstu_attn_varlen_func(
+            q=q_in,
+            k=k_in,
+            v=v_in,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            scaling_seqlen=scaling_seqlen,
+            num_contexts=None,
+            num_targets=None,
+            target_group_size=1,
+            window_size=window_size,
+            alpha=alpha,
+        )
+        dq, dk, dv = torch.autograd.grad(out, (q_in, k_in, v_in), dout_partial)
     return dq.detach(), dk.detach(), dv.detach()
 
 
@@ -631,7 +639,7 @@ def _multi_gpu_backward(
     scaling_seqlen: int,
     alpha: float,
     cp_group: dist.ProcessGroup,
-    cp_global_ranks: list[int],
+    cp_global_ranks: Sequence[int],
     cp_rank: int,
     cp_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -665,8 +673,10 @@ def _multi_gpu_backward(
     # We need the SAME KV stream the forward saw at each step. Re-run the
     # forward ring locally (read-only) to reconstruct kv_at_step[i]. Cheap
     # because comm dominates and we already paid that cost in forward.
-    cur_k = k_local
-    cur_v = v_local
+    # Clone to avoid the same aliasing hazard as in `_multi_gpu_forward`
+    # (buffer swap would otherwise mutate the saved-for-backward k_local/v_local).
+    cur_k = k_local.clone()
+    cur_v = v_local.clone()
     recv_k = torch.empty_like(k_local)
     recv_v = torch.empty_like(v_local)
 
@@ -867,7 +877,10 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         ctx.scaling_seqlen = scaling_seqlen
         ctx.alpha = alpha
         ctx.cp_group = cp_group
-        ctx.cp_global_ranks = cp_global_ranks
+        # Snapshot cp_global_ranks as a tuple so caller mutations between
+        # forward and backward cannot route reverse-ring partials to the
+        # wrong absolute ranks.
+        ctx.cp_global_ranks = tuple(cp_global_ranks)
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         return out

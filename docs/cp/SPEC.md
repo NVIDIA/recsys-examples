@@ -75,7 +75,7 @@ bottleneck is batch size — DP still wins for that.
 | **Variable-length packed input** | Same input format HSTU already uses: `q, k, v` are flat tensors of shape `(total_tokens, num_heads, head_dim)`; per-sample boundaries given by `cu_seqlens_q/k`. |
 | **CUTLASS kernel only** | We call the existing fused HSTU CUDA kernel (under `corelib/hstu/csrc/hstu_attn/`) as-is. No new C++/CUDA code. The PyTorch reference and the Triton kernel stay where they are; we don't touch them. |
 | **`head_dim ∈ {32, 64, 128, 256}`** | The full set the CUTLASS kernel supports today (`hstu_api.cpp:391`). The CP wrapper guards on this set; `head_dim ∈ {32, 64, 128}` is the test-matrix focus, with at least one cell at `head_dim=256` to exercise the upper bound. |
-| **Forward + backward correctness** | At `cp_size ∈ {2, 4, 8}`, both forward output and `q.grad / k.grad / v.grad` numerically match the single-GPU baseline (bf16 tolerance: `rtol=2e-2, atol=2e-2`). |
+| **Forward + backward correctness** | At `cp_size ∈ {2, 4, 8}`, output matches single-GPU baseline at `rtol=atol=2e-2` (bf16 fwd tolerance). Gradients (`q.grad / k.grad / v.grad`) match at `rtol=atol=5e-2` — looser to match the existing in-tree `assert_hstu_close` convention (multiplier 5 for bwd vs 2 for fwd; see `examples/commons/utils/hstu_assert_close.py`). |
 | **Reduction in fp32** | Partial outputs across ring steps accumulate in fp32, then cast back to the input dtype on return. This matches the validated PoC and avoids bf16 add-error pile-up. |
 
 ### What v0 does NOT support
