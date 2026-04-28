@@ -390,20 +390,20 @@ def test_cp_path_requires_real_pg(cuda_device: torch.device) -> None:
             )
 
 
-def test_cp_backward_not_implemented(cuda_device: torch.device) -> None:
-    """Backward path stub is still NotImplementedError until T4.2.
-
-    We can't actually trigger backward with a FakeProcessGroup (forward will
-    fail first). This test asserts the marker string is in the source so a
-    refactor that drops it is caught.
+def test_cp_backward_implemented_calls_helper(cuda_device: torch.device) -> None:
+    """Backward path is now implemented (T4.2). This test asserts the
+    `_multi_gpu_backward` helper is referenced from
+    `_HSTUVarlenCPFunc.backward` (so refactors that bypass the helper get
+    caught).
     """
     import inspect
 
     from hstu.hstu_attn_cp import _HSTUVarlenCPFunc  # type: ignore[attr-defined]
 
     src = inspect.getsource(_HSTUVarlenCPFunc.backward)
-    assert "T4.2" in src, "backward stub must reference plan T4.2"
-    assert "NotImplementedError" in src
+    assert (
+        "_multi_gpu_backward" in src
+    ), "backward must call _multi_gpu_backward (the reverse-ring helper)"
 
 
 # ============================================================================

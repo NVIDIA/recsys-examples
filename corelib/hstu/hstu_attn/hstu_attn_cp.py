@@ -20,8 +20,9 @@ What this module provides for v0
   sequential ring P2P via `dist.batch_isend_irecv`, plain-sum reduction
   in fp32 across the (rank, step) classification grid (diagonal /
   lower-triangle / upper-triangle).
-- Backward (`_HSTUVarlenCPFunc.backward`) is a stub raising
-  `NotImplementedError("v0 backward arrives in T4.2")`.
+- Backward (T4.2): explicit reverse-direction ring. dQ stays local; dK/dV
+  partials ride the reverse ring back to their owning rank with
+  copy-on-first-receive / add-after semantics.
 
 What this module does NOT do (v0 / SPEC §2)
 ===========================================
@@ -572,8 +573,248 @@ def _multi_gpu_forward(
 
 
 # ----------------------------------------------------------------------------
-# Multi-GPU autograd Function. Forward (T3.3) is implemented; backward (T4.2)
-# is still NotImplementedError pending Slice 4.
+# T4.2: multi-GPU backward. Reverse-direction ring; dQ stays local; dK/dV
+# partials ride the reverse ring back to their owning rank with copy-on-first /
+# add-after semantics.
+# ----------------------------------------------------------------------------
+def _per_tile_partial_grads(
+    q_input: torch.Tensor,
+    k_input: torch.Tensor,
+    v_input: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    *,
+    max_q: int,
+    max_k: int,
+    scaling_seqlen: int,
+    alpha: float,
+    window_size: tuple[int, int],
+    dout_partial: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run a per-tile forward with autograd on the LOCAL (detached + cloned)
+    inputs, then call torch.autograd.grad to extract partial dQ, dK, dV.
+
+    The wrapping of `hstu_attn_varlen_func` already has its own
+    `autograd.Function`, so this is just a thin re-execution that propagates
+    `dout_partial` back through it.
+    """
+    q_in = q_input.detach().clone().requires_grad_(True)
+    k_in = k_input.detach().clone().requires_grad_(True)
+    v_in = v_input.detach().clone().requires_grad_(True)
+    out = hstu_attn_varlen_func(
+        q=q_in,
+        k=k_in,
+        v=v_in,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        scaling_seqlen=scaling_seqlen,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=window_size,
+        alpha=alpha,
+    )
+    dq, dk, dv = torch.autograd.grad(out, (q_in, k_in, v_in), dout_partial)
+    return dq.detach(), dk.detach(), dv.detach()
+
+
+def _multi_gpu_backward(
+    q_local: torch.Tensor,
+    k_local: torch.Tensor,
+    v_local: torch.Tensor,
+    cu_seqlens_local: torch.Tensor,
+    dout_local: torch.Tensor,
+    *,
+    max_seqlen_q_global: int,
+    scaling_seqlen: int,
+    alpha: float,
+    cp_group: dist.ProcessGroup,
+    cp_global_ranks: list[int],
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reverse-direction-ring backward for HSTU CP forward.
+
+    Algorithm:
+      1. Initialise dq_local = 0, dk_local = 0, dv_local = 0.
+      2. For each forward step `i` in 0..cp_size-1, redo the per-tile forward
+         with autograd-enabled inputs and use `torch.autograd.grad` to extract
+         (dq_partial, dk_partial, dv_partial).
+         dq_partial accumulates locally; dk_partial / dv_partial are gradients
+         for the KV that was held at this step (peer rank src=(rank-i)%cp_size).
+      3. dKV partials ride the **reverse** ring back to their owners:
+         - At backward iteration 0, the rank holds its OWN dKV (step==0
+           diagonal tile). Add to local dk/dv directly.
+         - For iteration j>=1, the rank sends the dKV computed at forward
+           step j (which belongs to peer src=(rank-j)%cp) to that peer
+           via reverse ring (dst = (rank - j) % cp_size, equivalently
+           dst = src). Receives from rank `(rank + j) % cp_size` the dKV
+           that they computed for OUR K/V at their forward step j.
+         - The received dKV adds to local dk_local, dv_local.
+
+    Returned dtypes match the forward inputs (cast back from the fp32
+    accumulators).
+    """
+    2 * cp_size
+    local_max = max_seqlen_q_global // cp_size
+    half_max = local_max // 2
+    chunk_sizes = _chunk_sizes_from_cu(cu_seqlens_local)
+
+    # We need the SAME KV stream the forward saw at each step. Re-run the
+    # forward ring locally (read-only) to reconstruct kv_at_step[i]. Cheap
+    # because comm dominates and we already paid that cost in forward.
+    cur_k = k_local
+    cur_v = v_local
+    recv_k = torch.empty_like(k_local)
+    recv_v = torch.empty_like(v_local)
+
+    # fp32 accumulators (per SPEC §2 "Reduction in fp32").
+    dq_acc = torch.zeros_like(q_local, dtype=torch.float32)
+    dk_acc = torch.zeros_like(k_local, dtype=torch.float32)
+    dv_acc = torch.zeros_like(v_local, dtype=torch.float32)
+
+    # We collect (step, dk_partial, dv_partial) so that after the forward-pass
+    # backward computation, we send each dKV back to its rightful owner via
+    # the reverse ring. dq is purely local — accumulated inline.
+    # dk/dv at forward step 0 belong to rank itself; add directly.
+    dkv_to_send: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+
+    for step in range(cp_size):
+        # Issue next-step KV exchange (forward direction) so cur_k/v matches
+        # what was used in forward.
+        reqs: list[dist.Work] = []
+        if step < cp_size - 1:
+            reqs = _ring_send_recv_kv(
+                cur_k,
+                cur_v,
+                recv_k,
+                recv_v,
+                cp_group=cp_group,
+                cp_global_ranks=cp_global_ranks,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                direction="forward",
+            )
+
+        # Compute per-tile partial grads.
+        if step == 0:
+            # Diagonal: full Q × full local KV, causal.
+            dq_p, dk_p, dv_p = _per_tile_partial_grads(
+                q_local,
+                cur_k,
+                cur_v,
+                cu_seqlens_local,
+                cu_seqlens_local,
+                max_q=local_max,
+                max_k=local_max,
+                scaling_seqlen=scaling_seqlen,
+                alpha=alpha,
+                window_size=(-1, 0),
+                dout_partial=dout_local,
+            )
+            dq_acc += dq_p.float()
+            # Diagonal dKV is ours; add to local accumulator immediately.
+            dk_acc += dk_p.float()
+            dv_acc += dv_p.float()
+        elif step <= cp_rank:
+            # Lower-tri: full Q × peer K first-half (zero-padded), no causal.
+            k_pad = _zero_second_half_per_sample(cur_k, cu_seqlens_local, chunk_sizes)
+            v_pad = _zero_second_half_per_sample(cur_v, cu_seqlens_local, chunk_sizes)
+            dq_p, dk_p, dv_p = _per_tile_partial_grads(
+                q_local,
+                k_pad,
+                v_pad,
+                cu_seqlens_local,
+                cu_seqlens_local,
+                max_q=local_max,
+                max_k=local_max,
+                scaling_seqlen=scaling_seqlen,
+                alpha=alpha,
+                window_size=(-1, -1),
+                dout_partial=dout_local,
+            )
+            dq_acc += dq_p.float()
+            # The padded second-half slots received zero contribution in
+            # forward, so dK/dV at those positions is exactly 0. Zero them
+            # again for safety before sending back.
+            dk_p_for_peer = _zero_second_half_per_sample(
+                dk_p, cu_seqlens_local, chunk_sizes
+            )
+            dv_p_for_peer = _zero_second_half_per_sample(
+                dv_p, cu_seqlens_local, chunk_sizes
+            )
+            dkv_to_send.append((step, dk_p_for_peer, dv_p_for_peer))
+        else:
+            # Upper-tri: Q's second-half × full peer K, no mask.
+            q_half, cu_q_half = _select_second_half_per_sample(
+                q_local, cu_seqlens_local, chunk_sizes
+            )
+            dout_half, _ = _select_second_half_per_sample(
+                dout_local, cu_seqlens_local, chunk_sizes
+            )
+            dq_half_p, dk_p, dv_p = _per_tile_partial_grads(
+                q_half,
+                cur_k,
+                cur_v,
+                cu_q_half,
+                cu_seqlens_local,
+                max_q=half_max,
+                max_k=local_max,
+                scaling_seqlen=scaling_seqlen,
+                alpha=alpha,
+                window_size=(-1, -1),
+                dout_partial=dout_half,
+            )
+            # Scatter dq_half_p into rank's second-half slots.
+            _scatter_second_half_per_sample(
+                dq_acc, dq_half_p.float(), cu_seqlens_local, chunk_sizes
+            )
+            # dk_p, dv_p are full local-shape (matching cur_k/v). Send back.
+            dkv_to_send.append((step, dk_p, dv_p))
+
+        # Wait for next-step KV (forward ring) to arrive before swap.
+        for r in reqs:
+            r.wait()
+        if step < cp_size - 1:
+            cur_k, recv_k = recv_k, cur_k
+            cur_v, recv_v = recv_v, cur_v
+
+    # 3. Reverse-ring exchange of dKV partials. For each (step, dk_p, dv_p)
+    # in `dkv_to_send`, dk_p / dv_p belong to peer src = (rank - step) % cp.
+    # We send to dst=src and receive from peer that computed grads for our
+    # K/V at THEIR step (which is our same step index).
+    #
+    # Why simultaneous: at step `i`, every rank computed grads-for-its-peer
+    # at the same `i`. So each rank's `i`-step partial → dst=(rank-i)%cp;
+    # each rank's `i`-step incoming → from src=(rank+i)%cp.
+    recv_dk = torch.empty_like(k_local)
+    recv_dv = torch.empty_like(v_local)
+    for step, dk_p, dv_p in dkv_to_send:
+        send_dst = cp_global_ranks[(cp_rank - step) % cp_size]
+        recv_src = cp_global_ranks[(cp_rank + step) % cp_size]
+        ops = [
+            dist.P2POp(dist.isend, dk_p.contiguous(), send_dst, group=cp_group),
+            dist.P2POp(dist.isend, dv_p.contiguous(), send_dst, group=cp_group),
+            dist.P2POp(dist.irecv, recv_dk, recv_src, group=cp_group),
+            dist.P2POp(dist.irecv, recv_dv, recv_src, group=cp_group),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for r in reqs:
+            r.wait()
+        dk_acc += recv_dk.float()
+        dv_acc += recv_dv.float()
+
+    return (
+        dq_acc.to(q_local.dtype),
+        dk_acc.to(k_local.dtype),
+        dv_acc.to(v_local.dtype),
+    )
+
+
+# ----------------------------------------------------------------------------
+# Multi-GPU autograd Function. Forward (T3.3) and backward (T4.2) implemented.
 # ----------------------------------------------------------------------------
 class _HSTUVarlenCPFunc(torch.autograd.Function):
     """Multi-GPU forward+backward driver."""
@@ -632,10 +873,37 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, *grads):  # type: ignore[override]
-        raise NotImplementedError(
-            "v0 multi-GPU backward arrives in plan T4.2 (Slice 4). "
-            "Forward (T3.3) is implemented; backward is the next slice."
+    def backward(ctx, dout):  # type: ignore[override]
+        q, k, v, cu_seqlens_q, _cu_seqlens_k = ctx.saved_tensors
+        return (
+            *_multi_gpu_backward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                dout,
+                max_seqlen_q_global=ctx.max_seqlen_q,
+                scaling_seqlen=ctx.scaling_seqlen,
+                alpha=ctx.alpha,
+                cp_group=ctx.cp_group,
+                cp_global_ranks=ctx.cp_global_ranks,
+                cp_rank=ctx.cp_rank,
+                cp_size=ctx.cp_size,
+            ),
+            # No gradients for non-Tensor / metadata args. Forward took:
+            #   q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            #   scaling_seqlen, alpha, cp_group, cp_global_ranks, cp_stream,
+            #   cp_comm_type
+            None,  # cu_seqlens_q
+            None,  # cu_seqlens_k
+            None,  # max_seqlen_q
+            None,  # max_seqlen_k
+            None,  # scaling_seqlen
+            None,  # alpha
+            None,  # cp_group
+            None,  # cp_global_ranks
+            None,  # cp_stream
+            None,  # cp_comm_type
         )
 
 

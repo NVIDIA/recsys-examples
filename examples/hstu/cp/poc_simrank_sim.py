@@ -402,8 +402,18 @@ DEFAULT_MATRIX: list[dict] = [
 ]
 
 
-def run_one(entry: dict, *, device: torch.device, seed: int = 0) -> dict:
-    """Run a single matrix entry. Returns metrics + pass/fail for the report."""
+def run_one(
+    entry: dict, *, device: torch.device, seed: int = 0, bwd: bool = False
+) -> dict:
+    """Run a single matrix entry. Returns metrics + pass/fail for the report.
+
+    With `bwd=True`, also runs the autograd backward pass through both the
+    baseline and the CP simulator; compares q.grad / k.grad / v.grad. Since
+    `cp_simulate` is built from differentiable ops (index_select + kernel
+    calls + scatter-add), single-GPU autograd traces through it and gives
+    the same gradients that the production multi-GPU reverse-ring backward
+    must produce. T4.1 PoC oracle.
+    """
     cp_size = entry["cp_size"]
     seqlens = entry["seqlens"]
     head_dim = entry["head_dim"]
@@ -413,25 +423,97 @@ def run_one(entry: dict, *, device: torch.device, seed: int = 0) -> dict:
     q, k, v, cu = make_batch(
         seqlens, entry["num_heads"], head_dim, cp_size=cp_size, device=device, seed=seed
     )
-    out_baseline = baseline_hstu(q, k, v, cu, max_seqlen, alpha)
-    out_cp = cp_simulate(q, k, v, cu, max_seqlen, alpha, cp_size)
 
-    diff = (out_baseline.float() - out_cp.float()).abs()
-    max_abs = diff.max().item()
-    mean_abs = diff.mean().item()
+    if not bwd:
+        # Forward-only path (Slice 2 oracle).
+        out_baseline = baseline_hstu(q, k, v, cu, max_seqlen, alpha)
+        out_cp = cp_simulate(q, k, v, cu, max_seqlen, alpha, cp_size)
+        diff = (out_baseline.float() - out_cp.float()).abs()
+        max_abs = diff.max().item()
+        mean_abs = diff.mean().item()
+        base_max = out_baseline.float().abs().max().item()
+        return dict(
+            id=entry["id"],
+            cp_size=cp_size,
+            seqlens=seqlens,
+            head_dim=head_dim,
+            mode="fwd",
+            max_abs_fwd=max_abs,
+            mean_abs_fwd=mean_abs,
+            base_max=base_max,
+            passed=bool(max_abs <= 2e-2 + 2e-2 * base_max),
+            finite_baseline=bool(torch.isfinite(out_baseline).all().item()),
+            finite_cp=bool(torch.isfinite(out_cp).all().item()),
+        )
+
+    # bwd path: forward + backward, compare grads.
+    # Independent input copies so requires_grad is set cleanly.
+    q_b = q.detach().clone().requires_grad_(True)
+    k_b = k.detach().clone().requires_grad_(True)
+    v_b = v.detach().clone().requires_grad_(True)
+    out_baseline = baseline_hstu(q_b, k_b, v_b, cu, max_seqlen, alpha)
+    g = torch.Generator(device=device).manual_seed(seed + 1)
+    dout = torch.randn(
+        out_baseline.shape, generator=g, dtype=out_baseline.dtype, device=device
+    )
+    out_baseline.backward(dout)
+    dq_baseline = q_b.grad.detach()
+    dk_baseline = k_b.grad.detach()
+    dv_baseline = v_b.grad.detach()
+
+    q_c = q.detach().clone().requires_grad_(True)
+    k_c = k.detach().clone().requires_grad_(True)
+    v_c = v.detach().clone().requires_grad_(True)
+    out_cp = cp_simulate(q_c, k_c, v_c, cu, max_seqlen, alpha, cp_size)
+    out_cp.backward(dout)
+    dq_cp = q_c.grad.detach()
+    dk_cp = k_c.grad.detach()
+    dv_cp = v_c.grad.detach()
+
+    diff_fwd = (out_baseline.float() - out_cp.float()).abs()
+    diff_dq = (dq_baseline.float() - dq_cp.float()).abs()
+    diff_dk = (dk_baseline.float() - dk_cp.float()).abs()
+    diff_dv = (dv_baseline.float() - dv_cp.float()).abs()
+    max_abs_fwd = diff_fwd.max().item()
+    max_abs_dq = diff_dq.max().item()
+    max_abs_dk = diff_dk.max().item()
+    max_abs_dv = diff_dv.max().item()
     base_max = out_baseline.float().abs().max().item()
+
+    # bf16 tolerance per SPEC §3 (looser for gradients per existing
+    # `assert_hstu_close` convention: multiplier 5 vs 2).
+    tol_fwd = 2e-2 + 2e-2 * base_max
+    tol_grad = 5e-2 + 5e-2 * max(
+        dq_baseline.float().abs().max().item(),
+        dk_baseline.float().abs().max().item(),
+        dv_baseline.float().abs().max().item(),
+    )
+    passed = (
+        max_abs_fwd <= tol_fwd
+        and max_abs_dq <= tol_grad
+        and max_abs_dk <= tol_grad
+        and max_abs_dv <= tol_grad
+    )
 
     return dict(
         id=entry["id"],
         cp_size=cp_size,
         seqlens=seqlens,
         head_dim=head_dim,
-        max_abs=max_abs,
-        mean_abs=mean_abs,
+        mode="bwd",
+        max_abs_fwd=max_abs_fwd,
+        max_abs_dq=max_abs_dq,
+        max_abs_dk=max_abs_dk,
+        max_abs_dv=max_abs_dv,
         base_max=base_max,
-        passed=bool(max_abs <= 2e-2 + 2e-2 * base_max),
-        finite_baseline=bool(torch.isfinite(out_baseline).all().item()),
-        finite_cp=bool(torch.isfinite(out_cp).all().item()),
+        passed=passed,
+        finite_baseline=all(
+            torch.isfinite(t).all().item()
+            for t in (out_baseline, dq_baseline, dk_baseline, dv_baseline)
+        ),
+        finite_cp=all(
+            torch.isfinite(t).all().item() for t in (out_cp, dq_cp, dk_cp, dv_cp)
+        ),
     )
 
 
@@ -455,22 +537,30 @@ def main() -> None:
         action="store_true",
         help="Use a default varlen seqlens distribution at the chosen cp-size.",
     )
+    parser.add_argument(
+        "--bwd",
+        action="store_true",
+        help="Run forward + backward (autograd through cp_simulate) and "
+        "compare gradients (T4.1 PoC oracle for T4.2 multi-GPU backward).",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
     device = torch.device("cuda")
 
-    print(f"=== HSTU CP single-rank simulator ===")
+    print("=== HSTU CP single-rank simulator ===")
     if args.matrix:
-        print(f"running matrix ({len(DEFAULT_MATRIX)} entries)")
-        results = [run_one(e, device=device, seed=args.seed) for e in DEFAULT_MATRIX]
+        print(f"running matrix ({len(DEFAULT_MATRIX)} entries; bwd={args.bwd})")
+        results = [
+            run_one(e, device=device, seed=args.seed, bwd=args.bwd)
+            for e in DEFAULT_MATRIX
+        ]
     else:
         cp_size = args.cp_size
         if args.seqlens is not None:
             seqlens = [int(s) for s in args.seqlens.split(",")]
         elif args.varlen:
-            # A default varlen distribution at the chosen cp_size.
             chunk_unit = 2 * cp_size
             seqlens = [chunk_unit * 1, chunk_unit * 2, chunk_unit * 3, chunk_unit * 4]
         else:
@@ -483,15 +573,34 @@ def main() -> None:
             num_heads=args.num_heads,
             head_dim=args.head_dim,
         )
-        results = [run_one(entry, device=device, seed=args.seed)]
+        results = [run_one(entry, device=device, seed=args.seed, bwd=args.bwd)]
 
-    # Print results table.
-    fmt = "{:<22} {:<3} {:<6} {:<28} {:>11} {:>11} {:<6}"
+    # Print results table — wider when bwd is on.
     print()
-    print(
-        fmt.format("id", "cp", "head_d", "seqlens", "max|diff|", "base_max", "verdict")
-    )
-    print("-" * 100)
+    if args.bwd:
+        fmt = "{:<22} {:<3} {:<6} {:<22} {:>10} {:>10} {:>10} {:>10} {:<6}"
+        print(
+            fmt.format(
+                "id",
+                "cp",
+                "head_d",
+                "seqlens",
+                "|fwd|",
+                "|dq|",
+                "|dk|",
+                "|dv|",
+                "verdict",
+            )
+        )
+        print("-" * 116)
+    else:
+        fmt = "{:<22} {:<3} {:<6} {:<28} {:>11} {:>11} {:<6}"
+        print(
+            fmt.format(
+                "id", "cp", "head_d", "seqlens", "max|diff|", "base_max", "verdict"
+            )
+        )
+        print("-" * 100)
     n_pass = 0
     for r in results:
         verdict = (
@@ -502,17 +611,32 @@ def main() -> None:
         if verdict == "PASS":
             n_pass += 1
         seqlens_repr = str(r["seqlens"])[:26]
-        print(
-            fmt.format(
-                r["id"],
-                r["cp_size"],
-                r["head_dim"],
-                seqlens_repr,
-                f"{r['max_abs']:.3e}",
-                f"{r['base_max']:.3e}",
-                verdict,
+        if args.bwd:
+            print(
+                fmt.format(
+                    r["id"],
+                    r["cp_size"],
+                    r["head_dim"],
+                    seqlens_repr,
+                    f"{r['max_abs_fwd']:.2e}",
+                    f"{r['max_abs_dq']:.2e}",
+                    f"{r['max_abs_dk']:.2e}",
+                    f"{r['max_abs_dv']:.2e}",
+                    verdict,
+                )
             )
-        )
+        else:
+            print(
+                fmt.format(
+                    r["id"],
+                    r["cp_size"],
+                    r["head_dim"],
+                    seqlens_repr,
+                    f"{r['max_abs_fwd']:.3e}",
+                    f"{r['base_max']:.3e}",
+                    verdict,
+                )
+            )
     print()
     print(f"=== summary: {n_pass}/{len(results)} PASS ===")
     if n_pass != len(results):
