@@ -45,6 +45,7 @@ class BeamSearch:
         self.history_topk_sids: List[torch.Tensor] = []
         self.history_accumulate_topk_probs: List[torch.Tensor] = []
         self.history_probs: List[torch.Tensor] = []
+
         self.reset()
 
     def propagate(
