@@ -359,31 +359,55 @@ def test_guard_cu_seqlens_q_neq_k(cuda_device: torch.device) -> None:
 
 
 # ============================================================================
-# 3. Multi-GPU path raises NotImplementedError (until T3.3)
+# 3. Multi-GPU path attempts real comm (fails on a fake group).
+#
+# T3.3 implemented `_multi_gpu_forward`. With a FakeProcessGroup (no NCCL),
+# `dist.batch_isend_irecv` (or earlier `dist.get_rank`) must raise. The
+# important property is that the wrapper does NOT silently pass through —
+# it engages the CP path, which requires a real process group.
 # ============================================================================
-def test_cp_path_not_implemented(cuda_device: torch.device) -> None:
+def test_cp_path_requires_real_pg(cuda_device: torch.device) -> None:
     q, k, v, cu = random_varlen_batch(
         [16, 16], num_heads=2, head_dim=32, device=cuda_device, seed=0
     )
-    with fake_cp_group(2) as grp, pytest.raises(NotImplementedError, match="T3.3"):
-        hstu_attn_varlen_cp_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu,
-            cu_seqlens_k=cu,
-            seqused_q=None,
-            seqused_k=None,
-            max_seqlen_q=16,
-            max_seqlen_k=16,
-            scaling_seqlen=16,
-            num_contexts=None,
-            num_targets=None,
-            target_group_size=1,
-            window_size=(-1, 0),
-            alpha=1.0 / 32**0.5,
-            cp_group=grp,
-        )
+    with fake_cp_group(2) as grp:
+        with pytest.raises(
+            (RuntimeError, AttributeError, AssertionError, ValueError, TypeError)
+        ):
+            hstu_attn_varlen_cp_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu,
+                cu_seqlens_k=cu,
+                seqused_q=None,
+                seqused_k=None,
+                max_seqlen_q=16,
+                max_seqlen_k=16,
+                scaling_seqlen=16,
+                num_contexts=None,
+                num_targets=None,
+                target_group_size=1,
+                window_size=(-1, 0),
+                alpha=1.0 / 32**0.5,
+                cp_group=grp,
+            )
+
+
+def test_cp_backward_not_implemented(cuda_device: torch.device) -> None:
+    """Backward path stub is still NotImplementedError until T4.2.
+
+    We can't actually trigger backward with a FakeProcessGroup (forward will
+    fail first). This test asserts the marker string is in the source so a
+    refactor that drops it is caught.
+    """
+    import inspect
+
+    from hstu.hstu_attn_cp import _HSTUVarlenCPFunc  # type: ignore[attr-defined]
+
+    src = inspect.getsource(_HSTUVarlenCPFunc.backward)
+    assert "T4.2" in src, "backward stub must reference plan T4.2"
+    assert "NotImplementedError" in src
 
 
 # ============================================================================

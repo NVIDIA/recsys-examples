@@ -32,6 +32,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 
 from .hstu_attn_interface import hstu_attn_varlen_func
 
@@ -261,12 +262,303 @@ def _enforce_v0_contract(
 
 
 # ----------------------------------------------------------------------------
-# Multi-GPU autograd Function. Stubbed for T3.1; T3.3 / T4.2 fill in.
+# Per-tile slice helpers (varlen-aware). These mirror the validated PoC at
+# `examples/hstu/cp/poc_simrank_sim.py`. Pure Python/torch — no fused CUDA
+# (per SPEC §2 v0 contract; CUDA fusion is a Slice 5 follow-up if profiling
+# shows it matters).
+# ----------------------------------------------------------------------------
+def _chunk_sizes_from_cu(cu_local: torch.Tensor) -> list[int]:
+    """Each sample's chunk size c_b given the local layout (2 chunks per sample,
+    total 2*c_b)."""
+    seqlens = (cu_local[1:] - cu_local[:-1]).tolist()
+    return [s // 2 for s in seqlens]
+
+
+def _zero_second_half_per_sample(
+    t: torch.Tensor, cu_local: torch.Tensor, chunk_sizes: list[int]
+) -> torch.Tensor:
+    """Zero the second-half (chunk_(2cp-1-src)) slot of each sample's local layout."""
+    out = t.clone()
+    cu = cu_local.tolist()
+    for b, c_b in enumerate(chunk_sizes):
+        start = cu[b] + c_b
+        end = cu[b + 1]
+        out[start:end] = 0
+    return out
+
+
+def _select_second_half_per_sample(
+    t: torch.Tensor, cu_local: torch.Tensor, chunk_sizes: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Take the second-half slot per sample. Returns (concat tensor, cu_seqlens_half)."""
+    cu = cu_local.tolist()
+    parts: list[torch.Tensor] = []
+    half_lens: list[int] = []
+    for b, c_b in enumerate(chunk_sizes):
+        start = cu[b] + c_b
+        end = cu[b + 1]
+        parts.append(t[start:end])
+        half_lens.append(c_b)
+    out = torch.cat(parts, dim=0).contiguous()
+    cu_half = (
+        torch.tensor([0] + half_lens, dtype=torch.int32, device=t.device)
+        .cumsum(0)
+        .int()
+    )
+    return out, cu_half
+
+
+def _scatter_second_half_per_sample(
+    out_local: torch.Tensor,
+    partial_half: torch.Tensor,
+    cu_local: torch.Tensor,
+    chunk_sizes: list[int],
+) -> None:
+    """In-place add `partial_half` (B*c_b rows concatenated) into `out_local`'s
+    per-sample second-half slots."""
+    cu = cu_local.tolist()
+    cum_half = 0
+    for b, c_b in enumerate(chunk_sizes):
+        start = cu[b] + c_b
+        end = cu[b + 1]
+        out_local[start:end] += partial_half[cum_half : cum_half + c_b]
+        cum_half += c_b
+
+
+# ----------------------------------------------------------------------------
+# Per-tile kernel calls. All three flavours pass the GLOBAL `scaling_seqlen`
+# so partial outputs across ring steps share the same normaliser (plain-sum
+# remains correct).
+# ----------------------------------------------------------------------------
+def _diag_call(
+    q_loc, k_loc, v_loc, cu_loc, local_max, scaling_seqlen, alpha
+) -> torch.Tensor:
+    return hstu_attn_varlen_func(
+        q=q_loc,
+        k=k_loc,
+        v=v_loc,
+        cu_seqlens_q=cu_loc,
+        cu_seqlens_k=cu_loc,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=local_max,
+        max_seqlen_k=local_max,
+        scaling_seqlen=scaling_seqlen,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=(-1, 0),
+        alpha=alpha,
+    )
+
+
+def _lower_call(
+    q_loc, k_pad, v_pad, cu_loc, local_max, scaling_seqlen, alpha
+) -> torch.Tensor:
+    return hstu_attn_varlen_func(
+        q=q_loc,
+        k=k_pad,
+        v=v_pad,
+        cu_seqlens_q=cu_loc,
+        cu_seqlens_k=cu_loc,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=local_max,
+        max_seqlen_k=local_max,
+        scaling_seqlen=scaling_seqlen,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=(-1, -1),
+        alpha=alpha,
+    )
+
+
+def _upper_call(
+    q_half,
+    k_full,
+    v_full,
+    cu_q_half,
+    cu_full,
+    half_max,
+    local_max,
+    scaling_seqlen,
+    alpha,
+) -> torch.Tensor:
+    return hstu_attn_varlen_func(
+        q=q_half,
+        k=k_full,
+        v=v_full,
+        cu_seqlens_q=cu_q_half,
+        cu_seqlens_k=cu_full,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=half_max,
+        max_seqlen_k=local_max,
+        scaling_seqlen=scaling_seqlen,
+        num_contexts=None,
+        num_targets=None,
+        target_group_size=1,
+        window_size=(-1, -1),
+        alpha=alpha,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Ring P2P helper (sequential single-stream — Slice 5 adds two-stream overlap).
+# ----------------------------------------------------------------------------
+def _ring_send_recv_kv(
+    cur_k: torch.Tensor,
+    cur_v: torch.Tensor,
+    recv_k: torch.Tensor,
+    recv_v: torch.Tensor,
+    *,
+    cp_group: dist.ProcessGroup,
+    cp_global_ranks: list[int],
+    cp_rank: int,
+    cp_size: int,
+) -> list[dist.Work]:
+    """Issue P2P send (to next) + recv (from prev) for one ring step.
+
+    Uses `batch_isend_irecv` to avoid the deadlock pattern of naive isend/irecv
+    pairs. Returns the list of `Work` handles; caller must call `.wait()`
+    before consuming `recv_k`/`recv_v`.
+    """
+    dst = cp_global_ranks[(cp_rank + 1) % cp_size]
+    src = cp_global_ranks[(cp_rank - 1) % cp_size]
+    ops = [
+        dist.P2POp(dist.isend, cur_k, dst, group=cp_group),
+        dist.P2POp(dist.isend, cur_v, dst, group=cp_group),
+        dist.P2POp(dist.irecv, recv_k, src, group=cp_group),
+        dist.P2POp(dist.irecv, recv_v, src, group=cp_group),
+    ]
+    return dist.batch_isend_irecv(ops)
+
+
+# ----------------------------------------------------------------------------
+# T3.3: multi-GPU forward. Single CUDA stream, sequential ring P2P.
+# ----------------------------------------------------------------------------
+def _multi_gpu_forward(
+    q_local: torch.Tensor,
+    k_local: torch.Tensor,
+    v_local: torch.Tensor,
+    cu_seqlens_local: torch.Tensor,
+    *,
+    max_seqlen_q_global: int,
+    scaling_seqlen: int,
+    alpha: float,
+    cp_group: dist.ProcessGroup,
+    cp_global_ranks: list[int],
+    cp_rank: int,
+    cp_size: int,
+) -> torch.Tensor:
+    """Run the (rank, step) classification grid as a real multi-GPU ring.
+
+    `q_local, k_local, v_local, cu_seqlens_local` are this rank's DualChunkSwap
+    shard (already produced by `get_batch_on_this_cp_rank_for_hstu` upstream).
+    `max_seqlen_q_global` is the unsharded global max; we compute `local_max`
+    internally. `scaling_seqlen` is the global `1/N` divisor (must NOT change
+    across ring steps — that's why every per-tile call passes the same value).
+
+    Reduction is in fp32 (per SPEC §2). The returned tensor is cast back to
+    `q_local.dtype` on exit.
+    """
+    local_max = (
+        max_seqlen_q_global // cp_size
+    )  # 2 chunks per sample → local len = global / cp_size
+    half_max = local_max // 2  # one chunk per sample
+    chunk_sizes = _chunk_sizes_from_cu(cu_seqlens_local)
+
+    # Ping-pong KV buffers. Recv buffer must be same shape as send (DualChunkSwap
+    # gives every rank identical local total tokens, even under varlen).
+    cur_k = k_local
+    cur_v = v_local
+    recv_k = torch.empty_like(k_local)
+    recv_v = torch.empty_like(v_local)
+
+    # Output accumulator in fp32 for numerical stability across cp_size adds.
+    out_local = torch.zeros_like(q_local, dtype=torch.float32)
+
+    for step in range(cp_size):
+        # 1. Issue next-step KV exchange (skip on last step).
+        reqs: list[dist.Work] = []
+        if step < cp_size - 1:
+            reqs = _ring_send_recv_kv(
+                cur_k,
+                cur_v,
+                recv_k,
+                recv_v,
+                cp_group=cp_group,
+                cp_global_ranks=cp_global_ranks,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+
+        # 2. Compute on the current KV (still owned).
+        if step == 0:
+            partial = _diag_call(
+                q_local,
+                cur_k,
+                cur_v,
+                cu_seqlens_local,
+                local_max,
+                scaling_seqlen,
+                alpha,
+            )
+            out_local += partial.float()
+        elif step <= cp_rank:
+            # Lower-tri: zero peer's second-half (chunk_(2cp-1-src)) so
+            # K_len == Q_len; SiLU(α Q · 0) · 0 contributes 0.
+            k_pad = _zero_second_half_per_sample(cur_k, cu_seqlens_local, chunk_sizes)
+            v_pad = _zero_second_half_per_sample(cur_v, cu_seqlens_local, chunk_sizes)
+            partial = _lower_call(
+                q_local,
+                k_pad,
+                v_pad,
+                cu_seqlens_local,
+                local_max,
+                scaling_seqlen,
+                alpha,
+            )
+            out_local += partial.float()
+        else:
+            # Upper-tri: Q's second-half (chunk_(2cp-1-rank)) × peer's full K.
+            q_half, cu_q_half = _select_second_half_per_sample(
+                q_local, cu_seqlens_local, chunk_sizes
+            )
+            partial_half = _upper_call(
+                q_half,
+                cur_k,
+                cur_v,
+                cu_q_half,
+                cu_seqlens_local,
+                half_max,
+                local_max,
+                scaling_seqlen,
+                alpha,
+            )
+            _scatter_second_half_per_sample(
+                out_local, partial_half.float(), cu_seqlens_local, chunk_sizes
+            )
+
+        # 3. Wait for next-step KV to arrive before overwriting `cur_*`.
+        for r in reqs:
+            r.wait()
+
+        # 4. Swap buffers for the next iteration.
+        if step < cp_size - 1:
+            cur_k, recv_k = recv_k, cur_k
+            cur_v, recv_v = recv_v, cur_v
+
+    return out_local.to(q_local.dtype)
+
+
+# ----------------------------------------------------------------------------
+# Multi-GPU autograd Function. Forward (T3.3) is implemented; backward (T4.2)
+# is still NotImplementedError pending Slice 4.
 # ----------------------------------------------------------------------------
 class _HSTUVarlenCPFunc(torch.autograd.Function):
-    """Multi-GPU forward+backward driver. Forward is implemented in T3.3,
-    backward in T4.2. T3.1 only commits the autograd-Function shell so the
-    public API has its full shape from day 1."""
+    """Multi-GPU forward+backward driver."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -285,17 +577,47 @@ class _HSTUVarlenCPFunc(torch.autograd.Function):
         cp_stream,
         cp_comm_type,
     ):
-        raise NotImplementedError(
-            "v0 multi-GPU forward arrives in plan T3.3 (Slice 3). "
-            "Currently only `cp_size==1` (passthrough) and the dispatch helper "
-            "`get_batch_on_this_cp_rank_for_hstu` are implemented."
+        # `cp_stream` is reserved (Slice 5 will use it for two-stream overlap);
+        # v0 is single-stream so we ignore it here.
+        del cp_stream  # unused in v0
+        if cp_comm_type != "p2p":
+            raise GuardError(
+                f"cp_comm_type={cp_comm_type!r} not supported in v0; only 'p2p'"
+            )
+        cp_size = dist.get_world_size(cp_group)
+        cp_rank = dist.get_rank(cp_group)
+
+        out = _multi_gpu_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            max_seqlen_q_global=max_seqlen_q,
+            scaling_seqlen=scaling_seqlen,
+            alpha=alpha,
+            cp_group=cp_group,
+            cp_global_ranks=cp_global_ranks,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
         )
+
+        # Save for backward (T4.2).
+        ctx.save_for_backward(q, k, v, cu_seqlens_q, cu_seqlens_k)
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.scaling_seqlen = scaling_seqlen
+        ctx.alpha = alpha
+        ctx.cp_group = cp_group
+        ctx.cp_global_ranks = cp_global_ranks
+        ctx.cp_rank = cp_rank
+        ctx.cp_size = cp_size
+        return out
 
     @staticmethod
     def backward(ctx, *grads):  # type: ignore[override]
         raise NotImplementedError(
             "v0 multi-GPU backward arrives in plan T4.2 (Slice 4). "
-            "Forward is the prerequisite (T3.3)."
+            "Forward (T3.3) is implemented; backward is the next slice."
         )
 
 
