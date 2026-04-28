@@ -15,10 +15,12 @@ What this module provides for v0
   perf within plan §Global rule 3 thresholds.
 - DualChunkSwap dispatch helper `get_batch_on_this_cp_rank_for_hstu`
   (pure permutation; T3.2) plus testing-only `gather_global_from_cp_rank`.
-- Multi-GPU forward path is a stub `_HSTUVarlenCPFunc.forward` that
-  currently raises `NotImplementedError("v0 forward arrives in T3.3");
-  T3.3 will fill it in. Backward is `NotImplementedError("v0 backward
-  arrives in T4.2")`.
+- Multi-GPU forward path is implemented (T3.3): single CUDA stream,
+  sequential ring P2P via `dist.batch_isend_irecv`, plain-sum reduction
+  in fp32 across the (rank, step) classification grid (diagonal /
+  lower-triangle / upper-triangle).
+- Backward (`_HSTUVarlenCPFunc.backward`) is a stub raising
+  `NotImplementedError("v0 backward arrives in T4.2")`.
 
 What this module does NOT do (v0 / SPEC §2)
 ===========================================
@@ -188,7 +190,7 @@ def _enforce_v0_contract(
     page_ids: Optional[torch.Tensor],
     last_page_lens: Optional[torch.Tensor],
     func: Optional[torch.Tensor],
-    quant_mode: int,
+    quant_mode: Optional[int],
     cp_size: int,
 ) -> None:
     # 1-2. Heterogeneous mask
@@ -196,10 +198,10 @@ def _enforce_v0_contract(
         raise GuardError(f"num_contexts is not supported in v0 ({_SPEC_REF})")
     if num_targets is not None:
         raise GuardError(f"num_targets is not supported in v0 ({_SPEC_REF})")
-    # 3. target_group_size > 1
+    # 3. target_group_size != 1 (v0 supports only the default size 1)
     if target_group_size != 1:
         raise GuardError(
-            f"target_group_size > 1 is not supported in v0 (got {target_group_size}; {_SPEC_REF})"
+            f"target_group_size != 1 is not supported in v0 (got {target_group_size}; {_SPEC_REF})"
         )
     # 4. window_size != (-1, 0)
     ws = tuple(window_size)
@@ -224,10 +226,12 @@ def _enforce_v0_contract(
     # 10. func (post-attention hook)
     if func is not None:
         raise GuardError(f"func hook is not supported in v0 ({_SPEC_REF})")
-    # 11. quant_mode
-    if quant_mode != -1:
+    # 11. quant_mode (only `-1` (== off) is allowed; both `None` and any other
+    #     int are rejected so users can't accidentally bypass quantisation
+    #     guards by leaving the kwarg unset on a build that defaults to None).
+    if quant_mode is None or quant_mode != -1:
         raise GuardError(
-            f"quant_mode={quant_mode} not supported in v0; only -1 ({_SPEC_REF})"
+            f"quant_mode={quant_mode!r} not supported in v0; only -1 ({_SPEC_REF})"
         )
     # 12. seqused_q/k (the kernel takes them but v0 wrapper doesn't pass through)
     if seqused_q is not None:
@@ -339,8 +343,6 @@ def _diag_call(
         v=v_loc,
         cu_seqlens_q=cu_loc,
         cu_seqlens_k=cu_loc,
-        seqused_q=None,
-        seqused_k=None,
         max_seqlen_q=local_max,
         max_seqlen_k=local_max,
         scaling_seqlen=scaling_seqlen,
@@ -361,8 +363,6 @@ def _lower_call(
         v=v_pad,
         cu_seqlens_q=cu_loc,
         cu_seqlens_k=cu_loc,
-        seqused_q=None,
-        seqused_k=None,
         max_seqlen_q=local_max,
         max_seqlen_k=local_max,
         scaling_seqlen=scaling_seqlen,
@@ -391,8 +391,6 @@ def _upper_call(
         v=v_full,
         cu_seqlens_q=cu_q_half,
         cu_seqlens_k=cu_full,
-        seqused_q=None,
-        seqused_k=None,
         max_seqlen_q=half_max,
         max_seqlen_k=local_max,
         scaling_seqlen=scaling_seqlen,
@@ -417,15 +415,30 @@ def _ring_send_recv_kv(
     cp_global_ranks: list[int],
     cp_rank: int,
     cp_size: int,
+    direction: str = "forward",
 ) -> list[dist.Work]:
-    """Issue P2P send (to next) + recv (from prev) for one ring step.
+    """Issue P2P send + recv for one ring step.
+
+    `direction="forward"`: send to `(rank+1)`, recv from `(rank-1)`.
+    `direction="backward"`: send to `(rank-1)`, recv from `(rank+1)`. Used by
+    T4.2 (multi-GPU backward) to send dKV partials home along the reverse
+    ring. Note that for backward, the tensors typically named `cur_k/cur_v`
+    actually carry dK/dV gradients — the helper is direction-agnostic.
 
     Uses `batch_isend_irecv` to avoid the deadlock pattern of naive isend/irecv
     pairs. Returns the list of `Work` handles; caller must call `.wait()`
     before consuming `recv_k`/`recv_v`.
     """
-    dst = cp_global_ranks[(cp_rank + 1) % cp_size]
-    src = cp_global_ranks[(cp_rank - 1) % cp_size]
+    if direction == "forward":
+        dst = cp_global_ranks[(cp_rank + 1) % cp_size]
+        src = cp_global_ranks[(cp_rank - 1) % cp_size]
+    elif direction == "backward":
+        dst = cp_global_ranks[(cp_rank - 1) % cp_size]
+        src = cp_global_ranks[(cp_rank + 1) % cp_size]
+    else:
+        raise ValueError(
+            f"direction must be 'forward' or 'backward'; got {direction!r}"
+        )
     ops = [
         dist.P2POp(dist.isend, cur_k, dst, group=cp_group),
         dist.P2POp(dist.isend, cur_v, dst, group=cp_group),
@@ -665,45 +678,17 @@ def hstu_attn_varlen_cp_func(
 
     See SPEC §1-§2 for v0 scope. When `cp_group is None` or the group has size 1,
     the call short-circuits to the production single-GPU `hstu_attn_varlen_func`.
-    Otherwise the CP path runs (plan T3.3+ / T4.2+).
+    Otherwise the CP path runs (plan T3.3 forward / T4.2 backward).
     """
-    # 1. Determine cp_size BEFORE any other logic so we can short-circuit early.
+    # 1. Determine cp_size up front.
     if cp_group is None:
         cp_size = 1
     else:
-        cp_size = torch.distributed.get_world_size(cp_group)
+        cp_size = dist.get_world_size(cp_group)
 
-    # cp_size == 1 short-circuit: direct passthrough, no wrap, no guard cycle,
-    # no autograd extra layer. Keeps cp=1 perf within plan §Global rule 3.
-    if cp_size == 1:
-        return hstu_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            scaling_seqlen,
-            num_contexts,
-            num_targets,
-            target_group_size=target_group_size,
-            window_size=window_size,
-            alpha=alpha,
-            rab=rab,
-            has_drab=has_drab,
-            kv_cache=kv_cache,
-            page_offsets=page_offsets,
-            page_ids=page_ids,
-            last_page_lens=last_page_lens,
-            func=func,
-            quant_mode=quant_mode if quant_mode is not None else -1,
-        )
-
-    # 2. Hard guards. Only on the CP path (cp_size > 1) — passthrough relies on
-    #    the underlying kernel's own validation.
+    # 2. Hard guards. Applied UNIFORMLY at both cp=1 and cp>1 paths so the
+    #    contract is the same regardless of CP topology. The cost is a few
+    #    Python conditionals (well under any kernel-side overhead).
     _enforce_v0_contract(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
@@ -721,14 +706,47 @@ def hstu_attn_varlen_cp_func(
         page_ids=page_ids,
         last_page_lens=last_page_lens,
         func=func,
-        quant_mode=quant_mode if quant_mode is not None else -1,
+        quant_mode=quant_mode,  # leave None as None so guard fires
         cp_size=cp_size,
     )
+    if max_seqlen_q != max_seqlen_k:
+        raise GuardError(
+            f"v0 supports self-attention only; got max_seqlen_q={max_seqlen_q} "
+            f"!= max_seqlen_k={max_seqlen_k}"
+        )
 
-    # 3. Multi-GPU CP path. Currently raises NotImplementedError until T3.3.
+    # 3. cp_size == 1 short-circuit. After guards have rejected non-v0 modes,
+    #    the call is just the bare in-tree kernel with the v0-only kwargs.
+    if cp_size == 1:
+        return hstu_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            num_contexts=None,
+            num_targets=None,
+            target_group_size=1,
+            window_size=window_size,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        )
+
+    # 4. Multi-GPU CP path. cp_global_ranks defaults to the absolute world-rank
+    #    IDs of `cp_group` (correct for both the default world group and any
+    #    sub-group). NCCL P2P needs absolute ranks, so we resolve them now.
     if cp_global_ranks is None:
-        # Default to identity rank-list — T3.3 will use it for absolute NCCL P2P ranks.
-        cp_global_ranks = list(range(cp_size))
+        cp_global_ranks = dist.get_process_group_ranks(cp_group)
+    if (
+        not isinstance(cp_global_ranks, (list, tuple))
+        or len(cp_global_ranks) != cp_size
+    ):
+        raise GuardError(
+            f"cp_global_ranks must be a list of length cp_size={cp_size}; "
+            f"got {cp_global_ranks!r}"
+        )
     if cp_comm_type != "p2p":
         raise GuardError(
             f"cp_comm_type={cp_comm_type!r} not supported in v0; only 'p2p' (SPEC §2)"

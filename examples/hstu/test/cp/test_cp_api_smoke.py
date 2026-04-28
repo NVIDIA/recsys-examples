@@ -155,39 +155,39 @@ def test_cp1_passthrough_with_explicit_world_size_1(cuda_device: torch.device) -
     assert torch.equal(got, expected)
 
 
-def test_cp1_passthrough_does_not_invoke_chunking(cuda_device: torch.device) -> None:
-    """cp=1 must NOT call `get_batch_on_this_cp_rank_for_hstu` or any
-    distributed primitive. Monkeypatch the helper to fail-on-call."""
+def test_cp1_passthrough_does_not_invoke_distributed(cuda_device: torch.device) -> None:
+    """cp=1 must NOT call any distributed primitive. Monkeypatch comm
+    primitives to fail-on-call. (cp=1 still runs guards uniformly per
+    plan T3.1 — that's intentional, contract-equal to cp>1.)"""
     q, k, v, cu = random_varlen_batch(
         [64], num_heads=2, head_dim=32, device=cuda_device, seed=0
     )
     alpha = 1.0 / 32**0.5
 
     def _boom(*a, **kw):
-        raise AssertionError("cp=1 path leaked into chunking helper")
+        raise AssertionError("cp=1 path engaged a distributed primitive")
 
-    with patch(
-        "hstu.hstu_attn_cp.get_batch_on_this_cp_rank_for_hstu", side_effect=_boom
-    ):
-        with patch("torch.distributed.batch_isend_irecv", side_effect=_boom):
-            hstu_attn_varlen_cp_func(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=cu,
-                cu_seqlens_k=cu,
-                seqused_q=None,
-                seqused_k=None,
-                max_seqlen_q=64,
-                max_seqlen_k=64,
-                scaling_seqlen=64,
-                num_contexts=None,
-                num_targets=None,
-                target_group_size=1,
-                window_size=(-1, 0),
-                alpha=alpha,
-                cp_group=None,
-            )
+    with patch("torch.distributed.batch_isend_irecv", side_effect=_boom), patch(
+        "torch.distributed.get_rank", side_effect=_boom
+    ), patch("hstu.hstu_attn_cp._multi_gpu_forward", side_effect=_boom):
+        hstu_attn_varlen_cp_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=64,
+            max_seqlen_k=64,
+            scaling_seqlen=64,
+            num_contexts=None,
+            num_targets=None,
+            target_group_size=1,
+            window_size=(-1, 0),
+            alpha=alpha,
+            cp_group=None,
+        )
 
 
 # ============================================================================

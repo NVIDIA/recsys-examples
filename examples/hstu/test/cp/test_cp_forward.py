@@ -87,6 +87,8 @@ SLICE3_MATRIX_CP4 = [
     dict(id="cp4_padded_heavy", seqlens=[8, 8, 8, 256], num_heads=2, head_dim=32),
     dict(id="cp4_eq", seqlens=[128, 256, 384, 512], num_heads=4, head_dim=64),
     dict(id="cp4_one_long", seqlens=[16, 16, 16, 4096], num_heads=2, head_dim=32),
+    # head_dim=256 boundary cell (full kernel-supported range; plan §Global rule 4).
+    dict(id="cp4_hd256", seqlens=[128, 256, 384, 512], num_heads=4, head_dim=256),
 ]
 SLICE3_MATRIX_CP8 = [
     dict(id="cp8_padded_heavy", seqlens=[16] * 7 + [1024], num_heads=4, head_dim=128),
