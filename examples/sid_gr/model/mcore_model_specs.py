@@ -375,6 +375,7 @@ def get_gpt_decoder_block_spec(
         ), "arbitrary attention mask is only supported with Megatron-Core modules"
 
     # Layer specs.
+    #
     dense_layer_spec = (
         _get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,

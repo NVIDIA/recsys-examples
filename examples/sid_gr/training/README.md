@@ -75,12 +75,20 @@ PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun \
 
 **Note:** Ensure your current working directory is `examples/sid_gr` before running the command.
 
+## Attention Backend
+
+The decoder supports two attention backends, controlled by `use_jagged_flash_attn`:
+
+| Backend | Flag | Input Format | Mask Format | Dependency |
+|---------|------|-------------|-------------|------------|
+| Megatron-Core `TransformerBlock` | `False` | Padded dense `[S, B, D]` | Dense `[B, 1, N, N]` | megatron-core |
+| `JaggedTransformerBlock` (FA) | `True` | Flattened `[1, total_tokens, D]` (zero padding) | `arbitrary_func` interval encoding | [jiayus/flash-attention (arbitrary_mask branch)](https://github.com/jiayus-nvidia/flash-attention/tree/arbitrary_mask) |
+
+The FA backend flattens all batch sequences into a single sequence (B=1) and encodes the attention pattern via `arbitrary_func`. Block sparsity skips masked regions automatically. The caller is responsible for building the `arbitrary_func` or `attention_mask` tensor.
+
 ## Known Limitations
 
-⚠️ **This implementation is under active development.** The current version has not been fully optimized for performance. Known limitations include:
+**This implementation is under active development.**
 
-- **Attention mechanism**: Currently using padded local SDPA (Scaled Dot-Product Attention) implementation in Megatron-Core with explicit attention masks
-- **Beam search**: The beam search used during evaluation does not yet support KV cache optimization
-- **Performance**: The model performance has not reached optimal levels
-
-We are actively working on addressing these limitations and improving overall efficiency.
+- **Beam search**: Does not yet support KV cache optimization
+- **Performance**: Not fully optimized

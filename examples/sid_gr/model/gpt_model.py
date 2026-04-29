@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from beam_search.beam_search import BeamSearch
-from commons.datasets.gpt_sid_batch import GPTSIDBatch, to_packed_seq_params
+from commons.datasets.gpt_sid_batch import GPTSIDBatch
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 from commons.ops.length_to_offsets import length_to_complete_offsets
@@ -27,7 +27,6 @@ from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.models.common.embeddings.relative_pos_embedding import (
     RelativePositionEmbedding,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -37,9 +36,10 @@ from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 from .attention_mask import (
+    build_jagged_causal_arbitrary_func,
     padded_causal_mask_with_optional_bos,
-    padded_target_aware_causal_mask,
 )
+from .jagged_flash_attn_block import JaggedTransformerBlock
 
 
 def _padding_to_dense_and_transpose(
@@ -89,7 +89,15 @@ def _transpose_dense_to_jagged(
 
 class SIDGRDecoder(MegatronModule):
     """
-    Don't support PP currently. Does not inclu de embedding
+    Don't support PP currently. Does not include embedding.
+
+    Supports two backend modes controlled by *use_jagged_flash_attn*:
+
+    * **True** (default) — ``JaggedTransformerBlock``: flattens all batch
+      sequences into one (B=1) and uses jiayus's Flash Attention with
+      arbitrary_func mask encoding.  Zero padding.
+    * **False** — Megatron-Core ``TransformerBlock``: pads jagged to dense,
+      uses ``DotProductAttention`` with a dense arbitrary attention mask.
     """
 
     def __init__(
@@ -101,15 +109,16 @@ class SIDGRDecoder(MegatronModule):
         ] = "learned_absolute",
         relative_attention_num_buckets: int = 32,
         relative_attention_max_distance: int = 128,
+        use_jagged_flash_attn: bool = False,
     ):
         super().__init__(config=decoder_config)
 
         self.config: TransformerConfig = decoder_config
 
         self.transformer_decoder_layer_spec: ModuleSpec = transformer_decoder_layer_spec
-        # TODO, add position encoder
         self.model_type = ModelType.encoder_or_decoder
         self.position_embedding_type = position_embedding_type
+        self.use_jagged_flash_attn = use_jagged_flash_attn
         self.decoder_relative_pos_emb = RelativePositionEmbedding(
             bidirectional=False,
             init_method=self.config.init_method,
@@ -117,36 +126,45 @@ class SIDGRDecoder(MegatronModule):
             relative_attention_num_buckets=relative_attention_num_buckets,
             relative_attention_max_distance=relative_attention_max_distance,
         )
-        self.decoder = TransformerBlock(
-            config=self.config,
-            spec=self.transformer_decoder_layer_spec,
-        )
+
+        if use_jagged_flash_attn:
+            self.decoder = JaggedTransformerBlock(
+                num_layers=self.config.num_layers,
+                hidden_size=self.config.hidden_size,
+                num_attention_heads=self.config.num_attention_heads,
+                ffn_hidden_size=self.config.ffn_hidden_size,
+                layernorm_epsilon=getattr(self.config, "layernorm_epsilon", 1e-5),
+            )
+        else:
+            self.decoder = TransformerBlock(
+                config=self.config,
+                spec=self.transformer_decoder_layer_spec,
+            )
 
     def forward(
         self,
-        hidden_states,
-        attention_mask: Optional[
-            torch.Tensor
-        ] = None,  # decoder attention mask, always causal
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         *,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        offsets: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        arbitrary_func: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        attention_bias = None
-        # if self.position_embedding_type == 'relative':
-        #     # attention bias is supported by cudnn, but not fa.
-        #     # TODO@junzhang add jagged support once we have attention kernels
-        #     query_seq_length = input_max_seqlen
-        #     key_seq_length = query_seq_length
-        #     attention_bias = self.decoder_relative_pos_emb(query_seq_length, key_seq_length)
-        output = self.decoder(
-            hidden_states=hidden_states,  # query
-            attention_mask=attention_mask,  # attention mask
-            packed_seq_params=packed_seq_params,  # query and kv seqlens
-            attention_bias=attention_bias,
-            **kwargs,
-        )
-        return output
+        if self.use_jagged_flash_attn:
+            return self.decoder(
+                hidden_states=hidden_states,
+                arbitrary_func=arbitrary_func,
+            )
+        else:
+            # mcore path: expects dense [S, B, D] input
+            assert offsets is not None and max_seqlen is not None
+            padded = _padding_to_dense_and_transpose(hidden_states, offsets, max_seqlen)
+            output = self.decoder(
+                hidden_states=padded,
+                attention_mask=attention_mask,
+            )
+            return _transpose_dense_to_jagged(output, offsets, max_seqlen)
 
 
 class SIDGRModel(MegatronModule):
@@ -171,6 +189,7 @@ class SIDGRModel(MegatronModule):
         top_k_for_generation: int = 10,  # this is used for eval
         eval_metrics: Tuple[str, ...] = (),  # this is used for eval
         share_lm_head_across_hierarchies: bool = True,
+        use_jagged_flash_attn: bool = False,
     ):
         super(SIDGRModel, self).__init__(config=decoder_config)
         assert (
@@ -199,6 +218,7 @@ class SIDGRModel(MegatronModule):
             decoder_config,
             transformer_decoder_layer_spec,
             position_embedding_type="relative",
+            use_jagged_flash_attn=use_jagged_flash_attn,
         )
         self.codebook_sizes = codebook_sizes
         assert codebook_embedding_config.vocab_size >= sum(
@@ -513,66 +533,62 @@ class SIDGRModel(MegatronModule):
         input_offsets: torch.Tensor,
         input_max_seqlen: int,
         attention_mask: Optional[torch.Tensor] = None,
-        padding_to_dense: bool = True,
-        add_bos_to_history: bool = False,
+        arbitrary_func: Optional[torch.Tensor] = None,
+        *,
+        default_mask_add_bos_to_history: Optional[bool] = None,
     ) -> torch.Tensor:
         """
-        Input and Output are both jagged.
-        attention_mask is used only when padding_to_dense is True.
-        When attention mask is None, we will construct a causal attention mask if padding_to_dense is True.
+        Jagged in/out. Routes Megatron-Core vs jagged Flash Attention.
 
-        We now only support dense input.
+        If both ``attention_mask`` and ``arbitrary_func`` are omitted, builds
+        the usual causal mask for the active backend (same behavior as before
+        the explicit-mask refactor). Pass either tensor to override.
+
+        * FA path:    ``arbitrary_func`` (B=1 flattened arbitrary mask).
+        * mcore path: ``attention_mask`` (dense ``[B, 1, N, N]``).
+
+        ``default_mask_add_bos_to_history`` controls optional-BOS layout for the
+        built mcore mask: ``None`` uses ``self.add_bos_to_history_for_training``
+        (training-style); ``generate`` passes ``False``.
         """
-        if add_bos_to_history:
-            assert (
-                attention_mask is None
-            ), "attention mask should be None when adding bos to history"
-        # TODO, remove the padding.
-        input_offsets[-1].item()
-        if padding_to_dense:
-            decoder_input_hidden_states = _padding_to_dense_and_transpose(
-                input_hidden_states,
-                input_offsets,
-                input_max_seqlen,
-            )
-            packed_seq_params = None
-            if attention_mask is None:
+        if attention_mask is None and arbitrary_func is None:
+            if self.decoder.use_jagged_flash_attn:
+                total_tokens = int(input_offsets[-1].item())
+                arbitrary_func = build_jagged_causal_arbitrary_func(
+                    input_offsets, total_tokens
+                )
+            else:
+                add_bos = (
+                    self.add_bos_to_history_for_training
+                    if default_mask_add_bos_to_history is None
+                    else default_mask_add_bos_to_history
+                )
                 attention_mask = padded_causal_mask_with_optional_bos(
                     input_offsets,
                     input_max_seqlen,
-                    add_bos_to_history=add_bos_to_history,
+                    add_bos_to_history=add_bos,
                     bos_interval=self._num_hierarchies,
                 )
-        else:
-            # THD still needs batch dimension
-            # we need to unsqueeze the hidden states to [T, 1, hidden_size] and unsqueeze back after decoder
-            assert input_hidden_states.dim() == 2, "input_hidden_states should be 2D"
-            decoder_input_hidden_states = input_hidden_states.unsqueeze(1)
-            attention_mask = None
-            packed_seq_params = to_packed_seq_params(
-                input_offsets,
-                input_max_seqlen,
-            )
-        decoder_output_hidden_states = self.decoder(
-            hidden_states=decoder_input_hidden_states,  # input_hidden_states,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,  # we now enforce arbitrary attention mask + dense padding
-        )
 
-        if padding_to_dense:
-            output_hidden_states = _transpose_dense_to_jagged(
-                decoder_output_hidden_states,
-                input_offsets,
-                input_max_seqlen,
+        if self.decoder.use_jagged_flash_attn:
+            assert arbitrary_func is not None
+            return self.decoder(
+                hidden_states=input_hidden_states,
+                arbitrary_func=arbitrary_func,
             )
-        else:
-            # remove batch dim if THD
-            output_hidden_states = decoder_output_hidden_states.squeeze(1)
-        return output_hidden_states
+        assert attention_mask is not None
+        return self.decoder(
+            hidden_states=input_hidden_states,
+            attention_mask=attention_mask,
+            offsets=input_offsets,
+            max_seqlen=input_max_seqlen,
+        )
 
     def forward(
         self,
         batch: GPTSIDBatch,
+        attention_mask: Optional[torch.Tensor] = None,
+        arbitrary_func: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. prepare embeddings: embedding lookup + history, bos and candidate concat
         (
@@ -586,13 +602,12 @@ class SIDGRModel(MegatronModule):
         )
         history_offsets = batch.features[batch.history_feature_name].offsets()
 
-        # 2. decoder step
         jagged_output_hidden_states = self.decoder_step(
             input_hidden_states,
             input_offsets,
             input_max_seqlen,
-            attention_mask=None,
-            add_bos_to_history=self.add_bos_to_history_for_training,
+            attention_mask=attention_mask,
+            arbitrary_func=arbitrary_func,
         )
         # 3. postprocess: only keep the candidate hidden states
         candidate_hidden_states = self._postprocess_output(
@@ -636,7 +651,12 @@ class SIDGRModel(MegatronModule):
         return merged_losses, merged_logits
 
     @torch.no_grad
-    def generate(self, batch: GPTSIDBatch) -> torch.Tensor:
+    def generate(
+        self,
+        batch: GPTSIDBatch,
+        attention_mask: Optional[torch.Tensor] = None,
+        arbitrary_func: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Generate the output sids for the given batch. The generation will autogressively generate the output sids with a constrained fixed-width beam search strategy.
         Args:
@@ -645,7 +665,6 @@ class SIDGRModel(MegatronModule):
           torch.Tensor: The generated sids.
         """
 
-        attention_mask: Optional[torch.Tensor] = None
         # 0. prepare history and bos embeddings. Note that we do not append bos to history.
         (
             history_embeddings,
@@ -726,21 +745,14 @@ class SIDGRModel(MegatronModule):
                     dtype=input_offsets.dtype,
                 )
 
-            # 2. prepare the attention mask
-            attention_mask = padded_target_aware_causal_mask(
-                torch.diff(input_offsets),
-                input_max_seqlen,
-                0 if i == 0 else topk_prev_step,
-                candidate_length,
-            )
-            # 3. we need a decoder step with the concatenated hidden states and offsets. Note that we do not add bos to history for generation.
+            # 2. decoder (mask built in decoder_step when not overridden)
             jagged_output_hidden_states = self.decoder_step(
                 cated_hidden_states,
                 cated_offsets,
                 cated_max_seqlen,
                 attention_mask=attention_mask,
-                padding_to_dense=True,
-                add_bos_to_history=False,
+                arbitrary_func=arbitrary_func,
+                default_mask_add_bos_to_history=False,
             )
             # remove history[batchsize * topk_last_step * max(1,i), embedding_dim]
             _, candidate_hidden_states = triton_split_2D_jagged(
