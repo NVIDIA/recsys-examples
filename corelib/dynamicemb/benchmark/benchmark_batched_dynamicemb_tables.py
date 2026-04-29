@@ -31,8 +31,12 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EmbOptimType,
+    get_table_value_bytes,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.optimizer import get_optimizer_state_dim
+from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.types import DataType
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
@@ -115,11 +119,10 @@ _FBGEMM_POOL = {
     "mean": PoolingMode.MEAN,
 }
 
-_OPT_STATE_DIM = {
-    "sgd": lambda d: 0,
-    "adam": lambda d: 2 * d,
-    "exact_adagrad": lambda d: d,
-    "exact_row_wise_adagrad": lambda d: 1,
+_PRECISION_TO_DATATYPE = {
+    "fp32": DataType.FP32,
+    "fp16": DataType.FP16,
+    "bf16": DataType.BF16,
 }
 
 
@@ -182,8 +185,9 @@ class BenchmarkConfig:
 
     @property
     def value_dim(self):
-        opt_fn = _OPT_STATE_DIM.get(self.optimizer_type, lambda d: 0)
-        return self.embedding_dim + opt_fn(self.embedding_dim)
+        dtype = get_emb_precision(self.emb_precision)
+        optstate = get_optimizer_state_dim(_DYN_OPT[self.optimizer_type], self.embedding_dim, dtype)
+        return self.embedding_dim + optstate
 
     @property
     def mode(self):
@@ -195,12 +199,16 @@ class BenchmarkConfig:
             return "no_hbm"
         return "no_caching"
 
+    @property
+    def total_batch_size(self):
+        return self.batch_size * self.num_tables
+
     def label(self):
         caps = "_".join(
             f"{e // (1024 * 1024)}M" for e in self.num_embeddings_per_feature
         )
         return (
-            f"T{self.num_tables}_B{self.batch_size}_D{self.embedding_dim}_"
+            f"T{self.num_tables}_totalB{self.total_batch_size}_D{self.embedding_dim}_"
             f"{self.optimizer_type}_{self.mode}_"
             f"pool={self.pooling_mode}_cap={caps}"
         )
@@ -502,6 +510,67 @@ def benchmark_train_eval(model, sparse_features, num_iterations):
         "backward_ms": bwd_ms,
         "eval_ms": eval_ms,
     }
+
+
+# ── Per-iteration reporting ───────────────────────────────────────────────────
+
+
+def benchmark_one_iteration(model, sparse_feature):
+    start_event = torch.cuda.Event(enable_timing=True)
+    mid_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    output = model(sparse_feature.values(), sparse_feature.offsets())
+    mid_event.record()
+    grad = torch.empty_like(output)
+    output.backward(grad)
+    end_event.record()
+
+    torch.cuda.synchronize()
+    return (
+        start_event.elapsed_time(mid_event),
+        mid_event.elapsed_time(end_event),
+        start_event.elapsed_time(end_event),
+    )
+
+
+def run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg):
+    """Run num_iterations and print per-iteration latency and cache hit rate."""
+    print("\n  >> Reporting run (per-iteration latency)")
+    cache_miss_counter_trc = None
+
+    for i in range(cfg.num_iterations):
+        sf = sparse_features[i]
+        fwd, bwd, total = benchmark_one_iteration(dynamic_emb, sf)
+        cache_info = ""
+        if cfg.caching:
+            cache_metrics = dynamic_emb.cache.cache_metrics
+            unique_num = cache_metrics[0].item()
+            cache_hit = cache_metrics[1].item()
+            hit_rate = cache_hit / unique_num if unique_num > 0 else 0.0
+            cache_miss = unique_num - cache_hit
+            cache_info = f"  hit_rate={hit_rate:.4f} unique={unique_num} miss={int(cache_miss)}"
+        print(
+            f"    dyn iter {i:3d}: fwd={fwd:.3f} bwd={bwd:.3f} total={total:.3f} ms{cache_info}"
+        )
+
+    print()
+    for i in range(cfg.num_iterations):
+        sf = sparse_features[i]
+        fwd, bwd, total = benchmark_one_iteration(torchrec_emb, sf)
+        cache_info = ""
+        if cfg.caching:
+            cnt = torchrec_emb.get_cache_miss_counter().clone()
+            if cache_miss_counter_trc is not None:
+                miss = int((cnt - cache_miss_counter_trc)[1].item())
+            else:
+                miss = 0
+            cache_miss_counter_trc = cnt
+            cache_info = f"  cache_miss={miss}"
+        print(
+            f"    trc iter {i:3d}: fwd={fwd:.3f} bwd={bwd:.3f} total={total:.3f} ms{cache_info}"
+        )
 
 
 # ── Torch profiler integration ──────────────────────────────────────────────
@@ -884,9 +953,6 @@ def run_single_benchmark(
 
     if cfg.caching:
         dynamic_emb.set_record_cache_metrics(True)
-        # Not resetting cache states before benchmark to measure hit rate on warm cache
-        # dynamic_emb.reset_cache_states()
-        # torchrec_emb.reset_cache_states()
 
     bw_results: List[Dict] = []
     if profile_mode == "torch":
@@ -917,6 +983,8 @@ def run_single_benchmark(
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
         return {"label": cfg.label(), "ncu_run": True}
+    else:
+        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
 
     if cfg.caching:
         dynamic_emb.set_record_cache_metrics(False)
@@ -972,34 +1040,37 @@ def run_single_benchmark(
 # Test configuration and suites
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_NUM_TABLES = 10
 _CAP_PER_TABLE = 1 * 1024 * 1024  # 1M entries
-_CAPS = [_CAP_PER_TABLE] * _NUM_TABLES
 _DIM = 128
 
-_BATCH_SIZES = [65536]
-# _OPTIMIZERS = ["adam", "sgd"]
+_BATCH_SIZES = [1048576]
+_NUM_TABLES = [1]
+_OPTIMIZERS = ["adam", "sgd"]
 # _POOLING_MODES = ["none", "sum"]
-_OPTIMIZERS = ["sgd"]
 _POOLING_MODES = ["none"]
 
 
-def _cache_hbm(gpu_ratio, cap_per_table, dim, optimizer_type):
-    """HBM for caching mode: gpu_ratio fraction of the full table per table."""
-    opt_fn = _OPT_STATE_DIM.get(optimizer_type, lambda d: 0)
-    value_dim = dim + opt_fn(dim)
-    per_table = int(gpu_ratio * cap_per_table * value_dim * 4)
-    return [per_table] * _NUM_TABLES
+def _cache_hbm(gpu_ratio, cap_per_table, dim, optimizer_type, num_tables, emb_precision="fp32"):
+    """HBM for caching mode: gpu_ratio fraction of the full table value bytes per table."""
+    emb_cfg = EmbeddingConfig(
+        num_embeddings=cap_per_table,
+        embedding_dim=dim,
+        name="t",
+        feature_names=["f"],
+        data_type=_PRECISION_TO_DATATYPE.get(emb_precision, DataType.FP32),
+    )
+    table_bytes = get_table_value_bytes(emb_cfg, _DYN_OPT[optimizer_type], world_size=1)
+    return [int(gpu_ratio * table_bytes)] * num_tables
 
 
 def _gpu_configs():
-    hbm = [sys.maxsize] * _NUM_TABLES
+    cap_per_table = 24 * 1024 * 1024
     return [
         BenchmarkConfig(
-            batch_size=bs,
-            num_embeddings_per_feature=_CAPS,
+            batch_size=bs // nt,
+            num_embeddings_per_feature=[cap_per_table] * nt,
             embedding_dim=_DIM,
-            hbm_for_embeddings=hbm,
+            hbm_for_embeddings=[sys.maxsize] * nt,
             optimizer_type=opt,
             caching=False,
             gpu_ratio=1.0,
@@ -1007,6 +1078,7 @@ def _gpu_configs():
             max_hotness=10,
         )
         for bs in _BATCH_SIZES
+        for nt in _NUM_TABLES
         for opt in _OPTIMIZERS
         for pool in _POOLING_MODES
     ]
@@ -1014,13 +1086,15 @@ def _gpu_configs():
 
 _CACHE_GPU_RATIO = 0.1
 
+
 def _caching_configs():
+    cap_per_table = 256 * 1024 * 1024
     return [
         BenchmarkConfig(
-            batch_size=bs,
-            num_embeddings_per_feature=_CAPS,
+            batch_size=bs // nt,
+            num_embeddings_per_feature=[cap_per_table] * nt,
             embedding_dim=_DIM,
-            hbm_for_embeddings=_cache_hbm(_CACHE_GPU_RATIO, _CAP_PER_TABLE, _DIM, opt),
+            hbm_for_embeddings=_cache_hbm(_CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt),
             optimizer_type=opt,
             caching=True,
             cache_algorithm="lru",
@@ -1029,19 +1103,20 @@ def _caching_configs():
             max_hotness=10,
         )
         for bs in _BATCH_SIZES
+        for nt in _NUM_TABLES
         for opt in _OPTIMIZERS
         for pool in _POOLING_MODES
     ]
 
 
 def _no_caching_configs():
-    hbm = [0] * _NUM_TABLES
+    cap_per_table = 256 * 1024 * 1024
     return [
         BenchmarkConfig(
-            batch_size=bs,
-            num_embeddings_per_feature=_CAPS,
+            batch_size=bs // nt,
+            num_embeddings_per_feature=[cap_per_table] * nt,
             embedding_dim=_DIM,
-            hbm_for_embeddings=hbm,
+            hbm_for_embeddings=_cache_hbm(_CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt),
             optimizer_type=opt,
             caching=False,
             gpu_ratio=0.1,
@@ -1049,6 +1124,7 @@ def _no_caching_configs():
             max_hotness=10,
         )
         for bs in _BATCH_SIZES
+        for nt in _NUM_TABLES
         for opt in _OPTIMIZERS
         for pool in _POOLING_MODES
     ]
@@ -1056,13 +1132,13 @@ def _no_caching_configs():
 
 def _no_hbm_configs():
     """No HBM, no caching: all embedding data in system memory (UVM)."""
-    hbm = [0] * _NUM_TABLES
+    cap_per_table = 256 * 1024 * 1024
     return [
         BenchmarkConfig(
-            batch_size=bs,
-            num_embeddings_per_feature=_CAPS,
+            batch_size=bs // nt,
+            num_embeddings_per_feature=[cap_per_table] * nt,
             embedding_dim=_DIM,
-            hbm_for_embeddings=hbm,
+            hbm_for_embeddings=[0] * nt,
             optimizer_type=opt,
             caching=False,
             gpu_ratio=0.0,
@@ -1070,6 +1146,7 @@ def _no_hbm_configs():
             max_hotness=10,
         )
         for bs in _BATCH_SIZES
+        for nt in _NUM_TABLES
         for opt in _OPTIMIZERS
         for pool in _POOLING_MODES
     ]
