@@ -86,7 +86,7 @@ def apply_megatron_ddp(
         overlap_grad_reduce=False,
         use_distributed_optimizer=False,
         check_for_nan_in_grad=False,
-        bucket_size=True,
+        bucket_size=None,
     )
     # MCORE DDP does not broadcast parameters implicitly
     if isinstance(original_model, DistributedModelParallel):
