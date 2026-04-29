@@ -1,0 +1,22 @@
+ARG BASE_IMAGE=recsys-examples:inference
+FROM ${BASE_IMAGE}
+WORKDIR /workspace/deps
+ARG FLEXKV_REF=main
+ARG FLEXKV_MAX_JOBS=1
+ARG FLEXKV_CMAKE_JOBS=1
+RUN apt-get update -y --fix-missing && \
+    apt-get install -y --no-install-recommends git cmake patchelf liburing-dev libxxhash-dev && \
+    rm -rf /var/lib/apt/lists/*
+RUN git clone --recursive https://github.com/taco-project/FlexKV.git /workspace/deps/FlexKV && \
+    cd /workspace/deps/FlexKV && \
+    git checkout ${FLEXKV_REF} && \
+    git submodule update --init --recursive && \
+    mkdir -p build && cd build && cmake .. && cmake --build . -j"${FLEXKV_CMAKE_JOBS}" && \
+    cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
+    if ! MAX_JOBS=${FLEXKV_MAX_JOBS} FLEXKV_DEBUG=1 python3 setup.py install -v > /tmp/flexkv_setup.log 2>&1; then \
+      echo "FlexKV build failed:" && \
+      python3 -c "import pathlib,re; p=re.compile(r'(fatal error:|error:|ninja: build stopped|killed|undefined reference)', re.I); t=pathlib.Path('/tmp/flexkv_setup.log').read_text(errors='ignore').splitlines(); h=[f'{i+1}: {x}' for i,x in enumerate(t) if p.search(x)]; print('\n'.join(h[:160])); print(f'Total matched error lines: {len(h)}')" && \
+      exit 1; \
+    fi && \
+    cd /tmp && python3 -c "from flexkv.kvmanager import KVManager; print('flexkv import ok')" && \
+    rm -rf /workspace/deps/FlexKV
