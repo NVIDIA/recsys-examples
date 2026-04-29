@@ -249,9 +249,15 @@ class HSTUBatch(BaseBatch):
         assert self.action_feature_name is None or isinstance(
             self.action_feature_name, str
         ), "action_feature_name must be None or a string"
+        #Todo(Junyi Qiu and Yulu Liu): check if this is correct
+        dynamic_shapes_mod = getattr(getattr(torch, "export", None), "dynamic_shapes", None)
+        int_wrapper_cls = getattr(dynamic_shapes_mod, "_IntWrapper", int)
         assert isinstance(
-            self.max_num_candidates, (int, torch.export.dynamic_shapes._IntWrapper)
+            self.max_num_candidates, (int, int_wrapper_cls)
         ), "max_num_candidates must be an int"
+        # assert isinstance(
+        #     self.max_num_candidates, (int, torch.export.dynamic_shapes._IntWrapper)
+        # ), "max_num_candidates must be an int"
 
     def num_loss_tokens(self) -> torch.Tensor:
         """Per-rank loss token count (pre-TP, as a scalar tensor).
