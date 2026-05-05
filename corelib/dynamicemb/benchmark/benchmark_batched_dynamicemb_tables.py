@@ -35,8 +35,6 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.optimizer import get_optimizer_state_dim
-from torchrec.modules.embedding_configs import EmbeddingConfig
-from torchrec.types import DataType
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
@@ -50,6 +48,8 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     ComputeDevice,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
+from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.types import DataType
 
 try:
     from fbgemm_gpu.runtime_monitor import StdLogStatsReporterConfig
@@ -63,6 +63,7 @@ except ImportError:
 
 REPORT_INTERVAL = 10
 WARMUP_ITERS = 5
+RESULTS_FILE = os.environ.get("BENCHMARK_RESULTS_FILE", "benchmark_results.json")
 
 GPU_PEAK_BW_GB_S = {
     "H100 SXM": 3350,
@@ -161,9 +162,7 @@ class BenchmarkConfig:
     caching: bool = False
     cache_algorithm: str = "lru"
     gpu_ratio: float = 1.0
-    hbm_for_embeddings: List[int] = field(
-        default_factory=lambda: [36 * (1024**3)]
-    )
+    hbm_for_embeddings: List[int] = field(default_factory=lambda: [36 * (1024**3)])
     feature_distribution: str = "pow-law"
     alpha: float = 1.05
     pooling_mode: str = "none"
@@ -186,7 +185,9 @@ class BenchmarkConfig:
     @property
     def value_dim(self):
         dtype = get_emb_precision(self.emb_precision)
-        optstate = get_optimizer_state_dim(_DYN_OPT[self.optimizer_type], self.embedding_dim, dtype)
+        optstate = get_optimizer_state_dim(
+            _DYN_OPT[self.optimizer_type], self.embedding_dim, dtype
+        )
         return self.embedding_dim + optstate
 
     @property
@@ -358,7 +359,7 @@ def create_dynamic_embedding_tables(cfg: BenchmarkConfig, device: torch.device):
         num_tables = cfg.num_tables
         optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
         initial_accumulator = storage.init_optimizer_state()
-        value_dim = cfg.embedding_dim + optstate_dim
+        cfg.embedding_dim + optstate_dim
         max_num_embeddings = max(cfg.num_embeddings_per_feature)
         fill_batch = 1024 * 1024
 
@@ -369,13 +370,22 @@ def create_dynamic_embedding_tables(cfg: BenchmarkConfig, device: torch.device):
             chunk = end - start
             i += fill_batch
 
-            keys = torch.arange(start, end, device=device, dtype=torch.int64).repeat(num_tables)
-            table_ids = torch.arange(num_tables, device=device, dtype=torch.int64).repeat_interleave(chunk)
+            keys = torch.arange(start, end, device=device, dtype=torch.int64).repeat(
+                num_tables
+            )
+            table_ids = torch.arange(
+                num_tables, device=device, dtype=torch.int64
+            ).repeat_interleave(chunk)
             total = num_tables * chunk
 
-            emb = torch.rand(total, cfg.embedding_dim, device=device, dtype=torch.float32)
+            emb = torch.rand(
+                total, cfg.embedding_dim, device=device, dtype=torch.float32
+            )
             if optstate_dim > 0:
-                opt = torch.rand(total, optstate_dim, device=device, dtype=torch.float32) * initial_accumulator
+                opt = (
+                    torch.rand(total, optstate_dim, device=device, dtype=torch.float32)
+                    * initial_accumulator
+                )
                 values = torch.cat((emb, opt), dim=1).contiguous()
             else:
                 values = emb
@@ -404,14 +414,9 @@ def create_split_table_batched_embeddings(cfg: BenchmarkConfig, device: torch.de
     if cfg.caching:
         kwargs = {}
         if _HAS_STATS_REPORTER:
-            kwargs["stats_reporter_config"] = StdLogStatsReporterConfig(
-                REPORT_INTERVAL
-            )
+            kwargs["stats_reporter_config"] = StdLogStatsReporterConfig(REPORT_INTERVAL)
         emb = SplitTableBatchedEmbeddingBagsCodegen(
-            [
-                (e, D, EmbeddingLocation.MANAGED_CACHING, ComputeDevice.CUDA)
-                for e in Es
-            ],
+            [(e, D, EmbeddingLocation.MANAGED_CACHING, ComputeDevice.CUDA) for e in Es],
             optimizer=optimizer,
             weights_precision=get_fbgemm_precision(cfg.emb_precision),
             stochastic_rounding=False,
@@ -550,7 +555,9 @@ def run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg):
             cache_hit = cache_metrics[1].item()
             hit_rate = cache_hit / unique_num if unique_num > 0 else 0.0
             cache_miss = unique_num - cache_hit
-            cache_info = f"  hit_rate={hit_rate:.4f} unique={unique_num} miss={int(cache_miss)}"
+            cache_info = (
+                f"  hit_rate={hit_rate:.4f} unique={unique_num} miss={int(cache_miss)}"
+            )
         print(
             f"    dyn iter {i:3d}: fwd={fwd:.3f} bwd={bwd:.3f} total={total:.3f} ms{cache_info}"
         )
@@ -619,9 +626,7 @@ def benchmark_with_torch_profiler(
     trace_file = f"{trace_prefix}trace.json"
     prof.export_chrome_trace(trace_file)
     print(f"  Chrome trace -> {trace_file}")
-    print(
-        prof.key_averages().table(sort_by="device_time_total", row_limit=40)
-    )
+    print(prof.key_averages().table(sort_by="device_time_total", row_limit=40))
     return prof
 
 
@@ -631,15 +636,18 @@ def benchmark_with_torch_profiler(
 KERNEL_NAME_PATTERNS = {
     "load_from_flat": [
         "load_from_flat_table_kernel",
-        "load_from_flat_table", "load_from_flat",
+        "load_from_flat_table",
+        "load_from_flat",
     ],
     "store_to_flat": [
         "store_to_flat_table_kernel",
-        "store_to_flat_table", "store_to_flat",
+        "store_to_flat_table",
+        "store_to_flat",
     ],
     "gather_embedding": [
         "one_to_one_warp",
-        "forwardsequencefusedcopy", "forwardpooledfusedcopy",
+        "forwardsequencefusedcopy",
+        "forwardpooledfusedcopy",
         "gather_embedding",
     ],
     "reduce_grads": [
@@ -650,9 +658,12 @@ KERNEL_NAME_PATTERNS = {
         "update4_with_index_flat_table",
         "update_with_index_flat_table",
         "vecoptimizer",
-        "sgd_update", "adam_update",
-        "adagrad_update", "rowwise_adagrad",
-        "update_for_flat_table", "update_for_padded_buffer",
+        "sgd_update",
+        "adam_update",
+        "adagrad_update",
+        "rowwise_adagrad",
+        "update_for_flat_table",
+        "update_for_padded_buffer",
     ],
     "segmented_unique": ["segmented_unique"],
     "hash_find": ["lookup", "find_kernel", "_find"],
@@ -734,8 +745,11 @@ def precompute_unique_counts(sparse_features, num_tables, device):
         indices = kjt.values()
         offsets = kjt.offsets()
         table_range = get_table_range(offsets, feature_offsets)
-        num_uniques, _, _, _, _, _, _ = segmented_unique_cuda(
-            indices, table_range, num_tables, None
+        table_ids = expand_table_ids_cuda(
+            table_range, None, num_tables, 1, indices.numel()
+        )
+        num_uniques, _, _, _, _ = segmented_unique_cuda(
+            indices, table_ids, num_tables, None
         )
         counts.append(num_uniques.item())
     return counts
@@ -889,6 +903,17 @@ def format_bandwidth_table(rows):
             )
         )
     return "\n".join(lines)
+
+
+def append_result(result):
+    if os.path.exists(RESULTS_FILE):
+        with open(RESULTS_FILE, "r") as f:
+            data = json.load(f)
+    else:
+        data = []
+    data.append(result)
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(data, f, indent=2, default=str)
 
 
 def write_results(results, json_path=None, csv_path=None):
@@ -1050,7 +1075,9 @@ _OPTIMIZERS = ["adam", "sgd"]
 _POOLING_MODES = ["none"]
 
 
-def _cache_hbm(gpu_ratio, cap_per_table, dim, optimizer_type, num_tables, emb_precision="fp32"):
+def _cache_hbm(
+    gpu_ratio, cap_per_table, dim, optimizer_type, num_tables, emb_precision="fp32"
+):
     """HBM for caching mode: gpu_ratio fraction of the full table value bytes per table."""
     emb_cfg = EmbeddingConfig(
         num_embeddings=cap_per_table,
@@ -1094,7 +1121,9 @@ def _caching_configs():
             batch_size=bs // nt,
             num_embeddings_per_feature=[cap_per_table] * nt,
             embedding_dim=_DIM,
-            hbm_for_embeddings=_cache_hbm(_CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt),
+            hbm_for_embeddings=_cache_hbm(
+                _CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt
+            ),
             optimizer_type=opt,
             caching=True,
             cache_algorithm="lru",
@@ -1116,7 +1145,9 @@ def _no_caching_configs():
             batch_size=bs // nt,
             num_embeddings_per_feature=[cap_per_table] * nt,
             embedding_dim=_DIM,
-            hbm_for_embeddings=_cache_hbm(_CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt),
+            hbm_for_embeddings=_cache_hbm(
+                _CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt
+            ),
             optimizer_type=opt,
             caching=False,
             gpu_ratio=0.1,
@@ -1159,6 +1190,7 @@ class TestGpu:
     @pytest.mark.parametrize("cfg", _gpu_configs(), ids=lambda c: c.label())
     def test_gpu(self, cfg, device, timer, profile_mode):
         result = run_single_benchmark(cfg, device, timer, profile_mode)
+        append_result(result)
         assert "error" not in result
 
 
@@ -1166,6 +1198,7 @@ class TestCaching:
     @pytest.mark.parametrize("cfg", _caching_configs(), ids=lambda c: c.label())
     def test_caching(self, cfg, device, timer, profile_mode):
         result = run_single_benchmark(cfg, device, timer, profile_mode)
+        append_result(result)
         assert "error" not in result
 
 
@@ -1173,6 +1206,7 @@ class TestNoCaching:
     @pytest.mark.parametrize("cfg", _no_caching_configs(), ids=lambda c: c.label())
     def test_no_caching(self, cfg, device, timer, profile_mode):
         result = run_single_benchmark(cfg, device, timer, profile_mode)
+        append_result(result)
         assert "error" not in result
 
 
@@ -1180,4 +1214,5 @@ class TestNoHbm:
     @pytest.mark.parametrize("cfg", _no_hbm_configs(), ids=lambda c: c.label())
     def test_no_hbm(self, cfg, device, timer, profile_mode):
         result = run_single_benchmark(cfg, device, timer, profile_mode)
+        append_result(result)
         assert "error" not in result

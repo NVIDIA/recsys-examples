@@ -21,7 +21,10 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export BENCHMARK_RESULTS_FILE=${BENCHMARK_RESULTS_FILE:-benchmark_results.json}
+
+rm -f "$BENCHMARK_RESULTS_FILE"
 
 torchrun --nnodes 1 --nproc_per_node 1 \
     -m pytest ./benchmark/benchmark_batched_dynamicemb_tables.py \
-    -v -s "$@"
+    -svv "$@"
