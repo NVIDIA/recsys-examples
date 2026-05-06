@@ -51,6 +51,9 @@ at::Tensor expand_table_ids_cuda_impl(
         return at::empty({0}, at::TensorOptions().dtype(at::kLong).device(offsets.device()));
     }
 
+    TORCH_CHECK(local_batch_size > 0,
+        "INFERENCE_EMB::expand_table_ids expects local_batch_size > 0");
+
     const int64_t *feature_offsets_ptr = nullptr;
     if (table_offsets_in_feature.has_value() &&
         table_offsets_in_feature.value().defined() &&
