@@ -29,6 +29,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #endif
 
 #include <cassert>
+#include <cstdlib>
 #include <limits>
 
 #ifdef DEMB_USE_PYBIND11
@@ -474,6 +475,24 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   if (has_input_freq) {
     TORCH_CHECK(input_frequencies.numel() == num_keys,
                 "input_frequencies must have same length as keys");
+  }
+
+  // Debug validation of segmented_range (enabled via DYNAMICEMB_DEBUG=1).
+  // Checks: starts at 0, ends at num_keys, monotonically non-decreasing.
+  if (std::getenv("DYNAMICEMB_DEBUG")) {
+    at::Tensor sr_cpu = segmented_range.to(at::kCPU);
+    const int64_t *sr = sr_cpu.data_ptr<int64_t>();
+    TORCH_CHECK(sr[0] == 0,
+                "segmented_range[0] must be 0, got ", sr[0]);
+    TORCH_CHECK(sr[num_tables] == num_keys,
+                "segmented_range[num_tables] must equal num_keys (", num_keys,
+                "), got ", sr[num_tables]);
+    for (int64_t t = 0; t < num_tables; ++t) {
+      TORCH_CHECK(sr[t + 1] >= sr[t],
+                  "segmented_range must be non-decreasing: "
+                  "segmented_range[", t + 1, "]=", sr[t + 1],
+                  " < segmented_range[", t, "]=", sr[t]);
+    }
   }
 
   // Handle empty input
