@@ -710,9 +710,6 @@ def dynamicemb_prefetch(
 
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
-            None,
-            table_num,
-            1,
             unique_keys.numel(),
         )
 
@@ -824,9 +821,6 @@ def dynamicemb_eval_forward(
         if not is_pooling:
             table_ids = expand_table_ids_cuda(
                 indices_table_range,
-                None,
-                table_num,
-                1,
                 indices.numel(),
             )
             frequency_counts_int64 = (
@@ -862,9 +856,6 @@ def dynamicemb_eval_forward(
 
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
-            None,
-            table_num,
-            1,
             unique_indices.numel(),
         )
 

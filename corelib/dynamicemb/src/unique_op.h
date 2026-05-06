@@ -65,31 +65,19 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
                       at::Tensor input_frequencies = at::Tensor());
 
 /**
- * @brief Expand table IDs from offsets.
+ * @brief Expand table IDs from offsets (identity mapping: one feature per table,
+ * local_batch_size=1).
  *
- * Generates a table_id for each element based on offsets structure.
- * This is a helper function to prepare input for segmented_unique_cuda.
+ * Generates a table_id for each element via binary search on offsets.
+ * num_tables is derived from offsets.size(0)-1.
  *
- * @param offsets Jagged tensor offsets (int64)
- *                Size = num_features * local_batch_size + 1
- *                Indexed by (feature_id * local_batch_size + batch_id)
- *
- * @param table_offsets_in_feature Feature offsets per table (int64), or None
- *                Size = num_tables + 1
- *                Maps features to tables (adjacent features may share a table)
- *                table_offsets_in_feature[t] is the first feature index for
- * table t If None: each feature is treated as a separate table
- *
- * @param num_tables Number of tables (ignored if table_offsets_in_feature is
- * None)
- * @param local_batch_size Batch size per feature
+ * @param offsets Jagged tensor offsets (int64, size = num_tables + 1)
+ *                offsets[t] is the start index for table t's keys.
  * @param num_elements Total number of elements (keys)
  *
  * @return table_ids tensor (int64) with same length as num_elements
  */
-at::Tensor expand_table_ids_cuda(
-    at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
-    int64_t num_tables, int64_t local_batch_size, int64_t num_elements);
+at::Tensor expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements);
 
 /**
  * @brief Compute new lengths and offsets by evenly distributing unique keys.

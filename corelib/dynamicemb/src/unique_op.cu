@@ -380,45 +380,23 @@ __global__ void compact_keys_and_freq_kernel(
 // Helper kernel to expand table IDs from jagged offsets
 // ============================================================================
 
-// Binary search to find which table an index belongs to (for expand_table_ids)
-// When table_offsets_in_feature is nullptr, use identity mapping (feature i =
-// table i)
-__device__ __forceinline__ int64_t find_table_for_index(
-    const int64_t *table_offsets_in_feature, const int64_t *offsets,
-    int num_tables, int local_batch_size, int64_t global_idx) {
-  // Binary search through tables to find which one contains this index
-  int lo = 0, hi = num_tables;
-  while (lo < hi) {
-    int mid = (lo + hi + 1) / 2;
-    // If table_offsets_in_feature is nullptr, use identity: feature mid = table
-    // mid
-    int64_t table_start_feature =
-        table_offsets_in_feature ? table_offsets_in_feature[mid] : mid;
-    int64_t table_start_offset = table_start_feature * local_batch_size;
-    int64_t table_start_idx = offsets[table_start_offset];
-    if (table_start_idx <= global_idx) {
-      lo = mid;
-    } else {
-      hi = mid - 1;
-    }
-  }
-  return static_cast<int32_t>(lo);
-}
-
-// Expand jagged offsets to per-element table_ids (strided loop version)
-// Given: offsets tensor and table_offsets_in_feature, generate table_id for
-// each element
+// Expand jagged offsets to per-element table_ids (identity mapping,
+// local_batch_size=1). Binary search on offsets: find largest t such that
+// offsets[t] <= idx.
 __global__ void expand_table_ids_kernel(const int64_t *offsets,
-                                        const int64_t *table_offsets_in_feature,
                                         int64_t *table_ids, int num_tables,
-                                        int local_batch_size,
                                         int64_t num_elements) {
   const int64_t stride = blockDim.x * gridDim.x;
 
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_elements;
        idx += stride) {
-    table_ids[idx] = find_table_for_index(table_offsets_in_feature, offsets,
-                                          num_tables, local_batch_size, idx);
+    int lo = 0, hi = num_tables;
+    while (lo < hi) {
+      int mid = (lo + hi + 1) / 2;
+      if (offsets[mid] <= idx) lo = mid;
+      else hi = mid - 1;
+    }
+    table_ids[idx] = lo;
   }
 }
 
@@ -517,8 +495,8 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   at::Tensor table_ids = at::empty(
       {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
   expand_table_ids_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
-      get_pointer<const int64_t>(segmented_range), nullptr,
-      get_pointer<int64_t>(table_ids), num_tables, 1, num_keys);
+      get_pointer<const int64_t>(segmented_range),
+      get_pointer<int64_t>(table_ids), num_tables, num_keys);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   // Partitioned buffer uses segmented_range as per-table offsets, so total
@@ -634,53 +612,24 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
                          table_offsets, output_freq_counters);
 }
 
-// Helper function to expand table IDs from offsets
-//
-// offsets: size = num_features * local_batch_size + 1
-//   - Indexed by (feature_id * local_batch_size + batch_id)
-//   - Each feature contains local_batch_size buckets
-//
-// table_offsets_in_feature: size = num_tables + 1
-//   - Maps features to tables (adjacent features may belong to same table)
-//   - table_offsets_in_feature[t] is the first feature index for table t
-//
-// When table_offsets_in_feature is None:
-//   - Each feature is treated as a separate table
-//   - num_tables = num_features = (offsets.size(0) - 1) / local_batch_size
-//
-at::Tensor expand_table_ids_cuda(
-    at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
-    int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
+// Expand table IDs from offsets (identity mapping, local_batch_size=1).
+// offsets: size = num_tables + 1; offsets[t] is the start index for table t.
+// num_tables is derived from offsets.size(0)-1.
+at::Tensor expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const auto device = offsets.device();
   const int device_sm_count = DeviceProp::getDeviceProp(device.index()).num_sms;
 
   TORCH_CHECK(offsets.is_cuda(), "offsets must be on CUDA device");
-  TORCH_CHECK(local_batch_size > 0, "local_batch_size must be positive");
 
   // Handle empty input
   if (num_elements == 0) {
     return at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device));
   }
 
-  // Compute num_features from offsets size
-  int64_t num_features = (offsets.size(0) - 1) / local_batch_size;
-
-  // Determine if we have explicit table_offsets_in_feature or use identity
-  // mapping
-  const int64_t *table_offsets_ptr = nullptr;
-  if (table_offsets_in_feature.has_value() &&
-      table_offsets_in_feature.value().numel() > 0) {
-    const auto &table_offsets = table_offsets_in_feature.value();
-    TORCH_CHECK(table_offsets.is_cuda(),
-                "table_offsets_in_feature must be on CUDA device");
-    table_offsets_ptr = get_pointer<const int64_t>(table_offsets);
-  } else {
-    // Each feature = one table, so num_tables = num_features
-    // Kernel will use identity mapping when table_offsets_ptr is nullptr
-    num_tables = num_features;
-  }
+  // num_tables derived from offsets; local_batch_size is always 1
+  const int64_t num_tables = offsets.size(0) - 1;
 
   // Compute grid size based on SM count
   constexpr int BLOCKS_PER_SM = 4;
@@ -688,14 +637,12 @@ at::Tensor expand_table_ids_cuda(
       std::min((num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE,
                static_cast<int64_t>(device_sm_count * BLOCKS_PER_SM));
 
-  // Allocate output table_ids
   at::Tensor table_ids = at::empty(
       {num_elements}, at::TensorOptions().dtype(at::kLong).device(device));
 
   expand_table_ids_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
-      get_pointer<const int64_t>(offsets), table_offsets_ptr,
-      get_pointer<int64_t>(table_ids), num_tables, local_batch_size,
-      num_elements);
+      get_pointer<const int64_t>(offsets),
+      get_pointer<int64_t>(table_ids), num_tables, num_elements);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   return table_ids;
@@ -796,39 +743,24 @@ Returns:
 
   m.def(
       "expand_table_ids_cuda",
-      [](at::Tensor offsets, c10::optional<at::Tensor> table_offsets_in_feature,
-         int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
-        return dyn_emb::expand_table_ids_cuda(offsets, table_offsets_in_feature,
-                                              num_tables, local_batch_size,
-                                              num_elements);
+      [](at::Tensor offsets, int64_t num_elements) {
+        return dyn_emb::expand_table_ids_cuda(offsets, num_elements);
       },
       R"doc(
-Expand table IDs from offsets.
+Expand table IDs from offsets (identity mapping, local_batch_size=1).
 
-Generates a table_id for each element based on the offsets structure.
-This is a helper function to prepare input for segmented_unique_cuda.
+Generates a table_id for each element via binary search on offsets.
+num_tables is derived from offsets.size(0)-1.
 
 Args:
-    offsets: Jagged tensor offsets (int64)
-             Size = num_features * local_batch_size + 1
-             Indexed by (feature_id * local_batch_size + batch_id)
-
-    table_offsets_in_feature: Feature offsets per table (int64), or None
-             Size = num_tables + 1
-             Maps features to tables (adjacent features may share a table)
-             table_offsets_in_feature[t] is the first feature index for table t
-             If None: each feature is treated as a separate table
-
-    num_tables: Number of tables (ignored if table_offsets_in_feature is None)
-    local_batch_size: Batch size per feature
+    offsets: Table boundary offsets (int64, size = num_tables + 1)
+             offsets[t] is the start index for table t's keys.
     num_elements: Total number of elements (keys)
 
 Returns:
     table_ids tensor (int64) with same length as num_elements
 )doc",
-      py::arg("offsets"), py::arg("table_offsets_in_feature") = py::none(),
-      py::arg("num_tables") = 0, py::arg("local_batch_size") = 1,
-      py::arg("num_elements") = 0);
+      py::arg("offsets"), py::arg("num_elements") = 0);
 
   m.def(
       "compute_dedup_lengths_cuda",

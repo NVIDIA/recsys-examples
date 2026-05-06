@@ -416,83 +416,32 @@ def test_segmented_unique_with_custom_frequencies(setup_device):
 
 
 def test_expand_table_ids(setup_device):
-    """Test expand_table_ids_cuda helper function."""
+    """Test expand_table_ids_cuda (identity mapping, local_batch_size=1)."""
     device = setup_device
-    torch.cuda.get_device_properties(device).multi_processor_count
 
-    # Simulate a jagged tensor with 2 tables, 2 features per table, batch_size=3
-    # Table 0: features 0, 1
-    # Table 1: features 2, 3
-    # Offsets structure: offsets[feature_idx * batch_size + batch_idx]
-    num_tables = 2
-    local_batch_size = 3
-    features_per_table = 2
-    num_features = num_tables * features_per_table  # 4 features
+    # 3 tables with 5, 8, 3 keys respectively; total 16 elements
+    counts = torch.tensor([5, 8, 3], dtype=torch.int64)
+    segmented_range = torch.zeros(4, dtype=torch.int64, device=device)
+    segmented_range[1:] = torch.cumsum(counts, dim=0).to(device)
+    num_elements = segmented_range[-1].item()
 
-    # Create lengths for each (feature, batch) pair
-    # Feature 0: batch lengths [2, 1, 3] = 6 elements
-    # Feature 1: batch lengths [1, 2, 1] = 4 elements
-    # Feature 2: batch lengths [3, 2, 2] = 7 elements
-    # Feature 3: batch lengths [1, 1, 2] = 4 elements
-    # Total: 21 elements
-    lengths = torch.tensor(
-        [
-            2,
-            1,
-            3,  # Feature 0, batches 0-2
-            1,
-            2,
-            1,  # Feature 1, batches 0-2
-            3,
-            2,
-            2,  # Feature 2, batches 0-2
-            1,
-            1,
-            2,  # Feature 3, batches 0-2
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
-
-    offsets = torch.zeros(len(lengths) + 1, dtype=torch.int64, device=device)
-    offsets[1:] = torch.cumsum(lengths, dim=0)
-
-    # Table offsets in features: table 0 starts at feature 0, table 1 at feature 2
-    table_offsets_in_feature = torch.tensor([0, 2, 4], dtype=torch.int64, device=device)
-
-    num_elements = offsets[-1].item()
-
-    table_ids = expand_table_ids_cuda(
-        offsets,
-        table_offsets_in_feature,
-        num_tables,
-        local_batch_size,
-        num_elements,
-    )
+    table_ids = expand_table_ids_cuda(segmented_range, num_elements)
     torch.cuda.synchronize()
 
-    assert (
-        table_ids.numel() == num_elements
-    ), f"Expected {num_elements} table_ids, got {table_ids.numel()}"
-    assert table_ids.dtype == torch.int64, "table_ids should be int64"
+    assert table_ids.numel() == num_elements
+    assert table_ids.dtype == torch.int64
 
-    # Verify table_ids are correct
-    # Table 0 has features 0 and 1: elements 0-9 (6 + 4 = 10 elements)
-    # Table 1 has features 2 and 3: elements 10-20 (7 + 4 = 11 elements)
     table_ids_cpu = table_ids.cpu()
+    expected = torch.repeat_interleave(torch.arange(3), counts)
+    assert torch.equal(table_ids_cpu, expected), (
+        f"table_ids mismatch: {table_ids_cpu} vs {expected}"
+    )
 
-    # Table 0 ends at offset of feature 2 (which is table_offsets_in_feature[1] * batch_size)
-    table0_end_offset_idx = 2 * local_batch_size  # feature 2 * batch_size
-    table0_end = offsets[table0_end_offset_idx].item()  # = 10
+    # Edge: empty input
+    empty_ids = expand_table_ids_cuda(segmented_range, 0)
+    assert empty_ids.numel() == 0
 
-    assert torch.all(
-        table_ids_cpu[:table0_end] == 0
-    ), f"First table elements should have table_id=0, got {table_ids_cpu[:table0_end]}"
-    assert torch.all(
-        table_ids_cpu[table0_end:] == 1
-    ), f"Second table elements should have table_id=1, got {table_ids_cpu[table0_end:]}"
-
-    print(f"expand_table_ids test passed: {num_elements} elements, {num_tables} tables")
+    print(f"expand_table_ids test passed: {num_elements} elements, 3 tables")
 
 
 # ============================================================================
