@@ -28,25 +28,24 @@ namespace dyn_emb {
 /**
  * @brief Segmented unique operation that deduplicates keys per table.
  *
- * This function performs unique operation on keys partitioned by table_ids.
- * Keys are deduplicated within each table independently, allowing the same key
- * to appear in different tables. Uses compound hashing on (key, table_id) pairs
- * with a single shared hash table for memory efficiency.
+ * Keys must be pre-sorted by table: keys[segmented_range[t]:segmented_range[t+1]]
+ * all belong to table t. Uses compound hashing on (key, table_id) pairs with a
+ * single shared hash table for memory efficiency.
  *
  * NOTE: This function is fully asynchronous with no GPU-CPU synchronization.
  *
- * @param keys Input keys tensor (int64 or uint64)
- * @param table_ids Table ID for each key (int64, same length as keys,
- *                  must be in ascending order)
+ * @param keys Input keys tensor (int64 or uint64), sorted by table.
+ * @param segmented_range Table boundary offsets (int64, size = num_tables+1).
+ *                        segmented_range[t] is the start index in keys for
+ *                        table t; segmented_range[num_tables] == num_keys.
  * @param num_tables Total number of tables
  * @param input_frequencies Controls frequency counting behavior:
  *                          - Undefined/empty tensor with numel()==0: Enable
- *                            frequency counting with each occurrence counted as
- * 1
+ *                            frequency counting with each occurrence counted as 1
  *                          - Tensor with numel()==num_keys: Use provided
  *                            frequencies for weighted counting
  *                          - Pass None from Python to disable frequency
- * counting entirely (output freq_counters will be empty)
+ *                            counting entirely (output freq_counters will be empty)
  *
  * @return Tuple of (num_uniques, unique_keys, output_indices, table_offsets,
  *         freq_counters)
@@ -56,12 +55,13 @@ namespace dyn_emb {
  *           input). Only first num_uniques elements are valid.
  *         - output_indices: Index mapping (input idx -> global unique idx)
  *         - table_offsets: Tensor of size (num_tables + 1) with cumulative
- *           counts.
+ *           unique counts per table.
  *         - freq_counters: Frequency counts per unique key. Empty if frequency
  *           counting is disabled (input_frequencies was None).
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-segmented_unique_cuda(at::Tensor keys, at::Tensor table_ids, int64_t num_tables,
+segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
+                      int64_t num_tables,
                       at::Tensor input_frequencies = at::Tensor());
 
 /**
