@@ -381,8 +381,8 @@ __global__ void compact_keys_and_freq_kernel(
 // ============================================================================
 
 // Expand jagged offsets to per-element table_ids (identity mapping,
-// local_batch_size=1). Binary search on offsets: find largest t such that
-// offsets[t] <= idx.
+// local_batch_size=1). For each idx, find largest t such that offsets[t] <= idx
+// via binary_search_upper_bound (defined above).
 __global__ void expand_table_ids_kernel(const int64_t *offsets,
                                         int64_t *table_ids, int num_tables,
                                         int64_t num_elements) {
@@ -390,13 +390,7 @@ __global__ void expand_table_ids_kernel(const int64_t *offsets,
 
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_elements;
        idx += stride) {
-    int lo = 0, hi = num_tables;
-    while (lo < hi) {
-      int mid = (lo + hi + 1) / 2;
-      if (offsets[mid] <= idx) lo = mid;
-      else hi = mid - 1;
-    }
-    table_ids[idx] = lo;
+    table_ids[idx] = binary_search_upper_bound(offsets, num_tables + 1, idx);
   }
 }
 
