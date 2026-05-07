@@ -2433,6 +2433,7 @@ def test_multi_table_dump_load(opt_type, opt_params, tmp_path):
 
     print("test_multi_table_dump_load passed")
 
+
 def _make_multi_table_bdeb_for_dump_load(
     opt_type: EmbOptimType,
     opt_params: Dict[str, Any],
@@ -2477,9 +2478,7 @@ def _train_multi_table_bdeb_once(
     key_type: torch.dtype,
     device: torch.device,
 ) -> None:
-    indices = torch.tensor(
-        [0, 1, 2, 3, 10, 11, 12, 13], dtype=key_type, device=device
-    )
+    indices = torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=key_type, device=device)
     offsets = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=key_type, device=device)
 
     for _ in range(3):

@@ -38,7 +38,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchrec import DataType
-from torchrec.distributed.comm import get_local_rank, get_local_size
+from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
     QCommsConfig,
@@ -72,6 +72,7 @@ def rank_print(*args, **kwargs):
 builtins.print = rank_print
 cache_ratio = 0.5  # assume we will use 50% of the HBM for cache
 
+
 @dataclass
 class RuntimeContext:
     backend: str
@@ -79,6 +80,7 @@ class RuntimeContext:
     local_rank: int
     world_size: int
     device: torch.device
+
 
 def init_runtime() -> RuntimeContext:
     # Set LOCAL_WORLD_SIZE if not available for proper topology configuration.
@@ -114,10 +116,12 @@ def init_runtime() -> RuntimeContext:
         device=device,
     )
 
+
 def cleanup_runtime(runtime: Optional[RuntimeContext]) -> None:
     builtins.print = original_print
     if runtime is not None and dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
 
 def download_movielens(runtime: RuntimeContext, data_dir="./ml-1m"):
     if runtime.rank == 0:  # Use global rank for multi-node consistency
@@ -712,7 +716,15 @@ def create_model(args, runtime: RuntimeContext, training=True):
     return model
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs, runtime: RuntimeContext):
+def train_one_epoch(
+    model,
+    train_loader,
+    optimizer,
+    loss_fn,
+    epoch,
+    total_epochs,
+    runtime: RuntimeContext,
+):
     model.train()
     total_loss = 0
 
@@ -738,7 +750,9 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs
     print(f"Epoch {epoch+1}/{total_epochs}, Average Loss: {avg_loss:.4f}")
 
 
-def test_one_epoch(model, test_loader, loss_fn, epoch, total_epochs, runtime: RuntimeContext):
+def test_one_epoch(
+    model, test_loader, loss_fn, epoch, total_epochs, runtime: RuntimeContext
+):
     model.eval()
     test_loss = 0
     with torch.inference_mode():
@@ -790,7 +804,9 @@ def train(args, runtime: RuntimeContext):
 
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs, runtime)
+        train_one_epoch(
+            model, train_loader, optimizer, criterion, epoch, args.epochs, runtime
+        )
         test_one_epoch(model, test_loader, criterion, epoch, args.epochs, runtime)
 
 
@@ -819,7 +835,9 @@ def dump(args, runtime: RuntimeContext):
 
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs, runtime)
+        train_one_epoch(
+            model, train_loader, optimizer, criterion, epoch, args.epochs, runtime
+        )
 
         # ShardedDyanmicEmbeddingCollection.state_dict() will return a dummy tensor.
         torch.save(
@@ -827,9 +845,7 @@ def dump(args, runtime: RuntimeContext):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             },
-            os.path.join(
-                args.save_dir, f"model_epoch_{epoch+1}_rank{runtime.rank}.pt"
-            ),
+            os.path.join(args.save_dir, f"model_epoch_{epoch+1}_rank{runtime.rank}.pt"),
         )
     DynamicEmbDump(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
 
@@ -859,9 +875,7 @@ def load(args, runtime: RuntimeContext):
 
     # load
     checkpoint = torch.load(
-        os.path.join(
-            args.save_dir, f"model_epoch_{args.epochs}_rank{runtime.rank}.pt"
-        ),
+        os.path.join(args.save_dir, f"model_epoch_{args.epochs}_rank{runtime.rank}.pt"),
         weights_only=True,
     )
     # Must set strict to False, as there is no embedding's weight in model.state_dict()

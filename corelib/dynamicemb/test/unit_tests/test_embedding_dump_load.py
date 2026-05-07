@@ -448,6 +448,7 @@ def check_counter_table_checkpoint(x, y):
                     frequencies, score_out
                 ), f"counter frequency mismatch for table_id={table_id}"
 
+
 def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
     seen_sharding = False
     seen_input_dist = False
@@ -469,6 +470,7 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
 
     assert seen_sharding, "Did not find any DynamicEmb sharding carrying dist_type."
     assert seen_input_dist, "Did not find any input_dist carrying dist_type."
+
 
 @click.command()
 @click.option("--num-embedding-collections", type=int, required=True)
@@ -531,7 +533,7 @@ def test_model_load_dump(
         embedding_dim=embedding_dim,
         optimizer_kwargs=optimizer_kwargs,
         score_strategy=score_strategy_,
-        dist_type=dist_type,        
+        dist_type=dist_type,
         admit_strategy=FrequencyAdmissionStrategy(
             threshold=2 if counter else 1,
         ),
@@ -551,7 +553,7 @@ def test_model_load_dump(
         score_strategy=score_strategy,
         scores_collection=expect_scores_collection,
     )
-    
+
     asserted_ref_dist_type = False
     for kjt in kjts:
         ret = ref_model(kjt)

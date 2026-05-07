@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 import torch
 
-
 HASH_SIZE = 10_000_000
 KUAIRAND_1K_FEATURES = {
     "video_id": 49332,
@@ -324,7 +323,9 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
     except ImportError:
         pytest.skip("dynamicemb_extensions not available")
 
-    logical_indices = generate_zipf_logical_indices(feature_name, num_interactions=200_000)
+    logical_indices = generate_zipf_logical_indices(
+        feature_name, num_interactions=200_000
+    )
     adversarial_indices = remap_frequency_histogram_to_adversarial_keys(
         logical_indices,
         my_size,
@@ -387,4 +388,3 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
         assert total_output == batch_size
         assert torch.all(new_indices >= 0).item()
         assert rank_counts.tolist() == cpu_hist.tolist()
-

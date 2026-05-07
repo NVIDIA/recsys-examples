@@ -59,8 +59,12 @@ def test_segmented_unique_basic(setup_device):
     )
 
     # Assign tables, sort keys by table to satisfy segmented_range contract
-    table_assignments = torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
-    sort_idx, segmented_range = make_segmented_range(table_assignments, num_tables, device)
+    table_assignments = torch.randint(
+        0, num_tables, (num_keys,), dtype=torch.int64, device=device
+    )
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
     keys = keys_raw[sort_idx]
 
     (
@@ -118,8 +122,12 @@ def test_segmented_unique_overlapping_keys(setup_device):
         0, num_unique_keys, (num_keys,), dtype=torch.int64, device=device
     )
 
-    table_assignments = torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
-    sort_idx, segmented_range = make_segmented_range(table_assignments, num_tables, device)
+    table_assignments = torch.randint(
+        0, num_tables, (num_keys,), dtype=torch.int64, device=device
+    )
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
     keys = keys_raw[sort_idx]
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
@@ -164,11 +172,15 @@ def test_segmented_unique_empty_tables(setup_device):
     active_tables = [0, 1, 3, 4, 6, 8, 9]
     active_tables_tensor = torch.tensor(active_tables, dtype=torch.int64, device=device)
     table_assignments = active_tables_tensor[
-        torch.randint(0, len(active_tables), (num_keys,), dtype=torch.int64, device=device)
+        torch.randint(
+            0, len(active_tables), (num_keys,), dtype=torch.int64, device=device
+        )
     ]
 
     keys_raw = torch.randint(0, 10000, (num_keys,), dtype=torch.int64, device=device)
-    sort_idx, segmented_range = make_segmented_range(table_assignments, num_tables, device)
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
     keys = keys_raw[sort_idx]
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
@@ -244,8 +256,12 @@ def test_segmented_unique_random(setup_device):
     num_keys = 1_000_000
 
     keys_raw = torch.randint(0, 100000, (num_keys,), dtype=torch.int64, device=device)
-    table_assignments = torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
-    sort_idx, segmented_range = make_segmented_range(table_assignments, num_tables, device)
+    table_assignments = torch.randint(
+        0, num_tables, (num_keys,), dtype=torch.int64, device=device
+    )
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
     keys = keys_raw[sort_idx]
 
     num_uniques, unique_keys, output_indices, table_offsets, _ = segmented_unique_cuda(
@@ -283,8 +299,12 @@ def test_segmented_unique_stress(setup_device):
     num_keys = 4_000_000
 
     keys_raw = torch.randint(0, 500000, (num_keys,), dtype=torch.int64, device=device)
-    table_assignments = torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
-    sort_idx, segmented_range = make_segmented_range(table_assignments, num_tables, device)
+    table_assignments = torch.randint(
+        0, num_tables, (num_keys,), dtype=torch.int64, device=device
+    )
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
     keys = keys_raw[sort_idx]
 
     # Warmup
@@ -325,8 +345,12 @@ def test_segmented_unique_with_frequency_counters(setup_device):
     num_keys = 100000
 
     keys_raw = torch.randint(0, 1000, (num_keys,), dtype=torch.int64, device=device)
-    table_assignments = torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
-    sort_idx, segmented_range = make_segmented_range(table_assignments, num_tables, device)
+    table_assignments = torch.randint(
+        0, num_tables, (num_keys,), dtype=torch.int64, device=device
+    )
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
     keys = keys_raw[sort_idx]
 
     # Enable frequency counting by passing an empty tensor (numel==0)
@@ -378,8 +402,12 @@ def test_segmented_unique_with_custom_frequencies(setup_device):
     num_keys = 1000
 
     keys_raw = torch.randint(0, 100, (num_keys,), dtype=torch.int64, device=device)
-    table_assignments = torch.randint(0, num_tables, (num_keys,), dtype=torch.int64, device=device)
-    sort_idx, segmented_range = make_segmented_range(table_assignments, num_tables, device)
+    table_assignments = torch.randint(
+        0, num_tables, (num_keys,), dtype=torch.int64, device=device
+    )
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
     keys = keys_raw[sort_idx]
 
     # Custom frequencies: each key occurrence has frequency 2 (sorted same as keys)
@@ -433,9 +461,9 @@ def test_expand_table_ids(setup_device):
 
     table_ids_cpu = table_ids.cpu()
     expected = torch.repeat_interleave(torch.arange(3), counts)
-    assert torch.equal(table_ids_cpu, expected), (
-        f"table_ids mismatch: {table_ids_cpu} vs {expected}"
-    )
+    assert torch.equal(
+        table_ids_cpu, expected
+    ), f"table_ids mismatch: {table_ids_cpu} vs {expected}"
 
     # Edge: empty input
     empty_ids = expand_table_ids_cuda(segmented_range, 0)
