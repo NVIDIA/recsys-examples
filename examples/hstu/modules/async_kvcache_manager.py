@@ -286,7 +286,6 @@ class AsyncHSTUKVCacheManager:
         old_lengths = batch.features.lengths().cpu()
 
         item_offset = num_context * batch.batch_size
-        item_offset + batch.batch_size
 
         new_lengths = torch.zeros_like(old_lengths)
         new_lengths[:item_offset] = torch.where(
