@@ -114,7 +114,7 @@ def test_triton_jagged_tensor_concat(batch_size, max_len, hidden_dim):
         max_len_jt1 = torch.max(jt1.lengths()).item()
         max_len_jt2 = torch.max(jt2.lengths()).item()
         calculated_max_seq_len = max_len_jt1 + max_len_jt2
-    from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
+    from commons.ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 
     with torch.cuda.nvtx.range("triton concat", color="purple"):
         result = triton_concat_2D_jagged(
@@ -180,7 +180,7 @@ def test_forward_backward_verification(
     from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 
     if num == 2:
-        from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
+        from commons.ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 
         max_len_jt1 = torch.max(jt_list[0].lengths()).item()
         max_len_jt2 = torch.max(jt_list[1].lengths()).item()
@@ -499,7 +499,7 @@ def test_cudaop_vs_tritonop_benchmark(
     batch_size, max_len, hidden_dim, dtype=torch.float32
 ):
     from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
-    from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
+    from commons.ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 
     # Set random seeds for reproducibility
     torch.manual_seed(0)

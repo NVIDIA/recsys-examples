@@ -15,10 +15,10 @@
 import pytest
 import torch
 from commons.ops.length_to_offsets import length_to_complete_offsets
+from commons.ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 
 # from.datasets.hstu_batch import Batch, FeatureConfig
 from modules.position_encoder import HSTUPositionalEncoder
-from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 
 
 def merge_jagged_list(
