@@ -253,6 +253,13 @@ def hstu_preprocess_embeddings(
             num_candidates is not None
         ), "num_candidates should not be None during inference when compiling"
         total_candidates_seq_len = num_candidates.sum()
+    # In eager mode, materialize the 0-d tensor to a Python int here so the
+    # downstream `torch.empty((seq_len_a, D), ...)` inside _Split2DJaggedFunction
+    # does not trigger an implicit D2H sync at the end of the forward pass.
+    # During tracing (torch.export / torch.compile) keep it as a tensor so the
+    # dynamic shape is preserved in the graph (see PR #327).
+    if total_candidates_seq_len is not None and not torch.compiler.is_compiling():
+        total_candidates_seq_len = int(total_candidates_seq_len.item())
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
