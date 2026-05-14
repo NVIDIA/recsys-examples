@@ -35,7 +35,7 @@ jobs:
 
     # This job only runs for /build comments
     if: |
-         contains(fromJson('["EmmaQiaoCh","JacoCheung","kanghui0204","jiashuy","shijieliu","z52527"]'), github.actor) &&
+         contains(fromJson('["EmmaQiaoCh","JacoCheung","kanghui0204","jiashuy","shijieliu","z52527", "geoffreyQiu", "Clebrate"]'), github.actor) &&
          startsWith(github.event.comment.body, '/build')
     steps:
       - name: Check if comment is issued by authorized person
