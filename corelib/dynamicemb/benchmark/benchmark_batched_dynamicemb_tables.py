@@ -806,6 +806,62 @@ KERNEL_NAME_PATTERNS = {
 }
 
 
+# ── Nsight Systems profiler integration ──────────────────────────────────────
+
+
+def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
+    """Run fwd+bwd on both backends inside a cudaProfilerStart/Stop window.
+
+    Meant to be launched externally under
+    ``nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop ...``
+    so the trace contains only the marked iterations; setup kernels (table
+    alloc, sparse-feature gen, populate) and any preceding warmup
+    (``run_reporting_loop``) stay out of the capture.
+
+    Both backends share each iter so dyn and trc can be compared side-by-side
+    in the same trace.  NVTX layout:
+    ``<cfg.label()>`` -> ``nsys_iter_i`` -> ``dyn``/``trc`` -> ``forward``/``backward``.
+    The outermost range names the benchmark config so multiple traces are
+    distinguishable in nsys-ui.
+    """
+    dynamic_emb.train()
+    torchrec_emb.train()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push(cfg.label())
+    for i, sf in enumerate(sparse_features):
+        torch.cuda.nvtx.range_push(f"nsys_iter_{i}")
+
+        torch.cuda.nvtx.range_push("dyn")
+        torch.cuda.nvtx.range_push("forward")
+        out_dyn = dynamic_emb(sf.values(), sf.offsets())
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("backward")
+        grad_dyn = torch.empty_like(out_dyn)
+        out_dyn.backward(grad_dyn)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()  # dyn
+
+        torch.cuda.nvtx.range_push("trc")
+        torch.cuda.nvtx.range_push("forward")
+        out_trc = torchrec_emb(sf.values(), sf.offsets())
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("backward")
+        grad_trc = torch.empty_like(out_trc)
+        out_trc.backward(grad_trc)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()  # trc
+
+        torch.cuda.nvtx.range_pop()  # nsys_iter_i
+    torch.cuda.nvtx.range_pop()  # cfg.label()
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+
+    print(
+        f"  Nsys profiled {len(sparse_features)} iters (dyn + trc, fwd+bwd each)."
+    )
+
+
 # ── NCU (Nsight Compute) profiler integration ────────────────────────────────
 
 
@@ -1259,19 +1315,39 @@ def run_single_benchmark(
         if cfg.caching:
             dynamic_emb.reset_cache_states()
             torchrec_emb.reset_cache_states()
+        del dynamic_emb, torchrec_emb, sparse_features
+        torch.cuda.empty_cache()
+        result = {"label": cfg.label(), "torch_profile": True}
+        if bw_results:
+            result["bandwidth"] = bw_results
+        return result
     elif profile_mode == "nsys":
-        print("  (NVTX annotations active -- run under nsys profile)")
+        # Run reporting loop as untimed warmup (NOT captured by nsys -- the
+        # cudaProfilerStart/Stop window inside benchmark_with_nsys is what
+        # bounds the capture when launched under
+        # `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`).
+        print("  (run_reporting_loop warmup, then nsys sample 1 fwd+bwd)")
+        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
+        if cfg.caching:
+            dynamic_emb.set_record_cache_metrics(False)
+            dynamic_emb.reset_cache_states()
+            torchrec_emb.reset_cache_states()
+
+        benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg)
+        del dynamic_emb, torchrec_emb, sparse_features
+        torch.cuda.empty_cache()
+        return {"label": cfg.label(), "nsys": True}
     elif profile_mode == "ncu-run":
         benchmark_with_ncu(dynamic_emb, sparse_features)
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
         return {"label": cfg.label(), "ncu_run": True}
-    else:
-        # The reporting loop runs each backend independently with separate
-        # gradients, which drifts their weights apart; skip it when we need
-        # the post-loop weight state to match for the forward comparison.
-        if not cfg.correctness:
-            run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
+
+    # The reporting loop runs each backend independently with separate
+    # gradients, which drifts their weights apart; skip it when we need
+    # the post-loop weight state to match for the forward comparison.
+    if not cfg.correctness:
+        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
 
     if cfg.caching:
         dynamic_emb.set_record_cache_metrics(False)
