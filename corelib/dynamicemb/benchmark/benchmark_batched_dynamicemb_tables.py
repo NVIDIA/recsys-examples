@@ -17,6 +17,7 @@ import csv
 import json
 import os
 import sys
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -1237,6 +1238,20 @@ def run_single_benchmark(
     if profile_mode == "ncu-gen":
         print_ncu_command(cfg)
         return {"label": cfg.label(), "ncu_gen": True}
+
+    # Profile modes capture/profile workloads, not validate them.  cap/2
+    # sampling and the populate-then-reporting drift would yield a
+    # misleading trace, so force-disable correctness whenever any profile
+    # mode is active.  Warn if the user (cfg flag or --correctness CLI)
+    # explicitly asked for it so the override is not silent.
+    if profile_mode is not None and cfg.correctness:
+        warnings.warn(
+            f"profile_mode={profile_mode!r} is incompatible with "
+            f"cfg.correctness=True; disabling correctness for this run.",
+            UserWarning,
+            stacklevel=2,
+        )
+        cfg.correctness = False
 
     torch.cuda.manual_seed(cfg.seed)
     torch.cuda.empty_cache()
