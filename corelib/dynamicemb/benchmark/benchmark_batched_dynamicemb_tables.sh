@@ -16,7 +16,14 @@
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile torch       # with profiling
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-gen     # print ncu commands (no tests)
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-run     # single-iter run (wrap with ncu)
+#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --correctness          # force-enable forward-only correctness check on every config
+#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --correctness -k TestGpu  # correctness on gpu suite only
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --co                  # list configs
+#
+# Correctness can also be enabled per-config by setting `correctness=True` on
+# the BenchmarkConfig (in _gpu_configs / _caching_configs / etc.).  The check
+# runs only in the default (no --profile) path and compares forward outputs
+# against the TorchRec/FBGEMM TBE baseline.
 
 set -euo pipefail
 

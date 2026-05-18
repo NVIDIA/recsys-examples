@@ -33,6 +33,17 @@ def pytest_addoption(parser):
             "'ncu-run' to run a single-iteration benchmark under ncu."
         ),
     )
+    parser.addoption(
+        "--correctness",
+        action="store_true",
+        default=False,
+        help=(
+            "Force BenchmarkConfig.correctness=True on every parametrized "
+            "config, enabling the forward-only TBE vs DynamicEmb comparison "
+            "alongside the normal (profile=none) reporting/timing run. "
+            "Configs that already set correctness=True in code are unaffected."
+        ),
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -58,3 +69,9 @@ def timer():
 @pytest.fixture(scope="session")
 def profile_mode(request):
     return request.config.getoption("--profile")
+
+
+@pytest.fixture(scope="session")
+def correctness_flag(request):
+    """Session-wide override for BenchmarkConfig.correctness from --correctness."""
+    return request.config.getoption("--correctness")

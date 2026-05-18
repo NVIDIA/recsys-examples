@@ -177,6 +177,14 @@ class BenchmarkConfig:
     beta2: float = 0.999
     weight_decay: float = 0.0
     seed: int = 42
+    # When True the profile=none path runs a forward-output equality check
+    # against the TorchRec/FBGEMM TBE baseline inside benchmark_train_eval.
+    # Sampling is restricted to ``[0, cap/2)`` and DynamicEmb is populated by
+    # mirroring TorchRec's ``[0, cap/2)`` slice (its constructor's random
+    # init), so every lookup hits the same value on both backends.  The
+    # default fill_tables / hybrid-storage population is skipped to make room
+    # for the mirrored values.
+    correctness: bool = False
 
     @property
     def num_tables(self):
@@ -218,17 +226,31 @@ class BenchmarkConfig:
 # ── GPU-accelerated data generation ─────────────────────────────────────────
 
 
-def generate_sparse_features_gpu(cfg: BenchmarkConfig, device: torch.device):
+def generate_sparse_features_gpu(
+    cfg: BenchmarkConfig,
+    device: torch.device,
+    num_embeddings_override: Optional[List[int]] = None,
+):
     """Batch-generate all sparse features on GPU.
 
     All random number generation happens in bulk GPU calls.  Only the final
     KJT construction loops in Python (unavoidable since KJT is a Python object).
+
+    ``num_embeddings_override`` shrinks the per-table sampling range.  Used by
+    the correctness path to sample indices from ``[0, cap/2)`` so every lookup
+    hits the populated half of the table.
     """
     num_tables = cfg.num_tables
     num_iters = cfg.num_iterations
     bs = cfg.batch_size
     feature_names = [feature_idx_to_name(i) for i in range(num_tables)]
     is_pooling = cfg.pooling_mode != "none"
+    caps = (
+        num_embeddings_override
+        if num_embeddings_override is not None
+        else cfg.num_embeddings_per_feature
+    )
+    assert len(caps) == num_tables
 
     if is_pooling:
         all_lengths = torch.randint(
@@ -257,7 +279,7 @@ def generate_sparse_features_gpu(cfg: BenchmarkConfig, device: torch.device):
         per_table_vals = []
         for t in range(num_tables):
             n_samples = int(per_table_totals[t].item())
-            cap = cfg.num_embeddings_per_feature[t]
+            cap = caps[t]
             if cfg.feature_distribution == "pow-law":
                 vals = PowerLaw(1, cap, cfg.alpha, n_samples, device)
             else:
@@ -316,7 +338,9 @@ def is_hybrid_storage(cfg: BenchmarkConfig) -> bool:
     return True
 
 
-def create_dynamic_embedding_tables(cfg: BenchmarkConfig, device: torch.device):
+def create_dynamic_embedding_tables(
+    cfg: BenchmarkConfig, device: torch.device, populate: bool = True
+):
     table_options = []
     for i in range(cfg.num_tables):
         table_options.append(
@@ -353,6 +377,9 @@ def create_dynamic_embedding_tables(cfg: BenchmarkConfig, device: torch.device):
         beta1=cfg.beta1,
         beta2=cfg.beta2,
     )
+
+    if not populate:
+        return var
 
     if is_hybrid_storage(cfg):
         storage = var.tables
@@ -461,59 +488,141 @@ def create_split_table_batched_embeddings(cfg: BenchmarkConfig, device: torch.de
 # ── Benchmark execution ──────────────────────────────────────────────────────
 
 
-def benchmark_train_eval(model, sparse_features, num_iterations):
-    """Measure train / eval latencies (ms per iteration) using CUDA Events."""
-    model.train()
+def benchmark_train_eval(
+    dynamic_emb,
+    torchrec_emb,
+    sparse_features,
+    num_iterations,
+    cfg: BenchmarkConfig,
+    check_forward: bool = False,
+):
+    """Measure train / eval latencies for both backends using CUDA Events.
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    mid_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    total_forward_ms = 0.0
-    total_backward_ms = 0.0
-    total_iter_ms = 0.0
+    When ``check_forward`` is True the per-iter dyn/trc forward outputs are
+    compared with ``torch.allclose`` (precision-aware tolerance). The shared
+    backward gradient is allocated once outside the timed loop and reused for
+    every iter — ``backward`` does not mutate ``grad``, and using a valid
+    (non-uninitialized) tensor keeps the optimizer-driven weight evolution
+    deterministic across the two backends.
+    """
+    dynamic_emb.train()
+    torchrec_emb.train()
+
+    atol, rtol = _CORRECTNESS_TOL.get(cfg.emb_precision, (1e-4, 1e-3))
+    failures: List[Dict[str, Any]] = []
+
+    dyn_fwd = dyn_bwd = dyn_total = 0.0
+    trc_fwd = trc_bwd = trc_total = 0.0
+
+    # CUDA events are reusable across record() calls; allocate once.
+    dyn_s = torch.cuda.Event(enable_timing=True)
+    dyn_m = torch.cuda.Event(enable_timing=True)
+    dyn_e = torch.cuda.Event(enable_timing=True)
+    trc_s = torch.cuda.Event(enable_timing=True)
+    trc_m = torch.cuda.Event(enable_timing=True)
+    trc_e = torch.cuda.Event(enable_timing=True)
+
+    # grad shape is fixed across iters (pooling: [bs, D*nt]; non-pooling has
+    # lengths=1 so [bs*nt, D]).  Allocate once so torch.randn_like doesn't
+    # land inside dyn_bwd timing.
+    device = sparse_features[0].values().device
+    grad_dtype = get_emb_precision(cfg.output_dtype)
+    if cfg.pooling_mode != "none":
+        grad_shape = (cfg.batch_size, cfg.embedding_dim * cfg.num_tables)
+    else:
+        grad_shape = (cfg.batch_size * cfg.num_tables, cfg.embedding_dim)
+    grad = torch.randn(grad_shape, device=device, dtype=grad_dtype)
 
     for i in range(num_iterations):
         sf = sparse_features[i]
         torch.cuda.nvtx.range_push(f"train_iter_{i}")
-        torch.cuda.nvtx.range_push("forward")
-        start_event.record()
-        output = model(sf.values(), sf.offsets())
-        mid_event.record()
+
+        # ── dyn ──
+        torch.cuda.nvtx.range_push("dyn")
+        dyn_s.record()
+        out_dyn = dynamic_emb(sf.values(), sf.offsets())
+        dyn_m.record()
+        out_dyn.backward(grad)
+        dyn_e.record()
         torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push("backward")
-        grad = torch.empty_like(output)
-        output.backward(grad)
-        end_event.record()
+
+        # ── trc ──
+        torch.cuda.nvtx.range_push("trc")
+        trc_s.record()
+        out_trc = torchrec_emb(sf.values(), sf.offsets())
+        trc_m.record()
+        out_trc.backward(grad)
+        trc_e.record()
         torch.cuda.nvtx.range_pop()
+
         torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
-        total_forward_ms += start_event.elapsed_time(mid_event)
-        total_backward_ms += mid_event.elapsed_time(end_event)
-        total_iter_ms += start_event.elapsed_time(end_event)
+        dyn_fwd += dyn_s.elapsed_time(dyn_m)
+        dyn_bwd += dyn_m.elapsed_time(dyn_e)
+        dyn_total += dyn_s.elapsed_time(dyn_e)
+        trc_fwd += trc_s.elapsed_time(trc_m)
+        trc_bwd += trc_m.elapsed_time(trc_e)
+        trc_total += trc_s.elapsed_time(trc_e)
 
-    train_ms = total_iter_ms / num_iterations
-    fwd_ms = total_forward_ms / num_iterations
-    bwd_ms = total_backward_ms / num_iterations
+        if check_forward:
+            with torch.no_grad():
+                diff = (out_dyn.float() - out_trc.float()).abs()
+                max_diff = float(diff.max().item())
+                mean_diff = float(diff.mean().item())
+            if not torch.allclose(out_dyn, out_trc, atol=atol, rtol=rtol):
+                failures.append(
+                    {
+                        "phase": "train",
+                        "iter": i,
+                        "max_diff": max_diff,
+                        "mean_diff": mean_diff,
+                    }
+                )
 
-    model.eval()
-    eval_start = torch.cuda.Event(enable_timing=True)
-    eval_end = torch.cuda.Event(enable_timing=True)
-    total_eval_ms = 0.0
+    dynamic_emb.eval()
+    torchrec_emb.eval()
+    dyn_eval = trc_eval = 0.0
     for i in range(num_iterations):
         sf = sparse_features[i]
-        eval_start.record()
-        output = model(sf.values(), sf.offsets())
-        eval_end.record()
+        dyn_s.record()
+        out_dyn = dynamic_emb(sf.values(), sf.offsets())
+        dyn_e.record()
         torch.cuda.synchronize()
-        total_eval_ms += eval_start.elapsed_time(eval_end)
+        dyn_eval += dyn_s.elapsed_time(dyn_e)
 
-    eval_ms = total_eval_ms / num_iterations
+        trc_s.record()
+        out_trc = torchrec_emb(sf.values(), sf.offsets())
+        trc_e.record()
+        torch.cuda.synchronize()
+        trc_eval += trc_s.elapsed_time(trc_e)
+
+        if check_forward:
+            if not torch.allclose(out_dyn, out_trc, atol=atol, rtol=rtol):
+                with torch.no_grad():
+                    diff = (out_dyn.float() - out_trc.float()).abs()
+                    max_diff = float(diff.max().item())
+                    mean_diff = float(diff.mean().item())
+                failures.append(
+                    {
+                        "phase": "eval",
+                        "iter": i,
+                        "max_diff": max_diff,
+                        "mean_diff": mean_diff,
+                    }
+                )
+
+    if failures:
+        raise AssertionError(f"forward mismatch: {failures}")
 
     return {
-        "train_ms": train_ms,
-        "forward_ms": fwd_ms,
-        "backward_ms": bwd_ms,
-        "eval_ms": eval_ms,
+        "dyn_train_ms": dyn_total / num_iterations,
+        "dyn_forward_ms": dyn_fwd / num_iterations,
+        "dyn_backward_ms": dyn_bwd / num_iterations,
+        "dyn_eval_ms": dyn_eval / num_iterations,
+        "trc_train_ms": trc_total / num_iterations,
+        "trc_forward_ms": trc_fwd / num_iterations,
+        "trc_backward_ms": trc_bwd / num_iterations,
+        "trc_eval_ms": trc_eval / num_iterations,
     }
 
 
@@ -934,6 +1043,104 @@ def write_results(results, json_path=None, csv_path=None):
         print(f"Results -> {csv_path}")
 
 
+# ── Correctness init alignment ───────────────────────────────────────────────
+
+# torch.allclose tolerances picked per emb_precision.  fp32 gets a relatively
+# loose atol because fused vs split kernels can reorder reductions; fp16/bf16
+# loses much more precision per update, so we open the gates wider.
+_CORRECTNESS_TOL = {
+    "fp32": (1e-4, 1e-3),
+    "fp16": (5e-2, 5e-2),
+    "bf16": (5e-2, 5e-2),
+}
+
+
+def _per_table_unique_keys(sparse_features, num_tables, batch_size, device):
+    """Return list of per-table unique key tensors (int64) across all iters."""
+    per_table_chunks: List[List[torch.Tensor]] = [[] for _ in range(num_tables)]
+    for kjt in sparse_features:
+        vals = kjt.values()
+        offs = kjt.offsets()
+        for t in range(num_tables):
+            s = int(offs[t * batch_size].item())
+            e = int(offs[(t + 1) * batch_size].item())
+            per_table_chunks[t].append(vals[s:e])
+
+    unique_keys: List[torch.Tensor] = []
+    for t in range(num_tables):
+        chunks = per_table_chunks[t]
+        if chunks:
+            unique_keys.append(torch.unique(torch.cat(chunks)))
+        else:
+            unique_keys.append(torch.empty(0, dtype=torch.int64, device=device))
+    return unique_keys
+
+
+_INSERT_BATCH = 1024 * 1024
+
+
+def _populate_correctness_tables(
+    dynamic_emb, torchrec_emb, cfg: BenchmarkConfig, device
+):
+    """Mirror TorchRec's first-half weights into DynamicEmb.
+
+    TorchRec already has random init from its constructor; we read its
+    ``[0, cap/2)`` slice in ``_INSERT_BATCH``-sized chunks and ``insert`` the
+    same ``(key, value)`` pairs into the dynamicemb storage, with
+    optimizer-state slots zeroed to mirror the fused-optimizer default initial
+    state.  Sparse features (generated with ``cap/2`` as the upper bound) only
+    look up keys in this populated range, so every lookup hits the same value
+    on both backends.
+    """
+    nt = cfg.num_tables
+    D = cfg.embedding_dim
+    storage = dynamic_emb.tables
+    optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
+    emb_dtype = get_emb_precision(cfg.emb_precision)
+
+    trc_weights = torchrec_emb.split_embedding_weights()
+    total = 0
+    for t in range(nt):
+        cap = cfg.num_embeddings_per_feature[t]
+        half = cap // 2
+        if half == 0:
+            continue
+        trc_w_t = trc_weights[t]
+        assert trc_w_t.shape[1] == D, (
+            f"trc_weights[{t}] dim {trc_w_t.shape[1]} != cfg.embedding_dim {D}"
+        )
+
+        for start in range(0, half, _INSERT_BATCH):
+            end = min(start + _INSERT_BATCH, half)
+            chunk = end - start
+            keys = torch.arange(start, end, device=device, dtype=torch.int64)
+            init_w = trc_w_t[start:end].to(
+                device=device, dtype=torch.float32
+            )
+
+            if optstate_dim > 0:
+                opt_zero = torch.zeros(
+                    chunk, optstate_dim, device=device, dtype=torch.float32
+                )
+                values = torch.cat([init_w, opt_zero], dim=1).contiguous()
+            else:
+                values = init_w.contiguous()
+            values = values.to(emb_dtype)
+
+            table_ids = torch.full(
+                (chunk,), t, dtype=torch.int64, device=device
+            )
+            scores = (
+                torch.ones(chunk, dtype=torch.uint64, device=device)
+                if cfg.cache_algorithm == "lfu"
+                else None
+            )
+            storage.insert(keys, table_ids, values, scores)
+            total += chunk
+
+    return total
+
+
 # ── Single benchmark run ─────────────────────────────────────────────────────
 
 
@@ -955,7 +1162,11 @@ def run_single_benchmark(
     torch.cuda.empty_cache()
 
     timer.start()
-    dynamic_emb = create_dynamic_embedding_tables(cfg, device)
+    # When correctness is requested we skip the default fill so
+    # _populate_correctness_tables can mirror TorchRec's first-half weights.
+    dynamic_emb = create_dynamic_embedding_tables(
+        cfg, device, populate=not cfg.correctness
+    )
     timer.stop()
     print(f"  DynamicEmb created in {timer.elapsed_time() / 1000:.3f} s")
 
@@ -964,10 +1175,33 @@ def run_single_benchmark(
     timer.stop()
     print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
 
+    # In correctness mode the sparse-feature sampler is restricted to the
+    # populated half of each table so every lookup hits a key we mirrored
+    # from TorchRec into DynamicEmb.
+    half_caps = (
+        [c // 2 for c in cfg.num_embeddings_per_feature]
+        if cfg.correctness
+        else None
+    )
+
     timer.start()
-    sparse_features = generate_sparse_features_gpu(cfg, device)
+    sparse_features = generate_sparse_features_gpu(
+        cfg, device, num_embeddings_override=half_caps
+    )
     timer.stop()
     print(f"  Data generated in {timer.elapsed_time() / 1000:.3f} s")
+
+    if cfg.correctness:
+        # PowerLaw/zipf already produce values in [min, max-1] / [min, max),
+        # so passing half_caps as the upper bound guarantees every index is
+        # strictly less than cap/2 -- the populated range on DynamicEmb.
+        n_keys = _populate_correctness_tables(
+            dynamic_emb, torchrec_emb, cfg, device
+        )
+        print(
+            f"  Correctness: mirrored {n_keys} keys "
+            f"(TorchRec[:cap/2] -> DynamicEmb)"
+        )
 
     unique_counts = precompute_unique_counts(sparse_features, cfg.num_tables, device)
     avg_n_unique = sum(unique_counts) / len(unique_counts)
@@ -1009,15 +1243,25 @@ def run_single_benchmark(
         torch.cuda.empty_cache()
         return {"label": cfg.label(), "ncu_run": True}
     else:
-        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
+        # The reporting loop runs each backend independently with separate
+        # gradients, which drifts their weights apart; skip it when we need
+        # the post-loop weight state to match for the forward comparison.
+        if not cfg.correctness:
+            run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
 
     if cfg.caching:
         dynamic_emb.set_record_cache_metrics(False)
         dynamic_emb.reset_cache_states()
         torchrec_emb.reset_cache_states()
 
-    dyn = benchmark_train_eval(dynamic_emb, sparse_features, cfg.num_iterations)
-    trc = benchmark_train_eval(torchrec_emb, sparse_features, cfg.num_iterations)
+    metrics = benchmark_train_eval(
+        dynamic_emb,
+        torchrec_emb,
+        sparse_features,
+        cfg.num_iterations,
+        cfg=cfg,
+        check_forward=cfg.correctness,
+    )
 
     result = {
         "label": cfg.label(),
@@ -1031,25 +1275,29 @@ def run_single_benchmark(
         "feature_distribution": cfg.feature_distribution,
         "avg_n_unique": avg_n_unique,
         "avg_n_total": avg_n_total,
-        "dyn_forward_ms": dyn["forward_ms"],
-        "dyn_backward_ms": dyn["backward_ms"],
-        "dyn_train_ms": dyn["train_ms"],
-        "dyn_eval_ms": dyn["eval_ms"],
-        "trc_forward_ms": trc["forward_ms"],
-        "trc_backward_ms": trc["backward_ms"],
-        "trc_train_ms": trc["train_ms"],
-        "trc_eval_ms": trc["eval_ms"],
+        "dyn_forward_ms": metrics["dyn_forward_ms"],
+        "dyn_backward_ms": metrics["dyn_backward_ms"],
+        "dyn_train_ms": metrics["dyn_train_ms"],
+        "dyn_eval_ms": metrics["dyn_eval_ms"],
+        "trc_forward_ms": metrics["trc_forward_ms"],
+        "trc_backward_ms": metrics["trc_backward_ms"],
+        "trc_train_ms": metrics["trc_train_ms"],
+        "trc_eval_ms": metrics["trc_eval_ms"],
     }
     if bw_results:
         result["bandwidth"] = bw_results
 
     print(
-        f"\n  DynamicEmb  train={dyn['train_ms']:.3f}  fwd={dyn['forward_ms']:.3f}"
-        f"  bwd={dyn['backward_ms']:.3f}  eval={dyn['eval_ms']:.3f} ms"
+        f"\n  DynamicEmb  train={metrics['dyn_train_ms']:.3f}"
+        f"  fwd={metrics['dyn_forward_ms']:.3f}"
+        f"  bwd={metrics['dyn_backward_ms']:.3f}"
+        f"  eval={metrics['dyn_eval_ms']:.3f} ms"
     )
     print(
-        f"  TorchRec    train={trc['train_ms']:.3f}  fwd={trc['forward_ms']:.3f}"
-        f"  bwd={trc['backward_ms']:.3f}  eval={trc['eval_ms']:.3f} ms"
+        f"  TorchRec    train={metrics['trc_train_ms']:.3f}"
+        f"  fwd={metrics['trc_forward_ms']:.3f}"
+        f"  bwd={metrics['trc_backward_ms']:.3f}"
+        f"  eval={metrics['trc_eval_ms']:.3f} ms"
     )
     if bw_results:
         print("\n  Bandwidth (DynamicEmb):")
@@ -1186,9 +1434,17 @@ def _no_hbm_configs():
 # ── Test suites ───────────────────────────────────────────────────────────────
 
 
+def _apply_overrides(cfg: BenchmarkConfig, correctness_flag: bool) -> BenchmarkConfig:
+    """Apply session-wide CLI overrides onto a parametrized config."""
+    if correctness_flag:
+        cfg.correctness = True
+    return cfg
+
+
 class TestGpu:
     @pytest.mark.parametrize("cfg", _gpu_configs(), ids=lambda c: c.label())
-    def test_gpu(self, cfg, device, timer, profile_mode):
+    def test_gpu(self, cfg, device, timer, profile_mode, correctness_flag):
+        cfg = _apply_overrides(cfg, correctness_flag)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1196,7 +1452,8 @@ class TestGpu:
 
 class TestCaching:
     @pytest.mark.parametrize("cfg", _caching_configs(), ids=lambda c: c.label())
-    def test_caching(self, cfg, device, timer, profile_mode):
+    def test_caching(self, cfg, device, timer, profile_mode, correctness_flag):
+        cfg = _apply_overrides(cfg, correctness_flag)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1204,7 +1461,8 @@ class TestCaching:
 
 class TestNoCaching:
     @pytest.mark.parametrize("cfg", _no_caching_configs(), ids=lambda c: c.label())
-    def test_no_caching(self, cfg, device, timer, profile_mode):
+    def test_no_caching(self, cfg, device, timer, profile_mode, correctness_flag):
+        cfg = _apply_overrides(cfg, correctness_flag)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1212,7 +1470,8 @@ class TestNoCaching:
 
 class TestNoHbm:
     @pytest.mark.parametrize("cfg", _no_hbm_configs(), ids=lambda c: c.label())
-    def test_no_hbm(self, cfg, device, timer, profile_mode):
+    def test_no_hbm(self, cfg, device, timer, profile_mode, correctness_flag):
+        cfg = _apply_overrides(cfg, correctness_flag)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
