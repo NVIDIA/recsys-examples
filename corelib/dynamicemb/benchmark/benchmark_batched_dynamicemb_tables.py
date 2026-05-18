@@ -172,7 +172,7 @@ class BenchmarkConfig:
     output_dtype: str = "fp32"
     use_index_dedup: bool = False
     learning_rate: float = 0.1
-    eps: float = 1e-3
+    eps: float = 1e-8
     beta1: float = 0.9
     beta2: float = 0.999
     weight_decay: float = 0.0
@@ -376,6 +376,10 @@ def create_dynamic_embedding_tables(
         weight_decay=cfg.weight_decay,
         beta1=cfg.beta1,
         beta2=cfg.beta2,
+        # Align with TorchRec TBE construction so numerical differences are
+        # purely kernel-level: same rounding policy, same out-of-bounds policy.
+        stochastic_rounding=False,
+        bounds_check_mode=BoundsCheckMode.NONE,
     )
 
     if not populate:
@@ -842,25 +846,19 @@ def print_ncu_command(cfg: BenchmarkConfig):
 
 def precompute_unique_counts(sparse_features, num_tables, device):
     """Return list of N_unique per iteration (cheap GPU operation)."""
-    from dynamicemb_extensions import (
-        expand_table_ids_cuda,
-        get_table_range,
-        segmented_unique_cuda,
-    )
+    from dynamicemb_extensions import get_table_range, segmented_unique_cuda
 
     feature_offsets = torch.arange(num_tables + 1, device=device, dtype=torch.int64)
     counts = []
     for kjt in sparse_features:
-        indices = kjt.values()
         offsets = kjt.offsets()
         table_range = get_table_range(offsets, feature_offsets)
-        table_ids = expand_table_ids_cuda(
-            table_range, None, num_tables, 1, indices.numel()
-        )
+        # New dynamicemb API: second arg is per-table segment range, not the
+        # expanded per-key table_ids; no expand_table_ids_cuda needed here.
         num_uniques, _, _, _, _ = segmented_unique_cuda(
-            indices, table_ids, num_tables, None
+            kjt.values(), table_range, num_tables, None
         )
-        counts.append(num_uniques.item())
+        counts.append(int(num_uniques.item()))
     return counts
 
 
