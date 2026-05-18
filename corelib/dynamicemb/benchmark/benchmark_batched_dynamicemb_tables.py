@@ -1074,7 +1074,11 @@ def _per_table_unique_keys(sparse_features, num_tables, batch_size, device):
     return unique_keys
 
 
-_INSERT_BATCH = 1024 * 1024
+# Chunk size for mirroring TorchRec weights into DynamicEmb.  Each chunk
+# allocates init_w + opt_zero + cat result; on H200 with cap=24M Adam the
+# baseline tables already eat ~76 GiB out of 80 GiB, so we keep the per-chunk
+# workspace small (256K rows × (D + 2D) × 4 bytes ≈ 400 MiB for Adam).
+_INSERT_BATCH = 256 * 1024
 
 
 def _populate_correctness_tables(

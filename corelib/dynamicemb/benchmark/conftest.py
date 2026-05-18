@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 
 import pytest
@@ -75,3 +76,17 @@ def profile_mode(request):
 def correctness_flag(request):
     """Session-wide override for BenchmarkConfig.correctness from --correctness."""
     return request.config.getoption("--correctness")
+
+
+@pytest.fixture(autouse=True)
+def _gpu_mem_cleanup():
+    """Reclaim CUDA memory between tests, even when a test raises.
+
+    run_single_benchmark's own `del + empty_cache` is skipped on exception
+    paths, so a single OOM was cascading into every subsequent suite. This
+    finally-block runs unconditionally and lets each test start from a clean
+    allocator state.
+    """
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
