@@ -492,6 +492,30 @@ def create_split_table_batched_embeddings(cfg: BenchmarkConfig, device: torch.de
 # ── Benchmark execution ──────────────────────────────────────────────────────
 
 
+def _forward_allclose(out_dyn, out_trc, atol, rtol):
+    """Memory-light replacement for torch.allclose on full-size embedding outs.
+
+    Returns ``(passed, max_diff, mean_diff)``.  ``torch.allclose`` internally
+    recomputes ``(a-b).abs()`` and ``rtol*|b|`` -- with 512 MiB outputs this
+    stacked ~2.5 GiB of transients on top of the 72 GiB tables and tipped
+    TestGpu adam over the 80 GiB H200 budget.  This version reuses ``diff``
+    in-place and frees intermediates as soon as possible so the per-iter
+    peak stays around 1 GiB.
+    """
+    with torch.no_grad():
+        diff = (out_dyn - out_trc).abs()
+        max_diff = float(diff.max().item())
+        mean_diff = float(diff.mean().item())
+        # Manual element-wise allclose: |a-b| <= atol + rtol*|b|.
+        # diff <- |a-b| - rtol*|b|, then check max() <= atol.
+        scaled = out_trc.abs().mul_(rtol)
+        diff.sub_(scaled)
+        del scaled
+        passed = bool(diff.max().item() <= atol)
+        del diff
+    return passed, max_diff, mean_diff
+
+
 def benchmark_train_eval(
     dynamic_emb,
     torchrec_emb,
@@ -569,11 +593,10 @@ def benchmark_train_eval(
         trc_total += trc_s.elapsed_time(trc_e)
 
         if check_forward:
-            with torch.no_grad():
-                diff = (out_dyn.float() - out_trc.float()).abs()
-                max_diff = float(diff.max().item())
-                mean_diff = float(diff.mean().item())
-            if not torch.allclose(out_dyn, out_trc, atol=atol, rtol=rtol):
+            passed, max_diff, mean_diff = _forward_allclose(
+                out_dyn, out_trc, atol, rtol
+            )
+            if not passed:
                 failures.append(
                     {
                         "phase": "train",
@@ -601,11 +624,10 @@ def benchmark_train_eval(
         trc_eval += trc_s.elapsed_time(trc_e)
 
         if check_forward:
-            if not torch.allclose(out_dyn, out_trc, atol=atol, rtol=rtol):
-                with torch.no_grad():
-                    diff = (out_dyn.float() - out_trc.float()).abs()
-                    max_diff = float(diff.max().item())
-                    mean_diff = float(diff.mean().item())
+            passed, max_diff, mean_diff = _forward_allclose(
+                out_dyn, out_trc, atol, rtol
+            )
+            if not passed:
                 failures.append(
                     {
                         "phase": "eval",
