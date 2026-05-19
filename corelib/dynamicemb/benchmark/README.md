@@ -173,16 +173,64 @@ Other profile modes:
 | `ncu-gen`         | Prints the matching `ncu` command for the config and exits.           |
 | `ncu-run`         | Runs a single fwd+bwd inside `cudaProfilerStart/Stop` for `ncu` wrap. |
 
+### Plotting results
+
+`benchmark_results.json` produced above can be visualized with
+`plot_benchmark_results.py`.  With no flags it picks up
+`benchmark_results.json` in the same directory and writes the main
+per-suite latency figure to `benchmark_bdet_plot.png`.
+
+```bash
+# Main figure only
+python plot_benchmark_results.py
+# → benchmark_bdet_plot.png
+
+# Main + TorchRec/DynamicEmb speedup ratio figure
+python plot_benchmark_results.py --speedup
+# → benchmark_bdet_plot.png + benchmark_bdet_speedup_plot.png
+
+# Override paths
+python plot_benchmark_results.py \
+    --results /path/to/results.json \
+    --out /tmp/main.png \
+    --speedup --speedup-out /tmp/sp.png
+
+# Log y-axis (one suite dominates the range)
+python plot_benchmark_results.py --log
+
+# Hide bar value labels
+python plot_benchmark_results.py --no-values
+```
+
+Layout:
+- Main figure: 2 rows (optimizer) × 4 cols (storage mode), each panel
+  shows a stacked `train (fwd + bwd)` bar plus a separate `eval` bar
+  for DynamicEmb vs TorchRec; every panel auto-scales independently.
+- Speedup figure (with `--speedup`): same 2×4 layout, four bars per
+  panel (`fwd / bwd / train / eval`) showing `TorchRec / DynamicEmb`.
+  A dashed `1.0×` line marks parity; bars above → DynamicEmb is the
+  faster backend, below → TorchRec is.
+
 ### Test Results
 
-We test the `BatchedDynamicEmbeddingTablesV2` under `capacity=128x1024x1024`.
+The figures below were collected on **NVIDIA H100 80GB HBM3** (single GPU)
+with `pow-law(alpha=1.05)` index distribution.
 
-The overhead(ms) on H100 80GB HBM3, used pow-law(alpha=1.05) as input.
+Run configuration:
+- hardware: NVIDIA H100 80GB HBM3 (single GPU)
 - embedding_dtype: float32
 - embedding_dim: 128
+- batch_size: 1,048,576 (single table)
 - cache_algorithm: lru
-- cache_ratio: 1.0 and 0.1
-- capacity: 24M when cache_ratio=1.0, 256M when cache_ratio=0.1
+- gpu_ratio: 1.0 (`TestGpu`) / 0.1 (`TestCaching`, `TestNoCaching`) / 0.0 (`TestNoHbm`)
+- capacity: 24M when gpu_ratio=1.0, 256M otherwise
+- optimizers: adam (`eps=1e-8`) and sgd
 - num_iterations: 100
 
-![benchmark result of BatchedDynamicEmbeddingTables with torchrec](./benchmark_bdet_results.png)
+Latency by suite (DynamicEmb vs TorchRec TBE, lower is better):
+
+![benchmark result of BatchedDynamicEmbeddingTables with torchrec on H100](./benchmark_bdet_plot.png)
+
+TorchRec / DynamicEmb speedup ratio (>1× → DynamicEmb faster, <1× → TorchRec faster):
+
+![speedup ratio of DynamicEmb over TorchRec TBE on H100](./benchmark_bdet_speedup_plot.png)
