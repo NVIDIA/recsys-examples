@@ -85,7 +85,7 @@ class HostKVWaitResult:
     failed_user_ids: Optional[List[int]] = None
 
 
-class HostKVStorageManagerBase(ABC):
+class HostKVStorageBase(ABC):
     @abstractmethod
     def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
         ...
@@ -150,3 +150,7 @@ class HostKVStorageManagerBase(ABC):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # return (offload_uids, offload_start_indices, offload_lengths)
         ...
+
+
+# Backward compatibility alias; prefer HostKVStorageBase.
+HostKVStorageManagerBase = HostKVStorageBase

@@ -32,7 +32,7 @@ except Exception:
     KVResponse = Any  # type: ignore
 
 from .host_kvstorage_manager import (
-    HostKVStorageManagerBase,
+    HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
     HostKVWaitResult,
@@ -96,7 +96,7 @@ class FlexKVCacheLayout(KVCacheLayout):
         return self.kv_shape[3:].numel()
 
 
-class FlexKVStorageManager(HostKVStorageManagerBase):
+class FlexKVStorage(HostKVStorageBase):
     def __init__(
         self,
         mode: str = "direct",
@@ -684,3 +684,7 @@ class FlexKVClientAdapter:
                 }
             )
         return reqs
+
+
+# Backward compatibility alias; prefer FlexKVStorage.
+FlexKVStorageManager = FlexKVStorage

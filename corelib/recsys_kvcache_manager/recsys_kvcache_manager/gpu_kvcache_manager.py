@@ -22,7 +22,7 @@ from .kvcache_metadata import KVCacheMetadata, get_kvcache_metadata_buffer
 from .kvcache_utils import KVLookupResult
 
 
-class GPUKVCacheManager:
+class DeviceKVCache:
     def __init__(
         self,
         num_layers: int,
@@ -218,3 +218,7 @@ class GPUKVCacheManager:
         return self.impl_.release_offload_pages(
             uids, offload_start_indices, offload_lengths, offloaded
         )
+
+
+# Backward compatibility alias; prefer DeviceKVCache.
+GPUKVCacheManager = DeviceKVCache
