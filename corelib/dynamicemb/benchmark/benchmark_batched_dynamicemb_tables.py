@@ -401,22 +401,40 @@ def create_dynamic_embedding_tables(
         num_tables = cfg.num_tables
         optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
         initial_accumulator = storage.init_optimizer_state()
-        max_num_embeddings = max(cfg.num_embeddings_per_feature)
+        caps_per_table = cfg.num_embeddings_per_feature
+        max_num_embeddings = max(caps_per_table)
 
         i = 0
         while i < max_num_embeddings:
             start = i
-            end = min(i + _INSERT_BATCH, max_num_embeddings)
-            chunk = end - start
+            end_global = min(i + _INSERT_BATCH, max_num_embeddings)
             i += _INSERT_BATCH
 
-            keys = torch.arange(start, end, device=device, dtype=torch.int64).repeat(
-                num_tables
-            )
-            table_ids = torch.arange(
-                num_tables, device=device, dtype=torch.int64
-            ).repeat_interleave(chunk)
-            total = num_tables * chunk
+            # Per-table end is clamped to that table's own capacity so a
+            # heterogeneous cfg.num_embeddings_per_feature doesn't push
+            # keys past a smaller table's cap (cur configs are uniform so
+            # this is latent, but the function is general).
+            keys_list = []
+            tids_list = []
+            for t in range(num_tables):
+                cap_t = caps_per_table[t]
+                if start >= cap_t:
+                    continue
+                end_t = min(end_global, cap_t)
+                keys_list.append(
+                    torch.arange(start, end_t, device=device, dtype=torch.int64)
+                )
+                tids_list.append(
+                    torch.full(
+                        (end_t - start,), t, dtype=torch.int64, device=device
+                    )
+                )
+            if not keys_list:
+                break
+
+            keys = torch.cat(keys_list)
+            table_ids = torch.cat(tids_list)
+            total = keys.numel()
 
             emb = torch.rand(
                 total, cfg.embedding_dim, device=device, dtype=torch.float32
