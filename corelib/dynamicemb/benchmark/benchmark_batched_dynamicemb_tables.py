@@ -66,6 +66,12 @@ REPORT_INTERVAL = 10
 WARMUP_ITERS = 5
 RESULTS_FILE = os.environ.get("BENCHMARK_RESULTS_FILE", "benchmark_results.json")
 
+# Chunk size for any storage.insert population call.  256K rows keeps the
+# per-chunk workspace (init_w + opt_state + cat result) below ~400 MiB even
+# for Adam (D + 2D layout), which matters on H200 where dyn+trc Adam tables
+# already eat ~72 GiB of the 80 GiB HBM budget.
+_INSERT_BATCH = 256 * 1024
+
 GPU_PEAK_BW_GB_S = {
     "H100 SXM": 3350,
     "H100 NVL": 3350,
@@ -183,8 +189,8 @@ class BenchmarkConfig:
     # Sampling is restricted to ``[0, cap/2)`` and DynamicEmb is populated by
     # mirroring TorchRec's ``[0, cap/2)`` slice (its constructor's random
     # init), so every lookup hits the same value on both backends.  The
-    # default fill_tables / hybrid-storage population is skipped to make room
-    # for the mirrored values.
+    # default storage.insert population is skipped so the mirrored values
+    # aren't overwritten.
     correctness: bool = False
 
     @property
@@ -328,17 +334,6 @@ def generate_sparse_features_gpu(
 # ── Model creation ───────────────────────────────────────────────────────────
 
 
-def is_hybrid_storage(cfg: BenchmarkConfig) -> bool:
-    """HybridStorage: not pure caching, not full HBM, not zero HBM."""
-    if cfg.caching:
-        return False
-    if abs(cfg.gpu_ratio - 1.0) <= 1e-3:
-        return False
-    if abs(cfg.gpu_ratio - 0.0) <= 1e-3:
-        return False
-    return True
-
-
 def create_dynamic_embedding_tables(
     cfg: BenchmarkConfig, device: torch.device, populate: bool = True
 ):
@@ -386,50 +381,50 @@ def create_dynamic_embedding_tables(
     if not populate:
         return var
 
-    if is_hybrid_storage(cfg):
-        storage = var.tables
-        num_tables = cfg.num_tables
-        optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
-        initial_accumulator = storage.init_optimizer_state()
-        cfg.embedding_dim + optstate_dim
-        max_num_embeddings = max(cfg.num_embeddings_per_feature)
-        fill_batch = 1024 * 1024
+    # Populate every storage flavor (full HBM, caching, hybrid, no-HBM) via
+    # storage.insert with random weights for [0, num_embeddings) on each
+    # table.  fill_tables() only stamps random keys into the hash map and
+    # leaves the value slots zero, which made caching / gpu modes admit on
+    # every lookup; insert gives a uniform populated state across modes.
+    storage = var.tables
+    num_tables = cfg.num_tables
+    optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
+    initial_accumulator = storage.init_optimizer_state()
+    max_num_embeddings = max(cfg.num_embeddings_per_feature)
 
-        i = 0
-        while i < max_num_embeddings:
-            start = i
-            end = min(i + fill_batch, max_num_embeddings)
-            chunk = end - start
-            i += fill_batch
+    i = 0
+    while i < max_num_embeddings:
+        start = i
+        end = min(i + _INSERT_BATCH, max_num_embeddings)
+        chunk = end - start
+        i += _INSERT_BATCH
 
-            keys = torch.arange(start, end, device=device, dtype=torch.int64).repeat(
-                num_tables
+        keys = torch.arange(start, end, device=device, dtype=torch.int64).repeat(
+            num_tables
+        )
+        table_ids = torch.arange(
+            num_tables, device=device, dtype=torch.int64
+        ).repeat_interleave(chunk)
+        total = num_tables * chunk
+
+        emb = torch.rand(
+            total, cfg.embedding_dim, device=device, dtype=torch.float32
+        )
+        if optstate_dim > 0:
+            opt = (
+                torch.rand(total, optstate_dim, device=device, dtype=torch.float32)
+                * initial_accumulator
             )
-            table_ids = torch.arange(
-                num_tables, device=device, dtype=torch.int64
-            ).repeat_interleave(chunk)
-            total = num_tables * chunk
+            values = torch.cat((emb, opt), dim=1).contiguous()
+        else:
+            values = emb
 
-            emb = torch.rand(
-                total, cfg.embedding_dim, device=device, dtype=torch.float32
-            )
-            if optstate_dim > 0:
-                opt = (
-                    torch.rand(total, optstate_dim, device=device, dtype=torch.float32)
-                    * initial_accumulator
-                )
-                values = torch.cat((emb, opt), dim=1).contiguous()
-            else:
-                values = emb
-
-            scores = (
-                torch.ones(total, dtype=torch.uint64, device=device)
-                if cfg.cache_algorithm == "lfu"
-                else None
-            )
-            storage.insert(keys, table_ids, values, scores)
-    else:
-        var.fill_tables()
+        scores = (
+            torch.ones(total, dtype=torch.uint64, device=device)
+            if cfg.cache_algorithm == "lfu"
+            else None
+        )
+        storage.insert(keys, table_ids, values, scores)
 
     return var
 
@@ -1151,13 +1146,6 @@ def _per_table_unique_keys(sparse_features, num_tables, batch_size, device):
         else:
             unique_keys.append(torch.empty(0, dtype=torch.int64, device=device))
     return unique_keys
-
-
-# Chunk size for mirroring TorchRec weights into DynamicEmb.  Each chunk
-# allocates init_w + opt_zero + cat result; on H200 with cap=24M Adam the
-# baseline tables already eat ~76 GiB out of 80 GiB, so we keep the per-chunk
-# workspace small (256K rows × (D + 2D) × 4 bytes ≈ 400 MiB for Adam).
-_INSERT_BATCH = 256 * 1024
 
 
 def _populate_correctness_tables(
