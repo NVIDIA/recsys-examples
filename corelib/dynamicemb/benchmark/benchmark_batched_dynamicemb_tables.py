@@ -189,8 +189,8 @@ class BenchmarkConfig:
     # Sampling is restricted to ``[0, cap/2)`` and DynamicEmb is populated by
     # mirroring TorchRec's ``[0, cap/2)`` slice (its constructor's random
     # init), so every lookup hits the same value on both backends.  The
-    # default storage.insert population is skipped so the mirrored values
-    # aren't overwritten.
+    # default fill_tables / hybrid-storage population is skipped so the
+    # mirrored values aren't overwritten.
     correctness: bool = False
 
     @property
@@ -334,6 +334,17 @@ def generate_sparse_features_gpu(
 # ── Model creation ───────────────────────────────────────────────────────────
 
 
+def is_hybrid_storage(cfg: BenchmarkConfig) -> bool:
+    """HybridStorage: not pure caching, not full HBM, not zero HBM."""
+    if cfg.caching:
+        return False
+    if abs(cfg.gpu_ratio - 1.0) <= 1e-3:
+        return False
+    if abs(cfg.gpu_ratio - 0.0) <= 1e-3:
+        return False
+    return True
+
+
 def create_dynamic_embedding_tables(
     cfg: BenchmarkConfig, device: torch.device, populate: bool = True
 ):
@@ -381,50 +392,52 @@ def create_dynamic_embedding_tables(
     if not populate:
         return var
 
-    # Populate every storage flavor (full HBM, caching, hybrid, no-HBM) via
-    # storage.insert with random weights for [0, num_embeddings) on each
-    # table.  fill_tables() only stamps random keys into the hash map and
-    # leaves the value slots zero, which made caching / gpu modes admit on
-    # every lookup; insert gives a uniform populated state across modes.
-    storage = var.tables
-    num_tables = cfg.num_tables
-    optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
-    initial_accumulator = storage.init_optimizer_state()
-    max_num_embeddings = max(cfg.num_embeddings_per_feature)
+    # Hybrid storage needs an explicit per-key populate; full-HBM, caching,
+    # and zero-HBM modes use fill_tables() to stamp random keys into the
+    # hash map (faster, leaves value slots zero so first lookup triggers
+    # admit + initializer -- accepted for timing baselines).
+    if is_hybrid_storage(cfg):
+        storage = var.tables
+        num_tables = cfg.num_tables
+        optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
+        initial_accumulator = storage.init_optimizer_state()
+        max_num_embeddings = max(cfg.num_embeddings_per_feature)
 
-    i = 0
-    while i < max_num_embeddings:
-        start = i
-        end = min(i + _INSERT_BATCH, max_num_embeddings)
-        chunk = end - start
-        i += _INSERT_BATCH
+        i = 0
+        while i < max_num_embeddings:
+            start = i
+            end = min(i + _INSERT_BATCH, max_num_embeddings)
+            chunk = end - start
+            i += _INSERT_BATCH
 
-        keys = torch.arange(start, end, device=device, dtype=torch.int64).repeat(
-            num_tables
-        )
-        table_ids = torch.arange(
-            num_tables, device=device, dtype=torch.int64
-        ).repeat_interleave(chunk)
-        total = num_tables * chunk
-
-        emb = torch.rand(
-            total, cfg.embedding_dim, device=device, dtype=torch.float32
-        )
-        if optstate_dim > 0:
-            opt = (
-                torch.rand(total, optstate_dim, device=device, dtype=torch.float32)
-                * initial_accumulator
+            keys = torch.arange(start, end, device=device, dtype=torch.int64).repeat(
+                num_tables
             )
-            values = torch.cat((emb, opt), dim=1).contiguous()
-        else:
-            values = emb
+            table_ids = torch.arange(
+                num_tables, device=device, dtype=torch.int64
+            ).repeat_interleave(chunk)
+            total = num_tables * chunk
 
-        scores = (
-            torch.ones(total, dtype=torch.uint64, device=device)
-            if cfg.cache_algorithm == "lfu"
-            else None
-        )
-        storage.insert(keys, table_ids, values, scores)
+            emb = torch.rand(
+                total, cfg.embedding_dim, device=device, dtype=torch.float32
+            )
+            if optstate_dim > 0:
+                opt = (
+                    torch.rand(total, optstate_dim, device=device, dtype=torch.float32)
+                    * initial_accumulator
+                )
+                values = torch.cat((emb, opt), dim=1).contiguous()
+            else:
+                values = emb
+
+            scores = (
+                torch.ones(total, dtype=torch.uint64, device=device)
+                if cfg.cache_algorithm == "lfu"
+                else None
+            )
+            storage.insert(keys, table_ids, values, scores)
+    else:
+        var.fill_tables()
 
     return var
 
@@ -1258,16 +1271,15 @@ def run_single_benchmark(
     timer.stop()
     print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
 
-    # Restrict the sparse-feature sampler to ``[0, cap/2)`` for:
-    #   - correctness: every lookup must hit a key mirrored from TorchRec
-    #     into DynamicEmb's first half;
-    #   - profile_mode=None and "nsys": keep the workload (and thus timing /
-    #     nsys traces) directly comparable to the correctness path.
-    # Other profile modes (torch / ncu-run) keep the full-cap sampling.
-    if cfg.correctness or profile_mode in (None, "nsys"):
-        half_caps = [c // 2 for c in cfg.num_embeddings_per_feature]
-    else:
-        half_caps = None
+    # In correctness mode the sparse-feature sampler is restricted to the
+    # populated half of each table so every lookup hits a key we mirrored
+    # from TorchRec into DynamicEmb.  All other modes sample over the full
+    # cap.
+    half_caps = (
+        [c // 2 for c in cfg.num_embeddings_per_feature]
+        if cfg.correctness
+        else None
+    )
 
     timer.start()
     sparse_features = generate_sparse_features_gpu(
@@ -1318,6 +1330,8 @@ def run_single_benchmark(
         )
 
         if cfg.caching:
+            dynamic_emb.flush()
+            torchrec_emb.flush()
             dynamic_emb.reset_cache_states()
             torchrec_emb.reset_cache_states()
         del dynamic_emb, torchrec_emb, sparse_features
@@ -1335,6 +1349,8 @@ def run_single_benchmark(
         run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
         if cfg.caching:
             dynamic_emb.set_record_cache_metrics(False)
+            dynamic_emb.flush()
+            torchrec_emb.flush()
             dynamic_emb.reset_cache_states()
             torchrec_emb.reset_cache_states()
 
@@ -1356,6 +1372,8 @@ def run_single_benchmark(
 
     if cfg.caching:
         dynamic_emb.set_record_cache_metrics(False)
+        dynamic_emb.flush()
+        torchrec_emb.flush()
         dynamic_emb.reset_cache_states()
         torchrec_emb.reset_cache_states()
 
