@@ -910,11 +910,17 @@ def print_ncu_command(cfg: BenchmarkConfig):
     regex = "|".join(f".*{p}.*" for p in all_patterns)
 
     output_file = os.path.join(os.getcwd(), f"ncu_{label}")
-    k_parts = label.split("=")
-    k_filter = " and ".join(k_parts)
+    # pytest -k accepts substrings of the test id; the parametrize id is
+    # exactly cfg.label(), so passing the whole label uniquely selects this
+    # one config.  An earlier version split on "=" and AND-joined the
+    # fragments, but cfg.label() embeds "=" inside its values
+    # (pool=none, cap=24M) -- the split produced cross-field chunks like
+    # "none_cap" that happened to be substrings of the id today but would
+    # silently drift if the label format changed or two configs shared a
+    # fragment.
     inner_cmd = (
         f"bash benchmark/benchmark_batched_dynamicemb_tables.sh"
-        f" --profile ncu-run -k '{k_filter}'"
+        f" --profile ncu-run -k '{label}'"
     )
     ncu_cmd = (
         f"ncu -f --target-processes all"
