@@ -1270,14 +1270,16 @@ def run_single_benchmark(
     timer.stop()
     print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
 
-    # In correctness mode the sparse-feature sampler is restricted to the
-    # populated half of each table so every lookup hits a key we mirrored
-    # from TorchRec into DynamicEmb.
-    half_caps = (
-        [c // 2 for c in cfg.num_embeddings_per_feature]
-        if cfg.correctness
-        else None
-    )
+    # Restrict the sparse-feature sampler to ``[0, cap/2)`` for:
+    #   - correctness: every lookup must hit a key mirrored from TorchRec
+    #     into DynamicEmb's first half;
+    #   - profile_mode=None and "nsys": keep the workload (and thus timing /
+    #     nsys traces) directly comparable to the correctness path.
+    # Other profile modes (torch / ncu-run) keep the full-cap sampling.
+    if cfg.correctness or profile_mode in (None, "nsys"):
+        half_caps = [c // 2 for c in cfg.num_embeddings_per_feature]
+    else:
+        half_caps = None
 
     timer.start()
     sparse_features = generate_sparse_features_gpu(
