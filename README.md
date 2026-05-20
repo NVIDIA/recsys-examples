@@ -10,6 +10,9 @@ The project includes:
 - DynamicEmb for model-parallel dynamic embedding tables with zero-collision hashing, eviction, admission control, table fusion, and TorchRec integration ([documentation](./corelib/dynamicemb/README.md))
 
 # What's New
+- **[2026/5/20]** 🎉v26.04 released!
+  - Refactors the previous async KV-cache manager into a standalone [RecSys KVCache Manager package](corelib/recsys_kvcache_manager/), a new FlexKV backend for multi-node/multi-tier KV storage, LLM-style KV APIs, and updated HSTU inference examples.
+  - Introduces a new [beam-search decode attention kernel](./corelib/gr_decode_atten/) and CuTe kernels plus a `generate_beam_decode()` entry point, enabling more efficient KV-cache-based beam generation for the SID-GR model with vectorized masking utilities.
 - **[2026/4/14]** 🎉v26.03 released!
   - We added Torch export and AOTInductor packaging for end-to-end HSTU C++ inference. See the [HSTU inference overview](./examples/hstu/inference/README.md) and the [C++ inference guide](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md).
   - We improved DynamicEmb with table fusion and expansion, relaxed embedding-table alignment (no longer power-of-two), and capacity sizing aligned to `bucket_capacity`. See [DynamicEmb](./corelib/dynamicemb/README.md).
@@ -23,11 +26,12 @@ The project includes:
 - **[2026/1/13]** 🎉v25.12 released!
   - Support TritonServer for HSTU inference. Follow [the HSTU inference TritonServer example](https://github.com/NVIDIA/recsys-examples/tree/main/examples/hstu/inference#example-hstu-model-inference-with-triton-server) to try it out.
   - We introduced our first semantic-id retrieval model example. Follow the semantic‑id retrieval (sid_gr) [documentation](https://github.com/NVIDIA/recsys-examples/tree/main/examples/sid_gr) to run it. 
-- **[2025/12/10]** 🎉v25.11 released!
-  - DynamicEmb supports embedding admission, that decides whether a new feature ID is allowed to create or update an embedding entry in the dynamic embedding table. By controlling admission, the system can prevent very rare or noisy IDs from consuming parameters and optimizer state that bring little training benefit.
 
 <details>
 <summary>More</summary>
+
+- **[2025/12/10]** 🎉v25.11 released!
+  - DynamicEmb supports embedding admission, that decides whether a new feature ID is allowed to create or update an embedding entry in the dynamic embedding table. By controlling admission, the system can prevent very rare or noisy IDs from consuming parameters and optimizer state that bring little training benefit.
 
 - **[2025/11/11]** 🎉v25.10 released!
   - HSTU training example supports sequence parallelism.
