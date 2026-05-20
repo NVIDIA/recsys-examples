@@ -98,7 +98,12 @@ def _annotate_total(ax, x, total, fmt="{:.2f}"):
     )
 
 
-def make_figure(results: List[dict], log: bool, show_values: bool) -> plt.Figure:
+def make_figure(
+    results: List[dict],
+    log: bool,
+    show_values: bool,
+    subtitle: str = "",
+) -> plt.Figure:
     """Per-suite layout: rows = optimizer, cols = storage mode.
 
     Each subplot shows two grouped bars: a stacked train bar (forward at
@@ -169,22 +174,28 @@ def make_figure(results: List[dict], log: bool, show_values: bool) -> plt.Figure
         "BatchedDynamicEmbeddingTablesV2 vs TorchRec TBE  (lower is better)",
         fontsize=12,
     )
+    # n_lines: vertical-space budget for the subtitle strip (0 = no subtitle,
+    # 1 = hardware only, 2 = hardware + workload).  Each line takes ~2.5% of
+    # the figure height; legend and tight_layout shift down accordingly.
+    n_lines = subtitle.count("\n") + 1 if subtitle else 0
+    if subtitle:
+        fig.text(0.5, 0.955, subtitle, ha="center", va="top",
+                 fontsize=10, color="#444")
     if first_handles is not None:
         handles, labels = first_handles
         fig.legend(
             handles, labels,
             loc="upper center",
-            bbox_to_anchor=(0.5, 0.94),
+            bbox_to_anchor=(0.5, 0.95 - 0.025 * n_lines),
             ncol=len(labels),
             frameon=False,
             fontsize=9,
         )
-    # Reserve top strip for the suptitle + legend so they don't overlap axes.
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.tight_layout(rect=(0, 0, 1, 0.93 - 0.025 * n_lines))
     return fig
 
 
-def make_speedup_figure(results: List[dict]) -> plt.Figure:
+def make_speedup_figure(results: List[dict], subtitle: str = "") -> plt.Figure:
     """TorchRec / DynamicEmb latency ratio per (optimizer, mode, metric).
 
     Layout mirrors :func:`make_figure`: rows = optimizer, cols = storage
@@ -248,8 +259,56 @@ def make_speedup_figure(results: List[dict]) -> plt.Figure:
         "(>1 = DynamicEmb faster, <1 = TorchRec faster)",
         fontsize=12,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    n_lines = subtitle.count("\n") + 1 if subtitle else 0
+    if subtitle:
+        fig.text(0.5, 0.955, subtitle, ha="center", va="top",
+                 fontsize=10, color="#444")
+    fig.tight_layout(rect=(0, 0, 1, 0.95 - 0.025 * n_lines))
     return fig
+
+
+def _meta_str(results: List[dict], ratio):
+    """Two-line header strip.
+
+    Line 1: hardware / model dims (GPU, D, batch).
+    Line 2: input data + cache knob (distribution, hotness, pool, ratio).
+
+    Each field is skipped when its source key is absent from the result dict
+    so legacy JSONs degrade gracefully.
+    """
+    if not results:
+        return ""
+    r0 = results[0]
+
+    hw = []
+    if r0.get("gpu_name"):
+        hw.append(str(r0["gpu_name"]))
+    if r0.get("embedding_dim") is not None:
+        hw.append(f"D={r0['embedding_dim']}")
+    if r0.get("batch_size") is not None and r0.get("num_tables") is not None:
+        hw.append(f"batch={r0['batch_size'] * r0['num_tables']:,}")
+
+    wk = []
+    dist = r0.get("feature_distribution")
+    alpha = r0.get("alpha")
+    if dist:
+        if alpha is not None and dist in ("pow-law", "zipf"):
+            wk.append(f"{dist}(α={alpha})")
+        else:
+            wk.append(str(dist))
+    if r0.get("max_hotness") is not None:
+        wk.append(f"hotness={r0['max_hotness']}")
+    if r0.get("pooling_mode"):
+        wk.append(f"pool={r0['pooling_mode']}")
+    if ratio is not None:
+        wk.append(f"cache_footprint_ratio={ratio}")
+
+    lines = []
+    if hw:
+        lines.append("  ·  ".join(hw))
+    if wk:
+        lines.append("  ·  ".join(wk))
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -260,14 +319,8 @@ def main() -> None:
         help="path to benchmark_results.json",
     )
     parser.add_argument(
-        "--out", default=os.path.join(here, "benchmark_bdet_plot.png"),
-        help="output image path for the main figure "
-             "(PNG / PDF / SVG by extension)",
-    )
-    parser.add_argument(
-        "--speedup-out",
-        default=os.path.join(here, "benchmark_bdet_speedup_plot.png"),
-        help="output image path for the --speedup figure",
+        "--out-dir", default=os.path.join(here, "plots"),
+        help="directory to write generated PNGs into (created if missing)",
     )
     parser.add_argument("--log", action="store_true",
                         help="log-scale y-axis (useful when one mode dominates)")
@@ -275,24 +328,49 @@ def main() -> None:
                         help="hide numeric labels on bars")
     parser.add_argument(
         "--speedup", action="store_true",
-        help="also save a second figure with the trc/dyn ratio per metric, "
-             "written to --speedup-out",
+        help="also save a second figure with the trc/dyn ratio per metric",
     )
     args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
 
     with open(args.results) as f:
         results = filter_timing_entries(json.load(f))
     if not results:
         raise SystemExit(f"No timing entries found in {args.results}")
 
-    fig = make_figure(results, log=args.log, show_values=not args.no_values)
-    fig.savefig(args.out, dpi=130, bbox_inches="tight")
-    print(f"Saved -> {args.out}")
+    # The caching suite is parametrized by cache_footprint_ratio.  One main
+    # (and one speedup, if requested) figure is emitted per ratio so the
+    # caching panel reflects that ratio's measurement; non-caching panels
+    # (ratio metadata absent or None) appear in every figure unchanged.
+    ratios = sorted({
+        r.get("cache_footprint_ratio") for r in results
+        if r.get("cache_footprint_ratio") is not None
+    })
 
-    if args.speedup:
-        sp_fig = make_speedup_figure(results)
-        sp_fig.savefig(args.speedup_out, dpi=130, bbox_inches="tight")
-        print(f"Saved -> {args.speedup_out}")
+    def _save(fig, name):
+        path = os.path.join(args.out_dir, name)
+        fig.savefig(path, dpi=130, bbox_inches="tight")
+        print(f"Saved -> {path}")
+
+    def _emit(subset, suffix, subtitle):
+        fig = make_figure(subset, log=args.log,
+                          show_values=not args.no_values, subtitle=subtitle)
+        _save(fig, f"benchmark_bdet_plot{suffix}.png")
+        if args.speedup:
+            sp = make_speedup_figure(subset, subtitle=subtitle)
+            _save(sp, f"benchmark_bdet_speedup_plot{suffix}.png")
+
+    if not ratios:
+        # Old-style results with no ratio metadata: single figure set.
+        _emit(results, "", _meta_str(results, None))
+    else:
+        for r in ratios:
+            subset = [
+                x for x in results
+                if x.get("cache_footprint_ratio") in (None, r)
+            ]
+            _emit(subset, f"_cfr{r}", _meta_str(subset, r))
 
 
 if __name__ == "__main__":

@@ -173,27 +173,48 @@ Other profile modes:
 | `ncu-gen`         | Prints the matching `ncu` command for the config and exits.           |
 | `ncu-run`         | Runs a single fwd+bwd inside `cudaProfilerStart/Stop` for `ncu` wrap. |
 
+### Cache footprint sizing (TestCaching)
+
+`TestCaching` is parametrized by `cache_footprint_ratio` (currently
+`[0.5, 0.8]`).  At runtime the harness:
+
+1. Generates the full sparse-feature stream before any table is built.
+2. Counts distinct keys touched per table across all iterations -- the
+   workload's true HBM footprint.
+3. Resizes the cache so it holds
+   `footprint × cache_footprint_ratio` rows per table
+   (DynamicEmb `local_hbm_for_values`, FBGEMM `cache_load_factor`).
+
+This means TestCaching emits one config per ratio in the suite, with
+labels like `..._caching_..._cfr=0.5` / `..._cfr=0.8`.  The other three
+suites (`TestGpu`, `TestNoCaching`, `TestNoHbm`) leave
+`cache_footprint_ratio=None` and keep their construction-time
+`hbm_for_embeddings` / `gpu_ratio`.
+
 ### Plotting results
 
-`benchmark_results.json` produced above can be visualized with
-`plot_benchmark_results.py`.  With no flags it picks up
-`benchmark_results.json` in the same directory and writes the main
-per-suite latency figure to `benchmark_bdet_plot.png`.
+`benchmark_results.json` produced above is visualized with
+`plot_benchmark_results.py`.  All figures are written into a single
+output directory (default `./plots/`).  When the JSON contains
+`cache_footprint_ratio` metadata one figure is emitted **per ratio**:
+the caching panel shows that ratio's measurement, the other three mode
+panels (no ratio) are repeated unchanged.
 
 ```bash
-# Main figure only
+# Main figures, one per ratio, into ./plots/
 python plot_benchmark_results.py
-# → benchmark_bdet_plot.png
+# → plots/benchmark_bdet_plot_cfr0.5.png
+# → plots/benchmark_bdet_plot_cfr0.8.png
 
-# Main + TorchRec/DynamicEmb speedup ratio figure
+# Also produce the trc/dyn speedup figures, one per ratio
 python plot_benchmark_results.py --speedup
-# → benchmark_bdet_plot.png + benchmark_bdet_speedup_plot.png
+# → plots/benchmark_bdet_plot_cfr0.5.png + plots/benchmark_bdet_speedup_plot_cfr0.5.png
+# → plots/benchmark_bdet_plot_cfr0.8.png + plots/benchmark_bdet_speedup_plot_cfr0.8.png
 
-# Override paths
+# Different output directory / results file
 python plot_benchmark_results.py \
     --results /path/to/results.json \
-    --out /tmp/main.png \
-    --speedup --speedup-out /tmp/sp.png
+    --out-dir /tmp/bdet_plots --speedup
 
 # Log y-axis (one suite dominates the range)
 python plot_benchmark_results.py --log
@@ -201,6 +222,23 @@ python plot_benchmark_results.py --log
 # Hide bar value labels
 python plot_benchmark_results.py --no-values
 ```
+
+Legacy results without ratio metadata fall back to a single
+`benchmark_bdet_plot.png` (+ `benchmark_bdet_speedup_plot.png`) inside
+`--out-dir`.
+
+Each figure carries a two-line subtitle auto-derived from the result
+dict:
+
+```
+NVIDIA H100 80GB HBM3  ·  D=128  ·  batch=1,048,576
+pow-law(α=1.05)  ·  hotness=10  ·  pool=none  ·  cache_footprint_ratio=0.5
+```
+
+Fields populated by `run_single_benchmark`: `gpu_name`,
+`embedding_dim`, `batch_size`/`num_tables`, `feature_distribution`,
+`alpha`, `max_hotness`, `pooling_mode`, `cache_footprint_ratio`.
+Any field missing from a legacy JSON is silently skipped.
 
 Layout:
 - Main figure: 2 rows (optimizer) × 4 cols (storage mode), each panel
@@ -222,15 +260,18 @@ Run configuration:
 - embedding_dim: 128
 - batch_size: 1,048,576 (single table)
 - cache_algorithm: lru
-- gpu_ratio: 1.0 (`TestGpu`) / 0.1 (`TestCaching`, `TestNoCaching`) / 0.0 (`TestNoHbm`)
+- gpu_ratio: 1.0 (`TestGpu`) / footprint × `cache_footprint_ratio`
+  (`TestCaching`) / 0.1 (`TestNoCaching`) / 0.0 (`TestNoHbm`)
 - capacity: 24M when gpu_ratio=1.0, 256M otherwise
 - optimizers: adam (`eps=1e-8`) and sgd
 - num_iterations: 100
 
 Latency by suite (DynamicEmb vs TorchRec TBE, lower is better):
 
-![benchmark result of BatchedDynamicEmbeddingTables with torchrec on H100](./benchmark_bdet_plot.png)
+![benchmark result @ cache_footprint_ratio=0.5](./plots/benchmark_bdet_plot_cfr0.5.png)
+![benchmark result @ cache_footprint_ratio=0.8](./plots/benchmark_bdet_plot_cfr0.8.png)
 
 TorchRec / DynamicEmb speedup ratio (>1× → DynamicEmb faster, <1× → TorchRec faster):
 
-![speedup ratio of DynamicEmb over TorchRec TBE on H100](./benchmark_bdet_speedup_plot.png)
+![speedup @ cache_footprint_ratio=0.5](./plots/benchmark_bdet_speedup_plot_cfr0.5.png)
+![speedup @ cache_footprint_ratio=0.8](./plots/benchmark_bdet_speedup_plot_cfr0.8.png)

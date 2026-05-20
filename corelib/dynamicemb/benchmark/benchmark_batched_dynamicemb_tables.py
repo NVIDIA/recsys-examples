@@ -170,6 +170,12 @@ class BenchmarkConfig:
     cache_algorithm: str = "lru"
     gpu_ratio: float = 1.0
     hbm_for_embeddings: List[int] = field(default_factory=lambda: [36 * (1024**3)])
+    # When set together with ``caching=True``, the cache is re-sized at run
+    # time to ``per_table_unique_count * cache_footprint_ratio`` rows
+    # (per-table HBM bytes for DynamicEmb, pooled cache_load_factor for
+    # FBGEMM).  Overrides ``hbm_for_embeddings`` / ``gpu_ratio`` set at
+    # construction time.  ``None`` keeps the construction-time values.
+    cache_footprint_ratio: Optional[float] = None
     feature_distribution: str = "pow-law"
     alpha: float = 1.05
     pooling_mode: str = "none"
@@ -223,11 +229,14 @@ class BenchmarkConfig:
         caps = "_".join(
             f"{e // (1024 * 1024)}M" for e in self.num_embeddings_per_feature
         )
-        return (
+        s = (
             f"T{self.num_tables}_totalB{self.total_batch_size}_D{self.embedding_dim}_"
             f"{self.optimizer_type}_{self.mode}_"
             f"pool={self.pooling_mode}_cap={caps}"
         )
+        if self.cache_footprint_ratio is not None:
+            s += f"_cfr={self.cache_footprint_ratio}"
+        return s
 
 
 # ── GPU-accelerated data generation ─────────────────────────────────────────
@@ -1247,6 +1256,37 @@ def _populate_correctness_tables(
     return total
 
 
+def _resize_cache_to_footprint(
+    cfg: BenchmarkConfig, per_table_unique_counts: List[int]
+) -> None:
+    """Resize the cache to hold ``footprint * cache_footprint_ratio`` rows.
+
+    Mutates ``cfg.hbm_for_embeddings`` (per-table HBM bytes consumed by
+    DynamicEmb when ``caching=True``) and ``cfg.gpu_ratio`` (FBGEMM's
+    single global ``cache_load_factor``).  Per-row bytes use
+    ``cfg.value_dim`` so the budget covers values *and* optimizer state.
+    """
+    ratio = cfg.cache_footprint_ratio
+    elem = dtype_size(get_emb_precision(cfg.emb_precision))
+    bytes_per_row = cfg.value_dim * elem
+
+    cfg.hbm_for_embeddings = [
+        int(uc * ratio * bytes_per_row) for uc in per_table_unique_counts
+    ]
+
+    total_cap = sum(cfg.num_embeddings_per_feature)
+    total_target = sum(int(uc * ratio) for uc in per_table_unique_counts)
+    cfg.gpu_ratio = (
+        max(min(total_target / total_cap, 1.0), 0.0) if total_cap > 0 else 0.0
+    )
+
+    print(
+        f"  cache_footprint_ratio={ratio}: "
+        f"hbm_for_embeddings={cfg.hbm_for_embeddings} "
+        f"gpu_ratio={cfg.gpu_ratio:.6f}"
+    )
+
+
 # ── Single benchmark run ─────────────────────────────────────────────────────
 
 
@@ -1281,6 +1321,41 @@ def run_single_benchmark(
     torch.cuda.manual_seed(cfg.seed)
     torch.cuda.empty_cache()
 
+    # Sparse features are generated before table creation: when
+    # cfg.cache_footprint_ratio is set we size the cache from the actual
+    # unique-key footprint of the workload, which can only be known after
+    # the features have been sampled.
+    #
+    # In correctness mode the sampler is restricted to the populated half
+    # of each table so every lookup hits a key we mirrored from TorchRec
+    # into DynamicEmb.  All other modes sample over the full cap.
+    half_caps = (
+        [c // 2 for c in cfg.num_embeddings_per_feature]
+        if cfg.correctness
+        else None
+    )
+
+    timer.start()
+    sparse_features = generate_sparse_features_gpu(
+        cfg, device, num_embeddings_override=half_caps
+    )
+    timer.stop()
+    print(f"  Data generated in {timer.elapsed_time() / 1000:.3f} s")
+
+    # Per-table count of distinct keys seen across all iterations -- the
+    # workload's true HBM footprint.  Used to size the cache when
+    # cfg.cache_footprint_ratio is set.
+    per_table_unique_counts = [
+        int(t.numel())
+        for t in _per_table_unique_keys(
+            sparse_features, cfg.num_tables, cfg.batch_size, device
+        )
+    ]
+    print(f"  Per-table unique footprint: {per_table_unique_counts}")
+
+    if cfg.caching and cfg.cache_footprint_ratio is not None:
+        _resize_cache_to_footprint(cfg, per_table_unique_counts)
+
     timer.start()
     # When correctness is requested we skip the default fill so
     # _populate_correctness_tables can mirror TorchRec's first-half weights.
@@ -1294,23 +1369,6 @@ def run_single_benchmark(
     torchrec_emb = create_split_table_batched_embeddings(cfg, device)
     timer.stop()
     print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
-
-    # In correctness mode the sparse-feature sampler is restricted to the
-    # populated half of each table so every lookup hits a key we mirrored
-    # from TorchRec into DynamicEmb.  All other modes sample over the full
-    # cap.
-    half_caps = (
-        [c // 2 for c in cfg.num_embeddings_per_feature]
-        if cfg.correctness
-        else None
-    )
-
-    timer.start()
-    sparse_features = generate_sparse_features_gpu(
-        cfg, device, num_embeddings_override=half_caps
-    )
-    timer.stop()
-    print(f"  Data generated in {timer.elapsed_time() / 1000:.3f} s")
 
     if cfg.correctness:
         # PowerLaw/zipf already produce values in [min, max-1] / [min, max),
@@ -1412,14 +1470,18 @@ def run_single_benchmark(
 
     result = {
         "label": cfg.label(),
+        "gpu_name": torch.cuda.get_device_name(device),
         "num_tables": cfg.num_tables,
         "batch_size": cfg.batch_size,
         "embedding_dim": cfg.embedding_dim,
         "optimizer_type": cfg.optimizer_type,
         "caching": cfg.caching,
+        "cache_footprint_ratio": cfg.cache_footprint_ratio,
         "pooling_mode": cfg.pooling_mode,
         "num_embeddings_per_feature": cfg.num_embeddings_per_feature,
         "feature_distribution": cfg.feature_distribution,
+        "alpha": cfg.alpha,
+        "max_hotness": cfg.max_hotness,
         "avg_n_unique": avg_n_unique,
         "avg_n_total": avg_n_total,
         "dyn_forward_ms": metrics["dyn_forward_ms"],
@@ -1507,6 +1569,7 @@ def _gpu_configs():
 
 
 _CACHE_GPU_RATIO = 0.1
+_CACHE_FOOTPRINT_RATIOS = [0.5, 0.8]
 
 
 def _caching_configs():
@@ -1516,6 +1579,8 @@ def _caching_configs():
             batch_size=bs // nt,
             num_embeddings_per_feature=[cap_per_table] * nt,
             embedding_dim=_DIM,
+            # Placeholders -- both are overwritten at runtime by
+            # _resize_cache_to_footprint based on the actual workload.
             hbm_for_embeddings=_cache_hbm(
                 _CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt
             ),
@@ -1525,11 +1590,13 @@ def _caching_configs():
             gpu_ratio=_CACHE_GPU_RATIO,
             pooling_mode=pool,
             max_hotness=10,
+            cache_footprint_ratio=cfr,
         )
         for bs in _BATCH_SIZES
         for nt in _NUM_TABLES
         for opt in _OPTIMIZERS
         for pool in _POOLING_MODES
+        for cfr in _CACHE_FOOTPRINT_RATIOS
     ]
 
 
