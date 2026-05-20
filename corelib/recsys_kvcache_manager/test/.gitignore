@@ -1,0 +1,14 @@
+# Profiling artifacts (regenerate locally)
+**/profiler_result/rep/
+**/profiler_result/csv/
+**/*.nsys-rep
+**/*.sqlite
+.plot-venv/
+.plot_venv/
+.xlsx-venv/
+__pycache__/
+*.pyc
+
+# Optional local-only breakdown_1 helpers
+breakdown_1/generate_profiling_xlsx.py
+breakdown_1/profiling.xlsx
