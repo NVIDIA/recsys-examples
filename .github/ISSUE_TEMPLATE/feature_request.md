@@ -20,4 +20,4 @@ A clear and concise description of any alternative solutions or features you've 
 Add any other context, code examples, or references to existing implementations about the feature request here.
 
 -----
-By submitting this issue, you agree to follow our [code of conduct](https://docs.rapids.ai/resources/conduct/) and our [contributing guidelines](https://github.com/jarmak-nv/rapids-repo-template/blob/main/CONTRIBUTING.md).
+By submitting this issue, you agree to follow our [code of conduct](https://github.com/NVIDIA/recsys-examples/blob/main/CODE_OF_CONDUCT.md) and our [contributing guidelines](https://github.com/NVIDIA/recsys-examples/blob/main/CONTRIBUTING.md).

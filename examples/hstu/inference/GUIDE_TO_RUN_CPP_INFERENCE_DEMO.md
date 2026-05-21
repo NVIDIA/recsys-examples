@@ -15,8 +15,8 @@ This document explains the full workflow:
 
 ## Path placeholders used in this doc
 
-- `{RECSYS_DIR}`: root of `recsys-dynmicemb-alex`
-- `{NVE_DIR}`: root of `trt-recsys`
+- `{RECSYS_DIR}`: root of `recsys-examples`
+- `{NVE_DIR}`: root of `nv-embedding-cache` if building NVEmbedding outside the Docker image
 - `{RECSYS_INFERENCE_DIR}`: `{RECSYS_DIR}/examples/hstu/inference`
 - `{CPP_INFERENCE_BUILD_DIR}`: `{RECSYS_INFERENCE_DIR}/cpp_inference/build`
 - `{CPP_INFERENCE_LIB_DIR}`: `{RECSYS_INFERENCE_DIR}/cpp_inference/lib`
@@ -26,7 +26,9 @@ This document explains the full workflow:
 ## 1) Prerequisites
 
 - Linux with CUDA GPU available
-- PyTorch 2.11 + DynamicEmb + NVEmbedding
+- CUDA-enabled PyTorch environment compatible with the repository Dockerfile
+- DynamicEmb installed from this repository
+- NVEmbedding (`pynve`) installed; the repository Docker image installs it from [nv-embedding-cache](https://github.com/NVIDIA/nv-embedding-cache)
 
 ---
 
@@ -48,18 +50,19 @@ Expected output:
 
 ## 3) Build and install NVEmbedding
 
-Placeholder command block:
+The repository Docker image already installs NVEmbedding. If you are building a source environment outside Docker, install it from `nv-embedding-cache`:
 
 ```bash
 cd {NVE_DIR}  # at the repository root dir
 git submodule update --init --recursive
 git clone https://github.com/NVIDIA/NVTX.git third_party/NVTX
-CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install .
+CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
 ```
 
 Expected output:
 
-- Output library: `{NVE_DIR}/build/lib/libnve-common.so` and `{NVE_DIR}/build/lib/libnve_torch_ops.so`
+- Python package: `pynve`
+- Shared libraries discoverable under the installed `pynve` package, including `libnve-common.so` and `libnve-torch-ops.so`
 
 ---
 
@@ -70,7 +73,9 @@ From repository root:
 ```bash
 cd {RECSYS_DIR}/examples/hstu/
 export DYNAMICEMB_OPS_LIB_DIR=$(realpath ../../corelib/dynamicemb/torch_binding_build/)
-python3 ./inference/export_inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ci_checkpoint/fused_kuairand_1k_ckpt_v2
+python3 ./inference/export_inference_gr_ranking.py \
+  --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin \
+  --checkpoint_dir ${PATH_TO_CHECKPOINT}
 ```
 
 ---
@@ -101,8 +106,8 @@ cd {RECSYS_INFERENCE_DIR}/cpp_inference
 ```
 
 > ### Note (1)
-> FBGEMM shared libraries are also loaded in the C++ inference.
-> Their path are hard-coded.
+> FBGEMM, HSTU, DynamicEmb inference ops, and NVEmbedding shared libraries are loaded by the C++ inference executable.
+> The default lookup paths match the repository Docker image layout; pass explicit paths to the executable when using a custom environment.
 >
 > ### Note (2)
 > The current export in `export_inference_gr_ranking.py` uses pytree inputs:

@@ -123,11 +123,11 @@ Set before launching training, e.g. `export CUDA_MEM_WATCHDOG=1` in the SLURM jo
 
 ```bash
 # Run one experiment on 8 GPUs
-./training/benchmark/scripts/run_single_experiment_local.sh exp1_cutlass \
+./training/benchmark/scripts/run_single_experiment_local.sh exp2_cutlass \
     --kernel_backend cutlass --nproc=8
 
 # Dry-run (prints generated config, does not train)
-./training/benchmark/scripts/run_single_experiment_local.sh exp1_cutlass \
+./training/benchmark/scripts/run_single_experiment_local.sh exp2_cutlass \
     --kernel_backend cutlass --dry-run
 ```
 
@@ -200,7 +200,9 @@ training/benchmark/results/
     │   ├── exp0_baseline_{timestamp}.gin     # generated config
     │   ├── exp0_baseline_{timestamp}.log     # training log
     │   └── exp0_baseline_*.nsys-rep          # nsys profiles (if --nsys)
-    ├── exp1_cutlass/
+    ├── exp1_shuffler/
+    │   └── ...
+    ├── exp2_cutlass/
     │   └── ...
     ├── summary.txt                           # batch summary
     └── comparison.png                         # TFLOPS + MFU comparison chart

@@ -2,7 +2,7 @@
 
 Hardware: **NVIDIA H100 PCIe** (114 SMs).
 Container: recsys-examples Docker (torch 2.11.0a0+nv26, CUDA 13).
-Branch: `fea-mask-beam-search` (SID-GR + `beam_decode_attn` kernel).
+Code: SID-GR with the vendored `beam_decode_attn` kernel from `corelib/gr_decode_atten/`.
 Date: 2026-05-09 (re-run with jagged-native option and phase breakdown).
 
 Build dependencies pinned at this measurement:
@@ -309,7 +309,7 @@ verified A-vs-B equivalence at each config (top-1 exact, |lp delta| <
 ```bash
 cd examples/sid_gr
 PYTHONNOUSERSITE=1 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libnccl.so.2 \
-  PYTHONPATH=$REPO/examples:${PYTHONPATH} \
+  PYTHONPATH=$(realpath ..):${PYTHONPATH} \
   torchrun --nproc_per_node 1 --master_port 29504 \
   benchmark/benchmark_beam_decode.py \
   --sweep --validate_outputs \
@@ -329,7 +329,7 @@ useful for smoke-testing the integration end-to-end):
 ```bash
 cd examples/sid_gr
 PYTHONNOUSERSITE=1 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libnccl.so.2 \
-  PYTHONPATH=$REPO/examples:${PYTHONPATH} \
+  PYTHONPATH=$(realpath ..):${PYTHONPATH} \
   torchrun --nproc_per_node 1 --master_port 29504 \
   benchmark/benchmark_beam_decode.py \
   --sweep --sweep_hist 32,64,128,256 --sweep_beam 4,10,20 --sweep_dtype bf16,fp16
@@ -341,7 +341,7 @@ dense+seqused_k path` table above):
 ```bash
 cd examples/sid_gr
 PYTHONNOUSERSITE=1 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libnccl.so.2 \
-  PYTHONPATH=$REPO/examples:${PYTHONPATH} \
+  PYTHONPATH=$(realpath ..):${PYTHONPATH} \
   torchrun --nproc_per_node 1 --master_port 29504 \
   benchmark/benchmark_beam_decode.py \
   --compare_kv_modes --sweep_hist 32,64,128,256 --sweep_beam 4,10,20 \

@@ -1,6 +1,6 @@
 # Beam Search Decode Attention
 
-High-performance beam search decode attention kernels implemented in CuTe DSL, supporting SM8x (A100/L40/L20), SM90 (H100//H800/H20), SM100 (B200/B300), and SM120 (RTX PRO6000).
+High-performance beam search decode attention kernels implemented in CuTe DSL, supporting SM8x (A100/L40/L20), SM90 (H100/H800/H20), SM100 (B200/B300), and SM120 (RTX PRO6000).
 
 ## Provenance
 
@@ -131,7 +131,7 @@ out, lse = beam_decode_attn(
 ## Project Structure
 
 ```
-Beam_atten/
+corelib/gr_decode_atten/
 ├── interface.py                 # Public API: BeamDecodeAttn + beam_decode_attn
 ├── src/
 │   ├── common/                  # Shared: config, softmax, mask, block_info, tile_scheduler, ...

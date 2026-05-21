@@ -1,8 +1,11 @@
-# Build and Run Guide (inference_emb_ops)
+# Build `inference_emb_ops.so`
 
-## 1) Build `inference_emb_ops.so`
+`inference_emb_ops.so` registers the `torch.ops.INFERENCE_EMB.*` operators used
+by DynamicEmb exportable inference tables and the HSTU C++ AOTInductor demo.
 
-From repository root:
+## Build
+
+From the repository root:
 
 ```bash
 cd corelib/dynamicemb
@@ -12,36 +15,38 @@ cmake ..
 make -j
 ```
 
-Expected output library:
+Expected output:
 
-- `corelib/dynamicemb/torch_binding_build/inference_emb_ops.so`
-
-Optional quick check:
-
-```bash
-ls -l corelib/dynamicemb/torch_binding_build/inference_emb_ops.so
+```text
+corelib/dynamicemb/torch_binding_build/inference_emb_ops.so
 ```
 
----
+## Quick Check
 
-## 2) Run demo: `test_export_demo.py`
-
-From repository root:
+From the repository root:
 
 ```bash
-# Optional: ensure local dynamicemb package is importable
-export PYTHONPATH=$PWD/corelib/dynamicemb:$PYTHONPATH
+python3 - <<'PY'
+import os
+import torch
 
-python examples/hstu/inference/test_export_demo.py
+path = os.path.abspath("corelib/dynamicemb/torch_binding_build/inference_emb_ops.so")
+torch.ops.load_library(path)
+print("loaded", path)
+PY
 ```
 
-What the demo does:
+## Use with HSTU Export
 
-- Loads `inference_emb_ops.so`
-- Builds a small inference module using `INFERENCE_EMB` custom ops
-- Runs eager forward test
-- Runs `torch.export` smoke test
+The HSTU Python export path loads this library from `DYNAMICEMB_OPS_LIB_DIR`:
 
-If you see a warning that the `.so` cannot be loaded, re-check build output and path:
+```bash
+cd examples/hstu
+export DYNAMICEMB_OPS_LIB_DIR=$(realpath ../../corelib/dynamicemb/torch_binding_build)
+python3 ./inference/export_inference_gr_ranking.py \
+  --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin \
+  --checkpoint_dir ${PATH_TO_CHECKPOINT}
+```
 
-- `corelib/dynamicemb/torch_binding_build/inference_emb_ops.so`
+For the full Python export plus C++ runtime workflow, see
+[examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md).

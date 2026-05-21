@@ -27,4 +27,4 @@ A clear and concise description of what you expected to happen.
 Add any other context about the problem here.
 
 -----
-By submitting this issue, you agree to follow our [code of conduct](https://docs.rapids.ai/resources/conduct/) and our [contributing guidelines](https://github.com/jarmak-nv/rapids-repo-template/blob/main/CONTRIBUTING.md).
+By submitting this issue, you agree to follow our [code of conduct](https://github.com/NVIDIA/recsys-examples/blob/main/CODE_OF_CONDUCT.md) and our [contributing guidelines](https://github.com/NVIDIA/recsys-examples/blob/main/CONTRIBUTING.md).

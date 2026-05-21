@@ -88,7 +88,7 @@ CPU-only script that estimates parameter, activation, and optimizer memory. Supp
 ```bash
 # From gin config (batch_size, max_seq_len, etc. are read from the config)
 python ./training/benchmark/scripts/estimate_memory.py \
-    --gin_config training/benchmark/gin_configs/benchmark_exp0_baseline.gin
+    --gin_config training/configs/benchmark_ranking.gin
 
 # From command-line arguments (no gin file needed)
 python ./training/benchmark/scripts/estimate_memory.py \

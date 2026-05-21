@@ -25,7 +25,7 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 - **Seamless Integration with TorchREC**: DynamicEmb inherits the API from TorchREC, ensuring that its usage is largely consistent with TorchREC. Users can easily modify their existing code to run recommendation system models with dynamic embedding tables alongside TorchREC.
 **dynamicemb** provides a high-performance **hash table** to support dynamic embedding and leverages **torchrec** to implement sharding logic on multiple GPUs. This explains why dynamicemb largely reuses the user interface of torchrec while adding some new configuration options related to dynamic embedding.
 
-- **Embedded in DistributedGR Repository Supporting Generative-Recommenders(GR) Models**: Currently, DynamicEmb is integrated into the DistributedGR repository, serving as an embedding backend for GR models.
+- **Embedded in RecSys Examples Supporting Generative Recommender (GR) Models**: DynamicEmb is integrated into this repository as an embedding backend for GR models.
 
 - Support for creating dynamic embedding tables within `EmbeddingBagCollection` and `EmbeddingCollection` in TorchREC, allowing for embedding storage and lookup, and enabling coexistence with native Torch embedding tables within Torch models.
 
@@ -38,43 +38,48 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 
 ## Pre-requisites
 
-Currently, dynamicemb is integrated into latest TorchRec main branch, while TorchRec requires FBGEMM_GPU main branch, both of which are not packaged. Temporarily, installing from source code is required. Before installing the 2 libraries, make sure you have PyTorch CUDA version installed (refer to [PyTorch documentation](https://pytorch.org/get-started/locally/)).
+### Version Compatibility
+
+DynamicEmb builds on PyTorch, FBGEMM_GPU, and TorchRec. The project Docker image installs the validated dependency set from `docker/Dockerfile`:
+
+- FBGEMM_GPU `v1.5.0`
+- TorchRec `release/V1.5.0`
+
+For source installs outside the Docker image, make sure a CUDA-enabled PyTorch environment is already installed (refer to [PyTorch documentation](https://pytorch.org/get-started/locally/)), then install compatible FBGEMM_GPU and TorchRec packages.
 
 1. **FBGEMM_GPU**
 
-Please follow below instructions to build fbgemm_gpu from source code. It may take minutes to finish. 
+Please follow the instructions below to build FBGEMM_GPU from source. It may take several minutes.
 
 ```bash
 # install setup tools
-pip install --no-cache setuptools==69.5.1 setuptools-git-versioning scikit-build
-git clone --recursive -b main https://github.com/pytorch/FBGEMM.git fbgemm
+pip install --no-cache setuptools-git-versioning scikit-build
+git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm
 cd fbgemm/fbgemm_gpu
-git checkout 642ccb980d05aa1be00ccd131c5991b0914e2e64
 # please specify the proper TORCH_CUDA_ARCH_LIST for your ENV
-python setup.py bdist_wheel --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
-python setup.py install --package_variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
+python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
 ```
 
-Once above processing is done, please execute `python -c 'import fbgemm_gpu'` to make sure it's properly installed.
+Once the build is done, run `python -c 'import fbgemm_gpu'` to make sure it is installed.
 
 2. **TorchRec**
 
-> torchrec >= v1.2.0
+> torchrec >= v1.2.0; the Docker image currently validates against TorchRec `release/V1.5.0`.
 
 Thanks to the torchrec team for their [support](https://github.com/meta-pytorch/torchrec/commit/6aaf1fa72e884642f39c49ef232162fa3772055e), torchrec v1.2.0 added support for custom embedding lookup module.
 
-After fbgemm_gpu is installed, you can install TorchRec with below commands.
+After FBGEMM_GPU is installed, install TorchRec with:
 
 ```bash
 # torchrec depends on below 2 libs
 pip install --no-deps tensordict orjson
-git clone --recursive -b main https://github.com/pytorch/torchrec.git torchrec
-cd torchrec && git checkout 6aaf1fa72e884642f39c49ef232162fa3772055e
+git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec
+cd torchrec
 # with --no-deps to prevent from installing dependencies
 pip install --no-deps .
 ```
 
-Once above processing is done, please execute `python -c 'import torchrec'` to make sure it's properly installed.
+Once the install is done, run `python -c 'import torchrec'` to make sure it is installed.
 
 ## Installation
 
@@ -92,11 +97,11 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 
 1. Only the following optimizer types are supported: `EXACT_SGD`, `ADAM`, `EXACT_ADAGRAD`,`EXACT_ROWWISE_ADAGRAD`. This behavior is to maintain consistency with TorchREC.
 2. The sharding method for dynamic embedding tables is always `row-wise sharding`, which will be evenly distributed across all GPUs within the TorchREC scope, unlike the `table-wise` and other sharding methods in TorchREC.
-3. The allocated memory for dynamic embedding tables may have slight differences from the specified `num_embeddings` because each dynamic embedding table aligns capacity to `DEMB_TABLE_ALIGN_SIZE` (= 16). This is automatically calculated by the code.
+3. The allocated memory for dynamic embedding tables may differ slightly from the requested `num_embeddings`. Capacity is aligned through `bucket_capacity` rules in `DynamicEmbTableOptions` (`BUCKET_ALIGNMENT` = 16), and the planner writes the effective per-rank `max_capacity`.
 4. The lookup process for each dynamic embedding table incurs additional overhead from unique or radix sort operations. Therefore, if you request a large number of small dynamic embedding tables for lookup, the performance will be poor. Since the lookup range of dynamic embedding tables is particularly large (using the entire range of `int64_t`), it is recommended to create one large embedding table and perform a fused lookup for multiple features.
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
 6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
-7. (New) DynamicEmb supports Torch exportable embedding tables `InferenceEmbeddingTable` for inference. It is implemented with the hashing mechanism according to `ScoredHashTable` (freezed at export and inference time) from DynamicEmb, and the `LinearUVMEmbedding` from [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache), which supports both sequence mode and pooling mode (SUM, MEAN only). It takes in `DynamicEmbTableOptions` to initialize, and loads from DynamicEmb dumped embedding files.
+7. DynamicEmb supports Torch-exportable embedding tables through `InferenceEmbeddingTable`. It uses DynamicEmb `ScoredHashTable` metadata frozen at export/inference time and `LinearUVMEmbedding` from [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache), supporting sequence mode and pooling mode (`SUM`, `MEAN`). It is initialized from `DynamicEmbTableOptions` and loads from DynamicEmb dumped embedding files.
 
 ### DynamicEmb Insertion Behavior Checking Modes
 
@@ -128,9 +133,9 @@ To get started with DynamicEmb, we highly recommend checking out the [example.py
 
 ## Future Plans
 
-1. Support the latest version of TorchREC and continuously follow TorchREC's version updates.
-2. Support the separation of backward and optimizer update (required by certain large language model frameworks like Megatron), to better support large-scale GR training.
-3. Add more shard types for dynamic embedding tables, including `table-wise`, `table-row-wise` and `column-wise`.
+1. Continue tracking compatible TorchRec and FBGEMM_GPU releases.
+2. Support separation of backward and optimizer update, which is required by some large model frameworks.
+3. Add more shard types for dynamic embedding tables, including `table-wise`, `table-row-wise`, and `column-wise`.
 
 ## Acknowledgements
 
