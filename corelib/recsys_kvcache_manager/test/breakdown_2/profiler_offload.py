@@ -1,13 +1,4 @@
-"""
-Repeated FlexKV offload micro-benchmark (Micro-bench 2).
 
-Measures: lookup → allocate → gpu.put → offload_launch → offload_try_wait until
-this round completes (while loop in run_one_offload; not the single-shot sub-exp).
-
-FlexKV client.shutdown() after a scenario is omitted — it can hang; rely on process exit.
-
-CSV schemas / aggregation: utils.py (perf_counter on hooks, not nsys export).
-"""
 
 import argparse
 import csv
@@ -17,7 +8,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -25,22 +16,165 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from utils import (  # noqa: E402
-    FLEXKV_CSV_METRICS,
-    IterationMetrics,
-    origin_csv_header,
-    origin_csv_row,
-    summarization_csv_header,
-    summarization_csv_row,
-    summary_row_sum_effective,
-)
-
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 
-_current_metrics: ContextVar[Optional[IterationMetrics]] = ContextVar(
-    "current_metrics", default=None
+_current_timing_lists: ContextVar[Optional[Dict[str, List[float]]]] = ContextVar(
+    "current_timing_lists", default=None
 )
+_TIMING_LIST_METRICS: Tuple[str, ...] = (
+    "flexkv.offload_kvcache_wait",
+    "flexkv.client.try_wait",
+    "flexkv.client.wait",
+)
+
+
+class RepeatTimingRow:
+    def __init__(
+        self,
+        launch_count: int,
+        iteration: int,
+        batch_size: int,
+        len_per_seq: int,
+        total_burst_once_wait_ms: float,
+        offload_try_wait_each_ms: List[float],
+        client_try_wait_each_ms: List[float],
+        client_wait_each_ms: List[float],
+    ) -> None:
+        self.launch_count = launch_count
+        self.iteration = iteration
+        self.batch_size = batch_size
+        self.len_per_seq = len_per_seq
+        self.total_burst_once_wait_ms = total_burst_once_wait_ms
+        self.offload_try_wait_each_ms = offload_try_wait_each_ms
+        self.client_try_wait_each_ms = client_try_wait_each_ms
+        self.client_wait_each_ms = client_wait_each_ms
+
+    @staticmethod
+    def _sum(values: Sequence[float]) -> float:
+        return float(sum(values))
+
+    @property
+    def offload_try_wait_total_ms(self) -> float:
+        return self._sum(self.offload_try_wait_each_ms)
+
+    @property
+    def client_try_wait_total_ms(self) -> float:
+        return self._sum(self.client_try_wait_each_ms)
+
+    @property
+    def client_wait_total_ms(self) -> float:
+        return self._sum(self.client_wait_each_ms)
+
+    @property
+    def offload_try_wait_calls(self) -> int:
+        return len(self.offload_try_wait_each_ms)
+
+    @property
+    def client_try_wait_calls(self) -> int:
+        return len(self.client_try_wait_each_ms)
+
+    @property
+    def client_wait_calls(self) -> int:
+        return len(self.client_wait_each_ms)
+
+
+def _format_ms_list(values: Sequence[float]) -> str:
+    return "[" + ", ".join(f"{v:.3f}" for v in values) + "]"
+
+
+def origin_csv_header() -> List[str]:
+    return [
+        "launch_count",
+        "iteration",
+        "request_batch_size",
+        "len_per_seq",
+        "total_burst_once_wait_ms",
+        "offload_try_wait_total_ms",
+        "offload_try_wait_calls",
+        "offload_try_wait_each_ms",
+        "client_try_wait_total_ms",
+        "client_try_wait_calls",
+        "client_try_wait_each_ms",
+        "client_wait_total_ms",
+        "client_wait_calls",
+        "client_wait_each_ms",
+    ]
+
+
+def origin_csv_row(row: RepeatTimingRow) -> List:
+    return [
+        row.launch_count,
+        row.iteration,
+        row.batch_size,
+        row.len_per_seq,
+        row.total_burst_once_wait_ms,
+        row.offload_try_wait_total_ms,
+        row.offload_try_wait_calls,
+        _format_ms_list(row.offload_try_wait_each_ms),
+        row.client_try_wait_total_ms,
+        row.client_try_wait_calls,
+        _format_ms_list(row.client_try_wait_each_ms),
+        row.client_wait_total_ms,
+        row.client_wait_calls,
+        _format_ms_list(row.client_wait_each_ms),
+    ]
+
+
+def summarization_csv_header() -> List[str]:
+    return [
+        "launch_count",
+        "request_batch_size",
+        "len_per_seq",
+        "num_bursts_measured",
+        "sum_total_burst_once_wait_ms",
+        "avg_total_burst_once_wait_ms",
+        "sum_offload_try_wait_total_ms",
+        "sum_offload_try_wait_calls",
+        "sum_client_try_wait_total_ms",
+        "sum_client_try_wait_calls",
+        "sum_client_wait_total_ms",
+        "sum_client_wait_calls",
+        "scenario_wall_ms",
+    ]
+
+
+def summarization_csv_row(
+    offload_batch_count: int,
+    batch_size: int,
+    len_per_seq: int,
+    metrics_list: Sequence[RepeatTimingRow],
+    scenario_wall_ms: float,
+) -> List:
+    n = len(metrics_list)
+    if n == 0:
+        raise ValueError("cannot summarize empty metrics list")
+    sum_total_burst_once_wait_ms = sum(m.total_burst_once_wait_ms for m in metrics_list)
+    sum_offload_try_wait_total_ms = sum(m.offload_try_wait_total_ms for m in metrics_list)
+    sum_offload_try_wait_calls = sum(m.offload_try_wait_calls for m in metrics_list)
+    sum_client_try_wait_total_ms = sum(m.client_try_wait_total_ms for m in metrics_list)
+    sum_client_try_wait_calls = sum(m.client_try_wait_calls for m in metrics_list)
+    sum_client_wait_total_ms = sum(m.client_wait_total_ms for m in metrics_list)
+    sum_client_wait_calls = sum(m.client_wait_calls for m in metrics_list)
+    return [
+        offload_batch_count,
+        batch_size,
+        len_per_seq,
+        n,
+        sum_total_burst_once_wait_ms,
+        sum_total_burst_once_wait_ms / n,
+        sum_offload_try_wait_total_ms,
+        sum_offload_try_wait_calls,
+        sum_client_try_wait_total_ms,
+        sum_client_try_wait_calls,
+        sum_client_wait_total_ms,
+        sum_client_wait_calls,
+        scenario_wall_ms,
+    ]
+
+
+def summary_row_sum_total_burst(summary_row: Sequence) -> float:
+    return float(summary_row[4])
 
 
 @contextmanager
@@ -52,9 +186,9 @@ def track_flexkv_metric(name: str, print_nvtx: bool):
     finally:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         torch.cuda.nvtx.range_pop()
-        metrics = _current_metrics.get()
-        if metrics is not None and name in FLEXKV_CSV_METRICS:
-            metrics.record(name, elapsed_ms)
+        timing_lists = _current_timing_lists.get()
+        if timing_lists is not None and name in timing_lists:
+            timing_lists[name].append(elapsed_ms)
         if print_nvtx:
             print(f"[NVTX] {name:<44} {elapsed_ms:9.3f} ms")
 
@@ -115,10 +249,10 @@ def normalize_index_meta(index_meta) -> None:
 def parse_int_list(value: str) -> List[int]:
     parts = [x.strip() for x in value.split(",") if x.strip()]
     if not parts:
-        raise ValueError("offload batch counts cannot be empty")
+        raise ValueError("launch counts cannot be empty")
     counts = [int(x) for x in parts]
     if any(c <= 0 for c in counts):
-        raise ValueError("all offload batch counts must be positive")
+        raise ValueError("all launch counts must be positive")
     return counts
 
 
@@ -136,8 +270,8 @@ def resolve_output_paths(args: argparse.Namespace) -> Tuple[Path, Path]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Continuously send offload requests and record FlexKV launch/wait "
-            "breakdown per iteration into CSV."
+            "Breakdown_2 pressure benchmark: launch x N then one offload_try_wait "
+            "per measured repeat."
         )
     )
     parser.add_argument("--max-seq-len", type=int, default=1024)
@@ -151,14 +285,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--offload-batch-counts",
         type=str,
-        default="50,100,150,200,250,300",
-        help="Comma separated offload iteration counts per scenario",
+        default="50,100,150,200",
+        help="Comma separated launch_count (N) values per scenario",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Measured repeats per launch_count scenario",
     )
     parser.add_argument(
         "--host-capacity-scale",
         type=float,
         default=8.0,
         help="Multiply host capacity per layer to avoid early capacity bottleneck",
+    )
+    parser.add_argument(
+        "--flexkv-num-cpu-blocks",
+        type=int,
+        default=0,
+        help="Override FlexKV CPU blocks; 0 uses auto-scaled value.",
+    )
+    parser.add_argument(
+        "--flexkv-num-local-blocks",
+        type=int,
+        default=0,
+        help="Override FlexKV local blocks; 0 follows CPU blocks.",
+    )
+    parser.add_argument(
+        "--flexkv-num-tmp-cpu-blocks",
+        type=int,
+        default=0,
+        help="Override FlexKV tmp CPU blocks; 0 uses auto-scaled value.",
     )
     parser.add_argument(
         "--output-root",
@@ -182,12 +340,7 @@ def parse_args() -> argparse.Namespace:
         "--warmup-iterations",
         type=int,
         default=1,
-        help="First N iterations per scenario are warmup and not written to CSV",
-    )
-    parser.add_argument(
-        "--no-origin-data",
-        action="store_true",
-        help="Skip per-iteration origin_data CSV (summarization totals only)",
+        help="First N repeats per scenario are warmup and not written to CSV",
     )
     parser.add_argument(
         "--print-nvtx",
@@ -203,6 +356,9 @@ def create_stress_kvcache_manager(
     max_seq_len: int,
     host_capacity_scale: float,
     print_nvtx: bool,
+    flexkv_num_cpu_blocks: int,
+    flexkv_num_local_blocks: int,
+    flexkv_num_tmp_cpu_blocks: int,
 ) -> KVCacheManager:
     if host_capacity_scale <= 0:
         raise ValueError("host_capacity_scale must be positive")
@@ -228,6 +384,9 @@ def create_stress_kvcache_manager(
             "flexkv_mode": "direct",
             "flexkv_host_kvstorage_fail_policy": "fail_open",
             "flexkv_enable_mps": 0,
+            "flexkv_num_cpu_blocks": int(flexkv_num_cpu_blocks),
+            "flexkv_num_local_blocks": int(flexkv_num_local_blocks),
+            "flexkv_num_tmp_cpu_blocks": int(flexkv_num_tmp_cpu_blocks),
         },
     )
     gpu_gib = (
@@ -245,7 +404,10 @@ def create_stress_kvcache_manager(
     print(f"[DEBUG] KVCache GPU Memory Usage: {gpu_gib:.3f} GiB")
     print(f"[DEBUG] KVCache Host Memory Usage: {host_gib:.3f} GiB")
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
-    install_flexkv_offload_hooks(kvcache_mgr, print_nvtx=print_nvtx)
+    install_flexkv_offload_hooks(
+        kvcache_mgr,
+        print_nvtx=print_nvtx,
+    )
     return kvcache_mgr
 
 
@@ -263,69 +425,153 @@ def build_uniform_batch_for_user_range(
     return user_ids, sequence_lengths, keys, values
 
 
-def run_one_offload(kvcache_mgr, user_ids, sequence_lengths, keys, values) -> IterationMetrics:
-    index_meta, lookup_res = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
-    normalize_index_meta(index_meta)
-    kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
-
-    for layer_idx in range(3):
-        kvcache_mgr.gpu_kvcache_mgr.put(
-            torch.cat([k[layer_idx] for k in keys], dim=0),
-            torch.cat([v[layer_idx] for v in values], dim=0),
-            layer_idx,
-            kvcache_metadata,
-        )
-
-    metrics = IterationMetrics()
-    token = _current_metrics.set(metrics)
+def run_one_burst_once_wait(
+    kvcache_mgr: KVCacheManager,
+    launch_count: int,
+    repeat_idx: int,
+    batch_size: int,
+    len_per_seq: int,
+    all_keys,
+    all_values,
+) -> Tuple[
+    int,
+    int,
+    int,
+    int,
+    int,
+    float,
+    List[float],
+    List[float],
+    List[float],
+]:
+    timing_lists = {name: [] for name in _TIMING_LIST_METRICS}
+    timing_token = _current_timing_lists.set(timing_lists)
+    launch_succeeded = 0
+    launch_rejected = 0
+    wait_rounds = 0
+    uid_base = repeat_idx * launch_count * batch_size
     try:
-        task_handle = kvcache_mgr.offload_launch(
-            index_meta=index_meta,
-            kvcache_metadata=kvcache_metadata,
-        )
-        if task_handle is None or task_handle.handle is None:
-            raise RuntimeError("offload_launch did not return a valid handle")
+        total_t0 = time.perf_counter()
+        for i in range(launch_count):
+            user_ids, sequence_lengths, keys, values = build_uniform_batch_for_user_range(
+                all_keys=all_keys,
+                all_values=all_values,
+                user_start=uid_base + i * batch_size,
+                batch_size=batch_size,
+                len_per_seq=len_per_seq,
+            )
+            index_meta, lookup_res = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
+            normalize_index_meta(index_meta)
+            kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
+            for layer_idx in range(3):
+                kvcache_mgr.gpu_kvcache_mgr.put(
+                    torch.cat([k[layer_idx] for k in keys], dim=0),
+                    torch.cat([v[layer_idx] for v in values], dim=0),
+                    layer_idx,
+                    kvcache_metadata,
+                )
+            task_handle = kvcache_mgr.offload_launch(
+                index_meta=index_meta,
+                kvcache_metadata=kvcache_metadata,
+            )
+            if bool(task_handle is not None and task_handle.handle is not None):
+                launch_succeeded += 1
+            else:
+                launch_rejected += 1
 
+        pending_before_try_wait = len(kvcache_mgr.ongoing_offload_tasks)
         while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+            wait_rounds += 1
             kvcache_mgr.offload_try_wait()
+            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+                break
+            time.sleep(0.1)
+        pending_after_try_wait = len(kvcache_mgr.ongoing_offload_tasks)
+        total_burst_once_wait_ms = (time.perf_counter() - total_t0) * 1000.0
     finally:
-        _current_metrics.reset(token)
+        _current_timing_lists.reset(timing_token)
 
-    return metrics
+    return (
+        launch_succeeded,
+        launch_rejected,
+        pending_before_try_wait,
+        pending_after_try_wait,
+        wait_rounds,
+        total_burst_once_wait_ms,
+        list(timing_lists["flexkv.offload_kvcache_wait"]),
+        list(timing_lists["flexkv.client.try_wait"]),
+        list(timing_lists["flexkv.client.wait"]),
+    )
 
 
-def format_metrics_line(metrics: IterationMetrics) -> str:
-    parts = [
-        f"effective={metrics.flexkv_offload_effective_total_ms():.3f}ms",
-        f"raw_total={metrics.flexkv_offload_total_ms():.3f}ms",
-    ]
-    for name in FLEXKV_CSV_METRICS:
-        ms = metrics.get_sum_ms(name)
-        cnt = metrics.get_count(name)
-        if cnt > 0:
-            short = name.replace("flexkv.", "")
-            parts.append(f"{short}={ms:.3f}ms/x{cnt}")
-    return ", ".join(parts)
+def best_effort_shutdown_kvcache_mgr(
+    kvcache_mgr: KVCacheManager,
+) -> None:
+    host_mgr = getattr(kvcache_mgr, "host_kvstorage_manager", None)
+    client = getattr(host_mgr, "_client", None)
+    shutdown_fn = getattr(client, "shutdown", None)
+    if shutdown_fn is None:
+        return
+
+    try:
+        shutdown_fn()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] client.shutdown failed: {exc}")
 
 
 def run_scenario(
     offload_batch_count: int,
     args: argparse.Namespace,
     csv_writer: Optional[csv.writer],
-) -> Tuple[List[IterationMetrics], float]:
+) -> Tuple[List[RepeatTimingRow], float]:
     print("\n" + "=" * 88)
     print(
-        f"[SCENARIO] offload_batch_count={offload_batch_count}, "
+        f"[SCENARIO] launch_count={offload_batch_count}, "
         f"request_batch_size={args.batch_size}, len_per_seq={args.len_per_seq}, "
-        f"warmup_iterations={args.warmup_iterations}"
+        f"repeat={args.repeat}, warmup_repeats={args.warmup_iterations}"
     )
     print("=" * 88)
+
+    blocks_per_seq = (args.len_per_seq + 31) // 32
+    estimated_blocks = offload_batch_count * args.batch_size * blocks_per_seq
+    # FlexKV offload in this path materializes both K/V payloads; tmp blocks sized
+    # by a single-stream estimate can under-allocate and cause NOTFOUND under burst.
+    estimated_tmp_blocks = estimated_blocks * 2
+    auto_cpu_blocks = max(4096, int(estimated_blocks * 1.5))
+    auto_local_blocks = auto_cpu_blocks
+    auto_tmp_cpu_blocks = max(256, estimated_tmp_blocks)
+
+    flexkv_num_cpu_blocks = (
+        args.flexkv_num_cpu_blocks
+        if args.flexkv_num_cpu_blocks > 0
+        else auto_cpu_blocks
+    )
+    flexkv_num_local_blocks = (
+        args.flexkv_num_local_blocks
+        if args.flexkv_num_local_blocks > 0
+        else auto_local_blocks
+    )
+    flexkv_num_tmp_cpu_blocks = (
+        args.flexkv_num_tmp_cpu_blocks
+        if args.flexkv_num_tmp_cpu_blocks > 0
+        else auto_tmp_cpu_blocks
+    )
+
+    print(
+        f"[SCENARIO][FLEXKV_BLOCKS] estimated={estimated_blocks}, "
+        f"estimated_tmp={estimated_tmp_blocks}, "
+        f"cpu={flexkv_num_cpu_blocks}, local={flexkv_num_local_blocks}, "
+        f"tmp_cpu={flexkv_num_tmp_cpu_blocks}"
+    )
 
     kvcache_mgr = create_stress_kvcache_manager(
         max_batch_size=args.batch_size,
         max_seq_len=args.max_seq_len,
         host_capacity_scale=args.host_capacity_scale,
         print_nvtx=args.print_nvtx,
+        flexkv_num_cpu_blocks=flexkv_num_cpu_blocks,
+        flexkv_num_local_blocks=flexkv_num_local_blocks,
+        flexkv_num_tmp_cpu_blocks=flexkv_num_tmp_cpu_blocks,
     )
     all_keys = [
         torch.randn((3, args.max_seq_len, 4, 128), dtype=torch.bfloat16).cuda()
@@ -336,70 +582,70 @@ def run_scenario(
         for _ in range(args.batch_size)
     ]
 
-    measured: List[IterationMetrics] = []
+    measured: List[RepeatTimingRow] = []
     scenario_t0 = time.perf_counter()
-    for i in range(offload_batch_count):
+    for i in range(args.repeat):
         iteration = i + 1
         is_warmup = iteration <= args.warmup_iterations
 
-        user_ids, sequence_lengths, keys, values = build_uniform_batch_for_user_range(
-            all_keys=all_keys,
-            all_values=all_values,
-            user_start=i * args.batch_size,
+        (
+            launch_succeeded,
+            launch_rejected,
+            pending_before_try_wait,
+            pending_after_try_wait,
+            wait_rounds,
+            total_burst_once_wait_ms,
+            offload_try_wait_each_ms,
+            client_try_wait_each_ms,
+            client_wait_each_ms,
+        ) = run_one_burst_once_wait(
+            kvcache_mgr=kvcache_mgr,
+            launch_count=offload_batch_count,
+            repeat_idx=i,
             batch_size=args.batch_size,
             len_per_seq=args.len_per_seq,
+            all_keys=all_keys,
+            all_values=all_values,
         )
 
-        metrics = run_one_offload(
-            kvcache_mgr=kvcache_mgr,
-            user_ids=user_ids,
-            sequence_lengths=sequence_lengths,
-            keys=keys,
-            values=values,
-        )
-
-        tag = "WARMUP" if is_warmup else "OFFLOAD"
+        tag = "WARMUP" if is_warmup else "BURST"
         print(
-            f"[{tag}] scenario={offload_batch_count:>4}, "
-            f"iter={iteration:>4}/{offload_batch_count:<4} | "
-            f"{format_metrics_line(metrics)}"
+            f"[{tag}] launch_count={offload_batch_count:>4}, "
+            f"repeat={iteration:>4}/{args.repeat:<4} | "
+            f"launch_succeeded={launch_succeeded}/{offload_batch_count}, "
+            f"launch_rejected={launch_rejected}, "
+            f"pending={pending_before_try_wait}->{pending_after_try_wait}, "
+            f"wait_rounds={wait_rounds}, "
+            f"total_burst_once_wait={total_burst_once_wait_ms:.3f}ms, "
+            f"offload_try_wait_calls={len(offload_try_wait_each_ms)}, "
+            f"client_try_wait_calls={len(client_try_wait_each_ms)}, "
+            f"client_wait_calls={len(client_wait_each_ms)}"
         )
 
         if is_warmup:
             continue
 
-        measured.append(metrics)
+        row_data = RepeatTimingRow(
+            launch_count=offload_batch_count,
+            iteration=iteration,
+            batch_size=args.batch_size,
+            len_per_seq=args.len_per_seq,
+            total_burst_once_wait_ms=total_burst_once_wait_ms,
+            offload_try_wait_each_ms=offload_try_wait_each_ms,
+            client_try_wait_each_ms=client_try_wait_each_ms,
+            client_wait_each_ms=client_wait_each_ms,
+        )
+        measured.append(row_data)
         if csv_writer is not None:
-            csv_writer.writerow(
-                origin_csv_row(
-                    offload_batch_count=offload_batch_count,
-                    iteration=iteration,
-                    batch_size=args.batch_size,
-                    len_per_seq=args.len_per_seq,
-                    metrics=metrics,
-                )
-            )
-
-    # No FlexKV client.shutdown() here — it can hang after many offloads.
+            csv_writer.writerow(origin_csv_row(row_data))
 
     scenario_wall_ms = (time.perf_counter() - scenario_t0) * 1000.0
+    best_effort_shutdown_kvcache_mgr(kvcache_mgr=kvcache_mgr)
     return measured, scenario_wall_ms
 
 
 def main() -> None:
     args = parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required.")
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be a positive integer")
-    if args.len_per_seq <= 0:
-        raise ValueError("--len-per-seq must be a positive integer")
-    if args.max_seq_len < args.len_per_seq:
-        raise ValueError("--max-seq-len must be >= --len-per-seq")
-    if args.host_capacity_scale <= 0:
-        raise ValueError("--host-capacity-scale must be positive")
-    if args.warmup_iterations < 0:
-        raise ValueError("--warmup-iterations must be >= 0")
 
     offload_batch_counts = parse_int_list(args.offload_batch_counts)
     torch.manual_seed(args.seed)
@@ -407,19 +653,13 @@ def main() -> None:
     origin_path, summary_path = resolve_output_paths(args)
     origin_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[INFO] launch_counts={offload_batch_counts}, batch_size={args.batch_size}, "
+        f"len_per_seq={args.len_per_seq}, repeat={args.repeat}, "
+        f"warmup={args.warmup_iterations}, "
+    )
     print(f"[INFO] origin csv: {origin_path}")
     print(f"[INFO] summary csv: {summary_path}")
-    print(f"[INFO] offload_batch_counts={offload_batch_counts}")
-    print(
-        f"[INFO] request_batch_size={args.batch_size}, "
-        f"len_per_seq={args.len_per_seq}, host_capacity_scale={args.host_capacity_scale}"
-    )
-    print(
-        f"[INFO] warmup: first {args.warmup_iterations} iteration(s) per scenario "
-        "excluded from CSV and scenario totals"
-    )
-    if args.no_origin_data:
-        print("[INFO] --no-origin-data: skipping origin_data CSV")
 
     summary_rows: List[List] = []
 
@@ -431,7 +671,7 @@ def main() -> None:
         )
         if not measured:
             print(
-                f"[WARN] scenario={offload_batch_count}: no measured iterations "
+                f"[WARN] launch_count={offload_batch_count}: no measured repeats "
                 "(all warmup?)"
             )
             return
@@ -444,31 +684,26 @@ def main() -> None:
                 scenario_wall_ms=scenario_wall_ms,
             )
         )
-        sum_effective = summary_row_sum_effective(summary_rows[-1])
+        sum_total_burst = summary_row_sum_total_burst(summary_rows[-1])
         print(
-            f"[SUMMARY] offload_batch_count={offload_batch_count}, "
-            f"measured {len(measured)} offloads, "
-            f"sum_effective={sum_effective:.1f} ms, "
+            f"[SUMMARY] launch_count={offload_batch_count}, "
+            f"measured {len(measured)} bursts, "
+            f"sum_total_burst_once_wait={sum_total_burst:.1f} ms, "
             f"scenario_wall={scenario_wall_ms:.1f} ms"
         )
 
-    if args.no_origin_data:
+    with origin_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(origin_csv_header())
         for offload_batch_count in offload_batch_counts:
-            process_scenario(offload_batch_count, csv_writer=None)
-    else:
-        with origin_path.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(origin_csv_header())
-            for offload_batch_count in offload_batch_counts:
-                process_scenario(offload_batch_count, csv_writer=writer)
+            process_scenario(offload_batch_count, csv_writer=writer)
 
     with summary_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(summarization_csv_header())
         writer.writerows(summary_rows)
 
-    if not args.no_origin_data:
-        print(f"[DONE] origin_data: {origin_path}")
+    print(f"[DONE] origin_data: {origin_path}")
     print(f"[DONE] summarization: {summary_path}")
 
 
