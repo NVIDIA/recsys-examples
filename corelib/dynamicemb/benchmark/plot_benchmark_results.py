@@ -22,14 +22,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Canonical ordering for the four storage modes the suite parametrizes over.
-MODE_ORDER = ["gpu", "caching", "no_caching", "no_hbm"]
-MODE_LABEL = {
-    "gpu": "GPU\n(full HBM)",
-    "caching": "Caching\n(10% LRU)",
-    "no_caching": "NoCaching\n(10% HBM)",
-    "no_hbm": "NoHBM\n(UVM)",
-}
-
 METRICS = ["forward", "backward", "train", "eval"]
 
 
@@ -50,19 +42,57 @@ def filter_timing_entries(results: List[dict]) -> List[dict]:
     return [r for r in results if "dyn_train_ms" in r]
 
 
-def collect_suite(results: List[dict], optimizer: str, mode: str):
-    """Return (dyn_values, trc_values) over METRICS for one (optimizer, mode) suite.
+def build_panels(results: List[dict]):
+    """Column ordering for figure panels: (mode, cache_footprint_ratio).
 
-    Returns ``(None, None)`` when the suite isn't present in the results.
+    ``cache_footprint_ratio`` is None for non-caching modes; for caching it
+    expands one column per ratio found in the data, sorted ascending.  This
+    keeps cfr=0.5 and cfr=0.8 in the same figure rather than splitting them
+    into separate PNGs.
+    """
+    ratios = sorted({
+        r.get("cache_footprint_ratio") for r in results
+        if r.get("cache_footprint_ratio") is not None
+    })
+    panels = [("gpu", None)]
+    if ratios:
+        panels.extend([("caching", r) for r in ratios])
+    else:
+        panels.append(("caching", None))
+    panels.append(("no_caching", None))
+    panels.append(("no_hbm", None))
+    return panels
+
+
+def panel_label(mode: str, cfr) -> str:
+    """Title text for a panel, gpu_ratio-free."""
+    if mode == "gpu":
+        return "GPU\n(full HBM)"
+    if mode == "caching":
+        return f"Caching\ncfr={cfr}" if cfr is not None else "Caching"
+    if mode == "no_caching":
+        return "NoCaching"
+    if mode == "no_hbm":
+        return "NoHBM\n(UVM)"
+    return mode
+
+
+def collect_panel(results: List[dict], optimizer: str, mode: str, cfr):
+    """Return (dyn_values, trc_values) over METRICS for one panel.
+
+    A panel is uniquely identified by ``(optimizer, mode, cache_footprint_ratio)``.
+    Returns ``(None, None)`` when no matching result is present.
     """
     for r in results:
-        if (
-            r["optimizer_type"] == optimizer
-            and parse_mode(r["label"]) == mode
-        ):
-            dyn_v = [r[f"dyn_{m}_ms"] for m in METRICS]
-            trc_v = [r[f"trc_{m}_ms"] for m in METRICS]
-            return dyn_v, trc_v
+        if r.get("optimizer_type") != optimizer:
+            continue
+        if parse_mode(r["label"]) != mode:
+            continue
+        if r.get("cache_footprint_ratio") != cfr:
+            continue
+        dyn_v = [r[f"dyn_{m}_ms"] for m in METRICS]
+        trc_v = [r[f"trc_{m}_ms"] for m in METRICS]
+        return dyn_v, trc_v
     return None, None
 
 
@@ -100,11 +130,16 @@ def _annotate_total(ax, x, total, fmt="{:.2f}"):
 
 def make_figure(
     results: List[dict],
+    panels: List[tuple],
     log: bool,
     show_values: bool,
     subtitle: str = "",
 ) -> plt.Figure:
-    """Per-suite layout: rows = optimizer, cols = storage mode.
+    """Per-suite layout: rows = optimizer, cols = ``panels`` order.
+
+    ``panels`` is a list of ``(mode, cache_footprint_ratio)`` tuples produced
+    by :func:`build_panels` -- caching is fanned out into one column per
+    ratio so cfr=0.5 / cfr=0.8 sit side by side in the same figure.
 
     Each subplot shows two grouped bars: a stacked train bar (forward at
     the bottom, backward on top -- their sum equals the measured train
@@ -114,12 +149,13 @@ def make_figure(
     """
     optimizers = sorted({r["optimizer_type"] for r in results})
 
-    # Each subplot auto-scales its y-axis: the four modes span ~0.5 ms (GPU)
-    # to ~40 ms (NoHBM) so a shared row axis would squash the GPU panel into
-    # a sliver.  Independent axes keep every panel readable.
+    # Each subplot auto-scales its y-axis: modes span ~0.5 ms (GPU) to ~40 ms
+    # (NoHBM) so a shared row axis would squash the GPU panel into a sliver.
+    # Per-column width stays at 4.0 inches so the layout grows naturally as
+    # more cache_footprint_ratio columns are added.
     fig, axes = plt.subplots(
-        len(optimizers), len(MODE_ORDER),
-        figsize=(4.0 * len(MODE_ORDER), 3.5 * len(optimizers)),
+        len(optimizers), len(panels),
+        figsize=(4.0 * len(panels), 3.5 * len(optimizers)),
         squeeze=False,
     )
 
@@ -127,9 +163,9 @@ def make_figure(
     x_train, x_eval = 0, 1
     first_handles = None  # captured from first non-empty subplot for fig-level legend
     for row, opt in enumerate(optimizers):
-        for col, mode in enumerate(MODE_ORDER):
+        for col, (mode, cfr) in enumerate(panels):
             ax = axes[row, col]
-            dyn_v, trc_v = collect_suite(results, opt, mode)
+            dyn_v, trc_v = collect_panel(results, opt, mode, cfr)
             if dyn_v is None:
                 ax.set_visible(False)
                 continue
@@ -161,7 +197,7 @@ def make_figure(
             ax.set_xticklabels(["train\n(fwd + bwd)", "eval"], fontsize=9)
             ax.set_ylabel("ms")
             ax.set_title(
-                f"{opt} · {MODE_LABEL.get(mode, mode).replace(chr(10), ' ')}",
+                f"{opt} · {panel_label(mode, cfr).replace(chr(10), ' ')}",
                 fontsize=10,
             )
             ax.grid(axis="y", alpha=0.3)
@@ -195,21 +231,25 @@ def make_figure(
     return fig
 
 
-def make_speedup_figure(results: List[dict], subtitle: str = "") -> plt.Figure:
-    """TorchRec / DynamicEmb latency ratio per (optimizer, mode, metric).
+def make_speedup_figure(
+    results: List[dict],
+    panels: List[tuple],
+    subtitle: str = "",
+) -> plt.Figure:
+    """TorchRec / DynamicEmb latency ratio per panel × metric.
 
-    Layout mirrors :func:`make_figure`: rows = optimizer, cols = storage
-    mode, one panel per (optimizer, mode) suite.  Inside each panel four
-    bars show the ratio for forward / backward / train / eval.  A dashed
-    horizontal line at y=1.0 marks parity; bars above the line mean
-    DynamicEmb is faster, below means TorchRec is faster.  Each panel
-    auto-scales independently so 10× wins don't squash 0.3× cells.
+    Layout mirrors :func:`make_figure`: rows = optimizer, cols = ``panels``.
+    Inside each panel four bars show the ratio for forward / backward /
+    train / eval.  A dashed horizontal line at y=1.0 marks parity; bars
+    above the line mean DynamicEmb is faster, below means TorchRec is
+    faster.  Each panel auto-scales independently so 10× wins don't
+    squash 0.3× cells.
     """
     optimizers = sorted({r["optimizer_type"] for r in results})
 
     fig, axes = plt.subplots(
-        len(optimizers), len(MODE_ORDER),
-        figsize=(4.0 * len(MODE_ORDER), 3.5 * len(optimizers)),
+        len(optimizers), len(panels),
+        figsize=(4.0 * len(panels), 3.5 * len(optimizers)),
         squeeze=False,
     )
 
@@ -218,9 +258,9 @@ def make_speedup_figure(results: List[dict], subtitle: str = "") -> plt.Figure:
     x = np.arange(len(METRICS))
 
     for row, opt in enumerate(optimizers):
-        for col, mode in enumerate(MODE_ORDER):
+        for col, (mode, cfr) in enumerate(panels):
             ax = axes[row, col]
-            dyn_v, trc_v = collect_suite(results, opt, mode)
+            dyn_v, trc_v = collect_panel(results, opt, mode, cfr)
             if dyn_v is None:
                 ax.set_visible(False)
                 continue
@@ -249,7 +289,7 @@ def make_speedup_figure(results: List[dict], subtitle: str = "") -> plt.Figure:
             ax.set_xticklabels(METRICS, fontsize=9)
             ax.set_ylabel("trc / dyn")
             ax.set_title(
-                f"{opt} · {MODE_LABEL.get(mode, mode).replace(chr(10), ' ')}",
+                f"{opt} · {panel_label(mode, cfr).replace(chr(10), ' ')}",
                 fontsize=10,
             )
             ax.grid(axis="y", alpha=0.3)
@@ -267,11 +307,15 @@ def make_speedup_figure(results: List[dict], subtitle: str = "") -> plt.Figure:
     return fig
 
 
-def _meta_str(results: List[dict], ratio):
+def _meta_str(results: List[dict]):
     """Two-line header strip.
 
     Line 1: hardware / model dims (GPU, D, batch).
-    Line 2: input data + cache knob (distribution, hotness, pool, ratio).
+    Line 2: input data (distribution, hotness, pool).
+
+    ``cache_footprint_ratio`` is intentionally NOT included here: with the
+    single-figure layout the caching column shows one panel per ratio, so
+    the ratio is already visible in the panel titles.
 
     Each field is skipped when its source key is absent from the result dict
     so legacy JSONs degrade gracefully.
@@ -300,8 +344,6 @@ def _meta_str(results: List[dict], ratio):
         wk.append(f"hotness={r0['max_hotness']}")
     if r0.get("pooling_mode"):
         wk.append(f"pool={r0['pooling_mode']}")
-    if ratio is not None:
-        wk.append(f"cache_footprint_ratio={ratio}")
 
     lines = []
     if hw:
@@ -339,38 +381,23 @@ def main() -> None:
     if not results:
         raise SystemExit(f"No timing entries found in {args.results}")
 
-    # The caching suite is parametrized by cache_footprint_ratio.  One main
-    # (and one speedup, if requested) figure is emitted per ratio so the
-    # caching panel reflects that ratio's measurement; non-caching panels
-    # (ratio metadata absent or None) appear in every figure unchanged.
-    ratios = sorted({
-        r.get("cache_footprint_ratio") for r in results
-        if r.get("cache_footprint_ratio") is not None
-    })
+    # All cache_footprint_ratio variants share a single figure now: the
+    # caching column is fanned out into one panel per ratio, so cfr=0.5 and
+    # cfr=0.8 sit side-by-side instead of going to separate PNGs.
+    panels = build_panels(results)
+    subtitle = _meta_str(results)
 
     def _save(fig, name):
         path = os.path.join(args.out_dir, name)
         fig.savefig(path, dpi=130, bbox_inches="tight")
         print(f"Saved -> {path}")
 
-    def _emit(subset, suffix, subtitle):
-        fig = make_figure(subset, log=args.log,
-                          show_values=not args.no_values, subtitle=subtitle)
-        _save(fig, f"benchmark_bdet_plot{suffix}.png")
-        if args.speedup:
-            sp = make_speedup_figure(subset, subtitle=subtitle)
-            _save(sp, f"benchmark_bdet_speedup_plot{suffix}.png")
-
-    if not ratios:
-        # Old-style results with no ratio metadata: single figure set.
-        _emit(results, "", _meta_str(results, None))
-    else:
-        for r in ratios:
-            subset = [
-                x for x in results
-                if x.get("cache_footprint_ratio") in (None, r)
-            ]
-            _emit(subset, f"_cfr{r}", _meta_str(subset, r))
+    fig = make_figure(results, panels, log=args.log,
+                      show_values=not args.no_values, subtitle=subtitle)
+    _save(fig, "benchmark_bdet_plot.png")
+    if args.speedup:
+        sp = make_speedup_figure(results, panels, subtitle=subtitle)
+        _save(sp, "benchmark_bdet_speedup_plot.png")
 
 
 if __name__ == "__main__":

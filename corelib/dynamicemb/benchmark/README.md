@@ -191,25 +191,27 @@ suites (`TestGpu`, `TestNoCaching`, `TestNoHbm`) leave
 `cache_footprint_ratio=None` and keep their construction-time
 `hbm_for_embeddings` / `gpu_ratio`.
 
+Cache state from the warmup (`run_reporting_loop`) is **kept** for the
+subsequent timed `benchmark_train_eval` — only the hit-rate recorder is
+disabled.  The timed numbers therefore measure steady-state cache
+behavior, not a cold start.
+
 ### Plotting results
 
 `benchmark_results.json` produced above is visualized with
-`plot_benchmark_results.py`.  All figures are written into a single
-output directory (default `./plots/`).  When the JSON contains
-`cache_footprint_ratio` metadata one figure is emitted **per ratio**:
-the caching panel shows that ratio's measurement, the other three mode
-panels (no ratio) are repeated unchanged.
+`plot_benchmark_results.py`.  Figures are written into a single output
+directory (default `./plots/`) as **one figure** (`benchmark_bdet_plot.png`)
++ optionally one speedup figure (`benchmark_bdet_speedup_plot.png`).  The
+caching column auto-fans-out into one panel per `cache_footprint_ratio`
+present in the JSON, so cfr=0.5 and cfr=0.8 sit side-by-side in the same
+image (the figure width scales with column count).
 
 ```bash
-# Main figures, one per ratio, into ./plots/
+# Main figure into ./plots/benchmark_bdet_plot.png
 python plot_benchmark_results.py
-# → plots/benchmark_bdet_plot_cfr0.5.png
-# → plots/benchmark_bdet_plot_cfr0.8.png
 
-# Also produce the trc/dyn speedup figures, one per ratio
+# Main + trc/dyn speedup
 python plot_benchmark_results.py --speedup
-# → plots/benchmark_bdet_plot_cfr0.5.png + plots/benchmark_bdet_speedup_plot_cfr0.5.png
-# → plots/benchmark_bdet_plot_cfr0.8.png + plots/benchmark_bdet_speedup_plot_cfr0.8.png
 
 # Different output directory / results file
 python plot_benchmark_results.py \
@@ -223,29 +225,28 @@ python plot_benchmark_results.py --log
 python plot_benchmark_results.py --no-values
 ```
 
-Legacy results without ratio metadata fall back to a single
-`benchmark_bdet_plot.png` (+ `benchmark_bdet_speedup_plot.png`) inside
-`--out-dir`.
-
 Each figure carries a two-line subtitle auto-derived from the result
 dict:
 
 ```
 NVIDIA H100 80GB HBM3  ·  D=128  ·  batch=1,048,576
-pow-law(α=1.05)  ·  hotness=10  ·  pool=none  ·  cache_footprint_ratio=0.5
+pow-law(α=1.05)  ·  hotness=10  ·  pool=none
 ```
 
-Fields populated by `run_single_benchmark`: `gpu_name`,
-`embedding_dim`, `batch_size`/`num_tables`, `feature_distribution`,
-`alpha`, `max_hotness`, `pooling_mode`, `cache_footprint_ratio`.
-Any field missing from a legacy JSON is silently skipped.
+`cache_footprint_ratio` is intentionally not in the subtitle — it shows
+up in the per-panel titles instead (`Caching · cfr=0.5`, `Caching · cfr=0.8`).
+Fields populated by `run_single_benchmark`: `gpu_name`, `embedding_dim`,
+`batch_size`/`num_tables`, `feature_distribution`, `alpha`, `max_hotness`,
+`pooling_mode`, `cache_footprint_ratio`.  Any field missing from a legacy
+JSON is silently skipped.
 
 Layout:
-- Main figure: 2 rows (optimizer) × 4 cols (storage mode), each panel
-  shows a stacked `train (fwd + bwd)` bar plus a separate `eval` bar
-  for DynamicEmb vs TorchRec; every panel auto-scales independently.
-- Speedup figure (with `--speedup`): same 2×4 layout, four bars per
-  panel (`fwd / bwd / train / eval`) showing `TorchRec / DynamicEmb`.
+- Main figure: 2 rows (optimizer) × N cols (`GPU`, one per caching
+  ratio, `NoCaching`, `NoHBM`).  Each panel shows a stacked
+  `train (fwd + bwd)` bar plus a separate `eval` bar for DynamicEmb
+  vs TorchRec; every panel auto-scales independently.
+- Speedup figure (with `--speedup`): same row × col layout, four bars
+  per panel (`fwd / bwd / train / eval`) showing `TorchRec / DynamicEmb`.
   A dashed `1.0×` line marks parity; bars above → DynamicEmb is the
   faster backend, below → TorchRec is.
 
@@ -262,16 +263,14 @@ Run configuration:
 - cache_algorithm: lru
 - gpu_ratio: 1.0 (`TestGpu`) / footprint × `cache_footprint_ratio`
   (`TestCaching`) / 0.1 (`TestNoCaching`) / 0.0 (`TestNoHbm`)
-- capacity: 24M when gpu_ratio=1.0, 256M otherwise
+- capacity: 16M when gpu_ratio=1.0 (`TestGpu`, sized to fit dual backends in 80 GB), 256M otherwise
 - optimizers: adam (`eps=1e-8`) and sgd
 - num_iterations: 100
 
 Latency by suite (DynamicEmb vs TorchRec TBE, lower is better):
 
-![benchmark result @ cache_footprint_ratio=0.5](./plots/benchmark_bdet_plot_cfr0.5.png)
-![benchmark result @ cache_footprint_ratio=0.8](./plots/benchmark_bdet_plot_cfr0.8.png)
+![benchmark of BatchedDynamicEmbeddingTables vs TorchRec TBE](./plots/benchmark_bdet_plot.png)
 
 TorchRec / DynamicEmb speedup ratio (>1× → DynamicEmb faster, <1× → TorchRec faster):
 
-![speedup @ cache_footprint_ratio=0.5](./plots/benchmark_bdet_speedup_plot_cfr0.5.png)
-![speedup @ cache_footprint_ratio=0.8](./plots/benchmark_bdet_speedup_plot_cfr0.8.png)
+![speedup of DynamicEmb over TorchRec TBE](./plots/benchmark_bdet_speedup_plot.png)

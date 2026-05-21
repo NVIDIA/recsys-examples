@@ -1411,11 +1411,6 @@ def run_single_benchmark(
             trace_prefix=f"torchrec_{cfg.label()}_",
         )
 
-        if cfg.caching:
-            dynamic_emb.flush()
-            torchrec_emb.flush()
-            dynamic_emb.reset_cache_states()
-            torchrec_emb.reset_cache_states()
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
         result = {"label": cfg.label(), "torch_profile": True}
@@ -1429,12 +1424,11 @@ def run_single_benchmark(
         # `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`).
         print("  (run_reporting_loop warmup, then nsys sample 1 fwd+bwd)")
         run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
+        # Keep the cache warm from the reporting loop so nsys captures
+        # steady-state kernel behavior (same convention as the non-profile
+        # path).  Only stop recording hit-rate metrics.
         if cfg.caching:
             dynamic_emb.set_record_cache_metrics(False)
-            dynamic_emb.flush()
-            torchrec_emb.flush()
-            dynamic_emb.reset_cache_states()
-            torchrec_emb.reset_cache_states()
 
         benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg)
         del dynamic_emb, torchrec_emb, sparse_features
@@ -1453,11 +1447,11 @@ def run_single_benchmark(
         run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
 
     if cfg.caching:
+        # Keep the cache warm from the reporting loop -- benchmark_train_eval
+        # then measures steady-state hit-rate performance instead of a cold
+        # start.  We only stop *recording* hit-rate metrics; the cache
+        # contents and counters stay as the warmup left them.
         dynamic_emb.set_record_cache_metrics(False)
-        dynamic_emb.flush()
-        torchrec_emb.flush()
-        dynamic_emb.reset_cache_states()
-        torchrec_emb.reset_cache_states()
 
     metrics = benchmark_train_eval(
         dynamic_emb,
@@ -1548,7 +1542,13 @@ def _cache_hbm(
 
 
 def _gpu_configs():
-    cap_per_table = 24 * 1024 * 1024
+    # 16M instead of 24M: the dual-backend TestGpu path holds the DynamicEmb
+    # table + TorchRec TBE + (DynamicEmb + TorchRec) per-iter activations + a
+    # pre-allocated grad in HBM simultaneously.  At 24M with Adam (D + 2D state
+    # in fp32) this peaked > 78 GiB on H100 80GB and OOM'd inside
+    # benchmark_train_eval.  16M halves the table footprint to ~25 GiB each
+    # while keeping the sample pool large enough for pow-law alpha=1.05.
+    cap_per_table = 16 * 1024 * 1024
     return [
         BenchmarkConfig(
             batch_size=bs // nt,
