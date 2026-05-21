@@ -176,7 +176,7 @@ Other profile modes:
 ### Cache footprint sizing (TestCaching)
 
 `TestCaching` is parametrized by `cache_footprint_ratio` (currently
-`[0.5, 0.8]`).  At runtime the harness:
+`[1.0, 1.5]`).  At runtime the harness:
 
 1. Generates the full sparse-feature stream before any table is built.
 2. Counts distinct keys touched per table across all iterations -- the

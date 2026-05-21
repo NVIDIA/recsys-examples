@@ -1569,7 +1569,7 @@ def _gpu_configs():
 
 
 _CACHE_GPU_RATIO = 0.1
-_CACHE_FOOTPRINT_RATIOS = [0.5, 0.8]
+_CACHE_FOOTPRINT_RATIOS = [1.0, 1.5]
 
 
 def _caching_configs():
