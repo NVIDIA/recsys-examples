@@ -133,20 +133,63 @@ wraps the actual sampled iterations in a `cudaProfilerStart` /
 `cudaProfilerStop` window.  The benchmark itself only annotates NVTX
 ranges; the actual capture happens externally via `nsys profile`.
 
-Launch under nsys with `--capture-range=cudaProfilerApi
---capture-range-end=stop` so the trace contains only the marked window:
+`benchmark_with_nsys` emits **one Start/Stop window per config**.  We
+always use `--capture-range-end=repeat-shutdown` so nsys records every
+window it sees -- with `-k <label>` that's a single window, without
+filter it's the full suite.  Setup / reporting-loop warmup / between-
+config gaps stay out of the recording in both modes.
+
+**Single config** -- pick one config with `-k <label>`:
 
 ```bash
 nsys profile \
-    -o trace_dyn -f true \
-    --capture-range=cudaProfilerApi --capture-range-end=stop \
-    --trace=cuda,nvtx,osrt \
+    --output=trace_dyn \
+    --force-overwrite=true \
+    --sample=none \
+    --cpuctxsw=none \
+    --trace=cuda,nvtx,osrt,mpi,ucx \
+    --cuda-graph-trace=node \
+    --cuda-flush-interval=100 \
+    --capture-range=cudaProfilerApi \
+    --capture-range-end=repeat-shutdown \
     --target-processes=all \
     bash ./benchmark/benchmark_batched_dynamicemb_tables.sh \
         --profile nsys -k "TestGpu and adam"
 ```
 
-NVTX layout inside the capture window:
+**Multi config** -- whole suite into one trace:
+
+```bash
+nsys profile \
+    --output=trace_all \
+    --force-overwrite=true \
+    --sample=none \
+    --cpuctxsw=none \
+    --trace=cuda,nvtx,osrt,mpi,ucx \
+    --cuda-graph-trace=node \
+    --cuda-flush-interval=100 \
+    --capture-range=cudaProfilerApi \
+    --capture-range-end=repeat-shutdown \
+    --target-processes=all \
+    bash ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile nsys
+```
+
+Flag breakdown (shared by both invocations):
+
+| Flag | Meaning |
+| --- | --- |
+| `--sample=none` | disable periodic CPU stack sampling -- cuts overhead and trace size when only GPU/NVTX is needed |
+| `--cpuctxsw=none` | drop OS context-switch records -- noisy on multi-core, rarely needed for kernel-level perf |
+| `--trace=cuda,nvtx,osrt,mpi,ucx` | trace CUDA API + GPU work, NVTX markers, OS-runtime syscalls, MPI calls, UCX calls (the latter two are no-ops on single-node single-GPU and can be dropped) |
+| `--cuda-graph-trace=node` | expand CUDA Graph launches into per-node events so kernels inside a captured graph stay individually visible |
+| `--cuda-flush-interval=100` | flush the CUDA event buffer every 100 ms so long runs don't overflow the ring buffer and drop events |
+| `--capture-range=cudaProfilerApi` | start recording only when the process calls `cudaProfilerStart` (skips table/data setup and the reporting-loop warmup) |
+| `--capture-range-end=repeat-shutdown` | record **every** Start/Stop window into the same trace (skip gaps in between), end the session at process shutdown.  Works for both single-config (one window) and multi-config (N windows) without changing the flag |
+| `--target-processes=all` | follow children/forks too -- needed because `torchrun` spawns a worker process to host pytest |
+| `--force-overwrite=true` | overwrite an existing output file instead of erroring out |
+| `--output=<name>` | output file (`.nsys-rep` is the current extension; `.qdrep` from older releases still works) |
+
+NVTX layout inside each window:
 ```
 <cfg.label()>                          # e.g. T1_totalB1048576_D128_adam_gpu_...
 └─ nsys_iter_0                         # per-iter
@@ -159,8 +202,11 @@ NVTX layout inside the capture window:
 Browse the trace with `nsys-ui` (locally) or summarize on the cluster:
 
 ```bash
-nsys stats --report cuda_gpu_kern_sum trace_dyn.nsys-rep | head -30
-nsys stats --report nvtx_pushpop_sum  trace_dyn.nsys-rep | head -30
+# pick a kernel-time top-N across all configs
+nsys stats --report cuda_gpu_kern_sum trace_all.nsys-rep | head -30
+
+# group kernel time by NVTX range (= cfg.label()) to compare configs
+nsys stats --report cuda_gpu_kern_gb_sum trace_all.nsys-rep | head -30
 ```
 
 Other profile modes:

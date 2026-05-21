@@ -848,17 +848,26 @@ KERNEL_NAME_PATTERNS = {
 def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
     """Run fwd+bwd on both backends inside a cudaProfilerStart/Stop window.
 
-    Meant to be launched externally under
-    ``nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop ...``
-    so the trace contains only the marked iterations; setup kernels (table
-    alloc, sparse-feature gen, populate) and any preceding warmup
-    (``run_reporting_loop``) stay out of the capture.
+    One Start/Stop pair per config.  When pytest runs N configs under
+    ``--profile nsys`` this function is called N times, producing N
+    independent windows in the same process.  How those windows show up
+    in the trace depends on the nsys launcher flags:
 
-    Both backends share each iter so dyn and trc can be compared side-by-side
-    in the same trace.  NVTX layout:
+    * ``--capture-range=cudaProfilerApi --capture-range-end=stop``
+      (single-config) -- only the first window is recorded; use a
+      ``-k <label>`` pytest filter to pick which config that is.
+    * ``--capture-range=cudaProfilerApi --capture-range-end=repeat-shutdown``
+      (multi-config) -- every window is recorded into the same .nsys-rep,
+      the gaps between windows (setup, reporting loop, next-config build)
+      are skipped.  The outermost NVTX range ``cfg.label()`` lets nsys-ui
+      attribute each segment to its config.
+
+    Setup kernels (table alloc, sparse-feature gen, populate) and
+    ``run_reporting_loop`` warmup stay out of every window in both modes.
+
+    Both backends share each iter so dyn and trc can be compared
+    side-by-side in the same trace.  NVTX layout:
     ``<cfg.label()>`` -> ``nsys_iter_i`` -> ``dyn``/``trc`` -> ``forward``/``backward``.
-    The outermost range names the benchmark config so multiple traces are
-    distinguishable in nsys-ui.
     """
     dynamic_emb.train()
     torchrec_emb.train()
@@ -901,17 +910,24 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
 # ── NCU (Nsight Compute) profiler integration ────────────────────────────────
 
 
-def benchmark_with_ncu(model, sparse_features):
+def benchmark_with_ncu(model, sparse_features, cfg):
     """Run a single train iteration for NCU profiling.
 
-    Meant to be launched externally under ``ncu --profile-from-start off ...``.
-    Uses cudaProfilerStart/Stop to capture only the benchmark iteration,
-    excluding setup kernels (embedding creation, data gen, segmented_unique, etc.).
+    Meant to be launched externally under ``ncu --profile-from-start off
+    ...``.  The Start/Stop pair gates which launches ncu replays for PMU
+    counters; setup kernels (table create, data gen, segmented_unique,
+    etc.) stay outside the window.
+
+    ncu is per-kernel-launch (not timeline) so multi-config "Just Works":
+    invoking pytest without a ``-k`` filter under one ncu command profiles
+    every config's wrapped iter back-to-back into the same report; the
+    outermost NVTX range ``cfg.label()`` attributes kernels per config.
     """
     model.train()
 
     sf = sparse_features[0]
     torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push(cfg.label())
     torch.cuda.nvtx.range_push("ncu_iter")
     torch.cuda.nvtx.range_push("forward")
     output = model(sf.values(), sf.offsets())
@@ -920,7 +936,8 @@ def benchmark_with_ncu(model, sparse_features):
     grad = torch.empty_like(output)
     output.backward(grad)
     torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_pop()  # ncu_iter
+    torch.cuda.nvtx.range_pop()  # cfg.label()
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
@@ -928,7 +945,14 @@ def benchmark_with_ncu(model, sparse_features):
 
 
 def print_ncu_command(cfg: BenchmarkConfig):
-    """Print the ncu command for profiling this config to stdout."""
+    """Print two ncu commands to stdout: single-config and multi-config.
+
+    Both wrap the same shell launcher; the difference is whether pytest
+    is filtered to one config via ``-k`` or runs the whole suite.  ncu is
+    per-kernel-launch so the multi-config form profiles every config's
+    wrapped iter into the same report; the outermost NVTX range
+    ``cfg.label()`` separates them.
+    """
     label = cfg.label()
 
     all_patterns: list[str] = []
@@ -936,7 +960,6 @@ def print_ncu_command(cfg: BenchmarkConfig):
         all_patterns.extend(patterns)
     regex = "|".join(f".*{p}.*" for p in all_patterns)
 
-    output_file = os.path.join(os.getcwd(), f"ncu_{label}")
     # pytest -k accepts substrings of the test id; the parametrize id is
     # exactly cfg.label(), so passing the whole label uniquely selects this
     # one config.  An earlier version split on "=" and AND-joined the
@@ -945,20 +968,36 @@ def print_ncu_command(cfg: BenchmarkConfig):
     # "none_cap" that happened to be substrings of the id today but would
     # silently drift if the label format changed or two configs shared a
     # fragment.
-    inner_cmd = (
+    single_inner = (
         f"bash benchmark/benchmark_batched_dynamicemb_tables.sh"
         f" --profile ncu-run -k '{label}'"
     )
-    ncu_cmd = (
+    single_out = os.path.join(os.getcwd(), f"ncu_{label}")
+    single_cmd = (
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
         f" --kernel-name 'regex:{regex}'"
         f" --set full"
         f" --csv --page raw"
-        f" -o {output_file}"
-        f" {inner_cmd}"
+        f" -o {single_out}"
+        f" {single_inner}"
     )
-    print(ncu_cmd)
+
+    multi_inner = "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-run"
+    multi_out = os.path.join(os.getcwd(), "ncu_all_configs")
+    multi_cmd = (
+        f"ncu -f --target-processes all"
+        f" --profile-from-start off"
+        f" --kernel-name 'regex:{regex}'"
+        f" --set full"
+        f" --nvtx"
+        f" --csv --page raw"
+        f" -o {multi_out}"
+        f" {multi_inner}"
+    )
+
+    print(f"# single-config (this cfg only):\n{single_cmd}")
+    print(f"\n# multi-config (every config of the suite into one report):\n{multi_cmd}")
 
 
 # ── Pre-compute N_unique via segmented_unique ────────────────────────────────
@@ -1435,7 +1474,7 @@ def run_single_benchmark(
         torch.cuda.empty_cache()
         return {"label": cfg.label(), "nsys": True}
     elif profile_mode == "ncu-run":
-        benchmark_with_ncu(dynamic_emb, sparse_features)
+        benchmark_with_ncu(dynamic_emb, sparse_features, cfg)
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
         return {"label": cfg.label(), "ncu_run": True}
