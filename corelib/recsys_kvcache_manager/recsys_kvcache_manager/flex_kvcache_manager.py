@@ -487,16 +487,29 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         user_ids = task_handle.handle.uids
 
         remain_task_ids = [t for t in task_ids if t not in task_handle.handle.responses]
-        responses = self._client.try_wait(remain_task_ids)
+        if not remain_task_ids:
+            return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
 
+        responses = self._client.try_wait(remain_task_ids)
+        # print(f"responses: {responses}")
+        # print(f"task_ids: {task_ids}")
+
+        # try_wait is non-blocking: empty or partial result means tasks are still pending.
         has_unready = False
         # has_timeout = False
         has_cancelled = False
         has_failed = False
         msgs: List[str] = []
+        
+        missing_task_ids = [t for t in remain_task_ids if t not in responses]
+        if missing_task_ids:
+            has_unready = True
+            msgs.extend(f"{task_id}:{KVResponseStatus.UNREADY}" for task_id in missing_task_ids)
+
         for task_id, resp in responses.items():
             task_handle.handle.responses[task_id] = resp
             msgs.append(f"{task_id}:{resp.status}")
+            # print(f"task_id: {task_id}, resp: {resp.status}")
             if resp.status == KVResponseStatus.SUCCESS:
                 continue
             elif resp.status == KVResponseStatus.UNREADY:
