@@ -349,12 +349,11 @@ def _prefetch_cache_path(
         keys_to_insert_mask = storage_founds.clone()
 
         if new_in_miss.any() and admit_strategy is not None:
-            new_miss_indices = torch.where(new_in_miss)[0]
-            new_keys_sub = miss_keys[new_miss_indices]
-            new_tids_sub = miss_tids[new_miss_indices]
+            new_keys_sub = miss_keys[new_in_miss]
+            new_tids_sub = miss_tids[new_in_miss]
 
             freq_for_admission = (
-                miss_lfu_freq[new_miss_indices] if miss_lfu_freq is not None else None
+                miss_lfu_freq[new_in_miss] if miss_lfu_freq is not None else None
             )
             counters = (
                 freq_for_admission
@@ -366,14 +365,13 @@ def _prefetch_cache_path(
 
             if admit_mask.any():
                 admission_counter.erase(
-                    new_keys_sub[admit_mask], new_tids_sub[admit_mask]
+                    new_keys_sub, new_tids_sub, mask=admit_mask
                 )
-                keys_to_insert_mask[new_miss_indices[admit_mask]] = True
+            keys_to_insert_mask[new_in_miss] = admit_mask
 
-            non_admit = ~admit_mask
-            if non_admit.any():
-                non_admitted_miss_pos = new_miss_indices[non_admit]
-                non_admitted_positions = miss_compact_idx[non_admitted_miss_pos]
+            non_admit_miss = new_in_miss & ~keys_to_insert_mask
+            if non_admit_miss.any():
+                non_admitted_positions = miss_compact_idx[non_admit_miss]
         elif new_in_miss.any():
             keys_to_insert_mask = torch.ones(
                 h_num_miss, dtype=torch.bool, device=device
@@ -586,7 +584,7 @@ def _prefetch_hbm_direct_path(
 
             if admit_mask.any():
                 admission_counter.erase(
-                    missing_keys[admit_mask], missing_table_ids[admit_mask]
+                    missing_keys, missing_table_ids, mask=admit_mask
                 )
 
             non_admit = ~admit_mask

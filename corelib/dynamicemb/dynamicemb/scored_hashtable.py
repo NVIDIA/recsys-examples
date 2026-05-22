@@ -168,11 +168,13 @@ class ScoredHashTable(abc.ABC):
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Erase Keys
         Args:
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
+            mask: Optional boolean mask. If provided, only masked positions are erased.
         """
 
     @abc.abstractmethod
@@ -787,12 +789,15 @@ class LinearBucketTable(ScoredHashTable):
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Erase Keys
         Args:
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
+            mask: Optional boolean mask. If provided, only masked positions are erased.
         """
+        indices = torch.where(mask)[0] if mask is not None else None
         table_erase(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -800,6 +805,7 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_sizes,
             keys,
             table_ids,
+            indices,
         )
 
     def load(

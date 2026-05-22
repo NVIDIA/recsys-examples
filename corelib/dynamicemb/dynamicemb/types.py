@@ -337,13 +337,15 @@ class Counter(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor, mask: Optional[torch.Tensor] = None) -> None:
         """
         Erase keys from the `Counter`.
 
         Args:
             keys (torch.Tensor): The input keys to be erased.
             table_ids (torch.Tensor): The table id for each key.
+            mask (Optional[torch.Tensor]): Boolean mask of same length as keys.
+                If provided, only masked positions are erased.
         """
 
     @abc.abstractmethod
