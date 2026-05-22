@@ -146,15 +146,24 @@ def load_breakdown(sqlite_path: str) -> List[dict]:
     conn = sqlite3.connect(sqlite_path)
     cur = conn.cursor()
 
-    # Some nsys schemas use eventType 75 = NvtxPushPopRange; safer to filter by
-    # presence of end > start instead of relying on the exact event-type code,
-    # which changes across nsys releases.
+    # NVTX_EVENTS carries the range name in two mutually-exclusive columns
+    # depending on which API produced it:
+    #   * registered string (C/C++ nvtxRegisterStringA + nvtxRangePushEx):
+    #     textId is set, JOIN to StringIds resolves it
+    #   * inline text (Python torch.cuda.nvtx.range_push("xxx"), and the
+    #     common C++ nvtxRangePush): textId is NULL, text column holds the
+    #     string directly
+    # We must check BOTH columns or we silently drop one whole flavor (Python
+    # NVTX, including everything benchmark / dynamicemb add).  COALESCE picks
+    # whichever is non-NULL.  Filter by end > start to skip mark-style events
+    # and lazy-NULL leftovers.
     cur.execute(
         """
-        SELECT n.start, n.end, s.value
+        SELECT n.start, n.end, COALESCE(s.value, n.text) AS name
         FROM NVTX_EVENTS n
-        JOIN StringIds s ON s.id = n.textId
+        LEFT JOIN StringIds s ON s.id = n.textId
         WHERE n.end IS NOT NULL AND n.end > n.start
+          AND COALESCE(s.value, n.text) IS NOT NULL
         """
     )
     raw_ranges = cur.fetchall()

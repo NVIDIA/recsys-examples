@@ -134,10 +134,21 @@ wraps the actual sampled iterations in a `cudaProfilerStart` /
 ranges; the actual capture happens externally via `nsys profile`.
 
 `benchmark_with_nsys` emits **one Start/Stop window per config**.  We
-always use `--capture-range-end=repeat-shutdown` so nsys records every
-window it sees -- with `-k <label>` that's a single window, without
-filter it's the full suite.  Setup / reporting-loop warmup / between-
-config gaps stay out of the recording in both modes.
+always use `--capture-range-end=repeat-shutdown:N` (with `N >=` the
+number of configs) so nsys records every window it sees -- with `-k
+<label>` that's a single window, without filter it's the full suite.
+Setup / reporting-loop warmup / between-config gaps stay out of the
+recording in both modes.
+
+**Note on the `:N`.** Older nsys releases (including the one on the
+cluster's `distributed-recommender` container) reject bare
+`repeat-shutdown` and require an explicit cycle count.  Bare `repeat`
+is accepted, but its default behavior is a *sampled* capture -- in
+practice it keeps only a few cycles when many fire in sequence, so
+some configs silently end up missing from the trace.  Always pass an
+explicit `:N` and size it to the number of `cudaProfilerStart` calls
+your script will issue (10 for the full benchmark suite; use a larger
+N like 20 if unsure).
 
 **Single config** -- pick one config with `-k <label>`:
 
@@ -151,7 +162,7 @@ nsys profile \
     --cuda-graph-trace=node \
     --cuda-flush-interval=100 \
     --capture-range=cudaProfilerApi \
-    --capture-range-end=repeat-shutdown \
+    --capture-range-end=repeat-shutdown:10 \
     --target-processes=all \
     bash ./benchmark/benchmark_batched_dynamicemb_tables.sh \
         --profile nsys -k "TestGpu and adam"
@@ -169,7 +180,7 @@ nsys profile \
     --cuda-graph-trace=node \
     --cuda-flush-interval=100 \
     --capture-range=cudaProfilerApi \
-    --capture-range-end=repeat-shutdown \
+    --capture-range-end=repeat-shutdown:10 \
     --target-processes=all \
     bash ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile nsys
 ```
@@ -184,7 +195,7 @@ Flag breakdown (shared by both invocations):
 | `--cuda-graph-trace=node` | expand CUDA Graph launches into per-node events so kernels inside a captured graph stay individually visible |
 | `--cuda-flush-interval=100` | flush the CUDA event buffer every 100 ms so long runs don't overflow the ring buffer and drop events |
 | `--capture-range=cudaProfilerApi` | start recording only when the process calls `cudaProfilerStart` (skips table/data setup and the reporting-loop warmup) |
-| `--capture-range-end=repeat-shutdown` | record **every** Start/Stop window into the same trace (skip gaps in between), end the session at process shutdown.  Works for both single-config (one window) and multi-config (N windows) without changing the flag |
+| `--capture-range-end=repeat-shutdown:N` | record up to `N` Start/Stop windows into the same trace (skip gaps in between), end the session at process shutdown.  Set `N` ≥ number of `cudaProfilerStart` calls -- e.g. `:10` for the full suite.  Bare `repeat-shutdown` is rejected on older nsys; bare `repeat` is accepted but silently drops cycles when many fire back-to-back |
 | `--target-processes=all` | follow children/forks too -- needed because `torchrun` spawns a worker process to host pytest |
 | `--force-overwrite=true` | overwrite an existing output file instead of erroring out |
 | `--output=<name>` | output file (`.nsys-rep` is the current extension; `.qdrep` from older releases still works) |
