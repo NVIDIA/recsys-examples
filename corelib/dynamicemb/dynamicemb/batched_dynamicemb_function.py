@@ -71,7 +71,7 @@ def segmented_unique(
         per-table unique counts; total unique count is its sum or
         unique_keys_table_range[-1].
     """
-    with torch.cuda.nvtx.range("segmented_unique"):
+    with torch.cuda.nvtx.range("op:segmented_unique"):
         num_keys = keys.size(0)
         num_tables = segment_range.size(0) - 1
         device = keys.device
@@ -228,9 +228,10 @@ def _apply_admission(
         admit_mask = admit_strategy.admit(missing_keys, freq_for_missing_keys)
 
         non_admitted_mask = ~admit_mask
-        _, _, (non_admitted_indices,) = flagged_compact(
-            non_admitted_mask, [missing_indices]
-        )
+        with torch.cuda.nvtx.range("op:flagged_compact"):
+            _, _, (non_admitted_indices,) = flagged_compact(
+                non_admitted_mask, [missing_indices]
+            )
         initialized_non_admitted = False
         if non_admitted_indices.numel() > 0:
             initialized_non_admitted = (
@@ -240,19 +241,20 @@ def _apply_admission(
                 )
             )
 
-        (
-            _,
-            _,
+        with torch.cuda.nvtx.range("op:flagged_compact"):
             (
-                keys_to_insert,
-                positions_in_unique,
-                table_ids_to_insert,
-                scores_to_insert,
-            ),
-        ) = flagged_compact(
-            admit_mask,
-            [missing_keys, missing_indices, missing_table_ids, missing_scores],
-        )
+                _,
+                _,
+                (
+                    keys_to_insert,
+                    positions_in_unique,
+                    table_ids_to_insert,
+                    scores_to_insert,
+                ),
+            ) = flagged_compact(
+                admit_mask,
+                [missing_keys, missing_indices, missing_table_ids, missing_scores],
+            )
         indices_to_init = (
             missing_indices if initialized_non_admitted else positions_in_unique
         )
@@ -299,11 +301,12 @@ def _prefetch_cache_path(
             return empty, empty.clone(), None
 
         # 1. Lookup with overflow fallback
-        _, founds, cache_indices = cache.lookup(
-            unique_keys,
-            unique_table_ids,
-            lfu_accumulated_frequency=accumulated_frequency,
-        )
+        with torch.cuda.nvtx.range("op:cache_lookup"):
+            _, founds, cache_indices = cache.lookup(
+                unique_keys,
+                unique_table_ids,
+                lfu_accumulated_frequency=accumulated_frequency,
+            )
 
         slot_indices = cache_indices.clone()
 
@@ -313,9 +316,10 @@ def _prefetch_cache_path(
             cache.increment_counter(found_slots, unique_table_ids[founds])
 
         missing_mask = ~founds
-        h_num_miss, miss_compact_idx, (miss_keys, miss_tids) = flagged_compact(
-            missing_mask, [unique_keys, unique_table_ids]
-        )
+        with torch.cuda.nvtx.range("op:flagged_compact"):
+            h_num_miss, miss_compact_idx, (miss_keys, miss_tids) = flagged_compact(
+                missing_mask, [unique_keys, unique_table_ids]
+            )
 
         if h_num_miss == 0:
             return slot_indices, slot_indices.clone(), None
@@ -327,21 +331,22 @@ def _prefetch_cache_path(
         )
 
         # 3. Storage lookup for cache-miss keys
-        (
-            h_num_new,
-            new_keys,
-            new_indices_in_miss,
-            new_table_ids,
-            _,
-            storage_founds,
-            storage_score_out,
-            storage_values,
-        ) = storage.find(
-            miss_keys,
-            miss_tids,
-            copy_mode=CopyMode.VALUE,
-            lfu_accumulated_frequency=miss_lfu_freq,
-        )
+        with torch.cuda.nvtx.range("op:storage_find"):
+            (
+                h_num_new,
+                new_keys,
+                new_indices_in_miss,
+                new_table_ids,
+                _,
+                storage_founds,
+                storage_score_out,
+                storage_values,
+            ) = storage.find(
+                miss_keys,
+                miss_tids,
+                copy_mode=CopyMode.VALUE,
+                lfu_accumulated_frequency=miss_lfu_freq,
+            )
 
         # 4. Determine which new keys (not in storage) are admitted
         new_in_miss = ~storage_founds
@@ -385,9 +390,10 @@ def _prefetch_cache_path(
             update_slot_indices = slot_indices.clone()
             return slot_indices, update_slot_indices, non_admitted_positions
 
-        _, insert_to_miss, (insert_keys, insert_tids) = flagged_compact(
-            keys_to_insert_mask, [miss_keys, miss_tids]
-        )
+        with torch.cuda.nvtx.range("op:flagged_compact"):
+            _, insert_to_miss, (insert_keys, insert_tids) = flagged_compact(
+                keys_to_insert_mask, [miss_keys, miss_tids]
+            )
         if miss_lfu_freq is not None:
             # NO_EVICTION backing: scores from find are assign-on-insert row indices, not frequencies.
             if not _storage_find_scores_are_logical_row_indices(storage):
@@ -396,29 +402,32 @@ def _prefetch_cache_path(
         else:
             insert_scores = None
 
-        (
-            cache_insert_indices,
-            num_evicted,
-            evicted_keys,
-            evicted_indices,
-            evicted_scores,
-            evicted_table_ids,
-        ) = cache.insert_and_evict(insert_keys, insert_tids, insert_scores)
+        with torch.cuda.nvtx.range("op:cache_insert_evict"):
+            (
+                cache_insert_indices,
+                num_evicted,
+                evicted_keys,
+                evicted_indices,
+                evicted_scores,
+                evicted_table_ids,
+            ) = cache.insert_and_evict(insert_keys, insert_tids, insert_scores)
 
         # 6. Load evicted values before overwriting their slots
-        evicted_values = load_from_flat(
-            state, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
-        )
+        with torch.cuda.nvtx.range("op:load_from_flat"):
+            evicted_values = load_from_flat(
+                state, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
+            )
 
         # 7. Store storage-found values to their cache slots
         is_sf_in_insert = storage_founds[insert_to_miss]
         if is_sf_in_insert.any():
-            store_to_flat(
-                state,
-                cache_insert_indices[is_sf_in_insert],
-                insert_tids[is_sf_in_insert],
-                storage_values[insert_to_miss[is_sf_in_insert]],
-            )
+            with torch.cuda.nvtx.range("op:store_to_flat"):
+                store_to_flat(
+                    state,
+                    cache_insert_indices[is_sf_in_insert],
+                    insert_tids[is_sf_in_insert],
+                    storage_values[insert_to_miss[is_sf_in_insert]],
+                )
 
         # 8. Initialize admitted-new keys in their cache slots
         is_new_in_insert = ~is_sf_in_insert
@@ -431,17 +440,19 @@ def _prefetch_cache_path(
                 n_new_admitted, dtype=torch.int64, device=device
             )
             new_admitted_keys = insert_keys[is_new_in_insert]
-            initializer(init_vals[:, :emb_dim], init_indices, new_admitted_keys)
+            with torch.cuda.nvtx.range("op:initializer"):
+                initializer(init_vals[:, :emb_dim], init_indices, new_admitted_keys)
 
             if val_dim != emb_dim:
                 init_vals[:, emb_dim:] = storage.init_optimizer_state()
 
-            store_to_flat(
-                state,
-                cache_insert_indices[is_new_in_insert],
-                insert_tids[is_new_in_insert],
-                init_vals,
-            )
+            with torch.cuda.nvtx.range("op:store_to_flat"):
+                store_to_flat(
+                    state,
+                    cache_insert_indices[is_new_in_insert],
+                    insert_tids[is_new_in_insert],
+                    init_vals,
+                )
 
         # 9. Write back evicted to storage
         if num_evicted > 0:
@@ -461,44 +472,49 @@ def _prefetch_cache_path(
                     _ix_ev,
                 ) = _find_keys(ev_st, evicted_keys, evicted_table_ids)
                 if bool(ev_in_storage.all()):
-                    storage.insert(
-                        evicted_keys,
-                        evicted_table_ids,
-                        evicted_values,
-                        preserve_existing=True,
-                    )
+                    with torch.cuda.nvtx.range("op:storage_insert"):
+                        storage.insert(
+                            evicted_keys,
+                            evicted_table_ids,
+                            evicted_values,
+                            preserve_existing=True,
+                        )
                 elif bool((~ev_in_storage).all()):
-                    storage.insert(
-                        evicted_keys,
-                        evicted_table_ids,
-                        evicted_values,
-                        evicted_scores,
-                        preserve_existing=False,
-                    )
+                    with torch.cuda.nvtx.range("op:storage_insert"):
+                        storage.insert(
+                            evicted_keys,
+                            evicted_table_ids,
+                            evicted_values,
+                            evicted_scores,
+                            preserve_existing=False,
+                        )
                 else:
                     ex_m = ev_in_storage
                     nw_m = ~ev_in_storage
                     if ex_m.any():
-                        storage.insert(
-                            evicted_keys[ex_m],
-                            evicted_table_ids[ex_m],
-                            evicted_values[ex_m],
-                            preserve_existing=True,
-                        )
+                        with torch.cuda.nvtx.range("op:storage_insert"):
+                            storage.insert(
+                                evicted_keys[ex_m],
+                                evicted_table_ids[ex_m],
+                                evicted_values[ex_m],
+                                preserve_existing=True,
+                            )
                     if nw_m.any():
-                        storage.insert(
-                            evicted_keys[nw_m],
-                            evicted_table_ids[nw_m],
-                            evicted_values[nw_m],
-                            evicted_scores[nw_m]
-                            if evicted_scores is not None
-                            else None,
-                            preserve_existing=False,
-                        )
+                        with torch.cuda.nvtx.range("op:storage_insert"):
+                            storage.insert(
+                                evicted_keys[nw_m],
+                                evicted_table_ids[nw_m],
+                                evicted_values[nw_m],
+                                evicted_scores[nw_m]
+                                if evicted_scores is not None
+                                else None,
+                                preserve_existing=False,
+                            )
             else:
-                storage.insert(
-                    evicted_keys, evicted_table_ids, evicted_values, evicted_scores
-                )
+                with torch.cuda.nvtx.range("op:storage_insert"):
+                    storage.insert(
+                        evicted_keys, evicted_table_ids, evicted_values, evicted_scores
+                    )
 
         # 10. Counter & slot mapping
         cache.increment_counter(cache_insert_indices, insert_tids)
@@ -543,21 +559,22 @@ def _prefetch_hbm_direct_path(
             empty = torch.empty(0, dtype=torch.int64, device=device)
             return empty, empty.clone(), None
 
-        (
-            h_num_missing,
-            missing_keys,
-            missing_indices,
-            missing_table_ids,
-            missing_scores,
-            _,
-            _,
-            indices,
-        ) = _find_keys(
-            state,
-            unique_keys,
-            unique_table_ids,
-            lfu_accumulated_frequency=accumulated_frequency,
-        )
+        with torch.cuda.nvtx.range("op:storage_find"):
+            (
+                h_num_missing,
+                missing_keys,
+                missing_indices,
+                missing_table_ids,
+                missing_scores,
+                _,
+                _,
+                indices,
+            ) = _find_keys(
+                state,
+                unique_keys,
+                unique_table_ids,
+                lfu_accumulated_frequency=accumulated_frequency,
+            )
 
         found_mask = indices >= 0
         found_slots = indices[found_mask]
@@ -612,7 +629,8 @@ def _prefetch_hbm_direct_path(
                 n_admitted, val_dim, dtype=state.emb_dtype, device=device
             )
             init_idx = torch.arange(n_admitted, dtype=torch.int64, device=device)
-            initializer(init_values[:, :emb_dim], init_idx, admitted_keys)
+            with torch.cuda.nvtx.range("op:initializer"):
+                initializer(init_values[:, :emb_dim], init_idx, admitted_keys)
 
             if val_dim != emb_dim:
                 init_values[:, emb_dim:] = state.initial_optim_state
@@ -620,17 +638,19 @@ def _prefetch_hbm_direct_path(
             score_arg = get_insert_score_arg(
                 state, n_admitted, device, admitted_scores, table_ids=admitted_tids
             )
-            new_indices = state.key_index_map.insert(
-                admitted_keys,
-                admitted_tids,
-                score_arg,
-            )
+            with torch.cuda.nvtx.range("op:storage_insert"):
+                new_indices = state.key_index_map.insert(
+                    admitted_keys,
+                    admitted_tids,
+                    score_arg,
+                )
             new_indices = (
                 score_arg.value.to(torch.int64)
                 if state.no_eviction_next_index is not None
                 else new_indices
             )
-            store_to_flat(state, new_indices, admitted_tids, init_values)
+            with torch.cuda.nvtx.range("op:store_to_flat"):
+                store_to_flat(state, new_indices, admitted_tids, init_values)
 
             inserted_mask = new_indices >= 0
             if inserted_mask.any():
@@ -916,21 +936,22 @@ def _generic_forward_path(
         device = unique_keys.device
         unique_keys.numel()
 
-        (
-            h_num_missing,
-            missing_keys,
-            missing_indices,
-            missing_table_ids,
-            missing_scores,
-            founds,
-            _,
-            unique_values,
-        ) = storage.find(
-            unique_keys,
-            unique_table_ids,
-            copy_mode=CopyMode.VALUE,
-            lfu_accumulated_frequency=accumulated_frequency,
-        )
+        with torch.cuda.nvtx.range("op:storage_find"):
+            (
+                h_num_missing,
+                missing_keys,
+                missing_indices,
+                missing_table_ids,
+                missing_scores,
+                founds,
+                _,
+                unique_values,
+            ) = storage.find(
+                unique_keys,
+                unique_table_ids,
+                copy_mode=CopyMode.VALUE,
+                lfu_accumulated_frequency=accumulated_frequency,
+            )
 
         key_persisted = founds.clone()
 
@@ -971,21 +992,24 @@ def _generic_forward_path(
         )
 
         if indices_to_init.numel() > 0:
-            initializer(unique_values[:, :emb_dim], indices_to_init, unique_keys)
+            with torch.cuda.nvtx.range("op:initializer"):
+                initializer(unique_values[:, :emb_dim], indices_to_init, unique_keys)
 
         if val_dim != emb_dim:
             unique_values[missing_indices, emb_dim:] = storage.init_optimizer_state()
 
         values_to_insert = unique_values[positions_in_unique]
 
-        storage.insert(
-            keys_to_insert,
-            table_ids_to_insert,
-            values_to_insert,
-            scores_to_insert,
-        )
+        with torch.cuda.nvtx.range("op:storage_insert"):
+            storage.insert(
+                keys_to_insert,
+                table_ids_to_insert,
+                values_to_insert,
+                scores_to_insert,
+            )
         key_persisted[positions_in_unique] = True
-        _, persisted_unique_indices, _ = flagged_compact(key_persisted, [unique_keys])
+        with torch.cuda.nvtx.range("op:flagged_compact"):
+            _, persisted_unique_indices, _ = flagged_compact(key_persisted, [unique_keys])
         return unique_values, persisted_unique_indices
 
 
@@ -1027,22 +1051,24 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     if prefetch_state.storage_mode == StorageMode.CACHE
                     else storage._state
                 )
-                unique_embs = load_from_flat(
-                    state,
-                    prefetch_state.slot_indices,
-                    prefetch_state.unique_table_ids,
-                    copy_mode=CopyMode.EMBEDDING,
-                )
+                with torch.cuda.nvtx.range("op:load_from_flat"):
+                    unique_embs = load_from_flat(
+                        state,
+                        prefetch_state.slot_indices,
+                        prefetch_state.unique_table_ids,
+                        copy_mode=CopyMode.EMBEDDING,
+                    )
                 if out_dim != emb_dim:
                     unique_embs = unique_embs[:, :out_dim]
 
                 if prefetch_state.non_admitted_positions is not None:
                     na = prefetch_state.non_admitted_positions
-                    initializers[0](
-                        unique_embs[:, :emb_dim],
-                        na,
-                        prefetch_state.unique_keys,
-                    )
+                    with torch.cuda.nvtx.range("op:initializer"):
+                        initializers[0](
+                            unique_embs[:, :emb_dim],
+                            na,
+                            prefetch_state.unique_keys,
+                        )
                 unique_values = None
                 persisted_unique_indices = None
             else:
@@ -1074,17 +1100,18 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     dtype=output_dtype,
                     device=device,
                 )
-                gather_embedding_pooled(
-                    unique_embs,
-                    output_embs,
-                    prefetch_state.reverse_indices,
-                    offsets,
-                    combiner,
-                    total_D,
-                    batch_size,
-                    D_offsets,
-                    max_D,
-                )
+                with torch.cuda.nvtx.range("op:gather_embedding"):
+                    gather_embedding_pooled(
+                        unique_embs,
+                        output_embs,
+                        prefetch_state.reverse_indices,
+                        offsets,
+                        combiner,
+                        total_D,
+                        batch_size,
+                        D_offsets,
+                        max_D,
+                    )
             else:
                 combiner = -1
                 output_embs = torch.empty(
@@ -1093,9 +1120,10 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     dtype=output_dtype,
                     device=device,
                 )
-                gather_embedding(
-                    unique_embs, output_embs, prefetch_state.reverse_indices
-                )
+                with torch.cuda.nvtx.range("op:gather_embedding"):
+                    gather_embedding(
+                        unique_embs, output_embs, prefetch_state.reverse_indices
+                    )
 
             ctx.unique_keys = prefetch_state.unique_keys
             ctx.reverse_indices = prefetch_state.reverse_indices
@@ -1150,25 +1178,27 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             is_pooling = ctx.pooling_mode != DynamicEmbPoolingMode.NONE
             if is_pooling:
                 out_dim = ctx.max_D if ctx.mixed_D else ctx.emb_dim
-                unique_grads = reduce_grads(
-                    ctx.reverse_indices,
-                    grads,
-                    ctx.unique_keys.numel(),
-                    ctx.batch_size,
-                    out_dim,
-                    ctx.offsets,
-                    ctx.D_offsets,
-                    ctx.combiner,
-                    ctx.total_D,
-                )
+                with torch.cuda.nvtx.range("op:reduce_grads"):
+                    unique_grads = reduce_grads(
+                        ctx.reverse_indices,
+                        grads,
+                        ctx.unique_keys.numel(),
+                        ctx.batch_size,
+                        out_dim,
+                        ctx.offsets,
+                        ctx.D_offsets,
+                        ctx.combiner,
+                        ctx.total_D,
+                    )
             else:
-                unique_grads = reduce_grads(
-                    ctx.reverse_indices,
-                    grads,
-                    ctx.unique_keys.numel(),
-                    ctx.batch_size,
-                    ctx.emb_dim,
-                )
+                with torch.cuda.nvtx.range("op:reduce_grads"):
+                    unique_grads = reduce_grads(
+                        ctx.reverse_indices,
+                        grads,
+                        ctx.unique_keys.numel(),
+                        ctx.batch_size,
+                        ctx.emb_dim,
+                    )
 
             optimizer.step()
 
@@ -1181,17 +1211,18 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         if ctx.storage_mode == StorageMode.CACHE
                         else storage._state
                     )
-                    optimizer.fused_update_for_flat_table(
-                        unique_grads.to(ctx.emb_dtype),
-                        ctx.update_slot_indices,
-                        state.table_ptrs_dev,
-                        unique_table_ids,
-                        state.table_value_dims,
-                        state.table_emb_dims,
-                        state.max_emb_dim,
-                        state.all_dims_vec4,
-                        state.emb_dtype,
-                    )
+                    with torch.cuda.nvtx.range("op:optimizer_update_fused"):
+                        optimizer.fused_update_for_flat_table(
+                            unique_grads.to(ctx.emb_dtype),
+                            ctx.update_slot_indices,
+                            state.table_ptrs_dev,
+                            unique_table_ids,
+                            state.table_value_dims,
+                            state.table_emb_dims,
+                            state.max_emb_dim,
+                            state.all_dims_vec4,
+                            state.emb_dtype,
+                        )
 
                     counter_owner = (
                         cache if ctx.storage_mode == StorageMode.CACHE else storage
@@ -1202,12 +1233,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
-                    optimizer.update_for_padded_buffer(
-                        unique_grads,
-                        ctx.unique_values,
-                        ctx.emb_dim,
-                        ctx.value_dim,
-                    )
+                    with torch.cuda.nvtx.range("op:optimizer_update_padded"):
+                        optimizer.update_for_padded_buffer(
+                            unique_grads,
+                            ctx.unique_values,
+                            ctx.emb_dim,
+                            ctx.value_dim,
+                        )
                     pui = ctx.persisted_unique_indices
                     assert pui is not None
                     if pui.numel() > 0:
@@ -1218,11 +1250,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         # refresh embedding/optimizer buffers only; do not overwrite
                         # table scores (LFU / timestamp / etc.). For HybridStorage,
                         # the HBM tier uses this on backward; existing scores stay.
-                        storage.insert(
-                            keys_c,
-                            tids_c,
-                            vals_c,
-                            preserve_existing=True,
-                        )
+                        with torch.cuda.nvtx.range("op:storage_insert"):
+                            storage.insert(
+                                keys_c,
+                                tids_c,
+                                vals_c,
+                                preserve_existing=True,
+                            )
 
             return (None,) * 17
