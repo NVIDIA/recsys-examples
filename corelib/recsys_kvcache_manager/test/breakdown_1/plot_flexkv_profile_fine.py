@@ -75,7 +75,6 @@ L3_CALL_TIMELINE: list[tuple[str, str | None, str]] = [
     ("step1.flexkv.client.get_match", "step1.lookup", "::flexkv.client.get_match"),
     ("step1.recsys.merge_lookup_results", "step1.lookup", "::recsys.merge_lookup_results"),
     ("step1.gpu.allocate_py", "step1.allocate", "::gpu.allocate_py"),
-    ("gpu.put", "step1.allocate", "gpu.put_py"),
     (
         "step1.gpu.acquire_offload_pages_py",
         "step1.offload_launch",
@@ -131,7 +130,7 @@ def build_l3_call_timeline_df(detail_step_df: pd.DataFrame, index) -> pd.DataFra
     data = {}
     for col, step_op, token in L3_CALL_TIMELINE:
         bare = token.lstrip(":")
-        leaf_only = bare in LEAF_TOKENS or bare == "gpu.put_py"
+        leaf_only = bare in LEAF_TOKENS
         data[col] = sum_metric(detail_step_df, step_op, token, leaf_only=leaf_only)
     return drop_zero_columns(pd.DataFrame(data, index=index))
 
@@ -184,6 +183,15 @@ def save_view(
     ensure_dir(os.path.dirname(csv_path))
     df.to_csv(csv_path)
     title = os.path.splitext(os.path.basename(png_path))[0]
+    round_note = (
+        "step1: offload round (100% GPU miss) | "
+        "step2: evict | "
+        "step3: onboard round (100% GPU hit)"
+    )
+    if title.startswith("step_flow_") or title.startswith("step_op_flow_") or title.startswith(
+        "L3_breakdown_"
+    ):
+        title = f"{title}\n{round_note}"
     plot_stacked_breakdown(
         df=df,
         title=title,
@@ -261,7 +269,7 @@ def main() -> None:
         x_values=seq_lens,
         case_pattern=case_pattern,
         include_prefixes=default_prefixes_for_step_flow()
-        + ["recsys.", "step1.input", "step3.input", "gpu.put_py"],
+        + ["recsys.", "step1.input", "step3.input"],
         group_by_step=False,
         group_by_step_op=False,
     )

@@ -59,9 +59,9 @@ for len in "${SEQ_LENS[@]}"; do
   rep_file="${OUT_ROOT}/rep/${MODE_DIR}/${tag}.nsys-rep"
   out_prefix="${OUT_ROOT}/csv/${MODE_DIR}/${tag}"
   ok=0
-  for rpt in nvtxsum nvtxppsum nvtx_pushpop_sum; do
+  for rpt in nvtx_pushpop_sum nvtxppsum nvtxsum; do
     rm -f "${out_prefix}"*"${rpt}"*.csv || true
-    if nsys stats --report "${rpt}" --format csv --output "${out_prefix}" "${rep_file}" >/tmp/nsys_stats_${tag}.log 2>&1; then
+    if nsys stats --force-export=true --report "${rpt}" --format csv --output "${out_prefix}" "${rep_file}" >/tmp/nsys_stats_${tag}.log 2>&1; then
       shopt -s nullglob
       cands=( "${out_prefix}"*"${rpt}"*.csv )
       shopt -u nullglob
@@ -88,14 +88,7 @@ python3 plot_flexkv_profile_fine.py \
   --batch-size "${BATCH_SIZE}" \
   --output-root "${OUT_ROOT}/plot"
 
-# 4) profiling.xlsx
-python3 generate_profiling_xlsx.py \
-  --summarization-dir "${OUT_ROOT}/plot/csv_summarization" \
-  --output-xlsx "${OUT_ROOT}/profiling.xlsx" \
-  --batch-size "${BATCH_SIZE}" \
-  --seq-lens "${SEQ_LENS_CSV}"
-
-# 5) quick sanity check
+# 4) quick sanity check
 rg "flexkv\\.build_index_meta|recsys\\.merge_lookup_results|step1\\.gpu\\.lookup_py" \
   "${OUT_ROOT}/csv/${MODE_DIR}" -n || true
 
@@ -104,4 +97,3 @@ echo "  ${OUT_ROOT}/rep/${MODE_DIR}/"
 echo "  ${OUT_ROOT}/csv/${MODE_DIR}/"
 echo "  ${OUT_ROOT}/plot/plot/"
 echo "  ${OUT_ROOT}/plot/csv_summarization/"
-echo "  ${OUT_ROOT}/profiling.xlsx"
