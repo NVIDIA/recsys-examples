@@ -365,9 +365,9 @@ def _prefetch_cache_path(
 
             if admit_mask.any():
                 admission_counter.erase(
-                    new_keys_sub, new_tids_sub, mask=admit_mask
+                    new_keys_sub[admit_mask], new_tids_sub[admit_mask]
                 )
-            keys_to_insert_mask[new_in_miss] = admit_mask
+                keys_to_insert_mask[new_in_miss] = admit_mask
 
             non_admit_miss = new_in_miss & ~keys_to_insert_mask
             if non_admit_miss.any():
@@ -584,7 +584,7 @@ def _prefetch_hbm_direct_path(
 
             if admit_mask.any():
                 admission_counter.erase(
-                    missing_keys, missing_table_ids, mask=admit_mask
+                    missing_keys[admit_mask], missing_table_ids[admit_mask]
                 )
 
             non_admit = ~admit_mask
