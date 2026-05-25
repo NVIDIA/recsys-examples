@@ -226,9 +226,14 @@ class BenchmarkConfig:
         return self.batch_size * self.num_tables
 
     def label(self):
-        caps = "_".join(
-            f"{e // (1024 * 1024)}M" for e in self.num_embeddings_per_feature
-        )
+        # Uniform caps collapse to a single token (T{nt} already encodes the
+        # count); heterogeneous caps fall back to underscore-joined per-table
+        # values so the label remains lossless.
+        caps_mb = [e // (1024 * 1024) for e in self.num_embeddings_per_feature]
+        if len(set(caps_mb)) == 1:
+            caps = f"{caps_mb[0]}M"
+        else:
+            caps = "_".join(f"{c}M" for c in caps_mb)
         s = (
             f"T{self.num_tables}_totalB{self.total_batch_size}_D{self.embedding_dim}_"
             f"{self.optimizer_type}_{self.mode}_"
@@ -1555,11 +1560,19 @@ def run_single_benchmark(
 # Test configuration and suites
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_CAP_PER_TABLE = 1 * 1024 * 1024  # 1M entries
+# Total embedding-table capacity *per suite* (across all tables in a config).
+# At parametrize time we hand each table ``total_cap // nt`` rows so the
+# overall HBM (and TorchRec TBE mirror) stays fixed as ``num_tables`` grows;
+# without that scaling a 10-table TestGpu config would request ~240 GiB and
+# OOM on 80 GB H100.  See the discussion above _gpu_configs for the 16M
+# choice on TestGpu and 256M on the cache modes.
+_GPU_TOTAL_CAP = 16 * 1024 * 1024
+_CACHE_TOTAL_CAP = 256 * 1024 * 1024
+
 _DIM = 128
 
 _BATCH_SIZES = [1048576]
-_NUM_TABLES = [1]
+_NUM_TABLES = [10]
 _OPTIMIZERS = ["adam", "sgd"]
 # _POOLING_MODES = ["none", "sum"]
 _POOLING_MODES = ["none"]
@@ -1581,17 +1594,16 @@ def _cache_hbm(
 
 
 def _gpu_configs():
-    # 16M instead of 24M: the dual-backend TestGpu path holds the DynamicEmb
-    # table + TorchRec TBE + (DynamicEmb + TorchRec) per-iter activations + a
-    # pre-allocated grad in HBM simultaneously.  At 24M with Adam (D + 2D state
-    # in fp32) this peaked > 78 GiB on H100 80GB and OOM'd inside
-    # benchmark_train_eval.  16M halves the table footprint to ~25 GiB each
-    # while keeping the sample pool large enough for pow-law alpha=1.05.
-    cap_per_table = 16 * 1024 * 1024
+    # _GPU_TOTAL_CAP=16M is chosen so the dual-backend TestGpu path (DynamicEmb
+    # table + TorchRec TBE + per-iter activations on both + a pre-allocated
+    # grad) fits in 80 GB HBM.  At 24M total with Adam (D + 2D state in fp32)
+    # this peaked > 78 GiB and OOM'd inside benchmark_train_eval.  We hand
+    # each of ``nt`` tables ``_GPU_TOTAL_CAP // nt`` rows so the total table
+    # footprint stays at ~25 GiB per backend regardless of nt.
     return [
         BenchmarkConfig(
             batch_size=bs // nt,
-            num_embeddings_per_feature=[cap_per_table] * nt,
+            num_embeddings_per_feature=[_GPU_TOTAL_CAP // nt] * nt,
             embedding_dim=_DIM,
             hbm_for_embeddings=[sys.maxsize] * nt,
             optimizer_type=opt,
@@ -1612,16 +1624,15 @@ _CACHE_FOOTPRINT_RATIOS = [0.8, 1.0]
 
 
 def _caching_configs():
-    cap_per_table = 256 * 1024 * 1024
     return [
         BenchmarkConfig(
             batch_size=bs // nt,
-            num_embeddings_per_feature=[cap_per_table] * nt,
+            num_embeddings_per_feature=[_CACHE_TOTAL_CAP // nt] * nt,
             embedding_dim=_DIM,
             # Placeholders -- both are overwritten at runtime by
             # _resize_cache_to_footprint based on the actual workload.
             hbm_for_embeddings=_cache_hbm(
-                _CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt
+                _CACHE_GPU_RATIO, _CACHE_TOTAL_CAP // nt, _DIM, opt, nt
             ),
             optimizer_type=opt,
             caching=True,
@@ -1640,14 +1651,13 @@ def _caching_configs():
 
 
 def _no_caching_configs():
-    cap_per_table = 256 * 1024 * 1024
     return [
         BenchmarkConfig(
             batch_size=bs // nt,
-            num_embeddings_per_feature=[cap_per_table] * nt,
+            num_embeddings_per_feature=[_CACHE_TOTAL_CAP // nt] * nt,
             embedding_dim=_DIM,
             hbm_for_embeddings=_cache_hbm(
-                _CACHE_GPU_RATIO, cap_per_table, _DIM, opt, nt
+                _CACHE_GPU_RATIO, _CACHE_TOTAL_CAP // nt, _DIM, opt, nt
             ),
             optimizer_type=opt,
             caching=False,
@@ -1664,11 +1674,10 @@ def _no_caching_configs():
 
 def _no_hbm_configs():
     """No HBM, no caching: all embedding data in system memory (UVM)."""
-    cap_per_table = 256 * 1024 * 1024
     return [
         BenchmarkConfig(
             batch_size=bs // nt,
-            num_embeddings_per_feature=[cap_per_table] * nt,
+            num_embeddings_per_feature=[_CACHE_TOTAL_CAP // nt] * nt,
             embedding_dim=_DIM,
             hbm_for_embeddings=[0] * nt,
             optimizer_type=opt,
