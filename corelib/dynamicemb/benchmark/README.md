@@ -220,6 +220,79 @@ nsys stats --report cuda_gpu_kern_sum trace_all.nsys-rep | head -30
 nsys stats --report cuda_gpu_kern_gb_sum trace_all.nsys-rep | head -30
 ```
 
+#### Per-op breakdown pipeline (`.nsys-rep` → sunburst PNG)
+
+End-to-end pipeline that reduces each config's nsys trace into a CSV of
+per-op GPU time and renders it as a sunburst chart.  Tools:
+`nsys_breakdown.py` (trace → CSV) and `nsys_sunburst.py` (CSV → PNG).
+
+**Op attribution.**  `batched_dynamicemb_function.py` wraps the
+embedding-side hot path in `torch.cuda.nvtx.range("op:<name>")` markers
+(13 ops: `cache_lookup`, `storage_find`, `gather_embedding`,
+`reduce_grads`, `optimizer_update_fused`, ...).  Each launch falls into
+the innermost `op:*` range active on the CPU side at launch time
+(CUPTI_ACTIVITY_KIND_RUNTIME — *not* GPU exec time, which would miss
+async backward kernels).  Launches with no `op:*` parent above them
+are kept individually under their kernel name so they remain visible
+in the chart.
+
+**Step 1 — capture one `.nsys-rep` per config.**  The recommended
+approach is one `nsys profile` invocation per config (one
+`--capture-range-end=stop` window per process).  This sidesteps a
+buffer-rotation bug in older nsys releases that silently drops cycles
+when many `repeat`/`repeat-shutdown:N` windows fire back-to-back in a
+single process.  On the cluster, drive it from a loop like:
+
+```bash
+# pseudocode — see run_nsys_loop.sbatch for the working version
+for TEST_ID in $(pytest --collect-only -q ...); do
+    LABEL=$(echo "$TEST_ID" | sed -E 's/.*\[(.+)\]$/\1/')
+    nsys profile \
+        --output=nsys_run/trace_${LABEL} \
+        --sample=none --cpuctxsw=none \
+        --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end=stop \
+        torchrun --nnodes 1 --nproc_per_node 1 \
+            -m pytest -svv --profile nsys "$TEST_ID"
+done
+```
+
+After the loop you have one `trace_<NN>_<cfg-label>.nsys-rep` per
+config.
+
+**Step 2 — `nsys_breakdown.py`: trace → per-config CSV.**  Exports
+each `.nsys-rep` to a sqlite via `nsys export`, then joins
+`CUPTI_ACTIVITY_KIND_RUNTIME` (CPU launch times) with
+`CUPTI_ACTIVITY_KIND_KERNEL` (GPU exec times) and `NVTX_EVENTS` to
+attribute every kernel to the innermost `op:*` range live at launch:
+
+```bash
+python nsys_breakdown.py nsys_run/*.nsys-rep --out-dir nsys_run/
+# -> nsys_run/opcalls__<cfg-label>.csv  (one CSV per .nsys-rep)
+```
+
+Each CSV row is one op (or one bare kernel) with columns:
+`phase,parent_stages,op,calls_per_iter,avg_ms_per_iter,total_ms,num_iters,kernel_names,fallback_category`.
+
+**Step 3 — `nsys_sunburst.py`: CSV → PNG.**  Renders a 3-ring
+sunburst per CSV (phase / stage / op) with a legend table listing
+letter codes, op names, and percentage of total iteration time:
+
+```bash
+python nsys_sunburst.py nsys_run/opcalls__*.csv
+# -> nsys_run/opcalls__<cfg-label>.sunburst.png  (next to each CSV)
+```
+
+The PNG drops next to its CSV by default; pass paths individually to
+control output location.  Example outputs live under
+[`plots/breakdown_sgd_gpu.png`](./plots/breakdown_sgd_gpu.png) and
+[`plots/breakdown_adam_caching_cfr1.0.png`](./plots/breakdown_adam_caching_cfr1.0.png).
+
+Working artifacts (`.nsys-rep`, `.sqlite`, intermediate CSV/PNG) are
+expected to land under `local/` (gitignored).  Only the curated
+figures committed under `plots/` are tracked.
+
 Other profile modes:
 
 | `--profile` value | What it does                                                          |
@@ -243,7 +316,7 @@ Other profile modes:
    (DynamicEmb `local_hbm_for_values`, FBGEMM `cache_load_factor`).
 
 This means TestCaching emits one config per ratio in the suite, with
-labels like `..._caching_..._cfr=0.5` / `..._cfr=0.8`.  The other three
+labels like `..._caching_..._cfr=0.8` / `..._cfr=1.0`.  The other three
 suites (`TestGpu`, `TestNoCaching`, `TestNoHbm`) leave
 `cache_footprint_ratio=None` and keep their construction-time
 `hbm_for_embeddings` / `gpu_ratio`.
@@ -256,24 +329,21 @@ behavior, not a cold start.
 ### Plotting results
 
 `benchmark_results.json` produced above is visualized with
-`plot_benchmark_results.py`.  Figures are written into a single output
-directory (default `./plots/`) as **one figure** (`benchmark_bdet_plot.png`)
-+ optionally one speedup figure (`benchmark_bdet_speedup_plot.png`).  The
-caching column auto-fans-out into one panel per `cache_footprint_ratio`
-present in the JSON, so cfr=0.5 and cfr=0.8 sit side-by-side in the same
-image (the figure width scales with column count).
+`plot_benchmark_results.py`.  The script writes a single figure
+(`benchmark_bdet_plot.png`) into the output directory (default
+`./plots/`).  The caching column auto-fans-out into one panel per
+`cache_footprint_ratio` present in the JSON, so cfr=0.8 and cfr=1.0 sit
+side-by-side in the same image (the figure width scales with column
+count).
 
 ```bash
 # Main figure into ./plots/benchmark_bdet_plot.png
 python plot_benchmark_results.py
 
-# Main + trc/dyn speedup
-python plot_benchmark_results.py --speedup
-
 # Different output directory / results file
 python plot_benchmark_results.py \
     --results /path/to/results.json \
-    --out-dir /tmp/bdet_plots --speedup
+    --out-dir /tmp/bdet_plots
 
 # Log y-axis (one suite dominates the range)
 python plot_benchmark_results.py --log
@@ -291,21 +361,21 @@ pow-law(α=1.05)  ·  hotness=10  ·  pool=none
 ```
 
 `cache_footprint_ratio` is intentionally not in the subtitle — it shows
-up in the per-panel titles instead (`Caching · cfr=0.5`, `Caching · cfr=0.8`).
+up in the per-panel headers on the top secondary x-axis instead
+(`Caching cfr=0.8`, `Caching cfr=1.0`).
 Fields populated by `run_single_benchmark`: `gpu_name`, `embedding_dim`,
 `batch_size`/`num_tables`, `feature_distribution`, `alpha`, `max_hotness`,
 `pooling_mode`, `cache_footprint_ratio`.  Any field missing from a legacy
 JSON is silently skipped.
 
-Layout:
-- Main figure: 2 rows (optimizer) × N cols (`GPU`, one per caching
-  ratio, `NoCaching`, `NoHBM`).  Each panel shows a stacked
-  `train (fwd + bwd)` bar plus a separate `eval` bar for DynamicEmb
-  vs TorchRec; every panel auto-scales independently.
-- Speedup figure (with `--speedup`): same row × col layout, four bars
-  per panel (`fwd / bwd / train / eval`) showing `TorchRec / DynamicEmb`.
-  A dashed `1.0×` line marks parity; bars above → DynamicEmb is the
-  faster backend, below → TorchRec is.
+Layout: one row per optimizer; within each row, every panel (`GPU`,
+one per caching ratio, `NoCaching`, `NoHBM`) is drawn side-by-side on a
+**shared y-axis**.  Panel names sit on a secondary axis at the top,
+train/eval labels under the bars, dotted separators between panel
+regions.  Each panel shows a stacked `train (fwd + bwd)` bar plus a
+separate `eval` bar for DynamicEmb vs TorchRec.  Because modes span
+~0.5 ms (GPU) to ~40 ms (NoHBM), GPU bars look small under the shared
+scale — pass `--log` to expand the low end.
 
 ### Test Results
 
@@ -328,6 +398,22 @@ Latency by suite (DynamicEmb vs TorchRec TBE, lower is better):
 
 ![benchmark of BatchedDynamicEmbeddingTables vs TorchRec TBE](./plots/benchmark_bdet_plot.png)
 
-TorchRec / DynamicEmb speedup ratio (>1× → DynamicEmb faster, <1× → TorchRec faster):
+#### Per-op breakdown (DynamicEmb side)
 
-![speedup of DynamicEmb over TorchRec TBE](./plots/benchmark_bdet_speedup_plot.png)
+Two representative configs profiled via `nsys` and reduced with
+`nsys_breakdown.py` + `nsys_sunburst.py` (see [nsys profiling](#nsight-systems-nsys-profiling)).
+The sunburst rings are: phase (forward / backward) → stage
+(prefetch / forward / backward) → op (NVTX `op:*` range, or kernel name
+when no wrapper is present).  Percentages are share of the full
+iteration time; letter codes index the legend table below each chart.
+
+`sgd + GPU (full HBM)` — fastest config; cost dominated by
+`storage_find` and the SGD update:
+
+![sgd gpu per-op breakdown](./plots/breakdown_sgd_gpu.png)
+
+`adam + Caching cfr=1.0` — caching mode with the costlier optimizer;
+shows extra cache-traffic ops (`cache_lookup`, `cache_insert_evict`,
+`load_from_flat`/`store_to_flat`) on top of the adam update:
+
+![adam caching cfr=1.0 per-op breakdown](./plots/breakdown_adam_caching_cfr1.0.png)

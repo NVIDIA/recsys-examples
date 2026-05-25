@@ -3,13 +3,15 @@
 #
 # Plot benchmark_results.json produced by benchmark_batched_dynamicemb_tables.sh.
 #
-# Reads a list of per-config result dicts, groups by (optimizer, mode),
-# and renders a 2-row x 4-col bar chart comparing DynamicEmb vs TorchRec
-# for forward / backward / train / eval latencies (ms).
+# Reads a list of per-config result dicts, groups by (optimizer, mode), and
+# renders a one-axes-per-optimizer figure: the GPU / Caching (one entry per
+# cache_footprint_ratio) / NoCaching / NoHBM panels sit side-by-side on a
+# shared y-axis, each panel showing forward / backward / train / eval bars
+# for DynamicEmb vs TorchRec.
 #
 # Usage:
 #   python plot_benchmark_results.py
-#   python plot_benchmark_results.py --results benchmark_results.json --out bench.png
+#   python plot_benchmark_results.py --results benchmark_results.json --out-dir plots/
 #   python plot_benchmark_results.py --log              # log-scale y-axis
 #   python plot_benchmark_results.py --no-values        # hide bar labels
 
@@ -47,7 +49,7 @@ def build_panels(results: List[dict]):
 
     ``cache_footprint_ratio`` is None for non-caching modes; for caching it
     expands one column per ratio found in the data, sorted ascending.  This
-    keeps cfr=0.5 and cfr=0.8 in the same figure rather than splitting them
+    keeps cfr=0.8 and cfr=1.0 in the same figure rather than splitting them
     into separate PNGs.
     """
     ratios = sorted({
@@ -96,20 +98,6 @@ def collect_panel(results: List[dict], optimizer: str, mode: str, cfr):
     return None, None
 
 
-def _label_bars(ax, bars, fmt="{:.2f}"):
-    for b in bars:
-        h = b.get_height()
-        ax.annotate(
-            fmt.format(h),
-            xy=(b.get_x() + b.get_width() / 2, h),
-            xytext=(0, 2),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-        )
-
-
 DYN_FWD_COLOR = "#c2e07a"  # light NVIDIA green
 DYN_BWD_COLOR = "#76b900"  # NVIDIA green
 TRC_FWD_COLOR = "#9dc3e6"  # light blue
@@ -135,42 +123,45 @@ def make_figure(
     show_values: bool,
     subtitle: str = "",
 ) -> plt.Figure:
-    """Per-suite layout: rows = optimizer, cols = ``panels`` order.
+    """One axes per optimizer with all ``panels`` drawn side by side.
 
     ``panels`` is a list of ``(mode, cache_footprint_ratio)`` tuples produced
-    by :func:`build_panels` -- caching is fanned out into one column per
-    ratio so cfr=0.5 / cfr=0.8 sit side by side in the same figure.
+    by :func:`build_panels` -- caching is fanned out into one entry per
+    ratio so cfr=0.8 / cfr=1.0 sit side by side.
 
-    Each subplot shows two grouped bars: a stacked train bar (forward at
-    the bottom, backward on top -- their sum equals the measured train
-    latency) and a plain eval bar.  Within each group DynamicEmb and
-    TorchRec sit side by side so a single panel summarizes the entire
-    workload.
+    The figure has ``n_optimizers`` rows × 1 col; within each row, every
+    panel contributes a (stacked train, eval) bar group, all sharing the
+    same y-axis.  Note: modes span ~0.5 ms (GPU) to ~40 ms (NoHBM) so a
+    shared y-axis squashes the GPU bars -- pass ``log=True`` if that
+    matters.  Panel headers live on a secondary x-axis at the top of each
+    axes, dotted vertical lines separate the panel regions.
     """
     optimizers = sorted({r["optimizer_type"] for r in results})
 
-    # Each subplot auto-scales its y-axis: modes span ~0.5 ms (GPU) to ~40 ms
-    # (NoHBM) so a shared row axis would squash the GPU panel into a sliver.
-    # Per-column width stays at 4.0 inches so the layout grows naturally as
-    # more cache_footprint_ratio columns are added.
     fig, axes = plt.subplots(
-        len(optimizers), len(panels),
-        figsize=(4.0 * len(panels), 3.5 * len(optimizers)),
+        len(optimizers), 1,
+        figsize=(max(2.6 * len(panels), 10.0), 4.2 * len(optimizers)),
         squeeze=False,
     )
+    axes = [row[0] for row in axes]
 
     width = 0.30
-    x_train, x_eval = 0, 1
-    first_handles = None  # captured from first non-empty subplot for fig-level legend
+    panel_inner_width = 2.0  # group positions: x=0 (train) and x=1 (eval)
+    panel_gap = 0.9          # blank space between panels
+    panel_step = panel_inner_width + panel_gap
+
+    first_handles = None  # captured from first non-empty group for fig-level legend
     for row, opt in enumerate(optimizers):
+        ax = axes[row]
         for col, (mode, cfr) in enumerate(panels):
-            ax = axes[row, col]
             dyn_v, trc_v = collect_panel(results, opt, mode, cfr)
             if dyn_v is None:
-                ax.set_visible(False)
                 continue
             dyn_fwd, dyn_bwd, dyn_train, dyn_eval = dyn_v
             trc_fwd, trc_bwd, trc_train, trc_eval = trc_v
+
+            x_train = col * panel_step
+            x_eval = col * panel_step + 1
 
             # Train: stacked forward (bottom) + backward (top) per backend.
             ax.bar(x_train - width / 2, dyn_fwd, width,
@@ -193,18 +184,41 @@ def make_figure(
                 _annotate_total(ax, x_eval - width / 2, dyn_eval)
                 _annotate_total(ax, x_eval + width / 2, trc_eval)
 
-            ax.set_xticks([x_train, x_eval])
-            ax.set_xticklabels(["train\n(fwd + bwd)", "eval"], fontsize=9)
-            ax.set_ylabel("ms")
-            ax.set_title(
-                f"{opt} · {panel_label(mode, cfr).replace(chr(10), ' ')}",
-                fontsize=10,
-            )
-            ax.grid(axis="y", alpha=0.3)
-            if log:
-                ax.set_yscale("log")
             if first_handles is None:
                 first_handles = ax.get_legend_handles_labels()
+
+        # Dotted separators between panel regions
+        for i in range(1, len(panels)):
+            sep_x = i * panel_step - panel_gap / 2
+            ax.axvline(sep_x, color="#aaa", linestyle=":",
+                       linewidth=0.8, alpha=0.7)
+
+        # Inner x-ticks: train / eval label under every panel.
+        xticks: list = []
+        xticklabels: list = []
+        for i in range(len(panels)):
+            xticks.extend([i * panel_step, i * panel_step + 1])
+            xticklabels.extend(["train\n(fwd+bwd)", "eval"])
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(xticklabels, fontsize=8)
+        ax.set_xlim(-panel_gap / 2,
+                    len(panels) * panel_step - panel_gap / 2)
+        ax.set_ylabel("ms")
+        ax.grid(axis="y", alpha=0.3)
+        if log:
+            ax.set_yscale("log")
+
+        # Secondary x-axis on top: panel header per panel region.
+        sax = ax.secondary_xaxis("top")
+        sax.set_xticks([i * panel_step + 0.5 for i in range(len(panels))])
+        sax.set_xticklabels(
+            [panel_label(m, c).replace("\n", " ") for m, c in panels],
+            fontsize=10, fontweight="bold",
+        )
+        sax.tick_params(axis="x", length=0)  # no tick marks, just labels
+
+        # Optimizer name above the panel-header strip.
+        ax.set_title(opt, fontsize=12, fontweight="bold", pad=24)
 
     fig.suptitle(
         "BatchedDynamicEmbeddingTablesV2 vs TorchRec TBE  (lower is better)",
@@ -228,82 +242,6 @@ def make_figure(
             fontsize=9,
         )
     fig.tight_layout(rect=(0, 0, 1, 0.93 - 0.025 * n_lines))
-    return fig
-
-
-def make_speedup_figure(
-    results: List[dict],
-    panels: List[tuple],
-    subtitle: str = "",
-) -> plt.Figure:
-    """TorchRec / DynamicEmb latency ratio per panel × metric.
-
-    Layout mirrors :func:`make_figure`: rows = optimizer, cols = ``panels``.
-    Inside each panel four bars show the ratio for forward / backward /
-    train / eval.  A dashed horizontal line at y=1.0 marks parity; bars
-    above the line mean DynamicEmb is faster, below means TorchRec is
-    faster.  Each panel auto-scales independently so 10× wins don't
-    squash 0.3× cells.
-    """
-    optimizers = sorted({r["optimizer_type"] for r in results})
-
-    fig, axes = plt.subplots(
-        len(optimizers), len(panels),
-        figsize=(4.0 * len(panels), 3.5 * len(optimizers)),
-        squeeze=False,
-    )
-
-    width = 0.55
-    metric_colors = [DYN_FWD_COLOR, DYN_BWD_COLOR, TRC_FWD_COLOR, TRC_BWD_COLOR]
-    x = np.arange(len(METRICS))
-
-    for row, opt in enumerate(optimizers):
-        for col, (mode, cfr) in enumerate(panels):
-            ax = axes[row, col]
-            dyn_v, trc_v = collect_panel(results, opt, mode, cfr)
-            if dyn_v is None:
-                ax.set_visible(False)
-                continue
-            speedups = [
-                trc_v[i] / dyn_v[i] if dyn_v[i] > 0 else float("nan")
-                for i in range(len(METRICS))
-            ]
-            bars = ax.bar(
-                x, speedups, width,
-                color=metric_colors, edgecolor="#333", linewidth=0.4,
-            )
-            for b, s in zip(bars, speedups):
-                if np.isnan(s):
-                    continue
-                ax.annotate(
-                    f"{s:.2f}×",
-                    xy=(b.get_x() + b.get_width() / 2, s),
-                    xytext=(0, 2),
-                    textcoords="offset points",
-                    ha="center", va="bottom", fontsize=8,
-                )
-
-            ax.axhline(1.0, color="black", linestyle="--",
-                       linewidth=0.8, alpha=0.6)
-            ax.set_xticks(x)
-            ax.set_xticklabels(METRICS, fontsize=9)
-            ax.set_ylabel("trc / dyn")
-            ax.set_title(
-                f"{opt} · {panel_label(mode, cfr).replace(chr(10), ' ')}",
-                fontsize=10,
-            )
-            ax.grid(axis="y", alpha=0.3)
-
-    fig.suptitle(
-        "DynamicEmb Speedup over TorchRec TBE  "
-        "(>1 = DynamicEmb faster, <1 = TorchRec faster)",
-        fontsize=12,
-    )
-    n_lines = subtitle.count("\n") + 1 if subtitle else 0
-    if subtitle:
-        fig.text(0.5, 0.955, subtitle, ha="center", va="top",
-                 fontsize=10, color="#444")
-    fig.tight_layout(rect=(0, 0, 1, 0.95 - 0.025 * n_lines))
     return fig
 
 
@@ -368,10 +306,6 @@ def main() -> None:
                         help="log-scale y-axis (useful when one mode dominates)")
     parser.add_argument("--no-values", action="store_true",
                         help="hide numeric labels on bars")
-    parser.add_argument(
-        "--speedup", action="store_true",
-        help="also save a second figure with the trc/dyn ratio per metric",
-    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -382,8 +316,8 @@ def main() -> None:
         raise SystemExit(f"No timing entries found in {args.results}")
 
     # All cache_footprint_ratio variants share a single figure now: the
-    # caching column is fanned out into one panel per ratio, so cfr=0.5 and
-    # cfr=0.8 sit side-by-side instead of going to separate PNGs.
+    # caching column is fanned out into one panel per ratio, so cfr=0.8 and
+    # cfr=1.0 sit side-by-side instead of going to separate PNGs.
     panels = build_panels(results)
     subtitle = _meta_str(results)
 
@@ -395,9 +329,6 @@ def main() -> None:
     fig = make_figure(results, panels, log=args.log,
                       show_values=not args.no_values, subtitle=subtitle)
     _save(fig, "benchmark_bdet_plot.png")
-    if args.speedup:
-        sp = make_speedup_figure(results, panels, subtitle=subtitle)
-        _save(sp, "benchmark_bdet_speedup_plot.png")
 
 
 if __name__ == "__main__":
