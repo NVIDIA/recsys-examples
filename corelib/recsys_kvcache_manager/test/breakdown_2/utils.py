@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Mapping, Sequence, Tuple
 
-# Hook names recorded by profiler_offload.py (perf_counter + optional NVTX labels).
+# Hook names for legacy single-offload profiler paths (not profiler_offload.py burst).
 FLEXKV_CSV_METRICS: Tuple[str, ...] = (
     "flexkv.offload_kvcache_launch",
     "flexkv.offload_kvcache_wait",
@@ -12,6 +12,15 @@ FLEXKV_CSV_METRICS: Tuple[str, ...] = (
     "flexkv.client.put_async",
     "flexkv.client.try_wait",
     "flexkv.client.wait",
+)
+
+# profiler_offload.py burst benchmark (see profiler_offload.LAYER_METRICS).
+PROFILER_OFFLOAD_LAYER_METRICS: Tuple[str, ...] = (
+    "kvcache_manager.offload_try_wait",
+    "host_kvstorage_manager.offload_kvcache_wait",
+    "host_kvstorage_manager.finish_task",
+    "flexkv_client.try_wait",
+    "flexkv_client.wait",
 )
 
 # (exclusive_key, plot_label) — stack bottom → top
