@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Plot L1/L2/L3 (+ init) from nsys NVTX csv.
-
-L4/L5 (raw cpu/gpu py and cpp/kernel stacks) are omitted: they largely duplicate L3.
-Py/cpp per-path drill-down is available in the raw nsys CSV if needed.
-"""
 
 import argparse
 import os
+import re
 
 import pandas as pd
 
@@ -49,7 +45,15 @@ def sum_metric(
             return True
         if col.startswith(f"{step_op}::"):
             return True
-        if col == bare or col.endswith(f"::{bare}"):
+        # Legacy fallback: only map truly unscoped leaf labels to step1/step3.
+        # Do NOT accept "<other_step>::<bare>", otherwise step1/step3 will
+        # both absorb each other's scoped labels and inflate L3 totals.
+        if col == bare:
+            return step_op.startswith("step1.") or step_op.startswith("step3.")
+        if col.endswith(f"::{bare}"):
+            top_scope = col.split("::", 1)[0]
+            if re.match(r"step\d+\.", top_scope):
+                return False
             return step_op.startswith("step1.") or step_op.startswith("step3.")
         return False
 
@@ -85,8 +89,8 @@ L3_CALL_TIMELINE: list[tuple[str, str | None, str]] = [
         "step1.offload_launch",
         "::flexkv._build_slot_mappings",
     ),
+    # Offload launch uses put_async only (no client.launch in flex_kvcache_manager).
     ("step1.flexkv.client.put_async", "step1.offload_launch", "::flexkv.client.put_async"),
-    ("step1.flexkv.client.launch", "step1.offload_launch", "::flexkv.client.launch"),
     ("step1.flexkv.client.try_wait", "step1.offload_wait", "::flexkv.client.try_wait"),
     ("step1.flexkv.finish_task", "step1.offload_wait", "::flexkv.finish_task"),
     (
@@ -111,7 +115,7 @@ L3_CALL_TIMELINE: list[tuple[str, str | None, str]] = [
         "step3.onboard_launch",
         "::flexkv._build_slot_mappings",
     ),
-    ("step3.flexkv.client.put_async", "step3.onboard_launch", "::flexkv.client.put_async"),
+    # Onboard launch uses launch only (no client.put_async in flex_kvcache_manager).
     ("step3.flexkv.client.launch", "step3.onboard_launch", "::flexkv.client.launch"),
     ("step3.flexkv.client.wait", "step3.onboard_wait", "::flexkv.client.wait"),
 ]
@@ -130,7 +134,9 @@ def build_l3_call_timeline_df(detail_step_df: pd.DataFrame, index) -> pd.DataFra
     data = {}
     for col, step_op, token in L3_CALL_TIMELINE:
         bare = token.lstrip(":")
-        leaf_only = bare in LEAF_TOKENS
+        # Keep *_py as leaf-only to avoid double-counting nested cpp/kernel spans,
+        # e.g. gpu.allocate_py + gpu.allocate_py::gpu.allocate_cpp.
+        leaf_only = bare in LEAF_TOKENS or bare.endswith("_py")
         data[col] = sum_metric(detail_step_df, step_op, token, leaf_only=leaf_only)
     return drop_zero_columns(pd.DataFrame(data, index=index))
 
@@ -169,6 +175,33 @@ def reorder_step_op_columns(df):
     front = [c for c in STEP_OP_TIMELINE if c in df.columns]
     tail = [c for c in df.columns if c not in front]
     return df[front + tail].copy()
+
+
+def warn_l3_exceeds_step_ops(step_op_df: pd.DataFrame, l3_df: pd.DataFrame) -> None:
+    if step_op_df.empty or l3_df.empty:
+        return
+
+    # Only compare ops represented in the fixed L3 timeline map.
+    l3_by_op = {}
+    for col, step_op, _ in L3_CALL_TIMELINE:
+        if step_op is None or col not in l3_df.columns:
+            continue
+        if step_op not in l3_by_op:
+            l3_by_op[step_op] = pd.Series(0.0, index=l3_df.index)
+        l3_by_op[step_op] = l3_by_op[step_op] + l3_df[col]
+
+    for step_op, l3_sum in l3_by_op.items():
+        if step_op not in step_op_df.columns:
+            continue
+        l2_total = step_op_df[step_op]
+        # Small tolerance for CSV/report rounding and export noise.
+        exceeded = l3_sum > (l2_total + 1e-6)
+        if exceeded.any():
+            xs = [str(x) for x in step_op_df.index[exceeded]]
+            print(
+                f"[WARN] L3 sum exceeds L2 total for {step_op} at x={','.join(xs)}. "
+                "Check NVTX nesting or selected L3 call list."
+            )
 
 
 def save_view(
@@ -274,6 +307,7 @@ def main() -> None:
         group_by_step_op=False,
     )
     l3_df = build_l3_call_timeline_df(detail_step_df, step_op_df.index)
+    warn_l3_exceeds_step_ops(step_op_df, l3_df)
     save_view(
         reorder_l3_columns(l3_df),
         os.path.join(plot_dir, f"L3_breakdown_bs{bs}.png"),

@@ -1,7 +1,3 @@
-"""
-Micro-bench 1 — full 3-step pipeline + L1–L3 NVTX breakdown (nsys).
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -17,8 +13,6 @@ from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_utils import KVLookupResult
-
-PROFILE_MODE_FINE = "flexkv_fine"
 
 CURRENT_NVTX_SCOPE: ContextVar[str] = ContextVar("current_nvtx_scope", default="")
 
@@ -40,28 +34,38 @@ def nvtx_range(name: str):
             CURRENT_NVTX_SCOPE.reset(scope_token)
 
 
-def wrap_method_with_nvtx(obj, method_name: str, nvtx_name: str) -> None:
-    if obj is None or not hasattr(obj, method_name):
+def _scoped_name(name: str) -> str:
+    scope = CURRENT_NVTX_SCOPE.get()
+    return f"{scope}::{name}" if scope else name
+
+
+def wrap_with_nvtx(target, attr_name: str, nvtx_name: str) -> None:
+    """Wrap an instance method or module function with scoped NVTX ranges."""
+    if target is None or not hasattr(target, attr_name):
         return
-    original = getattr(obj, method_name)
+    original = getattr(target, attr_name)
     if getattr(original, "__nvtx_wrapped__", False):
         return
 
     @wraps(original)
     def wrapped(*args, **kwargs):
-        scope = CURRENT_NVTX_SCOPE.get()
-        scoped_name = f"{scope}::{nvtx_name}" if scope else nvtx_name
-        with nvtx_range(scoped_name):
+        with nvtx_range(_scoped_name(nvtx_name)):
             return original(*args, **kwargs)
 
     wrapped.__nvtx_wrapped__ = True
-    setattr(obj, method_name, wrapped)
+    try:
+        setattr(target, attr_name, wrapped)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[WARN] Failed to wrap {target!r}.{attr_name} with NVTX "
+            f"({nvtx_name}): {e}"
+        )
 
 
 def _install_precreate_nvtx_hooks() -> None:
     from recsys_kvcache_manager.flex_kvcache_manager import FlexKVStorageManager
 
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(
         FlexKVStorageManager,
         "register_gpu_cache_tables",
         "flexkv.register_gpu_cache_tables",
@@ -69,39 +73,38 @@ def _install_precreate_nvtx_hooks() -> None:
 
 
 def install_nvtx_hooks(kvcache_mgr: KVCacheManager) -> None:
-    """flexkv_fine: FlexKV host APIs, adapter/client RPC, recsys glue."""
     flexkv_mgr = kvcache_mgr.host_kvstorage_manager
-    wrap_method_with_nvtx(flexkv_mgr, "build_index_meta", "flexkv.build_index_meta")
-    wrap_method_with_nvtx(flexkv_mgr, "lookup_kvcache", "flexkv.lookup_kvcache")
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(flexkv_mgr, "build_index_meta", "flexkv.build_index_meta")
+    wrap_with_nvtx(flexkv_mgr, "lookup_kvcache", "flexkv.lookup_kvcache")
+    wrap_with_nvtx(
         flexkv_mgr, "onboard_kvcache_launch", "flexkv.onboard_kvcache_launch"
     )
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(
         flexkv_mgr, "onboard_kvcache_wait", "flexkv.onboard_kvcache_wait"
     )
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(
         flexkv_mgr, "offload_kvcache_launch", "flexkv.offload_kvcache_launch"
     )
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(
         flexkv_mgr, "offload_kvcache_wait", "flexkv.offload_kvcache_wait"
     )
-    wrap_method_with_nvtx(flexkv_mgr, "finish_task", "flexkv.finish_task")
-    wrap_method_with_nvtx(flexkv_mgr, "cancel_task", "flexkv.cancel_task")
+    wrap_with_nvtx(flexkv_mgr, "finish_task", "flexkv.finish_task")
+    wrap_with_nvtx(flexkv_mgr, "cancel_task", "flexkv.cancel_task")
 
     adapter = getattr(flexkv_mgr, "_adapter", None)
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(
         adapter, "to_get_match_requests", "flexkv.adapter.to_get_match_requests"
     )
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(
         flexkv_mgr, "_build_slot_mappings", "flexkv._build_slot_mappings"
     )
 
     client = getattr(flexkv_mgr, "_client", None)
-    wrap_method_with_nvtx(client, "get_match", "flexkv.client.get_match")
-    wrap_method_with_nvtx(client, "put_async", "flexkv.client.put_async")
-    wrap_method_with_nvtx(client, "launch", "flexkv.client.launch")
-    wrap_method_with_nvtx(client, "try_wait", "flexkv.client.try_wait")
-    wrap_method_with_nvtx(client, "wait", "flexkv.client.wait")
+    wrap_with_nvtx(client, "get_match", "flexkv.client.get_match")
+    wrap_with_nvtx(client, "put_async", "flexkv.client.put_async")
+    wrap_with_nvtx(client, "launch", "flexkv.client.launch")
+    wrap_with_nvtx(client, "try_wait", "flexkv.client.try_wait")
+    wrap_with_nvtx(client, "wait", "flexkv.client.wait")
 
     install_recsys_glue_hooks(kvcache_mgr)
 
@@ -114,16 +117,13 @@ def install_recsys_glue_hooks(kvcache_mgr: KVCacheManager) -> None:
     @classmethod
     @wraps(original_merge)
     def merge_with_nvtx(cls, lookup_res1, lookup_res2):
-        scope = CURRENT_NVTX_SCOPE.get()
-        nvtx_name = "recsys.merge_lookup_results"
-        scoped_name = f"{scope}::{nvtx_name}" if scope else nvtx_name
-        with nvtx_range(scoped_name):
+        with nvtx_range(_scoped_name("recsys.merge_lookup_results")):
             return original_merge(lookup_res1, lookup_res2)
 
     merge_with_nvtx.__nvtx_wrapped__ = True
     KVLookupResult.merge = merge_with_nvtx
 
-    wrap_method_with_nvtx(
+    wrap_with_nvtx(
         kvcache_mgr, "offload_try_wait", "recsys.offload_try_wait_loop"
     )
 
@@ -131,12 +131,7 @@ def install_recsys_glue_hooks(kvcache_mgr: KVCacheManager) -> None:
 def create_testing_kvcache_manager(
     max_batch_size: int,
     max_seq_len: int,
-    profile_mode: str = PROFILE_MODE_FINE,
 ) -> KVCacheManager:
-    if profile_mode != PROFILE_MODE_FINE:
-        raise ValueError(
-            f"Only profile_mode={PROFILE_MODE_FINE!r} is supported; got {profile_mode!r}"
-        )
     _install_precreate_nvtx_hooks()
     kvcache_config = get_kvcache_config(
         num_layers=3,
@@ -338,55 +333,6 @@ def run_step_3_onboard(
     assert onboard_ready, "step3: onboard_wait did not reach ready=True"
 
 
-def _scoped_name(name: str) -> str:
-    scope = CURRENT_NVTX_SCOPE.get()
-    return f"{scope}::{name}" if scope else name
-
-
-def wrap_method_with_nvtx_safe(obj, method_name: str, nvtx_name: str) -> None:
-    if obj is None or not hasattr(obj, method_name):
-        return
-    original = getattr(obj, method_name)
-    if getattr(original, "__nvtx_wrapped__", False):
-        return
-
-    @wraps(original)
-    def wrapped(*args, **kwargs):
-        with nvtx_range(_scoped_name(nvtx_name)):
-            return original(*args, **kwargs)
-
-    wrapped.__nvtx_wrapped__ = True
-    try:
-        setattr(obj, method_name, wrapped)
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"[WARN] Failed to wrap {obj}.{method_name} with NVTX "
-            f"({nvtx_name}): {e}"
-        )
-
-
-def wrap_module_function_with_nvtx_safe(module, func_name: str, nvtx_name: str) -> None:
-    if module is None or not hasattr(module, func_name):
-        return
-    original = getattr(module, func_name)
-    if getattr(original, "__nvtx_wrapped__", False):
-        return
-
-    @wraps(original)
-    def wrapped(*args, **kwargs):
-        with nvtx_range(_scoped_name(nvtx_name)):
-            return original(*args, **kwargs)
-
-    wrapped.__nvtx_wrapped__ = True
-    try:
-        setattr(module, func_name, wrapped)
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"[WARN] Failed to wrap module function {module}.{func_name} "
-            f"with NVTX ({nvtx_name}): {e}"
-        )
-
-
 class _NVTXProxy:
     def __init__(self, target, method_to_nvtx: Dict[str, str]):
         self._target = target
@@ -418,22 +364,22 @@ def install_gpu_cpp_kernel_hooks(kvcache_mgr) -> None:
     if gpu_mgr is None:
         return
 
-    wrap_method_with_nvtx_safe(gpu_mgr, "lookup", "gpu.lookup_py")
-    wrap_method_with_nvtx_safe(gpu_mgr, "allocate", "gpu.allocate_py")
-    wrap_method_with_nvtx_safe(gpu_mgr, "check_for_offload", "gpu.check_for_offload_py")
-    wrap_method_with_nvtx_safe(
+    wrap_with_nvtx(gpu_mgr, "lookup", "gpu.lookup_py")
+    wrap_with_nvtx(gpu_mgr, "allocate", "gpu.allocate_py")
+    wrap_with_nvtx(gpu_mgr, "check_for_offload", "gpu.check_for_offload_py")
+    wrap_with_nvtx(
         gpu_mgr, "acquire_offload_pages", "gpu.acquire_offload_pages_py"
     )
-    wrap_method_with_nvtx_safe(
+    wrap_with_nvtx(
         gpu_mgr, "release_offload_pages", "gpu.release_offload_pages_py"
     )
-    wrap_method_with_nvtx_safe(
+    wrap_with_nvtx(
         gpu_mgr, "revoke_onboard_pages", "gpu.revoke_onboard_pages_py"
     )
-    wrap_method_with_nvtx_safe(gpu_mgr, "evict", "gpu.evict_py")
-    wrap_method_with_nvtx_safe(gpu_mgr, "evict_all", "gpu.evict_all_py")
-    wrap_method_with_nvtx_safe(gpu_mgr, "put", "gpu.put_py")
-    wrap_method_with_nvtx_safe(gpu_mgr, "get", "gpu.get_py")
+    wrap_with_nvtx(gpu_mgr, "evict", "gpu.evict_py")
+    wrap_with_nvtx(gpu_mgr, "evict_all", "gpu.evict_all_py")
+    wrap_with_nvtx(gpu_mgr, "put", "gpu.put_py")
+    wrap_with_nvtx(gpu_mgr, "get", "gpu.get_py")
 
     gpu_impl = getattr(gpu_mgr, "impl_", None)
     if gpu_impl is not None:
@@ -457,7 +403,7 @@ def install_gpu_cpp_kernel_hooks(kvcache_mgr) -> None:
         print(f"[WARN] paged_kvcache_ops import failed, skip kernel hook: {e}")
         return
 
-    wrap_module_function_with_nvtx_safe(
+    wrap_with_nvtx(
         paged_kvcache_ops, "append_kvcache", "gpu.kernel.append_kvcache"
     )
 
@@ -542,12 +488,6 @@ def parse_args() -> argparse.Namespace:
         help="Repeat count for the 3-step flow in one run",
     )
     parser.add_argument(
-        "--base-profile-mode",
-        choices=[PROFILE_MODE_FINE],
-        default=PROFILE_MODE_FINE,
-        help="FlexKV fine-grained NVTX hooks before C++/kernel hooks.",
-    )
-    parser.add_argument(
         "--mark-input-nvtx",
         action="store_true",
         help="Also mark step1.input and step3.input.",
@@ -566,7 +506,6 @@ def run_one_case(
         kvcache_mgr = create_testing_kvcache_manager(
             max_batch_size=batch_size,
             max_seq_len=max_seq_len,
-            profile_mode=args.base_profile_mode,
         )
         install_gpu_cpp_kernel_hooks(kvcache_mgr)
         install_cpu_cpp_hooks(kvcache_mgr)
@@ -641,8 +580,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     print(
         f"[INFO] len_per_seq={args.len_per_seq}, "
-        f"batch_size={args.batch_size}, repeat={args.repeat}, "
-        f"base_profile_mode={args.base_profile_mode}"
+        f"batch_size={args.batch_size}, repeat={args.repeat}"
     )
     print(f"[INFO] seqlen={[args.len_per_seq] * args.batch_size}")
 

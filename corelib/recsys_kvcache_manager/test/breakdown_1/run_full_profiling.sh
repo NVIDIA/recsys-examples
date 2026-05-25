@@ -11,8 +11,6 @@ MODE_DIR="flexkv_profile_fine"
 SEQ_LENS=(1024 2048 4096)
 BATCH_SIZE=8
 REPEAT=1
-BASE_PROFILE_MODE="flexkv_fine"
-
 mkdir -p \
   "${OUT_ROOT}/rep/${MODE_DIR}" \
   "${OUT_ROOT}/csv/${MODE_DIR}" \
@@ -32,7 +30,6 @@ for len in "${SEQ_LENS[@]}"; do
     --force-overwrite true \
     -o "${OUT_ROOT}/rep/${MODE_DIR}/${tag}" \
     python3 test_flexkv_profile_fine.py \
-      --base-profile-mode "${BASE_PROFILE_MODE}" \
       --len-per-seq "${len}" \
       --batch-size "${BATCH_SIZE}" \
       --repeat "${REPEAT}" \

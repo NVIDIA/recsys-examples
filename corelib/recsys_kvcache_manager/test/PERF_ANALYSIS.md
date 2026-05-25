@@ -26,13 +26,14 @@
 
 
 ```text
-[Step1: offload round（100% GPU miss）] input (1024 x 8) → lookup → allocate(+gpu.put) → offload_launch(+put_async) → offload_wait
+[Step1: offload round（new sequence, no cache）] input (1024 x 8) → lookup → allocate(+gpu.put) → offload_launch(+put_async) → offload_wait
 [Step2] evict_gpu
-[Step3: onboard round (100% GPU hit)] input (the same, 1024 x 8 ) → lookup → allocate → onboard_launch → onboard_wait
+[Step3: onboard round (100% GPU miss, 100% CPU hit)] input (the same, 1024 x 8 ) → lookup → allocate → onboard_launch → onboard_wait
 ```
 
-### 1.2 step-op results
+![Profiling overview](breakdown_1/profiler_result/plot/plot/overview.png)
 
+### 1.2 step-op results
 
 <table>
   <thead>
@@ -46,61 +47,54 @@
   </thead>
   <tbody>
     <tr>
-      <td rowspan="4">offload round（100% GPU miss）</td>
+      <td rowspan="4">offload round（new sequence, no cache）</td>
       <td>lookup</td>
-      <td>10.18</td>
-      <td>5.04</td>
-      <td>5.09</td>
+      <td>4.949</td>
+      <td>5.191</td>
+      <td>5.188</td>
     </tr>
     <tr>
       <td>allocate</td>
-      <td>9.81</td>
-      <td>1.15</td>
-      <td>1.14</td>
+      <td>1.131</td>
+      <td>1.083</td>
+      <td>1.075</td>
     </tr>
     <tr>
       <td>offload_launch</td>
-      <td>11.44</td>
-      <td>9.74</td>
-      <td>10.25</td>
+      <td>9.232</td>
+      <td>9.196</td>
+      <td>9.237</td>
     </tr>
     <tr>
       <td><strong>offload_wait</strong></td>
-      <td><strong>15.34</strong></td>
-      <td><strong>24.48</strong></td>
-      <td><strong>39.41</strong></td>
+      <td><strong>15.532</strong></td>
+      <td><strong>23.488</strong></td>
+      <td><strong>40.736</strong></td>
     </tr>
     <tr>
-      <td>evict</td>
-      <td>evict_gpu</td>
-      <td>0.11</td>
-      <td>0.10</td>
-      <td>0.10</td>
-    </tr>
-    <tr>
-      <td rowspan="4">onboard round（100% GPU hit）</td>
+      <td rowspan="4">onboard round（100% GPU miss, 100% CPU hit）</td>
       <td>lookup</td>
-      <td>3.44</td>
-      <td>3.14</td>
-      <td>3.50</td>
+      <td>3.657</td>
+      <td>3.290</td>
+      <td>3.480</td>
     </tr>
     <tr>
       <td>allocate</td>
-      <td>0.46</td>
-      <td>0.44</td>
-      <td>0.46</td>
+      <td>0.452</td>
+      <td>0.447</td>
+      <td>0.455</td>
     </tr>
     <tr>
       <td>onboard_launch</td>
-      <td>2.77</td>
-      <td>2.29</td>
-      <td>2.30</td>
+      <td>2.381</td>
+      <td>2.253</td>
+      <td>2.261</td>
     </tr>
     <tr>
       <td>onboard_wait</td>
-      <td>9.27</td>
-      <td>10.69</td>
-      <td>15.78</td>
+      <td>9.589</td>
+      <td>12.052</td>
+      <td>15.696</td>
     </tr>
   </tbody>
 </table>
@@ -109,8 +103,6 @@
 ![Step ops breakdown](breakdown_1/profiler_result/plot/plot/step_op_flow_bs8.png)
 
 ### 1.3 L3 key-call breakdown
-
-
 <table>
   <thead>
     <tr>
@@ -123,155 +115,136 @@
   </thead>
   <tbody>
     <tr>
-      <td rowspan="13">offload round（100% GPU miss）</td>
+      <td rowspan="12">offload round（new sequence, no cache）</td>
       <td><code>gpu.lookup_py</code></td>
-      <td>0.114</td>
-      <td>0.109</td>
-      <td>0.120</td>
+      <td>0.066</td>
+      <td>0.086</td>
+      <td>0.068</td>
     </tr>
     <tr>
       <td><code>flexkv.build_index_meta</code></td>
-      <td>1.849</td>
-      <td>0.458</td>
-      <td>0.487</td>
+      <td>0.347</td>
+      <td>0.330</td>
+      <td>0.339</td>
     </tr>
     <tr>
       <td><code>flexkv.adapter.to_get_match_requests</code></td>
-      <td>0.139</td>
-      <td>0.136</td>
-      <td>0.144</td>
+      <td>0.078</td>
+      <td>0.079</td>
+      <td>0.083</td>
     </tr>
     <tr>
       <td><code>flexkv.client.get_match</code></td>
-      <td>6.791</td>
-      <td>4.674</td>
-      <td>5.059</td>
+      <td>2.455</td>
+      <td>2.581</td>
+      <td>2.666</td>
     </tr>
     <tr>
       <td><code>recsys.merge_lookup_results</code></td>
-      <td>2.749</td>
-      <td>0.788</td>
-      <td>0.804</td>
+      <td>0.386</td>
+      <td>0.390</td>
+      <td>0.384</td>
     </tr>
     <tr>
       <td><code>gpu.allocate_py</code></td>
-      <td>16.984</td>
-      <td>1.909</td>
-      <td>1.937</td>
+      <td>1.118</td>
+      <td>1.068</td>
+      <td>1.062</td>
     </tr>
     <tr>
       <td><code>gpu.acquire_offload_pages_py</code></td>
-      <td>0.230</td>
-      <td>0.213</td>
-      <td>0.219</td>
+      <td>0.127</td>
+      <td>0.127</td>
+      <td>0.131</td>
     </tr>
     <tr>
       <td><code>flexkv._build_slot_mappings</code></td>
-      <td>8.096</td>
-      <td>5.630</td>
-      <td>5.645</td>
+      <td>4.577</td>
+      <td>4.466</td>
+      <td>4.464</td>
     </tr>
     <tr>
       <td><code>flexkv.client.put_async</code></td>
-      <td>3.547</td>
-      <td>3.994</td>
-      <td>4.346</td>
-    </tr>
-    <tr>
-      <td><code>flexkv.client.launch</code></td>
-      <td>0.404</td>
-      <td>0.401</td>
-      <td>0.382</td>
+      <td>3.553</td>
+      <td>3.595</td>
+      <td>3.616</td>
     </tr>
     <tr>
       <td><code>flexkv.client.try_wait</code></td>
-      <td>7.681</td>
-      <td>12.137</td>
-      <td>18.742</td>
+      <td>7.518</td>
+      <td>11.224</td>
+      <td>19.632</td>
     </tr>
     <tr>
       <td><code>flexkv.finish_task</code></td>
-      <td>0.417</td>
-      <td>0.439</td>
-      <td>0.417</td>
+      <td>0.443</td>
+      <td>0.367</td>
+      <td>0.380</td>
     </tr>
     <tr>
       <td><code>gpu.release_offload_pages_py</code></td>
-      <td>0.224</td>
-      <td>0.228</td>
-      <td>0.163</td>
+      <td>0.120</td>
+      <td>0.127</td>
+      <td>0.096</td>
     </tr>
     <tr>
-      <td>evict</td>
-      <td><code>gpu.evict_py</code></td>
-      <td>0.126</td>
-      <td>0.119</td>
-      <td>0.113</td>
-    </tr>
-    <tr>
-      <td rowspan="10">onboard round（100% GPU hit）</td>
+      <td rowspan="9">onboard round（100% GPU miss, 100% CPU hit）</td>
       <td><code>gpu.lookup_py</code></td>
-      <td>0.103</td>
-      <td>0.101</td>
-      <td>0.105</td>
+      <td>0.022</td>
+      <td>0.022</td>
+      <td>0.022</td>
     </tr>
     <tr>
       <td><code>flexkv.build_index_meta</code></td>
-      <td>1.849</td>
-      <td>0.458</td>
-      <td>0.487</td>
+      <td>0.126</td>
+      <td>0.128</td>
+      <td>0.165</td>
     </tr>
     <tr>
       <td><code>flexkv.adapter.to_get_match_requests</code></td>
-      <td>0.139</td>
-      <td>0.136</td>
-      <td>0.144</td>
+      <td>0.058</td>
+      <td>0.057</td>
+      <td>0.061</td>
     </tr>
     <tr>
       <td><code>flexkv.client.get_match</code></td>
-      <td>6.791</td>
-      <td>4.674</td>
-      <td>5.059</td>
+      <td>2.636</td>
+      <td>2.307</td>
+      <td>2.414</td>
     </tr>
     <tr>
       <td><code>recsys.merge_lookup_results</code></td>
-      <td>2.749</td>
-      <td>0.788</td>
-      <td>0.804</td>
+      <td>0.435</td>
+      <td>0.390</td>
+      <td>0.406</td>
     </tr>
     <tr>
       <td><code>gpu.allocate_py</code></td>
-      <td>10.404</td>
-      <td>1.713</td>
-      <td>1.738</td>
+      <td>0.441</td>
+      <td>0.436</td>
+      <td>0.444</td>
     </tr>
     <tr>
       <td><code>flexkv._build_slot_mappings</code></td>
-      <td>8.096</td>
-      <td>5.630</td>
-      <td>5.645</td>
-    </tr>
-    <tr>
-      <td><code>flexkv.client.put_async</code></td>
-      <td>3.547</td>
-      <td>3.994</td>
-      <td>4.346</td>
+      <td>1.232</td>
+      <td>1.118</td>
+      <td>1.123</td>
     </tr>
     <tr>
       <td><code>flexkv.client.launch</code></td>
-      <td>0.404</td>
-      <td>0.401</td>
-      <td>0.382</td>
+      <td>0.385</td>
+      <td>0.392</td>
+      <td>0.389</td>
     </tr>
     <tr>
       <td><code>flexkv.client.wait</code></td>
-      <td>9.567</td>
-      <td>11.002</td>
-      <td>16.082</td>
+      <td>9.499</td>
+      <td>11.979</td>
+      <td>15.629</td>
     </tr>
   </tbody>
 </table>
-
+---
 
 ### 1.4 Offload_try_wait single breakdown
 
