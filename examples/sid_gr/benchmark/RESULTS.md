@@ -41,24 +41,15 @@ discussed below). Median of 20 iterations after 5 warmup;
 `cuda.synchronize()` before/after each iteration. All 16 configs PASS
 top-K beam set overlap ≥ 70% between the two paths.
 
-`generate_beam_decode()` / `generate()` speedup:
+<p align="center">
+  <img src="../figs/speedup_grid.png" alt="generate_beam_decode speedup over generate, across batch × history length" width="85%">
+</p>
 
-| Batch ↓ hist → | 256 | 512 | 1024 | 2048 |
-|---:|---:|---:|---:|---:|
-|  1 | 1.04× | 1.03× | 1.03× |  1.49× |
-|  4 | 1.14× | 1.63× | 2.19× |  8.59× |
-|  8 | 2.27× | 3.61× | 6.15× | 16.34× |
-| 16 | 5.97× | 10.77× | 20.98× | **49.73×** |
-
-Absolute `generate()` latency (ms) for context — `generate_beam_decode`
-runs in 21-80 ms across the same grid:
-
-| Batch ↓ hist → | 256 | 512 | 1024 | 2048 |
-|---:|---:|---:|---:|---:|
-|  1 |  22.32 |  22.19 |   22.15 |    44.71 |
-|  4 |  25.07 |  38.44 |   60.44 |   377.34 |
-|  8 |  50.55 |  85.85 |  188.85 |   817.46 |
-| 16 | 139.38 | 311.21 |  875.29 | **3975.12** |
+`generate_beam_decode()` over `generate()` speedup, log scale. The
+bottom-right (`B=16, hist=2048`) hits ~50× e2e; the top-left
+(`B=1, hist≤1024`) is essentially flat (overhead-bound). For context:
+at `B=16 hist=2048`, `generate()` takes ~4.0 s of wallclock while
+`generate_beam_decode()` takes ~80 ms.
 
 ## Summary
 
