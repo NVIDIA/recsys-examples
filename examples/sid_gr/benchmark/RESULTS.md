@@ -26,14 +26,16 @@ pinned to `b56db721`). Measured 2026-05-26.
   per layer).
 - **`generate_beam_decode()`** (optimized): one prefill over
   `[history + BOS]` populates a per-layer context KV cache, then
-  `num_hierarchies − 1` decode steps each process only `beam_width`
-  new tokens through the transformer, using the `beam_decode_attn`
-  kernel to reuse the context KV cache and track per-beam ancestry via
-  `topk_indices`.
+  `num_hierarchies − 1` decode steps each process `B × beam_width`
+  new tokens (one beam set per sample) through the transformer, using
+  the `beam_decode_attn` kernel to reuse the context KV cache and
+  track per-beam ancestry via `topk_indices`.
 
-The savings come from (a) MLP / projections only run on `beam_width`
-new tokens per step instead of on the full prefix × effective batch,
-and (b) attention complexity drops from O(seqlen²) to O(seqlen × W).
+The savings come from (a) MLP / projections only run on
+`B × beam_width` new tokens per step instead of on the full
+`[hist + already-generated] × B × beam_width` activations, and (b)
+attention complexity drops from O(seqlen²) to O(seqlen × W) per
+sample.
 
 ## End-to-end latency
 
@@ -54,10 +56,13 @@ The wallclock gap between the two bars widens along both axes:
   hierarchy step, so its cost scales super-linearly with history.
   `generate_beam_decode()` pays the history cost once during prefill,
   so it scales much more gently.
-- **Along batch** — `generate()`'s effective batch is `B × beam_w`
-  (each beam keeps its own prefix), which saturates the GPU quickly.
-  `generate_beam_decode()` only feeds `beam_w` new tokens per decode
-  step into the transformer.
+- **Along batch** — both paths scale with `B × beam_w` on the
+  transformer side (each beam carries its own activations), but
+  `generate()` re-runs that activation over the full
+  `[hist + already-generated]` sequence at every hierarchy step while
+  `generate_beam_decode()` runs it over only the `beam_w` new tokens
+  per sample per decode step. The compute saved per sample is roughly
+  proportional to history length.
 
 Concretely, the corner cases:
 
@@ -121,6 +126,20 @@ Three layers, strongest to weakest:
 
 ## Known issues
 
+- **Uniform beam widths across hierarchy steps.** The
+  `beam_decode_attn` kernel asserts a fixed stride
+  `k_beam.shape[1] == decode_nums × beam_width`, so
+  `generate_beam_decode` raises `ValueError` if the configured
+  `BeamSearch.beam_widths` list is non-uniform. For retrieval setups
+  that taper the beam width over steps, fall back to `generate()`.
+- **`beam_width ≤ min(codebook_sizes)`.** `BeamSearch.propagate`
+  clamps the per-step topk to
+  `min(beam_width, topk_prev × codebook_size_this_step)`. If any
+  codebook is smaller than the configured beam width, the clamp
+  shrinks topk and breaks the kernel's stride assumption, so
+  `generate_beam_decode` also rejects this combination at entry.
+  Realistic SID-GR retrieval may want `beam_width = 200 – 1000`;
+  ensure every level's codebook is at least that wide.
 - **Split-KV + `seqused_k`** hangs the K1 context-attention launch on
   SM90 (observed once during kernel development). The vendored kernel
   forces `num_splits=1` when `seqused_k` is set; the workaround costs
