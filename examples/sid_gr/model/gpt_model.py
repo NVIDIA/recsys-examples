@@ -1070,20 +1070,20 @@ class SIDGRModel(MegatronModule):
 
         if backend == "3kernel" and use_jagged_kv:
             # Jagged-native prefill: feed the concatenated [total_tokens, D]
-            # stream through FA as a B=1 sequence with arbitrary_func encoding
-            # per-sample causal isolation. The K/V caches that fall out are
-            # already jagged [total_tokens, H, D] — exactly the layout the
-            # kernel expects when cu_seqlens_k is supplied.
+            # stream through FA's `flash_attn_varlen_func` fast path. The
+            # K/V caches that fall out are already jagged [total_tokens, H, D]
+            # — exactly the layout the kernel expects when cu_seqlens_k is
+            # supplied. We hand cu_seqlens directly to FA (varlen + causal)
+            # instead of going through arbitrary_func + block-sparsity, which
+            # is ~6× slower at hist=2048 for the same semantics.
             total_tokens = int(input_offsets[-1].item())
-            jagged_arbitrary_func = build_jagged_causal_arbitrary_func(
-                input_offsets, total_tokens
-            )
             flat_history = history_embeddings.unsqueeze(0).to(
                 self._training_dtype
             )  # [1, total_tokens, D]
             prefill_output, context_kv_caches = fa_block.prefill(
                 flat_history,
-                arbitrary_func=jagged_arbitrary_func,
+                cu_seqlens=input_offsets.to(torch.int32),
+                max_seqlen=input_max_seqlen,
                 seqlen=total_tokens,
             )
             prefill_output = prefill_output.squeeze(0)  # [total_tokens, D]
