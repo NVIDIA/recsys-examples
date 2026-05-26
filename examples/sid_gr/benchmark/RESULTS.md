@@ -35,40 +35,45 @@ The savings come from (a) MLP / projections only run on `beam_width`
 new tokens per step instead of on the full prefix × effective batch,
 and (b) attention complexity drops from O(seqlen²) to O(seqlen × W).
 
-## Speedup
+## End-to-end latency
 
 Fixed across the grid: `hidden=1024`, `num_heads=8`, `kv_channels=128`
 (head_dim), `num_layers=8`, `num_hierarchies=4`, `codebook_size=256`,
-`beam_width=200`, `bf16`, `use_jagged_kv=True` (the default;
-discussed below). Median of 20 iterations after 5 warmup;
+`beam_width=200`, `bf16`. Median of 20 iterations after 5 warmup;
 `cuda.synchronize()` before/after each iteration. All 16 configs PASS
 top-K beam set overlap ≥ 70% between the two paths.
 
 <p align="center">
-  <img src="../figs/speedup_grid.png" alt="generate_beam_decode speedup over generate, across batch × history length" width="85%">
+  <img src="../figs/latency_grid.png" alt="End-to-end SID-GR generation latency: generate() vs generate_beam_decode() across batch × history length (lower is better)" width="100%">
 </p>
 
-`generate_beam_decode()` over `generate()` speedup, log scale. The
-bottom-right (`B=16, hist=2048`) hits ~50× e2e; the top-left
-(`B=1, hist≤1024`) is essentially flat (overhead-bound). For context:
-at `B=16 hist=2048`, `generate()` takes ~4.0 s of wallclock while
-`generate_beam_decode()` takes ~80 ms.
+The wallclock gap between the two bars widens along both axes:
 
-## Summary
+- **Along history length** — `generate()` reruns the full transformer
+  over the growing `[history + already-generated]` sequence every
+  hierarchy step, so its cost scales super-linearly with history.
+  `generate_beam_decode()` pays the history cost once during prefill,
+  so it scales much more gently.
+- **Along batch** — `generate()`'s effective batch is `B × beam_w`
+  (each beam keeps its own prefix), which saturates the GPU quickly.
+  `generate_beam_decode()` only feeds `beam_w` new tokens per decode
+  step into the transformer.
 
-Speedup grows monotonically along both dimensions. The bottom-right
-corner (`B=16, hist=2048, beam_w=200`) is the realistic offline
-candidate-generation regime: `generate()` takes **~4.0 s**,
-`generate_beam_decode()` takes **~80 ms** — a ~50× e2e wallclock cut
-that turns "unusable for online retrieval" into "usable as part of a
-serving pipeline."
+Concretely, the corner cases:
 
-The top-left corner (`B=1, hist≤1024, beam_w=200`) is essentially flat
-(~1.03×). At single-user scale the per-step Python orchestration (KJT
-construction, embedding lookup, layer-stack launch overhead) dominates
-wallclock, so saving the prefix recomputation work has nowhere to
-land. The optimization is targeted at batched offline / warm-pool
-inference, not single-request online serving.
+| | `generate()` | `generate_beam_decode()` | speedup |
+|---|---:|---:|---:|
+| `B=1`, `hist=256` (single online query, short hist) | 22.3 ms | 21.5 ms | 1.04× |
+| `B=1`, `hist=2048` | 44.7 ms | 30.1 ms | 1.49× |
+| `B=16`, `hist=256` | 139 ms | 23 ms | 5.97× |
+| **`B=16`, `hist=2048`** (offline batched candidates) | **3.98 s** | **80 ms** | **49.7×** |
+
+At `B=1` the speedup stays near 1× because per-step Python
+orchestration (KJT construction, embedding lookup, layer-stack launch
+overhead) dominates wallclock at single-user scale; the optimization
+saves prefix recomputation work, which has nowhere to land when there
+is little compute to amortize over. The target is batched offline /
+warm-pool inference, not single-request online serving.
 
 ## How to reproduce
 
