@@ -11,8 +11,8 @@ per-call kernel latency) lives in the upstream repo
 inference caller sees, including all Python orchestration, embedding
 lookup, and per-step KJT overhead.
 
-Hardware: **NVIDIA H100 NVL** (94 GB). Container: recsys-examples
-Docker (bf16). Branch: post-merge of PR #379.
+Hardware: **NVIDIA H100 80GB HBM3 (SXM)**. Container: recsys-examples
+Docker (bf16).
 
 ## What the two paths do
 
@@ -23,7 +23,7 @@ Docker (bf16). Branch: post-merge of PR #379.
   per layer).
 - **`generate_beam_decode()`** (optimized): one prefill over
   `[history + BOS]` populates a per-layer context KV cache, then
-  `num_hierarchies - 1` decode steps each process only `beam_width`
+  `num_hierarchies − 1` decode steps each process only `beam_width`
   new tokens through the transformer, using the `beam_decode_attn`
   kernel to reuse the context KV cache and track per-beam ancestry via
   `topk_indices`.
@@ -36,51 +36,52 @@ and (b) attention complexity drops from O(seqlen²) to O(seqlen × W).
 
 Fixed across the grid: `hidden=1024`, `num_heads=8`, `kv_channels=128`
 (head_dim), `num_layers=8`, `num_hierarchies=4`, `codebook_size=256`,
-`beam_width=200`, `bf16`. Median of 20 iterations after 5 warmup;
-`cuda.synchronize()` before/after each iteration. All configs PASS
+`beam_width=200`, `bf16`, `use_jagged_kv=True` (the default;
+discussed below). Median of 20 iterations after 5 warmup;
+`cuda.synchronize()` before/after each iteration. All 16 configs PASS
 top-K beam set overlap ≥ 70% between the two paths.
 
 `generate_beam_decode()` / `generate()` speedup:
 
-| Batch ↓  hist → | 256 | 512 | 1024 | 2048 |
+| Batch ↓ hist → | 256 | 512 | 1024 | 2048 |
 |---:|---:|---:|---:|---:|
-|  1 | 1.08× | 1.07× | 1.04× |  1.41× |
-|  4 | 1.25× | 1.59× | 1.82× |  7.68× |
-|  8 | 2.37× | 3.14× | 4.82× | 10.55× |
-| 16 | 5.31× | 8.69× | 13.45× | **28.30×** |
+|  1 | 1.04× | 1.03× | 1.03× |  1.49× |
+|  4 | 1.14× | 1.63× | 2.19× |  8.59× |
+|  8 | 2.27× | 3.61× | 6.15× | 16.34× |
+| 16 | 5.97× | 10.77× | 20.98× | **49.73×** |
 
 Absolute `generate()` latency (ms) for context — `generate_beam_decode`
-runs in 20-270 ms across the same grid:
+runs in 21-80 ms across the same grid:
 
-| Batch ↓  hist → | 256 | 512 | 1024 | 2048 |
+| Batch ↓ hist → | 256 | 512 | 1024 | 2048 |
 |---:|---:|---:|---:|---:|
-|  1 |  22.22 |  21.49 |   21.54 |    45.42 |
-|  4 |  26.39 |  42.08 |   66.72 |   477.74 |
-|  8 |  55.63 |  95.23 |  234.54 |  1183.50 |
-| 16 | 154.58 | 388.56 | 1256.90 | **7579.60** |
+|  1 |  22.32 |  22.19 |   22.15 |    44.71 |
+|  4 |  25.07 |  38.44 |   60.44 |   377.34 |
+|  8 |  50.55 |  85.85 |  188.85 |   817.46 |
+| 16 | 139.38 | 311.21 |  875.29 | **3975.12** |
 
 ## Summary
 
 Speedup grows monotonically along both dimensions. The bottom-right
 corner (`B=16, hist=2048, beam_w=200`) is the realistic offline
-candidate-generation regime: `generate()` takes **7.58 s**,
-`generate_beam_decode()` takes **268 ms** — a 28× e2e wallclock cut
+candidate-generation regime: `generate()` takes **~4.0 s**,
+`generate_beam_decode()` takes **~80 ms** — a ~50× e2e wallclock cut
 that turns "unusable for online retrieval" into "usable as part of a
 serving pipeline."
 
-The top-left corner (`B=1, hist≤1024, beam_w=200`) is essentially
-flat (~1.05×). At single-user scale the per-step Python orchestration
-(KJT construction, embedding lookup, layer-stack launch overhead)
-dominates wallclock, so saving the prefix recomputation work has
-nowhere to land. The optimization is targeted at batched offline /
-warm-pool inference, not single-request online serving.
+The top-left corner (`B=1, hist≤1024, beam_w=200`) is essentially flat
+(~1.03×). At single-user scale the per-step Python orchestration (KJT
+construction, embedding lookup, layer-stack launch overhead) dominates
+wallclock, so saving the prefix recomputation work has nowhere to
+land. The optimization is targeted at batched offline / warm-pool
+inference, not single-request online serving.
 
 ## How to reproduce
 
 ```bash
 cd examples/sid_gr
 torchrun --nproc_per_node 1 benchmark/benchmark_beam_decode.py \
-  --sweep \
+  --sweep --use_jagged_kv \
   --batch_size 16 --num_hierarchies 4 --num_layers 8 \
   --hidden_size 1024 --num_heads 8 --kv_channels 128 \
   --sweep_hist 256,512,1024,2048 \
@@ -91,24 +92,35 @@ Vary `--batch_size` to fill in the other rows of the grid. The
 Dockerfile adds `corelib/gr_decode_atten/` to `PYTHONPATH`, so no
 extra setup is needed inside the container.
 
-## Jagged-native context K/V (`use_jagged_kv=True`)
+## Jagged-native context K/V (`use_jagged_kv=True`, default)
 
-`generate_beam_decode` exposes a `use_jagged_kv` flag that feeds the
-prefill K/V as a flattened `[total_tokens, H, D]` stream + `cu_seqlens_k`
-instead of dense `[B, Sk_max, H, D]` + `seqused_k`. Measured at the
-same config (`B=16, beam_w=200, bf16`):
+`generate_beam_decode` exposes a `use_jagged_kv` flag that controls
+how the prefill K/V is fed into the kernel:
 
-| hist | dense (B) | jagged (C) | dense / jagged |
+- **`use_jagged_kv=True`** (default): pack history as a flattened
+  `[total_tokens, H, D]` stream and call FA's `flash_attn_varlen_func`
+  with `causal=True` + `cu_seqlens_k`. No padding compute.
+- **`use_jagged_kv=False`**: pad history to `[B, Sk_max, H, D]` and
+  call FA's `flash_attn_func` with `causal=True` + `seqused_k` to
+  mask the pad positions.
+
+Both paths share the same standard-causal FA fast path internally, so
+the only difference at the wallclock level is whether the padding
+compute is done (dense) or skipped (jagged). Measured at
+`B=16, beam_w=200, bf16`:
+
+| hist | dense (ms) | jagged (ms) | jagged / dense |
 |---:|---:|---:|---:|
-|  256 |  29.4 ms |  34.5 ms | **0.85×** |
-| 1024 |  87.5 ms | 268.8 ms | **0.33×** |
-| 2048 | 262.5 ms |  1.60 s  | **0.16×** |
+|  256 |  27.1 | 23.3 | **1.17×** |
+| 1024 |  59.5 | 41.6 | **1.43×** |
+| 2048 | 118.1 | 80.1 | **1.48×** |
 
-Dense is decisively faster — by 17% at short history and **6× at hist=2048**.
-The prefill `arbitrary=True` path in FA pays an O(N²) block-sparsity
-setup cost that scales much worse than the `causal=True` fast path,
-and that cost dominates as history grows. `use_jagged_kv=False` (the
-default) is the right choice on every measured shape.
+Jagged is 17 - 48 % faster across the range; the gap widens with
+history length because padding compute is proportional to
+`B × (Sk_max − seq_len[b])`.
+
+At `B=1` the two paths are equivalent (no inter-sample padding to
+skip); both are bounded by per-step orchestration overhead.
 
 ## Correctness verification
 
@@ -123,12 +135,12 @@ Three layers, weakest to strongest:
    `tests/test_beam_decode_generate.py`): direct geometry check on
    `padded_target_aware_causal_mask`.
 3. **End-to-end regression guard** (this benchmark + the
-   `test_generate_vs_generate_beam_decode_regression_guard` unit test):
-   asserts top-K beam SID set overlap ≥ 70% between the two paths.
-   bf16 noise plus beam-search topk tie-breaking make bit-exact
-   equivalence impossible; the overlap metric stays bounded in [0, 1]
-   regardless of scale, so the threshold remains meaningful as
-   workloads grow.
+   `test_generate_vs_generate_beam_decode_regression_guard` unit
+   test): asserts top-K beam SID set overlap ≥ 70% between the two
+   paths. bf16 noise plus beam-search topk tie-breaking make
+   bit-exact equivalence impossible; the overlap metric stays bounded
+   in `[0, 1]` regardless of scale, so the threshold remains
+   meaningful as workloads grow.
 
 ## Known issues
 
@@ -136,6 +148,8 @@ Three layers, weakest to strongest:
   SM90 (observed once during kernel development). The vendored kernel
   forces `num_splits=1` when `seqused_k` is set; the workaround costs
   a few percent on small-batch shapes but avoids the hang.
-- **`use_jagged_kv=True`** is kept as a developer-facing flag for
-  experiments but is not recommended for production use given the
-  numbers above.
+- **`use_jagged_kv=False`** (dense + `seqused_k`) is kept as an
+  alternative for callers that already produce padded inputs and want
+  to avoid the explicit `cu_seqlens` plumbing. It is 17 - 48 % slower
+  than the default `True` path at `B=16` but otherwise identical in
+  semantics.
