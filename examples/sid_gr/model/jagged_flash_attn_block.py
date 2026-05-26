@@ -459,7 +459,6 @@ class JaggedGPTLayer(nn.Module):
         hidden_states: torch.Tensor,
         arbitrary_func: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
         linear_k: Optional[object] = None,
         linear_q: Optional[object] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -469,7 +468,9 @@ class JaggedGPTLayer(nn.Module):
           1. ``cu_seqlens`` is set → flattened jagged input, plain
              per-sample causal. Uses FA's ``flash_attn_varlen_func``
              fast path (orders of magnitude faster than the
-             arbitrary-mask path for the same semantics).
+             arbitrary-mask path for the same semantics). The cute
+             interface infers ``max_seqlen`` from ``cu_seqlens``, so
+             we don't pass it explicitly.
           2. ``arbitrary_func`` is set → generic mask (e.g. beam
              isolation in ``generate()``). Uses the arbitrary-mask FA
              path.
@@ -480,7 +481,6 @@ class JaggedGPTLayer(nn.Module):
             hidden_states: ``[1, total_tokens, hidden]`` for mode 1,
                 ``[B, S, hidden]`` for modes 2/3.
             cu_seqlens: ``[B + 1]`` int32 offsets for mode 1.
-            max_seqlen: max per-sample length for mode 1.
 
         Returns:
             hidden_states: same leading shape as input.
@@ -769,7 +769,6 @@ class JaggedFlashAttnBlock(nn.Module):
         hidden_states: torch.Tensor,
         arbitrary_func: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
         seqlen: Optional[int] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward through all layers, returning per-layer KV caches.
@@ -780,9 +779,8 @@ class JaggedFlashAttnBlock(nn.Module):
             arbitrary_func: generic mask (mutually exclusive with
                 ``cu_seqlens``).
             cu_seqlens: ``[B + 1]`` int32 offsets for the varlen + causal
-                fast path (jagged input, per-sample causal).
-            max_seqlen: max per-sample length (required when
-                ``cu_seqlens`` is set; passed through to FA).
+                fast path (jagged input, per-sample causal). The cute
+                FA interface infers max_seqlen from cu_seqlens itself.
             seqlen: only used for ``arbitrary_func`` block-sparsity
                 construction; ignored otherwise.
 
@@ -808,7 +806,6 @@ class JaggedFlashAttnBlock(nn.Module):
                 hidden_states,
                 arbitrary_func=arbitrary_func,
                 cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
                 linear_k=linear_k,
                 linear_q=linear_q,
             )
