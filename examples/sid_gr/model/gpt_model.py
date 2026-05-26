@@ -855,7 +855,7 @@ class SIDGRModel(MegatronModule):
         batch: GPTSIDBatch,
         backend: str = "3kernel",
         phase_times: Optional[Dict[str, float]] = None,
-        use_jagged_kv: bool = False,
+        use_jagged_kv: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate using beam_decode_attn kernel with KV cache.
@@ -906,24 +906,18 @@ class SIDGRModel(MegatronModule):
                   - "prefill_ms": time spent in prefill (including embedding).
                   - "decode_loop_ms": time spent in the decode loop.
                 Useful for benchmarking. Adds tiny overhead.
-            use_jagged_kv: when True and ``backend="3kernel"``, run
-                prefill in jagged-native mode (concatenated
-                ``[total_tokens, D]`` stream through FA with an
-                arbitrary causal mask) and feed jagged
-                ``[total_k, H, D]`` context K/V caches to the kernel via
-                ``cu_seqlens_k``. No padding is computed anywhere.
-                When False (default), pad history to
-                ``[B, max_seqlen, D]``, run FA in ``causal=True``, and
-                pass ``seqused_k`` to mask pad positions.
-
-                Dense is faster on short-history shapes because FA's
-                ``causal=True`` is heavily optimized and the
-                arbitrary-mask path adds block-sparsity setup overhead.
-                Jagged wins once context grows past roughly
-                ``hist >= 1000`` items; see benchmark/RESULTS.md.
-
-                Requires ``backend="3kernel"``; raises ``ValueError``
-                otherwise.
+            use_jagged_kv: default ``True``. Prefill runs as a packed
+                ``[total_tokens, D]`` stream through FA's
+                ``flash_attn_varlen_func`` (``causal=True`` +
+                ``cu_seqlens``) and the resulting jagged
+                ``[total_k, H, D]`` K/V caches are fed to the kernel via
+                ``cu_seqlens_k``. No padding compute anywhere.
+                ``False`` is a legacy fallback that pads history to
+                ``[B, max_seqlen, D]`` and uses ``seqused_k`` to mask
+                pad positions; measured 17 – 48 % slower at ``B=16``
+                across ``hist ∈ {256, 1024, 2048}`` and kept only for
+                callers that already produce padded inputs.
+                Requires ``backend="3kernel"``.
         """
         # Backend whitelist: the kernel's interface silently treats any
         # non-"3kernel" string as the fused/dsl path, so reject typos
