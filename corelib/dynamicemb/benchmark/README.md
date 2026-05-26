@@ -55,7 +55,11 @@ use pytest's `-k`, `-x`, `--co`, etc. to select / inspect tests.
 
 ### Test suites
 
-Four suites parametrize over `(batch_size, optimizer, pooling_mode)`:
+Four suites parametrize over `(batch_size, num_tables, optimizer, pooling_mode)`
+plus `cache_footprint_ratio` for `TestCaching`.  Defaults: `num_tables=10`
+with per-table cap = `_GPU_TOTAL_CAP // nt` (`TestGpu`) or
+`_CACHE_TOTAL_CAP // nt` (everything else), so total HBM stays fixed
+as `nt` changes.
 
 | Suite           | gpu_ratio | caching | Notes                              |
 | --------------- | --------- | ------- | ---------------------------------- |
@@ -96,8 +100,10 @@ bash ./benchmark/benchmark_batched_dynamicemb_tables.sh --co
 ```
 
 Config labels look like
-`T1_totalB1048576_D128_adam_caching_pool=none_cap=256M`; you can match any
-substring of that with `-k`.
+`T10_totalB1048570_D128_adam_caching_pool=none_cap=25M_cfr=1.0`
+(`T<num_tables>_totalB<total_batch>_..._cap=<per-table>M`; uniform
+per-table caps collapse to a single `cap=<N>M` token); you can match
+any substring of that with `-k`.
 
 ### Correctness mode
 
@@ -202,7 +208,7 @@ Flag breakdown (shared by both invocations):
 
 NVTX layout inside each window:
 ```
-<cfg.label()>                          # e.g. T1_totalB1048576_D128_adam_gpu_...
+<cfg.label()>                          # e.g. T10_totalB1048570_D128_adam_gpu_...
 └─ nsys_iter_0                         # per-iter
    ├─ dyn → forward / backward
    └─ trc → forward / backward
@@ -356,7 +362,7 @@ Each figure carries a two-line subtitle auto-derived from the result
 dict:
 
 ```
-NVIDIA H100 80GB HBM3  ·  D=128  ·  batch=1,048,576
+NVIDIA H100 80GB HBM3  ·  D=128  ·  batch=1,048,570
 pow-law(α=1.05)  ·  hotness=10  ·  pool=none
 ```
 
@@ -386,11 +392,11 @@ Run configuration:
 - hardware: NVIDIA H100 80GB HBM3 (single GPU)
 - embedding_dtype: float32
 - embedding_dim: 128
-- batch_size: 1,048,576 (single table)
+- num_tables: 10 (per-table batch = total / 10 = 104,857; total batch = 1,048,570)
 - cache_algorithm: lru
 - gpu_ratio: 1.0 (`TestGpu`) / footprint × `cache_footprint_ratio`
   (`TestCaching`) / 0.1 (`TestNoCaching`) / 0.0 (`TestNoHbm`)
-- capacity: 16M when gpu_ratio=1.0 (`TestGpu`, sized to fit dual backends in 80 GB), 256M otherwise
+- per-table capacity: 1.6M (`TestGpu`, `_GPU_TOTAL_CAP // nt` = 16M / 10, sized so DynamicEmb + TorchRec TBE both fit in 80 GB), 25.6M otherwise (`_CACHE_TOTAL_CAP // nt` = 256M / 10)
 - optimizers: adam (`eps=1e-8`) and sgd
 - num_iterations: 100
 
@@ -407,13 +413,15 @@ The sunburst rings are: phase (forward / backward) → stage
 when no wrapper is present).  Percentages are share of the full
 iteration time; letter codes index the legend table below each chart.
 
-`sgd + GPU (full HBM)` — fastest config; cost dominated by
-`storage_find` and the SGD update:
+`sgd + GPU (full HBM)` — 1.59 ms/iter; cost dominated by
+`segmented_unique` (~24%), `gather_embedding` (~19%), and
+`optimizer_update_fused` (~12%):
 
 ![sgd gpu per-op breakdown](./plots/breakdown_sgd_gpu.png)
 
-`adam + Caching cfr=1.0` — caching mode with the costlier optimizer;
-shows extra cache-traffic ops (`cache_lookup`, `cache_insert_evict`,
-`load_from_flat`/`store_to_flat`) on top of the adam update:
+`adam + Caching cfr=1.0` — 11.63 ms/iter; cache traffic dominates:
+`storage_insert` (~32%), `storage_find` (~25%), `cache_insert_evict`
+(~15%), `cache_lookup` (~8%), with the Adam update (`optimizer_update_fused`)
+only ~5%:
 
 ![adam caching cfr=1.0 per-op breakdown](./plots/breakdown_adam_caching_cfr1.0.png)
