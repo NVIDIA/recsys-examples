@@ -63,10 +63,10 @@ Concretely, the corner cases:
 
 | | `generate()` | `generate_beam_decode()` | speedup |
 |---|---:|---:|---:|
-| `B=1`, `hist=256` (single online query, short hist) | 22.3 ms | 21.5 ms | 1.04× |
-| `B=1`, `hist=2048` | 44.7 ms | 30.1 ms | 1.49× |
-| `B=16`, `hist=256` | 139 ms | 23 ms | 5.97× |
-| **`B=16`, `hist=2048`** (offline batched candidates) | **3.98 s** | **80 ms** | **49.7×** |
+| `B=1`, `hist=256`   | 22.3 ms | 21.5 ms | 1.04× |
+| `B=1`, `hist=2048`  | 44.7 ms | 30.1 ms | 1.49× |
+| `B=16`, `hist=256`  |  139 ms |   23 ms | 5.97× |
+| **`B=16`, `hist=2048`** | **3.98 s** | **80 ms** | **49.7×** |
 
 At `B=1` the speedup stays near 1× because per-step Python
 orchestration (KJT construction, embedding lookup, layer-stack launch
