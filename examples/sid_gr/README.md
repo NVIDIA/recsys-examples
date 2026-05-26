@@ -244,7 +244,7 @@ The diagram is conceptual: rows = beams, columns = decode steps. In memory `beam
 
 `context_kv_caches[ℓ]` is a single per-layer slab populated by prefill and read every decode step by every beam; no per-beam indexing. `beam_kv_caches[ℓ]` is a 2-D conceptual grid (decode step × beam slot) that grows by `W` rows per decode step; per-beam ancestor lookup walks `parent_indices` backwards and is fed to the kernel as `topk_indices`. This split is what keeps the kernel from re-shuffling the cache after each beam-search pruning and what avoids replicating history `W` times.
 
-For backend selection (`backend="3kernel"` vs `"dsl"`), jagged-vs-dense context K/V (`use_jagged_kv`), kernel dependency notes, and measured numbers, see [`benchmark/RESULTS.md`](./benchmark/RESULTS.md) and [`training/README.md`](./training/README.md).
+For backend selection (`backend="3kernel"` vs `"dsl"`), context K/V layout (`use_jagged_kv`, default `True`), kernel dependency notes, and measured numbers, see [`benchmark/RESULTS.md`](./benchmark/RESULTS.md) and [`training/README.md`](./training/README.md).
 
 
 ## References
