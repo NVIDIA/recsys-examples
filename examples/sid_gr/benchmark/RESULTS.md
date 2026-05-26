@@ -12,7 +12,10 @@ inference caller sees, including all Python orchestration, embedding
 lookup, and per-step KJT overhead.
 
 Hardware: **NVIDIA H100 80GB HBM3 (SXM)**. Container: recsys-examples
-Docker (bf16).
+Docker (torch 2.11.0a0+nv26.02, CUDA 13.1, bf16). Code: branch
+`enh-sid-gr-bench-rerun` (vendored kernel at `corelib/gr_decode_atten/`
+pinned to upstream `1c540f6`; `flash-attention` `arbitrary_mask` branch
+pinned to `b56db721`). Measured 2026-05-26.
 
 ## What the two paths do
 
@@ -69,53 +72,31 @@ inference, not single-request online serving.
 
 ## How to reproduce
 
+The bar chart above covers `batch ∈ {1, 4, 8, 16}` × `hist ∈ {256,
+512, 1024, 2048}`. The benchmark CLI sweeps `hist` and `beam_w` but
+not `batch`, so the figure is the concatenation of four runs, one per
+batch:
+
 ```bash
 cd examples/sid_gr
-torchrun --nproc_per_node 1 benchmark/benchmark_beam_decode.py \
-  --sweep --use_jagged_kv \
-  --batch_size 16 --num_hierarchies 4 --num_layers 8 \
-  --hidden_size 1024 --num_heads 8 --kv_channels 128 \
-  --sweep_hist 256,512,1024,2048 \
-  --sweep_beam 200 --sweep_dtype bf16
+for B in 1 4 8 16; do
+  torchrun --nproc_per_node 1 benchmark/benchmark_beam_decode.py \
+    --sweep --batch_size $B \
+    --num_hierarchies 4 --num_layers 8 \
+    --hidden_size 1024 --num_heads 8 --kv_channels 128 \
+    --sweep_hist 256,512,1024,2048 \
+    --sweep_beam 200 --sweep_dtype bf16
+done
 ```
 
-Vary `--batch_size` to fill in the other rows of the grid. The
-Dockerfile adds `corelib/gr_decode_atten/` to `PYTHONPATH`, so no
-extra setup is needed inside the container.
-
-## Jagged-native context K/V (`use_jagged_kv=True`, default)
-
-`generate_beam_decode` exposes a `use_jagged_kv` flag that controls
-how the prefill K/V is fed into the kernel:
-
-- **`use_jagged_kv=True`** (default): pack history as a flattened
-  `[total_tokens, H, D]` stream and call FA's `flash_attn_varlen_func`
-  with `causal=True` + `cu_seqlens_k`. No padding compute.
-- **`use_jagged_kv=False`**: pad history to `[B, Sk_max, H, D]` and
-  call FA's `flash_attn_func` with `causal=True` + `seqused_k` to
-  mask the pad positions.
-
-Both paths share the same standard-causal FA fast path internally, so
-the only difference at the wallclock level is whether the padding
-compute is done (dense) or skipped (jagged). Measured at
-`B=16, beam_w=200, bf16`:
-
-| hist | dense (ms) | jagged (ms) | jagged / dense |
-|---:|---:|---:|---:|
-|  256 |  27.1 | 23.3 | **1.17×** |
-| 1024 |  59.5 | 41.6 | **1.43×** |
-| 2048 | 118.1 | 80.1 | **1.48×** |
-
-Jagged is 17 - 48 % faster across the range; the gap widens with
-history length because padding compute is proportional to
-`B × (Sk_max − seq_len[b])`.
-
-At `B=1` the two paths are equivalent (no inter-sample padding to
-skip); both are bounded by per-step orchestration overhead.
+The Dockerfile adds `corelib/gr_decode_atten/` to `PYTHONPATH`, so no
+extra setup is needed inside the container. `--use_jagged_kv` is on
+by default; pass `--no-use_jagged_kv` to opt into the dense fallback
+for comparison.
 
 ## Correctness verification
 
-Three layers, weakest to strongest:
+Three layers, strongest to weakest:
 
 1. **Kernel reference oracle** (upstream `cjerry/gr-decode_atten`,
    `tests/test_fwd.py` — 14 quick cases via `make tt`, 1200
@@ -139,8 +120,3 @@ Three layers, weakest to strongest:
   SM90 (observed once during kernel development). The vendored kernel
   forces `num_splits=1` when `seqused_k` is set; the workaround costs
   a few percent on small-batch shapes but avoids the hang.
-- **`use_jagged_kv=False`** (dense + `seqused_k`) is kept as an
-  alternative for callers that already produce padded inputs and want
-  to avoid the explicit `cu_seqlens` plumbing. It is 17 - 48 % slower
-  than the default `True` path at `B=16` but otherwise identical in
-  semantics.
