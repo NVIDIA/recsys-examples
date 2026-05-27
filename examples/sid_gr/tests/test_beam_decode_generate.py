@@ -77,6 +77,23 @@ _E2E_SKIP_REASON = (
 )
 
 
+# Some paths still go through `flash_attn.cute` (target-aware arbitrary
+# mask in baseline `generate()` and the Mode-3 dense prefill fallback),
+# which asserts SM90+. Tests that exercise either are gated on this.
+def _is_sm90_or_above() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 9
+
+
+_SM90_AVAILABLE = _is_sm90_or_above()
+_SM90_SKIP_REASON = (
+    "requires SM90+ (cute FA arbitrary-mask path / dense Mode-3 prefill); "
+    "current device compute capability < 9.0"
+)
+
+
 # ---------------------------------------------------------------------------
 # Test: BeamSearch.build_beam_topk_indices
 # ---------------------------------------------------------------------------
@@ -268,6 +285,7 @@ class TestJaggedGPTLayerPrefillDecode:
             .bfloat16()
         )
 
+    @pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
     def test_prefill_returns_kv_cache(self, layer):
         B, S, D = 2, 16, 64
         x = torch.randn(B, S, D, device="cuda", dtype=torch.bfloat16)
@@ -538,6 +556,7 @@ def test_generate_beam_decode_e2e(
 
 
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
+@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("max_history_length", [32, 128])
 @pytest.mark.parametrize("num_layers", [2])
@@ -678,6 +697,7 @@ def test_generate_vs_generate_beam_decode_regression_guard(
 
 
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
+@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("max_history_length", [32, 128])
 @pytest.mark.parametrize("num_layers", [2])
@@ -1227,6 +1247,7 @@ def test_jagged_target_aware_builder_matches_dense(
 
 
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
+@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 def test_generate_is_deterministic():
     """generate() called twice on the same batch must produce identical SIDs.
 
