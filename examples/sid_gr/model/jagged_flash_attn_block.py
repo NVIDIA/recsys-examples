@@ -459,6 +459,7 @@ class JaggedGPTLayer(nn.Module):
         hidden_states: torch.Tensor,
         arbitrary_func: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
         linear_k: Optional[object] = None,
         linear_q: Optional[object] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -466,21 +467,23 @@ class JaggedGPTLayer(nn.Module):
 
         Three mutually exclusive attention modes:
           1. ``cu_seqlens`` is set → flattened jagged input, plain
-             per-sample causal. Uses FA's ``flash_attn_varlen_func``
-             fast path (orders of magnitude faster than the
-             arbitrary-mask path for the same semantics). The cute
-             interface infers ``max_seqlen`` from ``cu_seqlens``, so
-             we don't pass it explicitly.
+             per-sample causal. Uses upstream Tri Dao FA2
+             ``flash_attn_varlen_func`` (``flash_attn.flash_attn_interface``),
+             which is shipped pre-built in the nvcr base image and
+             supports SM80+. ``max_seqlen`` must be supplied (FA2
+             requires it; cute could infer but we don't use cute here).
           2. ``arbitrary_func`` is set → generic mask (e.g. beam
-             isolation in ``generate()``). Uses the arbitrary-mask FA
-             path.
+             isolation in ``generate()``). Uses the cute FA
+             arbitrary-mask path (SM90+ only).
           3. Neither → dense per-batch causal (``[B, S, ...]`` input,
-             padded). Uses FA's ``causal=True`` fast path.
+             padded). Uses cute FA ``causal=True`` (SM90+ only).
 
         Args:
             hidden_states: ``[1, total_tokens, hidden]`` for mode 1,
                 ``[B, S, hidden]`` for modes 2/3.
             cu_seqlens: ``[B + 1]`` int32 offsets for mode 1.
+            max_seqlen: max sequence length across the batch, required
+                in mode 1.
 
         Returns:
             hidden_states: same leading shape as input.
@@ -491,8 +494,6 @@ class JaggedGPTLayer(nn.Module):
         ), "arbitrary_func and cu_seqlens are mutually exclusive"
         residual, q, k, v = self._qkv_projection(hidden_states)
 
-        from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
-
         input_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
             q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
@@ -501,22 +502,32 @@ class JaggedGPTLayer(nn.Module):
         v_cache = v.clone()
 
         if cu_seqlens is not None:
-            # Mode 1: jagged + plain causal via FA varlen fast path.
+            # Mode 1: jagged + plain causal via upstream FA2 varlen.
             # Squeeze B=1 leading dim so the call sees [total, H, D].
             assert q.shape[0] == 1, "cu_seqlens mode expects B=1 flattened input"
+            assert max_seqlen is not None, (
+                "max_seqlen is required when cu_seqlens is set "
+                "(FA2 flash_attn_varlen_func needs it explicitly)"
+            )
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func
+
             q_flat, k_flat, v_flat = q.squeeze(0), k.squeeze(0), v.squeeze(0)
-            attn_flat, _ = flash_attn_varlen_func(
+            attn_flat = flash_attn_varlen_func(
                 q_flat,
                 k_flat,
                 v_flat,
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
                 softmax_scale=self.head_dim ** (-0.5),
                 causal=True,
             )
             attn_out = attn_flat.unsqueeze(0)
         elif arbitrary_func is not None:
             # Mode 2: arbitrary mask (e.g. beam isolation).
+            from flash_attn.cute.interface import flash_attn_func
+
             attn_out, _ = flash_attn_func(
                 q,
                 k,
@@ -530,6 +541,8 @@ class JaggedGPTLayer(nn.Module):
             )
         else:
             # Mode 3: dense per-batch causal fast path.
+            from flash_attn.cute.interface import flash_attn_func
+
             attn_out, _ = flash_attn_func(
                 q,
                 k,
@@ -769,6 +782,7 @@ class JaggedFlashAttnBlock(nn.Module):
         hidden_states: torch.Tensor,
         arbitrary_func: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
         seqlen: Optional[int] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward through all layers, returning per-layer KV caches.
@@ -779,8 +793,11 @@ class JaggedFlashAttnBlock(nn.Module):
             arbitrary_func: generic mask (mutually exclusive with
                 ``cu_seqlens``).
             cu_seqlens: ``[B + 1]`` int32 offsets for the varlen + causal
-                fast path (jagged input, per-sample causal). The cute
-                FA interface infers max_seqlen from cu_seqlens itself.
+                fast path (jagged input, per-sample causal). Standard
+                FA2 ``flash_attn_varlen_func`` requires ``max_seqlen``
+                to be supplied alongside.
+            max_seqlen: max sequence length across the batch; required
+                when ``cu_seqlens`` is set.
             seqlen: only used for ``arbitrary_func`` block-sparsity
                 construction; ignored otherwise.
 
@@ -806,6 +823,7 @@ class JaggedFlashAttnBlock(nn.Module):
                 hidden_states,
                 arbitrary_func=arbitrary_func,
                 cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
                 linear_k=linear_k,
                 linear_q=linear_q,
             )

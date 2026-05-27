@@ -1077,6 +1077,7 @@ class SIDGRModel(MegatronModule):
             prefill_output, context_kv_caches = fa_block.prefill(
                 flat_history,
                 cu_seqlens=input_offsets.to(torch.int32),
+                max_seqlen=input_max_seqlen,
                 seqlen=total_tokens,
             )
             prefill_output = prefill_output.squeeze(0)  # [total_tokens, D]
