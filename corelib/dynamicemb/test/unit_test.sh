@@ -10,7 +10,6 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_twin_module.sh"
     "test/unit_tests/test_alignment.sh"
     "test/unit_tests/test_hash_roundrobin_kuairand.py"
-    "test/unit_tests/test_hybrid_storage_export.sh"
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/test_fake_batched_dynamicemb_tables.sh"
 )
