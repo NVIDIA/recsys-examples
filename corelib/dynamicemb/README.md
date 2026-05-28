@@ -11,6 +11,7 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 - [Pre-requisites](#pre-requisites)
   - [Version Compatibility](#version-compatibility)
 - [Installation](#installation)
+- [Running Without a GPU (Fake Mode)](#running-without-a-gpu-fake-mode)
 - [DynamicEmb APIs](#dynamicemb-apis)
 - [Usage Notes](#usage-notes)
   - [DynamicEmb Insertion Behavior Checking Modes](#dynamicemb-insertion-behavior-checking-modes)
@@ -88,6 +89,68 @@ To install DynamicEmb, please use the following command:
 ```bash
 python setup.py install
 ```
+
+To install without compiling the CUDA C++ extension (host without CUDA Toolkit / `nvcc`), set the opt-in env var:
+
+```bash
+DYNAMICEMB_SKIP_CUDA_BUILD=1 python setup.py install
+```
+
+This produces a Python-only install; the resulting package is only usable together with `DYNAMICEMB_FAKE_MODE=1` at runtime — see the next section.
+
+## Running Without a GPU (Fake Mode)
+
+DynamicEmb supports a "fake mode" so the package can be loaded, planner/sharding flows can run, and `BatchedDynamicEmbeddingTablesV2.forward/backward` calls return correctly-shaped tensors **without touching a GPU**. It is intended for:
+
+- CI runners without a GPU device
+- Local development on machines without CUDA Toolkit
+- Planner/DMP construction try-runs
+- Shape / dataflow analysis
+
+Activate by setting `DYNAMICEMB_FAKE_MODE=1` (accepted values: `1`, `true`, `yes`, `on`). When active:
+
+- `BatchedDynamicEmbeddingTablesV2(...)` construction is dispatched to a subclass whose backend (storage, cache, admission counter) is replaced with no-op stubs.
+- `forward()` returns a CPU zero tensor of the correct shape, wired into autograd so `.backward()` runs.
+- `dump()` / `load()` are no-ops and emit a `UserWarning`.
+- Host-side bookkeeping (attribute names, `dims`, `total_D`, `_optimizer`, `_scores`, …) matches the real implementation, so `isinstance` checks and attribute access keep working.
+
+There are two installation scenarios:
+
+### Scenario A — GPU absent at runtime, but CUDA Toolkit was available at install time
+
+The package was built normally; `dynamicemb_extensions*.so` is present. To run on a host without a GPU device:
+
+```bash
+DYNAMICEMB_FAKE_MODE=1 python your_script.py
+```
+
+The real `.so` still loads, but `BatchedDynamicEmbeddingTablesV2(...)` is routed to the fake subclass. Existing `isinstance(m, BatchedDynamicEmbeddingTablesV2)` checks throughout the codebase continue to match.
+
+### Scenario B — Neither GPU nor CUDA Toolkit available
+
+Skip the CUDA build at install time, then run with fake mode:
+
+```bash
+# Install: skip nvcc-based compilation of the C++ extension.
+DYNAMICEMB_SKIP_CUDA_BUILD=1 pip install .
+
+# Run: fake mode also installs a sys.modules stub for dynamicemb_extensions
+#      so the package's top-level imports succeed even with the .so missing.
+DYNAMICEMB_FAKE_MODE=1 python your_script.py
+```
+
+Behavior:
+
+- At package import time, the bootstrap in `dynamicemb/__init__.py` detects that `dynamicemb_extensions` is unimportable and installs a stub into `sys.modules`. All `from dynamicemb_extensions import X` lines across the package resolve successfully against the stub; the resolved symbol only raises `RuntimeError` if actually invoked, which the fake-mode code path never does.
+- `torchrec` and `fbgemm_gpu` are still required as Python dependencies (the fake-mode install does not skip them). They must be installable on the host.
+
+### Limitations
+
+- `DYNAMICEMB_FAKE_MODE` is a runtime flag; it does not affect installation. The build-time flag is `DYNAMICEMB_SKIP_CUDA_BUILD`.
+- Fake `forward` returns zeros — numerical results are not real. Tests that rely on embedding values being correct will not pass under fake mode.
+- Fake `dump` / `load` are no-ops; tests of checkpoint round-trips cannot run.
+- The TorchRec compute-kernel wrapping path (`BatchedDynamicEmbDenseAdagrad` etc.) is not formally tested under fake mode; usage on the `_emb_module._storage` internals beyond the methods defined on the fake stub may raise `AttributeError`.
+- The two env vars are orthogonal; CI should explicitly unset `DYNAMICEMB_FAKE_MODE` on GPU runners to avoid silently masking storage-side bugs.
 
 ## DynamicEmb APIs
 

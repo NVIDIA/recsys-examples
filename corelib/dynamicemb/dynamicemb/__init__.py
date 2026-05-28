@@ -13,6 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Fake mode bootstrap — must run before any submodule import. See
+# ``dynamicemb/_fake.py`` for the full mechanism.
+from ._fake import bootstrap as _dynamicemb_fake_bootstrap
+
+_dynamicemb_fake_bootstrap()
+del _dynamicemb_fake_bootstrap
+
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
