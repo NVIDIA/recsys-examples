@@ -31,6 +31,7 @@ from typing import List
 import pytest
 import torch
 from beam_search.beam_search import BeamSearch
+from tests.test_utils import is_sm90_or_above
 
 # Import jagged_flash_attn_block directly to avoid model/__init__.py
 # which pulls in heavy dependencies (dynamicemb, megatron, torchrec).
@@ -80,14 +81,7 @@ _E2E_SKIP_REASON = (
 # Some paths still go through `flash_attn.cute` (target-aware arbitrary
 # mask in baseline `generate()` and the Mode-3 dense prefill fallback),
 # which asserts SM90+. Tests that exercise either are gated on this.
-def _is_sm90_or_above() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
-
-
-_SM90_AVAILABLE = _is_sm90_or_above()
+_SM90_AVAILABLE = is_sm90_or_above()
 _SM90_SKIP_REASON = (
     "requires SM90+ (cute FA arbitrary-mask path / dense Mode-3 prefill); "
     "current device compute capability < 9.0"

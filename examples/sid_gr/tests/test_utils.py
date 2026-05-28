@@ -12,6 +12,18 @@ if TYPE_CHECKING:
     from commons.modules.embedding import ShardedEmbeddingConfig
 
 
+def is_sm90_or_above() -> bool:
+    """True if a CUDA device with compute capability >= 9.0 is visible.
+
+    Used by tests gated on Hopper-only kernels (cute FA arbitrary mask,
+    Mode-3 dense prefill).
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 9
+
+
 def _check_sids_shapes(*sids_tensors):
     """Validate that all sids tensors share a consistent ``[B, K, H]`` shape."""
     if not sids_tensors:
