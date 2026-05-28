@@ -6,4 +6,4 @@
 	url = https://github.com/jiayus-nvidia/FBGEMM.git
 [submodule "third_party/FlexKV"]
 	path = third_party/FlexKV
-	url = git@github.com:taco-project/FlexKV.git
+	url = https://github.com/taco-project/FlexKV.git
