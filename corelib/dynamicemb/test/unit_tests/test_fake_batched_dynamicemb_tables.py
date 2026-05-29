@@ -336,7 +336,12 @@ def test_fake_dmp_sequence_forward_backward():
                 "optimizer": EmbOptimType.SGD,
                 "learning_rate": 1.0,
             },
-            use_index_dedup=True,
+            # Disable dedup: ``_dedup_indices`` calls ``get_table_range``, a
+            # CUDA kernel from dynamicemb_extensions, which requires its
+            # ``offsets`` arg on device. In fake mode the input KJT lives on
+            # CPU, so dedup must be off. Dedup is an opt-in optimization;
+            # the rest of the DMP wiring path is exercised either way.
+            use_index_dedup=False,
         )
         plan = planner.collective_plan(ebc, [sharder], dist.GroupMember.WORLD)
 
