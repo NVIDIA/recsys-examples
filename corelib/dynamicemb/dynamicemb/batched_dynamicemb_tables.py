@@ -397,7 +397,7 @@ def _print_memory_consume(
                 ),
             )
         )
-    else:  # HOST_PS
+    elif layout == StorageLayout.HOST_PS:
         tiers.append(
             (
                 "external PS",
@@ -406,6 +406,8 @@ def _print_memory_consume(
                 ),
             )
         )
+    else:
+        raise ValueError(f"Unhandled StorageLayout: {layout!r}")
 
     # Pick a single unit (MB if any value reaches 1 MB; else KB).
     max_byte = 0
