@@ -369,7 +369,7 @@ def _prefetch_cache_path(
                 )
                 keys_to_insert_mask[new_in_miss] = admit_mask
 
-            non_admit_miss = new_in_miss & ~keys_to_insert_mask
+            non_admit_miss = ~keys_to_insert_mask
             if non_admit_miss.any():
                 non_admitted_positions = miss_compact_idx[non_admit_miss]
         elif new_in_miss.any():
@@ -582,21 +582,19 @@ def _prefetch_hbm_direct_path(
             freq = admission_counter.add(missing_keys, missing_table_ids, counters)
             admit_mask = admit_strategy.admit(missing_keys, freq)
 
-            if admit_mask.any():
-                admission_counter.erase(
-                    missing_keys[admit_mask], missing_table_ids[admit_mask]
-                )
-
-            non_admit = ~admit_mask
-            if non_admit.any():
-                non_admitted_positions = missing_indices[non_admit]
-
             admitted_keys = missing_keys[admit_mask]
             admitted_tids = missing_table_ids[admit_mask]
             admitted_scores = (
                 missing_scores[admit_mask] if missing_scores is not None else None
             )
             admitted_unique_positions = missing_indices[admit_mask]
+
+            if admit_mask.any():
+                admission_counter.erase(admitted_keys, admitted_tids)
+
+            non_admit = ~admit_mask
+            if non_admit.any():
+                non_admitted_positions = missing_indices[non_admit]
         else:
             admitted_keys = missing_keys
             admitted_tids = missing_table_ids
