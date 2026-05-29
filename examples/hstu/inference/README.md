@@ -4,18 +4,18 @@
 
 1. KV Cache Manager
 
-We use GPU memory and host storage for KV data cache by `KVCacheManager` from package [`recsys_kvcache_manager`](../../../corelib/recsys_kvcache_manager/README.md). This can help to reduce the recomputation of KV data. All the kvcache related operations are implemented as asynchronous, in order to hide the overhead with inference computation.
+`KVCacheManager` from [`recsys_kvcache_manager`](../../../corelib/recsys_kvcache_manager/README.md) uses GPU memory and host storage for KV-data caches. This reduces KV-data recomputation, and KV-cache-related operations are asynchronous so their overhead can overlap with inference computation.
 
-The GPU KV cache is organized as a paged KV-data table, and supports KV data adding/appending, lookup and eviction. When appending new data to the GPU cache, we will evict data from the oldest users according to the LRU policy if there is no empty page. The HSTU attention kernel also accepts KV data from a paged table. 
+The GPU KV cache is organized as a paged KV-data table and supports KV-data add/append, lookup, and eviction. When appending new data to the GPU cache, it evicts data from the oldest users according to the LRU policy if there is no empty page. The HSTU attention kernel also accepts KV data from a paged table.
 
-The host KV data storage support adding/appending and lookup. `recsys_kvcache_manager` integrates `native` backend using pinned host memory only, and `flexkv` backend based on [`FlexKV`](https://github.com/taco-project/FlexKV/tree/main).
+The host KV-data storage supports add/append and lookup. `recsys_kvcache_manager` integrates a `native` backend using pinned host memory only, and a `flexkv` backend based on [`FlexKV`](https://github.com/taco-project/FlexKV/tree/main).
 
 For its API and usage, please see [README.md](../../../corelib/recsys_kvcache_manager/README.md).
 
 2. Asynchronous H2D transfer of host KV data 
 
 By using asynchronous data copy on the side CUDA stream, we overlap the host-to-device KV data transfer with HSTU computation layer-wise, to reduce the latency of HSTU inference.
-**Note** this feature is only enabled with `native` backend in the kvcache manager. 
+**Note** this feature is only enabled with the `native` backend in the KV-cache manager.
 
 3. Optimization with CUDA graph
 
@@ -23,17 +23,16 @@ We utilize the graph capture and replay support in Torch for convenient CUDA gra
 
 4. Kernel fusion
 
-5. Serving HSTU model with Triton Server Python backend
+5. Serving HSTU model with Triton Inference Server Python backend
 
-Currently we use the python backend to load and serve hstu models. The hstu model consists of two parts -- the sparse module and the dense module.
-The sparse module is served as one instance per node, in which we create a set of gpu embedding tables or caches for each gpu sharing the same PS on the local host node or remote. (NVEmbedding backend only. To get access to NVEmbedding project please contact us.)
-The dense module is served as one instance per GPU, and the KV cache is not supported for now.
+The Triton path uses the Python backend to load and serve HSTU models. The model consists of a sparse module and a dense module.
+With the NVEmbedding backend, the sparse module creates GPU embedding tables or caches for each GPU while sharing the same local parameter-store data. The dense module is served as one instance per GPU. The current Triton dense path uses `forward_nokvcache`; KV-cache inference is available in the standalone Python inference path.
 
 6. End-to-end C++ inference with Torch Export and AOTInductor
 
-We support end-to-end C++ inference from PyTorch python model based on `torch.export` and `torch._inductor.aoti_compile_and_package`.
+We support end-to-end C++ inference from a PyTorch Python model based on `torch.export` and `torch._inductor.aoti_compile_and_package`.
 
-For the embedding part, our implementation is based on `InferenceEmbeddingTable` from DynamicEmb, using DynamicEmb ScoredHashTable and NVEmbedding layers. NVEmbedding implements customized `export_and_aot`, which generates layer metadata and dumped embedding table files together with the model `.pt2` archive, in order to avoid multiple copies of embedding table while loading. The structure of the complete exported and packaged model archive is:
+For the embedding part, our implementation is based on `InferenceEmbeddingTable` from DynamicEmb, using DynamicEmb `ScoredHashTable` and NVEmbedding layers. NVEmbedding implements customized `export_and_aot`, which generates layer metadata and dumped embedding table files together with the model `.pt2` archive, in order to avoid multiple copies of embedding table while loading. The structure of the complete exported and packaged model archive is:
 ```
 path/to/model_archive
         ├── model.pt2                              # AOT-compiled model package for AOTIModelPackageLoader
@@ -45,16 +44,13 @@ Start with the [guide](./GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md) for HSTU Python to 
 
 ## How to Setup
 
-1. Install the dependencies for Recsys-Examples.
-
-Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not required for inference.
+1. Install the dependencies for Recsys Examples.
 
 ```bash
 ~$ cd ${WORKING_DIR}
 ~$ git clone --recursive -b ${TEST_BRANCH} ${TEST_REPO} recsys-examples && cd recsys-examples
 ~$ docker build \
     --platform linux/amd64 \
-    --build-arg INFERENCEBUILD=1 \
     -t recsys-examples:inference \
     -f docker/Dockerfile .
 ```
@@ -65,7 +61,7 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
 ~$ cd recsys-examples/examples/hstu
 ~$ export PYTHONPATH=${PYTHONPATH}:$(realpath ../)
 ~$ 
-~$ # Proprocess the dataset for inference:
+~$ # Preprocess the dataset for inference:
 ~$ python3 ../commons/hstu_data_preprocessor.py --dataset_name "kuairand-1k" --inference
 ~$
 ~$ # Run the inference example
@@ -78,7 +74,7 @@ Currently, we use the evaluation metrics results (e.g. AUC) to check the consist
 
 1. Evaluation metrics from training
 
-* Add evaluation output in training configs. Make sure `max_train_iters` is a multiple of `max_train_iters`.
+* Add evaluation output in training configs. Make sure `max_train_iters` is a multiple of `eval_interval`, and save a checkpoint at the iteration you want to evaluate.
 
 ```
 # File: examples/hstu/training/configs/
@@ -91,7 +87,7 @@ TrainerArgs.ckpt_save_interval = 550
 
 * Get eval metrics from training
 ```
-/workspace/recsys-examples$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 ./training/pretrain_gr_ranking.py --gin-config-file ./training/configs/kuairand_1k_ranking.gin
+/workspace/recsys-examples/examples/hstu$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 ./training/pretrain_gr_ranking.py --gin-config-file ./training/configs/kuairand_1k_ranking.gin
 ... [training output] ...
 [eval] [eval 296 users]:
     Metrics.task0.AUC:0.557266
@@ -107,7 +103,7 @@ TrainerArgs.ckpt_save_interval = 550
 
 2. Evaluation metrics from inference
 ```
-/workspace/recsys-examples$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT} --mode eval
+/workspace/recsys-examples/examples/hstu$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT} --mode eval
 ... [inference output] ...
 [eval]:
     Metrics.task0.AUC:0.556894
@@ -121,20 +117,19 @@ TrainerArgs.ckpt_save_interval = 550
 ... [inference output] ...
 ```
 
-## Example: HSTU Model Inference with Triton Server
-1. Build the docker image for triton server serving HSTU model
+## Example: HSTU Model Inference with Triton Inference Server
+1. Build the Docker image for Triton Inference Server serving HSTU model
 ```
 ~/recsys-examples$ docker build \
-    --build-arg BASE_IMAGE=nvcr.io/nvidia/tritonserver:25.06-py3 \
-    --build-arg INFERENCEBUILD=1 \
+    --build-arg BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.02-py3 \
     --build-arg TRITONSERVER_BUILD=1 \
     -f docker/Dockerfile \
     -t recsys-examples:inference_tritonserver .
 ```
 
-2. Launch the triton server 
+2. Launch Triton Inference Server
 
-The triton server reads the model config from `inference/triton/hstu_model/config.pbtxt` and `inference/triton/hstu_sparse/config.pbtxt`.
+Triton Inference Server reads the model config from `inference/triton/hstu_model/config.pbtxt` and `inference/triton/hstu_sparse/config.pbtxt`.
 Setup `HSTU_GIN_CONFIG_FILE` and `HSTU_CHECKPOINT_DIR` in the config before launching the server.
 
 ```
@@ -149,7 +144,7 @@ Setup `HSTU_GIN_CONFIG_FILE` and `HSTU_CHECKPOINT_DIR` in the config before laun
     bash -cx inference/launch_triton_server.sh ${PATH_TO_CHECKPOINT}
 ```
 
-For development, launch the triton server in the interactive container as following:
+For development, launch Triton Inference Server in the interactive container as follows:
 ```
 ~/recsys-examples$ docker run \
     --shm-size=8G --ulimit memlock=-1 -p 8000:8000 -p 8001:8001 -p 8002:8002 --ulimit stack=67108864 \
@@ -162,7 +157,7 @@ For development, launch the triton server in the interactive container as follow
 /workspace/recsys-examples/examples/hstu$ bash ./inference/launch_triton_server.sh ${PATH_TO_CHECKPOINT}
 ```
 
-3. Launch the hstu container and inference with triton client
+3. Launch the HSTU container and run inference with the Triton client
 ```
 ~/recsys-examples$ docker run \
     --rm --shm-size 8G --cap-add SYS_NICE --net host \
@@ -178,7 +173,7 @@ Within the client container:
 /workspace/recsys-examples$ # install triton client
 /workspace/recsys-examples$ pip3 install tritonclient[all]
 /workspace/recsys-examples$ 
-/workspace/recsys-examples$ # check triton server readiness. note: HTTP Status Code 200 for readiness
+/workspace/recsys-examples$ # check Triton server readiness. note: HTTP status code 200 for readiness
 /workspace/recsys-examples$ curl -o /dev/null -s -w "%{http_code}\n" localhost:8000/v2/health/ready
 200
 /workspace/recsys-examples$ 
@@ -197,25 +192,21 @@ Within the client container:
     Metrics.task7.AUC: 0.556104
 ```
 
-## Serve HSTU model using triton server with NVEmbedding
+## Serve HSTU model using Triton Inference Server with NVEmbedding
 
-- **[Important]** Get the NVEmbedding repository
+The main `docker/Dockerfile` installs [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache) when building the inference images, so a separate `Dockerfile.nve` step is no longer required.
 
-**The NVEmbedding project is open-source limited to authorized customers only**. Please contact Nvidia DevTech (APAC) Team for further discussion.
-
-- Build the server image
+- Build the Triton server image:
 ```
-~$ cd ${NVEMBEDDING_DIR}
-~/nve$ git submodule update --init
-~/nve$ docker build \
-    --build-arg DEVEL_IMAGE=recsys-examples:inference_tritonserver \
-    -f ${RECSYS_DIR}/docker/Dockerfile.nve \
+~/recsys-examples$ docker build \
+    --build-arg BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.02-py3 \
+    --build-arg TRITONSERVER_BUILD=1 \
+    -f docker/Dockerfile \
     -t recsys-examples:inference_tritonserver .
 ```
 
-- Launch the triton server 
+- Launch the Triton server with the NVEmbedding backend enabled:
 ```
-~/recsys-examples$ cd ${PATH_TO_RECSYS_EXAMPLES}
 ~/recsys-examples$ docker run \
     --shm-size=8G --ulimit memlock=-1 -p 8000:8000 -p 8001:8001 -p 8002:8002 --ulimit stack=67108864 \
     --gpus \"device=$NV_GPU\" \
@@ -227,7 +218,7 @@ Within the client container:
     bash -cx "printf '\nNetworkArgs.embedding_backend = \"NVEmb\"\n' >> ./inference/configs/kuairand_1k_inference_ranking.gin && bash inference/launch_triton_server.sh ${PATH_TO_CHECKPOINT}"
 ```
 
-- Launch the hstu container and install triton client (showcase in the interactive model)
+- Launch the HSTU client container and install the Triton client:
 ```
 ~/recsys-examples$ docker run \
     --rm --shm-size 8G --cap-add SYS_NICE --net host \
@@ -239,7 +230,7 @@ Within the client container:
 /workspace/recsys-examples$ pip3 install tritonclient[all]
 ```
 
-- Inference with KuaiRank-1k Dataset
+- Run inference with the KuaiRand-1K dataset:
 ```
 /workspace/recsys-examples/examples/hstu$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/triton/hstu_model/client.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin
 ...
@@ -254,7 +245,7 @@ Within the client container:
     Metrics.task7.AUC: 0.556803
 ```
 
-Note: The NVEmbedding backend may provide different default embedding values for unseen tokens. Use the training_dataset for validation
+Note: The NVEmbedding backend may provide different default embedding values for unseen tokens. Use the training dataset for validation:
 ```
 /workspace/recsys-examples/examples/hstu$ PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/triton/hstu_model/client.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --train_dataset
 ...

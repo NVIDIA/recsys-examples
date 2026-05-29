@@ -344,6 +344,9 @@ class NetworkArgs:
         recompute_input_silu (bool): Recompute input SiLU activation. Default: False.
         item_embedding_dim (int): Item embedding dimension. Default: -1.
         contextual_embedding_dim (int): Contextual embedding dimension. Default: -1.
+        scaling_seqlen (int): Scaling sequence length. By default, the max sequence length in the batch is used. Default: -1.
+        embedding_backend (str): Embedding backend. Default: None.
+        disable_contextual_mask (bool): Whether to disable contextual mask. Default: False.
     """
 
     num_layers: int
@@ -370,6 +373,8 @@ class NetworkArgs:
 
     scaling_seqlen: int = -1
     embedding_backend: Optional[str] = None
+
+    disable_contextual_mask: bool = False
 
     def __post_init__(self):
         assert self.dtype_str in [

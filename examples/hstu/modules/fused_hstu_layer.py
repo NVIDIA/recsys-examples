@@ -120,6 +120,8 @@ class FusedHSTULayer(MegatronModule):
             FusedHSTULayer.forward, key_or_attr_name="values"
         )
 
+        self._disable_contextual_mask = config.disable_contextual_mask
+
     @output_nvtx_hook(nvtx_tag="FusedHSTULayer")
     def forward(self, jd: JaggedData) -> JaggedData:
         input = jd.values
@@ -146,7 +148,9 @@ class FusedHSTULayer(MegatronModule):
             # attn related
             attn_backend=self._attn_backend,
             num_targets=jd.num_candidates,
-            num_contextuals=jd.contextual_seqlen,
+            num_contextuals=jd.contextual_seqlen
+            if not self._disable_contextual_mask
+            else None,
             target_group_size=self._target_group_size,
             alpha=self._alpha,
             causal=self._is_causal,

@@ -31,6 +31,7 @@ from typing import List
 import pytest
 import torch
 from beam_search.beam_search import BeamSearch
+from tests.test_utils import is_sm90_or_above
 
 # Import jagged_flash_attn_block directly to avoid model/__init__.py
 # which pulls in heavy dependencies (dynamicemb, megatron, torchrec).
@@ -74,6 +75,16 @@ _E2E_DEPS = _try_import_e2e_deps()
 _E2E_AVAILABLE = "_error" not in _E2E_DEPS
 _E2E_SKIP_REASON = (
     f"E2E deps unavailable (need full Docker build): {_E2E_DEPS.get('_error', '')}"
+)
+
+
+# Some paths still go through `flash_attn.cute` (target-aware arbitrary
+# mask in baseline `generate()` and the Mode-3 dense prefill fallback),
+# which asserts SM90+. Tests that exercise either are gated on this.
+_SM90_AVAILABLE = is_sm90_or_above()
+_SM90_SKIP_REASON = (
+    "requires SM90+ (cute FA arbitrary-mask path / dense Mode-3 prefill); "
+    "current device compute capability < 9.0"
 )
 
 
@@ -268,6 +279,7 @@ class TestJaggedGPTLayerPrefillDecode:
             .bfloat16()
         )
 
+    @pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
     def test_prefill_returns_kv_cache(self, layer):
         B, S, D = 2, 16, 64
         x = torch.randn(B, S, D, device="cuda", dtype=torch.bfloat16)
@@ -538,6 +550,7 @@ def test_generate_beam_decode_e2e(
 
 
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
+@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("max_history_length", [32, 128])
 @pytest.mark.parametrize("num_layers", [2])
@@ -678,6 +691,7 @@ def test_generate_vs_generate_beam_decode_regression_guard(
 
 
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
+@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("max_history_length", [32, 128])
 @pytest.mark.parametrize("num_layers", [2])
@@ -1227,6 +1241,7 @@ def test_jagged_target_aware_builder_matches_dense(
 
 
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
+@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 def test_generate_is_deterministic():
     """generate() called twice on the same batch must produce identical SIDs.
 

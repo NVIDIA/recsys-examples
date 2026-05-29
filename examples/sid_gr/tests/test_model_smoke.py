@@ -7,7 +7,18 @@ from commons.checkpoint import get_unwrapped_module
 from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.ops.length_to_offsets import length_to_complete_offsets
-from tests.test_utils import create_sid_gr_model_and_optimizer
+from tests.test_utils import create_sid_gr_model_and_optimizer, is_sm90_or_above
+
+# Both tests forward through SIDGRModel, which goes through the cute FA
+# arbitrary-mask path. cute asserts SM90+, so the whole file is gated on
+# Hopper-or-newer hardware.
+pytestmark = pytest.mark.skipif(
+    not is_sm90_or_above(),
+    reason=(
+        "test_model_smoke forwards through cute FA arbitrary-mask path "
+        "(SM90+); current device compute capability < 9.0"
+    ),
+)
 
 
 def generate_batches(

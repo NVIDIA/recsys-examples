@@ -35,6 +35,6 @@ bash ./run_example.sh --dist_type hash_roundrobin
 
 - For detailed explanations of specific APIs and parameters, please refer to [API Doc](../DynamicEmb_APIs.md).
 
-- For usage of external storage, Refer to demo `PyDictStorage` in [uint test](../test/test_batched_dynamic_embedding_tables_v2.py).
+- For usage of external storage, refer to the `PyDictStorage` demo in the [unit test](../test/test_batched_dynamic_embedding_tables_v2.py).
 
 ***dynamicemb** supports not only `EmbeddingCollection` but also `EmbeddingBagCollection`. However, due to the requirements of generative recommendations, dynamicemb focuses on performance optimization of `EmbeddingCollection` while providing full functional support for `EmbeddingBagCollection`. And we use `EmbeddingCollection` as an example.*

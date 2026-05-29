@@ -106,6 +106,7 @@ def create_hstu_config(
         recompute_input_layernorm=network_args.recompute_input_layernorm,
         recompute_input_silu=network_args.recompute_input_silu,
         scaling_seqlen=network_args.scaling_seqlen,
+        disable_contextual_mask=network_args.disable_contextual_mask,
     )
 
 

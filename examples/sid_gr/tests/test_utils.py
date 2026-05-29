@@ -1,12 +1,27 @@
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from commons.distributed.sharding import make_optimizer_and_shard
-from commons.modules.embedding import ShardedEmbeddingConfig
-from commons.optimizer import OptimizerParam
-from configs.gpt_config import get_gpt_config
-from model.gpt_model import SIDGRModel
-from model.mcore_model_specs import get_gpt_decoder_block_spec
+
+# Heavy deps (commons / megatron / configs / model) are only needed by
+# `create_sid_gr_model_and_optimizer` below. The pure-tensor validators
+# `validate_compare_outputs` / `validate_pair_outputs` should be
+# callable without them, so callers like
+# `test_compare_kv_modes_default_raises_on_validation_failure` can
+# exercise the validation contract outside the full Docker stack.
+if TYPE_CHECKING:
+    from commons.modules.embedding import ShardedEmbeddingConfig
+
+
+def is_sm90_or_above() -> bool:
+    """True if a CUDA device with compute capability >= 9.0 is visible.
+
+    Used by tests gated on Hopper-only kernels (cute FA arbitrary mask,
+    Mode-3 dense prefill).
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 9
 
 
 def _check_sids_shapes(*sids_tensors):
@@ -16,8 +31,7 @@ def _check_sids_shapes(*sids_tensors):
     ref_shape = sids_tensors[0].shape
     if len(ref_shape) != 3:
         return (
-            f"unexpected rank: sids should be 3-D [B, K, H], "
-            f"got {tuple(ref_shape)}"
+            f"unexpected rank: sids should be 3-D [B, K, H], " f"got {tuple(ref_shape)}"
         )
     for i, s in enumerate(sids_tensors):
         if s.shape != ref_shape:
@@ -56,8 +70,7 @@ def _min_overlap(sets_x, sets_y, label, issues):
 def _sids_to_sets(sids: torch.Tensor):
     top_k = sids.shape[1]
     return [
-        {tuple(sids[b, k].tolist()) for k in range(top_k)}
-        for b in range(sids.shape[0])
+        {tuple(sids[b, k].tolist()) for k in range(top_k)} for b in range(sids.shape[0])
     ]
 
 
@@ -94,8 +107,7 @@ def validate_compare_outputs(
     worst = min(ov_ab, ov_bc, ov_ac)
 
     summary = (
-        f"ov_ab={ov_ab*100:.0f}% ov_bc={ov_bc*100:.0f}% "
-        f"ov_ac={ov_ac*100:.0f}%"
+        f"ov_ab={ov_ab*100:.0f}% ov_bc={ov_bc*100:.0f}% " f"ov_ac={ov_ac*100:.0f}%"
     )
     if issues:
         return False, "; ".join(issues) + " | " + summary, worst
@@ -133,7 +145,7 @@ def create_sid_gr_model_and_optimizer(
     kv_channels: int,
     num_layers: int,
     num_hierarchies: int,
-    codebook_embedding_config: ShardedEmbeddingConfig,
+    codebook_embedding_config: "ShardedEmbeddingConfig",
     codebook_sizes: List[int],
     should_add_sep_token: bool = False,
     optimizer_type_str: str = "adam",
@@ -141,6 +153,13 @@ def create_sid_gr_model_and_optimizer(
     device: torch.device = None,
     use_jagged_flash_attn: bool = False,
 ):
+    # Lazy imports of the heavy stack — see module-level comment.
+    from commons.distributed.sharding import make_optimizer_and_shard
+    from commons.optimizer import OptimizerParam
+    from configs.gpt_config import get_gpt_config
+    from model.gpt_model import SIDGRModel
+    from model.mcore_model_specs import get_gpt_decoder_block_spec
+
     decoder_config = get_gpt_config(
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,

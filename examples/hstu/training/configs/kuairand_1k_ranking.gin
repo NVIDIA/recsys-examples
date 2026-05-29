@@ -14,6 +14,7 @@ NetworkArgs.num_layers = 3
 NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 512
 NetworkArgs.kv_channels = 128
+NetworkArgs.disable_contextual_mask = True
 
 RankingArgs.prediction_head_arch = [
     512, 8

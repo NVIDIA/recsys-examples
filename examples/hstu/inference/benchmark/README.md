@@ -1,6 +1,6 @@
-# HSTU Inference benchmark
+# HSTU inference benchmark
 
-We provide a set of benchmarks for HSTU Inference on end-to-end inference and paged HSTU inference layer.
+We provide benchmarks for HSTU inference covering end-to-end inference and the paged HSTU inference layer.
 
 
 ## How to run the benchmark
@@ -14,7 +14,7 @@ We provide a set of benchmarks for HSTU Inference on end-to-end inference and pa
 
 ## Benchmark results
 
-Here we present the benchmark results of the HSTU layers with KV cache on single L20 gpu.
+Here we present the benchmark results of the HSTU layers with KV cache on a single L20 GPU.
 
 HSTU Setup for benchmark:
 
@@ -24,7 +24,7 @@ HSTU Setup for benchmark:
 | Hidden Dim Size             | 1024  |
 | Number of Heads             | 4     |
 | Head Dim Size               | 256   |
-| Max Batchsize               | 16    |
+| Max batch size              | 16    |
 | Max Per Sequence Length     | 4096  |
 | Per Sequence Targets Number | 256   |
 
@@ -46,10 +46,10 @@ Performance results:
 
 Note:
 
-1. The baseline performance is based on our implementation without KVCache support and CUDA Graph optimization.
+1. The baseline performance is based on our implementation without KV-cache support and CUDA Graph optimization.
 2. The end-to-end performance includes the embedding part, which utilizes both native `EmbeddingCollection` from TorchRec and `DynamicEmbedding`.
 3. The number of input sequences from the synthetic dataset increases according to the batch size. All test cases have 16 batches in total.
-4. In the test cases with KVCache enabled, the kvcache preparation and onloading/offloading are within time measurement, but they are hidden as asynchronous operations. 
+4. In the test cases with KV cache enabled, the KV-cache preparation and onloading/offloading are within time measurement, but they are hidden as asynchronous operations.
 
 ### 2. HSTU block performance
 
@@ -60,7 +60,7 @@ Note:
 
 When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3x ~ 20x** without candidate items, and a speedup of **3x ~ 8x** with extra 256 candidates for each sequence (for batch size = 1 and 8 respectively).
 
-Notice: In the L20 benchmark, the page size of KVCache is 32-token. The head dim of hstu attention kernel is 256. 
+Notice: In the L20 benchmark, the page size of KV cache is 32 tokens. The head dim of the HSTU attention kernel is 256.
 
 * **Performance Results on B200 (using HSTU Blackwell CuteDSL kernel):**
 
@@ -69,7 +69,7 @@ Notice: In the L20 benchmark, the page size of KVCache is 32-token. The head dim
 
 When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3.3 ~ 7.7x** with extra 256 candidates for each sequence (for batch size = 1 and 8 respectively).
 
-Notice: In the B200 benchmark, the page size of KVCache is 128-token. The head dim of hstu attention kernel is 128. This is limited by current kernel implementations.
+Notice: In the B200 benchmark, the page size of KV cache is 128 tokens. The head dim of the HSTU attention kernel is 128. This is limited by current kernel implementations.
 
 ### 3. HSTU model (training version) performance with Torch C++ Runtime
 

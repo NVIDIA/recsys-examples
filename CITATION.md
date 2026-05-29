@@ -15,7 +15,7 @@ If you use RecSys Examples in a publication, please use citations in the followi
 If you use the Generative Recommenders implementation in a publication, please use citations in the following format (BibTeX entry for LaTeX):
 ```tex
 @Manual{,
-  title = {Generative Recommenders: Pytorch library for large scale generative recommendation systems},
+  title = {Generative Recommenders: PyTorch library for large scale generative recommendation systems},
   author = {NVIDIA Corporation},
   year = {2024},
   url = {https://github.com/NVIDIA/recsys-examples},
@@ -24,11 +24,11 @@ If you use the Generative Recommenders implementation in a publication, please u
 
 ## Referenced Papers
 
-### Action Speaks Louder Than Words: Empowering Generative Recommender System with Hierarchical Fusion and Fine-grained Feedback Incorporating
+### Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations
 ```tex
-@misc{wang2024action,
-      title={Action Speaks Louder Than Words: Empowering Generative Recommender System with Hierarchical Fusion and Fine-grained Feedback Incorporating}, 
-      author={Yueming Wang and Jiaqi Zhai and Jianyi Yang and Linlin Zhu and Xiaosong Gao and Fan Zhang and Suhang Wang and Heng Huang},
+@misc{zhai2024actions,
+      title={Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations},
+      author={Jiaqi Zhai and Lucy Liao and Xing Liu and Yueming Wang and Rui Li and Xuan Cao and Leon Gao and Zhaojie Gong and Fangda Gu and Michael He and Yinghai Lu and Yu Shi},
       year={2024},
       eprint={2402.17152},
       archivePrefix={arXiv},

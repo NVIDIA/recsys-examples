@@ -24,7 +24,7 @@ The project includes:
   - We introduced a HSTU training optimization with workload-balanced batch shuffling for data parallel training.
   - We added caching and prefetching support for `EmbeddingBagCollection`.
 - **[2026/1/13]** 🎉v25.12 released!
-  - Support TritonServer for HSTU inference. Follow [the HSTU inference TritonServer example](https://github.com/NVIDIA/recsys-examples/tree/main/examples/hstu/inference#example-hstu-model-inference-with-triton-server) to try it out.
+  - Added Triton Inference Server support for HSTU inference. Follow [the HSTU inference Triton example](./examples/hstu/inference/README.md#example-hstu-model-inference-with-triton-inference-server) to try it out.
   - We introduced our first semantic-id retrieval model example. Follow the semantic‑id retrieval (sid_gr) [documentation](https://github.com/NVIDIA/recsys-examples/tree/main/examples/sid_gr) to run it. 
 
 <details>
@@ -45,20 +45,20 @@ The project includes:
   - HSTU attention now supports FP8 quantization.
 
 - **[2025/9/8]** 🎉v25.08 released!
-  - Added cache support for dynamicemb, enabling seamless hot embedding migration between cache and storage.
+  - Added cache support for DynamicEmb, enabling seamless hot embedding migration between cache and storage.
   - Released an end-to-end HSTU inference example, demonstrating precision aligned with training.
-  - Enabled evaluation mode support for dynamicemb.
+  - Enabled evaluation mode support for DynamicEmb.
 
 - **[2025/8/1]** 🎉v25.07 released!
-  - Released HSTU inference benchmark, including paged kvcache HSTU kernel, kvcache manager based on trt-llm, CUDA graph, and other optimizations.
+  - Released HSTU inference benchmark, including a paged KV-cache HSTU kernel, a KV-cache manager based on TensorRT-LLM, CUDA graph, and other optimizations.
   - Added support for Tensor Parallelism in the HSTU layer.
 
 - **[2025/7/4]** 🎉v25.06 released!
-  - Dynamicemb lookup module performance improvement and LFU eviction support. 
-  - Pipeline support for HSTU example, recompute support for HSTU layer and customized cuda ops for jagged tensor concat.
+  - DynamicEmb lookup module performance improvements and LFU eviction support.
+  - Pipeline support for HSTU example, recompute support for HSTU layer, and customized CUDA ops for jagged tensor concat.
 
 - **[2025/5/29]** 🎉v25.05 released! 
-  - Enhancements to the dynamicemb functionality, including support for EmbeddingBagCollection, truncated normal initialization, and initial_accumulator_value for Adagrad.
+  - Enhancements to DynamicEmb functionality, including support for EmbeddingBagCollection, truncated normal initialization, and initial_accumulator_value for Adagrad.
   - Fusion of operations like layernorm and dropout in the HSTU layer, resulting in about 1.2x end-to-end speedup.
   - Fix convergence issues on the Kuairand dataset.
 </details>

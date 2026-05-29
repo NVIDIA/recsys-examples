@@ -1,9 +1,9 @@
-# HSTU Training example
+# HSTU Training Example
 
-We have supported both retrieval and ranking model whose backbones are HSTU layers. In this example collection, we allow user to specify the model structures via gin-config file. Supported datasets are listed below. Regarding the gin-config interface, please refer to [inline comments](../utils/gin_config_args.py) .
+We support retrieval and ranking models whose backbones are HSTU layers. In this example collection, users specify model structures through gin config files. Supported datasets are listed below. For the gin-config interface, see the [inline comments](../utils/gin_config_args.py).
 
 ## Parallelism Introduction 
-To facilitate large embedding tables and scaling-laws of HSTU dense, we have integrate **[TorchRec](https://github.com/pytorch/torchrec)** that does shard embedding tables and **[Megatron-LM](https://github.com/NVIDIA/Megatron-LM)** that enable dense parallelism(e.g Data, Tensor, Sequence, Pipeline, and Context parallelism) in this example.
+To facilitate large embedding tables and HSTU dense-layer scaling, this example integrates **[TorchRec](https://github.com/pytorch/torchrec)** for embedding table sharding and **[Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core)** for dense parallelism, including data, tensor, sequence, pipeline, and context parallelism.
 This integration ensures efficient training by coordinating sparse (embedding) and dense (context/data) parallelisms within a single model.
 ![parallelism](../figs/parallelism.png)
 
@@ -22,11 +22,11 @@ docker build -f docker/Dockerfile --platform linux/arm64 -t recsys-examples:late
 ```
 > **Note:** The `--recursive` flag is required to fetch submodules (e.g. `third_party/FBGEMM` for HSTU attention kernels).
 > If you already cloned without it, run `git submodule update --init --recursive`.
-You can also set your own base image with args `--build-arg <BASE_IMAGE>`.
+You can also set your own base image with `--build-arg BASE_IMAGE=<image>`.
 
 ### Start from source file
 Before running examples, build and install libs following the instructions below:
-- [Dynamic Embeddings documentation](.../../../corelib/dynamicemb/README.md)
+- [DynamicEmb documentation](../../../corelib/dynamicemb/README.md)
 
 **HSTU attention kernels** are provided by the `fbgemm_gpu_hstu` package (import name: `hstu`),
 included as a git submodule at `third_party/FBGEMM`. Install it from source:
@@ -36,24 +36,19 @@ git submodule update --init --recursive
 cd third_party/FBGEMM/fbgemm_gpu/experimental/hstu && pip install .
 ```
 
-On top of those two core libs, Megatron-Core along with other libs are required. You can install them via pypi package:
+On top of those core libraries, Megatron-Core and other Python dependencies are required. The Docker image installs Megatron-Core from `core_v0.13.1`. For a source environment, install the Python dependencies and then install the matching Megatron-Core source:
 
 ```bash
-pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath megatron-core==0.12.1
+pip install torchx gin-config torchmetrics==1.0.3 typing-extensions iopath
+git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm
+pip install --no-deps -e ./megatron-lm
 ```
 
-If you fail to install the megatron-core package, usually due to the python version incompatibility, please try to clone and then install the source code. 
+We provide custom CUDA operators used by the HSTU examples under `examples/commons`. Install them with:
 
 ```bash
-git clone -b core_v0.12.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
-pip install -e ./megatron-lm
-```
-
-We provide our custom HSTU CUDA operators for enhanced performance. You need to install these operators using the following command:
-
-```bash
-cd /workspace/recsys-examples/examples/hstu && \
-python setup.py install
+cd /workspace/recsys-examples/examples/commons
+TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" python3 setup.py install
 ```
 ### Dataset Introduction
 
@@ -74,7 +69,7 @@ refer to [KuaiRand](https://kuairand.com/) for details.
 
 ## Running the examples
 
-Before getting started, please make sure that all pre-requisites are fulfilled. You can refer to [Get Started](../../../README) section in the root directory of the repo to set up the environment.
+Before getting started, make sure that all prerequisites are fulfilled. You can refer to the [Get Started](../../../README.md#get-started) section in the root README to set up the environment.
 
 
 ### Dataset preprocessing
@@ -94,15 +89,14 @@ Command to run retrieval task with `MovieLens 20m` dataset:
 
 ```bash
 # Before running the `pretrain_gr_retrieval.py`, make sure that current working directory is `hstu`
-cd <root-to-project>examples/hstu 
+cd <root-to-project>/examples/hstu
 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000  ./training/pretrain_gr_retrieval.py --gin-config-file ./training/configs/movielen_retrieval.gin
 ```
 
 To run ranking task with `MovieLens 20m` dataset:
 ```bash
 # Before running the `pretrain_gr_ranking.py`, make sure that current working directory is `hstu`
-cd <root-to-project>examples/hstu 
+cd <root-to-project>/examples/hstu
 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000  ./training/pretrain_gr_ranking.py --gin-config-file ./training/configs/movielen_ranking.gin
 ```
-
 

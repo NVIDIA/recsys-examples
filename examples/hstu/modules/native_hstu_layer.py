@@ -151,6 +151,7 @@ class HSTULayer(MegatronModule):
         register_setter_and_getter_for_nvtx(
             HSTULayer.forward, key_or_attr_name="values"
         )
+        self._disable_contextual_mask = config.disable_contextual_mask
 
     def get_user_value_query_key_tensors(self, hidden_states: torch.Tensor):
         """
@@ -234,7 +235,9 @@ class HSTULayer(MegatronModule):
                 tk,
                 tv,
                 jd.seqlen_offsets,
-                num_contextuals=jd.contextual_seqlen,
+                num_contextuals=jd.contextual_seqlen
+                if not self._disable_contextual_mask
+                else None,
                 num_candidates=jd.num_candidates,
                 max_seqlen=jd.max_seqlen,
                 scaling_seqlen=jd.scaling_seqlen,

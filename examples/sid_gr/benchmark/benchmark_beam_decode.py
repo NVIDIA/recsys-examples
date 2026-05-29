@@ -197,7 +197,7 @@ def measure_phase_breakdown(
     batch,
     num_iter: int,
     backend: str = "3kernel",
-    use_jagged_kv: bool = False,
+    use_jagged_kv: bool = True,
 ) -> Dict[str, float]:
     """Average prefill_ms and decode_loop_ms across num_iter calls."""
     prefill = []
@@ -651,12 +651,12 @@ def main():
     )
     parser.add_argument(
         "--use_jagged_kv",
-        action="store_true",
-        help="Use the jagged-native prefill + cu_seqlens_k path. "
-        "Only valid with backend='3kernel'. Needs the "
-        "cu_seqlens_k kernel entry point (already present "
-        "in the vendored corelib/gr_decode_atten). "
-        "See RESULTS.md for the perf trade-off.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pack history as [total_tokens, D] + cu_seqlens_k through "
+        "FA's varlen+causal fast path (default). Pass "
+        "--no-use_jagged_kv to fall back to dense + seqused_k (legacy, "
+        "17 - 48%% slower at B=16). Only valid with backend='3kernel'.",
     )
     parser.add_argument(
         "--compare_kv_modes",

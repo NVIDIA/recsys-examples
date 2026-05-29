@@ -1,10 +1,10 @@
 # Recsys KVCache Manager
 
-Recsys KVCache Manager is a Python package that LLM-compatible KV data caching, storage and lookup for generative recommanders models inference.
-It supports kvcache management based on **user-id**s from recommender systems, inter-requests kvcache reuse for the same user.
+Recsys KVCache Manager is a Python package that provides LLM-compatible KV data caching, storage, and lookup for generative recommender model inference.
+It supports KV-cache management based on recommender-system **user IDs**, enabling KV-cache reuse across requests from the same user.
 
-Recsys KVCache Manager is based on the **Pytorch** ecosystem. It contains kv data cache on both GPU memory and host memory backed with lower-tier storage.
-It supports lookup, offloading (to low-tier storage), and onboard (to GPU memory for inference), and also easy ways to read/write data to the kvcache.
+Recsys KVCache Manager is based on the **PyTorch** ecosystem. It manages KV data in GPU memory and host memory backed by lower-tier storage.
+It supports lookup, offloading to lower-tier storage, onboarding to GPU memory for inference, and read/write APIs for KV-cache data.
 
 
 ## Table of Contents
@@ -18,8 +18,8 @@ It supports lookup, offloading (to low-tier storage), and onboard (to GPU memory
 ## Features
 
 - **User ID Based Caching**:
-For recommander systems, the behaviour sequences (which generates the KV data) from different users varies greatly, and there is almost not common prefix for the input sequences.
-Recsys KVCache Manager supports data lookup based on user-id only, instead of comparing the token values of sequences.
+For recommender systems, behavior sequences that generate KV data vary greatly across users, and there is usually little common prefix between input sequences.
+Recsys KVCache Manager supports data lookup by user ID instead of comparing sequence token values.
 
 <div style="margin-left: 2em;"> 
 
@@ -28,27 +28,27 @@ Recsys KVCache Manager supports data lookup based on user-id only, instead of co
 </div>
 
 ```
-    + KVCacheManager :  Interface for kvcache operations
+    + KVCacheManager :  Interface for KV-cache operations
     |
-    ├---- GPUKVCacheManager :  Manager for GPU kvcache table
+    ├---- GPUKVCacheManager :  Manager for GPU KV-cache table
     |
-    └---- HostKVStorageManagerBase :  Interface of manager for host memory/ssd/remote kvcache
+    └---- HostKVStorageManagerBase :  Interface of manager for host memory/SSD/remote KV cache
         |
-        ├---- NativeHostKVCacheManager :  Wrapper to pinned host memory only kvcache
+        ├---- NativeHostKVCacheManager :  Wrapper for pinned-host-memory-only KV cache
         |
         └---- FlexKVCacheManager :  Wrapper to FlexKV cache system
 ```
 
 - **Paged GPU KVCache Table**:
-The GPU kvcache table is organized as a paged KV-data table, and supports KV data adding/appending, lookup and eviction. When appending new data to the GPU cache, we will evict data from the oldest users (based on the LRU policy) if there is no empty page. The HSTU attention kernel from FBGEMM-HSTU also load KV data directly from a paged table in HSTU attention kernels, which avoids additional data copy.
+The GPU KV-cache table is organized as a paged KV-data table and supports KV data add/append, lookup, and eviction. When appending new data to the GPU cache, it evicts data from the oldest users by LRU policy if there is no empty page. The HSTU attention kernel from FBGEMM-HSTU can load KV data directly from a paged table, avoiding additional data copies.
 
 - **Asynchronous Onboarding/Offloading**:
 By using asynchronous data copy on the side CUDA stream, we overlap the KV data transfer between GPU memory and host storage (onboarding/offloading) with embedding lookup, sequence pre-/post-processing, and inference for other requests (in some cases) to reduce the latency of HSTU inference.
 Furthermore, the `NativeHostKVCacheManager` backend supports layerwise KV data onboarding, overlapping the H2D data transfer with computation from the previous HSTU layers.
 
 - **Extension for Multiple Backend**: 
-`HostKVStorageManagerBase` is provided as an interface for other LLM-compatible kvcache systems for the host memory, storage and remote data pool.
-This can be easily extended to integration other kvcache system. Currently, we provide the integration with [`FlexKV`](https://github.com/taco-project/FlexKV/tree/main) as the low-tier kv storage backend. 
+`HostKVStorageManagerBase` is provided as an interface for other LLM-compatible KV-cache systems for host memory, storage, and remote data pools.
+This can be extended to integrate other KV-cache systems. Currently, we provide integration with [`FlexKV`](https://github.com/taco-project/FlexKV/tree/main) as the lower-tier KV storage backend.
 
 
 ## Installation
@@ -59,36 +59,36 @@ To install, please use the following command:
 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0" pip3 install --no-build-isolation .
 ```
 
-**Note**: To enable the FlexKV backend, please install FlexKV package according the [doc](https://github.com/taco-project/FlexKV/tree/main#how-to-use).
+**Note**: To enable the FlexKV backend, install the FlexKV package according to the [FlexKV doc](https://github.com/taco-project/FlexKV/tree/main#how-to-use).
 
 
 ## Basic APIs
 
--   `lookup_kvcache`: get the cached sequence length from both GPU cache table and host kv storage.
+-   `lookup_kvcache`: gets the cached sequence length from both the GPU cache table and host KV storage.
 
--   `allocate_kvcache`: assign required cache page in the GPU cache table for infernece.
-This generates page ids for read/write data, and also other metadata for appending KV data into the GPU table.
-It also evicts used cache pages when running out of empty pages. **No offloading** upon eviction in current implementation.
+-   `allocate_kvcache`: assigns required cache pages in the GPU cache table for inference.
+This generates page IDs for reading/writing data and metadata for appending KV data into the GPU table.
+It also evicts used cache pages when running out of empty pages. **No offloading** is performed upon eviction in the current implementation.
 
--   `onboard_launch`: launches async host-to-GPU kvcache transfer.
+-   `onboard_launch`: launches async host-to-GPU KV-cache transfer.
 
 -   `onboard_try_wait`, `onboard_wait`: performs non-blocking/blocking waiting for KV data onboarding.
 
 -   `offload_launch`: launches async GPU-to-host offload and records the task into ongoing offload queue.
 
--   `offload_try_wait`: polls ongoing offload tasks, finishes ready tasks, and cancels failed/timed-out tasks, and unlock 
+-   `offload_try_wait`: polls ongoing offload tasks, finishes ready tasks, cancels failed or timed-out tasks, and unlocks host KV storage state.
 
--	`evict`, `evict_all`: explicitly evicts cached data from GPU cache table and/or low-tier storage if supported.
+-   `evict`, `evict_all`: explicitly evicts cached data from the GPU cache table and/or lower-tier storage if supported.
 
-#### Importance Notes:
+#### Important Notes:
 
-There are some **limitations** for current implementation. These will be resolved soon for broader use cases, and better performance.
+There are some **limitations** in the current implementation. These are expected to be resolved for broader use cases and better performance.
 
 1. API `allocate_kvcache` is host blocking, and cannot overlap with other operations.
 
-2. Allow only **one** GPU kvcache manager per device, and only one inference instance for each GPU kvcache manager.
+2. Only **one** GPU KV-cache manager is allowed per device, and only one inference instance is allowed for each GPU KV-cache manager.
 
-3. Host backend "native" is limited for at most **one** GPU kvcache manager, and only one inference instance. Recommend to use with `user_id` based routing with inference instance isolation.
+3. The `native` host backend is limited to at most **one** GPU KV-cache manager and one inference instance. Use it with `user_id`-based routing and inference instance isolation.
 
 
 ## Example
@@ -112,8 +112,6 @@ There are some **limitations** for current implementation. These will be resolve
 
     # Onboard to GPU cache table, non-blocking, if necessary
     kvcache_mgr.onboard_launch(index_meta, lookup_res, kvcache_metadata)
-    for layer_idx in range(3):
-        kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
 
     [[ ... embedding lookup ... ]]
     [[ ... preprocess ... ]]
@@ -121,16 +119,16 @@ There are some **limitations** for current implementation. These will be resolve
 
     # Dense Module computation
     # Note: Here we show two possible ways to synchronize with onboard completion:
-    #       (1) blocking wait for onboard completion
-    #       (2) non-blocking "cuda stream wait" with layerwise onboard events.
+    #       (1) blocking wait for onboard completion, for non-layerwise backends
+    #       (2) non-blocking CUDA stream wait with layerwise onboard events
 
     # Case (1): Blocking total wait. [ Note: not supported with "native" backend. ]
     kvcache_mgr.onboard_wait(index_meta, kvcache_metadata.kv_onload_handle)
     for layer_idx in range(num_layers):
 
-        [[ ... write new KV data thru `kvcache_metadata.kv_cache_table` ]]  # See `k`vcache_mgr.gpu_kvcache_mgr.put``
+        [[ ... write new KV data through `kvcache_metadata.kv_cache_table` ]]  # See `kvcache_mgr.gpu_kvcache_mgr.put`
 
-        # Case (2): Layerwise stream wait. [ Note: only with "native" backend. ]
+        # Case (2): Layerwise stream wait. [ Note: only active with layerwise backends such as "native". ]
         kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
 
         [[ ... attention computation, loading data using `kv_indices`, `kvkv_indptr`, etc. ... ]]
@@ -144,10 +142,10 @@ There are some **limitations** for current implementation. These will be resolve
     [[ ... return inference results ... ]]
 ```
 
-**Refer to** HSTU model inference in (Recsys-Examples) for details [[InferenceRankingGR](../../examples/hstu/model/inference_ranking_gr.py), [InferenceDenseModule](../../examples/hstu/modules/inference_dense_module.py)]
+**Refer to** HSTU model inference in RecSys Examples for details: [InferenceRankingGR](../../examples/hstu/model/inference_ranking_gr.py), [InferenceDenseModule](../../examples/hstu/modules/inference_dense_module.py).
 
 
 ## Future Plans
 
-1. Support concurrent kvcache operations inference instances.
-2. Support torch export and AOT induction compilation with the recommenders models for Torch C++ runtime inference.
+1. Support concurrent KV-cache operations across inference instances.
+2. Broaden Torch Export and AOTInductor coverage for recommender-model KV-cache inference paths in the Torch C++ runtime.
