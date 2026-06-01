@@ -212,7 +212,10 @@ def parse_args():
         "the main process. When > 0, spawn-based workers are used to avoid "
         "cloning the parent's CUDA context.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.num_workers < 0:
+        parser.error("--num_workers must be >= 0")
+    return args
 
 
 class MovieLensDataset(Dataset):
