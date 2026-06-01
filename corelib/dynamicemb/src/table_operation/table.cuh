@@ -99,7 +99,8 @@ table_insert_and_evict(
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices);
+                 std::optional<at::Tensor> indices,
+		 std::optional<at::Tensor> mask);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
