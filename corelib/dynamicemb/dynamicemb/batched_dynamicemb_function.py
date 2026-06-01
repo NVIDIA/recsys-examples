@@ -45,6 +45,32 @@ from dynamicemb_extensions import (
 )
 
 
+def _copy_cuda_tensor_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.is_cuda:
+        return tensor.detach().cpu()
+    cpu = torch.empty(
+        tuple(tensor.shape),
+        dtype=tensor.dtype,
+        device=torch.device("cpu"),
+        pin_memory=True,
+    )
+    cpu.copy_(tensor.detach(), non_blocking=True)
+    torch.cuda.current_stream(tensor.device).synchronize()
+    return cpu
+
+
+def _scalar_item(tensor: torch.Tensor):
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    if tensor.numel() != 1:
+        raise ValueError(f"expected scalar tensor, got shape {tuple(tensor.shape)}")
+    return _copy_cuda_tensor_to_pinned_cpu(tensor.reshape(1))[0].item()
+
+
+def _bool_item(tensor: torch.Tensor) -> bool:
+    return bool(_scalar_item(tensor))
+
+
 def segmented_unique(
     keys: torch.Tensor,
     segment_range: torch.Tensor,
@@ -112,7 +138,7 @@ def segmented_unique(
             freq_counters,
         ) = segmented_unique_cuda(keys, segment_range, num_tables, input_frequencies)
 
-        table_offsets_cpu = table_offsets.cpu()
+        table_offsets_cpu = _copy_cuda_tensor_to_pinned_cpu(table_offsets)
         total_unique = table_offsets_cpu[num_tables].item()
         unique_size_per_table = (
             table_offsets_cpu[1 : num_tables + 1] - table_offsets_cpu[0:num_tables]
@@ -353,7 +379,8 @@ def _prefetch_cache_path(
         non_admitted_positions: Optional[torch.Tensor] = None
         keys_to_insert_mask = storage_founds.clone()
 
-        if new_in_miss.any() and admit_strategy is not None:
+        has_new_in_miss = _bool_item(new_in_miss.any())
+        if has_new_in_miss and admit_strategy is not None:
             new_keys_sub = miss_keys[new_in_miss]
             new_tids_sub = miss_tids[new_in_miss]
 
@@ -368,22 +395,22 @@ def _prefetch_cache_path(
             freq = admission_counter.add(new_keys_sub, new_tids_sub, counters)
             admit_mask = admit_strategy.admit(new_keys_sub, freq)
 
-            if admit_mask.any():
+            if _bool_item(admit_mask.any()):
                 admission_counter.erase(
                     new_keys_sub[admit_mask], new_tids_sub[admit_mask]
                 )
                 keys_to_insert_mask[new_in_miss] = admit_mask
 
             non_admit_miss = ~keys_to_insert_mask
-            if non_admit_miss.any():
+            if _bool_item(non_admit_miss.any()):
                 non_admitted_positions = miss_compact_idx[non_admit_miss]
-        elif new_in_miss.any():
+        elif has_new_in_miss:
             keys_to_insert_mask = torch.ones(
                 h_num_miss, dtype=torch.bool, device=device
             )
 
         # 5. Insert only storage-found + admitted-new keys into cache
-        if not keys_to_insert_mask.any():
+        if not _bool_item(keys_to_insert_mask.any()):
             slot_indices[miss_compact_idx] = -1
             update_slot_indices = slot_indices.clone()
             return slot_indices, update_slot_indices, non_admitted_positions
@@ -418,7 +445,7 @@ def _prefetch_cache_path(
 
         # 7. Store storage-found values to their cache slots
         is_sf_in_insert = storage_founds[insert_to_miss]
-        if is_sf_in_insert.any():
+        if _bool_item(is_sf_in_insert.any()):
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(
                     state,
@@ -429,8 +456,8 @@ def _prefetch_cache_path(
 
         # 8. Initialize admitted-new keys in their cache slots
         is_new_in_insert = ~is_sf_in_insert
-        if is_new_in_insert.any():
-            n_new_admitted = is_new_in_insert.sum().item()
+        if _bool_item(is_new_in_insert.any()):
+            n_new_admitted = int(_scalar_item(is_new_in_insert.sum()))
             init_vals = torch.empty(
                 n_new_admitted, val_dim, dtype=emb_dtype, device=device
             )
@@ -743,10 +770,11 @@ def dynamicemb_prefetch(
             if outstanding_keys_ref is not None:
                 outstanding_keys_ref += num_prefetched_keys
                 cache_capacity = cache._state.capacity
-                if outstanding_keys_ref.item() > cache_capacity:
+                outstanding_keys = _scalar_item(outstanding_keys_ref)
+                if outstanding_keys > cache_capacity:
                     raise RuntimeError(
                         f"Outstanding prefetched keys "
-                        f"({outstanding_keys_ref.item()}) "
+                        f"({outstanding_keys}) "
                         f"exceed cache capacity ({cache_capacity}). "
                         "Reduce prefetch pipeline depth or increase "
                         "cache size."
