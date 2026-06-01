@@ -293,8 +293,8 @@ Examples:
         "--log-interval",
         dest="log_interval",
         type=int,
-        default=100,
-        help="Training log interval in iterations (default: 100)",
+        default=20,
+        help="Training log interval in iterations (default: 20)",
     )
 
     parser.add_argument(
