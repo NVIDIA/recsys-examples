@@ -351,18 +351,15 @@ def _calculate_peak_tflops(
             tflops = num_sms * clock_mhz * 1e6 * flops_per_sm_per_cycle * 2 / 1e12
             peak_tflops[dtype] = tflops
 
-    # Validate/override with known specs if available
+    # Prefer known dense Tensor Core specs when available.  The formula above
+    # uses the device's reported max graphics clock, which can differ from the
+    # reference boost clock used in datasheets.  For example, H100 at 1980 MHz
+    # would compute ~1071 BF16 TFLOPS, while the dense datasheet value is 989.
     name_upper = device_name.upper()
     for pattern, known_specs in _KNOWN_GPU_SPECS.items():
-        if pattern in name_upper:
-            # Use known specs as reference (they account for real boost behavior)
+        if pattern.upper() in name_upper:
             for dtype, known_tflops in known_specs.items():
-                # If calculated value is significantly different, use known value
-                if (
-                    dtype not in peak_tflops
-                    or abs(peak_tflops[dtype] - known_tflops) / known_tflops > 0.2
-                ):
-                    peak_tflops[dtype] = known_tflops
+                peak_tflops[dtype] = known_tflops
             break
 
     return peak_tflops
@@ -394,9 +391,9 @@ def get_current_device_spec(device_index: Optional[int] = None) -> DeviceSpec:
         SMs: 132, Clock: 1980 MHz
         Memory: 80.0 GB, Bandwidth: 3350 GB/s
         Peak TFLOPS (Tensor Core):
-          bf16: 1979.0 TFLOPS
-          fp16: 1979.0 TFLOPS
-          fp8: 3958.0 TFLOPS
+          bf16: 989.0 TFLOPS
+          fp16: 989.0 TFLOPS
+          fp8: 1979.0 TFLOPS
           ...
 
         >>> # Get peak BF16 TFLOPS for MFU calculation
@@ -551,7 +548,9 @@ def cal_hstu_flops_single_rank(
         gemm_flops_per_layer = (
             2 * seqlens * 4 * num_heads * dim_per_head * hidden_size
         )  # qkvu proj fwd
-        gemm_flops_per_layer += 2 * seqlens * num_heads * hidden_size  # proj fwd
+        gemm_flops_per_layer += (
+            2 * seqlens * num_heads * hidden_size * dim_per_head
+        )  # proj fwd
         if has_bwd:
             gemm_flops_per_layer *= 3
 
@@ -597,69 +596,21 @@ def cal_hstu_flops(
     num_contextuals_tensor = torch.cat(num_contextuals)
     num_candidates_tensor = torch.cat(num_candidates)
 
-    # Use DP process group if provided, otherwise use default world group
-    if dp_pg is not None:
-        dp_world_size = torch.distributed.get_world_size(group=dp_pg)
-        dp_rank = torch.distributed.get_rank(group=dp_pg)
-        dst_global_rank = torch.distributed.get_global_rank(dp_pg, 0)
-    else:
-        dp_world_size = torch.distributed.get_world_size()
-        dp_rank = torch.distributed.get_rank()
-        dst_global_rank = 0
-
-    # Gather to group rank 0 in the DP group
-    gathered_seqlens = (
-        [torch.empty_like(seqlens_tensor) for _ in range(dp_world_size)]
-        if dp_rank == 0
-        else None
-    )
-    gathered_num_contextuals = (
-        [torch.empty_like(num_contextuals_tensor) for _ in range(dp_world_size)]
-        if dp_rank == 0
-        else None
-    )
-    gathered_num_candidates = (
-        [torch.empty_like(num_candidates_tensor) for _ in range(dp_world_size)]
-        if dp_rank == 0
-        else None
-    )
-
-    torch.distributed.gather(
-        seqlens_tensor, gathered_seqlens, dst=dst_global_rank, group=dp_pg
-    )
-    torch.distributed.gather(
+    flops = cal_hstu_flops_single_rank(
+        num_layers,
+        hidden_size,
+        num_heads,
+        dim_per_head,
+        seqlens_tensor,
         num_contextuals_tensor,
-        gathered_num_contextuals,
-        dst=dst_global_rank,
-        group=dp_pg,
-    )
-    torch.distributed.gather(
         num_candidates_tensor,
-        gathered_num_candidates,
-        dst=dst_global_rank,
-        group=dp_pg,
+        has_bwd,
+        is_causal,
+        residual,
     )
-
-    if dp_rank == 0:
-        flops = (
-            cal_hstu_flops_single_rank(
-                num_layers,
-                hidden_size,
-                num_heads,
-                dim_per_head,
-                torch.cat(gathered_seqlens),
-                torch.cat(gathered_num_contextuals),
-                torch.cat(gathered_num_candidates),
-                has_bwd,
-                is_causal,
-                residual,
-            )
-            .cpu()
-            .item()
-        )
-    else:
-        flops = 0
-    return flops
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(flops, group=dp_pg)
+    return flops.cpu().item()
 
 
 def get_mfu_summary(
@@ -685,10 +636,10 @@ def get_mfu_summary(
         >>> print(summary)
         MFU Summary:
           Achieved TFLOPS: 500.00 (global)
-          Peak TFLOPS per GPU: 1979.00 (bf16)
+          Peak TFLOPS per GPU: 989.00 (bf16)
           World size: 8
-          Global Peak TFLOPS: 15832.00
-          MFU: 3.16%
+          Global Peak TFLOPS: 7912.00
+          MFU: 6.32%
     """
     if device_spec is None:
         device_spec = get_current_device_spec()

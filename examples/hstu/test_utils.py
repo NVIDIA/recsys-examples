@@ -37,7 +37,6 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 debug_module_path_to_tpN_module_path = {
     "_output_layernorm_weight": "_output_ln_dropout_mul.weight",
@@ -51,62 +50,11 @@ def batch_slice(
     rank: int,
     world_size: int,
 ) -> HSTUBatch:
-    """
-    Slice the batch.
-    """
-    split_size = [batch_size for _ in range(world_size)]
-    keys = batch.features.keys()
-    values = []
-    lengths = []
-    for key in keys:
-        feature = batch.features[key]
-        sliced_lengths = torch.split(feature.lengths(), split_size)[rank]
-        segment_start = feature.offsets()[rank * batch_size]
-        segment_end = feature.offsets()[(rank + 1) * batch_size]
-        # in case of zero-sized segment
-        sliced_values = feature.values()[segment_start:segment_end].to(
-            feature.values().dtype
-        )
-        values.extend(sliced_values)
-        lengths.extend(sliced_lengths)
-    sliced_feature = KeyedJaggedTensor.from_lengths_sync(
-        keys=keys,
-        values=torch.tensor(values, device=batch.features.device()).long(),
-        lengths=torch.tensor(lengths, device=batch.features.device()),
-    )
-
-    if batch.num_candidates is not None:
-        num_candidates = batch.num_candidates[
-            rank * batch_size : (rank + 1) * batch_size
-        ]
-    else:
-        num_candidates = None
-    batch_kwargs = dict(
-        features=sliced_feature,
-        feature_to_max_seqlen=batch.feature_to_max_seqlen,
-        batch_size=batch_size,
-        contextual_feature_names=batch.contextual_feature_names,
-        item_feature_name=batch.item_feature_name,
-        action_feature_name=batch.action_feature_name,
-        max_num_candidates=batch.max_num_candidates,
-        num_candidates=num_candidates,
-    )
-    if batch.labels is not None:
-        sliced_lengths = torch.split(batch.labels.lengths(), split_size)[rank]
-        segment_start = batch.labels.offsets()[rank * batch_size]
-        segment_end = batch.labels.offsets()[(rank + 1) * batch_size]
-        # in case of zero-sized segment
-        sliced_values = batch.labels.values()[segment_start:segment_end].to(
-            batch.labels.values().dtype
-        )
-        labels = KeyedJaggedTensor.from_lengths_sync(
-            keys=["label"],
-            values=sliced_values,
-            lengths=sliced_lengths,
-        )
-        batch_kwargs["labels"] = labels
-
-    return HSTUBatch(**batch_kwargs)
+    """Slice the global batch range that belongs to ``rank``."""
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank {rank} must be in [0, {world_size})")
+    start = rank * batch_size
+    return batch.slice(start, start + batch_size, batch_size=batch_size)
 
 
 def get_batch_on_this_tp_rank(batch: JaggedData):

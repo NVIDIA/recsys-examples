@@ -73,13 +73,18 @@ class HSTURandomDataset(IterableDataset[HSTUBatch]):
             max_num_candidates=max_num_candidates,
             device=torch.cpu.current_device(),
         )
-        for _ in range(self._num_generated_batches):
-            if num_tasks > 0:
-                self._cached_batched.append(
-                    HSTUBatch.random(num_tasks=num_tasks, **kwargs)
-                )
-            else:
-                self._cached_batched.append(HSTUBatch.random(**kwargs))
+        combined_batch_size = batch_size * self._num_generated_batches
+        combined_kwargs = dict(kwargs)
+        combined_kwargs["batch_size"] = combined_batch_size
+        if num_tasks > 0:
+            combined_batch = HSTUBatch.random(num_tasks=num_tasks, **combined_kwargs)
+        else:
+            combined_batch = HSTUBatch.random(**combined_kwargs)
+        for i in range(self._num_generated_batches):
+            start = i * batch_size
+            self._cached_batched.append(
+                combined_batch.slice(start, start + batch_size, batch_size=batch_size)
+            )
         self._iloc = 0
 
     def __iter__(self) -> Iterator[HSTUBatch]:

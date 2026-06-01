@@ -16,7 +16,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, cast
 
 import gin
 import numpy as np
@@ -263,6 +263,112 @@ class HSTUBatch(BaseBatch):
             return torch.tensor(self.labels.values().numel(), dtype=torch.float)
         item_lengths = self.features[self.item_feature_name].lengths()
         return (item_lengths - 1).clamp(min=0).sum().float()
+
+    def slice(
+        self,
+        start: int,
+        end: int,
+        batch_size: Optional[int] = None,
+    ) -> "HSTUBatch":
+        """Slice a contiguous sample range from this batch.
+
+        Args:
+            start: Inclusive sample index.
+            end: Exclusive sample index.
+            batch_size: Optional padded output batch size. When omitted, the
+                sliced batch size is ``end - start``.
+
+        Returns:
+            A new ``HSTUBatch`` whose KJTs and per-sample tensors contain rows
+            ``[start, end)``. If ``batch_size`` is larger than ``end - start``,
+            trailing rows are zero-length padding.
+        """
+        if start < 0 or end <= start or end > self.batch_size:
+            raise ValueError(
+                f"invalid slice [{start}, {end}) for batch_size={self.batch_size}"
+            )
+        sliced_batch_size = end - start
+        output_batch_size = batch_size if batch_size is not None else sliced_batch_size
+        if output_batch_size < sliced_batch_size:
+            raise ValueError(
+                f"output batch_size ({output_batch_size}) must be >= slice size "
+                f"({sliced_batch_size})"
+            )
+
+        def slice_kjt_rows(kjt: KeyedJaggedTensor) -> KeyedJaggedTensor:
+            keys = list(kjt.keys())
+            sliced_values = []
+            sliced_lengths = []
+            sliced_weights = []
+            has_weights = kjt.weights_or_none() is not None
+            pad_size = output_batch_size - sliced_batch_size
+
+            for key in keys:
+                feature = kjt[key]
+                lengths = feature.lengths()[start:end]
+                offsets = feature.offsets()
+                value_start = offsets[start].item()
+                value_end = offsets[end].item()
+                values = feature.values()[value_start:value_end]
+                if pad_size > 0:
+                    lengths = torch.cat(
+                        [
+                            lengths,
+                            torch.zeros(
+                                pad_size, dtype=lengths.dtype, device=lengths.device
+                            ),
+                        ]
+                    )
+                sliced_lengths.append(lengths)
+                sliced_values.append(values)
+
+                if has_weights:
+                    weights = feature.weights_or_none()
+                    assert weights is not None
+                    sliced_weights.append(weights[value_start:value_end])
+
+            values = torch.cat(sliced_values)
+            lengths = torch.cat(sliced_lengths).long()
+            weights = torch.cat(sliced_weights) if has_weights else None
+            return KeyedJaggedTensor.from_lengths_sync(
+                keys=keys,
+                values=values,
+                lengths=lengths,
+                weights=weights,
+            )
+
+        actual_batch_size = max(
+            0,
+            min(cast(int, self.actual_batch_size), end) - start,
+        )
+        num_candidates = None
+        if self.num_candidates is not None:
+            num_candidates = self.num_candidates[start:end]
+            pad_size = output_batch_size - sliced_batch_size
+            if pad_size > 0:
+                num_candidates = torch.cat(
+                    [
+                        num_candidates,
+                        torch.zeros(
+                            pad_size,
+                            dtype=num_candidates.dtype,
+                            device=num_candidates.device,
+                        ),
+                    ]
+                )
+
+        return HSTUBatch(
+            features=slice_kjt_rows(self.features),
+            batch_size=output_batch_size,
+            feature_to_max_seqlen=dict(self.feature_to_max_seqlen),
+            contextual_feature_names=list(self.contextual_feature_names),
+            labels=slice_kjt_rows(self.labels) if self.labels is not None else None,
+            actual_batch_size=actual_batch_size,
+            item_feature_name=self.item_feature_name,
+            action_feature_name=self.action_feature_name,
+            max_num_candidates=self.max_num_candidates,
+            num_candidates=num_candidates,
+        )
 
     # to(), pin_memory(), record_stream() are inherited from BaseBatch
 

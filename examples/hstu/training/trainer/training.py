@@ -130,6 +130,15 @@ def batched(it: Iterator, n: int):
         yield chain((x,), islice(it, n - 1))
 
 
+def _warm_up_data_parallel_collective() -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        return
+
+    warmup = torch.zeros(1, device=torch.cuda.current_device())
+    dist.all_reduce(warmup, group=parallel_state.get_data_parallel_group())
+    torch.cuda.synchronize()
+
+
 def train_with_pipeline(
     pipeline: Union[
         JaggedMegatronPrefetchTrainPipelineSparseDist,
@@ -163,6 +172,7 @@ def train_with_pipeline(
     iter_slices = batched(train_loader_iter, n)
     start_iter = 0
     pipeline._model.train()
+    _warm_up_data_parallel_collective()
     for batched_iterator in iter_slices:
         # for one slice(every eval interval)
         for train_iter in watched_iter(count(start_iter), timeout=60, check_interval=1):
@@ -252,12 +262,15 @@ def train_with_pipeline(
                 print_rank_0(
                     f"[train] [iter {train_iter}, tokens {global_tokens}, elapsed_time {cur_td:.2f} ms, achieved FLOPS {flops / cur_td / 1e9:.2f} TFLOPS, MFU {mfu:.2f}%]: loss {avg_loss:.6f}"
                 )
-                last_td = cur_td + last_td
                 tokens_logged.zero_()
                 loss_logged.zero_()
                 ddp_seqlens = []
                 ddp_num_contextuals = []
                 ddp_num_candidates = []
+                # Keep log-time collectives and metric bookkeeping out of the
+                # next measured training interval.
+                last_td = 0
+                gpu_timer.start()
         if train_iter > 0 and train_iter % trainer_args.eval_interval == 0:
             # The training slice's batched_iterator is already exhausted
             # at this point, so the pipeline has drained naturally
