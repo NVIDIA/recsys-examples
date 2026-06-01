@@ -627,18 +627,6 @@ def _prefetch_hbm_direct_path(
             freq = admission_counter.add(missing_keys, missing_table_ids, counters)
             admit_mask = admit_strategy.admit(missing_keys, freq)
 
-<<<<<<< HEAD
-=======
-            if admit_mask.any():
-                admission_counter.erase(
-                    missing_keys, missing_table_ids, mask=admit_mask
-                )
-
-            non_admit = ~admit_mask
-            if non_admit.any():
-                non_admitted_positions = missing_indices[non_admit]
-
->>>>>>> 1fa4fcc (fix)
             admitted_keys = missing_keys[admit_mask]
             admitted_tids = missing_table_ids[admit_mask]
             admitted_scores = (
