@@ -1,0 +1,16 @@
+# HSTU Attention Kernel Benchmark Experiment List
+# Format: exp_name,<args to hstu_attn_kernel_benchmark.py>
+#
+# Each entry triggers one full (batch_size × seqlen) sweep of the CUTLASS
+# HSTU attention kernel and emits fwd/bwd/e2e TFLOPS+MFU heatmaps under
+# training/benchmark/figs/.
+#
+# Available args (see hstu_attn_kernel_benchmark.py --help for all):
+#   --gin-config-file PATH   (required)   Read NetworkArgs from gin config
+#   --batch-sizes CSV                     Comma-separated batch sizes
+#   --seqlens CSV                         Comma-separated sequence lengths
+#   --warmup-iters INT                    Warmup iterations per config (default: 10)
+#   --bench-iters INT                     Measured iterations per config (default: 50)
+#   --output-dir PATH                     Where to save heatmap PNGs
+
+default,--gin-config-file training/configs/benchmark_ranking.gin --batch-sizes 1,2,4,8,16,32,64,128 --seqlens 128,256,512,1024,2048,4096,8192,16384

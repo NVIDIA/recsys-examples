@@ -51,10 +51,10 @@ def get_baseline_template():
 # ===== Trainer Configuration =====
 TrainerArgs.train_batch_size = 32
 TrainerArgs.eval_batch_size = 32
-TrainerArgs.log_interval = 100
-TrainerArgs.eval_interval = 400
-TrainerArgs.max_train_iters = 1000
-TrainerArgs.max_eval_iters = 50
+TrainerArgs.log_interval = {log_interval}
+TrainerArgs.eval_interval = {eval_interval}
+TrainerArgs.max_train_iters = {max_train_iters}
+TrainerArgs.max_eval_iters = {max_eval_iters}
 TrainerArgs.seed = 1234
 TrainerArgs.pipeline_type = '{pipeline_type}'
 {balanced_shuffler_line}
@@ -62,7 +62,7 @@ TrainerArgs.pipeline_type = '{pipeline_type}'
 # Profiling, we need iteration later than num_generated_batches to make sure jit-compiled kernels are cached
 TrainerArgs.profile = True
 TrainerArgs.profile_step_start = 150
-TrainerArgs.profile_step_end = 200
+TrainerArgs.profile_step_end = 170
 
 # Checkpoint
 TrainerArgs.ckpt_save_dir = './checkpoints/generated_exp'
@@ -71,8 +71,8 @@ TrainerArgs.ckpt_save_interval = 999999999
 # ===== Dataset Configuration =====
 # Main sequence features (item + action)
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
-item_and_action_feature/FeatureArgs.max_sequence_length = 4096
-item_and_action_feature/FeatureArgs.is_jagged = True
+item_and_action_feature/FeatureArgs.max_sequence_length = {max_sequence_length}
+item_and_action_feature/FeatureArgs.is_jagged = {is_jagged}
 item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
 item_seqlen_dist/RandomDistribution.alpha = 1.2
 item_seqlen_dist/RandomDistribution.low = 1 # 256 is the minimum sequence length
@@ -103,7 +103,7 @@ BenchmarkDatasetArgs.contextual_feature_names = [
 ]  # Total 3 contextual features
 BenchmarkDatasetArgs.action_feature_name = 'action'
 BenchmarkDatasetArgs.max_num_candidates = 0
-BenchmarkDatasetArgs.num_generated_batches = 100
+BenchmarkDatasetArgs.num_generated_batches = {log_interval}
 
 # ===== Embedding Configuration =====
 # Item embedding (main ID)
@@ -113,6 +113,7 @@ item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50
 item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 item_embedding/DynamicEmbeddingArgs.evict_strategy = '{evict}'
 item_embedding/DynamicEmbeddingArgs.caching = {caching}
+item_embedding/DynamicEmbeddingArgs.dist_type = '{dist_type}'
 
 # Action embedding
 action_embedding/EmbeddingArgs.feature_names = ['action']
@@ -127,6 +128,7 @@ user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
 user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 user_id_emb/DynamicEmbeddingArgs.evict_strategy = '{evict}'
 user_id_emb/DynamicEmbeddingArgs.caching = {caching}
+user_id_emb/DynamicEmbeddingArgs.dist_type = '{dist_type}'
 
 user_age_emb/EmbeddingArgs.feature_names = ['user_age']
 user_age_emb/EmbeddingArgs.table_name = 'user_age'
@@ -252,6 +254,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--dist_type",
+        type=str,
+        choices=["continuous", "roundrobin", "hash_roundrobin"],
+        default="roundrobin",
+        help="DynamicEmb input distribution policy for row-wise sharding (default: roundrobin)",
+    )
+
+    parser.add_argument(
         "--pipeline_type",
         type=str,
         choices=["none", "prefetch", "sw_serial"],
@@ -278,7 +288,64 @@ Examples:
         help="Zipf alpha parameter when --value_dist=zipf (default: 1.2)",
     )
 
-    return parser.parse_args()
+    parser.add_argument(
+        "--log_interval",
+        "--log-interval",
+        dest="log_interval",
+        type=int,
+        default=100,
+        help="Training log interval in iterations (default: 100)",
+    )
+
+    parser.add_argument(
+        "--eval_interval",
+        "--eval-interval",
+        dest="eval_interval",
+        type=int,
+        default=None,
+        help="Evaluation interval in iterations (default: max_train_iters + 1, disables eval)",
+    )
+
+    parser.add_argument(
+        "--max_train_iters",
+        "--max-train-iters",
+        dest="max_train_iters",
+        type=int,
+        default=1000,
+        help="Maximum training iterations (default: 1000)",
+    )
+
+    parser.add_argument(
+        "--max_eval_iters",
+        "--max-eval-iters",
+        dest="max_eval_iters",
+        type=int,
+        default=50,
+        help="Maximum evaluation iterations (default: 50)",
+    )
+
+    parser.add_argument(
+        "--max_sequence_length",
+        "--max-sequence-length",
+        dest="max_sequence_length",
+        type=int,
+        default=4096,
+        help="Item/action feature max sequence length (default: 4096)",
+    )
+
+    parser.add_argument(
+        "--non_jagged",
+        "--non-jagged",
+        dest="non_jagged",
+        action="store_true",
+        default=False,
+        help="Use fixed non-jagged item/action feature lengths",
+    )
+
+    args = parser.parse_args()
+    if args.eval_interval is None:
+        args.eval_interval = args.max_train_iters + 1
+    return args
 
 
 def generate_config(args):
@@ -332,10 +399,17 @@ def generate_config(args):
         caching=str(args.caching),
         ratio=ratio,  # Use auto-corrected ratio
         evict=args.evict,
+        dist_type=args.dist_type,
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
         value_dist_section=value_dist_section,
         user_id_value_dist_section=user_id_value_dist_section,
+        log_interval=args.log_interval,
+        eval_interval=args.eval_interval,
+        max_train_iters=args.max_train_iters,
+        max_eval_iters=args.max_eval_iters,
+        max_sequence_length=args.max_sequence_length,
+        is_jagged=str(not args.non_jagged),
     )
 
     return config

@@ -50,6 +50,11 @@ def initialize_distributed():
     backend = "nccl"
     torch.cuda.set_device(device)
     torch.distributed.init_process_group(backend=backend)
+    global_rank = torch.distributed.get_rank()
+    print(
+        f"[Rank {global_rank}] PID={os.getpid()}, Node={os.environ.get('SLURM_NODEID', 'N/A')}, LocalRank={rank}",
+        flush=True,
+    )
 
 
 def initialize_model_parallel(tensor_model_parallel_size=1):

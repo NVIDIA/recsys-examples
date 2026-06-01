@@ -24,6 +24,7 @@
 # --recompute-input-layernorm True
 
 
+import os
 import warnings
 
 import torch
@@ -37,6 +38,7 @@ import commons.utils.initialize as init
 import nvtx
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.utils.gpu_timer import IGPUTimer
+from commons.utils.perf import cal_hstu_flops_single_rank, get_current_device_spec
 from configs.hstu_config import (
     HSTUConfig,
     HSTULayerType,
@@ -47,7 +49,6 @@ from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.fused_hstu_layer import FusedHSTULayer
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
-from training.trainer.utils import cal_flops_single_rank
 
 _backend_str_to_type = {
     "cutlass": KernelBackend.CUTLASS,
@@ -92,7 +93,7 @@ def create_hstu_layer(
 @click.option(
     "--layer-type",
     type=click.Choice(_layer_type_str_to_type.keys()),
-    default="native",
+    default="fused",
     required=False,
 )
 @click.option(
@@ -141,6 +142,14 @@ def create_hstu_layer(
 @click.option("--profiler-end", type=int, default=40, required=False)
 @click.option("--dump-memory-snapshot", type=bool, default=True, required=False)
 @click.option("--num-layers", type=int, default=1, required=False)
+@click.option("--profile", type=bool, default=False, required=False)
+@click.option(
+    "--output-dir",
+    type=str,
+    default=".",
+    required=False,
+    help="Directory to write the memory snapshot pickle. Defaults to cwd.",
+)
 def run(
     iters,
     warmup_iters,
@@ -161,6 +170,8 @@ def run(
     recompute_input_layernorm,
     recompute_input_silu,
     fuse_norm_mul_dropout,
+    profile,
+    output_dir,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -218,79 +229,131 @@ def run(
     }
     jagged_input = JaggedData(values=input, **ctor_nograd_dict)
     grad_output = torch.randn_like(input)
+
+    def _reset_grads():
+        # prevent gradient accumulation across iterations from inflating bwd timings
+        input.grad = None
+        for block in hstu_blocks:
+            block.zero_grad(set_to_none=True)
+
+    def _fwd():
+        ret_jd = hstu_blocks[0](jagged_input)
+        for hstu_layer in hstu_blocks[1:]:
+            ret_jd = hstu_layer(ret_jd)
+        return ret_jd
+
     # warmup
     if dump_memory_snapshot:
         torch.cuda.memory._record_memory_history(max_entries=10000)
     for _ in range(warmup_iters):
-        ret_jd = hstu_blocks[0](jagged_input)
-        for hstu_layer in hstu_blocks[1:]:
-            ret_jd = hstu_layer(ret_jd)
+        _reset_grads()
+        ret_jd = _fwd()
         ret_jd.values.backward(grad_output)
+    _reset_grads()
     if dump_memory_snapshot:
-        torch.cuda.memory._dump_snapshot(
-            f"{log_layer_type}x{num_layers}_bs{batchsize}_max_seqlen{max_seqlen}_dim{dim_per_head}_heads{num_heads}_memory_recomputeln{recompute_input_layernorm}_recomputesilu{recompute_input_silu}_snapshot.pickle"
+        os.makedirs(output_dir, exist_ok=True)
+        snapshot_filename = (
+            f"{log_layer_type}x{num_layers}_bs{batchsize}_max_seqlen{max_seqlen}"
+            f"_dim{dim_per_head}_heads{num_heads}"
+            f"_memory_recomputeln{recompute_input_layernorm}"
+            f"_recomputesilu{recompute_input_silu}_snapshot.pickle"
         )
+        torch.cuda.memory._dump_snapshot(os.path.join(output_dir, snapshot_filename))
         torch.cuda.memory._record_memory_history(enabled=None)
+
+    flops_kwargs = dict(
+        num_layers=hstu_config.num_layers,
+        hidden_size=hstu_config.hidden_size,
+        num_heads=hstu_config.num_attention_heads,
+        dim_per_head=hstu_config.kv_channels,
+        seqlens=lengths,
+        num_contextuals=None,
+        num_candidates=None,
+        is_causal=hstu_config.is_causal,
+        residual=hstu_config.residual,
+    )
+    fwd_flops = cal_hstu_flops_single_rank(has_bwd=False, **flops_kwargs)
+    total_flops = cal_hstu_flops_single_rank(has_bwd=True, **flops_kwargs)
+    bwd_flops = total_flops - fwd_flops
+
+    # Resolve peak TFLOPS for the current device + dtype so we can emit
+    # MFU alongside TFLOPS. Mirrors the kernel benchmark's approach.
+    device_spec = get_current_device_spec()
+    dtype_key = "bf16" if dtype == torch.bfloat16 else "fp16"
+    peak_tflops = device_spec.peak_tflops.get(
+        dtype_key, device_spec.peak_tflops.get("fp16", 312.0)
+    )
+
+    def _mfu_pct(flops, time_ms):
+        """flops: total FLOPs across all tokens; time_ms: step time in ms."""
+        tflops = flops / time_ms * 1e-9
+        return tflops, tflops / peak_tflops * 100.0
 
     # benchmark
     igpu_timer = IGPUTimer(max_iters=iters)
-    # fwd
+    # [train_fwd] — forward with autograd capture (matches the fwd portion of a training step)
     for iteration in range(iters):
+        _reset_grads()
         igpu_timer.start(iteration)
-        ret_jd = hstu_blocks[0](jagged_input)
-        for hstu_layer in hstu_blocks[1:]:
-            ret_jd = hstu_layer(ret_jd)
-        # ret_jd.values.backward(grad_output)
+        ret_jd = _fwd()
         igpu_timer.stop(iteration)
 
     fwd_median_time = igpu_timer.elapsed_time(reduction="median")
-    fwd_flops = cal_flops_single_rank(
-        hstu_config, lengths, num_contextuals=None, num_candidates=None, has_bwd=False
-    )
+    fwd_tflops, fwd_mfu = _mfu_pct(fwd_flops, fwd_median_time)
     print(
-        f"[{log_layer_type}] [fwd] tokens {L};time (median): {fwd_median_time:.4f} ms;achieved flops: {fwd_flops / fwd_median_time * 1e-9:.4f} TFLOPS"
+        f"[{log_layer_type}] [train_fwd] tokens {L};time (median): {fwd_median_time:.4f} ms;"
+        f"achieved flops: {fwd_tflops:.4f} TFLOPS;MFU: {fwd_mfu:.2f}%"
     )
     # bwd
     for iteration in range(iters):
-        ret_jd = hstu_blocks[0](jagged_input)
-        for hstu_layer in hstu_blocks[1:]:
-            ret_jd = hstu_layer(ret_jd)
+        _reset_grads()
+        ret_jd = _fwd()
         igpu_timer.start(iteration)
         ret_jd.values.backward(grad_output)
         igpu_timer.stop(iteration)
 
     bwd_median_time = igpu_timer.elapsed_time(reduction="median")
-    bwd_flops = (
-        cal_flops_single_rank(
-            hstu_config,
-            lengths,
-            num_contextuals=None,
-            num_candidates=None,
-            has_bwd=True,
-        )
-        - fwd_flops
-    )
+    bwd_tflops, bwd_mfu = _mfu_pct(bwd_flops, bwd_median_time)
     print(
-        f"[{log_layer_type}] [bwd] tokens {L};time (median): {bwd_median_time:.4f} ms;achieved flops: {bwd_flops / bwd_median_time * 1e-9:.4f} TFLOPS"
+        f"[{log_layer_type}] [bwd] tokens {L};time (median): {bwd_median_time:.4f} ms;"
+        f"achieved flops: {bwd_tflops:.4f} TFLOPS;MFU: {bwd_mfu:.2f}%"
     )
-    print(
-        f"[{log_layer_type}] [e2e] tokens {L};time: {fwd_median_time + bwd_median_time:.4f} ms;achieved flops: {(fwd_flops + bwd_flops) / (fwd_median_time + bwd_median_time) * 1e-9:.4f} TFLOPS"
-    )
-    # nsys
+    # [e2e] — real fwd+bwd step time (single timed region, not sum of medians)
     for iteration in range(iters):
-        if iteration == profiler_start or iteration == iters - 1:
-            torch.cuda.profiler.start()
+        _reset_grads()
+        igpu_timer.start(iteration)
+        ret_jd = _fwd()
+        ret_jd.values.backward(grad_output)
+        igpu_timer.stop(iteration)
 
-        with nvtx.annotate(f"hstu_layer_fwd {iteration}", color="ORANGE"):
-            ret_jd = hstu_blocks[0](jagged_input)
-            for hstu_layer in hstu_blocks[1:]:
-                ret_jd = hstu_layer(ret_jd)
+    e2e_median_time = igpu_timer.elapsed_time(reduction="median")
+    e2e_tflops, e2e_mfu = _mfu_pct(total_flops, e2e_median_time)
+    print(
+        f"[{log_layer_type}] [e2e] tokens {L};time (median): {e2e_median_time:.4f} ms;"
+        f"achieved flops: {e2e_tflops:.4f} TFLOPS;MFU: {e2e_mfu:.2f}%"
+    )
+    print(
+        f"[{log_layer_type}] [peak] {dtype_key} peak TFLOPS: {peak_tflops:.1f} on {device_spec.device_name}"
+    )
+    # nsys — only when --profile True
+    if profile:
+        for iteration in range(iters):
+            if iteration == profiler_start or iteration == iters - 1:
+                torch.cuda.profiler.start()
 
-        with nvtx.annotate(f"hstu_layer_bwd {iteration}", color="PURPLE"):
-            ret_jd.values.backward(grad_output)
+            _reset_grads()
+            # Outer `hstu_layer_step <i>` wraps both fwd and bwd so nsys
+            # post-analysis can pin the full step window (including any GPU
+            # idle gap between fwd and bwd enqueues — autograd graph setup).
+            with nvtx.annotate(f"hstu_layer_step {iteration}", color="CYAN"):
+                with nvtx.annotate(f"hstu_layer_fwd {iteration}", color="ORANGE"):
+                    ret_jd = _fwd()
 
-        if iteration == profiler_end or iteration == iters - 1:
-            torch.cuda.profiler.stop()
+                with nvtx.annotate(f"hstu_layer_bwd {iteration}", color="PURPLE"):
+                    ret_jd.values.backward(grad_output)
+
+            if iteration == profiler_end or iteration == iters - 1:
+                torch.cuda.profiler.stop()
 
 
 if __name__ == "__main__":

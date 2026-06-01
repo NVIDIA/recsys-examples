@@ -9,9 +9,23 @@
 #   --recompute_layernorm               (default: False)
 #   --balanced_shuffler                 (default: False)
 #   --tp_size INT                       (default: 1)
+#
+# Debug twin: when submit_all_experiments_slurm.sh is invoked with
+# --cache-debug and/or --mem-debug, each experiment in this file is paired
+# with one <exp>_dbg twin carrying all applicable debug flags combined:
+#   - MEM_DEBUG=1 when --mem-debug is passed
+#   - CACHE_DEBUG=1 when --cache-debug is passed AND the base exp uses --caching
+# The clean run stays debug-free so TFLOPS aren't perturbed; the twin
+# only contributes cache/memory line charts in the dashboard and is
+# hidden from the main TFLOPS comparison.
+#
+# You may also opt in per-line via pseudo-flags
+# (--cache-debug / --mem-debug / --mem-watchdog) which are stripped
+# before gin generation and turned into per-exp env vars.
 
 exp0_baseline,--value_dist zipf --value_dist_alpha 1.05
 exp1_shuffler,--balanced_shuffler --value_dist zipf --value_dist_alpha 1.05
 exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.05
-exp3_recompute,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --value_dist zipf --value_dist_alpha 1.05
-exp4_tp,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --tp_size 2 --value_dist zipf --value_dist_alpha 1.05
+exp3_caching,--balanced_shuffler --kernel_backend cutlass --caching --value_dist zipf --value_dist_alpha 1.05
+exp4_caching_hr,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --value_dist zipf --value_dist_alpha 1.05
+exp5_prefetch,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05

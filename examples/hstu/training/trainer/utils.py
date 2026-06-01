@@ -288,6 +288,7 @@ def create_dynamic_optitons_dict(
                 bucket_capacity=128,
                 training=training,
                 caching=embedding_args.caching,
+                dist_type=embedding_args.dist_type,
             )
     return dynamic_options_dict
 

@@ -1,42 +1,50 @@
 #!/bin/bash
 # ============================================================================
-# Batch Submit All Experiments via SLURM sbatch
-# 
-# Usage: 
-#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh --exp-file=<file> [options]
-# 
+# Batch Submit All Experiments via SLURM sbatch (unified dispatcher)
+#
+# Submits each line in --exp-file as one SLURM job via slurm_job.sub. All
+# entries must belong to the same benchmark type.
+#
+# Usage:
+#   ./training/benchmark/scripts/submit_all_experiments_slurm.sh [--benchmark-type=TYPE] --exp-file=<file> [options]
+#
 # Environment Variables:
 #   HSTU_ROOT            Path to examples/hstu directory (optional, defaults to pwd)
-# 
+#
 # Options:
-#   --exp-file=FILE      Experiment list file (required, format: exp_name,gin_options)
-#   --hstu-root=PATH     Specify examples/hstu directory path (overrides env var and pwd)
-#   --results-dir=PATH   Output directory (default: training/benchmark/results)
-#   --nsys               Enable nsys profile sampling
-#   --mem-debug          Enable GPU memory debug logging (MEM_DEBUG=1)
-#   --mem-watchdog       Enable CUDA memory fragmentation watchdog (CUDA_MEM_WATCHDOG=1)
-#   --cache-debug        Enable DynamicEmb cache hit rate logging (CACHE_DEBUG=1)
-#   --sequential         Sequential execution (use dependencies, start next after previous completes)
-#   --partition=NAME     SLURM partition name (default: batch)
-#   --account=NAME       SLURM account name (optional, passed to sbatch -A)
-#   --job-name=NAME      SLURM job name prefix (optional, passed to sbatch -J)
-#   --container-image=IMAGE  Container image (built from docker/Dockerfile)
-#   --nodes=N            Number of nodes (default: 2)
-#   --ranks-per-node=N   Number of ranks/processes per node (default: 8)
-#   --time=HH:MM:SS      Job time limit (default: 00:30:00)
-#   -y, --yes            Skip confirmation prompt
-#   --dry-run            Print sbatch commands only, do not submit
-#   --wait-and-analyze   Wait for all jobs to complete and auto-analyze results
-#   --poll-interval=SEC  Polling interval for job status check (default: 60)
-#   --scp-dest=USER@HOST:PATH  SCP destination for results archive (optional, skip if not set)
-#   --help               Show help information
-# 
-# Experiment List File Format:
+#   --benchmark-type=TYPE    e2e | hstu-layer | hstu-attn-kernel (default: e2e)
+#   --exp-file=FILE          Experiment list file. Defaults per benchmark type:
+#                              e2e              -> training/benchmark/experiments.txt
+#                              hstu-layer       -> training/benchmark/layer_experiments.txt
+#                              hstu-attn-kernel -> training/benchmark/kernel_experiments.txt
+#   --hstu-root=PATH         Specify examples/hstu directory path
+#   --results-dir=PATH       Output directory (default: training/benchmark/results)
+#   --nsys                   Enable nsys profile sampling (e2e only)
+#   --mem-debug              Enable GPU memory debug logging (MEM_DEBUG=1, e2e only)
+#   --mem-watchdog           Enable CUDA memory fragmentation watchdog (e2e only)
+#   --cache-debug            Enable DynamicEmb cache hit rate logging (e2e only)
+#   --sequential             Sequential execution (chain jobs with afterany)
+#   --partition=NAME         SLURM partition name (default: batch)
+#   --account=NAME           SLURM account (-A)
+#   --job-name=NAME          SLURM job name prefix (-J)
+#   --container-image=IMAGE  Container image
+#   --nodes=N                Number of nodes (default: e2e=2, single-GPU=1)
+#   --ranks-per-node=N       Ranks per node (default: e2e=8, single-GPU=1)
+#   --time=HH:MM:SS          Job time limit (default: 00:30:00)
+#   -y, --yes                Skip confirmation prompt
+#   --dry-run                Print sbatch commands only, do not submit
+#   --wait-and-analyze       Wait for all jobs and auto-analyze (e2e only)
+#   --poll-interval=SEC      Polling interval for job status (default: 60)
+#   --scp-dest=USER@HOST:PATH  SCP destination for results archive
+#   --help,-h                Show help information
+#
+# Experiment List File Format (all types):
 #   # Comment lines start with #
-#   exp_name,generate_gin_config_options
-#   exp0_baseline,
-#   exp1_cutlass,--kernel_backend cutlass
-#   exp4_caching,--kernel_backend cutlass --recompute_layernorm --balanced_shuffler --caching
+#   exp_name,<args>
+# Where <args> is benchmark-type-specific:
+#   - e2e              : gin options for generate_gin_config.py
+#   - hstu-layer       : CLI args for hstu_layer_benchmark.py run
+#   - hstu-attn-kernel : CLI args for hstu_attn_kernel_benchmark.py
 # 
 # Output Directory Structure:
 #   {results_dir}/
@@ -79,14 +87,15 @@ set -e
 # ============================================================================
 # Default Parameters
 # ============================================================================
+BENCHMARK_TYPE="e2e"
 ENABLE_NSYS=0
 SEQUENTIAL=0
 PARTITION="batch"
 ACCOUNT=""
 JOB_PREFIX=""
 CONTAINER_IMAGE=""  # Set to your container image, e.g. built from docker/Dockerfile
-NODES=2
-RANKS_PER_NODE=8
+NODES=""            # resolved after --benchmark-type (e2e=2, single-GPU=1)
+RANKS_PER_NODE=""   # resolved after --benchmark-type (e2e=8, single-GPU=1)
 TIME_LIMIT="00:30:00"
 DRY_RUN=0
 YES_FLAG=0
@@ -114,6 +123,14 @@ show_help() {
 # ============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --benchmark-type=*)
+            BENCHMARK_TYPE="${1#*=}"
+            shift
+            ;;
+        --benchmark-type)
+            BENCHMARK_TYPE="$2"
+            shift 2
+            ;;
         --exp-file=*)
             EXP_FILE="${1#*=}"
             shift
@@ -262,6 +279,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ============================================================================
+# Validate --benchmark-type and resolve per-type defaults
+# ============================================================================
+case "$BENCHMARK_TYPE" in
+    e2e|hstu-layer|hstu-attn-kernel) ;;
+    *)
+        echo "❌ Error: Unknown --benchmark-type: ${BENCHMARK_TYPE} (supported: e2e, hstu-layer, hstu-attn-kernel)"
+        exit 1
+        ;;
+esac
+
+# Defaults for nodes/ranks depend on benchmark type
+if [ "$BENCHMARK_TYPE" = "e2e" ]; then
+    [ -z "$NODES" ] && NODES=2
+    [ -z "$RANKS_PER_NODE" ] && RANKS_PER_NODE=8
+else
+    [ -z "$NODES" ] && NODES=1
+    [ -z "$RANKS_PER_NODE" ] && RANKS_PER_NODE=1
+fi
+
+# Default experiment list file per benchmark type
+if [ -z "$EXP_FILE" ]; then
+    case "$BENCHMARK_TYPE" in
+        e2e)              EXP_FILE="training/benchmark/experiments.txt" ;;
+        hstu-layer)       EXP_FILE="training/benchmark/layer_experiments.txt" ;;
+        hstu-attn-kernel) EXP_FILE="training/benchmark/kernel_experiments.txt" ;;
+    esac
+fi
+
+# ============================================================================
 # Set HSTU_ROOT (Priority: command line arg > env var > pwd)
 # ============================================================================
 if [ -n "$CUSTOM_HSTU_ROOT" ]; then
@@ -312,7 +358,15 @@ fi
 
 # Create timestamped batch experiment directory
 BATCH_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_TIMESTAMP}"
+# Prefix the batch dir with the benchmark type so a glance at results/
+# tells you what kind of benchmark produced each batch.
+case "${BENCHMARK_TYPE}" in
+    e2e)              BATCH_PREFIX="e2e" ;;
+    hstu-layer)       BATCH_PREFIX="hstu_layer" ;;
+    hstu-attn-kernel) BATCH_PREFIX="hstu_kernel" ;;
+    *)                BATCH_PREFIX="${BENCHMARK_TYPE//-/_}" ;;
+esac
+BATCH_OUTPUT_DIR="${RESULTS_BASE}/${BATCH_PREFIX}_${BATCH_TIMESTAMP}"
 
 # ============================================================================
 # Check Experiment List File
@@ -369,6 +423,45 @@ if [ -n "$EXP_FILE" ]; then
 fi
 
 # ============================================================================
+# Auto-spawn debug twins
+#
+# When --cache-debug / --mem-debug is passed at the batch level, append ONE
+# debug-instrumented twin job (suffix `_dbg`) per base exp with all
+# applicable debug flags combined on the twin. The clean runs stay
+# debug-free; after spawning, the batch-level CACHE_DEBUG / MEM_DEBUG are
+# zeroed so clean exps don't inherit them via EXPORT_VARS.
+#
+# Flag selection for the twin:
+#   --mem-debug   : always applied when MEM_DEBUG=1 at batch level
+#   --cache-debug : applied only when the base exp has --caching in its
+#                   gin_opts (otherwise DynamicEmb has no cache to log)
+#
+# The dashboard keys off the `_dbg` suffix to fold the twin's cache/mem
+# data back onto the clean exp and hide the twin from the TFLOPS bar.
+# ============================================================================
+if [ "${BENCHMARK_TYPE}" = "e2e" ] && { [ "${CACHE_DEBUG}" = "1" ] || [ "${MEM_DEBUG}" = "1" ]; }; then
+    _original_count=${#EXP_NAMES[@]}
+    for ((_ti=0; _ti<_original_count; _ti++)); do
+        _base_name="${EXP_NAMES[$_ti]}"
+        _base_opts="${GIN_OPTIONS[$_ti]}"
+        _twin_flags=""
+        if [ "${MEM_DEBUG}" = "1" ]; then
+            _twin_flags="${_twin_flags} --mem-debug"
+        fi
+        if [ "${CACHE_DEBUG}" = "1" ] && [[ " ${_base_opts} " == *" --caching "* ]]; then
+            _twin_flags="${_twin_flags} --cache-debug"
+        fi
+        if [ -n "${_twin_flags}" ]; then
+            EXP_NAMES+=("${_base_name}_dbg")
+            GIN_OPTIONS+=("${_base_opts}${_twin_flags}")
+        fi
+    done
+    # Prevent the batch-level flags from leaking onto clean exps via EXPORT_VARS.
+    CACHE_DEBUG=0
+    MEM_DEBUG=0
+fi
+
+# ============================================================================
 # Color Output
 # ============================================================================
 RED='\033[0;31m'
@@ -400,6 +493,8 @@ echo ""
 echo -e "${CYAN}==========================================${NC}"
 echo -e "${CYAN}🚀 HSTU Benchmark - SLURM Submission${NC}"
 echo -e "${CYAN}==========================================${NC}"
+echo ""
+echo -e "${BLUE}Benchmark type:    ${BENCHMARK_TYPE}${NC}"
 echo ""
 echo -e "${BLUE}SLURM Configuration:${NC}"
 echo "  Partition:        ${PARTITION}"
@@ -479,7 +574,24 @@ for i in "${!EXP_NAMES[@]}"; do
     exp="${EXP_NAMES[$i]}"
     gin_opts="${GIN_OPTIONS[$i]}"
     exp_num=$((i + 1))
-    
+
+    # Per-experiment debug overrides: a line in experiments.txt can opt in to
+    # debug instrumentation via --cache-debug / --mem-debug / --mem-watchdog
+    # pseudo-flags. These are stripped from gin_opts (so generate_gin_config
+    # never sees them) and set per-exp env vars. Lines without these flags
+    # inherit the batch-level defaults from --cache-debug/--mem-debug/etc.
+    EXP_CACHE_DEBUG="${CACHE_DEBUG}"
+    EXP_MEM_DEBUG="${MEM_DEBUG}"
+    EXP_WATCHDOG="${CUDA_MEM_WATCHDOG}"
+    for _flag_pair in "cache-debug:EXP_CACHE_DEBUG" "mem-debug:EXP_MEM_DEBUG" "mem-watchdog:EXP_WATCHDOG"; do
+        _flag="${_flag_pair%%:*}"
+        _var="${_flag_pair##*:}"
+        if [[ " ${gin_opts} " == *" --${_flag} "* ]]; then
+            printf -v "${_var}" '%s' 1
+            gin_opts="$(echo "${gin_opts}" | sed -E "s/(^| )--${_flag}( |\$)/ /g" | xargs)"
+        fi
+    done
+
     # Output directory for each experiment
     EXP_OUTPUT_DIR="${BATCH_OUTPUT_DIR}/${exp}"
     
@@ -511,16 +623,35 @@ for i in "${!EXP_NAMES[@]}"; do
     SBATCH_ARGS+=(--cpus-per-task=8)
     SBATCH_ARGS+=(--mem=0)
     SBATCH_ARGS+=(--time="${TIME_LIMIT}")
-    SBATCH_ARGS+=(--exclusive)
-    SBATCH_ARGS+=(--network=sharp)
-    
+    if [ "$BENCHMARK_TYPE" = "e2e" ]; then
+        SBATCH_ARGS+=(--exclusive)
+    fi
+    # cw-dfw batch_short rejects jobs without an explicit GPU spec, while
+    # some other clusters reject this GRES form. Keep the request
+    # cluster/partition aware.
+    if [[ "${PARTITION}" == "batch_short" || -n "${HSTU_SLURM_GPUS_PER_NODE:-}" ]]; then
+        SBATCH_ARGS+=(--gpus-per-node="${HSTU_SLURM_GPUS_PER_NODE:-${RANKS_PER_NODE}}")
+    fi
+    # SHARP is only relevant for multi-node E2E distributed training.
+    if [ "$BENCHMARK_TYPE" = "e2e" ]; then
+        SBATCH_ARGS+=(--network=sharp)
+    fi
+
     # Sequential execution mode: add dependency
     if [ ${SEQUENTIAL} -eq 1 ] && [ -n "$PREV_JOB_ID" ]; then
         SBATCH_ARGS+=(--dependency="afterany:${PREV_JOB_ID}")
     fi
-    
-    # Export environment variables (using array element to preserve spaces in GIN_OPTIONS)
-    EXPORT_VARS="ALL,EXP_NAME=${exp},GIN_OPTIONS=${gin_opts},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${MEM_DEBUG},CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${CACHE_DEBUG}"
+
+    # Write per-experiment args to a file to avoid sbatch --export comma
+    # splitting when args themselves contain commas (e.g., --batch-sizes
+    # 1,2,4,8 in kernel_experiments.txt). slurm_job.sub reads this file.
+    if [ ${DRY_RUN} -eq 0 ]; then
+        printf '%s' "${gin_opts}" > "${EXP_OUTPUT_DIR}/exp_args.txt"
+    fi
+
+    # Export environment variables — slurm_job.sub consumes BENCHMARK_TYPE +
+    # EXP_OUTPUT_DIR and reads EXP_ARGS / GIN_OPTIONS from exp_args.txt.
+    EXPORT_VARS="ALL,BENCHMARK_TYPE=${BENCHMARK_TYPE},EXP_NAME=${exp},EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR},ENABLE_NSYS=${ENABLE_NSYS},HSTU_ROOT=${HSTU_ROOT},CONTAINER_IMAGE=${CONTAINER_IMAGE},MEM_DEBUG=${EXP_MEM_DEBUG},CUDA_MEM_WATCHDOG=${EXP_WATCHDOG},CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5},CACHE_DEBUG=${EXP_CACHE_DEBUG}"
     SBATCH_ARGS+=(--export="${EXPORT_VARS}")
     
     # Specify SLURM job script

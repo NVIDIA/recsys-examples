@@ -24,11 +24,15 @@ Results are printed as 2-D tables in the terminal and saved as heatmap
 images to ``--output-dir``.
 
 Usage (run from examples/hstu/):
-    python training/benchmark/scripts/benchmark_hstu_attn_mfu.py \\
+    # Direct invocation
+    python training/benchmark/scripts/hstu_attn_kernel_benchmark.py \\
         --gin-config-file training/configs/benchmark_ranking.gin \\
         --batch-sizes 1,2,4,8,16,32,64,128 \\
-        --seqlens 64,128,256,512,1024,2048,4096 \\
+        --seqlens 128,256,512,1024,2048,4096,8192,16384 \\
         --warmup-iters 10 --bench-iters 50
+
+    # Via launch wrapper (sensible defaults)
+    bash training/benchmark/scripts/run_hstu_attn_kernel_benchmark.sh
 
 NetworkArgs (num_heads, kv_channels, kernel_backend, is_causal, dtype_str)
 are read from the gin-config file.
@@ -420,7 +424,7 @@ def main():
     parser.add_argument(
         "--seqlens",
         type=str,
-        default="64,128,256,512,1024,2048,4096",
+        default="128,256,512,1024,2048,4096,8192,16384",
         help="Comma-separated list of sequence lengths to sweep.",
     )
     parser.add_argument(

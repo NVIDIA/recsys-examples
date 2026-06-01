@@ -152,6 +152,8 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
         evict_strategy (str): Eviction strategy: "lru" or "lfu". Default: "lru".
         caching (bool): Enable caching on HBM. When caching is enabled, the
             global_hbm_for_values indicates the cache size. Default: False.
+        dist_type (str): Input distribution policy for row-wise sharding.
+            One of "continuous", "roundrobin", "hash_roundrobin". Default: "roundrobin".
 
     Note:
         - sharding_type is automatically set to "model_parallel".
@@ -171,10 +173,15 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
 
     evict_strategy: str = "lru"
     caching: bool = False
+    dist_type: str = "roundrobin"
 
     def __post_init__(self):
         self.sharding_type = "model_parallel"
         assert self.evict_strategy.lower() in ["lru", "lfu"]
+        assert self.dist_type in ("continuous", "roundrobin", "hash_roundrobin"), (
+            f"Invalid dist_type {self.dist_type!r}; "
+            f"must be one of 'continuous', 'roundrobin', 'hash_roundrobin'"
+        )
 
     def calculate_and_reset_global_hbm_for_values(self, hidden_size, multiplier=1):
         if self.global_hbm_for_values is not None:

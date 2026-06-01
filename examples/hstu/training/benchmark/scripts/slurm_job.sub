@@ -1,15 +1,24 @@
 #!/bin/bash
 # ============================================================================
-# SLURM Job Script - Single Experiment
-# This script is automatically submitted by submit_all_experiments_slurm.sh
-# 
+# SLURM Job Script - Single Experiment (unified dispatcher)
+# This script is automatically submitted by submit_all_experiments_slurm.sh.
+#
+# Supported BENCHMARK_TYPE values (dispatched at runtime):
+#   e2e              - distributed torchrun + pretrain_gr_ranking.py (default)
+#   hstu-layer       - single-GPU hstu_layer_benchmark.py
+#   hstu-attn-kernel - single-GPU hstu_attn_kernel_benchmark.py
+#
+# SBATCH headers below default to the e2e shape (2 nodes × 8 ranks); the
+# submitter overrides --nodes / --ntasks-per-node via the sbatch CLI for
+# the single-GPU benchmarks.
+#
 # Important: Working directory must be recsys-examples/examples/hstu
-# 
-# Output Directory Structure (new version):
+#
+# Output Directory Structure:
 #   {EXP_OUTPUT_DIR}/
 #   ├── {exp_name}_{jobid}_{timestamp}.log
-#   ├── {exp_name}_{jobid}_{timestamp}.gin    (generated config)
-#   └── {exp_name}_*_job{jobid}_*.nsys-rep  (if nsys enabled)
+#   ├── {exp_name}_{jobid}_{timestamp}.gin    (e2e only — generated config)
+#   └── {exp_name}_*_job{jobid}_*.nsys-rep    (if nsys enabled, e2e only)
 # ============================================================================
 
 #SBATCH --job-name=hstu_benchmark
@@ -19,7 +28,7 @@
 #SBATCH --mem=0
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
-#SBATCH --output=hstu-e2e-benchmark-%j.out
+#SBATCH --output=hstu-benchmark-%j.out
 
 # ============================================================================
 # Container Configuration (used with srun, not sbatch)
@@ -30,20 +39,25 @@ CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-"/lustre:/lustre"}"  # Set via CONTAINER_M
 
 # ============================================================================
 # Parameter Description:
+#   BENCHMARK_TYPE  - e2e | hstu-layer | hstu-attn-kernel (default: e2e)
 #   HSTU_ROOT       - Absolute path to examples/hstu directory (required)
 #   EXP_NAME        - Experiment name (required)
-#   GIN_OPTIONS     - Options for generate_gin_config.py (optional)
 #   EXP_OUTPUT_DIR  - Experiment output directory (required, passed by submit script)
-#   ENABLE_NSYS     - Whether to enable nsys profile (0/1, default 0)
-#   CONTAINER_IMAGE - Container image to use (optional, has default)
+#   CONTAINER_IMAGE - Container image to use (required)
+#   ENABLE_NSYS     - Whether to enable nsys profile (0/1, default 0; e2e only)
+#
+# Per-type payload env var:
+#   e2e              : GIN_OPTIONS   - options for generate_gin_config.py
+#   hstu-layer       : EXP_ARGS      - CLI args for hstu_layer_benchmark.py run
+#   hstu-attn-kernel : EXP_ARGS      - CLI args for hstu_attn_kernel_benchmark.py
 # ============================================================================
 
 set -e
 
 # Get parameters
+BENCHMARK_TYPE=${BENCHMARK_TYPE:-"e2e"}
 HSTU_ROOT=${HSTU_ROOT:-""}
 EXP_NAME=${EXP_NAME:-"exp0_baseline"}
-GIN_OPTIONS=${GIN_OPTIONS:-""}
 EXP_OUTPUT_DIR=${EXP_OUTPUT_DIR:-""}
 ENABLE_NSYS=${ENABLE_NSYS:-0}
 CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-""}
@@ -59,6 +73,24 @@ if [ -z "$EXP_OUTPUT_DIR" ]; then
     echo "❌ Error: EXP_OUTPUT_DIR environment variable not set"
     exit 1
 fi
+
+# Load EXP_ARGS from exp_args.txt (transferred via file to avoid sbatch
+# --export comma-splitting issues with CSV args like --batch-sizes 1,2,4).
+# Falls back to env var (local testing convenience).
+EXP_ARGS_FILE="${EXP_OUTPUT_DIR}/exp_args.txt"
+if [ -z "${EXP_ARGS}" ] && [ -f "${EXP_ARGS_FILE}" ]; then
+    EXP_ARGS=$(cat "${EXP_ARGS_FILE}")
+fi
+# e2e historically reads GIN_OPTIONS; alias to EXP_ARGS for the new flow.
+GIN_OPTIONS="${GIN_OPTIONS:-${EXP_ARGS}}"
+
+case "$BENCHMARK_TYPE" in
+    e2e|hstu-layer|hstu-attn-kernel) ;;
+    *)
+        echo "❌ Error: Unknown BENCHMARK_TYPE=$BENCHMARK_TYPE (supported: e2e, hstu-layer, hstu-attn-kernel)"
+        exit 1
+        ;;
+esac
 
 # Change to examples/hstu directory
 cd ${HSTU_ROOT}
@@ -81,8 +113,13 @@ CONFIG_FILE="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}.gin"
 echo "=========================================="
 echo "🚀 HSTU Benchmark - SLURM Job"
 echo "=========================================="
+echo "Benchmark type:   ${BENCHMARK_TYPE}"
 echo "Experiment:       ${EXP_NAME}"
-echo "GIN Options:      ${GIN_OPTIONS:-'(defaults)'}"
+if [ "${BENCHMARK_TYPE}" = "e2e" ]; then
+    echo "GIN Options:      ${GIN_OPTIONS:-'(defaults)'}"
+else
+    echo "Exp args:         ${EXP_ARGS:-'(defaults)'}"
+fi
 echo "Output dir:       ${EXP_OUTPUT_DIR}"
 echo "SLURM Job ID:     ${SLURM_JOB_ID}"
 echo "SLURM Job Name:   ${SLURM_JOB_NAME}"
@@ -102,33 +139,12 @@ echo "=========================================="
 echo ""
 
 # ============================================================================
-# Generate gin config file
-# ============================================================================
-echo "📝 Generating gin config file..."
-
-# Build gin config command (avoid passing empty string when GIN_OPTIONS is empty)
-if [ -n "${GIN_OPTIONS}" ]; then
-    GIN_CMD="python ${GIN_GENERATOR} ${GIN_OPTIONS}"
-else
-    GIN_CMD="python ${GIN_GENERATOR}"
-fi
-
-echo "   Command: ${GIN_CMD} -o ${CONFIG_FILE}"
-echo ""
-
-# Generate config and also print to terminal
-${GIN_CMD} | tee ${CONFIG_FILE}
-echo ""
-echo "✅ Config saved to: ${CONFIG_FILE}"
-echo ""
-
-# ============================================================================
-# Environment Variable Setup (add HSTU_ROOT's parent directory to PYTHONPATH)
+# Common environment variable setup (all benchmark types)
 # ============================================================================
 export PYTHONPATH="${HSTU_ROOT}/..:${PYTHONPATH}"
 export PYTHONWARNINGS="ignore"
-export PYTHONUNBUFFERED=1  # Ensure Python output is not buffered
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTHONUNBUFFERED=1
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
 export CUDA_MODULE_LOADING=EAGER
 export CUBLASLT_HEURISTICS_CACHE_CAPACITY=$((1024*1024))
 export FILL_DYNAMICEMB_TABLES=1
@@ -144,79 +160,87 @@ if [ -n "$CUDA_LAUNCH_BLOCKING" ]; then
     echo "⚠️  CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING} (debug mode)"
 fi
 
-
-# Get Master address (first node)
-MASTER_ADDR=$(scontrol show hostnames ${SLURM_JOB_NODELIST} | head -n 1)
-MASTER_PORT=${MASTER_PORT:-29500}
-
-export MASTER_ADDR
-export MASTER_PORT
-
-echo "Master Address:   ${MASTER_ADDR}"
-echo "Master Port:      ${MASTER_PORT}"
-echo ""
-
-# ============================================================================
-# Build Training Command
-# ============================================================================
-# Already changed to examples/hstu directory, no need to cd again
-
-# Base Python training command (relative to examples/hstu)
-TRAIN_CMD="training/pretrain_gr_ranking.py --gin-config-file ${CONFIG_FILE}"
-
-# Log file (saved in experiment output directory)
+# Common log file
 LOG_FILE="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}.log"
-
 echo "📝 Logging to: ${LOG_FILE}"
 echo "⏰ Started at: $(date)"
 echo ""
 
-# ============================================================================
-# Start Training
-# ============================================================================
-if [ ${ENABLE_NSYS} -eq 1 ]; then
-    # ========================================================================
-    # nsys profile mode enabled
-    # Each rank samples independently, using SLURM environment variables to differentiate
-    # Output file format: {exp_name}_{timestamp}_job{jobid}_node{nodeid}_rank{globalrank}_{hostname}
-    # ========================================================================
-    echo "🔬 Running with NVIDIA Nsight Systems profiling..."
-    echo ""
-    
-    # Get timestamp (generated in main script, ensures all ranks use the same timestamp)
-    NSYS_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    
-    # Create wrapper script to run nsys on each rank
-    WRAPPER_SCRIPT="${EXP_OUTPUT_DIR}/.nsys_wrapper_${SLURM_JOB_ID}.sh"
-    cat > ${WRAPPER_SCRIPT} << 'WRAPPER_EOF'
-#!/bin/bash
-# nsys wrapper script - creates independent profile for each rank
+CONFIG_FILE=""  # e2e only (empty placeholder for non-e2e benchmarks)
+NSYS_TIMESTAMP=""
 
-# Get environment variables
+case "$BENCHMARK_TYPE" in
+
+e2e)
+    # ========================================================================
+    # Generate gin config file
+    # ========================================================================
+    CONFIG_FILE="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}.gin"
+    echo "📝 Generating gin config file..."
+
+    if [ -n "${GIN_OPTIONS}" ]; then
+        GIN_CMD="python ${GIN_GENERATOR} ${GIN_OPTIONS}"
+    else
+        GIN_CMD="python ${GIN_GENERATOR}"
+    fi
+
+    echo "   Command: ${GIN_CMD} -o ${CONFIG_FILE}"
+    echo ""
+
+    ${GIN_CMD} | tee ${CONFIG_FILE}
+    echo ""
+    echo "✅ Config saved to: ${CONFIG_FILE}"
+    echo ""
+
+    # Get Master address (first node)
+    MASTER_ADDR=$(scontrol show hostnames ${SLURM_JOB_NODELIST} | head -n 1)
+    MASTER_PORT=${MASTER_PORT:-29500}
+    export MASTER_ADDR MASTER_PORT
+    echo "Master Address:   ${MASTER_ADDR}"
+    echo "Master Port:      ${MASTER_PORT}"
+    echo ""
+
+    TRAIN_CMD="training/pretrain_gr_ranking.py --gin-config-file ${CONFIG_FILE}"
+
+    if [ ${ENABLE_NSYS} -eq 1 ]; then
+        echo "🔬 Running with NVIDIA Nsight Systems profiling..."
+        echo ""
+
+        NSYS_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+        # Per-rank nsys wrapper
+        WRAPPER_SCRIPT="${EXP_OUTPUT_DIR}/.nsys_wrapper_${SLURM_JOB_ID}.sh"
+        cat > ${WRAPPER_SCRIPT} << 'WRAPPER_EOF'
+#!/bin/bash
 EXP_NAME=$1
 NSYS_OUTPUT_DIR=$2
 SLURM_JOB_ID=$3
 NSYS_TIMESTAMP=$4
 shift 4
 
-# Calculate global rank
 GLOBAL_RANK=${SLURM_PROCID}
 LOCAL_RANK=${SLURM_LOCALID}
 NODE_ID=${SLURM_NODEID}
 HOSTNAME=$(hostname -s)
 
-# Build unique output filename (saved in experiment directory)
-# Format: {exp_name}_{timestamp}_job{jobid}_node{nodeid}_rank{globalrank}_{hostname}
 NSYS_OUTPUT="${NSYS_OUTPUT_DIR}/${EXP_NAME}_${NSYS_TIMESTAMP}_job${SLURM_JOB_ID}_node${NODE_ID}_rank${GLOBAL_RANK}_${HOSTNAME}"
+RANK_TMP_PARENT="${HSTU_RANK_TMP_PARENT:-/tmp}"
+RANK_TMP_ROOT="${RANK_TMP_PARENT}/hstu_benchmark_${SLURM_JOB_ID}_node${NODE_ID}_rank${GLOBAL_RANK}"
+mkdir -p \
+    "${RANK_TMP_ROOT}/tmp" \
+    "${RANK_TMP_ROOT}/triton" \
+    "${RANK_TMP_ROOT}/torchinductor" \
+    "${RANK_TMP_ROOT}/xdg"
+export TMPDIR="${RANK_TMP_ROOT}/tmp"
+export TMP="${TMPDIR}"
+export TEMP="${TMPDIR}"
+export XDG_CACHE_HOME="${RANK_TMP_ROOT}/xdg"
+export TRITON_CACHE_DIR="${RANK_TMP_ROOT}/triton"
+export TORCHINDUCTOR_CACHE_DIR="${RANK_TMP_ROOT}/torchinductor"
 
 echo "[Rank ${GLOBAL_RANK}] Starting nsys profile, output: ${NSYS_OUTPUT}.nsys-rep"
+echo "[Rank ${GLOBAL_RANK}] TMPDIR=${TMPDIR}"
 
-# Note: Do NOT set CUDA_VISIBLE_DEVICES here, as the training script
-# handles device assignment based on LOCAL_RANK. Setting it here would
-# cause device index mismatch (e.g., CUDA_VISIBLE_DEVICES=3 makes GPU 3
-# appear as device 0, but training code tries to use device 3).
-
-# Run nsys profile
 export CUBLAS_NVTX_LEVEL=2
 exec nsys profile \
     -o "${NSYS_OUTPUT}" \
@@ -230,53 +254,104 @@ exec nsys profile \
     --cuda-graph-trace=node \
     "$@"
 WRAPPER_EOF
-    chmod +x ${WRAPPER_SCRIPT}
-    
-    # Use srun to launch distributed training + nsys profile (in container)
+        chmod +x ${WRAPPER_SCRIPT}
+
+        srun --kill-on-bad-exit=1 \
+            --unbuffered \
+            --container-image=${CONTAINER_IMAGE} \
+            --container-mounts=${CONTAINER_MOUNTS} \
+            bash -c "
+                if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && \
+                cd ${HSTU_ROOT} && \
+                export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
+                export PYTHONUNBUFFERED=1 && \
+                export DISABLE_RICH=1 && \
+                export MEM_DEBUG=${MEM_DEBUG:-0} && \
+                export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && \
+                export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && \
+                export CACHE_DEBUG=${CACHE_DEBUG:-0} && \
+                ${LAUNCH_BLOCKING_ENV} \
+                ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
+                python -u ${TRAIN_CMD}
+            " 2>&1 | tee -a ${LOG_FILE}
+
+        EXIT_CODE=${PIPESTATUS[0]}
+        rm -f ${WRAPPER_SCRIPT}
+
+        echo ""
+        echo "📊 nsys profile files saved to: ${EXP_OUTPUT_DIR}"
+        echo "   Files pattern: ${EXP_NAME}_${NSYS_TIMESTAMP}_job${SLURM_JOB_ID}_node*_rank*_*.nsys-rep"
+    else
+        echo "🏃 Running standard training (no profiling)..."
+        echo ""
+
+        srun --kill-on-bad-exit=1 \
+            --unbuffered \
+            --container-image=${CONTAINER_IMAGE} \
+            --container-mounts=${CONTAINER_MOUNTS} \
+            bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+            2>&1 | tee -a ${LOG_FILE}
+
+        EXIT_CODE=${PIPESTATUS[0]}
+    fi
+    ;;
+
+hstu-layer)
+    # Auto-inject --output-dir so the memory snapshot pickle lands in the
+    # per-exp results dir instead of cwd (only if user didn't specify).
+    if [[ ! " ${EXP_ARGS} " =~ [[:space:]]--output-dir([[:space:]=]|$) ]]; then
+        EXP_ARGS="${EXP_ARGS} --output-dir ${EXP_OUTPUT_DIR}"
+    fi
+    # If nsys profiling is enabled, force --profile True so the Python
+    # script calls torch.cuda.profiler.start/stop inside the steady-state
+    # window; nsys -c cudaProfilerApi captures only that window.
+    NSYS_OUTPUT=""
+    NSYS_PREFIX=""
+    if [ ${ENABLE_NSYS} -eq 1 ]; then
+        if [[ ! " ${EXP_ARGS} " =~ [[:space:]]--profile([[:space:]=]|$) ]]; then
+            EXP_ARGS="${EXP_ARGS} --profile True"
+        fi
+        NSYS_OUTPUT="${EXP_OUTPUT_DIR}/${EXP_NAME}_${SLURM_JOB_ID}_${TIMESTAMP}"
+        NSYS_PREFIX="CUBLAS_NVTX_LEVEL=2 nsys profile -o ${NSYS_OUTPUT} -f true -s none -t cuda,cublas-verbose,nvtx -c cudaProfilerApi --cpuctxsw none --cuda-flush-interval 100 --capture-range-end=stop --cuda-graph-trace=node"
+    fi
+
+    echo "🏃 Running hstu-layer benchmark (single GPU)..."
+    echo "   Args: ${EXP_ARGS}"
+    echo "   NSYS: $([ ${ENABLE_NSYS} -eq 1 ] && echo 'ENABLED' || echo 'DISABLED')"
+    echo ""
+
     srun --kill-on-bad-exit=1 \
         --unbuffered \
         --container-image=${CONTAINER_IMAGE} \
         --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "
-            nvidia-smi && \
-            cd ${HSTU_ROOT} && \
-            export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && \
-            export PYTHONUNBUFFERED=1 && \
-            export DISABLE_RICH=1 && \
-            export MEM_DEBUG=${MEM_DEBUG:-0} && \
-            export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && \
-            export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && \
-            export CACHE_DEBUG=${CACHE_DEBUG:-0} && \
-            ${LAUNCH_BLOCKING_ENV} \
-            ${WRAPPER_SCRIPT} ${EXP_NAME} ${EXP_OUTPUT_DIR} ${SLURM_JOB_ID} ${NSYS_TIMESTAMP} \
-            python -u ${TRAIN_CMD}
-        " 2>&1 | tee -a ${LOG_FILE}
-    
-    EXIT_CODE=${PIPESTATUS[0]}
-    
-    # Clean up wrapper script
-    rm -f ${WRAPPER_SCRIPT}
-    
-    echo ""
-    echo "📊 nsys profile files saved to: ${EXP_OUTPUT_DIR}"
-    echo "   Files pattern: ${EXP_NAME}_${NSYS_TIMESTAMP}_job${SLURM_JOB_ID}_node*_rank*_*.nsys-rep"
-    
-else
-    # ========================================================================
-    # Standard training mode (no nsys profile)
-    # ========================================================================
-    echo "🏃 Running standard training (no profiling)..."
-    echo ""
-    
-    srun --kill-on-bad-exit=1 \
-        --unbuffered \
-        --container-image=${CONTAINER_IMAGE} \
-        --container-mounts=${CONTAINER_MOUNTS} \
-        bash -c "nvidia-smi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && export DISABLE_RICH=1 && export MEM_DEBUG=${MEM_DEBUG:-0} && export CUDA_MEM_WATCHDOG=${CUDA_MEM_WATCHDOG:-0} && export CUDA_MEM_WATCHDOG_THRESHOLD=${CUDA_MEM_WATCHDOG_THRESHOLD:-0.5} && export CACHE_DEBUG=${CACHE_DEBUG:-0} && ${LAUNCH_BLOCKING_ENV}python -u ${TRAIN_CMD}" \
+        bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && ${LAUNCH_BLOCKING_ENV}${NSYS_PREFIX} python -u training/benchmark/scripts/hstu_layer_benchmark.py run ${EXP_ARGS}" \
         2>&1 | tee -a ${LOG_FILE}
-    
+
     EXIT_CODE=${PIPESTATUS[0]}
-fi
+    ;;
+
+hstu-attn-kernel)
+    # Auto-inject --output-dir so heatmap PNGs + results JSON land in the
+    # per-exp results dir (only if user didn't specify).
+    if [[ ! " ${EXP_ARGS} " =~ [[:space:]]--output-dir([[:space:]=]|$) ]]; then
+        EXP_ARGS="${EXP_ARGS} --output-dir ${EXP_OUTPUT_DIR}"
+    fi
+
+    echo "🏃 Running hstu-attn-kernel benchmark (single GPU)..."
+    echo "   Args: ${EXP_ARGS}"
+    echo ""
+
+    srun --kill-on-bad-exit=1 \
+        --unbuffered \
+        --container-image=${CONTAINER_IMAGE} \
+        --container-mounts=${CONTAINER_MOUNTS} \
+        bash -c "if [ \"\${SLURM_LOCALID}\" = \"0\" ]; then nvidia-smi; fi && cd ${HSTU_ROOT} && export PYTHONPATH=${HSTU_ROOT}/..:\${PYTHONPATH} && export PYTHONUNBUFFERED=1 && ${LAUNCH_BLOCKING_ENV}python -u training/benchmark/scripts/hstu_attn_kernel_benchmark.py ${EXP_ARGS}" \
+        2>&1 | tee -a ${LOG_FILE}
+
+    EXIT_CODE=${PIPESTATUS[0]}
+    ;;
+
+esac
 
 # ============================================================================
 # Results Summary
@@ -290,8 +365,8 @@ else
 fi
 echo "⏰ Finished at: $(date)"
 echo "📝 Log saved to: ${LOG_FILE}"
-echo "📄 Config file: ${CONFIG_FILE}"
-if [ ${ENABLE_NSYS} -eq 1 ]; then
+[ -n "${CONFIG_FILE}" ] && echo "📄 Config file: ${CONFIG_FILE}"
+if [ ${ENABLE_NSYS} -eq 1 ] && [ "${BENCHMARK_TYPE}" = "e2e" ]; then
     echo "📊 nsys profiles: ${EXP_OUTPUT_DIR}/${EXP_NAME}_*_job${SLURM_JOB_ID}_*.nsys-rep"
 fi
 echo "=========================================="
