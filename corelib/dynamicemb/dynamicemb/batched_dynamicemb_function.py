@@ -397,7 +397,7 @@ def _prefetch_cache_path(
 
             if _bool_item(admit_mask.any()):
                 admission_counter.erase(
-                    new_keys_sub[admit_mask], new_tids_sub[admit_mask]
+                    new_keys_sub[admit_mask], new_tids_sub[admit_mask], mask=admit_mask
                 )
                 keys_to_insert_mask[new_in_miss] = admit_mask
 

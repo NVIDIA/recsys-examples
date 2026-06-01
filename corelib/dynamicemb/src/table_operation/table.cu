@@ -124,7 +124,8 @@ void bind_table_operation(py::module &m) {
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
-        py::arg("table_ids"), py::arg("indices") = py::none());
+        py::arg("table_ids"), py::arg("indices") = py::none(),
+	py::arg("mask") = py::none());
 
   m.def("table_export_batch", &dyn_emb::table_export_batch,
         "export items[offset, offset + batch) from the table",
