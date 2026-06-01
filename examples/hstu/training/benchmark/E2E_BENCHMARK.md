@@ -14,11 +14,12 @@ Each experiment below adds **one** optimization on top of the previous, so the s
 
 | # | Optimization | What It Does |
 |---|-------------|-------------|
-| 0 | Baseline | Triton attention, DynamicEmb, no recompute, no shuffler, DP-only |
+| 0 | Baseline | Triton attention, DynamicEmb without caching, no shuffler, DP-only |
 | 1 | **Workload-Balanced Shuffler** | Redistribute variable-length sequences across GPUs so that each GPU's total attention FLOPs are balanced. Eliminates GPU idle time caused by HSTU's O(n²) attention on skewed sequence lengths. |
 | 2 | **CUTLASS Attention** | Replace Triton attention with a hand-tuned CUTLASS kernel optimized for HSTU's causal+context mask. Better register allocation and H100 utilization. |
-| 3 | **Selective Recompute** | Recompute LayerNorm activations during backward instead of storing them. Trades a small amount of compute for significant activation memory savings. |
-| 4 | **Tensor Parallel (TP=2)** | Split HSTU's UVQK projections and HSTU attention across 2 GPUs within a node. Halves per-GPU parameter and activation memory. |
+| 3 | **DynamicEmb Caching** | Cache hot DynamicEmb rows in GPU HBM while keeping the full table in host memory. |
+| 4 | **Hash-RoundRobin Sharding** | Use row-wise `hash_roundrobin` placement for DynamicEmb tables to distribute IDs more evenly across ranks. |
+| 5 | **Prefetch Pipeline** | Enable the prefetch pipeline on top of caching and Hash-RoundRobin sharding. |
 
 ### Benchmark Configuration
 
@@ -31,7 +32,7 @@ Each experiment below adds **one** optimization on top of the previous, so the s
 | Hidden size | 1024 |
 | Num HSTU layers | 8 |
 | Num attention heads | 4 |
-| Head dimension (kv_channels) | 256 |
+| Head dimension (kv_channels / dim_per_head) | 256 |
 | Item embedding dim | 128 |
 | Contextual embedding dim | 128 |
 | Prediction head | [512, 8] × 8 tasks |
@@ -44,8 +45,8 @@ Each experiment below adds **one** optimization on top of the previous, so the s
 | item | 50M | 128 | DynamicEmb |
 | action | 100 | 128 | Static (DP sharded) |
 | user_id | 50M | 128 | DynamicEmb |
-| user_age | 100 | 128 | DynamicEmb |
-| item_category_l1 | 50 | 128 | DynamicEmb |
+| user_age | 100 | 128 | Static (DP sharded) |
+| item_category_l1 | 50 | 128 | Static (DP sharded) |
 
 **Data distribution**:
 
@@ -54,8 +55,11 @@ Each experiment below adds **one** optimization on top of the previous, so the s
 | Batch size per GPU | 32 |
 | Max sequence length | 4096 |
 | Sequence length distribution | Zipf (α=1.2), jagged |
+| Key value distribution | Zipf (α=1.05) for `item` and `user_id` IDs |
 | Training iterations | 1000 |
-| Profiling window | iterations 150–200 |
+| Log interval | 100 |
+| Eval interval | 1001 (disabled for 1000-iteration benchmark runs) |
+| Profiling window | iterations 150-170 |
 
 Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed user-history patterns seen in production.
 
@@ -63,25 +67,37 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 
 ## 2. Results
 
-**Hardware**: 2× H100-SXM5-80GB nodes (16 GPUs total), measured on iteration 100–999 with 1 warmup skipped.
+**Hardware**: 2× H100-SXM5-80GB nodes (16 GPUs total).
 
-| Exp | Name | TFLOPS | MFU (%) | Speedup vs Baseline | Notes |
-|-----|------|--------|---------|---------------------|-------|
-| 0 | Baseline | 1092 | 6.38 | 1.00× | Triton attention, DP-only |
-| 1 | +Shuffler | 1667 | 9.73 | 1.53× | Eliminates attention skew from Zipf distribution |
-| 2 | **+CUTLASS** | **3933** | **22.96** | **3.60×** | Attention kernel swap — largest single-step gain |
-| 3 | +Recompute | 3919 | 22.88 | 3.59× | Saves memory with negligible throughput cost |
-| 4 | +TP=2 | 2880 | 16.81 | 2.64× | Trades communication for per-GPU memory savings |
+**Run**: `cwdfw_benchmark_cont_full_nsys_20260528_202615`, commit `bc40d89c`. The table reports per-GPU average TFLOPS/MFU from the logged intervals after the first warmup log, iter 199-999. Peak columns report the best logged interval. MFU uses 989 BF16 dense Tensor Core TFLOPS per H100 GPU.
+
+| Exp | Name | Avg TFLOPS/GPU | Avg MFU (%) | Peak TFLOPS/GPU | Peak MFU (%) | Speedup vs Baseline | Notes |
+|-----|------|---------------:|------------:|-----------------:|-------------:|---------------------:|-------|
+| 0 | Baseline | 75.6 | 7.65 | 77.5 | 7.84 | 1.00× | Triton attention, no shuffler/caching |
+| 1 | +Shuffler | 115.8 | 11.70 | 120.8 | 12.22 | 1.53× | Balances Zipf-distributed sequence lengths |
+| 2 | **+CUTLASS** | **302.6** | **30.59** | **329.4** | **33.30** | **4.00×** | Attention kernel swap, largest single-step gain |
+| 3 | +DynamicEmb Caching | 296.8 | 30.00 | 322.3 | 32.58 | 3.93× | Enables HBM cache for DynamicEmb hot rows |
+| 4 | +Hash-RoundRobin | 308.6 | 31.21 | 336.9 | 34.06 | 4.08× | Row-wise `hash_roundrobin` DynamicEmb placement |
+| 5 | +Prefetch Pipeline | 310.6 | 31.40 | 338.1 | 34.19 | 4.11× | Prefetch pipeline on top of caching + Hash-RoundRobin |
 
 ### Key Takeaways
 
-1. **CUTLASS attention is the foundation**: Replacing the Triton kernel with CUTLASS yields a 3.6× speedup (6.38% → 22.96% MFU) — by far the most impactful single optimization, reflecting the attention-bound nature of HSTU.
+1. **CUTLASS attention is the main jump**: Replacing Triton attention with CUTLASS raises average throughput from 115.8 TFLOPS/GPU to 302.6 TFLOPS/GPU after the shuffler step, and reaches 329.4 peak TFLOPS/GPU.
 
-2. **Workload-balanced shuffler delivers 1.53× speedup**: Zipf-distributed sequence lengths cause severe load imbalance with O(n²) attention. Redistributing sequences to equalize per-GPU FLOPs eliminates idle time (6.38% → 9.73% MFU).
+2. **Workload-balanced shuffler gives a clear baseline lift**: Zipf-distributed sequence lengths create load imbalance with O(n²) attention. The shuffler improves average throughput from 75.6 TFLOPS/GPU to 115.8 TFLOPS/GPU, a 1.53× speedup.
 
-3. **Selective recompute is memory-oriented**: Recompute LayerNorm activations during backward saves activation memory with negligible throughput cost (22.96% → 22.88% MFU).
+3. **DynamicEmb caching changes memory behavior more than raw throughput**: Caching slightly lowers average throughput compared with CUTLASS-only in this run, but it enables the intended host/HBM split for large DynamicEmb tables.
 
-4. **Tensor Parallel introduces communication overhead**: TP=2 reduces per-GPU weight memory by half but adds AllReduce/AllGather synchronization after each HSTU layer. The net effect is 16.81% MFU — better than baseline but lower than CUTLASS alone, suggesting TP is most beneficial when model size exceeds single-GPU memory capacity.
+4. **Hash-RoundRobin recovers and improves throughput with caching enabled**: `hash_roundrobin` raises average throughput from 296.8 TFLOPS/GPU to 308.6 TFLOPS/GPU and reaches the best non-prefetch peak of 336.9 TFLOPS/GPU.
+
+5. **Pipeline is nearly flat in this run**: Using the prefetch pipeline adds a small average gain over Hash-RoundRobin, from 308.6 TFLOPS/GPU to 310.6 TFLOPS/GPU. Peak throughput reaches 338.1 TFLOPS/GPU, or 34.19% MFU. The profile explains why the pipeline gain is limited: the fastest captured Hash-RoundRobin step already has little communication overlap opportunity, and the explicit prefetch kernels are very small.
+
+   | Variant | Fastest profiled step | Timeline TFLOPS/GPU | GPU busy time | Kernel sum | Total overlap | NCCL overlap | Exposed NCCL | Explicit prefetch kernels |
+   |---------|----------------------:|--------------------:|--------------:|-----------:|--------------:|-------------:|-------------:|--------------------------:|
+   | Hash-RoundRobin | 159 | 391.5 | 84.93 ms | 85.63 ms | 0.71 ms (0.75%) | 0.33 ms (0.36%) | 3.12 ms (3.33%) | 0.00 ms |
+   | Prefetch pipeline | 154 | 395.4 | 85.99 ms | 89.09 ms | 3.10 ms (3.33%) | 1.50 ms (1.61%) | 2.14 ms (2.30%) | 0.014 ms (0.015%) |
+
+   See the [GPU time breakdown in `PERF_ANALYSIS.md`](./PERF_ANALYSIS.md#22-gpu-time-breakdown) for the category definitions. In short, NCCL is a small slice of the profiled GPU window, so the pipeline has little communication time to hide; the pipeline's own prefetch kernels are also too small to move end-to-end throughput much.
 
 ---
 
@@ -104,8 +120,9 @@ Experiments are listed in `training/benchmark/experiments.txt`:
 exp0_baseline,--value_dist zipf --value_dist_alpha 1.05
 exp1_shuffler,--balanced_shuffler --value_dist zipf --value_dist_alpha 1.05
 exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf --value_dist_alpha 1.05
-exp3_recompute,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --value_dist zipf --value_dist_alpha 1.05
-exp4_tp,--balanced_shuffler --kernel_backend cutlass --recompute_layernorm --tp_size 2 --value_dist zipf --value_dist_alpha 1.05
+exp3_caching,--balanced_shuffler --kernel_backend cutlass --caching --value_dist zipf --value_dist_alpha 1.05
+exp4_caching_hr,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --value_dist zipf --value_dist_alpha 1.05
+exp5_prefetch,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05
 ```
 
 Each line is `exp_name,options_for_generate_gin_config.py`. The script `generate_gin_config.py` produces a complete gin config file from these flags.
@@ -203,6 +220,12 @@ training/benchmark/results/
     ├── exp1_shuffler/
     │   └── ...
     ├── exp2_cutlass/
+    │   └── ...
+    ├── exp3_caching/
+    │   └── ...
+    ├── exp4_caching_hr/
+    │   └── ...
+    ├── exp5_prefetch/
     │   └── ...
     ├── summary.txt                           # batch summary
     └── comparison.png                         # TFLOPS + MFU comparison chart
