@@ -9,6 +9,7 @@ from commons.ops.collective_ops import gather_along_first_dim
 from commons.perf_model.partitioner import karmarkar_karp
 from commons.sequence_batch.batch import BaseBatch
 from commons.utils.logger import debug_rank_0
+from commons.utils.tensor_transfer import tensor_from_cpu_array_like, tensor_to_cpu_list
 
 from .batch_all2all import _build_dst_rank_local, pad_and_all2all_batch
 from .batch_allgather import pad_and_allgather_batch
@@ -17,44 +18,6 @@ _PRINT_LOAD_BALANCE = os.environ.get("PRINT_LOAD_BALANCE", "0") == "1"
 _PRINT_LOAD_BALANCE_START = int(os.environ.get("PRINT_LOAD_BALANCE_START", "0"))
 _PRINT_LOAD_BALANCE_STOP = int(os.environ.get("PRINT_LOAD_BALANCE_STOP", "-1"))
 _SHUFFLE_WITH_ALL2ALL = os.environ.get("SHUFFLE_WITH_ALL2ALL", "0") == "1"
-
-
-def _copy_cuda_tensor_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
-    if not tensor.is_cuda:
-        return tensor.detach().cpu()
-    cpu = torch.empty(
-        tuple(tensor.shape),
-        dtype=tensor.dtype,
-        device=torch.device("cpu"),
-        pin_memory=True,
-    )
-    cpu.copy_(tensor.detach(), non_blocking=True)
-    torch.cuda.current_stream(tensor.device).synchronize()
-    return cpu
-
-
-def _tensor_to_cpu_list(tensor: torch.Tensor) -> Any:
-    return _copy_cuda_tensor_to_pinned_cpu(tensor).tolist()
-
-
-def _int64_tensor_from_cpu_nested_list(
-    values: List[List[int]],
-    device: Union[torch.device, str],
-) -> torch.Tensor:
-    target_device = torch.device(device)
-    cpu = torch.as_tensor(values, dtype=torch.int64, device=torch.device("cpu"))
-    if target_device.type != "cuda":
-        return cpu.to(device=target_device)
-    pinned = torch.empty(
-        tuple(cpu.shape),
-        dtype=cpu.dtype,
-        device=torch.device("cpu"),
-        pin_memory=True,
-    )
-    pinned.copy_(cpu)
-    # The non-blocking H2D copy is ordered only on the current CUDA stream.
-    # Callers must consume the returned tensor on the same stream.
-    return pinned.to(device=target_device, non_blocking=True)
 
 
 class ShuffleHandle:
@@ -160,7 +123,7 @@ def _log_load_balance(
         partitions_indices: 2-D int64 tensor ``[W, B]`` (may be on GPU).
     """
     pi = (
-        _tensor_to_cpu_list(partitions_indices)
+        tensor_to_cpu_list(partitions_indices)
         if isinstance(partitions_indices, torch.Tensor)
         else partitions_indices
     )
@@ -292,7 +255,7 @@ class BaseTaskBalancedBatchShuffler:
         # leads to reading incomplete / stale data and non-deterministic KK
         # partitions.  Converting here forces the D2H onto _memcpy_stream,
         # which is serialised after the AllGather.
-        allgather_workloads_cpu = _tensor_to_cpu_list(allgather_workloads)
+        allgather_workloads_cpu = tensor_to_cpu_list(allgather_workloads)
 
         # Create handle for this batch's shuffle state
         # This allows multiple batches to be in shuffle state simultaneously
@@ -371,9 +334,10 @@ class BaseTaskBalancedBatchShuffler:
         # KK partitions the *global* batch (including padding samples with
         # workload == 0), so ``partitions_indices`` — and consequently
         # ``indices_this_rank`` — may reference padding positions.
-        partitions_indices = _int64_tensor_from_cpu_nested_list(
+        partitions_indices = tensor_from_cpu_array_like(
             partitions_list,
-            meta["device"],
+            dtype=torch.int64,
+            device=meta["device"],
         )
         if has_padding:
             partitions_indices = _sort_partitions_padding_last(
@@ -496,7 +460,7 @@ class BaseTaskBalancedBatchShuffler:
         # 1. Allgather the workloads
         allgather_workloads = gather_along_first_dim(workloads, pg_group)
         # KK runs on CPU; .tolist() is needed regardless.
-        allgather_wl_cpu = _tensor_to_cpu_list(allgather_workloads)
+        allgather_wl_cpu = tensor_to_cpu_list(allgather_workloads)
         # Padding sits at the tail of each rank's chunk — O(W) check.
         has_padding = any(
             allgather_wl_cpu[(i + 1) * local_batch_size - 1] == 0
@@ -510,9 +474,10 @@ class BaseTaskBalancedBatchShuffler:
         partitions_list = karmarkar_karp(
             allgather_wl_cpu, num_partitions, equal_size=True
         )
-        partitions_indices = _int64_tensor_from_cpu_nested_list(
+        partitions_indices = tensor_from_cpu_array_like(
             partitions_list,
-            workloads.device,
+            dtype=torch.int64,
+            device=workloads.device,
         )
         if has_padding:
             partitions_indices = _sort_partitions_padding_last(
