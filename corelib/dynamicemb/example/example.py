@@ -61,15 +61,11 @@ warnings.filterwarnings(
 )
 
 BACKEND = "nccl"
-# print with rank info
+# Keep a handle to the original print; the rank-aware print is installed in
+# init_runtime(). Do NOT override builtins.print at module scope: with
+# spawn-based DataLoader workers the module is re-imported in each worker, and a
+# module-level override would run before any RuntimeContext exists.
 original_print = builtins.print
-
-
-def rank_print(*args, **kwargs):
-    original_print(f"[RANK {local_rank}] ", *args, **kwargs)
-
-
-builtins.print = rank_print
 cache_ratio = 0.5  # assume we will use 50% of the HBM for cache
 
 
@@ -207,6 +203,14 @@ def parse_args():
         choices=["continuous", "roundrobin", "hash_roundrobin"],
         default="roundrobin",
         help="DynamicEmb row-wise input distribution policy.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Number of DataLoader worker processes. 0 (default) loads data in "
+        "the main process. When > 0, spawn-based workers are used to avoid "
+        "cloning the parent's CUDA context.",
     )
     return parser.parse_args()
 
@@ -354,6 +358,33 @@ def collate_fn(batch):
     )
 
     return kjt, torch.tensor(labels, dtype=torch.float)
+
+
+def build_dataloader(dataset, sampler, args):
+    """Construct a DataLoader, optionally with spawn-based multi-worker loading.
+
+    The parent process initializes CUDA (torch.cuda.set_device in init_runtime),
+    so the default ``fork`` start method cannot be used for workers: a forked
+    child inherits an unusable copy of the CUDA context and raises
+    ``RuntimeError: initialization error`` on its first CUDA touch. When
+    ``num_workers > 0`` we therefore use the ``spawn`` start method, which gives
+    each worker a fresh interpreter with no inherited CUDA state. Workers only do
+    CPU work (dataset reads + collate_fn); the host->device copy stays in the
+    main process. ``persistent_workers`` keeps the (relatively expensive to
+    spawn) workers alive across epochs.
+    """
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": False,
+        "collate_fn": collate_fn,
+        "num_workers": args.num_workers,
+        "sampler": sampler,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if args.num_workers > 0:
+        loader_kwargs["multiprocessing_context"] = "spawn"
+        loader_kwargs["persistent_workers"] = True
+    return DataLoader(dataset, **loader_kwargs)
 
 
 class MovieLensModel(nn.Module):
@@ -778,23 +809,8 @@ def train(args, runtime: RuntimeContext):
         test_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=False
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
-        sampler=train_sampler,
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
-        sampler=test_sampler,
-    )
+    train_loader = build_dataloader(train_dataset, train_sampler, args)
+    test_loader = build_dataloader(test_dataset, test_sampler, args)
 
     model = create_model(args, runtime)
     model.to(runtime.device)
@@ -818,14 +834,7 @@ def dump(args, runtime: RuntimeContext):
         train_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=True
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
-        sampler=train_sampler,
-    )
+    train_loader = build_dataloader(train_dataset, train_sampler, args)
 
     model = create_model(args, runtime)
     model.to(runtime.device)
@@ -858,14 +867,7 @@ def load(args, runtime: RuntimeContext):
         test_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=False
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
-        sampler=test_sampler,
-    )
+    test_loader = build_dataloader(test_dataset, test_sampler, args)
 
     model = create_model(args, runtime)
     model.to(runtime.device)
@@ -904,14 +906,7 @@ def inc_dump(args, runtime: RuntimeContext):
         train_dataset, num_replicas=runtime.world_size, rank=runtime.rank, shuffle=True
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
-        sampler=train_sampler,
-    )
+    train_loader = build_dataloader(train_dataset, train_sampler, args)
 
     model = create_model(args, runtime)
     model.to(runtime.device)
