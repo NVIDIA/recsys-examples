@@ -635,7 +635,7 @@ def _prefetch_hbm_direct_path(
             admitted_unique_positions = missing_indices[admit_mask]
 
             if admit_mask.any():
-                admission_counter.erase(admitted_keys, admitted_tids)
+                admission_counter.erase(missing_keys, missing_table_ids, mask=admit_mask)
 
             non_admit = ~admit_mask
             if non_admit.any():

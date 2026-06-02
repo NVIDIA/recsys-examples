@@ -159,8 +159,6 @@ def run():
     admitted_expected = {k for k, v in expected_freq.items() if v >= admission_threshold}
     non_admitted_expected = {k for k, v in expected_freq.items() if v < admission_threshold}
 
-    non_admitted_missing_from_counter = non_admitted_expected - set(counter_keys.keys())
-
     print(f"Unique keys seen: {len(expected_freq)}")
     print(f"Expected admitted  (freq >= {admission_threshold}): {len(admitted_expected)}")
     print(f"Expected non-admitted: {len(non_admitted_expected)}")

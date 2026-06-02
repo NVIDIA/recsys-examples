@@ -561,7 +561,13 @@ __global__ void table_erase_kernel(
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
-    if (mask && !mask[i]) continue;
+    // mask: if non-null, only erase positions where mask[i] is true.
+    // When mask-skipped, write -1 to indices so callers never read
+    // uninitialized values from skipped slots.
+    if (mask && !mask[i]) {
+      if (indices) indices[i] = -1;
+      continue;
+    }
     KeyType key = input_keys[i];
 
     int64_t hashcode = 0;
