@@ -8,8 +8,10 @@ def test_qwen3_single_decoder_layer_prefill_writes_context_kv() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_kv import ContextKV
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3SingleLayerPrefill
 
@@ -48,9 +50,10 @@ def test_qwen3_single_decoder_layer_prefill_writes_context_kv() -> None:
     output = layer.forward_prefill(hidden_states, context_kv)
 
     assert tuple(output.shape) == (batch, seq_len, config.hidden_size)
-    assert layer.ops.qkv_proj.out_features == (
-        config.num_attention_heads + 2 * config.num_kv_heads
-    ) * config.head_dim
+    assert (
+        layer.ops.qkv_proj.out_features
+        == (config.num_attention_heads + 2 * config.num_kv_heads) * config.head_dim
+    )
     assert layer.ops.gate_up_proj.out_features == 2 * config.intermediate_size
     assert layer.ops.down_proj.in_features == config.intermediate_size
     assert tuple(context_kv.key.shape) == (
@@ -70,7 +73,6 @@ def test_qwen3_rope_preserves_shape_and_dtype() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_models.qwen3 import apply_qwen3_rope
 
     q = torch.randn(1, 4, 2, 8)
@@ -89,7 +91,6 @@ def test_qwen3_rms_norm_matches_manual_reference() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_models.qwen3 import Qwen3RMSNorm
 
     norm = Qwen3RMSNorm(8, eps=1e-6)
@@ -108,9 +109,8 @@ def test_qwen3_sgl_kernel_mlp_path_uses_packed_activation(monkeypatch) -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
 
-    import torch
-
     import gr_inference.gr_models.qwen3.layers as qwen3_layers
+    import torch
     from gr_inference.gr_kernels import CAP_FUSED_MLP
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig
     from gr_inference.gr_models.qwen3.layers import TorchQwen3LayerOps
@@ -138,14 +138,19 @@ def test_qwen3_sgl_kernel_mlp_path_uses_packed_activation(monkeypatch) -> None:
     def fake_silu_and_mul(packed_gate_up):
         fused_inputs.append(packed_gate_up)
         dim = packed_gate_up.shape[-1] // 2
-        return torch.nn.functional.silu(packed_gate_up[..., :dim]) * packed_gate_up[
-            ...,
-            dim:,
-        ]
+        return (
+            torch.nn.functional.silu(packed_gate_up[..., :dim])
+            * packed_gate_up[
+                ...,
+                dim:,
+            ]
+        )
 
     monkeypatch.setattr(qwen3_layers, "_selected_kernel_backend", selected_backend)
     monkeypatch.setattr(qwen3_layers, "_is_cuda_tensor", lambda _tensor: True)
-    monkeypatch.setattr(qwen3_layers, "_sgl_kernel_silu_and_mul", lambda: fake_silu_and_mul)
+    monkeypatch.setattr(
+        qwen3_layers, "_sgl_kernel_silu_and_mul", lambda: fake_silu_and_mul
+    )
 
     actual = ops.mlp(hidden_states)
     gate, up = ops.gate_up(hidden_states)
@@ -161,7 +166,6 @@ def test_qwen3_flashinfer_rmsnorm_flattens_leading_dims() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_models.qwen3.layers import _reshape_for_flashinfer_rmsnorm
 
     hidden_states = torch.randn(2, 3, 4, 8)
@@ -176,10 +180,7 @@ def test_qwen3_flashinfer_fused_add_rmsnorm_helper_matches_reference() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
-    from gr_inference.gr_models.qwen3.layers import (
-        _apply_flashinfer_fused_add_rmsnorm,
-    )
+    from gr_inference.gr_models.qwen3.layers import _apply_flashinfer_fused_add_rmsnorm
 
     residual = torch.randn(2, 3, 8)
     projected = torch.randn(2, 3, 8)
@@ -216,10 +217,7 @@ def test_qwen3_trtllm_fused_qk_norm_rope_helper_splits_packed_qkv() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
-    from gr_inference.gr_models.qwen3.layers import (
-        _apply_trtllm_fused_qk_norm_rope,
-    )
+    from gr_inference.gr_models.qwen3.layers import _apply_trtllm_fused_qk_norm_rope
 
     batch = 2
     seq_len = 3
@@ -272,9 +270,8 @@ def test_gr_trtllm_fused_qk_norm_rope_reference_matches_composed_path() -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
 
-    import torch
-
     import gr_inference_trtllm_kernels  # noqa: F401
+    import torch
     from gr_inference.gr_models.qwen3 import apply_qwen3_rope
 
     batch = 1
@@ -344,9 +341,8 @@ def test_gr_trtllm_gated_mlp_reference_matches_composed_path() -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
 
-    import torch
-
     import gr_inference_trtllm_kernels
+    import torch
 
     gr_inference_trtllm_kernels.reset_call_counts()
     hidden_states = torch.randn(2, 3, 8)
@@ -384,7 +380,6 @@ def test_qwen3_rope_accepts_decode_position_ids() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_models.qwen3 import apply_qwen3_rope
 
     q = torch.randn(1, 3, 2, 8)
@@ -402,8 +397,10 @@ def test_qwen3_layer_accepts_custom_ops_backend() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import (
         Qwen3GRConfig,
         Qwen3SingleLayerPrefill,
@@ -440,7 +437,6 @@ def test_torch_qwen3_layer_ops_loads_logical_weights() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, TorchQwen3LayerOps
 
     config = Qwen3GRConfig(

@@ -8,7 +8,6 @@ def test_batched_beam_path_appends_initial_selection() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kv import BatchedBeamPath
     from gr_inference.gr_runtime import select_initial_topk_batched
 
@@ -39,7 +38,6 @@ def test_batched_beam_path_rejects_batch_mismatch() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kv import BatchedBeamPath
     from gr_inference.gr_runtime import select_initial_topk_batched
 
@@ -52,4 +50,3 @@ def test_batched_beam_path_rejects_batch_mismatch() -> None:
 
     with pytest.raises(ValueError, match="batch_size"):
         path.append(selection)
-

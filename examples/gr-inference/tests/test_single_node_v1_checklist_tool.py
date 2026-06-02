@@ -40,7 +40,12 @@ def test_single_node_v1_checklist_dry_run_builds_plan(tmp_path, capsys) -> None:
 
 
 def test_single_node_v1_checklist_can_include_profile_and_soak_steps(tmp_path) -> None:
-    from run_single_node_v1_checklist import REPO_ROOT, _is_git_worktree, build_parser, build_plan
+    from run_single_node_v1_checklist import (
+        REPO_ROOT,
+        _is_git_worktree,
+        build_parser,
+        build_plan,
+    )
 
     args = build_parser().parse_args(
         [
@@ -65,8 +70,13 @@ def test_single_node_v1_checklist_can_include_profile_and_soak_steps(tmp_path) -
     assert "http_soak" in names
     profile = plan[names.index("profile_serving")]
     profile_command = profile["command"]
-    assert profile_command[profile_command.index("--model-dir") + 1] == "models/Qwen3-1.7B"
-    assert profile_command[profile_command.index("--beam-schedule") + 1] == "0:256,1:192,2:192"
+    assert (
+        profile_command[profile_command.index("--model-dir") + 1] == "models/Qwen3-1.7B"
+    )
+    assert (
+        profile_command[profile_command.index("--beam-schedule") + 1]
+        == "0:256,1:192,2:192"
+    )
     soak = plan[names.index("http_soak")]
     command = soak["command"]
     assert command[command.index("--input-len") + 1] == "16"
@@ -102,9 +112,7 @@ def test_single_node_v1_checklist_can_include_dynamic_beam_quality(tmp_path) -> 
     command = plan[names.index("dynamic_beam_quality")]["command"]
     assert "tools/compare_beam_policies.py" in command
     schedule_args = [
-        command[index + 1]
-        for index, item in enumerate(command)
-        if item == "--schedule"
+        command[index + 1] for index, item in enumerate(command) if item == "--schedule"
     ]
     assert schedule_args == [
         "0:256,1:192,2:192",

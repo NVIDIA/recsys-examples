@@ -67,7 +67,9 @@ def select_initial_topk(
     elif logits.dim() == 2:
         scores = logits
     else:
-        raise ValueError(f"logits expects [B, S, V] or [B, V], got {tuple(logits.shape)}")
+        raise ValueError(
+            f"logits expects [B, S, V] or [B, V], got {tuple(logits.shape)}"
+        )
 
     if scores.shape[0] != 1:
         raise ValueError("initial beam selection currently supports batch_size=1")

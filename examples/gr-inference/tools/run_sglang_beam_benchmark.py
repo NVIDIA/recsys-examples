@@ -3,21 +3,17 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import inspect
-from pathlib import Path
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Mapping
 
-from tool_utils import (
-    json_dumps,
-    load_optional_tokenizer,
-    numeric_median as _median,
-    read_jsonl,
-    write_json,
-)
+from tool_utils import json_dumps, load_optional_tokenizer
+from tool_utils import numeric_median as _median
+from tool_utils import read_jsonl, write_json
 
 
 def run_benchmark(args) -> dict[str, Any]:
@@ -77,11 +73,23 @@ def run_benchmark(args) -> dict[str, Any]:
             measured,
             (
                 ("wall_ms", "wall_ms", None, False, True),
-                ("output_normalization_ms", "output_normalization_ms", 0.0, False, True),
+                (
+                    "output_normalization_ms",
+                    "output_normalization_ms",
+                    0.0,
+                    False,
+                    True,
+                ),
                 ("request_latency_ms_p50", "request_latency_ms_p50", None, True, False),
                 ("request_latency_ms_p95", "request_latency_ms_p95", None, True, False),
                 ("qps", "qps", None, False, False),
-                ("generated_tokens_per_s", "generated_tokens_per_s", None, False, False),
+                (
+                    "generated_tokens_per_s",
+                    "generated_tokens_per_s",
+                    None,
+                    False,
+                    False,
+                ),
                 ("beam_candidates_per_s", "beam_candidates_per_s", None, False, False),
             ),
         ),
@@ -93,7 +101,9 @@ def run_benchmark(args) -> dict[str, Any]:
                 "sglang_module_profile": module_profiler.summary(),
                 "sglang_module_profile_aggregate": module_profiler.aggregate(),
                 "sglang_module_profile_model_path": module_profiler.model_path,
-                "sglang_module_profile_visited_types": module_profiler.visited_types[:120],
+                "sglang_module_profile_visited_types": module_profiler.visited_types[
+                    :120
+                ],
             }
             if module_profiler is not None
             else {}
@@ -137,12 +147,16 @@ def _create_engine(sgl, args):
         return sgl.Engine(**kwargs)
 
 
-def _run_once(engine, workload: list[dict], tokenizer, args, *, record_outputs: bool) -> dict[str, Any]:
+def _run_once(
+    engine, workload: list[dict], tokenizer, args, *, record_outputs: bool
+) -> dict[str, Any]:
     if args.arrival_mode == "staggered":
         return _run_staggered_once(
             engine, workload, tokenizer, args, record_outputs=record_outputs
         )
-    return _run_batch_once(engine, workload, tokenizer, args, record_outputs=record_outputs)
+    return _run_batch_once(
+        engine, workload, tokenizer, args, record_outputs=record_outputs
+    )
 
 
 def _run_batch_once(
@@ -177,7 +191,9 @@ def _run_batch_once(
     return {
         "wall_ms": wall_ms,
         "qps": request_count / elapsed_s if elapsed_s > 0 else None,
-        "generated_tokens_per_s": generated_tokens / elapsed_s if elapsed_s > 0 else None,
+        "generated_tokens_per_s": generated_tokens / elapsed_s
+        if elapsed_s > 0
+        else None,
         "beam_candidates_per_s": beam_candidates / elapsed_s if elapsed_s > 0 else None,
         "arrival_mode": "batch",
         "request_latencies_ms": [wall_ms for _ in workload],
@@ -224,7 +240,9 @@ def _run_staggered_once(
 
     max_workers = max(1, min(args.staggered_workers, len(workload)))
     if max_workers == 1:
-        request_results = [run_request(index, row) for index, row in enumerate(workload)]
+        request_results = [
+            run_request(index, row) for index, row in enumerate(workload)
+        ]
         client_mode = "serial"
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -249,7 +267,9 @@ def _run_staggered_once(
     return {
         "wall_ms": wall_ms,
         "qps": request_count / elapsed_s if elapsed_s > 0 else None,
-        "generated_tokens_per_s": generated_tokens / elapsed_s if elapsed_s > 0 else None,
+        "generated_tokens_per_s": generated_tokens / elapsed_s
+        if elapsed_s > 0
+        else None,
         "beam_candidates_per_s": beam_candidates / elapsed_s if elapsed_s > 0 else None,
         "arrival_mode": "staggered",
         "client_mode": client_mode,
@@ -300,7 +320,10 @@ def _engine_generate(
     except TypeError:
         signature = inspect.signature(generate)
         if "prompt" in signature.parameters:
-            return [generate(prompt=prompt, sampling_params=sampling_params) for prompt in prompts]
+            return [
+                generate(prompt=prompt, sampling_params=sampling_params)
+                for prompt in prompts
+            ]
         return [generate(prompt, sampling_params) for prompt in prompts]
 
 
@@ -332,7 +355,9 @@ def _engine_generate_single(
     return output_rows[0]
 
 
-def _normalize_outputs(outputs: Any, workload: list[dict], tokenizer) -> tuple[dict[str, Any], ...]:
+def _normalize_outputs(
+    outputs: Any, workload: list[dict], tokenizer
+) -> tuple[dict[str, Any], ...]:
     if isinstance(outputs, Mapping):
         output_rows = [outputs]
     else:
@@ -349,18 +374,14 @@ def _normalize_outputs(outputs: Any, workload: list[dict], tokenizer) -> tuple[d
             start = idx * beams_per_request
             end = start + beams_per_request
             candidates = output_rows[start:end]
-            records.append(
-                _normalize_request_output(row, candidates, tokenizer)
-            )
+            records.append(_normalize_request_output(row, candidates, tokenizer))
         return tuple(records)
     raise ValueError(
         f"cannot map {len(output_rows)} SGLang output rows to {len(workload)} workload rows"
     )
 
 
-def _normalize_request_output(
-    row: dict, output: Any, tokenizer
-) -> dict[str, Any]:
+def _normalize_request_output(row: dict, output: Any, tokenizer) -> dict[str, Any]:
     beams = _extract_beams(output, tokenizer)
     if not beams:
         candidates = output if isinstance(output, list | tuple) else [output]
@@ -468,7 +489,11 @@ def _load_tokenizer(args):
 
 
 def _candidate_score(candidate: Mapping[str, Any]) -> float | None:
-    for source in (candidate, _mapping(candidate.get("meta_info")), _mapping(candidate.get("sglext"))):
+    for source in (
+        candidate,
+        _mapping(candidate.get("meta_info")),
+        _mapping(candidate.get("sglext")),
+    ):
         for key in ("sequence_score", "score", "cumulative_score"):
             value = source.get(key)
             if value is not None:
@@ -476,7 +501,9 @@ def _candidate_score(candidate: Mapping[str, Any]) -> float | None:
     return None
 
 
-def _validate_beam_score_outputs(runs: list[dict[str, Any]], *, expected_beam_width: int) -> None:
+def _validate_beam_score_outputs(
+    runs: list[dict[str, Any]], *, expected_beam_width: int
+) -> None:
     if not runs:
         return
     outputs = runs[-1].get("outputs") or ()
@@ -514,7 +541,9 @@ def _environment(torch) -> dict[str, Any]:
         "torch": getattr(torch, "__version__", None),
         "cuda_available": cuda_available,
         "cuda_device_name": torch.cuda.get_device_name(0) if cuda_available else None,
-        "cuda_device_capability": torch.cuda.get_device_capability(0) if cuda_available else None,
+        "cuda_device_capability": torch.cuda.get_device_capability(0)
+        if cuda_available
+        else None,
     }
 
 
@@ -543,7 +572,9 @@ def _run_metric_summaries(
         samples = [run.get(run_key, default) for run in runs]
         if include_samples:
             summary[f"{output_name}_samples"] = samples
-        summary[f"{output_name}_median"] = _median_optional(samples) if optional else _median(samples)
+        summary[f"{output_name}_median"] = (
+            _median_optional(samples) if optional else _median(samples)
+        )
     return summary
 
 
@@ -608,7 +639,9 @@ class _SGLangModuleProfiler:
             if key in seen:
                 continue
             seen.add(key)
-            self.handles.append(module.register_forward_pre_hook(self._pre_hook(bucket)))
+            self.handles.append(
+                module.register_forward_pre_hook(self._pre_hook(bucket))
+            )
             self.handles.append(module.register_forward_hook(self._post_hook(bucket)))
 
     def remove(self) -> None:
@@ -625,8 +658,7 @@ class _SGLangModuleProfiler:
 
     def aggregate(self) -> dict[str, float]:
         aggregate = {
-            bucket: float(stats["total_ms"])
-            for bucket, stats in self.records.items()
+            bucket: float(stats["total_ms"]) for bucket, stats in self.records.items()
         }
         aggregate["attention_ms"] = aggregate.get("radix_attention_ms", 0.0)
         aggregate["mlp_ms"] = aggregate.get("mlp_block_ms", 0.0)
@@ -689,7 +721,9 @@ class _SGLangModuleProfiler:
             return None
         seen.add(id(obj))
         if len(self.visited_types) < 300:
-            self.visited_types.append(obj.__class__.__module__ + "." + obj.__class__.__name__)
+            self.visited_types.append(
+                obj.__class__.__module__ + "." + obj.__class__.__name__
+            )
         if hasattr(obj, "named_modules") and obj.__class__.__name__.startswith("Qwen"):
             return obj
         for attr in (

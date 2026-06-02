@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping
 from urllib import request as urllib_request
@@ -34,10 +34,14 @@ def main() -> None:
 def compare(args: argparse.Namespace, rows: list[dict[str, Any]]) -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=args.max_concurrency) as pool:
         gr_outputs = list(pool.map(lambda row: _send(args.gr_url, args, row), rows))
-        sglang_outputs = list(pool.map(lambda row: _send(args.sglang_url, args, row), rows))
+        sglang_outputs = list(
+            pool.map(lambda row: _send(args.sglang_url, args, row), rows)
+        )
 
     comparisons = []
-    for row, gr_output, sglang_output in zip(rows, gr_outputs, sglang_outputs, strict=True):
+    for row, gr_output, sglang_output in zip(
+        rows, gr_outputs, sglang_outputs, strict=True
+    ):
         gr_top1 = _extract_top1_ids(gr_output)
         sglang_top1 = _extract_top1_ids(sglang_output)
         comparisons.append(

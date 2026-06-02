@@ -55,13 +55,21 @@ def score_candidates(
     scored = []
     with torch.inference_mode():
         for candidate in candidates:
-            input_ids = torch.tensor([prompt_ids + candidate], dtype=torch.long, device=device)
+            input_ids = torch.tensor(
+                [prompt_ids + candidate], dtype=torch.long, device=device
+            )
             logits = model(input_ids).logits.float()
             prompt_len = len(prompt_ids)
-            candidate_logits = logits[:, prompt_len - 1 : prompt_len + len(candidate) - 1, :]
+            candidate_logits = logits[
+                :, prompt_len - 1 : prompt_len + len(candidate) - 1, :
+            ]
             logprobs = candidate_logits.log_softmax(dim=-1)
-            target_ids = torch.tensor(candidate, dtype=torch.long, device=device).view(1, -1, 1)
-            token_logprobs = logprobs.gather(dim=-1, index=target_ids).squeeze(0).squeeze(-1)
+            target_ids = torch.tensor(candidate, dtype=torch.long, device=device).view(
+                1, -1, 1
+            )
+            token_logprobs = (
+                logprobs.gather(dim=-1, index=target_ids).squeeze(0).squeeze(-1)
+            )
             token_logprobs_list = [float(value) for value in token_logprobs.cpu()]
             cumulative = sum(token_logprobs_list)
             scored.append(
@@ -89,7 +97,9 @@ def _load_workload_row(path: Path, request_id: str) -> dict[str, Any]:
     raise ValueError(f"request_id={request_id!r} not found in {path}")
 
 
-def _candidate_token_ids(args: argparse.Namespace, *, workload_id: str) -> list[list[int]]:
+def _candidate_token_ids(
+    args: argparse.Namespace, *, workload_id: str
+) -> list[list[int]]:
     if args.candidate_token_ids:
         return [_parse_token_ids(row) for row in args.candidate_token_ids]
     candidates = []
@@ -100,9 +110,13 @@ def _candidate_token_ids(args: argparse.Namespace, *, workload_id: str) -> list[
                 [int(token) for token in gr_output["beam_details"][0]["token_ids"]]
             )
     if args.sglang_json:
-        sglang_output = _sglang_output_by_workload_id(Path(args.sglang_json), workload_id)
+        sglang_output = _sglang_output_by_workload_id(
+            Path(args.sglang_json), workload_id
+        )
         if sglang_output.get("beams"):
-            candidates.append([int(token) for token in sglang_output["beams"][0]["token_ids"]])
+            candidates.append(
+                [int(token) for token in sglang_output["beams"][0]["token_ids"]]
+            )
     deduped = []
     seen = set()
     for candidate in candidates:
@@ -167,7 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Candidate continuation token IDs as comma-separated integers. Repeatable.",
     )
-    parser.add_argument("--gr-json", help="Optional GR artifact; uses top1 if candidates omitted.")
+    parser.add_argument(
+        "--gr-json", help="Optional GR artifact; uses top1 if candidates omitted."
+    )
     parser.add_argument(
         "--sglang-json",
         help="Optional SGLang artifact; uses last run top1 if candidates omitted.",

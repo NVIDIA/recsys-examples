@@ -1,11 +1,11 @@
 """Serving-layer contracts."""
 
+from gr_inference.gr_serving.api import GRInProcessServingFacade
 from gr_inference.gr_serving.batch import (
     FIFOBatchAssembler,
     GRRequestBatch,
     SchedulerPolicy,
 )
-from gr_inference.gr_serving.api import GRInProcessServingFacade
 from gr_inference.gr_serving.config import BeamScoreMode, GRServingConfig
 from gr_inference.gr_serving.continuous import (
     ContinuousRequestStage,
@@ -33,9 +33,9 @@ from gr_inference.gr_serving.memory import (
     GRContextKVPoolLease,
     GRDenseBeamKVPool,
     GRDenseContextKVPool,
-    GRKVMemoryEstimate,
     GRKVLease,
     GRKVLeaseAllocator,
+    GRKVMemoryEstimate,
     GRPagedKVLeaseAllocator,
     estimate_gr_kv_memory,
     estimate_gr_kv_memory_from_model_config,
@@ -87,4 +87,3 @@ __all__ = [
     "default_request_factory",
     "make_http_handler",
 ]
-

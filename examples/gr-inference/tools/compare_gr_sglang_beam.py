@@ -30,7 +30,9 @@ def compare(gr: Mapping[str, Any], sglang: Mapping[str, Any]) -> dict[str, Any]:
         "workload": {
             "model_dir": gr.get("model_dir") or sglang.get("model_dir"),
             "context_len": gr.get("context_len") or sglang.get("context_len"),
-            "decode_steps": gr_decode_steps if gr_decode_steps == sglang_decode_steps else None,
+            "decode_steps": gr_decode_steps
+            if gr_decode_steps == sglang_decode_steps
+            else None,
             "gr_decode_steps": gr_decode_steps,
             "sglang_decode_steps": sglang_decode_steps,
             "gr_output_token_budget": gr_output_token_budget,
@@ -55,10 +57,18 @@ def compare(gr: Mapping[str, Any], sglang: Mapping[str, Any]) -> dict[str, Any]:
         },
         "correctness": {
             "requests": correctness,
-            "top1_exact_match_rate": _mean(row["top1_exact_match"] for row in correctness),
-            "topk_set_overlap_mean": _mean(row["topk_set_overlap"] for row in correctness),
-            "ordered_prefix_match_mean": _mean(row["ordered_prefix_match"] for row in correctness),
-            "token_length_match_rate": _mean(row["token_length_match"] for row in correctness),
+            "top1_exact_match_rate": _mean(
+                row["top1_exact_match"] for row in correctness
+            ),
+            "topk_set_overlap_mean": _mean(
+                row["topk_set_overlap"] for row in correctness
+            ),
+            "ordered_prefix_match_mean": _mean(
+                row["ordered_prefix_match"] for row in correctness
+            ),
+            "token_length_match_rate": _mean(
+                row["token_length_match"] for row in correctness
+            ),
         },
         "caveats": (
             "GR max_decode_steps counts decode iterations after the initial prefill beam selection; "
@@ -101,7 +111,9 @@ def _gr_outputs(summary: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
             beams.append(
                 {
                     "rank": int(detail.get("rank", len(beams))),
-                    "token_ids": tuple(int(token) for token in detail.get("token_ids", ()) or ()),
+                    "token_ids": tuple(
+                        int(token) for token in detail.get("token_ids", ()) or ()
+                    ),
                     "score": optional_float(
                         detail.get("cumulative_score", detail.get("score"))
                     ),
@@ -112,7 +124,9 @@ def _gr_outputs(summary: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
             beams.append(
                 {
                     "rank": 0,
-                    "token_ids": tuple(int(token) for token in output.get("token_ids", ()) or ()),
+                    "token_ids": tuple(
+                        int(token) for token in output.get("token_ids", ()) or ()
+                    ),
                     "score": None,
                     "raw": output,
                 }
@@ -134,7 +148,9 @@ def _sglang_outputs(summary: Mapping[str, Any]) -> dict[str, list[dict[str, Any]
             beams.append(
                 {
                     "rank": int(beam.get("rank", len(beams))),
-                    "token_ids": tuple(int(token) for token in beam.get("token_ids", ()) or ()),
+                    "token_ids": tuple(
+                        int(token) for token in beam.get("token_ids", ()) or ()
+                    ),
                     "score": optional_float(beam.get("score")),
                     "text": beam.get("text"),
                     "raw": beam,
@@ -268,16 +284,18 @@ def _compare_request(
         "gr_request_id": gr_request_id,
         "sglang_request_id": sglang_request_id,
         "match_strategy": match_strategy,
-        "top1_exact_match": bool(gr_tokens and sglang_tokens and gr_tokens[0] == sglang_tokens[0]),
+        "top1_exact_match": bool(
+            gr_tokens and sglang_tokens and gr_tokens[0] == sglang_tokens[0]
+        ),
         "topk_set_overlap": len(overlap) / topk_denom,
-        "ordered_prefix_match": ordered_matches / max(min(len(gr_tokens), len(sglang_tokens)), 1),
+        "ordered_prefix_match": ordered_matches
+        / max(min(len(gr_tokens), len(sglang_tokens)), 1),
         "gr_beam_count": len(gr_tokens),
         "sglang_beam_count": len(sglang_tokens),
         "gr_token_len": gr_token_len,
         "sglang_token_len": sglang_token_len,
         "token_length_match": (
-            bool(gr_tokens and sglang_tokens)
-            and gr_token_len == sglang_token_len
+            bool(gr_tokens and sglang_tokens) and gr_token_len == sglang_token_len
         ),
         "same_position_count": ordered_matches,
         "common_prefix_count": common_prefix_count,
@@ -574,7 +592,9 @@ def main() -> None:
     sglang = read_json(Path(args.sglang_json))
     report = compare(gr, sglang)
     Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output_json).write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    Path(args.output_json).write_text(
+        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+    )
     Path(args.output_markdown).write_text(render_markdown(report), encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))
 

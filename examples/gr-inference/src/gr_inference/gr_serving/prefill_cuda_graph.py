@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
-import time
 from typing import Any
 
 from gr_inference.gr_kv import ContextKV
 from gr_inference.gr_runtime.generation import PrefillResult
-from gr_inference.gr_serving.cuda_graph_utils import (
-    CudaGraphCacheMixin,
-    env_flag as _env_flag,
-    env_int as _env_int,
-    is_cuda_tensor as _is_cuda_tensor,
-    tensor_data_ptr as _tensor_data_ptr,
-    tensor_nbytes as _tensor_nbytes,
-    tensor_view_key as _tensor_view_key,
-)
+from gr_inference.gr_serving.cuda_graph_utils import CudaGraphCacheMixin
+from gr_inference.gr_serving.cuda_graph_utils import env_flag as _env_flag
+from gr_inference.gr_serving.cuda_graph_utils import env_int as _env_int
+from gr_inference.gr_serving.cuda_graph_utils import is_cuda_tensor as _is_cuda_tensor
+from gr_inference.gr_serving.cuda_graph_utils import tensor_data_ptr as _tensor_data_ptr
+from gr_inference.gr_serving.cuda_graph_utils import tensor_nbytes as _tensor_nbytes
+from gr_inference.gr_serving.cuda_graph_utils import tensor_view_key as _tensor_view_key
 
 
 @dataclass
@@ -316,14 +314,15 @@ class GRPrefillCudaGraphRunner(CudaGraphCacheMixin):
                 current_hidden_states = hidden_states
                 current_normed_hidden_states = normed_hidden_states
                 for layer_idx in range(chunk_start, chunk_end):
-                    current_hidden_states, current_normed_hidden_states = (
-                        self.model.forward_prefill_layer(
-                            layer_idx,
-                            current_hidden_states,
-                            entry.context_kv,
-                            normed_hidden_states=current_normed_hidden_states,
-                            timing_recorder=None,
-                        )
+                    (
+                        current_hidden_states,
+                        current_normed_hidden_states,
+                    ) = self.model.forward_prefill_layer(
+                        layer_idx,
+                        current_hidden_states,
+                        entry.context_kv,
+                        normed_hidden_states=current_normed_hidden_states,
+                        timing_recorder=None,
                     )
                 return current_hidden_states, current_normed_hidden_states
 
@@ -418,6 +417,7 @@ class GRPrefillCudaGraphRunner(CudaGraphCacheMixin):
             _tensor_view_key(context_kv.value),
             bool(last_token_logits_only),
         )
+
 
 def _prefill_cuda_graph_mode() -> str:
     import os

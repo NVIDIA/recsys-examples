@@ -67,4 +67,3 @@ def test_kernel_profile_can_store_benchmark_results(tmp_path) -> None:
 
     assert loaded.benchmarks["real_decode_step_ms"] == 29.2
     assert loaded.benchmarks["beam_width"] == 128
-

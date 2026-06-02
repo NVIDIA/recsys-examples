@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass, field
-import time
 from typing import Any
 
 from gr_inference.gr_serving.batch import FIFOBatchAssembler, SchedulerPolicy
@@ -123,5 +123,6 @@ class SyncGRScheduler:
     def _avg_batch_size(self) -> float:
         if not self.batch_history:
             return 0.0
-        return sum(batch["size"] for batch in self.batch_history) / len(self.batch_history)
-
+        return sum(batch["size"] for batch in self.batch_history) / len(
+            self.batch_history
+        )

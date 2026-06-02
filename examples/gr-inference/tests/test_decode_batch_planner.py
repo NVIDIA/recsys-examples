@@ -8,7 +8,6 @@ def test_decode_batch_planner_groups_by_beam_width() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kv import ContextKV
     from gr_inference.gr_runtime import GRGenerationState, PrefillResult
     from gr_inference.gr_serving import GRDecodeBatchPlanner
@@ -42,4 +41,3 @@ def test_decode_batch_planner_groups_by_beam_width() -> None:
     assert batches[0].beam_width == 2
     assert batches[0].size == 2
     assert batches[0].metadata()["request_ids"] == ["a", "b"]
-

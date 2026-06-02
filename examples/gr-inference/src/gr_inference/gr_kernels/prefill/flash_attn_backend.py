@@ -18,7 +18,9 @@ class FlashAttentionPrefillBackend:
         try:
             from flash_attn import flash_attn_func
         except ImportError as exc:  # pragma: no cover - depends on environment
-            raise RuntimeError("FlashAttentionPrefillBackend requires flash-attn") from exc
+            raise RuntimeError(
+                "FlashAttentionPrefillBackend requires flash-attn"
+            ) from exc
 
         hidden = flash_attn_func(
             inputs.q,

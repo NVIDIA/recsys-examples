@@ -88,7 +88,9 @@ class GRInProcessServingFacade:
             for request_id, state in scheduler.states.items()
         )
 
-    def cancel(self, request_id: str, *, reason: str = "cancelled") -> GRServingResponse:
+    def cancel(
+        self, request_id: str, *, reason: str = "cancelled"
+    ) -> GRServingResponse:
         return self.executor.cancel(request_id, reason=reason)
 
     def drain(self) -> dict[str, Any]:
@@ -181,7 +183,10 @@ class GRInProcessServingFacade:
         return getattr(self.executor, "scheduler", self.executor)
 
     def _prepare_request(self, request: GRServingRequest) -> GRServingRequest:
-        if request.item_mask_provider is not None or self.item_mask_provider_store is None:
+        if (
+            request.item_mask_provider is not None
+            or self.item_mask_provider_store is None
+        ):
             return request
         return replace(
             request,

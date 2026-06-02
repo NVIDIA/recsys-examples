@@ -9,10 +9,10 @@ control.
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass, field
 import json
 import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any
 
 from gr_inference.gr_runtime.generation import PrefillResult
@@ -79,9 +79,9 @@ class GRPromptPrefixCache:
         self.max_entries = max_entries
         self.max_tokens = max_tokens
         self.page_size = page_size
-        self.entries: OrderedDict[tuple[Any, tuple[int, ...]], _GRPrefixEntry] = (
-            OrderedDict()
-        )
+        self.entries: OrderedDict[
+            tuple[Any, tuple[int, ...]], _GRPrefixEntry
+        ] = OrderedDict()
         self.root = _GRPrefixNode()
         self.insertions = 0
         self.evictions = 0
@@ -172,7 +172,9 @@ class GRPromptPrefixCache:
         self._rebuild_tree()
         return True
 
-    def match(self, input_ids: Any, *, extra_key: Any = None) -> GRPrefixCacheMatch | None:
+    def match(
+        self, input_ids: Any, *, extra_key: Any = None
+    ) -> GRPrefixCacheMatch | None:
         tokens = input_ids_to_token_tuple(input_ids)
         if not tokens or not self.entries:
             return None
@@ -209,7 +211,9 @@ class GRPromptPrefixCache:
             )
             if child is None:
                 break
-            common = _common_prefix_len(tree_tokens, child.key, position, self.page_size)
+            common = _common_prefix_len(
+                tree_tokens, child.key, position, self.page_size
+            )
             if common == 0:
                 break
             child.last_access_time = time.monotonic()
@@ -267,9 +271,9 @@ class GRPromptPrefixCache:
         self.evictions += 1
 
     def _recompute_tree_tokens(self) -> None:
-        rebuilt: OrderedDict[tuple[Any, tuple[int, ...]], _GRPrefixEntry] = (
-            OrderedDict()
-        )
+        rebuilt: OrderedDict[
+            tuple[Any, tuple[int, ...]], _GRPrefixEntry
+        ] = OrderedDict()
         self.total_tree_tokens = 0
         for cache_key, entry in self.entries.items():
             updated = _GRPrefixEntry(
@@ -327,7 +331,9 @@ class GRPromptPrefixCache:
             )
             child.key = child.key[common:]
             split.children[
-                _child_lookup_key(child.key, 0, extra_key=None, page_size=self.page_size)
+                _child_lookup_key(
+                    child.key, 0, extra_key=None, page_size=self.page_size
+                )
             ] = child
             node.children[lookup_key] = split
 
@@ -371,7 +377,9 @@ def input_ids_to_token_tuple(input_ids: Any) -> tuple[int, ...]:
         raw = [value]
     if raw and isinstance(raw[0], list | tuple):
         if len(raw) != 1:
-            raise ValueError("prefix cache expects one request per cached prefill entry")
+            raise ValueError(
+                "prefix cache expects one request per cached prefill entry"
+            )
         raw = raw[0]
     return tuple(int(token) for token in raw)
 

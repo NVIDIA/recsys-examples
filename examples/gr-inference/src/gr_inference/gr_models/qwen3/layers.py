@@ -7,10 +7,10 @@ in environments without torch.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from contextlib import nullcontext
 import importlib
 import os
+from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Any
 
 from gr_inference.gr_kernels import (
@@ -86,7 +86,6 @@ if nn is not None:
             hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
             return (self.weight * hidden_states).to(input_dtype)
 
-
     class Qwen3LayerOps(ABC, nn.Module):
         """Backend interface for replaceable Qwen3 layer operations."""
 
@@ -132,7 +131,6 @@ if nn is not None:
         @abstractmethod
         def mlp(self, hidden_states):
             raise NotImplementedError
-
 
     class TorchQwen3LayerOps(Qwen3LayerOps):
         """Torch eager implementation of Qwen3 layer operations.
@@ -328,9 +326,13 @@ if nn is not None:
                 and _trtllm_packed_gemm_scope_enabled("attention")
                 else None
             )
-            return projected if projected is not None else _linear_project(
-                self.out_proj,
-                flattened,
+            return (
+                projected
+                if projected is not None
+                else _linear_project(
+                    self.out_proj,
+                    flattened,
+                )
             )
 
         def post_attention_norm(self, hidden_states):
@@ -404,9 +406,13 @@ if nn is not None:
                 and _trtllm_packed_gemm_scope_enabled("mlp")
                 else None
             )
-            return gate_up if gate_up is not None else _linear_project(
-                self.gate_up_proj,
-                hidden_states,
+            return (
+                gate_up
+                if gate_up is not None
+                else _linear_project(
+                    self.gate_up_proj,
+                    hidden_states,
+                )
             )
 
         def gate_up(self, hidden_states):
@@ -432,9 +438,13 @@ if nn is not None:
                 and _trtllm_packed_gemm_scope_enabled("mlp")
                 else None
             )
-            return output if output is not None else _linear_project(
-                self.down_proj,
-                hidden_states,
+            return (
+                output
+                if output is not None
+                else _linear_project(
+                    self.down_proj,
+                    hidden_states,
+                )
             )
 
         def load_logical_weights(
@@ -515,7 +525,9 @@ if nn is not None:
                 strict=False,
             )
 
-        def _copy_weight(self, name: str, weights: dict[str, Any], param, *, strict: bool) -> None:
+        def _copy_weight(
+            self, name: str, weights: dict[str, Any], param, *, strict: bool
+        ) -> None:
             if name not in weights:
                 if strict:
                     raise KeyError(f"missing logical tensor: {name}")
@@ -531,7 +543,6 @@ if nn is not None:
                 )
             with torch.no_grad():
                 param.copy_(tensor.to(device=param.device, dtype=param.dtype))
-
 
     class Qwen3SingleLayerPrefill(nn.Module):
         """One full Qwen3 decoder layer wired to GR prefill runtime.
@@ -554,7 +565,9 @@ if nn is not None:
             self.config = config
             self.layer_idx = layer_idx
             self.prefill_runner = GRPrefillRunner(prefill_attention)
-            self.ops = ops if ops is not None else TorchQwen3LayerOps(config, dtype=dtype)
+            self.ops = (
+                ops if ops is not None else TorchQwen3LayerOps(config, dtype=dtype)
+            )
 
         def forward_prefill(
             self,
@@ -737,7 +750,9 @@ if nn is not None:
                             normed = self.ops.input_norm(hidden_states)
                     else:
                         normed = normed_hidden_states
-                    with _timed_fine(timing_recorder, f"layer{self.layer_idx}.qkv_proj"):
+                    with _timed_fine(
+                        timing_recorder, f"layer{self.layer_idx}.qkv_proj"
+                    ):
                         q, k, v = self.ops.qkv(normed)
                     decode_position = generation.prefill.context_len + step
                     if position_ids is None:
@@ -762,7 +777,9 @@ if nn is not None:
                         step=step,
                         active_beam_width=active_beam_width,
                         topk_indices=topk_indices,
-                        decode_nums=decode_nums if decode_nums is not None else step + 1,
+                        decode_nums=decode_nums
+                        if decode_nums is not None
+                        else step + 1,
                         return_lse=return_lse,
                         backend_name=backend_name,
                     )
@@ -772,14 +789,19 @@ if nn is not None:
                         decode_output.attention_output
                     )
                     if _is_fine_timing(timing_recorder):
-                        with _timed_fine(timing_recorder, f"layer{self.layer_idx}.o_proj"):
+                        with _timed_fine(
+                            timing_recorder, f"layer{self.layer_idx}.o_proj"
+                        ):
                             projected = self.ops.o_proj(attn_out)
-                        with _timed_fine(timing_recorder, f"layer{self.layer_idx}.post_norm"):
-                            residual, hidden_states = (
-                                self.ops.post_attention_residual_norm_projected(
-                                    residual,
-                                    projected,
-                                )
+                        with _timed_fine(
+                            timing_recorder, f"layer{self.layer_idx}.post_norm"
+                        ):
+                            (
+                                residual,
+                                hidden_states,
+                            ) = self.ops.post_attention_residual_norm_projected(
+                                residual,
+                                projected,
                             )
                     else:
                         residual, hidden_states = self.ops.post_attention_residual_norm(
@@ -787,10 +809,15 @@ if nn is not None:
                             attn_out,
                         )
                     with _timed(timing_recorder, f"layer{self.layer_idx}.mlp"):
-                        if _is_fine_timing(timing_recorder) and isinstance(
-                            self.ops,
-                            TorchQwen3LayerOps,
-                        ) and _selected_kernel_backend(CAP_FUSED_MLP) != "trtllm_aligned":
+                        if (
+                            _is_fine_timing(timing_recorder)
+                            and isinstance(
+                                self.ops,
+                                TorchQwen3LayerOps,
+                            )
+                            and _selected_kernel_backend(CAP_FUSED_MLP)
+                            != "trtllm_aligned"
+                        ):
                             with _timed_fine(
                                 timing_recorder,
                                 f"layer{self.layer_idx}.gate_up_proj",
@@ -826,23 +853,19 @@ if nn is not None:
                 return hidden_states, next_normed
             return hidden_states
 
-
 else:
 
     class Qwen3RMSNorm:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs) -> None:
             _require_torch()
 
-
     class Qwen3LayerOps:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs) -> None:
             _require_torch()
 
-
     class TorchQwen3LayerOps:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs) -> None:
             _require_torch()
-
 
     class Qwen3SingleLayerPrefill:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs) -> None:
@@ -877,10 +900,7 @@ def _suffix_position_ids(q, *, batch: int, suffix_len: int, prefix_len: int):
 
 
 def _qk_norm_rope_prefill_extend(ops, q, k, *, position_ids):
-    if all(
-        hasattr(ops, name)
-        for name in ("q_norm_only", "k_norm_only", "rope_only")
-    ):
+    if all(hasattr(ops, name) for name in ("q_norm_only", "k_norm_only", "rope_only")):
         q = ops.q_norm_only(q)
         k = ops.k_norm_only(k)
         return ops.rope_only(q, k, position_ids=position_ids)
@@ -959,11 +979,15 @@ def _torch_prefill_extend_attention(q, k, v, *, prefix_len: int):
         dropout_p=0.0,
         is_causal=False,
     )
-    return out.permute(0, 2, 1, 3).contiguous().view(
-        batch,
-        suffix_len,
-        num_q_heads,
-        q.shape[-1],
+    return (
+        out.permute(0, 2, 1, 3)
+        .contiguous()
+        .view(
+            batch,
+            suffix_len,
+            num_q_heads,
+            q.shape[-1],
+        )
     )
 
 
@@ -1344,7 +1368,9 @@ def _sglang_rope_inplace():
     return _SGLANG_ROPE_INPLACE
 
 
-def _sglang_rope_cos_sin_cache(q, *, head_dim: int, rope_theta: float, max_position: int):
+def _sglang_rope_cos_sin_cache(
+    q, *, head_dim: int, rope_theta: float, max_position: int
+):
     device = q.device
     device_key = (device.type, device.index)
     cache_key = (
@@ -1423,7 +1449,9 @@ def _apply_trtllm_packed_gemm(hidden_states, weight, bias=None):
         return None
     try:
         if _TRTLLM_PACKED_GEMM_KIND == "trtllm_cublas_mm":
-            return packed_gemm(hidden_states, weight.transpose(0, 1), bias, out_dtype=None)
+            return packed_gemm(
+                hidden_states, weight.transpose(0, 1), bias, out_dtype=None
+            )
         return packed_gemm(hidden_states, weight, bias)
     except Exception:
         return None
@@ -1475,7 +1503,9 @@ def _apply_torch_compile_gated_mlp(
     if compiled is None:
         return None
     try:
-        return compiled(hidden_states, gate_up_weight, down_weight, int(intermediate_size))
+        return compiled(
+            hidden_states, gate_up_weight, down_weight, int(intermediate_size)
+        )
     except Exception:
         _TORCH_COMPILE_GATED_MLP_FAILED = True
         return None
@@ -1493,7 +1523,9 @@ def _torch_compile_gated_mlp():
     try:
         _TORCH_COMPILE_GATED_MLP = torch.compile(
             _torch_compile_gated_mlp_impl,
-            mode=os.environ.get("GR_INFERENCE_TORCH_COMPILE_MLP_MODE", "reduce-overhead"),
+            mode=os.environ.get(
+                "GR_INFERENCE_TORCH_COMPILE_MLP_MODE", "reduce-overhead"
+            ),
             dynamic=False,
         )
         return _TORCH_COMPILE_GATED_MLP
@@ -1557,7 +1589,9 @@ def _apply_flashinfer_fused_add_rmsnorm(
         result = fused_add_rmsnorm(norm_input, residual_input, weight, eps)
         _record_flashinfer_call("fused_add_rmsnorm")
         if result is None:
-            return residual_input.reshape(original_shape), norm_input.reshape(original_shape)
+            return residual_input.reshape(original_shape), norm_input.reshape(
+                original_shape
+            )
         if isinstance(result, tuple):
             if len(result) == 2:
                 norm_output, residual_output = result
@@ -1783,7 +1817,8 @@ def _rope_cos_sin(q, *, head_dim: int, rope_theta: float, position_ids=None):
 
 def _rope_inv_freq(*, head_dim: int, rope_theta: float, device, dtype):
     return 1.0 / (
-        rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim)
+        rope_theta
+        ** (torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim)
     )
 
 

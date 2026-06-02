@@ -56,10 +56,12 @@ class Qwen3VariantSpec:
 
     def matches_config(self, config: Any) -> bool:
         return (
-            _int_config_value(config, "num_layers", "num_hidden_layers") == self.num_layers
+            _int_config_value(config, "num_layers", "num_hidden_layers")
+            == self.num_layers
             and _int_config_value(config, "hidden_size") == self.hidden_size
             and _int_config_value(config, "intermediate_size") == self.intermediate_size
-            and _int_config_value(config, "num_attention_heads") == self.num_attention_heads
+            and _int_config_value(config, "num_attention_heads")
+            == self.num_attention_heads
             and _int_config_value(config, "num_kv_heads", "num_key_value_heads")
             == self.num_kv_heads
             and _int_config_value(config, "head_dim") == self.head_dim
@@ -146,9 +148,7 @@ def resolve_qwen3_model_dir(
         return model_dir
     env = os.environ if env is None else env
     spec = get_qwen3_variant(
-        variant
-        or env.get("GR_QWEN3_MODEL_VARIANT")
-        or env.get("QWEN3_MODEL_VARIANT")
+        variant or env.get("GR_QWEN3_MODEL_VARIANT") or env.get("QWEN3_MODEL_VARIANT")
     )
     for key in (*_variant_model_dir_env_names(spec), "GR_QWEN3_MODEL_DIR"):
         value = env.get(key)

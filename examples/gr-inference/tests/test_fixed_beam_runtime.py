@@ -1,5 +1,4 @@
 import pytest
-
 from gr_inference.gr_kernels.attention import (
     ExistingGRDecodeAttentionBackend,
     GRDecodeAttention,

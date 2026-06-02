@@ -31,20 +31,25 @@ class GRRequestBatch:
         return self.requests[0].beam_width
 
     def input_shapes(self) -> tuple[Any, ...]:
-        return tuple(getattr(request.input_ids, "shape", None) for request in self.requests)
+        return tuple(
+            getattr(request.input_ids, "shape", None) for request in self.requests
+        )
 
     def compatible_for_tensor_batch(self) -> bool:
         if not self.requests:
             return False
         first = self.requests[0]
         first_shape = getattr(first.input_ids, "shape", None)
-        return all(
-            request.max_decode_steps == first.max_decode_steps
-            and request.beam_width == first.beam_width
-            and request.beam_width_policy is None
-            and getattr(request.input_ids, "shape", None) == first_shape
-            for request in self.requests
-        ) and first.beam_width_policy is None
+        return (
+            all(
+                request.max_decode_steps == first.max_decode_steps
+                and request.beam_width == first.beam_width
+                and request.beam_width_policy is None
+                and getattr(request.input_ids, "shape", None) == first_shape
+                for request in self.requests
+            )
+            and first.beam_width_policy is None
+        )
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -86,4 +91,3 @@ class FIFOBatchAssembler:
         if not requests:
             return None
         return GRRequestBatch(tuple(requests))
-

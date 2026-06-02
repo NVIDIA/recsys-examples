@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from gr_inference.gr_scheduler import BeamWidthPolicy, FixedBeamPolicy
 from gr_inference.gr_runtime.beam_search import item_mask_limited_beam_width
 from gr_inference.gr_runtime.engine import GRDecodeEngine
 from gr_inference.gr_runtime.generation import GRGenerationState
@@ -13,6 +12,7 @@ from gr_inference.gr_runtime.logits_processor import (
     LogitsProcessorContext,
     apply_logits_processors,
 )
+from gr_inference.gr_scheduler import BeamWidthPolicy, FixedBeamPolicy
 
 
 @dataclass(frozen=True)
@@ -182,13 +182,17 @@ def _infer_logits_device(logits: Any) -> Any:
     return getattr(logits, "device", None)
 
 
-def _observe_policy_scores(policy: BeamWidthPolicy, *, step: int, scores: tuple[float, ...]) -> None:
+def _observe_policy_scores(
+    policy: BeamWidthPolicy, *, step: int, scores: tuple[float, ...]
+) -> None:
     observer = getattr(policy, "observe_scores", None)
     if observer is not None:
         observer(step, scores)
 
 
-def _selection_all_stop(token_ids: tuple[int, ...], stop_token_ids: tuple[int, ...]) -> bool:
+def _selection_all_stop(
+    token_ids: tuple[int, ...], stop_token_ids: tuple[int, ...]
+) -> bool:
     if not stop_token_ids:
         return False
     stop_tokens = set(stop_token_ids)

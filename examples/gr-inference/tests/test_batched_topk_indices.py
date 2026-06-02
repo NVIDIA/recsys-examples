@@ -8,7 +8,6 @@ def test_make_batched_topk_indices_fast_path_decode_nums_one() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kv import BatchedBeamPath
     from gr_inference.gr_runtime import BatchedBeamSelection, make_batched_topk_indices
 
@@ -45,7 +44,6 @@ def test_make_batched_topk_indices_follows_parent_chain() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kv import BatchedBeamPath
     from gr_inference.gr_runtime import BatchedBeamSelection, make_batched_topk_indices
 
@@ -86,7 +84,6 @@ def test_make_compacted_batched_topk_indices_uses_query_slot_per_step() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import make_compacted_batched_topk_indices
 
     topk = make_compacted_batched_topk_indices(
@@ -102,5 +99,3 @@ def test_make_compacted_batched_topk_indices_uses_query_slot_per_step() -> None:
     assert torch.equal(topk[0, 0, 0], expected)
     assert torch.equal(topk[1, 0, 3], expected)
     assert topk.is_contiguous()
-
-

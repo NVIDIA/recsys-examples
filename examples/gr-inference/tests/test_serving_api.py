@@ -1,8 +1,11 @@
 import json
 
 import pytest
-
-from gr_inference.gr_runtime import TokenTrie, TrieItemMaskProvider, TrieItemMaskProviderStore
+from gr_inference.gr_runtime import (
+    TokenTrie,
+    TrieItemMaskProvider,
+    TrieItemMaskProviderStore,
+)
 from gr_inference.gr_serving import (
     GRContinuousBatchingPolicy,
     GRContinuousScheduler,
@@ -142,7 +145,9 @@ def test_in_process_facade_keeps_explicit_item_constraints() -> None:
         )
     )
 
-    assert scheduler.states["req-explicit"].request.item_mask_provider is explicit_provider
+    assert (
+        scheduler.states["req-explicit"].request.item_mask_provider is explicit_provider
+    )
 
 
 def test_in_process_facade_reloads_item_catalog_jsonl(tmp_path) -> None:

@@ -109,7 +109,11 @@ def write_beam_kv_step(
     ):
         _record_call("beam_kv_write_jit_non_cuda")
         return False
-    if beam_key.dtype != beam_value.dtype or k.dtype != beam_key.dtype or v.dtype != beam_key.dtype:
+    if (
+        beam_key.dtype != beam_value.dtype
+        or k.dtype != beam_key.dtype
+        or v.dtype != beam_key.dtype
+    ):
         _record_call("beam_kv_write_jit_dtype_mismatch")
         return False
     extension = _cuda_extension()
@@ -217,7 +221,10 @@ def exact_fused_add_rmsnorm(input_tensor, residual_tensor, weight, eps: float):
     if input_tensor.shape != residual_tensor.shape:
         _record_call("exact_add_rmsnorm_jit_shape_mismatch")
         return None
-    if input_tensor.dtype != residual_tensor.dtype or weight.dtype != residual_tensor.dtype:
+    if (
+        input_tensor.dtype != residual_tensor.dtype
+        or weight.dtype != residual_tensor.dtype
+    ):
         _record_call("exact_add_rmsnorm_jit_dtype_mismatch")
         return None
     extension = _cuda_extension()
@@ -266,7 +273,9 @@ def _fused_qk_norm_rope_reference(
 
     del num_kv_heads_for_cache, yarn_factor, yarn_low, yarn_high
     if qkv.dim() != 2:
-        raise RuntimeError("gr_trtllm.fused_qk_norm_rope expects qkv shaped [N, packed]")
+        raise RuntimeError(
+            "gr_trtllm.fused_qk_norm_rope expects qkv shaped [N, packed]"
+        )
     if rotary_dim != head_dim:
         raise RuntimeError("partial rotary_dim is not supported by the reference op")
     if head_dim % 2 != 0:
@@ -324,7 +333,9 @@ def _gated_mlp_reference(hidden_states, gate_up_weight, down_weight):
         raise RuntimeError("gate_up_weight output dimension must be even")
     intermediate_size = gate_up_weight.shape[0] // 2
     if down_weight.shape[-1] != intermediate_size:
-        raise RuntimeError("down_weight input dimension does not match intermediate size")
+        raise RuntimeError(
+            "down_weight input dimension does not match intermediate size"
+        )
 
     cuda_output = _try_cuda_gated_mlp(
         hidden_states,
@@ -372,12 +383,17 @@ def _packed_gemm_flatten_mm(flat_input, weight, bias=None):
     return torch.mm(flat_input, weight_t)
 
 
-def _apply_rope(x, position_ids, rope_theta: float, attention_factor: float, *, is_neox: bool):
+def _apply_rope(
+    x, position_ids, rope_theta: float, attention_factor: float, *, is_neox: bool
+):
     compute_dtype = torch.float32
     head_dim = x.shape[-1]
     inv_freq = 1.0 / (
         rope_theta
-        ** (torch.arange(0, head_dim, 2, device=x.device, dtype=compute_dtype) / head_dim)
+        ** (
+            torch.arange(0, head_dim, 2, device=x.device, dtype=compute_dtype)
+            / head_dim
+        )
     )
     positions = position_ids.to(device=x.device, dtype=compute_dtype).reshape(-1)
     if positions.numel() != x.shape[0]:
@@ -428,7 +444,11 @@ def _try_cuda_fused_qk_norm_rope(
         _record_call("fused_qk_norm_rope_jit_unavailable")
         return False
     try:
-        pos_ids = position_ids.to(device=qkv.device, dtype=torch.int32).reshape(-1).contiguous()
+        pos_ids = (
+            position_ids.to(device=qkv.device, dtype=torch.int32)
+            .reshape(-1)
+            .contiguous()
+        )
         extension.fused_qk_norm_rope_cuda(
             qkv,
             int(num_heads),
@@ -451,7 +471,9 @@ def _try_cuda_fused_qk_norm_rope(
         return False
 
 
-def _try_cuda_gated_mlp(hidden_states, gate_up_weight, down_weight, intermediate_size: int):
+def _try_cuda_gated_mlp(
+    hidden_states, gate_up_weight, down_weight, intermediate_size: int
+):
     if (
         os.environ.get("GR_INFERENCE_GR_TRTLLM_KERNELS_JIT", "0") != "1"
         or os.environ.get("GR_INFERENCE_GR_TRTLLM_GATED_MLP_JIT", "0") != "1"

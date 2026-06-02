@@ -9,24 +9,15 @@ step advancement without changing scheduler ownership.
 
 from __future__ import annotations
 
+import os
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-import os
-import time
 from typing import Any, Literal, Mapping
 
 from gr_inference.gr_kv import BatchedBeamPath, BeamKV, ContextKV
 from gr_inference.gr_runtime import BeamSelection, GRGenerationState
-from gr_inference.gr_runtime.generation import (
-    PrefillResult,
-    allocate_beam_kv_like_context,
-)
-from gr_inference.gr_runtime.logits_processor import (
-    LogitsProcessorContext,
-    apply_logits_processors,
-    logits_processors_metadata,
-)
 from gr_inference.gr_runtime.batched_beam_search import (
     BatchedBeamSelection,
     batched_item_mask_limited_beam_width,
@@ -42,17 +33,39 @@ from gr_inference.gr_runtime.beam_kv_compaction import (
     compact_batched_beam_kv_history,
     needs_batched_beam_kv_history_compaction,
 )
+from gr_inference.gr_runtime.generation import (
+    PrefillResult,
+    allocate_beam_kv_like_context,
+)
+from gr_inference.gr_runtime.logits_processor import (
+    LogitsProcessorContext,
+    apply_logits_processors,
+    logits_processors_metadata,
+)
 from gr_inference.gr_serving.beam_metadata import (
     attach_item_results as _attach_item_results,
+)
+from gr_inference.gr_serving.beam_metadata import (
     beam_details as _continuous_beam_details,
+)
+from gr_inference.gr_serving.beam_metadata import (
     beam_results as _continuous_beam_results,
-    beam_score_type as _beam_score_type,
+)
+from gr_inference.gr_serving.beam_metadata import beam_score_type as _beam_score_type
+from gr_inference.gr_serving.beam_metadata import (
     beam_width_policy_metadata as _beam_width_policy_metadata,
+)
+from gr_inference.gr_serving.beam_metadata import (
     request_stop_token_ids as _request_stop_token_ids,
+)
+from gr_inference.gr_serving.beam_metadata import (
     selected_decode_token_logprobs as _selected_decode_token_logprobs,
+)
+from gr_inference.gr_serving.beam_metadata import (
     selected_initial_token_logprobs as _selected_initial_token_logprobs,
 )
 from gr_inference.gr_serving.cuda_graph_utils import is_cuda_tensor as _is_cuda_tensor
+from gr_inference.gr_serving.decode_cuda_graph import GRDecodeCudaGraphRunner
 from gr_inference.gr_serving.memory import (
     GRBeamKVPoolLease,
     GRContextKVPoolLease,
@@ -61,12 +74,8 @@ from gr_inference.gr_serving.memory import (
     GRKVLease,
     GRKVLeaseAllocator,
 )
-from gr_inference.gr_serving.decode_cuda_graph import GRDecodeCudaGraphRunner
 from gr_inference.gr_serving.prefill_cuda_graph import GRPrefillCudaGraphRunner
-from gr_inference.gr_serving.prefix_cache import (
-    GRPrefixCacheMatch,
-    GRPromptPrefixCache,
-)
+from gr_inference.gr_serving.prefix_cache import GRPrefixCacheMatch, GRPromptPrefixCache
 from gr_inference.gr_serving.queue import GRRequestQueue
 from gr_inference.gr_serving.request import GRServingRequest, GRServingResponse
 
@@ -260,7 +269,9 @@ class GRContinuousScheduler:
     one logical decode step.
     """
 
-    policy: GRContinuousBatchingPolicy = field(default_factory=GRContinuousBatchingPolicy)
+    policy: GRContinuousBatchingPolicy = field(
+        default_factory=GRContinuousBatchingPolicy
+    )
     waiting_prefill: GRRequestQueue = field(default_factory=GRRequestQueue)
     decoding: dict[str, GRContinuousRequestState] = field(default_factory=dict)
     finished: dict[str, GRServingResponse] = field(default_factory=dict)
@@ -287,12 +298,16 @@ class GRContinuousScheduler:
         request.validate()
         if request.request_id in self.states:
             raise ValueError(f"duplicate request_id: {request.request_id}")
-        state = GRContinuousRequestState(request=request, submitted_tick=self.tick_count)
+        state = GRContinuousRequestState(
+            request=request, submitted_tick=self.tick_count
+        )
         self.states[request.request_id] = state
         self.waiting_prefill.submit(request)
         self.submitted_requests += 1
 
-    def cancel(self, request_id: str, *, reason: str = "cancelled") -> GRServingResponse:
+    def cancel(
+        self, request_id: str, *, reason: str = "cancelled"
+    ) -> GRServingResponse:
         if not reason:
             raise ValueError("cancel reason must be non-empty")
         if request_id in self.finished:
@@ -480,10 +495,7 @@ class GRContinuousScheduler:
             "kv_events_recorded": len(self.kv_events),
             "avg_prefill_batch_size": self._avg_prefill_batch_size(),
             "avg_decode_batch_size": self._avg_decode_batch_size(),
-            **{
-                f"kv_{name}": value
-                for name, value in self._memory_usage().items()
-            },
+            **{f"kv_{name}": value for name, value in self._memory_usage().items()},
         }
         metrics.update(
             _numeric_status_metrics(
@@ -543,7 +555,9 @@ class GRContinuousScheduler:
             ].append(state.request_id)
 
         batches: list[GRContinuousDecodeBatch] = []
-        for (step, beam_width, next_beam_width, context_len), request_ids in sorted(groups.items()):
+        for (step, beam_width, next_beam_width, context_len), request_ids in sorted(
+            groups.items()
+        ):
             for chunk in _chunks(tuple(request_ids), self.policy.max_decode_batch_size):
                 batches.append(
                     GRContinuousDecodeBatch(
@@ -574,20 +588,22 @@ class GRContinuousScheduler:
                     state.stop_reason = "max_decode_steps"
                     self.decoding.pop(request_id, None)
                     self._release_kv_lease(state)
-                    self._store_finished_response(GRServingResponse(
-                        request_id=request_id,
-                        token_ids=(),
-                        scores=(),
-                        metadata={
-                            **state.request.metadata,
-                            "continuous_batching": True,
-                            "decode_steps": state.current_decode_step,
-                            "stop_reason": state.stop_reason,
-                            "submitted_tick": state.submitted_tick,
-                            "admitted_tick": state.admitted_tick,
-                            "finished_tick": state.finished_tick,
-                        },
-                    ))
+                    self._store_finished_response(
+                        GRServingResponse(
+                            request_id=request_id,
+                            token_ids=(),
+                            scores=(),
+                            metadata={
+                                **state.request.metadata,
+                                "continuous_batching": True,
+                                "decode_steps": state.current_decode_step,
+                                "stop_reason": state.stop_reason,
+                                "submitted_tick": state.submitted_tick,
+                                "admitted_tick": state.admitted_tick,
+                                "finished_tick": state.finished_tick,
+                            },
+                        )
+                    )
                     self.succeeded_requests += 1
                     finished.append(request_id)
                 else:
@@ -640,7 +656,9 @@ class GRContinuousScheduler:
         if timeout_ticks is not None:
             metadata["timeout_ticks"] = timeout_ticks
         if error is not None:
-            metadata["error_type"] = type(error).__name__ if not isinstance(error, str) else "Error"
+            metadata["error_type"] = (
+                type(error).__name__ if not isinstance(error, str) else "Error"
+            )
             metadata["error_message"] = str(error)
         response = GRServingResponse(
             request_id=state.request_id,
@@ -686,7 +704,9 @@ class GRContinuousScheduler:
     def _memory_usage(self) -> dict[str, int]:
         return _require_allocator(self.kv_allocator).usage()
 
-    def _kv_health_status(self, allocator_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _kv_health_status(
+        self, allocator_status: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         if allocator_status is None:
             allocator_status = _require_allocator(self.kv_allocator).status()
         decoding_request_ids = set(self.decoding)
@@ -784,7 +804,9 @@ class GRContinuousServingExecutor:
     prefill_ms: float = 0.0
     decode_ms: float = 0.0
     prefill_cache: GRPromptPrefixCache = field(default_factory=GRPromptPrefixCache)
-    batched_prefill_cache: dict[tuple[str, ...], PrefillResult] = field(default_factory=dict)
+    batched_prefill_cache: dict[tuple[str, ...], PrefillResult] = field(
+        default_factory=dict
+    )
     decode_inputs_cache: dict[tuple[Any, ...], Any] = field(default_factory=dict)
     topk_indices_cache: dict[tuple[Any, ...], Any] = field(default_factory=dict)
     prefill_cache_hits: int = 0
@@ -804,7 +826,9 @@ class GRContinuousServingExecutor:
     decode_cuda_graph_padding_slots: int = 0
     decode_cuda_graph_padding_skips: int = 0
     decode_cuda_graph_padding_skip_reasons: dict[str, int] = field(default_factory=dict)
-    decode_cuda_graph_padding_cache: dict[tuple[Any, ...], Any] = field(default_factory=dict)
+    decode_cuda_graph_padding_cache: dict[tuple[Any, ...], Any] = field(
+        default_factory=dict
+    )
     decode_cuda_graph_padding_buffer_hits: int = 0
     decode_cuda_graph_padding_buffer_misses: int = 0
     decode_cuda_graph_dynamic_skips: int = 0
@@ -862,7 +886,9 @@ class GRContinuousServingExecutor:
                 "topk_indices_cache": {},
             }
             try:
-                setattr(self.engine, "_continuous_decode_template_caches", shared_caches)
+                setattr(
+                    self.engine, "_continuous_decode_template_caches", shared_caches
+                )
             except AttributeError:
                 # Some unit tests use a plain object() as a lightweight engine.
                 # Keep those executor-local while sharing caches on real engines.
@@ -934,7 +960,9 @@ class GRContinuousServingExecutor:
     def submit(self, request: GRServingRequest) -> None:
         self.scheduler.submit(request)
 
-    def cancel(self, request_id: str, *, reason: str = "cancelled") -> GRServingResponse:
+    def cancel(
+        self, request_id: str, *, reason: str = "cancelled"
+    ) -> GRServingResponse:
         response = self.scheduler.cancel(request_id, reason=reason)
         self._attach_execution_metadata((request_id,))
         return response
@@ -1007,7 +1035,9 @@ class GRContinuousServingExecutor:
     def metrics(self) -> dict[str, float | int]:
         metrics = dict(self.scheduler.metrics())
         metrics.update(self._execution_metrics())
-        metrics.update(_numeric_status_metrics("prefill_cache", self._prefill_cache_status()))
+        metrics.update(
+            _numeric_status_metrics("prefill_cache", self._prefill_cache_status())
+        )
         metrics.update(
             _numeric_status_metrics(
                 "decode_inputs_cache",
@@ -1111,17 +1141,23 @@ class GRContinuousServingExecutor:
             "decode_cuda_graph_padding_applied": self.decode_cuda_graph_padding_applied,
             "decode_cuda_graph_padding_slots": self.decode_cuda_graph_padding_slots,
             "decode_cuda_graph_padding_skips": self.decode_cuda_graph_padding_skips,
-            "decode_cuda_graph_padding_buffer_entries": len(self.decode_cuda_graph_padding_cache),
+            "decode_cuda_graph_padding_buffer_entries": len(
+                self.decode_cuda_graph_padding_cache
+            ),
             "decode_cuda_graph_padding_buffer_hits": self.decode_cuda_graph_padding_buffer_hits,
             "decode_cuda_graph_padding_buffer_misses": self.decode_cuda_graph_padding_buffer_misses,
             "decode_cuda_graph_dynamic_skips": self.decode_cuda_graph_dynamic_skips,
             **{
                 f"decode_cuda_graph_padding_skip_{reason}": count
-                for reason, count in sorted(self.decode_cuda_graph_padding_skip_reasons.items())
+                for reason, count in sorted(
+                    self.decode_cuda_graph_padding_skip_reasons.items()
+                )
             },
             **{
                 f"decode_cuda_graph_dynamic_skip_{reason}": count
-                for reason, count in sorted(self.decode_cuda_graph_dynamic_skip_reasons.items())
+                for reason, count in sorted(
+                    self.decode_cuda_graph_dynamic_skip_reasons.items()
+                )
             },
         }
 
@@ -1129,13 +1165,13 @@ class GRContinuousServingExecutor:
         if not request_ids:
             return
 
-        import torch
-
         with _torch_no_grad_context():
             requests_by_shape: dict[Any, list[GRServingRequest]] = defaultdict(list)
             for request_id in request_ids:
                 request = self.scheduler.states[request_id].request
-                requests_by_shape[getattr(request.input_ids, "shape", None)].append(request)
+                requests_by_shape[getattr(request.input_ids, "shape", None)].append(
+                    request
+                )
             for requests in requests_by_shape.values():
                 start = self._start_timer()
                 with self._profile_section("continuous.prefill"):
@@ -1467,7 +1503,9 @@ class GRContinuousServingExecutor:
         *,
         suffix_len: int,
     ) -> PrefillResult:
-        forward_prefill_extend = getattr(self.engine.model, "forward_prefill_extend", None)
+        forward_prefill_extend = getattr(
+            self.engine.model, "forward_prefill_extend", None
+        )
         if callable(forward_prefill_extend):
             return self._prefill_extend_cached_prefix_prefill(
                 request,
@@ -1497,7 +1535,9 @@ class GRContinuousServingExecutor:
         context_len = int(input_ids.shape[-1])
         suffix_ids = input_ids[:, prefix_len:]
         if int(suffix_ids.shape[-1]) != suffix_len:
-            raise ValueError("prefix cache suffix length changed during materialization")
+            raise ValueError(
+                "prefix cache suffix length changed during materialization"
+            )
 
         cached_prefix = _slice_context_kv(match.prefill.context_kv, prefix_len)
         full_context_kv = self._allocate_context_kv_for_prefill_cache_extend(
@@ -1528,7 +1568,7 @@ class GRContinuousServingExecutor:
         *,
         suffix_len: int,
     ) -> PrefillResult:
-        import torch
+        pass
 
         input_ids = request.input_ids.to(
             device=self._model_device(request.input_ids.device),
@@ -1538,7 +1578,9 @@ class GRContinuousServingExecutor:
         context_len = int(input_ids.shape[-1])
         suffix_ids = input_ids[:, prefix_len:]
         if int(suffix_ids.shape[-1]) != suffix_len:
-            raise ValueError("prefix cache suffix length changed during materialization")
+            raise ValueError(
+                "prefix cache suffix length changed during materialization"
+            )
 
         cached_prefix = _slice_context_kv(match.prefill.context_kv, prefix_len)
         full_context_kv = self._allocate_context_kv_for_prefill_cache_extend(
@@ -1618,12 +1660,9 @@ class GRContinuousServingExecutor:
         reference: ContextKV,
         device: Any | None,
     ) -> ContextKV:
-        if (
-            self.context_kv_pool is not None
-            and self.context_kv_pool.can_allocate(
-                request.request_id,
-                context_len=context_len,
-            )
+        if self.context_kv_pool is not None and self.context_kv_pool.can_allocate(
+            request.request_id,
+            context_len=context_len,
         ):
             lease = self.context_kv_pool.allocate(
                 request.request_id,
@@ -1673,7 +1712,9 @@ class GRContinuousServingExecutor:
             _flush_pending_decode_tensor_selections(state)
 
         start = self._start_timer()
-        with _torch_no_grad_context(), self._profile_section("continuous.decode_microbatch_total"):
+        with _torch_no_grad_context(), self._profile_section(
+            "continuous.decode_microbatch_total"
+        ):
             with self._profile_section("continuous.decode_batch_build"):
                 generations = tuple(_require_generation(state) for state in states)
                 selection = _current_batched_selection(generations)
@@ -1692,7 +1733,8 @@ class GRContinuousServingExecutor:
                     active_beam_width=decode_batch.beam_width,
                 )
                 batched_generation = _make_batched_generation(
-                    request_id="continuous-decode:" + ",".join(decode_batch.request_ids),
+                    request_id="continuous-decode:"
+                    + ",".join(decode_batch.request_ids),
                     generations=generations,
                     beam_score_mode=self.engine.config.beam_score_mode,
                     prefill=self._batched_prefill_for_states(states, generations),
@@ -1810,10 +1852,9 @@ class GRContinuousServingExecutor:
                 or len(state.decode_parent_history) < decode_nums
             ):
                 return False
-            if (
-                not _is_cuda_tensor(state.decode_selection_token_ids)
-                or not _is_cuda_tensor(state.decode_selection_scores)
-            ):
+            if not _is_cuda_tensor(
+                state.decode_selection_token_ids
+            ) or not _is_cuda_tensor(state.decode_selection_scores):
                 return False
         return True
 
@@ -1824,7 +1865,9 @@ class GRContinuousServingExecutor:
     ) -> tuple[str, ...]:
         start = self._start_timer()
         finalized_rows: dict[str, tuple[tuple[int, ...], tuple[float, ...]]] = {}
-        with _torch_no_grad_context(), self._profile_section("continuous.decode_microbatch_total"):
+        with _torch_no_grad_context(), self._profile_section(
+            "continuous.decode_microbatch_total"
+        ):
             with self._profile_section("continuous.decode_batch_build"):
                 generations = tuple(_require_generation(state) for state in states)
                 beam_token_ids = _stack_state_tensor_rows(
@@ -1837,7 +1880,8 @@ class GRContinuousServingExecutor:
                 )
                 decode_nums = decode_batch.step + 1
                 batched_generation = _make_batched_generation(
-                    request_id="continuous-decode:" + ",".join(decode_batch.request_ids),
+                    request_id="continuous-decode:"
+                    + ",".join(decode_batch.request_ids),
                     generations=generations,
                     beam_score_mode=self.engine.config.beam_score_mode,
                     prefill=self._batched_prefill_for_states(states, generations),
@@ -2088,8 +2132,7 @@ class GRContinuousServingExecutor:
             batch_size=batch_size,
             capacity=self.context_kv_pool.capacity,
             leased_slots={
-                int(lease.slot)
-                for lease in self.context_kv_pool.leases.values()
+                int(lease.slot) for lease in self.context_kv_pool.leases.values()
             },
         )
         if window is None:
@@ -2117,8 +2160,7 @@ class GRContinuousServingExecutor:
             batch_size=batch_size,
             capacity=self.beam_kv_pool.capacity,
             leased_slots={
-                int(lease.slot)
-                for lease in self.beam_kv_pool.leases.values()
+                int(lease.slot) for lease in self.beam_kv_pool.leases.values()
             },
         )
         if window is None:
@@ -2249,7 +2291,9 @@ class GRContinuousServingExecutor:
         _attach_item_results(
             response.metadata,
             request=state.request,
-            beam_path=state.generation.beam_path if state.generation is not None else None,
+            beam_path=state.generation.beam_path
+            if state.generation is not None
+            else None,
             beam_width=state.beam_width,
         )
         if state.generation is not None:
@@ -2267,8 +2311,8 @@ class GRContinuousServingExecutor:
                 score_type=_beam_score_type(self.engine.config.beam_score_mode),
             )
         if state.request.beam_width_policy is not None:
-            response.metadata["beam_width_policy"] = (
-                _beam_width_policy_metadata(state.request.beam_width_policy)
+            response.metadata["beam_width_policy"] = _beam_width_policy_metadata(
+                state.request.beam_width_policy
             )
         self.scheduler._store_finished_response(response)
         self.scheduler.succeeded_requests += 1
@@ -2299,7 +2343,9 @@ class GRContinuousServingExecutor:
                 response.metadata.setdefault("continuous_execution", "model_step")
                 response.metadata.setdefault("prefill_ms", self.prefill_ms)
                 response.metadata.setdefault("decode_ms", self.decode_ms)
-                response.metadata.setdefault("total_ms", self.prefill_ms + self.decode_ms)
+                response.metadata.setdefault(
+                    "total_ms", self.prefill_ms + self.decode_ms
+                )
                 response.metadata.setdefault("sync_timing", self.sync_timing)
             self._release_beam_kv_pool_lease(request_id)
             self._release_context_kv_pool_lease(request_id)
@@ -2498,7 +2544,9 @@ def _request_beam_slots(request: GRServingRequest) -> int:
     return int(request.max_decode_steps) * int(request.beam_width)
 
 
-def _numeric_status_metrics(prefix: str, status: Mapping[str, Any]) -> dict[str, float | int]:
+def _numeric_status_metrics(
+    prefix: str, status: Mapping[str, Any]
+) -> dict[str, float | int]:
     metrics: dict[str, float | int] = {}
     for name, value in status.items():
         metric_name = name if name.startswith(f"{prefix}_") else f"{prefix}_{name}"
@@ -2509,7 +2557,9 @@ def _numeric_status_metrics(prefix: str, status: Mapping[str, Any]) -> dict[str,
     return metrics
 
 
-def _cache_status(cache: Mapping[Any, Any], *, hits: int, misses: int) -> dict[str, int]:
+def _cache_status(
+    cache: Mapping[Any, Any], *, hits: int, misses: int
+) -> dict[str, int]:
     return {"entries": len(cache), "hits": hits, "misses": misses}
 
 
@@ -2701,7 +2751,9 @@ def _copy_suffix_beam_kv_to_context(
         return
     suffix_key = beam_kv.key[:, :, :suffix_len, 0]
     suffix_value = beam_kv.value[:, :, :suffix_len, 0]
-    _copy_tensor(destination.key[:, :, prefix_len : prefix_len + suffix_len], suffix_key)
+    _copy_tensor(
+        destination.key[:, :, prefix_len : prefix_len + suffix_len], suffix_key
+    )
     _copy_tensor(
         destination.value[:, :, prefix_len : prefix_len + suffix_len],
         suffix_value,
@@ -2717,7 +2769,9 @@ def _empty_context_like(reference: Any, *, context_len: int) -> Any:
         return reference.new_empty(new_shape)
     if hasattr(reference, "with_shape"):
         return reference.with_shape(new_shape)
-    raise TypeError(f"cannot allocate ContextKV from reference type {type(reference)!r}")
+    raise TypeError(
+        f"cannot allocate ContextKV from reference type {type(reference)!r}"
+    )
 
 
 def _topk_indices_cache_key(
@@ -2863,7 +2917,10 @@ def _require_allocator(allocator: GRKVLeaseAllocator | None) -> GRKVLeaseAllocat
 
 
 def _chunks(values: tuple[str, ...], chunk_size: int) -> tuple[tuple[str, ...], ...]:
-    return tuple(values[index : index + chunk_size] for index in range(0, len(values), chunk_size))
+    return tuple(
+        values[index : index + chunk_size]
+        for index in range(0, len(values), chunk_size)
+    )
 
 
 def _require_generation(state: GRContinuousRequestState) -> GRGenerationState:
@@ -2880,7 +2937,9 @@ def _current_batched_selection(
     parent_beams = []
     for generation in generations:
         if not generation.beam_path.entries:
-            raise ValueError(f"request {generation.request_id} has no initialized beams")
+            raise ValueError(
+                f"request {generation.request_id} has no initialized beams"
+            )
         entry = generation.beam_path.entries[-1]
         token_ids.append(entry.token_ids)
         scores.append(entry.scores)
@@ -2982,9 +3041,13 @@ def _make_tensor_parent_history_topk_indices(
             if len(state.decode_parent_history) <= step:
                 raise ValueError("decode parent history is shorter than decode_nums")
             rows.append(state.decode_parent_history[step].reshape(-1))
-        parent_history.append(torch.stack(tuple(rows), dim=0).to(device=device, dtype=torch.long))
+        parent_history.append(
+            torch.stack(tuple(rows), dim=0).to(device=device, dtype=torch.long)
+        )
 
-    current = torch.arange(beam_width, dtype=torch.long, device=device).view(1, beam_width)
+    current = torch.arange(beam_width, dtype=torch.long, device=device).view(
+        1, beam_width
+    )
     current = current.expand(len(states), beam_width)
     ancestry = [current for _ in range(decode_nums)]
     for step in range(decode_nums - 1, -1, -1):
@@ -2992,7 +3055,9 @@ def _make_tensor_parent_history_topk_indices(
         current = parent_history[step].gather(1, current)
 
     step_offsets = (
-        torch.arange(decode_nums, dtype=torch.int32, device=device).view(1, decode_nums, 1)
+        torch.arange(decode_nums, dtype=torch.int32, device=device).view(
+            1, decode_nums, 1
+        )
         * beam_width
     )
     pattern = torch.stack(
@@ -3000,13 +3065,17 @@ def _make_tensor_parent_history_topk_indices(
         dim=1,
     )
     pattern = pattern + step_offsets
-    return pattern.view(len(states), 1, 1, decode_nums, beam_width).expand(
-        len(states),
-        1,
-        num_q_heads,
-        decode_nums,
-        beam_width,
-    ).contiguous()
+    return (
+        pattern.view(len(states), 1, 1, decode_nums, beam_width)
+        .expand(
+            len(states),
+            1,
+            num_q_heads,
+            decode_nums,
+            beam_width,
+        )
+        .contiguous()
+    )
 
 
 def _update_decode_tensor_state(
@@ -3041,7 +3110,9 @@ def _flush_pending_decode_tensor_selections_batch(
         pending_steps == 0
         or any(len(state.pending_decode_token_ids) != pending_steps for state in states)
         or any(len(state.pending_decode_scores) != pending_steps for state in states)
-        or any(len(state.pending_decode_parent_beams) != pending_steps for state in states)
+        or any(
+            len(state.pending_decode_parent_beams) != pending_steps for state in states
+        )
     ):
         return {
             state.request_id: _flush_pending_decode_tensor_selections(state)
@@ -3051,24 +3122,39 @@ def _flush_pending_decode_tensor_selections_batch(
     import torch
 
     try:
-        parent_rows = _stack_pending_decode_field(
-            torch,
-            states,
-            "pending_decode_parent_beams",
-            pending_steps=pending_steps,
-        ).detach().cpu().tolist()
-        token_rows = _stack_pending_decode_field(
-            torch,
-            states,
-            "pending_decode_token_ids",
-            pending_steps=pending_steps,
-        ).detach().cpu().tolist()
-        score_rows = _stack_pending_decode_field(
-            torch,
-            states,
-            "pending_decode_scores",
-            pending_steps=pending_steps,
-        ).detach().cpu().tolist()
+        parent_rows = (
+            _stack_pending_decode_field(
+                torch,
+                states,
+                "pending_decode_parent_beams",
+                pending_steps=pending_steps,
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        token_rows = (
+            _stack_pending_decode_field(
+                torch,
+                states,
+                "pending_decode_token_ids",
+                pending_steps=pending_steps,
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        score_rows = (
+            _stack_pending_decode_field(
+                torch,
+                states,
+                "pending_decode_scores",
+                pending_steps=pending_steps,
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
     except (RuntimeError, ValueError):
         return {
             state.request_id: _flush_pending_decode_tensor_selections(state)
@@ -3132,7 +3218,9 @@ def _flush_pending_decode_tensor_selections(
         parent_beams = tuple(
             int(parent) for parent in parent_beams_tensor.detach().cpu().tolist()
         )
-        token_ids = tuple(int(token) for token in token_ids_tensor.detach().cpu().tolist())
+        token_ids = tuple(
+            int(token) for token in token_ids_tensor.detach().cpu().tolist()
+        )
         scores = tuple(float(score) for score in scores_tensor.detach().cpu().tolist())
         generation.beam_path.append(
             parent_beams=parent_beams,
@@ -3178,7 +3266,11 @@ def _make_batched_generation(
             )
         )
     if needs_history_compaction:
-        if batched_beam_path is None or decode_nums is None or active_beam_width is None:
+        if (
+            batched_beam_path is None
+            or decode_nums is None
+            or active_beam_width is None
+        ):
             raise ValueError("BeamKV compaction requires beam path and decode shape")
         beam_kv = compact_batched_beam_kv_history(
             beam_kv,
@@ -3201,7 +3293,9 @@ def _make_batched_prefill(
 ) -> PrefillResult:
     context_kv = _make_batched_context_kv(generations)
     return PrefillResult(
-        logits=_cat_tensors(tuple(generation.prefill.logits for generation in generations), dim=0),
+        logits=_cat_tensors(
+            tuple(generation.prefill.logits for generation in generations), dim=0
+        ),
         context_kv=context_kv,
         hidden_states=None,
     )
@@ -3221,8 +3315,14 @@ def _make_batched_context_kv(generations: tuple[GRGenerationState, ...]) -> Cont
         if value is not None:
             return ContextKV(key, value)
     return ContextKV(
-        _cat_tensors(tuple(generation.prefill.context_kv.key for generation in generations), dim=1),
-        _cat_tensors(tuple(generation.prefill.context_kv.value for generation in generations), dim=1),
+        _cat_tensors(
+            tuple(generation.prefill.context_kv.key for generation in generations),
+            dim=1,
+        ),
+        _cat_tensors(
+            tuple(generation.prefill.context_kv.value for generation in generations),
+            dim=1,
+        ),
     )
 
 
@@ -3240,8 +3340,12 @@ def _make_batched_beam_kv(generations: tuple[GRGenerationState, ...]) -> BeamKV:
         if value is not None:
             return BeamKV(key, value)
     return BeamKV(
-        _cat_tensors(tuple(generation.beam_kv.key for generation in generations), dim=1),
-        _cat_tensors(tuple(generation.beam_kv.value for generation in generations), dim=1),
+        _cat_tensors(
+            tuple(generation.beam_kv.key for generation in generations), dim=1
+        ),
+        _cat_tensors(
+            tuple(generation.beam_kv.value for generation in generations), dim=1
+        ),
     )
 
 
@@ -3249,10 +3353,15 @@ def _contiguous_pool_view(tensors: tuple[Any, ...]) -> Any | None:
     if not tensors or len(tensors) == 1:
         return tensors[0] if tensors else None
     first = tensors[0]
-    if not all(hasattr(tensor, "storage_offset") and hasattr(tensor, "stride") for tensor in tensors):
+    if not all(
+        hasattr(tensor, "storage_offset") and hasattr(tensor, "stride")
+        for tensor in tensors
+    ):
         return None
     storage_ptr = _storage_data_ptr(first)
-    if storage_ptr is None or any(_storage_data_ptr(tensor) != storage_ptr for tensor in tensors):
+    if storage_ptr is None or any(
+        _storage_data_ptr(tensor) != storage_ptr for tensor in tensors
+    ):
         return None
     try:
         starts = [int(tensor.storage_offset()) for tensor in tensors]
@@ -3310,7 +3419,9 @@ def _tensor_view_signature(tensor: Any) -> tuple[Any, ...] | None:
 
 def _same_tensor_view(left: Any, right: Any) -> bool:
     left_signature = _tensor_view_signature(left)
-    return left_signature is not None and left_signature == _tensor_view_signature(right)
+    return left_signature is not None and left_signature == _tensor_view_signature(
+        right
+    )
 
 
 def _root_base_tensor(tensor: Any) -> Any | None:
@@ -3376,10 +3487,14 @@ def _continuous_step_item_mask(
         provider = state.request.item_mask_provider
         if provider is None:
             masks.append(
-                torch.ones((beam_width, vocab_size), dtype=torch.bool, device=logits.device)
+                torch.ones(
+                    (beam_width, vocab_size), dtype=torch.bool, device=logits.device
+                )
             )
             continue
-        mask = provider.step_mask(_require_generation(state), logits[batch_idx : batch_idx + 1])
+        mask = provider.step_mask(
+            _require_generation(state), logits[batch_idx : batch_idx + 1]
+        )
         if mask.dim() == 3 and mask.shape[0] == 1:
             mask = mask[0]
         masks.append(mask.bool())

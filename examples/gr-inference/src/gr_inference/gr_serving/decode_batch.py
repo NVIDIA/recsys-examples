@@ -56,4 +56,3 @@ def _active_width(generation: GRGenerationState) -> int:
     if generation.beam_path.entries:
         return generation.beam_path.active_beam_width
     return generation.fixed_beam_width
-

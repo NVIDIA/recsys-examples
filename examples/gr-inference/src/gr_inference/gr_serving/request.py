@@ -81,4 +81,3 @@ def _validate_policy_width(width: int, request_beam_width: int) -> None:
             "beam_width_policy produced width outside request beam_width: "
             f"width={width}, request_beam_width={request_beam_width}"
         )
-

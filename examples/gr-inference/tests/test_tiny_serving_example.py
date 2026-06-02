@@ -41,7 +41,10 @@ def test_tiny_serving_example_run_demo() -> None:
     assert summary["first_metadata"]["batched_beam_path_steps"] == 3
     assert len(summary["first_metadata"]["beam_details"][0]["token_ids"]) == 3
     assert len(summary["first_metadata"]["beam_details"][0]["token_logprobs"]) == 3
-    assert summary["first_metadata"]["beam_details"][0]["logprob_type"] == "token_logsoftmax"
+    assert (
+        summary["first_metadata"]["beam_details"][0]["logprob_type"]
+        == "token_logsoftmax"
+    )
     assert summary["first_metadata"]["beam_details"][0]["score_type"] == (
         "beam_score_logprob_cumulative"
     )

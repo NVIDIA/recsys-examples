@@ -8,7 +8,6 @@ def test_torch_fused_mlp_backend_matches_explicit_ops() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kernels import FusedMLP, TorchFusedMLPBackend
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, TorchQwen3LayerOps
 
@@ -33,4 +32,3 @@ def test_torch_fused_mlp_backend_matches_explicit_ops() -> None:
     actual = FusedMLP(TorchFusedMLPBackend())(hidden_states, ops)
 
     assert torch.allclose(actual, expected)
-

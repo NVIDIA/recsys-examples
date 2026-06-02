@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable as IterableABC
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
-import json
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable, Mapping
@@ -336,14 +336,21 @@ class TrieItemMaskProviderStore:
                 "version": self._version,
                 "previous_version": self._previous_version,
                 "reload_history": tuple(self._reload_history),
-                "last_reload": self._reload_history[-1] if self._reload_history else None,
+                "last_reload": self._reload_history[-1]
+                if self._reload_history
+                else None,
                 **self._metadata,
             }
 
     def _record_reload_event(self, event: Mapping[str, Any]) -> None:
         self._reload_history.append(dict(event))
-        if self._max_reload_history > 0 and len(self._reload_history) > self._max_reload_history:
-            del self._reload_history[: len(self._reload_history) - self._max_reload_history]
+        if (
+            self._max_reload_history > 0
+            and len(self._reload_history) > self._max_reload_history
+        ):
+            del self._reload_history[
+                : len(self._reload_history) - self._max_reload_history
+            ]
 
 
 def _record_field(
@@ -363,7 +370,9 @@ def _coerce_token_ids(
     row_number: int,
     vocab_size: int | None,
 ) -> tuple[int, ...]:
-    if isinstance(raw_token_ids, (str, bytes)) or not isinstance(raw_token_ids, IterableABC):
+    if isinstance(raw_token_ids, (str, bytes)) or not isinstance(
+        raw_token_ids, IterableABC
+    ):
         raise ValueError(f"token_ids at row {row_number} must be a non-empty sequence")
 
     token_ids: list[int] = []
@@ -373,7 +382,9 @@ def _coerce_token_ids(
         try:
             token_id = int(token)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"token id at row {row_number} must be an integer") from exc
+            raise ValueError(
+                f"token id at row {row_number} must be an integer"
+            ) from exc
         if token_id < 0:
             raise ValueError(f"token id at row {row_number} must be non-negative")
         if vocab_size is not None and token_id >= vocab_size:

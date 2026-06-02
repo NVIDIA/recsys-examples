@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 
@@ -55,7 +55,9 @@ class ScheduledBeamPolicy:
     def width_for_step(self, step: int) -> int:
         if step < 0:
             raise ValueError("step must be non-negative")
-        candidates = [scheduled_step for scheduled_step in self.schedule if scheduled_step <= step]
+        candidates = [
+            scheduled_step for scheduled_step in self.schedule if scheduled_step <= step
+        ]
         return self.schedule[max(candidates)]
 
 
@@ -103,15 +105,15 @@ class ScoreMarginBeamPolicy:
             raise ValueError("step must be non-negative")
         if not scores:
             raise ValueError("scores must not be empty")
-        finite_scores = [float(score) for score in scores if math.isfinite(float(score))]
+        finite_scores = [
+            float(score) for score in scores if math.isfinite(float(score))
+        ]
         if not finite_scores:
             next_width = self.min_beam_width
         else:
             best = max(finite_scores)
             next_width = sum(
-                1
-                for score in finite_scores
-                if best - score <= self.score_margin
+                1 for score in finite_scores if best - score <= self.score_margin
             )
         next_width = max(self.min_beam_width, min(self.max_beam_width, next_width))
         if self.monotonic_shrink:

@@ -45,7 +45,9 @@ class KernelBackendRegistry:
             if backend.supports(capability)
         ]
 
-    def prefer(self, capability: str, order: tuple[str, ...]) -> KernelBackendInfo | None:
+    def prefer(
+        self, capability: str, order: tuple[str, ...]
+    ) -> KernelBackendInfo | None:
         for name in order:
             backend = self._backends.get(name)
             if backend is not None and backend.supports(capability):
@@ -74,4 +76,3 @@ CAP_GR_DECODE_ATTENTION = "gr_decode_attention"
 CAP_PACKED_GEMM = "packed_gemm"
 CAP_FUSED_MLP = "fused_mlp"
 CAP_SAMPLING_TOPK = "sampling_topk"
-

@@ -24,19 +24,20 @@ from gr_inference import (  # noqa: E402
     GRServingWorker,
     TrieItemMaskProviderStore,
 )
-from gr_inference.gr_runtime import TimingRecorder, logits_processors_from_specs  # noqa: E402
+from gr_inference.gr_runtime import (  # noqa: E402
+    TimingRecorder,
+    logits_processors_from_specs,
+)
+from gr_inference.gr_serving.cli import parse_unique_int_list  # noqa: E402
+from gr_inference.gr_serving.http import beam_width_policy_from_payload  # noqa: E402
+from gr_inference.gr_serving.payload import optional_int as _optional_int  # noqa: E402
+from gr_inference.gr_serving.payload import required_field as _required_field
+from gr_inference.gr_serving.payload import required_str as _required_str
 from run_qwen3_real_weight_serving import (  # noqa: E402
     _make_beam_kv_pool,
     _make_context_kv_pool,
     load_model,
     make_decode_backend,
-)
-from gr_inference.gr_serving.cli import parse_unique_int_list  # noqa: E402
-from gr_inference.gr_serving.http import beam_width_policy_from_payload  # noqa: E402
-from gr_inference.gr_serving.payload import (  # noqa: E402
-    optional_int as _optional_int,
-    required_field as _required_field,
-    required_str as _required_str,
 )
 
 
@@ -183,7 +184,9 @@ def make_torch_request_factory(
                 payload,
                 max_beam_width=int(payload.get("beam_width", default_beam_width)),
             ),
-            stop_token_ids=tuple(int(token) for token in payload.get("stop_token_ids", ())),
+            stop_token_ids=tuple(
+                int(token) for token in payload.get("stop_token_ids", ())
+            ),
             logits_processors=logits_processors_from_specs(logits_processor_specs),
         )
 
@@ -479,10 +482,16 @@ def _make_build_info(
             {
                 "cuda_current_device": current_device,
                 "cuda_device_name": cuda.get_device_name(current_device),
-                "cuda_device_capability": tuple(cuda.get_device_capability(current_device)),
-                "cuda_memory_allocated_bytes": int(cuda.memory_allocated(current_device)),
+                "cuda_device_capability": tuple(
+                    cuda.get_device_capability(current_device)
+                ),
+                "cuda_memory_allocated_bytes": int(
+                    cuda.memory_allocated(current_device)
+                ),
                 "cuda_memory_reserved_bytes": int(cuda.memory_reserved(current_device)),
-                "cuda_max_memory_reserved_bytes": int(cuda.max_memory_reserved(current_device)),
+                "cuda_max_memory_reserved_bytes": int(
+                    cuda.max_memory_reserved(current_device)
+                ),
             }
         )
     return info
@@ -502,8 +511,12 @@ def _ignore_eos_suppress_token_ids(args) -> tuple[int, ...]:
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-        token_ids = tuple(dict.fromkeys(int(token) for token in tokenizer.all_special_ids))
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_dir, trust_remote_code=True
+        )
+        token_ids = tuple(
+            dict.fromkeys(int(token) for token in tokenizer.all_special_ids)
+        )
         args._ignore_eos_suppress_token_ids_cache = token_ids
         return token_ids
     except Exception:
@@ -562,7 +575,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decode-backend", choices=["fake", "real"], default="fake")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--return-beam-details", action="store_true")
-    parser.add_argument("--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob")
+    parser.add_argument(
+        "--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob"
+    )
     parser.add_argument("--profile-continuous-decode", action="store_true")
     parser.add_argument(
         "--executor-sync-timing",

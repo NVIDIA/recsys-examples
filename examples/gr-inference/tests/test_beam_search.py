@@ -8,7 +8,6 @@ def test_select_initial_topk_from_prefill_logits() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk
 
     logits = torch.tensor([[[0.0, 5.0, 1.0, 3.0, 2.0]]])
@@ -25,7 +24,6 @@ def test_select_initial_topk_applies_item_mask() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk
 
     logits = torch.tensor([[0.0, 5.0, 1.0, 3.0, 2.0]])
@@ -41,7 +39,6 @@ def test_select_initial_topk_rejects_too_small_item_mask() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk
 
     logits = torch.tensor([[0.0, 5.0, 1.0, 3.0, 2.0]])
@@ -56,7 +53,6 @@ def test_select_initial_topk_rejects_batch_gt_one() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk
 
     with pytest.raises(ValueError, match="batch_size=1"):
@@ -68,7 +64,6 @@ def test_select_next_topk_uses_parent_scores() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_next_topk
 
     logits = torch.tensor([[[0.0, 1.0, 2.0], [10.0, 0.0, 0.5]]])
@@ -89,7 +84,6 @@ def test_select_next_topk_supports_logprob_ranking() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_next_topk
 
     logits = torch.tensor([[[10.0, 9.0], [1.0, -100.0]]])
@@ -118,7 +112,6 @@ def test_select_next_topk_applies_per_beam_mask() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_next_topk
 
     logits = torch.tensor([[[0.0, 1.0, 2.0], [10.0, 0.0, 0.5]]])
@@ -139,7 +132,6 @@ def test_item_mask_limited_beam_width_clamps_to_valid_candidates() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import (
         batched_item_mask_limited_beam_width,
         item_mask_limited_beam_width,
@@ -165,7 +157,6 @@ def test_item_mask_limited_beam_width_rejects_empty_mask() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import item_mask_limited_beam_width
 
     with pytest.raises(ValueError, match="no valid candidates"):

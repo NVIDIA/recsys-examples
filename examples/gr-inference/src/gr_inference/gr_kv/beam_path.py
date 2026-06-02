@@ -57,7 +57,9 @@ class BeamPath:
                 f"beam width {len(parents)} exceeds max_beam_width={self.max_beam_width}"
             )
         if len(tokens) != len(parents) or len(score_values) != len(parents):
-            raise ValueError("parent_beams, token_ids, and scores must have equal length")
+            raise ValueError(
+                "parent_beams, token_ids, and scores must have equal length"
+            )
 
         previous_width = self.active_beam_width
         for parent in parents:

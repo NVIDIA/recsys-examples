@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
-import time
 from typing import Any
 
 from gr_inference.gr_kv import BeamKV, ContextKV
 from gr_inference.gr_runtime import GRGenerationState
 from gr_inference.gr_runtime.generation import PrefillResult
-from gr_inference.gr_serving.cuda_graph_utils import (
-    CudaGraphCacheMixin,
-    env_int as _env_int,
-    is_cuda_tensor as _is_cuda_tensor,
-    tensor_data_ptr as _tensor_data_ptr,
-    tensor_nbytes as _tensor_nbytes,
-    tensor_view_key as _tensor_view_key,
-)
+from gr_inference.gr_serving.cuda_graph_utils import CudaGraphCacheMixin
+from gr_inference.gr_serving.cuda_graph_utils import env_int as _env_int
+from gr_inference.gr_serving.cuda_graph_utils import is_cuda_tensor as _is_cuda_tensor
+from gr_inference.gr_serving.cuda_graph_utils import tensor_data_ptr as _tensor_data_ptr
+from gr_inference.gr_serving.cuda_graph_utils import tensor_nbytes as _tensor_nbytes
+from gr_inference.gr_serving.cuda_graph_utils import tensor_view_key as _tensor_view_key
 
 
 @dataclass
@@ -275,9 +273,10 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
         entry: _DecodeGraphEntry,
         generation: GRGenerationState,
     ) -> None:
-        if (
-            _tensor_data_ptr(entry.beam_kv.key) == _tensor_data_ptr(generation.beam_kv.key)
-            and _tensor_data_ptr(entry.beam_kv.value) == _tensor_data_ptr(generation.beam_kv.value)
+        if _tensor_data_ptr(entry.beam_kv.key) == _tensor_data_ptr(
+            generation.beam_kv.key
+        ) and _tensor_data_ptr(entry.beam_kv.value) == _tensor_data_ptr(
+            generation.beam_kv.value
         ):
             self.direct_beam_kv_replays += 1
             return
@@ -312,7 +311,11 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
     ) -> str | None:
         checks = (
             ("context_key", entry.context_kv.key, generation.prefill.context_kv.key),
-            ("context_value", entry.context_kv.value, generation.prefill.context_kv.value),
+            (
+                "context_value",
+                entry.context_kv.value,
+                generation.prefill.context_kv.value,
+            ),
             ("beam_key", entry.beam_kv.key, generation.beam_kv.key),
             ("beam_value", entry.beam_kv.value, generation.beam_kv.value),
         )

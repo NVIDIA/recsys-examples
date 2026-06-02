@@ -94,4 +94,3 @@ class BatchedBeamPathBuilder:
     def append(self, selection: "BatchedBeamSelection") -> BatchedBeamPath:
         self.path.append(selection)
         return self.path
-

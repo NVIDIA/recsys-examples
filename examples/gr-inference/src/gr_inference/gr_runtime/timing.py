@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-import os
 from typing import Any
 
 
@@ -58,7 +58,11 @@ class TimingRecorder:
         if not self.sync_timing:
             return
         module = self.sync_module
-        if module is not None and hasattr(module, "cuda") and module.cuda.is_available():
+        if (
+            module is not None
+            and hasattr(module, "cuda")
+            and module.cuda.is_available()
+        ):
             module.cuda.synchronize()
 
     def _nvtx_push(self, name: str) -> bool:

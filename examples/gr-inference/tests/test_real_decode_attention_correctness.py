@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from gr_inference.gr_kernels.attention import (
     ExistingGRDecodeAttentionBackend,
     GRDecodeAttention,
@@ -53,7 +52,6 @@ def test_real_decode_attention_matches_reference() -> None:
     reference = _load_reference(backend.kernel_root)
 
     batch = 1
-    layers = 1
     context_len = 256
     max_decode_steps = 3
     decode_nums = 3
@@ -159,8 +157,6 @@ def test_real_decode_attention_matches_reference() -> None:
 
     finite_mask = lse.isfinite() & lse_ref.isfinite()
     lse_diff = (
-        (lse - lse_ref).abs()[finite_mask].max().item()
-        if finite_mask.any()
-        else 0.0
+        (lse - lse_ref).abs()[finite_mask].max().item() if finite_mask.any() else 0.0
     )
     assert lse_diff <= 1e-3

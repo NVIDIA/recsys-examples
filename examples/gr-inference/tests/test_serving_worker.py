@@ -23,7 +23,9 @@ def make_request(idx: int, *, decode_steps: int = 1) -> GRServingRequest:
     )
 
 
-def wait_for_result(worker: GRServingWorker, request_id: str, *, timeout_s: float = 1.0):
+def wait_for_result(
+    worker: GRServingWorker, request_id: str, *, timeout_s: float = 1.0
+):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         response = worker.poll(request_id)
@@ -59,6 +61,7 @@ def test_serving_worker_auto_ticks_until_request_finishes() -> None:
         worker.stop()
 
     assert worker.running is False
+
 
 def test_serving_worker_is_facade_compatible_for_manual_tick() -> None:
     worker = GRServingWorker(GRInProcessServingFacade(GRContinuousScheduler()))

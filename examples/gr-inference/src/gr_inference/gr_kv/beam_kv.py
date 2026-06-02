@@ -84,9 +84,7 @@ class BeamKV:
 
     def validate_step(self, step: int, active_beam_width: int) -> BeamStepWrite:
         if step < 0 or step >= self.max_decode_steps:
-            raise ValueError(
-                f"step={step} outside [0, {self.max_decode_steps})"
-            )
+            raise ValueError(f"step={step} outside [0, {self.max_decode_steps})")
         if active_beam_width <= 0:
             raise ValueError("active_beam_width must be positive")
         if active_beam_width > self.max_beam_width:

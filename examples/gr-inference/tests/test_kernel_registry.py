@@ -1,7 +1,6 @@
 import importlib.util
 
 import pytest
-
 from gr_inference.gr_kernels import (
     CAP_FUSED_MLP,
     CAP_GR_DECODE_ATTENTION,
@@ -114,7 +113,9 @@ def test_default_fused_mlp_prefers_exact_trtllm_before_torch() -> None:
     assert policy.capability_order[CAP_FUSED_MLP][:2] == ("trtllm_aligned", "torch")
 
 
-def test_gr_trtllm_reference_backend_is_discovered_without_enable_flag(monkeypatch) -> None:
+def test_gr_trtllm_reference_backend_is_discovered_without_enable_flag(
+    monkeypatch,
+) -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
 

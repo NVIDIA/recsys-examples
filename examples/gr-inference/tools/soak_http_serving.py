@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -119,7 +119,10 @@ def run_soak(client: Any, config: SoakConfig) -> dict[str, Any]:
             )
         else:
             batch_size = min(config.submit_batch_size, config.requests - next_request)
-        payloads = tuple(_request_payload(config, idx) for idx in range(next_request, next_request + batch_size))
+        payloads = tuple(
+            _request_payload(config, idx)
+            for idx in range(next_request, next_request + batch_size)
+        )
         submit_started = time.perf_counter()
         submit = _submit_payloads(client, payloads, response_status_counts)
         if submit.status == 202:
@@ -137,15 +140,22 @@ def run_soak(client: Any, config: SoakConfig) -> dict[str, Any]:
                 responses=responses,
             )
         else:
-            errors.append({"stage": "submit", "status": submit.status, "body": submit.body})
+            errors.append(
+                {"stage": "submit", "status": submit.status, "body": submit.body}
+            )
             if submit.status == 429:
                 ready = _request(client, "GET", "/ready", response_status_counts)
-                ready_samples.append({"label": f"overload_at_{next_request}", "body": ready.body})
+                ready_samples.append(
+                    {"label": f"overload_at_{next_request}", "body": ready.body}
+                )
 
         next_request += batch_size
         if config.manual_tick:
             _request(client, "POST", "/tick", response_status_counts, {})
-        if config.ready_sample_interval and next_request % config.ready_sample_interval == 0:
+        if (
+            config.ready_sample_interval
+            and next_request % config.ready_sample_interval == 0
+        ):
             ready = _request(client, "GET", "/ready", response_status_counts)
             ready_samples.append({"label": f"after_{next_request}", "body": ready.body})
         if config.progress_interval and next_request % config.progress_interval == 0:
@@ -197,7 +207,9 @@ def run_soak(client: Any, config: SoakConfig) -> dict[str, Any]:
 
     lifecycle_result = None
     if config.drain_at_end:
-        lifecycle_result = _request(client, "POST", "/drain", response_status_counts, {})
+        lifecycle_result = _request(
+            client, "POST", "/drain", response_status_counts, {}
+        )
     if config.shutdown_at_end:
         lifecycle_result = _request(
             client,
@@ -210,7 +222,9 @@ def run_soak(client: Any, config: SoakConfig) -> dict[str, Any]:
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     outcome_counts = _response_outcome_counts(responses)
     response_diagnostics = _response_diagnostics(responses)
-    latency_by_request_ms = _latency_by_request_ms(submitted_at_s, completed_at_s, responses)
+    latency_by_request_ms = _latency_by_request_ms(
+        submitted_at_s, completed_at_s, responses
+    )
     latency_summary = _latency_summary_ms(latency_by_request_ms)
     benchmark_metrics = _benchmark_metrics(
         config=config,
@@ -247,7 +261,9 @@ def run_soak(client: Any, config: SoakConfig) -> dict[str, Any]:
         "status": status.body,
         "metrics": metrics.body,
         "kv_events": kv_events.body,
-        "lifecycle_result": lifecycle_result.body if lifecycle_result is not None else None,
+        "lifecycle_result": lifecycle_result.body
+        if lifecycle_result is not None
+        else None,
     }
     if config.output_details:
         result["latency_details_ms"] = [
@@ -276,7 +292,9 @@ def _submit_payloads(
 ) -> HTTPResult:
     if len(payloads) == 1:
         return _request(client, "POST", "/submit", counts, payloads[0])
-    return _request(client, "POST", "/submit_many", counts, {"requests": list(payloads)})
+    return _request(
+        client, "POST", "/submit_many", counts, {"requests": list(payloads)}
+    )
 
 
 def _request_payload(config: SoakConfig, idx: int) -> dict[str, Any]:
@@ -403,7 +421,10 @@ def _slowest_requests_ms(
         key=lambda item: item[1],
         reverse=True,
     )[:limit]
-    return tuple({"request_id": request_id, "latency_ms": latency_ms} for request_id, latency_ms in slowest)
+    return tuple(
+        {"request_id": request_id, "latency_ms": latency_ms}
+        for request_id, latency_ms in slowest
+    )
 
 
 def _benchmark_metrics(
@@ -460,7 +481,9 @@ def _percentile(sorted_values: list[float], q: float) -> float:
     return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
-def _response_outcome_counts(responses: Mapping[str, Mapping[str, Any]]) -> dict[str, int]:
+def _response_outcome_counts(
+    responses: Mapping[str, Mapping[str, Any]]
+) -> dict[str, int]:
     counts = {
         "succeeded": 0,
         "cancelled": 0,
@@ -629,7 +652,9 @@ def _config_from_args(args: argparse.Namespace) -> SoakConfig:
 def main() -> None:
     args = build_parser().parse_args()
     config = _config_from_args(args)
-    summary = run_soak(UrllibHTTPClient(args.base_url, timeout_s=args.timeout_s), config)
+    summary = run_soak(
+        UrllibHTTPClient(args.base_url, timeout_s=args.timeout_s), config
+    )
     encoded = json.dumps(summary, indent=2, sort_keys=True)
     if args.output_json:
         Path(args.output_json).write_text(encoded + "\n", encoding="utf-8")

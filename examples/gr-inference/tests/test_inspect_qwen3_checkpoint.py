@@ -40,8 +40,7 @@ def test_inspect_qwen3_checkpoint_builds_report(tmp_path) -> None:
         {
             "metadata": {},
             "weight_map": {
-                name: "model-00001-of-00001.safetensors"
-                for name in weight_names
+                name: "model-00001-of-00001.safetensors" for name in weight_names
             },
         },
     )
@@ -99,8 +98,7 @@ def test_inspect_qwen3_checkpoint_recognizes_1_7b_tied_embeddings(tmp_path) -> N
         {
             "metadata": {},
             "weight_map": {
-                name: "model-00001-of-00001.safetensors"
-                for name in weight_names
+                name: "model-00001-of-00001.safetensors" for name in weight_names
             },
         },
     )

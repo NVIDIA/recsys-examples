@@ -2,30 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from importlib import metadata as importlib_metadata
 import json
 import platform
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 import time
+import uuid
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import metadata as importlib_metadata
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
-import uuid
 
 from gr_inference.gr_runtime import logits_processors_from_specs
 from gr_inference.gr_scheduler import ScheduledBeamPolicy, ScoreMarginBeamPolicy
 from gr_inference.gr_serving.api import GRInProcessServingFacade
 from gr_inference.gr_serving.beam_metadata import normalized_beam_results_from_metadata
-from gr_inference.gr_serving.payload import (
-    optional_int as _optional_int,
-    payload_list as _payload_list,
-    required_field as _required_field,
-    required_int as _required_int,
-    required_str as _required_str,
-)
+from gr_inference.gr_serving.payload import optional_int as _optional_int
+from gr_inference.gr_serving.payload import payload_list as _payload_list
+from gr_inference.gr_serving.payload import required_field as _required_field
+from gr_inference.gr_serving.payload import required_int as _required_int
+from gr_inference.gr_serving.payload import required_str as _required_str
 from gr_inference.gr_serving.request import GRServingRequest, GRServingResponse
-
 
 RequestFactory = Callable[[Mapping[str, Any]], GRServingRequest]
 LogSink = Callable[[Mapping[str, Any]], None]
@@ -94,7 +91,9 @@ class GRHTTPServingAdapter:
 
     facade: GRInProcessServingFacade
     request_factory: RequestFactory | None = None
-    validation_policy: GRHTTPValidationPolicy = field(default_factory=GRHTTPValidationPolicy)
+    validation_policy: GRHTTPValidationPolicy = field(
+        default_factory=GRHTTPValidationPolicy
+    )
     api_key: str | None = None
     api_key_header: str = "X-GR-API-Key"
     build_info: Mapping[str, Any] = field(default_factory=lambda: _default_build_info())
@@ -241,13 +240,21 @@ class GRHTTPServingAdapter:
                 max_ticks=_optional_int(payload, "max_ticks"),
                 timeout_unfinished=bool(payload.get("timeout_unfinished", False)),
             )
-            return _ok({"responses": tuple(_response_payload(response) for response in responses)})
+            return _ok(
+                {
+                    "responses": tuple(
+                        _response_payload(response) for response in responses
+                    )
+                }
+            )
         if method == "GET" and len(route) == 2 and route[0] == "poll":
             response = self.facade.poll(route[1])
             return _ok(
                 {
                     "ready": response is not None,
-                    "response": _response_payload(response) if response is not None else None,
+                    "response": _response_payload(response)
+                    if response is not None
+                    else None,
                 }
             )
         if method == "GET" and len(route) == 2 and route[0] == "result":
@@ -277,11 +284,15 @@ class GRHTTPServingAdapter:
                 _required_str(payload, "path"),
                 vocab_size=_required_int(payload, "vocab_size"),
                 eos_token_id=_optional_int(payload, "eos_token_id"),
-                allow_eos_for_terminal=bool(payload.get("allow_eos_for_terminal", True)),
+                allow_eos_for_terminal=bool(
+                    payload.get("allow_eos_for_terminal", True)
+                ),
                 item_id_field=str(payload.get("item_id_field", "item_id")),
                 token_ids_field=str(payload.get("token_ids_field", "token_ids")),
                 metadata_field=payload.get("metadata_field", "metadata"),
-                allow_duplicate_item_ids=bool(payload.get("allow_duplicate_item_ids", False)),
+                allow_duplicate_item_ids=bool(
+                    payload.get("allow_duplicate_item_ids", False)
+                ),
                 allow_duplicate_token_paths=bool(
                     payload.get("allow_duplicate_token_paths", False)
                 ),
@@ -366,7 +377,9 @@ class GRHTTPServingAdapter:
             response = self.facade.poll(request_id)
             if response is not None:
                 return response
-            if self.validation_policy.allow_manual_tick and not _worker_is_running(self.facade.status()):
+            if self.validation_policy.allow_manual_tick and not _worker_is_running(
+                self.facade.status()
+            ):
                 self.facade.tick()
             if time.perf_counter() - started > 300.0:
                 raise GRHTTPAdapterError(
@@ -412,13 +425,19 @@ class GRHTTPServingAdapter:
 
     def _validate_request(self, request: GRServingRequest) -> None:
         policy = self.validation_policy
-        if policy.max_decode_steps is not None and request.max_decode_steps > policy.max_decode_steps:
+        if (
+            policy.max_decode_steps is not None
+            and request.max_decode_steps > policy.max_decode_steps
+        ):
             raise GRHTTPAdapterError(
                 400,
                 f"max_decode_steps exceeds limit {policy.max_decode_steps}",
                 code="validation_error",
             )
-        if policy.max_beam_width is not None and request.beam_width > policy.max_beam_width:
+        if (
+            policy.max_beam_width is not None
+            and request.beam_width > policy.max_beam_width
+        ):
             raise GRHTTPAdapterError(
                 400,
                 f"beam_width exceeds limit {policy.max_beam_width}",
@@ -518,11 +537,15 @@ def default_request_factory(payload: Mapping[str, Any]) -> GRServingRequest:
             max_beam_width=beam_width,
         ),
         stop_token_ids=tuple(int(token) for token in payload.get("stop_token_ids", ())),
-        logits_processors=logits_processors_from_specs(payload.get("logits_processors")),
+        logits_processors=logits_processors_from_specs(
+            payload.get("logits_processors")
+        ),
     )
 
 
-def _sglang_generate_payload_to_gr_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _sglang_generate_payload_to_gr_payload(
+    payload: Mapping[str, Any]
+) -> dict[str, Any]:
     if "input_ids" not in payload:
         if "text" in payload:
             raise ValueError(
@@ -535,16 +558,24 @@ def _sglang_generate_payload_to_gr_payload(payload: Mapping[str, Any]) -> dict[s
         sampling_params = {}
     if not isinstance(sampling_params, Mapping):
         raise ValueError("sampling_params must be a JSON object")
-    max_new_tokens = int(sampling_params.get("max_new_tokens", payload.get("max_new_tokens", 1)))
-    beam_width = int(sampling_params.get("n", payload.get("n", payload.get("beam_width", 1))))
+    max_new_tokens = int(
+        sampling_params.get("max_new_tokens", payload.get("max_new_tokens", 1))
+    )
+    beam_width = int(
+        sampling_params.get("n", payload.get("n", payload.get("beam_width", 1)))
+    )
     gr_decode_steps = max(1, max_new_tokens - 1)
-    request_id = str(payload.get("request_id") or payload.get("rid") or f"generate-{uuid.uuid4()}")
+    request_id = str(
+        payload.get("request_id") or payload.get("rid") or f"generate-{uuid.uuid4()}"
+    )
     return {
         "request_id": request_id,
         "input_ids": payload["input_ids"],
         "max_decode_steps": gr_decode_steps,
         "beam_width": beam_width,
-        "stop_token_ids": tuple(int(token) for token in sampling_params.get("stop_token_ids", ())),
+        "stop_token_ids": tuple(
+            int(token) for token in sampling_params.get("stop_token_ids", ())
+        ),
         "logits_processors": payload.get("logits_processors", ()),
         "metadata": {
             "source": "sglang_generate",
@@ -606,10 +637,14 @@ def _top_beam_token_ids(
         if isinstance(beams, list) and beams:
             first = beams[0]
             if isinstance(first, Mapping) and isinstance(first.get("token_ids"), list):
-                return tuple(int(token) for token in first["token_ids"][:max_new_tokens])
+                return tuple(
+                    int(token) for token in first["token_ids"][:max_new_tokens]
+                )
     if isinstance(beam_details, (list, tuple)) and beam_details:
         first = beam_details[0]
-        if isinstance(first, Mapping) and isinstance(first.get("token_ids"), (list, tuple)):
+        if isinstance(first, Mapping) and isinstance(
+            first.get("token_ids"), (list, tuple)
+        ):
             return tuple(int(token) for token in first["token_ids"][:max_new_tokens])
     if response.token_ids:
         return (int(response.token_ids[0]),) * max_new_tokens
@@ -642,7 +677,9 @@ def beam_width_policy_from_payload(
             monotonic_shrink=bool(spec.get("monotonic_shrink", True)),
         )
     if policy_type in {"scheduled", "schedule"}:
-        schedule = _beam_width_schedule(spec.get("schedule"), max_beam_width=max_beam_width)
+        schedule = _beam_width_schedule(
+            spec.get("schedule"), max_beam_width=max_beam_width
+        )
         return ScheduledBeamPolicy(schedule)
     raise ValueError(f"unsupported beam_width_policy type: {policy_type!r}")
 
@@ -677,13 +714,17 @@ def make_http_handler(adapter: GRHTTPServingAdapter) -> type[BaseHTTPRequestHand
         def _handle(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else None
-            response = adapter.handle(self.command, self.path, body, headers=self.headers)
+            response = adapter.handle(
+                self.command, self.path, body, headers=self.headers
+            )
             if isinstance(response.body, str):
                 encoded = response.body.encode("utf-8")
             else:
                 encoded = json.dumps(_jsonable(response.body)).encode("utf-8")
             self.send_response(response.status)
-            self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
+            self.send_header(
+                "Content-Type", response.headers.get("Content-Type", "application/json")
+            )
             self.send_header("Content-Length", str(len(encoded)))
             for name, value in response.headers.items():
                 if name.lower() in {"content-type", "content-length"}:
@@ -746,8 +787,12 @@ def _ok(body: dict[str, Any], *, status: int = 200) -> GRHTTPResponse:
     return GRHTTPResponse(status=status, body=_jsonable(body))
 
 
-def _text(body: str, *, status: int = 200, content_type: str = "text/plain") -> GRHTTPResponse:
-    return GRHTTPResponse(status=status, body=body, headers={"Content-Type": content_type})
+def _text(
+    body: str, *, status: int = 200, content_type: str = "text/plain"
+) -> GRHTTPResponse:
+    return GRHTTPResponse(
+        status=status, body=body, headers={"Content-Type": content_type}
+    )
 
 
 def _error_response(
@@ -830,9 +875,15 @@ def _validation_policy_payload(policy: GRHTTPValidationPolicy) -> dict[str, Any]
 def _auth_config_payload(adapter: GRHTTPServingAdapter) -> dict[str, Any]:
     return {
         "enabled": adapter.api_key is not None,
-        "api_key_header": adapter.api_key_header if adapter.api_key is not None else None,
-        "accepted_schemes": ("Bearer", adapter.api_key_header) if adapter.api_key is not None else (),
-        "exempt_routes": ("GET /health", "GET /ready") if adapter.api_key is not None else (),
+        "api_key_header": adapter.api_key_header
+        if adapter.api_key is not None
+        else None,
+        "accepted_schemes": ("Bearer", adapter.api_key_header)
+        if adapter.api_key is not None
+        else (),
+        "exempt_routes": ("GET /health", "GET /ready")
+        if adapter.api_key is not None
+        else (),
     }
 
 

@@ -70,7 +70,9 @@ class GRGenerationState:
             beam_kv.max_decode_steps < max_decode_steps
             or beam_kv.max_beam_width < max_beam_width
         ):
-            raise ValueError("provided beam_kv is smaller than requested decode capacity")
+            raise ValueError(
+                "provided beam_kv is smaller than requested decode capacity"
+            )
         beam_path = BeamPath(
             # BeamPath stores the initial prefill topK plus every decode step.
             max_decode_steps=max_decode_steps + 1,
@@ -137,7 +139,9 @@ class GRGenerationState:
         )
         return selection
 
-    def initialize_beams_from_selection(self, selection: BeamSelection) -> BeamSelection:
+    def initialize_beams_from_selection(
+        self, selection: BeamSelection
+    ) -> BeamSelection:
         """Append a precomputed initial selection to the beam path."""
 
         if self.beam_path.steps_done != 0:
@@ -161,7 +165,7 @@ class GRGenerationState:
 
         if self.beam_path.steps_done == 0:
             raise ValueError("initialize_beams must be called before update")
-        previous_scores = self.beam_path.entries[-1].scores
+        self.beam_path.entries[-1].scores
         return self.update_beams_from_logits_with_width(
             logits,
             self.fixed_beam_width,

@@ -8,7 +8,6 @@ def test_compact_batched_beam_kv_history_gathers_shrunk_ancestors() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kv import BatchedBeamPath, BeamKV
     from gr_inference.gr_runtime import (
         BatchedBeamSelection,

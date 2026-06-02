@@ -8,7 +8,6 @@ def test_select_initial_topk_batched() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk_batched
 
     logits = torch.tensor(
@@ -31,7 +30,6 @@ def test_select_initial_topk_batched_applies_mask() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk_batched
 
     logits = torch.tensor([[0.0, 5.0, 1.0, 3.0], [4.0, 0.0, 2.0, 6.0]])
@@ -52,7 +50,6 @@ def test_select_initial_topk_batched_rejects_too_small_mask() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk_batched
 
     logits = torch.tensor([[0.0, 5.0, 1.0, 3.0], [4.0, 0.0, 2.0, 6.0]])
@@ -72,7 +69,6 @@ def test_select_initial_topk_batched_logprob_matches_log_softmax() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_initial_topk_batched
 
     logits = torch.tensor(
@@ -118,7 +114,6 @@ def test_select_next_topk_batched_supports_logprob_ranking() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_next_topk_batched
 
     logits = torch.tensor([[[10.0, 9.0], [1.0, -100.0]]])
@@ -147,7 +142,6 @@ def test_select_next_topk_batched_logprob_matches_log_softmax_with_mask() -> Non
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_next_topk_batched
 
     logits = torch.tensor(
@@ -206,7 +200,6 @@ def test_select_next_topk_batched_two_stage_matches_flat_topk() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_next_topk_batched
 
     logits = torch.tensor(
@@ -245,7 +238,9 @@ def test_select_next_topk_batched_two_stage_matches_flat_topk() -> None:
         tuple(int(token) for token in row.tolist()) for row in expected_token_ids
     )
     for selected_row, expected_row in zip(selection.scores, values):
-        assert selected_row == pytest.approx(tuple(float(value) for value in expected_row.tolist()))
+        assert selected_row == pytest.approx(
+            tuple(float(value) for value in expected_row.tolist())
+        )
 
 
 def test_select_next_topk_batched_tensor_backed_materializes_to_default() -> None:
@@ -253,7 +248,6 @@ def test_select_next_topk_batched_tensor_backed_materializes_to_default() -> Non
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import select_next_topk_batched
 
     logits = torch.tensor(
@@ -274,7 +268,9 @@ def test_select_next_topk_batched_tensor_backed_materializes_to_default() -> Non
 
     eager = select_next_topk_batched(
         logits,
-        previous_scores=tuple(tuple(float(value) for value in row) for row in previous_scores),
+        previous_scores=tuple(
+            tuple(float(value) for value in row) for row in previous_scores
+        ),
         beam_width=3,
         score_mode="logprob",
     )

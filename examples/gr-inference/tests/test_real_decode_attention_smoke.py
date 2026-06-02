@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib.util
 
 import pytest
-
 from gr_inference.gr_kernels.attention import (
     ExistingGRDecodeAttentionBackend,
     GRDecodeAttention,

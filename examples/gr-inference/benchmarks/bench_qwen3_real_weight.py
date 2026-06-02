@@ -14,13 +14,19 @@ for path in (SRC_ROOT, TOOLS_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from gr_inference import GRDecodeAttention, GRDecodeEngine, GRGenerationState  # noqa: E402
-from gr_inference.gr_runtime import TimingRecorder  # noqa: E402
-from gr_inference.gr_kernels.attention import ExistingGRDecodeAttentionBackend  # noqa: E402
+from gr_inference import (  # noqa: E402
+    GRDecodeAttention,
+    GRDecodeEngine,
+    GRGenerationState,
+)
+from gr_inference.gr_kernels.attention import (  # noqa: E402
+    ExistingGRDecodeAttentionBackend,
+)
 from gr_inference.gr_models.qwen3 import (  # noqa: E402
     flashinfer_call_counts,
     reset_flashinfer_call_counts,
 )
+from gr_inference.gr_runtime import TimingRecorder  # noqa: E402
 from run_qwen3_real_weight_tiny_gr import (  # noqa: E402
     build_identity_topk_indices,
     load_model,
@@ -75,7 +81,9 @@ def bench_fake_decode(torch, model, config, args, device) -> float:
                 attention=GRDecodeAttention(backend=lambda inputs: inputs.q),
                 fixed_beam_width=args.beam_width,
             )
-            model.generate_fixed_beam(generation, decode_engine, max_steps=args.decode_steps)
+            model.generate_fixed_beam(
+                generation, decode_engine, max_steps=args.decode_steps
+            )
 
     return time_call(torch, run, warmup=args.warmup, iters=args.iters)
 
@@ -112,7 +120,9 @@ def bench_real_decode(torch, model, config, args, device) -> float:
                 fixed_beam_width=args.beam_width,
             )
             selection = generation.initialize_beams()
-            beam_token_ids = torch.tensor([selection.token_ids], dtype=torch.long, device=device)
+            beam_token_ids = torch.tensor(
+                [selection.token_ids], dtype=torch.long, device=device
+            )
             model.forward_decode_step(
                 beam_token_ids,
                 generation,
@@ -144,7 +154,9 @@ def profile_real_decode(torch, model, config, args, device) -> dict:
             fixed_beam_width=args.beam_width,
         )
         selection = generation.initialize_beams()
-        beam_token_ids = torch.tensor([selection.token_ids], dtype=torch.long, device=device)
+        beam_token_ids = torch.tensor(
+            [selection.token_ids], dtype=torch.long, device=device
+        )
         topk_indices = build_identity_topk_indices(
             torch,
             batch=1,
@@ -265,12 +277,18 @@ def main() -> None:
     if args.mode in {"prefill", "all"}:
         print(f"prefill_ms={bench_prefill(torch, model, config, args, device):.3f}")
     if args.mode in {"fake-decode", "all"}:
-        print(f"fake_decode_loop_ms={bench_fake_decode(torch, model, config, args, device):.3f}")
+        print(
+            f"fake_decode_loop_ms={bench_fake_decode(torch, model, config, args, device):.3f}"
+        )
     if args.mode == "real-decode":
-        print(f"real_decode_step_ms={bench_real_decode(torch, model, config, args, device):.3f}")
+        print(
+            f"real_decode_step_ms={bench_real_decode(torch, model, config, args, device):.3f}"
+        )
     elif args.mode == "all":
         if args.decode_steps == 1 and device == "cuda":
-            print(f"real_decode_step_ms={bench_real_decode(torch, model, config, args, device):.3f}")
+            print(
+                f"real_decode_step_ms={bench_real_decode(torch, model, config, args, device):.3f}"
+            )
         else:
             print("real_decode_step_ms=SKIP (requires --decode-steps 1 and CUDA)")
 

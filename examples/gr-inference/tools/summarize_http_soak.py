@@ -42,7 +42,10 @@ def summarize_soak(
         failures.append(f"failed={outcomes.get('failed')}")
     if int(outcomes.get("timed_out", 0) or 0):
         failures.append(f"timed_out={outcomes.get('timed_out')}")
-    if expected_cancelled is not None and int(outcomes.get("cancelled", 0) or 0) != expected_cancelled:
+    if (
+        expected_cancelled is not None
+        and int(outcomes.get("cancelled", 0) or 0) != expected_cancelled
+    ):
         failures.append(
             f"cancelled={outcomes.get('cancelled')} expected={expected_cancelled}"
         )
@@ -62,9 +65,15 @@ def summarize_soak(
         "pending": len(pending),
         "outcomes": dict(outcomes),
         "response_diagnostics": {
-            "stop_reason_counts": dict(_mapping(response_diagnostics.get("stop_reason_counts"))),
-            "error_type_counts": dict(_mapping(response_diagnostics.get("error_type_counts"))),
-            "failed_samples": tuple(response_diagnostics.get("failed_samples", ()) or ()),
+            "stop_reason_counts": dict(
+                _mapping(response_diagnostics.get("stop_reason_counts"))
+            ),
+            "error_type_counts": dict(
+                _mapping(response_diagnostics.get("error_type_counts"))
+            ),
+            "failed_samples": tuple(
+                response_diagnostics.get("failed_samples", ()) or ()
+            ),
         },
         "latency_ms": dict(latency_ms),
         "benchmark_metrics": dict(benchmark_metrics),

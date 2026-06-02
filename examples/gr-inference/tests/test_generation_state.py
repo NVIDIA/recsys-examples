@@ -1,7 +1,6 @@
 import importlib.util
 
 import pytest
-
 from gr_inference.gr_kv import ContextKV, TensorSpec
 from gr_inference.gr_runtime import (
     BeamSelection,
@@ -146,8 +145,10 @@ def test_qwen3_model_prefill_can_return_generation_state() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
 
     config = Qwen3GRConfig(

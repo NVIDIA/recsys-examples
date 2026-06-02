@@ -38,7 +38,10 @@ def _serving_engine(
     **serving_config_kwargs,
 ):
     from gr_inference.gr_kernels.attention import GRDecodeAttention
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRModel
     from gr_inference.gr_runtime import GRDecodeEngine
     from gr_inference.gr_serving import GRServingConfig, GRServingEngine
@@ -175,7 +178,9 @@ def test_serving_engine_applies_initial_logits_processor_before_selection() -> N
         return forced
 
     def fail_if_decode_runs(inputs):
-        raise AssertionError("decode should not run after processor selects stop tokens")
+        raise AssertionError(
+            "decode should not run after processor selects stop tokens"
+        )
 
     engine, config = _serving_engine(backend=fail_if_decode_runs)
     request = _request(
@@ -231,7 +236,9 @@ def test_serving_engine_stops_when_initial_item_beams_are_complete() -> None:
         raise AssertionError("decode should not run after all initial beams complete")
 
     engine, config = _serving_engine(max_decode_steps=2, backend=fail_if_decode_runs)
-    provider = _item_provider([("item-a", (1,)), ("item-b", (2,))], vocab_size=config.vocab_size)
+    provider = _item_provider(
+        [("item-a", (1,)), ("item-b", (2,))], vocab_size=config.vocab_size
+    )
     request = _request(
         torch,
         config,
@@ -296,7 +303,9 @@ def test_serving_engine_uses_batched_decode_when_enabled() -> None:
     assert len(responses) == 2
     assert all(response.metadata["batched_prefill"] is True for response in responses)
     assert all(response.metadata["batched_decode"] is True for response in responses)
-    assert all(response.metadata["batched_beam_path_steps"] == 2 for response in responses)
+    assert all(
+        response.metadata["batched_beam_path_steps"] == 2 for response in responses
+    )
     assert all(len(response.metadata["beam_details"]) == 2 for response in responses)
     assert all(
         len(response.metadata["beam_details"][0]["token_ids"]) == 2
@@ -309,7 +318,9 @@ def test_serving_engine_uses_batched_decode_when_enabled() -> None:
     assert responses[0].metadata["beam_details"][0]["logprob_sum"] == pytest.approx(
         sum(responses[0].metadata["beam_details"][0]["token_logprobs"])
     )
-    assert responses[0].metadata["beam_details"][0]["logprob_type"] == "token_logsoftmax"
+    assert (
+        responses[0].metadata["beam_details"][0]["logprob_type"] == "token_logsoftmax"
+    )
     assert all(response.metadata["batch_size"] == 2 for response in responses)
     assert all(response.metadata["batched_decode_ms"] >= 0.0 for response in responses)
 
@@ -318,7 +329,9 @@ def test_serving_engine_batched_decode_stops_when_initial_items_complete() -> No
     torch = _torch()
 
     def fail_if_decode_runs(inputs):
-        raise AssertionError("batched decode should not run after all initial beams complete")
+        raise AssertionError(
+            "batched decode should not run after all initial beams complete"
+        )
 
     engine, config = _serving_engine(
         max_decode_steps=2,
@@ -326,16 +339,22 @@ def test_serving_engine_batched_decode_stops_when_initial_items_complete() -> No
         enable_batched_decode=True,
         return_beam_details=True,
     )
-    provider = _item_provider([("item-a", (1,)), ("item-b", (2,))], vocab_size=config.vocab_size)
+    provider = _item_provider(
+        [("item-a", (1,)), ("item-b", (2,))], vocab_size=config.vocab_size
+    )
     responses = engine.generate_batch(
         _batch(torch, config, max_decode_steps=2, item_mask_provider=provider)
     )
 
     assert len(responses) == 2
     assert all(response.metadata["batched_decode"] is True for response in responses)
-    assert all(response.metadata["stop_reason"] == "item_complete" for response in responses)
+    assert all(
+        response.metadata["stop_reason"] == "item_complete" for response in responses
+    )
     assert all(response.metadata["batched_decode_steps"] == 0 for response in responses)
-    assert all(response.metadata["batched_beam_path_steps"] == 1 for response in responses)
+    assert all(
+        response.metadata["batched_beam_path_steps"] == 1 for response in responses
+    )
     assert all(set(response.token_ids) == {1, 2} for response in responses)
     assert all(
         len(response.metadata["beam_details"][0]["token_ids"]) == 1
@@ -363,7 +382,9 @@ def test_serving_engine_uses_multi_step_batched_decode_when_enabled() -> None:
     assert len(responses) == 2
     assert all(response.metadata["batched_decode"] is True for response in responses)
     assert all(response.metadata["batched_decode_steps"] == 2 for response in responses)
-    assert all(response.metadata["batched_beam_path_steps"] == 3 for response in responses)
+    assert all(
+        response.metadata["batched_beam_path_steps"] == 3 for response in responses
+    )
     assert all(
         len(response.metadata["beam_details"][0]["token_ids"]) == 3
         for response in responses
@@ -373,14 +394,19 @@ def test_serving_engine_uses_multi_step_batched_decode_when_enabled() -> None:
         for response in responses
     )
     assert seen_topk_shapes == [(2, 1, 4, 1, 2), (2, 1, 4, 2, 2)]
-    assert responses[0].metadata["batched_decode_step_plan"][0]["topk_indices_shape"] == (
+    assert responses[0].metadata["batched_decode_step_plan"][0][
+        "topk_indices_shape"
+    ] == (
         2,
         1,
         4,
         1,
         2,
     )
-    assert all(len(response.metadata["batched_decode_step_plan"]) == 2 for response in responses)
+    assert all(
+        len(response.metadata["batched_decode_step_plan"]) == 2
+        for response in responses
+    )
     assert responses[0].metadata["decode_batch_plan"][0]["step"] == 0
     assert responses[0].metadata["decode_batch_plan"][1]["step"] == 1
 
@@ -431,6 +457,7 @@ def test_serving_engine_records_batched_decode_fallback_reason() -> None:
     assert all(response.metadata["batched_prefill"] is True for response in responses)
     assert all(response.metadata["batched_decode"] is False for response in responses)
     assert all(
-        "batched backend unavailable" in response.metadata["batched_decode_fallback_reason"]
+        "batched backend unavailable"
+        in response.metadata["batched_decode_fallback_reason"]
         for response in responses
     )

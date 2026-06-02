@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-
 SnapshotDownloader = Callable[..., str]
 
 _INDEX_FILES = (
@@ -115,8 +114,4 @@ def _has_weight_files(path: Path) -> bool:
 
 
 def _looks_like_local_path(value: str) -> bool:
-    return (
-        value.startswith(("/", "./", "../", "~"))
-        or value == "."
-        or value == ".."
-    )
+    return value.startswith(("/", "./", "../", "~")) or value == "." or value == ".."

@@ -53,8 +53,7 @@ def build_report(model_dir: str | Path, *, max_layers: int = 2) -> dict:
         "num_tensors": len(manifest.tensor_map),
         "num_load_requests": len(plan.requests),
         "grouped_files": {
-            filename: len(tensor_names)
-            for filename, tensor_names in grouped.items()
+            filename: len(tensor_names) for filename, tensor_names in grouped.items()
         },
         "sample_requests": [
             {
