@@ -33,8 +33,7 @@ def request_selection_all_item_complete(
     if is_complete is None or getattr(beam_path, "steps_done", 0) == 0:
         return False
     return beam_width > 0 and all(
-        bool(is_complete(beam_path.token_trace(beam)))
-        for beam in range(beam_width)
+        bool(is_complete(beam_path.token_trace(beam))) for beam in range(beam_width)
     )
 
 
@@ -126,7 +125,9 @@ def normalized_beam_results_from_metadata(
                 continue
             normalized.append(
                 {
-                    "output_ids": tuple(int(token) for token in output_ids[:max_new_tokens]),
+                    "output_ids": tuple(
+                        int(token) for token in output_ids[:max_new_tokens]
+                    ),
                     "text": str(row.get("text", "")) if "text" in row else "",
                     "meta_info": dict(row.get("meta_info", {}) or {}),
                 }
@@ -284,7 +285,9 @@ def selected_initial_token_logprobs_batched(
     log_probs = torch.log_softmax(scores.float(), dim=-1)
     rows: list[tuple[float, ...]] = []
     for batch_idx, token_row in enumerate(selection.token_ids):
-        rows.append(tuple(float(log_probs[batch_idx, token].item()) for token in token_row))
+        rows.append(
+            tuple(float(log_probs[batch_idx, token].item()) for token in token_row)
+        )
     return tuple(rows)
 
 

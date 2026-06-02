@@ -9,7 +9,6 @@ from typing import Any, Mapping
 
 from tool_utils import read_json
 
-
 DEFAULT_PROFILE_KEYS = (
     "model_forward_prefill_ms",
     "prefill_layer_total_ms",
@@ -57,7 +56,11 @@ def summarize_profile(
         }
         if baseline is not None:
             row["baseline_ms"] = baseline_value
-            row["delta_ms"] = None if value is None or baseline_value is None else value - baseline_value
+            row["delta_ms"] = (
+                None
+                if value is None or baseline_value is None
+                else value - baseline_value
+            )
             row["improvement_pct"] = _improvement_pct(value, baseline_value)
         rows.append(row)
 
@@ -122,7 +125,9 @@ def _improvement_pct(value: float | None, baseline: float | None) -> float | Non
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("path", help="Path to a serving profile JSON summary")
-    parser.add_argument("--baseline", help="Optional baseline profile JSON for comparison")
+    parser.add_argument(
+        "--baseline", help="Optional baseline profile JSON for comparison"
+    )
     parser.add_argument("--output-json")
     return parser
 

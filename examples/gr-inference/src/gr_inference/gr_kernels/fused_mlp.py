@@ -24,4 +24,3 @@ class FusedMLP:
 
     def __call__(self, hidden_states: Any, ops: Any) -> Any:
         return self.backend(hidden_states, ops)
-

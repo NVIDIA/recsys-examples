@@ -6,7 +6,9 @@ from gr_inference.gr_kernels.prefill.base import (
     PrefillAttentionInputs,
     PrefillAttentionOutput,
 )
-from gr_inference.gr_kernels.prefill.flash_attn_backend import FlashAttentionPrefillBackend
+from gr_inference.gr_kernels.prefill.flash_attn_backend import (
+    FlashAttentionPrefillBackend,
+)
 from gr_inference.gr_kernels.prefill.torch_sdpa_backend import TorchSDPAPrefillBackend
 
 

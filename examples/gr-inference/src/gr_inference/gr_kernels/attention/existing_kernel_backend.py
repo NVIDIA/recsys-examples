@@ -13,7 +13,6 @@ from gr_inference.gr_kernels.attention.gr_decode_attention import (
     MissingKernelBackend,
 )
 
-
 DEFAULT_KERNEL_ROOTS = (
     Path(__file__).resolve().parents[4] / "third_party/gr-decode-attention",
 )

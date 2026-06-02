@@ -105,7 +105,9 @@ class Qwen3GRConfig:
                 if "intermediate_size" in hf_config
                 else None
             ),
-            vocab_size=int(hf_config["vocab_size"]) if "vocab_size" in hf_config else None,
+            vocab_size=int(hf_config["vocab_size"])
+            if "vocab_size" in hf_config
+            else None,
             tie_word_embeddings=bool(hf_config.get("tie_word_embeddings", False)),
             rms_norm_eps=float(hf_config.get("rms_norm_eps", 1e-6)),
             rope_theta=float(hf_config.get("rope_theta", 1_000_000.0)),

@@ -8,9 +8,11 @@ def test_qwen3_model_decode_step_accepts_batched_beam_tokens() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kernels.attention import GRDecodeAttention
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
     from gr_inference.gr_runtime import GRDecodeEngine, GRGenerationState
 
@@ -59,4 +61,3 @@ def test_qwen3_model_decode_step_accepts_batched_beam_tokens() -> None:
     assert torch.isfinite(logits).all()
     assert torch.isfinite(generation.beam_kv.key[:, :, 0, :3]).all()
     assert torch.isfinite(generation.beam_kv.value[:, :, 0, :3]).all()
-

@@ -1,7 +1,6 @@
 import importlib.util
 
 import pytest
-
 from gr_inference.gr_kv import BeamKV, ContextKV, TensorSpec
 
 

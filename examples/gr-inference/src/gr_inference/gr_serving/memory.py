@@ -319,7 +319,9 @@ class GRKVLeaseAllocator:
     def usage(self) -> dict[str, int]:
         return {
             "running_requests": len(self.leases),
-            "context_tokens": sum(lease.context_tokens for lease in self.leases.values()),
+            "context_tokens": sum(
+                lease.context_tokens for lease in self.leases.values()
+            ),
             "beam_slots": sum(lease.beam_slots for lease in self.leases.values()),
         }
 
@@ -409,10 +411,9 @@ class GRPagedKVLeaseAllocator(GRKVLeaseAllocator):
             return False
         if request_id in self.leases:
             return True
-        return (
-            self._context_pages_needed(context_tokens) <= len(self.free_context_pages)
-            and self._beam_pages_needed(beam_slots) <= len(self.free_beam_pages)
-        )
+        return self._context_pages_needed(context_tokens) <= len(
+            self.free_context_pages
+        ) and self._beam_pages_needed(beam_slots) <= len(self.free_beam_pages)
 
     def allocate(
         self,
@@ -448,7 +449,9 @@ class GRPagedKVLeaseAllocator(GRKVLeaseAllocator):
         )
         self.leases[request_id] = lease
         usage = self.usage()
-        self.max_used_context_pages = max(self.max_used_context_pages, usage["context_pages"])
+        self.max_used_context_pages = max(
+            self.max_used_context_pages, usage["context_pages"]
+        )
         self.max_used_beam_pages = max(self.max_used_beam_pages, usage["beam_pages"])
         return lease
 
@@ -490,11 +493,13 @@ class GRPagedKVLeaseAllocator(GRKVLeaseAllocator):
             "free_beam_pages": len(self.free_beam_pages),
             "available_context_pages": len(self.free_context_pages),
             "available_beam_pages": len(self.free_beam_pages),
-            "context_page_capacity_tokens": usage["context_pages"] * self.context_page_size,
+            "context_page_capacity_tokens": usage["context_pages"]
+            * self.context_page_size,
             "beam_page_capacity_slots": usage["beam_pages"] * self.beam_page_size,
             "context_internal_fragmentation_tokens": max(
                 0,
-                usage["context_pages"] * self.context_page_size - usage["context_tokens"],
+                usage["context_pages"] * self.context_page_size
+                - usage["context_tokens"],
             ),
             "beam_internal_fragmentation_slots": max(
                 0,
@@ -634,7 +639,9 @@ class GRDenseBeamKVPool:
     def __post_init__(self) -> None:
         shape = _shape_of(self.key)
         if shape != _shape_of(self.value):
-            raise ValueError(f"BeamKV pool key/value shapes differ: {shape} vs {_shape_of(self.value)}")
+            raise ValueError(
+                f"BeamKV pool key/value shapes differ: {shape} vs {_shape_of(self.value)}"
+            )
         if len(shape) != 6:
             raise ValueError(
                 "BeamKV pool expects [layers, slots, max_decode_steps, max_beam_width, "
@@ -681,7 +688,9 @@ class GRDenseBeamKVPool:
         if request_id in self.leases:
             raise ValueError(f"request already has a BeamKV pool lease: {request_id}")
         if not self.free_slots:
-            raise MemoryError(f"no BeamKV pool slots available for request {request_id}")
+            raise MemoryError(
+                f"no BeamKV pool slots available for request {request_id}"
+            )
         slot = self.free_slots.pop(0)
         lease = GRBeamKVPoolLease(
             request_id=request_id,
@@ -764,18 +773,21 @@ class GRDenseContextKVPool:
         return _shape_of(self.key)[2]
 
     def can_allocate(self, request_id: str, *, context_len: int) -> bool:
-        return (
-            request_id in self.leases
-            or (bool(self.free_slots) and context_len <= self.max_context_len)
+        return request_id in self.leases or (
+            bool(self.free_slots) and context_len <= self.max_context_len
         )
 
     def allocate(self, request_id: str, *, context_len: int) -> GRContextKVPoolLease:
         if request_id in self.leases:
-            raise ValueError(f"request already has a ContextKV pool lease: {request_id}")
+            raise ValueError(
+                f"request already has a ContextKV pool lease: {request_id}"
+            )
         if context_len <= 0 or context_len > self.max_context_len:
             raise ValueError("context_len must be in (0, max_context_len]")
         if not self.free_slots:
-            raise MemoryError(f"no ContextKV pool slots available for request {request_id}")
+            raise MemoryError(
+                f"no ContextKV pool slots available for request {request_id}"
+            )
         slot = self.free_slots.pop(0)
         lease = GRContextKVPoolLease(
             request_id=request_id,
@@ -863,7 +875,9 @@ def _empty_like(reference: Any, shape: tuple[int, ...]) -> Any:
         return reference.new_empty(shape)
     if hasattr(reference, "with_shape"):
         return reference.with_shape(shape)
-    raise TypeError(f"cannot allocate BeamKV pool from reference type {type(reference)!r}")
+    raise TypeError(
+        f"cannot allocate BeamKV pool from reference type {type(reference)!r}"
+    )
 
 
 def _shape_of(tensor: Any) -> tuple[int, ...]:

@@ -11,12 +11,6 @@ from gr_inference.gr_models.qwen3.layers import (
     reset_flashinfer_call_counts,
 )
 from gr_inference.gr_models.qwen3.model import Qwen3GRModel
-from gr_inference.gr_models.qwen3.weights import (
-    Qwen3HFAdapter,
-    QwenLayerWeightNames,
-    QwenModelWeightNames,
-    materialize_qwen3_checkpoint,
-)
 from gr_inference.gr_models.qwen3.variants import (
     DEFAULT_QWEN3_MODEL_ID,
     DEFAULT_QWEN3_VARIANT,
@@ -25,6 +19,12 @@ from gr_inference.gr_models.qwen3.variants import (
     get_qwen3_variant,
     identify_qwen3_variant,
     resolve_qwen3_model_dir,
+)
+from gr_inference.gr_models.qwen3.weights import (
+    Qwen3HFAdapter,
+    QwenLayerWeightNames,
+    QwenModelWeightNames,
+    materialize_qwen3_checkpoint,
 )
 
 __all__ = [

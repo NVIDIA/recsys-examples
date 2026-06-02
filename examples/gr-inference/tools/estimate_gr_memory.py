@@ -9,9 +9,9 @@ from tool_utils import bootstrap_repo_paths
 
 bootstrap_repo_paths(__file__)
 
-from gr_inference.gr_serving import estimate_gr_kv_memory  # noqa: E402
 from gr_inference.gr_models import HFCheckpointLoader  # noqa: E402
 from gr_inference.gr_models.qwen3 import Qwen3GRConfig  # noqa: E402
+from gr_inference.gr_serving import estimate_gr_kv_memory  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,7 +67,11 @@ def main(argv: list[str] | None = None) -> int:
         bytes_per_element=args.bytes_per_element,
         vocab_size=vocab_size,
     )
-    print(json.dumps(estimate.metadata(), indent=2 if args.pretty else None, sort_keys=True))
+    print(
+        json.dumps(
+            estimate.metadata(), indent=2 if args.pretty else None, sort_keys=True
+        )
+    )
     return 0
 
 

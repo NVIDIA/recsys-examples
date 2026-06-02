@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
-import json
 from pathlib import Path
-import sys
 from threading import Event, RLock, Thread
-import time
 from typing import Any, Callable, Mapping
 
 from gr_inference.gr_serving.api import GRInProcessServingFacade
@@ -28,7 +28,9 @@ class GRServingWorker:
     log_sink: Callable[[Mapping[str, Any]], None] | None = None
     _lock: RLock = field(default_factory=RLock, init=False)
     _pending_lock: RLock = field(default_factory=RLock, init=False)
-    _pending_submissions: deque[GRServingRequest] = field(default_factory=deque, init=False)
+    _pending_submissions: deque[GRServingRequest] = field(
+        default_factory=deque, init=False
+    )
     _stop_event: Event = field(default_factory=Event, init=False)
     _thread: Thread | None = field(default=None, init=False)
     _started_at_s: float | None = field(default=None, init=False)
@@ -123,7 +125,9 @@ class GRServingWorker:
         with self._lock:
             return self.facade.request_statuses()
 
-    def cancel(self, request_id: str, *, reason: str = "cancelled") -> GRServingResponse:
+    def cancel(
+        self, request_id: str, *, reason: str = "cancelled"
+    ) -> GRServingResponse:
         with self._lock:
             return self.facade.cancel(request_id, reason=reason)
 
@@ -152,7 +156,9 @@ class GRServingWorker:
             status = dict(self.facade.status())
             pending = self._pending_count()
             status["pending_submissions"] = pending
-            status["waiting_prefill"] = int(status.get("waiting_prefill", 0) or 0) + pending
+            status["waiting_prefill"] = (
+                int(status.get("waiting_prefill", 0) or 0) + pending
+            )
             status["worker"] = self.worker_status()
             return status
 
@@ -223,7 +229,9 @@ class GRServingWorker:
                     has_work = self._has_work_unlocked()
                     if has_work:
                         self._tick_unlocked()
-                self._stop_event.wait(self.tick_interval_s if has_work else self.idle_sleep_s)
+                self._stop_event.wait(
+                    self.tick_interval_s if has_work else self.idle_sleep_s
+                )
             except Exception as exc:  # pragma: no cover - defensive worker guard
                 self._worker_errors += 1
                 self._last_error = f"{type(exc).__name__}: {exc}"
@@ -289,7 +297,9 @@ class GRServingWorker:
         return 1
 
 
-def _emit_worker_log(payload: Mapping[str, Any], sink: Callable[[Mapping[str, Any]], None] | None) -> None:
+def _emit_worker_log(
+    payload: Mapping[str, Any], sink: Callable[[Mapping[str, Any]], None] | None
+) -> None:
     if sink is not None:
         sink(payload)
         return

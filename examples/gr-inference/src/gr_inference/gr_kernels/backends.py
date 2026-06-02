@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from gr_inference.gr_kernels.package_imports import (
     distribution_available as _distribution_available,
+)
+from gr_inference.gr_kernels.package_imports import (
     load_trtllm_kernel_registration as _load_trtllm_kernel_registration,
+)
+from gr_inference.gr_kernels.package_imports import (
     module_attribute_available as _module_attribute_available,
+)
+from gr_inference.gr_kernels.package_imports import (
     module_available as _module_available,
 )
 from gr_inference.gr_kernels.registry import (
@@ -112,30 +118,24 @@ def trtllm_aligned_backend_info() -> KernelBackendInfo:
             import torch  # type: ignore[import-not-found]
 
             has_gr_trtllm_namespace = hasattr(torch.ops, "gr_trtllm")
-            has_gr_fused_qk_norm_rope = (
-                has_gr_trtllm_namespace
-                and hasattr(torch.ops.gr_trtllm, "fused_qk_norm_rope")
+            has_gr_fused_qk_norm_rope = has_gr_trtllm_namespace and hasattr(
+                torch.ops.gr_trtllm, "fused_qk_norm_rope"
             )
-            has_gr_gated_mlp = (
-                has_gr_trtllm_namespace
-                and hasattr(torch.ops.gr_trtllm, "gated_mlp")
+            has_gr_gated_mlp = has_gr_trtllm_namespace and hasattr(
+                torch.ops.gr_trtllm, "gated_mlp"
             )
-            has_gr_packed_gemm = (
-                has_gr_trtllm_namespace
-                and hasattr(torch.ops.gr_trtllm, "packed_gemm")
+            has_gr_packed_gemm = has_gr_trtllm_namespace and hasattr(
+                torch.ops.gr_trtllm, "packed_gemm"
             )
             has_trtllm_namespace = hasattr(torch.ops, "trtllm")
-            has_fused_qk_norm_rope = (
-                has_trtllm_namespace
-                and hasattr(torch.ops.trtllm, "fused_qk_norm_rope")
+            has_fused_qk_norm_rope = has_trtllm_namespace and hasattr(
+                torch.ops.trtllm, "fused_qk_norm_rope"
             )
-            has_gated_mlp = (
-                has_trtllm_namespace
-                and hasattr(torch.ops.trtllm, "gated_mlp")
+            has_gated_mlp = has_trtllm_namespace and hasattr(
+                torch.ops.trtllm, "gated_mlp"
             )
-            has_cublas_mm = (
-                has_trtllm_namespace
-                and hasattr(torch.ops.trtllm, "cublas_mm")
+            has_cublas_mm = has_trtllm_namespace and hasattr(
+                torch.ops.trtllm, "cublas_mm"
             )
         except Exception:
             has_gr_trtllm_namespace = False
@@ -195,11 +195,7 @@ def flashinfer_backend_info() -> KernelBackendInfo:
     )
     has_rope = _module_attribute_available("flashinfer.rope", "apply_rope_pos_ids")
     available = (
-        has_package
-        and has_norm_module
-        and has_rope_module
-        and has_rmsnorm
-        and has_rope
+        has_package and has_norm_module and has_rope_module and has_rmsnorm and has_rope
     )
     return KernelBackendInfo(
         name="flashinfer",
@@ -242,4 +238,3 @@ def gr_decode_atten_backend_info() -> KernelBackendInfo:
         available=True,
         capabilities=frozenset({CAP_GR_DECODE_ATTENTION}),
     )
-

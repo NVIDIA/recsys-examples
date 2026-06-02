@@ -3,8 +3,8 @@
 from gr_inference.gr_scheduler.beam_policy import (
     BeamWidthPolicy,
     FixedBeamPolicy,
-    ScoreMarginBeamPolicy,
     ScheduledBeamPolicy,
+    ScoreMarginBeamPolicy,
 )
 
 __all__ = [

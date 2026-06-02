@@ -1,8 +1,7 @@
-import json
 import importlib.util
+import json
 
 import pytest
-
 from gr_inference.gr_models import (
     HFCheckpointLoader,
     TensorLoadRequest,
@@ -248,12 +247,14 @@ def test_load_plan_groups_required_tensors_by_file(tmp_path) -> None:
         "model-00001-of-00002.safetensors",
         "model-00002-of-00002.safetensors",
     }
-    assert "model.layers.0.self_attn.q_proj.weight" in grouped[
-        "model-00001-of-00002.safetensors"
-    ]
-    assert "model.layers.1.self_attn.q_proj.weight" in grouped[
-        "model-00002-of-00002.safetensors"
-    ]
+    assert (
+        "model.layers.0.self_attn.q_proj.weight"
+        in grouped["model-00001-of-00002.safetensors"]
+    )
+    assert (
+        "model.layers.1.self_attn.q_proj.weight"
+        in grouped["model-00002-of-00002.safetensors"]
+    )
 
 
 def test_load_plan_materializes_identity_and_concat() -> None:
@@ -305,15 +306,14 @@ def test_hf_loader_discovers_unindexed_safetensors(tmp_path) -> None:
     manifest = HFCheckpointLoader(tmp_path).manifest()
 
     assert manifest.has_tensor("model.embed_tokens.weight")
-    assert manifest.tensor_map["model.embed_tokens.weight"].filename == "model.safetensors"
+    assert (
+        manifest.tensor_map["model.embed_tokens.weight"].filename == "model.safetensors"
+    )
 
 
 def test_qwen3_model_dir_resolver_defaults_to_1_7b() -> None:
     assert resolve_qwen3_model_dir(env={}) == "models/Qwen3-1.7B"
-    assert (
-        resolve_qwen3_model_dir(variant="qwen3-0.6b", env={})
-        == "models/Qwen3-0.6B"
-    )
+    assert resolve_qwen3_model_dir(variant="qwen3-0.6b", env={}) == "models/Qwen3-0.6B"
     assert (
         resolve_qwen3_model_dir(
             variant="qwen3-1.7b",

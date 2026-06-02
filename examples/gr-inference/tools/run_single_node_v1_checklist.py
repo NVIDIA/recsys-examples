@@ -284,7 +284,9 @@ def main(argv: list[str] | None = None) -> int:
             log_path=output_dir / f"{name}.log",
         )
         if "output_json" in step:
-            Path(str(step["output_json"])).write_text(completed.stdout, encoding="utf-8")
+            Path(str(step["output_json"])).write_text(
+                completed.stdout, encoding="utf-8"
+            )
     print(f"single-node v1 checklist passed; artifacts: {output_dir}")
     return 0
 
@@ -300,7 +302,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-dir",
         help="Checkpoint directory. Defaults to the selected Qwen3 variant path.",
     )
-    parser.add_argument("--gr-decode-atten-root", default="/cb/gr_inference/gr-decode_atten")
+    parser.add_argument(
+        "--gr-decode-atten-root", default="/cb/gr_inference/gr-decode_atten"
+    )
     parser.add_argument("--output-dir", default="profiles/single_node_v1")
     parser.add_argument("--pythonpath", default="src")
     parser.add_argument("--dry-run", action="store_true")

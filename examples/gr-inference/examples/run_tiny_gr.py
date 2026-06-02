@@ -19,8 +19,8 @@ from gr_inference import (  # noqa: E402
     Qwen3GRConfig,
     Qwen3GRModel,
     ScheduledBeamPolicy,
-    TorchSDPAPrefillBackend,
     TokenTrie,
+    TorchSDPAPrefillBackend,
     TrieItemMaskProvider,
 )
 

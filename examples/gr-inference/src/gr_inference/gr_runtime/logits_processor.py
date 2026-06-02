@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from math import inf
 from typing import Any, Literal, Mapping, Sequence
 
-
 LogitsProcessorPhase = Literal["prefill", "decode"]
 
 
@@ -113,10 +112,14 @@ def validate_logits_processors(processors: tuple[Any, ...]) -> None:
         if process is None:
             process = processor
         if not callable(process):
-            raise ValueError("logits_processors must be callable or define process_logits")
+            raise ValueError(
+                "logits_processors must be callable or define process_logits"
+            )
 
 
-def logits_processors_metadata(processors: tuple[Any, ...]) -> tuple[dict[str, Any], ...]:
+def logits_processors_metadata(
+    processors: tuple[Any, ...]
+) -> tuple[dict[str, Any], ...]:
     """Return debug metadata for response payloads."""
 
     rows: list[dict[str, Any]] = []

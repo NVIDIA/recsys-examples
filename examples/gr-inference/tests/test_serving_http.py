@@ -1,9 +1,12 @@
 import json
 
 import pytest
-
-from gr_inference.gr_runtime import TokenTrie, TrieItemMaskProvider, TrieItemMaskProviderStore
 from gr_inference.gr_kv import BeamPath
+from gr_inference.gr_runtime import (
+    TokenTrie,
+    TrieItemMaskProvider,
+    TrieItemMaskProviderStore,
+)
 from gr_inference.gr_serving import (
     GRContinuousBatchingPolicy,
     GRContinuousScheduler,
@@ -255,7 +258,9 @@ def test_http_adapter_submit_many_rejects_duplicates_atomically() -> None:
     assert partial_conflict.status == 409
     assert partial_conflict.body["error"]["code"] == "duplicate_request_id"
     assert status.body["waiting_prefill"] == 1
-    assert [request["request_id"] for request in requests.body["requests"]] == ["existing"]
+    assert [request["request_id"] for request in requests.body["requests"]] == [
+        "existing"
+    ]
 
 
 def test_http_adapter_reports_readiness_and_config() -> None:
@@ -290,10 +295,18 @@ def test_http_adapter_api_key_auth_protects_non_probe_routes() -> None:
     health = adapter.handle("GET", "/health")
     ready = adapter.handle("GET", "/ready")
     unauthorized = adapter.handle("GET", "/metrics")
-    forbidden = adapter.handle("GET", "/metrics", headers={"Authorization": "Bearer wrong"})
-    authorized = adapter.handle("GET", "/metrics", headers={"Authorization": "Bearer secret"})
-    build_authorized = adapter.handle("GET", "/build", headers={"Authorization": "Bearer secret"})
-    header_authorized = adapter.handle("GET", "/config", headers={"X-GR-API-Key": "secret"})
+    forbidden = adapter.handle(
+        "GET", "/metrics", headers={"Authorization": "Bearer wrong"}
+    )
+    authorized = adapter.handle(
+        "GET", "/metrics", headers={"Authorization": "Bearer secret"}
+    )
+    build_authorized = adapter.handle(
+        "GET", "/build", headers={"Authorization": "Bearer secret"}
+    )
+    header_authorized = adapter.handle(
+        "GET", "/config", headers={"X-GR-API-Key": "secret"}
+    )
 
     assert health.status == 200
     assert ready.status == 200
@@ -305,7 +318,10 @@ def test_http_adapter_api_key_auth_protects_non_probe_routes() -> None:
     assert authorized.status == 200
     assert build_authorized.status == 200
     assert header_authorized.body["auth"]["enabled"] is True
-    assert header_authorized.body["auth"]["exempt_routes"] == ["GET /health", "GET /ready"]
+    assert header_authorized.body["auth"]["exempt_routes"] == [
+        "GET /health",
+        "GET /ready",
+    ]
 
 
 def test_http_adapter_emits_structured_request_logs() -> None:
@@ -316,7 +332,7 @@ def test_http_adapter_emits_structured_request_logs() -> None:
     )
 
     response = adapter.handle("POST", "/submit", request_payload("logged"))
-    missing = adapter.handle("GET", "/result/missing")
+    adapter.handle("GET", "/result/missing")
     config = adapter.handle("GET", "/config")
 
     assert response.status == 202
@@ -562,7 +578,12 @@ def test_http_adapter_catalog_status_and_reload(tmp_path) -> None:
     )
     assert failed_reload.status == 400
     assert store.snapshot().resolve_item_ids((2, 11)) == ("item-b",)
-    assert adapter.handle("GET", "/catalog/status").body["catalog"]["last_reload"]["status"] == "failed"
+    assert (
+        adapter.handle("GET", "/catalog/status").body["catalog"]["last_reload"][
+            "status"
+        ]
+        == "failed"
+    )
 
     rollback = adapter.handle("POST", "/catalog/rollback", {})
     rolled_back = adapter.handle("GET", "/catalog/status")
@@ -622,11 +643,16 @@ def test_http_adapter_rejects_overloaded_waiting_queue() -> None:
 def test_http_adapter_accepts_top_level_timeout_ticks() -> None:
     adapter = make_adapter()
 
-    submit = adapter.handle("POST", "/submit", {**request_payload(), "timeout_ticks": 1})
+    submit = adapter.handle(
+        "POST", "/submit", {**request_payload(), "timeout_ticks": 1}
+    )
     request_status = adapter.handle("GET", "/requests/req-0")
 
     assert submit.status == 202
-    assert adapter.facade._scheduler().states["req-0"].request.metadata["timeout_ticks"] == 1
+    assert (
+        adapter.facade._scheduler().states["req-0"].request.metadata["timeout_ticks"]
+        == 1
+    )
     assert request_status.body["request"]["submitted_tick"] == 0
     assert request_status.body["request"]["age_ticks"] == 0
     assert request_status.body["request"]["timeout_ticks"] == 1
@@ -636,7 +662,9 @@ def test_http_adapter_accepts_top_level_timeout_ticks() -> None:
 def test_http_adapter_rejects_timeout_ticks_over_policy_limit() -> None:
     adapter = policy_adapter(max_timeout_ticks=2)
 
-    response = adapter.handle("POST", "/submit", {**request_payload(), "timeout_ticks": 3})
+    response = adapter.handle(
+        "POST", "/submit", {**request_payload(), "timeout_ticks": 3}
+    )
     config = adapter.handle("GET", "/config")
 
     assert response.status == 400
@@ -648,7 +676,11 @@ def test_http_adapter_rejects_timeout_ticks_over_policy_limit() -> None:
 def test_http_adapter_metrics_include_request_outcomes() -> None:
     adapter = make_adapter()
 
-    adapter.handle("POST", "/submit", {**request_payload(), "max_decode_steps": 3, "timeout_ticks": 1})
+    adapter.handle(
+        "POST",
+        "/submit",
+        {**request_payload(), "max_decode_steps": 3, "timeout_ticks": 1},
+    )
     adapter.handle("POST", "/tick", {})
     adapter.handle("POST", "/tick", {})
     metrics = adapter.handle("GET", "/metrics")
@@ -693,7 +725,11 @@ def test_http_adapter_reports_retained_and_evicted_results() -> None:
         )
     )
 
-    adapter.handle("POST", "/submit_many", {"requests": [request_payload("req-0"), request_payload("req-1")]})
+    adapter.handle(
+        "POST",
+        "/submit_many",
+        {"requests": [request_payload("req-0"), request_payload("req-1")]},
+    )
     adapter.handle("POST", "/run_until_idle", {})
     metrics = adapter.handle("GET", "/metrics")
     status = adapter.handle("GET", "/status")
@@ -815,7 +851,9 @@ def test_http_default_request_factory_builds_scheduled_policy() -> None:
     assert request.beam_width_policy.width_for_step(3) == 1
 
 
-def test_http_default_request_factory_rejects_scheduled_width_over_request_width() -> None:
+def test_http_default_request_factory_rejects_scheduled_width_over_request_width() -> (
+    None
+):
     adapter = simple_adapter()
 
     response = adapter.handle(

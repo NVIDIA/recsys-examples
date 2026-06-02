@@ -8,12 +8,6 @@ from typing import Any
 
 from gr_inference.gr_kv import BatchedBeamPath
 from gr_inference.gr_runtime import GRDecodeEngine, GRGenerationState
-from gr_inference.gr_runtime.generation import PrefillResult
-from gr_inference.gr_runtime.logits_processor import (
-    LogitsProcessorContext,
-    apply_logits_processors,
-    logits_processors_metadata,
-)
 from gr_inference.gr_runtime.batched_beam_search import (
     batched_item_mask_limited_beam_width,
     select_initial_topk_batched,
@@ -21,15 +15,31 @@ from gr_inference.gr_runtime.batched_beam_search import (
 )
 from gr_inference.gr_runtime.batched_decode_inputs import make_batched_beam_token_ids
 from gr_inference.gr_runtime.batched_topk_indices import make_batched_topk_indices
+from gr_inference.gr_runtime.generation import PrefillResult
+from gr_inference.gr_runtime.logits_processor import (
+    LogitsProcessorContext,
+    apply_logits_processors,
+    logits_processors_metadata,
+)
 from gr_inference.gr_serving.batch import GRRequestBatch
 from gr_inference.gr_serving.beam_metadata import (
     attach_item_results as _attach_item_results,
-    batched_beam_details as _beam_details,
+)
+from gr_inference.gr_serving.beam_metadata import batched_beam_details as _beam_details
+from gr_inference.gr_serving.beam_metadata import (
     batched_selection_stop_reason as _batched_selection_stop_reason,
-    beam_score_type as _beam_score_type,
+)
+from gr_inference.gr_serving.beam_metadata import beam_score_type as _beam_score_type
+from gr_inference.gr_serving.beam_metadata import (
     beam_width_policy_metadata as _beam_width_policy_metadata,
+)
+from gr_inference.gr_serving.beam_metadata import (
     request_stop_token_ids as _request_stop_token_ids,
+)
+from gr_inference.gr_serving.beam_metadata import (
     selected_decode_token_logprobs as _selected_decode_token_logprobs,
+)
+from gr_inference.gr_serving.beam_metadata import (
     selected_initial_token_logprobs_batched as _selected_initial_token_logprobs,
 )
 from gr_inference.gr_serving.config import GRServingConfig
@@ -102,7 +112,9 @@ class GRServingEngine:
 
         metrics = ServingMetrics()
         with metrics.section("batch_prefill_ms"):
-            input_ids = torch.cat([request.input_ids for request in batch.requests], dim=0)
+            input_ids = torch.cat(
+                [request.input_ids for request in batch.requests], dim=0
+            )
             prefill = self.model.forward_prefill(input_ids, return_result=True)
 
         responses: list[GRServingResponse] = []
@@ -157,7 +169,8 @@ class GRServingEngine:
                     {
                         "batched_decode": False,
                         "batched_decode_fallback_reason": (
-                            batched_decode_fallback_reason or "batched_decode_unavailable"
+                            batched_decode_fallback_reason
+                            or "batched_decode_unavailable"
                         ),
                     }
                 )
@@ -194,7 +207,9 @@ class GRServingEngine:
                 step=0,
                 beam_width=batch.beam_width or 0,
             )
-            initial_item_mask = _batched_initial_item_mask(batch.requests, prefill_logits)
+            initial_item_mask = _batched_initial_item_mask(
+                batch.requests, prefill_logits
+            )
             initial_beam_width = batched_item_mask_limited_beam_width(
                 batch.beam_width or 0,
                 initial_item_mask,
@@ -365,14 +380,18 @@ class GRServingEngine:
 
         with metrics.section("total_ms"):
             with metrics.section("prefill_ms"):
-                prefill = self.model.forward_prefill(request.input_ids, return_result=True)
+                prefill = self.model.forward_prefill(
+                    request.input_ids, return_result=True
+                )
             response = self._generate_from_prefill(
                 request,
                 prefill,
                 metadata=metrics.to_metadata(),
                 outer_metrics=metrics,
             )
-        response.metadata.setdefault("total_ms", metrics.to_metadata().get("total_ms", 0.0))
+        response.metadata.setdefault(
+            "total_ms", metrics.to_metadata().get("total_ms", 0.0)
+        )
         return response
 
     def _generate_from_prefill(
@@ -501,7 +520,9 @@ def _batched_initial_item_mask(
         if request.item_mask_provider is None:
             rows.append(torch.ones(vocab_size, dtype=torch.bool, device=scores.device))
             continue
-        mask = request.item_mask_provider.initial_mask(scores[batch_idx : batch_idx + 1])
+        mask = request.item_mask_provider.initial_mask(
+            scores[batch_idx : batch_idx + 1]
+        )
         if mask.dim() == 2 and mask.shape[0] == 1:
             mask = mask[0]
         if tuple(mask.shape) != (vocab_size,):

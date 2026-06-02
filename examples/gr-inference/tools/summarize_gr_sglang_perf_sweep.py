@@ -25,7 +25,9 @@ def _row_for(gr_path: Path, sglang_path: Path) -> dict[str, Any]:
     sg_wall = _number(sg.get("wall_ms_median"))
     speedup = sg_wall / gr_wall if gr_wall and sg_wall else None
     context_len = gr.get("context_len") or sg.get("context_len")
-    beam_width = gr.get("engine_status", {}).get("max_beam_width") or sg.get("beam_width")
+    beam_width = gr.get("engine_status", {}).get("max_beam_width") or sg.get(
+        "beam_width"
+    )
     requests = gr.get("responses") or sg.get("requests")
     return {
         "context_len": context_len,
@@ -50,7 +52,13 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         if not sglang_path.exists():
             continue
         rows.append(_row_for(gr_path, sglang_path))
-    rows.sort(key=lambda row: (int(row["context_len"]), int(row["beam_width"]), int(row["batch_requests"])))
+    rows.sort(
+        key=lambda row: (
+            int(row["context_len"]),
+            int(row["beam_width"]),
+            int(row["batch_requests"]),
+        )
+    )
     return rows
 
 

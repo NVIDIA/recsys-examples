@@ -8,7 +8,6 @@ from pathlib import Path
 
 from tool_utils import load_optional_tokenizer
 
-
 BASE_PARAGRAPH = (
     "User profile: long history recommendation context with repeated item "
     "signals, category preferences, timestamps, and behavioral evidence. "
@@ -62,7 +61,9 @@ def build_workload(args) -> list[dict]:
                 "metadata": {
                     "source": "make_qwen3_beam_workload.py",
                     "model_dir": args.model_dir,
-                    "mode": "tokenizer" if tokenizer is not None else "deterministic_ids",
+                    "mode": "tokenizer"
+                    if tokenizer is not None
+                    else "deterministic_ids",
                     "shared_prefix_len": args.shared_prefix_len
                     if tokenizer is None
                     else None,
@@ -76,7 +77,9 @@ def _load_tokenizer(args):
     return load_optional_tokenizer(args)
 
 
-def _deterministic_token_ids(idx: int, *, context_len: int, vocab_size: int) -> list[int]:
+def _deterministic_token_ids(
+    idx: int, *, context_len: int, vocab_size: int
+) -> list[int]:
     if vocab_size <= 1024:
         raise ValueError("--vocab-size must be > 1024 for deterministic workload")
     start = 1024 + idx * 17

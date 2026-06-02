@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 
 import pytest
-
 from gr_inference.gr_kernels.attention import (
     ExistingGRDecodeAttentionBackend,
     GRDecodeAttention,
@@ -32,7 +31,10 @@ def test_qwen3_model_real_decode_attention_smoke() -> None:
 
     backend = _existing_backend_or_skip()
 
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
     from gr_inference.gr_runtime import GRDecodeEngine, GRGenerationState
 
@@ -67,7 +69,9 @@ def test_qwen3_model_real_decode_attention_smoke() -> None:
         fixed_beam_width=config.max_beam_width,
     )
     selection = generation.initialize_beams()
-    beam_token_ids = torch.tensor([selection.token_ids], dtype=torch.long, device="cuda")
+    beam_token_ids = torch.tensor(
+        [selection.token_ids], dtype=torch.long, device="cuda"
+    )
 
     qhead_per_kv = config.num_attention_heads // config.num_kv_heads
     topk_kv = torch.arange(config.max_beam_width, device="cuda", dtype=torch.int32)
@@ -112,7 +116,10 @@ def test_continuous_serving_real_decode_attention_multi_step_smoke() -> None:
 
     backend = _existing_backend_or_skip()
 
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
     from gr_inference.gr_runtime import GRDecodeEngine
     from gr_inference.gr_serving import (
@@ -172,7 +179,9 @@ def test_continuous_serving_real_decode_attention_multi_step_smoke() -> None:
             executor.submit(
                 GRServingRequest(
                     request_id=f"req-{idx}",
-                    input_ids=torch.randint(0, config.vocab_size, (1, 16), device="cuda"),
+                    input_ids=torch.randint(
+                        0, config.vocab_size, (1, 16), device="cuda"
+                    ),
                     max_decode_steps=2,
                     beam_width=config.max_beam_width,
                 )
@@ -182,14 +191,24 @@ def test_continuous_serving_real_decode_attention_multi_step_smoke() -> None:
     assert len(responses) == 2
     assert executor.scheduler.status()["ticks"] == 2
     assert all(response.metadata["decode_steps"] == 2 for response in responses)
-    assert all(response.metadata["stop_reason"] == "max_decode_steps" for response in responses)
-    assert all(tuple(response.scores) and torch.isfinite(torch.tensor(response.scores)).all() for response in responses)
-    assert all(len(response.metadata["beam_details"]) == config.max_beam_width for response in responses)
+    assert all(
+        response.metadata["stop_reason"] == "max_decode_steps" for response in responses
+    )
+    assert all(
+        tuple(response.scores) and torch.isfinite(torch.tensor(response.scores)).all()
+        for response in responses
+    )
+    assert all(
+        len(response.metadata["beam_details"]) == config.max_beam_width
+        for response in responses
+    )
     assert len(responses[0].metadata["beam_details"][0]["token_ids"]) == 3
 
 
 @pytest.mark.parametrize("beam_width", [8, 16, 32, 64])
-def test_existing_gr_decode_attention_backend_small_beam_width_smoke(beam_width: int) -> None:
+def test_existing_gr_decode_attention_backend_small_beam_width_smoke(
+    beam_width: int,
+) -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
 
@@ -212,12 +231,46 @@ def test_existing_gr_decode_attention_backend_small_beam_width_smoke(beam_width:
     dtype = torch.bfloat16
     q = torch.randn(batch, beam_width, head_q, head_dim, device="cuda", dtype=dtype)
     context_kv = ContextKV(
-        torch.randn(num_layers, batch, context_len, head_kv, head_dim, device="cuda", dtype=dtype),
-        torch.randn(num_layers, batch, context_len, head_kv, head_dim, device="cuda", dtype=dtype),
+        torch.randn(
+            num_layers,
+            batch,
+            context_len,
+            head_kv,
+            head_dim,
+            device="cuda",
+            dtype=dtype,
+        ),
+        torch.randn(
+            num_layers,
+            batch,
+            context_len,
+            head_kv,
+            head_dim,
+            device="cuda",
+            dtype=dtype,
+        ),
     )
     beam_kv = BeamKV(
-        torch.randn(num_layers, batch, decode_nums, beam_width, head_kv, head_dim, device="cuda", dtype=dtype),
-        torch.randn(num_layers, batch, decode_nums, beam_width, head_kv, head_dim, device="cuda", dtype=dtype),
+        torch.randn(
+            num_layers,
+            batch,
+            decode_nums,
+            beam_width,
+            head_kv,
+            head_dim,
+            device="cuda",
+            dtype=dtype,
+        ),
+        torch.randn(
+            num_layers,
+            batch,
+            decode_nums,
+            beam_width,
+            head_kv,
+            head_dim,
+            device="cuda",
+            dtype=dtype,
+        ),
     )
     beam_path = BeamPath(max_decode_steps=decode_nums, max_beam_width=beam_width)
     beam_path.append(
@@ -232,7 +285,9 @@ def test_existing_gr_decode_attention_backend_small_beam_width_smoke(beam_width:
         1,
         beam_width,
     )
-    topk_indices = topk_indices.expand(batch, 1, head_q, decode_nums, beam_width).contiguous()
+    topk_indices = topk_indices.expand(
+        batch, 1, head_q, decode_nums, beam_width
+    ).contiguous()
 
     out = backend(
         GRDecodeAttentionInputs(

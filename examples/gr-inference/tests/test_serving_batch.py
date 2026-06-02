@@ -45,4 +45,3 @@ def test_batch_compatibility_checks_shape_and_decode_config() -> None:
     batch = FIFOBatchAssembler(SchedulerPolicy(max_batch_size=2)).assemble(queue)
 
     assert batch.compatible_for_tensor_batch()
-

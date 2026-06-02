@@ -2,7 +2,6 @@ import importlib.util
 import json
 
 import pytest
-
 from gr_inference.gr_kv import ContextKV, TensorSpec
 from gr_inference.gr_runtime import (
     GRGenerationState,
@@ -44,7 +43,6 @@ def test_trie_item_mask_provider_initial_and_step_masks() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import TrieItemMaskProvider
 
     trie = TokenTrie.from_sequences([[1, 10], [1, 11], [2, 20]])
@@ -82,7 +80,6 @@ def test_trie_item_mask_provider_allows_eos_for_terminal_items() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import TrieItemMaskProvider
 
     trie = TokenTrie.from_items([("item-a", (1, 10)), ("item-b", (2, 11))])
@@ -101,15 +98,21 @@ def test_trie_item_mask_provider_allows_eos_for_terminal_items() -> None:
         max_decode_steps=3,
         max_beam_width=2,
     )
-    generation.initialize_beams_with_width(beam_width=2, item_mask=provider.initial_mask(prefill.logits))
-    generation.beam_path.append(parent_beams=(0, 1), token_ids=(10, 11), scores=(1.0, 0.9))
+    generation.initialize_beams_with_width(
+        beam_width=2, item_mask=provider.initial_mask(prefill.logits)
+    )
+    generation.beam_path.append(
+        parent_beams=(0, 1), token_ids=(10, 11), scores=(1.0, 0.9)
+    )
 
     step_mask = provider.step_mask(generation, torch.zeros(1, 2, 32))
 
     assert step_mask[:, 0].tolist() == [True, True]
     assert not step_mask[:, 12].any()
     assert provider.resolve_item_ids((1, 10, 0)) == ("item-a",)
-    assert provider.beam_item_results(generation.beam_path, beam_width=2)[0]["item_id"] in {
+    assert provider.beam_item_results(generation.beam_path, beam_width=2)[0][
+        "item_id"
+    ] in {
         "item-a",
         "item-b",
     }

@@ -16,7 +16,9 @@ from gr_inference import (  # noqa: E402
     Qwen3GRModel,
     TorchSDPAPrefillBackend,
 )
-from gr_inference.gr_kernels.attention import ExistingGRDecodeAttentionBackend  # noqa: E402
+from gr_inference.gr_kernels.attention import (  # noqa: E402
+    ExistingGRDecodeAttentionBackend,
+)
 from gr_inference.gr_models import HFCheckpointLoader, resolve_model_dir  # noqa: E402
 from gr_inference.gr_models.qwen3 import (  # noqa: E402
     DEFAULT_QWEN3_MODEL_ID,
@@ -29,7 +31,9 @@ def choose_dtype(torch, device: str):
     return torch.bfloat16 if device == "cuda" else torch.float32
 
 
-def build_identity_topk_indices(torch, *, batch: int, head_q: int, decode_nums: int, beam_width: int, device):
+def build_identity_topk_indices(
+    torch, *, batch: int, head_q: int, decode_nums: int, beam_width: int, device
+):
     indices = torch.arange(beam_width, dtype=torch.int32, device=device)
     indices = indices.view(1, 1, 1, 1, beam_width)
     indices = indices.expand(batch, 1, head_q, decode_nums, beam_width).contiguous()
@@ -57,7 +61,12 @@ def load_model(args, torch):
         max_decode_steps=max(args.decode_steps, 1),
         max_beam_width=args.beam_width,
     )
-    device = "cuda" if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available()) else "cpu"
+    device = (
+        "cuda"
+        if args.device == "cuda"
+        or (args.device == "auto" and torch.cuda.is_available())
+        else "cpu"
+    )
     dtype = choose_dtype(torch, device)
 
     print("Materializing checkpoint logical tensors...")
@@ -76,7 +85,9 @@ def load_model(args, torch):
 
 
 def run_fake_decode(args, torch, model, config, device):
-    input_ids = torch.randint(0, config.vocab_size, (1, args.context_len), device=device)
+    input_ids = torch.randint(
+        0, config.vocab_size, (1, args.context_len), device=device
+    )
     with torch.no_grad():
         prefill = model.forward_prefill(input_ids, return_result=True)
         generation = GRGenerationState.from_prefill(
@@ -90,7 +101,9 @@ def run_fake_decode(args, torch, model, config, device):
             attention=GRDecodeAttention(backend=lambda inputs: inputs.q),
             fixed_beam_width=args.beam_width,
         )
-        result = model.generate_fixed_beam(generation, decode_engine, max_steps=args.decode_steps)
+        result = model.generate_fixed_beam(
+            generation, decode_engine, max_steps=args.decode_steps
+        )
     return {
         "backend": "fake",
         "prefill_logits": tuple(prefill.logits.shape),
@@ -107,7 +120,9 @@ def run_real_decode(args, torch, model, config, device):
     if args.decode_steps != 1:
         raise RuntimeError("--decode-backend real currently supports --decode-steps 1")
 
-    input_ids = torch.randint(0, config.vocab_size, (1, args.context_len), device=device)
+    input_ids = torch.randint(
+        0, config.vocab_size, (1, args.context_len), device=device
+    )
     with torch.no_grad():
         prefill = model.forward_prefill(input_ids, return_result=True)
         generation = GRGenerationState.from_prefill(
@@ -118,7 +133,9 @@ def run_real_decode(args, torch, model, config, device):
             fixed_beam_width=args.beam_width,
         )
         selection = generation.initialize_beams()
-        beam_token_ids = torch.tensor([selection.token_ids], dtype=torch.long, device=device)
+        beam_token_ids = torch.tensor(
+            [selection.token_ids], dtype=torch.long, device=device
+        )
         topk_indices = build_identity_topk_indices(
             torch,
             batch=1,

@@ -123,7 +123,9 @@ def main() -> None:
         for batch in args.batches:
             for seq in args.seqs:
                 for backend in args.backends:
-                    latency_ms = run_one(args, torch, backend=backend, batch=batch, seq=seq)
+                    latency_ms = run_one(
+                        args, torch, backend=backend, batch=batch, seq=seq
+                    )
                     results[(batch, seq, backend)] = latency_ms
                     print(
                         f"backend={backend} batch={batch} seq={seq} "
@@ -145,7 +147,9 @@ def main() -> None:
                     )
         return
 
-    latency_ms = run_one(args, torch, backend=args.backend, batch=args.batch, seq=args.seq)
+    latency_ms = run_one(
+        args, torch, backend=args.backend, batch=args.batch, seq=args.seq
+    )
 
     print(
         f"backend={args.backend} batch={args.batch} seq={args.seq} "

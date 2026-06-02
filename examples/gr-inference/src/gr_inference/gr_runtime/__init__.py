@@ -1,12 +1,5 @@
 """Runtime contracts for GR inference."""
 
-from gr_inference.gr_runtime.beam_search import (
-    BeamSelection,
-    InitialTopKBeamSelector,
-    item_mask_limited_beam_width,
-    select_initial_topk,
-    select_next_topk,
-)
 from gr_inference.gr_runtime.batched_beam_search import (
     BatchedBeamSelection,
     batched_item_mask_limited_beam_width,
@@ -25,6 +18,13 @@ from gr_inference.gr_runtime.beam_kv_compaction import (
     compact_batched_beam_kv_history,
     needs_batched_beam_kv_history_compaction,
 )
+from gr_inference.gr_runtime.beam_search import (
+    BeamSelection,
+    InitialTopKBeamSelector,
+    item_mask_limited_beam_width,
+    select_initial_topk,
+    select_next_topk,
+)
 from gr_inference.gr_runtime.decode_kv import BeamKVWrite, BeamKVWriter
 from gr_inference.gr_runtime.decode_loop import (
     DecodeLoopResult,
@@ -38,8 +38,8 @@ from gr_inference.gr_runtime.generation import (
     allocate_beam_kv_like_context,
 )
 from gr_inference.gr_runtime.item_constraints import (
-    SemanticItemCatalog,
     SemanticItem,
+    SemanticItemCatalog,
     TokenTrie,
     TrieItemMaskProvider,
     TrieItemMaskProviderStore,

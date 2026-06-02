@@ -88,7 +88,9 @@ def make_engine(args, torch, config, device: str, model) -> GRServingEngine:
         batched_decode=True,
     )
     decode_engine = GRDecodeEngine(
-        attention=GRDecodeAttention(backend=make_decode_backend(decode_backend_args, device)),
+        attention=GRDecodeAttention(
+            backend=make_decode_backend(decode_backend_args, device)
+        ),
         fixed_beam_width=args.beam_width,
     )
     return GRServingEngine(
@@ -173,7 +175,9 @@ def run_policy(
     }
 
 
-def compare_to_fixed(fixed: dict[str, Any], other: dict[str, Any], *, compare_top_k: int) -> dict[str, Any]:
+def compare_to_fixed(
+    fixed: dict[str, Any], other: dict[str, Any], *, compare_top_k: int
+) -> dict[str, Any]:
     fixed_items = [tuple(item) for item in fixed["items"]]
     other_items = [tuple(item) for item in other["items"]]
     fixed_scores = _final_scores(fixed)
@@ -210,19 +214,26 @@ def compare_to_fixed(fixed: dict[str, Any], other: dict[str, Any], *, compare_to
     return {
         "policy": other["policy"],
         "compared_top_k": k,
-        "top1_match": bool(fixed_items and other_items and fixed_items[0] == other_items[0]),
+        "top1_match": bool(
+            fixed_items and other_items and fixed_items[0] == other_items[0]
+        ),
         "topk_overlap_count": overlap,
         "topk_overlap_ratio": overlap / k if k else None,
         "top10_changed": bool(
             top10_k and set(fixed_items[:top10_k]) != set(other_items[:top10_k])
         ),
         "fixed_top10_missing_count": (
-            top10_k - len(set(fixed_items[:top10_k]).intersection(other_items[:top10_k]))
+            top10_k
+            - len(set(fixed_items[:top10_k]).intersection(other_items[:top10_k]))
             if top10_k
             else None
         ),
-        "mean_rank_score_delta": sum(score_deltas) / len(score_deltas) if score_deltas else None,
-        "max_abs_rank_score_delta": max((abs(delta) for delta in score_deltas), default=None),
+        "mean_rank_score_delta": sum(score_deltas) / len(score_deltas)
+        if score_deltas
+        else None,
+        "max_abs_rank_score_delta": max(
+            (abs(delta) for delta in score_deltas), default=None
+        ),
         "mean_matched_item_score_delta": (
             sum(matched_score_deltas) / len(matched_score_deltas)
             if matched_score_deltas
@@ -252,7 +263,10 @@ def compare_to_fixed(fixed: dict[str, Any], other: dict[str, Any], *, compare_to
 def _final_items(response) -> list[tuple[int, ...]]:
     beam_details = response.metadata.get("beam_details")
     if beam_details:
-        return [tuple(int(token) for token in detail["token_ids"]) for detail in beam_details]
+        return [
+            tuple(int(token) for token in detail["token_ids"])
+            for detail in beam_details
+        ]
     return [(int(token),) for token in response.token_ids]
 
 
@@ -299,7 +313,9 @@ def main() -> None:
     parser.add_argument("--compare-top-k", type=int, default=10)
     parser.add_argument("--decode-backend", choices=["fake", "real"], default="real")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
-    parser.add_argument("--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob")
+    parser.add_argument(
+        "--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob"
+    )
     parser.add_argument("--output-json")
     parser.add_argument("--output-markdown")
     parser.add_argument("--min-top1-match-rate", type=float, default=1.0)
@@ -446,11 +462,15 @@ def aggregate_comparisons(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "top1_match_rate": _mean(row["top1_match"] for row in rows),
             "topk_overlap_ratio_mean": _mean(row["topk_overlap_ratio"] for row in rows),
             "top10_changed_rate": _mean(row["top10_changed"] for row in rows),
-            "latency_improvement_pct_mean": _mean(row["latency_improvement_pct"] for row in rows),
+            "latency_improvement_pct_mean": _mean(
+                row["latency_improvement_pct"] for row in rows
+            ),
             "decode_latency_improvement_pct_mean": _mean(
                 row["decode_latency_improvement_pct"] for row in rows
             ),
-            "mean_rank_score_delta_mean": _mean(row["mean_rank_score_delta"] for row in rows),
+            "mean_rank_score_delta_mean": _mean(
+                row["mean_rank_score_delta"] for row in rows
+            ),
             "max_abs_rank_score_delta_max": max(
                 (
                     row["max_abs_rank_score_delta"]

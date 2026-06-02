@@ -2,7 +2,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from tool_utils import (  # noqa: E402
     bootstrap_repo_paths,
     iter_jsonl,
@@ -16,7 +15,9 @@ def test_bootstrap_repo_paths_adds_requested_import_roots(tmp_path: Path) -> Non
     anchor = tmp_path / "repo" / "tools" / "tool.py"
     original_path = list(sys.path)
     try:
-        repo_root = bootstrap_repo_paths(anchor, include_tools=True, include_benchmarks=True)
+        repo_root = bootstrap_repo_paths(
+            anchor, include_tools=True, include_benchmarks=True
+        )
 
         assert repo_root == tmp_path / "repo"
         assert str(repo_root / "src") in sys.path

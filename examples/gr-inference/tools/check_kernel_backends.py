@@ -23,7 +23,6 @@ from gr_inference.gr_kernels import (  # noqa: E402
     default_kernel_selection_policy,
 )
 
-
 INSTALL_HINTS = {
     "flashinfer": 'cd /cb/gr-inference && python -m pip install -U ".[kernels]"',
     "flash_attn": "Install flash-attn in the current Python environment.",

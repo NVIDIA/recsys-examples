@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
-import sqlite3
 from typing import Any, Iterable
 
-from tool_utils import json_dumps, read_json as _load_json, write_json
+from tool_utils import json_dumps
+from tool_utils import read_json as _load_json
+from tool_utils import write_json
 
 NS_PER_MS = 1_000_000.0
 
@@ -93,7 +95,9 @@ def analyze(path: Path) -> dict[str, Any]:
         "kernel_total_ms": kernel_total_ms,
         "cuda_window_minus_kernel_total_ms": kernel_gap_ms,
         "runtime_total_ms": runtime_total_ms,
-        "active_runtime_total_ms": _sum_overlap_ms(runtime, stage_windows.get("overall") or []),
+        "active_runtime_total_ms": _sum_overlap_ms(
+            runtime, stage_windows.get("overall") or []
+        ),
         "kernel_launch_count": len(kernels),
         "cuda_graph_launches": _count_graph_launches(runtime),
         "cpu_gap_ms_over_50us": _gap_ms(runtime, threshold_ns=50_000),
@@ -128,13 +132,48 @@ def build_comparison(
     legacy_rows = [
         _row(metric, gr_value, sglang_value, notes)
         for metric, gr_value, sglang_value, notes in (
-            ("CUDA capture window", gr.get("cuda_window_ms"), sglang.get("cuda_window_ms"), "raw kernel/runtime event window; can include CUDA Graph precapture"),
-            ("Kernel total", gr.get("kernel_total_ms"), sglang.get("kernel_total_ms"), "sum of all captured CUDA kernel durations"),
-            ("Non-attention kernel total", _non_attention_kernel_total(gr), _non_attention_kernel_total(sglang), "legacy mixed bucket; prefer the stage tables above"),
-            ("CUDA window - kernel total", gr.get("cuda_window_minus_kernel_total_ms"), sglang.get("cuda_window_minus_kernel_total_ms"), "rough host/runtime/scheduling gap; kernels may overlap"),
-            ("CUDA runtime API total", gr.get("runtime_total_ms"), sglang.get("runtime_total_ms"), "raw sum of captured CUDA runtime API durations"),
-            ("NVTX span", gr.get("nvtx_window_ms"), sglang.get("nvtx_window_ms"), "diagnostic only; may include long-lived ranges"),
-            ("prefill NVTX total", _stage(gr, "prefill"), _stage(sglang, "prefill"), "legacy broad NVTX-name sum; can double count nested ranges"),
+            (
+                "CUDA capture window",
+                gr.get("cuda_window_ms"),
+                sglang.get("cuda_window_ms"),
+                "raw kernel/runtime event window; can include CUDA Graph precapture",
+            ),
+            (
+                "Kernel total",
+                gr.get("kernel_total_ms"),
+                sglang.get("kernel_total_ms"),
+                "sum of all captured CUDA kernel durations",
+            ),
+            (
+                "Non-attention kernel total",
+                _non_attention_kernel_total(gr),
+                _non_attention_kernel_total(sglang),
+                "legacy mixed bucket; prefer the stage tables above",
+            ),
+            (
+                "CUDA window - kernel total",
+                gr.get("cuda_window_minus_kernel_total_ms"),
+                sglang.get("cuda_window_minus_kernel_total_ms"),
+                "rough host/runtime/scheduling gap; kernels may overlap",
+            ),
+            (
+                "CUDA runtime API total",
+                gr.get("runtime_total_ms"),
+                sglang.get("runtime_total_ms"),
+                "raw sum of captured CUDA runtime API durations",
+            ),
+            (
+                "NVTX span",
+                gr.get("nvtx_window_ms"),
+                sglang.get("nvtx_window_ms"),
+                "diagnostic only; may include long-lived ranges",
+            ),
+            (
+                "prefill NVTX total",
+                _stage(gr, "prefill"),
+                _stage(sglang, "prefill"),
+                "legacy broad NVTX-name sum; can double count nested ranges",
+            ),
         )
     ]
     decode_gr = gr.get("decode_step_ms") or []
@@ -151,9 +190,17 @@ def build_comparison(
     legacy_rows.extend(
         _row(metric, gr.get(key), sglang.get(key), notes)
         for metric, key, notes in (
-            ("CUDA graph launches", "cuda_graph_launches", "raw CUDA runtime API calls"),
+            (
+                "CUDA graph launches",
+                "cuda_graph_launches",
+                "raw CUDA runtime API calls",
+            ),
             ("kernel launch count", "kernel_launch_count", "captured kernel rows"),
-            ("CPU gaps", "cpu_gap_ms_over_50us", "raw gaps between CUDA runtime calls >50us"),
+            (
+                "CPU gaps",
+                "cpu_gap_ms_over_50us",
+                "raw gaps between CUDA runtime calls >50us",
+            ),
         )
     )
     for category, _ in KERNEL_CATEGORIES:
@@ -178,7 +225,14 @@ def build_comparison(
         gr_value = (gr.get("nvtx_module_buckets_ms") or {}).get(bucket)
         sglang_value = (sglang.get("nvtx_module_buckets_ms") or {}).get(bucket)
         if gr_value is not None or sglang_value is not None:
-            legacy_rows.append(_row(f"NVTX {bucket}", gr_value, sglang_value, "fine-grained module/stage NVTX bucket"))
+            legacy_rows.append(
+                _row(
+                    f"NVTX {bucket}",
+                    gr_value,
+                    sglang_value,
+                    "fine-grained module/stage NVTX bucket",
+                )
+            )
     return {
         "gr": gr,
         "sglang": sglang,
@@ -220,11 +274,20 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
             ("CUDA Runtime Calls", "cuda_runtime_calls"),
             ("NVTX Ranges", "top_nvtx_names"),
         ):
-            lines.extend(["", f"## Top {label} {title}", "", *_top_name_lines(data.get(key) or [])])
+            lines.extend(
+                [
+                    "",
+                    f"## Top {label} {title}",
+                    "",
+                    *_top_name_lines(data.get(key) or []),
+                ]
+            )
     lines.extend(["", "## NVTX Bucket Totals", "", *_nvtx_bucket_lines(report), ""])
     warnings = _diagnostic_warnings(report)
     if warnings:
-        lines.extend(["## Diagnostic Notes", "", *[f"- {warning}" for warning in warnings], ""])
+        lines.extend(
+            ["## Diagnostic Notes", "", *[f"- {warning}" for warning in warnings], ""]
+        )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -245,16 +308,32 @@ def _strings(conn: sqlite3.Connection) -> dict[int, str]:
     }
 
 
-def _kernel_rows(conn: sqlite3.Connection, strings: dict[int, str]) -> list[dict[str, Any]]:
-    return _event_rows(conn, KERNEL_TABLE, strings, ("demangledName", "shortName", "mangledName", "name"))
+def _kernel_rows(
+    conn: sqlite3.Connection, strings: dict[int, str]
+) -> list[dict[str, Any]]:
+    return _event_rows(
+        conn,
+        KERNEL_TABLE,
+        strings,
+        ("demangledName", "shortName", "mangledName", "name"),
+    )
 
 
-def _runtime_rows(conn: sqlite3.Connection, strings: dict[int, str]) -> list[dict[str, Any]]:
+def _runtime_rows(
+    conn: sqlite3.Connection, strings: dict[int, str]
+) -> list[dict[str, Any]]:
     return _event_rows(conn, RUNTIME_TABLE, strings, ("nameId", "name"))
 
 
-def _nvtx_rows(conn: sqlite3.Connection, strings: dict[int, str]) -> list[dict[str, Any]]:
-    return _event_rows(conn, NVTX_TABLE, strings, ("text", "name", "message", "textId", "nameId", "messageId"))
+def _nvtx_rows(
+    conn: sqlite3.Connection, strings: dict[int, str]
+) -> list[dict[str, Any]]:
+    return _event_rows(
+        conn,
+        NVTX_TABLE,
+        strings,
+        ("text", "name", "message", "textId", "nameId", "messageId"),
+    )
 
 
 def _event_rows(
@@ -284,7 +363,9 @@ def _event(
     return {
         "start": _number(row["start"]) if "start" in columns else None,
         "end": _number(row["end"]) if "end" in columns else None,
-        "name": _resolve_name(row, columns=columns, strings=strings, name_cols=name_cols),
+        "name": _resolve_name(
+            row, columns=columns, strings=strings, name_cols=name_cols
+        ),
     }
 
 
@@ -328,8 +409,18 @@ def _sum_duration_ms(events: Iterable[dict[str, Any]]) -> float:
 
 
 def _event_window(*groups: list[dict[str, Any]]) -> tuple[int | None, int | None]:
-    starts = [event["start"] for group in groups for event in group if event.get("start") is not None]
-    ends = [event["end"] for group in groups for event in group if event.get("end") is not None]
+    starts = [
+        event["start"]
+        for group in groups
+        for event in group
+        if event.get("start") is not None
+    ]
+    ends = [
+        event["end"]
+        for group in groups
+        for event in group
+        if event.get("end") is not None
+    ]
     return (min(starts), max(ends)) if starts and ends else (None, None)
 
 
@@ -461,8 +552,13 @@ def _paired_stage_windows(
     return windows
 
 
-def _serialize_windows(windows: dict[str, list[tuple[int, int]]]) -> dict[str, list[list[int]]]:
-    return {stage: [[start, end] for start, end in values] for stage, values in windows.items()}
+def _serialize_windows(
+    windows: dict[str, list[tuple[int, int]]]
+) -> dict[str, list[list[int]]]:
+    return {
+        stage: [[start, end] for start, end in values]
+        for stage, values in windows.items()
+    }
 
 
 def _stage_breakdown(
@@ -509,7 +605,9 @@ def _stage_breakdown(
 def _windows_duration_ms(windows: list[tuple[int, int]]) -> float | None:
     if not windows:
         return None
-    return sum(max(0, end - start) for start, end in _merge_windows(windows)) / NS_PER_MS
+    return (
+        sum(max(0, end - start) for start, end in _merge_windows(windows)) / NS_PER_MS
+    )
 
 
 def _sum_overlap_ms(
@@ -588,12 +686,20 @@ def _merge_windows(windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def _count_graph_launches(events: list[dict[str, Any]]) -> int:
-    return sum(1 for event in events if "graph" in event["name"].lower() and "launch" in event["name"].lower())
+    return sum(
+        1
+        for event in events
+        if "graph" in event["name"].lower() and "launch" in event["name"].lower()
+    )
 
 
 def _gap_ms(events: list[dict[str, Any]], *, threshold_ns: int) -> float:
     ordered = sorted(
-        (event for event in events if event.get("start") is not None and event.get("end") is not None),
+        (
+            event
+            for event in events
+            if event.get("start") is not None and event.get("end") is not None
+        ),
         key=lambda event: event["start"],
     )
     total = 0
@@ -615,7 +721,11 @@ def _kernel_categories(
     totals: dict[str, float] = defaultdict(float)
     for kernel in kernels:
         lower = kernel["name"].lower()
-        duration = _event_overlap_ms(kernel, windows) if windows is not None else _event_duration_ms(kernel)
+        duration = (
+            _event_overlap_ms(kernel, windows)
+            if windows is not None
+            else _event_duration_ms(kernel)
+        )
         if duration <= 0.0:
             continue
         matched = False
@@ -721,12 +831,42 @@ def _overall_rows(
             gr,
             sglang,
             (
-                ("Active CUDA window", "overall", "window_ms", "first-to-last captured kernel; avoids CUDA Graph precapture runtime"),
-                ("CUDA runtime API total", "overall", "cuda_runtime_api_ms", "runtime API duration clipped to the active CUDA window"),
-                ("CUDA graph API total", "overall", "cuda_graph_runtime_api_ms", "CUDA graph runtime API duration clipped to the active CUDA window"),
-                ("CPU runtime gaps >50us", "overall", "cpu_gap_ms_over_50us", "gaps between CUDA runtime calls inside the active window"),
-                ("Kernel total", "overall", "kernel_total_ms", "sum of captured CUDA kernel durations"),
-                ("Decode attention kernels", "decode", "attention_kernel_ms", "attention bucket inside the decode stage"),
+                (
+                    "Active CUDA window",
+                    "overall",
+                    "window_ms",
+                    "first-to-last captured kernel; avoids CUDA Graph precapture runtime",
+                ),
+                (
+                    "CUDA runtime API total",
+                    "overall",
+                    "cuda_runtime_api_ms",
+                    "runtime API duration clipped to the active CUDA window",
+                ),
+                (
+                    "CUDA graph API total",
+                    "overall",
+                    "cuda_graph_runtime_api_ms",
+                    "CUDA graph runtime API duration clipped to the active CUDA window",
+                ),
+                (
+                    "CPU runtime gaps >50us",
+                    "overall",
+                    "cpu_gap_ms_over_50us",
+                    "gaps between CUDA runtime calls inside the active window",
+                ),
+                (
+                    "Kernel total",
+                    "overall",
+                    "kernel_total_ms",
+                    "sum of captured CUDA kernel durations",
+                ),
+                (
+                    "Decode attention kernels",
+                    "decode",
+                    "attention_kernel_ms",
+                    "attention bucket inside the decode stage",
+                ),
             ),
         ),
         _row(
@@ -739,8 +879,18 @@ def _overall_rows(
             gr,
             sglang,
             (
-                ("CUDA graph launches", "overall", "cuda_graph_launches", "cudaGraphLaunch runtime calls in the active window"),
-                ("Kernel launches", "overall", "kernel_launch_count", "kernel rows overlapping the active window"),
+                (
+                    "CUDA graph launches",
+                    "overall",
+                    "cuda_graph_launches",
+                    "cudaGraphLaunch runtime calls in the active window",
+                ),
+                (
+                    "Kernel launches",
+                    "overall",
+                    "kernel_launch_count",
+                    "kernel rows overlapping the active window",
+                ),
             ),
         ),
     ]
@@ -756,10 +906,30 @@ def _stage_rows(
         gr,
         sglang,
         (
-            ("Stage total", stage, "window_ms", f"{stage_label} stage window from NVTX boundary; includes host gaps inside the stage"),
-            ("Attention kernels", stage, "attention_kernel_ms", "prefill attention for prefill; decode attention for decode"),
-            ("Non-attention kernels", stage, "other_kernel_ms", "stage kernel total minus stage attention kernels"),
-            ("CPU overhead", stage, "cpu_overhead_ms", "stage total minus stage kernel total; rough host/runtime/bubble component"),
+            (
+                "Stage total",
+                stage,
+                "window_ms",
+                f"{stage_label} stage window from NVTX boundary; includes host gaps inside the stage",
+            ),
+            (
+                "Attention kernels",
+                stage,
+                "attention_kernel_ms",
+                "prefill attention for prefill; decode attention for decode",
+            ),
+            (
+                "Non-attention kernels",
+                stage,
+                "other_kernel_ms",
+                "stage kernel total minus stage attention kernels",
+            ),
+            (
+                "CPU overhead",
+                stage,
+                "cpu_overhead_ms",
+                "stage total minus stage kernel total; rough host/runtime/bubble component",
+            ),
         ),
     )
 
@@ -770,7 +940,12 @@ def _breakdown_rows(
     specs: tuple[tuple[str, str, str, str], ...],
 ) -> list[dict[str, Any]]:
     return [
-        _row(metric, _breakdown_value(gr, stage, key), _breakdown_value(sglang, stage, key), notes)
+        _row(
+            metric,
+            _breakdown_value(gr, stage, key),
+            _breakdown_value(sglang, stage, key),
+            notes,
+        )
         for metric, stage, key, notes in specs
     ]
 
@@ -788,10 +963,9 @@ def _other_excluding_decode_attention(report: dict[str, Any]) -> float | None:
 
 
 def _category_value(report: dict[str, Any], category: str) -> float | None:
-    return (
-        (report.get("nvtx_module_buckets_ms") or {}).get(category)
-        or (report.get("kernel_categories_ms") or {}).get(category)
-    )
+    return (report.get("nvtx_module_buckets_ms") or {}).get(category) or (
+        report.get("kernel_categories_ms") or {}
+    ).get(category)
 
 
 def _non_attention_kernel_total(report: dict[str, Any]) -> float | None:
@@ -831,7 +1005,9 @@ def _kernel_bucket_lines(report: dict[str, Any]) -> list[str]:
     return _bucket_lines(gr, sglang, empty="No kernel bucket rows found.")
 
 
-def _bucket_lines(gr: dict[str, Any], sglang: dict[str, Any], *, empty: str) -> list[str]:
+def _bucket_lines(
+    gr: dict[str, Any], sglang: dict[str, Any], *, empty: str
+) -> list[str]:
     keys = sorted(set(gr) | set(sglang))
     if not keys:
         return [empty]
@@ -862,13 +1038,10 @@ def _diagnostic_warnings(report: dict[str, Any]) -> list[str]:
         )
     for label in ("gr", "sglang"):
         data = report[label]
-        decode = ((data.get("stage_breakdown") or {}).get("decode") or {})
-        if (
-            (decode.get("cuda_graph_launches") or 0) > 0
-            and (
-                (decode.get("kernel_launch_count") or 0) == 0
-                or (decode.get("attention_kernel_ms") or 0.0) == 0.0
-            )
+        decode = (data.get("stage_breakdown") or {}).get("decode") or {}
+        if (decode.get("cuda_graph_launches") or 0) > 0 and (
+            (decode.get("kernel_launch_count") or 0) == 0
+            or (decode.get("attention_kernel_ms") or 0.0) == 0.0
         ):
             warnings.append(
                 f"{label} decode has CUDA graph launches but no expanded decode attention kernels. Rerun nsys with --cuda-graph-trace=node:nvtx-precapture when comparing decode attention and other decode kernels."
@@ -910,7 +1083,9 @@ def main() -> None:
         analyze(Path(args.gr_sqlite)),
         analyze(Path(args.sglang_sqlite)),
         gr_benchmark=_load_json(Path(args.gr_json)) if args.gr_json else None,
-        sglang_benchmark=_load_json(Path(args.sglang_json)) if args.sglang_json else None,
+        sglang_benchmark=_load_json(Path(args.sglang_json))
+        if args.sglang_json
+        else None,
     )
     write_json(args.output_json, report)
     write_markdown(report, Path(args.output_markdown))

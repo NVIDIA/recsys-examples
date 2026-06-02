@@ -1,5 +1,4 @@
 import pytest
-
 from gr_inference.gr_kv import BeamPath
 
 

@@ -8,7 +8,6 @@ def test_make_batched_beam_token_ids() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_runtime import (
         BatchedBeamSelection,
         make_batched_beam_token_ids,
@@ -29,7 +28,10 @@ def test_make_batched_beam_token_ids() -> None:
 
 
 def test_make_batched_beam_token_ids_rejects_ragged_rows() -> None:
-    from gr_inference.gr_runtime import BatchedBeamSelection, make_batched_beam_token_ids
+    from gr_inference.gr_runtime import (
+        BatchedBeamSelection,
+        make_batched_beam_token_ids,
+    )
 
     selection = BatchedBeamSelection(
         token_ids=((1, 2), (3,)),
@@ -39,4 +41,3 @@ def test_make_batched_beam_token_ids_rejects_ragged_rows() -> None:
 
     with pytest.raises(ValueError, match="equal beam width"):
         make_batched_beam_token_ids(selection)
-

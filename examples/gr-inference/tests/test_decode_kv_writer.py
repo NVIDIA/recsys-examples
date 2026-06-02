@@ -1,7 +1,6 @@
 import importlib.util
 
 import pytest
-
 from gr_inference.gr_kv import BeamKV, TensorSpec
 from gr_inference.gr_runtime import BeamKVWriter
 

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import os
+from dataclasses import dataclass, field
 
 from gr_inference.gr_kernels.backends import build_default_kernel_registry
 from gr_inference.gr_kernels.profile import KernelProfile
@@ -22,7 +22,6 @@ from gr_inference.gr_kernels.registry import (
     KernelBackendRegistry,
 )
 
-
 DEFAULT_CAPABILITY_ORDER: dict[str, tuple[str, ...]] = {
     CAP_RMSNORM: ("flashinfer", "torch"),
     CAP_FUSED_ADD_RMSNORM: ("flashinfer",),
@@ -35,13 +34,18 @@ DEFAULT_CAPABILITY_ORDER: dict[str, tuple[str, ...]] = {
     CAP_PREFILL_ATTENTION: ("flash_attn", "torch"),
     CAP_GR_DECODE_ATTENTION: ("gr_decode_atten",),
     CAP_PACKED_GEMM: ("torch", "trtllm", "cutlass_triton"),
-    CAP_FUSED_MLP: ("trtllm_aligned", "torch", "sgl_kernel", "trtllm", "cutlass_triton"),
+    CAP_FUSED_MLP: (
+        "trtllm_aligned",
+        "torch",
+        "sgl_kernel",
+        "trtllm",
+        "cutlass_triton",
+    ),
     CAP_SAMPLING_TOPK: ("flashinfer", "torch"),
 }
 
 TORCH_ONLY_CAPABILITY_ORDER: dict[str, tuple[str, ...]] = {
-    capability: ("torch",)
-    for capability in DEFAULT_CAPABILITY_ORDER
+    capability: ("torch",) for capability in DEFAULT_CAPABILITY_ORDER
 }
 TORCH_ONLY_CAPABILITY_ORDER[CAP_GR_DECODE_ATTENTION] = ("gr_decode_atten",)
 

@@ -35,7 +35,9 @@ def scheduled_widths(
     decode_steps: int,
     fractions: str,
 ) -> dict[int, int]:
-    parsed_fractions = [float(part.strip()) for part in fractions.split(",") if part.strip()]
+    parsed_fractions = [
+        float(part.strip()) for part in fractions.split(",") if part.strip()
+    ]
     if not parsed_fractions:
         raise ValueError("expected at least one scheduled beam fraction")
     if parsed_fractions[0] != 1.0:
@@ -206,7 +208,9 @@ def main() -> None:
     )
     parser.add_argument("--decode-backend", choices=["fake", "real"], default="real")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cuda")
-    parser.add_argument("--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob")
+    parser.add_argument(
+        "--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob"
+    )
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument(
         "--arrival-stagger-ticks",
@@ -221,7 +225,9 @@ def main() -> None:
         help="With staggered arrivals, submit this many requests per arrival tick",
     )
     parser.add_argument("--profile-continuous-decode", action="store_true")
-    parser.add_argument("--profile-detail", choices=["coarse", "fine"], default="coarse")
+    parser.add_argument(
+        "--profile-detail", choices=["coarse", "fine"], default="coarse"
+    )
     parser.add_argument("--beam-kv-pool-capacity", type=int, default=0)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)

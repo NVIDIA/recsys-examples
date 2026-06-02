@@ -23,4 +23,3 @@ class ServingMetrics:
 
     def to_metadata(self) -> dict[str, float]:
         return dict(self.values_ms)
-

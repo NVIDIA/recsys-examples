@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 import os
+from contextlib import nullcontext
 from typing import Any
 
 from gr_inference.gr_kernels.prefill import PrefillAttention
@@ -129,14 +129,10 @@ if nn is not None:
                 raise IndexError(f"prefill layer_idx out of range: {layer_idx}")
             layer = self.layers[layer_idx]
             next_layer = (
-                self.layers[layer_idx + 1]
-                if layer_idx + 1 < len(self.layers)
-                else None
+                self.layers[layer_idx + 1] if layer_idx + 1 < len(self.layers) else None
             )
             next_input_norm = (
-                next_layer.ops.input_layernorm
-                if next_layer is not None
-                else None
+                next_layer.ops.input_layernorm if next_layer is not None else None
             )
             return layer.forward_prefill(
                 hidden_states,
@@ -161,9 +157,7 @@ if nn is not None:
                 hidden_states = self.norm(hidden_states)
             with _timed(timing_recorder, "prefill.lm_head"):
                 logits_input = (
-                    hidden_states[:, -1, :]
-                    if last_token_logits_only
-                    else hidden_states
+                    hidden_states[:, -1, :] if last_token_logits_only else hidden_states
                 )
                 logits = _linear_project(self.lm_head, logits_input)
             return PrefillResult(
@@ -361,18 +355,30 @@ if nn is not None:
                 initial_item_mask=initial_item_mask,
             )
 
-        def load_logical_weights(self, weights: dict[str, Any], *, strict: bool = True) -> None:
+        def load_logical_weights(
+            self, weights: dict[str, Any], *, strict: bool = True
+        ) -> None:
             """Load model-level logical tensors produced by Qwen3HFAdapter."""
 
-            self._copy_tensor(self.embed_tokens.weight, weights, "embed_tokens.weight", strict=strict)
-            self._copy_tensor(self.norm.weight, weights, "final_norm.weight", strict=strict)
+            self._copy_tensor(
+                self.embed_tokens.weight, weights, "embed_tokens.weight", strict=strict
+            )
+            self._copy_tensor(
+                self.norm.weight, weights, "final_norm.weight", strict=strict
+            )
             if not self.config.tie_word_embeddings:
-                self._copy_tensor(self.lm_head.weight, weights, "lm_head.weight", strict=strict)
+                self._copy_tensor(
+                    self.lm_head.weight, weights, "lm_head.weight", strict=strict
+                )
             for layer_idx, layer in enumerate(self.layers):
-                layer.ops.load_logical_weights(weights, layer_idx=layer_idx, strict=strict)
+                layer.ops.load_logical_weights(
+                    weights, layer_idx=layer_idx, strict=strict
+                )
 
         @staticmethod
-        def _copy_tensor(param, weights: dict[str, Any], name: str, *, strict: bool) -> None:
+        def _copy_tensor(
+            param, weights: dict[str, Any], name: str, *, strict: bool
+        ) -> None:
             if name not in weights:
                 if strict:
                     raise KeyError(f"missing logical tensor: {name}")
@@ -385,7 +391,6 @@ if nn is not None:
                 )
             with torch.no_grad():
                 param.copy_(tensor.to(device=param.device, dtype=param.dtype))
-
 
 else:
 

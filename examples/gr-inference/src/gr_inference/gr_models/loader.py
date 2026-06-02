@@ -82,7 +82,9 @@ class CheckpointLoadPlan:
     def validate(self, manifest: CheckpointManifest) -> None:
         manifest.require(self.source_names(required_only=True))
 
-    def grouped_by_file(self, manifest: CheckpointManifest) -> dict[str, tuple[str, ...]]:
+    def grouped_by_file(
+        self, manifest: CheckpointManifest
+    ) -> dict[str, tuple[str, ...]]:
         """Group required source tensor names by checkpoint file.
 
         This is the hook for SGLang/vLLM-style streaming, buffering, and
@@ -149,7 +151,9 @@ def concat_tensors(tensors: list[Any], *, dim: int) -> Any:
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("concat transform requires torch or a concat-capable fake tensor") from exc
+        raise RuntimeError(
+            "concat transform requires torch or a concat-capable fake tensor"
+        ) from exc
     return torch.cat(tensors, dim=dim)
 
 

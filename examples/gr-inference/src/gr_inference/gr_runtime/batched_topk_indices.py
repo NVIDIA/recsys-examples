@@ -64,13 +64,17 @@ def make_batched_topk_indices(
         dtype=torch.int32,
         device=device,
     ).view(path.batch_size, decode_nums, beam_width)
-    return pattern.view(path.batch_size, 1, 1, decode_nums, beam_width).expand(
-        path.batch_size,
-        1,
-        num_q_heads,
-        decode_nums,
-        beam_width,
-    ).contiguous()
+    return (
+        pattern.view(path.batch_size, 1, 1, decode_nums, beam_width)
+        .expand(
+            path.batch_size,
+            1,
+            num_q_heads,
+            decode_nums,
+            beam_width,
+        )
+        .contiguous()
+    )
 
 
 def make_compacted_batched_topk_indices(
@@ -105,13 +109,17 @@ def make_compacted_batched_topk_indices(
         beam_width,
     )
     pattern = step_offsets + beam_offsets
-    return pattern.view(1, 1, 1, decode_nums, beam_width).expand(
-        batch_size,
-        1,
-        num_q_heads,
-        decode_nums,
-        beam_width,
-    ).contiguous()
+    return (
+        pattern.view(1, 1, 1, decode_nums, beam_width)
+        .expand(
+            batch_size,
+            1,
+            num_q_heads,
+            decode_nums,
+            beam_width,
+        )
+        .contiguous()
+    )
 
 
 def _make_initial_topk_indices(
@@ -127,13 +135,17 @@ def _make_initial_topk_indices(
         device_type=_device_type(device),
         device_index=_device_index(device),
     )
-    return pattern.view(1, 1, 1, 1, beam_width).expand(
-        batch_size,
-        1,
-        num_q_heads,
-        1,
-        beam_width,
-    ).contiguous()
+    return (
+        pattern.view(1, 1, 1, 1, beam_width)
+        .expand(
+            batch_size,
+            1,
+            num_q_heads,
+            1,
+            beam_width,
+        )
+        .contiguous()
+    )
 
 
 @lru_cache(maxsize=128)

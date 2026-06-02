@@ -2,7 +2,6 @@ import importlib.util
 from types import SimpleNamespace
 
 import pytest
-
 from gr_inference.gr_scheduler import ScheduledBeamPolicy
 from gr_inference.gr_serving import (
     GRContinuousBatchingPolicy,
@@ -66,7 +65,9 @@ def serving_engine(model=None, decode_engine=None, **config_overrides):
     )
 
 
-def context_kv(torch, context_len: int, *, batch: int = 1, heads: int = 1, head_dim: int = 4):
+def context_kv(
+    torch, context_len: int, *, batch: int = 1, heads: int = 1, head_dim: int = 4
+):
     from gr_inference.gr_kv import ContextKV
 
     return ContextKV(
@@ -116,10 +117,14 @@ def counting_prefill_model(torch):
         def forward_prefill(self, input_ids, **_kwargs):
             self.calls += 1
             batch, context_len = input_ids.shape
-            logits = torch.arange(16, dtype=torch.float32).view(1, 1, 16).repeat(
-                batch,
-                1,
-                1,
+            logits = (
+                torch.arange(16, dtype=torch.float32)
+                .view(1, 1, 16)
+                .repeat(
+                    batch,
+                    1,
+                    1,
+                )
             )
             return PrefillResult(
                 logits=logits,
@@ -129,7 +134,9 @@ def counting_prefill_model(torch):
     return Model()
 
 
-def run_prefill_cache_requests(torch, engine, *, max_prefill_cache_entries=None) -> None:
+def run_prefill_cache_requests(
+    torch, engine, *, max_prefill_cache_entries=None
+) -> None:
     executor_kwargs = {}
     if max_prefill_cache_entries is not None:
         executor_kwargs["max_prefill_cache_entries"] = max_prefill_cache_entries
@@ -228,7 +235,9 @@ def test_continuous_executor_caches_batched_prefill(monkeypatch) -> None:
         calls += 1
         return original(generations)
 
-    monkeypatch.setattr(continuous, "_make_batched_prefill", wrapped_make_batched_prefill)
+    monkeypatch.setattr(
+        continuous, "_make_batched_prefill", wrapped_make_batched_prefill
+    )
     executor = GRContinuousServingExecutor(engine=object())
     generations = tuple(
         GRGenerationState.from_prefill(
@@ -282,7 +291,10 @@ def test_continuous_executor_prefill_cache_storage_limits(
     )
 
     assert model.calls == expected_calls
-    assert len(engine._continuous_decode_template_caches["prefill_cache"]) == expected_entries
+    assert (
+        len(engine._continuous_decode_template_caches["prefill_cache"])
+        == expected_entries
+    )
 
 
 def test_prompt_prefix_cache_matches_divergent_prefix() -> None:
@@ -341,7 +353,10 @@ def test_prompt_prefix_cache_page_aligns_partial_matches() -> None:
 def test_continuous_executor_extends_cached_prefix_prefill() -> None:
     torch = torch_or_skip()
 
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
 
     torch.manual_seed(7)
@@ -437,9 +452,15 @@ def test_continuous_executor_extends_cached_prefix_prefill() -> None:
     assert prefill_calls == 1
     assert extend_calls == 1
     assert decode_calls == 0
-    assert torch.allclose(cached.logits.squeeze(1), reference.logits, atol=2e-5, rtol=2e-5)
-    assert torch.allclose(cached.context_kv.key, reference.context_kv.key, atol=2e-5, rtol=2e-5)
-    assert torch.allclose(cached.context_kv.value, reference.context_kv.value, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(
+        cached.logits.squeeze(1), reference.logits, atol=2e-5, rtol=2e-5
+    )
+    assert torch.allclose(
+        cached.context_kv.key, reference.context_kv.key, atol=2e-5, rtol=2e-5
+    )
+    assert torch.allclose(
+        cached.context_kv.value, reference.context_kv.value, atol=2e-5, rtol=2e-5
+    )
 
 
 def test_continuous_executor_caches_topk_indices(monkeypatch) -> None:
@@ -719,7 +740,10 @@ def test_continuous_scheduler_groups_dynamic_beam_by_current_and_next_width() ->
     )
 
     first = scheduler.tick()
-    assert [(batch.beam_width, batch.next_beam_width, batch.request_ids) for batch in first.decode_batches] == [
+    assert [
+        (batch.beam_width, batch.next_beam_width, batch.request_ids)
+        for batch in first.decode_batches
+    ] == [
         (4, 2, ("req-0",)),
         (4, 3, ("req-1",)),
     ]
@@ -735,7 +759,10 @@ def test_continuous_scheduler_groups_dynamic_beam_by_current_and_next_width() ->
     )
 
     second = scheduler.tick()
-    assert [(batch.beam_width, batch.next_beam_width, batch.request_ids) for batch in second.decode_batches] == [
+    assert [
+        (batch.beam_width, batch.next_beam_width, batch.request_ids)
+        for batch in second.decode_batches
+    ] == [
         (2, 2, ("req-0",)),
         (3, 3, ("req-1",)),
     ]
@@ -766,7 +793,9 @@ def test_continuous_scheduler_respects_memory_budget() -> None:
 
 def test_memory_budget_counts_context_tokens_and_beam_slots() -> None:
     budget = GRMemoryBudget(max_context_tokens=12, max_beam_slots=8)
-    state = scheduler_state(make_request(0, decode_steps=2, beam_width=2, context_len=8))
+    state = scheduler_state(
+        make_request(0, decode_steps=2, beam_width=2, context_len=8)
+    )
 
     assert budget.can_admit((state,), make_request(1, context_len=4))
     assert not budget.can_admit((state,), make_request(2, context_len=5))
@@ -803,7 +832,9 @@ def test_gr_kv_memory_estimator_quantifies_shared_context_savings() -> None:
 
 
 def test_kv_lease_allocator_tracks_usage_and_release() -> None:
-    allocator = GRKVLeaseAllocator(max_running_requests=2, max_context_tokens=12, max_beam_slots=8)
+    allocator = GRKVLeaseAllocator(
+        max_running_requests=2, max_context_tokens=12, max_beam_slots=8
+    )
 
     lease = allocator.allocate(request_id="req-0", context_tokens=8, beam_slots=4)
 
@@ -818,7 +849,9 @@ def test_kv_lease_allocator_tracks_usage_and_release() -> None:
         "beam_slots": 4,
     }
     assert allocator.can_allocate(request_id="req-1", context_tokens=4, beam_slots=4)
-    assert not allocator.can_allocate(request_id="req-2", context_tokens=5, beam_slots=1)
+    assert not allocator.can_allocate(
+        request_id="req-2", context_tokens=5, beam_slots=1
+    )
     status = allocator.status()
     assert status["available_running_requests"] == 1
     assert status["available_context_tokens"] == 4
@@ -862,7 +895,9 @@ def test_paged_kv_lease_allocator_assigns_and_reuses_pages() -> None:
     assert allocator.status()["context_page_utilization"] == 2 / 3
     assert allocator.status()["beam_page_utilization"] == 0.5
 
-    assert not allocator.can_allocate(request_id="req-1", context_tokens=8, beam_slots=2)
+    assert not allocator.can_allocate(
+        request_id="req-1", context_tokens=8, beam_slots=2
+    )
     assert allocator.release("req-0") is lease
     assert allocator.status()["free_context_pages"] == 3
 
@@ -1255,7 +1290,10 @@ def test_continuous_serving_executor_runs_model_steps() -> None:
     torch = torch_or_skip()
 
     from gr_inference.gr_kernels.attention import GRDecodeAttention
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
     from gr_inference.gr_runtime import (
         GRDecodeEngine,
@@ -1345,7 +1383,10 @@ def test_continuous_serving_executor_runs_model_steps() -> None:
 
     assert len(responses) == 2
     assert all(len(response.token_ids) == 2 for response in responses)
-    assert all(response.metadata["continuous_execution"] == "model_step" for response in responses)
+    assert all(
+        response.metadata["continuous_execution"] == "model_step"
+        for response in responses
+    )
     assert all(response.metadata["prefill_ms"] >= 0.0 for response in responses)
     assert all(response.metadata["decode_ms"] >= 0.0 for response in responses)
     assert all(response.metadata["total_ms"] >= 0.0 for response in responses)
@@ -1358,10 +1399,16 @@ def test_continuous_serving_executor_runs_model_steps() -> None:
         state.generation is None and state.token_logprob_steps is None
         for state in executor.scheduler.states.values()
     )
-    assert all(state.request.input_ids is None for state in executor.scheduler.states.values())
-    assert all(state.beam_kv_pool_lease is None for state in executor.scheduler.states.values())
+    assert all(
+        state.request.input_ids is None for state in executor.scheduler.states.values()
+    )
+    assert all(
+        state.beam_kv_pool_lease is None for state in executor.scheduler.states.values()
+    )
     assert executor.status()["beam_kv_pool"]["beam_kv_pool_max_used"] == 2
-    assert executor.status()["beam_kv_pool_health"]["beam_kv_pool_leak_detected"] is False
+    assert (
+        executor.status()["beam_kv_pool_health"]["beam_kv_pool_leak_detected"] is False
+    )
     assert executor.metrics()["beam_kv_pool_max_used"] == 2
     assert executor.metrics()["beam_kv_pool_health_beam_kv_pool_leak_detected"] == 0
     profile = executor.timing_recorder.summary()
@@ -1372,12 +1419,16 @@ def test_continuous_serving_executor_runs_model_steps() -> None:
     assert len(responses[0].metadata["beam_details"]) == 2
     assert len(responses[0].metadata["beam_details"][0]["token_ids"]) == 2
     assert len(responses[0].metadata["beam_details"][0]["token_logprobs"]) == 2
-    assert responses[0].metadata["beam_details"][0]["logprob_type"] == "token_logsoftmax"
+    assert (
+        responses[0].metadata["beam_details"][0]["logprob_type"] == "token_logsoftmax"
+    )
     assert responses[0].metadata["beam_details"][0]["score_type"] == (
         "beam_score_logprob_cumulative"
     )
     assert len(responses[0].metadata["item_results"]) == 2
-    assert all(result["is_complete"] for result in responses[0].metadata["item_results"])
+    assert all(
+        result["is_complete"] for result in responses[0].metadata["item_results"]
+    )
     assert {result["item_id"] for result in responses[0].metadata["item_results"]} == {
         "item-a",
         "item-b",
@@ -1553,7 +1604,9 @@ def test_continuous_executor_decode_cuda_graph_pads_to_bucket_with_pool_views() 
     assert graph_inputs.generation.prefill.context_kv.batch_size == 4
     assert graph_inputs.generation.beam_kv.batch_size == 4
     assert torch.equal(graph_inputs.beam_token_ids[:3], beam_token_ids)
-    assert torch.equal(graph_inputs.beam_token_ids[3:], torch.zeros(1, 2, dtype=torch.long))
+    assert torch.equal(
+        graph_inputs.beam_token_ids[3:], torch.zeros(1, 2, dtype=torch.long)
+    )
     assert torch.equal(graph_inputs.topk_indices[:3], topk_indices)
     assert executor.decode_cuda_graph_padding_applied == 1
     assert executor.decode_cuda_graph_padding_buffer_misses == 2
@@ -1606,7 +1659,10 @@ def test_continuous_executor_decode_cuda_graph_skips_dynamic_pool_gaps() -> None
             logits=torch.zeros(2, 1, 8),
             context_kv=ContextKV(
                 torch.cat(
-                    (context_leases[0].context_kv.key, context_leases[2].context_kv.key),
+                    (
+                        context_leases[0].context_kv.key,
+                        context_leases[2].context_kv.key,
+                    ),
                     dim=1,
                 ),
                 torch.cat(
@@ -1664,7 +1720,9 @@ def test_decode_cuda_graph_runner_store_limits(
     from gr_inference.gr_serving.decode_cuda_graph import GRDecodeCudaGraphRunner
 
     monkeypatch.setenv("GR_INFERENCE_DECODE_CUDA_GRAPH_MAX_ENTRIES", max_entries)
-    runner = GRDecodeCudaGraphRunner(model=SimpleNamespace(), decode_engine=SimpleNamespace())
+    runner = GRDecodeCudaGraphRunner(
+        model=SimpleNamespace(), decode_engine=SimpleNamespace()
+    )
 
     runner._store_graph(("first",), SimpleNamespace())
     runner._store_graph(("second",), SimpleNamespace())
@@ -1750,7 +1808,9 @@ def test_decode_cuda_graph_key_distinguishes_pool_views() -> None:
 def test_decode_cuda_graph_runner_records_fallback_reason() -> None:
     from gr_inference.gr_serving.decode_cuda_graph import GRDecodeCudaGraphRunner
 
-    runner = GRDecodeCudaGraphRunner(model=SimpleNamespace(), decode_engine=SimpleNamespace())
+    runner = GRDecodeCudaGraphRunner(
+        model=SimpleNamespace(), decode_engine=SimpleNamespace()
+    )
     generation = SimpleNamespace()
 
     logits = runner.forward_decode_step(

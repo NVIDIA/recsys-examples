@@ -109,7 +109,9 @@ def iter_jsonl(
     limit: int | None = None,
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     rows_read = 0
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_no, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         if not line.strip():
             continue
         row = json.loads(line)

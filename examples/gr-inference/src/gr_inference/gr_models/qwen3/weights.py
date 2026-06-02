@@ -226,7 +226,9 @@ class Qwen3HFAdapter:
         return CheckpointLoadPlan(tuple(requests))
 
 
-def materialize_qwen3_checkpoint(model_dir: str, *, pack_qkv: bool = True, pack_gate_up: bool = True):
+def materialize_qwen3_checkpoint(
+    model_dir: str, *, pack_qkv: bool = True, pack_gate_up: bool = True
+):
     """Load and materialize a Qwen3 HF checkpoint into logical GR tensors.
 
     This is the high-level bridge from HF checkpoint layout to the logical names

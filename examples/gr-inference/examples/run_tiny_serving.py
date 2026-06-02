@@ -109,7 +109,9 @@ def main() -> None:
     parser.add_argument("--max-batch-size", type=int, default=1)
     parser.add_argument("--batched-decode", action="store_true")
     parser.add_argument("--return-beam-details", action="store_true")
-    parser.add_argument("--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob")
+    parser.add_argument(
+        "--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob"
+    )
     args = parser.parse_args()
 
     summary = run_demo(args)
@@ -121,4 +123,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

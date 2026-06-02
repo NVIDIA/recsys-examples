@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
-import sqlite3
-import sys
 from typing import Any, Iterable
 
 from tool_utils import bootstrap_repo_paths, write_json
 
 bootstrap_repo_paths(__file__, include_tools=True)
 import analyze_nsys_gr_sglang as nsys  # noqa: E402
-
 
 NS_PER_MS = 1_000_000.0
 
@@ -91,7 +89,9 @@ def analyze_trace(path: Path, *, framework: str) -> dict[str, Any]:
         "stage_summaries": stages,
         "decode_kernel_categories_ms": decode_kernel_categories,
         "decode_top_non_attention_kernels": decode_top_non_attention,
-        "top_runtime_calls_overall": _top_runtime_calls(runtime, windows.get("overall") or []),
+        "top_runtime_calls_overall": _top_runtime_calls(
+            runtime, windows.get("overall") or []
+        ),
         "nvtx_ranges": _top_nvtx(nvtx, windows.get("overall") or []),
     }
     if framework == "sglang":
@@ -316,15 +316,21 @@ def _event_overlap_ns(event: dict[str, Any], windows: list[tuple[int, int]]) -> 
     return total
 
 
-def _sum_overlap_ms(events: Iterable[dict[str, Any]], windows: list[tuple[int, int]]) -> float:
+def _sum_overlap_ms(
+    events: Iterable[dict[str, Any]], windows: list[tuple[int, int]]
+) -> float:
     return sum(_event_overlap_ns(event, windows) for event in events) / NS_PER_MS
 
 
-def _count_overlapping(events: Iterable[dict[str, Any]], windows: list[tuple[int, int]]) -> int:
+def _count_overlapping(
+    events: Iterable[dict[str, Any]], windows: list[tuple[int, int]]
+) -> int:
     return sum(1 for event in events if _event_overlap_ns(event, windows) > 0)
 
 
-def _union_ms(events: Iterable[dict[str, Any]], windows: list[tuple[int, int]]) -> float:
+def _union_ms(
+    events: Iterable[dict[str, Any]], windows: list[tuple[int, int]]
+) -> float:
     intervals = []
     for event in events:
         for window_start, window_end in nsys._merge_windows(windows):
@@ -533,7 +539,9 @@ def _sglang_decode_tail_summary(
     }
 
 
-def _serialize_windows(windows: dict[str, list[tuple[int, int]]]) -> dict[str, list[list[int]]]:
+def _serialize_windows(
+    windows: dict[str, list[tuple[int, int]]]
+) -> dict[str, list[list[int]]]:
     return {
         key: [[start, end] for start, end in value]
         for key, value in sorted(windows.items())
@@ -572,7 +580,9 @@ def _decode_category_rows(traces: dict[str, dict[str, Any]]) -> list[dict[str, A
         rows.append(
             {
                 "category": category,
-                "gr_fixed_256_ms": traces["gr_fixed_256"]["decode_kernel_categories_ms"].get(category, 0.0),
+                "gr_fixed_256_ms": traces["gr_fixed_256"][
+                    "decode_kernel_categories_ms"
+                ].get(category, 0.0),
                 "gr_dynamic_64_128_256_ms": traces["gr_dynamic_64_128_256"][
                     "decode_kernel_categories_ms"
                 ].get(category, 0.0),

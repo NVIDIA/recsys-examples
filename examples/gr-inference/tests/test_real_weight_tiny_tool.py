@@ -1,8 +1,8 @@
 import importlib.util
 import json
 import sys
-from pathlib import Path
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -87,11 +87,18 @@ class FakeSoakClient:
         if method == "GET" and path == "/kv/events":
             return _http_result(200, {"events": [{"type": "allocate"}], "count": 1})
         if method == "GET" and path == "/ready":
-            return _http_result(200, {"ready": True, "reasons": [], "admission": {"queue_full": False}})
+            return _http_result(
+                200, {"ready": True, "reasons": [], "admission": {"queue_full": False}}
+            )
         if method == "POST" and path == "/submit_many":
             request_ids = [row["request_id"] for row in payload["requests"]]
-            if any(request_id.endswith(self.overload_suffixes) for request_id in request_ids):
-                return _http_result(429, {"error": {"code": "overloaded", "message": "full"}})
+            if any(
+                request_id.endswith(self.overload_suffixes)
+                for request_id in request_ids
+            ):
+                return _http_result(
+                    429, {"error": {"code": "overloaded", "message": "full"}}
+                )
             self.submitted.extend(request_ids)
             return _http_result(202, {"request_ids": request_ids})
         if method == "POST" and path == "/submit":
@@ -248,8 +255,9 @@ def test_real_weight_serving_real_backend_requires_batched_decode() -> None:
         )
 
 
-def test_real_weight_serving_real_backend_allows_single_request_batch(monkeypatch) -> None:
-
+def test_real_weight_serving_real_backend_allows_single_request_batch(
+    monkeypatch,
+) -> None:
     class FakeExistingBackend:
         def __init__(self):
             pass
@@ -460,7 +468,10 @@ def test_real_weight_serving_writes_verbose_beam_path_json(tmp_path) -> None:
     _write_summary_json({"first_metadata": {"_beam_path": beam_path}}, str(output_json))
 
     payload = json.loads(output_json.read_text(encoding="utf-8"))
-    assert payload["first_metadata"]["_beam_path"]["entries"][0]["token_ids"] == [311, 389]
+    assert payload["first_metadata"]["_beam_path"]["entries"][0]["token_ids"] == [
+        311,
+        389,
+    ]
 
 
 def test_compare_gr_sglang_beam_reports_gr_output_token_budget() -> None:
@@ -809,7 +820,9 @@ def test_http_serving_online_warmup_cases_can_use_legacy_batch_shapes() -> None:
     )
 
 
-def test_http_serving_online_warmup_prefills_blockers_before_targets(monkeypatch) -> None:
+def test_http_serving_online_warmup_prefills_blockers_before_targets(
+    monkeypatch,
+) -> None:
     torch = torch_or_skip()
     import serve_qwen3_gr_http
 
@@ -1182,7 +1195,9 @@ def test_http_soak_summary_tool_reports_pass_and_failures(tmp_path) -> None:
     assert report["passed"] is True
     assert report["request_prefix"] == "soak"
     assert report["beam_pool_max_used"] == 2
-    assert report["response_diagnostics"]["stop_reason_counts"] == {"max_decode_steps": 3}
+    assert report["response_diagnostics"]["stop_reason_counts"] == {
+        "max_decode_steps": 3
+    }
     assert failed["passed"] is False
     assert "accepted=3 requested=4" in failed["failures"]
     assert "failed=1" in failed["failures"]
@@ -1201,7 +1216,12 @@ def test_http_soak_summary_tool_cli_writes_json(tmp_path) -> None:
                 "completed": 1,
                 "pending": [],
                 "overload_errors": 0,
-                "outcomes": {"succeeded": 1, "cancelled": 0, "failed": 0, "timed_out": 0},
+                "outcomes": {
+                    "succeeded": 1,
+                    "cancelled": 0,
+                    "failed": 0,
+                    "timed_out": 0,
+                },
                 "metrics": {
                     "kv_health_kv_allocator_leak_detected": 0,
                     "beam_kv_pool_health_beam_kv_pool_leak_detected": 0,
@@ -1303,7 +1323,9 @@ def test_serving_profile_summary_tool_cli_writes_json(tmp_path) -> None:
 
 
 def test_http_serving_launcher_exposes_production_env_knobs() -> None:
-    launcher = Path(__file__).resolve().parents[1] / "scripts" / "serve_qwen3_gr_http.sh"
+    launcher = (
+        Path(__file__).resolve().parents[1] / "scripts" / "serve_qwen3_gr_http.sh"
+    )
 
     text = launcher.read_text(encoding="utf-8")
 

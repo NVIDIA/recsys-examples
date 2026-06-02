@@ -8,8 +8,10 @@ def test_qwen3_model_prefill_writes_all_context_kv_layers() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
 
     config = Qwen3GRConfig(
@@ -52,7 +54,6 @@ def test_qwen3_rope_matches_hf_half_split_layout() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_models.qwen3.layers import apply_qwen3_rope
 
     q = torch.arange(1 * 3 * 1 * 8, dtype=torch.float32).reshape(1, 3, 1, 8)
@@ -62,9 +63,7 @@ def test_qwen3_rope_matches_hf_half_split_layout() -> None:
     q_rope, k_rope = apply_qwen3_rope(q, k, rope_theta=theta)
 
     def expected_rope(x):
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
         positions = torch.arange(3, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
         cos = freqs.cos()[None, :, None, :]
@@ -84,7 +83,10 @@ def test_qwen3_model_allocate_context_kv_validates_context_len() -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
 
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
 
     config = Qwen3GRConfig(
@@ -115,9 +117,11 @@ def test_qwen3_model_decode_step_writes_beam_kv_and_returns_logits() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kernels.attention import GRDecodeAttention
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
     from gr_inference.gr_runtime import GRDecodeEngine, GRGenerationState
 
@@ -174,9 +178,11 @@ def test_qwen3_model_generate_fixed_beam_two_steps() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kernels.attention import GRDecodeAttention
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
     from gr_inference.gr_runtime import GRDecodeEngine, GRGenerationState
 
@@ -230,9 +236,11 @@ def test_qwen3_model_generate_fixed_beam_with_trie_constraints() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
     from gr_inference.gr_kernels.attention import GRDecodeAttention
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
     from gr_inference.gr_runtime import (
         GRDecodeEngine,
@@ -292,8 +300,10 @@ def test_qwen3_model_loads_logical_weights() -> None:
         pytest.skip("torch is not installed")
 
     import torch
-
-    from gr_inference.gr_kernels.prefill import PrefillAttention, TorchSDPAPrefillBackend
+    from gr_inference.gr_kernels.prefill import (
+        PrefillAttention,
+        TorchSDPAPrefillBackend,
+    )
     from gr_inference.gr_models.qwen3 import Qwen3GRConfig, Qwen3GRModel
 
     config = Qwen3GRConfig(

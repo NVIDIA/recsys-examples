@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -14,31 +13,21 @@ from tool_utils import bootstrap_repo_paths
 bootstrap_repo_paths(__file__)
 
 from gr_inference import (  # noqa: E402
-    GRDecodeAttention,
     GRContinuousBatchingPolicy,
     GRContinuousScheduler,
     GRContinuousServingExecutor,
-    GRDenseContextKVPool,
-    GRDenseBeamKVPool,
+    GRDecodeAttention,
     GRDecodeEngine,
+    GRDenseBeamKVPool,
+    GRDenseContextKVPool,
     GRServingConfig,
     GRServingEngine,
     GRServingRequest,
     PrefillAttention,
-    SchedulerPolicy,
     ScheduledBeamPolicy,
+    SchedulerPolicy,
     SyncGRScheduler,
     TokenSuppressLogitsProcessor,
-)
-from gr_inference.gr_serving.cli import parse_unique_int_list  # noqa: E402
-from gr_inference.gr_serving.beam_metadata import (  # noqa: E402
-    normalized_beam_results_from_metadata,
-)
-from gr_inference.gr_kernels.prefill import (  # noqa: E402
-    AutoPrefillBackend,
-    FlashAttentionPrefillBackend,
-    SGLangFlashAttentionPrefillBackend,
-    TorchSDPAPrefillBackend,
 )
 from gr_inference.gr_kernels import (  # noqa: E402
     CAP_FUSED_MLP,
@@ -51,7 +40,15 @@ from gr_inference.gr_kernels import (  # noqa: E402
     build_default_kernel_registry,
     default_kernel_selection_policy,
 )
-from gr_inference.gr_kernels.attention import ExistingGRDecodeAttentionBackend  # noqa: E402
+from gr_inference.gr_kernels.attention import (  # noqa: E402
+    ExistingGRDecodeAttentionBackend,
+)
+from gr_inference.gr_kernels.prefill import (  # noqa: E402
+    AutoPrefillBackend,
+    FlashAttentionPrefillBackend,
+    SGLangFlashAttentionPrefillBackend,
+    TorchSDPAPrefillBackend,
+)
 from gr_inference.gr_models import HFCheckpointLoader, resolve_model_dir  # noqa: E402
 from gr_inference.gr_models.qwen3 import (  # noqa: E402
     DEFAULT_QWEN3_MODEL_ID,
@@ -62,11 +59,17 @@ from gr_inference.gr_models.qwen3 import (  # noqa: E402
     reset_flashinfer_call_counts,
 )
 from gr_inference.gr_runtime import TimingRecorder  # noqa: E402
-from tool_utils import iter_jsonl, numeric_median as _median, write_json  # noqa: E402
+from gr_inference.gr_serving.beam_metadata import (  # noqa: E402
+    normalized_beam_results_from_metadata,
+)
+from gr_inference.gr_serving.cli import parse_unique_int_list  # noqa: E402
+from tool_utils import iter_jsonl
+from tool_utils import numeric_median as _median  # noqa: E402
+from tool_utils import write_json
 
 try:  # noqa: E402
+    from gr_inference_trtllm_kernels import call_counts as gr_trtllm_call_counts
     from gr_inference_trtllm_kernels import (
-        call_counts as gr_trtllm_call_counts,
         reset_call_counts as reset_gr_trtllm_call_counts,
     )
 except Exception:  # pragma: no cover - optional kernel package
@@ -139,9 +142,7 @@ def make_decode_backend(args, device: str):
     if device != "cuda":
         raise RuntimeError("--decode-backend real requires CUDA")
     if not args.batched_decode:
-        raise RuntimeError(
-            "--decode-backend real currently requires --batched-decode"
-        )
+        raise RuntimeError("--decode-backend real currently requires --batched-decode")
     return ExistingGRDecodeAttentionBackend()
 
 
@@ -214,7 +215,9 @@ def run_serving(args) -> dict:
         ]
     finally:
         _cuda_profiler_stop(torch, enabled=getattr(args, "cuda_profiler_range", False))
-    primary = measured_runs[-1] if args.verbose_metadata else _compact_run(measured_runs[-1])
+    primary = (
+        measured_runs[-1] if args.verbose_metadata else _compact_run(measured_runs[-1])
+    )
     summary = {
         "decode_backend": args.decode_backend,
         "serving_mode": "continuous" if args.continuous else "sync",
@@ -225,7 +228,9 @@ def run_serving(args) -> dict:
         "arrival_stagger_ticks": arrival_stagger_ticks,
         "arrival_burst_size": arrival_burst_size,
     }
-    summary.update(_metadata_metric_summaries(measured_runs, "prefill_ms", "decode_ms", "total_ms"))
+    summary.update(
+        _metadata_metric_summaries(measured_runs, "prefill_ms", "decode_ms", "total_ms")
+    )
     summary.update(
         _scheduler_metric_summaries(
             measured_runs,
@@ -235,7 +240,11 @@ def run_serving(args) -> dict:
                 ("planned_decode_batches", "planned_decode_batches", 0),
                 ("avg_decode_batch_size", "avg_decode_batch_size", 0.0),
                 ("inflight_admission_ticks", "inflight_admission_ticks", 0),
-                ("inflight_mixed_decode_step_ticks", "inflight_mixed_decode_step_ticks", 0),
+                (
+                    "inflight_mixed_decode_step_ticks",
+                    "inflight_mixed_decode_step_ticks",
+                    0,
+                ),
                 ("inflight_max_decode_batch_size", "inflight_max_decode_batch_size", 0),
             ),
         )
@@ -298,7 +307,9 @@ def _scheduler_metric_summaries(
     return {
         output_key: value
         for output_name, metric_name, default in specs
-        for samples in ([run["scheduler_metrics"].get(metric_name, default) for run in runs],)
+        for samples in (
+            [run["scheduler_metrics"].get(metric_name, default) for run in runs],
+        )
         for output_key, value in (
             (f"{output_name}_samples", samples),
             (f"{output_name}_median", _median(samples)),
@@ -338,7 +349,9 @@ def _run_once(
     )
 
 
-def _run_scheduler_once(args, torch, config, device: str, engine, *, request_prefix: str) -> dict:
+def _run_scheduler_once(
+    args, torch, config, device: str, engine, *, request_prefix: str
+) -> dict:
     scheduler = SyncGRScheduler(
         engine,
         policy=SchedulerPolicy(max_batch_size=args.max_batch_size),
@@ -508,7 +521,9 @@ def _run_continuous_once(
         extra=(
             {
                 "decode_profile": decode_profile,
-                "decode_profile_aggregate": _aggregate_decode_profile(decode_profile or {}),
+                "decode_profile_aggregate": _aggregate_decode_profile(
+                    decode_profile or {}
+                ),
             }
             if decode_profile is not None
             else None
@@ -633,7 +648,9 @@ def _inflight_arrival_metrics(
         if len(decode_steps) > 1:
             mixed_decode_step_ticks += 1
         for batch in decode_batches:
-            max_decode_batch_size = max(max_decode_batch_size, int(batch.get("size", 0)))
+            max_decode_batch_size = max(
+                max_decode_batch_size, int(batch.get("size", 0))
+            )
     return {
         "arrival_stagger_ticks": arrival_stagger_ticks,
         "inflight_submitted_after_start": submitted_after_start,
@@ -672,7 +689,9 @@ def _load_workload_inputs(args, torch, device: str) -> tuple[dict, ...]:
     return tuple(rows)
 
 
-def _request_input_ids(args, torch, config, device: str, workload: tuple[dict, ...], idx: int):
+def _request_input_ids(
+    args, torch, config, device: str, workload: tuple[dict, ...], idx: int
+):
     if workload:
         row = workload[idx]
         return row["input_ids"], row["workload_id"]
@@ -782,9 +801,7 @@ def _parse_beam_schedule(schedule: str) -> dict[int, int]:
         if not entry:
             continue
         if ":" not in entry:
-            raise ValueError(
-                "--beam-schedule entries must be formatted as step:width"
-            )
+            raise ValueError("--beam-schedule entries must be formatted as step:width")
         raw_step, raw_width = entry.split(":", 1)
         try:
             step = int(raw_step.strip())
@@ -850,7 +867,8 @@ def _aggregate_decode_profile(summary: dict) -> dict[str, float]:
             aggregate[output_name] = sum(
                 stats["total_ms"]
                 for name, stats in summary.items()
-                if name == suffix or (name.startswith("layer") and name.endswith(suffix))
+                if name == suffix
+                or (name.startswith("layer") and name.endswith(suffix))
             )
     aggregate["model_forward_decode_step_ms"] = summary.get(
         "model.forward_decode_step",
@@ -963,7 +981,9 @@ def main() -> None:
         default="",
         help="Comma/space separated token IDs to suppress before beam selection",
     )
-    parser.add_argument("--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob")
+    parser.add_argument(
+        "--beam-score-mode", choices=["raw_logits", "logprob"], default="logprob"
+    )
     parser.add_argument("--profile-continuous-decode", action="store_true")
     parser.add_argument(
         "--executor-sync-timing",

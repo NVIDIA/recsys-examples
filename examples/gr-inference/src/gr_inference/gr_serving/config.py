@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-
 BeamScoreMode = Literal["raw_logits", "logprob"]
 
 
@@ -27,4 +26,3 @@ class GRServingConfig:
             raise ValueError("max_beam_width must be positive")
         if self.beam_score_mode not in {"raw_logits", "logprob"}:
             raise ValueError("beam_score_mode must be 'raw_logits' or 'logprob'")
-

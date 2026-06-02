@@ -3,14 +3,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _kernel_extra_block() -> str:
     text = PYPROJECT.read_text(encoding="utf-8")
-    match = re.search(r"^kernels = \[\n(?P<body>.*?)^\]", text, flags=re.MULTILINE | re.DOTALL)
+    match = re.search(
+        r"^kernels = \[\n(?P<body>.*?)^\]", text, flags=re.MULTILINE | re.DOTALL
+    )
     assert match is not None, "pyproject.toml must define the kernels extra"
     return match.group("body")
 

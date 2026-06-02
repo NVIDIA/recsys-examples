@@ -48,7 +48,9 @@ class BatchedBeamSelection:
         return BatchedBeamSelection(
             token_ids=tuple(tuple(int(token) for token in row) for row in token_rows),
             scores=tuple(tuple(float(score) for score in row) for row in score_rows),
-            parent_beams=tuple(tuple(int(parent) for parent in row) for row in parent_rows),
+            parent_beams=tuple(
+                tuple(int(parent) for parent in row) for row in parent_rows
+            ),
             token_ids_tensor=self.token_ids_tensor,
             scores_tensor=self.scores_tensor,
             parent_beams_tensor=self.parent_beams_tensor,
@@ -77,7 +79,9 @@ def select_initial_topk_batched(
     elif logits.dim() == 2:
         scores = logits
     else:
-        raise ValueError(f"logits expects [B, S, V] or [B, V], got {tuple(logits.shape)}")
+        raise ValueError(
+            f"logits expects [B, S, V] or [B, V], got {tuple(logits.shape)}"
+        )
     if beam_width > scores.shape[-1]:
         raise ValueError("beam_width exceeds vocabulary size")
 
@@ -164,9 +168,13 @@ def select_next_topk_batched(
         local_values, local_token_ids = torch.topk(candidate_logits, k=local_k, dim=-1)
 
     if previous_scores_tensor is None:
-        prev = torch.tensor(previous_scores, device=local_values.device, dtype=local_values.dtype)
+        prev = torch.tensor(
+            previous_scores, device=local_values.device, dtype=local_values.dtype
+        )
     else:
-        prev = previous_scores_tensor.to(device=local_values.device, dtype=local_values.dtype)
+        prev = previous_scores_tensor.to(
+            device=local_values.device, dtype=local_values.dtype
+        )
     if tuple(prev.shape) != (batch_size, previous_width):
         raise ValueError(
             f"previous_scores must be shaped {(batch_size, previous_width)}, got {tuple(prev.shape)}"

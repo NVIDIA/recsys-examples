@@ -8,7 +8,11 @@ from tool_utils import bootstrap_repo_paths
 
 bootstrap_repo_paths(__file__)
 
-from gr_inference import PrefillAttention, Qwen3GRModel, TorchSDPAPrefillBackend  # noqa: E402
+from gr_inference import (  # noqa: E402
+    PrefillAttention,
+    Qwen3GRModel,
+    TorchSDPAPrefillBackend,
+)
 from gr_inference.gr_models import HFCheckpointLoader, resolve_model_dir  # noqa: E402
 from gr_inference.gr_models.qwen3 import (  # noqa: E402
     DEFAULT_QWEN3_MODEL_ID,
