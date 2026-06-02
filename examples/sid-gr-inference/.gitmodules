@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[submodule "third_party/gr-decode-attention"]
+	path = third_party/gr-decode-attention
+	url = ../gr-decode-attention.git
