@@ -70,6 +70,7 @@ The examples we supported:
 - [HSTU recommender examples](./examples/hstu/README.md)
 - [HSTU inference](./examples/hstu/inference/README.md) — KV cache, Triton Inference Server, [C++ AOTInductor](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md)
 - [SID based generative recommender examples](./examples/sid_gr/README.md)
+- [GR inference example](./examples/gr-inference/README.md)
 
 # Benchmarks
 - [HSTU inference](./examples/hstu/inference/benchmark/README.md)

@@ -1,0 +1,3 @@
+[submodule "third_party/gr-decode-attention"]
+	path = third_party/gr-decode-attention
+	url = ../gr-decode-attention.git
