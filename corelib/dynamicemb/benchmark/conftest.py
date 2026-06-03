@@ -27,11 +27,11 @@ def pytest_addoption(parser):
         "--profile",
         action="store",
         default=None,
-        choices=["torch", "nsys", "ncu-gen", "ncu-run"],
+        choices=["torch", "nsys", "ncu-gen", "ncu"],
         help=(
             "Profiling mode: 'torch' for torch.profiler, 'nsys' for NVTX only, "
             "'ncu-gen' to print ncu commands without running tests, "
-            "'ncu-run' to run a single-iteration benchmark under ncu."
+            "'ncu' to run a single-iteration benchmark under ncu."
         ),
     )
     parser.addoption(
@@ -43,6 +43,19 @@ def pytest_addoption(parser):
             "config, enabling the forward-only TBE vs DynamicEmb comparison "
             "alongside the normal (profile=none) reporting/timing run. "
             "Configs that already set correctness=True in code are unaffected."
+        ),
+    )
+    parser.addoption(
+        "--num-iterations",
+        action="store",
+        type=int,
+        default=None,
+        help=(
+            "Override BenchmarkConfig.num_iterations on every config (default "
+            "100).  This sets the number of sampled batches, which also bounds "
+            "the warmup/reporting loop and how many iterations each profile "
+            "mode covers -- useful to keep `--profile ncu` tractable, e.g. "
+            "`--profile ncu --num-iterations 3`."
         ),
     )
 
@@ -76,6 +89,12 @@ def profile_mode(request):
 def correctness_flag(request):
     """Session-wide override for BenchmarkConfig.correctness from --correctness."""
     return request.config.getoption("--correctness")
+
+
+@pytest.fixture(scope="session")
+def num_iterations(request):
+    """Session-wide override for BenchmarkConfig.num_iterations (None = keep config default)."""
+    return request.config.getoption("--num-iterations")
 
 
 @pytest.fixture(autouse=True)

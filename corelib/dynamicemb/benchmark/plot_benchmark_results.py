@@ -39,7 +39,7 @@ def parse_mode(label: str) -> str:
 
 
 def filter_timing_entries(results: List[dict]) -> List[dict]:
-    """Skip profile-only entries (ncu_gen / ncu_run / nsys / torch_profile)."""
+    """Skip profile-only entries (ncu_gen / ncu / nsys / torch_profile)."""
     return [r for r in results if "dyn_train_ms" in r]
 
 

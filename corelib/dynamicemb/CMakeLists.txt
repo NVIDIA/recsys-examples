@@ -77,6 +77,8 @@ target_compile_options(inference_emb_ops PRIVATE
     >
     $<$<COMPILE_LANGUAGE:CUDA>:
         -O3
+        # SASS<->source line mapping for ncu (does not disable optimizations).
+        -lineinfo
         --expt-relaxed-constexpr
         --expt-extended-lambda
         --use_fast_math

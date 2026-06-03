@@ -307,7 +307,13 @@ Other profile modes:
 | `torch`           | Runs each backend under `torch.profiler`; exports Chrome trace + bandwidth report. |
 | `nsys`            | NVTX-annotated profile path described above.                          |
 | `ncu-gen`         | Prints the matching `ncu` command for the config and exits.           |
-| `ncu-run`         | Runs a single fwd+bwd inside `cudaProfilerStart/Stop` for `ncu` wrap. |
+| `ncu`             | Warms up via the reporting loop, then profiles every iteration's fwd+bwd inside `cudaProfilerStart/Stop` for `ncu` wrap. |
+
+`--num-iterations N` overrides `BenchmarkConfig.num_iterations` (default 100) on
+every config.  This is the number of sampled batches, so it also bounds the
+warmup/reporting loop and how many iterations each profile mode covers.  Lower
+it to keep `--profile ncu` tractable (ncu replays every matched kernel launch
+with the full metric set), e.g. `--profile ncu --num-iterations 3`.
 
 ### Cache footprint sizing (TestCaching)
 

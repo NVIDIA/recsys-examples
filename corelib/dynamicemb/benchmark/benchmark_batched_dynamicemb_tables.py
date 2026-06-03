@@ -702,7 +702,10 @@ def benchmark_one_iteration(model, sparse_feature):
     start_event.record()
     output = model(sparse_feature.values(), sparse_feature.offsets())
     mid_event.record()
-    grad = torch.empty_like(output)
+    # Deterministic grad: empty_like is uninitialized and NaN/denormals here
+    # would be written into the embedding table by the fused optimizer update,
+    # then carried into the subsequent measured/profiled run.
+    grad = torch.ones_like(output)
     output.backward(grad)
     end_event.record()
 
@@ -769,7 +772,7 @@ def benchmark_with_torch_profiler(
     for i in range(n_warm):
         sf = sparse_features[i]
         output = model(sf.values(), sf.offsets())
-        grad = torch.empty_like(output)
+        grad = torch.ones_like(output)
         output.backward(grad)
     torch.cuda.synchronize()
 
@@ -791,7 +794,7 @@ def benchmark_with_torch_profiler(
             output = model(sf.values(), sf.offsets())
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_push("backward")
-            grad = torch.empty_like(output)
+            grad = torch.ones_like(output)
             output.backward(grad)
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_pop()
@@ -885,7 +888,8 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
         out_dyn = dynamic_emb(sf.values(), sf.offsets())
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("backward")
-        grad_dyn = torch.empty_like(out_dyn)
+        # Deterministic grad (empty_like is uninitialized -> NaN/denormal noise).
+        grad_dyn = torch.ones_like(out_dyn)
         out_dyn.backward(grad_dyn)
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()  # dyn
@@ -895,7 +899,7 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
         out_trc = torchrec_emb(sf.values(), sf.offsets())
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("backward")
-        grad_trc = torch.empty_like(out_trc)
+        grad_trc = torch.ones_like(out_trc)
         out_trc.backward(grad_trc)
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()  # trc
@@ -912,37 +916,44 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
 
 
 def benchmark_with_ncu(model, sparse_features, cfg):
-    """Run a single train iteration for NCU profiling.
+    """Run every iteration's fwd+bwd for NCU profiling.
 
     Meant to be launched externally under ``ncu --profile-from-start off
-    ...``.  The Start/Stop pair gates which launches ncu replays for PMU
-    counters; setup kernels (table create, data gen, segmented_unique,
-    etc.) stay outside the window.
+    ...``.  The cudaProfilerStart/Stop pair gates the capture window so setup
+    kernels (table create, data gen, warmup, etc.) stay outside it.
 
+    Each of ``sparse_features`` is profiled (same coverage as the nsys path).
     ncu is per-kernel-launch (not timeline) so multi-config "Just Works":
     invoking pytest without a ``-k`` filter under one ncu command profiles
-    every config's wrapped iter back-to-back into the same report; the
-    outermost NVTX range ``cfg.label()`` attributes kernels per config.
+    every config's iters back-to-back into the same report.  The outermost
+    NVTX range ``cfg.label()`` attributes kernels per config; the inner
+    ``ncu_iter`` range wraps all iterations so ``--nvtx-include 'ncu_iter/'``
+    excludes any kernel that leaked into the cudaProfiler window.
     """
     model.train()
 
-    sf = sparse_features[0]
     torch.cuda.cudart().cudaProfilerStart()
     torch.cuda.nvtx.range_push(cfg.label())
     torch.cuda.nvtx.range_push("ncu_iter")
-    torch.cuda.nvtx.range_push("forward")
-    output = model(sf.values(), sf.offsets())
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_push("backward")
-    grad = torch.empty_like(output)
-    output.backward(grad)
-    torch.cuda.nvtx.range_pop()
+    for i, sf in enumerate(sparse_features):
+        torch.cuda.nvtx.range_push(f"iter_{i}")
+        torch.cuda.nvtx.range_push("forward")
+        output = model(sf.values(), sf.offsets())
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("backward")
+        # Deterministic grad: empty_like is uninitialized and may hold
+        # NaN/denormals that propagate through reduce_grads -> fused_update and
+        # add FP-counter / timing noise to the profiled kernels.
+        grad = torch.ones_like(output)
+        output.backward(grad)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()  # iter_i
     torch.cuda.nvtx.range_pop()  # ncu_iter
     torch.cuda.nvtx.range_pop()  # cfg.label()
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
-    print("  NCU profiled iteration complete (1 fwd+bwd).")
+    print(f"  NCU profiled {len(sparse_features)} iters (fwd+bwd each).")
 
 
 def print_ncu_command(cfg: BenchmarkConfig):
@@ -971,21 +982,29 @@ def print_ncu_command(cfg: BenchmarkConfig):
     # fragment.
     single_inner = (
         f"bash benchmark/benchmark_batched_dynamicemb_tables.sh"
-        f" --profile ncu-run -k '{label}'"
+        f" --profile ncu -k '{label}'"
     )
     single_out = os.path.join(os.getcwd(), f"ncu_{label}")
     single_cmd = (
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
+        # NVTX range filter as a belt-and-suspenders complement to the
+        # cudaProfilerStart/Stop gate: only kernels under the ``ncu_iter``
+        # range (pushed in benchmark_with_ncu) are profiled, so any setup
+        # kernel that leaked into the cudaProfiler window is still excluded.
+        f" --nvtx --nvtx-include 'ncu_iter/'"
         f" --kernel-name 'regex:{regex}'"
         f" --set full"
+        # Embed CUDA source into the report so the Source page works offline /
+        # on a machine without the sources (requires -lineinfo at build time).
+        f" --import-source=yes"
         f" --csv --page raw"
         f" -o {single_out}"
         f" {single_inner}"
     )
 
     multi_inner = (
-        "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-run"
+        "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu"
     )
     multi_out = os.path.join(os.getcwd(), "ncu_all_configs")
     multi_cmd = (
@@ -993,7 +1012,12 @@ def print_ncu_command(cfg: BenchmarkConfig):
         f" --profile-from-start off"
         f" --kernel-name 'regex:{regex}'"
         f" --set full"
-        f" --nvtx"
+        # --nvtx records ranges so kernels can be attributed per config via the
+        # outermost cfg.label() range; --nvtx-include also *restricts* profiling
+        # to the ncu_iter range (same gate as single-config).
+        f" --nvtx --nvtx-include 'ncu_iter/'"
+        # Embed CUDA source into the report (requires -lineinfo at build time).
+        f" --import-source=yes"
         f" --csv --page raw"
         f" -o {multi_out}"
         f" {multi_inner}"
@@ -1426,6 +1450,25 @@ def run_single_benchmark(
     if cfg.caching:
         dynamic_emb.set_record_cache_metrics(True)
 
+    # Warm up before timing/profiling for every mode except correctness.  The
+    # reporting loop populates the cache (so measured runs see steady-state hit
+    # rate instead of a cold start), warms the caching allocator, and triggers
+    # first-launch autotune / lazy init.  Correctness is excluded because the
+    # loop advances each backend with independent gradients, drifting their
+    # weights apart and breaking the forward-output comparison.
+    #
+    # Profile windows are bounded separately (cudaProfilerStart/Stop inside
+    # benchmark_with_nsys / benchmark_with_ncu, and torch.profiler's own
+    # schedule), so this warmup is never captured.
+    if not cfg.correctness:
+        print("  (run_reporting_loop warmup)")
+        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
+
+    if cfg.caching:
+        # Keep the warm cache contents/counters; only stop *recording* hit-rate
+        # metrics so the measured/profiled run reflects steady state.
+        dynamic_emb.set_record_cache_metrics(False)
+
     bw_results: List[Dict] = []
     if profile_mode == "torch":
         print("\n  >> DynamicEmb profiler run")
@@ -1452,40 +1495,15 @@ def run_single_benchmark(
             result["bandwidth"] = bw_results
         return result
     elif profile_mode == "nsys":
-        # Run reporting loop as untimed warmup (NOT captured by nsys -- the
-        # cudaProfilerStart/Stop window inside benchmark_with_nsys is what
-        # bounds the capture when launched under
-        # `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`).
-        print("  (run_reporting_loop warmup, then nsys sample 1 fwd+bwd)")
-        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
-        # Keep the cache warm from the reporting loop so nsys captures
-        # steady-state kernel behavior (same convention as the non-profile
-        # path).  Only stop recording hit-rate metrics.
-        if cfg.caching:
-            dynamic_emb.set_record_cache_metrics(False)
-
         benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg)
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
         return {"label": cfg.label(), "nsys": True}
-    elif profile_mode == "ncu-run":
+    elif profile_mode == "ncu":
         benchmark_with_ncu(dynamic_emb, sparse_features, cfg)
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
-        return {"label": cfg.label(), "ncu_run": True}
-
-    # The reporting loop runs each backend independently with separate
-    # gradients, which drifts their weights apart; skip it when we need
-    # the post-loop weight state to match for the forward comparison.
-    if not cfg.correctness:
-        run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg)
-
-    if cfg.caching:
-        # Keep the cache warm from the reporting loop -- benchmark_train_eval
-        # then measures steady-state hit-rate performance instead of a cold
-        # start.  We only stop *recording* hit-rate metrics; the cache
-        # contents and counters stay as the warmup left them.
-        dynamic_emb.set_record_cache_metrics(False)
+        return {"label": cfg.label(), "ncu": True}
 
     metrics = benchmark_train_eval(
         dynamic_emb,
@@ -1686,17 +1704,25 @@ def _no_hbm_configs():
 # ── Test suites ───────────────────────────────────────────────────────────────
 
 
-def _apply_overrides(cfg: BenchmarkConfig, correctness_flag: bool) -> BenchmarkConfig:
+def _apply_overrides(
+    cfg: BenchmarkConfig,
+    correctness_flag: bool,
+    num_iterations: Optional[int] = None,
+) -> BenchmarkConfig:
     """Apply session-wide CLI overrides onto a parametrized config."""
     if correctness_flag:
         cfg.correctness = True
+    if num_iterations is not None:
+        cfg.num_iterations = num_iterations
     return cfg
 
 
 class TestGpu:
     @pytest.mark.parametrize("cfg", _gpu_configs(), ids=lambda c: c.label())
-    def test_gpu(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_gpu(
+        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+    ):
+        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1704,8 +1730,10 @@ class TestGpu:
 
 class TestCaching:
     @pytest.mark.parametrize("cfg", _caching_configs(), ids=lambda c: c.label())
-    def test_caching(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_caching(
+        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+    ):
+        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1713,8 +1741,10 @@ class TestCaching:
 
 class TestNoCaching:
     @pytest.mark.parametrize("cfg", _no_caching_configs(), ids=lambda c: c.label())
-    def test_no_caching(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_no_caching(
+        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+    ):
+        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1722,8 +1752,10 @@ class TestNoCaching:
 
 class TestNoHbm:
     @pytest.mark.parametrize("cfg", _no_hbm_configs(), ids=lambda c: c.label())
-    def test_no_hbm(self, cfg, device, timer, profile_mode, correctness_flag):
-        cfg = _apply_overrides(cfg, correctness_flag)
+    def test_no_hbm(
+        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+    ):
+        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result

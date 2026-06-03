@@ -15,7 +15,8 @@
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh -k "adam and sum"     # filter
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile torch       # with profiling
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-gen     # print ncu commands (no tests)
-#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-run     # single-iter run (wrap with ncu)
+#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu         # run all iters (wrap with ncu)
+#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu --num-iterations 3  # fewer iters to keep ncu tractable
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --correctness          # force-enable forward-only correctness check on every config
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --correctness -k TestGpu  # correctness on gpu suite only
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --co                  # list configs

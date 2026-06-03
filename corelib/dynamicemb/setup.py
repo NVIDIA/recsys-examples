@@ -112,6 +112,10 @@ def get_extensions():
         "cxx": ["-O3", "-fdiagnostics-color=always", "-w", "-DDEMB_USE_PYBIND11"],
         "nvcc": [
             "-O3",
+            # SASS<->source line mapping for ncu's Source page / --import-source.
+            # Does not disable device optimizations (unlike -G), so runtime
+            # kernel performance is unaffected.
+            "-lineinfo",
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "--use_fast_math",
