@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Benchmark to verify the fused mask-based erase in table_erase_kernel (Part B).
+Benchmark to verify the fused mask-based erase in table_erase_kernel.
 
 This script verifies the mask parameter correctly filters which keys are erased
-from the admission counter, and that non-admitted keys retain their counter state.
+from the admission counter, and that non-admitted keys retain their counter state
 
 Usage:
-    torchrun --nproc_per_node=1 benchmark_issue357_fusion.py
+    torchrun --nproc_per_node=1 benchmark_selection_kernel_fusion.py
 """
 
 import os
