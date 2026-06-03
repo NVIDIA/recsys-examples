@@ -226,22 +226,14 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
     const int64_t table_id = d_table_ids[idx];
     const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
 
-    // Per-table sub-table.  Keys are pre-segmented by table, so each table owns
-    // a contiguous slice [off_t, off_t + cap_t) of the shared hash buffer,
-    // sized 2x its key count (cap_t = 2 * cnt_t).  Since unique_t <= cnt_t the
-    // sub-table never fills (load factor <= 0.5).  A sub-table holds only one
-    // table's keys, so the slot identity is the key alone -- table_id is no
-    // longer hashed in, packed, or re-checked on a key match.
-    const int64_t seg_lo = d_segmented_range[table_id];
-    const int64_t seg_hi = d_segmented_range[table_id + 1];
-    const size_t off_t = static_cast<size_t>(2 * seg_lo);
-    const size_t cap_t = static_cast<size_t>(2 * (seg_hi - seg_lo));
-
+    // Hash the (key, table_id) pair
     uint32_t key_hash = Hasher::hash(key);
-    size_t hash_index = off_t + (key_hash % cap_t);
+    uint32_t tid_hash = Hasher::hash(static_cast<uint32_t>(table_id));
+    uint32_t combined_hash = Hasher::hash_combine(key_hash, tid_hash);
+    size_t hash_index = combined_hash % capacity;
 
     bool done = false;
-    for (size_t probe = 0; probe < cap_t && !done; ++probe) {
+    for (size_t probe = 0; probe < capacity && !done; ++probe) {
       const KeyType existing_key = hash_keys[hash_index];
 
       if (existing_key == empty_key) {
@@ -250,17 +242,21 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
             atomicCAS(&hash_keys[hash_index], empty_key, key);
 
         if (old_key == empty_key) {
-          // Successfully claimed the slot; get this table's local unique index
+          // Successfully claimed the slot
+          // Get unique index for this table
           int32_t local_unique_idx =
               static_cast<int32_t>(atomicAdd(&table_counters[table_id], 1));
 
           // Store unique key in partitioned layout using segmented_range offsets
-          size_t output_pos = static_cast<size_t>(seg_lo) + local_unique_idx;
+          size_t output_pos =
+              static_cast<size_t>(d_segmented_range[table_id]) +
+              local_unique_idx;
           d_unique_keys[output_pos] = key;
 
-          // Publish local_idx (signals completion to duplicate waiters).
+          // Pack and store (table_id, local_idx) - this signals completion
+          // Use volatile write to ensure visibility
           *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]) =
-              static_cast<int64_t>(local_unique_idx);
+              pack_table_val(table_id, local_unique_idx);
 
           d_output_indices[idx] = local_unique_idx;
 
@@ -270,47 +266,61 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
           }
           done = true;
         } else if (old_key == key) {
-          // Another thread claimed the same key first; wait for its local_idx.
-          int64_t stored_val;
+          // Another thread claimed with same key, wait for packed value
+          int64_t packed_val;
           do {
-            stored_val =
+            packed_val =
                 *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
             __nanosleep(1);
-          } while (stored_val == empty_val);
+          } while (packed_val == empty_val);
 
-          int32_t local_idx = static_cast<int32_t>(stored_val);
+          // Check if table_id matches
+          if (unpack_table_id(packed_val) == table_id) {
+            // Same (key, table_id) pair - use existing index
+            int32_t local_idx = unpack_local_idx(packed_val);
+            d_output_indices[idx] = local_idx;
+
+            // Update frequency counter for duplicate key
+            if (frequency_counters) {
+              size_t output_pos =
+                  static_cast<size_t>(d_segmented_range[table_id]) +
+                  local_idx;
+              atomicAdd(&frequency_counters[output_pos], input_freq);
+            }
+            done = true;
+          }
+          // Different table_id with same key, continue probing
+        }
+        // Different key claimed this slot, continue probing
+      } else if (existing_key == key) {
+        // Slot has same key - read packed value to check table_id
+        int64_t packed_val;
+        do {
+          packed_val =
+              *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
+          __nanosleep(1);
+        } while (packed_val == empty_val);
+
+        if (unpack_table_id(packed_val) == table_id) {
+          // Exact (key, table_id) match found
+          int32_t local_idx = unpack_local_idx(packed_val);
           d_output_indices[idx] = local_idx;
+
+          // Update frequency counter for duplicate key
           if (frequency_counters) {
-            size_t output_pos = static_cast<size_t>(seg_lo) + local_idx;
+            size_t output_pos =
+                static_cast<size_t>(d_segmented_range[table_id]) + local_idx;
             atomicAdd(&frequency_counters[output_pos], input_freq);
           }
           done = true;
         }
-        // Different key claimed this slot, continue probing
-      } else if (existing_key == key) {
-        // Slot already holds our key (same table) -- reuse its local_idx.
-        int64_t stored_val;
-        do {
-          stored_val =
-              *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
-          __nanosleep(1);
-        } while (stored_val == empty_val);
-
-        int32_t local_idx = static_cast<int32_t>(stored_val);
-        d_output_indices[idx] = local_idx;
-        if (frequency_counters) {
-          size_t output_pos = static_cast<size_t>(seg_lo) + local_idx;
-          atomicAdd(&frequency_counters[output_pos], input_freq);
-        }
-        done = true;
+        // Different table_id with same key, continue probing
       }
 
-      // Linear probing within the sub-table [off_t, off_t + cap_t)
-      ++hash_index;
-      if (hash_index == off_t + cap_t)
-        hash_index = off_t;
+      // Linear probing
+      hash_index = (hash_index + 1) % capacity;
     }
-    assert(done && "segmented_unique_kernel: sub-table full");
+    assert(done && "segmented_unique_kernel: hash table full");
   }
 }
 
