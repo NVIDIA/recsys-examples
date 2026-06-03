@@ -38,7 +38,7 @@ namespace py = pybind11;
 
 namespace dyn_emb {
 
-constexpr int BLOCK_SIZE = 64;
+constexpr int BLOCK_SIZE = 256;
 
 // MurmurHash3_32 hash function
 template <typename Key, uint32_t m_seed = 0> struct MurmurHash3_32 {
@@ -479,9 +479,21 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)));
   }
 
-  // Compute grid size based on SM count (4 blocks per SM is a good heuristic)
-  constexpr int BLOCKS_PER_SM = 4;
-  const int grid_size = device_sm_count * BLOCKS_PER_SM;
+  // Size the grid to fill the SMs.  These kernels (esp. segmented_unique_kernel)
+  // are latency-bound on scattered global probe loads (~88% long_scoreboard
+  // stalls), which are hidden by having many resident warps.  With
+  // BLOCK_SIZE=256 (8 warps/block), 8 blocks/SM = 64 warps/SM = full occupancy
+  // on sm_90 (regs=32 fit).  Cap at full occupancy and never exceed the work.
+  // The old SM*4 x 64-thread launch sat at ~12% occupancy / 0.12 waves, leaving
+  // nothing for the scheduler to hide the memory latency behind.
+  constexpr int BLOCKS_PER_SM = 8;
+  int64_t grid64 = (num_keys + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  const int64_t full_grid = static_cast<int64_t>(device_sm_count) * BLOCKS_PER_SM;
+  if (grid64 > full_grid)
+    grid64 = full_grid;
+  if (grid64 < 1)
+    grid64 = 1;
+  const int grid_size = static_cast<int>(grid64);
 
   // Generate per-element table_ids from segmented_range for hash logic and
   // adjust_output_indices_kernel. Keys must be sorted by table:
