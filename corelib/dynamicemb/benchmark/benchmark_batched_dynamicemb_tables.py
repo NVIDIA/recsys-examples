@@ -1051,17 +1051,17 @@ def print_ncu_command(cfg: BenchmarkConfig):
         )
         nvtx_part = "--nvtx --nvtx-include 'ncu_iter/iter_0/'"
 
-    # pytest -k accepts substrings of the test id; the parametrize id is
-    # exactly cfg.label(), so passing the whole label uniquely selects this
-    # one config.  An earlier version split on "=" and AND-joined the
-    # fragments, but cfg.label() embeds "=" inside its values
-    # (pool=none, cap=24M) -- the split produced cross-field chunks like
-    # "none_cap" that happened to be substrings of the id today but would
-    # silently drift if the label format changed or two configs shared a
-    # fragment.
+    # pytest -k is an expression grammar that REJECTS '=', which cfg.label()
+    # embeds (pool=none, cap=1M); passing the whole label fails at runtime with
+    # "Wrong expression passed to '-k': ... unexpected character '='".  Split on
+    # '=' and AND-join the remaining chunks into a valid -k expression that
+    # still uniquely selects this config -- the leading chunk already encodes
+    # tables/batch/dim/opt/mode, so the conjunction is unambiguous.  (The '='
+    # is only a problem for -k; it is fine inside the -o report filename below.)
+    k_expr = " and ".join(part for part in label.split("=") if part)
     single_inner = (
         f"bash benchmark/benchmark_batched_dynamicemb_tables.sh"
-        f" --profile ncu -k '{label}'"
+        f" --profile ncu -k '{k_expr}'"
     )
     single_out = os.path.join(os.getcwd(), f"ncu_{label}")
     single_cmd = (
