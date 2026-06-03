@@ -181,6 +181,12 @@ class BenchmarkConfig:
     pooling_mode: str = "none"
     max_hotness: int = 10
     num_iterations: int = 100
+    # Profiling-only: which iterations --profile ncu captures (raw spec string,
+    # parsed by parse_ncu_iterations).  None = capture iter 0.  Not in cfg.label().
+    ncu_iterations: Optional[str] = None
+    # Profiling-only: user-supplied kernel-name regex for the generated ncu
+    # command (--ncu-kernel-regex).  Required for --profile ncu-gen.
+    ncu_kernel_regex: Optional[str] = None
     emb_precision: str = "fp32"
     output_dtype: str = "fp32"
     use_index_dedup: bool = False
@@ -915,20 +921,63 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
 # ── NCU (Nsight Compute) profiler integration ────────────────────────────────
 
 
+def parse_ncu_iterations(spec: Optional[str], num_iterations: int) -> set:
+    """Parse --ncu-iterations into a set of 0-based iteration indices to profile.
+
+    Two accepted forms:
+      * comma-separated list, e.g. ``"0,3,7"``
+      * Python-style slice ``begin:end:step`` (end exclusive, any part optional),
+        e.g. ``":10"``, ``"5:"``, ``"::2"``, ``"2:20:3"``
+
+    Indices are clamped to ``[0, num_iterations)``.  ``None`` selects every
+    iteration (profile all).  Raises ValueError on malformed input.
+    """
+    if spec is None:
+        return set(range(num_iterations))
+    spec = spec.strip()
+    if not spec:
+        return set(range(num_iterations))
+
+    if ":" in spec:
+        parts = spec.split(":")
+        if len(parts) > 3:
+            raise ValueError(f"--ncu-iterations slice has too many ':' parts: {spec!r}")
+        begin = int(parts[0]) if parts[0].strip() else 0
+        end = int(parts[1]) if len(parts) > 1 and parts[1].strip() else num_iterations
+        step = int(parts[2]) if len(parts) > 2 and parts[2].strip() else 1
+        if step <= 0:
+            raise ValueError(f"--ncu-iterations step must be positive: {spec!r}")
+        return {i for i in range(begin, end, step) if 0 <= i < num_iterations}
+
+    selected = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        idx = int(tok)
+        if 0 <= idx < num_iterations:
+            selected.add(idx)
+    return selected
+
+
 def benchmark_with_ncu(model, sparse_features, cfg):
-    """Run every iteration's fwd+bwd for NCU profiling.
+    """Run all iterations for NCU profiling under a single capture window.
 
     Meant to be launched externally under ``ncu --profile-from-start off
-    ...``.  The cudaProfilerStart/Stop pair gates the capture window so setup
-    kernels (table create, data gen, warmup, etc.) stay outside it.
+    ...``.  A *single* cudaProfilerStart/Stop pair wraps the whole loop (ncu
+    reliably honors one cudaProfiler window), so setup kernels (table create,
+    data gen, warmup) stay outside it.
 
-    Each of ``sparse_features`` is profiled (same coverage as the nsys path).
-    ncu is per-kernel-launch (not timeline) so multi-config "Just Works":
-    invoking pytest without a ``-k`` filter under one ncu command profiles
-    every config's iters back-to-back into the same report.  The outermost
-    NVTX range ``cfg.label()`` attributes kernels per config; the inner
-    ``ncu_iter`` range wraps all iterations so ``--nvtx-include 'ncu_iter/'``
-    excludes any kernel that leaked into the cudaProfiler window.
+    Every iteration runs and is tagged with its own ``iter_{i}`` NVTX range
+    nested under ``ncu_iter``.  *Which* iterations are actually captured is
+    decided in the ncu command itself: ``--ncu-iterations`` turns into per-iter
+    ``--nvtx-include 'ncu_iter/iter_{i}/'`` filters (see print_ncu_command), so
+    the unselected iterations still run here (advancing the table / keeping the
+    cache warm) but their kernels are filtered out by NVTX.
+
+    ncu is per-kernel-launch (not timeline) so multi-config "Just Works": one
+    ncu command without ``-k`` profiles every config's iters into the same
+    report.  The outer NVTX range ``cfg.label()`` attributes kernels per config.
     """
     model.train()
 
@@ -953,7 +1002,7 @@ def benchmark_with_ncu(model, sparse_features, cfg):
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
-    print(f"  NCU profiled {len(sparse_features)} iters (fwd+bwd each).")
+    print(f"  NCU ran {len(sparse_features)} iters (capture scoped by --nvtx-include).")
 
 
 def print_ncu_command(cfg: BenchmarkConfig):
@@ -967,10 +1016,40 @@ def print_ncu_command(cfg: BenchmarkConfig):
     """
     label = cfg.label()
 
-    all_patterns: list[str] = []
-    for patterns in KERNEL_NAME_PATTERNS.values():
-        all_patterns.extend(patterns)
-    regex = "|".join(f".*{p}.*" for p in all_patterns)
+    # The kernel-name regex is user-supplied (--ncu-kernel-regex), emitted
+    # verbatim as ncu's --kernel-name 'regex:...'.  Required: profiling every
+    # dynamicemb kernel with --set full is rarely what you want, so the user
+    # must name the kernel(s) of interest.
+    regex = cfg.ncu_kernel_regex
+    if not regex:
+        raise ValueError(
+            "--ncu-kernel-regex is required with --profile ncu-gen: pass the "
+            "kernel-name regex ncu should profile (matched as a substring of "
+            "the real kernel symbol), e.g. "
+            "--ncu-kernel-regex 'segmented_unique|table_insert'"
+        )
+
+    # NVTX-range filter: belt-and-suspenders to the cudaProfilerStart/Stop gate
+    # (only kernels under ncu_iter are profiled, excluding anything that leaked
+    # into the cudaProfiler window).  --ncu-iterations narrows this to specific
+    # iterations by OR-ing one --nvtx-include per selected iter
+    # (ncu_iter/iter_{i}/), instead of toggling the single cudaProfiler window.
+    selected = parse_ncu_iterations(cfg.ncu_iterations, cfg.num_iterations)
+    if cfg.ncu_iterations is None:
+        # Default to iteration 0 only -- profiling every iteration with the full
+        # metric set is prohibitively expensive.  Use --ncu-iterations to widen.
+        nvtx_part = "--nvtx --nvtx-include 'ncu_iter/iter_0/'"
+    elif selected:
+        includes = " ".join(
+            f"--nvtx-include 'ncu_iter/iter_{i}/'" for i in sorted(selected)
+        )
+        nvtx_part = f"--nvtx {includes}"
+    else:
+        print(
+            f"# WARNING: --ncu-iterations={cfg.ncu_iterations!r} selects no "
+            f"iteration in [0, {cfg.num_iterations}); defaulting to iter_0."
+        )
+        nvtx_part = "--nvtx --nvtx-include 'ncu_iter/iter_0/'"
 
     # pytest -k accepts substrings of the test id; the parametrize id is
     # exactly cfg.label(), so passing the whole label uniquely selects this
@@ -988,11 +1067,7 @@ def print_ncu_command(cfg: BenchmarkConfig):
     single_cmd = (
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
-        # NVTX range filter as a belt-and-suspenders complement to the
-        # cudaProfilerStart/Stop gate: only kernels under the ``ncu_iter``
-        # range (pushed in benchmark_with_ncu) are profiled, so any setup
-        # kernel that leaked into the cudaProfiler window is still excluded.
-        f" --nvtx --nvtx-include 'ncu_iter/'"
+        f" {nvtx_part}"
         f" --kernel-name 'regex:{regex}'"
         f" --set full"
         # Embed CUDA source into the report so the Source page works offline /
@@ -1003,19 +1078,14 @@ def print_ncu_command(cfg: BenchmarkConfig):
         f" {single_inner}"
     )
 
-    multi_inner = (
-        "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu"
-    )
+    multi_inner = "bash benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu"
     multi_out = os.path.join(os.getcwd(), "ncu_all_configs")
     multi_cmd = (
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
         f" --kernel-name 'regex:{regex}'"
         f" --set full"
-        # --nvtx records ranges so kernels can be attributed per config via the
-        # outermost cfg.label() range; --nvtx-include also *restricts* profiling
-        # to the ncu_iter range (same gate as single-config).
-        f" --nvtx --nvtx-include 'ncu_iter/'"
+        f" {nvtx_part}"
         # Embed CUDA source into the report (requires -lineinfo at build time).
         f" --import-source=yes"
         f" --csv --page raw"
@@ -1708,21 +1778,37 @@ def _apply_overrides(
     cfg: BenchmarkConfig,
     correctness_flag: bool,
     num_iterations: Optional[int] = None,
+    ncu_iterations: Optional[str] = None,
+    ncu_kernel_regex: Optional[str] = None,
 ) -> BenchmarkConfig:
     """Apply session-wide CLI overrides onto a parametrized config."""
     if correctness_flag:
         cfg.correctness = True
     if num_iterations is not None:
         cfg.num_iterations = num_iterations
+    if ncu_iterations is not None:
+        cfg.ncu_iterations = ncu_iterations
+    if ncu_kernel_regex is not None:
+        cfg.ncu_kernel_regex = ncu_kernel_regex
     return cfg
 
 
 class TestGpu:
     @pytest.mark.parametrize("cfg", _gpu_configs(), ids=lambda c: c.label())
     def test_gpu(
-        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
     ):
-        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
+        cfg = _apply_overrides(
+            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1731,9 +1817,19 @@ class TestGpu:
 class TestCaching:
     @pytest.mark.parametrize("cfg", _caching_configs(), ids=lambda c: c.label())
     def test_caching(
-        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
     ):
-        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
+        cfg = _apply_overrides(
+            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1742,9 +1838,19 @@ class TestCaching:
 class TestNoCaching:
     @pytest.mark.parametrize("cfg", _no_caching_configs(), ids=lambda c: c.label())
     def test_no_caching(
-        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
     ):
-        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
+        cfg = _apply_overrides(
+            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result
@@ -1753,9 +1859,19 @@ class TestNoCaching:
 class TestNoHbm:
     @pytest.mark.parametrize("cfg", _no_hbm_configs(), ids=lambda c: c.label())
     def test_no_hbm(
-        self, cfg, device, timer, profile_mode, correctness_flag, num_iterations
+        self,
+        cfg,
+        device,
+        timer,
+        profile_mode,
+        correctness_flag,
+        num_iterations,
+        ncu_iterations,
+        ncu_kernel_regex,
     ):
-        cfg = _apply_overrides(cfg, correctness_flag, num_iterations)
+        cfg = _apply_overrides(
+            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+        )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
         assert "error" not in result

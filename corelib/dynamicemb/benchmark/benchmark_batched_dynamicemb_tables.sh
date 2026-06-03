@@ -14,9 +14,10 @@
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh -k TestCaching        # caching only
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh -k "adam and sum"     # filter
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile torch       # with profiling
-#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-gen     # print ncu commands (no tests)
+#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-gen --ncu-kernel-regex 'segmented_unique'  # print ncu commands (no tests; regex required)
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu         # run all iters (wrap with ncu)
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu --num-iterations 3  # fewer iters to keep ncu tractable
+#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu --ncu-iterations 90:  # only capture late (warm) iters; supports 0,3,7 or begin:end:step
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --correctness          # force-enable forward-only correctness check on every config
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --correctness -k TestGpu  # correctness on gpu suite only
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --co                  # list configs

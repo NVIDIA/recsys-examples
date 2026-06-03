@@ -58,6 +58,31 @@ def pytest_addoption(parser):
             "`--profile ncu --num-iterations 3`."
         ),
     )
+    parser.addoption(
+        "--ncu-kernel-regex",
+        action="store",
+        default=None,
+        help=(
+            "REQUIRED for `--profile ncu-gen`: the kernel-name regex the "
+            "generated ncu command profiles, emitted verbatim as "
+            "--kernel-name 'regex:<value>'.  e.g. "
+            "--ncu-kernel-regex 'segmented_unique|table_insert'."
+        ),
+    )
+    parser.addoption(
+        "--ncu-iterations",
+        action="store",
+        default=None,
+        help=(
+            "Only used with `--profile ncu` (pass it to `--profile ncu-gen`): "
+            "select which iterations ncu captures, widening the default of "
+            "iteration 0 only.  Accepts a comma list ('0,3,7') or a Python-style "
+            "slice 'begin:end:step' (end exclusive, parts optional: ':10', '5:', "
+            "'::2', '2:20:3').  Implemented as one --nvtx-include "
+            "'ncu_iter/iter_{i}/' per selected iter in the generated command; "
+            "all iterations still run, unselected ones are filtered out by NVTX."
+        ),
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -95,6 +120,18 @@ def correctness_flag(request):
 def num_iterations(request):
     """Session-wide override for BenchmarkConfig.num_iterations (None = keep config default)."""
     return request.config.getoption("--num-iterations")
+
+
+@pytest.fixture(scope="session")
+def ncu_iterations(request):
+    """Session-wide --ncu-iterations spec for which iterations ncu captures (None = iter 0)."""
+    return request.config.getoption("--ncu-iterations")
+
+
+@pytest.fixture(scope="session")
+def ncu_kernel_regex(request):
+    """Session-wide --ncu-kernel-regex: user-supplied kernel-name regex for ncu-gen."""
+    return request.config.getoption("--ncu-kernel-regex")
 
 
 @pytest.fixture(autouse=True)
