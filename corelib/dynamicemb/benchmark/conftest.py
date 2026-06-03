@@ -63,10 +63,12 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help=(
-            "REQUIRED for `--profile ncu-gen`: the kernel-name regex the "
-            "generated ncu command profiles, emitted verbatim as "
-            "--kernel-name 'regex:<value>'.  e.g. "
-            "--ncu-kernel-regex 'segmented_unique|table_insert'."
+            "Optional kernel-name regex for the generated ncu command "
+            "(--profile ncu-gen), emitted verbatim as --kernel-name "
+            "'regex:<value>', e.g. 'segmented_unique|table_insert'.  If omitted, "
+            "no --kernel-name filter is emitted, so every kernel within the "
+            "--nvtx-include scope is profiled -- use this to capture all kernels "
+            "of an op range."
         ),
     )
     parser.addoption(

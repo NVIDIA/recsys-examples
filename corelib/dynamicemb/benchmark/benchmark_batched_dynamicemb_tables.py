@@ -1016,18 +1016,14 @@ def print_ncu_command(cfg: BenchmarkConfig):
     """
     label = cfg.label()
 
-    # The kernel-name regex is user-supplied (--ncu-kernel-regex), emitted
-    # verbatim as ncu's --kernel-name 'regex:...'.  Required: profiling every
-    # dynamicemb kernel with --set full is rarely what you want, so the user
-    # must name the kernel(s) of interest.
+    # Optional kernel-name filter (--ncu-kernel-regex), emitted verbatim as
+    # ncu's --kernel-name 'regex:...'.  If omitted, no name filter is emitted so
+    # every kernel within the --nvtx-include scope is profiled -- the way to
+    # capture all kernels of an op range (e.g. op:segmented_unique), since one
+    # op launches several differently-named kernels that a name regex can't all
+    # match.
     regex = cfg.ncu_kernel_regex
-    if not regex:
-        raise ValueError(
-            "--ncu-kernel-regex is required with --profile ncu-gen: pass the "
-            "kernel-name regex ncu should profile (matched as a substring of "
-            "the real kernel symbol), e.g. "
-            "--ncu-kernel-regex 'segmented_unique|table_insert'"
-        )
+    kernel_part = f"--kernel-name 'regex:{regex}'" if regex else ""
 
     # NVTX-range filter: belt-and-suspenders to the cudaProfilerStart/Stop gate
     # (only kernels under ncu_iter are profiled, excluding anything that leaked
@@ -1068,7 +1064,7 @@ def print_ncu_command(cfg: BenchmarkConfig):
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
         f" {nvtx_part}"
-        f" --kernel-name 'regex:{regex}'"
+        f" {kernel_part}"
         f" --set full"
         # Embed CUDA source into the report so the Source page works offline /
         # on a machine without the sources (requires -lineinfo at build time).
@@ -1083,7 +1079,7 @@ def print_ncu_command(cfg: BenchmarkConfig):
     multi_cmd = (
         f"ncu -f --target-processes all"
         f" --profile-from-start off"
-        f" --kernel-name 'regex:{regex}'"
+        f" {kernel_part}"
         f" --set full"
         f" {nvtx_part}"
         # Embed CUDA source into the report (requires -lineinfo at build time).

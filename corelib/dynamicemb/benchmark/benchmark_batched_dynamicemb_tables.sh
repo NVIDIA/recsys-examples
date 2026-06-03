@@ -14,7 +14,7 @@
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh -k TestCaching        # caching only
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh -k "adam and sum"     # filter
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile torch       # with profiling
-#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-gen --ncu-kernel-regex 'segmented_unique'  # print ncu commands (no tests; regex required)
+#   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu-gen --ncu-kernel-regex 'segmented_unique'  # print ncu commands (no tests; regex optional, omit for all kernels in nvtx scope)
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu         # run all iters (wrap with ncu)
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu --num-iterations 3  # fewer iters to keep ncu tractable
 #   ./benchmark/benchmark_batched_dynamicemb_tables.sh --profile ncu --ncu-iterations 90:  # only capture late (warm) iters; supports 0,3,7 or begin:end:step
