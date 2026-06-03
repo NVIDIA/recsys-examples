@@ -22,7 +22,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "utils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cooperative_groups.h>
 #include <cub/cub.cuh>
+namespace cg = cooperative_groups;
 #ifdef DEMB_USE_PYBIND11
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
@@ -242,10 +244,20 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
             atomicCAS(&hash_keys[hash_index], empty_key, key);
 
         if (old_key == empty_key) {
-          // Successfully claimed the slot
-          // Get unique index for this table
-          int32_t local_unique_idx =
-              static_cast<int32_t>(atomicAdd(&table_counters[table_id], 1));
+          // Successfully claimed the slot; get this table's local unique index.
+          // Warp-aggregate the counter bump: threads in this warp that are
+          // claiming a new key for the SAME table_id share one atomicAdd (of
+          // the group size), then each takes a distinct slot from the reserved
+          // range.  table_counters[table_id] is highly contended (num_tables is
+          // small), so this collapses up to 32 atomics into 1 per table_id.
+          auto active = cg::coalesced_threads();
+          auto grp = cg::labeled_partition(active, static_cast<int>(table_id));
+          int32_t base = 0;
+          if (grp.thread_rank() == 0)
+            base = static_cast<int32_t>(
+                atomicAdd(&table_counters[table_id], grp.size()));
+          base = grp.shfl(base, 0);
+          int32_t local_unique_idx = base + grp.thread_rank();
 
           // Store unique key in partitioned layout using segmented_range offsets
           size_t output_pos =
