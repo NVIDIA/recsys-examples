@@ -212,7 +212,7 @@ __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
 template <typename KeyType, typename Hasher,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
-__global__ void
+__global__ void __launch_bounds__(BLOCK_SIZE, 8)
 segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
                         KeyType *d_unique_keys, int64_t *d_output_indices,
                         size_t num_keys, KeyType *hash_keys, int64_t *hash_vals,
@@ -225,17 +225,20 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
        idx += stride) {
     const KeyType key = d_keys[idx];
-    const int64_t table_id = d_table_ids[idx];
+    const int table_id = static_cast<int>(d_table_ids[idx]);
     const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
 
-    // Hash the (key, table_id) pair
+    // Hash the (key, table_id) pair.  capacity = 2*num_keys fits 32-bit
+    // (num_keys < INT32_MAX is enforced), so keep the probe index in 32-bit
+    // registers and use a 32-bit modulo: cheaper than a 64-bit modulo.
+    const uint32_t cap = static_cast<uint32_t>(capacity);
     uint32_t key_hash = Hasher::hash(key);
     uint32_t tid_hash = Hasher::hash(static_cast<uint32_t>(table_id));
     uint32_t combined_hash = Hasher::hash_combine(key_hash, tid_hash);
-    size_t hash_index = combined_hash % capacity;
+    uint32_t hash_index = combined_hash % cap;
 
     bool done = false;
-    for (size_t probe = 0; probe < capacity && !done; ++probe) {
+    for (uint32_t probe = 0; probe < cap && !done; ++probe) {
       const KeyType existing_key = hash_keys[hash_index];
 
       if (existing_key == empty_key) {
@@ -330,7 +333,7 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
       }
 
       // Linear probing
-      hash_index = (hash_index + 1) % capacity;
+      hash_index = (hash_index + 1) % cap;
     }
     assert(done && "segmented_unique_kernel: hash table full");
   }
