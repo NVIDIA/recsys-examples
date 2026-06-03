@@ -181,11 +181,12 @@ __device__ __forceinline__ int32_t unpack_local_idx(int64_t packed) {
 }
 
 // Initialize segmented hash table kernel (strided loop version)
-// Uses packed (table_id, local_idx) in hash_vals for memory efficiency
+// hash_vals stores the per-table local unique index (int32); empty_val marks
+// an unwritten slot.
 template <typename KeyType,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
-          int64_t empty_val = std::numeric_limits<int64_t>::max()>
-__global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
+          int32_t empty_val = std::numeric_limits<int32_t>::max()>
+__global__ void segmented_init_kernel(KeyType *hash_keys, int32_t *hash_vals,
                                       int64_t *table_counters, size_t capacity,
                                       int64_t num_tables) {
   const size_t stride = blockDim.x * gridDim.x;
@@ -202,18 +203,18 @@ __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
   }
 }
 
-// Segmented unique kernel - deduplicates (key, table_id) pairs (strided loop
-// version) Uses packed (table_id, local_idx) encoding in hash_vals for
-// efficiency Only hash_vals needs volatile reads - hash_keys uses CAS for
-// synchronization Supports optional frequency counting for LFU eviction
-// strategy
+// Segmented unique kernel - deduplicates keys per table (strided loop version).
+// Keys are pre-segmented by table, so each table gets its own sub-table region
+// of the shared buffer and hash_vals stores only the per-table local unique
+// index (int32).  Only hash_vals needs volatile reads - hash_keys uses CAS for
+// synchronization.  Supports optional frequency counting for LFU eviction.
 template <typename KeyType, typename Hasher,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
-          int64_t empty_val = std::numeric_limits<int64_t>::max()>
+          int32_t empty_val = std::numeric_limits<int32_t>::max()>
 __global__ void
 segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
                         KeyType *d_unique_keys, int64_t *d_output_indices,
-                        size_t num_keys, KeyType *hash_keys, int64_t *hash_vals,
+                        size_t num_keys, KeyType *hash_keys, int32_t *hash_vals,
                         size_t capacity, int64_t *table_counters,
                         const int64_t *d_segmented_range,
                         int64_t *frequency_counters,
@@ -259,8 +260,8 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
           d_unique_keys[output_pos] = key;
 
           // Publish local_idx (signals completion to duplicate waiters).
-          *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]) =
-              static_cast<int64_t>(local_unique_idx);
+          *reinterpret_cast<volatile int32_t *>(&hash_vals[hash_index]) =
+              local_unique_idx;
 
           d_output_indices[idx] = local_unique_idx;
 
@@ -271,14 +272,14 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
           done = true;
         } else if (old_key == key) {
           // Another thread claimed the same key first; wait for its local_idx.
-          int64_t stored_val;
+          int32_t stored_val;
           do {
             stored_val =
-                *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
+                *reinterpret_cast<volatile int32_t *>(&hash_vals[hash_index]);
             __nanosleep(1);
           } while (stored_val == empty_val);
 
-          int32_t local_idx = static_cast<int32_t>(stored_val);
+          int32_t local_idx = stored_val;
           d_output_indices[idx] = local_idx;
           if (frequency_counters) {
             size_t output_pos = static_cast<size_t>(seg_lo) + local_idx;
@@ -289,14 +290,14 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
         // Different key claimed this slot, continue probing
       } else if (existing_key == key) {
         // Slot already holds our key (same table) -- reuse its local_idx.
-        int64_t stored_val;
+        int32_t stored_val;
         do {
           stored_val =
-              *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
+              *reinterpret_cast<volatile int32_t *>(&hash_vals[hash_index]);
           __nanosleep(1);
         } while (stored_val == empty_val);
 
-        int32_t local_idx = static_cast<int32_t>(stored_val);
+        int32_t local_idx = stored_val;
         d_output_indices[idx] = local_idx;
         if (frequency_counters) {
           size_t output_pos = static_cast<size_t>(seg_lo) + local_idx;
@@ -502,18 +503,18 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
   }
 
-  // Allocate shared hash table for (key, table_id) pairs
-  // capacity = 2 * num_keys for good load factor
-  // hash_vals stores packed (table_id << 32 | local_idx)
+  // Allocate the shared hash table, viewed as per-table sub-tables.
+  // capacity = 2 * num_keys (each table's sub-table is 2x its key count).
+  // hash_vals stores only the per-table local unique index (int32).
   const int64_t capacity = num_keys * 2;
   at::Tensor hash_keys = at::empty({capacity}, keys.options());
   at::Tensor hash_vals = at::empty(
-      {capacity}, at::TensorOptions().dtype(at::kLong).device(device));
+      {capacity}, at::TensorOptions().dtype(at::kInt).device(device));
 
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
     // Initialize hash table and counters
     segmented_init_kernel<KeyType><<<grid_size, BLOCK_SIZE, 0, stream>>>(
-        get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
+        get_pointer<KeyType>(hash_keys), get_pointer<int32_t>(hash_vals),
         get_pointer<int64_t>(table_counters), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -524,7 +525,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
             get_pointer<const int64_t>(table_ids),
             get_pointer<KeyType>(partitioned_unique_keys),
             get_pointer<int64_t>(output_indices), num_keys,
-            get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
+            get_pointer<KeyType>(hash_keys), get_pointer<int32_t>(hash_vals),
             capacity, get_pointer<int64_t>(table_counters),
             get_pointer<const int64_t>(segmented_range),
             enable_freq_counting
