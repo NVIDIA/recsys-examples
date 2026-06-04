@@ -339,6 +339,129 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
   }
 }
 
+// Per-key segmented unique with a PRIVATIZED table_counters atomic, no shared
+// dedup table.  Applies su_flush's two-phase counter trick directly to the
+// input stream: a block sums its NEW-key count per table in SHARED (phase 1),
+// commits ONE global atomic per table (phase 2), then assigns indices
+// (phase 3).  output_indices doubles as per-key scratch carrying the global
+// probe slot between phases (claim: gi+1; existing: -(gi+1)); it is overwritten
+// with the final local index in phase 3, so no extra global array is needed.
+//
+// IMPORTANT: the deferred cross-block publish requires every block to be
+// co-resident (a block may spin on another block's phase-3 publish).  The host
+// MUST size the grid to exactly the max active blocks (no oversubscription).
+template <typename KeyType, typename Hasher,
+          KeyType empty_key = std::numeric_limits<KeyType>::max(),
+          int64_t empty_val = std::numeric_limits<int64_t>::max()>
+__global__ void __launch_bounds__(1024) // SHARED_BLOCK_SIZE, defined below
+segmented_unique_perkey_kernel(
+    const KeyType *d_keys, const int64_t *d_table_ids, KeyType *d_unique_keys,
+    int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
+    int64_t *hash_vals, size_t capacity, int64_t *table_counters,
+    const int64_t *d_segmented_range, int64_t *frequency_counters,
+    const int64_t *input_frequencies, int64_t num_tables) {
+  const int B = blockDim.x;
+  const int tid = threadIdx.x;
+  const uint32_t cap = static_cast<uint32_t>(capacity);
+  const bool count_freq = frequency_counters != nullptr;
+
+  extern __shared__ char smem[];
+  int *s_tc = reinterpret_cast<int *>(smem);            // [num_tables]
+  int *s_tnext = reinterpret_cast<int *>(s_tc + num_tables);
+
+  for (int t = tid; t < num_tables; t += B)
+    s_tc[t] = 0;
+  __syncthreads();
+
+  const size_t start = static_cast<size_t>(blockIdx.x) * B + tid;
+  const size_t stride = static_cast<size_t>(gridDim.x) * B;
+
+  // Phase 1: probe + claim-or-find; count new keys in shared; stash the global
+  // slot into output_indices (claim: gi+1, existing: -(gi+1)).
+  for (size_t idx = start; idx < num_keys; idx += stride) {
+    const KeyType key = d_keys[idx];
+    const int t = static_cast<int>(d_table_ids[idx]);
+    uint32_t kh = Hasher::hash(key);
+    uint32_t th = Hasher::hash(static_cast<uint32_t>(t));
+    uint32_t gi = Hasher::hash_combine(kh, th) % cap;
+    int64_t marker = 0;
+    for (uint32_t probe = 0; probe < cap; ++probe) {
+      const KeyType ek = hash_keys[gi];
+      if (ek == empty_key) {
+        const KeyType old = atomicCAS(&hash_keys[gi], empty_key, key);
+        if (old == empty_key) {
+          *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
+              pack_table_val(t, -1);
+          ::atomicAdd(&s_tc[t], 1);
+          marker = static_cast<int64_t>(gi) + 1;
+          break;
+        } else if (old == key) {
+          int64_t pv;
+          do {
+            pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+          } while (pv == empty_val);
+          if (unpack_table_id(pv) == t) {
+            marker = -(static_cast<int64_t>(gi) + 1);
+            break;
+          }
+        }
+      } else if (ek == key) {
+        int64_t pv;
+        do {
+          pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+        } while (pv == empty_val);
+        if (unpack_table_id(pv) == t) {
+          marker = -(static_cast<int64_t>(gi) + 1);
+          break;
+        }
+      }
+      gi = (gi + 1) % cap;
+    }
+    d_output_indices[idx] = marker;
+  }
+  __syncthreads();
+
+  // Phase 2: one global atomic per table reserves a contiguous index range.
+  for (int t = tid; t < num_tables; t += B) {
+    const int cnt = s_tc[t];
+    s_tnext[t] = cnt > 0 ? static_cast<int>(atomicAdd(
+                               &table_counters[t], static_cast<int64_t>(cnt)))
+                         : 0;
+  }
+  __syncthreads();
+
+  // Phase 3: assign + publish for claims; resolve duplicates.
+  for (size_t idx = start; idx < num_keys; idx += stride) {
+    const int t = static_cast<int>(d_table_ids[idx]);
+    const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
+    const int64_t marker = d_output_indices[idx];
+    const uint32_t gi =
+        static_cast<uint32_t>((marker > 0 ? marker : -marker) - 1);
+    int local_idx;
+    if (marker > 0) { // claimer: draw idx from the shared reserved range
+      local_idx = ::atomicAdd(&s_tnext[t], 1);
+      const size_t opos = static_cast<size_t>(d_segmented_range[t]) + local_idx;
+      d_unique_keys[opos] = d_keys[idx];
+      *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
+          pack_table_val(t, local_idx);
+      if (count_freq)
+        atomicAdd(&frequency_counters[opos], input_freq);
+    } else { // duplicate: wait for the owner's final index
+      int64_t pv;
+      do {
+        pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+      } while (unpack_local_idx(pv) < 0);
+      local_idx = unpack_local_idx(pv);
+      if (count_freq) {
+        const size_t opos =
+            static_cast<size_t>(d_segmented_range[t]) + local_idx;
+        atomicAdd(&frequency_counters[opos], input_freq);
+      }
+    }
+    d_output_indices[idx] = local_idx;
+  }
+}
+
 // ============================================================================
 // Two-level segmented unique: shared-memory first-level dedup, then merge into
 // the global hash table.
@@ -978,22 +1101,30 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         get_pointer<int64_t>(table_counters), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // Dynamic shared memory: persistent table s_keys[S]+s_freq[S]+s_tabs[S]+
-    // s_gidx[S] (24B/slot) + s_ghash[S] (4B/slot, global probe index across the
-    // 3-phase flush) + s_tcount[num_tables]+s_tnext[num_tables] (privatized
-    // per-table counter).  Exceeds the 48KB default, so opt in explicitly.
-    const size_t smem_bytes =
-        static_cast<size_t>(SHARED_TABLE_SIZE) *
-            (sizeof(KeyType) + sizeof(int64_t) + 3 * sizeof(int)) +
-        static_cast<size_t>(num_tables) * 2 * sizeof(int);
+    // Per-key kernel with privatized table_counters, block size 1024.  Shared
+    // is just the two privatized per-table counters (s_tc + s_tnext).
+    const size_t smem_bytes = static_cast<size_t>(num_tables) * 2 * sizeof(int);
     auto kernel =
-        segmented_unique_shared_kernel<KeyType, MurmurHash3_32<KeyType>>;
-    cudaFuncSetAttribute(kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem_bytes));
+        segmented_unique_perkey_kernel<KeyType, MurmurHash3_32<KeyType>>;
 
-    // Run flush-on-fill segmented unique kernel with optional freq counting
-    kernel<<<shared_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
+    // Deferred cross-block publish requires all launched blocks to be
+    // co-resident, so size the grid to exactly the max active blocks/SM (never
+    // oversubscribe).  grid-stride then covers all keys.
+    int blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, kernel, SHARED_BLOCK_SIZE, smem_bytes);
+    if (blocks_per_sm < 1)
+      blocks_per_sm = 1;
+    int64_t pk_grid64 = static_cast<int64_t>(device_sm_count) * blocks_per_sm;
+    const int64_t pk_need =
+        (num_keys + SHARED_BLOCK_SIZE - 1) / SHARED_BLOCK_SIZE;
+    if (pk_grid64 > pk_need)
+      pk_grid64 = pk_need;
+    if (pk_grid64 < 1)
+      pk_grid64 = 1;
+    const int pk_grid = static_cast<int>(pk_grid64);
+
+    kernel<<<pk_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
         get_pointer<const KeyType>(keys),
         get_pointer<const int64_t>(table_ids),
         get_pointer<KeyType>(partitioned_unique_keys),
@@ -1006,7 +1137,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
             : nullptr,
         has_input_freq ? get_pointer<const int64_t>(input_frequencies)
                        : nullptr,
-        get_pointer<int32_t>(key_slot), num_tables);
+        num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
