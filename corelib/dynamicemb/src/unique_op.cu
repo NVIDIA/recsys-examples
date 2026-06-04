@@ -445,46 +445,144 @@ __device__ __forceinline__ int32_t global_insert(
   return -1; // table full (guarded against by capacity = 2*num_keys)
 }
 
-// Flush the persistent shared table to the global table and clear it.
-// Called collectively by all threads of the block (contains __syncthreads).
-//   1. one thread per occupied slot merges its distinct (key, table_id) into
-//      the global table via global_insert, recording the global local idx in
-//      s_gidx (the tile-accumulated freq is added once here);
-//   2. scatter that global idx to every input position of the current epoch
-//      [lo, hi) via the per-input slot map key_slot;
-//   3. reset the table (keys/tabs/freq) and the distinct counter so the block
-//      can keep accumulating into a fresh table.
+// Flush the persistent shared table into the global table and clear it.
+// Called collectively by all threads (contains __syncthreads).  Three phases
+// privatize the table_counters atomic: the per-table NEW-key count is summed in
+// SHARED during phase 1, then committed to the GLOBAL counter with ONE atomic
+// per table in phase 2 -- cutting global atomics from O(claims) to
+// O(num_tables) per flush.
+//
+//   Phase 1 (no global counter atomic, claim path never blocks): probe the
+//     global table for each occupied slot.  A CAS-claim publishes the table_id
+//     immediately with a PENDING (-1) index so concurrent probers can still
+//     disambiguate the composite (key, table_id) by reading the table_id, while
+//     the real index is deferred.  New claims bump the SHARED s_tcount[table].
+//   Phase 2: one global atomicAdd(table_counters[t], s_tcount[t]) reserves a
+//     contiguous index range per table -> s_tnext[t].
+//   Phase 3: claimers draw their local idx from the SHARED s_tnext[t], write
+//     d_unique_keys and overwrite hash_vals with the final index; duplicates
+//     spin until the owner publishes a real (>=0) index.  Claimers publish
+//     before any spin, so the block always makes progress -> deadlock-free.
+//
+// Then scatter idx to this epoch's input positions [lo,hi) and clear the table.
 // MUST run before the table is reused, because clearing recycles slot ids.
 template <typename KeyType, typename Hasher,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
 __device__ void su_flush(KeyType *s_keys, int64_t *s_freq, int *s_tabs,
-                         int *s_gidx, int *s_distinct, int S, bool count_freq,
-                         size_t lo, size_t hi, const int *key_slot,
-                         int64_t *d_output_indices, KeyType *hash_keys,
-                         int64_t *hash_vals, uint32_t cap,
+                         int *s_gidx, uint32_t *s_ghash, int *s_tcount,
+                         int *s_tnext, int *s_distinct, int S, int num_tables,
+                         bool count_freq, size_t lo, size_t hi,
+                         const int *key_slot, int64_t *d_output_indices,
+                         KeyType *hash_keys, int64_t *hash_vals, uint32_t cap,
                          int64_t *table_counters,
                          const int64_t *d_segmented_range, KeyType *d_unique_keys,
                          int64_t *frequency_counters) {
   const int B = blockDim.x;
   const int tid = threadIdx.x;
+  constexpr int CLAIM = -1, EXIST = -2;
   __syncthreads();
-  // 1. merge occupied slots into the global table.
+
+  for (int t = tid; t < num_tables; t += B)
+    s_tcount[t] = 0;
+  __syncthreads();
+
+  // Phase 1: claim-or-find in the global table; count new keys in shared.
   for (int s = tid; s < S; s += B) {
-    if (s_keys[s] != empty_key) {
-      const int64_t freq_add = count_freq ? s_freq[s] : 0;
-      s_gidx[s] = global_insert<KeyType, Hasher, empty_key, empty_val>(
-          s_keys[s], s_tabs[s], freq_add, hash_keys, hash_vals, cap,
-          table_counters, d_segmented_range, d_unique_keys, frequency_counters);
+    if (s_keys[s] == empty_key)
+      continue;
+    const KeyType key = s_keys[s];
+    const int t = s_tabs[s];
+    uint32_t kh = Hasher::hash(key);
+    uint32_t th = Hasher::hash(static_cast<uint32_t>(t));
+    uint32_t gi = Hasher::hash_combine(kh, th) % cap;
+    for (uint32_t probe = 0; probe < cap; ++probe) {
+      const KeyType ek = hash_keys[gi];
+      if (ek == empty_key) {
+        const KeyType old = atomicCAS(&hash_keys[gi], empty_key, key);
+        if (old == empty_key) {
+          // Claimed: publish table_id now (PENDING index), defer the index.
+          *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
+              pack_table_val(t, -1);
+          ::atomicAdd(&s_tcount[t], 1);
+          s_ghash[s] = gi;
+          s_gidx[s] = CLAIM;
+          break;
+        } else if (old == key) {
+          int64_t pv;
+          do {
+            pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+          } while (pv == empty_val);
+          if (unpack_table_id(pv) == t) {
+            s_ghash[s] = gi;
+            s_gidx[s] = EXIST;
+            break;
+          }
+        }
+      } else if (ek == key) {
+        int64_t pv;
+        do {
+          pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+        } while (pv == empty_val);
+        if (unpack_table_id(pv) == t) {
+          s_ghash[s] = gi;
+          s_gidx[s] = EXIST;
+          break;
+        }
+      }
+      gi = (gi + 1) % cap;
     }
   }
   __syncthreads();
-  // 2. scatter the global idx to this epoch's input positions.
+
+  // Phase 2: one global atomic per table reserves a contiguous index range.
+  for (int t = tid; t < num_tables; t += B) {
+    const int cnt = s_tcount[t];
+    s_tnext[t] = cnt > 0 ? static_cast<int>(atomicAdd(
+                               &table_counters[t], static_cast<int64_t>(cnt)))
+                         : 0;
+  }
+  __syncthreads();
+
+  // Phase 3: assign indices for claims (publish final), resolve duplicates.
+  for (int s = tid; s < S; s += B) {
+    if (s_keys[s] == empty_key)
+      continue;
+    const int t = s_tabs[s];
+    const uint32_t gi = s_ghash[s];
+    const int64_t freq_add = count_freq ? s_freq[s] : 0;
+    int local_idx;
+    if (s_gidx[s] == CLAIM) {
+      local_idx = ::atomicAdd(&s_tnext[t], 1); // shared, within reserved range
+      const size_t opos = static_cast<size_t>(d_segmented_range[t]) + local_idx;
+      d_unique_keys[opos] = s_keys[s];
+      *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
+          pack_table_val(t, local_idx);
+      if (count_freq)
+        atomicAdd(&frequency_counters[opos], freq_add);
+    } else { // EXIST: wait for the owner's final (>=0) index.
+      int64_t pv;
+      do {
+        pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+      } while (unpack_local_idx(pv) < 0);
+      local_idx = unpack_local_idx(pv);
+      if (count_freq) {
+        const size_t opos =
+            static_cast<size_t>(d_segmented_range[t]) + local_idx;
+        atomicAdd(&frequency_counters[opos], freq_add);
+      }
+    }
+    s_gidx[s] = local_idx;
+  }
+  __syncthreads();
+
+  // Scatter the global idx to this epoch's input positions.
   for (size_t i = lo + tid; i < hi; i += B) {
     d_output_indices[i] = s_gidx[key_slot[i]];
   }
   __syncthreads();
-  // 3. clear the table for the next epoch.
+
+  // Clear the table for the next epoch.
   for (int s = tid; s < S; s += B) {
     s_keys[s] = empty_key;
     s_tabs[s] = -1;
@@ -527,18 +625,25 @@ segmented_unique_shared_kernel(
     int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
     int64_t *hash_vals, size_t capacity, int64_t *table_counters,
     const int64_t *d_segmented_range, int64_t *frequency_counters,
-    const int64_t *input_frequencies, int *key_slot) {
+    const int64_t *input_frequencies, int *key_slot, int64_t num_tables) {
   constexpr int S = SHARED_TABLE_SIZE;
   const int B = blockDim.x;
   const int tid = threadIdx.x;
   const uint32_t cap = static_cast<uint32_t>(capacity);
   const bool count_freq = frequency_counters != nullptr;
 
+  // Dynamic shared layout: persistent table (s_keys/s_freq/s_tabs/s_gidx),
+  // s_ghash[S] remembers each occupied slot's global probe index across the
+  // 3-phase flush, and s_tcount/s_tnext[num_tables] privatize the per-table
+  // counter (shared count in phase 1 -> one global reserve in phase 2).
   extern __shared__ char smem[];
   KeyType *s_keys = reinterpret_cast<KeyType *>(smem);
   int64_t *s_freq = reinterpret_cast<int64_t *>(s_keys + S);
   int *s_tabs = reinterpret_cast<int *>(s_freq + S);
   int *s_gidx = reinterpret_cast<int *>(s_tabs + S);
+  uint32_t *s_ghash = reinterpret_cast<uint32_t *>(s_gidx + S);
+  int *s_tcount = reinterpret_cast<int *>(s_ghash + S);
+  int *s_tnext = reinterpret_cast<int *>(s_tcount + num_tables);
   __shared__ int s_distinct;
 
   // This block owns the contiguous chunk [cstart, cend).  Contiguous (not
@@ -568,10 +673,10 @@ segmented_unique_shared_kernel(
     // end-of-loop sync), so this branch is uniform across the block.
     if (s_distinct + B > SHARED_FLUSH_CAP) {
       su_flush<KeyType, Hasher, empty_key, empty_val>(
-          s_keys, s_freq, s_tabs, s_gidx, &s_distinct, S, count_freq,
-          epoch_start, wave, key_slot, d_output_indices, hash_keys, hash_vals,
-          cap, table_counters, d_segmented_range, d_unique_keys,
-          frequency_counters);
+          s_keys, s_freq, s_tabs, s_gidx, s_ghash, s_tcount, s_tnext,
+          &s_distinct, S, static_cast<int>(num_tables), count_freq, epoch_start,
+          wave, key_slot, d_output_indices, hash_keys, hash_vals, cap,
+          table_counters, d_segmented_range, d_unique_keys, frequency_counters);
       epoch_start = wave;
     }
 
@@ -629,9 +734,10 @@ segmented_unique_shared_kernel(
 
   // Final flush of the last epoch.
   su_flush<KeyType, Hasher, empty_key, empty_val>(
-      s_keys, s_freq, s_tabs, s_gidx, &s_distinct, S, count_freq, epoch_start,
-      cend, key_slot, d_output_indices, hash_keys, hash_vals, cap,
-      table_counters, d_segmented_range, d_unique_keys, frequency_counters);
+      s_keys, s_freq, s_tabs, s_gidx, s_ghash, s_tcount, s_tnext, &s_distinct, S,
+      static_cast<int>(num_tables), count_freq, epoch_start, cend, key_slot,
+      d_output_indices, hash_keys, hash_vals, cap, table_counters,
+      d_segmented_range, d_unique_keys, frequency_counters);
 }
 
 // Binary search helper for compaction
@@ -872,12 +978,14 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         get_pointer<int64_t>(table_counters), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // Dynamic shared memory: s_keys[S] + s_freq[S] + s_tabs[S] + s_gidx[S]
-    // = S * 24 bytes (per-input slot map moved to global key_slot).  Exceeds
-    // the 48KB default, so opt in explicitly.
+    // Dynamic shared memory: persistent table s_keys[S]+s_freq[S]+s_tabs[S]+
+    // s_gidx[S] (24B/slot) + s_ghash[S] (4B/slot, global probe index across the
+    // 3-phase flush) + s_tcount[num_tables]+s_tnext[num_tables] (privatized
+    // per-table counter).  Exceeds the 48KB default, so opt in explicitly.
     const size_t smem_bytes =
         static_cast<size_t>(SHARED_TABLE_SIZE) *
-        (sizeof(KeyType) + sizeof(int64_t) + 2 * sizeof(int));
+            (sizeof(KeyType) + sizeof(int64_t) + 3 * sizeof(int)) +
+        static_cast<size_t>(num_tables) * 2 * sizeof(int);
     auto kernel =
         segmented_unique_shared_kernel<KeyType, MurmurHash3_32<KeyType>>;
     cudaFuncSetAttribute(kernel,
@@ -898,7 +1006,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
             : nullptr,
         has_input_freq ? get_pointer<const int64_t>(input_frequencies)
                        : nullptr,
-        get_pointer<int32_t>(key_slot));
+        get_pointer<int32_t>(key_slot), num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
