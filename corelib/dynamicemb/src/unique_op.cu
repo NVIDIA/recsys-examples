@@ -353,7 +353,7 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
 template <typename KeyType, typename Hasher,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
-__global__ void __launch_bounds__(1024) // SHARED_BLOCK_SIZE, defined below
+__global__ void __launch_bounds__(1024, 2) // force 2 blocks/SM (reg<=32)
 segmented_unique_perkey_kernel(
     const KeyType *d_keys, const int64_t *d_table_ids, KeyType *d_unique_keys,
     int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
@@ -364,69 +364,101 @@ segmented_unique_perkey_kernel(
   const int tid = threadIdx.x;
   const uint32_t cap = static_cast<uint32_t>(capacity);
   const bool count_freq = frequency_counters != nullptr;
+  constexpr int U = 2; // keys per thread (unroll for memory-level parallelism)
 
+  // Shared holds the per-table privatized counters AND the COLD per-lane state
+  // (input index, freq, kind, rank) -- moved off registers so the U-lane probe
+  // fits in <=32 regs (full occupancy) without spilling to local.  The HOT
+  // probe state (key/tb/gi/done) stays in registers.  Lane u of thread tid is
+  // at shared index u*B + tid.
   extern __shared__ char smem[];
-  int *s_wc = reinterpret_cast<int *>(smem);                // [num_tables]
-  int *s_base = reinterpret_cast<int *>(s_wc + num_tables); // [num_tables]
+  int64_t *s_freq = reinterpret_cast<int64_t *>(smem);      // [U*B]
+  int *s_wc = reinterpret_cast<int *>(s_freq + U * B);      // [num_tables]
+  int *s_base = s_wc + num_tables;                          // [num_tables]
+  int *s_idx = s_base + num_tables;                         // [U*B]
+  int *s_kind = s_idx + U * B;                              // [U*B]
+  int *s_rank = s_kind + U * B;                             // [U*B]
 
-  // Single pass over keys, processed in waves of B.  Each key is probed once
-  // (original logic).  The table_counters atomic is reduced in SHARED across
-  // the block per wave, then ONE global atomicAdd per table fetches the base,
-  // then local_idx = base + within-wave rank -- no second full pass.
-  for (size_t wave = static_cast<size_t>(blockIdx.x) * B; wave < num_keys;
-       wave += static_cast<size_t>(gridDim.x) * B) {
+  for (size_t wave = static_cast<size_t>(blockIdx.x) * U * B; wave < num_keys;
+       wave += static_cast<size_t>(gridDim.x) * U * B) {
     for (int t = tid; t < num_tables; t += B)
       s_wc[t] = 0;
     __syncthreads();
 
-    const size_t idx = wave + tid;
-    const bool valid = idx < num_keys;
-    KeyType key = empty_key;
-    int t = -1;
-    int64_t input_freq = 1;
-    uint32_t gi = 0;
-    int kind = 0; // 0 none, 1 claim, 2 existing
-    int rank = 0;
-    if (valid) {
-      key = d_keys[idx];
-      t = static_cast<int>(d_table_ids[idx]);
-      input_freq = input_frequencies ? input_frequencies[idx] : 1;
-      uint32_t kh = Hasher::hash(key);
-      uint32_t th = Hasher::hash(static_cast<uint32_t>(t));
-      gi = Hasher::hash_combine(kh, th) % cap;
-      for (uint32_t probe = 0; probe < cap; ++probe) {
-        const KeyType ek = hash_keys[gi];
-        if (ek == empty_key) {
-          const KeyType old = atomicCAS(&hash_keys[gi], empty_key, key);
+    // Hot per-lane state in registers; cold state in shared.
+    KeyType key[U];
+    int tb[U];
+    uint32_t gi[U];
+    bool done[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const size_t idx = wave + static_cast<size_t>(u) * B + tid;
+      const int li = u * B + tid;
+      s_kind[li] = 0;
+      gi[u] = 0;
+      const bool valid = idx < num_keys;
+      done[u] = !valid;
+      if (valid) {
+        s_idx[li] = static_cast<int>(idx);
+        const KeyType k = d_keys[idx];
+        const int t = static_cast<int>(d_table_ids[idx]);
+        key[u] = k;
+        tb[u] = t;
+        if (count_freq)
+          s_freq[li] = input_frequencies ? input_frequencies[idx] : 1;
+        gi[u] = Hasher::hash_combine(Hasher::hash(k),
+                                     Hasher::hash(static_cast<uint32_t>(t))) %
+                cap;
+      }
+    }
+
+    // Interleaved probe: issue both lanes' hash_keys loads, then consume both.
+    bool any = !(done[0] && done[1]);
+    while (any) {
+      KeyType ek[U];
+#pragma unroll
+      for (int u = 0; u < U; ++u)
+        if (!done[u])
+          ek[u] = hash_keys[gi[u]]; // independent loads -> overlap (MLP)
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        if (done[u])
+          continue;
+        const int li = u * B + tid;
+        if (ek[u] == empty_key) {
+          const KeyType old = atomicCAS(&hash_keys[gi[u]], empty_key, key[u]);
           if (old == empty_key) {
-            // claimed: publish table_id (PENDING idx); count in shared.
-            *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
-                pack_table_val(t, -1);
-            rank = ::atomicAdd(&s_wc[t], 1); // shared reduction
-            kind = 1;
-            break;
-          } else if (old == key) {
+            *reinterpret_cast<volatile int64_t *>(&hash_vals[gi[u]]) =
+                pack_table_val(tb[u], -1);
+            s_rank[li] = ::atomicAdd(&s_wc[tb[u]], 1);
+            s_kind[li] = 1;
+            done[u] = true;
+            continue;
+          } else if (old == key[u]) {
             int64_t pv;
             do {
-              pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+              pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi[u]]);
             } while (pv == empty_val);
-            if (unpack_table_id(pv) == t) {
-              kind = 2;
-              break;
+            if (unpack_table_id(pv) == tb[u]) {
+              s_kind[li] = 2;
+              done[u] = true;
+              continue;
             }
           }
-        } else if (ek == key) {
+        } else if (ek[u] == key[u]) {
           int64_t pv;
           do {
-            pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+            pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi[u]]);
           } while (pv == empty_val);
-          if (unpack_table_id(pv) == t) {
-            kind = 2;
-            break;
+          if (unpack_table_id(pv) == tb[u]) {
+            s_kind[li] = 2;
+            done[u] = true;
+            continue;
           }
         }
-        gi = (gi + 1) % cap;
+        gi[u] = (gi[u] + 1) % cap;
       }
+      any = !(done[0] && done[1]);
     }
     __syncthreads();
 
@@ -438,26 +470,37 @@ segmented_unique_perkey_kernel(
     }
     __syncthreads();
 
-    if (valid && kind == 1) {
-      const int local_idx = s_base[t] + rank;
-      const size_t opos = static_cast<size_t>(d_segmented_range[t]) + local_idx;
-      d_unique_keys[opos] = key;
-      *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
-          pack_table_val(t, local_idx);
-      d_output_indices[idx] = local_idx;
-      if (count_freq)
-        atomicAdd(&frequency_counters[opos], input_freq);
-    } else if (valid && kind == 2) {
-      int64_t pv;
-      do {
-        pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
-      } while (unpack_local_idx(pv) < 0);
-      const int local_idx = unpack_local_idx(pv);
-      d_output_indices[idx] = local_idx;
-      if (count_freq) {
-        const size_t opos =
-            static_cast<size_t>(d_segmented_range[t]) + local_idx;
-        atomicAdd(&frequency_counters[opos], input_freq);
+    // Phase 3: publish ALL of this thread's claims first, then its duplicates.
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int li = u * B + tid;
+      if (s_kind[li] == 1) {
+        const int t = tb[u];
+        const int local_idx = s_base[t] + s_rank[li];
+        const size_t opos = static_cast<size_t>(d_segmented_range[t]) + local_idx;
+        d_unique_keys[opos] = key[u];
+        *reinterpret_cast<volatile int64_t *>(&hash_vals[gi[u]]) =
+            pack_table_val(t, local_idx);
+        d_output_indices[s_idx[li]] = local_idx;
+        if (count_freq)
+          atomicAdd(&frequency_counters[opos], s_freq[li]);
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int li = u * B + tid;
+      if (s_kind[li] == 2) {
+        int64_t pv;
+        do {
+          pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi[u]]);
+        } while (unpack_local_idx(pv) < 0);
+        const int local_idx = unpack_local_idx(pv);
+        d_output_indices[s_idx[li]] = local_idx;
+        if (count_freq) {
+          const size_t opos =
+              static_cast<size_t>(d_segmented_range[tb[u]]) + local_idx;
+          atomicAdd(&frequency_counters[opos], s_freq[li]);
+        }
       }
     }
     __syncthreads();
@@ -1103,11 +1146,18 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         get_pointer<int64_t>(table_counters), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // Per-key kernel with privatized table_counters, block size 1024.  Shared
-    // is just the two privatized per-table counters (s_tc + s_tnext).
-    const size_t smem_bytes = static_cast<size_t>(num_tables) * 2 * sizeof(int);
+    // Per-key kernel, block 1024, U=2 keys/thread.  Shared = s_freq[U*B] +
+    // s_wc/s_base[num_tables] + s_idx/s_kind/s_rank[U*B] (cold per-lane state
+    // moved off registers to keep <=32 regs / full occupancy without spilling).
+    constexpr int PK_U = 2;
+    const size_t smem_bytes =
+        static_cast<size_t>(PK_U) * SHARED_BLOCK_SIZE * sizeof(int64_t) +
+        static_cast<size_t>(num_tables) * 2 * sizeof(int) +
+        static_cast<size_t>(PK_U) * SHARED_BLOCK_SIZE * 3 * sizeof(int);
     auto kernel =
         segmented_unique_perkey_kernel<KeyType, MurmurHash3_32<KeyType>>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem_bytes));
 
     // Deferred cross-block publish requires all launched blocks to be
     // co-resident, so size the grid to exactly the max active blocks/SM (never
