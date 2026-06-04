@@ -28,12 +28,14 @@ void bind_index_calculation_op(py::module &m);
 void bind_initializer_op(py::module &m);
 void bind_table_operation(py::module &m);
 void bind_vmm_op(py::module &m);
+void bind_probe_stats(py::module &m);
 
 PYBIND11_MODULE(dynamicemb_extensions, m) {
   m.doc() = "DYNAMICEMB"; // Optional
 
   bind_dyn_emb_op(m);
   bind_unique_op(m);
+  bind_probe_stats(m);
   bind_bucktiz_kernel_op(m);
   bind_optimizer_kernel_op(m);
   bind_index_calculation_op(m);
