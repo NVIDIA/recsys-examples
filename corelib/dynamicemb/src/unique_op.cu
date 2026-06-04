@@ -343,13 +343,22 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
 // Two-level segmented unique: shared-memory first-level dedup, then merge into
 // the global hash table.
 // ============================================================================
-// Block tile size and shared hash-table size.  The shared table holds 2x the
-// tile's keys, so its load factor is <= 0.5 (a tile has at most BLOCK_SIZE
-// distinct keys) and it can never overflow.  BLOCK_SIZE is opened to the H100
-// maximum (1024) so each tile collapses as many duplicates as possible before
-// touching the global table.
+// Block size and persistent shared hash-table size for the flush-on-fill
+// segmented unique kernel.  BLOCK_SIZE is opened to the H100 maximum (1024).
+// The shared table is PERSISTENT across the block's whole key stream (not
+// reset per tile); it is flushed to the global table and cleared only when it
+// is about to fill.  SHARED_TABLE_SIZE must be a power of two (the probe index
+// is masked with S-1) and >= 2*SHARED_BLOCK_SIZE so a freshly cleared table
+// always has room for a full wave.  At 24 bytes/slot (key8 + freq8 + tab4 +
+// gidx4): 4096 slots = 96KB -> 2 blocks/SM (full occupancy); 8192 = 192KB ->
+// 1 block/SM (50% occupancy, but fewer flushes).
 constexpr int SHARED_BLOCK_SIZE = 1024;
-constexpr int SHARED_TABLE_SIZE = 2 * SHARED_BLOCK_SIZE;
+constexpr int SHARED_TABLE_SIZE = 4096;
+// Flush when the next wave might push the distinct count past this fraction of
+// the table.  Below 1.0 keeps linear-probe chains short (cheap shared probing)
+// at the cost of slightly more frequent flushes -- the load-factor knob.
+constexpr int SHARED_FLUSH_CAP =
+    static_cast<int>(SHARED_TABLE_SIZE * 0.7);
 
 // Insert/lookup (key, table_id) in the GLOBAL hash table and return its local
 // unique index within the table.  Shared between the per-key kernel and the
@@ -436,21 +445,79 @@ __device__ __forceinline__ int32_t global_insert(
   return -1; // table full (guarded against by capacity = 2*num_keys)
 }
 
-// Two-level segmented unique kernel.  Each block processes a tile of
-// SHARED_BLOCK_SIZE consecutive keys: it first deduplicates the tile in a
-// shared-memory hash table (Pass 1), then a single thread per occupied shared
-// slot inserts that distinct (key, table_id) into the global table (Pass 2),
-// and finally every input position is scattered to its global local index
-// (Pass 3).  This collapses duplicates in fast shared memory, so the number of
-// scattered global probes drops from num_keys to the count of tile-distinct
-// keys -- directly attacking the long_scoreboard latency bound.
+// Flush the persistent shared table to the global table and clear it.
+// Called collectively by all threads of the block (contains __syncthreads).
+//   1. one thread per occupied slot merges its distinct (key, table_id) into
+//      the global table via global_insert, recording the global local idx in
+//      s_gidx (the tile-accumulated freq is added once here);
+//   2. scatter that global idx to every input position of the current epoch
+//      [lo, hi) via the per-input slot map key_slot;
+//   3. reset the table (keys/tabs/freq) and the distinct counter so the block
+//      can keep accumulating into a fresh table.
+// MUST run before the table is reused, because clearing recycles slot ids.
+template <typename KeyType, typename Hasher,
+          KeyType empty_key = std::numeric_limits<KeyType>::max(),
+          int64_t empty_val = std::numeric_limits<int64_t>::max()>
+__device__ void su_flush(KeyType *s_keys, int64_t *s_freq, int *s_tabs,
+                         int *s_gidx, int *s_distinct, int S, bool count_freq,
+                         size_t lo, size_t hi, const int *key_slot,
+                         int64_t *d_output_indices, KeyType *hash_keys,
+                         int64_t *hash_vals, uint32_t cap,
+                         int64_t *table_counters,
+                         const int64_t *d_segmented_range, KeyType *d_unique_keys,
+                         int64_t *frequency_counters) {
+  const int B = blockDim.x;
+  const int tid = threadIdx.x;
+  __syncthreads();
+  // 1. merge occupied slots into the global table.
+  for (int s = tid; s < S; s += B) {
+    if (s_keys[s] != empty_key) {
+      const int64_t freq_add = count_freq ? s_freq[s] : 0;
+      s_gidx[s] = global_insert<KeyType, Hasher, empty_key, empty_val>(
+          s_keys[s], s_tabs[s], freq_add, hash_keys, hash_vals, cap,
+          table_counters, d_segmented_range, d_unique_keys, frequency_counters);
+    }
+  }
+  __syncthreads();
+  // 2. scatter the global idx to this epoch's input positions.
+  for (size_t i = lo + tid; i < hi; i += B) {
+    d_output_indices[i] = s_gidx[key_slot[i]];
+  }
+  __syncthreads();
+  // 3. clear the table for the next epoch.
+  for (int s = tid; s < S; s += B) {
+    s_keys[s] = empty_key;
+    s_tabs[s] = -1;
+    if (count_freq)
+      s_freq[s] = 0;
+  }
+  if (tid == 0)
+    *s_distinct = 0;
+  __syncthreads();
+}
+
+// Flush-on-fill segmented unique kernel.  Each block owns a CONTIGUOUS chunk of
+// keys and accumulates their distinct (key, table_id) pairs into a PERSISTENT
+// shared-memory hash table, collapsing duplicates in fast shared memory.  The
+// table is flushed to the global table (su_flush) and cleared only when it is
+// about to fill -- not once per tile -- so a block with many duplicates touches
+// the global table just once.  This cuts scattered global probes from num_keys
+// down to the number of distinct keys, attacking the long_scoreboard bound,
+// while amortizing the barrier/reset cost across the whole chunk.
+//
+// Intermediate state lives in three places:
+//   - distinct (key,table) + accumulated freq -> persistent shared table
+//     (s_keys/s_tabs/s_freq), survives across waves, cleared only on flush;
+//   - per-slot global idx -> s_gidx (filled at flush, consumed by the scatter);
+//   - per-input -> slot map -> GLOBAL key_slot[num_keys] (an epoch's total key
+//     count can exceed S, so it cannot live in shared); scattered to
+//     d_output_indices before each clear.
 //
 // Dynamic shared layout (bytes), 8-byte types first for alignment:
-//   s_keys [S] KeyType   - tile hash table keys (empty_key sentinel)
-//   s_freq [S] int64     - tile-accumulated frequency per slot
+//   s_keys [S] KeyType   - persistent table keys (empty_key sentinel)
+//   s_freq [S] int64     - accumulated frequency per slot
 //   s_tabs [S] int32     - table_id per slot (-1 = unpublished, producer/consumer)
-//   s_gidx [S] int32     - global local unique idx per slot (filled in Pass 2)
-//   s_slot [B] int32     - shared slot each thread's key landed in (for Pass 3)
+//   s_gidx [S] int32     - global local unique idx per slot (filled at flush)
 template <typename KeyType, typename Hasher,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
@@ -460,7 +527,7 @@ segmented_unique_shared_kernel(
     int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
     int64_t *hash_vals, size_t capacity, int64_t *table_counters,
     const int64_t *d_segmented_range, int64_t *frequency_counters,
-    const int64_t *input_frequencies) {
+    const int64_t *input_frequencies, int *key_slot) {
   constexpr int S = SHARED_TABLE_SIZE;
   const int B = blockDim.x;
   const int tid = threadIdx.x;
@@ -472,24 +539,44 @@ segmented_unique_shared_kernel(
   int64_t *s_freq = reinterpret_cast<int64_t *>(s_keys + S);
   int *s_tabs = reinterpret_cast<int *>(s_freq + S);
   int *s_gidx = reinterpret_cast<int *>(s_tabs + S);
-  int *s_slot = reinterpret_cast<int *>(s_gidx + S);
+  __shared__ int s_distinct;
 
-  for (size_t tile_start = static_cast<size_t>(blockIdx.x) * B;
-       tile_start < num_keys;
-       tile_start += static_cast<size_t>(gridDim.x) * B) {
-    // Reset shared table for this tile.
-    for (int i = tid; i < S; i += B) {
-      s_keys[i] = empty_key;
-      s_tabs[i] = -1;
-      if (count_freq)
-        s_freq[i] = 0;
+  // This block owns the contiguous chunk [cstart, cend).  Contiguous (not
+  // strided) so each flush epoch is a contiguous range [epoch_start, wave) that
+  // the scatter can walk, and so the d_keys loads coalesce.
+  const size_t chunk = (num_keys + gridDim.x - 1) / gridDim.x;
+  const size_t cstart = static_cast<size_t>(blockIdx.x) * chunk;
+  if (cstart >= num_keys)
+    return;
+  const size_t cend = (cstart + chunk < num_keys) ? cstart + chunk : num_keys;
+
+  // Initialize the persistent table once.
+  for (int i = tid; i < S; i += B) {
+    s_keys[i] = empty_key;
+    s_tabs[i] = -1;
+    if (count_freq)
+      s_freq[i] = 0;
+  }
+  if (tid == 0)
+    s_distinct = 0;
+  __syncthreads();
+
+  size_t epoch_start = cstart;
+  for (size_t wave = cstart; wave < cend; wave += B) {
+    // Flush before a wave that could overflow the table.  s_distinct is the
+    // count carried over from prior waves (same value for all threads after the
+    // end-of-loop sync), so this branch is uniform across the block.
+    if (s_distinct + B > SHARED_FLUSH_CAP) {
+      su_flush<KeyType, Hasher, empty_key, empty_val>(
+          s_keys, s_freq, s_tabs, s_gidx, &s_distinct, S, count_freq,
+          epoch_start, wave, key_slot, d_output_indices, hash_keys, hash_vals,
+          cap, table_counters, d_segmented_range, d_unique_keys,
+          frequency_counters);
+      epoch_start = wave;
     }
-    __syncthreads();
 
-    // Pass 1: dedup this tile in shared memory.
-    const size_t idx = tile_start + tid;
-    const bool valid = idx < num_keys;
-    if (valid) {
+    const size_t idx = wave + tid;
+    if (idx < cend) {
       const KeyType key = d_keys[idx];
       const int table_id = static_cast<int>(d_table_ids[idx]);
       const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
@@ -505,8 +592,10 @@ segmented_unique_shared_kernel(
         if (ek == empty_key) {
           const KeyType old = atomicCAS(&s_keys[si], empty_key, key);
           if (old == empty_key) {
-            // Claimed: publish table_id (volatile so spinners observe it).
+            // Claimed a new distinct slot: publish table_id (volatile so
+            // spinners observe it) and bump the distinct counter.
             *reinterpret_cast<volatile int *>(&s_tabs[si]) = table_id;
+            ::atomicAdd(&s_distinct, 1); // built-in int overload (dyn_emb:: hides it)
             slot = si;
             break;
           } else if (old == key) {
@@ -531,32 +620,18 @@ segmented_unique_shared_kernel(
         }
         si = (si + 1) & (S - 1);
       }
-      s_slot[tid] = slot;
+      key_slot[idx] = slot;
       if (count_freq && slot >= 0)
         atomicAdd(&s_freq[slot], input_freq);
     }
-    __syncthreads();
-
-    // Pass 2: one thread per occupied slot inserts into the global table.
-    for (int s = tid; s < S; s += B) {
-      const KeyType k = s_keys[s];
-      if (k != empty_key) {
-        const int table_id = s_tabs[s];
-        const int64_t freq_add = count_freq ? s_freq[s] : 0;
-        s_gidx[s] = global_insert<KeyType, Hasher, empty_key, empty_val>(
-            k, table_id, freq_add, hash_keys, hash_vals, cap, table_counters,
-            d_segmented_range, d_unique_keys, frequency_counters);
-      }
-    }
-    __syncthreads();
-
-    // Pass 3: scatter the global local index back to every input position.
-    if (valid) {
-      const int slot = s_slot[tid];
-      d_output_indices[idx] = s_gidx[slot];
-    }
-    __syncthreads();
+    __syncthreads(); // all inserts of this wave land before the next flush check
   }
+
+  // Final flush of the last epoch.
+  su_flush<KeyType, Hasher, empty_key, empty_val>(
+      s_keys, s_freq, s_tabs, s_gidx, &s_distinct, S, count_freq, epoch_start,
+      cend, key_slot, d_output_indices, hash_keys, hash_vals, cap,
+      table_counters, d_segmented_range, d_unique_keys, frequency_counters);
 }
 
 // Binary search helper for compaction
@@ -767,9 +842,18 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   at::Tensor hash_vals = at::empty(
       {capacity}, at::TensorOptions().dtype(at::kLong).device(device));
 
-  // Grid for the two-level shared kernel: one block per tile of
-  // SHARED_BLOCK_SIZE keys, capped at 2 blocks/SM (the 52KB shared table allows
-  // 2 resident blocks of 1024 threads = full occupancy on sm_90).
+  // Per-input -> shared-slot map for the flush-on-fill kernel.  An epoch's key
+  // count can exceed the shared table size, so this linkage cannot live in
+  // shared; it is written once per key and read once at each flush (int32 is
+  // enough: a slot index is < SHARED_TABLE_SIZE).
+  at::Tensor key_slot = at::empty(
+      {num_keys}, at::TensorOptions().dtype(at::kInt).device(device));
+
+  // Grid for the flush-on-fill shared kernel: each block owns a contiguous
+  // chunk of keys.  Cap at SHARED_BLOCKS_PER_SM blocks/SM (the 96KB persistent
+  // table at S=4096 allows 2 resident blocks of 1024 threads = full occupancy
+  // on sm_90; a larger table drops this to 1).  Never launch more blocks than
+  // there is work for (>= 1 wave each).
   constexpr int SHARED_BLOCKS_PER_SM = 2;
   int64_t shared_grid64 =
       (num_keys + SHARED_BLOCK_SIZE - 1) / SHARED_BLOCK_SIZE;
@@ -789,18 +873,18 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Dynamic shared memory: s_keys[S] + s_freq[S] + s_tabs[S] + s_gidx[S]
-    // + s_slot[BLOCK].  Exceeds the 48KB default, so opt in explicitly.
+    // = S * 24 bytes (per-input slot map moved to global key_slot).  Exceeds
+    // the 48KB default, so opt in explicitly.
     const size_t smem_bytes =
         static_cast<size_t>(SHARED_TABLE_SIZE) *
-            (sizeof(KeyType) + sizeof(int64_t) + 2 * sizeof(int)) +
-        static_cast<size_t>(SHARED_BLOCK_SIZE) * sizeof(int);
+        (sizeof(KeyType) + sizeof(int64_t) + 2 * sizeof(int));
     auto kernel =
         segmented_unique_shared_kernel<KeyType, MurmurHash3_32<KeyType>>;
     cudaFuncSetAttribute(kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
 
-    // Run two-level segmented unique kernel with optional frequency counting
+    // Run flush-on-fill segmented unique kernel with optional freq counting
     kernel<<<shared_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
         get_pointer<const KeyType>(keys),
         get_pointer<const int64_t>(table_ids),
@@ -813,7 +897,8 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
             ? get_pointer<int64_t>(partitioned_freq_counters)
             : nullptr,
         has_input_freq ? get_pointer<const int64_t>(input_frequencies)
-                       : nullptr);
+                       : nullptr,
+        get_pointer<int32_t>(key_slot));
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
