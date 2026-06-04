@@ -359,11 +359,6 @@ constexpr int SHARED_TABLE_SIZE = 4096;
 // at the cost of slightly more frequent flushes -- the load-factor knob.
 constexpr int SHARED_FLUSH_CAP =
     static_cast<int>(SHARED_TABLE_SIZE * 0.7);
-// Number of low combined-hash bits used as the radix bucket key.  Inputs are
-// pre-sorted on bits [0, SHARED_SORT_BITS) to cluster equal keys into the same
-// block; the shared table is then indexed with the bits ABOVE these, so a
-// bucket's keys still spread across the table.  8 bits = 256 buckets.
-constexpr int SHARED_SORT_BITS = 8;
 
 // Insert/lookup (key, table_id) in the GLOBAL hash table and return its local
 // unique index within the table.  Shared between the per-key kernel and the
@@ -470,7 +465,7 @@ __device__ void su_flush(KeyType *s_keys, int64_t *s_freq, int *s_tabs,
                          int64_t *hash_vals, uint32_t cap,
                          int64_t *table_counters,
                          const int64_t *d_segmented_range, KeyType *d_unique_keys,
-                         int64_t *frequency_counters, const int *perm) {
+                         int64_t *frequency_counters) {
   const int B = blockDim.x;
   const int tid = threadIdx.x;
   __syncthreads();
@@ -484,11 +479,9 @@ __device__ void su_flush(KeyType *s_keys, int64_t *s_freq, int *s_tabs,
     }
   }
   __syncthreads();
-  // 2. scatter the global idx to this epoch's input positions.  Input was
-  // permuted into hash-bucket order, so map sorted position i back to its
-  // original position perm[i].
+  // 2. scatter the global idx to this epoch's input positions.
   for (size_t i = lo + tid; i < hi; i += B) {
-    d_output_indices[perm[i]] = s_gidx[key_slot[i]];
+    d_output_indices[i] = s_gidx[key_slot[i]];
   }
   __syncthreads();
   // 3. clear the table for the next epoch.
@@ -534,7 +527,7 @@ segmented_unique_shared_kernel(
     int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
     int64_t *hash_vals, size_t capacity, int64_t *table_counters,
     const int64_t *d_segmented_range, int64_t *frequency_counters,
-    const int64_t *input_frequencies, int *key_slot, const int *perm) {
+    const int64_t *input_frequencies, int *key_slot) {
   constexpr int S = SHARED_TABLE_SIZE;
   const int B = blockDim.x;
   const int tid = threadIdx.x;
@@ -578,7 +571,7 @@ segmented_unique_shared_kernel(
           s_keys, s_freq, s_tabs, s_gidx, &s_distinct, S, count_freq,
           epoch_start, wave, key_slot, d_output_indices, hash_keys, hash_vals,
           cap, table_counters, d_segmented_range, d_unique_keys,
-          frequency_counters, perm);
+          frequency_counters);
       epoch_start = wave;
     }
 
@@ -591,13 +584,7 @@ segmented_unique_shared_kernel(
       uint32_t key_hash = Hasher::hash(key);
       uint32_t tid_hash = Hasher::hash(static_cast<uint32_t>(table_id));
       uint32_t combined_hash = Hasher::hash_combine(key_hash, tid_hash);
-      // The inputs were radix-sorted on combined_hash bits [0,SORT_BITS), so
-      // within a block those low bits are nearly constant.  Index the shared
-      // table with the bits ABOVE the sort key so a bucket's keys spread across
-      // the whole table (duplicates still collide -- identical full hash ->
-      // identical high bits).  Using the sort bits here would pile a bucket
-      // into S/2^SORT_BITS slots and explode the probe chains.
-      uint32_t si = (combined_hash >> SHARED_SORT_BITS) & (S - 1);
+      uint32_t si = combined_hash & (S - 1);
 
       int slot = -1;
       for (uint32_t probe = 0; probe < static_cast<uint32_t>(S); ++probe) {
@@ -644,45 +631,7 @@ segmented_unique_shared_kernel(
   su_flush<KeyType, Hasher, empty_key, empty_val>(
       s_keys, s_freq, s_tabs, s_gidx, &s_distinct, S, count_freq, epoch_start,
       cend, key_slot, d_output_indices, hash_keys, hash_vals, cap,
-      table_counters, d_segmented_range, d_unique_keys, frequency_counters,
-      perm);
-}
-
-// Compute the combined (key, table_id) hash per input, used as the radix key
-// to bucket-sort equal keys together before the shared dedup.  Same hash the
-// dedup kernel uses, so equal (key, table_id) pairs share the low bits and land
-// in the same bucket / block.
-template <typename KeyType, typename Hasher>
-__global__ void compute_combined_hash_kernel(const KeyType *d_keys,
-                                             const int64_t *d_table_ids,
-                                             uint32_t *d_hash, size_t num_keys) {
-  const size_t stride = blockDim.x * gridDim.x;
-  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
-       idx += stride) {
-    uint32_t kh = Hasher::hash(d_keys[idx]);
-    uint32_t th = Hasher::hash(static_cast<uint32_t>(d_table_ids[idx]));
-    d_hash[idx] = Hasher::hash_combine(kh, th);
-  }
-}
-
-// Gather inputs into hash-bucket-sorted order via the permutation perm
-// (perm[i] = original position of the i-th sorted element).  Writes are
-// contiguous so the dedup kernel reads coalesced sorted streams.
-template <typename KeyType>
-__global__ void gather_inputs_kernel(const int *perm, const KeyType *d_keys,
-                                     const int64_t *d_table_ids,
-                                     const int64_t *d_freq, KeyType *s_keys,
-                                     int64_t *s_tabs, int64_t *s_freq,
-                                     size_t num_keys) {
-  const size_t stride = blockDim.x * gridDim.x;
-  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < num_keys;
-       i += stride) {
-    const int o = perm[i];
-    s_keys[i] = d_keys[o];
-    s_tabs[i] = d_table_ids[o];
-    if (d_freq)
-      s_freq[i] = d_freq[o];
-  }
+      table_counters, d_segmented_range, d_unique_keys, frequency_counters);
 }
 
 // Binary search helper for compaction
@@ -900,23 +849,6 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   at::Tensor key_slot = at::empty(
       {num_keys}, at::TensorOptions().dtype(at::kInt).device(device));
 
-  // Hash-bucket pre-sort scratch.  We radix-sort the inputs by the low 8 bits
-  // of their combined (key, table_id) hash so that equal pairs (identical full
-  // hash -> identical low bits) cluster into the same 256-bucket and thus the
-  // same block, giving the shared dedup a high within-block duplicate rate.
-  // perm_sorted[i] = original position of the i-th hash-sorted element.
-  const auto i32 = at::TensorOptions().dtype(at::kInt).device(device);
-  at::Tensor combined_hash = at::empty({num_keys}, i32);
-  at::Tensor combined_hash_sorted = at::empty({num_keys}, i32);
-  at::Tensor perm = at::arange(num_keys, i32);
-  at::Tensor perm_sorted = at::empty({num_keys}, i32);
-  at::Tensor sorted_table_ids = at::empty(
-      {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
-  at::Tensor sorted_freq;
-  if (has_input_freq)
-    sorted_freq = at::empty(
-        {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
-
   // Grid for the flush-on-fill shared kernel: each block owns a contiguous
   // chunk of keys.  Cap at SHARED_BLOCKS_PER_SM blocks/SM (the 96KB persistent
   // table at S=4096 allows 2 resident blocks of 1024 threads = full occupancy
@@ -934,52 +866,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   const int shared_grid = static_cast<int>(shared_grid64);
 
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
-    using Hasher = MurmurHash3_32<KeyType>;
-
-    // 1. Compute the combined (key, table_id) hash to bucket-sort on.
-    compute_combined_hash_kernel<KeyType, Hasher>
-        <<<grid_size, BLOCK_SIZE, 0, stream>>>(
-            get_pointer<const KeyType>(keys),
-            get_pointer<const int64_t>(table_ids),
-            reinterpret_cast<uint32_t *>(get_pointer<int32_t>(combined_hash)),
-            num_keys);
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-
-    // 2. Radix-sort (hash, original_index) pairs by the low 8 bits only -- a
-    // single-pass 256-bucket sort that clusters equal keys, far cheaper than a
-    // full sort.
-    uint32_t *hash_in =
-        reinterpret_cast<uint32_t *>(get_pointer<int32_t>(combined_hash));
-    uint32_t *hash_out =
-        reinterpret_cast<uint32_t *>(get_pointer<int32_t>(combined_hash_sorted));
-    int32_t *idx_in = get_pointer<int32_t>(perm);
-    int32_t *idx_out = get_pointer<int32_t>(perm_sorted);
-    size_t sort_bytes = 0;
-    cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, hash_in, hash_out,
-                                    idx_in, idx_out,
-                                    static_cast<int>(num_keys), 0,
-                                    SHARED_SORT_BITS, stream);
-    at::Tensor sort_temp =
-        at::empty({static_cast<int64_t>(sort_bytes)},
-                  at::TensorOptions().dtype(at::kByte).device(device));
-    cub::DeviceRadixSort::SortPairs(sort_temp.data_ptr(), sort_bytes, hash_in,
-                                    hash_out, idx_in, idx_out,
-                                    static_cast<int>(num_keys), 0, 8, stream);
-
-    // 3. Gather keys / table_ids / frequencies into hash-bucket-sorted order.
-    at::Tensor sorted_keys = at::empty({num_keys}, keys.options());
-    gather_inputs_kernel<KeyType><<<grid_size, BLOCK_SIZE, 0, stream>>>(
-        get_pointer<const int32_t>(perm_sorted),
-        get_pointer<const KeyType>(keys), get_pointer<const int64_t>(table_ids),
-        has_input_freq ? get_pointer<const int64_t>(input_frequencies)
-                       : nullptr,
-        get_pointer<KeyType>(sorted_keys),
-        get_pointer<int64_t>(sorted_table_ids),
-        has_input_freq ? get_pointer<int64_t>(sorted_freq) : nullptr,
-        num_keys);
-    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
-
-    // 4. Initialize hash table and counters.
+    // Initialize hash table and counters
     segmented_init_kernel<KeyType><<<grid_size, BLOCK_SIZE, 0, stream>>>(
         get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
         get_pointer<int64_t>(table_counters), capacity, num_tables);
@@ -991,16 +878,16 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     const size_t smem_bytes =
         static_cast<size_t>(SHARED_TABLE_SIZE) *
         (sizeof(KeyType) + sizeof(int64_t) + 2 * sizeof(int));
-    auto kernel = segmented_unique_shared_kernel<KeyType, Hasher>;
+    auto kernel =
+        segmented_unique_shared_kernel<KeyType, MurmurHash3_32<KeyType>>;
     cudaFuncSetAttribute(kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
 
-    // 5. Run flush-on-fill dedup over the hash-sorted streams.  output_indices
-    // is scattered back to original positions via perm_sorted.
+    // Run flush-on-fill segmented unique kernel with optional freq counting
     kernel<<<shared_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
-        get_pointer<const KeyType>(sorted_keys),
-        get_pointer<const int64_t>(sorted_table_ids),
+        get_pointer<const KeyType>(keys),
+        get_pointer<const int64_t>(table_ids),
         get_pointer<KeyType>(partitioned_unique_keys),
         get_pointer<int64_t>(output_indices), num_keys,
         get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
@@ -1009,9 +896,9 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         enable_freq_counting
             ? get_pointer<int64_t>(partitioned_freq_counters)
             : nullptr,
-        has_input_freq ? get_pointer<const int64_t>(sorted_freq) : nullptr,
-        get_pointer<int32_t>(key_slot),
-        get_pointer<const int32_t>(perm_sorted));
+        has_input_freq ? get_pointer<const int64_t>(input_frequencies)
+                       : nullptr,
+        get_pointer<int32_t>(key_slot));
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
