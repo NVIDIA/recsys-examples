@@ -339,6 +339,226 @@ segmented_unique_kernel(const KeyType *d_keys, const int64_t *d_table_ids,
   }
 }
 
+// ============================================================================
+// Two-level segmented unique: shared-memory first-level dedup, then merge into
+// the global hash table.
+// ============================================================================
+// Block tile size and shared hash-table size.  The shared table holds 2x the
+// tile's keys, so its load factor is <= 0.5 (a tile has at most BLOCK_SIZE
+// distinct keys) and it can never overflow.  BLOCK_SIZE is opened to the H100
+// maximum (1024) so each tile collapses as many duplicates as possible before
+// touching the global table.
+constexpr int SHARED_BLOCK_SIZE = 1024;
+constexpr int SHARED_TABLE_SIZE = 2 * SHARED_BLOCK_SIZE;
+
+// Insert/lookup (key, table_id) in the GLOBAL hash table and return its local
+// unique index within the table.  Shared between the per-key kernel and the
+// two-level kernel's merge pass.  `freq_add` is added to the unique key's
+// frequency counter (the tile-accumulated count in the two-level path, or 1 in
+// the per-key path).  Mirrors the original inline probe logic exactly:
+//   - claim an empty slot via CAS on hash_keys, warp-aggregate the per-table
+//     counter bump, write the unique key + packed (table_id, local_idx),
+//   - on a same-key slot, spin until the packed value is published, then match
+//     table_id (probe past on mismatch).
+template <typename KeyType, typename Hasher,
+          KeyType empty_key = std::numeric_limits<KeyType>::max(),
+          int64_t empty_val = std::numeric_limits<int64_t>::max()>
+__device__ __forceinline__ int32_t global_insert(
+    KeyType key, int table_id, int64_t freq_add, KeyType *hash_keys,
+    int64_t *hash_vals, uint32_t cap, int64_t *table_counters,
+    const int64_t *d_segmented_range, KeyType *d_unique_keys,
+    int64_t *frequency_counters) {
+  uint32_t key_hash = Hasher::hash(key);
+  uint32_t tid_hash = Hasher::hash(static_cast<uint32_t>(table_id));
+  uint32_t combined_hash = Hasher::hash_combine(key_hash, tid_hash);
+  uint32_t hash_index = combined_hash % cap;
+
+  for (uint32_t probe = 0; probe < cap; ++probe) {
+    const KeyType existing_key = hash_keys[hash_index];
+
+    if (existing_key == empty_key) {
+      const KeyType old_key =
+          atomicCAS(&hash_keys[hash_index], empty_key, key);
+      if (old_key == empty_key) {
+        auto active = cg::coalesced_threads();
+        auto grp = cg::labeled_partition(active, table_id);
+        int32_t base = 0;
+        if (grp.thread_rank() == 0)
+          base = static_cast<int32_t>(
+              atomicAdd(&table_counters[table_id], grp.size()));
+        base = grp.shfl(base, 0);
+        int32_t local_unique_idx = base + grp.thread_rank();
+
+        size_t output_pos =
+            static_cast<size_t>(d_segmented_range[table_id]) + local_unique_idx;
+        d_unique_keys[output_pos] = key;
+        *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]) =
+            pack_table_val(table_id, local_unique_idx);
+        if (frequency_counters)
+          atomicAdd(&frequency_counters[output_pos], freq_add);
+        return local_unique_idx;
+      } else if (old_key == key) {
+        int64_t packed_val;
+        do {
+          packed_val =
+              *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
+          __nanosleep(1);
+        } while (packed_val == empty_val);
+        if (unpack_table_id(packed_val) == table_id) {
+          int32_t local_idx = unpack_local_idx(packed_val);
+          if (frequency_counters) {
+            size_t output_pos =
+                static_cast<size_t>(d_segmented_range[table_id]) + local_idx;
+            atomicAdd(&frequency_counters[output_pos], freq_add);
+          }
+          return local_idx;
+        }
+      }
+    } else if (existing_key == key) {
+      int64_t packed_val;
+      do {
+        packed_val =
+            *reinterpret_cast<volatile int64_t *>(&hash_vals[hash_index]);
+        __nanosleep(1);
+      } while (packed_val == empty_val);
+      if (unpack_table_id(packed_val) == table_id) {
+        int32_t local_idx = unpack_local_idx(packed_val);
+        if (frequency_counters) {
+          size_t output_pos =
+              static_cast<size_t>(d_segmented_range[table_id]) + local_idx;
+          atomicAdd(&frequency_counters[output_pos], freq_add);
+        }
+        return local_idx;
+      }
+    }
+    hash_index = (hash_index + 1) % cap;
+  }
+  return -1; // table full (guarded against by capacity = 2*num_keys)
+}
+
+// Two-level segmented unique kernel.  Each block processes a tile of
+// SHARED_BLOCK_SIZE consecutive keys: it first deduplicates the tile in a
+// shared-memory hash table (Pass 1), then a single thread per occupied shared
+// slot inserts that distinct (key, table_id) into the global table (Pass 2),
+// and finally every input position is scattered to its global local index
+// (Pass 3).  This collapses duplicates in fast shared memory, so the number of
+// scattered global probes drops from num_keys to the count of tile-distinct
+// keys -- directly attacking the long_scoreboard latency bound.
+//
+// Dynamic shared layout (bytes), 8-byte types first for alignment:
+//   s_keys [S] KeyType   - tile hash table keys (empty_key sentinel)
+//   s_freq [S] int64     - tile-accumulated frequency per slot
+//   s_tabs [S] int32     - table_id per slot (-1 = unpublished, producer/consumer)
+//   s_gidx [S] int32     - global local unique idx per slot (filled in Pass 2)
+//   s_slot [B] int32     - shared slot each thread's key landed in (for Pass 3)
+template <typename KeyType, typename Hasher,
+          KeyType empty_key = std::numeric_limits<KeyType>::max(),
+          int64_t empty_val = std::numeric_limits<int64_t>::max()>
+__global__ void __launch_bounds__(SHARED_BLOCK_SIZE)
+segmented_unique_shared_kernel(
+    const KeyType *d_keys, const int64_t *d_table_ids, KeyType *d_unique_keys,
+    int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
+    int64_t *hash_vals, size_t capacity, int64_t *table_counters,
+    const int64_t *d_segmented_range, int64_t *frequency_counters,
+    const int64_t *input_frequencies) {
+  constexpr int S = SHARED_TABLE_SIZE;
+  const int B = blockDim.x;
+  const int tid = threadIdx.x;
+  const uint32_t cap = static_cast<uint32_t>(capacity);
+  const bool count_freq = frequency_counters != nullptr;
+
+  extern __shared__ char smem[];
+  KeyType *s_keys = reinterpret_cast<KeyType *>(smem);
+  int64_t *s_freq = reinterpret_cast<int64_t *>(s_keys + S);
+  int *s_tabs = reinterpret_cast<int *>(s_freq + S);
+  int *s_gidx = reinterpret_cast<int *>(s_tabs + S);
+  int *s_slot = reinterpret_cast<int *>(s_gidx + S);
+
+  for (size_t tile_start = static_cast<size_t>(blockIdx.x) * B;
+       tile_start < num_keys;
+       tile_start += static_cast<size_t>(gridDim.x) * B) {
+    // Reset shared table for this tile.
+    for (int i = tid; i < S; i += B) {
+      s_keys[i] = empty_key;
+      s_tabs[i] = -1;
+      if (count_freq)
+        s_freq[i] = 0;
+    }
+    __syncthreads();
+
+    // Pass 1: dedup this tile in shared memory.
+    const size_t idx = tile_start + tid;
+    const bool valid = idx < num_keys;
+    if (valid) {
+      const KeyType key = d_keys[idx];
+      const int table_id = static_cast<int>(d_table_ids[idx]);
+      const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
+
+      uint32_t key_hash = Hasher::hash(key);
+      uint32_t tid_hash = Hasher::hash(static_cast<uint32_t>(table_id));
+      uint32_t combined_hash = Hasher::hash_combine(key_hash, tid_hash);
+      uint32_t si = combined_hash & (S - 1);
+
+      int slot = -1;
+      for (uint32_t probe = 0; probe < static_cast<uint32_t>(S); ++probe) {
+        const KeyType ek = s_keys[si];
+        if (ek == empty_key) {
+          const KeyType old = atomicCAS(&s_keys[si], empty_key, key);
+          if (old == empty_key) {
+            // Claimed: publish table_id (volatile so spinners observe it).
+            *reinterpret_cast<volatile int *>(&s_tabs[si]) = table_id;
+            slot = si;
+            break;
+          } else if (old == key) {
+            int t;
+            do {
+              t = *reinterpret_cast<volatile int *>(&s_tabs[si]);
+            } while (t < 0);
+            if (t == table_id) {
+              slot = si;
+              break;
+            }
+          }
+        } else if (ek == key) {
+          int t;
+          do {
+            t = *reinterpret_cast<volatile int *>(&s_tabs[si]);
+          } while (t < 0);
+          if (t == table_id) {
+            slot = si;
+            break;
+          }
+        }
+        si = (si + 1) & (S - 1);
+      }
+      s_slot[tid] = slot;
+      if (count_freq && slot >= 0)
+        atomicAdd(&s_freq[slot], input_freq);
+    }
+    __syncthreads();
+
+    // Pass 2: one thread per occupied slot inserts into the global table.
+    for (int s = tid; s < S; s += B) {
+      const KeyType k = s_keys[s];
+      if (k != empty_key) {
+        const int table_id = s_tabs[s];
+        const int64_t freq_add = count_freq ? s_freq[s] : 0;
+        s_gidx[s] = global_insert<KeyType, Hasher, empty_key, empty_val>(
+            k, table_id, freq_add, hash_keys, hash_vals, cap, table_counters,
+            d_segmented_range, d_unique_keys, frequency_counters);
+      }
+    }
+    __syncthreads();
+
+    // Pass 3: scatter the global local index back to every input position.
+    if (valid) {
+      const int slot = s_slot[tid];
+      d_output_indices[idx] = s_gidx[slot];
+    }
+    __syncthreads();
+  }
+}
+
 // Binary search helper for compaction
 __device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
                                                          int n, int64_t val) {
@@ -547,6 +767,20 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   at::Tensor hash_vals = at::empty(
       {capacity}, at::TensorOptions().dtype(at::kLong).device(device));
 
+  // Grid for the two-level shared kernel: one block per tile of
+  // SHARED_BLOCK_SIZE keys, capped at 2 blocks/SM (the 52KB shared table allows
+  // 2 resident blocks of 1024 threads = full occupancy on sm_90).
+  constexpr int SHARED_BLOCKS_PER_SM = 2;
+  int64_t shared_grid64 =
+      (num_keys + SHARED_BLOCK_SIZE - 1) / SHARED_BLOCK_SIZE;
+  const int64_t shared_full_grid =
+      static_cast<int64_t>(device_sm_count) * SHARED_BLOCKS_PER_SM;
+  if (shared_grid64 > shared_full_grid)
+    shared_grid64 = shared_full_grid;
+  if (shared_grid64 < 1)
+    shared_grid64 = 1;
+  const int shared_grid = static_cast<int>(shared_grid64);
+
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
     // Initialize hash table and counters
     segmented_init_kernel<KeyType><<<grid_size, BLOCK_SIZE, 0, stream>>>(
@@ -554,21 +788,32 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         get_pointer<int64_t>(table_counters), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // Run segmented unique kernel with optional frequency counting
-    segmented_unique_kernel<KeyType, MurmurHash3_32<KeyType>>
-        <<<grid_size, BLOCK_SIZE, 0, stream>>>(
-            get_pointer<const KeyType>(keys),
-            get_pointer<const int64_t>(table_ids),
-            get_pointer<KeyType>(partitioned_unique_keys),
-            get_pointer<int64_t>(output_indices), num_keys,
-            get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
-            capacity, get_pointer<int64_t>(table_counters),
-            get_pointer<const int64_t>(segmented_range),
-            enable_freq_counting
-                ? get_pointer<int64_t>(partitioned_freq_counters)
-                : nullptr,
-            has_input_freq ? get_pointer<const int64_t>(input_frequencies)
-                           : nullptr);
+    // Dynamic shared memory: s_keys[S] + s_freq[S] + s_tabs[S] + s_gidx[S]
+    // + s_slot[BLOCK].  Exceeds the 48KB default, so opt in explicitly.
+    const size_t smem_bytes =
+        static_cast<size_t>(SHARED_TABLE_SIZE) *
+            (sizeof(KeyType) + sizeof(int64_t) + 2 * sizeof(int)) +
+        static_cast<size_t>(SHARED_BLOCK_SIZE) * sizeof(int);
+    auto kernel =
+        segmented_unique_shared_kernel<KeyType, MurmurHash3_32<KeyType>>;
+    cudaFuncSetAttribute(kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem_bytes));
+
+    // Run two-level segmented unique kernel with optional frequency counting
+    kernel<<<shared_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
+        get_pointer<const KeyType>(keys),
+        get_pointer<const int64_t>(table_ids),
+        get_pointer<KeyType>(partitioned_unique_keys),
+        get_pointer<int64_t>(output_indices), num_keys,
+        get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
+        capacity, get_pointer<int64_t>(table_counters),
+        get_pointer<const int64_t>(segmented_range),
+        enable_freq_counting
+            ? get_pointer<int64_t>(partitioned_freq_counters)
+            : nullptr,
+        has_input_freq ? get_pointer<const int64_t>(input_frequencies)
+                       : nullptr);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
