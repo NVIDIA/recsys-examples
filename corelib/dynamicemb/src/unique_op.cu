@@ -366,99 +366,101 @@ segmented_unique_perkey_kernel(
   const bool count_freq = frequency_counters != nullptr;
 
   extern __shared__ char smem[];
-  int *s_tc = reinterpret_cast<int *>(smem);            // [num_tables]
-  int *s_tnext = reinterpret_cast<int *>(s_tc + num_tables);
+  int *s_wc = reinterpret_cast<int *>(smem);                // [num_tables]
+  int *s_base = reinterpret_cast<int *>(s_wc + num_tables); // [num_tables]
 
-  for (int t = tid; t < num_tables; t += B)
-    s_tc[t] = 0;
-  __syncthreads();
+  // Single pass over keys, processed in waves of B.  Each key is probed once
+  // (original logic).  The table_counters atomic is reduced in SHARED across
+  // the block per wave, then ONE global atomicAdd per table fetches the base,
+  // then local_idx = base + within-wave rank -- no second full pass.
+  for (size_t wave = static_cast<size_t>(blockIdx.x) * B; wave < num_keys;
+       wave += static_cast<size_t>(gridDim.x) * B) {
+    for (int t = tid; t < num_tables; t += B)
+      s_wc[t] = 0;
+    __syncthreads();
 
-  const size_t start = static_cast<size_t>(blockIdx.x) * B + tid;
-  const size_t stride = static_cast<size_t>(gridDim.x) * B;
-
-  // Phase 1: probe + claim-or-find; count new keys in shared; stash the global
-  // slot into output_indices (claim: gi+1, existing: -(gi+1)).
-  for (size_t idx = start; idx < num_keys; idx += stride) {
-    const KeyType key = d_keys[idx];
-    const int t = static_cast<int>(d_table_ids[idx]);
-    uint32_t kh = Hasher::hash(key);
-    uint32_t th = Hasher::hash(static_cast<uint32_t>(t));
-    uint32_t gi = Hasher::hash_combine(kh, th) % cap;
-    int64_t marker = 0;
-    for (uint32_t probe = 0; probe < cap; ++probe) {
-      const KeyType ek = hash_keys[gi];
-      if (ek == empty_key) {
-        const KeyType old = atomicCAS(&hash_keys[gi], empty_key, key);
-        if (old == empty_key) {
-          *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
-              pack_table_val(t, -1);
-          ::atomicAdd(&s_tc[t], 1);
-          marker = static_cast<int64_t>(gi) + 1;
-          break;
-        } else if (old == key) {
+    const size_t idx = wave + tid;
+    const bool valid = idx < num_keys;
+    KeyType key = empty_key;
+    int t = -1;
+    int64_t input_freq = 1;
+    uint32_t gi = 0;
+    int kind = 0; // 0 none, 1 claim, 2 existing
+    int rank = 0;
+    if (valid) {
+      key = d_keys[idx];
+      t = static_cast<int>(d_table_ids[idx]);
+      input_freq = input_frequencies ? input_frequencies[idx] : 1;
+      uint32_t kh = Hasher::hash(key);
+      uint32_t th = Hasher::hash(static_cast<uint32_t>(t));
+      gi = Hasher::hash_combine(kh, th) % cap;
+      for (uint32_t probe = 0; probe < cap; ++probe) {
+        const KeyType ek = hash_keys[gi];
+        if (ek == empty_key) {
+          const KeyType old = atomicCAS(&hash_keys[gi], empty_key, key);
+          if (old == empty_key) {
+            // claimed: publish table_id (PENDING idx); count in shared.
+            *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
+                pack_table_val(t, -1);
+            rank = ::atomicAdd(&s_wc[t], 1); // shared reduction
+            kind = 1;
+            break;
+          } else if (old == key) {
+            int64_t pv;
+            do {
+              pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
+            } while (pv == empty_val);
+            if (unpack_table_id(pv) == t) {
+              kind = 2;
+              break;
+            }
+          }
+        } else if (ek == key) {
           int64_t pv;
           do {
             pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
           } while (pv == empty_val);
           if (unpack_table_id(pv) == t) {
-            marker = -(static_cast<int64_t>(gi) + 1);
+            kind = 2;
             break;
           }
         }
-      } else if (ek == key) {
-        int64_t pv;
-        do {
-          pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
-        } while (pv == empty_val);
-        if (unpack_table_id(pv) == t) {
-          marker = -(static_cast<int64_t>(gi) + 1);
-          break;
-        }
+        gi = (gi + 1) % cap;
       }
-      gi = (gi + 1) % cap;
     }
-    d_output_indices[idx] = marker;
-  }
-  __syncthreads();
+    __syncthreads();
 
-  // Phase 2: one global atomic per table reserves a contiguous index range.
-  for (int t = tid; t < num_tables; t += B) {
-    const int cnt = s_tc[t];
-    s_tnext[t] = cnt > 0 ? static_cast<int>(atomicAdd(
-                               &table_counters[t], static_cast<int64_t>(cnt)))
-                         : 0;
-  }
-  __syncthreads();
+    // One global atomic per table reserves the base for this wave's claims.
+    for (int tt = tid; tt < num_tables; tt += B) {
+      if (s_wc[tt] > 0)
+        s_base[tt] = static_cast<int>(
+            atomicAdd(&table_counters[tt], static_cast<int64_t>(s_wc[tt])));
+    }
+    __syncthreads();
 
-  // Phase 3: assign + publish for claims; resolve duplicates.
-  for (size_t idx = start; idx < num_keys; idx += stride) {
-    const int t = static_cast<int>(d_table_ids[idx]);
-    const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
-    const int64_t marker = d_output_indices[idx];
-    const uint32_t gi =
-        static_cast<uint32_t>((marker > 0 ? marker : -marker) - 1);
-    int local_idx;
-    if (marker > 0) { // claimer: draw idx from the shared reserved range
-      local_idx = ::atomicAdd(&s_tnext[t], 1);
+    if (valid && kind == 1) {
+      const int local_idx = s_base[t] + rank;
       const size_t opos = static_cast<size_t>(d_segmented_range[t]) + local_idx;
-      d_unique_keys[opos] = d_keys[idx];
+      d_unique_keys[opos] = key;
       *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
           pack_table_val(t, local_idx);
+      d_output_indices[idx] = local_idx;
       if (count_freq)
         atomicAdd(&frequency_counters[opos], input_freq);
-    } else { // duplicate: wait for the owner's final index
+    } else if (valid && kind == 2) {
       int64_t pv;
       do {
         pv = *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]);
       } while (unpack_local_idx(pv) < 0);
-      local_idx = unpack_local_idx(pv);
+      const int local_idx = unpack_local_idx(pv);
+      d_output_indices[idx] = local_idx;
       if (count_freq) {
         const size_t opos =
             static_cast<size_t>(d_segmented_range[t]) + local_idx;
         atomicAdd(&frequency_counters[opos], input_freq);
       }
     }
-    d_output_indices[idx] = local_idx;
+    __syncthreads();
   }
 }
 
