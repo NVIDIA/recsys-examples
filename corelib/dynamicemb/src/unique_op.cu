@@ -432,7 +432,15 @@ segmented_unique_perkey_kernel(
             // claimed: publish table_id (PENDING idx); count in shared.
             *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
                 pack_table_val(t, -1);
-            rank = ::atomicAdd(&s_wc[t], 1); // shared reduction
+            // Warp-aggregate the shared counter bump: lanes claiming for the
+            // SAME table (likely -- input is table-sorted) share one shared
+            // atomic instead of serializing on s_wc[t].
+            auto active = cg::coalesced_threads();
+            auto grp = cg::labeled_partition(active, t);
+            int base = 0;
+            if (grp.thread_rank() == 0)
+              base = ::atomicAdd(&s_wc[t], static_cast<int>(grp.size()));
+            rank = grp.shfl(base, 0) + static_cast<int>(grp.thread_rank());
             kind = 1;
             break;
           } else if (old == key) {
