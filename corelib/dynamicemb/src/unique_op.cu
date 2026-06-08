@@ -205,9 +205,8 @@ template <typename KeyType,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
 __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
-                                      int64_t *table_counters,
-                                      int64_t *unique_table_offsets,
-                                      size_t capacity, int64_t num_tables) {
+                                      int64_t *table_counters, size_t capacity,
+                                      int64_t num_tables) {
   const size_t stride = blockDim.x * gridDim.x;
   // Initialize hash table entries
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < capacity;
@@ -220,11 +219,6 @@ __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
        idx < static_cast<size_t>(num_tables); idx += stride) {
     table_counters[idx] = 0;
   }
-  // unique_table_offsets is filled by the inclusive scan into [1, num_tables];
-  // element [0] is not written by the scan, so seed it to 0 here (the tensor is
-  // allocated with at::empty, i.e. uninitialized).
-  if (blockIdx.x == 0 && threadIdx.x == 0)
-    unique_table_offsets[0] = 0;
 }
 
 // Segmented unique kernel - deduplicates (key, table_id) pairs (strided loop
@@ -903,40 +897,48 @@ segmented_unique_shared_kernel(
       d_segmented_range, d_unique_keys, frequency_counters);
 }
 
-// Fused kernel to compact both keys and frequency counters from partitioned
-// layout Shares binary search computation between both operations, reducing
-// overhead d_total_unique is a device pointer to avoid GPU-CPU synchronization
-// partitioned_freq and output_freq can be nullptr if frequency counting is
-// disabled
+// Fused kernel: compute the per-table unique offsets AND compact keys/freq
+// from the partitioned layout, replacing the separate cub::DeviceScan.
+// num_tables is small, so each block independently builds the inclusive prefix
+// sum of table_counters in shared (s_off[0..num_tables]); block 0 publishes it
+// to the global unique_table_offsets (for adjust_output_indices and the return
+// value), and every block uses its shared copy to compact.
+// partitioned_freq/output_freq may be nullptr when frequency counting is off.
 template <typename KeyType>
 __global__ void compact_keys_and_freq_kernel(
     const KeyType *partitioned_keys, const int64_t *partitioned_freq,
-    const int64_t *d_segmented_range, const int64_t *table_offsets,
+    const int64_t *d_segmented_range, const int64_t *table_counters,
     int64_t num_tables, KeyType *output_keys, int64_t *output_freq,
-    const int64_t *d_total_unique) {
-  const int64_t total_unique = *d_total_unique;
-  const int64_t stride = blockDim.x * gridDim.x;
+    int64_t *unique_table_offsets) {
+  extern __shared__ int64_t s_off[]; // [num_tables + 1]
+  if (threadIdx.x == 0) {
+    s_off[0] = 0;
+    for (int t = 0; t < num_tables; ++t)
+      s_off[t + 1] = s_off[t] + table_counters[t];
+  }
+  __syncthreads();
 
+  // Block 0 publishes the offsets globally for the later adjust kernel and the
+  // returned table_offsets / num_uniques.
+  if (blockIdx.x == 0)
+    for (int i = threadIdx.x; i <= num_tables; i += blockDim.x)
+      unique_table_offsets[i] = s_off[i];
+
+  const int64_t total_unique = s_off[num_tables];
+  const int64_t stride = blockDim.x * gridDim.x;
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_unique;
        idx += stride) {
-    // Find which table this output index belongs to via output table_offsets
-    int table_id =
-        binary_search_upper_bound(table_offsets, num_tables + 1, idx);
-
-    // Offset within this table's unique keys
-    int64_t local_idx = idx - table_offsets[table_id];
+    // Find which table this output index belongs to, and its offset within.
+    int table_id = binary_search_upper_bound(s_off, num_tables + 1, idx);
+    int64_t local_idx = idx - s_off[table_id];
 
     // Source position uses segmented_range (input partition layout)
     size_t src_pos =
         static_cast<size_t>(d_segmented_range[table_id]) + local_idx;
 
-    // Compact keys
     output_keys[idx] = partitioned_keys[src_pos];
-
-    // Compact frequency counters if enabled
-    if (partitioned_freq != nullptr) {
+    if (partitioned_freq != nullptr)
       output_freq[idx] = partitioned_freq[src_pos];
-    }
   }
 }
 
@@ -1084,9 +1086,9 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   at::Tensor table_counters = at::empty(
       {num_tables}, at::TensorOptions().dtype(at::kLong).device(device));
 
-  // Cumulative unique counts per table; [1, num_tables] is filled by the
-  // inclusive scan after the dedup kernel and [0] is seeded to 0 inside
-  // segmented_init_kernel, so allocate uninitialized.
+  // Cumulative unique counts per table; computed (prefix sum of table_counters)
+  // and published inside compact_keys_and_freq_kernel, so allocate
+  // uninitialized.
   at::Tensor unique_table_offsets = at::empty(
       {num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
 
@@ -1132,8 +1134,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     // Initialize hash table and counters
     segmented_init_kernel<KeyType><<<grid_size, BLOCK_SIZE, 0, stream>>>(
         get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
-        get_pointer<int64_t>(table_counters),
-        get_pointer<int64_t>(unique_table_offsets), capacity, num_tables);
+        get_pointer<int64_t>(table_counters), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Per-key kernel, block 1024.  Shared = s_wc + s_base (privatized per-table
@@ -1177,20 +1178,6 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
-  // Compute table offsets via inclusive scan into unique_table_offsets[1..];
-  // [0] was already seeded to 0 in segmented_init_kernel.
-  size_t temp_storage_bytes = 0;
-  cub::DeviceScan::InclusiveSum(
-      nullptr, temp_storage_bytes, get_pointer<int64_t>(table_counters),
-      get_pointer<int64_t>(unique_table_offsets) + 1, num_tables, stream);
-  at::Tensor temp_storage =
-      at::empty({static_cast<int64_t>(temp_storage_bytes)},
-                at::TensorOptions().dtype(at::kByte).device(device));
-  cub::DeviceScan::InclusiveSum(temp_storage.data_ptr(), temp_storage_bytes,
-                                get_pointer<int64_t>(table_counters),
-                                get_pointer<int64_t>(unique_table_offsets) + 1,
-                                num_tables, stream);
-
   // Allocate compacted output with size num_keys (worst case: all keys unique)
   // Actual count is unique_table_offsets[num_tables], available on device
   at::Tensor unique_keys = at::empty({num_keys}, keys.options());
@@ -1204,19 +1191,21 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device));
   }
 
-  // Compact keys and frequency counters in a single fused kernel
+  // Fused: build unique_table_offsets (prefix sum of table_counters) and
+  // compact keys + frequency counters in a single kernel -- no separate scan.
+  const size_t off_smem = static_cast<size_t>(num_tables + 1) * sizeof(int64_t);
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
-    compact_keys_and_freq_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
+    compact_keys_and_freq_kernel<<<grid_size, BLOCK_SIZE, off_smem, stream>>>(
         get_pointer<const KeyType>(partitioned_unique_keys),
         enable_freq_counting
             ? get_pointer<const int64_t>(partitioned_freq_counters)
             : nullptr,
         get_pointer<const int64_t>(segmented_range),
-        get_pointer<const int64_t>(unique_table_offsets),
+        get_pointer<const int64_t>(table_counters),
         num_tables, get_pointer<KeyType>(unique_keys),
         enable_freq_counting ? get_pointer<int64_t>(output_freq_counters)
                              : nullptr,
-        get_pointer<const int64_t>(unique_table_offsets) + num_tables);
+        get_pointer<int64_t>(unique_table_offsets));
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
