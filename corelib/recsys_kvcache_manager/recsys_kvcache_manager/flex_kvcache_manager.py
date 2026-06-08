@@ -290,19 +290,20 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         for i in range(kv_indptr.size(0) - 1):
             page_ids = kv_indices[kv_indptr[i] : kv_indptr[i + 1]]
             if page_ids.numel() == 0:
-                mappings.append(
-                    torch.empty((0,), dtype=torch.int64, device=kv_indices.device)
-                )
+                mappings.append(torch.empty((0,), dtype=torch.int64, device="cpu"))
                 continue
-            # page_ids -> token slots:
-            # cat([arange(pid * page_size, (pid + 1) * page_size) for pid in page_ids])
-            token_offsets = torch.arange(
-                self.page_size, dtype=torch.int64, device=page_ids.device
-            )
-            slot_mapping = (
-                page_ids.unsqueeze(1) * self.page_size + token_offsets.unsqueeze(0)
-            ).reshape(-1)
-            mappings.append(slot_mapping)
+            # D2H only page_ids (O(num_pages)), expand slots on CPU for FlexKV numpy path.
+            page_ids_cpu = page_ids.detach().to(device="cpu", dtype=torch.int64)
+            page_ids_np = page_ids_cpu.numpy()
+            chunks = [
+                np.arange(
+                    int(pid) * self.page_size,
+                    (int(pid) + 1) * self.page_size,
+                    dtype=np.int64,
+                )
+                for pid in page_ids_np
+            ]
+            mappings.append(torch.from_numpy(np.concatenate(chunks)))
         return mappings
 
     def onboard_kvcache_launch(
@@ -333,11 +334,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 > lookup_result.gpu_cached_start_indices[i]
                 + lookup_result.gpu_cached_lengths[i].item()
             ):
-                slot_mapping = (
-                    index_meta.slot_mappings[i]
-                    .to(device="cpu", dtype=torch.int64)
-                    .contiguous()
-                )
+                slot_mapping = index_meta.slot_mappings[i].contiguous()[
+                    : int(index_meta.seq_lengths[i].item())
+                ]
                 onboard_uids.append(index_meta.user_ids[i].item())
                 onboard_task_ids.append(lookup_result.extra["task_ids"][i])
                 onboard_start_indices.append(0)
@@ -348,11 +347,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             # Case 2: GPU cache has evicted the offloaded tokens
             if lookup_result.gpu_cached_start_indices[i].item() > 0:
                 # assert lookup_result.gpu_cached_lengths[i].item() > 0
-                slot_mapping = (
-                    index_meta.slot_mappings[i]
-                    .to(device="cpu", dtype=torch.int64)
-                    .contiguous()
-                )
+                slot_mapping = index_meta.slot_mappings[i].contiguous()[
+                    : int(index_meta.seq_lengths[i].item())
+                ]
                 onboard_uids.append(index_meta.user_ids[i].item())
                 onboard_task_ids.append(lookup_result.extra["task_ids"][i])
                 onboard_start_indices.append(0)
@@ -458,10 +455,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             else:
                 valid_len = int(token_mask.sum())
 
-            slot_mapping = slot_mappings[idx]
-            slot_mapping = slot_mapping.contiguous()[:valid_len].to(
-                device="cpu", dtype=torch.int64
-            )
+            slot_mapping = slot_mappings[idx].contiguous()[:valid_len]
 
             task_id = self._client.put_async(
                 token_ids=index_meta.token_ids[idx],
