@@ -188,8 +188,9 @@ template <typename KeyType,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
 __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
-                                      int64_t *table_counters, size_t capacity,
-                                      int64_t num_tables) {
+                                      int64_t *table_counters,
+                                      int64_t *unique_table_offsets,
+                                      size_t capacity, int64_t num_tables) {
   const size_t stride = blockDim.x * gridDim.x;
   // Initialize hash table entries
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < capacity;
@@ -202,6 +203,11 @@ __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
        idx < static_cast<size_t>(num_tables); idx += stride) {
     table_counters[idx] = 0;
   }
+  // unique_table_offsets is filled by the inclusive scan into [1, num_tables];
+  // element [0] is not written by the scan, so seed it to 0 here (the tensor is
+  // allocated with at::empty, i.e. uninitialized).
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    unique_table_offsets[0] = 0;
 }
 
 // Segmented unique kernel - deduplicates (key, table_id) pairs (strided loop
@@ -1010,13 +1016,14 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
 
   // Handle empty input
   if (num_keys == 0) {
-    at::Tensor table_offsets = at::zeros(
+    at::Tensor unique_table_offsets = at::zeros(
         {num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
-    at::Tensor num_uniques = table_offsets.slice(0, num_tables, num_tables + 1);
+    at::Tensor num_uniques =
+        unique_table_offsets.slice(0, num_tables, num_tables + 1);
     return std::make_tuple(
         num_uniques, at::empty({0}, keys.options()),
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)),
-        table_offsets,
+        unique_table_offsets,
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device)));
   }
 
@@ -1055,8 +1062,14 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
       {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
 
   // Per-table unique counters
-  at::Tensor table_counters = at::zeros(
+  at::Tensor table_counters = at::empty(
       {num_tables}, at::TensorOptions().dtype(at::kLong).device(device));
+
+  // Cumulative unique counts per table; [1, num_tables] is filled by the
+  // inclusive scan after the dedup kernel and [0] is seeded to 0 inside
+  // segmented_init_kernel, so allocate uninitialized.
+  at::Tensor unique_table_offsets = at::empty(
+      {num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
 
   // Allocate partitioned frequency counters if needed
   at::Tensor partitioned_freq_counters;
@@ -1100,7 +1113,8 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     // Initialize hash table and counters
     segmented_init_kernel<KeyType><<<grid_size, BLOCK_SIZE, 0, stream>>>(
         get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
-        get_pointer<int64_t>(table_counters), capacity, num_tables);
+        get_pointer<int64_t>(table_counters),
+        get_pointer<int64_t>(unique_table_offsets), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Per-key kernel with privatized table_counters, block size 1024.  Shared
@@ -1143,25 +1157,22 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
-  // Compute table offsets using inclusive scan
-  at::Tensor table_offsets = at::zeros(
-      {num_tables + 1}, at::TensorOptions().dtype(at::kLong).device(device));
-
-  // Use CUB for inclusive scan
+  // Compute table offsets via inclusive scan into unique_table_offsets[1..];
+  // [0] was already seeded to 0 in segmented_init_kernel.
   size_t temp_storage_bytes = 0;
   cub::DeviceScan::InclusiveSum(
       nullptr, temp_storage_bytes, get_pointer<int64_t>(table_counters),
-      get_pointer<int64_t>(table_offsets) + 1, num_tables, stream);
+      get_pointer<int64_t>(unique_table_offsets) + 1, num_tables, stream);
   at::Tensor temp_storage =
       at::empty({static_cast<int64_t>(temp_storage_bytes)},
                 at::TensorOptions().dtype(at::kByte).device(device));
   cub::DeviceScan::InclusiveSum(temp_storage.data_ptr(), temp_storage_bytes,
                                 get_pointer<int64_t>(table_counters),
-                                get_pointer<int64_t>(table_offsets) + 1,
+                                get_pointer<int64_t>(unique_table_offsets) + 1,
                                 num_tables, stream);
 
   // Allocate compacted output with size num_keys (worst case: all keys unique)
-  // Actual count is table_offsets[num_tables], available on device
+  // Actual count is unique_table_offsets[num_tables], available on device
   at::Tensor unique_keys = at::empty({num_keys}, keys.options());
   at::Tensor output_freq_counters;
   if (enable_freq_counting) {
@@ -1181,27 +1192,28 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
             ? get_pointer<const int64_t>(partitioned_freq_counters)
             : nullptr,
         get_pointer<const int64_t>(segmented_range),
-        get_pointer<const int64_t>(table_offsets),
+        get_pointer<const int64_t>(unique_table_offsets),
         num_tables, get_pointer<KeyType>(unique_keys),
         enable_freq_counting ? get_pointer<int64_t>(output_freq_counters)
                              : nullptr,
-        get_pointer<const int64_t>(table_offsets) + num_tables);
+        get_pointer<const int64_t>(unique_table_offsets) + num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
   // Adjust output indices to global indices
   adjust_output_indices_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
       get_pointer<const int64_t>(table_ids),
-      get_pointer<const int64_t>(table_offsets),
+      get_pointer<const int64_t>(unique_table_offsets),
       get_pointer<int64_t>(output_indices), num_keys);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   // Extract num_uniques as a separate tensor (view of
-  // table_offsets[num_tables])
-  at::Tensor num_uniques = table_offsets.slice(0, num_tables, num_tables + 1);
+  // unique_table_offsets[num_tables])
+  at::Tensor num_uniques =
+      unique_table_offsets.slice(0, num_tables, num_tables + 1);
 
   return std::make_tuple(num_uniques, unique_keys, output_indices,
-                         table_offsets, output_freq_counters);
+                         unique_table_offsets, output_freq_counters);
 }
 
 // Expand table IDs from offsets (identity mapping, local_batch_size=1).
