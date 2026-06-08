@@ -182,6 +182,23 @@ __device__ __forceinline__ int32_t unpack_local_idx(int64_t packed) {
   return static_cast<int32_t>(packed & 0xFFFFFFFF);
 }
 
+// Binary search helper: largest t such that arr[t] <= val.  Used to derive a
+// key's table_id from segmented_range on the fly (instead of materializing a
+// per-key table_ids array) and to compact from the partitioned layout.
+__device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
+                                                         int n, int64_t val) {
+  int lo = 0, hi = n;
+  while (lo < hi) {
+    int mid = (lo + hi) / 2;
+    if (arr[mid] <= val) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo - 1;
+}
+
 // Initialize segmented hash table kernel (strided loop version)
 // Uses packed (table_id, local_idx) in hash_vals for memory efficiency
 template <typename KeyType,
@@ -361,7 +378,7 @@ template <typename KeyType, typename Hasher,
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
 __global__ void __launch_bounds__(1024) // SHARED_BLOCK_SIZE, defined below
 segmented_unique_perkey_kernel(
-    const KeyType *d_keys, const int64_t *d_table_ids, KeyType *d_unique_keys,
+    const KeyType *d_keys, KeyType *d_unique_keys,
     int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
     int64_t *hash_vals, size_t capacity, int64_t *table_counters,
     const int64_t *d_segmented_range, int64_t *frequency_counters,
@@ -374,6 +391,12 @@ segmented_unique_perkey_kernel(
   extern __shared__ char smem[];
   int *s_wc = reinterpret_cast<int *>(smem);                // [num_tables]
   int *s_base = reinterpret_cast<int *>(s_wc + num_tables); // [num_tables]
+  // segmented_range cached in shared; a key's table_id is found by binary
+  // search on it, so no per-key table_ids array is materialized.
+  int64_t *s_segrange = reinterpret_cast<int64_t *>(s_base + num_tables);
+  for (int i = tid; i <= num_tables; i += B)
+    s_segrange[i] = d_segmented_range[i];
+  __syncthreads();
 
   // Single pass over keys, processed in waves of B.  Each key is probed once
   // (original logic).  The table_counters atomic is reduced in SHARED across
@@ -395,7 +418,8 @@ segmented_unique_perkey_kernel(
     int rank = 0;
     if (valid) {
       key = d_keys[idx];
-      t = static_cast<int>(d_table_ids[idx]);
+      t = binary_search_upper_bound(s_segrange, static_cast<int>(num_tables) + 1,
+                                    static_cast<int64_t>(idx));
       input_freq = input_frequencies ? input_frequencies[idx] : 1;
       uint32_t kh = Hasher::hash(key);
       uint32_t th = Hasher::hash(static_cast<uint32_t>(t));
@@ -871,21 +895,6 @@ segmented_unique_shared_kernel(
       d_segmented_range, d_unique_keys, frequency_counters);
 }
 
-// Binary search helper for compaction
-__device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
-                                                         int n, int64_t val) {
-  int lo = 0, hi = n;
-  while (lo < hi) {
-    int mid = (lo + hi) / 2;
-    if (arr[mid] <= val) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo - 1;
-}
-
 // Fused kernel to compact both keys and frequency counters from partitioned
 // layout Shares binary search computation between both operations, reducing
 // overhead d_total_unique is a device pointer to avoid GPU-CPU synchronization
@@ -942,16 +951,23 @@ __global__ void expand_table_ids_kernel(const int64_t *offsets,
 }
 
 // Adjust output indices to global indices using table offsets (strided loop
-// version)
-__global__ void adjust_output_indices_kernel(const int64_t *d_table_ids,
+// version).  The table_id is derived per key by binary-searching the cached
+// segmented_range, so no per-key table_ids array is needed.
+__global__ void adjust_output_indices_kernel(const int64_t *d_segmented_range,
                                              const int64_t *table_offsets,
                                              int64_t *d_output_indices,
-                                             size_t num_keys) {
-  const size_t stride = blockDim.x * gridDim.x;
+                                             size_t num_keys,
+                                             int64_t num_tables) {
+  extern __shared__ int64_t s_segrange[]; // [num_tables + 1]
+  for (int i = threadIdx.x; i <= num_tables; i += blockDim.x)
+    s_segrange[i] = d_segmented_range[i];
+  __syncthreads();
 
+  const size_t stride = blockDim.x * gridDim.x;
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
        idx += stride) {
-    int64_t table_id = d_table_ids[idx];
+    int table_id = binary_search_upper_bound(
+        s_segrange, static_cast<int>(num_tables) + 1, static_cast<int64_t>(idx));
     d_output_indices[idx] += table_offsets[table_id];
   }
 }
@@ -1043,15 +1059,10 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     grid64 = 1;
   const int grid_size = static_cast<int>(grid64);
 
-  // Generate per-element table_ids from segmented_range for hash logic and
-  // adjust_output_indices_kernel. Keys must be sorted by table:
+  // No per-key table_ids array: the dedup and adjust kernels cache
+  // segmented_range in shared and binary-search it to get a key's table_id on
+  // the fly.  Keys must be sorted by table:
   // keys[segmented_range[t]:segmented_range[t+1]] all belong to table t.
-  at::Tensor table_ids = at::empty(
-      {num_keys}, at::TensorOptions().dtype(at::kLong).device(device));
-  expand_table_ids_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
-      get_pointer<const int64_t>(segmented_range),
-      get_pointer<int64_t>(table_ids), num_tables, num_keys);
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   // Partitioned buffer uses segmented_range as per-table offsets, so total
   // size is num_keys instead of the worst-case num_tables * num_keys.
@@ -1117,9 +1128,11 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         get_pointer<int64_t>(unique_table_offsets), capacity, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // Per-key kernel with privatized table_counters, block size 1024.  Shared
-    // is just the two privatized per-table counters (s_tc + s_tnext).
-    const size_t smem_bytes = static_cast<size_t>(num_tables) * 2 * sizeof(int);
+    // Per-key kernel, block 1024.  Shared = s_wc + s_base (privatized per-table
+    // counters) + s_segrange[num_tables+1] (cached for the table_id lookup).
+    const size_t smem_bytes =
+        static_cast<size_t>(num_tables) * 2 * sizeof(int) +
+        static_cast<size_t>(num_tables + 1) * sizeof(int64_t);
     auto kernel =
         segmented_unique_perkey_kernel<KeyType, MurmurHash3_32<KeyType>>;
 
@@ -1142,7 +1155,6 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
 
     kernel<<<pk_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
         get_pointer<const KeyType>(keys),
-        get_pointer<const int64_t>(table_ids),
         get_pointer<KeyType>(partitioned_unique_keys),
         get_pointer<int64_t>(output_indices), num_keys,
         get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
@@ -1200,11 +1212,13 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
-  // Adjust output indices to global indices
-  adjust_output_indices_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
-      get_pointer<const int64_t>(table_ids),
+  // Adjust output indices to global indices (table_id via binary search on
+  // segmented_range cached in shared).
+  adjust_output_indices_kernel<<<grid_size, BLOCK_SIZE,
+                                 (num_tables + 1) * sizeof(int64_t), stream>>>(
+      get_pointer<const int64_t>(segmented_range),
       get_pointer<const int64_t>(unique_table_offsets),
-      get_pointer<int64_t>(output_indices), num_keys);
+      get_pointer<int64_t>(output_indices), num_keys, num_tables);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   // Extract num_uniques as a separate tensor (view of
