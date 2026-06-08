@@ -897,48 +897,61 @@ segmented_unique_shared_kernel(
       d_segmented_range, d_unique_keys, frequency_counters);
 }
 
-// Fused kernel: compute the per-table unique offsets AND compact keys/freq
-// from the partitioned layout, replacing the separate cub::DeviceScan.
-// num_tables is small, so each block independently builds the inclusive prefix
-// sum of table_counters in shared (s_off[0..num_tables]); block 0 publishes it
-// to the global unique_table_offsets (for adjust_output_indices and the return
-// value), and every block uses its shared copy to compact.
+// Fused tail kernel: compute the per-table unique offsets, compact keys/freq
+// from the partitioned layout, AND adjust output_indices to global indices --
+// replacing the separate cub::DeviceScan and adjust_output_indices_kernel.
+// num_tables is small, so each block builds the inclusive prefix sum of
+// table_counters (s_off) and caches segmented_range (s_seg) in shared; block 0
+// publishes s_off to the global unique_table_offsets (return value).  Two
+// independent grid-stride loops then run off the shared tables:
+//   - compaction over [0, total_unique): gather unique keys/freq;
+//   - adjust over [0, num_keys): output_indices[i] += s_off[table_id(i)].
 // partitioned_freq/output_freq may be nullptr when frequency counting is off.
 template <typename KeyType>
 __global__ void compact_keys_and_freq_kernel(
     const KeyType *partitioned_keys, const int64_t *partitioned_freq,
     const int64_t *d_segmented_range, const int64_t *table_counters,
     int64_t num_tables, KeyType *output_keys, int64_t *output_freq,
-    int64_t *unique_table_offsets) {
-  extern __shared__ int64_t s_off[]; // [num_tables + 1]
+    int64_t *unique_table_offsets, int64_t *output_indices, size_t num_keys) {
+  extern __shared__ int64_t smem_off[];
+  int64_t *s_off = smem_off;                        // [num_tables+1] unique offs
+  int64_t *s_seg = smem_off + (num_tables + 1);     // [num_tables+1] seg range
   if (threadIdx.x == 0) {
     s_off[0] = 0;
     for (int t = 0; t < num_tables; ++t)
       s_off[t + 1] = s_off[t] + table_counters[t];
   }
+  for (int i = threadIdx.x; i <= num_tables; i += blockDim.x)
+    s_seg[i] = d_segmented_range[i];
   __syncthreads();
 
-  // Block 0 publishes the offsets globally for the later adjust kernel and the
-  // returned table_offsets / num_uniques.
+  // Block 0 publishes the offsets globally for the returned table_offsets /
+  // num_uniques.
   if (blockIdx.x == 0)
     for (int i = threadIdx.x; i <= num_tables; i += blockDim.x)
       unique_table_offsets[i] = s_off[i];
 
+  const int nt1 = static_cast<int>(num_tables) + 1;
   const int64_t total_unique = s_off[num_tables];
   const int64_t stride = blockDim.x * gridDim.x;
+
+  // Compaction: partitioned -> compacted unique keys/freq.
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_unique;
        idx += stride) {
-    // Find which table this output index belongs to, and its offset within.
-    int table_id = binary_search_upper_bound(s_off, num_tables + 1, idx);
+    int table_id = binary_search_upper_bound(s_off, nt1, idx);
     int64_t local_idx = idx - s_off[table_id];
-
-    // Source position uses segmented_range (input partition layout)
-    size_t src_pos =
-        static_cast<size_t>(d_segmented_range[table_id]) + local_idx;
-
+    size_t src_pos = static_cast<size_t>(s_seg[table_id]) + local_idx;
     output_keys[idx] = partitioned_keys[src_pos];
     if (partitioned_freq != nullptr)
       output_freq[idx] = partitioned_freq[src_pos];
+  }
+
+  // Adjust: per-table-local output index -> global unique index.
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
+       idx += stride) {
+    int table_id =
+        binary_search_upper_bound(s_seg, nt1, static_cast<int64_t>(idx));
+    output_indices[idx] += s_off[table_id];
   }
 }
 
@@ -960,27 +973,7 @@ __global__ void expand_table_ids_kernel(const int64_t *offsets,
   }
 }
 
-// Adjust output indices to global indices using table offsets (strided loop
-// version).  The table_id is derived per key by binary-searching the cached
-// segmented_range, so no per-key table_ids array is needed.
-__global__ void adjust_output_indices_kernel(const int64_t *d_segmented_range,
-                                             const int64_t *table_offsets,
-                                             int64_t *d_output_indices,
-                                             size_t num_keys,
-                                             int64_t num_tables) {
-  extern __shared__ int64_t s_segrange[]; // [num_tables + 1]
-  for (int i = threadIdx.x; i <= num_tables; i += blockDim.x)
-    s_segrange[i] = d_segmented_range[i];
-  __syncthreads();
-
-  const size_t stride = blockDim.x * gridDim.x;
-  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
-       idx += stride) {
-    int table_id = binary_search_upper_bound(
-        s_segrange, static_cast<int>(num_tables) + 1, static_cast<int64_t>(idx));
-    d_output_indices[idx] += table_offsets[table_id];
-  }
-}
+// (adjust_output_indices folded into compact_keys_and_freq_kernel above.)
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
@@ -1191,32 +1184,29 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device));
   }
 
-  // Fused: build unique_table_offsets (prefix sum of table_counters) and
-  // compact keys + frequency counters in a single kernel -- no separate scan.
-  const size_t off_smem = static_cast<size_t>(num_tables + 1) * sizeof(int64_t);
+  // Fused tail: build unique_table_offsets (prefix sum of table_counters),
+  // compact keys + frequency counters, AND adjust output_indices to global
+  // indices -- all in one kernel (no separate scan or adjust kernel).  Shared
+  // holds two int64[num_tables+1] tables (unique offsets + segmented_range).
+  const size_t tail_smem =
+      static_cast<size_t>(num_tables + 1) * 2 * sizeof(int64_t);
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
-    compact_keys_and_freq_kernel<<<grid_size, BLOCK_SIZE, off_smem, stream>>>(
+    compact_keys_and_freq_kernel<<<grid_size, BLOCK_SIZE, tail_smem, stream>>>(
         get_pointer<const KeyType>(partitioned_unique_keys),
         enable_freq_counting
-            ? get_pointer<const int64_t>(partitioned_freq_counters)
+            ? get_pointer<int64_t>(partitioned_freq_counters)
             : nullptr,
         get_pointer<const int64_t>(segmented_range),
         get_pointer<const int64_t>(table_counters),
         num_tables, get_pointer<KeyType>(unique_keys),
         enable_freq_counting ? get_pointer<int64_t>(output_freq_counters)
                              : nullptr,
-        get_pointer<int64_t>(unique_table_offsets));
+        get_pointer<int64_t>(unique_table_offsets),
+        get_pointer<int64_t>(output_indices), num_keys);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
-  // Adjust output indices to global indices (table_id via binary search on
-  // segmented_range cached in shared).
-  adjust_output_indices_kernel<<<grid_size, BLOCK_SIZE,
-                                 (num_tables + 1) * sizeof(int64_t), stream>>>(
-      get_pointer<const int64_t>(segmented_range),
-      get_pointer<const int64_t>(unique_table_offsets),
-      get_pointer<int64_t>(output_indices), num_keys, num_tables);
-  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  // (output_indices adjustment is fused into compact_keys_and_freq_kernel.)
 
   // Extract num_uniques as a separate tensor (view of
   // unique_table_offsets[num_tables])
