@@ -501,6 +501,13 @@ def reorder_step_op_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[front + tail].copy()
 
 
+def drop_step2_step_ops(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cols = [c for c in df.columns if not str(c).startswith("step2.")]
+    return df[cols].copy()
+
+
 def warn_l2_exceeds_l1(step_op_df: pd.DataFrame, l2_df: pd.DataFrame) -> None:
     if step_op_df.empty or l2_df.empty:
         return
@@ -526,12 +533,10 @@ def warn_l2_exceeds_l1(step_op_df: pd.DataFrame, l2_df: pd.DataFrame) -> None:
             )
 
 
-L1_DONUT_EXCLUDE = {"step1.lookup", "step1.allocate"}
+L1_DONUT_EXCLUDE = {"step1.lookup", "step1.allocate", "step1.input", "step3.input"}
 L1_DONUT_ORDER = [
-    "step1.input",
     "step1.offload_launch",
     "step1.offload_wait",
-    "step3.input",
     "step3.lookup",
     "step3.allocate",
     "step3.onboard_launch",
@@ -629,13 +634,13 @@ def plot_nested_donut_breakdown(
         ax.add_patch(
             Wedge(
                 (0.0, 0.0),
-                OUTER_RING_R,
+                INNER_RING_R,
                 theta1,
                 theta2,
-                width=OUTER_RING_WIDTH,
+                width=INNER_RING_WIDTH,
                 facecolor=color,
                 edgecolor="white",
-                linewidth=WEDGE_EDGE_LW_OUTER,
+                linewidth=WEDGE_EDGE_LW_INNER,
                 zorder=2,
             )
         )
@@ -646,26 +651,26 @@ def plot_nested_donut_breakdown(
         children = group["children"]
         if children:
             child_total = sum(v for _, v in children)
-            inner_cursor = theta2
+            outer_cursor = theta2
             for _, child_val in children:
                 child_span = (child_val / child_total) * span if child_total > 0 else 0.0
-                c_theta2 = inner_cursor
-                c_theta1 = inner_cursor - child_span
+                c_theta2 = outer_cursor
+                c_theta1 = outer_cursor - child_span
                 ax.add_patch(
                     Wedge(
                         (0.0, 0.0),
-                        INNER_RING_R,
+                        OUTER_RING_R,
                         c_theta1,
                         c_theta2,
-                        width=INNER_RING_WIDTH,
+                        width=OUTER_RING_WIDTH,
                         facecolor=color,
                         edgecolor="white",
-                        linewidth=WEDGE_EDGE_LW_INNER,
+                        linewidth=WEDGE_EDGE_LW_OUTER,
                         alpha=0.92,
                         zorder=3,
                     )
                 )
-                inner_cursor = c_theta1
+                outer_cursor = c_theta1
 
         cursor = theta1
 
@@ -707,7 +712,7 @@ def save_donut_views(
             continue
         png_path = os.path.join(
             plot_dir,
-            f"donut_L1L2_bs{batch_size}_len{seq_len}.png",
+            f"L1L2_latency_breakdown_latency_bs{batch_size}_len{seq_len}.png",
         )
         plot_nested_donut_breakdown(
             l1_df.loc[seq_len],
@@ -734,12 +739,18 @@ def save_view(
     ensure_dir(os.path.dirname(csv_path))
     df.to_csv(csv_path)
     title = os.path.splitext(os.path.basename(png_path))[0]
-    round_note = (
-        "step1: offload round (100% GPU miss) | "
-        "step2: evict | "
-        "step3: onboard round (100% GPU hit)"
-    )
-    if title.startswith("L1_breakdown_") or title.startswith("L2_breakdown_"):
+    if title.startswith("L1_breakdown_"):
+        round_note = (
+            "step1: offload round (100% GPU miss) | "
+            "step3: onboard round (100% GPU hit)"
+        )
+        title = f"{title}\n{round_note}"
+    elif title.startswith("L2_breakdown_"):
+        round_note = (
+            "step1: offload round (100% GPU miss) | "
+            "step2: evict | "
+            "step3: onboard round (100% GPU hit)"
+        )
         title = f"{title}\n{round_note}"
     plot_stacked_breakdown(
         df=df,
@@ -768,7 +779,7 @@ def main() -> None:
 
     seq_lens = parse_int_list(args.seq_lens, "--seq-lens")
     case_pattern = f"len{{value}}_bs{args.batch_size}"
-    plot_dir = os.path.join(args.output_root, "plot")
+    plot_dir = args.output_root
     csv_dir = os.path.join(args.output_root, "csv_summarization")
     x_label = "Sequence Length"
     bs = args.batch_size
@@ -783,8 +794,9 @@ def main() -> None:
         include_prefixes=step_prefixes,
         group_by_step_op=True,
     )
+    l1_step_op_df = reorder_step_op_columns(drop_step2_step_ops(step_op_df))
     save_view(
-        reorder_step_op_columns(step_op_df),
+        l1_step_op_df,
         os.path.join(plot_dir, f"L1_breakdown_bs{bs}.png"),
         os.path.join(csv_dir, f"L1_breakdown_bs{bs}.csv"),
         x_label,

@@ -1,8 +1,6 @@
 
-
 import argparse
 import csv
-import sys
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -12,10 +10,6 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
-
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
 
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
@@ -254,78 +248,7 @@ def wrap_method_with_nvtx(obj, method_name: str, nvtx_name: str, print_nvtx: boo
         )
 
 
-# Wrap a method with before/after stage markers when debugging is active.
-def wrap_method_with_stage_debug(obj, method_name: str, stage_name: str) -> None:
-    if obj is None or not hasattr(obj, method_name):
-        return
-    original = getattr(obj, method_name)
-    if getattr(original, "__stage_debug_wrapped__", False):
-        return
-
-    # Emit stage markers around the original method call.
-    @wraps(original)
-    def wrapped(*args, **kwargs):
-        marker = _current_stage_marker.get()
-        stage_t0 = marker(f"inside_{stage_name}.before") if marker else None
-        try:
-            return original(*args, **kwargs)
-        finally:
-            marker = _current_stage_marker.get()
-            if marker:
-                marker(f"inside_{stage_name}.after", stage_t0)
-
-    wrapped.__stage_debug_wrapped__ = True
-    try:
-        setattr(obj, method_name, wrapped)
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"[WARN] Failed to wrap {obj}.{method_name} "
-            f"with stage debug ({stage_name}): {e}"
-        )
-
-
-# Install deep stage hooks along the offload launch submit path.
-def install_launch_stage_debug_hooks(kvcache_mgr: KVCacheManager) -> None:
-    wrap_method_with_stage_debug(
-        getattr(kvcache_mgr, "gpu_kvcache_mgr", None),
-        "acquire_offload_pages",
-        "gpu_kvcache_mgr.acquire_offload_pages",
-    )
-    host_mgr = getattr(kvcache_mgr, "host_kvstorage_manager", None)
-    wrap_method_with_stage_debug(
-        host_mgr,
-        "offload_kvcache_launch",
-        "host_kvstorage_manager.offload_kvcache_launch",
-    )
-    wrap_method_with_stage_debug(
-        getattr(host_mgr, "_client", None),
-        "put_async",
-        "flexkv_client.put_async",
-    )
-    flexkv_client = getattr(host_mgr, "_client", None)
-    task_engine = getattr(flexkv_client, "kv_task_engine", None)
-    wrap_method_with_stage_debug(
-        task_engine,
-        "put_async",
-        "kv_task_engine.put_async",
-    )
-    cache_engine = getattr(task_engine, "cache_engine", None)
-    wrap_method_with_stage_debug(
-        cache_engine,
-        "put",
-        "cache_engine.put",
-    )
-    for handle_idx, transfer_handle in enumerate(
-        getattr(task_engine, "transfer_handles", []) or []
-    ):
-        wrap_method_with_stage_debug(
-            transfer_handle,
-            "submit",
-            f"transfer_handle{handle_idx}.submit",
-        )
-
-
-# Install timing and stage-debug hooks for the FlexKV offload path.
+# Install timing hooks for the FlexKV offload path.
 def install_flexkv_offload_hooks(kvcache_mgr: KVCacheManager, print_nvtx: bool) -> None:
     flexkv_mgr = getattr(kvcache_mgr, "host_kvstorage_manager", None)
     if flexkv_mgr is None or getattr(flexkv_mgr, "backend_name", "") != "flexkv":
@@ -353,7 +276,6 @@ def install_flexkv_offload_hooks(kvcache_mgr: KVCacheManager, print_nvtx: bool) 
     client = getattr(flexkv_mgr, "_client", None)
     wrap_method_with_nvtx(client, "try_wait", "flexkv_client.try_wait", print_nvtx)
     wrap_method_with_nvtx(client, "wait", "flexkv_client.wait", print_nvtx)
-    install_launch_stage_debug_hooks(kvcache_mgr)
 
 
 # Normalize index metadata fields used by the offload API.
