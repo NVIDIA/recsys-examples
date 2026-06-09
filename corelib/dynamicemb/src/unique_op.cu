@@ -205,14 +205,21 @@ template <typename KeyType,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
 __global__ void segmented_init_kernel(KeyType *hash_keys, int64_t *hash_vals,
-                                      int64_t *table_counters, size_t capacity,
+                                      int64_t *table_counters, int *local_index,
+                                      size_t capacity, size_t num_keys,
                                       int64_t num_tables) {
   const size_t stride = blockDim.x * gridDim.x;
-  // Initialize hash table entries
+  // Initialize hash table entries, and fold in the per-input local_index init
+  // (-1 = "duplicate / not a claimer"; the dedup kernel overwrites it with the
+  // local unique index for each unique key's claimer, and compact emits keys
+  // only for entries that stay >= 0).  capacity (= 2*num_keys) >= num_keys, so
+  // both fit in one strided loop.
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < capacity;
        idx += stride) {
     hash_keys[idx] = empty_key;
     hash_vals[idx] = empty_val;
+    if (idx < num_keys)
+      local_index[idx] = -1;
   }
   // Initialize per-table counters
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -372,7 +379,7 @@ template <typename KeyType, typename Hasher,
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
 __global__ void __launch_bounds__(1024) // SHARED_BLOCK_SIZE, defined below
 segmented_unique_perkey_kernel(
-    const KeyType *d_keys, KeyType *d_unique_keys,
+    const KeyType *d_keys, int *local_index,
     int64_t *d_output_indices, size_t num_keys, KeyType *hash_keys,
     int64_t *hash_vals, size_t capacity, int64_t *table_counters,
     const int64_t *d_segmented_range, int64_t *frequency_counters,
@@ -472,13 +479,18 @@ segmented_unique_perkey_kernel(
 
     if (valid && kind == 1) {
       const int local_idx = s_base[t] + rank;
-      const size_t opos = static_cast<size_t>(d_segmented_range[t]) + local_idx;
-      d_unique_keys[opos] = key;
+      // This input is the unique key's claimer: mark its local index (coalesced
+      // write to the input position) so compact emits keys[idx] -- no scattered
+      // key copy into a partitioned buffer.
+      local_index[idx] = local_idx;
       *reinterpret_cast<volatile int64_t *>(&hash_vals[gi]) =
           pack_table_val(t, local_idx);
       d_output_indices[idx] = local_idx;
-      if (count_freq)
+      if (count_freq) {
+        const size_t opos =
+            static_cast<size_t>(d_segmented_range[t]) + local_idx;
         atomicAdd(&frequency_counters[opos], input_freq);
+      }
     } else if (valid && kind == 2) {
       int64_t pv;
       do {
@@ -945,7 +957,7 @@ block_offsets_scan(const int64_t *counts, int64_t *s_off, int64_t *s_part,
 
 template <typename KeyType>
 __global__ void compact_keys_and_freq_kernel(
-    const KeyType *partitioned_keys, const int64_t *partitioned_freq,
+    const KeyType *d_keys, const int *local_index, const int64_t *partitioned_freq,
     const int64_t *d_segmented_range, const int64_t *table_counters,
     int64_t num_tables, KeyType *output_keys, int64_t *output_freq,
     int64_t *unique_table_offsets, int64_t *output_indices, size_t num_keys) {
@@ -966,26 +978,27 @@ __global__ void compact_keys_and_freq_kernel(
       unique_table_offsets[i] = s_off[i];
 
   const int nt1 = static_cast<int>(num_tables) + 1;
-  const int64_t total_unique = s_off[num_tables];
   const int64_t stride = blockDim.x * gridDim.x;
 
-  // Compaction: partitioned -> compacted unique keys/freq.
-  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_unique;
-       idx += stride) {
-    int table_id = binary_search_upper_bound(s_off, nt1, idx);
-    int64_t local_idx = idx - s_off[table_id];
-    size_t src_pos = static_cast<size_t>(s_seg[table_id]) + local_idx;
-    output_keys[idx] = partitioned_keys[src_pos];
-    if (partitioned_freq != nullptr)
-      output_freq[idx] = partitioned_freq[src_pos];
-  }
-
-  // Adjust: per-table-local output index -> global unique index.
+  // Single pass over all inputs: adjust output_indices to global, and -- for
+  // the claimer of each unique key (local_index >= 0) -- scatter its key (and
+  // gathered frequency) directly to the compacted output.  No partitioned key
+  // buffer / separate compaction loop.
   for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
        idx += stride) {
     int table_id =
         binary_search_upper_bound(s_seg, nt1, static_cast<int64_t>(idx));
-    output_indices[idx] += s_off[table_id];
+    const int64_t base = s_off[table_id];
+    output_indices[idx] += base;
+
+    const int li = local_index[idx];
+    if (li >= 0) {
+      const int64_t gidx = base + li;
+      output_keys[gidx] = d_keys[idx];
+      if (partitioned_freq != nullptr)
+        output_freq[gidx] =
+            partitioned_freq[static_cast<size_t>(s_seg[table_id]) + li];
+    }
   }
 }
 
@@ -1101,9 +1114,12 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   // the fly.  Keys must be sorted by table:
   // keys[segmented_range[t]:segmented_range[t+1]] all belong to table t.
 
-  // Partitioned buffer uses segmented_range as per-table offsets, so total
-  // size is num_keys instead of the worst-case num_tables * num_keys.
-  at::Tensor partitioned_unique_keys = at::empty({num_keys}, keys.options());
+  // Per-input local unique index: -1 for duplicates, the claimer's within-table
+  // index otherwise.  Replaces the partitioned key buffer -- compact emits
+  // keys[idx] directly for entries that stay >= 0.  Initialized to -1 in
+  // segmented_init_kernel.
+  at::Tensor local_index = at::empty(
+      {num_keys}, at::TensorOptions().dtype(at::kInt).device(device));
 
   // Allocate output indices (local indices within each table, adjusted later)
   at::Tensor output_indices = at::empty(
@@ -1161,7 +1177,8 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     // Initialize hash table and counters
     segmented_init_kernel<KeyType><<<grid_size, BLOCK_SIZE, 0, stream>>>(
         get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
-        get_pointer<int64_t>(table_counters), capacity, num_tables);
+        get_pointer<int64_t>(table_counters), get_pointer<int32_t>(local_index),
+        capacity, num_keys, num_tables);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Per-key kernel, block 1024.  Shared = s_wc + s_base (privatized per-table
@@ -1191,7 +1208,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
 
     kernel<<<pk_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
         get_pointer<const KeyType>(keys),
-        get_pointer<KeyType>(partitioned_unique_keys),
+        get_pointer<int32_t>(local_index),
         get_pointer<int64_t>(output_indices), num_keys,
         get_pointer<KeyType>(hash_keys), get_pointer<int64_t>(hash_vals),
         capacity, get_pointer<int64_t>(table_counters),
@@ -1231,7 +1248,8 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(tail_smem));
     compact_keys_and_freq_kernel<<<grid_size, BLOCK_SIZE, tail_smem, stream>>>(
-        get_pointer<const KeyType>(partitioned_unique_keys),
+        get_pointer<const KeyType>(keys),
+        get_pointer<const int32_t>(local_index),
         enable_freq_counting
             ? get_pointer<int64_t>(partitioned_freq_counters)
             : nullptr,
