@@ -111,6 +111,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         num_tmp_cpu_blocks: int = 256,
         dtype: torch.dtype = torch.bfloat16,
         enable_mps: bool = False,
+        as_batch: bool = True,
         hostkv_wait_timeout_ms: int = 0,
         host_kvstorage_fail_policy: str = "fail_open",
     ) -> None:
@@ -128,6 +129,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self.hostkv_wait_timeout_ms = int(hostkv_wait_timeout_ms)
         self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
         self.enable_mps = bool(enable_mps)
+        self.as_batch = bool(as_batch)
         self.backend_name = "flexkv"
 
         self._gpu_cache_table_list: Optional[List[torch.Tensor]] = None
@@ -306,13 +308,49 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 )
         return mappings
 
+    def _slice_put_launch_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        return_mask: np.ndarray,
+        aligned_token_count: int,
+    ) -> Optional[torch.Tensor]:
+        # Required for put_match + launch (BATCH_PUT): put_match defers slot fill until
+        # launch, and return_mask marks tokens that still need host write.
+        mask = np.asarray(return_mask, dtype=np.bool_)
+        if aligned_token_count == 0 or mask.size == 0:
+            return None
+        # Normalize mask length to the aligned token_ids sent to put_match.
+        if mask.size < aligned_token_count:
+            mask = np.concatenate(
+                [mask, np.zeros(aligned_token_count - mask.size, dtype=np.bool_)]
+            )
+        elif mask.size > aligned_token_count:
+            mask = mask[:aligned_token_count]
+
+        # True entries are tokens FlexKV will transfer on launch.
+        num_unmatched = int(mask.sum())
+        if num_unmatched == 0:
+            return None
+
+        # Slice slot_mapping to the unmatched block range (vLLM-style block offset).
+        num_matched = aligned_token_count - num_unmatched
+        num_matched_blocks = num_matched // self.page_size
+        num_unmatched_blocks = num_unmatched // self.page_size
+        if num_unmatched_blocks == 0:
+            return None
+
+        start = num_matched_blocks * self.page_size
+        end = start + num_unmatched_blocks * self.page_size
+        if end > slot_mapping.numel():
+            return None
+        return slot_mapping[start:end].contiguous()
+
     def onboard_kvcache_launch(
         self,
         index_meta: KVIndexMeta,
         lookup_result: KVLookupResult,
         kvcache_metadata: KVCacheMetadata,
     ) -> HostKVTaskHandle:
-        # Save slot_mappings for Offload
         index_meta.slot_mappings = self._build_slot_mappings(kvcache_metadata)
 
         # Step 1. Filter out uids not to onboard
@@ -384,12 +422,17 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             },
         )
 
-        self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
+        use_batch = self.as_batch and len(onboard_task_ids) > 1
+        self._client.launch(
+            onload_handle.task_ids,
+            onload_handle.slot_mappings,
+            as_batch=use_batch,
+        )
         return onload_task_handle
 
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         onboard_results: Dict[int, "KVResponse"] = self._client.wait(
-            task_handle.handle.task_ids
+            task_handle.handle.task_ids,
         )
 
         failed_flag = list()
@@ -445,7 +488,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             else self._build_slot_mappings(kvcache_metadata)
         )
 
+        use_batch = self.as_batch and offload_user_ids.size(0) > 1
         task_ids: List[int] = []
+        batch_slot_mappings: List[torch.Tensor] = []
         for idx in range(offload_user_ids.size(0)):
             token_ids = index_meta.token_ids[idx]
             token_mask = index_meta.token_mask[idx]
@@ -457,13 +502,45 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
 
             slot_mapping = slot_mappings[idx].contiguous()[:valid_len]
 
-            task_id = self._client.put_async(
-                token_ids=index_meta.token_ids[idx],
-                token_mask=index_meta.token_mask[idx],
-                slot_mapping=slot_mapping,
-                namespace=index_meta.namespaces[idx],
+            if use_batch:
+                if valid_len < self.page_size:
+                    continue
+                put_ids = token_ids[:valid_len]
+                if put_ids.dtype != torch.int64:
+                    put_ids = put_ids.to(torch.int64)
+                put_token_ids = put_ids.contiguous().cpu().numpy()
+                # Two-phase PUT: match host radix tree, defer transfer until launch.
+                # Tail-block truncation is done inside FlexKV cache_engine.put.
+                task_id, return_mask = self._client.put_match(
+                    token_ids=put_token_ids,
+                    token_mask=None,
+                    namespace=index_meta.namespaces[idx],
+                )
+                # slot_mapping is per-token and block-aligned; slice uses the same
+                # aligned prefix length FlexKV uses (not valid_len with tail tokens).
+                aligned_len = (valid_len // self.page_size) * self.page_size
+                launch_slot = self._slice_put_launch_slot_mapping(
+                    slot_mapping, return_mask, aligned_len
+                )
+                if launch_slot is None:
+                    self._client.cancel(int(task_id))
+                    continue
+                task_ids.append(int(task_id))
+                batch_slot_mappings.append(launch_slot)
+            else:
+                task_id = self._client.put_async(
+                    token_ids=index_meta.token_ids[idx],
+                    token_mask=index_meta.token_mask[idx],
+                    slot_mapping=slot_mapping,
+                    namespace=index_meta.namespaces[idx],
+                )
+                task_ids.append(int(task_id))
+
+        if use_batch and task_ids:
+            batch_launch = len(task_ids) > 1
+            self._client.launch(
+                task_ids, batch_slot_mappings, as_batch=batch_launch
             )
-            task_ids.append(int(task_id))
         return HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,

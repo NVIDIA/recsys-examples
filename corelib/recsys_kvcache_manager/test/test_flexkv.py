@@ -42,23 +42,23 @@ def create_testing_kvcache_manager() -> KVCacheManager:
             "flexkv_mode": "direct",
             "flexkv_host_kvstorage_fail_policy": "fail_open",
             "flexkv_enable_mps": 0,
+            "flexkv_as_batch": 1,
         },
     )
-    print(
-        f"[TEST] KVCache GPU Memory Usage: {\
-        (kvcache_config.num_layers * \
-        kvcache_config.num_primary_cache_pages * \
-        kvcache_config.page_size * \
-        2 * kvcache_config.num_heads * \
-        kvcache_config.head_dim * 2) / (1024. ** 3) \
-        } GiB."
-    )
-    print(
-        f"[TEST] KVCache Host Memory Usage: {\
-        kvcache_config.num_layers * \
-        kvcache_config.host_capacity_per_layer / (1024. ** 3) \
-        } GiB."
-    )
+    gpu_gib = (
+        kvcache_config.num_layers
+        * kvcache_config.num_primary_cache_pages
+        * kvcache_config.page_size
+        * 2
+        * kvcache_config.num_heads
+        * kvcache_config.head_dim
+        * 2
+    ) / (1024.0**3)
+    host_gib = (
+        kvcache_config.num_layers * kvcache_config.host_capacity_per_layer
+    ) / (1024.0**3)
+    print(f"[TEST] KVCache GPU Memory Usage: {gpu_gib} GiB.")
+    print(f"[TEST] KVCache Host Memory Usage: {host_gib} GiB.")
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
     print("[TEST] Created KVCache Manager")
     return kvcache_mgr
