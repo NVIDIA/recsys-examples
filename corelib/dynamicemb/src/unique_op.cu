@@ -907,6 +907,42 @@ segmented_unique_shared_kernel(
 //   - compaction over [0, total_unique): gather unique keys/freq;
 //   - adjust over [0, num_keys): output_indices[i] += s_off[table_id(i)].
 // partitioned_freq/output_freq may be nullptr when frequency counting is off.
+// Block-cooperative exclusive prefix sum: s_off[t] = sum(counts[0..t)) for t in
+// [0, num_tables], with s_off[num_tables] = grand total.  Scales to
+// num_tables >> blockDim via contiguous per-thread chunks + a Hillis-Steele
+// scan of the per-thread totals (O(num_tables/blockDim + log blockDim) instead
+// of the O(num_tables) serial scan).  s_part[blockDim] is shared scratch.
+__device__ __forceinline__ void
+block_offsets_scan(const int64_t *counts, int64_t *s_off, int64_t *s_part,
+                   int num_tables) {
+  const int B = blockDim.x, tid = threadIdx.x;
+  const int chunk = (num_tables + B - 1) / B;
+  const int begin = min(tid * chunk, num_tables);
+  const int end = min(begin + chunk, num_tables);
+  // 1. per-thread sum of its contiguous chunk
+  int64_t sum = 0;
+  for (int i = begin; i < end; ++i)
+    sum += counts[i];
+  s_part[tid] = sum;
+  __syncthreads();
+  // 2. inclusive Hillis-Steele scan of the blockDim per-thread totals
+  for (int d = 1; d < B; d <<= 1) {
+    int64_t add = (tid >= d) ? s_part[tid - d] : 0;
+    __syncthreads();
+    s_part[tid] += add;
+    __syncthreads();
+  }
+  // 3. write this thread's chunk: exclusive base = inclusive[tid] - own sum
+  int64_t run = s_part[tid] - sum;
+  for (int i = begin; i < end; ++i) {
+    s_off[i] = run;
+    run += counts[i];
+  }
+  if (tid == B - 1)
+    s_off[num_tables] = s_part[B - 1]; // grand total
+  __syncthreads();
+}
+
 template <typename KeyType>
 __global__ void compact_keys_and_freq_kernel(
     const KeyType *partitioned_keys, const int64_t *partitioned_freq,
@@ -916,11 +952,9 @@ __global__ void compact_keys_and_freq_kernel(
   extern __shared__ int64_t smem_off[];
   int64_t *s_off = smem_off;                        // [num_tables+1] unique offs
   int64_t *s_seg = smem_off + (num_tables + 1);     // [num_tables+1] seg range
-  if (threadIdx.x == 0) {
-    s_off[0] = 0;
-    for (int t = 0; t < num_tables; ++t)
-      s_off[t + 1] = s_off[t] + table_counters[t];
-  }
+  int64_t *s_part = s_seg + (num_tables + 1);       // [blockDim] scan scratch
+  // Parallel prefix sum of table_counters -> s_off (scales to large num_tables).
+  block_offsets_scan(table_counters, s_off, s_part, static_cast<int>(num_tables));
   for (int i = threadIdx.x; i <= num_tables; i += blockDim.x)
     s_seg[i] = d_segmented_range[i];
   __syncthreads();
@@ -1184,13 +1218,18 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device));
   }
 
-  // Fused tail: build unique_table_offsets (prefix sum of table_counters),
-  // compact keys + frequency counters, AND adjust output_indices to global
-  // indices -- all in one kernel (no separate scan or adjust kernel).  Shared
-  // holds two int64[num_tables+1] tables (unique offsets + segmented_range).
+  // Fused tail: build unique_table_offsets (parallel prefix sum of
+  // table_counters), compact keys + frequency counters, AND adjust
+  // output_indices to global indices -- all in one kernel (no separate scan or
+  // adjust kernel).  Shared = s_off[num_tables+1] + s_seg[num_tables+1] +
+  // s_part[BLOCK_SIZE] (scan scratch); opt in since it can exceed 48KB for
+  // large num_tables.
   const size_t tail_smem =
-      static_cast<size_t>(num_tables + 1) * 2 * sizeof(int64_t);
+      (static_cast<size_t>(num_tables + 1) * 2 + BLOCK_SIZE) * sizeof(int64_t);
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
+    cudaFuncSetAttribute(compact_keys_and_freq_kernel<KeyType>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(tail_smem));
     compact_keys_and_freq_kernel<<<grid_size, BLOCK_SIZE, tail_smem, stream>>>(
         get_pointer<const KeyType>(partitioned_unique_keys),
         enable_freq_counting
