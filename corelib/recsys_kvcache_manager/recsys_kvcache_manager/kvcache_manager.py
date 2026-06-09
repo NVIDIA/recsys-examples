@@ -236,7 +236,6 @@ class KVCacheManager:
         remain_tasks = list()
         for task_handle in self.ongoing_offload_tasks:
             wait_result = self.host_kvstorage_manager.offload_kvcache_wait(task_handle)
-            # print(f"wait_result: {wait_result}")
             if wait_result.status == HostKVTaskStatus.LAUNCHED:
                 remain_tasks.append(task_handle)
                 continue
