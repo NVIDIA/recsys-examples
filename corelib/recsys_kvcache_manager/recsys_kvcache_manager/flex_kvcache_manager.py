@@ -284,26 +284,26 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
     def _build_slot_mappings(
         self, kvcache_metadata: KVCacheMetadata
     ) -> List[torch.Tensor]:
-        mappings: List[torch.Tensor] = []
         kv_indices = kvcache_metadata.kv_indices
         kv_indptr = kvcache_metadata.kv_indptr
-        for i in range(kv_indptr.size(0) - 1):
-            page_ids = kv_indices[kv_indptr[i] : kv_indptr[i + 1]]
-            if page_ids.numel() == 0:
-                mappings.append(torch.empty((0,), dtype=torch.int64, device="cpu"))
-                continue
-            # D2H only page_ids (O(num_pages)), expand slots on CPU for FlexKV numpy path.
-            page_ids_cpu = page_ids.detach().to(device="cpu", dtype=torch.int64)
-            page_ids_np = page_ids_cpu.numpy()
-            chunks = [
-                np.arange(
-                    int(pid) * self.page_size,
-                    (int(pid) + 1) * self.page_size,
-                    dtype=np.int64,
+        kv_indices_cpu = (
+            kv_indices.detach().contiguous().to(device="cpu", dtype=torch.int64)
+        )
+        kv_indptr_cpu = kv_indptr.detach().contiguous().to(
+            device="cpu", dtype=torch.int64
+        )
+        indptr = kv_indptr_cpu.tolist()
+        offsets = torch.arange(self.page_size, dtype=torch.int64)
+        mappings: List[torch.Tensor] = []
+        for i in range(len(indptr) - 1):
+            start, end = indptr[i], indptr[i + 1]
+            if start == end:
+                mappings.append(torch.empty((0,), dtype=torch.int64))
+            else:
+                page_ids_i64 = kv_indices_cpu[start:end]
+                mappings.append(
+                    (page_ids_i64.unsqueeze(1) * self.page_size + offsets).reshape(-1)
                 )
-                for pid in page_ids_np
-            ]
-            mappings.append(torch.from_numpy(np.concatenate(chunks)))
         return mappings
 
     def onboard_kvcache_launch(
