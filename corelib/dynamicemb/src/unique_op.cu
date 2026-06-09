@@ -203,11 +203,10 @@ __device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
 }
 
 // Initialize the chaining hash structures: bucket heads and chain pointers to
-// -1 (empty), output_indices to -1 (so duplicates spin until a claimer
-// publishes a valid index), node_freq to 0, and the per-table counters to 0.
+// -1 (empty), node_freq to 0, and the per-table counters to 0.  rep_local and
+// output_indices need no init -- core writes rep_local for every input and
+// finalize writes every output_indices.
 __global__ void segmented_unique_prepare(int *head, int *next_arr,
-                                         int *rep_local,
-                                         int64_t *output_indices,
                                          int64_t *node_freq,
                                          int64_t *table_counters,
                                          bool count_freq, size_t num_buckets,
@@ -218,8 +217,6 @@ __global__ void segmented_unique_prepare(int *head, int *next_arr,
     head[i] = -1;
   for (size_t i = gtid; i < num_keys; i += stride) {
     next_arr[i] = -1;
-    rep_local[i] = -1;
-    output_indices[i] = -1;
     if (count_freq)
       node_freq[i] = 0;
   }
@@ -240,24 +237,22 @@ __global__ void segmented_unique_prepare(int *head, int *next_arr,
 //   - the per-table unique counter is PRIVATIZED: claimers warp-aggregate into a
 //     shared per-wave counter s_wc, then ONE global atomicAdd per table per wave
 //     reserves the index range (s_base);
-//   - phase 3: a claimer writes its local index to rep_local (compaction marker)
-//     and publishes it via output_indices, seeding node_freq; a duplicate spins
-//     on the rep's output_indices and adds into the rep's node_freq.
+//   - phase 3: a claimer records its local index in rep_local (compaction
+//     marker) and seeds node_freq; a duplicate records -(rep+1) in rep_local
+//     and adds into the rep's node_freq.  Nothing is published/spun-on here --
+//     finalize derives every input's global index from rep_local, so there is
+//     no cross-block wait (and thus no co-residency requirement).
 // d_head is int32 and keys live in the reused input array, so the hot table
 // footprint is ~half the open-addressing version -> better L2 residency.
-//
-// IMPORTANT: the deferred cross-block publish requires every block to be
-// co-resident (a duplicate may spin on another block's published index).  The
-// host MUST size the grid to exactly the max active blocks (no oversubscription).
 template <typename KeyType, typename Hasher,
           KeyType empty_key = std::numeric_limits<KeyType>::max(),
           int64_t empty_val = std::numeric_limits<int64_t>::max()>
 __global__ void __launch_bounds__(SHARED_BLOCK_SIZE)
 segmented_unique_core(
-    const KeyType *d_keys, int64_t *d_output_indices, size_t num_keys,
-    int *d_head, int *d_next, int64_t *node_freq, int *rep_local,
-    int64_t *table_counters, const int64_t *d_segmented_range,
-    const int64_t *input_frequencies, int64_t num_tables) {
+    const KeyType *d_keys, size_t num_keys, int *d_head, int *d_next,
+    int64_t *node_freq, int *rep_local, int64_t *table_counters,
+    const int64_t *d_segmented_range, const int64_t *input_frequencies,
+    int64_t num_tables) {
   const int B = blockDim.x;
   const int tid = threadIdx.x;
   const bool count_freq = node_freq != nullptr;
@@ -351,18 +346,16 @@ segmented_unique_core(
     __syncthreads();
 
     if (valid && kind == 1) {
-      const int local_idx = s_base[t] + rank;
-      rep_local[idx] = local_idx;
+      // Representative: record its local index (compaction marker).  No
+      // output_indices publish -- finalize derives every input's global index
+      // from rep_local, so duplicates need not spin here.
+      rep_local[idx] = s_base[t] + rank;
       if (count_freq)
         atomicAdd(&node_freq[idx], input_freq);
-      // Publish last so a duplicate that observes it reads a valid index.
-      *reinterpret_cast<volatile int64_t *>(&d_output_indices[idx]) = local_idx;
     } else if (valid && kind == 2) {
-      int64_t pub;
-      do {
-        pub = *reinterpret_cast<volatile int64_t *>(&d_output_indices[rep]);
-      } while (pub < 0);
-      d_output_indices[idx] = pub;
+      // Duplicate: encode the representative node as -(rep+1); finalize reads
+      // rep_local[rep] (the rep's local index, stable) to resolve it.
+      rep_local[idx] = -(rep + 1);
       if (count_freq)
         atomicAdd(&node_freq[rep], input_freq);
     }
@@ -451,14 +444,19 @@ __global__ void segmented_unique_finalize(
     const int table_id =
         binary_search_upper_bound(s_seg, nt1, static_cast<int64_t>(idx));
     const int64_t base = s_off[table_id];
-    output_indices[idx] += base;
-
-    const int li = rep_local[idx];
-    if (li >= 0) { // this input is the representative of a unique key
-      const int64_t gidx = base + li;
+    const int r = rep_local[idx];
+    if (r >= 0) {
+      // Representative of a unique key: its global index, and emit key/freq.
+      const int64_t gidx = base + r;
+      output_indices[idx] = gidx;
       output_keys[gidx] = d_keys[idx];
       if (output_freq != nullptr)
         output_freq[gidx] = node_freq[idx];
+    } else {
+      // Duplicate: r == -(rep+1); the rep's local index is rep_local[rep]
+      // (same table -> same base), read-only here so no race.
+      const int rep = -r - 1;
+      output_indices[idx] = base + rep_local[rep];
     }
   }
 }
@@ -617,7 +615,6 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   // Initialize the chaining structures + counters (not key-type dependent).
   segmented_unique_prepare<<<grid_size, BLOCK_SIZE, 0, stream>>>(
       get_pointer<int32_t>(head), get_pointer<int32_t>(next_arr),
-      get_pointer<int32_t>(rep_local), get_pointer<int64_t>(output_indices),
       enable_freq_counting ? get_pointer<int64_t>(node_freq) : nullptr,
       get_pointer<int64_t>(table_counters), enable_freq_counting,
       static_cast<size_t>(num_buckets), num_keys, num_tables);
@@ -650,8 +647,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
     const int pk_grid = static_cast<int>(pk_grid64);
 
     kernel<<<pk_grid, SHARED_BLOCK_SIZE, smem_bytes, stream>>>(
-        get_pointer<const KeyType>(keys),
-        get_pointer<int64_t>(output_indices), num_keys,
+        get_pointer<const KeyType>(keys), num_keys,
         get_pointer<int32_t>(head), get_pointer<int32_t>(next_arr),
         enable_freq_counting ? get_pointer<int64_t>(node_freq) : nullptr,
         get_pointer<int32_t>(rep_local), get_pointer<int64_t>(table_counters),
