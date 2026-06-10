@@ -629,9 +629,10 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         static_cast<size_t>(num_tables + 1) * sizeof(int64_t);
     auto kernel = segmented_unique_core<KeyType, MurmurHash3_32<KeyType>>;
 
-    // Deferred cross-block publish requires all launched blocks to be
-    // co-resident, so size the grid to exactly the max active blocks/SM (never
-    // oversubscribe).  grid-stride then covers all keys.
+    // Size the grid to the resident-block count and let each block grid-stride
+    // over multiple waves.  Reusing a resident block across waves amortizes its
+    // setup (one s_segrange load) and keeps the SMs busy -- measured faster than
+    // one-block-per-wave (which reloads s_segrange per block).
     int blocks_per_sm = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm, kernel, SHARED_BLOCK_SIZE, smem_bytes);
