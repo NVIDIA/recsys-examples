@@ -308,43 +308,6 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 )
         return mappings
 
-    def _slice_put_launch_slot_mapping(
-        self,
-        slot_mapping: torch.Tensor,
-        return_mask: np.ndarray,
-        aligned_token_count: int,
-    ) -> Optional[torch.Tensor]:
-        # Required for put_match + launch (BATCH_PUT): put_match defers slot fill until
-        # launch, and return_mask marks tokens that still need host write.
-        mask = np.asarray(return_mask, dtype=np.bool_)
-        if aligned_token_count == 0 or mask.size == 0:
-            return None
-        # Normalize mask length to the aligned token_ids sent to put_match.
-        if mask.size < aligned_token_count:
-            mask = np.concatenate(
-                [mask, np.zeros(aligned_token_count - mask.size, dtype=np.bool_)]
-            )
-        elif mask.size > aligned_token_count:
-            mask = mask[:aligned_token_count]
-
-        # True entries are tokens FlexKV will transfer on launch.
-        num_unmatched = int(mask.sum())
-        if num_unmatched == 0:
-            return None
-
-        # Slice slot_mapping to the unmatched block range (vLLM-style block offset).
-        num_matched = aligned_token_count - num_unmatched
-        num_matched_blocks = num_matched // self.page_size
-        num_unmatched_blocks = num_unmatched // self.page_size
-        if num_unmatched_blocks == 0:
-            return None
-
-        start = num_matched_blocks * self.page_size
-        end = start + num_unmatched_blocks * self.page_size
-        if end > slot_mapping.numel():
-            return None
-        return slot_mapping[start:end].contiguous()
-
     def onboard_kvcache_launch(
         self,
         index_meta: KVIndexMeta,
@@ -503,25 +466,33 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             slot_mapping = slot_mappings[idx].contiguous()[:valid_len]
 
             if use_batch:
+                # aligned_len == 0 when valid_len < page_size; skip put_match
                 if valid_len < self.page_size:
                     continue
                 put_ids = token_ids[:valid_len]
                 if put_ids.dtype != torch.int64:
                     put_ids = put_ids.to(torch.int64)
                 put_token_ids = put_ids.contiguous().cpu().numpy()
-                # Two-phase PUT: match host radix tree, defer transfer until launch.
-                # Tail-block truncation is done inside FlexKV cache_engine.put.
+
                 task_id, return_mask = self._client.put_match(
                     token_ids=put_token_ids,
                     token_mask=None,
                     namespace=index_meta.namespaces[idx],
                 )
-                # slot_mapping is per-token and block-aligned; slice uses the same
-                # aligned prefix length FlexKV uses (not valid_len with tail tokens).
+                # Slice slot_mapping for launch: mask is prefix matched=False,
+                # suffix to write=True (FlexKV put_match); aligned to full pages only.
                 aligned_len = (valid_len // self.page_size) * self.page_size
-                launch_slot = self._slice_put_launch_slot_mapping(
-                    slot_mapping, return_mask, aligned_len
-                )
+                mask = np.asarray(return_mask, dtype=np.bool_)[:aligned_len]
+                if mask.size < aligned_len:
+                    mask = np.pad(mask, (0, aligned_len - mask.size), constant_values=False)
+                num_unmatched = int(mask.sum())
+                launch_slot = None
+                if num_unmatched > 0:
+                    num_matched = aligned_len - num_unmatched
+                    start = (num_matched // self.page_size) * self.page_size
+                    end = start + (num_unmatched // self.page_size) * self.page_size
+                    if end > start and end <= slot_mapping.numel():
+                        launch_slot = slot_mapping[start:end].contiguous()
                 if launch_slot is None:
                     self._client.cancel(int(task_id))
                     continue
