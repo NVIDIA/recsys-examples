@@ -224,8 +224,8 @@ __global__ void segmented_unique_prepare(int *head, int *next_arr,
     table_counters[i] = 0;
 }
 
-// Core dedup kernel (chaining hash, per-table bucket space).  Flat grid-stride
-// pass, no block barriers; each distinct (key, table) gets exactly one chain
+// Core dedup kernel (chaining hash, per-table bucket space).  One pass over the
+// input in WAVES of blockDim; each distinct (key, table) gets exactly one chain
 // node (= its first-occurrence input index):
 //   - table_id t comes from a binary search on segmented_range cached in shared;
 //     the bucket space is PER-TABLE (offset 4*seg[t], size 4*table_size) so the
@@ -234,12 +234,14 @@ __global__ void segmented_unique_prepare(int *head, int *next_arr,
 //     key match (d_keys[cur]==key; the input array is immutable, always readable)
 //     is a duplicate; at the tail, ::atomicCAS(-1, idx) appends a new node, and
 //     the loser of the CAS re-walks the new tail (collapsing same-key races);
-//   - a claimer takes its local index from the global per-table counter via a
-//     warp-aggregated atomicAdd (same-table lanes share one atomic) and records
-//     it in rep_local (compaction marker); a duplicate records -(rep+1) and adds
-//     into the rep's node_freq.  Nothing is published/spun-on -- finalize
-//     derives every input's global index from rep_local, so there is no
-//     cross-block wait and no inter-thread barrier in the loop.
+//   - the per-table unique counter is PRIVATIZED: claimers warp-aggregate into a
+//     shared per-wave counter s_wc, then ONE global atomicAdd per table per wave
+//     reserves the index range (s_base);
+//   - phase 3: a claimer records its local index in rep_local (compaction
+//     marker) and seeds node_freq; a duplicate records -(rep+1) in rep_local
+//     and adds into the rep's node_freq.  Nothing is published/spun-on here --
+//     finalize derives every input's global index from rep_local, so there is
+//     no cross-block wait (and thus no co-residency requirement).
 // d_head is int32 and keys live in the reused input array, so the hot table
 // footprint is ~half the open-addressing version -> better L2 residency.
 template <typename KeyType, typename Hasher,
@@ -256,77 +258,108 @@ segmented_unique_core(
   const bool count_freq = node_freq != nullptr;
 
   extern __shared__ char smem[];
-  int64_t *s_segrange = reinterpret_cast<int64_t *>(smem); // [num_tables + 1]
+  int *s_wc = reinterpret_cast<int *>(smem);                // [num_tables]
+  int *s_base = reinterpret_cast<int *>(s_wc + num_tables); // [num_tables]
+  int64_t *s_segrange = reinterpret_cast<int64_t *>(s_base + num_tables);
   for (int i = tid; i <= num_tables; i += B)
     s_segrange[i] = d_segmented_range[i];
   __syncthreads();
 
-  // Flat grid-stride: no per-wave barriers.  A claimer takes its local index
-  // straight from the global per-table counter via a warp-aggregated atomicAdd.
-  const size_t stride = static_cast<size_t>(gridDim.x) * B;
-  for (size_t idx = static_cast<size_t>(blockIdx.x) * B + tid; idx < num_keys;
-       idx += stride) {
-    const KeyType key = d_keys[idx];
-    const int t = binary_search_upper_bound(
-        s_segrange, static_cast<int>(num_tables) + 1, static_cast<int64_t>(idx));
-    const int64_t input_freq = input_frequencies ? input_frequencies[idx] : 1;
-    const int64_t seg_t = s_segrange[t];
-    const uint64_t nbkt = 4ull * static_cast<uint64_t>(s_segrange[t + 1] - seg_t);
-    const size_t bucket = static_cast<size_t>(
-        4ull * static_cast<uint64_t>(seg_t) + (Hasher::hash(key) % nbkt));
+  for (size_t wave = static_cast<size_t>(blockIdx.x) * B; wave < num_keys;
+       wave += static_cast<size_t>(gridDim.x) * B) {
+    for (int t = tid; t < num_tables; t += B)
+      s_wc[t] = 0;
+    __syncthreads();
 
-    // Lock-free tail-append dedup.
-    int kind = 0, rep = -1;
-    int cur = d_head[bucket];
-    if (cur == -1) {
-      const int old = ::atomicCAS(&d_head[bucket], -1, static_cast<int>(idx));
-      if (old == -1) {
-        kind = 1;
-        rep = static_cast<int>(idx);
-      } else {
-        cur = old;
-      }
-    }
-    while (kind == 0) {
-      if (d_keys[cur] == key) {
-        kind = 2;
-        rep = cur;
-        break;
-      }
-      const int nxt = d_next[cur];
-      if (nxt == -1) {
-        const int old = ::atomicCAS(&d_next[cur], -1, static_cast<int>(idx));
+    const size_t idx = wave + tid;
+    const bool valid = idx < num_keys;
+    int t = -1;
+    int64_t input_freq = 1;
+    int kind = 0; // 0 none, 1 claim, 2 duplicate
+    int rep = -1; // representative node (idx if claim, matched node if dup)
+    int rank = 0;
+    if (valid) {
+      const KeyType key = d_keys[idx];
+      t = binary_search_upper_bound(s_segrange, static_cast<int>(num_tables) + 1,
+                                    static_cast<int64_t>(idx));
+      input_freq = input_frequencies ? input_frequencies[idx] : 1;
+      const int64_t seg_t = s_segrange[t];
+      const uint64_t nbkt =
+          4ull * static_cast<uint64_t>(s_segrange[t + 1] - seg_t);
+      const size_t bucket = static_cast<size_t>(4ull * static_cast<uint64_t>(seg_t) +
+                                                (Hasher::hash(key) % nbkt));
+
+      // Lock-free tail-append dedup.
+      int cur = d_head[bucket];
+      if (cur == -1) {
+        const int old = ::atomicCAS(&d_head[bucket], -1, static_cast<int>(idx));
         if (old == -1) {
           kind = 1;
           rep = static_cast<int>(idx);
+        } else {
+          cur = old;
+        }
+      }
+      while (kind == 0) {
+        if (d_keys[cur] == key) {
+          kind = 2;
+          rep = cur;
           break;
         }
-        cur = old;
-      } else {
-        cur = nxt;
+        const int nxt = d_next[cur];
+        if (nxt == -1) {
+          const int old = ::atomicCAS(&d_next[cur], -1, static_cast<int>(idx));
+          if (old == -1) {
+            kind = 1;
+            rep = static_cast<int>(idx);
+            break;
+          }
+          cur = old;
+        } else {
+          cur = nxt;
+        }
       }
     }
 
-    if (kind == 1) {
-      // Representative: take its local index from the global per-table counter,
-      // warp-aggregated so same-table claimers share one atomicAdd.
+    // Warp-aggregate the shared per-table counter bump for claimers: lanes
+    // claiming for the SAME table share one shared atomic (label non-claimers
+    // -1 so they form a harmless separate group).
+    {
+      const int label = (kind == 1) ? t : -1;
       auto active = cg::coalesced_threads();
-      auto grp = cg::labeled_partition(active, t);
-      int64_t base = 0;
-      if (grp.thread_rank() == 0)
-        base = atomicAdd(&table_counters[t], static_cast<int64_t>(grp.size()));
-      base = grp.shfl(base, 0);
-      rep_local[idx] =
-          static_cast<int>(base) + static_cast<int>(grp.thread_rank());
+      auto grp = cg::labeled_partition(active, label);
+      if (kind == 1) {
+        int base = 0;
+        if (grp.thread_rank() == 0)
+          base = ::atomicAdd(&s_wc[t], static_cast<int>(grp.size()));
+        rank = grp.shfl(base, 0) + static_cast<int>(grp.thread_rank());
+      }
+    }
+    __syncthreads();
+
+    // One global atomic per table reserves the base for this wave's claims.
+    for (int tt = tid; tt < num_tables; tt += B) {
+      if (s_wc[tt] > 0)
+        s_base[tt] = static_cast<int>(
+            atomicAdd(&table_counters[tt], static_cast<int64_t>(s_wc[tt])));
+    }
+    __syncthreads();
+
+    if (valid && kind == 1) {
+      // Representative: record its local index (compaction marker).  No
+      // output_indices publish -- finalize derives every input's global index
+      // from rep_local, so duplicates need not spin here.
+      rep_local[idx] = s_base[t] + rank;
       if (count_freq)
         atomicAdd(&node_freq[idx], input_freq);
-    } else {
+    } else if (valid && kind == 2) {
       // Duplicate: encode the representative node as -(rep+1); finalize reads
       // rep_local[rep] (the rep's local index, stable) to resolve it.
       rep_local[idx] = -(rep + 1);
       if (count_freq)
         atomicAdd(&node_freq[rep], input_freq);
     }
+    __syncthreads();
   }
 }
 
@@ -588,10 +621,11 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
-    // Core dedup kernel, block 1024.  Shared = s_segrange[num_tables+1] only
-    // (cached for the table_id lookup / per-table bucket offset); the counter is
-    // bumped straight in global, so no per-block counter shared/barriers.
+    // Core dedup kernel, block 1024.  Shared = s_wc + s_base (privatized
+    // per-table counters) + s_segrange[num_tables+1] (cached for the table_id
+    // lookup / per-table bucket offset).
     const size_t smem_bytes =
+        static_cast<size_t>(num_tables) * 2 * sizeof(int) +
         static_cast<size_t>(num_tables + 1) * sizeof(int64_t);
     auto kernel = segmented_unique_core<KeyType, MurmurHash3_32<KeyType>>;
 
