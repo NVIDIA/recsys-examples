@@ -15,7 +15,6 @@
 
 import json
 import math
-import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -32,6 +31,7 @@ from dynamicemb.extendable_tensor import (
     ExtendableBuffer,
     HostExtendableBuffer,
 )
+from dynamicemb.filesystem import get_filesystem
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
     pad_optimizer_states_from_checkpoint,
@@ -116,7 +116,7 @@ def _all_gather_dumped_keys_values(
 
 def save_to_json(data: Dict[str, Any], file_path: str) -> None:
     try:
-        with open(file_path, "w") as json_file:
+        with get_filesystem(file_path).open(file_path, "w") as json_file:
             json.dump(data, json_file, indent=4)
     except Exception as e:
         raise RuntimeError(f"Error saving data to JSON file: {e}")
@@ -124,7 +124,7 @@ def save_to_json(data: Dict[str, Any], file_path: str) -> None:
 
 def load_from_json(file_path: str) -> Dict[str, Any]:
     try:
-        with open(file_path, "r") as json_file:
+        with get_filesystem(file_path).open(file_path, "r") as json_file:
             data = json.load(json_file)
         return data
     except Exception as e:
@@ -1090,33 +1090,32 @@ def _dump_table(
         save_to_json(meta_data, meta_json_file_path)
 
     mode = "ab" if append else "wb"
-    fkey = open(emb_key_path, mode)
-    fembedding = open(embedding_file_path, mode)
-    fscore = open(score_file_path, mode)
-    fopt_states = open(opt_file_path, mode) if include_optim else None
+    fs = get_filesystem(emb_key_path)
+    with fs.open(emb_key_path, mode) as fkey, fs.open(
+        embedding_file_path, mode
+    ) as fembedding, fs.open(score_file_path, mode) as fscore:
+        fopt_states = None
+        if include_optim:
+            fopt_states = fs.open(opt_file_path, mode)
 
-    for keys, embeddings, opt_states_batch, scores in export_keys_values_iter(
-        state, device=device, table_id=table_id
-    ):
-        fkey.write(keys.cpu().numpy().tobytes())
-        fembedding.write(embeddings.cpu().numpy().tobytes())
-        if state.evict_strategy == EvictStrategy.KLru:
-            scores = timestamp - scores
-        fscore.write(scores.cpu().numpy().tobytes())
-        if fopt_states and opt_states_batch is not None:
-            to_write = truncate_optimizer_states_for_checkpoint(
-                state.optimizer,
-                state.table_emb_dims_cpu[table_id],
-                opt_states_batch,
-            )
-            fopt_states.write(to_write.cpu().numpy().tobytes())
+        for keys, embeddings, opt_states_batch, scores in export_keys_values_iter(
+            state, device=device, table_id=table_id
+        ):
+            fkey.write(keys.cpu().numpy().tobytes())
+            fembedding.write(embeddings.cpu().numpy().tobytes())
+            if state.evict_strategy == EvictStrategy.KLru:
+                scores = timestamp - scores
+            fscore.write(scores.cpu().numpy().tobytes())
+            if fopt_states and opt_states_batch is not None:
+                to_write = truncate_optimizer_states_for_checkpoint(
+                    state.optimizer,
+                    state.table_emb_dims_cpu[table_id],
+                    opt_states_batch,
+                )
+                fopt_states.write(to_write.cpu().numpy().tobytes())
 
-    fkey.close()
-    fembedding.close()
-    if fscore:
-        fscore.close()
-    if fopt_states:
-        fopt_states.close()
+        if fopt_states:
+            fopt_states.close()
 
 
 def _iter_batches_from_files(
@@ -1134,15 +1133,16 @@ def _iter_batches_from_files(
     Handles file I/O, numpy deserialization, and distributed world_size filtering.
     Pass *score_file_path* / *opt_file_path* as ``None`` to skip those files.
     """
-    fkey = open(emb_key_path, "rb")
-    fembedding = open(embedding_file_path, "rb")
+    fs = get_filesystem(emb_key_path)
+    fkey = fs.open(emb_key_path, "rb")
+    fembedding = fs.open(embedding_file_path, "rb")
     fscore = (
-        open(score_file_path, "rb")
-        if score_file_path and os.path.exists(score_file_path)
+        fs.open(score_file_path, "rb")
+        if score_file_path and fs.exists(score_file_path)
         else None
     )
-    fopt = open(opt_file_path, "rb") if opt_file_path else None
-    num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
+    fopt = fs.open(opt_file_path, "rb") if opt_file_path else None
+    num_keys = fs.size(emb_key_path) // KEY_TYPE.itemsize
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1258,7 +1258,7 @@ def _validate_load_meta(
             f"Score file {score_file_path} does not exist. Will not load score states."
         )
 
-    if not opt_file_path or not os.path.exists(opt_file_path):
+    if not opt_file_path or not get_filesystem(opt_file_path).exists(opt_file_path):
         include_optim = False
         print(
             f"Optimizer file {opt_file_path} does not exist. Will not load optimizer states."
@@ -1273,24 +1273,23 @@ def _validate_load_meta(
     if include_optim:
         state.optimizer.set_opt_args(meta_data)
 
-    num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
-    num_embeddings = (
-        os.path.getsize(embedding_file_path) // EMBEDDING_TYPE.itemsize // dim
-    )
+    fs = get_filesystem(emb_key_path)
+    num_keys = fs.size(emb_key_path) // KEY_TYPE.itemsize
+    num_embeddings = fs.size(embedding_file_path) // EMBEDDING_TYPE.itemsize // dim
     if num_keys != num_embeddings:
         raise ValueError(
             f"The number of keys in {emb_key_path} does not match with number of embeddings in {embedding_file_path}."
         )
-    if score_file_path and os.path.exists(score_file_path):
-        num_scores = os.path.getsize(score_file_path) // SCORE_TYPE.itemsize
+    if score_file_path and fs.exists(score_file_path):
+        num_scores = fs.size(score_file_path) // SCORE_TYPE.itemsize
         if num_keys != num_scores:
             raise ValueError(
                 f"The number of keys in {emb_key_path} does not match with number of scores in {score_file_path}."
             )
 
     file_optstate_dim = 0
-    if include_optim and opt_file_path and os.path.exists(opt_file_path):
-        file_bytes = os.path.getsize(opt_file_path)
+    if include_optim and opt_file_path and fs.exists(opt_file_path):
+        file_bytes = fs.size(opt_file_path)
         if num_keys == 0:
             if file_bytes != 0:
                 raise ValueError(

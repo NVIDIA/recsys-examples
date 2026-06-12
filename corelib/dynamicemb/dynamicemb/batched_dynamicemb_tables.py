@@ -38,6 +38,7 @@ from dynamicemb.dynamicemb_config import (
     warning_for_cstm_score,
 )
 from dynamicemb.embedding_admission import MultiTableKVCounter
+from dynamicemb.filesystem import get_filesystem
 from dynamicemb.initializer import create_initializer_from_args
 from dynamicemb.key_value_table import (
     Cache,
@@ -90,6 +91,17 @@ def encode_counter_checkpoint_file_path(
     )
 
 
+def _strip_scheme_prefix(path: str) -> str:
+    """Strip ``hdfs://host:port`` prefix if present, returning ``/path``."""
+    if path.startswith("hdfs://"):
+        # hdfs://host:port/path  →  /path
+        without_scheme = path[len("hdfs://") :]
+        idx = without_scheme.find("/")
+        if idx != -1:
+            return without_scheme[idx:]
+    return path
+
+
 def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str], int]:
     suffix_to_encode_file_path_func = {
         "emb_keys": partial(encode_checkpoint_file_path, item="keys"),
@@ -105,10 +117,10 @@ def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str],
         raise RuntimeError(f"Invalid suffix: {suffix}")
     encode_file_path_func = suffix_to_encode_file_path_func[suffix]
 
-    import glob
-
     # v2 version
-    files = glob.glob(encode_file_path_func(root_path, table_name, "*", "*"))
+    files = get_filesystem(root_path).glob(
+        encode_file_path_func(root_path, table_name, "*", "*")
+    )
     if len(files) == 0:
         return [], 0
     files = sorted(files)
@@ -118,11 +130,23 @@ def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str],
             f"Checkpoints is corrupted. Found {len(files)} under path {root_path} for table {table_name}, but the number of checkpointed world size is {world_size}."
         )
 
+    # HDFS backends (fsspec/pyarrow) strip the scheme prefix from glob
+    # results.  Rewrite returned paths to include the original scheme so
+    # downstream code can use them directly.
+    if root_path.startswith("hdfs://"):
+        scheme = root_path[: root_path.index("/", len("hdfs://"))]  # hdfs://host:port
+        files = [f if f.startswith("hdfs://") else scheme + f for f in files]
+
+    # Validate that every expected rank file is present.
+    files_set = set(files)
     for i in range(world_size):
-        expected_file_path = encode_file_path_func(root_path, table_name, i, world_size)
-        if expected_file_path not in set(files):
+        expected = encode_file_path_func(root_path, table_name, i, world_size)
+        if (
+            expected not in files_set
+            and _strip_scheme_prefix(expected) not in files_set
+        ):
             raise RuntimeError(
-                f"Checkpoints is corrupted. Expected file path {expected_file_path} for table {table_name}, but it is not found."
+                f"Checkpoints is corrupted. Expected file path {expected} for table {table_name}, but it is not found."
             )
 
     return files, len(files)
@@ -134,7 +158,7 @@ def get_loading_files(
     rank: int,
     world_size: int,
 ) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
-    if not os.path.exists(root_path):
+    if not get_filesystem(root_path).exists(root_path):
         raise RuntimeError(f"can't find path to load, path:", root_path)
 
     key_files, num_key_files = find_files(root_path, name, "emb_keys")
