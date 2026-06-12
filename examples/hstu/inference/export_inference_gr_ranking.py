@@ -41,7 +41,6 @@ from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
 
-
 def init_single_rank_distributed():
     if dist.is_available() and not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")

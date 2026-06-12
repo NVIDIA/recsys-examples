@@ -102,13 +102,13 @@ def benchmark_model(
         "num_layers": hstu_config.num_layers,
         "num_heads": hstu_config.num_heads,
         "head_dim": hstu_config.head_dim,
-        "page_size": 32,
-        "offload_chunksize": 1024,
-        "num_primary_cache_pages": 10240,
+        "page_size": page_size,
+        "offload_chunksize": offload_chunksize,
+        "num_primary_cache_pages": num_primary_cache_pages,
         "num_buffer_pages": 0,
         "host_capacity_per_layer": 0,
         "max_batch_size": hstu_config.max_batch_size,
-        "max_seq_len": math.ceil(hstu_config.max_seq_len * 2 / 32) * 32,
+        "max_seq_len": math.ceil(hstu_config.max_seq_len * 2 / page_size) * page_size,
         "dtype": torch.bfloat16,
         "device": torch.cuda.current_device(),
         "host_kvstorage_backend": "native",
@@ -429,6 +429,8 @@ def run_single_bench(
 
 
 def run_benchmark():
+    page_size = 128 if torch.cuda.get_device_capability()[0] >= 10 else 32
+    num_pages = math.ceil(10240 * 32 / page_size)
     kwargs = {
         # model config
         "embedding_dim": 1024,
@@ -445,8 +447,8 @@ def run_benchmark():
         # inference config
         "max_batch_size": 16,
         # kvcache config
-        "page_size": 32,
-        "num_pages": 10240,
+        "page_size": page_size,
+        "num_pages": num_pages,
         "offload_chunksize": 1024,
     }
     print()

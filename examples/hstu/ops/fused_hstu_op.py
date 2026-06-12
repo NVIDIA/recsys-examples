@@ -369,6 +369,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     torch.bfloat16,
                     torch.float16,
                 ), f"Blackwell fwd expects bfloat16 or float16, got {q.dtype}"
+                if q.shape[-1] not in (64, 128):
+                    raise ValueError(
+                        "Blackwell fwd only supports head_dim in (64, 128), "
+                        f"got {q.shape[-1]}"
+                    )
                 num_contexts = _blackwell_num_contexts_or_none(num_contexts)
                 jagged_attn_output = hstu.hstu_attn_varlen_func(
                     q,

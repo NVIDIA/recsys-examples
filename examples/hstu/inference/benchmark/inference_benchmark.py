@@ -70,9 +70,11 @@ def run_ranking_gr_inference(disable_kvcache: bool):
         dtype=inference_dtype,
     )
 
-    _page_size = 32
+    sm_major = torch.cuda.get_device_capability()[0]
+    _page_size = 128 if sm_major >= 10 else 32
     _offload_chunksize = 8192
-    _num_primary_cache_pages = 10240
+    _base_cache_tokens = 10240 * 32
+    _num_primary_cache_pages = math.ceil(_base_cache_tokens / _page_size)
     host_capacity_per_layer = (
         _num_primary_cache_pages * 2 * _page_size * (num_heads * head_dim) * 2
     )
@@ -86,7 +88,7 @@ def run_ranking_gr_inference(disable_kvcache: bool):
         "num_buffer_pages": 0,
         "host_capacity_per_layer": host_capacity_per_layer,
         "max_batch_size": max_batch_size,
-        "max_seq_len": math.ceil(max_seqlen / 32) * 32,
+        "max_seq_len": math.ceil(max_seqlen / _page_size) * _page_size,
         "dtype": torch.bfloat16,
         "device": torch.cuda.current_device(),
         "host_kvstorage_backend": "native",

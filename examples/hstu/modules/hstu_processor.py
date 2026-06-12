@@ -86,9 +86,14 @@ def hstu_preprocess_embeddings(
         embedding_dim = sequence_embeddings.size(1)
 
         if not is_inference:
-            sequence_embeddings = torch.cat(
-                [sequence_embeddings, action_jt.values().to(dtype)], dim=1
-            ).view(2 * jagged_size, embedding_dim)
+            if not torch.compiler.is_compiling():
+                sequence_embeddings = torch.cat(
+                    [sequence_embeddings, action_jt.values().to(dtype)], dim=1
+                ).view(2 * jagged_size, embedding_dim)
+            else:
+                sequence_embeddings = torch.stack(
+                    [sequence_embeddings, action_jt.values().to(dtype)], dim=1
+                ).flatten(0, 1)
             sequence_embeddings_lengths = sequence_embeddings_lengths * 2
             sequence_embeddings_lengths_offsets = (
                 sequence_embeddings_lengths_offsets * 2

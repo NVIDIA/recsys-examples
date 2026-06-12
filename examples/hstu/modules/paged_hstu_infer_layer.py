@@ -26,6 +26,14 @@ from ops.triton_ops.triton_norm_mul_dropout import triton_layer_norm_mul_dropout
 from .debug.debug_paged_hstu_layer import dump, dump_paged_hstu_forward_naive
 
 
+def _select_addmm_silu_impl(sm: int):
+    if sm == 8:
+        return triton_addmm_silu_fwd
+    if sm in (9, 10):
+        return torch_addmm_silu_fwd
+    raise ValueError(f"Unsupported SM major version: {sm}")
+
+
 class PagedHSTUInferLayer(torch.nn.Module):
     """
     x = ln(x)
@@ -151,12 +159,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
         )
 
         sm = torch.cuda.get_device_properties(0).major
-        if sm == 8:
-            self.addmm_silu_impl = triton_addmm_silu_fwd
-        elif sm == 9:
-            self.addmm_silu_impl = torch_addmm_silu_fwd
-        else:
-            raise ValueError(f"Unsupported SM major version: {sm}")
+        self.addmm_silu_impl = _select_addmm_silu_impl(sm)
 
     def uvqk_addmm_impl(self, input_data, num_tokens):
         if num_tokens >= 2048:  # fusion impl

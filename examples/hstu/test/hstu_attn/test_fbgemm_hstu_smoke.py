@@ -40,10 +40,10 @@ def get_arch_major():
 
 @pytest.mark.parametrize("batchsize", [32])
 @pytest.mark.parametrize("max_seqlen", [200])
-@pytest.mark.parametrize("head_dim", [64])
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("max_num_targets", [10])
-@pytest.mark.parametrize("max_num_contextuals", [0])
+@pytest.mark.parametrize("max_num_contextuals", [0, 4])
 def test_fbgemm_hstu_fwd_bwd(
     batchsize,
     max_seqlen,

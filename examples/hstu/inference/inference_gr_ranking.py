@@ -161,10 +161,17 @@ def get_inference_hstu_model(
         contextual_max_seqlen=num_contextual_features,
     )
 
+    sm_major = torch.cuda.get_device_capability()[0]
+    kvcache_page_size = 128 if sm_major >= 10 else 32
+    base_cache_tokens = 10240 * 32
+    num_primary_cache_pages = math.ceil(base_cache_tokens / kvcache_page_size)
+    kvcache_max_seq_len = (
+        math.ceil(total_max_seqlen / kvcache_page_size) * kvcache_page_size
+    )
     host_capacity_per_layer = (
-        10240
+        num_primary_cache_pages
         * 2
-        * 32
+        * kvcache_page_size
         * (network_args.num_attention_heads * network_args.kv_channels)
         * 2
     )
@@ -172,13 +179,13 @@ def get_inference_hstu_model(
         "num_layers": network_args.num_layers,
         "num_heads": network_args.num_attention_heads,
         "head_dim": network_args.kv_channels,
-        "page_size": 32,
+        "page_size": kvcache_page_size,
         "offload_chunksize": 1024,
-        "num_primary_cache_pages": 10240,
+        "num_primary_cache_pages": num_primary_cache_pages,
         "num_buffer_pages": 0,
         "host_capacity_per_layer": host_capacity_per_layer,
         "max_batch_size": max_batch_size,
-        "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
+        "max_seq_len": kvcache_max_seq_len,
         "dtype": torch.bfloat16,
         "device": torch.cuda.current_device(),
         "host_kvstorage_backend": "native",

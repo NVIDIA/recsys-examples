@@ -15,6 +15,7 @@
 
 
 import torch
+import torch.nn.functional as F
 
 
 def torch_addmm_silu_fwd(
@@ -22,13 +23,27 @@ def torch_addmm_silu_fwd(
     w: torch.Tensor,
     y: torch.Tensor,
     silu: bool = False,
-) -> torch.Tensor:
+    keep_unfused_out: bool = True,
+    out: torch.Tensor | None = None,
+    silu_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """
     compute z = silu(y + x @ w); silu is optional
     """
     z = torch.addmm(y, x, w)
+    if out is not None:
+        out.copy_(z)
+        z_out = out
+    elif keep_unfused_out:
+        z_out = z
+    else:
+        z_out = silu_out
+
     if silu:
-        silu_z = torch.nn.functional.silu(z)
+        silu_z = F.silu(z)
+        if silu_out is not None:
+            silu_out.copy_(silu_z)
+            silu_z = silu_out
     else:
         silu_z = None
-    return z, silu_z
+    return z_out, silu_z
