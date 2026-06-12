@@ -111,6 +111,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
 FROM ${DEVEL_IMAGE} AS build
 ARG TRITONSERVER_BUILD
 
+RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
 COPY . .
 
