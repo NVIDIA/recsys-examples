@@ -233,6 +233,9 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 offloaded=offload_success,
             )
         self.ongoing_offload_tasks = remain_tasks
+    
+    def offload_reap_completed(self) -> None:
+        self.offload_try_wait()
 
     def evict(
         self, user_ids: torch.Tensor, for_gpu: bool = False, for_host: bool = False

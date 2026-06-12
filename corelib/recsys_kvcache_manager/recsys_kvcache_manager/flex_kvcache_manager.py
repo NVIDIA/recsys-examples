@@ -53,14 +53,14 @@ class FlexKVIndexMeta(KVIndexMeta):
 
 @dataclass
 class _FlexKVOnloadHandle:
-    task_ids: List[int]
+    task_ids: Union[List[int], torch.Tensor]
     uids: torch.Tensor
     slot_mappings: List[torch.Tensor]
 
 
 @dataclass
 class _FlexKVOffloadHandle:
-    task_ids: List[int]
+    task_ids: Union[List[int], torch.Tensor]
     uids: torch.Tensor
     seqlens: torch.Tensor
     responses: Optional[Dict[int, Any]] = None

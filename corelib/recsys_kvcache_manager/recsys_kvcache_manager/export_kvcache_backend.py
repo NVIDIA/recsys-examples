@@ -36,6 +36,7 @@ class ExportKVCacheBackend(KVCacheBackend):
 			gpu_cached_lengths,
 			host_cached_start_indices,
 			host_cached_lengths,
+			task_ids,
 		) = torch.ops.kvcache_manager_ops.lookup_kvcache(user_ids, sequence_lengths)
 
 		index_meta = KVIndexMeta(
@@ -50,6 +51,9 @@ class ExportKVCacheBackend(KVCacheBackend):
 			gpu_cached_lengths=gpu_cached_lengths,
 			host_cached_start_indices=host_cached_start_indices,
 			host_cached_lengths=host_cached_lengths,
+			extra={
+				"task_ids": task_ids
+			}
 		)
 		return index_meta, lookup_result
 
@@ -59,7 +63,35 @@ class ExportKVCacheBackend(KVCacheBackend):
 		lookup_results: KVLookupResult,
 		output_kvcache_metadata: Optional[KVCacheMetadata] = None,
 	) -> KVCacheMetadata:
-		raise NotImplementedError("ExportKVCacheBackend.allocate_kvcache is not implemented yet.")
+		# assert output_kvcache_metadata is None, "Pre-allocated KVCacheMetadata is not supported in ExportKVCacheBackend yet."
+
+		(metadata_buffer, metadata_tensors) = torch.ops.kvcache_manager_ops.allocate_kvcache(
+			index_meta.user_ids,
+			index_meta.seq_lengths,
+			lookup_results.cached_lengths,
+			lookup_results.host_cached_lengths,
+		)
+
+		return KVCacheMetadata(
+			page_ids_gpu_buffer=metadata_buffer[0],
+			metadata_gpu_buffer=metadata_buffer[1],
+			kv_indices=metadata_buffer[0],
+			
+			kv_indptr=metadata_tensors[0],
+			kv_last_page_len=metadata_tensors[1],
+			total_history_lengths=metadata_tensors[2],
+			total_history_offsets=metadata_tensors[3],
+			new_history_offsets=metadata_tensors[4],
+			batch_indices=metadata_tensors[5],
+			position=metadata_tensors[6],
+
+			new_history_nnz=metadata_tensors[7],
+			new_history_nnz_cuda=metadata_tensors[8],
+
+			kv_seqlens=metadata_tensors[9],
+			kv_seqlen_offsets=metadata_tensors[10],
+			kv_onload_handle=None,
+		)
 
 	def onboard_launch(
 		self,
@@ -67,7 +99,36 @@ class ExportKVCacheBackend(KVCacheBackend):
 		lookup_result: KVLookupResult,
 		kvcache_metadata: KVCacheMetadata,
 	) -> HostKVTaskHandle:
-		raise NotImplementedError("ExportKVCacheBackend.onboard_launch is not implemented yet.")
+		slot_mappings = torch.ops.kvcache_manager_ops.onboard_kvcache_launch(
+			index_meta.user_ids,
+			index_meta.seq_lengths,
+			lookup_result.cached_lengths,
+			lookup_result.host_cached_lengths,
+			lookup_result.gpu_cached_start_indices,
+			lookup_result.gpu_cached_lengths,
+			lookup_result.extra["task_ids"],
+			kvcache_metadata.kv_indices,
+			kvcache_metadata.kv_indptr,
+		)
+
+		# In export backend, all user_ids and slot mappings are recorded. User ids with no cache to onboard will have task_id of -1, and the corresponding slot mapping can be ignored in the downstream processing.
+		onload_handle = _FlexKVOnloadHandle(
+            task_ids=lookup_result.extra["task_ids"],
+            uids=index_meta.user_ids,
+            slot_mappings=slot_mappings,
+        )
+		return HostKVTaskHandle(
+			backend="flexkv",
+            user_ids=onload_handle.uids,
+            handle=onload_handle,
+            status=HostKVTaskStatus.LAUNCHED,
+            # metadata={
+            #     "onboard_start_indices": torch.tensor(
+            #         onboard_start_indices, dtype=torch.int32
+            #     ),
+            #     "onboard_lengths": torch.tensor(onboard_lengths, dtype=torch.int32),
+            # },
+		)
 
 	def onboard_try_wait(
 		self,
@@ -81,17 +142,24 @@ class ExportKVCacheBackend(KVCacheBackend):
 		kv_index_meta: KVIndexMeta,
 		task_handle: Optional[HostKVTaskHandle],
 	) -> Optional[HostKVWaitResult]:
-		raise NotImplementedError("ExportKVCacheBackend.onboard_wait is not implemented yet.")
+		torch.ops.kvcache_manager_ops.onboard_kvcache_wait(
+			task_handle.handle.task_ids,
+		)
 
 	def offload_launch(
 		self,
 		index_meta: KVIndexMeta,
 		kvcache_metadata: Optional[KVCacheMetadata] = None,
 	):
-		raise NotImplementedError("ExportKVCacheBackend.offload_launch is not implemented yet.")
+		torch.ops.kvcache_manager_ops.offload_launch(
+			task_handle.handle.task_ids,
+		)
 
 	def offload_try_wait(self) -> None:
 		raise NotImplementedError("ExportKVCacheBackend.offload_try_wait is not implemented yet.")
+	
+	def offload_reap_completed(self) -> None:
+		torch.ops.kvcache_manager_ops.offload_reap_completed()
 
 	def evict(
 		self, user_ids: torch.Tensor, for_gpu: bool = False, for_host: bool = False

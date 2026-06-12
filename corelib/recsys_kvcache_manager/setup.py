@@ -72,10 +72,15 @@ def get_extensions():
         "src/native_host_kvcache_manager_impl.cpp",
         "src/gather_scatter.cpp",
         "src/gather_scatter_kernels.cu",
+        "src/torch_binding/flexkv_aoti_protocol.cpp",
+        "src/torch_binding/flexkv_cpp_client.cpp",
+        "src/torch_binding/kvcache_manager_ops.cpp",
+        "src/torch_binding/kvcache_manager_context.cpp",
     ]
 
     include_dirs = [
         str(root_path / "src"),
+        str(root_path / "src/torch_binding"),
     ]
 
     ext_modules = [
@@ -92,6 +97,8 @@ def get_extensions():
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
             include_dirs=include_dirs,
+            libraries=["zmq"],
+            extra_link_args=["-lzmq"],
         ),
     ]
 
