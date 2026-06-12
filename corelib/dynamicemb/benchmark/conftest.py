@@ -85,6 +85,42 @@ def pytest_addoption(parser):
             "all iterations still run, unselected ones are filtered out by NVTX."
         ),
     )
+    parser.addoption(
+        "--num-tables",
+        action="store",
+        type=int,
+        default=None,
+        help=(
+            "Override the number of tables on every parametrized config (e.g. "
+            "1000).  The per-suite total capacity and total batch are held "
+            "fixed, so each table gets total_cap//N rows and batch_size "
+            "total_batch//N -- stresses the many-tables path without changing "
+            "the overall HBM footprint or total key count."
+        ),
+    )
+    parser.addoption(
+        "--sparse-key-range",
+        action="store",
+        type=int,
+        default=None,
+        help=(
+            "Override the sparse-key sampling range: each table draws indices "
+            "from [.., N) instead of [.., per-table cap), controlling the "
+            "duplicate rate independently of table capacity (smaller N -> more "
+            "duplicates).  Should be <= per-table cap for in-range embedding "
+            "lookups.  Default (None) samples over the per-table cap."
+        ),
+    )
+    parser.addoption(
+        "--no-torchrec",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the TorchRec/FBGEMM TBE baseline entirely (neither built nor "
+            "run); only DynamicEmb is exercised and trc_* metrics are null.  "
+            "Incompatible with --correctness (which needs the baseline)."
+        ),
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -134,6 +170,24 @@ def ncu_iterations(request):
 def ncu_kernel_regex(request):
     """Session-wide --ncu-kernel-regex: user-supplied kernel-name regex for ncu-gen."""
     return request.config.getoption("--ncu-kernel-regex")
+
+
+@pytest.fixture(scope="session")
+def num_tables(request):
+    """Session-wide override for the table count (None = keep config default)."""
+    return request.config.getoption("--num-tables")
+
+
+@pytest.fixture(scope="session")
+def sparse_key_range(request):
+    """Session-wide override for the sparse-key sampling range (None = per-table cap)."""
+    return request.config.getoption("--sparse-key-range")
+
+
+@pytest.fixture(scope="session")
+def no_torchrec(request):
+    """Session-wide flag: when True, skip the TorchRec baseline."""
+    return request.config.getoption("--no-torchrec")
 
 
 @pytest.fixture(autouse=True)

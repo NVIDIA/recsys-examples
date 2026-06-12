@@ -204,6 +204,14 @@ class BenchmarkConfig:
     # default fill_tables / hybrid-storage population is skipped so the
     # mirrored values aren't overwritten.
     correctness: bool = False
+    # Sparse-key sampling range: when set, each table draws indices from its
+    # distribution over ``[.., sparse_key_range)`` instead of ``[.., per-table
+    # cap)``, decoupling the duplicate rate from table capacity (a smaller range
+    # yields more duplicates).  ``None`` keeps the per-table cap.
+    sparse_key_range: Optional[int] = None
+    # When False the TorchRec/FBGEMM TBE baseline is neither built nor run; only
+    # DynamicEmb is exercised and the ``trc_*`` metrics are reported as None.
+    run_torchrec: bool = True
 
     @property
     def num_tables(self):
@@ -234,12 +242,17 @@ class BenchmarkConfig:
     def label(self):
         # Uniform caps collapse to a single token (T{nt} already encodes the
         # count); heterogeneous caps fall back to underscore-joined per-table
-        # values so the label remains lossless.
-        caps_mb = [e // (1024 * 1024) for e in self.num_embeddings_per_feature]
-        if len(set(caps_mb)) == 1:
-            caps = f"{caps_mb[0]}M"
-        else:
-            caps = "_".join(f"{c}M" for c in caps_mb)
+        # values so the label remains lossless.  Sub-MB caps (e.g. 16K with many
+        # tables) render in K rather than rounding to "0M".
+        def _fmt_cap(e):
+            if e >= 1024 * 1024 and e % (1024 * 1024) == 0:
+                return f"{e // (1024 * 1024)}M"
+            if e >= 1024 and e % 1024 == 0:
+                return f"{e // 1024}K"
+            return str(e)
+
+        caps_fmt = [_fmt_cap(e) for e in self.num_embeddings_per_feature]
+        caps = caps_fmt[0] if len(set(caps_fmt)) == 1 else "_".join(caps_fmt)
         s = (
             f"T{self.num_tables}_totalB{self.total_batch_size}_D{self.embedding_dim}_"
             f"{self.optimizer_type}_{self.mode}_"
@@ -292,10 +305,15 @@ def generate_sparse_features_gpu(
             num_iters, bs * num_tables, device=device, dtype=torch.int64
         )
 
+    # Optional override of the per-table sampling range (decouples duplicate
+    # rate from table capacity).  Applied on top of caps for every table.
+    skr = cfg.sparse_key_range
+
     if cfg.feature_distribution == "random":
         total_vals = int(all_lengths.sum().item())
+        hi = skr if skr is not None else (2**63) - 1
         all_values = torch.randint(
-            0, (2**63) - 1, (total_vals,), device=device, dtype=torch.int64
+            0, hi, (total_vals,), device=device, dtype=torch.int64
         )
     elif cfg.feature_distribution in ("pow-law", "zipf"):
         from dataset_generator import PowerLaw, zipf
@@ -306,7 +324,7 @@ def generate_sparse_features_gpu(
         per_table_vals = []
         for t in range(num_tables):
             n_samples = int(per_table_totals[t].item())
-            cap = caps[t]
+            cap = skr if skr is not None else caps[t]
             if cfg.feature_distribution == "pow-law":
                 vals = PowerLaw(1, cap, cfg.alpha, n_samples, device)
             else:
@@ -578,9 +596,13 @@ def benchmark_train_eval(
     (non-uninitialized) tensor keeps the optimizer-driven weight evolution
     deterministic across the two backends.
     """
+    has_trc = torchrec_emb is not None
     dynamic_emb.train()
-    torchrec_emb.train()
+    if has_trc:
+        torchrec_emb.train()
 
+    # check_forward needs the baseline to compare against.
+    check_forward = check_forward and has_trc
     atol, rtol = _CORRECTNESS_TOL.get(cfg.emb_precision, (1e-4, 1e-3))
     failures: List[Dict[str, Any]] = []
 
@@ -620,22 +642,25 @@ def benchmark_train_eval(
         torch.cuda.nvtx.range_pop()
 
         # ── trc ──
-        torch.cuda.nvtx.range_push("trc")
-        trc_s.record()
-        out_trc = torchrec_emb(sf.values(), sf.offsets())
-        trc_m.record()
-        out_trc.backward(grad)
-        trc_e.record()
-        torch.cuda.nvtx.range_pop()
+        out_trc = None
+        if has_trc:
+            torch.cuda.nvtx.range_push("trc")
+            trc_s.record()
+            out_trc = torchrec_emb(sf.values(), sf.offsets())
+            trc_m.record()
+            out_trc.backward(grad)
+            trc_e.record()
+            torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
         dyn_fwd += dyn_s.elapsed_time(dyn_m)
         dyn_bwd += dyn_m.elapsed_time(dyn_e)
         dyn_total += dyn_s.elapsed_time(dyn_e)
-        trc_fwd += trc_s.elapsed_time(trc_m)
-        trc_bwd += trc_m.elapsed_time(trc_e)
-        trc_total += trc_s.elapsed_time(trc_e)
+        if has_trc:
+            trc_fwd += trc_s.elapsed_time(trc_m)
+            trc_bwd += trc_m.elapsed_time(trc_e)
+            trc_total += trc_s.elapsed_time(trc_e)
 
         if check_forward:
             passed, max_diff, mean_diff = _forward_allclose(
@@ -652,7 +677,8 @@ def benchmark_train_eval(
                 )
 
     dynamic_emb.eval()
-    torchrec_emb.eval()
+    if has_trc:
+        torchrec_emb.eval()
     dyn_eval = trc_eval = 0.0
     for i in range(num_iterations):
         sf = sparse_features[i]
@@ -662,11 +688,13 @@ def benchmark_train_eval(
         torch.cuda.synchronize()
         dyn_eval += dyn_s.elapsed_time(dyn_e)
 
-        trc_s.record()
-        out_trc = torchrec_emb(sf.values(), sf.offsets())
-        trc_e.record()
-        torch.cuda.synchronize()
-        trc_eval += trc_s.elapsed_time(trc_e)
+        out_trc = None
+        if has_trc:
+            trc_s.record()
+            out_trc = torchrec_emb(sf.values(), sf.offsets())
+            trc_e.record()
+            torch.cuda.synchronize()
+            trc_eval += trc_s.elapsed_time(trc_e)
 
         if check_forward:
             passed, max_diff, mean_diff = _forward_allclose(
@@ -690,10 +718,10 @@ def benchmark_train_eval(
         "dyn_forward_ms": dyn_fwd / num_iterations,
         "dyn_backward_ms": dyn_bwd / num_iterations,
         "dyn_eval_ms": dyn_eval / num_iterations,
-        "trc_train_ms": trc_total / num_iterations,
-        "trc_forward_ms": trc_fwd / num_iterations,
-        "trc_backward_ms": trc_bwd / num_iterations,
-        "trc_eval_ms": trc_eval / num_iterations,
+        "trc_train_ms": trc_total / num_iterations if has_trc else None,
+        "trc_forward_ms": trc_fwd / num_iterations if has_trc else None,
+        "trc_backward_ms": trc_bwd / num_iterations if has_trc else None,
+        "trc_eval_ms": trc_eval / num_iterations if has_trc else None,
     }
 
 
@@ -744,6 +772,9 @@ def run_reporting_loop(dynamic_emb, torchrec_emb, sparse_features, cfg):
         print(
             f"    dyn iter {i:3d}: fwd={fwd:.3f} bwd={bwd:.3f} total={total:.3f} ms{cache_info}"
         )
+
+    if torchrec_emb is None:
+        return
 
     print()
     for i in range(cfg.num_iterations):
@@ -881,8 +912,10 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
     side-by-side in the same trace.  NVTX layout:
     ``<cfg.label()>`` -> ``nsys_iter_i`` -> ``dyn``/``trc`` -> ``forward``/``backward``.
     """
+    has_trc = torchrec_emb is not None
     dynamic_emb.train()
-    torchrec_emb.train()
+    if has_trc:
+        torchrec_emb.train()
 
     torch.cuda.cudart().cudaProfilerStart()
     torch.cuda.nvtx.range_push(cfg.label())
@@ -900,15 +933,16 @@ def benchmark_with_nsys(dynamic_emb, torchrec_emb, sparse_features, cfg):
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()  # dyn
 
-        torch.cuda.nvtx.range_push("trc")
-        torch.cuda.nvtx.range_push("forward")
-        out_trc = torchrec_emb(sf.values(), sf.offsets())
-        torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push("backward")
-        grad_trc = torch.ones_like(out_trc)
-        out_trc.backward(grad_trc)
-        torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_pop()  # trc
+        if has_trc:
+            torch.cuda.nvtx.range_push("trc")
+            torch.cuda.nvtx.range_push("forward")
+            out_trc = torchrec_emb(sf.values(), sf.offsets())
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("backward")
+            grad_trc = torch.ones_like(out_trc)
+            out_trc.backward(grad_trc)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()  # trc
 
         torch.cuda.nvtx.range_pop()  # nsys_iter_i
     torch.cuda.nvtx.range_pop()  # cfg.label()
@@ -1446,6 +1480,17 @@ def run_single_benchmark(
         )
         cfg.correctness = False
 
+    # The correctness check compares against the TorchRec baseline, so it cannot
+    # run with the baseline disabled.
+    if cfg.correctness and not cfg.run_torchrec:
+        warnings.warn(
+            "cfg.correctness=True requires the TorchRec baseline; "
+            "re-enabling run_torchrec for this run.",
+            UserWarning,
+            stacklevel=2,
+        )
+        cfg.run_torchrec = True
+
     torch.cuda.manual_seed(cfg.seed)
     torch.cuda.empty_cache()
 
@@ -1491,10 +1536,14 @@ def run_single_benchmark(
     timer.stop()
     print(f"  DynamicEmb created in {timer.elapsed_time() / 1000:.3f} s")
 
-    timer.start()
-    torchrec_emb = create_split_table_batched_embeddings(cfg, device)
-    timer.stop()
-    print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
+    if cfg.run_torchrec:
+        timer.start()
+        torchrec_emb = create_split_table_batched_embeddings(cfg, device)
+        timer.stop()
+        print(f"  TorchRec created in {timer.elapsed_time() / 1000:.3f} s")
+    else:
+        torchrec_emb = None
+        print("  TorchRec baseline disabled (run_torchrec=False)")
 
     if cfg.correctness:
         # PowerLaw/zipf already produce values in [min, max-1] / [min, max),
@@ -1546,13 +1595,14 @@ def run_single_benchmark(
         )
         bw_results = compute_bandwidth_report(prof, avg_n_unique, avg_n_total, cfg)
 
-        print("\n  >> TorchRec profiler run")
-        benchmark_with_torch_profiler(
-            torchrec_emb,
-            sparse_features,
-            cfg.num_iterations,
-            trace_prefix=f"torchrec_{cfg.label()}_",
-        )
+        if torchrec_emb is not None:
+            print("\n  >> TorchRec profiler run")
+            benchmark_with_torch_profiler(
+                torchrec_emb,
+                sparse_features,
+                cfg.num_iterations,
+                trace_prefix=f"torchrec_{cfg.label()}_",
+            )
 
         del dynamic_emb, torchrec_emb, sparse_features
         torch.cuda.empty_cache()
@@ -1614,12 +1664,13 @@ def run_single_benchmark(
         f"  bwd={metrics['dyn_backward_ms']:.3f}"
         f"  eval={metrics['dyn_eval_ms']:.3f} ms"
     )
-    print(
-        f"  TorchRec    train={metrics['trc_train_ms']:.3f}"
-        f"  fwd={metrics['trc_forward_ms']:.3f}"
-        f"  bwd={metrics['trc_backward_ms']:.3f}"
-        f"  eval={metrics['trc_eval_ms']:.3f} ms"
-    )
+    if metrics["trc_train_ms"] is not None:
+        print(
+            f"  TorchRec    train={metrics['trc_train_ms']:.3f}"
+            f"  fwd={metrics['trc_forward_ms']:.3f}"
+            f"  bwd={metrics['trc_backward_ms']:.3f}"
+            f"  eval={metrics['trc_eval_ms']:.3f} ms"
+        )
     if bw_results:
         print("\n  Bandwidth (DynamicEmb):")
         print(format_bandwidth_table(bw_results))
@@ -1770,12 +1821,29 @@ def _no_hbm_configs():
 # ── Test suites ───────────────────────────────────────────────────────────────
 
 
+def _retable(cfg: BenchmarkConfig, new_nt: int) -> None:
+    """Rebuild a config for ``new_nt`` tables in place, holding the per-suite
+    total capacity and total batch fixed (per-table cap = total // new_nt,
+    batch_size = total_batch // new_nt).  The per-table HBM entry is preserved
+    and replicated to the new length."""
+    old_nt = cfg.num_tables
+    total_cap = sum(cfg.num_embeddings_per_feature)
+    total_batch = cfg.batch_size * old_nt
+    cfg.num_embeddings_per_feature = [max(1, total_cap // new_nt)] * new_nt
+    cfg.batch_size = max(1, total_batch // new_nt)
+    hbm0 = cfg.hbm_for_embeddings[0] if cfg.hbm_for_embeddings else sys.maxsize
+    cfg.hbm_for_embeddings = [hbm0] * new_nt
+
+
 def _apply_overrides(
     cfg: BenchmarkConfig,
     correctness_flag: bool,
     num_iterations: Optional[int] = None,
     ncu_iterations: Optional[str] = None,
     ncu_kernel_regex: Optional[str] = None,
+    num_tables: Optional[int] = None,
+    sparse_key_range: Optional[int] = None,
+    no_torchrec: bool = False,
 ) -> BenchmarkConfig:
     """Apply session-wide CLI overrides onto a parametrized config."""
     if correctness_flag:
@@ -1786,6 +1854,12 @@ def _apply_overrides(
         cfg.ncu_iterations = ncu_iterations
     if ncu_kernel_regex is not None:
         cfg.ncu_kernel_regex = ncu_kernel_regex
+    if num_tables is not None and num_tables != cfg.num_tables:
+        _retable(cfg, num_tables)
+    if sparse_key_range is not None:
+        cfg.sparse_key_range = sparse_key_range
+    if no_torchrec:
+        cfg.run_torchrec = False
     return cfg
 
 
@@ -1801,9 +1875,19 @@ class TestGpu:
         num_iterations,
         ncu_iterations,
         ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
     ):
         cfg = _apply_overrides(
-            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
@@ -1822,9 +1906,19 @@ class TestCaching:
         num_iterations,
         ncu_iterations,
         ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
     ):
         cfg = _apply_overrides(
-            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
@@ -1843,9 +1937,19 @@ class TestNoCaching:
         num_iterations,
         ncu_iterations,
         ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
     ):
         cfg = _apply_overrides(
-            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
@@ -1864,9 +1968,19 @@ class TestNoHbm:
         num_iterations,
         ncu_iterations,
         ncu_kernel_regex,
+        num_tables,
+        sparse_key_range,
+        no_torchrec,
     ):
         cfg = _apply_overrides(
-            cfg, correctness_flag, num_iterations, ncu_iterations, ncu_kernel_regex
+            cfg,
+            correctness_flag,
+            num_iterations,
+            ncu_iterations,
+            ncu_kernel_regex,
+            num_tables,
+            sparse_key_range,
+            no_torchrec,
         )
         result = run_single_benchmark(cfg, device, timer, profile_mode)
         append_result(result)
