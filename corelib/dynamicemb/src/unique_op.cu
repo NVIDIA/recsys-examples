@@ -628,6 +628,11 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         static_cast<size_t>(num_tables) * 2 * sizeof(int) +
         static_cast<size_t>(num_tables + 1) * sizeof(int64_t);
     auto kernel = segmented_unique_core<KeyType, MurmurHash3_32<KeyType>>;
+    // s_wc/s_base/s_segrange grow with num_tables and exceed the 48KB default
+    // dynamic-shared limit past ~3071 tables; opt in (must precede the
+    // occupancy query so it accounts for the raised limit).
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem_bytes));
 
     // Size the grid to the resident-block count and let each block grid-stride
     // over multiple waves.  Reusing a resident block across waves amortizes its
