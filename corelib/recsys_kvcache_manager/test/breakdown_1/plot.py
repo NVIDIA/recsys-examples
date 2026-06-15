@@ -352,7 +352,9 @@ def plot_stacked_breakdown(
     )
     fig.subplots_adjust(right=0.72)
     fig.tight_layout()
-    os.makedirs(os.path.dirname(output_png), exist_ok=True)
+    out_dir = os.path.dirname(output_png)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     fig.savefig(output_png, dpi=180, bbox_inches="tight")
     plt.close(fig)
 

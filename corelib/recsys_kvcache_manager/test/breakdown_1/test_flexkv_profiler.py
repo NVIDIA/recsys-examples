@@ -15,6 +15,7 @@ from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_utils import KVLookupResult
 
 CURRENT_NVTX_SCOPE: ContextVar[str] = ContextVar("current_nvtx_scope", default="")
+_PROFILER_NUM_LAYERS = 3
 
 
 @contextmanager
@@ -110,18 +111,19 @@ def install_nvtx_hooks(kvcache_mgr: KVCacheManager) -> None:
 
 
 def install_recsys_glue_hooks(kvcache_mgr: KVCacheManager) -> None:
-    if getattr(KVLookupResult.merge, "__nvtx_wrapped__", False):
+    merge_descriptor = KVLookupResult.__dict__.get("merge")
+    merge_func = getattr(merge_descriptor, "__func__", merge_descriptor)
+    if getattr(merge_func, "__nvtx_wrapped__", False):
         return
     original_merge = KVLookupResult.merge
 
-    @classmethod
     @wraps(original_merge)
     def merge_with_nvtx(cls, lookup_res1, lookup_res2):
         with nvtx_range(_scoped_name("recsys.merge_lookup_results")):
             return original_merge(lookup_res1, lookup_res2)
 
     merge_with_nvtx.__nvtx_wrapped__ = True
-    KVLookupResult.merge = merge_with_nvtx
+    KVLookupResult.merge = classmethod(merge_with_nvtx)
 
     wrap_with_nvtx(
         kvcache_mgr, "offload_try_wait", "recsys.offload_try_wait_loop"
@@ -134,7 +136,7 @@ def create_testing_kvcache_manager(
 ) -> KVCacheManager:
     _install_precreate_nvtx_hooks()
     kvcache_config = get_kvcache_config(
-        num_layers=3,
+        num_layers=_PROFILER_NUM_LAYERS,
         num_heads=4,
         head_dim=128,
         page_size=32,
@@ -243,7 +245,7 @@ def run_step_1_offload(
         kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
     assert torch.allclose(kvcache_metadata.total_history_lengths, sequence_lengths.cuda())
 
-    for layer_idx in range(3):
+    for layer_idx in range(_PROFILER_NUM_LAYERS):
         kvcache_mgr.gpu_kvcache_mgr.put(
             torch.cat([k[layer_idx] for k in keys], dim=0),
             torch.cat([v[layer_idx] for v in values], dim=0),

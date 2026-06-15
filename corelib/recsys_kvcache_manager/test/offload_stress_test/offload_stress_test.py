@@ -346,7 +346,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--flexkv-cpu-cache-gb",
-        type=int,
+        type=float,
         default=8,
         help=(
             "FlexKV CPU cache size in GB (aligned with benchmarks/example_config.yml). "
@@ -577,7 +577,7 @@ def run_one_burst_once_wait(
             kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
             stage_t0 = stage_marker("after_allocate", stage_t0)
             stage_t0 = stage_marker("before_gpu_put")
-            for layer_idx in range(3):
+            for layer_idx in range(_PROFILER_NUM_LAYERS):
                 layer_t0 = stage_marker(f"before_gpu_put_layer{layer_idx}")
                 kvcache_mgr.gpu_kvcache_mgr.put(
                     torch.cat([k[layer_idx] for k in keys], dim=0),
