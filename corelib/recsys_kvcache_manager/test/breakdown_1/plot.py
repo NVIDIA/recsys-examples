@@ -551,6 +551,11 @@ WEDGE_EDGE_LW_OUTER = 1.2
 WEDGE_EDGE_LW_INNER = 1.0
 
 
+def _polar_point(theta_deg: float, radius: float) -> Tuple[float, float]:
+    theta = math.radians(theta_deg)
+    return radius * math.cos(theta), radius * math.sin(theta)
+
+
 def l2_donut_exclude_columns() -> set:
     return {
         col
@@ -567,6 +572,15 @@ def _is_step2_label(label: str) -> bool:
 
 def op_legend_label(name: str) -> str:
     return re.sub(r"^step\d+\.", "", name)
+
+
+def l2_callout_label(name: str) -> str:
+    label = re.sub(r"^step\d+\.", "", name)
+    return label.replace("_py", "")
+
+
+def pct_label(value: float) -> str:
+    return f"{value:.2f}%" if value < 0.1 else f"{value:.1f}%"
 
 
 def build_nested_donut_groups(
@@ -620,6 +634,7 @@ def plot_nested_donut_breakdown(
     cmap = plt.get_cmap("tab10")
     legend_handles: List[Patch] = []
     legend_labels: List[str] = []
+    outer_callouts: List[Dict] = []
 
     cursor = 90.0
 
@@ -628,6 +643,7 @@ def plot_nested_donut_breakdown(
         l1_key = group["l1_key"]
         l1_val = group["l1_val"]
         span = (l1_val / total) * 360.0
+        l1_pct = (l1_val / total) * 100.0
 
         theta2 = cursor
         theta1 = cursor - span
@@ -648,14 +664,35 @@ def plot_nested_donut_breakdown(
         legend_handles.append(Patch(facecolor=color, edgecolor="white", label=op_legend_label(l1_key)))
         legend_labels.append(op_legend_label(l1_key))
 
+        mid = (theta1 + theta2) / 2.0
+        if l1_pct >= 0.4 and span >= 3.0:
+            text_xy = _polar_point(mid, INNER_RING_R - INNER_RING_WIDTH / 2.0)
+            ax.text(
+                text_xy[0],
+                text_xy[1],
+                f"{l1_pct:.1f}%",
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="black",
+                bbox=dict(
+                    boxstyle="round,pad=0.12",
+                    fc="white",
+                    ec="none",
+                    alpha=0.65,
+                ),
+                zorder=7,
+            )
+
         children = group["children"]
         if children:
             child_total = sum(v for _, v in children)
             outer_cursor = theta2
-            for _, child_val in children:
+            for child_name, child_val in children:
                 child_span = (child_val / child_total) * span if child_total > 0 else 0.0
                 c_theta2 = outer_cursor
                 c_theta1 = outer_cursor - child_span
+                child_pct = (child_val / total) * 100.0
                 ax.add_patch(
                     Wedge(
                         (0.0, 0.0),
@@ -670,11 +707,63 @@ def plot_nested_donut_breakdown(
                         zorder=3,
                     )
                 )
+                c_mid = (c_theta1 + c_theta2) / 2.0
+                anchor = _polar_point(c_mid, OUTER_RING_R - OUTER_RING_WIDTH / 2.0)
+                label_base = _polar_point(c_mid, OUTER_RING_R + 0.30)
+                label_x = 1.18 if label_base[0] >= 0 else -1.08
+                label_y = label_base[1]
+                if child_name.startswith("step1.") and group["l1_key"] == "step1.offload_launch":
+                    label_x = 0.88
+                    label_y *= 0.76
+                elif child_name == "step1.flexkv.client.try_wait":
+                    label_x = 1.18
+                    label_y -= 0.02
+                elif child_name == "step1.gpu.release_offload_pages_py":
+                    label_x = -0.36
+                    label_y = -1.12
+                elif child_name == "step1.flexkv.finish_task":
+                    label_x = 0.08
+                    label_y = -1.16
+                outer_callouts.append(
+                    {
+                        "anchor": anchor,
+                        "x": label_x,
+                        "y": label_y,
+                        "label": f"{l2_callout_label(child_name)} {pct_label(child_pct)}",
+                        "color": color,
+                        "side": 1 if label_base[0] >= 0 else -1,
+                    }
+                )
                 outer_cursor = c_theta1
 
         cursor = theta1
 
-    plot_radius = OUTER_RING_R + 0.02
+    min_gap = 0.075
+    for side in (-1, 1):
+        side_callouts = sorted(
+            [c for c in outer_callouts if c["side"] == side],
+            key=lambda c: c["y"],
+        )
+        prev_y = None
+        for callout in side_callouts:
+            if prev_y is not None and callout["y"] - prev_y < min_gap:
+                callout["y"] = prev_y + min_gap
+            prev_y = callout["y"]
+
+    for callout in outer_callouts:
+        ax.annotate(
+            callout["label"],
+            xy=callout["anchor"],
+            xytext=(callout["x"], callout["y"]),
+            ha="left" if callout["side"] > 0 else "right",
+            va="center",
+            fontsize=5.6,
+            arrowprops=dict(arrowstyle="-", color=callout["color"], lw=0.7),
+            bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.78),
+            zorder=7,
+        )
+
+    plot_radius = OUTER_RING_R + 0.35
     ax.set(aspect="equal")
     ax.set_xlim(-plot_radius, plot_radius)
     ax.set_ylim(-plot_radius, plot_radius)

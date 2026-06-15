@@ -214,97 +214,10 @@ Inner ring: **L1** step-ops (lookup, allocate, onboard launch, onboard wait, off
 Outer ring: **L2** functions nested within the corresponding L1 sector.
 
 <p align="center">
-  <img src="breakdown_1/H100_result/L1L2_latency_breakdown_latency_bs8_len2048.png" alt="L1/L2 latency breakdown percentage" width="420"/>
+  <img src="breakdown_1/H100_result/L1L2_latency_breakdown_latency_bs8_len2048.png" alt="L1/L2 latency breakdown percentage" width="620"/>
 </p>
 
-<table>
-        <thead>
-          <tr>
-            <th colspan="2">L1 (step-op)</th>
-            <th colspan="2">L2 (function)</th>
-          </tr>
-          <tr>
-            <th>op</th>
-            <th>%</th>
-            <th>function</th>
-            <th>%</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td rowspan="3">offload_launch</td>
-            <td rowspan="3">11.47%</td>
-            <td><code>recsys.gpu.acquire_offload_pages</code></td>
-            <td>0.15%</td>
-          </tr>
-          <tr>
-            <td><code>recsys.host._build_slot_mappings</code></td>
-            <td>5.27%</td>
-          </tr>
-          <tr>
-            <td><code>flexkv.client.put_async</code></td>
-            <td>4.64%</td>
-          </tr>
-          <tr>
-            <td rowspan="3"><strong>offload_wait</strong></td>
-            <td rowspan="3"><strong>48.88%</strong></td>
-            <td><code>recsys.host.offload_wait</code></td>
-            <td>24.21%</td>
-          </tr>
-          <tr>
-            <td><code>recsys.host.finish_task</code></td>
-            <td>0.02%</td>
-          </tr>
-          <tr>
-            <td><code>recsys.gpu.release_offload_pages</code></td>
-            <td>0.12%</td>
-          </tr>
-          <tr>
-            <td rowspan="5">lookup</td>
-            <td rowspan="5">3.11%</td>
-            <td><code>recsys.gpu.lookup</code></td>
-            <td>0.02%</td>
-          </tr>
-          <tr>
-            <td><code>recsys.host.build_index_meta</code></td>
-            <td>0.17%</td>
-          </tr>
-          <tr>
-            <td><code>recsys.host.adapter.to_get_match_requests</code></td>
-            <td>0.05%</td>
-          </tr>
-          <tr>
-            <td><code>flexkv.client.get_match</code></td>
-            <td>2.20%</td>
-          </tr>
-          <tr>
-            <td><code>recsys.merge_lookup_results</code></td>
-            <td>0.32%</td>
-          </tr>
-          <tr>
-            <td>allocate</td>
-            <td>0.47%</td>
-            <td><code>recsys.gpu.allocate</code></td>
-            <td>0.45%</td>
-          </tr>
-          <tr>
-            <td rowspan="2">onboard_launch</td>
-            <td rowspan="2">2.20%</td>
-            <td><code>recsys.host._build_slot_mappings</code></td>
-            <td>0.99%</td>
-          </tr>
-          <tr>
-            <td><code>flexkv.client.launch</code></td>
-            <td>0.50%</td>
-          </tr>
-          <tr>
-            <td><strong>onboard_wait</strong></td>
-            <td><strong>33.87%</strong></td>
-            <td><code>flexkv.client.wait</code></td>
-            <td>33.77%</td>
-          </tr>
-        </tbody>
-</table>
+
 
 ### 1.4 Conclusion
 
@@ -313,6 +226,7 @@ Outer ring: **L2** functions nested within the corresponding L1 sector.
   - metadata and fixed orchestration overhead
   - lookup, allocation, offload/onboard launch
   - wrapper/runtime bookkeeping
+- **Scalability over `seq_len`:** as sequence length increases, transfer wait remains the dominant component while fixed metadata/orchestration costs become relatively smaller, so the pipeline scales primarily with transfer volume and bandwidth overlap.
 
 ---
 
@@ -333,14 +247,14 @@ Outer ring: **L2** functions nested within the corresponding L1 sector.
 
 ### 2.2 Results
 
-| Total data size | Effective bandwidth (GiB/s) | Bandwidth utility (%) |
-| --------------- | ----------------------------- | --------------------- |
-| 25 GiB | 16.28 | 25.44% |
-| 50 GiB | 25.82 | 40.34% |
-| 75 GiB | 29.66 | 46.34% |
-| 100 GiB | 37.18 | 58.09% |
-| 125 GiB | 39.46 | 61.66% |
-| 150 GiB | 41.48 | 64.81% |
+| Occupancy (GiB-equivalent) | Effective bandwidth (GiB/s) | Bandwidth utility (%) |
+| -------------------------- | ----------------------------- | --------------------- |
+| 25 | 16.28 | 25.44% |
+| 50 | 25.82 | 40.34% |
+| 75 | 29.66 | 46.34% |
+| 100 | 37.18 | 58.09% |
+| 125 | 39.46 | 61.66% |
+| 150 | 41.48 | 64.81% |
 
 ### 2.3 Conclusion
 
