@@ -963,8 +963,9 @@ def parse_ncu_iterations(spec: Optional[str], num_iterations: int) -> set:
       * Python-style slice ``begin:end:step`` (end exclusive, any part optional),
         e.g. ``":10"``, ``"5:"``, ``"::2"``, ``"2:20:3"``
 
-    Indices are clamped to ``[0, num_iterations)``.  ``None`` selects every
-    iteration (profile all).  Raises ValueError on malformed input.
+    Indices are clamped to ``[0, num_iterations)``.  ``None`` means "not
+    specified by the caller"; ``print_ncu_command`` treats it as iteration 0
+    only (the default capture target).  Raises ValueError on malformed input.
     """
     if spec is None:
         return set(range(num_iterations))

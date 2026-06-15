@@ -31,7 +31,8 @@ def pytest_addoption(parser):
         help=(
             "Profiling mode: 'torch' for torch.profiler, 'nsys' for NVTX only, "
             "'ncu-gen' to print ncu commands without running tests, "
-            "'ncu' to run a single-iteration benchmark under ncu."
+            "'ncu' to run all iterations inside one cudaProfilerStart/Stop "
+            "window (use --num-iterations to limit replay overhead)."
         ),
     )
     parser.addoption(
