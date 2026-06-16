@@ -311,6 +311,7 @@ class KVCacheManager:
             flexkv_mode = extra.get("flexkv_mode", "direct")
             flexkv_server_addr = extra.get("flexkv_server_addr", "")
             flexkv_server_port = int(extra.get("flexkv_server_port", 0))
+            flexkv_config_path = extra.get("flexkv_config_path", None)
             flexkv_num_cpu_blocks = int(extra.get("flexkv_num_cpu_blocks", 4096))
             flexkv_num_local_blocks = int(extra.get("flexkv_num_local_blocks", 4096))
             flexkv_num_tmp_cpu_blocks = int(extra.get("flexkv_num_tmp_cpu_blocks", 256))
@@ -354,6 +355,7 @@ class KVCacheManager:
                 as_batch=flexkv_as_batch,
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
+                config_path=flexkv_config_path,
             )
         else:
             raise NotImplementedError(

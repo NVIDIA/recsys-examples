@@ -114,6 +114,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         as_batch: bool = True,
         hostkv_wait_timeout_ms: int = 0,
         host_kvstorage_fail_policy: str = "fail_open",
+        config_path: Optional[str] = None,
     ) -> None:
         self.mode = mode
         self.server_addr = server_addr
@@ -130,6 +131,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
         self.enable_mps = bool(enable_mps)
         self.as_batch = bool(as_batch)
+        self.config_path = config_path or ""
         self.backend_name = "flexkv"
 
         self._gpu_cache_table_list: Optional[List[torch.Tensor]] = None
@@ -210,6 +212,17 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         if self.num_tmp_cpu_blocks > 0:
             cache_cfg_kwargs["num_tmp_cpu_blocks"] = self.num_tmp_cpu_blocks
         cache_cfg = CacheConfig(**cache_cfg_kwargs)
+        if self.config_path:
+            try:
+                from flexkv.common.config import (
+                    load_user_config_from_file,
+                    update_default_config_from_user_config,
+                )
+            except Exception as e:
+                raise RuntimeError(f"FlexKV config import failed: {e}") from e
+
+            user_cfg = load_user_config_from_file(self.config_path)
+            update_default_config_from_user_config(model_cfg, cache_cfg, user_cfg)
         self._client = KVManager(
             model_config=model_cfg,
             cache_config=cache_cfg,
