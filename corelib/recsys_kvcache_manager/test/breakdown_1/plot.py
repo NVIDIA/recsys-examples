@@ -121,7 +121,9 @@ def load_mode_breakdown(
         df["time_ms"] = df[time_col] * scale_to_ms
         df["label_norm"] = df[label_col].astype(str).str.strip().str.lstrip(":")
         if include_prefixes:
-            mask = df["label_norm"].apply(lambda lbl: matches_any_prefix(lbl, include_prefixes))
+            mask = df["label_norm"].apply(
+                lambda lbl: matches_any_prefix(lbl, include_prefixes)
+            )
             df = df[mask]
         if group_by_step_op:
             df = df[~df["label_norm"].str.contains("::", regex=False)]
@@ -414,7 +416,11 @@ L2_CALL_TIMELINE: List[Tuple[str, Optional[str], str]] = [
         "::flexkv.adapter.to_get_match_requests",
     ),
     ("step1.flexkv.client.get_match", "step1.lookup", "::flexkv.client.get_match"),
-    ("step1.recsys.merge_lookup_results", "step1.lookup", "::recsys.merge_lookup_results"),
+    (
+        "step1.recsys.merge_lookup_results",
+        "step1.lookup",
+        "::recsys.merge_lookup_results",
+    ),
     ("step1.gpu.allocate_py", "step1.allocate", "::gpu.allocate_py"),
     (
         "step1.gpu.acquire_offload_pages_py",
@@ -426,7 +432,11 @@ L2_CALL_TIMELINE: List[Tuple[str, Optional[str], str]] = [
         "step1.offload_launch",
         "::flexkv._build_slot_mappings",
     ),
-    ("step1.flexkv.client.put_async", "step1.offload_launch", "::flexkv.client.put_async"),
+    (
+        "step1.flexkv.client.put_async",
+        "step1.offload_launch",
+        "::flexkv.client.put_async",
+    ),
     ("step1.flexkv.client.try_wait", "step1.offload_wait", "::flexkv.client.try_wait"),
     ("step1.flexkv.finish_task", "step1.offload_wait", "::flexkv.finish_task"),
     (
@@ -444,7 +454,11 @@ L2_CALL_TIMELINE: List[Tuple[str, Optional[str], str]] = [
         "::flexkv.adapter.to_get_match_requests",
     ),
     ("step3.flexkv.client.get_match", "step3.lookup", "::flexkv.client.get_match"),
-    ("step3.recsys.merge_lookup_results", "step3.lookup", "::recsys.merge_lookup_results"),
+    (
+        "step3.recsys.merge_lookup_results",
+        "step3.lookup",
+        "::recsys.merge_lookup_results",
+    ),
     ("step3.gpu.allocate_py", "step3.allocate", "::gpu.allocate_py"),
     (
         "step3.flexkv._build_slot_mappings",
@@ -600,7 +614,9 @@ def build_nested_donut_groups(
         for col, step_op, _ in L2_CALL_TIMELINE:
             if col in l2_skip or col not in l2_row:
                 continue
-            if _is_step2_label(col) or (step_op is not None and _is_step2_label(step_op)):
+            if _is_step2_label(col) or (
+                step_op is not None and _is_step2_label(step_op)
+            ):
                 continue
             parent = step_op if step_op is not None else col
             if parent != l1_key:
@@ -663,7 +679,9 @@ def plot_nested_donut_breakdown(
             )
         )
 
-        legend_handles.append(Patch(facecolor=color, edgecolor="white", label=op_legend_label(l1_key)))
+        legend_handles.append(
+            Patch(facecolor=color, edgecolor="white", label=op_legend_label(l1_key))
+        )
         legend_labels.append(op_legend_label(l1_key))
 
         mid = (theta1 + theta2) / 2.0
@@ -691,7 +709,9 @@ def plot_nested_donut_breakdown(
             child_total = sum(v for _, v in children)
             outer_cursor = theta2
             for child_name, child_val in children:
-                child_span = (child_val / child_total) * span if child_total > 0 else 0.0
+                child_span = (
+                    (child_val / child_total) * span if child_total > 0 else 0.0
+                )
                 c_theta2 = outer_cursor
                 c_theta1 = outer_cursor - child_span
                 child_pct = (child_val / total) * 100.0
@@ -714,7 +734,10 @@ def plot_nested_donut_breakdown(
                 label_base = _polar_point(c_mid, OUTER_RING_R + 0.30)
                 label_x = 1.18 if label_base[0] >= 0 else -1.08
                 label_y = label_base[1]
-                if child_name.startswith("step1.") and group["l1_key"] == "step1.offload_launch":
+                if (
+                    child_name.startswith("step1.")
+                    and group["l1_key"] == "step1.offload_launch"
+                ):
                     label_x = 0.88
                     label_y *= 0.76
                 elif child_name == "step1.flexkv.client.try_wait":

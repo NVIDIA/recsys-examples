@@ -1,4 +1,3 @@
-
 import argparse
 import csv
 import time
@@ -10,7 +9,6 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
-
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 
@@ -51,12 +49,13 @@ def flexkv_cpu_blocks_from_cache_gb(
     block_size_bytes = token_size_bytes * tokens_per_block
     return int(cpu_cache_gb * (1024**3) / block_size_bytes)
 
+
 _current_timing_lists: ContextVar[Optional[Dict[str, List[float]]]] = ContextVar(
     "current_timing_lists", default=None
 )
-_current_stage_marker: ContextVar[Optional[Callable[[str, Optional[float]], float]]] = (
-    ContextVar("current_stage_marker", default=None)
-)
+_current_stage_marker: ContextVar[
+    Optional[Callable[[str, Optional[float]], float]]
+] = ContextVar("current_stage_marker", default=None)
 
 
 # Convert a metric name into a CSV-safe column prefix.
@@ -84,6 +83,7 @@ def format_layer_timing_line(metric: str, each_ms: Sequence[float]) -> str:
         f"  {metric}: calls={calls}, total_ms={total_ms:.3f}, "
         f"avg_ms={avg_ms:.3f}, each_ms={_format_ms_list(each_ms)}"
     )
+
 
 # Store one measured burst repeat and its hook timing lists.
 @dataclass
@@ -207,6 +207,7 @@ def summarization_csv_row(
 def summary_row_sum_total_burst(summary_row: Sequence) -> float:
     return float(summary_row[4])
 
+
 # Track one wrapped call with NVTX and optional timing collection.
 @contextmanager
 def track_flexkv_metric(name: str, print_nvtx: bool):
@@ -225,7 +226,9 @@ def track_flexkv_metric(name: str, print_nvtx: bool):
 
 
 # Wrap a method to record NVTX and per-call latency metrics.
-def wrap_method_with_nvtx(obj, method_name: str, nvtx_name: str, print_nvtx: bool) -> None:
+def wrap_method_with_nvtx(
+    obj, method_name: str, nvtx_name: str, print_nvtx: bool
+) -> None:
     if obj is None or not hasattr(obj, method_name):
         return
     original = getattr(obj, method_name)
@@ -467,9 +470,9 @@ def create_stress_kvcache_manager(
         * kvcache_config.head_dim
         * 2
     ) / (1024.0**3)
-    host_gib = (
-        kvcache_config.num_layers * kvcache_config.host_capacity_per_layer
-    ) / (1024.0**3)
+    host_gib = (kvcache_config.num_layers * kvcache_config.host_capacity_per_layer) / (
+        1024.0**3
+    )
     print(f"[DEBUG] KVCache GPU Memory Usage: {gpu_gib:.3f} GiB")
     print(f"[DEBUG] KVCache Host Memory Usage: {host_gib:.3f} GiB")
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
@@ -493,6 +496,7 @@ def build_uniform_batch_for_user_range(
     keys = [all_keys[i][:, :len_per_seq, ...] for i in range(batch_size)]
     values = [all_values[i][:, :len_per_seq, ...] for i in range(batch_size)]
     return user_ids, sequence_lengths, keys, values
+
 
 # Store launch and wait results for one burst-once run.
 @dataclass
@@ -559,7 +563,12 @@ def run_one_burst_once_wait(
                     flush=True,
                 )
             stage_t0 = stage_marker("before_build_batch")
-            user_ids, sequence_lengths, keys, values = build_uniform_batch_for_user_range(
+            (
+                user_ids,
+                sequence_lengths,
+                keys,
+                values,
+            ) = build_uniform_batch_for_user_range(
                 all_keys=all_keys,
                 all_values=all_values,
                 user_start=uid_base + i * batch_size,
@@ -568,7 +577,9 @@ def run_one_burst_once_wait(
             )
             stage_t0 = stage_marker("after_build_batch", stage_t0)
             stage_t0 = stage_marker("before_lookup")
-            index_meta, lookup_res = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
+            index_meta, lookup_res = kvcache_mgr.lookup_kvcache(
+                user_ids, sequence_lengths
+            )
             stage_t0 = stage_marker("after_lookup", stage_t0)
             stage_t0 = stage_marker("before_normalize")
             normalize_index_meta(index_meta)
@@ -589,9 +600,7 @@ def run_one_burst_once_wait(
             stage_t0 = stage_marker("after_gpu_put", stage_t0)
             stage_t0 = stage_marker("before_offload_launch")
             stage_token = (
-                _current_stage_marker.set(stage_marker)
-                if should_debug_stage
-                else None
+                _current_stage_marker.set(stage_marker) if should_debug_stage else None
             )
             try:
                 task_handle = kvcache_mgr.offload_launch(
@@ -637,7 +646,9 @@ def run_one_burst_once_wait(
 
 
 # Print one burst result and its per-layer timing breakdown.
-def print_burst_timing_report(tag: str, burst: BurstRunResult, launch_count: int, iteration: int, repeat: int) -> None:
+def print_burst_timing_report(
+    tag: str, burst: BurstRunResult, launch_count: int, iteration: int, repeat: int
+) -> None:
     print(
         f"[{tag}] launch_count={launch_count:>4}, repeat={iteration:>4}/{repeat:<4} | "
         f"launch_succeeded={burst.launch_succeeded}/{launch_count}, "

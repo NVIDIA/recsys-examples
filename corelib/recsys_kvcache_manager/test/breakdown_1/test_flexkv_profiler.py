@@ -8,7 +8,6 @@ from functools import wraps
 from typing import Dict
 
 import torch
-
 from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
@@ -80,15 +79,11 @@ def install_nvtx_hooks(kvcache_mgr: KVCacheManager) -> None:
     wrap_with_nvtx(
         flexkv_mgr, "onboard_kvcache_launch", "flexkv.onboard_kvcache_launch"
     )
-    wrap_with_nvtx(
-        flexkv_mgr, "onboard_kvcache_wait", "flexkv.onboard_kvcache_wait"
-    )
+    wrap_with_nvtx(flexkv_mgr, "onboard_kvcache_wait", "flexkv.onboard_kvcache_wait")
     wrap_with_nvtx(
         flexkv_mgr, "offload_kvcache_launch", "flexkv.offload_kvcache_launch"
     )
-    wrap_with_nvtx(
-        flexkv_mgr, "offload_kvcache_wait", "flexkv.offload_kvcache_wait"
-    )
+    wrap_with_nvtx(flexkv_mgr, "offload_kvcache_wait", "flexkv.offload_kvcache_wait")
     wrap_with_nvtx(flexkv_mgr, "finish_task", "flexkv.finish_task")
     wrap_with_nvtx(flexkv_mgr, "cancel_task", "flexkv.cancel_task")
 
@@ -96,9 +91,7 @@ def install_nvtx_hooks(kvcache_mgr: KVCacheManager) -> None:
     wrap_with_nvtx(
         adapter, "to_get_match_requests", "flexkv.adapter.to_get_match_requests"
     )
-    wrap_with_nvtx(
-        flexkv_mgr, "_build_slot_mappings", "flexkv._build_slot_mappings"
-    )
+    wrap_with_nvtx(flexkv_mgr, "_build_slot_mappings", "flexkv._build_slot_mappings")
 
     client = getattr(flexkv_mgr, "_client", None)
     wrap_with_nvtx(client, "get_match", "flexkv.client.get_match")
@@ -125,9 +118,7 @@ def install_recsys_glue_hooks(kvcache_mgr: KVCacheManager) -> None:
     merge_with_nvtx.__nvtx_wrapped__ = True
     KVLookupResult.merge = classmethod(merge_with_nvtx)
 
-    wrap_with_nvtx(
-        kvcache_mgr, "offload_try_wait", "recsys.offload_try_wait_loop"
-    )
+    wrap_with_nvtx(kvcache_mgr, "offload_try_wait", "recsys.offload_try_wait_loop")
 
 
 def create_testing_kvcache_manager(
@@ -166,9 +157,9 @@ def create_testing_kvcache_manager(
         * kvcache_config.head_dim
         * 2
     ) / (1024.0**3)
-    host_gib = (
-        kvcache_config.num_layers * kvcache_config.host_capacity_per_layer
-    ) / (1024.0**3)
+    host_gib = (kvcache_config.num_layers * kvcache_config.host_capacity_per_layer) / (
+        1024.0**3
+    )
     print(f"[DEBUG] KVCache GPU Memory Usage: {gpu_gib:.3f} GiB")
     print(f"[DEBUG] KVCache Host Memory Usage: {host_gib:.3f} GiB")
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
@@ -192,12 +183,10 @@ def build_uniform_batch(all_keys, all_values, len_per_seq: int, batch_size: int)
     user_ids = torch.tensor(list(range(batch_size)), dtype=torch.int64)
     sequence_lengths = torch.tensor(seqlen, dtype=torch.int32)
     keys = [
-        all_keys[uid][:, : seqlen[i], ...]
-        for i, uid in enumerate(range(batch_size))
+        all_keys[uid][:, : seqlen[i], ...] for i, uid in enumerate(range(batch_size))
     ]
     values = [
-        all_values[uid][:, : seqlen[i], ...]
-        for i, uid in enumerate(range(batch_size))
+        all_values[uid][:, : seqlen[i], ...] for i, uid in enumerate(range(batch_size))
     ]
     return user_ids, sequence_lengths, keys, values, seqlen
 
@@ -243,7 +232,9 @@ def run_step_1_offload(
 
     with nvtx_range(f"{step_name}.allocate"):
         kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
-    assert torch.allclose(kvcache_metadata.total_history_lengths, sequence_lengths.cuda())
+    assert torch.allclose(
+        kvcache_metadata.total_history_lengths, sequence_lengths.cuda()
+    )
 
     for layer_idx in range(_PROFILER_NUM_LAYERS):
         kvcache_mgr.gpu_kvcache_mgr.put(
@@ -315,13 +306,15 @@ def run_step_3_onboard(
     )
 
     with nvtx_range(f"{step_name}.onboard_launch"):
-        onboard_handle = kvcache_mgr.onboard_launch(index_meta, lookup_res, kvcache_metadata)
-    assert onboard_handle is not None and onboard_handle.handle is not None, (
-        "step3: onboard_launch did not return a valid handle"
-    )
-    assert onboard_handle.status == HostKVTaskStatus.LAUNCHED, (
-        f"step3: onboard status is {onboard_handle.status}, expected LAUNCHED"
-    )
+        onboard_handle = kvcache_mgr.onboard_launch(
+            index_meta, lookup_res, kvcache_metadata
+        )
+    assert (
+        onboard_handle is not None and onboard_handle.handle is not None
+    ), "step3: onboard_launch did not return a valid handle"
+    assert (
+        onboard_handle.status == HostKVTaskStatus.LAUNCHED
+    ), f"step3: onboard status is {onboard_handle.status}, expected LAUNCHED"
 
     with nvtx_range(f"{step_name}.onboard_wait"):
         deadline = time.time() + 60.0
@@ -369,15 +362,9 @@ def install_gpu_cpp_kernel_hooks(kvcache_mgr) -> None:
     wrap_with_nvtx(gpu_mgr, "lookup", "gpu.lookup_py")
     wrap_with_nvtx(gpu_mgr, "allocate", "gpu.allocate_py")
     wrap_with_nvtx(gpu_mgr, "check_for_offload", "gpu.check_for_offload_py")
-    wrap_with_nvtx(
-        gpu_mgr, "acquire_offload_pages", "gpu.acquire_offload_pages_py"
-    )
-    wrap_with_nvtx(
-        gpu_mgr, "release_offload_pages", "gpu.release_offload_pages_py"
-    )
-    wrap_with_nvtx(
-        gpu_mgr, "revoke_onboard_pages", "gpu.revoke_onboard_pages_py"
-    )
+    wrap_with_nvtx(gpu_mgr, "acquire_offload_pages", "gpu.acquire_offload_pages_py")
+    wrap_with_nvtx(gpu_mgr, "release_offload_pages", "gpu.release_offload_pages_py")
+    wrap_with_nvtx(gpu_mgr, "revoke_onboard_pages", "gpu.revoke_onboard_pages_py")
     wrap_with_nvtx(gpu_mgr, "evict", "gpu.evict_py")
     wrap_with_nvtx(gpu_mgr, "evict_all", "gpu.evict_all_py")
     wrap_with_nvtx(gpu_mgr, "put", "gpu.put_py")
@@ -405,9 +392,7 @@ def install_gpu_cpp_kernel_hooks(kvcache_mgr) -> None:
         print(f"[WARN] paged_kvcache_ops import failed, skip kernel hook: {e}")
         return
 
-    wrap_with_nvtx(
-        paged_kvcache_ops, "append_kvcache", "gpu.kernel.append_kvcache"
-    )
+    wrap_with_nvtx(paged_kvcache_ops, "append_kvcache", "gpu.kernel.append_kvcache")
 
 
 def install_cpu_cpp_hooks(kvcache_mgr) -> None:
@@ -447,9 +432,7 @@ def install_cpu_cpp_hooks(kvcache_mgr) -> None:
             print(f"[INFO] CPU C++ hooks installed on _client.{attr_name}")
             return
         except Exception as e:  # noqa: BLE001
-            print(
-                f"[WARN] Failed to install CPU C++ hooks on _client.{attr_name}: {e}"
-            )
+            print(f"[WARN] Failed to install CPU C++ hooks on _client.{attr_name}: {e}")
 
     try:
         flexkv_mgr._client = _NVTXProxy(client, method_to_nvtx)
