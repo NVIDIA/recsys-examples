@@ -25,6 +25,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.transformer.module import Float16Module
 from torch import nn
+
 from torchrec.distributed.model_parallel import DistributedModelParallel
 
 

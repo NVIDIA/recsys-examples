@@ -25,6 +25,7 @@ from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, DynamicEmbTableO
 from dynamicemb.planner import DynamicEmbParameterSharding
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn
+
 from torchrec.distributed.batched_embedding_kernel import (
     BaseBatchedEmbedding,
     BaseBatchedEmbeddingBag,

@@ -18,9 +18,10 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import torchrec
 from packaging.version import Version
 from torch import distributed as dist
+
+import torchrec
 from torchrec.distributed.embedding_kernel import BaseEmbedding
 from torchrec.distributed.embedding_lookup import (
     GroupedEmbeddingsLookup as _GroupedEmbeddingsLookup,

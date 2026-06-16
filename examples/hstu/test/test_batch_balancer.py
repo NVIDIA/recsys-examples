@@ -7,6 +7,7 @@ from commons.datasets.hstu_batch import FeatureConfig
 from hstu.utils.hstu_batch_balancer import HASTUBalancedBatchShuffler
 from megatron.core import parallel_state
 from test_utils import generate_random_batches
+
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

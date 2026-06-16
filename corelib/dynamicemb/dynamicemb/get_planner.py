@@ -27,6 +27,7 @@ from dynamicemb.planner import (
 )
 from dynamicemb.planner import DynamicEmbParameterConstraints
 from torch import distributed as dist
+
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_types import ShardingType
 

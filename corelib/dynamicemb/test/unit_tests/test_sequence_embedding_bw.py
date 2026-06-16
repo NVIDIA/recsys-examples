@@ -21,7 +21,6 @@ from typing import Dict, List
 
 import torch
 import torch.distributed as dist
-import torchrec
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -31,6 +30,8 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from torch.distributed.elastic.multiprocessing.errors import record
+
+import torchrec
 
 
 def str2bool(v):

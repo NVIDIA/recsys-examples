@@ -18,6 +18,7 @@ import torch
 from commons.datasets.hstu_batch import FeatureConfig, HSTUBatch
 from configs import get_hstu_config
 from modules.hstu_block import HSTUBlock
+
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

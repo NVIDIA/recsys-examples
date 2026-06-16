@@ -37,6 +37,7 @@ from fbgemm_gpu.split_embedding_configs import SparseType
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+
 from torchrec import DataType
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.fbgemm_qcomm_codec import (

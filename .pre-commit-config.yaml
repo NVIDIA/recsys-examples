@@ -1,3 +1,4 @@
+exclude: ^(examples/sid-gr-inference/.*)$
 repos:
 -   repo: https://github.com/pycqa/isort
     rev: 5.12.0
@@ -25,6 +26,9 @@ repos:
     hooks:
     -   id: mypy
         entry: mypy examples
-        args: ["--ignore-missing-imports", "--explicit-package-bases", 
-               "--exclude=examples/hstu/inference/triton/hstu_.*/[0-9]*/model.py$"]
+        args: ["--ignore-missing-imports", 
+                "--explicit-package-bases", 
+                "--exclude=examples/hstu/inference/triton/hstu_.*/[0-9]*/model.py$",
+                "--exclude=^examples/sid-gr-inference/"
+            ]
         pass_filenames: false

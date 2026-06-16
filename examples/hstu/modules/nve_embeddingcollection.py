@@ -16,6 +16,7 @@ import os
 from typing import Dict, List, Optional
 
 import torch
+
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import get_embedding_names_by_table
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor

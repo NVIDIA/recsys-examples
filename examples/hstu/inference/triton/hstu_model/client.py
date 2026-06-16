@@ -34,9 +34,10 @@ from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from modules.metrics import get_multi_event_metric_module
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from tritonclient.utils import *
 from utils import DatasetArgs, RankingArgs
+
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 model_name = "hstu_model"
 

@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from commons.sequence_batch.batch import BaseBatch
+
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 try:

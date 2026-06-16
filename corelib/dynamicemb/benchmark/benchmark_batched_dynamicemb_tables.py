@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
-import torchrec
 from benchmark_utils import GPUTimer
 from dynamicemb import (
     DynamicEmbInitializerArgs,
@@ -49,6 +48,8 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     ComputeDevice,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
+
+import torchrec
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.types import DataType
 

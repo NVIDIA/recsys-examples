@@ -9,6 +9,7 @@ from commons.ops.collective_ops import (
 )
 from commons.ops.grad_scaling import grad_scaling
 from megatron.core import parallel_state
+
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 

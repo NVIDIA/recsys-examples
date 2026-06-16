@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.enumerators import (

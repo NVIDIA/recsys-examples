@@ -65,6 +65,7 @@ from commons.utils.distributed_utils import collective_assert
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from torch.autograd.profiler import record_function
+
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.types import Awaitable

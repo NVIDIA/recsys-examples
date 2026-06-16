@@ -33,6 +33,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from modules.eval_metrics import SIDRetrievalEvaluator
 from modules.gpt_loss_module import GPTSIDLossModule
+
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 from .attention_mask import (

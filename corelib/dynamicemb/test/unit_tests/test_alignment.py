@@ -43,6 +43,7 @@ from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.types import MAX_BUCKET_CAPACITY
 from dynamicemb.utils import DTYPE_NUM_BYTES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
+
 from torchrec import DataType
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.modules.embedding_configs import EmbeddingConfig

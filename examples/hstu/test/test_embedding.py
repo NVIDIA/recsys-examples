@@ -17,6 +17,7 @@ import torch
 from configs.inference_config import EmbeddingBackend, InferenceEmbeddingConfig
 from modules.inference_embedding import InferenceEmbedding
 from modules.nve_embeddingcollection import InferenceNVEEmbeddingCollection
+
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

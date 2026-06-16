@@ -22,7 +22,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.key_value_table import Storage
@@ -37,6 +36,8 @@ from dynamicemb.shard import (
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torch import nn
+
+import torchrec
 from torchrec import EmbeddingBagCollection, EmbeddingCollection
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,

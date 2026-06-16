@@ -33,6 +33,7 @@ from test_utils import (
     init_tpN_weights_from_debug,
     zero_bias,
 )
+
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )

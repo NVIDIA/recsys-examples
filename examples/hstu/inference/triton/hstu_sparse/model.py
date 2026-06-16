@@ -37,8 +37,9 @@ import triton_python_backend_utils as pb_utils
 from configs import EmbeddingBackend, InferenceEmbeddingConfig
 from modules.inference_embedding import get_inference_sparse_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs
+
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 TRITON_STRING_TO_NUMPY = {
     "TYPE_BOOL": torch.bool,

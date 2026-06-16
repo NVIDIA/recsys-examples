@@ -3,8 +3,9 @@ import torch
 from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from commons.datasets.sid_sequence_dataset import SIDSequenceDataset
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from tqdm import tqdm
+
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 @pytest.mark.parametrize("batch_size", [128, 256, 512])

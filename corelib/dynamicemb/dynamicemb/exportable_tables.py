@@ -28,6 +28,7 @@ from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
 from dynamicemb.scored_hashtable import ScorePolicy
 from dynamicemb_extensions import table_insert
 from torch.nn import ModuleDict
+
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
 # ---------------------------------------------------------------------------

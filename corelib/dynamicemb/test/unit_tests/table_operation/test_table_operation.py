@@ -20,7 +20,6 @@ from typing import List
 import pytest
 import torch
 import torch.distributed as dist
-import torchrec
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import (
     InsertResult,
@@ -28,6 +27,8 @@ from dynamicemb_extensions import (
     bucketize_keys,
     table_partition,
 )
+
+import torchrec
 
 
 @pytest.fixture

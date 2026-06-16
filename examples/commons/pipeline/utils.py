@@ -47,6 +47,7 @@ from typing import (
 
 import torch
 from torch import distributed as dist
+
 from torchrec.distributed.types import LazyAwaitable
 
 if not torch._running_with_deploy():
@@ -65,6 +66,7 @@ from torch.fx.immutable_collections import immutable_list as fx_immutable_list
 from torch.fx.node import Node
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.profiler import record_function
+
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,

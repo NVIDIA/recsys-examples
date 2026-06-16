@@ -33,8 +33,9 @@ from configs import (
 )
 from modules.metrics import get_multi_event_metric_module
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
+
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr

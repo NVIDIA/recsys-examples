@@ -25,6 +25,7 @@ from commons.ops.collective_ops import (
 )
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from megatron.core import parallel_state, tensor_parallel
+
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

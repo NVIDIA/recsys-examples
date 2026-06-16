@@ -21,6 +21,7 @@ from configs import InferenceHSTUConfig, RankingConfig
 from modules.inference_dense_module import InferenceDenseModule
 from modules.inference_embedding import InferenceEmbedding
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
+
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

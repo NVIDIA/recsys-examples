@@ -45,8 +45,9 @@ from configs import (
 )
 from modules.inference_dense_module import get_inference_dense_model
 from torch.utils.dlpack import from_dlpack, to_dlpack
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
+
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 TRITON_STRING_TO_NUMPY = {
     "TYPE_BOOL": torch.bool,

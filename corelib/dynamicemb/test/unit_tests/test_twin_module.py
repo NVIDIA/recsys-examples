@@ -21,8 +21,9 @@ from typing import List
 import pytest
 import torch
 import torch.distributed as dist
-import torchrec
 from dynamicemb.construct_twin_module import ConstructTwinModule
+
+import torchrec
 from torchrec.modules.embedding_configs import PoolingType
 
 

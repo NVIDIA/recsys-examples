@@ -16,6 +16,7 @@
 from typing import Dict, List, Optional
 
 import torch
+
 from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     EmbeddingShardingContext,
