@@ -28,7 +28,6 @@ from modules.hstu_block import HSTUBlock
 from modules.metrics import get_multi_event_metric_module
 from modules.mlp import MLP
 from modules.multi_task_loss_module import MultiTaskLossModule
-
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 

@@ -34,7 +34,6 @@ from dynamicemb.types import (
 )
 from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 

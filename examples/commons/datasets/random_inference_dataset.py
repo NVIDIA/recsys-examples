@@ -16,7 +16,6 @@ from typing import Dict, Iterator, List, Tuple
 
 import torch
 from torch.utils.data.dataset import IterableDataset
-
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 from .hstu_batch import FeatureConfig, HSTUBatch

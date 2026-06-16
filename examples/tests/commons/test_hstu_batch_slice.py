@@ -4,7 +4,6 @@ from typing import List
 
 import pytest
 import torch
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))

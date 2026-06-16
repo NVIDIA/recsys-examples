@@ -22,7 +22,6 @@ import gin
 import numpy as np
 import torch
 from commons.sequence_batch.batch import BaseBatch
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

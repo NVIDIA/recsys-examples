@@ -17,7 +17,6 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 from commons.ops.length_to_offsets import length_to_complete_offsets
-
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 

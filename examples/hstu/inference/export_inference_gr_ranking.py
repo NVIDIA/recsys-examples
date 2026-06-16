@@ -31,9 +31,8 @@ from model.inference_ranking_gr import apply_inference
 from modules.metrics import get_multi_event_metric_module
 from pynve.torch.nve_export import export_aot
 from torch.export import Dim, ShapesCollection
-from utils import NetworkArgs, TensorModelParallelArgs
-
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from utils import NetworkArgs, TensorModelParallelArgs
 
 sys.path.append("./training/")
 from pretrain_gr_ranking import create_ranking_config

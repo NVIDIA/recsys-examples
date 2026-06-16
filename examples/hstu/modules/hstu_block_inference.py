@@ -9,7 +9,6 @@ from configs import InferenceHSTUConfig
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
-
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 

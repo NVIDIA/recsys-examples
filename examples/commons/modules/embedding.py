@@ -27,7 +27,6 @@ from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_f
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
-
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.sharding.dp_sequence_sharding import (

@@ -20,6 +20,7 @@ from typing import Dict, List
 import pytest
 import torch
 import torch.distributed as dist
+import torchrec
 from dynamicemb import (
     BATCH_SIZE_PER_DUMP,
     DynamicEmbInitializerArgs,
@@ -38,8 +39,6 @@ from dynamicemb.shard import (
     DynamicEmbeddingCollectionSharder,
 )
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-
-import torchrec
 from torchrec.distributed.comm import intra_and_cross_node_pg
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology

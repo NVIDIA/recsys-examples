@@ -23,7 +23,6 @@ from dynamicemb_extensions import (
     segmented_unique_cuda,
 )
 from torch.autograd.profiler import record_function
-
 from torchrec.distributed.embedding import (
     EmbeddingCollectionContext,
     EmbeddingCollectionSharder,

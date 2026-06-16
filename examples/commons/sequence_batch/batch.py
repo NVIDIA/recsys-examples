@@ -3,7 +3,6 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
 

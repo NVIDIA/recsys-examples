@@ -30,7 +30,6 @@ from test_embedding_dump_load import (
     get_optimizer_kwargs,
     idx_to_name,
 )
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

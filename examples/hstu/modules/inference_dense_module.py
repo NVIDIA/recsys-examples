@@ -42,7 +42,6 @@ else:
     )
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
-
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 

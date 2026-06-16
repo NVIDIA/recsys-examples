@@ -26,7 +26,6 @@ from configs.inference_config import InferenceHSTUConfig
 from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from modules.mlp import MLP
 from modules.position_encoder import HSTUPositionalEncoder
-
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 try:

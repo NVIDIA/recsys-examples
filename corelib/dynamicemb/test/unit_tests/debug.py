@@ -23,7 +23,6 @@ from typing import List
 import torch  # usort:skip
 import torch.distributed as dist
 from torch import Tensor, nn  # usort:skip
-
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 

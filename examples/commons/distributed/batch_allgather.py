@@ -7,7 +7,6 @@ from commons.ops.collective_ops import (
     keyed_jagged_tensor_list_allgather,
 )
 from commons.sequence_batch.batch import BaseBatch
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

@@ -6,7 +6,7 @@ NVIDIA RecSys Examples is a collection of optimized recommender models and compo
 The project is organized into two parts:
 
 ## Examples
-- [HSTU recommender examples](./examples/hstu/README.md) for large-scale ranking and retrieval training, with [TorchRec](https://github.com/pytorch/torchrec), [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core), DynamicEmb, training benchmarks, and Blackwell (`sm_100`) coverage through `fbgemm_gpu_hstu`
+- [HSTU recommender examples](./examples/hstu/README.md) for large-scale ranking and retrieval training, with [TorchRec](https://github.com/pytorch/torchrec), [Megatron-Core](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core), DynamicEmb, training benchmarks, and optimized HSTU attention through `fbgemm_gpu_hstu`
 - [HSTU inference](./examples/hstu/inference/README.md) with paged GPU KV cache, asynchronous host KV onload/offload, [Triton Inference Server](https://github.com/triton-inference-server/server), CUDA graph optimization, and C++ deployment with AOTInductor
 - [Semantic ID generative recommender examples](./examples/sid_gr/README.md) for SID-GR training and retrieval, including hierarchical semantic-ID prediction, Megatron-Core decoder support, TorchRec jagged tensors, baseline beam generation, and KV-cache `generate_beam_decode()`
 - [SID-GR inference](./examples/sid-gr-inference/README.md) for long-context, short-decode, large-beam serving with ContextKV/BeamKV/BeamPath runtime abstractions, continuous batching, CUDA graph replay, HTTP `/generate`, and SGLang comparison benchmarks

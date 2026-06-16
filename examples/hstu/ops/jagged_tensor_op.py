@@ -16,7 +16,6 @@ from typing import List, Tuple
 
 import fbgemm_gpu  # to load permute_2D_sparse_data
 import torch
-
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 

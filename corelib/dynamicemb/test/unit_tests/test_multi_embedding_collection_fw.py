@@ -21,6 +21,7 @@ from typing import List
 
 import torch
 import torch.distributed as dist
+import torchrec
 from debug import Debugger
 from dynamicemb import (
     DynamicEmbCheckMode,
@@ -39,8 +40,6 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
-
-import torchrec
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,

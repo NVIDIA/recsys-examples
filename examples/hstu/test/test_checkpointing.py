@@ -165,7 +165,6 @@ def test_checkpoint_model(
 
 
 from commons.modules.embedding import DataParallelEmbeddingCollection
-
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.types import BoundsCheckMode, ShardingEnv, ShardingType

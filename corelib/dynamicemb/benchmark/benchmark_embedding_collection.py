@@ -22,6 +22,7 @@ import numpy as np
 import torch
 import torch.cuda
 import torch.distributed as dist
+import torchrec
 from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
@@ -39,8 +40,6 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
-
-import torchrec
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.fbgemm_qcomm_codec import (

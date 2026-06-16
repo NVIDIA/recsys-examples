@@ -12,7 +12,6 @@ from modules.fused_hstu_layer import FusedHSTULayer
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer as NativeHSTULayer
-
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 

@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from torch import distributed as dist
 from torch import nn
-
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, ParameterConstraints

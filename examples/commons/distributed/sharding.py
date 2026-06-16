@@ -41,7 +41,6 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from torch import distributed as dist
-
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )

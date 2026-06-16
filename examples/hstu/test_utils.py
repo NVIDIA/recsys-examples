@@ -34,7 +34,6 @@ from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
 from modules.jagged_data import JaggedData
 from modules.native_hstu_layer import HSTULayer
 from torch.distributed._shard.sharded_tensor import ShardedTensor
-
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )

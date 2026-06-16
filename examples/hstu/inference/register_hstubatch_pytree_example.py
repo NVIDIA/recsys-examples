@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Tuple
 
 from commons.datasets.hstu_batch import HSTUBatch
 from torch.utils import _pytree as pytree
-
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 

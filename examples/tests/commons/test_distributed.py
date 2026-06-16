@@ -15,7 +15,6 @@ from commons.distributed.batch_allgather import pad_and_allgather_batch
 from commons.distributed.batch_shuffler import _strip_dense_padding
 from commons.sequence_batch.batch import BaseBatch
 from megatron.core import parallel_state
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

@@ -22,7 +22,6 @@ from test_embedding_dump_load import (
     get_score_strategy,
     idx_to_name,
 )
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

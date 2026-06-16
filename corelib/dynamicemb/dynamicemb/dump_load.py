@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from torch import nn
-
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_parallel import get_unwrapped_module

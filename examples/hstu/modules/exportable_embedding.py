@@ -78,7 +78,6 @@ from dynamicemb.exportable_tables import (
     InferenceEmbeddingCollection,
     create_inference_embedding_collection,
 )
-
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
