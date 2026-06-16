@@ -15,6 +15,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
+// Needed for mremap()/MREMAP_MAYMOVE (a GNU extension); must be defined before
+// any libc header pulls in <sys/mman.h>.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -258,8 +264,10 @@ public:
     auto dtype_bytes = get_size(scalar_type);
     std::size_t required_bytes = numel * dtype_bytes;
 
-    m_reserved = getTotalPhysicalMemory();
-    if (required_bytes > m_reserved) {
+    // A HostVMMTensor is pinned (mlock + cudaHostRegister), so it can never
+    // exceed installed RAM; reject early with a clear message.
+    std::size_t total_ram = getTotalPhysicalMemory();
+    if (required_bytes > total_ram) {
       throw std::runtime_error("Requested HostVMMTensor size exceeds total physical memory");
     }
 
@@ -276,24 +284,29 @@ public:
       throw std::runtime_error("sysconf error\n");
     }
     m_page_size = page_size;
-    m_reserved = (m_reserved + m_page_size - 1) / m_page_size * m_page_size;
     m_size =
         (required_bytes + m_page_size - 1) / m_page_size * m_page_size;
+    // Map exactly the bytes we back. The previous implementation mmap'd the
+    // whole machine's RAM per tensor as a "reservation"; with many tables those
+    // multi-TB mappings accumulate and exhaust the process virtual address
+    // space, so mmap eventually fails with ENOMEM even for tiny tensors.
+    // extend() grows this mapping on demand via mremap() instead.
+    m_reserved = m_size;
 
-    // reserve host virtual memory
-    m_addr_h = mmap(nullptr, m_reserved, PROT_READ | PROT_WRITE,
+    m_addr_h = mmap(nullptr, m_size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m_addr_h == MAP_FAILED) {
-      throw std::runtime_error("mmap virtual memory failed\n");
+      throw std::runtime_error(std::string("mmap host memory failed (size=") +
+                               std::to_string(m_size) +
+                               " bytes): " + std::strerror(errno));
     }
 
-    // Accessing virtual addresses to trigger page loss interrupts and allocate
-    // physical pages
+    // MADV_WILLNEED is only a readahead hint; the memset loop below and mlock()
+    // are what actually fault in and pin the pages, so a failure here is
+    // non-fatal. Surface it as a warning rather than aborting (or swallowing).
     if (madvise(m_addr_h, m_size, MADV_WILLNEED) == -1) {
-      munmap(m_addr_h, m_reserved);
-      m_addr_h = nullptr;
-      throw std::runtime_error(
-          "madvise allocate initial physical memory failed\n");
+      std::cerr << "HostVMMTensor: madvise(MADV_WILLNEED) failed: "
+                << std::strerror(errno) << " (non-fatal)\n";
     }
 
     // memset(m_addr_h, 0, m_size);
@@ -311,15 +324,76 @@ public:
       throw std::runtime_error("mlock initial physical memory failed");
     }
 
-    CUDA_CHECK(cudaHostRegister(
-        m_addr_h, m_size, cudaHostRegisterMapped | cudaHostRegisterPortable));
-
-    CUDA_CHECK(
-        cudaHostGetDevicePointer((void **)&m_addr_d, (void *)m_addr_h, 0));
+    // On failure, free the already mmap'd + mlocked buffer before throwing: the
+    // constructor is not done, so ~HostVMMTensor() will not run to clean it up.
+    cudaError_t err =
+        cudaHostRegister(m_addr_h, m_size,
+                         cudaHostRegisterMapped | cudaHostRegisterPortable);
+    if (err == cudaSuccess) {
+      err = cudaHostGetDevicePointer((void **)&m_addr_d, (void *)m_addr_h, 0);
+    }
+    if (err != cudaSuccess) {
+      cudaGetLastError();
+      munlock(m_addr_h, m_reserved);
+      munmap(m_addr_h, m_reserved);
+      m_addr_h = nullptr;
+      throw std::runtime_error(
+          std::string(
+              "cudaHostRegister/cudaHostGetDevicePointer (init) failed: ") +
+          cudaGetErrorString(err));
+    }
   }
 
-  // Set logical size to new_total_logical_numel; uses slack first, allocates
-  // only when needed.
+  // Best-effort recovery for extend(): bring the buffer back to a working,
+  // self-consistent state at `restore_bytes` after a failed grow. The mapping
+  // may currently be larger than restore_bytes (mremap already succeeded) and
+  // may be registered at either size, so: drop any CUDA registration, shrink
+  // the mapping back, then re-register and refresh the device pointer. Updates
+  // m_addr_h / m_reserved / m_addr_d so that afterwards m_size == m_reserved ==
+  // restore_bytes. Returns an empty string on success, or a description if the
+  // recovery itself fails (the buffer is then unusable and must be destroyed).
+  std::string restore_to_size(std::size_t restore_bytes) {
+    // CUDA registration pins the pages, so it must be dropped before remapping.
+    // The buffer may already be unregistered here; ignore that error and clear
+    // the sticky CUDA error so it cannot leak into an unrelated CUDA_CHECK.
+    cudaHostUnregister(m_addr_h);
+    cudaGetLastError();
+
+    if (m_reserved != restore_bytes) {
+      // Shrinking never needs MREMAP_MAYMOVE and keeps the base address; the
+      // truncated tail is unmapped (and thereby munlocked) for us.
+      void *p = mremap(m_addr_h, m_reserved, restore_bytes, 0);
+      if (p == MAP_FAILED) {
+        return std::string("mremap shrink to ") +
+               std::to_string(restore_bytes) +
+               " bytes failed: " + std::strerror(errno);
+      }
+      m_addr_h = p;
+      m_reserved = restore_bytes;
+    }
+
+    cudaError_t err =
+        cudaHostRegister(m_addr_h, restore_bytes,
+                         cudaHostRegisterMapped | cudaHostRegisterPortable);
+    if (err != cudaSuccess) {
+      cudaGetLastError();
+      return std::string("cudaHostRegister(") + std::to_string(restore_bytes) +
+             ") failed: " + cudaGetErrorString(err);
+    }
+    err = cudaHostGetDevicePointer((void **)&m_addr_d, (void *)m_addr_h, 0);
+    if (err != cudaSuccess) {
+      cudaGetLastError();
+      return std::string("cudaHostGetDevicePointer failed: ") +
+             cudaGetErrorString(err);
+    }
+    return std::string();
+  }
+
+  // Set logical size to new_total_logical_numel; uses slack first, grows the
+  // backing mapping (via mremap) only when needed. On any failure after the
+  // mapping has grown, the buffer is rolled back to its previous size via
+  // restore_to_size() so the object stays consistent (m_size == m_reserved)
+  // and is safe to use or retry.
   void extend(std::size_t new_total_logical_numel) {
     if (m_addr_h == nullptr) {
       throw std::runtime_error("Not initlialized.");
@@ -337,78 +411,90 @@ public:
 
     std::size_t new_bytes =
         (required_bytes + m_page_size - 1) / m_page_size * m_page_size;
-    if (new_bytes > m_reserved) {
-      throw std::runtime_error("Requested size exceeds reserved VA range");
+    std::size_t total_ram = getTotalPhysicalMemory();
+    std::size_t total_ram_aligned =
+        (total_ram + m_page_size - 1) / m_page_size * m_page_size;
+    if (new_bytes > total_ram_aligned) {
+      throw std::runtime_error(
+          "Requested HostVMMTensor size exceeds total physical memory");
     }
 
-    std::size_t old_size = m_size;
-
-    uintptr_t append_start = (uintptr_t)m_addr_h + m_size;
+    std::size_t old_size = m_size; // == m_reserved on entry (consistent state)
     std::size_t delta = new_bytes - old_size;
 
-    if (madvise((void *)append_start, delta, MADV_WILLNEED) == -1) {
-      throw std::runtime_error("madvise allocate physical memory failed\n");
-    }
+    // CUDA registration is tied to the current virtual address, so drop it
+    // before remapping. If this throws, nothing has changed and the buffer is
+    // still valid at its old size.
+    CUDA_CHECK(cudaHostUnregister(m_addr_h));
 
+    // mremap() may relocate the buffer (MREMAP_MAYMOVE); that is safe because
+    // callers rebuild value-buffer pointers after extend() (get_table_ptrs()).
+    void *new_addr = mremap(m_addr_h, old_size, new_bytes, MREMAP_MAYMOVE);
+    if (new_addr == MAP_FAILED) {
+      int saved_errno = errno; // mremap left the old mapping intact.
+      std::string rec = restore_to_size(old_size);
+      std::string msg = std::string("mremap (extend) failed (old=") +
+                        std::to_string(old_size) + " new=" +
+                        std::to_string(new_bytes) +
+                        " bytes): " + std::strerror(saved_errno);
+      if (!rec.empty()) {
+        msg += "; buffer recovery also failed: " + rec;
+      }
+      throw std::runtime_error(msg);
+    }
+    m_addr_h = new_addr;
+    // The mapping is now new_bytes large at new_addr; record the true extent
+    // before anything below can throw so the destructor and restore_to_size()
+    // always see the real mapping size.
+    m_reserved = new_bytes;
+
+    // MADV_WILLNEED is only a readahead hint; the memset loop and mlock() below
+    // are what actually fault in and pin the pages, so a failure here is
+    // non-fatal. Surface it as a warning rather than aborting or swallowing.
+    uintptr_t tail_start = (uintptr_t)m_addr_h + old_size;
+    if (madvise((void *)tail_start, delta, MADV_WILLNEED) == -1) {
+      std::cerr << "HostVMMTensor::extend: madvise(MADV_WILLNEED) failed: "
+                << std::strerror(errno) << " (non-fatal)\n";
+    }
     uintptr_t aligned_ptr =
-        (((uintptr_t)append_start + m_page_size - 1) & ~(m_page_size - 1));
-    for (uintptr_t p = aligned_ptr; p < ((uintptr_t)append_start + delta);
+        (((uintptr_t)tail_start + m_page_size - 1) & ~(m_page_size - 1));
+    for (uintptr_t p = aligned_ptr; p < ((uintptr_t)m_addr_h + new_bytes);
          p += m_page_size) {
       memset((void *)p, 0, 1);
     }
 
-    if (mlock((void *)append_start, delta) == -1) {
-      throw std::runtime_error("mlock physical memory failed");
-    }
-
-    CUDA_CHECK(cudaHostUnregister(m_addr_h));
-
-    try {
-      CUDA_CHECK(
-          cudaHostRegister(m_addr_h, m_size + delta,
-                           cudaHostRegisterMapped | cudaHostRegisterPortable));
-    } catch (const std::runtime_error &e) {
-      munlock((void *)append_start, delta);
-      try {
-        CUDA_CHECK(cudaHostRegister(
-            m_addr_h, m_size, cudaHostRegisterMapped | cudaHostRegisterPortable));
-      } catch (const std::runtime_error &e2) {
-        throw std::runtime_error(
-            std::string(
-                "cudaHostRegister failed for the expanded buffer size; "
-                "fallback cudaHostRegister with the previous size also failed. "
-                "Expand error: ") +
-            e.what() + "; fallback error: " + e2.what());
+    if (mlock(m_addr_h, new_bytes) == -1) {
+      int saved_errno = errno;
+      std::string rec = restore_to_size(old_size);
+      std::string msg =
+          std::string("mlock (extend) failed: ") + std::strerror(saved_errno);
+      if (!rec.empty()) {
+        msg += "; buffer recovery also failed: " + rec;
       }
-      throw;
+      throw std::runtime_error(msg);
     }
 
-    CUdeviceptr m_addr_d_new = 0;
-
-    try {
-
-      CUDA_CHECK(cudaHostGetDevicePointer((void **)&m_addr_d_new,
-                                          (void *)m_addr_h, 0));
-
-      m_addr_d = m_addr_d_new;
-      m_size = old_size + delta;
-      m_logical_numel = new_total_logical_numel;
-    } catch (const std::runtime_error &e) {
-      munlock((void *)append_start, delta);
-      CUDA_CHECK(cudaHostUnregister(m_addr_h));
-      try {
-        CUDA_CHECK(cudaHostRegister(
-            m_addr_h, m_size, cudaHostRegisterMapped | cudaHostRegisterPortable));
-      } catch (const std::runtime_error &e2) {
-        throw std::runtime_error(
-            std::string(
-                "cudaHostGetDevicePointer failed after expanding the registered "
-                "buffer; cudaHostRegister with the previous size also failed. "
-                "Prior error: ") +
-            e.what() + "; fallback error: " + e2.what());
+    cudaError_t err =
+        cudaHostRegister(m_addr_h, new_bytes,
+                         cudaHostRegisterMapped | cudaHostRegisterPortable);
+    if (err == cudaSuccess) {
+      err = cudaHostGetDevicePointer((void **)&m_addr_d, (void *)m_addr_h, 0);
+    }
+    if (err != cudaSuccess) {
+      cudaGetLastError();
+      std::string primary = cudaGetErrorString(err);
+      std::string rec = restore_to_size(old_size);
+      std::string msg = std::string("cudaHostRegister/cudaHostGetDevicePointer "
+                                     "(extend) failed: ") +
+                        primary;
+      if (!rec.empty()) {
+        msg += "; buffer recovery also failed: " + rec;
       }
-      throw;
+      throw std::runtime_error(msg);
     }
+
+    m_size = new_bytes;
+    m_logical_numel = new_total_logical_numel;
   }
 
   at::Tensor data() const {
@@ -440,8 +526,11 @@ public:
   ~HostVMMTensor() {
 
     if (m_size > 0) {
-      munlock(m_addr_h, m_size);
-      CUDA_CHECK(cudaHostUnregister(m_addr_h));
+      munlock(m_addr_h, m_reserved);
+      // Best-effort: a destructor must never throw, so do not CUDA_CHECK here.
+      // Clear the sticky error so it cannot surface in an unrelated check.
+      cudaHostUnregister(m_addr_h);
+      cudaGetLastError();
       munmap(m_addr_h, m_reserved);
     }
   }
