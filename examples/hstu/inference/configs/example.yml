@@ -1,0 +1,11 @@
+# FlexKV layerwise transfer config for recsys KVCacheManager.
+# Use with:
+#   export RECSYS_FLEXKV_CONFIG_PATH=/path/to/flexkv_layerwise.yml
+#   export RECSYS_FLEXKV_ENABLE_LAYERWISE=1
+cpu_cache_gb: 0.2
+ssd_cache_gb: 0.99
+ssd_cache_dir: /home/scratch.noliu_gpu/ssd_cache
+enable_gds: false
+enable_p2p_cpu: false
+enable_p2p_ssd: false
+enable_3rd_remote: false

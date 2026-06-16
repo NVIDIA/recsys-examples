@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 
 import torch
@@ -21,7 +22,21 @@ from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 
 
+def _get_flexkv_config_path() -> str:
+    return os.environ.get("RECSYS_FLEXKV_CONFIG_PATH", "")
+
+
 def create_testing_kvcache_manager() -> KVCacheManager:
+    flexkv_config_path = _get_flexkv_config_path()
+    extra_configs = {
+        "flexkv_mode": "direct",
+        "flexkv_host_kvstorage_fail_policy": "fail_open",
+        "flexkv_enable_mps": 0,
+        "flexkv_as_batch": 1,
+    }
+    if flexkv_config_path:
+        extra_configs["flexkv_config_path"] = flexkv_config_path
+
     kvcache_config = get_kvcache_config(
         num_layers=3,
         num_heads=4,
@@ -38,12 +53,7 @@ def create_testing_kvcache_manager() -> KVCacheManager:
         host_kvstorage_backend="flexkv",
         offload_timeout_ms=100.0,
         offload_mode="lazy",
-        extra_configs={
-            "flexkv_mode": "direct",
-            "flexkv_host_kvstorage_fail_policy": "fail_open",
-            "flexkv_enable_mps": 0,
-            "flexkv_as_batch": 1,
-        },
+        extra_configs=extra_configs,
     )
     gpu_gib = (
         kvcache_config.num_layers
@@ -59,8 +69,21 @@ def create_testing_kvcache_manager() -> KVCacheManager:
     ) / (1024.0**3)
     print(f"[TEST] KVCache GPU Memory Usage: {gpu_gib} GiB.")
     print(f"[TEST] KVCache Host Memory Usage: {host_gib} GiB.")
+    if flexkv_config_path:
+        print(f"[TEST] FlexKV config path: {flexkv_config_path}")
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
-    print("[TEST] Created KVCache Manager")
+    flexkv_mgr = kvcache_mgr.host_kvstorage_manager
+    cache_cfg = flexkv_mgr._client.cache_config
+    if cache_cfg.enable_ssd:
+        print(
+            "[TEST] Created KVCache Manager with FlexKV SSD tier: "
+            f"num_cpu_blocks={cache_cfg.num_cpu_blocks}, "
+            f"num_ssd_blocks={cache_cfg.num_ssd_blocks}, "
+            f"ssd_cache_dir={cache_cfg.ssd_cache_dir}, "
+            f"enable_gds={cache_cfg.enable_gds}"
+        )
+    else:
+        print("[TEST] Created KVCache Manager with FlexKV CPU tier only")
     return kvcache_mgr
 
 
