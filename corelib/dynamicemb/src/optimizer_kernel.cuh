@@ -28,7 +28,14 @@ namespace dyn_emb {
 template <typename wgrad_t, typename weight_t> struct OptimizierInput {
   const wgrad_t *wgrad_ptr;
   weight_t *weight_ptr;
+  // Per-row embedding width: number of weight/grad elements processed and the
+  // width of every optimizer state region (e.g. Adam m and v are each `dim`).
   const uint32_t dim;
+  // Offset (in elements) from weight_ptr to the first optimizer state region.
+  // Compact flat-table layout packs states right after the embedding, so this
+  // equals `dim`. The padded buffer reserves `max_emb_dim` for the embedding
+  // region of every row, so states begin at `max_emb_dim` regardless of `dim`.
+  const uint32_t state_offset;
 };
 
 template <typename wgrad_t, typename weight_t, int kWarpSize = 32>
@@ -88,7 +95,7 @@ struct AdamVecOptimizer {
     weight_t *weight_ptr = input.weight_ptr;
     if (not weight_ptr)
       return;
-    weight_t *m_ptr = weight_ptr + input.dim;
+    weight_t *m_ptr = weight_ptr + input.state_offset;
     weight_t *v_ptr = m_ptr + input.dim;
 
     Vec4T<float> weight_vec;
@@ -169,7 +176,7 @@ struct AdamVecOptimizer {
     weight_t *weight_ptr = input.weight_ptr;
     if (not weight_ptr)
       return;
-    weight_t *m_ptr = weight_ptr + input.dim;
+    weight_t *m_ptr = weight_ptr + input.state_offset;
     weight_t *v_ptr = m_ptr + input.dim;
 
     for (int i = threadIdx.x; i < input.dim; i += blockDim.x) {
@@ -207,7 +214,7 @@ struct AdaGradVecOptimizer {
     weight_t *weight_ptr = input.weight_ptr;
     if (not weight_ptr)
       return;
-    weight_t *gt_ptr = weight_ptr + input.dim;
+    weight_t *gt_ptr = weight_ptr + input.state_offset;
 
     Vec4T<float> weight_vec;
     Vec4T<float> gt_vec;
@@ -250,7 +257,7 @@ struct AdaGradVecOptimizer {
     weight_t *weight_ptr = input.weight_ptr;
     if (not weight_ptr)
       return;
-    weight_t *gt_ptr = weight_ptr + input.dim;
+    weight_t *gt_ptr = weight_ptr + input.state_offset;
 
     for (int i = threadIdx.x; i < input.dim; i += blockDim.x) {
       float tmp_grad = TypeConvertFunc<float, wgrad_t>::convert(wgrad_ptr[i]);
@@ -302,7 +309,7 @@ struct RowWiseAdaGradVecOptimizer {
 
     if (not(weight_ptr))
       return;
-    weight_t *gt_ptr = weight_ptr + input.dim;
+    weight_t *gt_ptr = weight_ptr + input.state_offset;
 
     float tmp_gt = TypeConvertFunc<float, weight_t>::convert(*gt_ptr);
     float tmp_g_pow = 0;
@@ -356,7 +363,7 @@ struct RowWiseAdaGradVecOptimizer {
 
     if (not(weight_ptr))
       return;
-    weight_t *gt_ptr = weight_ptr + input.dim;
+    weight_t *gt_ptr = weight_ptr + input.state_offset;
 
     float tmp_gt = TypeConvertFunc<float, weight_t>::convert(*gt_ptr);
     float tmp_g_pow = 0;
@@ -423,7 +430,7 @@ __global__ void update4_with_index_flat_table_kernel(
     const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
-                                             (uint32_t)edim};
+                                             (uint32_t)edim, (uint32_t)edim};
     optimizer.update4(input);
   }
 }
@@ -450,39 +457,55 @@ __global__ void update_with_index_flat_table_kernel(
     const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
-                                             (uint32_t)edim};
+                                             (uint32_t)edim, (uint32_t)edim};
     optimizer.update(input);
   }
 }
 
+// The padded buffer reserves `max_emb_dim` for the embedding region of every
+// row and packs the optimizer states immediately after it (see
+// load_from_flat_table / store_to_flat_table). A row's embedding occupies
+// [0, edim) and its states begin at `max_emb_dim`, so `dim` is the per-row
+// embedding width while `state_offset` is the fixed `max_emb_dim`. When the
+// table ids / per-table dims are unavailable (all rows share one dim) the
+// caller passes nullptr and the uniform `max_emb_dim` is used as `dim`.
 template <typename wgrad_t, typename weight_t, typename OptimizerFunc>
-__global__ void
-update4_padded_buffer_kernel(const uint32_t num_rows,
-                             const uint32_t grad_stride,
-                             const uint32_t value_stride, const wgrad_t *grads,
-                             weight_t *values, OptimizerFunc optimizer) {
+__global__ void update4_padded_buffer_kernel(
+    const uint32_t num_rows, const uint32_t grad_stride,
+    const uint32_t value_stride, const uint32_t max_emb_dim,
+    const wgrad_t *grads, weight_t *values, const int64_t *table_ids,
+    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
   const int warp_id_in_block = threadIdx.x / kWarpSize;
 
   for (uint32_t row = warp_num_per_block * blockIdx.x + warp_id_in_block;
        row < num_rows; row += gridDim.x * warp_num_per_block) {
+    uint32_t edim = table_emb_dims == nullptr
+                        ? max_emb_dim
+                        : (uint32_t)table_emb_dims[table_ids[row]];
     weight_t *weight_ptr = values + row * value_stride;
     const wgrad_t *grad_ptr = grads + row * grad_stride;
-    OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, grad_stride};
+    OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
+                                             max_emb_dim};
     optimizer.update4(input);
   }
 }
 
 template <typename wgrad_t, typename weight_t, typename OptimizerFunc>
-__global__ void
-update_padded_buffer_kernel(const uint32_t num_rows, const uint32_t grad_stride,
-                            const uint32_t value_stride, const wgrad_t *grads,
-                            weight_t *values, OptimizerFunc optimizer) {
+__global__ void update_padded_buffer_kernel(
+    const uint32_t num_rows, const uint32_t grad_stride,
+    const uint32_t value_stride, const uint32_t max_emb_dim,
+    const wgrad_t *grads, weight_t *values, const int64_t *table_ids,
+    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
   for (uint32_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+    uint32_t edim = table_emb_dims == nullptr
+                        ? max_emb_dim
+                        : (uint32_t)table_emb_dims[table_ids[row]];
     weight_t *weight_ptr = values + row * value_stride;
     const wgrad_t *grad_ptr = grads + row * grad_stride;
-    OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, grad_stride};
+    OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
+                                             max_emb_dim};
     optimizer.update(input);
   }
 }

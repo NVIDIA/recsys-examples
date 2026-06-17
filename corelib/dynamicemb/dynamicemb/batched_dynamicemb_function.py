@@ -1259,10 +1259,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
+                    padded_state = storage._state
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
                             unique_grads,
                             ctx.unique_values,
+                            unique_table_ids,
+                            padded_state.table_emb_dims,
                             ctx.emb_dim,
                             ctx.value_dim,
                         )

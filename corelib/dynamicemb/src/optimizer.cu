@@ -243,7 +243,7 @@ void launch_update_kernel_for_padded_buffer(
     GradType *grads, WeightType *values, OptimizerType opt,
     int64_t const num_rows, uint32_t const grad_stride,
     uint32_t const value_stride, uint32_t const emb_dim, bool all_dims_vec4,
-    int device_id,
+    int device_id, int64_t const *table_ids, int64_t const *table_emb_dims,
     std::function<float(int)> smem_size_f = [](int block_size) { return 0; }) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(device_id);
@@ -262,21 +262,24 @@ void launch_update_kernel_for_padded_buffer(
     }
     update4_padded_buffer_kernel<GradType, WeightType, OptimizerType>
         <<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-            num_rows, grad_stride, value_stride, grads, values, opt);
+            num_rows, grad_stride, value_stride, emb_dim, grads, values,
+            table_ids, table_emb_dims, opt);
   } else {
     int block_size =
         emb_dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : emb_dim;
     int grid_size = num_rows;
     update_padded_buffer_kernel<GradType, WeightType, OptimizerType>
         <<<grid_size, block_size, smem_size_f(block_size), stream>>>(
-            num_rows, grad_stride, value_stride, grads, values, opt);
+            num_rows, grad_stride, value_stride, emb_dim, grads, values,
+            table_ids, table_emb_dims, opt);
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                  int64_t emb_dim, int64_t value_dim,
-                                  float lr) {
+                                  at::Tensor table_ids,
+                                  at::Tensor table_emb_dims, int64_t emb_dim,
+                                  int64_t value_dim, float lr) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -289,20 +292,25 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
+  auto tid_ptr = get_pointer<int64_t>(table_ids);
+  auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
       SgdVecOptimizer<g_t, w_t> opt{lr};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
-          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id);
+          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
+          tid_ptr, ted_ptr);
     });
   });
 }
 
 void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                   int64_t emb_dim, int64_t value_dim, float lr,
-                                   float beta1, float beta2, float eps,
-                                   float weight_decay, uint32_t iter_num) {
+                                   at::Tensor table_ids,
+                                   at::Tensor table_emb_dims, int64_t emb_dim,
+                                   int64_t value_dim, float lr, float beta1,
+                                   float beta2, float eps, float weight_decay,
+                                   uint32_t iter_num) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -315,18 +323,23 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
+  auto tid_ptr = get_pointer<int64_t>(table_ids);
+  auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
       AdamVecOptimizer<g_t, w_t> opt{lr,  beta1,        beta2,
                                      eps, weight_decay, iter_num};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
-          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id);
+          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
+          tid_ptr, ted_ptr);
     });
   });
 }
 
 void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
+                                      at::Tensor table_ids,
+                                      at::Tensor table_emb_dims,
                                       int64_t emb_dim, int64_t value_dim,
                                       float lr, float eps) {
   int64_t num_rows = grads.size(0);
@@ -341,17 +354,22 @@ void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
+  auto tid_ptr = get_pointer<int64_t>(table_ids);
+  auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
       AdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
-          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id);
+          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
+          tid_ptr, ted_ptr);
     });
   });
 }
 
 void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
+                                       at::Tensor table_ids,
+                                       at::Tensor table_emb_dims,
                                        int64_t emb_dim, int64_t value_dim,
                                        float lr, float eps) {
   int64_t num_rows = grads.size(0);
@@ -366,12 +384,15 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
+  auto tid_ptr = get_pointer<int64_t>(table_ids);
+  auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
       RowWiseAdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
+          tid_ptr, ted_ptr,
           [](int block_size) { return block_size * sizeof(float); });
     });
   });
@@ -416,25 +437,28 @@ void bind_optimizer_kernel_op(py::module &m) {
 
   m.def("sgd_update_for_padded_buffer", &dyn_emb::sgd_update_for_padded_buffer,
         "SGD optimizer for contiguous padded buffer", py::arg("grads"),
-        py::arg("values"), py::arg("emb_dim"), py::arg("value_dim"),
-        py::arg("lr"));
+        py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
+        py::arg("emb_dim"), py::arg("value_dim"), py::arg("lr"));
 
   m.def("adam_update_for_padded_buffer",
         &dyn_emb::adam_update_for_padded_buffer,
         "Adam optimizer for contiguous padded buffer", py::arg("grads"),
-        py::arg("values"), py::arg("emb_dim"), py::arg("value_dim"),
-        py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
+        py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
+        py::arg("emb_dim"), py::arg("value_dim"), py::arg("lr"),
+        py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
         py::arg("weight_decay"), py::arg("iter_num"));
 
   m.def("adagrad_update_for_padded_buffer",
         &dyn_emb::adagrad_update_for_padded_buffer,
         "Adagrad optimizer for contiguous padded buffer", py::arg("grads"),
-        py::arg("values"), py::arg("emb_dim"), py::arg("value_dim"),
-        py::arg("lr"), py::arg("eps"));
+        py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
+        py::arg("emb_dim"), py::arg("value_dim"), py::arg("lr"),
+        py::arg("eps"));
 
   m.def("rowwise_adagrad_for_padded_buffer",
         &dyn_emb::rowwise_adagrad_for_padded_buffer,
         "Row Wise Adagrad optimizer for contiguous padded buffer",
-        py::arg("grads"), py::arg("values"), py::arg("emb_dim"),
-        py::arg("value_dim"), py::arg("lr"), py::arg("eps"));
+        py::arg("grads"), py::arg("values"), py::arg("table_ids"),
+        py::arg("table_emb_dims"), py::arg("emb_dim"), py::arg("value_dim"),
+        py::arg("lr"), py::arg("eps"));
 }
