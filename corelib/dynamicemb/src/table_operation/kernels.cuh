@@ -552,7 +552,7 @@ __global__ void table_erase_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int *__restrict__ bucket_sizes, int64_t batch,
     typename Table::KeyType const *__restrict__ input_keys,
-    int64_t const *__restrict__ table_ids, IndexType *__restrict__ indices) {
+    int64_t const *__restrict__ table_ids, IndexType *__restrict__ indices, bool const *__restrict__ mask) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -561,7 +561,13 @@ __global__ void table_erase_kernel(
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
-
+    // mask: if non-null, only erase positions where mask[i] is true.
+    // When mask-skipped, write -1 to indices so callers never read
+    // uninitialized values from skipped slots.
+    if (mask && !mask[i]) {
+      if (indices) indices[i] = -1;
+      continue;
+    }
     KeyType key = input_keys[i];
 
     int64_t hashcode = 0;

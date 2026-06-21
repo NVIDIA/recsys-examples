@@ -91,8 +91,8 @@ class MultiTableKVCounter(Counter):
         self.table_.insert(keys, table_ids, self.score_arg_, score_out=scores_out)
         return scores_out
 
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
-        self.table_.erase(keys, table_ids)
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor, mask=None) -> None:
+        self.table_.erase(keys, table_ids, mask=mask)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         return self.table_.memory_usage(mem_type)

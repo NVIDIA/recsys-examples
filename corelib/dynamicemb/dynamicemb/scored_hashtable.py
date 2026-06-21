@@ -168,6 +168,7 @@ class ScoredHashTable(abc.ABC):
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
     ) -> None:
         """
         Erase Keys
@@ -787,6 +788,7 @@ class LinearBucketTable(ScoredHashTable):
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Erase Keys
@@ -800,6 +802,8 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_sizes,
             keys,
             table_ids,
+            indices=None,
+            mask=mask,
         )
 
     def load(

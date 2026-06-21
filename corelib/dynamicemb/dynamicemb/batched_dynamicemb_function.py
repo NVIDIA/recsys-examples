@@ -381,6 +381,7 @@ def _prefetch_cache_path(
 
         has_new_in_miss = _bool_item(new_in_miss.any())
         if has_new_in_miss and admit_strategy is not None:
+
             new_keys_sub = miss_keys[new_in_miss]
             new_tids_sub = miss_tids[new_in_miss]
 
@@ -397,7 +398,7 @@ def _prefetch_cache_path(
 
             if _bool_item(admit_mask.any()):
                 admission_counter.erase(
-                    new_keys_sub[admit_mask], new_tids_sub[admit_mask]
+                    new_keys_sub, new_tids_sub, mask=admit_mask
                 )
                 keys_to_insert_mask[new_in_miss] = admit_mask
 
@@ -634,7 +635,7 @@ def _prefetch_hbm_direct_path(
             admitted_unique_positions = missing_indices[admit_mask]
 
             if admit_mask.any():
-                admission_counter.erase(admitted_keys, admitted_tids)
+                admission_counter.erase(missing_keys, missing_table_ids, mask=admit_mask)
 
             non_admit = ~admit_mask
             if non_admit.any():
