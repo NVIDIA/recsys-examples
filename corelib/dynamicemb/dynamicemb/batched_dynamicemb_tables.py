@@ -457,6 +457,18 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     optimizer_args: OptimizerArgs
 
+    def __new__(cls, *args, **kwargs):
+        # Dispatch to the fake subclass when DYNAMICEMB_FAKE_MODE is set.
+        # Only redirect when the user is constructing the base class itself,
+        # so explicit subclass construction is left untouched.
+        if cls is BatchedDynamicEmbeddingTablesV2:
+            from dynamicemb._fake import maybe_get_fake_class
+
+            fake_cls = maybe_get_fake_class()
+            if fake_cls is not None:
+                return super().__new__(fake_cls)
+        return super().__new__(cls)
+
     def __init__(
         self,
         table_options: List[DynamicEmbTableOptions],

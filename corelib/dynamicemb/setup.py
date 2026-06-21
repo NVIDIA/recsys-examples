@@ -103,7 +103,30 @@ def get_version():
     return version, sha
 
 
+def _skip_cuda_build() -> bool:
+    """Opt-in: skip building the CUDA C++ extension.
+
+    Set ``DYNAMICEMB_SKIP_CUDA_BUILD=1`` to install the Python-only portion
+    of the package on a host without CUDA Toolkit / nvcc. The resulting
+    install is only usable with ``DYNAMICEMB_FAKE_MODE=1`` at runtime,
+    which installs a ``sys.modules`` stub for ``dynamicemb_extensions``.
+    """
+    return os.environ.get("DYNAMICEMB_SKIP_CUDA_BUILD", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def get_extensions():
+    if _skip_cuda_build():
+        print(
+            "DYNAMICEMB_SKIP_CUDA_BUILD is set — skipping the CUDA extension build. "
+            "The installed package will require DYNAMICEMB_FAKE_MODE=1 at runtime."
+        )
+        return []
+
     extra_link_args = [
         "-Wl,--no-as-needed",
         "-lcuda",  # CUDA drive API
