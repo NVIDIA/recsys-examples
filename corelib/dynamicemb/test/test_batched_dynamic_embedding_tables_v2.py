@@ -1295,6 +1295,15 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def max_value_dim(self) -> int:
         return self._max_value_dim
 
+    def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
+        device = self.device if on_device else "cpu"
+        return torch.tensor(self._emb_dims, dtype=torch.int64, device=device)
+
+    def all_dims_vec4(self) -> bool:
+        return all(d % 4 == 0 for d in self._emb_dims) and all(
+            v % 4 == 0 for v in self._value_dims
+        )
+
     def init_optimizer_state(
         self,
     ) -> float:
