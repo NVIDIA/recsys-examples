@@ -287,6 +287,9 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
+  TORCH_CHECK(table_emb_dims.is_cuda(),
+              "table_emb_dims must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
@@ -318,6 +321,9 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
+  TORCH_CHECK(table_emb_dims.is_cuda(),
+              "table_emb_dims must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
@@ -348,6 +354,9 @@ void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
+  TORCH_CHECK(table_emb_dims.is_cuda(),
+              "table_emb_dims must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
@@ -378,6 +387,9 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
+  TORCH_CHECK(table_emb_dims.is_cuda(),
+              "table_emb_dims must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
