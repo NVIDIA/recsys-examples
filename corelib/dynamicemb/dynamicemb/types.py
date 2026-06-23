@@ -250,7 +250,6 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         kernel); otherwise it is on CPU. For multi-tier storage the dims come
         from the tier that produces the value buffer in :meth:`find`.
         """
-        pass
 
     @abc.abstractmethod
     def all_dims_vec4(self) -> bool:
@@ -261,7 +260,6 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         kernels must be used, so a vec4 store does not run past a row's
         optimizer state and corrupt the next state region.
         """
-        pass
 
     @abc.abstractmethod
     def init_optimizer_state(
