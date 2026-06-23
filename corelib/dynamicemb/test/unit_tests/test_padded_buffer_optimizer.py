@@ -62,7 +62,10 @@ def _build_padded_adam_buffer(dims, max_emb_dim, m_init, v_init, dtype, device):
 
     Returns ``(values, table_ids, table_emb_dims, value_dim)``.
     """
-    value_dim = max_emb_dim + 2 * max_emb_dim  # adam state = 2 * max_emb_dim
+    # Value row stride = emb(max_emb_dim) + m(max_emb_dim) + v(max_emb_dim).
+    # Each slot is reserved max_emb_dim wide, but only the row's own edim values
+    # are live -- the kernel reads/writes edim elements per slot (see layout above).
+    value_dim = 3 * max_emb_dim
     n = len(dims)
     values = torch.zeros(n, value_dim, dtype=dtype, device=device)
     for row, edim in enumerate(dims):
@@ -152,7 +155,7 @@ def test_adam_padded_buffer_matches_reference_with_grad(dims, dtype):
 
     m_init, v_init, w_init, g_val = 0.5, 0.25, 1.0, 0.7
 
-    value_dim = max_emb_dim + 2 * max_emb_dim
+    value_dim = 3 * max_emb_dim  # emb + m + v, each slot max_emb_dim wide
     n = len(dims)
     values = torch.zeros(n, value_dim, dtype=dtype, device=device)
     grads = torch.zeros(n, max_emb_dim, dtype=dtype, device=device)
