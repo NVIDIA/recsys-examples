@@ -1943,6 +1943,9 @@ class DynamicEmbStorage(Storage):
             return self._state.table_emb_dims
         return torch.tensor(self._state.table_emb_dims_cpu, dtype=torch.int64)
 
+    def all_dims_vec4(self) -> bool:
+        return self._state.all_dims_vec4
+
     def init_optimizer_state(self) -> float:
         return self._state.initial_optim_state
 
@@ -2033,6 +2036,11 @@ class HybridStorage(Storage):
         if on_device:
             return self._hbm.table_emb_dims
         return torch.tensor(self._hbm.table_emb_dims_cpu, dtype=torch.int64)
+
+    def all_dims_vec4(self) -> bool:
+        # HBM tier produces the value buffer in find(); its alignment governs
+        # whether the vec4 padded-buffer kernels are safe for all rows.
+        return self._hbm.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
         return self._hbm.initial_optim_state

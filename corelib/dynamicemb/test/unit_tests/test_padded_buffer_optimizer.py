@@ -28,6 +28,12 @@ each state occupied the full ``max_emb_dim`` width (m at ``max_emb_dim``, v at
 ``2*max_emb_dim``). For a table with ``edim < max_emb_dim`` this made the kernel
 write the velocity slot with the momentum (beta1) formula, corrupting v.
 
+A second corruption path is covered too: the vectorized (vec4) kernel writes m
+in 4-element chunks, so when a table's ``edim`` is not a multiple of 4 the final
+m store would spill into the start of v with the beta1 rule. ``all_dims_vec4``
+must therefore reflect *per-table* dims (as ``state.all_dims_vec4`` does), not
+just ``max_emb_dim``; a misaligned table must fall back to the scalar kernel.
+
 These tests build the buffer by hand for two tables of different dims and check
 that m and v land in the right place with the right update rule. They require a
 GPU + the compiled ``dynamicemb_extensions`` and are skipped otherwise.
@@ -39,6 +45,16 @@ import torch
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
 
 dynamicemb_extensions = pytest.importorskip("dynamicemb_extensions")
+
+
+def _all_dims_vec4(dims):
+    """Per-table vec4 alignment, mirroring create_table_state for Adam.
+
+    Adam value dim per table is ``3 * edim`` (emb + m + v), so vec4 is safe only
+    when every embedding dim (and hence value dim) is a multiple of 4.
+    """
+    value_dims = [3 * d for d in dims]
+    return all(d % 4 == 0 for d in dims) and all(v % 4 == 0 for v in value_dims)
 
 
 def _build_padded_adam_buffer(dims, max_emb_dim, m_init, v_init, dtype, device):
@@ -58,11 +74,21 @@ def _build_padded_adam_buffer(dims, max_emb_dim, m_init, v_init, dtype, device):
 
 
 @cuda
+@pytest.mark.parametrize(
+    "dims",
+    [
+        [8, 4],  # all dims multiple of 4 -> vec4 path
+        [8, 6],  # second table not vec4-aligned -> scalar path
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float32])
-def test_adam_padded_buffer_mixed_dims_velocity(dtype):
-    """v of the smaller table must use beta2, not beta1 (issue #419)."""
+def test_adam_padded_buffer_mixed_dims_velocity(dims, dtype):
+    """v of the smaller table must use beta2, not beta1 (issue #419).
+
+    Parametrized over both an all-vec4-aligned mix and a mix where the smaller
+    table is not 4-aligned, exercising both the vec4 and the scalar kernels.
+    """
     device = torch.device("cuda")
-    dims = [8, 4]  # max_emb_dim = 8, second table is smaller
     max_emb_dim = max(dims)
 
     lr = 0.1
@@ -90,6 +116,7 @@ def test_adam_padded_buffer_mixed_dims_velocity(dtype):
         table_emb_dims,
         max_emb_dim,
         value_dim,
+        _all_dims_vec4(dims),
         lr,
         beta1,
         beta2,
@@ -114,11 +141,11 @@ def test_adam_padded_buffer_mixed_dims_velocity(dtype):
 
 
 @cuda
+@pytest.mark.parametrize("dims", [[8, 4], [8, 6]])
 @pytest.mark.parametrize("dtype", [torch.float32])
-def test_adam_padded_buffer_matches_reference_with_grad(dtype):
+def test_adam_padded_buffer_matches_reference_with_grad(dims, dtype):
     """Full Adam step (nonzero grad) per row matches a torch reference."""
     device = torch.device("cuda")
-    dims = [8, 4]
     max_emb_dim = max(dims)
 
     lr, beta1, beta2, eps, weight_decay, iter_num = 0.1, 0.9, 0.999, 1e-8, 0.01, 3
@@ -151,6 +178,7 @@ def test_adam_padded_buffer_matches_reference_with_grad(dtype):
         table_emb_dims,
         max_emb_dim,
         value_dim,
+        _all_dims_vec4(dims),
         lr,
         beta1,
         beta2,

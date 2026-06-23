@@ -279,7 +279,8 @@ void launch_update_kernel_for_padded_buffer(
 void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                   at::Tensor table_ids,
                                   at::Tensor table_emb_dims, int64_t emb_dim,
-                                  int64_t value_dim, float lr) {
+                                  int64_t value_dim, bool all_dims_vec4,
+                                  float lr) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -288,7 +289,6 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
-  bool all_dims_vec4 = (emb_dim % 4 == 0);
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
@@ -308,8 +308,9 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
 void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    at::Tensor table_ids,
                                    at::Tensor table_emb_dims, int64_t emb_dim,
-                                   int64_t value_dim, float lr, float beta1,
-                                   float beta2, float eps, float weight_decay,
+                                   int64_t value_dim, bool all_dims_vec4,
+                                   float lr, float beta1, float beta2,
+                                   float eps, float weight_decay,
                                    uint32_t iter_num) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
@@ -319,7 +320,6 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
-  bool all_dims_vec4 = (emb_dim % 4 == 0);
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
@@ -341,7 +341,7 @@ void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                       at::Tensor table_ids,
                                       at::Tensor table_emb_dims,
                                       int64_t emb_dim, int64_t value_dim,
-                                      float lr, float eps) {
+                                      bool all_dims_vec4, float lr, float eps) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -350,7 +350,6 @@ void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
-  bool all_dims_vec4 = (emb_dim % 4 == 0);
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
@@ -371,7 +370,8 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                        at::Tensor table_ids,
                                        at::Tensor table_emb_dims,
                                        int64_t emb_dim, int64_t value_dim,
-                                       float lr, float eps) {
+                                       bool all_dims_vec4, float lr,
+                                       float eps) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -380,7 +380,6 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
-  bool all_dims_vec4 = (emb_dim % 4 == 0);
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
   int device_id = grads.device().index();
@@ -438,27 +437,28 @@ void bind_optimizer_kernel_op(py::module &m) {
   m.def("sgd_update_for_padded_buffer", &dyn_emb::sgd_update_for_padded_buffer,
         "SGD optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
-        py::arg("emb_dim"), py::arg("value_dim"), py::arg("lr"));
+        py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
+        py::arg("lr"));
 
   m.def("adam_update_for_padded_buffer",
         &dyn_emb::adam_update_for_padded_buffer,
         "Adam optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
-        py::arg("emb_dim"), py::arg("value_dim"), py::arg("lr"),
-        py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
+        py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
+        py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
         py::arg("weight_decay"), py::arg("iter_num"));
 
   m.def("adagrad_update_for_padded_buffer",
         &dyn_emb::adagrad_update_for_padded_buffer,
         "Adagrad optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
-        py::arg("emb_dim"), py::arg("value_dim"), py::arg("lr"),
-        py::arg("eps"));
+        py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
+        py::arg("lr"), py::arg("eps"));
 
   m.def("rowwise_adagrad_for_padded_buffer",
         &dyn_emb::rowwise_adagrad_for_padded_buffer,
         "Row Wise Adagrad optimizer for contiguous padded buffer",
         py::arg("grads"), py::arg("values"), py::arg("table_ids"),
         py::arg("table_emb_dims"), py::arg("emb_dim"), py::arg("value_dim"),
-        py::arg("lr"), py::arg("eps"));
+        py::arg("all_dims_vec4"), py::arg("lr"), py::arg("eps"));
 }

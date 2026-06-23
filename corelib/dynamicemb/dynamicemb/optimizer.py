@@ -147,6 +147,7 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         table_emb_dims: torch.Tensor,
         emb_dim: int,
         value_dim: int,
+        all_dims_vec4: bool,
     ) -> None:
         ...
 
@@ -206,6 +207,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         table_emb_dims: torch.Tensor,
         emb_dim: int,
         value_dim: int,
+        all_dims_vec4: bool,
     ) -> None:
         sgd_update_for_padded_buffer(
             grads,
@@ -214,6 +216,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             table_emb_dims,
             emb_dim,
             value_dim,
+            all_dims_vec4,
             self._opt_args.learning_rate,
         )
 
@@ -276,6 +279,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         table_emb_dims: torch.Tensor,
         emb_dim: int,
         value_dim: int,
+        all_dims_vec4: bool,
     ) -> None:
         adam_update_for_padded_buffer(
             grads,
@@ -284,6 +288,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             table_emb_dims,
             emb_dim,
             value_dim,
+            all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.beta1,
             self._opt_args.beta2,
@@ -362,6 +367,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         table_emb_dims: torch.Tensor,
         emb_dim: int,
         value_dim: int,
+        all_dims_vec4: bool,
     ) -> None:
         adagrad_update_for_padded_buffer(
             grads,
@@ -370,6 +376,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             table_emb_dims,
             emb_dim,
             value_dim,
+            all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.eps,
         )
@@ -437,6 +444,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         table_emb_dims: torch.Tensor,
         emb_dim: int,
         value_dim: int,
+        all_dims_vec4: bool,
     ) -> None:
         rowwise_adagrad_for_padded_buffer(
             grads,
@@ -445,6 +453,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             table_emb_dims,
             emb_dim,
             value_dim,
+            all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.eps,
         )

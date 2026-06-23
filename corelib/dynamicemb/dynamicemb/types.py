@@ -253,6 +253,17 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         pass
 
     @abc.abstractmethod
+    def all_dims_vec4(self) -> bool:
+        """Whether every per-table embedding dim and value dim is a multiple of 4.
+
+        When True the vectorized (vec4) optimizer / load / store kernels are safe
+        for all rows; otherwise some per-table dim is misaligned and the scalar
+        kernels must be used, so a vec4 store does not run past a row's
+        optimizer state and corrupt the next state region.
+        """
+        pass
+
+    @abc.abstractmethod
     def init_optimizer_state(
         self,
     ) -> float:

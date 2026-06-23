@@ -68,26 +68,28 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
 void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                   at::Tensor table_ids,
                                   at::Tensor table_emb_dims, int64_t emb_dim,
-                                  int64_t value_dim, float lr);
+                                  int64_t value_dim, bool all_dims_vec4,
+                                  float lr);
 
 void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    at::Tensor table_ids,
                                    at::Tensor table_emb_dims, int64_t emb_dim,
-                                   int64_t value_dim, float lr, float beta1,
-                                   float beta2, float eps, float weight_decay,
+                                   int64_t value_dim, bool all_dims_vec4,
+                                   float lr, float beta1, float beta2,
+                                   float eps, float weight_decay,
                                    uint32_t iter_num);
 
 void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                       at::Tensor table_ids,
                                       at::Tensor table_emb_dims,
                                       int64_t emb_dim, int64_t value_dim,
-                                      float lr, float eps);
+                                      bool all_dims_vec4, float lr, float eps);
 
 void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                        at::Tensor table_ids,
                                        at::Tensor table_emb_dims,
                                        int64_t emb_dim, int64_t value_dim,
-                                       float lr, float eps);
+                                       bool all_dims_vec4, float lr, float eps);
 
 } // namespace dyn_emb
 #endif // OPTIMIZER_H

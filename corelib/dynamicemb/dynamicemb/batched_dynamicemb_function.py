@@ -1264,6 +1264,11 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     # max_emb_dim offset using the row's own width. Provided
                     # uniformly across storage types via embedding_dims().
                     table_emb_dims = storage.embedding_dims(on_device=True)
+                    # all_dims_vec4 must reflect per-table dims, not just
+                    # max_emb_dim: a vec4 store on a row whose edim % 4 != 0 would
+                    # run past its m region into v. storage.all_dims_vec4() is the
+                    # per-table-correct flag used by load/store too.
+                    all_dims_vec4 = storage.all_dims_vec4()
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
                             unique_grads,
@@ -1272,6 +1277,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                             table_emb_dims,
                             ctx.emb_dim,
                             ctx.value_dim,
+                            all_dims_vec4,
                         )
                     pui = ctx.persisted_unique_indices
                     assert pui is not None
