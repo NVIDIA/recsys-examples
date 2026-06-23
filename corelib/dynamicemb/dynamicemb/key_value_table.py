@@ -1938,6 +1938,11 @@ class DynamicEmbStorage(Storage):
     def max_value_dim(self) -> int:
         return self._state.value_dim
 
+    def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
+        if on_device:
+            return self._state.table_emb_dims
+        return torch.tensor(self._state.table_emb_dims_cpu, dtype=torch.int64)
+
     def init_optimizer_state(self) -> float:
         return self._state.initial_optim_state
 
@@ -2021,6 +2026,13 @@ class HybridStorage(Storage):
 
     def max_value_dim(self) -> int:
         return self._hbm.value_dim
+
+    def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
+        # find() builds the value buffer from the HBM tier (load_from_flat(self._hbm)),
+        # and max_*_dim above also report the HBM tier, so its dims are authoritative.
+        if on_device:
+            return self._hbm.table_emb_dims
+        return torch.tensor(self._hbm.table_emb_dims_cpu, dtype=torch.int64)
 
     def init_optimizer_state(self) -> float:
         return self._hbm.initial_optim_state

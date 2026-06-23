@@ -1259,13 +1259,17 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
-                    padded_state = storage._state
+                    # Per-table embedding dims (on the CUDA device) let the
+                    # padded-buffer kernel place each row's optimizer state at the
+                    # max_emb_dim offset using the row's own width. Provided
+                    # uniformly across storage types via embedding_dims().
+                    table_emb_dims = storage.embedding_dims(on_device=True)
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
                             unique_grads,
                             ctx.unique_values,
                             unique_table_ids,
-                            padded_state.table_emb_dims,
+                            table_emb_dims,
                             ctx.emb_dim,
                             ctx.value_dim,
                         )
