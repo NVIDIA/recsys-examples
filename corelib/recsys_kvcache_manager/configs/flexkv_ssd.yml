@@ -2,7 +2,7 @@
 
 cpu_cache_gb: 0.2
 ssd_cache_gb: 0.5
-ssd_cache_dir: /home/scratch.noliu_gpu/ssd_cache
+ssd_cache_dir: /path/to/your/ssd_cache
 enable_gds: false
 enable_p2p_cpu: false
 enable_p2p_ssd: false
