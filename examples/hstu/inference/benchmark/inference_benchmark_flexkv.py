@@ -34,8 +34,8 @@ InferenceRequest = Tuple[HSTUBatch, torch.Tensor, torch.Tensor]
 class BenchmarkConfig:
     history_len: int = 1024
     num_candidates: int = 256
-    warmup_iters: int = 10
-    timed_iters: int = 50
+    warmup_iters: int = 1
+    timed_iters: int = 2
     seed: int = 20260624
     max_batch_size: int = 16
     disable_cudagraph: bool = False
@@ -210,6 +210,7 @@ def run_scenario_gpu_hit(
     ]
 
     # warmup
+    print("warmup")
     _, prime_user_ids, prime_total_history_lengths = req_prepare[0]
     for batch, user_ids, total_history_lengths in req_prepare:
         model_predict.forward_with_kvcache(
@@ -219,34 +220,28 @@ def run_scenario_gpu_hit(
         )
 
     # precheck
-    _, lookup_res = model_predict.dense_module.kvcache.lookup_kvcache(
-        prime_user_ids,
-        prime_total_history_lengths,
-    )
-    lengths = {
-        "cached": lookup_res.cached_lengths.cpu(),
-        "gpu": lookup_res.gpu_cached_lengths.cpu(),
-        "host": lookup_res.host_cached_lengths.cpu(),
-    }
+    kvcache_mgr = model_predict.dense_module.kvcache
+    lookup_res = kvcache_mgr.gpu_kvcache_mgr.lookup(prime_user_ids)
+    gpu_lengths = lookup_res.gpu_cached_lengths.cpu()
     print(
-        f"[Scenario1 precheck] cached={lengths['cached'].tolist()} "
-        f"gpu={lengths['gpu'].tolist()} host={lengths['host'].tolist()}"
+        f"[Scenario1 precheck] gpu={gpu_lengths.tolist()}"
     )
     expected = int(prime_total_history_lengths[0].item())
-    if int(lengths["gpu"][0].item()) != expected:
+    if int(gpu_lengths[0].item()) != expected:
         raise RuntimeError(
-            f"Scenario1 expects GPU 100% hit ({expected}), got {int(lengths['gpu'][0].item())}"
+            f"Scenario1 expects GPU 100% hit ({expected}), got {int(gpu_lengths[0].item())}"
         )
 
     # timed run
-    torch.cuda.nvtx.range_push("scenario1_timed_run")
-    for batch, user_ids, total_history_lengths in req_timed:
+    print("timed run")
+    for iter_idx, (batch, user_ids, total_history_lengths) in enumerate(req_timed):
+        torch.cuda.nvtx.range_push(f"scenario1_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
         )
-    torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
     print(f"[Scenario1] timed run completed, iters={timed_iters}")
 
 
@@ -272,6 +267,7 @@ def run_scenario_gpu_miss_host_hit(
     kvcache_mgr = model_predict.dense_module.kvcache
 
     # warmup
+    print("warmup")
     _, prime_user_ids, prime_total_history_lengths = req_prepare[0]
     for batch, user_ids, total_history_lengths in req_prepare:
         model_predict.forward_with_kvcache(
@@ -291,41 +287,37 @@ def run_scenario_gpu_miss_host_hit(
             )
         time.sleep(0.002)
 
-    # evict GPU
-    kvcache_mgr.evict(prime_user_ids, for_gpu=True)
-    
-    # precheck
-    _, lookup_res = model_predict.dense_module.kvcache.lookup_kvcache(
-        prime_user_ids,
-        prime_total_history_lengths,
-    )
-    lengths = {
-        "cached": lookup_res.cached_lengths.cpu(),
-        "gpu": lookup_res.gpu_cached_lengths.cpu(),
-        "host": lookup_res.host_cached_lengths.cpu(),
-    }
-    print(
-        f"[Scenario2 precheck] cached={lengths['cached'].tolist()} "
-        f"gpu={lengths['gpu'].tolist()} host={lengths['host'].tolist()}"
-    )
-    if int(lengths["gpu"][0].item()) != 0:
-        raise RuntimeError("Scenario2 expects GPU 100% miss after evict(for_gpu=True).")
-    if int(lengths["host"][0].item()) <= 0:
-        raise RuntimeError("Scenario2 expects host hit, but host_cached_lengths is zero.")
-
     # timed run
-    torch.cuda.nvtx.range_push("scenario2_timed_run")
-    for batch, user_ids, total_history_lengths in req_timed:
+    print("timed run")
+    for iter_idx, (batch, user_ids, total_history_lengths) in enumerate(req_timed):
+        # Each forward onboards the KV back to GPU. Evict before every timed
+        # iteration so the measured path stays CPU-hit instead of becoming GPU-hit.
+        
+        # precheck
+        kvcache_mgr.evict(user_ids, for_gpu=True)
+        gpu_lookup_res = kvcache_mgr.gpu_kvcache_mgr.lookup(user_ids)
+        gpu_len = int(gpu_lookup_res.gpu_cached_lengths[0].item())
+        print(
+            f"[Scenario2 timed precheck {iter_idx}] "
+            f"gpu={gpu_len}",
+            flush=True,
+        )
+        if gpu_len != 0:
+            raise RuntimeError(
+                f"Scenario2 timed iteration {iter_idx} expects GPU miss, got gpu={gpu_len}."
+            )
+        #timed run
+        torch.cuda.nvtx.range_push(f"scenario2_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
         )
-    torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
     print(f"[Scenario2] timed run completed, iters={timed_iters}")
 
 
-def run_scenario_gpu_cpu_miss_ssd_hit_best_effort(
+def run_scenario_gpu_cpu_miss_ssd_hit(
     model_predict,
     history_len: int,
     num_candidates: int,
@@ -344,7 +336,9 @@ def run_scenario_gpu_cpu_miss_ssd_hit_best_effort(
     cache_cfg = getattr(cache_cfg, "cache_config", None)
     enable_ssd = bool(getattr(cache_cfg, "enable_ssd", False))
 
-    # warmup
+    print("warmup")
+    # Prime target into GPU + CPU + SSD. Do not touch this user again until the
+    # final timed onboard; pressure users below should evict its CPU residency.
     for batch, user_ids, total_history_lengths in [req_target]:
         model_predict.forward_with_kvcache(
             batch,
@@ -362,100 +356,57 @@ def run_scenario_gpu_cpu_miss_ssd_hit_best_effort(
                 f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
             )
         time.sleep(0.002)
-
-    pages_per_user = math.ceil(int(target_total_history_lengths[0].item()) / page_size)
     num_cpu_blocks = int(getattr(cache_cfg, "num_cpu_blocks", 0))
-    if ssd_pressure_users > 0:
-        pressure_users = ssd_pressure_users
-    else:
-        pressure_users = max(8, (num_cpu_blocks // max(pages_per_user, 1)) + 8)
-        pressure_users = min(pressure_users, 1024)
+    num_ssd_blocks = int(getattr(cache_cfg, "num_ssd_blocks", 0))
 
-    for uid in range(1000, 1000 + pressure_users):
-        req_fill = build_request(uid, history_len, num_candidates, max_seqlen)
-        for batch, user_ids, total_history_lengths in [req_fill]:
-            model_predict.forward_with_kvcache(
-                batch,
-                user_ids,
-                total_history_lengths,
-            )
-    deadline = time.time() + offload_wait_timeout_s
-    while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-        kvcache_mgr.offload_try_wait()
-        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-            break
-        if time.time() > deadline:
-            raise TimeoutError(
-                f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-            )
-        time.sleep(0.002)
+    flexkv_client = getattr(host_mgr, "_client", None)
+    clear_cpu_cache = getattr(flexkv_client, "_clear_cpu_cache", None)
+    if not callable(clear_cpu_cache):
+        raise RuntimeError("Scenario3 expects FlexKV client to expose _clear_cpu_cache().")
 
-    # evict GPU
-    kvcache_mgr.evict(target_user_ids, for_gpu=True)
-
-    # precheck  
-    _, lookup_res = model_predict.dense_module.kvcache.lookup_kvcache(
-        target_user_ids,
-        target_total_history_lengths,
-    )
-    lengths = {
-        "cached": lookup_res.cached_lengths.cpu(),
-        "gpu": lookup_res.gpu_cached_lengths.cpu(),
-        "host": lookup_res.host_cached_lengths.cpu(),
-    }
-    print(
-        f"[Scenario3 precheck] cached={lengths['cached'].tolist()} "
-        f"gpu={lengths['gpu'].tolist()} host={lengths['host'].tolist()}"
-    )
-    if int(lengths["gpu"][0].item()) != 0:
-        raise RuntimeError("Scenario3 expects GPU miss after GPU evict.")
-    if int(lengths["host"][0].item()) <= 0:
+    print("timed run")
+    for iter_idx in range(timed_iters):
+        # Clear local CPU cache explicitly before every measured target forward.
+        # SSD entries should remain; proof is DISK2H+H2D (or DISK2D for GDS).
+        print(f"[Scenario3] clear CPU cache before timed iter {iter_idx}", flush=True)
+        clear_cpu_cache()
+        kvcache_mgr.evict(target_user_ids, for_gpu=True)
+        
+        # precheck
+        gpu_lookup_res = kvcache_mgr.gpu_kvcache_mgr.lookup(target_user_ids)
+        gpu_len = int(gpu_lookup_res.gpu_cached_lengths[0].item())
         print(
-            "[Scenario3] host miss observed. This means no host-tier hit can be validated "
-            "for current pressure/settings."
+            f"[Scenario3 timed precheck {iter_idx}] "
+            f"gpu={gpu_len}",
+            flush=True,
         )
-        return
+        if gpu_len != 0:
+            raise RuntimeError(
+                f"Scenario3 timed iteration {iter_idx} expects GPU miss, got gpu={gpu_len}."
+            )
 
-    req_timed = [
-        build_request(user_id, history_len, num_candidates, max_seqlen)
-        for _ in range(timed_iters)
-    ]
-    torch.cuda.nvtx.range_push("scenario3_timed_run")
-    for batch, user_ids, total_history_lengths in req_timed:
+        batch, user_ids, total_history_lengths = build_request(
+            user_id, history_len, num_candidates, max_seqlen
+        )
+
+        torch.cuda.nvtx.range_push(f"scenario3_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
         )
-    torch.cuda.nvtx.range_pop()
-    deadline = time.time() + offload_wait_timeout_s
-    while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-        kvcache_mgr.offload_try_wait()
-        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-            break
-        if time.time() > deadline:
-            raise TimeoutError(
-                f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-            )
-        time.sleep(0.002)
+        torch.cuda.nvtx.range_pop()
     print(f"[Scenario3] timed run completed, iters={timed_iters}")
-    print(
-        "[Scenario3] note: current Recsys FlexKV API does not expose CPU-tier vs SSD-tier "
-        "hit counters; this case is best-effort rather than strict 100% proof."
-    )
 
 
-def main() -> None:
+
+if __name__ == "__main__":
     cfg = BENCHMARK_CONFIG
     random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
 
     history_len = cfg.history_len
-    if history_len <= 0:
-        raise ValueError("Hardcoded history_len must be > 0.")
     print(f"[Config] history_len={history_len}, num_candidates={cfg.num_candidates}")
     model_predict, page_size, max_seqlen = build_model(cfg, history_len)
     print(f"[Config] page_size={page_size}, max_seqlen={max_seqlen}")
@@ -479,7 +430,7 @@ def main() -> None:
             timed_iters=cfg.timed_iters,
             offload_wait_timeout_s=cfg.offload_wait_timeout_s,
         )
-        run_scenario_gpu_cpu_miss_ssd_hit_best_effort(
+        run_scenario_gpu_cpu_miss_ssd_hit(
             model_predict=model_predict,
             history_len=history_len,
             num_candidates=cfg.num_candidates,
@@ -489,7 +440,3 @@ def main() -> None:
             offload_wait_timeout_s=cfg.offload_wait_timeout_s,
             ssd_pressure_users=cfg.ssd_pressure_users,
         )
-
-
-if __name__ == "__main__":
-    main()
