@@ -191,6 +191,9 @@ class DynamicEmbTableState:
     # Per-table value buffer base pointers on ``device``; refreshed on init and expand.
     table_ptrs_dev: torch.Tensor
     table_emb_dims: torch.Tensor
+    # Persistent host (CPU) copy of table_emb_dims as a tensor (the ``_cpu`` field
+    # below is the Python int list); long-lived so callers get a stable host tensor.
+    table_emb_dims_host: torch.Tensor
     table_value_dims: torch.Tensor
     table_emb_dims_cpu: List[int]
     table_value_dims_cpu: List[int]
@@ -279,6 +282,7 @@ def create_table_state(
     )
 
     table_emb_dims = torch.tensor(dims, dtype=torch.int64, device=device)
+    table_emb_dims_host = torch.tensor(dims, dtype=torch.int64)
     table_value_dims = torch.tensor(value_dims, dtype=torch.int64, device=device)
 
     key_index_map_caps = key_index_map.per_table_capacity_
@@ -330,6 +334,7 @@ def create_table_state(
         tables=tables,
         table_ptrs_dev=get_table_ptrs(tables, device),
         table_emb_dims=table_emb_dims,
+        table_emb_dims_host=table_emb_dims_host,
         table_value_dims=table_value_dims,
         table_emb_dims_cpu=dims,
         table_value_dims_cpu=value_dims,
@@ -1939,9 +1944,11 @@ class DynamicEmbStorage(Storage):
         return self._state.value_dim
 
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
-        if on_device:
-            return self._state.table_emb_dims
-        return torch.tensor(self._state.table_emb_dims_cpu, dtype=torch.int64)
+        return (
+            self._state.table_emb_dims
+            if on_device
+            else self._state.table_emb_dims_host
+        )
 
     def all_dims_vec4(self) -> bool:
         return self._state.all_dims_vec4
@@ -2033,9 +2040,11 @@ class HybridStorage(Storage):
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
         # find() builds the value buffer from the HBM tier (load_from_flat(self._hbm)),
         # and max_*_dim above also report the HBM tier, so its dims are authoritative.
-        if on_device:
-            return self._hbm.table_emb_dims
-        return torch.tensor(self._hbm.table_emb_dims_cpu, dtype=torch.int64)
+        return (
+            self._hbm.table_emb_dims
+            if on_device
+            else self._hbm.table_emb_dims_host
+        )
 
     def all_dims_vec4(self) -> bool:
         # HBM tier produces the value buffer in find(); its alignment governs
