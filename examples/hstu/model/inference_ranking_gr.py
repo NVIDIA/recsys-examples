@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 from typing import Dict
 
 import torch
@@ -21,6 +22,7 @@ from configs import InferenceHSTUConfig, RankingConfig
 from modules.inference_dense_module import InferenceDenseModule
 from modules.inference_embedding import InferenceEmbedding
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
+from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -139,21 +141,29 @@ class InferenceRankingGR(torch.nn.Module):
         batch: HSTUBatch,
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
+        kvcache_info=None,
+        skip_onboard: bool = False,
+        skip_offload: bool = False,
     ):
         with torch.inference_mode():
-            # lookup and allocate for kv cache
-            index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
-                user_ids,
-                total_history_lengths,
-            )
-            kvcache_metadata = self.dense_module.kvcache.allocate_kvcache(
-                index_meta, lookup_res
-            )
+            if kvcache_info is None:
+                # lookup and allocate for kv cache
+                index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
+                    user_ids,
+                    total_history_lengths,
+                )
+                kvcache_metadata = self.dense_module.kvcache.allocate_kvcache(
+                    index_meta, lookup_res
+                )
+            else:
+                index_meta, lookup_res, kvcache_metadata = kvcache_info
 
             # asynchronous kvdata onboard, overlapping with strip_cached and embedding lookup
-            self.dense_module.kvcache.onboard_launch(
-                index_meta, lookup_res, kvcache_metadata
-            )
+            onboard_handle = None
+            if not skip_onboard:
+                onboard_handle = self.dense_module.kvcache.onboard_launch(
+                    index_meta, lookup_res, kvcache_metadata
+                )
 
             old_cached_lengths = lookup_res.cached_lengths
             striped_batch = self.strip_cached_tokens(
@@ -165,6 +175,29 @@ class InferenceRankingGR(torch.nn.Module):
             embeddings = self.sparse_module(striped_batch.features)
             torch.cuda.nvtx.range_pop()
 
+            if (
+                not skip_onboard
+                and onboard_handle is not None
+                and onboard_handle.status != HostKVTaskStatus.SKIPPED
+                and onboard_handle.backend == "flexkv"
+            ):
+                torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait_full")
+                deadline = time.time() + 60.0
+                try:
+                    while True:
+                        wait_result = self.dense_module.kvcache.onboard_wait(
+                            index_meta, onboard_handle
+                        )
+                        if wait_result.ready:
+                            break
+                        if time.time() > deadline:
+                            raise TimeoutError(
+                                "FlexKV onboard_wait did not become ready within 60s."
+                            )
+                        time.sleep(0.001)
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
             kvcache_info = (index_meta, lookup_res, kvcache_metadata)
             logits = self.dense_module.forward_with_kvcache(
                 striped_batch,
@@ -172,6 +205,7 @@ class InferenceRankingGR(torch.nn.Module):
                 user_ids,
                 total_history_lengths,
                 kvcache_info,
+                skip_offload=skip_offload,
             )
 
         return logits
