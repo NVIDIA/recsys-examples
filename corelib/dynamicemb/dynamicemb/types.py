@@ -242,6 +242,26 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         pass
 
     @abc.abstractmethod
+    def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
+        """Per-table embedding dimensions, indexed by table id.
+
+        Returns an int64 tensor of shape ``(num_tables,)``. When ``on_device`` is
+        True the tensor lives on the storage's CUDA device (e.g. to pass to a
+        kernel); otherwise it is on CPU. For multi-tier storage the dims come
+        from the tier that produces the value buffer in :meth:`find`.
+        """
+
+    @abc.abstractmethod
+    def all_dims_vec4(self) -> bool:
+        """Whether every per-table embedding dim and value dim is a multiple of 4.
+
+        When True the vectorized (vec4) optimizer / load / store kernels are safe
+        for all rows; otherwise some per-table dim is misaligned and the scalar
+        kernels must be used, so a vec4 store does not run past a row's
+        optimizer state and corrupt the next state region.
+        """
+
+    @abc.abstractmethod
     def init_optimizer_state(
         self,
     ) -> float:

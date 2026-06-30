@@ -882,6 +882,13 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
 
+        # Persistent per-table emb-dim tensors (device + host) so embedding_dims()
+        # returns a long-lived tensor regardless of on_device.
+        self._emb_dims_dev = torch.tensor(
+            self._emb_dims, dtype=torch.int64, device=self.device
+        )
+        self._emb_dims_host = torch.tensor(self._emb_dims, dtype=torch.int64)
+
     def size(self) -> int:
         return len(self.dict)
 
@@ -1294,6 +1301,14 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
 
     def max_value_dim(self) -> int:
         return self._max_value_dim
+
+    def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
+        return self._emb_dims_dev if on_device else self._emb_dims_host
+
+    def all_dims_vec4(self) -> bool:
+        return all(d % 4 == 0 for d in self._emb_dims) and all(
+            v % 4 == 0 for v in self._value_dims
+        )
 
     def init_optimizer_state(
         self,
