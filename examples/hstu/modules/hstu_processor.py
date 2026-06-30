@@ -168,8 +168,6 @@ def hstu_preprocess_embeddings(
         contextual_max_seqlen = max(
             len(batch.contextual_feature_names), sum(contextual_max_seqlens)
         )
-        print(contextual_seqlen_offsets, sequence_embeddings_lengths_offsets, type(contextual_seqlen_offsets), type(sequence_embeddings_lengths_offsets))
-        print(contextual_max_seqlen, sequence_max_seqlen, type(contextual_max_seqlen), type(sequence_max_seqlen))
         (
             sequence_embeddings,
             sequence_embeddings_lengths,

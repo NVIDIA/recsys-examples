@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import paged_kvcache_ops
-import os
 import torch
 import torch.nn.functional as F
 import commons.ops.cuda_ops.fake_paged_kvcache_ops  # noqa: F401
@@ -75,12 +74,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
         ]
         self._max_seqlen = config.max_seq_len
         self._export_mode = self._resolve_export_mode(config)
-        self._export_skip_append_kvcache = self._export_env_flag(
-            "HSTU_EXPORT_SKIP_APPEND_KVCACHE", default=False
-        )
-        self._export_skip_paged_attention = self._export_env_flag(
-            "HSTU_EXPORT_SKIP_PAGED_ATTENTION", default=False
-        )
 
         dtype = (
             torch.bfloat16
@@ -172,13 +165,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
     @staticmethod
     def _resolve_export_mode(config: InferenceHSTUConfig) -> bool:
         return getattr(config, "export_mode", False)
-
-    @staticmethod
-    def _export_env_flag(name: str, default: bool) -> bool:
-        value = os.environ.get(name)
-        if value is None:
-            return default
-        return value.lower() not in ("0", "false", "off", "no")
 
     def uvqk_addmm_impl(self, input_data, num_tokens):
         if not self._export_mode and num_tokens >= 2048:  # fusion impl
@@ -355,46 +341,31 @@ class PagedHSTUInferLayer(torch.nn.Module):
 
         if kv_cache_metadata is not None:
             kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
-            if not (self._export_mode and self._export_skip_append_kvcache):
-                print("Running append_kvcache in export mode.")
-                kv_cache_table = torch.ops.paged_kvcache_ops.append_kvcache(
-                    key,
-                    value,
-                    kv_cache_metadata.batch_indices,
-                    kv_cache_metadata.position,
-                    jd.num_candidates_offsets[: batch_size + 1],
-                    kv_cache_metadata.new_history_nnz_cuda,
-                    kv_cache_table,
-                    kv_cache_metadata.kv_indices,
-                    kv_cache_metadata.kv_indptr,
-                    kv_cache_metadata.kv_last_page_len,
-                    0,  # NHD layout
-                )
-            else:
-                print("Skipping append_kvcache in export mode.")
+            kv_cache_table = torch.ops.paged_kvcache_ops.append_kvcache(
+                key,
+                value,
+                kv_cache_metadata.batch_indices,
+                kv_cache_metadata.position,
+                jd.num_candidates_offsets[: batch_size + 1],
+                kv_cache_metadata.new_history_nnz_cuda,
+                kv_cache_table,
+                kv_cache_metadata.kv_indices,
+                kv_cache_metadata.kv_indptr,
+                kv_cache_metadata.kv_last_page_len,
+                0,  # NHD layout
+            )
 
             if not self._export_mode and kv_cache_metadata.kv_onload_handle is not None:
                 kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)
-            if self._export_mode and self._export_skip_paged_attention:
-                print("Skipping paged attention in export mode.")
-                dt = query.dtype
-                jagged_attn_output = (
-                    query
-                    + key.flatten()[0].to(dt)
-                    + value.flatten()[0].to(dt)
-                    + kv_cache_table.flatten()[0].to(dt)
-                )
-            else:
-                print("Running paged attention in export mode.")
-                jagged_attn_output = self.hstu_attn_export_impl(
-                    query,
-                    key,
-                    value,
-                    jd,
-                    kv_cache_metadata,
-                    kv_cache_table,
-                    batch_size,
-                )
+            jagged_attn_output = self.hstu_attn_export_impl(
+                query,
+                key,
+                value,
+                jd,
+                kv_cache_metadata,
+                kv_cache_table,
+                batch_size,
+            )
         else:
             jagged_attn_output = hstu_attn_varlen_func(
                 query,

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import enum
 import gc
 import math
 import os
@@ -43,19 +42,17 @@ from commons.datasets.hstu_batch import HSTUBatch
 from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
-from configs import HSTUConfig, InferenceHSTUConfig, RankingConfig, get_inference_hstu_config
+from configs import HSTUConfig, InferenceHSTUConfig, get_inference_hstu_config
 from flexkv.common.config import CacheConfig, ModelConfig, UserConfig, update_default_config_from_user_config
 from flexkv.server.server import KVServer
 from megatron.core import parallel_state
 from model import get_ranking_model
-from model.inference_ranking_gr import _STRIP_CACHED_TOKENS_OP
+from model.export_kvcached_inference_ranking_gr import ExportKVCachedInferenceRankingGR
 from modules.inference_dense_module import InferenceDenseModule
 from modules.metrics import get_multi_event_metric_module
 from pynve.torch.nve_export import export_aot
 from recsys_kvcache_manager import register_fake_kvcache_manager_ops
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig, get_kvcache_config
-from recsys_kvcache_manager.kvcache_metadata import KVCacheMetadata
-from recsys_kvcache_manager.kvcache_utils import KVIndexMeta, KVLookupResult
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import NetworkArgs, TensorModelParallelArgs
@@ -208,44 +205,6 @@ def cleanup_single_rank_distributed():
         dist.destroy_process_group()
 
 
-class RunningMode(enum.Enum):
-    EVAL = "eval"
-    SIMULATE = "simulate"
-    EXPORT = "export"
-
-    def __str__(self):
-        return self.value
-
-
-def debug_print_flattened_export_args(batch, embeddings=None) -> None:
-    from torch.utils import _pytree as pytree
-
-    print("\n===== FLATTENED EXPORT ARGS DEBUG =====")
-    export_args = (batch,)
-    flat_leaves, tree_spec = pytree.tree_flatten(export_args)
-    print(f"Total flattened tensors: {len(flat_leaves)}")
-    print(f"Tree spec: {tree_spec}\n")
-
-    print("Batch structure:")
-    batch_flat, _ = pytree.tree_flatten(batch)
-    print(f"  Batch flattened count: {len(batch_flat)}")
-    for i, leaf in enumerate(batch_flat):
-        if isinstance(leaf, torch.Tensor):
-            print(f"    [{i}] Tensor: shape={leaf.shape}, dtype={leaf.dtype}")
-        else:
-            print(f"    [{i}] {type(leaf).__name__}: {leaf}")
-
-    # print(f"\nEmbeddings dict keys (order): {list(embeddings.keys())}")
-    # print(f"Embeddings flattened count: {len(flat_leaves) - len(batch_flat)}")
-    # embeddings_flat, _ = pytree.tree_flatten(embeddings)
-    # for i, leaf in enumerate(embeddings_flat):
-    #     if isinstance(leaf, torch.Tensor):
-    #         print(f"    [{i}] Tensor: shape={leaf.shape}, dtype={leaf.dtype}")
-    #     else:
-    #         print(f"    [{i}] {type(leaf).__name__}: {leaf}")
-    # print("===== END FLATTENED DEBUG =====\n")
-
-
 def get_inference_dataset_and_embedding_configs(
     disable_contextual_features: bool = False,
 ):
@@ -381,209 +340,6 @@ def make_export_kvcache_config(
     )
 
 
-class ExportKVCachedInferenceRankingGR(torch.nn.Module):
-    def __init__(
-        self,
-        sparse_module: torch.nn.Module,
-        dense_module: InferenceDenseModule,
-        kvcache_config: KVCacheConfig,
-    ):
-        super().__init__()
-        self.sparse_module = sparse_module
-        self.dense_module = dense_module
-        self.kvcache_config = kvcache_config
-        # self._kv_cache_tables: Optional[list[torch.Tensor]] = None
-
-        self.register_buffer(
-            "_offload_slot_mapping_sentinel",
-            torch.full((1,), -1, dtype=torch.int64),
-            persistent=False,
-        )
-
-    # @property
-    # def kv_cache_tables(self):
-    #     # if self._kv_cache_tables is None:
-    #     #     self._kv_cache_tables = torch.ops.kvcache_manager_ops.get_cache_tables(
-    #     #         self._offload_slot_mapping_sentinel.cpu()
-    #     #     )
-    #     # return self._kv_cache_tables
-    #     return None
-
-    def bfloat16(self):
-        self.dense_module.bfloat16()
-        return self
-
-    def half(self):
-        self.dense_module.half()
-        return self
-
-    def get_num_class(self):
-        return self.dense_module.get_num_class()
-
-    def get_num_tasks(self):
-        return self.dense_module.get_num_tasks()
-
-    def get_metric_types(self):
-        return self.dense_module.get_metric_types()
-
-    def load_checkpoint(self, checkpoint_dir):
-        if checkpoint_dir is None:
-            return
-
-        model_state_dict_path = os.path.join(
-            checkpoint_dir, "torch_module", "model.0.pth"
-        )
-        model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
-
-        self.sparse_module.load_checkpoint(checkpoint_dir, model_state_dict)
-        self.dense_module.load_state_dict(model_state_dict, strict=False)
-
-    def _lookup_result_from_ops(
-        self,
-        user_ids: torch.Tensor,
-        lookup_res,
-    ) -> KVLookupResult:
-        return KVLookupResult(
-            user_ids=user_ids,
-            cached_start_indices=lookup_res[0],
-            cached_lengths=lookup_res[1],
-            gpu_cached_start_indices=lookup_res[2],
-            gpu_cached_lengths=lookup_res[3],
-            host_cached_start_indices=lookup_res[4],
-            host_cached_lengths=lookup_res[5],
-            extra={"onboard_task_ids": lookup_res[6]},
-        )
-
-    def _kvcache_metadata_from_ops(self, alloc_result) -> KVCacheMetadata:
-        return KVCacheMetadata(
-            page_ids_gpu_buffer=alloc_result[0],
-            metadata_gpu_buffer=alloc_result[1],
-            kv_indices=alloc_result[0],
-            kv_indptr=alloc_result[2],
-            kv_last_page_len=alloc_result[3],
-            total_history_lengths=alloc_result[4],
-            total_history_offsets=alloc_result[5],
-            new_history_offsets=alloc_result[6],
-            batch_indices=alloc_result[7],
-            position=alloc_result[8],
-            new_history_nnz=alloc_result[9],
-            new_history_nnz_cuda=alloc_result[10],
-            kv_seqlens=alloc_result[11],
-            kv_seqlen_offsets=alloc_result[12],
-            kv_cache_table=None,
-            kv_onload_handle=None,
-            max_seqlen=self.kvcache_config.max_seq_len,
-        )
-
-    def _strip_cached_tokens(self, batch: HSTUBatch, cached_lengths: torch.Tensor):
-        num_context = len(batch.contextual_feature_names)
-        feature_order = list(range(num_context + 2))
-        lengths = batch.features.lengths()
-        cached_i64 = cached_lengths.to(device=lengths.device, dtype=torch.int64)
-        print(f"[INFO] Stripping cached tokens with feature_order={feature_order}, cached_lengths={cached_i64}")
-        print(batch.features.keys())
-        new_values, new_lengths = _STRIP_CACHED_TOKENS_OP(
-            batch.features.values(),
-            lengths,
-            batch.features.offsets(),
-            cached_i64,
-            feature_order,
-        )
-        batch.features = KeyedJaggedTensor(
-            values=new_values,
-            lengths=new_lengths,
-            keys=batch.features.keys(),
-        )
-        return batch
-
-    def forward(
-        self,
-        batch: HSTUBatch,
-        user_ids: torch.Tensor,
-        total_history_lengths: torch.Tensor,
-    ):
-        with torch.inference_mode():
-            print(f"[DEBUG][init] batch.features.lengths().view(-1, batch.batch_size).sum(dim=0): {batch.features.lengths().view(-1, batch.batch_size).sum(dim=0)}")
-            print(f"[DEBUG][init] total_history_lengths: {total_history_lengths}")
-            completed_offloads = torch.ops.kvcache_manager_ops.offload_reap_completed(
-                user_ids
-            )
-            lookup_res = torch.ops.kvcache_manager_ops.lookup(
-                user_ids,
-                total_history_lengths,
-                completed_offloads,
-            )
-            alloc_result = torch.ops.kvcache_manager_ops.allocate(
-                user_ids,
-                total_history_lengths,
-                lookup_res[1],
-                lookup_res[5],
-            )
-            kvcache_metadata = self._kvcache_metadata_from_ops(alloc_result)
-
-            onboard_slot_mappings = torch.ops.kvcache_manager_ops.onboard_launch(
-                user_ids,
-                total_history_lengths,
-                lookup_res,
-                alloc_result[0],
-                alloc_result[2],
-            )
-            onboard_task_ids = onboard_slot_mappings[2]
-
-            lookup_result = self._lookup_result_from_ops(user_ids, lookup_res)
-            print(f"[INFO] Lookup result: {lookup_result.cached_lengths}")
-            striped_batch = self._strip_cached_tokens(batch, lookup_result.cached_lengths)
-            embeddings = self.sparse_module(striped_batch.features)
-
-            jagged_data = self.dense_module._hstu_block._preprocessor(
-                embeddings=embeddings,
-                batch=striped_batch,
-                seq_start_position=lookup_result.cached_lengths.cuda(),
-            )
-            # torch.cuda.synchronize()
-            jagged_data.scaling_seqlen = self.dense_module._scaling_seqlen
-            kvcache_metadata.kv_seqlen_offsets = (
-                kvcache_metadata.total_history_offsets
-                + jagged_data.num_candidates_offsets
-            )
-            kvcache_metadata.kv_seqlens = (
-                kvcache_metadata.total_history_lengths + jagged_data.num_candidates
-            )
-            kvcache_metadata.kv_cache_table = torch.ops.kvcache_manager_ops.onboard_wait(
-                onboard_task_ids,
-                jagged_data.values,
-            )
-
-            num_tokens = striped_batch.features.values().shape[0]
-            print(f"[INFO] HSTU block {type(self.dense_module._hstu_block).__name__} forward with {num_tokens} tokens")
-            jagged_data.values = self.dense_module._hstu_block.predict(
-                striped_batch.batch_size,
-                num_tokens,
-                jagged_data.values,
-                jagged_data,
-                kvcache_metadata,
-                use_cudagraph=False,
-            )
-            print(f"[INFO] HSTU block forward completed, output shape: {jagged_data.values.shape}")
-
-            offload_task_ids = torch.ops.kvcache_manager_ops.offload_launch(
-                user_ids,
-                total_history_lengths,
-                lookup_res[1],
-                lookup_res[5],
-                lookup_res[2],
-                lookup_res[3],
-                alloc_result[0],
-                alloc_result[2],
-                [self._offload_slot_mapping_sentinel.cpu()],
-                jagged_data.values,
-            )
-            print(f"[INFO] Offload launch completed, toal history lengths: {total_history_lengths}, cached lengths: {lookup_result.cached_lengths}")
-
-            jagged_data = self.dense_module._hstu_block._postprocessor(jagged_data)
-            return self.dense_module._mlp(jagged_data.values), offload_task_ids
-
-
 def get_exportable_model_for_inference(
     dynamic_table_configs,
     trained_emb_table_sizes,
@@ -641,7 +397,6 @@ def get_exportable_model_for_inference(
 def export_inference_gr_ranking(
     checkpoint_dir: str,
     max_bs: int = 1,
-    debug_flattened_inputs: bool = False,
     stop_after_warmup: bool = False,
 ):
     def _split_model_outputs(outputs):
@@ -853,19 +608,6 @@ def export_inference_gr_ranking(
                 rebuilt_batch = export_model._rebuild_batch(
                     example_values, example_lengths, example_num_candidates
                 )
-            # assert rebuilt_batch.features.keys() == batch.features.keys(), (
-            #     "Wrapper rebuilt feature keys differ from original batch."
-            # )
-            # assert torch.equal(rebuilt_batch.features.values(), batch.features.values()), (
-            #     "Wrapper rebuilt feature values differ from original batch."
-            # )
-            # assert torch.equal(rebuilt_batch.features.lengths(), batch.features.lengths()), (
-            #     "Wrapper rebuilt feature lengths differ from original batch."
-            # )
-            # assert torch.equal(rebuilt_batch.num_candidates, batch.num_candidates), (
-            #     "Wrapper rebuilt num_candidates differ from original batch."
-            # )
-            # print("[INFO][L0 wrapper-rebuild-check] rebuilt batch matches tensor inputs")
 
             # get dynamic shapes (now keyed on the plain tensor inputs)
             sc = ShapesCollection()
@@ -879,10 +621,6 @@ def export_inference_gr_ranking(
             sc[total_history_lengths] = {0: dim_batch}
             dynamic_shapes = sc.dynamic_shapes(export_model, example_inputs)
             print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
-
-            if debug_flattened_inputs:
-                embeddings = None  # Placeholder for embeddings
-                debug_print_flattened_export_args(batch, embeddings)
 
             # export & aoti_compile_and_package
             export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
@@ -996,19 +734,6 @@ def export_inference_gr_ranking(
                         f"compiled offload task id shape={compiled_offload_shape}"
                     )
                     dump_idx += 1
-                    # ref_offload_shape = (
-                    #     tuple(ref_offload_task_ids.shape)
-                    #     if isinstance(ref_offload_task_ids, torch.Tensor)
-                    #     else None
-                    # )
-                    # print(
-                    #     f"    [Batch {dump_idx}] Check equal:",
-                    #     torch.max(torch.abs(logits - ref_logits)).item() <= 0.0625,
-                    # )
-                    # print(
-                    #     f"    [Batch {dump_idx}] Offload task id shapes: compiled={compiled_offload_shape}, eager={ref_offload_shape}"
-                    # )
-
                     eval_module(logits.cuda(), batch.labels.values())
 
             print(f"[INFO] Dumped {dump_idx} test batches to {dump_dir}.")
@@ -1019,63 +744,6 @@ def export_inference_gr_ranking(
                 + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
             )
 
-            # === Benchmark Compiled Model ===
-            # print("[INFO][benchmark]:")
-            # print(
-            #     "    Benchmark on GPU:",
-            #     torch.cuda.get_device_name(torch.cuda.current_device()),
-            # )
-            # import time
-
-            # compiled_time = []
-            # for _ in range(3):
-            #     torch.cuda.synchronize()
-            #     results = []
-            #     start = time.perf_counter()
-            #     with torch.inference_mode():
-            #         for b, user_ids, total_history_lengths in inputs:
-            #             compiled_outputs = compiled_model(
-            #                 (
-            #                     b.features.values(),
-            #                     b.features.lengths(),
-            #                     b.num_candidates,
-            #                     user_ids,
-            #                     total_history_lengths,
-            #                 )
-            #             )
-            #             logits, _ = _split_model_outputs(compiled_outputs)
-            #             results.append(logits)
-            #     torch.cuda.synchronize()
-            #     end = time.perf_counter()
-            #     compiled_time.append(end - start)
-            # print(
-            #     f"    Compiled model elapsed time: {sum(compiled_time) / len(compiled_time):.6f} seconds"
-            # )
-
-            # for item in results:
-            #     del item
-
-            # import time
-
-            # python_time = []
-            # for _ in range(3):
-            #     torch.cuda.synchronize()
-            #     results = []
-            #     start = time.perf_counter()
-            #     with torch.inference_mode():
-            #         for b, user_ids, total_history_lengths in inputs:
-            #             ref_outputs = model(b, user_ids, total_history_lengths)
-            #             ref_logits, _ = _split_model_outputs(ref_outputs)
-            #             results.append(ref_logits)
-            #     torch.cuda.synchronize()
-            #     end = time.perf_counter()
-            #     python_time.append(end - start)
-            # print(
-            #     f"    Python model elapsed time: {sum(python_time) / len(python_time):.6f} seconds"
-            # )
-
-            # for item in results:
-            #     del item
         finally:
             shutdown_flexkv_runtime_and_server(model)
 
@@ -1086,7 +754,6 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--max_bs", type=int, default=2)
-    parser.add_argument("--debug_flattened_inputs", action="store_true")
     parser.add_argument("--stop_after_warmup", action="store_true")
 
     args = parser.parse_args()
@@ -1102,7 +769,6 @@ if __name__ == "__main__":
     export_inference_gr_ranking(
         checkpoint_dir=args.checkpoint_dir,
         max_bs=args.max_bs,
-        debug_flattened_inputs=args.debug_flattened_inputs,
         stop_after_warmup=args.stop_after_warmup,
     )
     print("[INFO] Finished.")

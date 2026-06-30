@@ -13,6 +13,22 @@
 
 namespace kvcache_manager {
 
+namespace {
+
+#ifndef KVCACHE_MANAGER_FLEXKV_CLIENT_DEBUG
+#define KVCACHE_MANAGER_FLEXKV_CLIENT_DEBUG 0
+#endif
+
+void log_flexkv_client_message(const std::string& message) {
+#if KVCACHE_MANAGER_FLEXKV_CLIENT_DEBUG
+    std::cout << "[KVCACHE][flexkv_client] " << message << std::endl;
+#else
+    (void)message;
+#endif
+}
+
+} // namespace
+
 class FlexKVCppClient::Impl {
 public:
     explicit Impl(const std::string& serverAddr, int32_t dpClientId, int32_t tpSize)
@@ -32,8 +48,10 @@ public:
         send_sock_->connect(server_addr_);
         recv_port_ = create_recv_endpoint();
         recv_sock_->bind(recv_port_);
-        std::cout << "[KVCACHE][flexkv_client] connected server_addr=" << server_addr_
-              << " client_recv_port=" << recv_port_ << std::endl;
+        log_flexkv_client_message(
+            "connected server_addr=" + server_addr_
+            + " client_recv_port=" + recv_port_
+        );
     }
 
     ~Impl() {
@@ -69,16 +87,18 @@ public:
 
     std::vector<uint8_t> send_and_recv(const std::vector<uint8_t>& payload, int timeoutMs = 25000) {
         send_only(payload);
-        std::cout << "[KVCACHE][flexkv_client] waiting for response timeout_ms="
-                  << timeoutMs << std::endl;
+        log_flexkv_client_message(
+            "waiting for response timeout_ms=" + std::to_string(timeoutMs)
+        );
         zmq::pollitem_t items[] = {{recv_sock_->handle(), 0, ZMQ_POLLIN, 0}};
         const auto rc = zmq::poll(items, 1, std::chrono::milliseconds(timeoutMs));
         TORCH_CHECK(rc >= 0, "FlexKV poll failed");
         TORCH_CHECK(items[0].revents & ZMQ_POLLIN, "Timed out waiting for FlexKV response");
         zmq::message_t response;
         recv_sock_->recv(response, zmq::recv_flags::none);
-        std::cout << "[KVCACHE][flexkv_client] received response bytes="
-                  << response.size() << std::endl;
+        log_flexkv_client_message(
+            "received response bytes=" + std::to_string(response.size())
+        );
         const auto* begin = static_cast<const uint8_t*>(response.data());
         return std::vector<uint8_t>(begin, begin + response.size());
     }
@@ -114,21 +134,24 @@ void FlexKVCppClient::register_to_server() {
     if (impl_->registered_) {
         return;
     }
-    std::cout << "[KVCACHE][flexkv_client] register DP client begin dp="
-              << impl_->dp_client_id_ << " recv=" << impl_->recv_port_ << std::endl;
+    log_flexkv_client_message(
+        "register DP client begin dp=" + std::to_string(impl_->dp_client_id_)
+        + " recv=" + impl_->recv_port_
+    );
     impl_->send_only(encodeRegisterDPClientRequest(
         impl_->dp_client_id_,
         impl_->recv_port_,
         impl_->tp_size_));
     impl_->registered_ = true;
-    std::cout << "[KVCACHE][flexkv_client] register DP client sent" << std::endl;
+    log_flexkv_client_message("register DP client sent");
 }
 
 void FlexKVCppClient::start_server_and_register() {
-    std::cout << "[KVCACHE][flexkv_client] start request begin dp="
-              << impl_->dp_client_id_ << std::endl;
+    log_flexkv_client_message(
+        "start request begin dp=" + std::to_string(impl_->dp_client_id_)
+    );
     impl_->send_only(encodeStartRequest(impl_->dp_client_id_));
-    std::cout << "[KVCACHE][flexkv_client] start request sent" << std::endl;
+    log_flexkv_client_message("start request sent");
     register_to_server();
 }
 
@@ -245,8 +268,9 @@ void FlexKVCppClient::cancel(const std::vector<int64_t>& task_ids) {
 }
 
 bool FlexKVCppClient::is_ready() {
-    std::cout << "[KVCACHE][flexkv_client] is_ready request begin dp="
-              << impl_->dp_client_id_ << std::endl;
+    log_flexkv_client_message(
+        "is_ready request begin dp=" + std::to_string(impl_->dp_client_id_)
+    );
     return decodeIsReadyResponse(
         impl_->send_and_recv(encodeIsReadyRequest(impl_->dp_client_id_)));
 }

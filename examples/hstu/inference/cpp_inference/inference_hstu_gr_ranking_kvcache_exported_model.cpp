@@ -20,6 +20,22 @@
 
 namespace {
 
+#ifndef HSTU_KVCACHE_CPP_DEMO_DEBUG
+#define HSTU_KVCACHE_CPP_DEMO_DEBUG 0
+#endif
+
+#ifndef HSTU_KVCACHE_CPP_DEMO_CUDA_CHECK
+#define HSTU_KVCACHE_CPP_DEMO_CUDA_CHECK 0
+#endif
+
+void log_demo_debug(const std::string& message) {
+#if HSTU_KVCACHE_CPP_DEMO_DEBUG
+  std::cout << message << '\n';
+#else
+  (void)message;
+#endif
+}
+
 bool load_shared_library(const std::string& label, const std::string& path) {
   dlerror();
   void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
@@ -32,7 +48,7 @@ bool load_shared_library(const std::string& label, const std::string& path) {
     std::cerr << '\n';
     return false;
   }
-  std::cout << "[INFO] Loaded " << label << ": " << path << '\n';
+  log_demo_debug("[INFO] Loaded " + label + ": " + path);
   return true;
 }
 
@@ -84,7 +100,7 @@ std::string infer_default_paged_kvcache_ops_path(const char* argv0) {
 
 void try_load_fbgemm_operators() {
 #ifdef FBGEMM_GPU_AVAILABLE
-  std::cout << "[INFO] FBGEMM GPU library is linked.\n";
+  log_demo_debug("[INFO] FBGEMM GPU library is linked.");
 #else
   const char* fbgemm_so_paths[] = {
       "/usr/local/lib/python3.12/dist-packages/fbgemm_gpu/fbgemm_gpu_py.so",
@@ -98,7 +114,7 @@ void try_load_fbgemm_operators() {
     }
   }
   if (!loaded) {
-    std::cout << "[WARN] Could not load fbgemm_gpu_py.so. fbgemm ops may be unavailable.\n";
+    log_demo_debug("[WARN] Could not load fbgemm_gpu_py.so. fbgemm ops may be unavailable.");
   }
 #endif
 }
@@ -116,8 +132,9 @@ void try_load_fbgemm_hstu_experimental_operators() {
     }
   }
   if (!loaded) {
-    std::cout << "[WARN] Could not load fbgemm_gpu_experimental_hstu.so. "
-                 "HSTU experimental fbgemm ops may be unavailable.\n";
+    log_demo_debug(
+        "[WARN] Could not load fbgemm_gpu_experimental_hstu.so. "
+        "HSTU experimental fbgemm ops may be unavailable.");
   }
 }
 
@@ -223,7 +240,7 @@ void check_required_env() {
     const char* value = std::getenv(name);
     TORCH_CHECK(value != nullptr && std::string(value).size() > 0, "Missing required env var: ", name);
     if (std::string(name) == "SERVER_RECV_PORT" || std::string(name) == "GPU_REGISTER_PORT") {
-      std::cout << "[INFO] Env " << name << "=" << value << "\n";
+      log_demo_debug(std::string("[INFO] Env ") + name + "=" + value);
     }
   }
 }
@@ -241,17 +258,19 @@ void shutdown_kvcache_runtime() {
 }
 
 void init_kvcache_runtime() {
-  std::cout << "[INFO] Preflight kvcache_manager_ops::init_kvcache begin" << std::endl;
+  log_demo_debug("[INFO] Preflight kvcache_manager_ops::init_kvcache begin");
   auto dummy = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
   int64_t result = c10::Dispatcher::singleton()
       .findSchemaOrThrow("kvcache_manager_ops::init_kvcache", "")
       .typed<int64_t(at::Tensor)>()
       .call(dummy);
-  std::cout << "[INFO] Preflight kvcache_manager_ops::init_kvcache done result="
-            << result << std::endl;
+  log_demo_debug(
+      "[INFO] Preflight kvcache_manager_ops::init_kvcache done result="
+      + std::to_string(result));
 }
 
 void check_cuda_after(const char* label) {
+#if HSTU_KVCACHE_CPP_DEMO_CUDA_CHECK
   cudaError_t last_error = cudaGetLastError();
   if (last_error != cudaSuccess) {
     std::cerr << "[ERROR] CUDA last error after " << label << ": "
@@ -264,7 +283,10 @@ void check_cuda_after(const char* label) {
     throw std::runtime_error(
         std::string("CUDA synchronize failed after ") + label + ": " + cudaGetErrorString(sync_error));
   }
-  std::cout << "[INFO] CUDA synchronize ok after " << label << std::endl;
+  log_demo_debug(std::string("[INFO] CUDA synchronize ok after ") + label);
+#else
+  (void)label;
+#endif
 }
 
 bool run_one_batch(
@@ -294,17 +316,18 @@ bool run_one_batch(
       load_tensor(total_history_lengths_path).to(torch::kCPU, torch::kInt64).contiguous();
   auto ref_logits_cpu = load_tensor(compiled_logits_path).to(torch::kCPU).contiguous();
 
-  std::cout << "[INFO] Batch " << batch_idx << " loader.run begin" << std::endl;
+    log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) + " loader.run begin");
   std::vector<torch::Tensor> outputs = loader.run(
       {values, lengths, num_candidates, user_ids, total_history_lengths});
-  std::cout << "[INFO] Batch " << batch_idx << " loader.run returned outputs="
-            << outputs.size() << std::endl;
+    log_demo_debug(
+      "[INFO] Batch " + std::to_string(batch_idx)
+      + " loader.run returned outputs=" + std::to_string(outputs.size()));
   check_cuda_after("loader.run");
   TORCH_CHECK(!outputs.empty(), "Model returned no outputs.");
 
-  std::cout << "[INFO] Batch " << batch_idx << " logits copy to CPU begin" << std::endl;
+    log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) + " logits copy to CPU begin");
   torch::Tensor logits_cpu = outputs[0].to(torch::kCPU).contiguous();
-  std::cout << "[INFO] Batch " << batch_idx << " logits copy to CPU done" << std::endl;
+    log_demo_debug("[INFO] Batch " + std::to_string(batch_idx) + " logits copy to CPU done");
   torch::Tensor ref_cpu = ref_logits_cpu.to(logits_cpu.dtype()).contiguous();
   if (!logits_cpu.sizes().equals(ref_cpu.sizes())) {
     std::cerr << "[ERROR] Batch " << batch_idx << " shape mismatch: logits="
@@ -362,13 +385,14 @@ int main(int argc, char** argv) {
     load_required_libraries(cfg);
     init_kvcache_runtime();
 
-    std::cout << "\nLoading NVE layers from " << cfg.package_path << '\n';
+    std::cout << "Loading NVE layers from " << cfg.package_path << '\n';
     nve::LayerDirectory dir(cfg.package_path, cfg.device_index);
-    std::cout << "  Loaded " << dir.size() << " layer(s)\n\n";
+    std::cout << "  Loaded " << dir.size() << " layer(s)\n";
 
     const bool run_single_threaded = env_flag_enabled("KVCACHE_CPP_RUN_SINGLE_THREADED");
-    std::cout << "[INFO] AOTI run_single_threaded="
-              << (run_single_threaded ? "true" : "false") << std::endl;
+    log_demo_debug(
+      std::string("[INFO] AOTI run_single_threaded=")
+      + (run_single_threaded ? "true" : "false"));
 
     torch::inductor::AOTIModelPackageLoader loader(
         cfg.package_path + "/model.pt2",
@@ -378,8 +402,8 @@ int main(int argc, char** argv) {
         cfg.device_index);
 
     auto call_spec = loader.get_call_spec();
-    std::cout << "Input call spec:\n" << call_spec[0] << "\n\n";
-    std::cout << "Output call spec:\n" << call_spec[1] << "\n\n";
+    std::cout << "Input call spec:\n" << call_spec[0] << "\n";
+    std::cout << "Output call spec:\n" << call_spec[1] << "\n";
 
     std::vector<int> batch_indices;
     if (cfg.batch_index >= 0) {
@@ -392,7 +416,7 @@ int main(int argc, char** argv) {
     int passed = 0;
     int total = 0;
     for (int idx : batch_indices) {
-      std::cout << "\n[INFO] Running batch " << idx << "...\n";
+      std::cout << "[INFO] Running batch " << idx << "...\n";
       ++total;
       if (run_one_batch(loader, cfg.dump_dir, idx, device)) {
         ++passed;

@@ -10,7 +10,23 @@
 #define KVCACHE_MANAGER_ENABLE_SCOPED_CONTEXT_GUARD 0
 #endif
 
+#ifndef KVCACHE_MANAGER_CONTEXT_DEBUG
+#define KVCACHE_MANAGER_CONTEXT_DEBUG 0
+#endif
+
 namespace kvcache_manager {
+
+namespace {
+
+void log_kvcache_context_message(const std::string& message) {
+#if KVCACHE_MANAGER_CONTEXT_DEBUG
+    std::cout << "[KVCACHE][context] " << message << std::endl;
+#else
+    (void)message;
+#endif
+}
+
+} // namespace
 
 #if KVCACHE_MANAGER_ENABLE_SCOPED_CONTEXT_GUARD
 namespace {
@@ -54,18 +70,24 @@ thread_local std::shared_ptr<IKVCacheRuntime> KVCacheRuntimeContext::kvcache_man
 KVCacheRuntimeContext& KVCacheRuntimeContext::instance() {
     static KVCacheRuntimeContext context;
     if (!context.has_manager()) {
-        std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
-                  << " creating ExportKVCacheRuntime" << std::endl;
+        log_kvcache_context_message(
+            "thread=" + c10::str(std::this_thread::get_id())
+            + " creating ExportKVCacheRuntime"
+        );
         context.set_manager(std::make_shared<ExportKVCacheRuntime>());
-        std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
-                  << " ExportKVCacheRuntime ready" << std::endl;
+        log_kvcache_context_message(
+            "thread=" + c10::str(std::this_thread::get_id())
+            + " ExportKVCacheRuntime ready"
+        );
     }
     return context;
 }
 
 void KVCacheRuntimeContext::set_manager(std::shared_ptr<IKVCacheRuntime> manager) {
-    std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
-              << " set_manager manager=" << manager.get() << std::endl;
+    log_kvcache_context_message(
+        "thread=" + c10::str(std::this_thread::get_id())
+        + " set_manager manager=" + c10::str(manager.get())
+    );
     kvcache_manager_ = std::move(manager);
 }
 
@@ -86,8 +108,10 @@ std::shared_ptr<IKVCacheRuntime> KVCacheRuntimeContext::get_manager() {
 }
 
 void KVCacheRuntimeContext::clear_manager() {
-    std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
-              << " clear_manager manager=" << kvcache_manager_.get() << std::endl;
+    log_kvcache_context_message(
+        "thread=" + c10::str(std::this_thread::get_id())
+        + " clear_manager manager=" + c10::str(kvcache_manager_.get())
+    );
     kvcache_manager_.reset();
 }
 

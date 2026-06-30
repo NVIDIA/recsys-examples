@@ -11,75 +11,93 @@
 #include "interface_kvcache_runtime.h"
 
 TORCH_LIBRARY_FRAGMENT(kvcache_manager_ops, m) {
-    m.def("init_kvcache(Tensor dummy) -> int");
-    m.def("shutdown_runtime(Tensor dummy) -> ()");
-    m.def("lookup(Tensor user_ids, Tensor seqlens, Tensor sync_point) -> Tensor[]");
+    m.def("init_kvcache(Tensor ordering_tensor) -> int");
+    m.def("shutdown_runtime(Tensor ordering_tensor) -> ()");
+    m.def("lookup(Tensor user_ids, Tensor seqlens, Tensor ordering_tensor) -> Tensor[]");
     m.def("allocate(Tensor user_ids, Tensor seqlens, Tensor merged_cached_lengths, Tensor host_cached_lengths) -> Tensor[]");
     m.def("onboard_launch(Tensor user_ids, Tensor seqlens, Tensor[] lookup_results, Tensor kv_page_indices, Tensor kv_page_indptr) -> (Tensor, Tensor, Tensor)");
-    m.def("onboard_wait(Tensor task_ids, Tensor? dummy_dependency=None) -> Tensor[]");
-    m.def("offload_launch(Tensor user_ids, Tensor seqlens, Tensor merged_cached_lengths, Tensor host_cached_lengths, Tensor gpu_cached_startpos, Tensor gpu_cached_lengths, Tensor kv_page_indices, Tensor kv_page_indptr, Tensor[] slot_mappings, Tensor dummy_dependency) -> Tensor");
-    m.def("offload_reap_completed(Tensor dummy) -> Tensor");
-    m.def("get_cache_tables(Tensor dummy) -> Tensor[]");
+    m.def("onboard_wait(Tensor task_ids, Tensor? ordering_tensor=None) -> Tensor[]");
+    m.def("offload_launch(Tensor user_ids, Tensor seqlens, Tensor merged_cached_lengths, Tensor host_cached_lengths, Tensor gpu_cached_startpos, Tensor gpu_cached_lengths, Tensor kv_page_indices, Tensor kv_page_indptr, Tensor[] slot_mappings, Tensor ordering_tensor) -> Tensor");
+    m.def("offload_reap_completed(Tensor ordering_tensor) -> Tensor");
+    m.def("get_cache_tables(Tensor ordering_tensor) -> Tensor[]");
 
     m.def("offload_wait(Tensor task_ids) -> Tensor");
-    m.def("evict_kvcache(Tensor user_ids, bool evict_gpu_only, Tensor sync_point) -> Tensor");
+    m.def("evict_kvcache(Tensor user_ids, bool evict_gpu_only, Tensor ordering_tensor) -> Tensor");
 }
 
 namespace kvcache_manager {
 
 namespace {
 
+#ifndef KVCACHE_MANAGER_OP_DEBUG
+#define KVCACHE_MANAGER_OP_DEBUG 0
+#endif
+
 void log_op(const char* name, const char* phase) {
+#if KVCACHE_MANAGER_OP_DEBUG
     std::cout << "[KVCACHE][op] thread=" << std::this_thread::get_id()
               << " " << name << " " << phase << std::endl;
+#else
+    (void)name;
+    (void)phase;
+#endif
 }
 
 void log_tensor(const char* name, const at::Tensor& tensor) {
+#if KVCACHE_MANAGER_OP_DEBUG
     std::cout << "[KVCACHE][op]   " << name
               << " sizes=" << tensor.sizes()
               << " dtype=" << tensor.scalar_type()
               << " device=" << tensor.device()
               << std::endl;
+#else
+    (void)name;
+    (void)tensor;
+#endif
+}
+
+void log_message(const std::string& message) {
+#if KVCACHE_MANAGER_OP_DEBUG
+    std::cout << "[KVCACHE][op] " << message << std::endl;
+#else
+    (void)message;
+#endif
 }
 
 } // namespace
 
-int64_t init_kvcache(at::Tensor dummy) {
+int64_t init_kvcache(at::Tensor ordering_tensor) {
     // Force initialization of the runtime context and its manager before any operator calls.
     log_op("init_kvcache", "enter");
-    log_tensor("dummy", dummy);
+    log_tensor("ordering_tensor", ordering_tensor);
     (void)KVCacheRuntimeContext::instance().manager();
     log_op("init_kvcache", "exit");
     return 0;
 }
 
-void shutdown_runtime_impl(at::Tensor dummy) {
-    (void)dummy;
+void shutdown_runtime_impl(at::Tensor ordering_tensor) {
+    (void)ordering_tensor;
     log_op("shutdown_runtime", "enter");
     KVCacheRuntimeContext::instance().clear_manager();
     log_op("shutdown_runtime", "exit");
 }
 
-std::vector<at::Tensor> lookup_impl(at::Tensor user_ids, at::Tensor seqlens, at::Tensor sync_point) {
+std::vector<at::Tensor> lookup_impl(
+    at::Tensor user_ids,
+    at::Tensor seqlens,
+    at::Tensor ordering_tensor
+) {
     log_op("lookup", "enter");
     log_tensor("user_ids", user_ids);
     log_tensor("seqlens", seqlens);
-    log_tensor("sync_point", sync_point);
-    if (user_ids.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: user_ids is a CUDA tensor." << std::endl;
-        user_ids = user_ids.cpu();
-    }
-    if (seqlens.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: seqlens is a CUDA tensor." << std::endl;
-        seqlens = seqlens.cpu();
-    }
+    log_tensor("ordering_tensor", ordering_tensor);
     TORCH_CHECK(!user_ids.is_cuda(), "kvcache_manager_ops::lookup expects CPU tensors.");
     TORCH_CHECK(!seqlens.is_cuda(), "kvcache_manager_ops::lookup expects CPU tensors.");
-    (void)sync_point;
+    (void)ordering_tensor;
 
     auto runtime = KVCacheRuntimeContext::instance().manager();
     auto result = runtime->lookup_kvcache(user_ids, seqlens);
-    std::cout << "[KVCACHE][op] lookup exit outputs=" << result.size() << std::endl;
+    log_message("lookup exit outputs=" + std::to_string(result.size()));
     return result;
 }
 
@@ -91,32 +109,14 @@ allocate_impl(at::Tensor user_ids, at::Tensor seqlens, at::Tensor merged_cached_
     log_tensor("seqlens", seqlens);
     log_tensor("merged_cached_lengths", merged_cached_lengths);
     log_tensor("host_cached_lengths", host_cached_lengths);
-    if (user_ids.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: user_ids is a CUDA tensor." << std::endl;
-        user_ids = user_ids.cpu();
-    }
-    if (seqlens.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: seqlens is a CUDA tensor." << std::endl;
-        seqlens = seqlens.cpu();
-    }
-    if (merged_cached_lengths.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: merged_cached_lengths is a CUDA tensor." << std::endl;
-        merged_cached_lengths = merged_cached_lengths.cpu();
-    } else {
-        std::cout << "[KVCACHE][op] DEBUG: merged_cached_lengths is already a CPU tensor." << std::endl;
-    }
-    if (host_cached_lengths.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: host_cached_lengths is a CUDA tensor." << std::endl;
-        host_cached_lengths = host_cached_lengths.cpu();
-    } else {
-        std::cout << "[KVCACHE][op] DEBUG: host_cached_lengths is already a CPU tensor." << std::endl;
-    }
     TORCH_CHECK(!user_ids.is_cuda(), "kvcache_manager_ops::allocate expects CPU tensors.");
     TORCH_CHECK(!seqlens.is_cuda(), "kvcache_manager_ops::allocate expects CPU tensors.");
+    TORCH_CHECK(!merged_cached_lengths.is_cuda(), "kvcache_manager_ops::allocate expects CPU merged_cached_lengths tensor.");
+    TORCH_CHECK(!host_cached_lengths.is_cuda(), "kvcache_manager_ops::allocate expects CPU host_cached_lengths tensor.");
 
     auto runtime = KVCacheRuntimeContext::instance().manager();
     auto result = runtime->allocate_kvcache(user_ids, seqlens, merged_cached_lengths, host_cached_lengths);
-    std::cout << "[KVCACHE][op] allocate exit outputs=" << result.size() << std::endl;
+    log_message("allocate exit outputs=" + std::to_string(result.size()));
     return result;
 }
 
@@ -132,14 +132,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> onboard_launch_impl(
     log_tensor("seqlens", seqlens);
     log_tensor("kv_page_indices", kv_page_indices);
     log_tensor("kv_page_indptr", kv_page_indptr);
-    if (user_ids.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: user_ids is a CUDA tensor." << std::endl;
-        user_ids = user_ids.cpu();
-    }
-    if (seqlens.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: seqlens is a CUDA tensor." << std::endl;
-        seqlens = seqlens.cpu();
-    }
     TORCH_CHECK(!user_ids.is_cuda(), "kvcache_manager_ops::onboard_launch expects CPU tensors.");
     TORCH_CHECK(!seqlens.is_cuda(), "kvcache_manager_ops::onboard_launch expects CPU tensors.");
     TORCH_CHECK(lookup_results.size() == 7, "kvcache_manager_ops::onboard_launch expects 7 lookup result tensors.");
@@ -160,8 +152,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> onboard_launch_impl(
         slot_mapping_offsets.push_back(slot_mapping_offsets.back() + slot_mapping.size(0));
     }
 
-    std::cout << "[KVCACHE][op] onboard_launch exit slot_mappings=" << slot_mappings.size()
-              << " task_ids_sizes=" << task_ids.sizes() << std::endl;
+    log_message(
+        "onboard_launch exit slot_mappings=" + std::to_string(slot_mappings.size())
+        + " task_ids_sizes=" + c10::str(task_ids.sizes())
+    );
     return std::make_tuple(
         concat_slot_mappings,
         at::tensor(slot_mapping_offsets, at::dtype(torch::kInt64)),
@@ -171,26 +165,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> onboard_launch_impl(
 
 std::vector<at::Tensor> onboard_wait_impl(
     at::Tensor task_ids,
-    c10::optional<at::Tensor> dummy_dependency
+    c10::optional<at::Tensor> ordering_tensor
 ) {
     log_op("onboard_wait", "enter");
     log_tensor("task_ids", task_ids);
-    if (task_ids.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: task_ids is a CUDA tensor." << std::endl;
-        task_ids = task_ids.cpu();
-    } else {
-        std::cout << "[KVCACHE][op] DEBUG: task_ids is already a CPU tensor." << std::endl;
-    }
-    // if (dummy_dependency.has_value()) {
-    //     log_tensor("dummy_dependency", dummy_dependency.value());
+    // if (ordering_tensor.has_value()) {
+    //     log_tensor("ordering_tensor", ordering_tensor.value());
     // }
     TORCH_CHECK(!task_ids.is_cuda(), "kvcache_manager_ops::onboard_wait expects CPU tensors.");
-    (void)dummy_dependency;
+    (void)ordering_tensor;
 
     auto runtime = KVCacheRuntimeContext::instance().manager();
     runtime->onboard_kvcache_wait(task_ids);
     auto result = runtime->get_kvcache_tables();
-    std::cout << "[KVCACHE][op] onboard_wait exit cache_tables=" << result.size() << std::endl;
+    log_message("onboard_wait exit cache_tables=" + std::to_string(result.size()));
     return result;
 }
 
@@ -204,7 +192,7 @@ at::Tensor offload_launch_impl(
     at::Tensor kv_page_indices,
     at::Tensor kv_page_indptr,
     std::vector<at::Tensor> slot_mappings,
-    at::Tensor dummy_dependency
+    at::Tensor ordering_tensor
 ) {
     log_op("offload_launch", "enter");
     log_tensor("user_ids", user_ids);
@@ -215,20 +203,9 @@ at::Tensor offload_launch_impl(
     log_tensor("gpu_cached_lengths", gpu_cached_lengths);
     log_tensor("kv_page_indices", kv_page_indices);
     log_tensor("kv_page_indptr", kv_page_indptr);
-    std::cout << "[KVCACHE][op]   slot_mappings=" << slot_mappings.size() << std::endl;
-    if (user_ids.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: user_ids is a CUDA tensor." << std::endl;
-        user_ids = user_ids.cpu();
-    }
-    if (seqlens.is_cuda()) {
-        std::cout << "[KVCACHE][op] WARNING: seqlens is a CUDA tensor." << std::endl;
-        seqlens = seqlens.cpu();
-    }
-    std::cout << "[KVCACHE][op]   dummy_dependency=" << dummy_dependency.sizes() << std::endl;
-    cudaDeviceSynchronize();  // Ensure all previous CUDA operations are complete before proceeding
     TORCH_CHECK(!user_ids.is_cuda(), "kvcache_manager_ops::offload_launch expects CPU tensors.");
     TORCH_CHECK(!seqlens.is_cuda(), "kvcache_manager_ops::offload_launch expects CPU tensors.");
-    (void)dummy_dependency;
+    (void)ordering_tensor;
 
     auto runtime = KVCacheRuntimeContext::instance().manager();
     auto result = runtime->offload_kvcache_launch(
@@ -246,10 +223,10 @@ at::Tensor offload_launch_impl(
     return result;
 }
 
-at::Tensor offload_reap_completed_impl(at::Tensor dummy) {
+at::Tensor offload_reap_completed_impl(at::Tensor ordering_tensor) {
     log_op("offload_reap_completed", "enter");
-    log_tensor("dummy", dummy);
-    (void)dummy;
+    log_tensor("ordering_tensor", ordering_tensor);
+    (void)ordering_tensor;
     auto runtime = KVCacheRuntimeContext::instance().manager();
     auto result = runtime->offload_kvcache_reap_completed();
     log_tensor("reap_result", result);
@@ -257,12 +234,12 @@ at::Tensor offload_reap_completed_impl(at::Tensor dummy) {
     return result;
 }
 
-std::vector<at::Tensor> get_cache_tables_impl(at::Tensor dummy) {
+std::vector<at::Tensor> get_cache_tables_impl(at::Tensor ordering_tensor) {
     log_op("get_cache_tables", "enter");
-    (void)dummy;
+    (void)ordering_tensor;
     auto runtime = KVCacheRuntimeContext::instance().manager();
     auto result = runtime->get_kvcache_tables();
-    std::cout << "[KVCACHE][op] get_cache_tables exit cache_tables=" << result.size() << std::endl;
+    log_message("get_cache_tables exit cache_tables=" + std::to_string(result.size()));
     return result;
 }
 
@@ -284,11 +261,15 @@ at::Tensor offload_wait_impl(at::Tensor task_ids) {
     return reap_result;
 }
 
-at::Tensor evict_kvcache_impl(at::Tensor user_ids, bool evict_gpu_only, at::Tensor sync_point) {
+at::Tensor evict_kvcache_impl(
+    at::Tensor user_ids,
+    bool evict_gpu_only,
+    at::Tensor ordering_tensor
+) {
     log_op("evict_kvcache", "enter");
     log_tensor("user_ids", user_ids);
     TORCH_CHECK(!user_ids.is_cuda(), "kvcache_manager_ops::evict_kvcache expects CPU tensors.");
-    (void)sync_point;
+    (void)ordering_tensor;
 
     auto runtime = KVCacheRuntimeContext::instance().manager();
     runtime->evict_kvcache(user_ids, evict_gpu_only);
@@ -296,34 +277,6 @@ at::Tensor evict_kvcache_impl(at::Tensor user_ids, bool evict_gpu_only, at::Tens
     return at::empty({1}, at::dtype(torch::kInt32));  // return empty tensor as placeholder
 }
 
-// std::vector<at::Tensor> lookup_meta_impl(at::Tensor user_ids, at::Tensor seqlens) {
-//     return {
-//         at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//         at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//         at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//         at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//         at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//         at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//     };
-// }
-
-// std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>>
-// allocate_meta_impl(at::Tensor user_ids, at::Tensor seqlens, at::Tensor merged_cached_lengths, at::Tensor host_cached_lengths) {
-//     return std::make_tuple(
-//         {
-//             at::empty({0}, at::dtype(torch::kInt32).device(at::kCUDA)),
-//             at::empty({0}, at::dtype(torch::kInt32).device(at::kCUDA)),
-//         },
-//         {
-//             at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//             at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//             at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//             at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//             at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//             at::empty_like(user_ids, at::TensorOptions().dtype(at::kInt32)),
-//         }
-//     );
-// }
 
 } // namespace kvcache_manager
 
