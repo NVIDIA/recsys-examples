@@ -2,6 +2,8 @@
 #include "export_kvcache_runtime.h"
 
 #include <ATen/ATen.h>
+#include <iostream>
+#include <thread>
 #include <utility>
 
 #ifndef KVCACHE_MANAGER_ENABLE_SCOPED_CONTEXT_GUARD
@@ -51,12 +53,19 @@ thread_local std::shared_ptr<IKVCacheRuntime> KVCacheRuntimeContext::kvcache_man
 
 KVCacheRuntimeContext& KVCacheRuntimeContext::instance() {
     static KVCacheRuntimeContext context;
-    if (!context.has_manager())
+    if (!context.has_manager()) {
+        std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
+                  << " creating ExportKVCacheRuntime" << std::endl;
         context.set_manager(std::make_shared<ExportKVCacheRuntime>());
+        std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
+                  << " ExportKVCacheRuntime ready" << std::endl;
+    }
     return context;
 }
 
 void KVCacheRuntimeContext::set_manager(std::shared_ptr<IKVCacheRuntime> manager) {
+    std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
+              << " set_manager manager=" << manager.get() << std::endl;
     kvcache_manager_ = std::move(manager);
 }
 
@@ -77,6 +86,8 @@ std::shared_ptr<IKVCacheRuntime> KVCacheRuntimeContext::get_manager() {
 }
 
 void KVCacheRuntimeContext::clear_manager() {
+    std::cout << "[KVCACHE][context] thread=" << std::this_thread::get_id()
+              << " clear_manager manager=" << kvcache_manager_.get() << std::endl;
     kvcache_manager_.reset();
 }
 

@@ -43,7 +43,12 @@ from ops.triton_ops.triton_position import (  # type: ignore[attr-defined]
     triton_add_position_embeddings,
     triton_add_timestamp_positional_embeddings,
 )
-from torch.fx._symbolic_trace import is_fx_tracing
+from torch.fx._symbolic_trace import is_fx_symbolic_tracing
+
+
+@torch.fx.wrap
+def _should_run_eager_shape_checks() -> bool:
+    return not (torch.compiler.is_compiling() or is_fx_symbolic_tracing())
 
 
 @torch.fx.wrap
@@ -128,7 +133,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
             high_inds = _get_high_inds(
                 seq_lengths, self._position_embeddings_weight, num_targets, False
             )
-            if not is_fx_tracing():
+            if _should_run_eager_shape_checks():
                 _, D = seq_embeddings.shape
                 torch._assert(
                     seq_offsets.size(0) - 1 == high_inds.size(0),
@@ -153,7 +158,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
                 num_targets,
                 False,
             )
-            if not is_fx_tracing():
+            if _should_run_eager_shape_checks():
                 _, D = seq_embeddings.shape
                 torch._assert(
                     seq_offsets.size(0) - 1 == high_inds.size(0),

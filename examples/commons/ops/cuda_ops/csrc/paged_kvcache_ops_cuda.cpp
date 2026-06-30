@@ -20,12 +20,18 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
 #include <driver_types.h>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/ATen.h>
+#ifdef WITH_PYBIND11
 #include <torch/extension.h>
-#include <torch/serialize/tensor.h>
+#endif
+#include <torch/library.h>
 
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCache(DType* k_data,
@@ -88,14 +94,59 @@ cudaError_t GetPagedBatchIndicesPositions(
   cudaStream_t stream
 );
 
-void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
-                           at::Tensor positions, at::Tensor seqlen_offsets, 
-                           at::Tensor nnz_cuda, unsigned int nnz,
-                           at::Tensor paged_k_cache, at::Tensor paged_v_cache,
-                           at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           int64_t kv_layout, const int num_sms) {
-  // unsigned int batch_size = kv_last_page_len.size(0);
+namespace {
+
+int resolve_num_sms(const at::Device& device) {
+  const char* env_value = std::getenv("PAGED_KVCACHE_NUM_SMS");
+  if (env_value != nullptr && std::string(env_value).size() > 0) {
+    return std::stoi(env_value);
+  }
+
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  int device_index = device.index();
+  if (device_index < 0) {
+    auto status = cudaGetDevice(&device_index);
+    TORCH_CHECK(status == cudaSuccess,
+                "cudaGetDevice failed with error: ",
+                cudaGetErrorString(status));
+  }
+
+  cudaDeviceProp props;
+  auto status = cudaGetDeviceProperties(&props, device_index);
+  TORCH_CHECK(status == cudaSuccess,
+              "cudaGetDeviceProperties failed with error: ",
+              cudaGetErrorString(status));
+  return props.multiProcessorCount;
+}
+
+void check_cuda_status(cudaError_t status, const char* message) {
+  TORCH_CHECK(status == cudaSuccess, message, ": ", cudaGetErrorString(status));
+}
+
+} // namespace
+
+at::Tensor append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
+                                 at::Tensor positions, at::Tensor seqlen_offsets, 
+                                 at::Tensor nnz_cuda,
+                                 at::Tensor kv_cache_table,
+                                 at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
+                                 int64_t kv_layout) {
+  TORCH_CHECK(nnz_cuda.is_cuda(), "nnz_cuda must be a CUDA tensor");
+  TORCH_CHECK(nnz_cuda.scalar_type() == at::ScalarType::Int,
+              "nnz_cuda must have dtype int32, got ", nnz_cuda.scalar_type());
+  TORCH_CHECK(nnz_cuda.numel() == 1, "nnz_cuda must contain exactly one element");
+  auto paged_k_cache = kv_cache_table.select(1, 0);
+  auto paged_v_cache = kv_cache_table.select(1, 1);
+  const auto nnz = static_cast<unsigned int>(nnz_cuda.item<int32_t>());
+  if (nnz == 0) {
+    return kv_cache_table;
+  }
+  // TORCH_CHECK(nnz == append_key.size(0) - seqlen_offsets[-1].item<int32_t>(),  // skipped this check due to the D2H transfer overhead
+  //             "nnz must be equal to the number of tokens in append_key excluding skipped tokens summed as seqlen_offsets[-1]"
+  //             "got nnz=", nnz, " append_key.size(0)=", append_key.size(0), " seqlen_offsets[-1]=", seqlen_offsets[-1].item<int32_t>());
+
   auto device = append_key.device();
+  const auto num_sms = resolve_num_sms(device);
 
   unsigned int num_heads, page_size, head_dim;
   head_dim = paged_k_cache.size(3);
@@ -128,6 +179,7 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
+  // check_cuda_status(cudaGetLastError(), "AppendPagedKVCache found a pre-existing CUDA error before launch");
 
   cudaError_t status;
   switch (kv_scalar_dtype) {
@@ -166,8 +218,9 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
     default:
         TORCH_CHECK(false, "AppendPagedKVCache failed to dispatch with dtype ", kv_scalar_dtype);
   }
-  TORCH_CHECK(status == cudaSuccess,
-              "AppendPagedKVCache failed with error: ", cudaGetErrorString(status));
+  check_cuda_status(status, "AppendPagedKVCache launch failed");
+
+  return kv_cache_table;
 }
 
 void gather_paged_kv_cache(at::Tensor gather_kv_gpu_buffer,
@@ -264,8 +317,18 @@ void gather_paged_kv_cache_all_layers(uint16_t *gather_kv_gpu_buffer,
               "GatherPagedKVCacheAllLayers failed with error: ", cudaGetErrorString(status));
 }
 
+#ifdef WITH_PYBIND11
 
 PYBIND11_MODULE(paged_kvcache_ops, m) {
   m.def("append_kvcache", &append_paged_kv_cache, "append paged kv cache on GPU", py::call_guard<py::gil_scoped_release>());
   m.def("gather_kvcache", &gather_paged_kv_cache, "gather paged kv cache on GPU", py::call_guard<py::gil_scoped_release>());
+}
+#endif
+
+TORCH_LIBRARY_FRAGMENT(paged_kvcache_ops, m) {
+  m.def("append_kvcache(Tensor append_key, Tensor append_value, Tensor batch_indices, Tensor positions, Tensor seqlen_offsets, Tensor nnz_cuda, Tensor kv_cache_table, Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len, int kv_layout) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(paged_kvcache_ops, CUDA, m) {
+  m.impl("append_kvcache", &append_paged_kv_cache);
 }

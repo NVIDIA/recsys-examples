@@ -53,7 +53,7 @@ _ALL_EXT_MODULES = [
             "ops/cuda_ops/csrc/paged_kvcache_ops_kernel.cu",
         ],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"]
+            "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden", "-DWITH_PYBIND11=1"]
             + [
                 "-I/workspace/deps/nvcomp/include",
                 "-L/workspace/deps/nvcomp/lib",

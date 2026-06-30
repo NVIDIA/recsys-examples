@@ -1,17 +1,54 @@
+import json
 import os
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 import torch
+from torch.export import Dim
 from flexkv.server.server import KVServer
 from flexkv.common.config import (
     ModelConfig, CacheConfig, UserConfig,
     update_default_config_from_user_config, parse_path_list,
     GLOBAL_CONFIG_FROM_ENV,
 )
-
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+from recsys_kvcache_manager import register_fake_kvcache_manager_ops
+
 torch.ops.load_library(PACKAGE_ROOT / "build" / "kcache_manager_ops.so")
+
+
+def _dtype_env_value(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    if dtype == torch.float16:
+        return "float16"
+    raise ValueError(f"Unsupported dtype for export runtime env: {dtype}")
+
+
+def set_export_kvcache_runtime_env(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+) -> None:
+    env_values = {
+        "KVCACHE_MANAGER_NUM_LAYERS": model_config.num_layers,
+        "KVCACHE_MANAGER_NUM_KV_HEADS": model_config.num_kv_heads,
+        "KVCACHE_MANAGER_HEAD_SIZE": model_config.head_size,
+        "KVCACHE_MANAGER_TOKENS_PER_PAGE": cache_config.tokens_per_block,
+        "KVCACHE_MANAGER_TOKENS_PER_CHUNK": 128,
+        "KVCACHE_MANAGER_NUM_PRIMARY_CACHE_PAGES": 512,
+        "KVCACHE_MANAGER_NUM_BUFFER_PAGES": 0,
+        "KVCACHE_MANAGER_MAX_BATCH_SIZE": 8,
+        "KVCACHE_MANAGER_MAX_SEQUENCE_LENGTH": 2048,
+        "KVCACHE_MANAGER_DEVICE_IDX": torch.cuda.current_device(),
+        "KVCACHE_MANAGER_DTYPE": _dtype_env_value(model_config.dtype),
+    }
+    for name, value in env_values.items():
+        os.environ[name] = str(value)
 
 
 def _ipc_endpoint(name: str) -> str:
@@ -113,8 +150,125 @@ def get_config(config_path: str):
 
     return model_config, cache_config
 
+
+class KVCacheManagerTestModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("dummy", torch.zeros(0, dtype=torch.int64))
+    
+    def forward(self, seqlens, uids):
+        with torch.no_grad():
+            # Init kvcache manager context and manager before lookup
+            # torch.ops.kvcache_manager_ops.init_kvcache(self.dummy)
+            
+            # Lookup
+            lookup_res = torch.ops.kvcache_manager_ops.lookup(uids, seqlens, uids)
+            
+            # Allocate
+            alloc_result = torch.ops.kvcache_manager_ops.allocate(
+                uids, seqlens, lookup_res[1], lookup_res[5])
+
+            # # Offload launch
+            offload_task_ids = torch.ops.kvcache_manager_ops.offload_launch(
+                uids, seqlens, lookup_res[1], lookup_res[5], lookup_res[2], lookup_res[3], alloc_result[0], alloc_result[2], [torch.ones(1, dtype=torch.int64) * -1], self.dummy)
+
+            # # Reap completed offload tasks
+            reap_result = torch.ops.kvcache_manager_ops.offload_reap_completed(self.dummy)
+            reap_result2 = torch.ops.kvcache_manager_ops.offload_wait(offload_task_ids)
+
+            # Lookup
+            lookup_res_ = torch.ops.kvcache_manager_ops.lookup(uids, seqlens, reap_result2)
+
+            # Evict GPU cache only
+            evict_res = torch.ops.kvcache_manager_ops.evict_kvcache(uids, True, lookup_res_[0])
+
+            # Lookup
+            lookup_res2 = torch.ops.kvcache_manager_ops.lookup(uids, seqlens, evict_res)
+            # Allocate (new)
+            alloc_result2 = torch.ops.kvcache_manager_ops.allocate(
+                uids, seqlens, lookup_res2[1], lookup_res2[5])
+
+            # Onboard launch
+            onboard_slot_mappings = torch.ops.kvcache_manager_ops.onboard_launch(
+                uids, seqlens, lookup_res2, alloc_result2[0], alloc_result2[2])
+            masked_onboard_task_ids = onboard_slot_mappings[2]
+
+            # Onboard wait
+            cache_tables = torch.ops.kvcache_manager_ops.onboard_wait(
+                masked_onboard_task_ids,
+                alloc_result2[0],
+            )
+        
+        return lookup_res, alloc_result, offload_task_ids, reap_result, reap_result2, lookup_res_, evict_res, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
+
+
+def test_print(
+    uids, lookup_res, alloc_result, offload_task_ids, reap_result, reap_result2, lookup_res_, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
+):
+    # Lookup
+    print("[DEV] Lookup result:")
+    print(f"\tMerged cached startpos: {lookup_res[0]}")
+    print(f"\tMerged cached lengths: {lookup_res[1]}")
+    print(f"\tGPU cached startpos: {lookup_res[2]}")
+    print(f"\tGPU cached lengths: {lookup_res[3]}")
+    print(f"\tHost cached startpos: {lookup_res[4]}")
+    print(f"\tHost cached lengths: {lookup_res[5]}")
+            
+    # Allocate
+    print(f"[DEV] Allocate result:")
+    print(f"\tPage indices: {alloc_result[0]}")
+    print(f"\tPage indptr: {alloc_result[2]}")
+
+    # Offload launch
+    print(f"[DEV] Offload result:")
+    print(f"\tTask IDs: {offload_task_ids}")
+
+    # Reap completed offload tasks
+    print(f"[DEV] Offload reap result: {reap_result}, shape: {reap_result.shape}")
+    print(f"[DEV] Offload reap result: {reap_result2}, shape: {reap_result2.shape}")
+            
+    # Lookup
+    print("[DEV] Lookup result:")
+    print(f"\tMerged cached startpos: {lookup_res_[0]}")
+    print(f"\tMerged cached lengths: {lookup_res_[1]}")
+
+
+    print(f"\tGPU cached startpos: {lookup_res_[2]}")
+    print(f"\tGPU cached lengths: {lookup_res_[3]}")
+    print(f"\tHost cached startpos: {lookup_res_[4]}")
+    print(f"\tHost cached lengths: {lookup_res_[5]}")
+
+    # Evict GPU cache only
+    print("[DEV] Evicted GPU cache for user_ids:", uids)
+
+    # Lookup
+    print("[DEV] Lookup result:")
+    print(f"\tMerged cached startpos: {lookup_res2[0]}")
+    print(f"\tMerged cached lengths: {lookup_res2[1]}")
+    print(f"\tGPU cached startpos: {lookup_res2[2]}")
+    print(f"\tGPU cached lengths: {lookup_res2[3]}")
+    print(f"\tHost cached startpos: {lookup_res2[4]}")
+    print(f"\tHost cached lengths: {lookup_res2[5]}")
+
+    # Allocate (new)
+    print(f"[DEV] Allocate result:")
+    print(f"\tPage indices: {alloc_result2[0]}")
+    print(f"\tPage indptr: {alloc_result2[2]}")
+
+    # Onboard launch
+    print(f"[DEV] Onboard result:")
+    print(f"\tLaunched tasks: {lookup_res2[6]}")  # Onboard task IDs returned in lookup result
+    print(f"\tSlot mappings: {onboard_slot_mappings}")
+
+    # Onboard wait
+    print(f"[DEV] Onboard tasks completed: {lookup_res2[6]}")
+    print(f"[DEV] Cache tables after onboard wait: {len(cache_tables)} tensors")
+    return
+
+
 if __name__ == "__main__":
-    model_config, cache_config = get_config(str(PACKAGE_ROOT / "test" / "x_test_config.yml"))
+    model_config, cache_config = get_config(str(PACKAGE_ROOT / "test" / "bindings_test_config.yml"))
+    set_export_kvcache_runtime_env(model_config, cache_config)
     server_recv_port = _ipc_endpoint("flexkv_server_sock")
     gpu_register_port = server_recv_port + "_gpu_register"
     os.environ['SERVER_RECV_PORT'] = server_recv_port
@@ -126,10 +280,79 @@ if __name__ == "__main__":
         gpu_register_port=gpu_register_port,
         server_recv_port=server_recv_port,
         total_clients=1,
-        inherit_env=False)
+        inherit_env=True)
     print("[DEV] Started KVServer")
+    time.sleep(3)  # Wait a bit for server to be fully ready
 
-    tokens = torch.tensor([0, 1, 2, 3, ], dtype=torch.int64)
-    uids = torch.tensor([100], dtype=torch.int64)
-    x = torch.ops.kvcache_manager_ops.lookup(tokens, uids)
-    print(x)
+    test_model = KVCacheManagerTestModel()
+
+    # Warmup
+    tokens = torch.arange(0, 100, dtype=torch.int64)
+    uids = torch.tensor([11, 12], dtype=torch.int64)
+    seqlens = torch.tensor([tokens.size(0), tokens.size(0)], dtype=torch.int64)
+
+    (
+        lookup_res, alloc_result, offload_task_ids, reap_result, reap_result2,
+        lookup_res_, evict_res, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
+    ) = test_model(seqlens, uids)
+    del evict_res
+    test_print(
+        uids,
+        lookup_res, 
+        alloc_result, offload_task_ids, reap_result, reap_result2,
+        lookup_res_, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
+    )
+    print("\n" * 5)
+
+    # Export
+    register_fake_kvcache_manager_ops()
+
+    uids = torch.tensor([23, 24], dtype=torch.int64)
+    # num_tokens = Dim("num_tokens", min=1, max=40000)
+    batch = Dim("batch", min=1, max=8)
+    dynamic_shapes = {
+        "seqlens": {0: batch},
+        "uids": {0: batch},
+    }
+    
+    save_dir = PACKAGE_ROOT 
+    exported = torch.export.export(
+        test_model, (seqlens, uids), dynamic_shapes=dynamic_shapes)
+    torch._inductor.aoti_compile_and_package(
+        exported,
+        package_path=os.path.join(save_dir, "model.pt2"),
+        inductor_configs={},
+    )
+    print(f"[DEV] Exported and compiled model to {os.path.join(save_dir, 'model.pt2')}.")
+    print("\n" * 5)
+
+    # Test
+    export_dir = PACKAGE_ROOT
+    compiled_model = torch._inductor.aoti_load_package(
+        os.path.join(export_dir, "model.pt2")
+    )
+    print(f"[DEV] Loaded compiled model from {os.path.join(export_dir, 'model.pt2')}.")
+
+    seqlens = torch.tensor([100], dtype=torch.int64)
+    uids = torch.tensor([37], dtype=torch.int64)
+    with torch.no_grad():
+        (
+            lookup_res, alloc_result, offload_task_ids, reap_result, reap_result2,
+            lookup_res_, evict_res, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
+        ) = compiled_model((seqlens, uids))
+        del evict_res
+        test_print(
+            uids,
+            lookup_res, 
+            alloc_result, offload_task_ids, reap_result, reap_result2,
+            lookup_res_, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
+        )
+
+    server_handle.shutdown()
+    start_time = time.time()
+    while server_handle._is_alive():
+        time.sleep(1)
+        if time.time() - start_time > 10:
+            print("[ERROR] Server did not shut down within 10 seconds, forcing exit")
+            break
+    print("[DEV] KVServer shutdown complete")

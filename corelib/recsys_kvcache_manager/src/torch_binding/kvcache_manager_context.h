@@ -10,6 +10,7 @@ class __attribute__((visibility("default"))) KVCacheRuntimeContext {
 public:
     static KVCacheRuntimeContext& instance();
     std::shared_ptr<IKVCacheRuntime> manager() const;
+    void clear_manager();
 
 private:
     void set_manager(std::shared_ptr<IKVCacheRuntime> manager);
@@ -17,7 +18,6 @@ private:
     std::shared_ptr<IKVCacheRuntime> get_manager(
         
     );
-    void clear_manager();
 
 private:
     KVCacheRuntimeContext() = default;

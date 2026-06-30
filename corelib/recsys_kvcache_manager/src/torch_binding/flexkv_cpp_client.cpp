@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <unistd.h>
@@ -24,9 +25,15 @@ public:
           context_(std::make_shared<zmq::context_t>(2)),
           send_sock_(std::make_shared<zmq::socket_t>(*context_, zmq::socket_type::push)),
           recv_sock_(std::make_shared<zmq::socket_t>(*context_, zmq::socket_type::pull)) {
+        send_sock_->set(zmq::sockopt::linger, 0);
+        send_sock_->set(zmq::sockopt::immediate, 1);
+        send_sock_->set(zmq::sockopt::sndtimeo, 5000);
+        recv_sock_->set(zmq::sockopt::linger, 0);
         send_sock_->connect(server_addr_);
         recv_port_ = create_recv_endpoint();
         recv_sock_->bind(recv_port_);
+        std::cout << "[KVCACHE][flexkv_client] connected server_addr=" << server_addr_
+              << " client_recv_port=" << recv_port_ << std::endl;
     }
 
     ~Impl() {
@@ -56,17 +63,22 @@ public:
     void send_only(const std::vector<uint8_t>& payload) {
         zmq::message_t message(payload.size());
         std::memcpy(message.data(), payload.data(), payload.size());
-        send_sock_->send(message, zmq::send_flags::none);
+        const auto sent = send_sock_->send(message, zmq::send_flags::none);
+        TORCH_CHECK(sent.has_value(), "Timed out sending FlexKV request to ", server_addr_);
     }
 
     std::vector<uint8_t> send_and_recv(const std::vector<uint8_t>& payload, int timeoutMs = 25000) {
         send_only(payload);
+        std::cout << "[KVCACHE][flexkv_client] waiting for response timeout_ms="
+                  << timeoutMs << std::endl;
         zmq::pollitem_t items[] = {{recv_sock_->handle(), 0, ZMQ_POLLIN, 0}};
         const auto rc = zmq::poll(items, 1, std::chrono::milliseconds(timeoutMs));
         TORCH_CHECK(rc >= 0, "FlexKV poll failed");
         TORCH_CHECK(items[0].revents & ZMQ_POLLIN, "Timed out waiting for FlexKV response");
         zmq::message_t response;
         recv_sock_->recv(response, zmq::recv_flags::none);
+        std::cout << "[KVCACHE][flexkv_client] received response bytes="
+                  << response.size() << std::endl;
         const auto* begin = static_cast<const uint8_t*>(response.data());
         return std::vector<uint8_t>(begin, begin + response.size());
     }
@@ -102,17 +114,21 @@ void FlexKVCppClient::register_to_server() {
     if (impl_->registered_) {
         return;
     }
+    std::cout << "[KVCACHE][flexkv_client] register DP client begin dp="
+              << impl_->dp_client_id_ << " recv=" << impl_->recv_port_ << std::endl;
     impl_->send_only(encodeRegisterDPClientRequest(
         impl_->dp_client_id_,
         impl_->recv_port_,
         impl_->tp_size_));
     impl_->registered_ = true;
+    std::cout << "[KVCACHE][flexkv_client] register DP client sent" << std::endl;
 }
 
 void FlexKVCppClient::start_server_and_register() {
-    std::flush(std::cout);
-    auto x = encodeStartRequest(impl_->dp_client_id_);
+    std::cout << "[KVCACHE][flexkv_client] start request begin dp="
+              << impl_->dp_client_id_ << std::endl;
     impl_->send_only(encodeStartRequest(impl_->dp_client_id_));
+    std::cout << "[KVCACHE][flexkv_client] start request sent" << std::endl;
     register_to_server();
 }
 
@@ -229,6 +245,8 @@ void FlexKVCppClient::cancel(const std::vector<int64_t>& task_ids) {
 }
 
 bool FlexKVCppClient::is_ready() {
+    std::cout << "[KVCACHE][flexkv_client] is_ready request begin dp="
+              << impl_->dp_client_id_ << std::endl;
     return decodeIsReadyResponse(
         impl_->send_and_recv(encodeIsReadyRequest(impl_->dp_client_id_)));
 }
@@ -252,7 +270,8 @@ public:
     void send_only(const std::vector<uint8_t>& payload) {
         zmq::message_t message(payload.size());
         std::memcpy(message.data(), payload.data(), payload.size());
-        send_sock_->send(message, zmq::send_flags::dontwait);
+        const auto sent = send_sock_->send(message, zmq::send_flags::dontwait);
+        TORCH_CHECK(sent.has_value(), "Failed to send FlexKV GPU registration request to ", gpu_register_port_);
     }
 
     std::string gpu_register_port_;

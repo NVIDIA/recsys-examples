@@ -42,7 +42,7 @@ public:
     std::pair<int64_t, at::Tensor> get_match(
         const at::Tensor& token_ids,
         const std::optional<at::Tensor>& token_mask,
-        int layer_granularity = 0,
+        int layer_granularity = -1,
         const std::vector<std::string>& namespace_list = {});
 
     int64_t put_async(
@@ -55,7 +55,7 @@ public:
         const at::Tensor& token_ids,
         const at::Tensor& slot_mapping,
         const std::optional<at::Tensor>& token_mask,
-        int layer_granularity = 0,
+        int layer_granularity = -1,
         const std::vector<std::string>& namespace_list = {});
 
     std::vector<int64_t> launch_tasks(

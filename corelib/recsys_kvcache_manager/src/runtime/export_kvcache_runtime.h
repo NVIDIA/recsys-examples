@@ -35,17 +35,22 @@ public:
         at::Tensor kv_page_indptr
     ) override;
     void onboard_kvcache_wait(at::Tensor user_ids) override;
-    void offload_kvcache_launch(
+    at::Tensor offload_kvcache_launch(
         at::Tensor user_ids,
         at::Tensor seqlens,
         at::Tensor merged_cached_lengths,
         at::Tensor host_cached_lengths,
         at::Tensor gpu_cached_startpos,
         at::Tensor gpu_cached_lengths,
-        at::Tensor& task_ids,  // from `get_match` in lookup and reused in offloading only, returned as masked
-        std::vector<at::Tensor>& slot_mappings
+        at::Tensor kv_page_indices,
+        at::Tensor kv_page_indptr,
+        std::vector<at::Tensor> slot_mappings
     ) override;
-    void offload_kvcache_reap_completed() override;
+    at::Tensor offload_kvcache_reap_completed() override;
+    std::vector<at::Tensor> get_kvcache_tables() override;
+
+public:
+    void evict_kvcache(at::Tensor user_ids, bool evict_gpu_only) override;
 
 private:
     std::unique_ptr<kvcache::GPUKVCacheManagerImpl> gpu_kvcache_;
@@ -57,6 +62,9 @@ private:
 private:
     at::Tensor lookup_token_index_;  // in recsys only namespace matters, so we can pre-allocate a tensor for the token index in get_match.
     at::Tensor token_slot_mappings_in_page_;  // re-use for slot mapping building in onboard_kvcache_launch
+    at::Tensor cache_tensor_;
+    std::vector<at::Tensor> cache_tables_;
+    int num_layers_;
 };
 
 } // namespace kvcache_manager
