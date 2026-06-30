@@ -1,0 +1,118 @@
+# 优化 1：before vs. after: slot_mapping D2H offload_launch / onboard_launch
+
+`_build_slot_mappings` 改为仅 D2H `page_ids` + CPU numpy 展开；offload/onboard loop 去掉全量 `.to("cpu")`。 
+## 1. 理论收益
+- before: transfer_datasize = seq_len * (int64) = page_size * num_pages * (int64)
+- after : transfer_datasize = page_size * (int64)
+- 压缩比 : page_size
+
+## 2. offload_launch
+
+### 2.1 L1（step-op 总耗时）
+
+| seq_len | Before (ms) | After (ms) | Δ (ms) | Δ (%) |
+| --- | --- | --- | --- | --- |
+| 1024 | 6.682 | 3.268 | **-3.414** | **-51.1%** |
+| 2048 | 7.192 | 3.958 | **-3.234** | **-45.0%** |
+| 4096 | 7.948 | 5.145 | **-2.803** | **-35.3%** |
+
+### 2.2 L2（offload_launch 内子函数）
+
+| L2 function | seq_len | Before (ms) | After (ms) | Δ (ms) | Δ (%) |
+| --- | --- | --- | --- | --- | --- |
+| `recsys.gpu.acquire_offload_pages` | 1024 | 0.098 | 0.088 | -0.010 | -10.2% |
+| | 2048 | 0.093 | 0.094 | +0.001 | +1.1% |
+| | 4096 | 0.102 | 0.097 | -0.005 | -4.9% |
+| `recsys.host._build_slot_mappings` | 1024 | 3.329 | 0.857 | **-2.472** | **-74.3%** |
+| | 2048 | 3.303 | 1.129 | **-2.174** | **-65.8%** |
+| | 4096 | 3.790 | 2.109 | **-1.681** | **-44.4%** |
+| `flexkv.client.put_async` | 1024 | 2.529 | 2.055 | **-0.474** | **-18.7%** |
+| | 2048 | 2.911 | 2.407 | **-0.504** | **-17.3%** |
+| | 4096 | 3.192 | 2.601 | **-0.591** | **-18.5%** |
+
+---
+
+## 3. onboard_launch
+
+### 3.1 L1（step-op 总耗时）
+
+| seq_len | Before (ms) | After (ms) | Δ (ms) | Δ (%) |
+| --- | --- | --- | --- | --- |
+| 1024 | 1.306 | 1.283 | -0.023 | -1.8% |
+| 2048 | 1.380 | 1.537 | **+0.157** | **+11.4%** |
+| 4096 | 1.424 | 1.987 | **+0.563** | **+39.5%** |
+
+### 3.2 L2（onboard_launch 内子函数）
+
+| L2 function | seq_len | Before (ms) | After (ms) | Δ (ms) | Δ (%) |
+| --- | --- | --- | --- | --- | --- |
+| `recsys.host._build_slot_mappings` | 1024 | 0.630 | 0.766 | +0.136 | +21.6% |
+| | 2048 | 0.623 | 0.953 | **+0.330** | **+53.0%** |
+| | 4096 | 0.615 | 1.376 | **+0.761** | **+123.7%** |
+| `flexkv.client.launch` | 1024 | 0.259 | 0.246 | -0.013 | -5.0% |
+| | 2048 | 0.311 | 0.299 | -0.012 | -3.9% |
+| | 4096 | 0.324 | 0.308 | -0.016 | -4.9% |
+
+---
+
+## 4. Conclusion
+- **offload_launch 收益显著。** L1 在 1024/2048/4096 上下降 35–51%（2048：7.19 → 3.96 ms）。主要来自 `_build_slot_mappings` L2 下降 44–74%，以及 `put_async` L2 下降约 17–19%（slot 已在 CPU，省去 loop 内全量 `.to("cpu")`）。
+- **onboard_launch：看 L1 变化不大，看 slot 子阶段 optimized 略优。** `_build_slot_mappings` L2 在 2048 上 0.62 → 0.95 ms（+53%），主因是 baseline 的 sync/D2H 落在 **未单独打 NVTX 的 loop 代码** 里（`slot_d2h` ≈ 0.32 ms）。子阶段合计：baseline build+`slot_d2h` ≈ 1.43 ms，optimized `page_ids_d2h`+`cpu_expand` ≈ 1.02 ms。
+- **继续优化：** 通过分析 timeline发现，v1 虽把 D2H 量从整段 slot 压到 `page_ids`，但实现仍是 **每个 seq 各做一次 `page_ids.to(cpu)`**（8 次小 D2H + 多次 sync），且在 CPU 上用 **numpy 逐 page `arange` 拼接** 展开 slot。子阶段 profiling（`page_ids_d2h` + `cpu_expand`）显示：`cpu_expand` 在 2048 上约 **0.76 ms/步**，占 build 内大头；8 次 per-seq D2H 的 API/sync 开销也偏高。因此 v2 改为 **整批 `kv_indices`/`kv_indptr` 一次 D2H**，并用 **torch CPU 广播** 做向量化 expand，详见 §5。
+---
+<!-- - **offload vs onboard 差异来自 GPU 状态：** step1 刚做完 8 层 `gpu.put`，GPU 更忙，baseline `_build_slot_mappings` 在 offload 上偏高；step3 前已 evict，GPU 相对空闲，baseline onboard 本身偏低，故 L1 收益不明显。 -->
+
+
+## 5. 进一步优化 v2：bulk D2H + 向量化 expand
+
+在 §2–§3「After (v1)」基础上进一步改动：整批 `kv_indices`/`kv_indptr` 一次 D2H + torch CPU 广播 expand（去掉 per-seq `.to(cpu)` 与 numpy for-loop）。
+ 
+> 测试：3 次独立 `run_full_profiling.sh`；**下表 After v2 列为三次 profiling 的 mean**。  
+
+### 5.1 offload_launch
+
+#### L1（step-op 总耗时）
+
+| seq_len | Before (ms) | After v1 (ms) | After v2 (ms) | vs Before (ms) | vs v1 (ms) | vs Before (%) | vs v1 (%) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1024 | 6.682 | 3.268 | 3.132 | **-3.550** | -0.136 | **-53.1%** | -4.2% |
+| 2048 | 7.192 | 3.958 | 3.793 | **-3.399** | -0.165 | **-47.3%** | -4.2% |
+| 4096 | 7.948 | 5.145 | 4.314 | **-3.634** | **-0.831** | **-45.7%** | **-16.1%** |
+
+#### L2（offload_launch 内子函数）
+
+| L2 function | seq_len | Before (ms) | After v1 (ms) | After v2 (ms) | vs Before (ms) | vs v1 (ms) | vs Before (%) | vs v1 (%) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `recsys.host._build_slot_mappings` | 1024 | 3.329 | 0.857 | 0.404 | **-2.925** | **-0.453** | **-87.9%** | **-52.9%** |
+| | 2048 | 3.303 | 1.129 | 0.489 | **-2.814** | **-0.640** | **-85.2%** | **-56.7%** |
+| | 4096 | 3.790 | 2.109 | 0.981 | **-2.809** | **-1.128** | **-74.1%** | **-53.5%** |
+| `flexkv.client.put_async` | 1024 | 2.529 | 2.055 | 2.261 | -0.268 | +0.206 | -10.6% | +10.0% |
+| | 2048 | 2.911 | 2.407 | 2.743 | -0.168 | +0.336 | -5.8% | +14.0% |
+| | 4096 | 3.192 | 2.601 | 2.805 | -0.387 | +0.204 | -12.1% | +7.8% |
+
+### 5.2 onboard_launch
+
+#### L1（step-op 总耗时）
+
+| seq_len | Before (ms) | After v1 (ms) | After v2 (ms) | vs Before (ms) | vs v1 (ms) | vs Before (%) | vs v1 (%) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1024 | 1.306 | 1.283 | 1.229 | -0.077 | -0.054 | -5.9% | -4.2% |
+| 2048 | 1.380 | 1.537 | 1.308 | -0.072 | **-0.229** | **-5.2%** | **-14.9%** |
+| 4096 | 1.424 | 1.987 | 1.352 | -0.072 | **-0.635** | **-5.1%** | **-32.0%** |
+
+#### L2（onboard_launch 内子函数）
+
+| L2 function | seq_len | Before (ms) | After v1 (ms) | After v2 (ms) | vs Before (ms) | vs v1 (ms) | vs Before (%) | vs v1 (%) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `recsys.host._build_slot_mappings` | 1024 | 0.630 | 0.766 | 0.309 | **-0.321** | **-0.457** | **-51.0%** | **-59.7%** |
+| | 2048 | 0.623 | 0.953 | 0.327 | **-0.296** | **-0.626** | **-47.5%** | **-65.7%** |
+| | 4096 | 0.615 | 1.376 | 0.397 | **-0.218** | **-0.979** | **-35.4%** | **-71.2%** |
+| `flexkv.client.launch` | 1024 | 0.259 | 0.246 | 0.440 | +0.181 | +0.194 | +69.9% | +78.9% |
+| | 2048 | 0.311 | 0.299 | 0.515 | +0.204 | +0.216 | +65.6% | +72.2% |
+| | 4096 | 0.324 | 0.308 | 0.490 | +0.166 | +0.182 | +51.2% | +59.1% |
+
+### 5.3 Conclusion（v2）
+
+- **`_build_slot_mappings` L2 在 v2 上稳定低于 v1**（2048 offload：1.13 → 0.49 ms；onboard：0.95 → 0.33 ms）。bulk D2H + 向量化 expand 达到预期。
+- **offload_launch L1**：v2 相对 Before 降 **46–53%**；相对 v1，4096 再降 16%，1024/2048 与 v1 基本持平。
+- **onboard_launch L1**：v2 相对 v1 在 2048/4096 上降 **15–32%**，相对 Before 略优（约 -5%）；L1 仍受 `launch` 等子阶段波动影响，但 build 路径已显著快于 v1。

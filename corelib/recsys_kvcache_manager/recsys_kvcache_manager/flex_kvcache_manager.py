@@ -111,8 +111,10 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         num_tmp_cpu_blocks: int = 256,
         dtype: torch.dtype = torch.bfloat16,
         enable_mps: bool = False,
+        as_batch: bool = True,
         hostkv_wait_timeout_ms: int = 0,
         host_kvstorage_fail_policy: str = "fail_open",
+        config_path: Optional[str] = None,
     ) -> None:
         self.mode = mode
         self.server_addr = server_addr
@@ -128,6 +130,8 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self.hostkv_wait_timeout_ms = int(hostkv_wait_timeout_ms)
         self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
         self.enable_mps = bool(enable_mps)
+        self.as_batch = bool(as_batch)
+        self.config_path = config_path or ""
         self.backend_name = "flexkv"
 
         self._gpu_cache_table_list: Optional[List[torch.Tensor]] = None
@@ -139,6 +143,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self._adapter = FlexKVClientAdapter(mode, server_addr, server_port)
         self._client = None
         self._ready = False
+        self._page_offsets: Optional[torch.Tensor] = None
 
     def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
         assert (
@@ -208,6 +213,17 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         if self.num_tmp_cpu_blocks > 0:
             cache_cfg_kwargs["num_tmp_cpu_blocks"] = self.num_tmp_cpu_blocks
         cache_cfg = CacheConfig(**cache_cfg_kwargs)
+        if self.config_path:
+            try:
+                from flexkv.common.config import (
+                    load_user_config_from_file,
+                    update_default_config_from_user_config,
+                )
+            except Exception as e:
+                raise RuntimeError(f"FlexKV config import failed: {e}") from e
+
+            user_cfg = load_user_config_from_file(self.config_path)
+            update_default_config_from_user_config(model_cfg, cache_cfg, user_cfg)
         self._client = KVManager(
             model_config=model_cfg,
             cache_config=cache_cfg,
@@ -284,25 +300,28 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
     def _build_slot_mappings(
         self, kvcache_metadata: KVCacheMetadata
     ) -> List[torch.Tensor]:
-        mappings: List[torch.Tensor] = []
         kv_indices = kvcache_metadata.kv_indices
         kv_indptr = kvcache_metadata.kv_indptr
-        for i in range(kv_indptr.size(0) - 1):
-            page_ids = kv_indices[kv_indptr[i] : kv_indptr[i + 1]]
-            if page_ids.numel() == 0:
+        kv_indices_cpu = (
+            kv_indices.detach().contiguous().to(device="cpu", dtype=torch.int64)
+        )
+        kv_indptr_cpu = (
+            kv_indptr.detach().contiguous().to(device="cpu", dtype=torch.int64)
+        )
+        indptr = kv_indptr_cpu.tolist()
+        if self._page_offsets is None or self._page_offsets.numel() != self.page_size:
+            self._page_offsets = torch.arange(self.page_size, dtype=torch.int64)
+        offsets = self._page_offsets
+        mappings: List[torch.Tensor] = []
+        for i in range(len(indptr) - 1):
+            start, end = indptr[i], indptr[i + 1]
+            if start == end:
+                mappings.append(torch.empty((0,), dtype=torch.int64))
+            else:
+                page_ids_i64 = kv_indices_cpu[start:end]
                 mappings.append(
-                    torch.empty((0,), dtype=torch.int64, device=kv_indices.device)
+                    (page_ids_i64.unsqueeze(1) * self.page_size + offsets).reshape(-1)
                 )
-                continue
-            # page_ids -> token slots:
-            # cat([arange(pid * page_size, (pid + 1) * page_size) for pid in page_ids])
-            token_offsets = torch.arange(
-                self.page_size, dtype=torch.int64, device=page_ids.device
-            )
-            slot_mapping = (
-                page_ids.unsqueeze(1) * self.page_size + token_offsets.unsqueeze(0)
-            ).reshape(-1)
-            mappings.append(slot_mapping)
         return mappings
 
     def onboard_kvcache_launch(
@@ -311,7 +330,6 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         lookup_result: KVLookupResult,
         kvcache_metadata: KVCacheMetadata,
     ) -> HostKVTaskHandle:
-        # Save slot_mappings for Offload
         index_meta.slot_mappings = self._build_slot_mappings(kvcache_metadata)
 
         # Step 1. Filter out uids not to onboard
@@ -333,11 +351,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 > lookup_result.gpu_cached_start_indices[i]
                 + lookup_result.gpu_cached_lengths[i].item()
             ):
-                slot_mapping = (
-                    index_meta.slot_mappings[i]
-                    .to(device="cpu", dtype=torch.int64)
-                    .contiguous()
-                )
+                slot_mapping = index_meta.slot_mappings[i].contiguous()[
+                    : int(index_meta.seq_lengths[i].item())
+                ]
                 onboard_uids.append(index_meta.user_ids[i].item())
                 onboard_task_ids.append(lookup_result.extra["task_ids"][i])
                 onboard_start_indices.append(0)
@@ -348,11 +364,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             # Case 2: GPU cache has evicted the offloaded tokens
             if lookup_result.gpu_cached_start_indices[i].item() > 0:
                 # assert lookup_result.gpu_cached_lengths[i].item() > 0
-                slot_mapping = (
-                    index_meta.slot_mappings[i]
-                    .to(device="cpu", dtype=torch.int64)
-                    .contiguous()
-                )
+                slot_mapping = index_meta.slot_mappings[i].contiguous()[
+                    : int(index_meta.seq_lengths[i].item())
+                ]
                 onboard_uids.append(index_meta.user_ids[i].item())
                 onboard_task_ids.append(lookup_result.extra["task_ids"][i])
                 onboard_start_indices.append(0)
@@ -387,12 +401,17 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             },
         )
 
-        self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
+        use_batch = self.as_batch and len(onboard_task_ids) > 1
+        self._client.launch(
+            onload_handle.task_ids,
+            onload_handle.slot_mappings,
+            as_batch=use_batch,
+        )
         return onload_task_handle
 
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         onboard_results: Dict[int, "KVResponse"] = self._client.wait(
-            task_handle.handle.task_ids
+            task_handle.handle.task_ids,
         )
 
         failed_flag = list()
@@ -448,7 +467,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             else self._build_slot_mappings(kvcache_metadata)
         )
 
+        use_batch = self.as_batch and offload_user_ids.size(0) > 1
         task_ids: List[int] = []
+        batch_slot_mappings: List[torch.Tensor] = []
         for idx in range(offload_user_ids.size(0)):
             token_ids = index_meta.token_ids[idx]
             token_mask = index_meta.token_mask[idx]
@@ -458,18 +479,55 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             else:
                 valid_len = int(token_mask.sum())
 
-            slot_mapping = slot_mappings[idx]
-            slot_mapping = slot_mapping.contiguous()[:valid_len].to(
-                device="cpu", dtype=torch.int64
-            )
+            slot_mapping = slot_mappings[idx].contiguous()[:valid_len]
 
-            task_id = self._client.put_async(
-                token_ids=index_meta.token_ids[idx],
-                token_mask=index_meta.token_mask[idx],
-                slot_mapping=slot_mapping,
-                namespace=index_meta.namespaces[idx],
-            )
-            task_ids.append(int(task_id))
+            if use_batch:
+                # aligned_len == 0 when valid_len < page_size; skip put_match
+                if valid_len < self.page_size:
+                    continue
+                put_ids = token_ids[:valid_len]
+                if put_ids.dtype != torch.int64:
+                    put_ids = put_ids.to(torch.int64)
+                put_token_ids = put_ids.contiguous().cpu().numpy()
+
+                task_id, return_mask = self._client.put_match(
+                    token_ids=put_token_ids,
+                    token_mask=None,
+                    namespace=index_meta.namespaces[idx],
+                )
+                # Slice slot_mapping for launch: mask is prefix matched=False,
+                # suffix to write=True (FlexKV put_match); aligned to full pages only.
+                aligned_len = (valid_len // self.page_size) * self.page_size
+                mask = np.asarray(return_mask, dtype=np.bool_)[:aligned_len]
+                if mask.size < aligned_len:
+                    mask = np.pad(
+                        mask, (0, aligned_len - mask.size), constant_values=False
+                    )
+                num_unmatched = int(mask.sum())
+                launch_slot = None
+                if num_unmatched > 0:
+                    num_matched = aligned_len - num_unmatched
+                    start = (num_matched // self.page_size) * self.page_size
+                    end = start + (num_unmatched // self.page_size) * self.page_size
+                    if end > start and end <= slot_mapping.numel():
+                        launch_slot = slot_mapping[start:end].contiguous()
+                if launch_slot is None:
+                    self._client.cancel(int(task_id))
+                    continue
+                task_ids.append(int(task_id))
+                batch_slot_mappings.append(launch_slot)
+            else:
+                task_id = self._client.put_async(
+                    token_ids=index_meta.token_ids[idx],
+                    token_mask=index_meta.token_mask[idx],
+                    slot_mapping=slot_mapping,
+                    namespace=index_meta.namespaces[idx],
+                )
+                task_ids.append(int(task_id))
+
+        if use_batch and task_ids:
+            batch_launch = len(task_ids) > 1
+            self._client.launch(task_ids, batch_slot_mappings, as_batch=batch_launch)
         return HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,
