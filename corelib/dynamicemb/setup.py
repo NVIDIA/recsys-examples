@@ -224,4 +224,7 @@ setup(
     python_requires=">=3.9",
     cmdclass={"build_ext": NinjaBuildExtension},
     install_requires=["torch"],
+    extras_require={
+        "hdfs": ["fsspec[arrow]>=2023.0.0"],
+    },
 )
