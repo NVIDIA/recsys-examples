@@ -141,21 +141,29 @@ class InferenceRankingGR(torch.nn.Module):
         batch: HSTUBatch,
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
+        kvcache_info=None,
+        skip_onboard: bool = False,
+        skip_offload: bool = False,
     ):
         with torch.inference_mode():
-            # lookup and allocate for kv cache
-            index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
-                user_ids,
-                total_history_lengths,
-            )
-            kvcache_metadata = self.dense_module.kvcache.allocate_kvcache(
-                index_meta, lookup_res
-            )
+            if kvcache_info is None:
+                # lookup and allocate for kv cache
+                index_meta, lookup_res = self.dense_module.kvcache.lookup_kvcache(
+                    user_ids,
+                    total_history_lengths,
+                )
+                kvcache_metadata = self.dense_module.kvcache.allocate_kvcache(
+                    index_meta, lookup_res
+                )
+            else:
+                index_meta, lookup_res, kvcache_metadata = kvcache_info
 
             # asynchronous kvdata onboard, overlapping with strip_cached and embedding lookup
-            onboard_handle = self.dense_module.kvcache.onboard_launch(
-                index_meta, lookup_res, kvcache_metadata
-            )
+            onboard_handle = None
+            if not skip_onboard:
+                onboard_handle = self.dense_module.kvcache.onboard_launch(
+                    index_meta, lookup_res, kvcache_metadata
+                )
 
             old_cached_lengths = lookup_res.cached_lengths
             striped_batch = self.strip_cached_tokens(
@@ -168,7 +176,8 @@ class InferenceRankingGR(torch.nn.Module):
             torch.cuda.nvtx.range_pop()
 
             if (
-                onboard_handle is not None
+                not skip_onboard
+                and onboard_handle is not None
                 and onboard_handle.status != HostKVTaskStatus.SKIPPED
                 and onboard_handle.backend == "flexkv"
             ):
@@ -196,6 +205,7 @@ class InferenceRankingGR(torch.nn.Module):
                 user_ids,
                 total_history_lengths,
                 kvcache_info,
+                skip_offload=skip_offload,
             )
 
         return logits

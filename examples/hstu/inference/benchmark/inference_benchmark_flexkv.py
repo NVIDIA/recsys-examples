@@ -44,9 +44,71 @@ class BenchmarkConfig:
     flexkv_num_local_blocks: int = 4096
     ssd_pressure_users: int = 0
     offload_wait_timeout_s: float = 60.0
+    ablation: str = "baseline"
 
 
 BENCHMARK_CONFIG = BenchmarkConfig()
+
+ABLATION_BASELINE = "baseline"
+ABLATION_SKIP_ONBOARD = "skip_onboard"
+ABLATION_SKIP_LOOKUP_ALLOCATE_ONBOARD = "skip_lookup_allocate_onboard"
+ABLATION_SKIP_LOOKUP_ALLOCATE_ONBOARD_OFFLOAD = (
+    "skip_lookup_allocate_onboard_offload"
+)
+VALID_ABLATIONS = {
+    ABLATION_BASELINE,
+    ABLATION_SKIP_ONBOARD,
+    ABLATION_SKIP_LOOKUP_ALLOCATE_ONBOARD,
+    ABLATION_SKIP_LOOKUP_ALLOCATE_ONBOARD_OFFLOAD,
+}
+
+
+def normalize_ablation(ablation: str) -> str:
+    aliases = {
+        "case0": ABLATION_BASELINE,
+        "case1": ABLATION_SKIP_ONBOARD,
+        "case2": ABLATION_SKIP_LOOKUP_ALLOCATE_ONBOARD,
+        "case3": ABLATION_SKIP_LOOKUP_ALLOCATE_ONBOARD_OFFLOAD,
+    }
+    normalized = aliases.get(ablation, ablation)
+    if normalized not in VALID_ABLATIONS:
+        raise ValueError(
+            f"Unknown ablation={ablation}. Expected one of {sorted(VALID_ABLATIONS)} "
+            "or case0/case1/case2/case3."
+        )
+    return normalized
+
+
+def get_ablation_forward_kwargs(
+    model_predict,
+    batch: HSTUBatch,
+    user_ids: torch.Tensor,
+    total_history_lengths: torch.Tensor,
+):
+    ablation = normalize_ablation(BENCHMARK_CONFIG.ablation)
+    if ablation == ABLATION_BASELINE:
+        return {}
+    if ablation == ABLATION_SKIP_ONBOARD:
+        return {"skip_onboard": True}
+
+    kvcache_mgr = model_predict.dense_module.kvcache
+    torch.cuda.nvtx.range_push("recsys.kvcache.ablation_prepare_lookup_allocate")
+    try:
+        index_meta, lookup_res = kvcache_mgr.lookup_kvcache(
+            user_ids,
+            total_history_lengths,
+        )
+        kvcache_metadata = kvcache_mgr.allocate_kvcache(index_meta, lookup_res)
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+    kwargs = {
+        "kvcache_info": (index_meta, lookup_res, kvcache_metadata),
+        "skip_onboard": True,
+    }
+    if ablation == ABLATION_SKIP_LOOKUP_ALLOCATE_ONBOARD_OFFLOAD:
+        kwargs["skip_offload"] = True
+    return kwargs
 
 
 def build_request(
@@ -235,11 +297,18 @@ def run_scenario_gpu_hit(
     # timed run
     print("timed run")
     for iter_idx, (batch, user_ids, total_history_lengths) in enumerate(req_timed):
+        forward_kwargs = get_ablation_forward_kwargs(
+            model_predict,
+            batch,
+            user_ids,
+            total_history_lengths,
+        )
         torch.cuda.nvtx.range_push(f"scenario1_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
+            **forward_kwargs,
         )
         torch.cuda.nvtx.range_pop()
     print(f"[Scenario1] timed run completed, iters={timed_iters}")
@@ -307,11 +376,18 @@ def run_scenario_gpu_miss_host_hit(
                 f"Scenario2 timed iteration {iter_idx} expects GPU miss, got gpu={gpu_len}."
             )
         #timed run
+        forward_kwargs = get_ablation_forward_kwargs(
+            model_predict,
+            batch,
+            user_ids,
+            total_history_lengths,
+        )
         torch.cuda.nvtx.range_push(f"scenario2_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
+            **forward_kwargs,
         )
         torch.cuda.nvtx.range_pop()
     print(f"[Scenario2] timed run completed, iters={timed_iters}")
@@ -389,11 +465,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
             user_id, history_len, num_candidates, max_seqlen
         )
 
+        forward_kwargs = get_ablation_forward_kwargs(
+            model_predict,
+            batch,
+            user_ids,
+            total_history_lengths,
+        )
         torch.cuda.nvtx.range_push(f"scenario3_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
+            **forward_kwargs,
         )
         torch.cuda.nvtx.range_pop()
     print(f"[Scenario3] timed run completed, iters={timed_iters}")
@@ -407,7 +490,11 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(cfg.seed)
 
     history_len = cfg.history_len
-    print(f"[Config] history_len={history_len}, num_candidates={cfg.num_candidates}")
+    cfg_ablation = normalize_ablation(cfg.ablation)
+    print(
+        f"[Config] history_len={history_len}, num_candidates={cfg.num_candidates}, "
+        f"ablation={cfg_ablation}"
+    )
     model_predict, page_size, max_seqlen = build_model(cfg, history_len)
     print(f"[Config] page_size={page_size}, max_seqlen={max_seqlen}")
 
