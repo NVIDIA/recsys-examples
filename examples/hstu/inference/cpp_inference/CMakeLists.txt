@@ -42,8 +42,30 @@ set_target_properties(hstu_cuda_ops_runtime PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(paged_kvcache_ops_runtime SHARED
+  ../../../commons/ops/cuda_ops/csrc/paged_kvcache_ops_cuda.cpp
+  ../../../commons/ops/cuda_ops/csrc/paged_kvcache_ops_kernel.cu
+)
+target_link_libraries(paged_kvcache_ops_runtime PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(paged_kvcache_ops_runtime PRIVATE CUDA::cudart)
+target_link_libraries(paged_kvcache_ops_runtime PRIVATE /workspace/deps/nvcomp/lib/libnvcomp_static.a)
+target_include_directories(paged_kvcache_ops_runtime PRIVATE
+  ${TORCH_INCLUDE_DIRS}
+  /workspace/deps/nvcomp/include
+  ../../../commons/ops/cuda_ops/csrc
+)
+target_compile_features(paged_kvcache_ops_runtime PRIVATE cxx_std_20)
+set_target_properties(paged_kvcache_ops_runtime PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 add_executable(inference_hstu_gr_ranking_exported_model inference_hstu_gr_ranking_exported_model.cpp)
 set_source_files_properties(inference_hstu_gr_ranking_exported_model.cpp PROPERTIES LANGUAGE CUDA)
+
+add_executable(inference_hstu_gr_ranking_kvcache_exported_model inference_hstu_gr_ranking_kvcache_exported_model.cpp)
+set_source_files_properties(inference_hstu_gr_ranking_kvcache_exported_model.cpp PROPERTIES LANGUAGE CUDA)
 
 target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE CUDA::cudart)
 target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${TORCH_LIBRARIES})
@@ -52,6 +74,14 @@ target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${CMAKE_D
 target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${NVE_TORCH_OPS_LIB} ${NVE_COMMON_LIB})
 target_compile_definitions(inference_hstu_gr_ranking_exported_model PRIVATE HSTU_CUDA_OPS_AVAILABLE=1)
 
+target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE CUDA::cudart)
+target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE hstu_cuda_ops_runtime)
+target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE paged_kvcache_ops_runtime)
+target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE ${NVE_TORCH_OPS_LIB} ${NVE_COMMON_LIB})
+target_compile_definitions(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE HSTU_CUDA_OPS_AVAILABLE=1)
+
 target_include_directories(inference_hstu_gr_ranking_exported_model PRIVATE
     ${TORCH_INCLUDE_DIRS}
     /workspace/deps/nve
@@ -59,11 +89,20 @@ target_include_directories(inference_hstu_gr_ranking_exported_model PRIVATE
     /workspace/deps/nve/third_party/json/include/
 )
 
+target_include_directories(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE
+  ${TORCH_INCLUDE_DIRS}
+  /workspace/deps/nve
+  /workspace/deps/nve/include
+  /workspace/deps/nve/third_party/json/include/
+)
+
 # If fbgemm_gpu is found, link against it to register fbgemm operators
 if(FBGEMM_GPU_LIB)
   message(STATUS "Found fbgemm_gpu library: ${FBGEMM_GPU_LIB}")
   target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_GPU_LIB})
+  target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE ${FBGEMM_GPU_LIB})
   target_compile_definitions(inference_hstu_gr_ranking_exported_model PRIVATE FBGEMM_GPU_AVAILABLE=1)
+  target_compile_definitions(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE FBGEMM_GPU_AVAILABLE=1)
 else()
   message(STATUS "fbgemm_gpu library not found. FBGEMM operators may not work.")
   message(STATUS "To use FBGEMM operators, install fbgemm_gpu and set appropriate CMake paths.")
@@ -72,12 +111,15 @@ endif()
 if(FBGEMM_HSTU_EXPERIMENTAL_LIB)
   message(STATUS "Found fbgemm experimental hstu library: ${FBGEMM_HSTU_EXPERIMENTAL_LIB}")
   target_link_libraries(inference_hstu_gr_ranking_exported_model PRIVATE ${FBGEMM_HSTU_EXPERIMENTAL_LIB})
+  target_link_libraries(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE ${FBGEMM_HSTU_EXPERIMENTAL_LIB})
 else()
   message(STATUS "fbgemm experimental hstu library not found. Will rely on runtime dlopen path.")
 endif()
 
 target_compile_features(inference_hstu_gr_ranking_exported_model PRIVATE cxx_std_17)
 target_compile_options(inference_hstu_gr_ranking_exported_model PRIVATE -w)
+target_compile_features(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE cxx_std_17)
+target_compile_options(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE -w)
 
 if(NOT NVE_CACHE_LINE_SIZE)
   if (WIN32)
@@ -92,6 +134,22 @@ if(NOT NVE_CACHE_LINE_SIZE)
 endif()
 
 target_compile_options(inference_hstu_gr_ranking_exported_model PRIVATE 
+  -DNVE_FEATURE_HT_PART_FNV1A=1
+  -DNVE_FEATURE_HT_PART_MURMUR=1
+  -DNVE_FEATURE_HT_PART_RRXMRRXMSX0=1
+  -DNVE_FEATURE_HT_PART_STD_HASH=1
+  -DNVE_FEATURE_HT_MASK_64=1
+  -DNVE_FEATURE_HT_MASK_32=1
+  -DNVE_FEATURE_HT_MASK_16=1
+  -DNVE_FEATURE_HT_MASK_8=1
+  -DNVE_FEATURE_HT_KEY_64=1
+  -DNVE_FEATURE_HT_KEY_32=1
+  -DNVE_FEATURE_HT_KEY_16=1
+  -DNVE_FEATURE_HT_KEY_8=1
+  -DNVE_CACHE_LINE_SIZE=${NVE_CACHE_LINE_SIZE}
+)
+
+target_compile_options(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE 
   -DNVE_FEATURE_HT_PART_FNV1A=1
   -DNVE_FEATURE_HT_PART_MURMUR=1
   -DNVE_FEATURE_HT_PART_RRXMRRXMSX0=1

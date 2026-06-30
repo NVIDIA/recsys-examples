@@ -28,7 +28,7 @@ We utilize the graph capture and replay support in Torch for convenient CUDA gra
 The Triton path uses the Python backend to load and serve HSTU models. The model consists of a sparse module and a dense module.
 With the NVEmbedding backend, the sparse module creates GPU embedding tables or caches for each GPU while sharing the same local parameter-store data. The dense module is served as one instance per GPU. The current Triton dense path uses `forward_nokvcache`; KV-cache inference is available in the standalone Python inference path.
 
-6. End-to-end C++ inference with Torch Export and AOTInductor
+6. End-to-end C++ inference with Torch Export and AOTInductor, covering inference with kvcache (based on `corelib/recsys_kvcache_manager`)
 
 We support end-to-end C++ inference from a PyTorch Python model based on `torch.export` and `torch._inductor.aoti_compile_and_package`.
 

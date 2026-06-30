@@ -15,6 +15,7 @@
 import paged_kvcache_ops
 import torch
 import torch.nn.functional as F
+import commons.ops.cuda_ops.fake_paged_kvcache_ops  # noqa: F401
 from configs import InferenceHSTUConfig
 from hstu import hstu_attn_varlen_func
 from modules.jagged_data import JaggedData
@@ -72,6 +73,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             self._attention_dim_per_head * self._num_heads,
         ]
         self._max_seqlen = config.max_seq_len
+        self._export_mode = self._resolve_export_mode(config)
 
         dtype = (
             torch.bfloat16
@@ -81,7 +83,6 @@ class PagedHSTUInferLayer(torch.nn.Module):
             else torch.float32
         )
         device = torch.cuda.current_device()
-        self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
 
         # linear_uvqk
         self._linear_uvqk = torch.nn.Linear(
@@ -161,8 +162,12 @@ class PagedHSTUInferLayer(torch.nn.Module):
         sm = torch.cuda.get_device_properties(0).major
         self.addmm_silu_impl = _select_addmm_silu_impl(sm)
 
+    @staticmethod
+    def _resolve_export_mode(config: InferenceHSTUConfig) -> bool:
+        return getattr(config, "export_mode", False)
+
     def uvqk_addmm_impl(self, input_data, num_tokens):
-        if num_tokens >= 2048:  # fusion impl
+        if not self._export_mode and num_tokens >= 2048:  # fusion impl
             _, silu_output_data = self.addmm_silu_impl(
                 x=input_data,
                 w=self._linear_uvqk_weight,  # transposed
@@ -195,7 +200,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             F.silu(silu_output_data, inplace=True)
 
     def proj_addmm_impl(self, input_data, residual, num_tokens):
-        if num_tokens >= 2048:  # fusion impl
+        if not self._export_mode and num_tokens >= 2048:  # fusion impl
             output_data, _ = self.addmm_silu_impl(
                 x=input_data,
                 w=self._linear_proj_weight,  # transposed
@@ -227,7 +232,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
         return output_data
 
     def norm_mul_impl(self, jagged_attn_output, user, enable_fusion):
-        if enable_fusion:  # fusion impl
+        if not self._export_mode and enable_fusion:  # fusion impl
             parallel_input, _, _, _, _, _ = triton_layer_norm_mul_dropout_fwd(
                 x=jagged_attn_output,
                 u=user,
@@ -247,6 +252,49 @@ class PagedHSTUInferLayer(torch.nn.Module):
             )
 
         return parallel_input
+
+    def hstu_attn_export_impl(
+        self,
+        query,
+        key,
+        value,
+        jd: JaggedData,
+        kv_cache_metadata,
+        kv_cache_table,
+        batch_size: int,
+    ):
+        sm_major_version = torch.cuda.get_device_properties(0).major
+        if sm_major_version != 8:
+            raise RuntimeError(
+                "Export-mode paged-KV HSTU attention currently calls "
+                "torch.ops.fbgemm.hstu_varlen_fwd_80 directly. Add the matching "
+                "direct dispatcher path before exporting this on non-sm80 GPUs."
+            )
+        jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
+            query,
+            key,
+            value,
+            jd.seqlen_offsets[: batch_size + 1],
+            kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1],
+            None,
+            None,  # seqused_q, seqused_k
+            jd.max_seqlen,
+            jd.max_seqlen,
+            jd.scaling_seqlen,
+            None,  # num_contexts
+            jd.num_candidates[:batch_size],
+            self._target_group_size,
+            -1,
+            0,
+            self._alpha,
+            None,
+            None,  # rab, func
+            kv_cache_table,
+            kv_cache_metadata.kv_indptr,
+            kv_cache_metadata.kv_indices,
+            kv_cache_metadata.kv_last_page_len,
+        )
+        return jagged_attn_output
 
     def layer_output(num_tokens):
         return self.output_buffer_[:num_tokens, ...]
@@ -285,48 +333,38 @@ class PagedHSTUInferLayer(torch.nn.Module):
         query = query.view(-1, self._num_heads, self._attention_dim_per_head)
         key = key.view(-1, self._num_heads, self._attention_dim_per_head)
 
+        if self._export_mode:
+            if kv_cache_metadata is None:
+                raise RuntimeError(
+                    "kv_cache_metadata must not be None in export mode"
+                )
+
         if kv_cache_metadata is not None:
             kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
-            (paged_k_cache, paged_v_cache) = kv_cache_table.unbind(dim=1)
-            paged_kvcache_ops.append_kvcache(
+            kv_cache_table = torch.ops.paged_kvcache_ops.append_kvcache(
                 key,
                 value,
                 kv_cache_metadata.batch_indices,
                 kv_cache_metadata.position,
                 jd.num_candidates_offsets[: batch_size + 1],
                 kv_cache_metadata.new_history_nnz_cuda,
-                kv_cache_metadata.new_history_nnz,
-                paged_k_cache,
-                paged_v_cache,
+                kv_cache_table,
                 kv_cache_metadata.kv_indices,
                 kv_cache_metadata.kv_indptr,
                 kv_cache_metadata.kv_last_page_len,
                 0,  # NHD layout
-                self.num_sms,
             )
 
-            if kv_cache_metadata.kv_onload_handle is not None:
+            if not self._export_mode and kv_cache_metadata.kv_onload_handle is not None:
                 kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)
-            jagged_attn_output = hstu_attn_varlen_func(
+            jagged_attn_output = self.hstu_attn_export_impl(
                 query,
                 key,
                 value,
-                jd.seqlen_offsets[: batch_size + 1],
-                kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1],
-                None,
-                None,  # seqused_q, seqused_k
-                jd.max_seqlen,
-                jd.max_seqlen,
-                jd.scaling_seqlen,
-                None,  # num_contexts
-                jd.num_candidates[:batch_size],
-                target_group_size=1,
-                window_size=(-1, 0),
-                alpha=self._alpha,
-                kv_cache=kv_cache_table,
-                page_offsets=kv_cache_metadata.kv_indptr,
-                page_ids=kv_cache_metadata.kv_indices,
-                last_page_lens=kv_cache_metadata.kv_last_page_len,
+                jd,
+                kv_cache_metadata,
+                kv_cache_table,
+                batch_size,
             )
         else:
             jagged_attn_output = hstu_attn_varlen_func(
@@ -390,24 +428,26 @@ class PagedHSTUInferLayer(torch.nn.Module):
         value = value.view(-1, self._num_heads, self._linear_dim_per_head)
         key = key.view(-1, self._num_heads, self._attention_dim_per_head)
 
+        if self._export_mode:
+            if kv_cache_metadata is None:
+                raise RuntimeError(
+                    "kv_cache_metadata must not be None in export mode"
+                )
+
         if kv_cache_metadata is not None:
             kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
-            (paged_k_cache, paged_v_cache) = kv_cache_table.unbind(dim=1)
-            paged_kvcache_ops.append_kvcache(
+            kv_cache_metadata.kv_cache_table[self.layer_idx] = torch.ops.paged_kvcache_ops.append_kvcache(
                 key,
                 value,
                 kv_cache_metadata.batch_indices,
                 kv_cache_metadata.position,
                 jd.num_candidates_offsets[: batch_size + 1],
                 kv_cache_metadata.new_history_nnz_cuda,
-                num_tokens,  # Note: In cudagraph, need to input max{kv_cache_metadata.new_history_nnz}
-                paged_k_cache,
-                paged_v_cache,
+                kv_cache_table,
                 kv_cache_metadata.kv_indices,
                 kv_cache_metadata.kv_indptr,
                 kv_cache_metadata.kv_last_page_len,
                 0,  # NHD layout
-                self.num_sms,
             )
 
         return self.uvqk_buffer_[:num_tokens, ...]
@@ -431,7 +471,13 @@ class PagedHSTUInferLayer(torch.nn.Module):
         query = query.view(-1, self._num_heads, self._attention_dim_per_head)
         key = key.view(-1, self._num_heads, self._attention_dim_per_head)
 
-        use_kvcache = kv_cache_metadata is not None
+        if self._export_mode:
+            if kv_cache_metadata is None:
+                raise RuntimeError(
+                    "kv_cache_metadata must not be None in export mode"
+                )
+
+        use_kvcache = True if self._export_mode else kv_cache_metadata is not None
         kv_cache_table = (
             kv_cache_metadata.kv_cache_table[self.layer_idx] if use_kvcache else None
         )

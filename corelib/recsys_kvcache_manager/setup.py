@@ -76,6 +76,8 @@ def get_extensions():
 
     include_dirs = [
         str(root_path / "src"),
+        str(root_path / "src/runtime"),
+        str(root_path / "src/torch_binding"),
     ]
 
     ext_modules = [
@@ -92,6 +94,8 @@ def get_extensions():
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
             include_dirs=include_dirs,
+            libraries=["zmq"],
+            extra_link_args=["-lzmq"],
         ),
     ]
 

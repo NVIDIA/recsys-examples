@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import itertools
 from typing import Dict, Optional, Union
 
 import torch
@@ -100,80 +99,34 @@ def hstu_preprocess_embeddings(
             )
             sequence_max_seqlen = sequence_max_seqlen * 2
         else:
-            # TODO@junyi: We can optimize the concat:
-            # 1. use jagged split to get [history_embs, candidate_embs]
-            # 2. use cat to interleave the history_embs and history_action_embs part
-            # 3. use jagged concat to append the candidate_embs
-
-            action_offsets = action_jt.offsets()
-            item_offsets = item_jt.offsets()
-            candidates_indptr = item_offsets[: batch.batch_size] + action_jt.lengths()
-
-            item_embs = item_jt.values().to(dtype)
-            action_embs = action_jt.values().to(dtype)
-            if not torch.compiler.is_compiling():
-                interleaved_embeddings = [
-                    (
-                        torch.cat(
-                            [
-                                item_embs[
-                                    item_offsets[idx]
-                                    .item() : candidates_indptr[idx]
-                                    .item()
-                                ],
-                                action_embs[
-                                    action_offsets[idx]
-                                    .item() : action_offsets[idx + 1]
-                                    .item()
-                                ],
-                            ],
-                            dim=1,
-                        ).view(-1, embedding_dim),
-                        item_embs[
-                            candidates_indptr[idx].item() : item_offsets[idx + 1].item()
-                        ],
-                    )
-                    for idx in range(batch.batch_size)
-                ]
-                interleaved_embeddings = list(itertools.chain(*interleaved_embeddings))
-                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
-                    -1, embedding_dim
-                )
-            else:
-                interleaved_embeddings = list()
-                for idx in range(batch.batch_size):
-                    interleaved_embeddings.append(
-                        torch.cat(
-                            [
-                                item_embs[
-                                    torch.arange(
-                                        item_offsets[idx], candidates_indptr[idx]
-                                    )
-                                ],
-                                action_embs[
-                                    torch.arange(
-                                        action_offsets[idx], action_offsets[idx + 1]
-                                    )
-                                ],
-                            ],
-                            dim=1,
-                        ).view(-1, embedding_dim)
-                    )
-                    interleaved_embeddings.append(
-                        item_embs[
-                            torch.arange(candidates_indptr[idx], item_offsets[idx + 1])
-                        ]
-                    )
-                sequence_embeddings = torch.cat(interleaved_embeddings, dim=0).view(
-                    -1, embedding_dim
-                )
-            sequence_embeddings_lengths = item_jt.lengths() + action_jt.lengths()
-            sequence_embeddings_lengths_offsets = (
-                item_jt.offsets() + action_jt.offsets()
+            assert batch.num_candidates is not None, (
+                "num_candidates should not be None during inference with action embeddings"
             )
-            sequence_max_seqlen += batch.feature_to_max_seqlen[
-                batch.action_feature_name
-            ]
+            (
+                sequence_embeddings,
+                sequence_embeddings_lengths,
+                sequence_embeddings_lengths_offsets,
+                _,
+            ) = torch.ops.hstu_cuda_ops.hstu_inference_preprocess(
+                item_jt.values().to(dtype),
+                item_jt.lengths(),
+                action_jt.values().to(dtype),
+                action_jt.lengths(),
+                batch.num_candidates,
+            )
+            history_max_seqlen = (
+                batch.feature_to_max_seqlen[batch.item_feature_name]
+                - batch.max_num_candidates
+            )
+            action_history_max_seqlen = (
+                batch.feature_to_max_seqlen[batch.action_feature_name]
+                - batch.max_num_candidates
+            )
+            sequence_max_seqlen = (
+                history_max_seqlen
+                + action_history_max_seqlen
+                + batch.max_num_candidates
+            )
         if item_mlp is not None:
             sequence_embeddings = item_mlp(sequence_embeddings)
 
@@ -235,7 +188,7 @@ def hstu_preprocess_embeddings(
     # the KJT-derived sequence_embeddings_lengths.
     if num_candidates is not None:
         bs_kjt = sequence_embeddings_lengths.size(0)
-        if num_candidates.size(0) < bs_kjt:
+        if not torch.compiler.is_compiling() and num_candidates.size(0) < bs_kjt:
             num_candidates = torch.nn.functional.pad(
                 num_candidates, (0, bs_kjt - num_candidates.size(0))
             )

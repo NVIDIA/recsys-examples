@@ -23,6 +23,25 @@ from modules.inference_embedding import InferenceEmbedding
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+try:
+    import hstu_cuda_ops  # noqa: F401 - registers torch.ops.hstu_cuda_ops.*
+except ImportError:
+    hstu_cuda_ops = None
+
+try:
+    _STRIP_CACHED_TOKENS_OP = torch.ops.hstu_cuda_ops.strip_cached_tokens
+    _HAS_STRIP_CACHED_TOKENS_OP = hstu_cuda_ops is not None
+except (AttributeError, RuntimeError):
+    _STRIP_CACHED_TOKENS_OP = None
+    _HAS_STRIP_CACHED_TOKENS_OP = False
+    raise ImportError(
+        "hstu_cuda_ops.strip_cached_tokens is not available. "
+        "Please ensure that the hstu_cuda_ops extension is built and installed correctly."
+    )
+
+if _HAS_STRIP_CACHED_TOKENS_OP:
+    import commons.ops.cuda_ops.fake_hstu_cuda_ops  # noqa: F401
+
 
 class InferenceRankingGR(torch.nn.Module):
     """
@@ -87,46 +106,20 @@ class InferenceRankingGR(torch.nn.Module):
         torch.cuda.nvtx.range_push("strip_cached_tokens")
 
         num_context = len(batch.contextual_feature_names)
-
-        num_cached = torch.clamp_min(origin_num_cached - num_context, 0).to(torch.int32)
-        num_cached_action = num_cached // 2
-        num_cached_item = num_cached - num_cached_action
-        num_hist_cached = torch.concat([num_cached_item, num_cached_action], dim=0)
-
-        old_offsets = batch.features.offsets().cpu()
-        old_lengths = batch.features.lengths().cpu()
-
-        item_offset = num_context * batch.batch_size
-
-        new_lengths = torch.zeros_like(old_lengths)
-        new_lengths[:item_offset] = torch.where(
-            (origin_num_cached == 0).view(-1, batch.batch_size),
-            old_lengths[:item_offset].view(-1, batch.batch_size),
-            new_lengths[:item_offset].view(-1, batch.batch_size),
-        ).view(-1)
-        new_lengths[item_offset:] = old_lengths[item_offset:] - num_hist_cached
-
-        startpos = (
-            old_offsets[item_offset : item_offset + 2 * batch.batch_size]
-            + num_hist_cached
+        feature_order = list(range(num_context + 2))
+        lengths = batch.features.lengths()
+        cached_i64 = origin_num_cached.to(device=lengths.device, dtype=torch.int64)
+        new_values, new_lengths = _STRIP_CACHED_TOKENS_OP(
+            batch.features.values(),
+            lengths,
+            batch.features.offsets(),
+            cached_i64,
+            feature_order,
         )
-        endpos = old_offsets[item_offset + 1 :]
-
-        old_values = batch.features.values()
-        new_hist_value = [
-            old_values[startpos[idx] : endpos[idx]]
-            for idx in range(2 * batch.batch_size)
-        ]
-
-        new_context_value = [
-            old_values[idx : idx + 1]
-            for idx in range(num_context * batch.batch_size)
-            if int(new_lengths[idx]) > 0
-        ]
 
         new_features = KeyedJaggedTensor(
-            values=torch.cat(new_context_value + new_hist_value, dim=0),
-            lengths=new_lengths.cuda(),
+            values=new_values,
+            lengths=new_lengths,
             keys=batch.features.keys(),
         )
         batch.features = new_features
