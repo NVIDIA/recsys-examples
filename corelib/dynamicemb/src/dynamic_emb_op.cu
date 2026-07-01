@@ -683,6 +683,596 @@ void store_to_flat_table_value(at::Tensor table_ptrs, at::Tensor indices,
       table_value_dims, table_emb_dims, max_emb_dim, all_dims_vec4);
 }
 
+// ---------------------------------------------------------------------------
+// Sparse cache <-> storage value exchange
+// ---------------------------------------------------------------------------
+
+constexpr int kExchangeWarpSize = 32;
+constexpr int kExchangeBytesPerThread = 16;
+constexpr int kExchangeTileBytes =
+    kExchangeWarpSize * kExchangeBytesPerThread;
+constexpr int kExchangeDirections = 2;
+constexpr int kExchangeWarpsPerBlock = 8;
+constexpr int kExchangePipelineDepth = 4;
+constexpr int kExchangeRowsPerWarp = 8;
+constexpr int kExchangeInputsPerBlock =
+    kExchangeWarpsPerBlock * kExchangeRowsPerWarp;
+constexpr int kExchangeCacheToStorage = 0;
+constexpr int kExchangeStorageToCache = 1;
+
+constexpr uint32_t kExchangeMetadataValid = 1U << 0;
+constexpr uint32_t kExchangeMetadataStorageToCache = 1U << 1;
+constexpr uint32_t kExchangeMetadataCacheToStorage = 1U << 2;
+
+// The eight warps preload one sparse metadata tensor each. Every warp accesses
+// 32 consecutive input positions and writes a shared-memory SoA, so all global
+// reads are coalesced even when the found/evicted masks are sparse.
+struct ExchangeRawMetadata {
+  int64_t table_ids[kExchangeInputsPerBlock];
+  int64_t cache_rows[kExchangeInputsPerBlock];
+  int64_t storage_src_rows[kExchangeInputsPerBlock];
+  int64_t storage_lookup_slots[kExchangeInputsPerBlock];
+  int64_t storage_dst_slots[kExchangeInputsPerBlock];
+  int64_t storage_dst_rows[kExchangeInputsPerBlock];
+  bool storage_founds[kExchangeInputsPerBlock];
+  bool evicted_mask[kExchangeInputsPerBlock];
+  bool valid[kExchangeInputsPerBlock];
+};
+
+// Resolved row pointers and reference-counter locations are reused by every
+// lane in the warp's four-stage value pipeline.
+struct ExchangeMetadata {
+  int64_t storage_to_cache_src;
+  int64_t storage_to_cache_dst;
+  int64_t cache_to_storage_src;
+  int64_t cache_to_storage_dst;
+  int64_t value_dim;
+  int64_t storage_to_cache_ref_counter;
+  int64_t cache_to_storage_ref_counter;
+  uint32_t flags;
+};
+
+struct alignas(kExchangeBytesPerThread) ExchangeBytes16 {
+  uint32_t value[4];
+};
+
+struct alignas(8) ExchangeBytes8 {
+  uint32_t value[2];
+};
+
+struct alignas(4) ExchangeBytes4 {
+  uint32_t value;
+};
+
+__forceinline__ __device__ bool exchange_address_aligned(const void *ptr,
+                                                         uintptr_t alignment) {
+  return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) == 0;
+}
+
+template <typename ValueT>
+__forceinline__ __device__ void exchange_stage_tile_async(
+    const ValueT *src, int64_t dim, int64_t tile_offset, ValueT *smem_dst,
+    bool active) {
+  constexpr int kValuesPerThread = kExchangeBytesPerThread / sizeof(ValueT);
+  const int lane = threadIdx.x & (kExchangeWarpSize - 1);
+  const int64_t offset =
+      tile_offset + static_cast<int64_t>(lane) * kValuesPerThread;
+  const int valid =
+      active && offset < dim
+          ? static_cast<int>(dim - offset < kValuesPerThread
+                                 ? dim - offset
+                                 : kValuesPerThread)
+          : 0;
+  ValueT *thread_smem = smem_dst + lane * kValuesPerThread;
+  const ValueT *thread_src = valid > 0 ? src + offset : nullptr;
+  if (valid == kValuesPerThread &&
+      exchange_address_aligned(thread_src, kExchangeBytesPerThread)) {
+    // CUDA's classic pipeline intrinsic lowers to per-thread cp.async on SM80+
+    // and retains build compatibility with the existing SM75 target.
+    __pipeline_memcpy_async(thread_smem, thread_src, 16);
+  } else if (valid == kValuesPerThread &&
+             exchange_address_aligned(thread_src, 8)) {
+    constexpr int kValuesPer8B = 8 / sizeof(ValueT);
+    __pipeline_memcpy_async(thread_smem, thread_src, 8);
+    __pipeline_memcpy_async(thread_smem + kValuesPer8B,
+                            thread_src + kValuesPer8B, 8);
+  } else if (valid == kValuesPerThread &&
+             exchange_address_aligned(thread_src, 4)) {
+    constexpr int kValuesPer4B = 4 / sizeof(ValueT);
+#pragma unroll
+    for (int copy = 0; copy < 4; ++copy) {
+      __pipeline_memcpy_async(thread_smem + copy * kValuesPer4B,
+                              thread_src + copy * kValuesPer4B, 4);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < kValuesPerThread; ++i) {
+      if (i < valid)
+        thread_smem[i] = src[offset + i];
+    }
+  }
+}
+
+template <typename ValueT>
+__forceinline__ __device__ void exchange_store_tile(
+    ValueT *dst, int64_t dim, int64_t tile_offset, const ValueT *smem_src,
+    bool active) {
+  constexpr int kValuesPerThread = kExchangeBytesPerThread / sizeof(ValueT);
+  const int lane = threadIdx.x & (kExchangeWarpSize - 1);
+  const int64_t offset =
+      tile_offset + static_cast<int64_t>(lane) * kValuesPerThread;
+  const int valid =
+      active && offset < dim
+          ? static_cast<int>(dim - offset < kValuesPerThread
+                                 ? dim - offset
+                                 : kValuesPerThread)
+          : 0;
+  const ValueT *thread_smem = smem_src + lane * kValuesPerThread;
+  ValueT *thread_dst = valid > 0 ? dst + offset : nullptr;
+  if (valid == kValuesPerThread &&
+      exchange_address_aligned(thread_dst, 16)) {
+    *reinterpret_cast<ExchangeBytes16 *>(dst + offset) =
+        *reinterpret_cast<const ExchangeBytes16 *>(thread_smem);
+  } else if (valid == kValuesPerThread &&
+             exchange_address_aligned(thread_dst, 8)) {
+    constexpr int kValuesPer8B = 8 / sizeof(ValueT);
+    *reinterpret_cast<ExchangeBytes8 *>(thread_dst) =
+        *reinterpret_cast<const ExchangeBytes8 *>(thread_smem);
+    *reinterpret_cast<ExchangeBytes8 *>(thread_dst + kValuesPer8B) =
+        *reinterpret_cast<const ExchangeBytes8 *>(thread_smem + kValuesPer8B);
+  } else if (valid == kValuesPerThread &&
+             exchange_address_aligned(thread_dst, 4)) {
+    constexpr int kValuesPer4B = 4 / sizeof(ValueT);
+#pragma unroll
+    for (int copy = 0; copy < 4; ++copy) {
+      *reinterpret_cast<ExchangeBytes4 *>(thread_dst + copy * kValuesPer4B) =
+          *reinterpret_cast<const ExchangeBytes4 *>(thread_smem +
+                                                     copy * kValuesPer4B);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < kValuesPerThread; ++i) {
+      if (i < valid)
+        dst[offset + i] = thread_smem[i];
+    }
+  }
+}
+
+template <typename ValueT, int Direction>
+__forceinline__ __device__ void exchange_issue_stage(
+    const ExchangeMetadata &metadata, int64_t tile_offset, ValueT *smem) {
+  constexpr uint32_t kActiveFlag =
+      Direction == kExchangeCacheToStorage
+          ? kExchangeMetadataCacheToStorage
+          : kExchangeMetadataStorageToCache;
+  const bool active = (metadata.flags & kActiveFlag) != 0;
+  const int64_t src_address =
+      Direction == kExchangeCacheToStorage
+          ? metadata.cache_to_storage_src
+          : metadata.storage_to_cache_src;
+  exchange_stage_tile_async(reinterpret_cast<const ValueT *>(src_address),
+                            metadata.value_dim, tile_offset, smem, active);
+  // Keep the following commit converged even when lanes took different
+  // alignment/tail paths while issuing their classic cp.async operations.
+  __syncwarp();
+}
+
+template <typename ValueT, int Direction>
+__forceinline__ __device__ void exchange_store_stage(
+    const ExchangeMetadata &metadata, int64_t tile_offset,
+    const ValueT *smem) {
+  constexpr uint32_t kActiveFlag =
+      Direction == kExchangeCacheToStorage
+          ? kExchangeMetadataCacheToStorage
+          : kExchangeMetadataStorageToCache;
+  const bool active = (metadata.flags & kActiveFlag) != 0;
+  const int64_t dst_address =
+      Direction == kExchangeCacheToStorage
+          ? metadata.cache_to_storage_dst
+          : metadata.storage_to_cache_dst;
+  exchange_store_tile(reinterpret_cast<ValueT *>(dst_address),
+                      metadata.value_dim, tile_offset, smem, active);
+}
+
+template <typename ValueT>
+__forceinline__ __device__ void exchange_resolve_metadata(
+    const ExchangeRawMetadata &raw, int local_input,
+    ExchangeMetadata *metadata, int64_t num_tables,
+    const int64_t *__restrict__ cache_table_ptrs,
+    const int64_t *__restrict__ cache_table_value_dims,
+    const int64_t *__restrict__ storage_table_ptrs,
+    const int64_t *__restrict__ storage_table_value_dims,
+    const int64_t *__restrict__ storage_table_bucket_offsets,
+    int64_t storage_bucket_capacity) {
+  *metadata = ExchangeMetadata{};
+  if (!raw.valid[local_input])
+    return;
+
+  const int64_t table_id = raw.table_ids[local_input];
+  const int64_t cache_row = raw.cache_rows[local_input];
+  // Every input is provisioned in cache before exchange.  Continuing with a
+  // negative row would let forward consume uninitialized memory.
+  if (table_id < 0 || table_id >= num_tables || cache_row < 0) {
+    __trap();
+  }
+
+  const bool storage_to_cache = raw.storage_founds[local_input];
+  const bool cache_to_storage = raw.evicted_mask[local_input];
+  metadata->flags = kExchangeMetadataValid |
+                    (storage_to_cache
+                         ? kExchangeMetadataStorageToCache
+                         : 0U) |
+                    (cache_to_storage
+                         ? kExchangeMetadataCacheToStorage
+                         : 0U);
+  if (!storage_to_cache && !cache_to_storage)
+    return;
+
+  const int64_t cache_dim = cache_table_value_dims[table_id];
+  const int64_t storage_dim = storage_table_value_dims[table_id];
+  if (cache_dim <= 0 || cache_dim != storage_dim) {
+    __trap();
+  }
+  metadata->value_dim = cache_dim;
+
+  const int64_t bucket_begin = storage_table_bucket_offsets[table_id];
+  const int64_t table_capacity =
+      (storage_table_bucket_offsets[table_id + 1] - bucket_begin) *
+      storage_bucket_capacity;
+  const int64_t counter_begin = bucket_begin * storage_bucket_capacity;
+
+  ValueT *cache_row_ptr =
+      reinterpret_cast<ValueT *>(cache_table_ptrs[table_id]) +
+      cache_row * cache_dim;
+  if (storage_to_cache) {
+    const int64_t storage_row = raw.storage_src_rows[local_input];
+    const int64_t lookup_slot = raw.storage_lookup_slots[local_input];
+    if (storage_row < 0 || lookup_slot < 0 ||
+        lookup_slot >= table_capacity) {
+      __trap();
+    }
+    metadata->storage_to_cache_src =
+        reinterpret_cast<int64_t>(
+            reinterpret_cast<const ValueT *>(storage_table_ptrs[table_id]) +
+            storage_row * storage_dim);
+    metadata->storage_to_cache_dst = reinterpret_cast<int64_t>(cache_row_ptr);
+    metadata->storage_to_cache_ref_counter = counter_begin + lookup_slot;
+  }
+
+  if (cache_to_storage) {
+    const int64_t storage_row = raw.storage_dst_rows[local_input];
+    const int64_t insert_slot = raw.storage_dst_slots[local_input];
+    if (storage_row < 0 || insert_slot < 0 || insert_slot >= table_capacity) {
+      // A failed storage insertion would discard the only current copy of the
+      // evicted cache row, so fail instead of silently dropping it.
+      __trap();
+    }
+    metadata->cache_to_storage_src = reinterpret_cast<int64_t>(cache_row_ptr);
+    metadata->cache_to_storage_dst =
+        reinterpret_cast<int64_t>(
+            reinterpret_cast<ValueT *>(storage_table_ptrs[table_id]) +
+            storage_row * storage_dim);
+    metadata->cache_to_storage_ref_counter = counter_begin + insert_slot;
+  }
+}
+
+template <typename ValueT>
+__global__ void exchange_cache_storage_values_kernel(
+    int64_t batch, int64_t num_tables,
+    const int64_t *__restrict__ cache_table_ptrs,
+    const int64_t *__restrict__ cache_table_value_dims,
+    const int64_t *__restrict__ storage_table_ptrs,
+    const int64_t *__restrict__ storage_table_value_dims,
+    const int64_t *__restrict__ storage_table_bucket_offsets,
+    int64_t storage_bucket_capacity,
+    int32_t *__restrict__ storage_ref_counter,
+    const int64_t *__restrict__ input_table_ids,
+    const int64_t *__restrict__ cache_slots,
+    const int64_t *__restrict__ storage_src_rows,
+    const int64_t *__restrict__ storage_lookup_slots,
+    const bool *__restrict__ storage_founds,
+    const int64_t *__restrict__ evicted_storage_slots,
+    const int64_t *__restrict__ evicted_storage_dst_rows,
+    const bool *__restrict__ evicted_mask) {
+
+  // The fused callers guarantee that input keys/cache rows are unique and
+  // that acquired storage lookup slots cannot be selected by the subsequent
+  // publish-and-acquire insertion. Therefore cache rows alias only within the
+  // same input pair, while storage source and destination rows never alias.
+  // This contract is what permits the two directions to run independently.
+
+  constexpr int kExchangeTileValues = kExchangeTileBytes / sizeof(ValueT);
+  __shared__ ExchangeRawMetadata raw_metadata;
+  __shared__ ExchangeMetadata metadata[kExchangeInputsPerBlock];
+  __shared__ __align__(16) ValueT
+      smem[kExchangeWarpsPerBlock][kExchangePipelineDepth]
+          [kExchangeDirections][kExchangeTileValues];
+
+  const int warp = threadIdx.x / kExchangeWarpSize;
+  const int lane = threadIdx.x & (kExchangeWarpSize - 1);
+  const int64_t block_stride =
+      static_cast<int64_t>(gridDim.x) * kExchangeInputsPerBlock;
+
+  for (int64_t block_input =
+           static_cast<int64_t>(blockIdx.x) * kExchangeInputsPerBlock;
+       block_input < batch; block_input += block_stride) {
+    // One warp per tensor lets all eight metadata transactions be issued in
+    // parallel. Each loop iteration is a contiguous 32-element lane access.
+#pragma unroll
+    for (int local_input = lane; local_input < kExchangeInputsPerBlock;
+         local_input += kExchangeWarpSize) {
+      const int64_t input_id = block_input + local_input;
+      const bool valid_input = input_id < batch;
+      switch (warp) {
+      case 0:
+        raw_metadata.table_ids[local_input] =
+            valid_input ? input_table_ids[input_id] : -1;
+        raw_metadata.valid[local_input] = valid_input;
+        break;
+      case 1:
+        raw_metadata.cache_rows[local_input] =
+            valid_input ? cache_slots[input_id] : -1;
+        break;
+      case 2:
+        raw_metadata.storage_src_rows[local_input] =
+            valid_input ? storage_src_rows[input_id] : -1;
+        break;
+      case 3:
+        raw_metadata.storage_lookup_slots[local_input] =
+            valid_input ? storage_lookup_slots[input_id] : -1;
+        break;
+      case 4:
+        raw_metadata.storage_founds[local_input] =
+            valid_input && storage_founds[input_id];
+        break;
+      case 5:
+        raw_metadata.storage_dst_slots[local_input] =
+            valid_input ? evicted_storage_slots[input_id] : -1;
+        break;
+      case 6:
+        raw_metadata.storage_dst_rows[local_input] =
+            valid_input ? evicted_storage_dst_rows[input_id] : -1;
+        break;
+      default:
+        raw_metadata.evicted_mask[local_input] =
+            valid_input && evicted_mask[input_id];
+        break;
+      }
+    }
+    __syncthreads();
+
+    // Each warp resolves the rows it will process. The raw slot metadata
+    // remains in shared memory through this step, matching the sparse API
+    // directly without a compact/gathered layout.
+    if (lane < kExchangeRowsPerWarp) {
+      const int local_input = warp + lane * kExchangeWarpsPerBlock;
+      exchange_resolve_metadata<ValueT>(
+          raw_metadata, local_input, &metadata[local_input], num_tables,
+          cache_table_ptrs, cache_table_value_dims, storage_table_ptrs,
+          storage_table_value_dims, storage_table_bucket_offsets,
+          storage_bucket_capacity);
+    }
+    __syncwarp();
+
+    int64_t max_dim = 0;
+    bool any_cache_to_storage = false;
+#pragma unroll
+    for (int row = 0; row < kExchangeRowsPerWarp; ++row) {
+      const ExchangeMetadata &item =
+          metadata[warp + row * kExchangeWarpsPerBlock];
+      if ((item.flags &
+           (kExchangeMetadataStorageToCache |
+            kExchangeMetadataCacheToStorage)) != 0 &&
+          item.value_dim > max_dim) {
+        max_dim = item.value_dim;
+      }
+      any_cache_to_storage |=
+          (item.flags & kExchangeMetadataCacheToStorage) != 0;
+    }
+
+    const int64_t num_tiles =
+        (max_dim + kExchangeTileValues - 1) / kExchangeTileValues;
+    for (int64_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+      const int64_t tile_offset = tile_idx * kExchangeTileValues;
+
+      // Prime depth - 1 ring slots. Each group contains both directions for
+      // one row, and sparse/inactive rows still commit an empty group so every
+      // lane observes the same pipeline sequence.
+#pragma unroll
+      for (int row = 0; row < kExchangePipelineDepth - 1; ++row) {
+        exchange_issue_stage<ValueT, kExchangeCacheToStorage>(
+            metadata[warp + row * kExchangeWarpsPerBlock], tile_offset,
+            &smem[warp][row][kExchangeCacheToStorage][0]);
+        exchange_issue_stage<ValueT, kExchangeStorageToCache>(
+            metadata[warp + row * kExchangeWarpsPerBlock], tile_offset,
+            &smem[warp][row][kExchangeStorageToCache][0]);
+        __pipeline_commit();
+      }
+
+      // Rolling ring: wait for the oldest cache+storage snapshot, issue the
+      // next row into the free tail slot, then exchange the completed head.
+      // Tail storage reads can overlap the head's mapped-storage writes.
+#pragma unroll
+      for (int head = 0; head < kExchangeRowsPerWarp; ++head) {
+        const int rows_left = kExchangeRowsPerWarp - head;
+        const int pending =
+            rows_left < kExchangePipelineDepth - 1
+                ? rows_left
+                : kExchangePipelineDepth - 1;
+        // The loop is fully unrolled, making pending - 1 the immediate operand
+        // required by cp.async.wait_group.
+        __pipeline_wait_prior(pending - 1);
+        __syncwarp();
+
+        const int tail = head + kExchangePipelineDepth - 1;
+        if (tail < kExchangeRowsPerWarp) {
+          const int tail_slot = tail % kExchangePipelineDepth;
+          const ExchangeMetadata &tail_metadata =
+              metadata[warp + tail * kExchangeWarpsPerBlock];
+          exchange_issue_stage<ValueT, kExchangeCacheToStorage>(
+              tail_metadata, tile_offset,
+              &smem[warp][tail_slot][kExchangeCacheToStorage][0]);
+          exchange_issue_stage<ValueT, kExchangeStorageToCache>(
+              tail_metadata, tile_offset,
+              &smem[warp][tail_slot][kExchangeStorageToCache][0]);
+          __pipeline_commit();
+        }
+
+        const int head_slot = head % kExchangePipelineDepth;
+        const ExchangeMetadata &head_metadata =
+            metadata[warp + head * kExchangeWarpsPerBlock];
+        exchange_store_stage<ValueT, kExchangeCacheToStorage>(
+            head_metadata, tile_offset,
+            &smem[warp][head_slot][kExchangeCacheToStorage][0]);
+        exchange_store_stage<ValueT, kExchangeStorageToCache>(
+            head_metadata, tile_offset,
+            &smem[warp][head_slot][kExchangeStorageToCache][0]);
+        // Complete every lane's shared-memory reads before this ring slot is
+        // eligible to become a tail on the next iteration.
+        __syncwarp();
+      }
+    }
+
+    // Every lane fences its own mapped-host stores before lane zero releases
+    // the insertion references.  Lookup references stay pinned until all
+    // storage reads have drained as well.
+    if (any_cache_to_storage)
+      __threadfence_system();
+    __syncwarp();
+    if (lane == 0) {
+#pragma unroll
+      for (int row = 0; row < kExchangeRowsPerWarp; ++row) {
+        const ExchangeMetadata &item =
+            metadata[warp + row * kExchangeWarpsPerBlock];
+        if ((item.flags & kExchangeMetadataStorageToCache) != 0)
+          atomicSub(storage_ref_counter +
+                        item.storage_to_cache_ref_counter,
+                    1);
+        if ((item.flags & kExchangeMetadataCacheToStorage) != 0)
+          atomicSub(storage_ref_counter +
+                        item.cache_to_storage_ref_counter,
+                    1);
+      }
+    }
+    __syncwarp();
+    __syncthreads();
+  }
+}
+
+void exchange_cache_storage_values(
+    at::Tensor cache_table_ptrs, at::Tensor cache_table_value_dims,
+    at::Tensor storage_table_ptrs, at::Tensor storage_table_value_dims,
+    at::Tensor storage_table_bucket_offsets, int64_t storage_bucket_capacity,
+    at::Tensor storage_ref_counter, at::Tensor input_table_ids,
+    at::Tensor cache_slots, at::Tensor storage_src_rows,
+    at::Tensor storage_lookup_slots, at::Tensor storage_founds,
+    at::Tensor evicted_storage_slots, at::Tensor evicted_storage_dst_rows,
+    at::Tensor evicted_mask, int64_t target_grid_size,
+    dyn_emb::DataType value_type) {
+
+  TORCH_CHECK(cache_slots.defined(), "cache_slots must be defined");
+  const c10::Device device = cache_slots.device();
+  auto check_metadata = [&](const at::Tensor &tensor, const char *name,
+                            at::ScalarType scalar_type) {
+    TORCH_CHECK(tensor.defined(), name, " must be defined");
+    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(tensor.device() == device, name,
+                " must be on the same device as cache_slots");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(tensor.dim() == 1, name, " must be 1-D");
+    TORCH_CHECK(tensor.scalar_type() == scalar_type, name, " must have dtype ",
+                scalar_type, ", got ", tensor.scalar_type());
+  };
+
+  check_metadata(cache_table_ptrs, "cache_table_ptrs", at::kLong);
+  check_metadata(cache_table_value_dims, "cache_table_value_dims", at::kLong);
+  check_metadata(storage_table_ptrs, "storage_table_ptrs", at::kLong);
+  check_metadata(storage_table_value_dims, "storage_table_value_dims",
+                 at::kLong);
+  check_metadata(storage_table_bucket_offsets,
+                 "storage_table_bucket_offsets", at::kLong);
+  check_metadata(storage_ref_counter, "storage_ref_counter", at::kInt);
+  check_metadata(input_table_ids, "input_table_ids", at::kLong);
+  check_metadata(cache_slots, "cache_slots", at::kLong);
+  check_metadata(storage_src_rows, "storage_src_rows", at::kLong);
+  check_metadata(storage_lookup_slots, "storage_lookup_slots", at::kLong);
+  check_metadata(storage_founds, "storage_founds", at::kBool);
+  check_metadata(evicted_storage_slots, "evicted_storage_slots", at::kLong);
+  check_metadata(evicted_storage_dst_rows, "evicted_storage_dst_rows",
+                 at::kLong);
+  check_metadata(evicted_mask, "evicted_mask", at::kBool);
+
+  const int64_t num_tables = cache_table_ptrs.numel();
+  TORCH_CHECK(num_tables > 0, "table pointer arrays must be non-empty");
+  TORCH_CHECK(cache_table_value_dims.numel() == num_tables,
+              "cache_table_value_dims must match cache_table_ptrs");
+  TORCH_CHECK(storage_table_ptrs.numel() == num_tables,
+              "cache and storage must have the same number of tables");
+  TORCH_CHECK(storage_table_value_dims.numel() == num_tables,
+              "storage_table_value_dims must match storage_table_ptrs");
+  TORCH_CHECK(storage_table_bucket_offsets.numel() == num_tables + 1,
+              "storage_table_bucket_offsets must have num_tables + 1 entries");
+  TORCH_CHECK(storage_bucket_capacity > 0,
+              "storage_bucket_capacity must be positive");
+
+  const int64_t batch = cache_slots.numel();
+  TORCH_CHECK(input_table_ids.numel() == batch,
+              "input_table_ids must match cache_slots");
+  TORCH_CHECK(storage_src_rows.numel() == batch,
+              "storage_src_rows must match cache_slots");
+  TORCH_CHECK(storage_lookup_slots.numel() == batch,
+              "storage_lookup_slots must match cache_slots");
+  TORCH_CHECK(storage_founds.numel() == batch,
+              "storage_founds must match cache_slots");
+  TORCH_CHECK(evicted_storage_slots.numel() == batch,
+              "evicted_storage_slots must match cache_slots");
+  TORCH_CHECK(evicted_storage_dst_rows.numel() == batch,
+              "evicted_storage_dst_rows must match cache_slots");
+  TORCH_CHECK(evicted_mask.numel() == batch,
+              "evicted_mask must match cache_slots");
+  TORCH_CHECK(value_type == dyn_emb::DataType::Float32 ||
+                  value_type == dyn_emb::DataType::Float16 ||
+                  value_type == dyn_emb::DataType::BFloat16,
+              "value_type must be Float32, Float16, or BFloat16");
+  TORCH_CHECK(target_grid_size > 0,
+              "target_grid_size must be initialized to a positive value");
+
+  if (batch == 0)
+    return;
+
+  c10::cuda::CUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  constexpr int kBlockSize = 256;
+  static_assert(kBlockSize ==
+                    kExchangeWarpsPerBlock * kExchangeWarpSize,
+                "exchange launch must match the per-warp shared layout");
+  const int64_t needed_blocks =
+      (batch + kExchangeInputsPerBlock - 1) / kExchangeInputsPerBlock;
+  const int grid_size = static_cast<int>(
+      needed_blocks < target_grid_size ? needed_blocks : target_grid_size);
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+    exchange_cache_storage_values_kernel<ValueType>
+        <<<grid_size, kBlockSize, 0, stream>>>(
+            batch, num_tables,
+            get_pointer<int64_t>(cache_table_ptrs),
+            get_pointer<int64_t>(cache_table_value_dims),
+            get_pointer<int64_t>(storage_table_ptrs),
+            get_pointer<int64_t>(storage_table_value_dims),
+            get_pointer<int64_t>(storage_table_bucket_offsets),
+            storage_bucket_capacity, get_pointer<int32_t>(storage_ref_counter),
+            get_pointer<int64_t>(input_table_ids),
+            get_pointer<int64_t>(cache_slots),
+            get_pointer<int64_t>(storage_src_rows),
+            get_pointer<int64_t>(storage_lookup_slots),
+            get_pointer<bool>(storage_founds),
+            get_pointer<int64_t>(evicted_storage_slots),
+            get_pointer<int64_t>(evicted_storage_dst_rows),
+            get_pointer<bool>(evicted_mask));
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <typename IndexT, typename ValueT>
 __global__ void select_insert_failed_values_kernel_vec4(
     int64_t batch, int64_t stride, ValueT const *__restrict__ in_v_ptr,
@@ -872,6 +1462,21 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("input"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
         py::arg("all_dims_vec4"));
+
+  m.def(
+      "exchange_cache_storage_values", &exchange_cache_storage_values,
+      "Exchange physical value rows directly between cache and mapped storage.",
+      py::arg("cache_table_ptrs"), py::arg("cache_table_value_dims"),
+      py::arg("storage_table_ptrs"), py::arg("storage_table_value_dims"),
+      py::arg("storage_table_bucket_offsets"),
+      py::arg("storage_bucket_capacity"), py::arg("storage_ref_counter"),
+      py::arg("input_table_ids"), py::arg("cache_slots"),
+      py::arg("storage_src_rows"), py::arg("storage_lookup_slots"),
+      py::arg("storage_founds"),
+      py::arg("evicted_storage_slots"),
+      py::arg("evicted_storage_dst_rows"),
+      py::arg("evicted_mask"), py::arg("target_grid_size"),
+      py::arg("value_type"));
 
   m.def("select_insert_failed_values", &select_insert_failed_values,
         "select_insert_failed_values", py::arg("indices"),
