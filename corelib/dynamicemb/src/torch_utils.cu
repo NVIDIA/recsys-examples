@@ -128,15 +128,19 @@ at::ScalarType toScalarType(torch::Dtype dt) {
   case torch::kUInt64:
     return at::kUInt64;
   case torch::kInt32:
-    at::kInt;
+    return at::kInt;
   case torch::kUInt32:
-    at::kUInt32;
+    return at::kUInt32;
+  case torch::kFloat16:
+    return at::kHalf;
+  case torch::kBFloat16:
+    return at::kBFloat16;
   case torch::kFloat32:
-    at::kFloat;
+    return at::kFloat;
   case torch::kFloat64:
-    at::kDouble;
+    return at::kDouble;
   case torch::kBool:
-    at::kBool;
+    return at::kBool;
   }
 
   TORCH_CHECK(false, "Unsupported torch::Dtype");

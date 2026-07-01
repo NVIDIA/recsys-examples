@@ -699,6 +699,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     if PS
                     else DynamicEmbStorage(storage_options, self._optimizer)
                 )
+                if type(self._storage).exchange is Storage.exchange:
+                    raise TypeError(
+                        f"Caching storage {type(self._storage).__name__} must "
+                        "implement Storage.exchange(); the cache prefetch path "
+                        "has no find/insert fallback"
+                    )
                 self._storage_layout = (
                     StorageLayout.CACHING_PS if PS else StorageLayout.CACHING
                 )

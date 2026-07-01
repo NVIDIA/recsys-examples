@@ -51,6 +51,7 @@ from dynamicemb.key_value_table import (
     export_keys_values_iter,
     load_from_flat,
     load_from_flat_single_table,
+    store_to_flat,
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
@@ -58,7 +59,14 @@ from dynamicemb.optimizer import (
     pad_optimizer_states_from_checkpoint,
     truncate_optimizer_states_for_checkpoint,
 )
-from dynamicemb.types import EMBEDDING_TYPE, KEY_TYPE, OPT_STATE_TYPE, CopyMode
+from dynamicemb.types import (
+    EMBEDDING_TYPE,
+    KEY_TYPE,
+    OPT_STATE_TYPE,
+    CacheExchangeRequest,
+    CacheExchangeResult,
+    CopyMode,
+)
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -892,6 +900,77 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def size(self) -> int:
         return len(self.dict)
 
+    def exchange(self, request: CacheExchangeRequest) -> CacheExchangeResult:
+        """Reference semantic exchange for the external-storage test double.
+
+        External stores own their transfer implementation and may stage values;
+        the optimized built-in DynamicEmbStorage path does not use this code.
+        """
+        cache_state = request.cache_state
+
+        # Snapshot displaced cache rows before any incoming value overwrites a
+        # reused slot. The reference backend may compact the sparse mask; the
+        # optimized built-in exchange consumes the input-aligned layout.
+        evicted_input_positions = torch.nonzero(
+            request.evicted_mask, as_tuple=False
+        ).flatten()
+        if evicted_input_positions.numel() > 0:
+            evicted_values = load_from_flat(
+                cache_state,
+                request.evicted_indices[evicted_input_positions],
+                request.evicted_table_ids[evicted_input_positions],
+                copy_mode=CopyMode.VALUE,
+            )
+            self.insert(
+                request.evicted_keys[evicted_input_positions],
+                request.evicted_table_ids[evicted_input_positions],
+                evicted_values,
+                request.evicted_scores[evicted_input_positions],
+            )
+
+        storage_founds = torch.zeros_like(request.cache_founds)
+        storage_scores = torch.zeros(
+            request.keys.numel(), dtype=torch.int64, device=request.keys.device
+        )
+        cache_misses = ~request.cache_founds
+        miss_positions = torch.nonzero(cache_misses, as_tuple=False).flatten()
+        if miss_positions.numel() > 0:
+            (
+                _,
+                _,
+                _,
+                _,
+                _,
+                miss_founds,
+                miss_scores,
+                miss_values,
+            ) = self.find(
+                request.keys[miss_positions],
+                request.table_ids[miss_positions],
+                copy_mode=CopyMode.VALUE,
+                lfu_accumulated_frequency=(
+                    request.scores[miss_positions]
+                    if request.scores is not None
+                    else None
+                ),
+            )
+            storage_founds[miss_positions] = miss_founds
+            storage_scores[miss_positions] = miss_scores
+            found_positions = miss_positions[miss_founds]
+            if found_positions.numel() > 0:
+                store_to_flat(
+                    cache_state,
+                    request.cache_indices[found_positions],
+                    request.table_ids[found_positions],
+                    miss_values[miss_founds],
+                )
+
+        return CacheExchangeResult(
+            founds=request.cache_founds | storage_founds,
+            storage_founds=storage_founds,
+            storage_scores=storage_scores,
+        )
+
     def find_impl(
         self,
         unique_keys: torch.Tensor,
@@ -908,12 +987,14 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     ]:
         h_unique_keys = unique_keys.cpu()
         h_table_ids = table_ids.cpu()
+        h_input_scores = input_scores.cpu() if input_scores is not None else None
         lookup_dim = unique_embs.size(1)
         results = []
         missing_keys = []
         missing_indices = []
         missing_scores_list = []
         founds_ = []
+        output_scores_list = []
         for i in range(h_unique_keys.size(0)):
             key = h_unique_keys[i].item()
             tid = h_table_ids[i].item()
@@ -921,12 +1002,18 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             if composite_key in self.dict:
                 results.append(self.dict[composite_key][0:lookup_dim])
                 founds_.append(True)
+                stored_score = self.scores.get(composite_key, 0)
+                if h_input_scores is not None:
+                    stored_score += int(h_input_scores[i].item())
+                    self.scores[composite_key] = stored_score
+                output_scores_list.append(stored_score)
             else:
                 missing_keys.append(key)
                 missing_indices.append(i)
                 if input_scores is not None:
-                    missing_scores_list.append(input_scores[i].item())
+                    missing_scores_list.append(h_input_scores[i].item())
                 founds_.append(False)
+                output_scores_list.append(0)
         founds_ = torch.tensor(founds_, dtype=torch.bool, device=self.device)
         if len(results) > 0:
             unique_embs[founds_, :] = torch.cat(
@@ -950,12 +1037,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         else:
             missing_scores = torch.empty(0, dtype=torch.uint64, device=self.device)
 
-        # output_scores: scores for all keys (0 for missing, input_scores for found)
-        output_scores = torch.zeros(
-            unique_keys.size(0), dtype=torch.int64, device=self.device
+        output_scores = torch.tensor(
+            output_scores_list, dtype=torch.int64, device=self.device
         )
-        if input_scores is not None:
-            output_scores[founds_] = input_scores[founds_].to(torch.int64)
 
         return (
             num_missing,

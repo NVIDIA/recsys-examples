@@ -100,14 +100,25 @@ void bind_table_operation(py::module &m) {
         py::arg("bucket_capacity"), py::arg("keys"), py::arg("table_ids"),
         py::arg("score_input"), py::arg("policy_type"),
         py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
-        py::arg("ovf_output_offsets") = py::none());
+        py::arg("ovf_output_offsets") = py::none(),
+        py::arg("active_mask") = py::none(),
+        py::arg("active_count") = py::none(),
+        py::arg("score_output") = py::none(),
+        py::arg("founds_output") = py::none(),
+        py::arg("indices_output") = py::none(),
+        py::arg("acquire_counter") = py::none(),
+        py::arg("acquire_ovf_counter") = py::none());
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
         py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
         py::arg("counter"), py::arg("insert_results") = py::none(),
-        py::arg("score_output") = py::none());
+        py::arg("score_output") = py::none(),
+        py::arg("active_mask") = py::none(),
+        py::arg("active_count") = py::none(),
+        py::arg("row_counters") = py::none(),
+        py::arg("publish_and_acquire") = false);
 
   m.def("table_insert_and_evict", &dyn_emb::table_insert_and_evict,
         "insert into the table", py::arg("table_storage"),
@@ -121,10 +132,62 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_counter") = py::none(),
         py::arg("ovf_output_offsets") = py::none());
 
+  m.def("table_find_or_insert", &dyn_emb::table_find_or_insert,
+        "fused lookup, insert/evict, and reference acquisition with "
+        "input-aligned sparse eviction outputs",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
+        py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
+        py::arg("counter"), py::arg("max_cooperative_blocks"),
+        py::arg("insert_results") = py::none(),
+        py::arg("score_output") = py::none(),
+        py::arg("active_mask") = py::none(),
+        py::arg("active_count") = py::none(),
+        py::arg("indices_output") = py::none(),
+        py::arg("founds_output") = py::none(),
+        py::arg("evicted_keys_output") = py::none(),
+        py::arg("evicted_indices_output") = py::none(),
+        py::arg("evicted_scores_output") = py::none(),
+        py::arg("evicted_table_ids_output") = py::none(),
+        py::arg("evicted_mask_output") = py::none(),
+        py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
+        py::arg("ovf_bucket_sizes") = py::none(),
+        py::arg("ovf_counter") = py::none(),
+        py::arg("ovf_output_offsets") = py::none());
+
+  m.def("table_find_or_insert_max_cooperative_blocks",
+        &dyn_emb::table_find_or_insert_max_cooperative_blocks,
+        "query the resident grid limit for one find_or_insert specialization",
+        py::arg("key_type_device_ref"), py::arg("policy_type"),
+        py::arg("output_score"), py::arg("enable_overflow"));
+
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
-        py::arg("table_ids"), py::arg("indices") = py::none());
+        py::arg("table_ids"), py::arg("indices") = py::none(),
+        py::arg("active_mask") = py::none(),
+        py::arg("active_count") = py::none());
+
+  m.def("table_reclaim_by_slot", &dyn_emb::table_reclaim_by_slot,
+        "reclaim masked entries by known per-table slot",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
+        py::arg("table_ids"), py::arg("slot_indices"),
+        py::arg("counter"), py::arg("mask") = py::none(),
+        py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
+        py::arg("ovf_bucket_sizes") = py::none(),
+        py::arg("ovf_counter") = py::none(),
+        py::arg("ovf_output_offsets") = py::none());
+
+  m.def("table_update_score_by_slot", &dyn_emb::table_update_score_by_slot,
+        "replace scores at masked known per-table slots",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("slot_indices"),
+        py::arg("table_ids"), py::arg("scores"),
+        py::arg("active_mask") = py::none(),
+        py::arg("active_count") = py::none(),
+        py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
+        py::arg("ovf_output_offsets") = py::none());
 
   m.def("table_export_batch", &dyn_emb::table_export_batch,
         "export items[offset, offset + batch) from the table",
@@ -158,7 +221,9 @@ void bind_table_operation(py::module &m) {
   m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
         "Assign per-table monotonic scores via atomicAdd on "
         "no_eviction_next_index_dev; mutates no_eviction_next_index_dev.",
-        py::arg("no_eviction_next_index_dev"), py::arg("table_ids"));
+        py::arg("no_eviction_next_index_dev"), py::arg("table_ids"),
+        py::arg("active_mask") = py::none(),
+        py::arg("active_count") = py::none());
 
   py::enum_<dyn_emb::ScorePolicyType>(m, "ScorePolicy")
       .value("CONST", dyn_emb::ScorePolicyType::Const)

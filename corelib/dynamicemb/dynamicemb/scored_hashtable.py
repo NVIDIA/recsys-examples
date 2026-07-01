@@ -26,18 +26,31 @@ import torch.distributed as dist
 from dynamicemb.dynamicemb_config import dtype_to_bytes
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
 from dynamicemb_extensions import (
+    InsertResult,
     ScorePolicy,
     bucketize_keys,
     device_timestamp,
     table_count_matched,
     table_erase,
     table_export_batch,
+    table_find_or_insert,
+    table_find_or_insert_max_cooperative_blocks,
     table_insert,
     table_insert_and_evict,
     table_lookup,
     table_partition,
+    table_reclaim_by_slot,
     table_update_counter_with_layout,
+    table_update_score_by_slot,
 )
+
+
+# Occupancy depends only on the compiled kernel specialization and CUDA device,
+# not table capacity. Keep it process-wide so table expansion cannot reissue
+# driver queries from the forward path.
+_FIND_OR_INSERT_MAX_COOPERATIVE_BLOCKS: Dict[
+    Tuple[int, torch.dtype, bool], Dict[Tuple[ScorePolicy, bool], int]
+] = {}
 
 
 @dataclass(frozen=True)
@@ -114,6 +127,12 @@ class ScoredHashTable(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         score: ScoreArg,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
+        founds_out: Optional[torch.Tensor] = None,
+        indices_out: Optional[torch.Tensor] = None,
+        acquire: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Lookup keys in the table.
@@ -133,6 +152,10 @@ class ScoredHashTable(abc.ABC):
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
+        row_counters: Optional[torch.Tensor] = None,
+        publish_and_acquire: bool = False,
     ) -> torch.Tensor:
         """
         Keys have to be unique.
@@ -164,10 +187,37 @@ class ScoredHashTable(abc.ABC):
         """
 
     @abc.abstractmethod
+    def find_or_insert(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score: ScoreArg,
+        insert_results: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Fused lookup/insert/evict with input-aligned eviction metadata.
+
+        The final tuple element is a boolean mask selecting valid positions in
+        each full-length eviction tensor.
+        """
+
+    @abc.abstractmethod
     def erase(
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Erase Keys
@@ -457,6 +507,36 @@ class LinearBucketTable(ScoredHashTable):
             )
             self._ovf_counter = None
 
+        # Cooperative launch occupancy depends on the exact compile-time
+        # score/output/overflow specialization. Query every variant on the
+        # first matching table construction, then share it across later tables
+        # and expansions so find_or_insert has no steady-state config queries.
+        score_policies = (
+            ScorePolicy.CONST,
+            ScorePolicy.ASSIGN,
+            ScorePolicy.ACCUMULATE,
+            ScorePolicy.GLOBAL_TIMER,
+        )
+        config_key = (
+            self.keys_.device.index,
+            self.key_type_,
+            self.enable_overflow_,
+        )
+        if config_key not in _FIND_OR_INSERT_MAX_COOPERATIVE_BLOCKS:
+            _FIND_OR_INSERT_MAX_COOPERATIVE_BLOCKS[config_key] = {
+                (
+                    policy,
+                    output_score,
+                ): table_find_or_insert_max_cooperative_blocks(
+                    self.keys_, policy, output_score, self.enable_overflow_
+                )
+                for policy in score_policies
+                for output_score in (False, True)
+            }
+        self._find_or_insert_max_cooperative_blocks = (
+            _FIND_OR_INSERT_MAX_COOPERATIVE_BLOCKS[config_key]
+        )
+
     def _init_table(
         self,
         keys,
@@ -516,6 +596,12 @@ class LinearBucketTable(ScoredHashTable):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         score: ScoreArg,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
+        founds_out: Optional[torch.Tensor] = None,
+        indices_out: Optional[torch.Tensor] = None,
+        acquire: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Lookup keys in the table. Score is optional input for Assign/Accumulate policies.
@@ -534,6 +620,15 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             score_value,
             policy,
+            active_mask=mask,
+            active_count=count,
+            score_output=score_out,
+            founds_output=founds_out,
+            indices_output=indices_out,
+            acquire_counter=self._ref_counter if acquire else None,
+            acquire_ovf_counter=(
+                self._ovf_counter if acquire and self.enable_overflow_ else None
+            ),
         )
         return score_out, founds, indices
 
@@ -544,6 +639,10 @@ class LinearBucketTable(ScoredHashTable):
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
+        row_counters: Optional[torch.Tensor] = None,
+        publish_and_acquire: bool = False,
     ) -> torch.Tensor:
         """
         Keys have to be unique.
@@ -555,8 +654,21 @@ class LinearBucketTable(ScoredHashTable):
         """
         score_value, policy = self._parse_score(score)
 
-        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
-            return self._deterministic_insert(keys, table_ids, score_value, policy)
+        if (
+            os.environ.get("DEMB_DETERMINISM_MODE") is not None
+            and insert_results is None
+        ):
+            return self._deterministic_sparse_insert(
+                keys,
+                table_ids,
+                score_value,
+                policy,
+                score_out,
+                mask,
+                count,
+                row_counters,
+                publish_and_acquire,
+            )
 
         indices = table_insert(
             self.table_storage_,
@@ -570,8 +682,93 @@ class LinearBucketTable(ScoredHashTable):
             self._ref_counter,
             insert_results,
             score_out,
+            mask,
+            count,
+            row_counters,
+            publish_and_acquire,
         )
         return indices
+
+    def find_or_insert(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score: ScoreArg,
+        insert_results: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Fused cache lookup/insert/evict with reference acquisition.
+
+        Returns full-length ``(indices, founds, evicted_keys,
+        evicted_indices, evicted_scores, evicted_table_ids, evicted_mask)``.
+        The eviction tensors stay aligned with the input; their valid entries
+        are selected by ``evicted_mask``.
+        The calling thread must keep this table's CUDA device current.
+        """
+        if keys.dtype != self.key_type_:
+            raise TypeError(
+                f"find_or_insert expected keys with dtype {self.key_type_}, "
+                f"got {keys.dtype}"
+            )
+        if keys.device != self.table_storage_.device:
+            raise ValueError(
+                f"find_or_insert expected keys on {self.table_storage_.device}, "
+                f"got {keys.device}"
+            )
+        score_value, policy = self._parse_score(score)
+        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            return self._deterministic_find_or_insert(
+                keys,
+                table_ids,
+                score_value,
+                policy,
+                insert_results,
+                score_out,
+                mask,
+                count,
+            )
+
+        return table_find_or_insert(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            self._ref_counter,
+            self._find_or_insert_max_cooperative_blocks[
+                (policy, score_out is not None)
+            ],
+            insert_results=insert_results,
+            score_output=score_out,
+            active_mask=mask,
+            active_count=count,
+            ovf_storage=(
+                self.overflow_table_storage_ if self.enable_overflow_ else None
+            ),
+            ovf_bucket_capacity=(
+                self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
+            ),
+            ovf_bucket_sizes=(
+                self.overflow_bucket_sizes if self.enable_overflow_ else None
+            ),
+            ovf_counter=self._ovf_counter if self.enable_overflow_ else None,
+            ovf_output_offsets=(
+                self.overflow_output_offsets_ if self.enable_overflow_ else None
+            ),
+        )
 
     def insert_and_evict(
         self,
@@ -787,6 +984,8 @@ class LinearBucketTable(ScoredHashTable):
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Erase Keys
@@ -800,6 +999,70 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_sizes,
             keys,
             table_ids,
+            active_mask=mask,
+            active_count=count,
+        )
+
+    def reclaim_by_slot(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        slot_indices: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Release provisional entries without probing and invalidate slots."""
+        table_reclaim_by_slot(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            slot_indices,
+            self._ref_counter,
+            mask=mask,
+            ovf_storage=(
+                self.overflow_table_storage_ if self.enable_overflow_ else None
+            ),
+            ovf_bucket_capacity=(
+                self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
+            ),
+            ovf_bucket_sizes=(
+                self.overflow_bucket_sizes if self.enable_overflow_ else None
+            ),
+            ovf_counter=self._ovf_counter if self.enable_overflow_ else None,
+            ovf_output_offsets=(
+                self.overflow_output_offsets_ if self.enable_overflow_ else None
+            ),
+        )
+
+    def update_score_by_slot(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        count: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Replace scores at known main/overflow slots without a hash probe."""
+        table_update_score_by_slot(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            slot_indices,
+            table_ids,
+            scores,
+            active_mask=mask,
+            active_count=count,
+            ovf_storage=(
+                self.overflow_table_storage_ if self.enable_overflow_ else None
+            ),
+            ovf_bucket_capacity=(
+                self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
+            ),
+            ovf_output_offsets=(
+                self.overflow_output_offsets_ if self.enable_overflow_ else None
+            ),
         )
 
     def load(
@@ -1321,6 +1584,154 @@ class LinearBucketTable(ScoredHashTable):
     # Deterministic insert helpers
     # ------------------------------------------------------------------
 
+    def _deterministic_find_or_insert(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+        policy: ScorePolicy,
+        insert_results: Optional[torch.Tensor],
+        score_out: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+        count: Optional[torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Protect hits first, then insert in stable one-key-per-table waves."""
+        n = keys.numel()
+        device = keys.device
+        indices = torch.full((n,), -1, dtype=torch.int64, device=device)
+        founds = torch.zeros(n, dtype=torch.bool, device=device)
+        evicted_keys = torch.empty_like(keys)
+        evicted_indices = torch.empty(n, dtype=torch.int64, device=device)
+        evicted_scores = torch.empty(n, dtype=torch.int64, device=device)
+        evicted_tids = torch.empty(n, dtype=torch.int64, device=device)
+        evicted_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        if n == 0:
+            return (
+                indices,
+                founds,
+                evicted_keys,
+                evicted_indices,
+                evicted_scores,
+                evicted_tids,
+                evicted_mask,
+            )
+
+        # Deterministic mode is intentionally a slower control path.  Acquire
+        # all hit references before any insertion wave, preserving the same
+        # hit-before-eviction ordering as the cooperative hot-path kernel.
+        _, founds, indices = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            ovf_storage=(
+                self.overflow_table_storage_ if self.enable_overflow_ else None
+            ),
+            ovf_bucket_capacity=(
+                self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
+            ),
+            ovf_output_offsets=(
+                self.overflow_output_offsets_ if self.enable_overflow_ else None
+            ),
+            active_mask=mask,
+            active_count=count,
+            score_output=score_out,
+            founds_output=founds,
+            indices_output=indices,
+            acquire_counter=self._ref_counter,
+            acquire_ovf_counter=(
+                self._ovf_counter if self.enable_overflow_ else None
+            ),
+        )
+        if insert_results is not None:
+            insert_results[founds] = InsertResult.ASSIGN.value
+
+        # The overflow tier has one shared bucket per table.  One key per main
+        # bucket is not sufficient for deterministic overflow behavior, so
+        # serialize each table while still processing different tables in
+        # parallel.
+        sorted_indices = torch.argsort(table_ids, stable=True)
+        sorted_tids = table_ids[sorted_indices]
+        _, lengths = torch.unique_consecutive(sorted_tids, return_counts=True)
+        offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=device),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        max_wave = int(lengths.max().item()) if lengths.numel() else 0
+        sorted_positions = torch.arange(n, device=device) - torch.repeat_interleave(
+            offsets[:-1], lengths
+        )
+        wave_ids = torch.empty(n, dtype=torch.int64, device=device)
+        wave_ids[sorted_indices] = sorted_positions
+
+        for wave in range(max_wave):
+            wave_mask = wave_ids == wave
+            if mask is not None:
+                wave_mask &= mask
+            wave_mask &= ~founds
+            table_find_or_insert(
+                self.table_storage_,
+                self.table_bucket_offsets_,
+                self.bucket_capacity_,
+                self.bucket_sizes,
+                keys,
+                table_ids,
+                score_value,
+                policy,
+                self._ref_counter,
+                self._find_or_insert_max_cooperative_blocks[
+                    (policy, score_out is not None)
+                ],
+                insert_results=insert_results,
+                score_output=score_out,
+                active_mask=wave_mask,
+                active_count=count,
+                indices_output=indices,
+                founds_output=founds,
+                evicted_keys_output=evicted_keys,
+                evicted_indices_output=evicted_indices,
+                evicted_scores_output=evicted_scores,
+                evicted_table_ids_output=evicted_tids,
+                evicted_mask_output=evicted_mask,
+                ovf_storage=(
+                    self.overflow_table_storage_ if self.enable_overflow_ else None
+                ),
+                ovf_bucket_capacity=(
+                    self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
+                ),
+                ovf_bucket_sizes=(
+                    self.overflow_bucket_sizes if self.enable_overflow_ else None
+                ),
+                ovf_counter=self._ovf_counter if self.enable_overflow_ else None,
+                ovf_output_offsets=(
+                    self.overflow_output_offsets_
+                    if self.enable_overflow_
+                    else None
+                ),
+            )
+        return (
+            indices,
+            founds,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+            evicted_tids,
+            evicted_mask,
+        )
+
     def _bucketize_and_pad(
         self,
         keys: torch.Tensor,
@@ -1428,6 +1839,151 @@ class LinearBucketTable(ScoredHashTable):
             None,
             ScorePolicy.CONST,
         )
+        return indices
+
+    def _deterministic_sparse_insert(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+        policy: ScorePolicy,
+        score_out: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+        count: Optional[torch.Tensor],
+        row_counters: Optional[torch.Tensor],
+        publish_and_acquire: bool,
+    ) -> torch.Tensor:
+        """Deterministic insert while preserving the caller's sparse layout."""
+        n = keys.numel()
+        if row_counters is not None or publish_and_acquire:
+            if row_counters is not None and score_out is None:
+                raise ValueError("row_counters requires score_out")
+            indices = torch.full(
+                (n,), -1, dtype=torch.int64, device=keys.device
+            )
+            if n == 0:
+                return indices
+
+            active = torch.ones(n, dtype=torch.bool, device=keys.device)
+            if mask is not None:
+                active &= mask
+            if count is not None:
+                active &= torch.arange(n, device=keys.device) < count
+
+            # Serialize each table in stable input order.  At most one active
+            # key per table reaches each kernel, so row allocation and
+            # hash-table mutation are deterministic without compacting the
+            # caller's score/output layout.
+            # Inactive capacity entries may have uninitialized table IDs.
+            # Give each one a distinct sentinel group so only active entries
+            # for the same table contribute to the serialized wave count.
+            positions = torch.arange(n, device=keys.device)
+            grouped_tids = torch.where(
+                active, table_ids, self.num_tables_ + positions
+            )
+            sorted_indices = torch.argsort(grouped_tids, stable=True)
+            sorted_tids = grouped_tids[sorted_indices]
+            _, lengths = torch.unique_consecutive(
+                sorted_tids, return_counts=True
+            )
+            offsets = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int64, device=keys.device),
+                    torch.cumsum(lengths, dim=0),
+                ]
+            )
+            max_wave = int(lengths.max().item()) if lengths.numel() else 0
+            sorted_positions = positions - torch.repeat_interleave(
+                offsets[:-1], lengths
+            )
+            wave_ids = torch.empty(n, dtype=torch.int64, device=keys.device)
+            wave_ids[sorted_indices] = sorted_positions
+
+            for wave in range(max_wave):
+                wave_mask = active & (wave_ids == wave)
+                wave_indices = table_insert(
+                    self.table_storage_,
+                    self.table_bucket_offsets_,
+                    self.bucket_capacity_,
+                    self.bucket_sizes,
+                    keys,
+                    table_ids,
+                    score_value,
+                    policy,
+                    self._ref_counter,
+                    score_output=score_out,
+                    active_mask=wave_mask,
+                    row_counters=row_counters,
+                    publish_and_acquire=publish_and_acquire,
+                )
+                indices[wave_mask] = wave_indices[wave_mask]
+            return indices
+
+        if mask is None and count is None:
+            indices = self._deterministic_insert(
+                keys, table_ids, score_value, policy
+            )
+            if score_out is not None:
+                table_lookup(
+                    self.table_storage_,
+                    self.table_bucket_offsets_,
+                    self.bucket_capacity_,
+                    keys,
+                    table_ids,
+                    None,
+                    ScorePolicy.CONST,
+                    score_output=score_out,
+                )
+            return indices
+
+        active = torch.ones(n, dtype=torch.bool, device=keys.device)
+        if mask is not None:
+            active &= mask
+        if count is not None:
+            active &= torch.arange(n, device=keys.device) < count
+        positions = torch.nonzero(active, as_tuple=False).flatten()
+        indices = torch.full(
+            (n,), -1, dtype=torch.int64, device=keys.device
+        )
+        if positions.numel() == 0:
+            if score_out is not None:
+                # Let the masked lookup kernel initialize every skipped score
+                # to zero; callers are free to provide torch.empty storage.
+                table_lookup(
+                    self.table_storage_,
+                    self.table_bucket_offsets_,
+                    self.bucket_capacity_,
+                    keys,
+                    table_ids,
+                    None,
+                    ScorePolicy.CONST,
+                    active_mask=active,
+                    score_output=score_out,
+                )
+            return indices
+
+        compact_scores = (
+            score_value[positions] if score_value is not None else None
+        )
+        compact_indices = self._deterministic_insert(
+            keys[positions],
+            table_ids[positions],
+            compact_scores,
+            policy,
+        )
+        indices[positions] = compact_indices
+        if score_out is not None:
+            table_lookup(
+                self.table_storage_,
+                self.table_bucket_offsets_,
+                self.bucket_capacity_,
+                keys,
+                table_ids,
+                None,
+                ScorePolicy.CONST,
+                active_mask=active,
+                score_output=score_out,
+            )
         return indices
 
     def _deterministic_insert_and_evict(

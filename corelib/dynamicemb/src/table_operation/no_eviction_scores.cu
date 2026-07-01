@@ -19,9 +19,11 @@ constexpr int64_t kMaxNumTablesShm = 1024;
 __global__ void no_eviction_assign_scores_kernel_global(
     int64_t *__restrict__ no_eviction_next_index_dev,
     int64_t const *__restrict__ table_ids, uint64_t *__restrict__ scores,
-    int64_t n) {
+    int64_t n, bool const *__restrict__ active_mask,
+    int64_t const *__restrict__ active_count) {
   int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= n)
+  if (i >= n || (active_count != nullptr && i >= *active_count) ||
+      (active_mask != nullptr && !active_mask[i]))
     return;
   int64_t tid = table_ids[i];
   int64_t old_val = atomicAdd(no_eviction_next_index_dev + tid, 1);
@@ -69,15 +71,20 @@ __global__ void no_eviction_assign_scores_kernel_shm(
 }
 
 at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
-                                     at::Tensor table_ids) {
+                                     at::Tensor table_ids,
+                                     std::optional<at::Tensor> active_mask,
+                                     std::optional<at::Tensor> active_count) {
   TORCH_CHECK(no_eviction_next_index_dev.is_cuda());
   TORCH_CHECK(table_ids.is_cuda());
   TORCH_CHECK(no_eviction_next_index_dev.scalar_type() == at::kLong);
   TORCH_CHECK(table_ids.scalar_type() == at::kLong);
   int64_t n = table_ids.numel();
   int64_t num_tables = no_eviction_next_index_dev.numel();
+  bool sparse = (active_mask.has_value() && active_mask->defined()) ||
+                (active_count.has_value() && active_count->defined());
   at::Tensor scores =
-      torch::empty({n}, table_ids.options().dtype(torch::kUInt64));
+      sparse ? torch::zeros({n}, table_ids.options().dtype(torch::kUInt64))
+             : torch::empty({n}, table_ids.options().dtype(torch::kUInt64));
   if (n == 0)
     return scores;
   constexpr int BLOCK = 256;
@@ -94,7 +101,8 @@ at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
     no_eviction_assign_scores_kernel_global<<<(n + BLOCK - 1) / BLOCK, BLOCK, 0,
                                               stream>>>(
         no_eviction_next_index_dev.data_ptr<int64_t>(),
-        table_ids.data_ptr<int64_t>(), scores.data_ptr<uint64_t>(), n);
+        table_ids.data_ptr<int64_t>(), scores.data_ptr<uint64_t>(), n,
+        get_pointer<bool>(active_mask), get_pointer<int64_t>(active_count));
   // }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   return scores;
