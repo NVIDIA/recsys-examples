@@ -14,6 +14,7 @@
 # limitations under the License.
 import math
 import os
+import time
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -24,6 +25,7 @@ from commons.ops.triton_ops.common import (
 )
 from configs import HSTUConfig, InferenceHSTUConfig, RankingConfig
 from modules.hstu_block_inference import HSTUBlockInference
+from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_metadata import (
@@ -335,6 +337,7 @@ class InferenceDenseModule(torch.nn.Module):
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
         kvcache_info: Tuple[KVIndexMeta, KVLookupResult, KVCacheMetadata],
+        onboard_handle=None,
     ):
         with torch.inference_mode():
             (
@@ -359,6 +362,28 @@ class InferenceDenseModule(torch.nn.Module):
                 kvcache_metadata.total_history_lengths + jagged_data.num_candidates
             )
             kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
+
+            if (
+                onboard_handle is not None
+                and onboard_handle.status != HostKVTaskStatus.SKIPPED
+                and onboard_handle.backend == "flexkv"
+            ):
+                torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait_full")
+                deadline = time.time() + 60.0
+                try:
+                    while True:
+                        wait_result = self.kvcache.onboard_wait(
+                            kv_index_meta, onboard_handle
+                        )
+                        if wait_result.ready:
+                            break
+                        if time.time() > deadline:
+                            raise TimeoutError(
+                                "FlexKV onboard_wait did not become ready within 60s."
+                            )
+                        time.sleep(0.001)
+                finally:
+                    torch.cuda.nvtx.range_pop()
 
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:

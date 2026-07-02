@@ -151,7 +151,7 @@ class InferenceRankingGR(torch.nn.Module):
             )
 
             # asynchronous kvdata onboard, overlapping with strip_cached and embedding lookup
-            self.dense_module.kvcache.onboard_launch(
+            onboard_handle = self.dense_module.kvcache.onboard_launch(
                 index_meta, lookup_res, kvcache_metadata
             )
 
@@ -172,6 +172,7 @@ class InferenceRankingGR(torch.nn.Module):
                 user_ids,
                 total_history_lengths,
                 kvcache_info,
+                onboard_handle,
             )
 
         return logits
