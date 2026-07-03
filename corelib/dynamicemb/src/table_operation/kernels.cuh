@@ -157,9 +157,20 @@ __global__ void table_lookup_kernel(
         if (ovf_found) {
           found = true;
           index = ovf_out_iter;
+          Iter local = ovf_out_iter - ovf_output_offsets[t_id];
           if constexpr (PolicyType == ScorePolicyType::Const) {
-            Iter local = ovf_out_iter - ovf_output_offsets[t_id];
             score = *ovf_bucket.scores(local);
+          } else {
+            // Maintain the overflow entry's score on access (stamp timestamp /
+            // accumulate frequency), mirroring the main-table found path; for
+            // LruLfu update() writes both words. Lock the slot for a consistent
+            // write; skip if the entry moved out concurrently.
+            KeyType expected_key = key;
+            if (ovf_bucket.try_lock(local, expected_key)) {
+              score = ScorePolicy<PolicyType>::update(ovf_bucket.scores(local),
+                                                      score);
+              ovf_bucket.unlock(local, key);
+            }
           }
         }
       }
@@ -473,14 +484,28 @@ __global__ void table_insert_and_evict_kernel(
           index = ovf_iter;
           final_result = ovf_result;
           table_key_slot = nullptr;
-          if (ovf_result == InsertResult::Evict) {
-            Iter local = ovf_iter - ovf_output_offsets[t_id];
+          Iter local = ovf_iter - ovf_output_offsets[t_id];
+          if (ovf_result == InsertResult::Insert ||
+              ovf_result == InsertResult::Evict) {
+            // Newly occupied overflow slot (locked until table_unlock_kernel):
+            // clear the whole score block so LruLfu frequency restarts at 0,
+            // then write the score words via the policy.
+            for (int64_t s = 0; s < ovf_bucket.num_scores(); ++s)
+              *ovf_bucket.scores(local, s) = ScoreType();
+            score = Policy::update(ovf_bucket.scores(local), score);
             table_key_slot = ovf_bucket.keys(local);
-            final_evict_key = ovf_evict_key;
-            final_evict_index = ovf_iter;
-          } else if (ovf_result == InsertResult::Insert) {
-            Iter local = ovf_iter - ovf_output_offsets[t_id];
-            table_key_slot = ovf_bucket.keys(local);
+            if (ovf_result == InsertResult::Evict) {
+              final_evict_key = ovf_evict_key;
+              final_evict_index = ovf_iter;
+            }
+          } else if (ovf_result == InsertResult::Assign) {
+            // Existing overflow key re-inserted: update its score under lock
+            // (accumulate for LruLfu). It is not locked by the find, so guard.
+            KeyType expected_key = key;
+            if (ovf_bucket.try_lock(local, expected_key)) {
+              score = Policy::update(ovf_bucket.scores(local), score);
+              ovf_bucket.unlock(local, key);
+            }
           }
         }
       }
