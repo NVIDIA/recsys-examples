@@ -149,6 +149,18 @@ void bind_table_operation(py::module &m) {
         py::arg("num_scores"), py::arg("src_bkt_begin"), py::arg("dst_bkt_begin"),
         py::arg("src_slots"), py::arg("dst_slots"), py::arg("key_dtype"));
 
+  m.def("table_gather_score_blocks", &dyn_emb::table_gather_score_blocks,
+        "gather all score words at the given slots into a [n, num_scores] tensor",
+        py::arg("table_storage"), py::arg("bucket_capacity"),
+        py::arg("num_scores"), py::arg("bkt_begin"), py::arg("slots"),
+        py::arg("key_dtype"));
+
+  m.def("table_scatter_score_blocks", &dyn_emb::table_scatter_score_blocks,
+        "scatter a [n, num_scores] score block into the given slots",
+        py::arg("table_storage"), py::arg("bucket_capacity"),
+        py::arg("num_scores"), py::arg("bkt_begin"), py::arg("slots"),
+        py::arg("values"), py::arg("key_dtype"));
+
   m.def("bucketize_keys", &dyn_emb::bucketize_keys,
         "bucketize input keys into a dense tensor, and return the output keys, "
         "buckets offset, inverse indices. num_buckets must equal "

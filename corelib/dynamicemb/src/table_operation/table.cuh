@@ -123,6 +123,16 @@ void table_copy_score_blocks(at::Tensor src_storage, int64_t src_bucket_capacity
                              int64_t dst_bkt_begin, at::Tensor src_slots,
                              at::Tensor dst_slots, torch::Dtype key_dtype);
 
+at::Tensor table_gather_score_blocks(at::Tensor table_storage,
+                                     int64_t bucket_capacity, int64_t num_scores,
+                                     int64_t bkt_begin, at::Tensor slots,
+                                     torch::Dtype key_dtype);
+
+void table_scatter_score_blocks(at::Tensor table_storage,
+                                int64_t bucket_capacity, int64_t num_scores,
+                                int64_t bkt_begin, at::Tensor slots,
+                                at::Tensor values, torch::Dtype key_dtype);
+
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,
                                         int64_t bucket_capacity,

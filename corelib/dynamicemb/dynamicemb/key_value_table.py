@@ -1115,11 +1115,19 @@ def export_keys_values_iter(
             ).to(device)
         else:
             opt_states = None
+        # Multi-word score layouts (e.g. LruLfu: timestamp + frequency) must
+        # persist ALL words, not just the exported column, so the checkpoint can
+        # restore them exactly. Gather the full [N, num_scores] block at the
+        # exported slots; single-score tables keep the [N] shape unchanged.
+        if state.key_index_map.num_scores_ > 1:
+            out_scores = state.key_index_map.gather_score_blocks(table_id, indices)
+        else:
+            out_scores = scores.to(SCORE_TYPE)
         yield (
             keys.to(device),
             embeddings.to(device),
             opt_states,
-            scores.to(SCORE_TYPE).to(device),
+            out_scores.to(device),
         )
 
 
@@ -1188,8 +1196,13 @@ def _iter_batches_from_files(
     optstate_dim: int,
     device: torch.device,
     batch_size: int = 65536,
+    num_scores: int = 1,
 ) -> Iterator[Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]]:
     """Yield (keys, embeddings, scores, opt_states) batches from checkpoint files.
+
+    ``num_scores`` is the number of score words per key in the score file. When
+    > 1 (e.g. LruLfu's timestamp+frequency) the yielded ``scores`` is
+    [n, num_scores]; otherwise it is [n].
 
     Handles file I/O, numpy deserialization, and distributed world_size filtering.
     Pass *score_file_path* / *opt_file_path* as ``None`` to skip those files.
@@ -1227,7 +1240,7 @@ def _iter_batches_from_files(
 
             scores = None
             if fscore:
-                score_bytes = fscore.read(SCORE_TYPE.itemsize * n)
+                score_bytes = fscore.read(SCORE_TYPE.itemsize * n * num_scores)
                 scores = torch.tensor(
                     np.frombuffer(
                         score_bytes, dtype=torch_dtype_to_np_dtype[SCORE_TYPE]
@@ -1235,6 +1248,8 @@ def _iter_batches_from_files(
                     dtype=SCORE_TYPE,
                     device=device,
                 )
+                if num_scores > 1:
+                    scores = scores.view(-1, num_scores)
 
             opt_states = None
             if fopt:
@@ -1429,6 +1444,30 @@ def _load_key_values(
         if opt_states is not None
         else embeddings
     )
+
+    # Multi-word score layouts (LruLfu: timestamp + frequency) cannot be restored
+    # by a single-value insert (which only writes word 0). Place the keys without
+    # touching scores (CONST), then scatter the full [N, num_scores] block.
+    num_scores = state.key_index_map.num_scores_
+    if num_scores > 1:
+        assert (
+            scores is not None and scores.dim() == 2 and scores.size(1) == num_scores
+        ), (
+            f"multi-word load expects [N, {num_scores}] scores, "
+            f"got {None if scores is None else tuple(scores.shape)}"
+        )
+        tid_tensor = torch.full(
+            (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
+        )
+        place_arg = ScoreArg(
+            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+        )
+        indices = state.key_index_map.insert(keys, tid_tensor, place_arg)
+        state.key_index_map.scatter_score_blocks(
+            table_id, indices, scores.to(SCORE_TYPE).contiguous()
+        )
+        store_to_flat_single_table(state, indices, table_id, values)
+        return
 
     policy = ScorePolicy.ASSIGN
     tid_tensor = torch.full(
@@ -1900,6 +1939,7 @@ class DynamicEmbStorage(Storage):
             params.dim,
             params.file_optstate_dim,
             device,
+            num_scores=self._state.key_index_map.num_scores_,
         ):
             if scores is not None and self._state.evict_strategy == EvictStrategy.KLru:
                 scores = torch.clamp(timestamp - scores, min=0)
@@ -2417,6 +2457,19 @@ class HybridStorage(Storage):
         current_score: Optional[int] = None,
         timestamp: int = 0,
     ) -> None:
+        if (
+            self._host.key_index_map.num_scores_ > 1
+            or self._hbm.key_index_map.num_scores_ > 1
+        ):
+            # Hybrid dump appends the HBM tier after the host tier into the same
+            # score file; the tiers can have different num_scores (e.g. host
+            # LruLfu = 2 words, HBM cache TIMESTAMP = 1 word), so a uniform score
+            # file is ill-defined. Multi-word dump/load for HybridStorage needs
+            # per-tier score files -- left as a follow-up.
+            raise NotImplementedError(
+                "dump is not yet supported for HybridStorage with multi-word "
+                "score layouts (e.g. LFU + need_incremental_dump with caching)."
+            )
         _dump_table(
             self._host,
             table_id,
@@ -2458,6 +2511,16 @@ class HybridStorage(Storage):
         include_optim: bool = True,
         timestamp: int = 0,
     ) -> Optional[int]:
+        if (
+            self._host.key_index_map.num_scores_ > 1
+            or self._hbm.key_index_map.num_scores_ > 1
+        ):
+            # Mirror of the dump guard: multi-word (e.g. LruLfu) checkpoints for
+            # HybridStorage need per-tier score files -- left as a follow-up.
+            raise NotImplementedError(
+                "load is not yet supported for HybridStorage with multi-word "
+                "score layouts (e.g. LFU + need_incremental_dump with caching)."
+            )
         params = _validate_load_meta(
             self._hbm,
             table_id,

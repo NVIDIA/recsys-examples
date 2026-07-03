@@ -31,6 +31,8 @@ from dynamicemb_extensions import (
     device_timestamp,
     table_copy_score_blocks,
     table_count_matched,
+    table_gather_score_blocks,
+    table_scatter_score_blocks,
     table_erase,
     table_export_batch,
     table_insert,
@@ -1340,6 +1342,38 @@ class LinearBucketTable(ScoredHashTable):
             dst_bkt_begin,
             src_slots,
             dst_slots,
+            self.key_type_,
+        )
+
+    def gather_score_blocks(
+        self, table_id: int, slots: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather all score words at ``slots`` (table-relative flat indices) into a
+        [N, num_scores_] tensor. Used by dump to persist multi-word layouts."""
+        bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
+        return table_gather_score_blocks(
+            self.table_storage_,
+            self.bucket_capacity_,
+            self.num_scores_,
+            bkt_begin,
+            slots,
+            self.key_type_,
+        )
+
+    def scatter_score_blocks(
+        self, table_id: int, slots: torch.Tensor, values: torch.Tensor
+    ) -> None:
+        """Scatter a [N, num_scores_] score block into ``slots`` (table-relative
+        flat indices). Used by load to restore multi-word layouts after keys are
+        placed."""
+        bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
+        table_scatter_score_blocks(
+            self.table_storage_,
+            self.bucket_capacity_,
+            self.num_scores_,
+            bkt_begin,
+            slots,
+            values,
             self.key_type_,
         )
 

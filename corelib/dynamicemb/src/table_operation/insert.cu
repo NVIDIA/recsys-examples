@@ -185,4 +185,67 @@ void table_copy_score_blocks(at::Tensor src_storage, int64_t src_bucket_capacity
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Gather all score words at `slots` into a [n, num_scores] uint64 tensor.
+// Used by dump to persist multi-word score layouts (LruLfu).
+at::Tensor table_gather_score_blocks(at::Tensor table_storage,
+                                     int64_t bucket_capacity, int64_t num_scores,
+                                     int64_t bkt_begin, at::Tensor slots,
+                                     torch::Dtype key_dtype) {
+  int64_t n = slots.size(0);
+  auto out = torch::empty(
+      {n, num_scores},
+      torch::TensorOptions().dtype(torch::kInt64).device(table_storage.device()));
+  if (n == 0)
+    return out;
+  auto key_type = scalartype_to_datatype(toScalarType(key_dtype));
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  constexpr int BLOCK_SIZE = 256;
+  DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
+    using Bucket = LinearBucket<KeyType>;
+    using Table = LinearBucketTable<Bucket>;
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
+    int64_t num_buckets = table_storage.numel() * table_storage.element_size() /
+                          (bucket_capacity * total_size);
+    auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
+                       num_buckets, bucket_capacity, num_scores);
+    gather_score_blocks_kernel<Table>
+        <<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table, bkt_begin, n, slots.data_ptr<int64_t>(),
+            reinterpret_cast<ScoreType *>(out.data_ptr<int64_t>()));
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+// Scatter a [n, num_scores] uint64 score block into `slots`. Used by load to
+// restore multi-word score layouts (LruLfu) after keys are placed.
+void table_scatter_score_blocks(at::Tensor table_storage,
+                                int64_t bucket_capacity, int64_t num_scores,
+                                int64_t bkt_begin, at::Tensor slots,
+                                at::Tensor values, torch::Dtype key_dtype) {
+  int64_t n = slots.size(0);
+  if (n == 0)
+    return;
+  auto key_type = scalartype_to_datatype(toScalarType(key_dtype));
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  constexpr int BLOCK_SIZE = 256;
+  at::Tensor vals = values.contiguous();
+  DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
+    using Bucket = LinearBucket<KeyType>;
+    using Table = LinearBucketTable<Bucket>;
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
+    int64_t num_buckets = table_storage.numel() * table_storage.element_size() /
+                          (bucket_capacity * total_size);
+    auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
+                       num_buckets, bucket_capacity, num_scores);
+    scatter_score_blocks_kernel<Table>
+        <<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table, bkt_begin, n, slots.data_ptr<int64_t>(),
+            reinterpret_cast<const ScoreType *>(vals.data_ptr<int64_t>()));
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 } // namespace dyn_emb

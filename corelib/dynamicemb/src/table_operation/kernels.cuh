@@ -831,4 +831,50 @@ __global__ void copy_score_blocks_kernel(
   }
 }
 
+// Gather all score words for a set of slots into a row-major [n, num_scores]
+// output. Used by dump to persist multi-word score layouts (LruLfu). Slots are
+// table-relative flat indices; bkt_begin is the table's first global bucket.
+template <typename Table>
+__global__ void gather_score_blocks_kernel(
+    Table table, int64_t bkt_begin, int64_t n,
+    const int64_t *__restrict__ slots, ScoreType *__restrict__ out) {
+  using Bucket = typename Table::BucketType;
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  int64_t ns = table.num_scores();
+  int64_t s = slots[i];
+  if (s < 0) {
+    for (int64_t k = 0; k < ns; ++k)
+      out[i * ns + k] = ScoreType();
+    return;
+  }
+  int64_t bc = table.bucket_capacity();
+  Bucket b = table[bkt_begin + s / bc];
+  int64_t it = s % bc;
+  for (int64_t k = 0; k < ns; ++k)
+    out[i * ns + k] = *b.scores(it, k);
+}
+
+// Scatter a row-major [n, num_scores] score block into a set of slots. Used by
+// load to restore multi-word score layouts (LruLfu) after the keys are placed.
+template <typename Table>
+__global__ void scatter_score_blocks_kernel(
+    Table table, int64_t bkt_begin, int64_t n,
+    const int64_t *__restrict__ slots, const ScoreType *__restrict__ vals) {
+  using Bucket = typename Table::BucketType;
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  int64_t s = slots[i];
+  if (s < 0)
+    return;
+  int64_t ns = table.num_scores();
+  int64_t bc = table.bucket_capacity();
+  Bucket b = table[bkt_begin + s / bc];
+  int64_t it = s % bc;
+  for (int64_t k = 0; k < ns; ++k)
+    *b.scores(it, k) = vals[i * ns + k];
+}
+
 } // namespace dyn_emb
