@@ -133,6 +133,7 @@ __global__ void table_lookup_kernel(
       } else {
         KeyType expected_key = key;
         if (bucket.try_lock(iter, expected_key)) {
+          // For LruLfu, update() writes both words (timestamp + frequency).
           score = ScorePolicy<PolicyType>::update(bucket.scores(iter), score);
           bucket.unlock(iter, key);
         } else {
@@ -235,7 +236,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
             continue;
           }
         }
-        if (*bucket.scores(iter) != evict_score) {
+        if (*bucket.reduction_score(iter) != evict_score) {
           bucket.unlock(iter, evict_key);
         } else {
           *bucket.digests(iter) = Bucket::key_to_digest(key);
@@ -243,7 +244,11 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
             atomicAdd(&bucket_sizes[bucket_id], 1);
             result = InsertResult::Reclaim;
           } else {
-            *bucket.scores(iter) = ScoreType();
+            // Clear the evicted key's whole (AoS-contiguous) score block so the
+            // new occupant starts fresh (e.g. LruLfu frequency restarts at 0).
+            ScoreType *sblk = bucket.scores(iter);
+            for (int64_t s = 0; s < bucket.num_scores(); ++s)
+              sblk[s] = ScoreType();
             result = InsertResult::Evict;
           }
           if (evict_key_out)
@@ -341,6 +346,8 @@ __global__ void table_insert_kernel(
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
+      // For LruLfu, update() writes both words (timestamp + frequency); a freshly
+      // evicted slot already had its block cleared in insert().
       score = Policy::update(bucket.scores(iter), score);
       index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
@@ -437,6 +444,7 @@ __global__ void table_insert_and_evict_kernel(
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
+      // For LruLfu, update() writes both words (timestamp + frequency).
       score = Policy::update(bucket.scores(iter), score);
       index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
@@ -619,7 +627,8 @@ __global__ void table_export_batch_kernel(
     Table table, IndexType begin, IndexType end, IndexType table_begin,
     CounterType *__restrict__ counter,
     typename Table::KeyType *__restrict__ keys, ScoreType *__restrict__ scores,
-    PredFunctor pred, IndexType *__restrict__ indices) {
+    PredFunctor pred, IndexType *__restrict__ indices,
+    int64_t score_index = 0) {
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
@@ -637,7 +646,10 @@ __global__ void table_export_batch_kernel(
     Iter iter = Iter(i % bucket.capacity());
 
     const KeyType key = *bucket.keys(iter);
-    const ScoreType score = *bucket.scores(iter);
+    // Predicate + exported score read from the selected column (score_index).
+    // col0 (default) is the reduction score; an auxiliary column (e.g. a
+    // last-access timestamp) is used for time-based incremental dump.
+    const ScoreType score = *bucket.scores(iter, score_index);
     const IndexType index = i - table_begin;
 
     bool valid = Bucket::is_valid(key);
@@ -761,7 +773,8 @@ __forceinline__ __device__ void overflow_insert_and_evict(
 
 template <typename Table, typename ExecFunctor, int TileSize>
 __global__ void table_traverse_kernel(Table table, IndexType begin,
-                                      IndexType end, ExecFunctor f) {
+                                      IndexType end, ExecFunctor f,
+                                      int64_t score_index = 0) {
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
@@ -780,7 +793,7 @@ __global__ void table_traverse_kernel(Table table, IndexType begin,
     Iter iter = Iter(i % bucket.capacity());
 
     const KeyType key = *bucket.keys(iter);
-    const ScoreType score = *bucket.scores(iter);
+    const ScoreType score = *bucket.scores(iter, score_index);
 
     bool valid = Bucket::is_valid(key);
     f.template operator()<TileSize>(score, g, valid);

@@ -51,7 +51,7 @@ void table_insert_single_score(at::Tensor table_storage,
                                ScorePolicyType policy_type, at::Tensor indices,
                                std::optional<at::Tensor> insert_results,
                                std::optional<at::Tensor> score_output,
-                               at::Tensor counter) {
+                               at::Tensor counter, int64_t num_scores) {
 
   auto key_type = get_data_type(keys);
 
@@ -92,8 +92,8 @@ void table_insert_single_score(at::Tensor table_storage,
     auto keys_ptr = get_pointer<KeyType>(keys);
     auto table_key_slots_ptr = get_pointer<KeyType *>(table_key_slots);
 
-    constexpr int64_t total_size =
-        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
     int64_t bucket_bytes = bucket_capacity * total_size;
     int64_t num_buckets =
         table_storage.numel() * table_storage.element_size() / bucket_bytes;
@@ -102,7 +102,7 @@ void table_insert_single_score(at::Tensor table_storage,
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity);
+                       num_buckets, bucket_capacity, num_scores);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       if (output_score) {
@@ -129,7 +129,8 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results,
-                        std::optional<at::Tensor> score_output) {
+                        std::optional<at::Tensor> score_output,
+                        int64_t num_scores) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -142,7 +143,7 @@ at::Tensor table_insert(at::Tensor table_storage,
   table_insert_single_score(table_storage, table_bucket_offsets,
                             bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
-                            score_output, counter);
+                            score_output, counter, num_scores);
 
   return indices;
 }

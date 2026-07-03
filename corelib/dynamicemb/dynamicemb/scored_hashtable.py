@@ -58,6 +58,13 @@ class ScoreArg:
     ] = None  # How to set the new score, and providing this will override the default.
 
 
+def score_policy_num_scores(policy) -> int:
+    """Number of contiguous score words a policy occupies per key. LRU_LFU stores
+    a (timestamp, frequency) pair; every other policy is a single word. Mirrors
+    ``score_policy_num_scores`` on the C++ side."""
+    return 2 if policy == ScorePolicy.LRU_LFU else 1
+
+
 @enum.unique
 class ProbingType(enum.Enum):
     LINEAR = "linear"
@@ -315,21 +322,27 @@ class LinearBucketTable(ScoredHashTable):
         ), "Only accept 64 bits integer as key's type."
 
         # score type
+        # A ScoreSpec may occupy more than one physical score word: the LRU_LFU
+        # policy is a single spec that spans two AoS words per key -- word 0 is a
+        # last-access timestamp (used only for time-based incremental dump) and
+        # word 1 is the frequency, which drives eviction. Every other policy is a
+        # single word. The number of score *words* (num_scores_) is therefore the
+        # sum of each spec's word count, which can exceed the number of specs.
+        assert len(score_specs) == 1, "Only a single ScoreSpec is supported."
+        self.score_specs_ = list(score_specs)
         assert (
-            len(score_specs) >= 1 and len(score_specs) <= 1
-        ), "Only support at least one and at most one ScoreSpec in this version."
-        self.score_specs_ = sorted(
-            score_specs, key=lambda x: (not x.is_reduction, x.priority)
-        )
-        assert self.score_specs_[0].is_reduction is True
+            self.score_specs_[-1].is_reduction is True
+        ), "The last score column must be the reduction (eviction) score."
         accepted_score_types = {torch.uint64}
-        self.score_types_ = []
-        self.score_names_ = []
+        self.score_types_ = []  # one entry per physical score word
+        self.score_names_ = []  # one entry per ScoreSpec
         for score_spec in self.score_specs_:
             assert (
                 score_spec.dtype in accepted_score_types
             ), "Only accept 64 bits unsigned integer as score's type."
-            self.score_types_.append(score_spec.dtype)
+            self.score_types_.extend(
+                [score_spec.dtype] * score_policy_num_scores(score_spec.policy)
+            )
             self.score_names_.append(score_spec.name)
 
         # digest type
@@ -511,6 +524,13 @@ class LinearBucketTable(ScoredHashTable):
             ), "Global timer can only work for torch.uint64"
         return score.value, policy
 
+    @property
+    def num_scores_(self) -> int:
+        """Number of physical score words per key. 2 for the LruLfu (timestamp,
+        frequency) layout, 1 otherwise. Threaded to the kernels so bucket striding
+        and reduce() pick the right layout. Note: this counts words, not specs."""
+        return len(self.score_types_)
+
     def lookup(
         self,
         keys: torch.Tensor,
@@ -525,6 +545,7 @@ class LinearBucketTable(ScoredHashTable):
             (score_out, founds, indices): score tensor (int64), found mask, indices.
         """
         score_value, policy = self._parse_score(score)
+        num_scores = self.num_scores_
 
         score_out, founds, indices = table_lookup(
             self.table_storage_,
@@ -534,6 +555,7 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             score_value,
             policy,
+            num_scores=num_scores,
         )
         return score_out, founds, indices
 
@@ -554,8 +576,12 @@ class LinearBucketTable(ScoredHashTable):
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
         score_value, policy = self._parse_score(score)
+        num_scores = self.num_scores_
 
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            assert (
+                num_scores == 1
+            ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._deterministic_insert(keys, table_ids, score_value, policy)
 
         indices = table_insert(
@@ -570,6 +596,7 @@ class LinearBucketTable(ScoredHashTable):
             self._ref_counter,
             insert_results,
             score_out,
+            num_scores=num_scores,
         )
         return indices
 
@@ -593,8 +620,12 @@ class LinearBucketTable(ScoredHashTable):
         """
 
         score_value, policy = self._parse_score(score)
+        num_scores = self.num_scores_
 
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            assert (
+                num_scores == 1
+            ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._deterministic_insert_and_evict(
                 keys, table_ids, score_value, policy
             )
@@ -618,6 +649,7 @@ class LinearBucketTable(ScoredHashTable):
             self._ref_counter,
             insert_results,
             score_out,
+            num_scores=num_scores,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -710,6 +742,7 @@ class LinearBucketTable(ScoredHashTable):
             self.enable_overflow_
         ), "lookup_with_overflow requires enable_overflow=True"
         score_value, policy = self._parse_score(score)
+        num_scores = self.num_scores_
 
         score_out, founds, indices = table_lookup(
             self.table_storage_,
@@ -722,6 +755,7 @@ class LinearBucketTable(ScoredHashTable):
             ovf_storage=self.overflow_table_storage_,
             ovf_bucket_capacity=self.overflow_bucket_capacity_,
             ovf_output_offsets=self.overflow_output_offsets_,
+            num_scores=num_scores,
         )
         return score_out, founds, indices
 
@@ -741,8 +775,12 @@ class LinearBucketTable(ScoredHashTable):
             self.enable_overflow_
         ), "insert_and_evict_with_counter_and_overflow requires enable_overflow=True"
         score_value, policy = self._parse_score(score)
+        num_scores = self.num_scores_
 
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            assert (
+                num_scores == 1
+            ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._deterministic_insert_and_evict_with_overflow(
                 keys, table_ids, score_value, policy
             )
@@ -771,6 +809,7 @@ class LinearBucketTable(ScoredHashTable):
             ovf_bucket_sizes=self.overflow_bucket_sizes,
             ovf_counter=self._ovf_counter,
             ovf_output_offsets=self.overflow_output_offsets_,
+            num_scores=num_scores,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -947,16 +986,25 @@ class LinearBucketTable(ScoredHashTable):
 
         key_dtype = self.key_type_
 
-        # With single score, resolve the threshold to a single optional value.
+        # Resolve which score column to threshold and export on. Only one score
+        # threshold per export call is supported; for multi-column tables the
+        # requested score name selects the column (e.g. the timestamp column for
+        # time-based incremental dump). Defaults to the reduction column (0).
+        num_scores = self.num_scores_
         threshold_: Optional[int] = None
+        score_index = 0
         if thresholds is not None:
             assert len(score_names) == len(
                 thresholds
             ), "Thresholds' length have to consistent with score names."
-            assert len(self.score_names_) == 1, "Only single score is supported."
-            if self.score_names_[0] in score_names:
-                idx = score_names.index(self.score_names_[0])
-                threshold_ = thresholds[idx]
+            matched = [n for n in score_names if n in self.score_names_]
+            assert (
+                len(matched) <= 1
+            ), "Only a single score threshold per export is supported."
+            if matched:
+                name = matched[0]
+                threshold_ = thresholds[score_names.index(name)]
+                score_index = self.score_names_.index(name)
 
         while offset < search_capacity:
             batch_ = min(batch_size, search_capacity - offset)
@@ -969,6 +1017,8 @@ class LinearBucketTable(ScoredHashTable):
                 key_dtype,
                 threshold_,
                 begin_slot,
+                num_scores=num_scores,
+                score_index=score_index,
             )
 
             actual_length = d_counter.item()
@@ -1001,6 +1051,8 @@ class LinearBucketTable(ScoredHashTable):
                     key_dtype,
                     threshold_,
                     ovf_begin,
+                    num_scores=num_scores,
+                    score_index=score_index,
                 )
                 actual_length = d_counter.item()
                 if actual_length > 0:
@@ -1100,6 +1152,11 @@ class LinearBucketTable(ScoredHashTable):
         scores = []
         thresholds = []
         threshold_val: int = 0
+        # Column the threshold applies to (and counts/exports on). Defaults to the
+        # reduction column; for time-based incremental dump it is the timestamp
+        # column selected by the requested score name.
+        num_scores = self.num_scores_
+        score_index = 0
         for score_name, threshold in score_threshold.items():
             if score_name not in self.score_names_:
                 print(f"Score name {score_name} not existed, will not dump it.")
@@ -1110,6 +1167,7 @@ class LinearBucketTable(ScoredHashTable):
                 out_scores[score_name] = None
 
                 threshold_val = threshold
+                score_index = self.score_names_.index(score_name)
 
         count_begin = (
             int(self.table_bucket_offsets_cpu_[table_id].item()) * self.bucket_capacity_
@@ -1126,6 +1184,8 @@ class LinearBucketTable(ScoredHashTable):
             threshold_val,
             count_begin,
             count_end,
+            num_scores,
+            score_index,
         )
 
         # if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
@@ -1141,6 +1201,8 @@ class LinearBucketTable(ScoredHashTable):
                 threshold_val,
                 ovf_begin,
                 ovf_end,
+                num_scores,
+                score_index,
             )
             total_matched += d_ovf_matched.cpu().item()
 

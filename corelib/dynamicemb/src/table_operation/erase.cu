@@ -23,7 +23,7 @@ namespace dyn_emb {
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices) {
+                 std::optional<at::Tensor> indices, int64_t num_scores) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0)
@@ -42,8 +42,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
   DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
     auto keys_ = get_pointer<KeyType>(keys);
 
-    constexpr int64_t total_size =
-        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
     int64_t bucket_bytes = bucket_capacity * total_size;
     int64_t num_buckets =
         table_storage.numel() * table_storage.element_size() / bucket_bytes;
@@ -52,7 +52,7 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity);
+                       num_buckets, bucket_capacity, num_scores);
 
     table_erase_kernel<Table, 1>
         <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(

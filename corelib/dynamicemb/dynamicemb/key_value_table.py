@@ -217,6 +217,14 @@ class DynamicEmbTableState:
     # CPU tensor of shape (num_tables,), used to avoid key_index_map.size() when not needed.
     estimated_table_sizes: Optional[torch.Tensor] = None
     collect_table_sizes_flag: bool = False
+    # All score columns for the underlying table: score_specs[0] is the
+    # reduction (eviction) score == score_policy; any extra columns are
+    # auxiliary (e.g. an incremental-dump timestamp). Defaults to [score_policy].
+    score_specs: Optional[List[ScoreSpec]] = None
+    # Name of the score column incremental_dump thresholds on. Equals
+    # score_policy.name unless a dedicated timestamp column was added for
+    # need_incremental_dump, in which case it is that column's name.
+    incremental_score_name: Optional[str] = None
 
 
 def create_table_state(
@@ -242,6 +250,43 @@ def create_table_state(
     score_policy = get_score_policy(base_opt.score_strategy)
     evict_strategy = base_opt.evict_strategy.value
 
+    # Score columns. score_specs[0] is the reduction (eviction) score. When
+    # need_incremental_dump is requested for a strategy whose reduction score is
+    # NOT already a timestamp (i.e. anything but TIMESTAMP), add a dedicated
+    # GLOBAL_TIMER column used only to select keys for incremental dump; eviction
+    # still ranks by score_specs[0]. incremental_score_name names the column
+    # incremental_dump thresholds on.
+    # Score columns for the underlying table. score_specs[-1] is the reduction
+    # (eviction) score. incremental_score_name names the column incremental_dump
+    # thresholds on.
+    score_specs: List[ScoreSpec] = [score_policy]
+    incremental_score_name = score_policy.name
+    if base_opt.need_incremental_dump:
+        if base_opt.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
+            # The reduction score is already a per-key timestamp; nothing to add.
+            pass
+        elif base_opt.score_strategy == DynamicEmbScoreStrategy.LFU:
+            # Compound LruLfu layout: a single ScoreSpec that spans two AoS words
+            # per key -- word 0 is a last-access timestamp (used only to select
+            # keys for incremental dump) and word 1 is the access frequency
+            # (drives eviction). The LruLfu ScorePolicy updates both words on
+            # each access. incremental_dump thresholds on word 0 (the timestamp),
+            # which is the spec's leading word.
+            lru_lfu_spec = ScoreSpec(
+                name="frequency",
+                policy=ScorePolicy.LRU_LFU,
+                dtype=torch.uint64,
+                is_reduction=True,
+            )
+            score_specs = [lru_lfu_spec]
+            score_policy = lru_lfu_spec  # forward pass uses the LruLfu policy
+            incremental_score_name = lru_lfu_spec.name
+        else:
+            raise NotImplementedError(
+                "need_incremental_dump is currently supported only for "
+                "TIMESTAMP and LFU score strategies."
+            )
+
     # NO_EVICTION: key_index_map uses max_load_factor=0.5 to avoid eviction; table uses init_capacity.
     bucket_capacity = base_opt.bucket_capacity
     if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
@@ -263,7 +308,7 @@ def create_table_state(
         capacity=capacities,
         bucket_capacity=base_opt.bucket_capacity,
         key_type=base_opt.index_type,
-        score_specs=[score_policy],
+        score_specs=score_specs,
         device=device,
         enable_overflow=enable_overflow,
     )
@@ -328,6 +373,8 @@ def create_table_state(
         num_tables=num_tables,
         device=device,
         score_policy=score_policy,
+        score_specs=score_specs,
+        incremental_score_name=incremental_score_name,
         evict_strategy=evict_strategy,
         key_index_map=key_index_map,
         capacity=capacity,
@@ -1871,13 +1918,13 @@ class DynamicEmbStorage(Storage):
         all_values: List[Tensor] = []
         for s in states_to_dump:
             keys, named_scores, indices = s.key_index_map.incremental_dump(
-                {s.score_policy.name: threshold},
+                {s.incremental_score_name: threshold},
                 pg=pg,
                 return_index=True,
                 table_id=table_id,
             )
             emb_dim = s.table_emb_dims_cpu[table_id]
-            scores_batch = named_scores[s.score_policy.name]
+            scores_batch = named_scores[s.incremental_score_name]
             flat_rows = _flat_row_indices_from_slots_and_scores(
                 s, indices, scores_batch
             )
@@ -2304,13 +2351,13 @@ class HybridStorage(Storage):
         all_values = []
         for s in states_to_dump:
             keys, named_scores, indices = s.key_index_map.incremental_dump(
-                {s.score_policy.name: threshold},
+                {s.incremental_score_name: threshold},
                 pg=pg,
                 return_index=True,
                 table_id=table_id,
             )
             emb_dim = s.table_emb_dims_cpu[table_id]
-            scores_batch = named_scores[s.score_policy.name]
+            scores_batch = named_scores[s.incremental_score_name]
             flat_rows = _flat_row_indices_from_slots_and_scores(
                 s, indices, scores_batch
             )

@@ -301,6 +301,21 @@ class DynamicEmbTableOptions:
     dist_type: str = "roundrobin"
     admit_strategy: Optional[AdmissionStrategy] = None
     admission_counter: Optional[Any] = None
+    need_incremental_dump: bool = False
+    """Enables time-based ``incremental_dump`` for score strategies that do not
+    otherwise carry a timestamp. Default False.
+      - TIMESTAMP already maintains a per-key last-access timestamp as its
+        (reduction) score, so it supports incremental dump regardless of this
+        flag (implied and a no-op).
+      - LFU keeps only a 64-bit access count with no time dimension. Set
+        ``need_incremental_dump=True`` to ALSO store a 64-bit last-access
+        timestamp per key (a second, non-reduction score column). The timestamp
+        is used ONLY to select keys for incremental dump (touched since the last
+        dump); eviction still ranks by the LFU access count. Costs an extra 8
+        bytes/key.
+      - STEP / CUSTOMIZED / NO_EVICTION: a user-managed or step score may or may
+        not be monotonic in time; enabling this adds a dedicated timestamp
+        column so incremental dump is well-defined."""
 
     def __post_init__(self):
         assert (
@@ -333,6 +348,7 @@ class DynamicEmbTableOptions:
         grouped_key["dist_type"] = self.dist_type
         grouped_key["score_strategy"] = self.score_strategy
         grouped_key["admit_strategy"] = self.admit_strategy
+        grouped_key["need_incremental_dump"] = self.need_incremental_dump
         return grouped_key
 
     def __hash__(self):

@@ -82,6 +82,10 @@ def generate_sparse_feature(feature_num, batch, multi_hot_size):
         DynamicEmbScoreStrategy.TIMESTAMP,
         DynamicEmbScoreStrategy.STEP,
         DynamicEmbScoreStrategy.CUSTOMIZED,
+        # LFU with need_incremental_dump: incremental dump uses an auxiliary
+        # last-access timestamp column, so it behaves like TIMESTAMP for the
+        # "dump keys touched since last dump" check below.
+        DynamicEmbScoreStrategy.LFU,
     ],
 )
 @pytest.mark.parametrize(
@@ -133,6 +137,9 @@ def test_without_eviction(
             local_hbm_for_values=1024**3,
             score_strategy=score_strategy,
             caching=caching,
+            need_incremental_dump=(
+                score_strategy == DynamicEmbScoreStrategy.LFU
+            ),
         )
         for i in range(table_num)
     ]

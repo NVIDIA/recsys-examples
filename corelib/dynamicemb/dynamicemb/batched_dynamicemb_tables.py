@@ -1162,11 +1162,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._scores[table_name] = table_score
 
     def get_score(self) -> Dict[str, int]:
-        """Return current score per table. For TIMESTAMP score strategy, returns device_timestamp(); otherwise returns the stored score."""
+        """Return current score per table. For TIMESTAMP score strategy, or any
+        table with need_incremental_dump (whose incremental dump thresholds on a
+        device-timestamp column), returns device_timestamp(); otherwise returns
+        the stored score."""
         result: Dict[str, int] = {}
         ts: Optional[int] = None
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
-            if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
+            if (
+                option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP
+                or option.need_incremental_dump
+            ):
                 if ts is None:
                     ts = device_timestamp()
                 result[table_name] = ts
@@ -1447,7 +1453,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             keys_cat, values_cat = storage.incremental_dump(table_id, threshold, pg)
             ret_tensors[table_name] = (keys_cat, values_cat)
             option = self._dynamicemb_options[table_id]
-            if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
+            if (
+                option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP
+                or option.need_incremental_dump
+            ):
                 if ts is None:
                     ts = device_timestamp()
                 ret_scores[table_name] = ts
