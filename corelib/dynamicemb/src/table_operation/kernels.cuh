@@ -129,11 +129,14 @@ __global__ void table_lookup_kernel(
     IndexType index = -1;
     if (found) {
       if constexpr (PolicyType == ScorePolicyType::Const) {
-        score = *bucket.scores(iter);
+        // Return the reduction score (frequency for LruLfu; word 0 otherwise),
+        // not word 0 which for LruLfu is the timestamp.
+        score = *bucket.reduction_score(iter);
       } else {
         KeyType expected_key = key;
         if (bucket.try_lock(iter, expected_key)) {
-          // For LruLfu, update() writes both words (timestamp + frequency).
+          // For LruLfu, update() writes both words (timestamp + frequency) and
+          // returns the frequency.
           score = ScorePolicy<PolicyType>::update(bucket.scores(iter), score);
           bucket.unlock(iter, key);
         } else {
@@ -159,7 +162,8 @@ __global__ void table_lookup_kernel(
           index = ovf_out_iter;
           Iter local = ovf_out_iter - ovf_output_offsets[t_id];
           if constexpr (PolicyType == ScorePolicyType::Const) {
-            score = *ovf_bucket.scores(local);
+            // Reduction score (frequency for LruLfu), not word 0 (timestamp).
+            score = *ovf_bucket.reduction_score(local);
           } else {
             // Maintain the overflow entry's score on access (stamp timestamp /
             // accumulate frequency), mirroring the main-table found path; for
