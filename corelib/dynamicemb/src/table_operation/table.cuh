@@ -117,6 +117,12 @@ at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
                                int64_t begin = -1, int64_t end = -1,
                                int64_t num_scores = 1, int64_t score_index = 0);
 
+void table_copy_score_blocks(at::Tensor src_storage, int64_t src_bucket_capacity,
+                             at::Tensor dst_storage, int64_t dst_bucket_capacity,
+                             int64_t num_scores, int64_t src_bkt_begin,
+                             int64_t dst_bkt_begin, at::Tensor src_slots,
+                             at::Tensor dst_slots, torch::Dtype key_dtype);
+
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,
                                         int64_t bucket_capacity,

@@ -800,4 +800,35 @@ __global__ void table_traverse_kernel(Table table, IndexType begin,
   }
 }
 
+// Copy every score word for a set of (src_slot, dst_slot) key pairs from one
+// table to another. Used by rehash to preserve multi-word score layouts (e.g.
+// LruLfu's timestamp+frequency) that a single-value re-insert cannot restore.
+// Slots are table-relative flat indices ((local_bucket * bucket_capacity) +
+// iter); *_bkt_begin is the table's first global bucket. Reuses the AoS
+// Bucket::scores(iter, k) accessor so no layout math is duplicated.
+template <typename Table>
+__global__ void copy_score_blocks_kernel(
+    Table src_table, int64_t src_bkt_begin, Table dst_table,
+    int64_t dst_bkt_begin, int64_t n, const int64_t *__restrict__ src_slots,
+    const int64_t *__restrict__ dst_slots) {
+  using Bucket = typename Table::BucketType;
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  int64_t ss = src_slots[i];
+  int64_t ds = dst_slots[i];
+  if (ss < 0 || ds < 0)
+    return;
+  int64_t s_bc = src_table.bucket_capacity();
+  int64_t d_bc = dst_table.bucket_capacity();
+  Bucket sb = src_table[src_bkt_begin + ss / s_bc];
+  Bucket db = dst_table[dst_bkt_begin + ds / d_bc];
+  int64_t s_iter = ss % s_bc;
+  int64_t d_iter = ds % d_bc;
+  int64_t ns = dst_table.num_scores();
+  for (int64_t k = 0; k < ns; ++k) {
+    *db.scores(d_iter, k) = *sb.scores(s_iter, k);
+  }
+}
+
 } // namespace dyn_emb

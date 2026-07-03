@@ -29,6 +29,7 @@ from dynamicemb_extensions import (
     ScorePolicy,
     bucketize_keys,
     device_timestamp,
+    table_copy_score_blocks,
     table_count_matched,
     table_erase,
     table_export_batch,
@@ -1310,6 +1311,37 @@ class LinearBucketTable(ScoredHashTable):
                     + other.overflow_bucket_capacity_
                 ]
             )
+
+    def copy_score_blocks_from(
+        self,
+        other: "LinearBucketTable",
+        table_id: int,
+        src_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+    ) -> None:
+        """Copy every score word for aligned key pairs from ``other`` (at
+        ``src_slots``) to ``self`` (at ``dst_slots``). ``src_slots``/``dst_slots``
+        are table-relative flat slot indices (as returned by export / insert) and
+        must correspond element-wise to the same key. Used during rehash to
+        preserve multi-word score layouts (e.g. LruLfu's timestamp+frequency)
+        that a single-value re-insert cannot restore. num_scores must match."""
+        assert self.num_scores_ == other.num_scores_, "num_scores mismatch"
+        if src_slots.numel() == 0:
+            return
+        src_bkt_begin = int(other.table_bucket_offsets_cpu_[table_id].item())
+        dst_bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
+        table_copy_score_blocks(
+            other.table_storage_,
+            other.bucket_capacity_,
+            self.table_storage_,
+            self.bucket_capacity_,
+            self.num_scores_,
+            src_bkt_begin,
+            dst_bkt_begin,
+            src_slots,
+            dst_slots,
+            self.key_type_,
+        )
 
     def capacity(self, table_id: Optional[int] = None) -> int:
         """

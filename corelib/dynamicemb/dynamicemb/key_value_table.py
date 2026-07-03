@@ -542,6 +542,14 @@ def _expand_tables_impl(
                 (keys.numel(),), table_id, dtype=torch.int64, device=device
             )
             dst_indices = new_key_index_map.insert(keys, tid_tensor, score_arg)
+            # Single-value re-insert above only restores the leading score word.
+            # For multi-word layouts (LruLfu: timestamp + frequency) copy the
+            # whole score block so the frequency (and exact timestamp) survive
+            # rehash; otherwise LFU eviction would see all frequencies reset to 0.
+            if new_key_index_map.num_scores_ > 1:
+                new_key_index_map.copy_score_blocks_from(
+                    old_key_index_map, table_id, src_indices, dst_indices
+                )
             new_key_index_map._ref_counter[dst_indices].copy_(
                 old_key_index_map._ref_counter[src_indices]
             )

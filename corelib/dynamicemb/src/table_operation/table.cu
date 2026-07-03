@@ -141,6 +141,14 @@ void bind_table_operation(py::module &m) {
         py::arg("end") = -1, py::arg("num_scores") = 1,
         py::arg("score_index") = 0);
 
+  m.def("table_copy_score_blocks", &dyn_emb::table_copy_score_blocks,
+        "copy all score words for aligned (src_slot, dst_slot) pairs between "
+        "two tables (used by rehash to preserve multi-word LruLfu scores)",
+        py::arg("src_storage"), py::arg("src_bucket_capacity"),
+        py::arg("dst_storage"), py::arg("dst_bucket_capacity"),
+        py::arg("num_scores"), py::arg("src_bkt_begin"), py::arg("dst_bkt_begin"),
+        py::arg("src_slots"), py::arg("dst_slots"), py::arg("key_dtype"));
+
   m.def("bucketize_keys", &dyn_emb::bucketize_keys,
         "bucketize input keys into a dense tensor, and return the output keys, "
         "buckets offset, inverse indices. num_buckets must equal "

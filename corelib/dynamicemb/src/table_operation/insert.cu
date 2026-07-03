@@ -148,4 +148,41 @@ at::Tensor table_insert(at::Tensor table_storage,
   return indices;
 }
 
+// Copy all score words for aligned (src_slot, dst_slot) pairs between two tables.
+// Used by rehash to preserve multi-word score layouts (e.g. LruLfu) that a
+// single-value re-insert cannot restore. Slots are table-relative flat indices;
+// *_bkt_begin is each table's first global bucket for the logical table.
+void table_copy_score_blocks(at::Tensor src_storage, int64_t src_bucket_capacity,
+                             at::Tensor dst_storage, int64_t dst_bucket_capacity,
+                             int64_t num_scores, int64_t src_bkt_begin,
+                             int64_t dst_bkt_begin, at::Tensor src_slots,
+                             at::Tensor dst_slots, torch::Dtype key_dtype) {
+  int64_t n = src_slots.size(0);
+  if (n == 0)
+    return;
+  auto key_type = scalartype_to_datatype(toScalarType(key_dtype));
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  constexpr int BLOCK_SIZE = 256;
+
+  DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
+    using Bucket = LinearBucket<KeyType>;
+    using Table = LinearBucketTable<Bucket>;
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
+    int64_t src_num_buckets = src_storage.numel() * src_storage.element_size() /
+                              (src_bucket_capacity * total_size);
+    int64_t dst_num_buckets = dst_storage.numel() * dst_storage.element_size() /
+                              (dst_bucket_capacity * total_size);
+    auto src_table = Table(reinterpret_cast<uint8_t *>(src_storage.data_ptr()),
+                           src_num_buckets, src_bucket_capacity, num_scores);
+    auto dst_table = Table(reinterpret_cast<uint8_t *>(dst_storage.data_ptr()),
+                           dst_num_buckets, dst_bucket_capacity, num_scores);
+    copy_score_blocks_kernel<Table>
+        <<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            src_table, src_bkt_begin, dst_table, dst_bkt_begin, n,
+            src_slots.data_ptr<int64_t>(), dst_slots.data_ptr<int64_t>());
+  });
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 } // namespace dyn_emb
