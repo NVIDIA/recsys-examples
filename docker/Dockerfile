@@ -47,7 +47,7 @@ ARG TRITONSERVER_BUILD
 WORKDIR /workspace/deps
 
 # -- Layer 1: system setup + arch symlinks.
-RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash-dev libssl-dev && \
+RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash-dev libssl-dev libzmq3-dev && \
     ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
     rm -rf /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1 && \
     if [ ${ARCH} = "aarch64" ]; then \
@@ -94,7 +94,7 @@ RUN cd FlexKV && mkdir -p build && cd build && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
     MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python3 setup.py install && \
     cd /workspace/deps && \
-    git clone --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
+    git clone -b v26.05 --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
     cd nve && git submodule update --init --recursive && \
     cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
     if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then AVX512_ENV=""; else AVX512_ENV="PYNVE_DISABLE_AVX512=1"; fi && \
@@ -139,8 +139,64 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" pip3 install --no-build-isolation . && \
     if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
-      ln -s /usr/local/cuda-13.1/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+      test -e /usr/local/cuda-13.2/compat/lib.real/libcuda.so.1 && \
+      ln -s /usr/local/cuda-13.2/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
       cd /workspace/recsys-examples/corelib/dynamicemb && \
       mkdir -p torch_binding_build && cd torch_binding_build && \
       cmake .. && make -j; \
     fi
+
+# ============================================================================
+# AOTI additions: C++ replay executable, NVE init hook, Triton backend prep,
+# optional checkpoint export, and Triton runtime library staging.
+# ============================================================================
+RUN cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
+    mkdir -p build && cd build && \
+    cmake .. && make -j
+
+RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')" && \
+    cmake -S "./examples/hstu/inference/cpp_inference" -B "./examples/hstu/inference/cpp_inference/build" && \
+    cmake --build "./examples/hstu/inference/cpp_inference/build" --target inference_hstu_gr_ranking_kvcache_exported_model -j 8 && \
+    cmake -S "./examples/hstu/inference/nve_init_hook" -B "./examples/hstu/inference/nve_init_hook/build" && \
+    cmake --build "./examples/hstu/inference/nve_init_hook/build" -j 8
+
+RUN python3 -m pip install --no-cache-dir --upgrade "cmake>=3.31.8" && \
+    cp /usr/local/lib/libjpeg.so.62 /usr/local/lib/python3.12/dist-packages/torch/lib/libjpeg.so.62 && \
+    cd /workspace/deps && \
+    git clone https://github.com/triton-inference-server/pytorch_backend.git pytorch_backend && \
+    cd pytorch_backend && git checkout ceeecb7 && \
+    mkdir -p build && cd build && \
+    cmake \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX:PATH="$PWD/install" \
+      -DTRITON_PYTORCH_INCLUDE_PATHS="/usr/local/lib/python3.12/dist-packages/torch/include;/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include;/opt/pytorch/vision/torchvision/csrc" \
+      -DTRITON_PYTORCH_LIB_PATHS="/usr/local/lib/python3.12/dist-packages/torch/lib" \
+      -DTRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
+      -DTRITON_BACKEND_REPO_TAG=r26.05 \
+      -DTRITON_CORE_REPO_TAG=r26.05 \
+      -DTRITON_COMMON_REPO_TAG=r26.05 \
+      .. && \
+    cmake --build . -j"$(nproc)" --target install
+
+RUN cd ./examples/hstu && \
+    mkdir -p \
+      triton_libs/emb \
+      triton_libs/recsys_kvcache_manager \
+      triton_libs/hstu_attn \
+      triton_libs/fbgemm_gpu \
+      triton_libs/pynve \
+      triton_libs/lib \
+      triton_libs/system && \
+    cp -P ./corelib/dynamicemb/torch_binding_build/inference_emb_ops.so triton_libs/emb/ && \
+    cp -P ./corelib/recsys_kvcache_manager/build/kcache_manager_ops.so triton_libs/recsys_kvcache_manager/ && \
+    cp -P inference/cpp_inference/build/libhstu_cuda_ops_runtime.so triton_libs/ && \
+    cp -P inference/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
+    cp -a /usr/local/lib/python3.12/dist-packages/hstu/. triton_libs/hstu_attn/ && \
+    cp -a /usr/local/lib/python3.12/dist-packages/fbgemm_gpu/. triton_libs/fbgemm_gpu/ && \
+    cp -a /usr/local/lib/python3.12/dist-packages/pynve/. triton_libs/pynve/ && \
+    cp -a /usr/local/lib/. triton_libs/lib/ && \
+    cp -P /usr/lib/$(uname -m)-linux-gnu/libpng16.so.16* triton_libs/system/ && \
+    sed -i 's#string_value: ".*libnve_init_hook.so"#string_value: "/workspace/recsys-examples/examples/hstu/inference/nve_init_hook/build/libnve_init_hook.so"#' \
+      inference/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt
+
+WORKDIR /workspace/recsys-examples/

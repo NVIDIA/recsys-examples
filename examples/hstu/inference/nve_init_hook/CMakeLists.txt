@@ -38,7 +38,7 @@ target_include_directories(nve_init_hook PRIVATE
   ${NVE_ROOT}/third_party/json/include/
 )
 target_link_libraries(nve_init_hook PRIVATE
-  CUDA::cudart ${NVE_TORCH_OPS_LIB} ${NVE_COMMON_LIB})
+  CUDA::cudart CUDA::cuda_driver ${NVE_TORCH_OPS_LIB} ${NVE_COMMON_LIB})
 
 # NVE header feature flags (mirror examples/.../cpp_inference/CMakeLists.txt).
 if(NOT NVE_CACHE_LINE_SIZE)
