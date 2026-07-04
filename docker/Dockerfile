@@ -187,14 +187,14 @@ RUN cd ./examples/hstu && \
       triton_libs/pynve \
       triton_libs/lib \
       triton_libs/system && \
-    cp -P ./corelib/dynamicemb/torch_binding_build/inference_emb_ops.so triton_libs/emb/ && \
-    cp -P ./corelib/recsys_kvcache_manager/build/kcache_manager_ops.so triton_libs/recsys_kvcache_manager/ && \
-    cp -P inference/cpp_inference/build/libhstu_cuda_ops_runtime.so triton_libs/ && \
-    cp -P inference/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
+    cp -P /workspace/recsys-examples/corelib/dynamicemb/torch_binding_build/inference_emb_ops.so triton_libs/emb/ && \
+    cp -P /workspace/recsys-examples/corelib/recsys_kvcache_manager/build/kcache_manager_ops.so triton_libs/recsys_kvcache_manager/ && \
+    cp -P /workspace/recsys-examples/examples/hstu/inference/cpp_inference/build/libhstu_cuda_ops_runtime.so triton_libs/ && \
+    cp -P /workspace/recsys-examples/examples/hstu/inference/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/hstu/. triton_libs/hstu_attn/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/fbgemm_gpu/. triton_libs/fbgemm_gpu/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/pynve/. triton_libs/pynve/ && \
-    cp -a /usr/local/lib/. triton_libs/lib/ && \
+    find /usr/local/lib -maxdepth 1 \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -exec cp -P {} triton_libs/lib/ \; && \
     cp -P /usr/lib/$(uname -m)-linux-gnu/libpng16.so.16* triton_libs/system/ && \
     sed -i 's#string_value: ".*libnve_init_hook.so"#string_value: "/workspace/recsys-examples/examples/hstu/inference/nve_init_hook/build/libnve_init_hook.so"#' \
       inference/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt
