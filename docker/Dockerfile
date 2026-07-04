@@ -162,7 +162,7 @@ RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join
 
 RUN python3 -m pip install --no-cache-dir --upgrade "cmake>=3.31.8" && \
     cp /usr/local/lib/libjpeg.so.62 /usr/local/lib/python3.12/dist-packages/torch/lib/libjpeg.so.62 && \
-    cd /workspace/deps && \
+    cd /workspace/deps && rm -rf pytorch_backend && \
     git clone https://github.com/triton-inference-server/pytorch_backend.git pytorch_backend && \
     cd pytorch_backend && git checkout ceeecb7 && \
     mkdir -p build && cd build && \
