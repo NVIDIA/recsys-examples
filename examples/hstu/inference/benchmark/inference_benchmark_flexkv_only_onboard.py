@@ -48,6 +48,7 @@ class BenchmarkConfig:
     ssd_pressure_batch_size: int = 8
     ssd_pressure_batch_sleep_s: float = 1.0
     offload_wait_timeout_s: float = 60.0
+    force_skip_offload: bool = False
 
 
 BENCHMARK_CONFIG = BenchmarkConfig()
@@ -212,7 +213,7 @@ def run_scenario_gpu_hit(
     req_timed = [
         build_request(
             user_id,
-            history_len + append_history_len,
+            history_len,
             num_candidates,
             max_seqlen,
         )
@@ -246,10 +247,12 @@ def run_scenario_gpu_hit(
     print("timed run")
     for iter_idx, (batch, user_ids, total_history_lengths) in enumerate(req_timed):
         torch.cuda.nvtx.range_push(f"scenario1_timed_run_{iter_idx}")
+        forward_kwargs = {"skip_offload": True} if BENCHMARK_CONFIG.force_skip_offload else {}
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
+            **forward_kwargs,
         )
         torch.cuda.nvtx.range_pop()
     print(f"[Scenario1] timed run completed, iters={timed_iters}")
@@ -274,7 +277,7 @@ def run_scenario_gpu_miss_host_hit(
     req_timed = [
         build_request(
             user_id,
-            history_len + append_history_len,
+            history_len,
             num_candidates,
             max_seqlen,
         )
@@ -321,10 +324,12 @@ def run_scenario_gpu_miss_host_hit(
 
         #timed run
         torch.cuda.nvtx.range_push(f"scenario2_timed_run_{iter_idx}")
+        forward_kwargs = {"skip_offload": True} if BENCHMARK_CONFIG.force_skip_offload else {}
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
+            **forward_kwargs,
         )
         torch.cuda.nvtx.range_pop()
     deadline = time.time() + offload_wait_timeout_s
@@ -476,8 +481,9 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     enable_ssd = bool(getattr(cache_cfg, "enable_ssd", False))
 
     print("warmup")
-    # Prime targets into GPU + CPU + SSD. Timed requests append a new tail so
-    # offload cannot be fully eliminated by put_match.
+    # Prime targets into GPU + CPU + SSD. Timed requests reuse this same prefix
+    # so the measured range isolates onboard; --force-skip-offload additionally
+    # removes the offload path itself.
     for batch, user_ids, total_history_lengths in req_targets:
         model_predict.forward_with_kvcache(
             batch,
@@ -601,17 +607,19 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
 
         batch, user_ids, total_history_lengths = build_request(
             user_id,
-            history_len + append_history_len,
+            history_len,
             num_candidates,
             max_seqlen,
         )
 
         # timed run
         torch.cuda.nvtx.range_push(f"scenario3_timed_run_{iter_idx}")
+        forward_kwargs = {"skip_offload": True} if BENCHMARK_CONFIG.force_skip_offload else {}
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
+            **forward_kwargs,
         )
         torch.cuda.nvtx.range_pop()
     deadline = time.time() + offload_wait_timeout_s
@@ -648,6 +656,7 @@ if __name__ == "__main__":
     parser.add_argument("--scenarios", type=str, default="1,2,3")
     parser.add_argument("--disable-cudagraph", action="store_true")
     parser.add_argument("--ablation", type=str, default=None)
+    parser.add_argument("--force-skip-offload", action="store_true")
     args, _ = parser.parse_known_args()
 
     cfg = BENCHMARK_CONFIG
@@ -668,6 +677,8 @@ if __name__ == "__main__":
         cfg = replace(cfg, ssd_pressure_batch_sleep_s=args.ssd_pressure_batch_sleep_s)
     if args.disable_cudagraph:
         cfg = replace(cfg, disable_cudagraph=True)
+    if args.force_skip_offload:
+        cfg = replace(cfg, force_skip_offload=True)
     if args.ablation not in (None, "baseline"):
         raise ValueError("This restored benchmark currently supports only --ablation baseline.")
     BENCHMARK_CONFIG = cfg
@@ -678,9 +689,11 @@ if __name__ == "__main__":
 
     history_len = cfg.history_len
     scenarios = {scenario.strip() for scenario in args.scenarios.split(",") if scenario.strip()}
+    print("[Mode] only_onboard=True, timed forwards use history_len")
     print(
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
         f"num_candidates={cfg.num_candidates}, disable_cudagraph={cfg.disable_cudagraph}, "
+        f"force_skip_offload={cfg.force_skip_offload}, "
         f"scenarios={','.join(sorted(scenarios))}"
     )
     model_predict, page_size, max_seqlen = build_model(cfg, history_len)
