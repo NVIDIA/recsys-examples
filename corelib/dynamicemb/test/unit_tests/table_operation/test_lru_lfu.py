@@ -20,6 +20,10 @@ gather_score_blocks primitive so the CUDA kernels are directly observable."""
 
 import pytest
 import torch
+from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
+from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
+from dynamicemb.key_value_table import DynamicEmbStorage, _expand_tables_impl
+from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
 
@@ -113,37 +117,46 @@ def test_lru_lfu_frequency_accumulation(current_device):
 
 
 def test_lru_lfu_eviction_by_frequency(current_device):
-    """Eviction ranks by frequency (word 1): frequently-accessed keys survive even
-    though newly inserted keys have more recent timestamps. Exercises the 2-score
-    reduce() path."""
+    """Eviction ranks by frequency (word 1): a small set of frequently-accessed
+    keys survives even though newly inserted keys have more recent timestamps.
+    Exercises the 2-score reduce() path. The hot set is kept well below capacity
+    so it is never forced out just for lack of room -- only the frequency ranking
+    should matter."""
     device = torch.cuda.current_device()
     bc = 128
     table = _lru_lfu_table(bc, bucket_capacity=bc)  # single bucket: all keys compete
 
-    n = bc
+    # Fill ~80% of the bucket with frequency-1 keys.
+    n = 100
     keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
     tids = torch.zeros(n, dtype=torch.int64, device=device)
     ones = torch.ones(n, dtype=torch.uint64, device=device)
-    _insert(table, keys, tids, ones)
+    idx, _ = _insert(table, keys, tids, ones)
 
-    # Boost the frequency of the first half ("hot") via repeated accesses; the
-    # second half ("cold") stays at frequency 1.
-    hot = keys[: n // 2]
-    hot_tids = tids[: n // 2]
-    hot_freq = torch.ones(n // 2, dtype=torch.uint64, device=device)
-    for _ in range(10):
+    # Boost a small "hot" subset (10 keys) far above the rest.
+    n_hot = 10
+    hot = keys[:n_hot]
+    hot_tids = tids[:n_hot]
+    hot_freq = torch.ones(n_hot, dtype=torch.uint64, device=device)
+    for _ in range(20):
         table.lookup(
             hot,
             hot_tids,
             ScoreArg(name="frequency", value=hot_freq, policy=ScorePolicy.LRU_LFU),
         )
 
-    # Insert a bucket's worth of brand-new keys (frequency 1, newest timestamps)
-    # to force eviction.
-    new_keys = torch.arange(100000, 100000 + n, dtype=torch.int64, device=device)
-    new_tids = torch.zeros(n, dtype=torch.int64, device=device)
-    new_freq = torch.ones(n, dtype=torch.uint64, device=device)
-    ir = torch.empty(n, dtype=table.result_type, device=device).fill_(
+    # Sanity: the boost actually raised the hot keys' frequency (word 1).
+    hot_blocks = table.gather_score_blocks(0, idx[:n_hot])
+    assert torch.all(hot_blocks[:, 1] == 21), "hot keys should have frequency 1 + 20"
+
+    # Insert enough brand-new (frequency 1) keys to overflow the bucket and force
+    # eviction. There are many more frequency-1 keys (cold + new) than eviction
+    # slots, so a correct LFU must evict only those, never the hot keys.
+    n_new = 100
+    new_keys = torch.arange(100000, 100000 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    new_freq = torch.ones(n_new, dtype=torch.uint64, device=device)
+    ir = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
         InsertResult.INIT.value
     )
     _, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
@@ -153,7 +166,7 @@ def test_lru_lfu_eviction_by_frequency(current_device):
         ir,
     )
 
-    assert num_evicted > 0, "eviction should have occurred in the full bucket"
+    assert num_evicted > 0, "eviction should have occurred (bucket overflowed)"
     evicted_set = set(int(k) for k in evicted_keys.tolist())
     assert evicted_set.isdisjoint(
         set(int(k) for k in hot.tolist())
@@ -173,7 +186,7 @@ def test_lru_lfu_gather_scatter_roundtrip(current_device):
     n = 50
     keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
     tids = torch.zeros(n, dtype=torch.int64, device=device)
-    freq = torch.arange(1, 1 + n, dtype=torch.uint64, device=device)  # varied
+    freq = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(torch.uint64)  # varied
 
     src = _lru_lfu_table(4096)
     idx_src, _ = _insert(src, keys, tids, freq)
@@ -195,7 +208,7 @@ def test_lru_lfu_copy_score_blocks_roundtrip(current_device):
     n = 50
     keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
     tids = torch.zeros(n, dtype=torch.int64, device=device)
-    freq = torch.arange(1, 1 + n, dtype=torch.uint64, device=device)
+    freq = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(torch.uint64)
 
     src = _lru_lfu_table(4096)
     idx_src, _ = _insert(src, keys, tids, freq)
@@ -208,3 +221,106 @@ def test_lru_lfu_copy_score_blocks_roundtrip(current_device):
     assert torch.equal(
         dst.gather_score_blocks(0, idx_dst), blocks
     ), "copy_score_blocks_from must preserve both score words across tables"
+
+
+# ---------------------------------------------------------------------------
+# Storage-level integration: dump/load round-trip and rehash preservation for
+# the LruLfu layout (LFU + need_incremental_dump). These exercise the Python
+# glue around the gather/scatter/copy kernels (export_keys_values_iter,
+# _dump_table, _iter_batches_from_files, _load_key_values, _expand_tables_impl).
+# ---------------------------------------------------------------------------
+
+
+def _lru_lfu_storage(dim=8, max_capacity=4096, init_capacity=None):
+    device_id = torch.cuda.current_device()
+    opts = [
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=device_id,
+            dim=dim,
+            max_capacity=max_capacity,
+            # Constructing DynamicEmbStorage directly bypasses the batched layer's
+            # planner/_create_score, so set init_capacity and the LFU evict
+            # strategy explicitly (batched normally derives these).
+            init_capacity=init_capacity if init_capacity is not None else max_capacity,
+            bucket_capacity=128,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=1024**3,
+            score_strategy=DynamicEmbScoreStrategy.LFU,
+            evict_strategy=DynamicEmbEvictStrategy.LFU,
+            need_incremental_dump=True,
+        )
+    ]
+    return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+
+
+def _read_score_blocks(storage, keys, tids):
+    """Look up keys and gather their full [N, num_scores] score blocks."""
+    name = storage._state.score_policy.name
+    _, founds, idx = storage.key_index_map.lookup(
+        keys, tids, ScoreArg(name=name, policy=ScorePolicy.CONST)
+    )
+    assert torch.all(founds), "all keys must be present"
+    return storage.key_index_map.gather_score_blocks(0, idx)
+
+
+def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path):
+    """DynamicEmbStorage dump -> load preserves BOTH LruLfu score words
+    (timestamp and frequency), not just word 0."""
+    device = torch.cuda.current_device()
+    dim = 8
+    n = 60
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    values = torch.randn(n, dim, dtype=torch.float32, device=device)
+    freq_ref = torch.arange(1, 1 + n, dtype=torch.int64, device=device)  # varied
+
+    src = _lru_lfu_storage(dim=dim)
+    src.insert(keys, tids, values, scores=freq_ref.to(torch.uint64))
+
+    blocks_src = _read_score_blocks(src, keys, tids)
+    assert torch.all(
+        blocks_src[:, 1] == freq_ref
+    ), "insert should set word 1 (frequency) to the provided value"
+
+    d = str(tmp_path)
+    paths = [f"{d}/meta.json", f"{d}/keys", f"{d}/emb", f"{d}/score", f"{d}/opt"]
+    src.dump(0, *paths, include_optim=False)
+
+    dst = _lru_lfu_storage(dim=dim)
+    dst.load(0, *paths, include_optim=False)
+
+    blocks_dst = _read_score_blocks(dst, keys, tids)
+    assert torch.equal(
+        blocks_dst, blocks_src
+    ), "dump/load must preserve both score words (timestamp + frequency)"
+
+
+def test_lru_lfu_storage_rehash_preserves_frequency(current_device):
+    """Growing the table (_expand_tables_impl re-hashes keys into more buckets)
+    must preserve both LruLfu score words -- a single-value re-insert would reset
+    the frequency to 0."""
+    device = torch.cuda.current_device()
+    dim = 8
+    bc = 128
+    # Start with a single bucket, leave room to grow.
+    storage = _lru_lfu_storage(dim=dim, max_capacity=8 * bc, init_capacity=bc)
+    n = 80
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    values = torch.randn(n, dim, dtype=torch.float32, device=device)
+    freq_ref = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    storage.insert(keys, tids, values, scores=freq_ref.to(torch.uint64))
+
+    before = _read_score_blocks(storage, keys, tids)
+    assert torch.all(before[:, 1] == freq_ref)
+
+    # Rehash: grow the single logical table to 8 buckets; keys re-hash and are
+    # re-inserted, and copy_score_blocks must carry both words across.
+    _expand_tables_impl(storage._state, [True], [8 * bc])
+
+    after = _read_score_blocks(storage, keys, tids)
+    assert torch.equal(
+        after, before
+    ), "rehash must preserve both score words (timestamp + frequency)"

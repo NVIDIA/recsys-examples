@@ -1357,8 +1357,11 @@ def _validate_load_meta(
             f"The number of keys in {emb_key_path} does not match with number of embeddings in {embedding_file_path}."
         )
     if score_file_path and os.path.exists(score_file_path):
-        num_scores = os.path.getsize(score_file_path) // SCORE_TYPE.itemsize
-        if num_keys != num_scores:
+        # The score file holds num_scores words per key (e.g. LruLfu = 2:
+        # timestamp + frequency), so compare against num_keys * num_scores.
+        per_key = state.key_index_map.num_scores_
+        num_score_words = os.path.getsize(score_file_path) // SCORE_TYPE.itemsize
+        if num_score_words != num_keys * per_key:
             raise ValueError(
                 f"The number of keys in {emb_key_path} does not match with number of scores in {score_file_path}."
             )
