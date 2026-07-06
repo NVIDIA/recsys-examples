@@ -842,6 +842,7 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_sizes,
             keys,
             table_ids,
+            num_scores=self.num_scores_,
         )
 
     def load(
@@ -1345,9 +1346,7 @@ class LinearBucketTable(ScoredHashTable):
             self.key_type_,
         )
 
-    def gather_score_blocks(
-        self, table_id: int, slots: torch.Tensor
-    ) -> torch.Tensor:
+    def gather_score_blocks(self, table_id: int, slots: torch.Tensor) -> torch.Tensor:
         """Gather all score words at ``slots`` (table-relative flat indices) into a
         [N, num_scores_] tensor. Used by dump to persist multi-word layouts."""
         bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
