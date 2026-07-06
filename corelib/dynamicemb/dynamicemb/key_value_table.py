@@ -1441,12 +1441,20 @@ def _load_key_values(
     # touching scores (CONST), then scatter the full [N, num_scores] block.
     num_scores = state.key_index_map.num_scores_
     if num_scores > 1:
-        assert (
-            scores is not None and scores.dim() == 2 and scores.size(1) == num_scores
-        ), (
-            f"multi-word load expects [N, {num_scores}] scores, "
-            f"got {None if scores is None else tuple(scores.shape)}"
-        )
+        # Validate the score-block shape before scatter_score_blocks writes it
+        # into device memory: a malformed checkpoint (e.g. a 1-D score tensor)
+        # would otherwise produce out-of-bounds / wrong writes. Use ValueError
+        # (not assert) so the check survives `python -O`.
+        if (
+            scores is None
+            or scores.dim() != 2
+            or scores.size(1) != num_scores
+            or scores.size(0) != keys.numel()
+        ):
+            raise ValueError(
+                f"multi-word load expects [{keys.numel()}, {num_scores}] scores, "
+                f"got {None if scores is None else tuple(scores.shape)}"
+            )
         tid_tensor = torch.full(
             (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
         )
