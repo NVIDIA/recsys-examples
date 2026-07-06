@@ -303,19 +303,22 @@ class DynamicEmbTableOptions:
     admission_counter: Optional[Any] = None
     need_incremental_dump: bool = False
     """Enables time-based ``incremental_dump`` for score strategies that do not
-    otherwise carry a timestamp. Default False.
+    otherwise carry a timestamp. Default False. Currently supported ONLY for the
+    TIMESTAMP and LFU score strategies; any other strategy with this flag set
+    raises ``NotImplementedError``.
       - TIMESTAMP already maintains a per-key last-access timestamp as its
         (reduction) score, so it supports incremental dump regardless of this
         flag (implied and a no-op).
       - LFU keeps only a 64-bit access count with no time dimension. Set
         ``need_incremental_dump=True`` to ALSO store a 64-bit last-access
-        timestamp per key (a second, non-reduction score column). The timestamp
-        is used ONLY to select keys for incremental dump (touched since the last
+        timestamp per key, using the compound ``LruLfu`` score policy (two AoS
+        score words: word 0 = timestamp, word 1 = frequency). The timestamp is
+        used ONLY to select keys for incremental dump (touched since the last
         dump); eviction still ranks by the LFU access count. Costs an extra 8
         bytes/key.
-      - STEP / CUSTOMIZED / NO_EVICTION: a user-managed or step score may or may
-        not be monotonic in time; enabling this adds a dedicated timestamp
-        column so incremental dump is well-defined."""
+      - STEP / CUSTOMIZED / NO_EVICTION: NOT supported yet (rejected). Their
+        score is not a device timestamp, and a dedicated timestamp column for
+        these strategies is a follow-up."""
 
     def __post_init__(self):
         assert (
