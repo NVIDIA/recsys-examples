@@ -159,6 +159,12 @@ def local_DynamicEmbDump(
                 for keys, _, _, scores in storage.export_keys_values(
                     device, batch_size, table_id=table_idx
                 ):
+                    # For LFU + need_incremental_dump (the compound LruLfu policy)
+                    # each key exports two score words [timestamp, frequency];
+                    # the frequency is the reduction (last) word. Plain LFU
+                    # exports a single frequency word.
+                    if scores.dim() == 2:
+                        scores = scores[:, -1]
                     for key, score in zip(keys, scores):
                         table_key_scores[int(key)] = int(score)
 
@@ -234,6 +240,18 @@ def validate_lfu_scores(
         "HybridStorage and prefetch StorageMode DEFAULT (_generic_forward_path)."
     ),
 )
+@click.option(
+    "--need-incremental-dump",
+    is_flag=True,
+    help=(
+        "Enable need_incremental_dump: LFU tables use the compound LruLfu policy "
+        "(word 0 = timestamp, word 1 = frequency). The frequency (word 1) must "
+        "still equal the true access count -- this reuses the same validation to "
+        "prove the extra timestamp word does not corrupt LFU semantics. Not "
+        "supported with caching/HybridStorage (multi-word checkpoints are a "
+        "follow-up)."
+    ),
+)
 def test_lfu_score_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -247,6 +265,7 @@ def test_lfu_score_validation(
     cache_capacity_ratio: float,
     use_index_dedup: bool,
     global_hbm_budget_scale: float,
+    need_incremental_dump: bool,
 ):
     """Test LFU score correctness by comparing with naive frequency counting.
 
@@ -258,6 +277,13 @@ def test_lfu_score_validation(
 
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
+
+    if need_incremental_dump and (caching or global_hbm_budget_scale < 1.0):
+        raise ValueError(
+            "--need-incremental-dump is only supported for storage-only "
+            "(HBM_DIRECT) LFU; caching / HybridStorage multi-word score layouts "
+            "are a follow-up."
+        )
 
     if not caching:
         for num_embedding, multi_hot_size in zip(num_embeddings, multi_hot_sizes):
@@ -283,6 +309,7 @@ def test_lfu_score_validation(
     else:
         print(f"  - Caching: DISABLED")
     print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
+    print(f"  - need_incremental_dump: {need_incremental_dump} (LruLfu 2-word score)")
     if not caching and global_hbm_budget_scale < 1.0:
         print(f"  - Storage path: expect HybridStorage (StorageMode DEFAULT)")
 
@@ -298,6 +325,7 @@ def test_lfu_score_validation(
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
         global_hbm_budget_scale=global_hbm_budget_scale,
+        need_incremental_dump=need_incremental_dump,
     )
     assert_batched_dynamicemb_storage_class(
         model,

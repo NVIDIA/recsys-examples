@@ -284,6 +284,7 @@ def apply_dmp(
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
+    need_incremental_dump: bool = False,
 ):
     eb_configs: List[EmbeddingConfig] = []
     for _, m in model.named_modules():
@@ -323,6 +324,7 @@ def apply_dmp(
             caching=caching,
             admit_strategy=admit_strategy,
             admission_counter=admission_counter,
+            need_incremental_dump=need_incremental_dump,
         )
     planner = get_planner(
         eb_configs,
@@ -364,6 +366,7 @@ def create_model(
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
+    need_incremental_dump: bool = False,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -402,6 +405,7 @@ def create_model(
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
         global_hbm_budget_scale=global_hbm_budget_scale,
+        need_incremental_dump=need_incremental_dump,
     )
     return model
 
