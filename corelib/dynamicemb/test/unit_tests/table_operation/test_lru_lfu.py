@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,9 +40,7 @@ def _lru_lfu_table(capacity, bucket_capacity=128, key_type=torch.int64):
         bucket_capacity=bucket_capacity,
         key_type=key_type,
         score_specs=[
-            ScoreSpec(
-                name="frequency", policy=ScorePolicy.LRU_LFU, is_reduction=True
-            )
+            ScoreSpec(name="frequency", policy=ScorePolicy.LRU_LFU, is_reduction=True)
         ],
     )
 
@@ -50,9 +48,9 @@ def _lru_lfu_table(capacity, bucket_capacity=128, key_type=torch.int64):
 def _insert(table, keys, tids, freq, policy=ScorePolicy.LRU_LFU):
     n = keys.numel()
     score_out = torch.empty(n, dtype=torch.int64, device=keys.device)
-    insert_results = torch.empty(
-        n, dtype=table.result_type, device=keys.device
-    ).fill_(InsertResult.INIT.value)
+    insert_results = torch.empty(n, dtype=table.result_type, device=keys.device).fill_(
+        InsertResult.INIT.value
+    )
     indices = table.insert(
         keys,
         tids,
@@ -186,7 +184,9 @@ def test_lru_lfu_gather_scatter_roundtrip(current_device):
     n = 50
     keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
     tids = torch.zeros(n, dtype=torch.int64, device=device)
-    freq = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(torch.uint64)  # varied
+    freq = torch.arange(1, 1 + n, dtype=torch.int64, device=device).to(
+        torch.uint64
+    )  # varied
 
     src = _lru_lfu_table(4096)
     idx_src, _ = _insert(src, keys, tids, freq)

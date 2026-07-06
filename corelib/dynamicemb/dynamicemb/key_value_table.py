@@ -155,8 +155,11 @@ def get_score_policy(score_strategy, need_incremental_dump=False):
             # Compound LruLfu: two adjacent AoS score words per key -- word 0 =
             # last-access timestamp (selects keys for incremental dump), word 1 =
             # frequency (drives eviction). num_scores is derived from the policy.
+            # The spec name maps to word 0 (score_index 0), i.e. the timestamp
+            # column incremental_dump thresholds on -- hence "lru_lfu", not
+            # "frequency".
             return ScoreSpec(
-                name="frequency",
+                name="lru_lfu",
                 policy=ScorePolicy.LRU_LFU,
                 dtype=torch.uint64,
                 is_reduction=True,
@@ -2028,9 +2031,7 @@ class DynamicEmbStorage(Storage):
 
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
         return (
-            self._state.table_emb_dims
-            if on_device
-            else self._state.table_emb_dims_host
+            self._state.table_emb_dims if on_device else self._state.table_emb_dims_host
         )
 
     def all_dims_vec4(self) -> bool:
@@ -2123,11 +2124,7 @@ class HybridStorage(Storage):
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
         # find() builds the value buffer from the HBM tier (load_from_flat(self._hbm)),
         # and max_*_dim above also report the HBM tier, so its dims are authoritative.
-        return (
-            self._hbm.table_emb_dims
-            if on_device
-            else self._hbm.table_emb_dims_host
-        )
+        return self._hbm.table_emb_dims if on_device else self._hbm.table_emb_dims_host
 
     def all_dims_vec4(self) -> bool:
         # HBM tier produces the value buffer in find(); its alignment governs
