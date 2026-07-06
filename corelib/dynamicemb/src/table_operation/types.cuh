@@ -248,8 +248,10 @@ struct LinearBucket {
   static constexpr int BucketBytes = ScoreOffset + sizeof(ScoreType);
 
   // Bytes occupied by one bucket of `size` slots. With num_scores > 1 the score
-  // region holds num_scores contiguous columns per bucket (SoA: [col0 block]
-  // [col1 block]...). num_scores == 1 reproduces BucketBytes * size exactly.
+  // region holds num_scores words per key laid out AoS -- each key's words are
+  // contiguous: [key0: w0..w_{n-1}][key1: w0..w_{n-1}]... -- matching the
+  // scores(iter, k) accessor below (iter * num_scores_ + k). num_scores == 1
+  // reproduces BucketBytes * size exactly.
   static __device__ __forceinline__ uint64_t
   memory_usage(int64_t size, int64_t num_scores = 1) {
     return (ScoreOffset + num_scores * sizeof(ScoreType)) * size;
