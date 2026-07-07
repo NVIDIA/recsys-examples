@@ -469,7 +469,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             },
         )
 
-        use_batch = self.as_batch and len(onboard_task_ids) > 1
+        use_batch = self.as_batch and (
+            len(onboard_task_ids) > 1 or bool(self.enable_layerwise)
+        )
         launch_kwargs = {"as_batch": use_batch}
         if self.enable_layerwise:
             launch_kwargs.update(
