@@ -107,14 +107,21 @@ def _make_uniform_offsets(
 def _make_cuda_events(
     bench_iters: int,
 ) -> list[tuple[torch.cuda.Event, torch.cuda.Event]]:
-    """Allocate all CUDA event pairs before entering a timed loop."""
-    return [
+    """Allocate and eagerly initialize CUDA events before a timed loop."""
+    events = [
         (
             torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True),
         )
         for _ in range(bench_iters)
     ]
+    # torch.cuda.Event creates its underlying cudaEvent_t lazily on first use.
+    # Record every event once so cudaEventCreateWithFlags stays outside profiling.
+    for start, end in events:
+        start.record()
+        end.record()
+    torch.cuda.synchronize()
+    return events
 
 
 def _profiler_start_if_needed(iter_idx: int, profiler_start_iter: int) -> None:
