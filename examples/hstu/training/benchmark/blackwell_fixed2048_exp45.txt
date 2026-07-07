@@ -1,7 +1,0 @@
-# HSTU Blackwell fixed-length 2048 E2E benchmark list.
-# 16-GPU runs use 2x8 on cw-dfw and 4x4 on OCI-HSG.
-# Non-jagged fixed-length data does not need the balanced shuffler, so the
-# exp4/exp5 lines intentionally omit --balanced_shuffler.
-
-exp4_caching_hr,--kernel_backend cutlass --caching --dist_type hash_roundrobin --value_dist zipf --value_dist_alpha 1.05 --kv_channels 128 --num_attention_heads 8 --max_sequence_length 2048 --non_jagged
-exp5_prefetch,--kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05 --kv_channels 128 --num_attention_heads 8 --max_sequence_length 2048 --non_jagged

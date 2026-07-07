@@ -29,16 +29,24 @@ Usage (run from examples/hstu/):
         --gin-config-file training/configs/benchmark_ranking.gin \\
         --batch-sizes 1,2,4,8,16,32,64,128 \\
         --seqlens 128,256,512,1024,2048,4096,8192,16384 \\
-        --warmup-iters 10 --bench-iters 50
+        --phase fwd,bwd,e2e \\
+        --warmup-iters 10 --bench-iters 50 \\
+        --profiler-start-iter 0 --profiler-stop-iter -1 \\
+        --cuda-graph
 
     # Via launch wrapper (sensible defaults)
     bash training/benchmark/scripts/run_hstu_attn_kernel_benchmark.sh
+
+Each selected phase and sweep configuration emits one cudaProfilerStart/Stop
+window. For multiple windows, set nsys ``--capture-range-end`` to
+``repeat-shutdown:N`` with N at least as large as the number of windows.
 
 NetworkArgs (num_heads, kv_channels, kernel_backend, is_causal, dtype_str)
 are read from the gin-config file.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import statistics
@@ -68,12 +76,148 @@ from utils.gin_config_args import NetworkArgs
 # Helpers
 # ---------------------------------------------------------------------------
 
+PHASE_LABELS = {
+    "fwd": "Forward",
+    "bwd": "Backward",
+    "e2e": "End-to-End",
+}
+ALL_PHASES = tuple(PHASE_LABELS)
+
+
+def _parse_phases(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated, de-duplicated list of benchmark phases."""
+    phases = tuple(dict.fromkeys(part.strip().lower() for part in value.split(",")))
+    invalid = [phase for phase in phases if phase not in PHASE_LABELS]
+    if not phases or invalid:
+        choices = ",".join(ALL_PHASES)
+        detail = f": {','.join(invalid)}" if invalid else ""
+        raise argparse.ArgumentTypeError(
+            f"phases must be selected from {choices}{detail}"
+        )
+    return phases
+
 
 def _make_uniform_offsets(
     batch_size: int, seqlen: int, device: torch.device
 ) -> torch.Tensor:
     """Create offsets for non-jagged (uniform) sequences."""
-    return torch.arange(0, batch_size + 1, dtype=torch.int64, device=device) * seqlen
+    return torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen
+
+
+def _make_cuda_events(
+    bench_iters: int,
+) -> list[tuple[torch.cuda.Event, torch.cuda.Event]]:
+    """Allocate all CUDA event pairs before entering a timed loop."""
+    return [
+        (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        for _ in range(bench_iters)
+    ]
+
+
+def _profiler_start_if_needed(iter_idx: int, profiler_start_iter: int) -> None:
+    if iter_idx == profiler_start_iter:
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
+
+
+def _profiler_stop_if_needed(iter_idx: int, profiler_stop_iter: int) -> None:
+    if iter_idx == profiler_stop_iter:
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+
+
+def _time_cuda_graph(
+    graph: torch.cuda.CUDAGraph,
+    bench_iters: int,
+    profiler_start_iter: int,
+    profiler_stop_iter: int,
+) -> float:
+    """Return the median CUDA event time in milliseconds for graph replay."""
+    events = _make_cuda_events(bench_iters)
+    for iter_idx, (start, end) in enumerate(events):
+        _profiler_start_if_needed(iter_idx, profiler_start_iter)
+        start.record()
+        graph.replay()
+        end.record()
+        _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
+
+    torch.cuda.synchronize()
+    return statistics.median(start.elapsed_time(end) for start, end in events)
+
+
+@contextlib.contextmanager
+def _cutlass_current_stream_for_capture():
+    """Route CUTLASS DSL launches to the active CUDA graph capture stream."""
+    try:
+        import cutlass.torch as cutlass_torch
+    except ImportError:
+        yield
+        return
+
+    default_stream = cutlass_torch.default_stream
+    cutlass_torch.default_stream = cutlass_torch.current_stream
+    try:
+        yield
+    finally:
+        cutlass_torch.default_stream = default_stream
+
+
+def _capture_and_time_cuda_graph(
+    phase: str,
+    attn_module: torch.nn.Module,
+    tq: torch.Tensor,
+    tk: torch.Tensor,
+    tv: torch.Tensor,
+    offsets: torch.Tensor,
+    seqlen: int,
+    grad_output: torch.Tensor,
+    bench_iters: int,
+    profiler_start_iter: int,
+    profiler_stop_iter: int,
+) -> float:
+    """Capture one benchmark phase and return its median replay time."""
+    requires_grad = phase != "fwd"
+    static_tq = tq.detach().requires_grad_(requires_grad)
+    static_tk = tk.detach().requires_grad_(requires_grad)
+    static_tv = tv.detach().requires_grad_(requires_grad)
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+
+    with _cutlass_current_stream_for_capture():
+        if phase == "bwd":
+            with torch.cuda.stream(capture_stream):
+                static_out = attn_module(
+                    static_tq, static_tk, static_tv, offsets, seqlen, seqlen
+                )
+            capture_stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            if phase == "fwd":
+                static_out = attn_module(
+                    static_tq, static_tk, static_tv, offsets, seqlen, seqlen
+                )
+            elif phase == "bwd":
+                static_out.backward(grad_output, retain_graph=True)
+            elif phase == "e2e":
+                static_out = attn_module(
+                    static_tq, static_tk, static_tv, offsets, seqlen, seqlen
+                )
+                static_out.backward(grad_output)
+            else:
+                raise ValueError(f"Unsupported CUDA graph benchmark phase: {phase}")
+
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+    return _time_cuda_graph(
+        graph,
+        bench_iters,
+        profiler_start_iter,
+        profiler_stop_iter,
+    )
 
 
 def _benchmark_one(
@@ -87,11 +231,18 @@ def _benchmark_one(
     dtype: torch.dtype,
     warmup_iters: int = 10,
     bench_iters: int = 50,
+    use_cuda_graph: bool = False,
+    phases: tuple[str, ...] = ALL_PHASES,
+    profiler_start_iter: int = 0,
+    profiler_stop_iter: int = -1,
 ) -> dict:
     """Run forward + backward benchmark for a single (batch_size, seqlen) config.
 
     Returns a dict with timing (ms) and TFLOPS for both forward and backward.
     """
+    if profiler_stop_iter == -1:
+        profiler_stop_iter = bench_iters - 1
+
     device = torch.cuda.current_device()
     T = batch_size * seqlen
 
@@ -116,97 +267,109 @@ def _benchmark_one(
     bwd_flops = fwd_flops * 2.5  # backward ≈ 2.5× forward for attention
 
     # ----- warmup -----
+    warmup_backward = "bwd" in phases or "e2e" in phases
     for _ in range(warmup_iters):
-        tq.requires_grad_(True)
-        tk.requires_grad_(True)
-        tv.requires_grad_(True)
+        tq.requires_grad_(warmup_backward)
+        tk.requires_grad_(warmup_backward)
+        tv.requires_grad_(warmup_backward)
         out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-        out.backward(grad_output)
-        tq = tq.detach()
-        tk = tk.detach()
-        tv = tv.detach()
+        if warmup_backward:
+            out.backward(grad_output)
+            tq = tq.detach()
+            tk = tk.detach()
+            tv = tv.detach()
     torch.cuda.synchronize()
 
-    # ----- benchmark forward -----
-    fwd_events = []
-    for _ in range(bench_iters):
-        tq.requires_grad_(True)
-        tk.requires_grad_(True)
-        tv.requires_grad_(True)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-        end.record()
-        fwd_events.append((start, end))
-        # must do backward so that next iteration can call requires_grad_ again
-        out.backward(grad_output)
-        tq = tq.detach()
-        tk = tk.detach()
-        tv = tv.detach()
-    torch.cuda.synchronize()
-    fwd_times = [s.elapsed_time(e) for s, e in fwd_events]
-    fwd_median_ms = statistics.median(fwd_times)
+    phase_times: dict[str, float] = {}
+    if use_cuda_graph:
+        for phase in phases:
+            phase_times[phase] = _capture_and_time_cuda_graph(
+                phase,
+                attn_module,
+                tq,
+                tk,
+                tv,
+                offsets,
+                seqlen,
+                grad_output,
+                bench_iters,
+                profiler_start_iter,
+                profiler_stop_iter,
+            )
+    else:
+        if "fwd" in phases:
+            fwd_events = _make_cuda_events(bench_iters)
+            tq = tq.detach()
+            tk = tk.detach()
+            tv = tv.detach()
+            for iter_idx, (start, end) in enumerate(fwd_events):
+                _profiler_start_if_needed(iter_idx, profiler_start_iter)
+                start.record()
+                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
+                end.record()
+                _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
+            torch.cuda.synchronize()
+            phase_times["fwd"] = statistics.median(
+                start.elapsed_time(end) for start, end in fwd_events
+            )
 
-    # ----- benchmark backward -----
-    bwd_events = []
-    for _ in range(bench_iters):
-        tq.requires_grad_(True)
-        tk.requires_grad_(True)
-        tv.requires_grad_(True)
-        out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        out.backward(grad_output)
-        end.record()
-        bwd_events.append((start, end))
-        tq = tq.detach()
-        tk = tk.detach()
-        tv = tv.detach()
-    torch.cuda.synchronize()
-    bwd_times = [s.elapsed_time(e) for s, e in bwd_events]
-    bwd_median_ms = statistics.median(bwd_times)
+        if "bwd" in phases:
+            bwd_events = _make_cuda_events(bench_iters)
+            for iter_idx, (start, end) in enumerate(bwd_events):
+                tq.requires_grad_(True)
+                tk.requires_grad_(True)
+                tv.requires_grad_(True)
+                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
+                _profiler_start_if_needed(iter_idx, profiler_start_iter)
+                start.record()
+                out.backward(grad_output)
+                end.record()
+                _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
+                tq = tq.detach()
+                tk = tk.detach()
+                tv = tv.detach()
+            torch.cuda.synchronize()
+            phase_times["bwd"] = statistics.median(
+                start.elapsed_time(end) for start, end in bwd_events
+            )
 
-    # ----- benchmark e2e (fwd + bwd) -----
-    e2e_events = []
-    for _ in range(bench_iters):
-        tq.requires_grad_(True)
-        tk.requires_grad_(True)
-        tv.requires_grad_(True)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-        out.backward(grad_output)
-        end.record()
-        e2e_events.append((start, end))
-        tq = tq.detach()
-        tk = tk.detach()
-        tv = tv.detach()
-    torch.cuda.synchronize()
-    e2e_times = [s.elapsed_time(e) for s, e in e2e_events]
-    e2e_median_ms = statistics.median(e2e_times)
+        if "e2e" in phases:
+            e2e_events = _make_cuda_events(bench_iters)
+            for iter_idx, (start, end) in enumerate(e2e_events):
+                tq.requires_grad_(True)
+                tk.requires_grad_(True)
+                tv.requires_grad_(True)
+                _profiler_start_if_needed(iter_idx, profiler_start_iter)
+                start.record()
+                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
+                out.backward(grad_output)
+                end.record()
+                _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
+                tq = tq.detach()
+                tk = tk.detach()
+                tv = tv.detach()
+            torch.cuda.synchronize()
+            phase_times["e2e"] = statistics.median(
+                start.elapsed_time(end) for start, end in e2e_events
+            )
 
-    fwd_tflops = fwd_flops / (fwd_median_ms * 1e-3) / 1e12 if fwd_median_ms > 0 else 0.0
-    bwd_tflops = bwd_flops / (bwd_median_ms * 1e-3) / 1e12 if bwd_median_ms > 0 else 0.0
-    e2e_tflops = (
-        (fwd_flops + bwd_flops) / (e2e_median_ms * 1e-3) / 1e12
-        if e2e_median_ms > 0
-        else 0.0
-    )
-
-    return {
-        "fwd_ms": fwd_median_ms,
-        "bwd_ms": bwd_median_ms,
-        "e2e_ms": e2e_median_ms,
-        "fwd_tflops": fwd_tflops,
-        "bwd_tflops": bwd_tflops,
-        "e2e_tflops": e2e_tflops,
+    phase_flops = {
+        "fwd": fwd_flops,
+        "bwd": bwd_flops,
+        "e2e": fwd_flops + bwd_flops,
+    }
+    result = {
         "fwd_flops": fwd_flops,
         "bwd_flops": bwd_flops,
         "tokens": T,
     }
+    for phase in phases:
+        elapsed_ms = phase_times[phase]
+        result[f"{phase}_ms"] = elapsed_ms
+        result[f"{phase}_tflops"] = (
+            phase_flops[phase] / (elapsed_ms * 1e-3) / 1e12 if elapsed_ms > 0 else 0.0
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -218,18 +381,13 @@ def _print_2d_tables(
     results: dict,
     batch_sizes: list,
     seqlens: list,
-    peak_tflops: float,
+    phases: tuple[str, ...],
 ) -> None:
     """Print 2-D tables (batch_size × seqlen) for TFLOPS and MFU in the terminal."""
 
     metrics = [
-        ("fwd_tflops", "Forward TFLOPS"),
-        ("bwd_tflops", "Backward TFLOPS"),
-        ("e2e_tflops", "End-to-End TFLOPS"),
-        ("fwd_mfu", "Forward MFU (%)"),
-        ("bwd_mfu", "Backward MFU (%)"),
-        ("e2e_mfu", "End-to-End MFU (%)"),
-    ]
+        (f"{phase}_tflops", f"{PHASE_LABELS[phase]} TFLOPS") for phase in phases
+    ] + [(f"{phase}_mfu", f"{PHASE_LABELS[phase]} MFU (%)") for phase in phases]
 
     for key, title in metrics:
         print(f"\n  ── {title} ──")
@@ -337,16 +495,15 @@ def _plot_heatmaps(
     num_heads: int,
     dim_per_head: int,
     output_dir: str,
+    phases: tuple[str, ...],
 ) -> None:
-    """Generate a single combined heatmap image with Forward / Backward / E2E.
+    """Generate a combined heatmap image for the selected benchmark phases.
 
     Each cell shows TFLOPS (bold) with MFU in parentheses below it.
     """
 
-    phases = [
-        ("fwd_tflops", "fwd_mfu", "Forward"),
-        ("bwd_tflops", "bwd_mfu", "Backward"),
-        ("e2e_tflops", "e2e_mfu", "End-to-End"),
+    phase_specs = [
+        (f"{phase}_tflops", f"{phase}_mfu", PHASE_LABELS[phase]) for phase in phases
     ]
 
     os.makedirs(output_dir, exist_ok=True)
@@ -354,7 +511,7 @@ def _plot_heatmaps(
     n_bs, n_sl = len(batch_sizes), len(seqlens)
 
     matrices: dict = {}
-    for tflops_key, mfu_key, label in phases:
+    for tflops_key, mfu_key, label in phase_specs:
         tflops_mat = np.full((n_bs, n_sl), np.nan)
         mfu_mat = np.full((n_bs, n_sl), np.nan)
         for i, bs in enumerate(batch_sizes):
@@ -371,9 +528,14 @@ def _plot_heatmaps(
 
     cell_w = max(10, n_sl * 1.4)
     cell_h = max(5, n_bs * 0.8)
-    fig, axes = plt.subplots(3, 1, figsize=(cell_w, cell_h * 3 + 4))
+    fig, axes = plt.subplots(
+        len(phase_specs),
+        1,
+        figsize=(cell_w, cell_h * len(phase_specs) + 4),
+        squeeze=False,
+    )
 
-    for idx, (ax, (_, _, phase_label)) in enumerate(zip(axes, phases)):
+    for idx, (ax, (_, _, phase_label)) in enumerate(zip(axes[:, 0], phase_specs)):
         _draw_heatmap(
             ax,
             matrices[phase_label]["tflops"],
@@ -382,7 +544,7 @@ def _plot_heatmaps(
             seqlens,
             title=phase_label,
         )
-        if idx < len(phases) - 1:
+        if idx < len(phase_specs) - 1:
             ax.set_xlabel("")
 
     fig.suptitle(
@@ -428,6 +590,12 @@ def main():
         help="Comma-separated list of sequence lengths to sweep.",
     )
     parser.add_argument(
+        "--phase",
+        type=_parse_phases,
+        default=ALL_PHASES,
+        help="Comma-separated phases to run: fwd,bwd,e2e (default: all).",
+    )
+    parser.add_argument(
         "--warmup-iters", type=int, default=10, help="Warmup iterations per config."
     )
     parser.add_argument(
@@ -437,12 +605,43 @@ def main():
         help="Benchmark iterations per config (median is reported).",
     )
     parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture each benchmark phase in a CUDA graph.",
+    )
+    parser.add_argument(
+        "--profiler-start-iter",
+        type=int,
+        default=0,
+        help="First profiled iteration, inclusive (default: 0).",
+    )
+    parser.add_argument(
+        "--profiler-stop-iter",
+        type=int,
+        default=-1,
+        help="Last profiled iteration, inclusive; -1 selects the last iteration.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="training/benchmark/figs",
         help="Directory to save heatmap images (default: training/benchmark/figs).",
     )
     args = parser.parse_args()
+
+    if args.bench_iters <= 0:
+        parser.error("--bench-iters must be greater than zero")
+    profiler_stop_iter = (
+        args.bench_iters - 1
+        if args.profiler_stop_iter == -1
+        else args.profiler_stop_iter
+    )
+    if not 0 <= args.profiler_start_iter < args.bench_iters:
+        parser.error("--profiler-start-iter must select a benchmark iteration")
+    if not args.profiler_start_iter <= profiler_stop_iter < args.bench_iters:
+        parser.error(
+            "--profiler-stop-iter must be -1 or an iteration at/after profiler start"
+        )
 
     # ---- Init (single-rank, no TP) ----
     init.initialize_single_rank()
@@ -494,28 +693,26 @@ def main():
     print(f"  is_causal       : {is_causal}")
     print(f"  dtype           : {dtype_str}")
     print(f"  warmup/bench    : {args.warmup_iters}/{args.bench_iters} iters")
+    print(f"  phases          : {','.join(args.phase)}")
+    print(f"  cuda_graph      : {'enabled' if args.cuda_graph else 'disabled'}")
+    print(
+        f"  profiler iters  : {args.profiler_start_iter}..{profiler_stop_iter} inclusive"
+    )
     print(sep)
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     seqlens = [int(x) for x in args.seqlens.split(",")]
 
     # ---- Sweep grid ----
-    col_hdr = (
-        f"{'BS':>6} {'SeqLen':>8} {'Tokens':>10} | "
-        f"{'fwd_ms':>9} {'fwd_TFLOPS':>12} {'fwd_MFU':>9} | "
-        f"{'bwd_ms':>9} {'bwd_TFLOPS':>12} {'bwd_MFU':>9} | "
-        f"{'e2e_ms':>9} {'e2e_TFLOPS':>12} {'e2e_MFU':>9}"
-    )
+    col_hdr = f"{'BS':>6} {'SeqLen':>8} {'Tokens':>10}"
+    for phase in args.phase:
+        col_hdr += f" | {phase + '_ms':>9} {phase + '_TFLOPS':>12} {phase + '_MFU':>9}"
     print(col_hdr)
     print("-" * len(col_hdr))
 
     results: dict = {}
-    best_fwd_mfu = 0.0
-    best_bwd_mfu = 0.0
-    best_e2e_mfu = 0.0
-    best_fwd_cfg = None
-    best_bwd_cfg = None
-    best_e2e_cfg = None
+    best_mfu = {phase: 0.0 for phase in args.phase}
+    best_cfg = {phase: None for phase in args.phase}
 
     for bs in batch_sizes:
         for sl in seqlens:
@@ -532,42 +729,33 @@ def main():
                     dtype,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    use_cuda_graph=args.cuda_graph,
+                    phases=args.phase,
+                    profiler_start_iter=args.profiler_start_iter,
+                    profiler_stop_iter=profiler_stop_iter,
                 )
-                fwd_mfu = r["fwd_tflops"] / peak_tflops * 100.0
-                bwd_mfu = r["bwd_tflops"] / peak_tflops * 100.0
-                e2e_mfu = r["e2e_tflops"] / peak_tflops * 100.0
+                for phase in args.phase:
+                    r[f"{phase}_mfu"] = r[f"{phase}_tflops"] / peak_tflops * 100.0
+                results[(bs, sl)] = r
 
-                results[(bs, sl)] = {
-                    **r,
-                    "fwd_mfu": fwd_mfu,
-                    "bwd_mfu": bwd_mfu,
-                    "e2e_mfu": e2e_mfu,
-                }
-
-                print(
-                    f"{bs:>6} {sl:>8} {tokens:>10} | "
-                    f"{r['fwd_ms']:>9.3f} {r['fwd_tflops']:>12.2f} {fwd_mfu:>8.1f}% | "
-                    f"{r['bwd_ms']:>9.3f} {r['bwd_tflops']:>12.2f} {bwd_mfu:>8.1f}% | "
-                    f"{r['e2e_ms']:>9.3f} {r['e2e_tflops']:>12.2f} {e2e_mfu:>8.1f}%"
-                )
-
-                if fwd_mfu > best_fwd_mfu:
-                    best_fwd_mfu = fwd_mfu
-                    best_fwd_cfg = (bs, sl)
-                if bwd_mfu > best_bwd_mfu:
-                    best_bwd_mfu = bwd_mfu
-                    best_bwd_cfg = (bs, sl)
-                if e2e_mfu > best_e2e_mfu:
-                    best_e2e_mfu = e2e_mfu
-                    best_e2e_cfg = (bs, sl)
+                row = f"{bs:>6} {sl:>8} {tokens:>10}"
+                for phase in args.phase:
+                    row += (
+                        f" | {r[f'{phase}_ms']:>9.3f} "
+                        f"{r[f'{phase}_tflops']:>12.2f} "
+                        f"{r[f'{phase}_mfu']:>8.1f}%"
+                    )
+                    if r[f"{phase}_mfu"] > best_mfu[phase]:
+                        best_mfu[phase] = r[f"{phase}_mfu"]
+                        best_cfg[phase] = (bs, sl)
+                print(row)
 
             except torch.cuda.OutOfMemoryError:
-                print(
-                    f"{bs:>6} {sl:>8} {tokens:>10} | "
-                    f"{'OOM':>9} {'---':>12} {'---':>9} | "
-                    f"{'OOM':>9} {'---':>12} {'---':>9} | "
-                    f"{'OOM':>9} {'---':>12} {'---':>9}"
+                row = f"{bs:>6} {sl:>8} {tokens:>10}"
+                row += "".join(
+                    f" | {'OOM':>9} {'---':>12} {'---':>9}" for _ in args.phase
                 )
+                print(row)
                 torch.cuda.empty_cache()
                 break  # larger seqlens at this BS will also OOM
 
@@ -575,21 +763,15 @@ def main():
     print(f"\n{sep}")
     print("SUMMARY")
     print(sep)
-    if best_fwd_cfg:
-        print(
-            f"  Best fwd MFU : {best_fwd_mfu:>6.1f}%  at BS={best_fwd_cfg[0]}, SeqLen={best_fwd_cfg[1]}"
-        )
-    if best_bwd_cfg:
-        print(
-            f"  Best bwd MFU : {best_bwd_mfu:>6.1f}%  at BS={best_bwd_cfg[0]}, SeqLen={best_bwd_cfg[1]}"
-        )
-    if best_e2e_cfg:
-        print(
-            f"  Best e2e MFU : {best_e2e_mfu:>6.1f}%  at BS={best_e2e_cfg[0]}, SeqLen={best_e2e_cfg[1]}"
-        )
+    for phase in args.phase:
+        if best_cfg[phase]:
+            print(
+                f"  Best {phase} MFU : {best_mfu[phase]:>6.1f}%  "
+                f"at BS={best_cfg[phase][0]}, SeqLen={best_cfg[phase][1]}"
+            )
 
     # ---- Print 2-D tables in terminal ----
-    _print_2d_tables(results, batch_sizes, seqlens, peak_tflops)
+    _print_2d_tables(results, batch_sizes, seqlens, args.phase)
 
     # ---- Save raw results as JSON for later re-plotting ----
     os.makedirs(args.output_dir, exist_ok=True)
@@ -604,6 +786,11 @@ def main():
         "seqlens": seqlens,
         "warmup_iters": args.warmup_iters,
         "bench_iters": args.bench_iters,
+        "phases": list(args.phase),
+        "cuda_graph": args.cuda_graph,
+        "profiler_start_iter": args.profiler_start_iter,
+        "profiler_stop_iter": args.profiler_stop_iter,
+        "profiler_stop_iter_effective": profiler_stop_iter,
         "results": {f"{bs},{sl}": v for (bs, sl), v in results.items()},
     }
     json_path = os.path.join(args.output_dir, "hstu_attn_mfu_results.json")
@@ -623,6 +810,7 @@ def main():
         num_heads=num_heads,
         dim_per_head=dim_per_head,
         output_dir=args.output_dir,
+        phases=args.phase,
     )
     print("Done.")
 
