@@ -143,6 +143,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self._adapter = FlexKVClientAdapter(mode, server_addr, server_port)
         self._client = None
         self._ready = False
+        self._page_offsets: Optional[torch.Tensor] = None
 
     def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
         assert (
@@ -304,11 +305,13 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         kv_indices_cpu = (
             kv_indices.detach().contiguous().to(device="cpu", dtype=torch.int64)
         )
-        kv_indptr_cpu = kv_indptr.detach().contiguous().to(
-            device="cpu", dtype=torch.int64
+        kv_indptr_cpu = (
+            kv_indptr.detach().contiguous().to(device="cpu", dtype=torch.int64)
         )
         indptr = kv_indptr_cpu.tolist()
-        offsets = torch.arange(self.page_size, dtype=torch.int64)
+        if self._page_offsets is None or self._page_offsets.numel() != self.page_size:
+            self._page_offsets = torch.arange(self.page_size, dtype=torch.int64)
+        offsets = self._page_offsets
         mappings: List[torch.Tensor] = []
         for i in range(len(indptr) - 1):
             start, end = indptr[i], indptr[i + 1]
@@ -497,7 +500,9 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
                 aligned_len = (valid_len // self.page_size) * self.page_size
                 mask = np.asarray(return_mask, dtype=np.bool_)[:aligned_len]
                 if mask.size < aligned_len:
-                    mask = np.pad(mask, (0, aligned_len - mask.size), constant_values=False)
+                    mask = np.pad(
+                        mask, (0, aligned_len - mask.size), constant_values=False
+                    )
                 num_unmatched = int(mask.sum())
                 launch_slot = None
                 if num_unmatched > 0:
@@ -522,9 +527,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
 
         if use_batch and task_ids:
             batch_launch = len(task_ids) > 1
-            self._client.launch(
-                task_ids, batch_slot_mappings, as_batch=batch_launch
-            )
+            self._client.launch(task_ids, batch_slot_mappings, as_batch=batch_launch)
         return HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,

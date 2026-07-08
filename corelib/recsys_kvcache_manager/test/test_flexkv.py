@@ -64,9 +64,9 @@ def create_testing_kvcache_manager() -> KVCacheManager:
         * kvcache_config.head_dim
         * 2
     ) / (1024.0**3)
-    host_gib = (
-        kvcache_config.num_layers * kvcache_config.host_capacity_per_layer
-    ) / (1024.0**3)
+    host_gib = (kvcache_config.num_layers * kvcache_config.host_capacity_per_layer) / (
+        1024.0**3
+    )
     print(f"[TEST] KVCache GPU Memory Usage: {gpu_gib} GiB.")
     print(f"[TEST] KVCache Host Memory Usage: {host_gib} GiB.")
     if flexkv_config_path:
