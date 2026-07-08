@@ -644,6 +644,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     print(f"[Scenario3] timed run completed, iters={timed_iters}")
 
 
+def shutdown_flexkv_client(model_predict) -> None:
+    kvcache_mgr = getattr(getattr(model_predict, "dense_module", None), "kvcache", None)
+    host_mgr = getattr(kvcache_mgr, "host_kvstorage_manager", None)
+    client = getattr(host_mgr, "_client", None)
+    if client is not None and hasattr(client, "shutdown"):
+        try:
+            client.shutdown()
+            print("[Cleanup] FlexKV client shutdown completed", flush=True)
+        except Exception as exc:
+            print(f"[WARN] FlexKV client shutdown failed: {exc}", flush=True)
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -699,40 +711,43 @@ if __name__ == "__main__":
     model_predict, page_size, max_seqlen = build_model(cfg, history_len)
     print(f"[Config] page_size={page_size}, max_seqlen={max_seqlen}")
 
-    with torch.inference_mode():
-        if "1" in scenarios:
-            run_scenario_gpu_hit(
-                model_predict=model_predict,
-                history_len=history_len,
-                append_history_len=cfg.append_history_len,
-                num_candidates=cfg.num_candidates,
-                max_seqlen=max_seqlen,
-                warmup_iters=cfg.warmup_iters,
-                timed_iters=cfg.timed_iters,
-                offload_wait_timeout_s=cfg.offload_wait_timeout_s,
-            )
-        if "2" in scenarios:
-            run_scenario_gpu_miss_host_hit(
-                model_predict=model_predict,
-                history_len=history_len,
-                append_history_len=cfg.append_history_len,
-                num_candidates=cfg.num_candidates,
-                max_seqlen=max_seqlen,
-                warmup_iters=cfg.warmup_iters,
-                timed_iters=cfg.timed_iters,
-                offload_wait_timeout_s=cfg.offload_wait_timeout_s,
-            )
-        if "3" in scenarios:
-            run_scenario_gpu_cpu_miss_ssd_hit(
-                model_predict=model_predict,
-                history_len=history_len,
-                append_history_len=cfg.append_history_len,
-                num_candidates=cfg.num_candidates,
-                max_seqlen=max_seqlen,
-                page_size=page_size,
-                timed_iters=cfg.timed_iters,
-                offload_wait_timeout_s=cfg.offload_wait_timeout_s,
-                ssd_pressure_users=cfg.ssd_pressure_users,
-                ssd_pressure_batch_size=cfg.ssd_pressure_batch_size,
-                ssd_pressure_batch_sleep_s=cfg.ssd_pressure_batch_sleep_s,
-            )
+    try:
+        with torch.inference_mode():
+            if "1" in scenarios:
+                run_scenario_gpu_hit(
+                    model_predict=model_predict,
+                    history_len=history_len,
+                    append_history_len=cfg.append_history_len,
+                    num_candidates=cfg.num_candidates,
+                    max_seqlen=max_seqlen,
+                    warmup_iters=cfg.warmup_iters,
+                    timed_iters=cfg.timed_iters,
+                    offload_wait_timeout_s=cfg.offload_wait_timeout_s,
+                )
+            if "2" in scenarios:
+                run_scenario_gpu_miss_host_hit(
+                    model_predict=model_predict,
+                    history_len=history_len,
+                    append_history_len=cfg.append_history_len,
+                    num_candidates=cfg.num_candidates,
+                    max_seqlen=max_seqlen,
+                    warmup_iters=cfg.warmup_iters,
+                    timed_iters=cfg.timed_iters,
+                    offload_wait_timeout_s=cfg.offload_wait_timeout_s,
+                )
+            if "3" in scenarios:
+                run_scenario_gpu_cpu_miss_ssd_hit(
+                    model_predict=model_predict,
+                    history_len=history_len,
+                    append_history_len=cfg.append_history_len,
+                    num_candidates=cfg.num_candidates,
+                    max_seqlen=max_seqlen,
+                    page_size=page_size,
+                    timed_iters=cfg.timed_iters,
+                    offload_wait_timeout_s=cfg.offload_wait_timeout_s,
+                    ssd_pressure_users=cfg.ssd_pressure_users,
+                    ssd_pressure_batch_size=cfg.ssd_pressure_batch_size,
+                    ssd_pressure_batch_sleep_s=cfg.ssd_pressure_batch_sleep_s,
+                )
+    finally:
+        shutdown_flexkv_client(model_predict)
