@@ -92,6 +92,15 @@ See the [E2E benchmark documentation](./E2E_BENCHMARK.md) for the latest results
 
 Standalone benchmark for the **CUTLASS-based HSTU attention kernel**. Sweeps batch sizes and sequence lengths on non-jagged (full-length) inputs and outputs TFLOPS/MFU heatmaps as PNG files.
 
+The default `per-iter` timing mode allocates one CUDA Event pair per benchmark
+iteration, including when `--cuda-graph` is enabled. It records
+P1/P10/P20/P50/P100 elapsed times for every phase and configuration. TFLOPS and
+MFU use **P10** rather than the median so that power-throttled iterations in the
+tail of a sustained sweep do not distort the reported performance. P1, P20,
+P50, and P100 are printed in the terminal; all five percentiles are retained in
+the JSON output and annotated in the heatmap. With `--timing-mode aggregate`,
+the benchmark has one average-time sample, so every percentile is identical.
+
 Configs live in [`kernel_experiments.txt`](./kernel_experiments.txt) — each line is one `(exp_name, CLI args)` pair consumed by the unified launcher.
 
 ```bash
@@ -108,7 +117,8 @@ bash training/benchmark/scripts/submit_all_experiments_slurm.sh \
 python training/benchmark/scripts/hstu_attn_kernel_benchmark.py \
     --gin-config-file training/configs/benchmark_ranking.gin \
     --batch-sizes 1,2,4,8,16,32,64,128 \
-    --seqlens 128,256,512,1024,2048,4096,8192,16384
+    --seqlens 128,256,512,1024,2048,4096,8192,16384 \
+    --timing-mode per-iter
 ```
 
 #### Results (single H100-SXM5-80GB)

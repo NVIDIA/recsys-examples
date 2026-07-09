@@ -20,8 +20,8 @@ Benchmark HSTUAttention forward & backward kernels across a grid of
 Only **non-jagged** (padded / uniform) inputs are considered:
 all sequences in a batch share the same sequence length.
 
-Results are printed as 2-D tables in the terminal and saved as heatmap
-images to ``--output-dir``.
+Results are printed as 2-D tables in the terminal and saved as combined
+TFLOPS/MFU/time heatmap images to ``--output-dir``.
 
 Usage (run from examples/hstu/):
     # Direct invocation
@@ -31,6 +31,7 @@ Usage (run from examples/hstu/):
         --seqlens 128,256,512,1024,2048,4096,8192,16384 \\
         --phase fwd,bwd,e2e \\
         --warmup-iters 10 --bench-iters 50 \\
+        --timing-mode per-iter \\
         --profiler-start-iter 0 --profiler-stop-iter -1 \\
         --cuda-graph
 
@@ -47,10 +48,11 @@ are read from the gin-config file.
 
 import argparse
 import contextlib
+import inspect
 import json
 import os
-import statistics
 import warnings
+from typing import Callable
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
@@ -67,6 +69,7 @@ import torch
 # Import all gin-configurable classes so gin.parse_config_file succeeds
 # even when the config file contains bindings for unrelated classes.
 import utils.gin_config_args as _gin_args  # noqa: F401
+from commons.utils.nvtx_op import nvtx_hooks_enabled
 from commons.utils.perf import _compute_attn_fwd_flops, get_current_device_spec
 from configs.hstu_config import KernelBackend
 from modules.hstu_attention import create_hstu_attention
@@ -82,6 +85,10 @@ PHASE_LABELS = {
     "e2e": "End-to-End",
 }
 ALL_PHASES = tuple(PHASE_LABELS)
+TIMING_MODES = ("per-iter", "aggregate")
+TIME_PERCENTILES = (1, 10, 20, 50, 100)
+PRINTED_TIME_PERCENTILES = (1, 20, 50, 100)
+PERFORMANCE_PERCENTILE = 10
 
 
 def _parse_phases(value: str) -> tuple[str, ...]:
@@ -104,16 +111,29 @@ def _make_uniform_offsets(
     return torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen
 
 
+def _get_unwrapped_attention_forward(
+    attn_module: torch.nn.Module,
+) -> Callable[..., torch.Tensor]:
+    """Bypass benchmark-external module and NVTX autograd hooks."""
+    raw_forward = inspect.unwrap(type(attn_module).forward)
+    return raw_forward.__get__(attn_module, type(attn_module))
+
+
 def _make_cuda_events(
     bench_iters: int,
+    timing_mode: str,
 ) -> list[tuple[torch.cuda.Event, torch.cuda.Event]]:
     """Allocate and eagerly initialize CUDA events before a timed loop."""
+    if timing_mode not in TIMING_MODES:
+        raise ValueError(f"Unsupported timing mode: {timing_mode}")
+
+    event_pair_count = bench_iters if timing_mode == "per-iter" else 1
     events = [
         (
             torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True),
         )
-        for _ in range(bench_iters)
+        for _ in range(event_pair_count)
     ]
     # torch.cuda.Event creates its underlying cudaEvent_t lazily on first use.
     # Record every event once so cudaEventCreateWithFlags stays outside profiling.
@@ -122,6 +142,47 @@ def _make_cuda_events(
         end.record()
     torch.cuda.synchronize()
     return events
+
+
+def _record_timing_start(
+    events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    iter_idx: int,
+    timing_mode: str,
+) -> None:
+    if timing_mode == "per-iter":
+        events[iter_idx][0].record()
+    elif iter_idx == 0:
+        events[0][0].record()
+
+
+def _record_timing_end(
+    events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    iter_idx: int,
+    bench_iters: int,
+    timing_mode: str,
+) -> None:
+    if timing_mode == "per-iter":
+        events[iter_idx][1].record()
+    elif iter_idx == bench_iters - 1:
+        events[0][1].record()
+
+
+def _summarize_cuda_time(
+    events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    bench_iters: int,
+    timing_mode: str,
+) -> dict[str, float]:
+    if timing_mode == "aggregate":
+        start, end = events[0]
+        elapsed_times = [start.elapsed_time(end) / bench_iters]
+    else:
+        elapsed_times = [start.elapsed_time(end) for start, end in events]
+
+    percentile_values = np.percentile(elapsed_times, TIME_PERCENTILES)
+    return {
+        f"p{percentile}": float(value)
+        for percentile, value in zip(TIME_PERCENTILES, percentile_values)
+    }
 
 
 def _profiler_start_if_needed(iter_idx: int, profiler_start_iter: int) -> None:
@@ -139,20 +200,21 @@ def _profiler_stop_if_needed(iter_idx: int, profiler_stop_iter: int) -> None:
 def _time_cuda_graph(
     graph: torch.cuda.CUDAGraph,
     bench_iters: int,
+    timing_mode: str,
     profiler_start_iter: int,
     profiler_stop_iter: int,
-) -> float:
-    """Return the median CUDA event time in milliseconds for graph replay."""
-    events = _make_cuda_events(bench_iters)
-    for iter_idx, (start, end) in enumerate(events):
+) -> dict[str, float]:
+    """Return per-replay CUDA event time percentiles in milliseconds."""
+    events = _make_cuda_events(bench_iters, timing_mode)
+    for iter_idx in range(bench_iters):
         _profiler_start_if_needed(iter_idx, profiler_start_iter)
-        start.record()
+        _record_timing_start(events, iter_idx, timing_mode)
         graph.replay()
-        end.record()
+        _record_timing_end(events, iter_idx, bench_iters, timing_mode)
         _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
 
     torch.cuda.synchronize()
-    return statistics.median(start.elapsed_time(end) for start, end in events)
+    return _summarize_cuda_time(events, bench_iters, timing_mode)
 
 
 @contextlib.contextmanager
@@ -174,7 +236,7 @@ def _cutlass_current_stream_for_capture():
 
 def _capture_and_time_cuda_graph(
     phase: str,
-    attn_module: torch.nn.Module,
+    attn_fn: Callable[..., torch.Tensor],
     tq: torch.Tensor,
     tk: torch.Tensor,
     tv: torch.Tensor,
@@ -182,10 +244,11 @@ def _capture_and_time_cuda_graph(
     seqlen: int,
     grad_output: torch.Tensor,
     bench_iters: int,
+    timing_mode: str,
     profiler_start_iter: int,
     profiler_stop_iter: int,
-) -> float:
-    """Capture one benchmark phase and return its median replay time."""
+) -> dict[str, float]:
+    """Capture one benchmark phase and return per-replay time percentiles."""
     requires_grad = phase != "fwd"
     static_tq = tq.detach().requires_grad_(requires_grad)
     static_tk = tk.detach().requires_grad_(requires_grad)
@@ -196,7 +259,7 @@ def _capture_and_time_cuda_graph(
     with _cutlass_current_stream_for_capture():
         if phase == "bwd":
             with torch.cuda.stream(capture_stream):
-                static_out = attn_module(
+                static_out = attn_fn(
                     static_tq, static_tk, static_tv, offsets, seqlen, seqlen
                 )
             capture_stream.synchronize()
@@ -204,31 +267,49 @@ def _capture_and_time_cuda_graph(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_stream):
             if phase == "fwd":
-                static_out = attn_module(
+                static_out = attn_fn(
                     static_tq, static_tk, static_tv, offsets, seqlen, seqlen
                 )
             elif phase == "bwd":
-                static_out.backward(grad_output, retain_graph=True)
+                static_grads = torch.autograd.grad(
+                    static_out,
+                    (static_tq, static_tk, static_tv),
+                    grad_outputs=grad_output,
+                    retain_graph=True,
+                )
             elif phase == "e2e":
-                static_out = attn_module(
+                static_out = attn_fn(
                     static_tq, static_tk, static_tv, offsets, seqlen, seqlen
                 )
-                static_out.backward(grad_output)
+                static_grads = torch.autograd.grad(
+                    static_out,
+                    (static_tq, static_tk, static_tv),
+                    grad_outputs=grad_output,
+                )
             else:
                 raise ValueError(f"Unsupported CUDA graph benchmark phase: {phase}")
 
     torch.cuda.current_stream().wait_stream(capture_stream)
     torch.cuda.synchronize()
-    return _time_cuda_graph(
+
+    # Exclude first-launch graph setup and upload costs from benchmark timing.
+    graph.replay()
+    torch.cuda.synchronize()
+
+    phase_time = _time_cuda_graph(
         graph,
         bench_iters,
+        timing_mode,
         profiler_start_iter,
         profiler_stop_iter,
     )
+    if phase != "fwd":
+        del static_grads
+    return phase_time
 
 
 def _benchmark_one(
-    attn_module: torch.nn.Module,
+    attn_fn: Callable[..., torch.Tensor],
     batch_size: int,
     seqlen: int,
     num_heads: int,
@@ -238,6 +319,7 @@ def _benchmark_one(
     dtype: torch.dtype,
     warmup_iters: int = 10,
     bench_iters: int = 50,
+    timing_mode: str = "per-iter",
     use_cuda_graph: bool = False,
     phases: tuple[str, ...] = ALL_PHASES,
     profiler_start_iter: int = 0,
@@ -279,20 +361,24 @@ def _benchmark_one(
         tq.requires_grad_(warmup_backward)
         tk.requires_grad_(warmup_backward)
         tv.requires_grad_(warmup_backward)
-        out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
+        out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
         if warmup_backward:
-            out.backward(grad_output)
+            torch.autograd.grad(
+                out,
+                (tq, tk, tv),
+                grad_outputs=grad_output,
+            )
             tq = tq.detach()
             tk = tk.detach()
             tv = tv.detach()
     torch.cuda.synchronize()
 
-    phase_times: dict[str, float] = {}
+    phase_time_percentiles: dict[str, dict[str, float]] = {}
     if use_cuda_graph:
         for phase in phases:
-            phase_times[phase] = _capture_and_time_cuda_graph(
+            phase_time_percentiles[phase] = _capture_and_time_cuda_graph(
                 phase,
-                attn_module,
+                attn_fn,
                 tq,
                 tk,
                 tv,
@@ -300,64 +386,87 @@ def _benchmark_one(
                 seqlen,
                 grad_output,
                 bench_iters,
+                timing_mode,
                 profiler_start_iter,
                 profiler_stop_iter,
             )
     else:
         if "fwd" in phases:
-            fwd_events = _make_cuda_events(bench_iters)
+            fwd_events = _make_cuda_events(bench_iters, timing_mode)
             tq = tq.detach()
             tk = tk.detach()
             tv = tv.detach()
-            for iter_idx, (start, end) in enumerate(fwd_events):
+            for iter_idx in range(bench_iters):
                 _profiler_start_if_needed(iter_idx, profiler_start_iter)
-                start.record()
-                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-                end.record()
+                _record_timing_start(fwd_events, iter_idx, timing_mode)
+                out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
+                _record_timing_end(fwd_events, iter_idx, bench_iters, timing_mode)
                 _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
             torch.cuda.synchronize()
-            phase_times["fwd"] = statistics.median(
-                start.elapsed_time(end) for start, end in fwd_events
+            phase_time_percentiles["fwd"] = _summarize_cuda_time(
+                fwd_events, bench_iters, timing_mode
             )
 
         if "bwd" in phases:
-            bwd_events = _make_cuda_events(bench_iters)
-            for iter_idx, (start, end) in enumerate(bwd_events):
+            bwd_events = _make_cuda_events(bench_iters, timing_mode)
+            if timing_mode == "aggregate":
                 tq.requires_grad_(True)
                 tk.requires_grad_(True)
                 tv.requires_grad_(True)
-                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
+                out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
+
+            for iter_idx in range(bench_iters):
+                if timing_mode == "per-iter":
+                    tq.requires_grad_(True)
+                    tk.requires_grad_(True)
+                    tv.requires_grad_(True)
+                    out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
                 _profiler_start_if_needed(iter_idx, profiler_start_iter)
-                start.record()
-                out.backward(grad_output)
-                end.record()
+                _record_timing_start(bwd_events, iter_idx, timing_mode)
+                torch.autograd.grad(
+                    out,
+                    (tq, tk, tv),
+                    grad_outputs=grad_output,
+                    retain_graph=timing_mode == "aggregate",
+                )
+                _record_timing_end(bwd_events, iter_idx, bench_iters, timing_mode)
                 _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
+                if timing_mode == "per-iter":
+                    tq = tq.detach()
+                    tk = tk.detach()
+                    tv = tv.detach()
+            torch.cuda.synchronize()
+            phase_time_percentiles["bwd"] = _summarize_cuda_time(
+                bwd_events, bench_iters, timing_mode
+            )
+            if timing_mode == "aggregate":
+                del out
                 tq = tq.detach()
                 tk = tk.detach()
                 tv = tv.detach()
-            torch.cuda.synchronize()
-            phase_times["bwd"] = statistics.median(
-                start.elapsed_time(end) for start, end in bwd_events
-            )
 
         if "e2e" in phases:
-            e2e_events = _make_cuda_events(bench_iters)
-            for iter_idx, (start, end) in enumerate(e2e_events):
+            e2e_events = _make_cuda_events(bench_iters, timing_mode)
+            for iter_idx in range(bench_iters):
                 tq.requires_grad_(True)
                 tk.requires_grad_(True)
                 tv.requires_grad_(True)
                 _profiler_start_if_needed(iter_idx, profiler_start_iter)
-                start.record()
-                out = attn_module(tq, tk, tv, offsets, seqlen, seqlen)
-                out.backward(grad_output)
-                end.record()
+                _record_timing_start(e2e_events, iter_idx, timing_mode)
+                out = attn_fn(tq, tk, tv, offsets, seqlen, seqlen)
+                torch.autograd.grad(
+                    out,
+                    (tq, tk, tv),
+                    grad_outputs=grad_output,
+                )
+                _record_timing_end(e2e_events, iter_idx, bench_iters, timing_mode)
                 _profiler_stop_if_needed(iter_idx, profiler_stop_iter)
                 tq = tq.detach()
                 tk = tk.detach()
                 tv = tv.detach()
             torch.cuda.synchronize()
-            phase_times["e2e"] = statistics.median(
-                start.elapsed_time(end) for start, end in e2e_events
+            phase_time_percentiles["e2e"] = _summarize_cuda_time(
+                e2e_events, bench_iters, timing_mode
             )
 
     phase_flops = {
@@ -371,8 +480,10 @@ def _benchmark_one(
         "tokens": T,
     }
     for phase in phases:
-        elapsed_ms = phase_times[phase]
+        time_percentiles = phase_time_percentiles[phase]
+        elapsed_ms = time_percentiles[f"p{PERFORMANCE_PERCENTILE}"]
         result[f"{phase}_ms"] = elapsed_ms
+        result[f"{phase}_time_percentiles_ms"] = time_percentiles
         result[f"{phase}_tflops"] = (
             phase_flops[phase] / (elapsed_ms * 1e-3) / 1e12 if elapsed_ms > 0 else 0.0
         )
@@ -400,7 +511,8 @@ def _print_2d_tables(
         print(f"\n  ── {title} ──")
         # Header row: BS \ SeqLen ...
         sl_labels = [f"{sl:>8}" for sl in seqlens]
-        print(f"  {'BS \\ SeqLen':>12}" + "".join(sl_labels))
+        axis_label = "BS \\ SeqLen"
+        print(f"  {axis_label:>12}" + "".join(sl_labels))
         print("  " + "-" * (12 + 8 * len(seqlens)))
 
         for bs in batch_sizes:
@@ -423,73 +535,79 @@ def _draw_heatmap(
     ax: plt.Axes,
     tflops_mat: np.ndarray,
     mfu_mat: np.ndarray,
+    time_percentile_mats: dict[str, np.ndarray],
     batch_sizes: list,
     seqlens: list,
     title: str,
+    show_x_label: bool,
 ) -> None:
-    """Draw a single heatmap with TFLOPS as colour and MFU in parentheses."""
+    """Draw a TFLOPS heatmap annotated with MFU and time percentiles."""
     n_bs, n_sl = tflops_mat.shape
     masked = np.ma.masked_invalid(tflops_mat)
-    cmap = plt.cm.YlOrRd.copy()
-    cmap.set_bad(color="lightgrey")
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad(color="#d9d9d9")
 
     im = ax.imshow(masked, cmap=cmap, aspect="auto", origin="upper")
     cbar = ax.figure.colorbar(im, ax=ax, pad=0.02)
-    cbar.set_label("TFLOPS", fontsize=21)
-    cbar.ax.tick_params(labelsize=15)
+    cbar.set_label("TFLOPS", fontsize=11)
+    cbar.ax.tick_params(labelsize=9)
 
     ax.set_xticks(range(n_sl))
-    ax.set_xticklabels([str(s) for s in seqlens], fontsize=18)
+    ax.set_xticklabels([str(s) for s in seqlens], rotation=45, ha="right", fontsize=9)
     ax.set_yticks(range(n_bs))
-    ax.set_yticklabels([str(b) for b in batch_sizes], fontsize=18)
-    ax.set_xlabel("Sequence Length", fontsize=21)
-    ax.set_ylabel("Batch Size", fontsize=21)
+    ax.set_yticklabels([str(b) for b in batch_sizes], fontsize=9)
+    ax.set_xlabel("Sequence length" if show_x_label else "", fontsize=11)
+    ax.set_ylabel(f"{title}\nBatch size", fontsize=11)
 
-    vmin, vmax = np.nanmin(tflops_mat), np.nanmax(tflops_mat)
-    mid = (vmin + vmax) / 2 if vmax > vmin else vmax
+    finite_tflops = tflops_mat[np.isfinite(tflops_mat)]
+    midpoint = np.nanmedian(finite_tflops) if finite_tflops.size else 0.0
 
     for i in range(n_bs):
         for j in range(n_sl):
-            if np.isnan(tflops_mat[i, j]):
+            if not np.isfinite(tflops_mat[i, j]):
                 ax.text(
                     j,
                     i,
                     "OOM",
                     ha="center",
                     va="center",
-                    fontsize=16,
-                    color="grey",
-                    fontstyle="italic",
+                    fontsize=7,
+                    color="#333333",
                 )
             else:
                 tv = tflops_mat[i, j]
                 mv = mfu_mat[i, j]
-                t_fmt = f"{tv:.0f}" if tv >= 10 else f"{tv:.1f}"
-                m_fmt = f"({mv:.1f}%)"
-                text_color = "white" if tv > mid else "black"
-                mfu_color = "#66FF66" if tv > mid else "#006600"
+                percentile_values = {
+                    key: values[i, j] for key, values in time_percentile_mats.items()
+                }
+                elapsed_ms = percentile_values[f"p{PERFORMANCE_PERCENTILE}"]
+                lines = [f"{tv:.0f} TF"]
+                if np.isfinite(mv):
+                    lines.append(f"{mv:.1f}% | P10 {elapsed_ms:.3g} ms")
+                if np.isfinite(elapsed_ms):
+                    lines.extend(
+                        [
+                            "P1/20 "
+                            f"{percentile_values['p1']:.3g}/"
+                            f"{percentile_values['p20']:.3g}",
+                            "P50/100 "
+                            f"{percentile_values['p50']:.3g}/"
+                            f"{percentile_values['p100']:.3g} ms",
+                        ]
+                    )
                 ax.text(
                     j,
-                    i - 0.12,
-                    t_fmt,
+                    i,
+                    "\n".join(lines),
                     ha="center",
                     va="center",
-                    fontsize=16,
-                    fontweight="bold",
-                    color=text_color,
-                )
-                ax.text(
-                    j,
-                    i + 0.22,
-                    m_fmt,
-                    ha="center",
-                    va="center",
-                    fontsize=14,
-                    fontweight="bold",
-                    color=mfu_color,
+                    fontsize=6.0,
+                    color="white" if tv < midpoint else "#111111",
                 )
 
-    ax.set_title(title, fontsize=21)
+    ax.tick_params(length=2.5, width=0.8)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.9)
 
 
 def _plot_heatmaps(
@@ -506,7 +624,8 @@ def _plot_heatmaps(
 ) -> None:
     """Generate a combined heatmap image for the selected benchmark phases.
 
-    Each cell shows TFLOPS (bold) with MFU in parentheses below it.
+    Each cell shows TFLOPS, MFU, and P1/P10/P20/P50/P100 elapsed times.
+    TFLOPS and MFU are calculated from P10; TFLOPS controls the colour.
     """
 
     phase_specs = [
@@ -518,27 +637,40 @@ def _plot_heatmaps(
     n_bs, n_sl = len(batch_sizes), len(seqlens)
 
     matrices: dict = {}
-    for tflops_key, mfu_key, label in phase_specs:
+    for phase, (tflops_key, mfu_key, label) in zip(phases, phase_specs):
         tflops_mat = np.full((n_bs, n_sl), np.nan)
         mfu_mat = np.full((n_bs, n_sl), np.nan)
+        time_percentile_mats = {
+            f"p{percentile}": np.full((n_bs, n_sl), np.nan)
+            for percentile in TIME_PERCENTILES
+        }
         for i, bs in enumerate(batch_sizes):
             for j, sl in enumerate(seqlens):
                 if (bs, sl) in results:
                     tflops_mat[i, j] = results[(bs, sl)][tflops_key]
                     mfu_mat[i, j] = results[(bs, sl)][mfu_key]
-        matrices[label] = {"tflops": tflops_mat, "mfu": mfu_mat}
+                    for key in time_percentile_mats:
+                        time_percentile_mats[key][i, j] = results[(bs, sl)][
+                            f"{phase}_time_percentiles_ms"
+                        ][key]
+        matrices[label] = {
+            "tflops": tflops_mat,
+            "mfu": mfu_mat,
+            "time_percentiles": time_percentile_mats,
+        }
 
     hw_info = (
         f"{device_name}  |  {kernel_backend_str}  |  "
         f"H={num_heads} D={dim_per_head}  |  peak {peak_tflops:.0f} TFLOPS"
     )
 
-    cell_w = max(10, n_sl * 1.4)
-    cell_h = max(5, n_bs * 0.8)
+    figure_width = max(11, n_sl * 1.55)
+    phase_height = max(4.0, n_bs * 0.85)
     fig, axes = plt.subplots(
         len(phase_specs),
         1,
-        figsize=(cell_w, cell_h * len(phase_specs) + 4),
+        figsize=(figure_width, phase_height * len(phase_specs) + 1.5),
+        constrained_layout=True,
         squeeze=False,
     )
 
@@ -547,20 +679,18 @@ def _plot_heatmaps(
             ax,
             matrices[phase_label]["tflops"],
             matrices[phase_label]["mfu"],
+            matrices[phase_label]["time_percentiles"],
             batch_sizes,
             seqlens,
             title=phase_label,
+            show_x_label=idx == len(phase_specs) - 1,
         )
-        if idx < len(phase_specs) - 1:
-            ax.set_xlabel("")
 
     fig.suptitle(
-        f"HSTU Attention TFLOPS  (MFU%)\n{hw_info}",
-        fontsize=22,
-        fontweight="bold",
-        y=1.01,
+        "HSTU Attention TFLOPS / MFU / Time Percentiles "
+        f"(performance=P{PERFORMANCE_PERCENTILE})\n{hw_info}",
+        fontsize=16,
     )
-    fig.tight_layout()
 
     fname = "hstu_attn_mfu.png"
     fpath = os.path.join(output_dir, fname)
@@ -576,7 +706,10 @@ def _plot_heatmaps(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark HSTUAttention fwd/bwd across (batch_size, seqlen) grid and output TFLOPS/MFU heatmaps."
+        description=(
+            "Benchmark HSTUAttention fwd/bwd across a (batch_size, seqlen) "
+            "grid and output TFLOPS/MFU/time heatmaps."
+        )
     )
     parser.add_argument(
         "--gin-config-file",
@@ -609,7 +742,17 @@ def main():
         "--bench-iters",
         type=int,
         default=50,
-        help="Benchmark iterations per config (median is reported).",
+        help="Benchmark iterations per config.",
+    )
+    parser.add_argument(
+        "--timing-mode",
+        choices=TIMING_MODES,
+        default="per-iter",
+        help=(
+            "CUDA event timing method: per-iter uses one event pair per iteration "
+            "and uses P10 for TFLOPS/MFU; aggregate uses one pair around the full "
+            "loop and reports total elapsed time divided by the iteration count."
+        ),
     )
     parser.add_argument(
         "--cuda-graph",
@@ -678,6 +821,7 @@ def main():
     )
     attn = attn.to(dtype).cuda()
     attn.eval()  # deterministic (no dropout)
+    attn_fn = _get_unwrapped_attention_forward(attn)
 
     # ---- Device info ----
     device_spec = get_current_device_spec()
@@ -700,10 +844,15 @@ def main():
     print(f"  is_causal       : {is_causal}")
     print(f"  dtype           : {dtype_str}")
     print(f"  warmup/bench    : {args.warmup_iters}/{args.bench_iters} iters")
+    print(f"  timing_mode     : {args.timing_mode}")
+    print(f"  performance time: P{PERFORMANCE_PERCENTILE}")
+    print("  attention_call  : unwrapped forward")
+    print(f"  nvtx_hooks      : {'enabled' if nvtx_hooks_enabled() else 'disabled'}")
     print(f"  phases          : {','.join(args.phase)}")
     print(f"  cuda_graph      : {'enabled' if args.cuda_graph else 'disabled'}")
     print(
-        f"  profiler iters  : {args.profiler_start_iter}..{profiler_stop_iter} inclusive"
+        "  profiler iters  : "
+        f"{args.profiler_start_iter}..{profiler_stop_iter} inclusive"
     )
     print(sep)
 
@@ -713,7 +862,10 @@ def main():
     # ---- Sweep grid ----
     col_hdr = f"{'BS':>6} {'SeqLen':>8} {'Tokens':>10}"
     for phase in args.phase:
-        col_hdr += f" | {phase + '_ms':>9} {phase + '_TFLOPS':>12} {phase + '_MFU':>9}"
+        col_hdr += (
+            f" | {phase + '_P10_ms':>11} "
+            f"{phase + '_TFLOPS':>12} {phase + '_MFU':>9}"
+        )
     print(col_hdr)
     print("-" * len(col_hdr))
 
@@ -726,7 +878,7 @@ def main():
             tokens = bs * sl
             try:
                 r = _benchmark_one(
-                    attn,
+                    attn_fn,
                     bs,
                     sl,
                     num_heads,
@@ -736,6 +888,7 @@ def main():
                     dtype,
                     warmup_iters=args.warmup_iters,
                     bench_iters=args.bench_iters,
+                    timing_mode=args.timing_mode,
                     use_cuda_graph=args.cuda_graph,
                     phases=args.phase,
                     profiler_start_iter=args.profiler_start_iter,
@@ -748,7 +901,7 @@ def main():
                 row = f"{bs:>6} {sl:>8} {tokens:>10}"
                 for phase in args.phase:
                     row += (
-                        f" | {r[f'{phase}_ms']:>9.3f} "
+                        f" | {r[f'{phase}_ms']:>11.3f} "
                         f"{r[f'{phase}_tflops']:>12.2f} "
                         f"{r[f'{phase}_mfu']:>8.1f}%"
                     )
@@ -756,11 +909,20 @@ def main():
                         best_mfu[phase] = r[f"{phase}_mfu"]
                         best_cfg[phase] = (bs, sl)
                 print(row)
+                printed_percentiles = []
+                for phase in args.phase:
+                    phase_percentiles = r[f"{phase}_time_percentiles_ms"]
+                    values = " ".join(
+                        f"P{percentile}=" f"{phase_percentiles[f'p{percentile}']:.3f}"
+                        for percentile in PRINTED_TIME_PERCENTILES
+                    )
+                    printed_percentiles.append(f"{phase}: {values} ms")
+                print(" " * 28 + "percentiles | " + " | ".join(printed_percentiles))
 
             except torch.cuda.OutOfMemoryError:
                 row = f"{bs:>6} {sl:>8} {tokens:>10}"
                 row += "".join(
-                    f" | {'OOM':>9} {'---':>12} {'---':>9}" for _ in args.phase
+                    f" | {'OOM':>11} {'---':>12} {'---':>9}" for _ in args.phase
                 )
                 print(row)
                 torch.cuda.empty_cache()
@@ -793,6 +955,11 @@ def main():
         "seqlens": seqlens,
         "warmup_iters": args.warmup_iters,
         "bench_iters": args.bench_iters,
+        "timing_mode": args.timing_mode,
+        "performance_percentile": PERFORMANCE_PERCENTILE,
+        "time_percentiles": list(TIME_PERCENTILES),
+        "attention_call": "unwrapped_forward",
+        "nvtx_hooks_enabled": nvtx_hooks_enabled(),
         "phases": list(args.phase),
         "cuda_graph": args.cuda_graph,
         "profiler_start_iter": args.profiler_start_iter,
