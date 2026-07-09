@@ -90,7 +90,10 @@ See the [E2E benchmark documentation](./E2E_BENCHMARK.md) for the latest results
 
 ### HSTU Attention Kernel Benchmark
 
-Standalone benchmark for the **CUTLASS-based HSTU attention kernel**. Sweeps batch sizes and sequence lengths on non-jagged (full-length) inputs and outputs TFLOPS/MFU heatmaps as PNG files.
+Standalone benchmark for the **CUTLASS-based HSTU attention kernel**. Sweeps
+batch sizes and sequence lengths on non-jagged (full-length) inputs and writes
+TFLOPS/MFU/time results as JSON. Generate heatmaps afterwards from the saved
+JSON files with `plot_hstu_attn_kernel_heatmap.py`.
 
 The default `per-iter` timing mode allocates one CUDA Event pair per benchmark
 iteration, including when `--cuda-graph` is enabled. It records
@@ -98,7 +101,7 @@ P1/P10/P20/P50/P100 elapsed times for every phase and configuration. TFLOPS and
 MFU use **P10** rather than the median so that power-throttled iterations in the
 tail of a sustained sweep do not distort the reported performance. P1, P20,
 P50, and P100 are printed in the terminal; all five percentiles are retained in
-the JSON output and annotated in the heatmap. With `--timing-mode aggregate`,
+the JSON output and can be annotated in the heatmap. With `--timing-mode aggregate`,
 the benchmark has one average-time sample, so every percentile is identical.
 
 Configs live in [`kernel_experiments.txt`](./kernel_experiments.txt) — each line is one `(exp_name, CLI args)` pair consumed by the unified launcher.
@@ -119,21 +122,22 @@ python training/benchmark/scripts/hstu_attn_kernel_benchmark.py \
     --batch-sizes 1,2,4,8,16,32,64,128 \
     --seqlens 128,256,512,1024,2048,4096,8192,16384 \
     --timing-mode per-iter
+
+# Plot one or more completed HSTU attention kernel JSON results.
+python training/benchmark/scripts/plot_hstu_attn_kernel_heatmap.py \
+    --output-dir training/benchmark/results/<timestamp>
 ```
 
-#### Results (single H100-SXM5-80GB)
+#### Results (P10 timing)
 
-<p align="center"><img src="figs/hstu_attn_mfu.png" width="60%" /></p>
+The following figures report P10 CUDA-event timing for the CUTLASS HSTU
+attention kernel. Each cell shows TFLOPS, MFU, and elapsed time. MFU uses the
+dense BF16 Tensor Core peak of 2500 TFLOPS per GB200 GPU and 989 TFLOPS per
+H100 GPU.
 
-MFU uses the dense BF16 Tensor Core peak of 989 TFLOPS per H100 GPU.
+<p align="center"><img src="figs/hstu_attn_gb200_p10_heatmap.png" width="100%" /></p>
 
-| Phase | Best config | Time | TFLOPS | MFU |
-|-------|-------------|-----:|-------:|----:|
-| Forward | BS=32, SeqLen=16384 | 25.256 ms | 696.6 | 70.4% |
-| Backward | BS=128, SeqLen=16384 | 462.121 ms | 380.7 | 38.5% |
-| Forward+Backward | BS=2, SeqLen=16384 | 8.834 ms | 435.6 | 44.0% |
-
-The CUTLASS attention kernel reaches peak MFU at large sequence lengths, where the GPU compute units are fully saturated.
+<p align="center"><img src="figs/hstu_attn_h100_p10_heatmap.png" width="100%" /></p>
 
 ### Memory Estimation
 

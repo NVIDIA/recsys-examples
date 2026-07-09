@@ -20,8 +20,8 @@ Benchmark HSTUAttention forward & backward kernels across a grid of
 Only **non-jagged** (padded / uniform) inputs are considered:
 all sequences in a batch share the same sequence length.
 
-Results are printed as 2-D tables in the terminal and saved as combined
-TFLOPS/MFU/time heatmap images to ``--output-dir``.
+Results are printed as 2-D tables in the terminal and saved as JSON to
+``--output-dir``.
 
 Usage (run from examples/hstu/):
     # Direct invocation
@@ -57,12 +57,8 @@ from typing import Callable
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
-import gin
-import matplotlib
-
-matplotlib.use("Agg")  # non-interactive backend, no display needed
 import commons.utils.initialize as init
-import matplotlib.pyplot as plt
+import gin
 import numpy as np
 import torch
 
@@ -527,179 +523,6 @@ def _print_2d_tables(
 
 
 # ---------------------------------------------------------------------------
-# Heatmap plotting
-# ---------------------------------------------------------------------------
-
-
-def _draw_heatmap(
-    ax: plt.Axes,
-    tflops_mat: np.ndarray,
-    mfu_mat: np.ndarray,
-    time_percentile_mats: dict[str, np.ndarray],
-    batch_sizes: list,
-    seqlens: list,
-    title: str,
-    show_x_label: bool,
-) -> None:
-    """Draw a TFLOPS heatmap annotated with MFU and time percentiles."""
-    n_bs, n_sl = tflops_mat.shape
-    masked = np.ma.masked_invalid(tflops_mat)
-    cmap = plt.cm.viridis.copy()
-    cmap.set_bad(color="#d9d9d9")
-
-    im = ax.imshow(masked, cmap=cmap, aspect="auto", origin="upper")
-    cbar = ax.figure.colorbar(im, ax=ax, pad=0.02)
-    cbar.set_label("TFLOPS", fontsize=11)
-    cbar.ax.tick_params(labelsize=9)
-
-    ax.set_xticks(range(n_sl))
-    ax.set_xticklabels([str(s) for s in seqlens], rotation=45, ha="right", fontsize=9)
-    ax.set_yticks(range(n_bs))
-    ax.set_yticklabels([str(b) for b in batch_sizes], fontsize=9)
-    ax.set_xlabel("Sequence length" if show_x_label else "", fontsize=11)
-    ax.set_ylabel(f"{title}\nBatch size", fontsize=11)
-
-    finite_tflops = tflops_mat[np.isfinite(tflops_mat)]
-    midpoint = np.nanmedian(finite_tflops) if finite_tflops.size else 0.0
-
-    for i in range(n_bs):
-        for j in range(n_sl):
-            if not np.isfinite(tflops_mat[i, j]):
-                ax.text(
-                    j,
-                    i,
-                    "OOM",
-                    ha="center",
-                    va="center",
-                    fontsize=7,
-                    color="#333333",
-                )
-            else:
-                tv = tflops_mat[i, j]
-                mv = mfu_mat[i, j]
-                percentile_values = {
-                    key: values[i, j] for key, values in time_percentile_mats.items()
-                }
-                elapsed_ms = percentile_values[f"p{PERFORMANCE_PERCENTILE}"]
-                lines = [f"{tv:.0f} TF"]
-                if np.isfinite(mv):
-                    lines.append(f"{mv:.1f}% | P10 {elapsed_ms:.3g} ms")
-                if np.isfinite(elapsed_ms):
-                    lines.extend(
-                        [
-                            "P1/20 "
-                            f"{percentile_values['p1']:.3g}/"
-                            f"{percentile_values['p20']:.3g}",
-                            "P50/100 "
-                            f"{percentile_values['p50']:.3g}/"
-                            f"{percentile_values['p100']:.3g} ms",
-                        ]
-                    )
-                ax.text(
-                    j,
-                    i,
-                    "\n".join(lines),
-                    ha="center",
-                    va="center",
-                    fontsize=6.0,
-                    color="white" if tv < midpoint else "#111111",
-                )
-
-    ax.tick_params(length=2.5, width=0.8)
-    for spine in ax.spines.values():
-        spine.set_linewidth(0.9)
-
-
-def _plot_heatmaps(
-    results: dict,
-    batch_sizes: list,
-    seqlens: list,
-    peak_tflops: float,
-    device_name: str,
-    kernel_backend_str: str,
-    num_heads: int,
-    dim_per_head: int,
-    output_dir: str,
-    phases: tuple[str, ...],
-) -> None:
-    """Generate a combined heatmap image for the selected benchmark phases.
-
-    Each cell shows TFLOPS, MFU, and P1/P10/P20/P50/P100 elapsed times.
-    TFLOPS and MFU are calculated from P10; TFLOPS controls the colour.
-    """
-
-    phase_specs = [
-        (f"{phase}_tflops", f"{phase}_mfu", PHASE_LABELS[phase]) for phase in phases
-    ]
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    n_bs, n_sl = len(batch_sizes), len(seqlens)
-
-    matrices: dict = {}
-    for phase, (tflops_key, mfu_key, label) in zip(phases, phase_specs):
-        tflops_mat = np.full((n_bs, n_sl), np.nan)
-        mfu_mat = np.full((n_bs, n_sl), np.nan)
-        time_percentile_mats = {
-            f"p{percentile}": np.full((n_bs, n_sl), np.nan)
-            for percentile in TIME_PERCENTILES
-        }
-        for i, bs in enumerate(batch_sizes):
-            for j, sl in enumerate(seqlens):
-                if (bs, sl) in results:
-                    tflops_mat[i, j] = results[(bs, sl)][tflops_key]
-                    mfu_mat[i, j] = results[(bs, sl)][mfu_key]
-                    for key in time_percentile_mats:
-                        time_percentile_mats[key][i, j] = results[(bs, sl)][
-                            f"{phase}_time_percentiles_ms"
-                        ][key]
-        matrices[label] = {
-            "tflops": tflops_mat,
-            "mfu": mfu_mat,
-            "time_percentiles": time_percentile_mats,
-        }
-
-    hw_info = (
-        f"{device_name}  |  {kernel_backend_str}  |  "
-        f"H={num_heads} D={dim_per_head}  |  peak {peak_tflops:.0f} TFLOPS"
-    )
-
-    figure_width = max(11, n_sl * 1.55)
-    phase_height = max(4.0, n_bs * 0.85)
-    fig, axes = plt.subplots(
-        len(phase_specs),
-        1,
-        figsize=(figure_width, phase_height * len(phase_specs) + 1.5),
-        constrained_layout=True,
-        squeeze=False,
-    )
-
-    for idx, (ax, (_, _, phase_label)) in enumerate(zip(axes[:, 0], phase_specs)):
-        _draw_heatmap(
-            ax,
-            matrices[phase_label]["tflops"],
-            matrices[phase_label]["mfu"],
-            matrices[phase_label]["time_percentiles"],
-            batch_sizes,
-            seqlens,
-            title=phase_label,
-            show_x_label=idx == len(phase_specs) - 1,
-        )
-
-    fig.suptitle(
-        "HSTU Attention TFLOPS / MFU / Time Percentiles "
-        f"(performance=P{PERFORMANCE_PERCENTILE})\n{hw_info}",
-        fontsize=16,
-    )
-
-    fname = "hstu_attn_mfu.png"
-    fpath = os.path.join(output_dir, fname)
-    fig.savefig(fpath, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {fpath}")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -708,7 +531,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark HSTUAttention fwd/bwd across a (batch_size, seqlen) "
-            "grid and output TFLOPS/MFU/time heatmaps."
+            "grid and output TFLOPS/MFU/time JSON."
         )
     )
     parser.add_argument(
@@ -775,7 +598,7 @@ def main():
         "--output-dir",
         type=str,
         default="training/benchmark/figs",
-        help="Directory to save heatmap images (default: training/benchmark/figs).",
+        help="Directory to save benchmark JSON (default: training/benchmark/figs).",
     )
     args = parser.parse_args()
 
@@ -971,22 +794,6 @@ def main():
     with open(json_path, "w") as f:
         json.dump(json_data, f, indent=2)
     print(f"  Saved results: {json_path}")
-
-    # ---- Plot and save heatmaps ----
-    print("\nGenerating heatmaps ...")
-    _plot_heatmaps(
-        results=results,
-        batch_sizes=batch_sizes,
-        seqlens=seqlens,
-        peak_tflops=peak_tflops,
-        device_name=device_spec.device_name,
-        kernel_backend_str=kernel_backend_str,
-        num_heads=num_heads,
-        dim_per_head=dim_per_head,
-        output_dir=args.output_dir,
-        phases=args.phase,
-    )
-    print("Done.")
 
 
 if __name__ == "__main__":
