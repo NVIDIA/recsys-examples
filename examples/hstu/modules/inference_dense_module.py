@@ -24,6 +24,7 @@ from commons.ops.triton_ops.common import (
 )
 from configs import HSTUConfig, InferenceHSTUConfig, RankingConfig
 from modules.hstu_block_inference import HSTUBlockInference
+from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_metadata import (
@@ -359,6 +360,19 @@ class InferenceDenseModule(torch.nn.Module):
                 kvcache_metadata.total_history_lengths + jagged_data.num_candidates
             )
             kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
+
+            onboard_handle = kvcache_metadata.kv_onload_handle
+            if (
+                onboard_handle is not None
+                and onboard_handle.handle is not None
+                and onboard_handle.status != HostKVTaskStatus.SKIPPED
+                and onboard_handle.backend == "flexkv"
+            ):
+                torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
+                try:
+                    self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
+                finally:
+                    torch.cuda.nvtx.range_pop()
 
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
