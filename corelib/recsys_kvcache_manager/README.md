@@ -12,6 +12,8 @@ It supports lookup, offloading to lower-tier storage, onboarding to GPU memory f
 - [Features](#features)
 - [Installation](#installation)
 - [Basic APIs](#basic-apis)
+- [FlexKV Backend Options](#flexkv-backend-options)
+- [Important Notes](#important-notes)
 - [Examples](#example)
 - [Future Plans](#future-plans)
 
@@ -80,7 +82,40 @@ It also evicts used cache pages when running out of empty pages. **No offloading
 
 -   `evict`, `evict_all`: explicitly evicts cached data from the GPU cache table and/or lower-tier storage if supported.
 
-#### Important Notes:
+## FlexKV Backend Options
+
+When `host_kvstorage_backend` is set to `flexkv`, additional FlexKV options can be passed through `extra_configs`.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `flexkv_as_batch` | `1` | Enables batched FlexKV launch for multi-user onboard/offload requests. Set to `0` / `false` to disable. |
+| `flexkv_config_path` | `None` | Optional FlexKV tier config path. Use this to enable SSD-backed cache tiers or other FlexKV user config settings. |
+
+Example:
+
+```python
+extra_configs = {
+    "flexkv_mode": "direct",
+    "flexkv_as_batch": 1,
+    "flexkv_config_path": "corelib/recsys_kvcache_manager/configs/flexkv_ssd.yml",
+}
+```
+
+The sample SSD config is:
+
+```yaml
+cpu_cache_gb: 0.2
+ssd_cache_gb: 0.5
+ssd_cache_dir: /path/to/your/ssd_cache
+enable_gds: false
+enable_p2p_cpu: false
+enable_p2p_ssd: false
+enable_3rd_remote: false
+```
+
+Before using SSD cache, update `ssd_cache_dir` to a writable local SSD path and set `ssd_cache_gb` > 0.
+
+## Important Notes
 
 There are some **limitations** in the current implementation. These are expected to be resolved for broader use cases and better performance.
 

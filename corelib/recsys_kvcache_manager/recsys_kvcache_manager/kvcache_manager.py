@@ -311,6 +311,7 @@ class KVCacheManager:
             flexkv_mode = extra.get("flexkv_mode", "direct")
             flexkv_server_addr = extra.get("flexkv_server_addr", "")
             flexkv_server_port = int(extra.get("flexkv_server_port", 0))
+            flexkv_config_path = extra.get("flexkv_config_path", None)
             flexkv_num_cpu_blocks = int(extra.get("flexkv_num_cpu_blocks", 4096))
             flexkv_num_local_blocks = int(extra.get("flexkv_num_local_blocks", 4096))
             flexkv_num_tmp_cpu_blocks = int(extra.get("flexkv_num_tmp_cpu_blocks", 256))
@@ -327,6 +328,16 @@ class KVCacheManager:
                 }
             else:
                 flexkv_enable_mps = bool(flexkv_enable_mps_raw)
+            flexkv_as_batch_raw = extra.get("flexkv_as_batch", 1)
+            if isinstance(flexkv_as_batch_raw, str):
+                flexkv_as_batch = flexkv_as_batch_raw.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            else:
+                flexkv_as_batch = bool(flexkv_as_batch_raw)
 
             return FlexKVStorageManager(
                 mode=flexkv_mode,
@@ -341,8 +352,10 @@ class KVCacheManager:
                 num_tmp_cpu_blocks=flexkv_num_tmp_cpu_blocks,
                 dtype=kvcache_config.dtype,
                 enable_mps=flexkv_enable_mps,
+                as_batch=flexkv_as_batch,
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
+                config_path=flexkv_config_path,
             )
         else:
             raise NotImplementedError(
