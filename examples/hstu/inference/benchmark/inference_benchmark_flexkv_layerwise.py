@@ -20,6 +20,33 @@ from inference_benchmark_flexkv import (
 )
 
 
+SCENARIO_ALIASES = {
+    "gpu_hit": "1",
+    "scenario1": "1",
+    "cpu_hit": "2",
+    "scenario2": "2",
+    "ssd_hit": "3",
+    "scenario3": "3",
+}
+SUPPORTED_SCENARIOS = frozenset({"1", "2", "3"})
+
+
+def parse_scenarios(scenarios_arg: str) -> set[str]:
+    scenarios = set()
+    for scenario in scenarios_arg.split(","):
+        scenario = scenario.strip()
+        if not scenario:
+            continue
+        scenario = SCENARIO_ALIASES.get(scenario, scenario)
+        if scenario not in SUPPORTED_SCENARIOS:
+            raise ValueError(
+                f"Unsupported scenario '{scenario}'. "
+                "Use 1,2,3 or gpu_hit,cpu_hit,ssd_hit."
+            )
+        scenarios.add(scenario)
+    return scenarios
+
+
 def forward_with_kvcache_layerwise_attention_overlap(
     model_predict,
     batch,
@@ -370,7 +397,15 @@ if __name__ == "__main__":
     parser.add_argument("--ssd-pressure-batch-size", type=int, default=None)
     parser.add_argument("--ssd-pressure-batch-sleep-s", type=float, default=None)
     parser.add_argument("--flexkv-config-path", type=str, default=None)
-    parser.add_argument("--scenarios", type=str, default="2,3")
+    parser.add_argument(
+        "--scenarios",
+        type=str,
+        default="2,3",
+        help=(
+            "Comma-separated scenarios to run: 1,2,3 "
+            "(aliases: gpu_hit,cpu_hit,ssd_hit)."
+        ),
+    )
     parser.add_argument("--disable-cudagraph", action="store_true")
     args, _ = parser.parse_known_args()
 
@@ -395,9 +430,7 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(cfg.seed)
 
     history_len = cfg.history_len
-    scenarios = {
-        scenario.strip() for scenario in args.scenarios.split(",") if scenario.strip()
-    }
+    scenarios = parse_scenarios(args.scenarios)
     print(
         f"[Layerwise Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
         f"num_candidates={cfg.num_candidates}, disable_cudagraph={cfg.disable_cudagraph}, "
