@@ -25,14 +25,7 @@ ITEM_FEATURE_NAME = "item_feat"
 ACTION_FEATURE_NAME = "act_feat"
 ITEM_VOCAB_SIZE = 10000
 ACTION_VOCAB_SIZE = 128
-SCENARIO_ALIASES = {
-    "1": "gpu_hit",
-    "2": "cpu_hit",
-    "3": "ssd_hit",
-    "gpu_hit": "gpu_hit",
-    "cpu_hit": "cpu_hit",
-    "ssd_hit": "ssd_hit",
-}
+SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit"})
 
 
 InferenceRequest = Tuple[HSTUBatch, torch.Tensor, torch.Tensor]
@@ -68,12 +61,12 @@ def parse_scenarios(scenarios_arg: str) -> set[str]:
         scenario = scenario.strip()
         if not scenario:
             continue
-        if scenario not in SCENARIO_ALIASES:
+        if scenario not in SUPPORTED_SCENARIOS:
             raise ValueError(
                 f"Unsupported scenario '{scenario}'. "
-                "Use gpu_hit,cpu_hit,ssd_hit or legacy aliases 1,2,3."
+                "Use gpu_hit,cpu_hit,ssd_hit."
             )
-        scenarios.add(SCENARIO_ALIASES[scenario])
+        scenarios.add(scenario)
     return scenarios
 
 
@@ -456,7 +449,6 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     host_mgr = kvcache_mgr.host_kvstorage_manager
     cache_cfg = getattr(host_mgr, "_client", None)
     cache_cfg = getattr(cache_cfg, "cache_config", None)
-    bool(getattr(cache_cfg, "enable_ssd", False))
 
     print("warmup")
     # Prime targets into GPU + CPU + SSD. Timed requests append a new tail so
@@ -643,10 +635,7 @@ if __name__ == "__main__":
         "--scenarios",
         type=str,
         default="gpu_hit,cpu_hit,ssd_hit",
-        help=(
-            "Comma-separated scenarios to run: gpu_hit,cpu_hit,ssd_hit. "
-            "Legacy aliases 1,2,3 are also accepted."
-        ),
+        help="Comma-separated scenarios to run: gpu_hit,cpu_hit,ssd_hit.",
     )
     parser.add_argument(
         "--only-onboard",
