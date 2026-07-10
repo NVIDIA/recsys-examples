@@ -266,7 +266,7 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     assert kvcache_metadata.kv_onload_handle.status == HostKVTaskStatus.SKIPPED
 
     for layer_idx in range(3):
-        kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
+        kvcache_metadata.kv_onload_handle.wait_layer(layer_idx)
     assert kvcache_metadata.kv_onload_handle.handle is None
 
     for layer_idx in range(3):
@@ -404,7 +404,7 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     if onboard_task_handle.is_layerwise:
         for layer_idx in range(3):
-            kvcache_mgr.onboard_wait_by_layer(onboard_task_handle, layer_idx)
+            onboard_task_handle.wait_layer(layer_idx)
 
     onboard_deadline = time.time() + 60.0
     onboard_ready = False
@@ -665,7 +665,7 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     if onboard_task_handle.is_layerwise:
         for layer_idx in range(3):
-            kvcache_mgr.onboard_wait_by_layer(onboard_task_handle, layer_idx)
+            onboard_task_handle.wait_layer(layer_idx)
 
     onboard_deadline = time.time() + 60.0
     onboard_ready = False

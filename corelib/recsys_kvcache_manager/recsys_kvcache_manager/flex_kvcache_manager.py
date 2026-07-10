@@ -447,19 +447,15 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             },
         )
 
-        launch_kwargs = {}
         if self.enable_layerwise:
-            launch_kwargs.update(
-                {
-                    "layerwise_transfer": True,
-                    "counter_id": self.layerwise_counter_id,
-                }
+            self._client.launch(
+                onload_handle.task_ids,
+                onload_handle.slot_mappings,
+                layerwise_transfer=True,
+                counter_id=self.layerwise_counter_id,
             )
-        self._client.launch(
-            onload_handle.task_ids,
-            onload_handle.slot_mappings,
-            **launch_kwargs,
-        )
+        else:
+            self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
         return onload_task_handle
 
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
