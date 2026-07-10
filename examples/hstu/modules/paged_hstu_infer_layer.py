@@ -305,8 +305,13 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 self.num_sms,
             )
 
-            if kv_cache_metadata.kv_onload_handle is not None:
-                kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)
+            kv_onload_handle = kv_cache_metadata.kv_onload_handle
+            if (
+                kv_onload_handle is not None
+                and kv_onload_handle.handle is not None
+                and kv_onload_handle.is_layerwise
+            ):
+                kv_onload_handle.wait_layer(self.layer_idx)
             jagged_attn_output = hstu_attn_varlen_func(
                 query,
                 key,

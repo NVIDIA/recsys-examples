@@ -58,6 +58,7 @@ class HostKVTaskHandle:
     metadata: Optional[Dict[str, Any]] = None
     time_launched: Optional[float] = None
     is_layerwise: bool = False
+    onboard_wait_by_layer: Optional[Any] = None
 
     def __post_init__(self):
         if self.status not in {
@@ -74,6 +75,11 @@ class HostKVTaskHandle:
     def stream_wait_layer(self, layer_idx: int) -> None:
         if self.is_layerwise:
             self.handle.wait_layer(layer_idx)
+
+    def wait_layer(self, layer_idx: int):
+        if self.onboard_wait_by_layer is not None:
+            return self.onboard_wait_by_layer(self, layer_idx)
+        self.stream_wait_layer(layer_idx)
 
 
 @dataclass
@@ -112,6 +118,14 @@ class HostKVStorageManagerBase(ABC):
     @abstractmethod
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         ...
+
+    def onboard_kvcache_wait_by_layer(
+        self, task_handle: HostKVTaskHandle, layer_idx: int
+    ) -> HostKVWaitResult:
+        return HostKVWaitResult(
+            status=HostKVTaskStatus.SKIPPED,
+            ready=False,
+        )
 
     @abstractmethod
     def offload_kvcache_launch(
