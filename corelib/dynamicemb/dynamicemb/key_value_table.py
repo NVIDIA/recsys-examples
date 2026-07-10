@@ -26,6 +26,8 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     align_to_table_size,
+    score_dump_permutation,
+    score_load_permutation,
 )
 from dynamicemb.extendable_tensor import (
     DeviceExtendableBuffer,
@@ -131,18 +133,34 @@ def load_from_json(file_path: str) -> Dict[str, Any]:
         raise RuntimeError(f"Error loading data from JSON file: {e}")
 
 
-def get_score_policy(score_strategy, need_incremental_dump=False):
-    # incremental_dump thresholds on the reduction score column, so it is only
-    # supported for strategies whose reduction score is (or can carry) a
-    # timestamp: TIMESTAMP (already a timestamp) and LFU (via the compound
-    # LruLfu policy below).
-    if need_incremental_dump and score_strategy not in (
-        DynamicEmbScoreStrategy.TIMESTAMP,
-        DynamicEmbScoreStrategy.LFU,
-    ):
+def get_score_policy(score_strategy):
+    """Build the physical :class:`ScoreSpec` for a (validated) score strategy.
+
+    *score_strategy* is either a single :class:`DynamicEmbScoreStrategy` or a
+    supported compound tuple (currently only ``{TIMESTAMP, LFU}`` in either order).
+    A compound strategy maps to the ``LruLfu`` policy whose physical layout is
+    fixed at ``(timestamp, frequency)`` regardless of the user's tuple order; the
+    user's ordering only affects checkpoint column order (see
+    :func:`score_dump_permutation`).
+    """
+    if isinstance(score_strategy, tuple):
+        # Only the {TIMESTAMP, LFU} compound is supported (validated at config
+        # construction). Two adjacent AoS score words per key -- word 0 =
+        # last-access timestamp (selects keys for a time-based incremental dump),
+        # word 1 = frequency (drives LFU eviction). num_scores is derived from the
+        # policy. The spec name maps to word 0 (score_index 0), i.e. the timestamp
+        # column incremental_dump thresholds on -- hence "lru_lfu".
+        if frozenset(score_strategy) == frozenset(
+            {DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}
+        ):
+            return ScoreSpec(
+                name="lru_lfu",
+                policy=ScorePolicy.LRU_LFU,
+                dtype=torch.uint64,
+                is_reduction=True,
+            )
         raise NotImplementedError(
-            "need_incremental_dump is currently supported only for "
-            "TIMESTAMP and LFU score strategies."
+            f"Unsupported compound score_strategy {score_strategy}."
         )
     if score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
         return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
@@ -151,19 +169,6 @@ def get_score_policy(score_strategy, need_incremental_dump=False):
     elif score_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
         return ScoreSpec(name="customized", policy=ScorePolicy.ASSIGN)
     elif score_strategy == DynamicEmbScoreStrategy.LFU:
-        if need_incremental_dump:
-            # Compound LruLfu: two adjacent AoS score words per key -- word 0 =
-            # last-access timestamp (selects keys for incremental dump), word 1 =
-            # frequency (drives eviction). num_scores is derived from the policy.
-            # The spec name maps to word 0 (score_index 0), i.e. the timestamp
-            # column incremental_dump thresholds on -- hence "lru_lfu", not
-            # "frequency".
-            return ScoreSpec(
-                name="lru_lfu",
-                policy=ScorePolicy.LRU_LFU,
-                dtype=torch.uint64,
-                is_reduction=True,
-            )
         return ScoreSpec(name="frequency", policy=ScorePolicy.ACCUMULATE)
     elif score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
         return ScoreSpec(name="index", policy=ScorePolicy.ASSIGN)
@@ -267,9 +272,7 @@ def create_table_state(
 
     device_idx = torch.cuda.current_device()
     device = torch.device(f"cuda:{device_idx}")
-    score_policy = get_score_policy(
-        base_opt.score_strategy, base_opt.need_incremental_dump
-    )
+    score_policy = get_score_policy(base_opt.score_strategy)
     evict_strategy = base_opt.evict_strategy.value
 
     # incremental_dump thresholds on the reduction score column (word 0 -- the
@@ -1109,6 +1112,13 @@ def export_keys_values_iter(
         # exported slots; single-score tables keep the [N] shape unchanged.
         if state.key_index_map.num_scores_ > 1:
             out_scores = state.key_index_map.gather_score_blocks(table_id, indices)
+            # Reorder the physical device layout into the user's configured
+            # (logical) score-column order so both the checkpoint and callers of
+            # export_keys_values see scores in the order they configured. Identity
+            # when the logical order matches the physical layout.
+            dump_perm = score_dump_permutation(state.options_list[table_id].score_strategy)
+            if dump_perm != list(range(out_scores.size(1))):
+                out_scores = out_scores[:, dump_perm].contiguous()
         else:
             out_scores = scores.to(SCORE_TYPE)
         yield (
@@ -1930,6 +1940,15 @@ class DynamicEmbStorage(Storage):
         self.expand_if_need(unique_size_per_table)
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        num_scores = self._state.key_index_map.num_scores_
+        # The checkpoint stores multi-word scores in the user's configured
+        # (logical) order; reorder each batch back into the physical device layout
+        # before scatter. Identity when logical order matches the physical layout.
+        load_perm = (
+            score_load_permutation(self._state.options_list[table_id].score_strategy)
+            if num_scores > 1
+            else None
+        )
         for keys, embeddings, scores, opt_states in _iter_batches_from_files(
             emb_key_path,
             embedding_file_path,
@@ -1938,8 +1957,14 @@ class DynamicEmbStorage(Storage):
             params.dim,
             params.file_optstate_dim,
             device,
-            num_scores=self._state.key_index_map.num_scores_,
+            num_scores=num_scores,
         ):
+            if (
+                scores is not None
+                and load_perm is not None
+                and load_perm != list(range(scores.size(1)))
+            ):
+                scores = scores[:, load_perm].contiguous()
             if scores is not None and self._state.evict_strategy == EvictStrategy.KLru:
                 scores = torch.clamp(timestamp - scores, min=0)
             _load_key_values(
@@ -2461,7 +2486,7 @@ class HybridStorage(Storage):
             # per-tier score files -- left as a follow-up.
             raise NotImplementedError(
                 "dump is not yet supported for HybridStorage with multi-word "
-                "score layouts (e.g. LFU + need_incremental_dump with caching)."
+                "score layouts (e.g. the (TIMESTAMP, LFU) compound score with caching)."
             )
         _dump_table(
             self._host,
@@ -2512,7 +2537,7 @@ class HybridStorage(Storage):
             # HybridStorage need per-tier score files -- left as a follow-up.
             raise NotImplementedError(
                 "load is not yet supported for HybridStorage with multi-word "
-                "score layouts (e.g. LFU + need_incremental_dump with caching)."
+                "score layouts (e.g. the (TIMESTAMP, LFU) compound score with caching)."
             )
         params = _validate_load_meta(
             self._hbm,

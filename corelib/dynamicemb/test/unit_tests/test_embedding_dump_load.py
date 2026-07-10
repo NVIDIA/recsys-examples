@@ -38,6 +38,7 @@ from dynamicemb.dump_load import (
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    ScoreStrategy,
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
@@ -277,14 +278,13 @@ def apply_dmp(
     model: torch.nn.Module,
     optimizer_kwargs: Dict[str, Any],
     device: torch.device,
-    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    score_strategy: ScoreStrategy = DynamicEmbScoreStrategy.LFU,
     dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
-    need_incremental_dump: bool = False,
 ):
     eb_configs: List[EmbeddingConfig] = []
     for _, m in model.named_modules():
@@ -324,7 +324,6 @@ def apply_dmp(
             caching=caching,
             admit_strategy=admit_strategy,
             admission_counter=admission_counter,
-            need_incremental_dump=need_incremental_dump,
         )
     planner = get_planner(
         eb_configs,
@@ -359,14 +358,13 @@ def create_model(
     num_embeddings: List[int],
     embedding_dim: int,
     optimizer_kwargs: Dict[str, Any],
-    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    score_strategy: ScoreStrategy = DynamicEmbScoreStrategy.LFU,
     dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
-    need_incremental_dump: bool = False,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -405,7 +403,6 @@ def create_model(
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
         global_hbm_budget_scale=global_hbm_budget_scale,
-        need_incremental_dump=need_incremental_dump,
     )
     return model
 

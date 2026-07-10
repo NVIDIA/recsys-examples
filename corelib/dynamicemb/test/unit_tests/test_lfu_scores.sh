@@ -96,18 +96,18 @@ for dedup_flag in "${DEDUP_FLAGS[@]}"; do
 done
 
 
-# need_incremental_dump: LFU tables use the compound LruLfu policy (2 score
-# words: timestamp + frequency). The frequency word must still equal the true
-# access count, proving the extra timestamp word does not corrupt LFU. Only the
-# storage-only (HBM_DIRECT) path supports multi-word scores; caching/Hybrid is a
-# follow-up, so this section is storage-only.
+# Compound (TIMESTAMP, LFU) score: LFU tables use the compound LruLfu policy (2
+# score words: timestamp + frequency). The frequency word must still equal the
+# true access count, proving the extra timestamp word does not corrupt LFU. Only
+# the storage-only (HBM_DIRECT) path supports multi-word scores; caching/Hybrid is
+# a follow-up, so this section is storage-only.
 for dedup_flag in "${DEDUP_FLAGS[@]}"; do
   dedup_label=$( [ "$dedup_flag" = "--use-index-dedup" ] && echo "dedup" || echo "no-dedup" )
   for num_gpus in ${NUM_GPUS[@]}; do
     for optimizer_type in ${OPTIMIZER_TYPE[@]}; do
       echo ""
       echo "----------------------------------------"
-      echo "Test: Storage-Only + need_incremental_dump ($dedup_label) | GPUs: $num_gpus | Optimizer: $optimizer_type"
+      echo "Test: Storage-Only + compound (TIMESTAMP, LFU) ($dedup_label) | GPUs: $num_gpus | Optimizer: $optimizer_type"
       echo "----------------------------------------"
       torchrun \
         --nnodes 1 \

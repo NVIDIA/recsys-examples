@@ -82,10 +82,10 @@ def generate_sparse_feature(feature_num, batch, multi_hot_size):
         DynamicEmbScoreStrategy.TIMESTAMP,
         DynamicEmbScoreStrategy.STEP,
         DynamicEmbScoreStrategy.CUSTOMIZED,
-        # LFU with need_incremental_dump: incremental dump uses an auxiliary
+        # Compound (TIMESTAMP, LFU): incremental dump uses the auxiliary
         # last-access timestamp column, so it behaves like TIMESTAMP for the
-        # "dump keys touched since last dump" check below.
-        DynamicEmbScoreStrategy.LFU,
+        # "dump keys touched since last dump" check below (eviction still LFU).
+        (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU),
     ],
 )
 @pytest.mark.parametrize(
@@ -137,9 +137,6 @@ def test_without_eviction(
             local_hbm_for_values=1024**3,
             score_strategy=score_strategy,
             caching=caching,
-            need_incremental_dump=(
-                score_strategy == DynamicEmbScoreStrategy.LFU
-            ),
         )
         for i in range(table_num)
     ]
@@ -230,7 +227,7 @@ def _feature_from_keys(keys, device):
 
 @pytest.mark.parametrize("caching", [False, True])
 def test_lfu_incremental_dump_retouch(current_device, caching):
-    """LFU + need_incremental_dump: incremental_dump must return exactly the keys
+    """Compound (TIMESTAMP, LFU): incremental_dump must return exactly the keys
     accessed since the last dump. A re-accessed (re-touched) key must be dumped
     again (its timestamp advances), while keys not touched in the window must not,
     and a window with no access dumps nothing."""
@@ -246,9 +243,11 @@ def test_lfu_incremental_dump_retouch(current_device, caching):
             bucket_capacity=128,
             safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
-            score_strategy=DynamicEmbScoreStrategy.LFU,
+            score_strategy=(
+                DynamicEmbScoreStrategy.TIMESTAMP,
+                DynamicEmbScoreStrategy.LFU,
+            ),
             caching=caching,
-            need_incremental_dump=True,
         )
     ]
     model = BatchedDynamicEmbeddingTablesV2(

@@ -15,7 +15,7 @@
 
 import os
 import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pytest
 import torch
@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
+from dynamicemb.dynamicemb_config import ScoreStrategy
 from dynamicemb.incremental_dump import get_score, incremental_dump, set_score
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
@@ -101,7 +102,7 @@ def get_planner(
     table_names: List[str],
     eb_configs: List[BaseEmbeddingConfig],
     use_dynamicembs: List[bool],
-    score_strategies: List[DynamicEmbScoreStrategy],
+    score_strategies: List[Optional[ScoreStrategy]],
     batch_size: int,
     multi_hot_sizes: List[int],
     device,

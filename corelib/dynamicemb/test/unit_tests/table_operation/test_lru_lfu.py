@@ -18,10 +18,15 @@ word 0 = last-access timestamp, word 1 = frequency; eviction ranks by frequency,
 the timestamp serves time-based incremental dump). Scores are read back via the
 gather_score_blocks primitive so the CUDA kernels are directly observable."""
 
+import numpy as np
 import pytest
 import torch
 from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
-from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
+from dynamicemb.dynamicemb_config import (
+    DynamicEmbEvictStrategy,
+    DynamicEmbTableOptions,
+    ScoreStrategy,
+)
 from dynamicemb.key_value_table import DynamicEmbStorage, _expand_tables_impl
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
@@ -225,13 +230,23 @@ def test_lru_lfu_copy_score_blocks_roundtrip(current_device):
 
 # ---------------------------------------------------------------------------
 # Storage-level integration: dump/load round-trip and rehash preservation for
-# the LruLfu layout (LFU + need_incremental_dump). These exercise the Python
-# glue around the gather/scatter/copy kernels (export_keys_values_iter,
+# the LruLfu layout (the (TIMESTAMP, LFU) compound score). These exercise the
+# Python glue around the gather/scatter/copy kernels (export_keys_values_iter,
 # _dump_table, _iter_batches_from_files, _load_key_values, _expand_tables_impl).
 # ---------------------------------------------------------------------------
 
+# The compound score in both column orders. The two are equivalent at runtime
+# (identical physical LruLfu layout); they differ only in checkpoint column order.
+LRU_LFU_TS_FIRST = (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
+LRU_LFU_LFU_FIRST = (DynamicEmbScoreStrategy.LFU, DynamicEmbScoreStrategy.TIMESTAMP)
 
-def _lru_lfu_storage(dim=8, max_capacity=4096, init_capacity=None):
+
+def _lru_lfu_storage(
+    dim=8,
+    max_capacity=4096,
+    init_capacity=None,
+    score_strategy: ScoreStrategy = LRU_LFU_TS_FIRST,
+):
     device_id = torch.cuda.current_device()
     opts = [
         DynamicEmbTableOptions(
@@ -247,9 +262,8 @@ def _lru_lfu_storage(dim=8, max_capacity=4096, init_capacity=None):
             bucket_capacity=128,
             safe_check_mode=DynamicEmbCheckMode.IGNORE,
             local_hbm_for_values=1024**3,
-            score_strategy=DynamicEmbScoreStrategy.LFU,
+            score_strategy=score_strategy,
             evict_strategy=DynamicEmbEvictStrategy.LFU,
-            need_incremental_dump=True,
         )
     ]
     return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
@@ -265,9 +279,14 @@ def _read_score_blocks(storage, keys, tids):
     return storage.key_index_map.gather_score_blocks(0, idx)
 
 
-def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path):
+@pytest.mark.parametrize(
+    "score_strategy", [LRU_LFU_TS_FIRST, LRU_LFU_LFU_FIRST], ids=["ts_first", "lfu_first"]
+)
+def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path, score_strategy):
     """DynamicEmbStorage dump -> load preserves BOTH LruLfu score words
-    (timestamp and frequency), not just word 0."""
+    (timestamp and frequency), not just word 0. The checkpoint stores the two
+    columns in the user's configured (logical) order, and load reorders them back
+    into the physical device layout, so the round-trip is exact for either order."""
     device = torch.cuda.current_device()
     dim = 8
     n = 60
@@ -276,19 +295,41 @@ def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path):
     values = torch.randn(n, dim, dtype=torch.float32, device=device)
     freq_ref = torch.arange(1, 1 + n, dtype=torch.int64, device=device)  # varied
 
-    src = _lru_lfu_storage(dim=dim)
+    src = _lru_lfu_storage(dim=dim, score_strategy=score_strategy)
     src.insert(keys, tids, values, scores=freq_ref.to(torch.uint64))
 
+    # Device layout is always physical [timestamp, frequency] regardless of order.
     blocks_src = _read_score_blocks(src, keys, tids)
     assert torch.all(
         blocks_src[:, 1] == freq_ref
-    ), "insert should set word 1 (frequency) to the provided value"
+    ), "insert should set physical word 1 (frequency) to the provided value"
 
     d = str(tmp_path)
     paths = [f"{d}/meta.json", f"{d}/keys", f"{d}/emb", f"{d}/score", f"{d}/opt"]
     src.dump(0, *paths, include_optim=False)
 
-    dst = _lru_lfu_storage(dim=dim)
+    # The score file must be written in the user's logical column order. Export
+    # keys in the same order to align rows, then check the frequency column lands
+    # in the position the user configured.
+    exported_keys = []
+    for k, _emb, _opt, _score in src.export_keys_values(device):
+        exported_keys.append(k)
+    exported_keys = torch.cat(exported_keys)
+    file_scores = torch.tensor(
+        np.fromfile(f"{d}/score", dtype=np.uint64), dtype=torch.uint64, device=device
+    ).view(-1, 2)
+    freq_col = list(score_strategy).index(DynamicEmbScoreStrategy.LFU)
+    # Map exported key -> its checkpoint frequency column value, compare to freq_ref.
+    key_to_freq = {
+        int(k): int(file_scores[i, freq_col])
+        for i, k in enumerate(exported_keys.tolist())
+    }
+    for k, f in zip(keys.tolist(), freq_ref.tolist()):
+        assert key_to_freq[k] == f, (
+            f"checkpoint frequency column ({freq_col}) must match user's logical order"
+        )
+
+    dst = _lru_lfu_storage(dim=dim, score_strategy=score_strategy)
     dst.load(0, *paths, include_optim=False)
 
     blocks_dst = _read_score_blocks(dst, keys, tids)

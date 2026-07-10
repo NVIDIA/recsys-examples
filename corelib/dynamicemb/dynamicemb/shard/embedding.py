@@ -49,7 +49,12 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from ..dynamicemb_config import DynamicEmbKernel, DynamicEmbScoreStrategy
+from ..dynamicemb_config import (
+    DynamicEmbKernel,
+    DynamicEmbScoreStrategy,
+    ScoreStrategy,
+    get_eviction_score_strategy,
+)
 from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
 
 
@@ -78,15 +83,19 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
     def __init__(
         self,
         *args,
-        score_strategy: Optional[DynamicEmbScoreStrategy] = None,
+        score_strategy: Optional[ScoreStrategy] = None,
         has_admit_strategy: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         # Store the global score strategy
         self._score_strategy = score_strategy
+        # LFU is enabled when the strategy's eviction column is LFU -- for a single
+        # LFU strategy or for a compound strategy such as (TIMESTAMP, LFU).
         self._is_lfu_enabled = (
-            (score_strategy == DynamicEmbScoreStrategy.LFU) if score_strategy else False
+            get_eviction_score_strategy(score_strategy) == DynamicEmbScoreStrategy.LFU
+            if score_strategy is not None
+            else False
         )
         self._has_admit_strategy = has_admit_strategy
 

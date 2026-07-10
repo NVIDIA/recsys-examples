@@ -35,6 +35,8 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
+    get_eviction_score_strategy,
+    score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
 from dynamicemb.embedding_admission import MultiTableKVCounter
@@ -1162,17 +1164,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._scores[table_name] = table_score
 
     def get_score(self) -> Dict[str, int]:
-        """Return current score per table. For TIMESTAMP score strategy, or any
-        table with need_incremental_dump (whose incremental dump thresholds on a
-        device-timestamp column), returns device_timestamp(); otherwise returns
-        the stored score."""
+        """Return current score per table. For any table whose score strategy
+        carries a device-timestamp column (single TIMESTAMP, or a compound strategy
+        that includes TIMESTAMP, whose incremental dump thresholds on that column),
+        returns device_timestamp(); otherwise returns the stored score."""
         result: Dict[str, int] = {}
         ts: Optional[int] = None
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
-            if (
-                option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP
-                or option.need_incremental_dump
-            ):
+            if score_strategy_has_timestamp_column(option.score_strategy):
                 if ts is None:
                     ts = device_timestamp()
                 result[table_name] = ts
@@ -1211,19 +1210,25 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def _create_score(self):
         self._scores: Dict[str, int] = {}
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
-            if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
+            # Compound strategies (e.g. (TIMESTAMP, LFU)) are driven by their
+            # eviction element: the score value fed to the table and the eviction
+            # strategy follow that element (the timestamp column is maintained
+            # automatically by the LruLfu policy). Single strategies map to
+            # themselves.
+            eviction_strategy = get_eviction_score_strategy(option.score_strategy)
+            if eviction_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
                 option.evict_strategy = DynamicEmbEvictStrategy.LRU
                 self._scores[table_name] = 0
-            elif option.score_strategy == DynamicEmbScoreStrategy.STEP:
+            elif eviction_strategy == DynamicEmbScoreStrategy.STEP:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 1
-            elif option.score_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
+            elif eviction_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 0
-            elif option.score_strategy == DynamicEmbScoreStrategy.LFU:
+            elif eviction_strategy == DynamicEmbScoreStrategy.LFU:
                 option.evict_strategy = DynamicEmbEvictStrategy.LFU
                 self._scores[table_name] = 1
-            elif option.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
+            elif eviction_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 0
 
@@ -1429,6 +1434,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         named_thresholds: Dict[str, int] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ) -> Tuple[Dict[str, Tuple[Tensor, Tensor]], Dict[str, int]]:
+        """Dump keys/values whose score crosses the per-table threshold.
+
+        The meaning of the threshold depends on the table's score strategy:
+
+        - Strategies that carry a device-timestamp column (single ``TIMESTAMP``, or a
+          compound strategy that includes ``TIMESTAMP`` such as ``(TIMESTAMP, LFU)``)
+          produce a *time-based* incremental dump: only items whose last-access
+          timestamp crosses the threshold (i.e. touched/changed since the reference
+          time) are dumped. Use the value returned by :meth:`get_score` as the
+          reference threshold.
+        - Strategies without a timestamp column (e.g. ``STEP``, single ``LFU``,
+          ``NO_EVICTION``) instead threshold on the absolute score value: items whose
+          score is not less than the threshold are dumped. This is not a time-based
+          increment.
+        """
         storage = self._storage
         if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
             raise TypeError(
@@ -1453,10 +1473,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             keys_cat, values_cat = storage.incremental_dump(table_id, threshold, pg)
             ret_tensors[table_name] = (keys_cat, values_cat)
             option = self._dynamicemb_options[table_id]
-            if (
-                option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP
-                or option.need_incremental_dump
-            ):
+            if score_strategy_has_timestamp_column(option.score_strategy):
                 if ts is None:
                     ts = device_timestamp()
                 ret_scores[table_name] = ts
