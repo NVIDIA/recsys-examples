@@ -308,21 +308,19 @@ def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path, score_str
     paths = [f"{d}/meta.json", f"{d}/keys", f"{d}/emb", f"{d}/score", f"{d}/opt"]
     src.dump(0, *paths, include_optim=False)
 
-    # The score file must be written in the user's logical column order. Export
-    # keys in the same order to align rows, then check the frequency column lands
-    # in the position the user configured.
-    exported_keys = []
-    for k, _emb, _opt, _score in src.export_keys_values(device):
-        exported_keys.append(k)
-    exported_keys = torch.cat(exported_keys)
+    # The score file must be written in the user's logical column order. Read the
+    # keys and scores from the SAME dump so rows stay aligned (a fresh
+    # export_keys_values scan is a separate iteration and need not reproduce the
+    # dump's row order). The frequency column must land at the position where the
+    # user placed LFU in score_strategy.
+    file_keys = torch.tensor(np.fromfile(f"{d}/keys", dtype=np.int64), dtype=torch.int64)
     file_scores = torch.tensor(
-        np.fromfile(f"{d}/score", dtype=np.uint64), dtype=torch.uint64, device=device
+        np.fromfile(f"{d}/score", dtype=np.uint64), dtype=torch.uint64
     ).view(-1, 2)
     freq_col = list(score_strategy).index(DynamicEmbScoreStrategy.LFU)
-    # Map exported key -> its checkpoint frequency column value, compare to freq_ref.
+    # Map dumped key -> its checkpoint frequency column value, compare to freq_ref.
     key_to_freq = {
-        int(k): int(file_scores[i, freq_col])
-        for i, k in enumerate(exported_keys.tolist())
+        int(k): int(file_scores[i, freq_col]) for i, k in enumerate(file_keys.tolist())
     }
     for k, f in zip(keys.tolist(), freq_ref.tolist()):
         assert key_to_freq[k] == f, (
