@@ -191,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-tokenizer", action="store_true", default=True)
     parser.add_argument("--require-tokenizer", action="store_true")
     parser.add_argument("--extra-phrase", nargs="*", default=())
+    parser.add_argument("--shared-prefix-len", type=int, default=0)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown")
     return parser
