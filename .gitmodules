@@ -4,7 +4,7 @@
 [submodule "third_party/FBGEMM"]
 	path = third_party/FBGEMM
 	url = https://github.com/jiayus-nvidia/FBGEMM.git
-	branch = recsys-examples-v26.05
+	branch = recsys-examples-dev
 [submodule "third_party/FlexKV"]
 	path = third_party/FlexKV
 	url = https://github.com/taco-project/FlexKV.git

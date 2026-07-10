@@ -1,0 +1,9 @@
+# FlexKV tier config for recsys KVCacheManager.
+
+cpu_cache_gb: 0.2
+ssd_cache_gb: 0.5
+ssd_cache_dir: /path/to/your/ssd_cache
+enable_gds: false
+enable_p2p_cpu: false
+enable_p2p_ssd: false
+enable_3rd_remote: false
