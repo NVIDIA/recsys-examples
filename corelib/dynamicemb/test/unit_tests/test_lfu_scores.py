@@ -241,15 +241,15 @@ def validate_lfu_scores(
     ),
 )
 @click.option(
-    "--need-incremental-dump",
+    "--lru-lfu",
     is_flag=True,
     help=(
-        "Use the compound (TIMESTAMP, LFU) score strategy: LFU tables also carry a "
-        "timestamp column (physical word 0 = timestamp, word 1 = frequency). The "
-        "frequency (word 1) must still equal the true access count -- this reuses "
-        "the same validation to prove the extra timestamp word does not corrupt LFU "
-        "semantics. Not supported with caching/HybridStorage (multi-word checkpoints "
-        "are a follow-up)."
+        "Use the compound (TIMESTAMP, LFU) score strategy (the LruLfu policy): LFU "
+        "tables also carry a timestamp column (physical word 0 = timestamp, word 1 = "
+        "frequency). The frequency (word 1) must still equal the true access count -- "
+        "this reuses the same validation to prove the extra timestamp word does not "
+        "corrupt LFU semantics. Not supported with caching/HybridStorage (multi-word "
+        "checkpoints are a follow-up)."
     ),
 )
 def test_lfu_score_validation(
@@ -265,7 +265,7 @@ def test_lfu_score_validation(
     cache_capacity_ratio: float,
     use_index_dedup: bool,
     global_hbm_budget_scale: float,
-    need_incremental_dump: bool,
+    lru_lfu: bool,
 ):
     """Test LFU score correctness by comparing with naive frequency counting.
 
@@ -278,11 +278,10 @@ def test_lfu_score_validation(
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
 
-    if need_incremental_dump and (caching or global_hbm_budget_scale < 1.0):
+    if lru_lfu and (caching or global_hbm_budget_scale < 1.0):
         raise ValueError(
-            "--need-incremental-dump is only supported for storage-only "
-            "(HBM_DIRECT) LFU; caching / HybridStorage multi-word score layouts "
-            "are a follow-up."
+            "--lru-lfu is only supported for storage-only (HBM_DIRECT) LFU; "
+            "caching / HybridStorage multi-word score layouts are a follow-up."
         )
 
     if not caching:
@@ -310,18 +309,18 @@ def test_lfu_score_validation(
         print(f"  - Caching: DISABLED")
     print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
     print(
-        f"  - compound (TIMESTAMP, LFU) score: {need_incremental_dump} (LruLfu 2-word score)"
+        f"  - compound (TIMESTAMP, LFU) score: {lru_lfu} (LruLfu 2-word score)"
     )
     if not caching and global_hbm_budget_scale < 1.0:
         print(f"  - Storage path: expect HybridStorage (StorageMode DEFAULT)")
 
-    # Create model. When --need-incremental-dump is set, use the compound
-    # (TIMESTAMP, LFU) score strategy so LFU tables also carry a timestamp column;
-    # eviction is still driven by the LFU frequency, so the same validation applies.
+    # Create model. When --lru-lfu is set, use the compound (TIMESTAMP, LFU) score
+    # strategy so LFU tables also carry a timestamp column; eviction is still driven
+    # by the LFU frequency, so the same validation applies.
     optimizer_kwargs = get_optimizer_kwargs(optimizer_type)
     score_strategy = (
         (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
-        if need_incremental_dump
+        if lru_lfu
         else DynamicEmbScoreStrategy.LFU
     )
     model = create_model(

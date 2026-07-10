@@ -121,7 +121,7 @@ for dedup_flag in "${DEDUP_FLAGS[@]}"; do
         --batch-size $BATCH_SIZE \
         --num-iterations $NUM_ITERATIONS \
         --tolerance $TOLERANCE \
-        --need-incremental-dump \
+        --lru-lfu \
         $dedup_flag || exit 1
     done
   done
