@@ -5,10 +5,12 @@
 
 import argparse
 import math
+import os
 import random
+import sys
 import time
 from dataclasses import dataclass, replace
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
@@ -16,16 +18,21 @@ from configs import InferenceEmbeddingConfig, RankingConfig, get_inference_hstu_
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
-import sys
-
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
-
 
 ITEM_FEATURE_NAME = "item_feat"
 ACTION_FEATURE_NAME = "act_feat"
 ITEM_VOCAB_SIZE = 10000
 ACTION_VOCAB_SIZE = 128
+SCENARIO_ALIASES = {
+    "1": "gpu_hit",
+    "2": "cpu_hit",
+    "3": "ssd_hit",
+    "gpu_hit": "gpu_hit",
+    "cpu_hit": "cpu_hit",
+    "ssd_hit": "ssd_hit",
+}
 
 
 InferenceRequest = Tuple[HSTUBatch, torch.Tensor, torch.Tensor]
@@ -38,6 +45,7 @@ class BenchmarkConfig:
     num_candidates: int = 256
     warmup_iters: int = 1
     timed_iters: int = 10
+    batch_size: int = 1
     seed: int = 20260624
     max_batch_size: int = 16
     disable_cudagraph: bool = False
@@ -48,38 +56,85 @@ class BenchmarkConfig:
     ssd_pressure_batch_size: int = 8
     ssd_pressure_batch_sleep_s: float = 1.0
     offload_wait_timeout_s: float = 60.0
+    only_onboard: bool = False
 
 
 BENCHMARK_CONFIG = BenchmarkConfig()
 
 
+def parse_scenarios(scenarios_arg: str) -> set[str]:
+    scenarios = set()
+    for scenario in scenarios_arg.split(","):
+        scenario = scenario.strip()
+        if not scenario:
+            continue
+        if scenario not in SCENARIO_ALIASES:
+            raise ValueError(
+                f"Unsupported scenario '{scenario}'. "
+                "Use gpu_hit,cpu_hit,ssd_hit or legacy aliases 1,2,3."
+            )
+        scenarios.add(SCENARIO_ALIASES[scenario])
+    return scenarios
+
+
+def get_timed_history_len(history_len: int, append_history_len: int) -> int:
+    if BENCHMARK_CONFIG.only_onboard:
+        return history_len
+    return history_len + append_history_len
+
+
+def build_user_batches(
+    base_user_id: int,
+    num_batches: int,
+    batch_size: int,
+) -> list[list[int]]:
+    return [
+        [
+            base_user_id + batch_idx * batch_size + batch_offset
+            for batch_offset in range(batch_size)
+        ]
+        for batch_idx in range(num_batches)
+    ]
+
+
 def build_request(
-    user_id: int,
+    user_id: int | Sequence[int],
     history_len: int,
     num_candidates: int,
     max_seqlen: int,
 ) -> InferenceRequest:
-    item_seq = torch.randint(
-        low=0,
-        high=ITEM_VOCAB_SIZE,
-        size=(history_len + num_candidates,),
-        dtype=torch.long,
-    )
-    action_seq = torch.randint(
-        low=0,
-        high=ACTION_VOCAB_SIZE,
-        size=(history_len,),
-        dtype=torch.long,
-    )
+    user_ids = [user_id] if isinstance(user_id, int) else list(user_id)
+    batch_size = len(user_ids)
+    if batch_size <= 0:
+        raise ValueError("build_request expects at least one user id.")
+
+    item_seqs = [
+        torch.randint(
+            low=0,
+            high=ITEM_VOCAB_SIZE,
+            size=(history_len + num_candidates,),
+            dtype=torch.long,
+        )
+        for _ in user_ids
+    ]
+    action_seqs = [
+        torch.randint(
+            low=0,
+            high=ACTION_VOCAB_SIZE,
+            size=(history_len,),
+            dtype=torch.long,
+        )
+        for _ in user_ids
+    ]
     features = KeyedJaggedTensor.from_jt_dict(
         {
-            ITEM_FEATURE_NAME: JaggedTensor.from_dense([item_seq]),
-            ACTION_FEATURE_NAME: JaggedTensor.from_dense([action_seq]),
+            ITEM_FEATURE_NAME: JaggedTensor.from_dense(item_seqs),
+            ACTION_FEATURE_NAME: JaggedTensor.from_dense(action_seqs),
         }
     )
     batch = HSTUBatch(
         features=features,
-        batch_size=1,
+        batch_size=batch_size,
         feature_to_max_seqlen={
             ITEM_FEATURE_NAME: max_seqlen,
             ACTION_FEATURE_NAME: max_seqlen,
@@ -88,12 +143,12 @@ def build_request(
         item_feature_name=ITEM_FEATURE_NAME,
         action_feature_name=ACTION_FEATURE_NAME,
         max_num_candidates=num_candidates,
-        num_candidates=torch.full((1,), num_candidates, dtype=torch.long),
+        num_candidates=torch.full((batch_size,), num_candidates, dtype=torch.long),
     ).to(device=torch.cuda.current_device())
     return (
         batch,
-        torch.tensor([user_id], dtype=torch.int64),
-        torch.tensor([history_len * 2], dtype=torch.int32),
+        torch.tensor(user_ids, dtype=torch.int64),
+        torch.full((batch_size,), history_len * 2, dtype=torch.int32),
     )
 
 
@@ -108,7 +163,7 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     num_layers = 8
     inference_dtype = torch.bfloat16
     hstu_cudagraph_configs = {
-        "batch_size": [1, 2, 4, 8],
+        "batch_size": sorted({1, 2, 4, 8, cfg.batch_size}),
         "length_per_sequence": [i * 256 for i in range(2, 18)],
     }
     hstu_config = get_inference_hstu_config(
@@ -193,6 +248,7 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     model_predict.eval()
     return model_predict, page_size, max_seqlen
 
+
 def run_scenario_gpu_hit(
     model_predict,
     history_len: int,
@@ -201,22 +257,23 @@ def run_scenario_gpu_hit(
     max_seqlen: int,
     warmup_iters: int,
     timed_iters: int,
+    batch_size: int,
     offload_wait_timeout_s: float,
 ) -> None:
     base_user_id = 10
-    timed_user_ids = [base_user_id + i for i in range(timed_iters)]
+    timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
     req_prepare = [
-        build_request(user_id, history_len, num_candidates, max_seqlen)
-        for user_id in timed_user_ids
+        build_request(user_ids, history_len, num_candidates, max_seqlen)
+        for user_ids in timed_user_batches
     ]
     req_timed = [
         build_request(
-            user_id,
-            history_len + append_history_len,
+            user_ids,
+            get_timed_history_len(history_len, append_history_len),
             num_candidates,
             max_seqlen,
         )
-        for user_id in timed_user_ids
+        for user_ids in timed_user_batches
     ]
 
     # warmup
@@ -230,12 +287,13 @@ def run_scenario_gpu_hit(
 
     # precheck
     kvcache_mgr = model_predict.dense_module.kvcache
-    precheck_user_ids = torch.tensor(timed_user_ids, dtype=torch.int64)
+    precheck_user_ids = torch.tensor(
+        [user_id for user_ids in timed_user_batches for user_id in user_ids],
+        dtype=torch.int64,
+    )
     lookup_res = kvcache_mgr.gpu_kvcache_mgr.lookup(precheck_user_ids)
     gpu_lengths = lookup_res.gpu_cached_lengths.cpu()
-    print(
-        f"[Scenario1 precheck] gpu={gpu_lengths.tolist()}"
-    )
+    print(f"[Scenario1 precheck] gpu={gpu_lengths.tolist()}")
     expected = history_len * 2
     if any(int(length.item()) != expected for length in gpu_lengths):
         raise RuntimeError(
@@ -283,22 +341,23 @@ def run_scenario_gpu_miss_host_hit(
     max_seqlen: int,
     warmup_iters: int,
     timed_iters: int,
+    batch_size: int,
     offload_wait_timeout_s: float,
 ) -> None:
     base_user_id = 20
-    timed_user_ids = [base_user_id + i for i in range(timed_iters)]
+    timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
     req_prepare = [
-        build_request(user_id, history_len, num_candidates, max_seqlen)
-        for user_id in timed_user_ids
+        build_request(user_ids, history_len, num_candidates, max_seqlen)
+        for user_ids in timed_user_batches
     ]
     req_timed = [
         build_request(
-            user_id,
-            history_len + append_history_len,
+            user_ids,
+            get_timed_history_len(history_len, append_history_len),
             num_candidates,
             max_seqlen,
         )
-        for user_id in timed_user_ids
+        for user_ids in timed_user_batches
     ]
     kvcache_mgr = model_predict.dense_module.kvcache
 
@@ -339,7 +398,7 @@ def run_scenario_gpu_miss_host_hit(
         # evict GPU
         kvcache_mgr.evict(user_ids, for_gpu=True)
 
-        #timed run
+        # timed run
         torch.cuda.nvtx.range_push(f"scenario2_timed_run_{iter_idx}")
         model_predict.forward_with_kvcache(
             batch,
@@ -377,123 +436,27 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     max_seqlen: int,
     page_size: int,
     timed_iters: int,
+    batch_size: int,
     offload_wait_timeout_s: float,
     ssd_pressure_users: int,
     ssd_pressure_batch_size: int,
     ssd_pressure_batch_sleep_s: float,
 ) -> None:
-    # Previous clear_cpu_cache() based version, kept here for reference.
-    # It is intentionally commented out instead of deleted so the two Scenario3
-    # designs can be compared in-place.
-    #
-    # base_user_id = 30
-    # timed_user_ids = [base_user_id + i for i in range(timed_iters)]
-    # req_targets = [
-    #     build_request(user_id, history_len, num_candidates, max_seqlen)
-    #     for user_id in timed_user_ids
-    # ]
-    # kvcache_mgr = model_predict.dense_module.kvcache
-    # host_mgr = kvcache_mgr.host_kvstorage_manager
-    # cache_cfg = getattr(host_mgr, "_client", None)
-    # cache_cfg = getattr(cache_cfg, "cache_config", None)
-    # enable_ssd = bool(getattr(cache_cfg, "enable_ssd", False))
-    #
-    # print("warmup")
-    # # Prime targets into GPU + CPU + SSD. Timed requests append a new tail so
-    # # offload cannot be fully eliminated by put_match.
-    # for batch, user_ids, total_history_lengths in req_targets:
-    #     model_predict.forward_with_kvcache(
-    #         batch,
-    #         user_ids,
-    #         total_history_lengths,
-    #     )
-    # deadline = time.time() + offload_wait_timeout_s
-    # torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all")
-    # try:
-    #     while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-    #         torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all.try_wait")
-    #         try:
-    #             kvcache_mgr.offload_try_wait()
-    #         finally:
-    #             torch.cuda.nvtx.range_pop()
-    #         if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-    #             break
-    #         if time.time() > deadline:
-    #             raise TimeoutError(
-    #                 f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-    #                 f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-    #             )
-    #         time.sleep(0.001)
-    # finally:
-    #     torch.cuda.nvtx.range_pop()
-    # num_cpu_blocks = int(getattr(cache_cfg, "num_cpu_blocks", 0))
-    # num_ssd_blocks = int(getattr(cache_cfg, "num_ssd_blocks", 0))
-    #
-    # flexkv_client = getattr(host_mgr, "_client", None)
-    # clear_cpu_cache = getattr(flexkv_client, "_clear_cpu_cache", None)
-    # if not callable(clear_cpu_cache):
-    #     raise RuntimeError("Scenario3 expects FlexKV client to expose _clear_cpu_cache().")
-    #
-    # print("timed run")
-    # for iter_idx in range(timed_iters):
-    #     # Clear local CPU cache explicitly before every measured target forward.
-    #     # SSD entries should remain; proof is DISK2H+H2D (or DISK2D for GDS).
-    #     print(f"[Scenario3] clear CPU cache before timed iter {iter_idx}", flush=True)
-    #     clear_cpu_cache()
-    #     user_id = timed_user_ids[iter_idx]
-    #     user_ids = torch.tensor([user_id], dtype=torch.int64)
-    #     kvcache_mgr.evict(user_ids, for_gpu=True)
-    #
-    #     batch, user_ids, total_history_lengths = build_request(
-    #         user_id,
-    #         history_len + append_history_len,
-    #         num_candidates,
-    #         max_seqlen,
-    #     )
-    #
-    #     # timed run
-    #     torch.cuda.nvtx.range_push(f"scenario3_timed_run_{iter_idx}")
-    #     model_predict.forward_with_kvcache(
-    #         batch,
-    #         user_ids,
-    #         total_history_lengths,
-    #     )
-    #     torch.cuda.nvtx.range_pop()
-    # deadline = time.time() + offload_wait_timeout_s
-    # torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all")
-    # try:
-    #     while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-    #         torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all.try_wait")
-    #         try:
-    #             kvcache_mgr.offload_try_wait()
-    #         finally:
-    #             torch.cuda.nvtx.range_pop()
-    #         if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-    #             break
-    #         if time.time() > deadline:
-    #             raise TimeoutError(
-    #                 f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-    #                 f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-    #             )
-    #         time.sleep(0.001)
-    # finally:
-    #     torch.cuda.nvtx.range_pop()
-    # print(f"[Scenario3] timed run completed, iters={timed_iters}")
-    #
-    # New pressure based version starts here. It avoids clear_cpu_cache() and
-    # evicts CPU residency through FlexKV's normal cache path.
+    # Use pressure users instead of FlexKV's private _clear_cpu_cache().
+    # RecSys FlexKV has no per-user host eviction API, so this follows the
+    # normal LRU path to move targets out of CPU while keeping them in SSD.
 
     base_user_id = 30
-    timed_user_ids = [base_user_id + i for i in range(timed_iters)]
+    timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
     req_targets = [
-        build_request(user_id, history_len, num_candidates, max_seqlen)
-        for user_id in timed_user_ids
+        build_request(user_ids, history_len, num_candidates, max_seqlen)
+        for user_ids in timed_user_batches
     ]
     kvcache_mgr = model_predict.dense_module.kvcache
     host_mgr = kvcache_mgr.host_kvstorage_manager
     cache_cfg = getattr(host_mgr, "_client", None)
     cache_cfg = getattr(cache_cfg, "cache_config", None)
-    enable_ssd = bool(getattr(cache_cfg, "enable_ssd", False))
+    bool(getattr(cache_cfg, "enable_ssd", False))
 
     print("warmup")
     # Prime targets into GPU + CPU + SSD. Timed requests append a new tail so
@@ -614,14 +577,13 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
         time.sleep(ssd_pressure_batch_sleep_s)
 
     print("timed run")
-    for iter_idx in range(timed_iters):
-        user_id = timed_user_ids[iter_idx]
-        user_ids = torch.tensor([user_id], dtype=torch.int64)
+    for iter_idx, user_batch in enumerate(timed_user_batches):
+        user_ids = torch.tensor(user_batch, dtype=torch.int64)
         kvcache_mgr.evict(user_ids, for_gpu=True)
 
         batch, user_ids, total_history_lengths = build_request(
-            user_id,
-            history_len + append_history_len,
+            user_batch,
+            get_timed_history_len(history_len, append_history_len),
             num_candidates,
             max_seqlen,
         )
@@ -668,16 +630,29 @@ def shutdown_flexkv_client(model_predict) -> None:
             print(f"[WARN] FlexKV client shutdown failed: {exc}", flush=True)
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--timed-iters", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--append-history-len", type=int, default=None)
     parser.add_argument("--ssd-pressure-users", type=int, default=None)
     parser.add_argument("--ssd-pressure-batch-size", type=int, default=None)
     parser.add_argument("--ssd-pressure-batch-sleep-s", type=float, default=None)
     parser.add_argument("--flexkv-config-path", type=str, default=None)
-    parser.add_argument("--scenarios", type=str, default="1,2,3")
+    parser.add_argument(
+        "--scenarios",
+        type=str,
+        default="gpu_hit,cpu_hit,ssd_hit",
+        help=(
+            "Comma-separated scenarios to run: gpu_hit,cpu_hit,ssd_hit. "
+            "Legacy aliases 1,2,3 are also accepted."
+        ),
+    )
+    parser.add_argument(
+        "--only-onboard",
+        action="store_true",
+        help="Measure only onboard by reusing the warmed prefix in timed forwards.",
+    )
     parser.add_argument("--disable-cudagraph", action="store_true")
     parser.add_argument("--ablation", type=str, default=None)
     args, _ = parser.parse_known_args()
@@ -690,6 +665,8 @@ if __name__ == "__main__":
         cfg = replace(cfg, flexkv_config_path=flexkv_config_path)
     if args.timed_iters is not None:
         cfg = replace(cfg, timed_iters=args.timed_iters)
+    if args.batch_size is not None:
+        cfg = replace(cfg, batch_size=args.batch_size)
     if args.append_history_len is not None:
         cfg = replace(cfg, append_history_len=args.append_history_len)
     if args.ssd_pressure_users is not None:
@@ -700,8 +677,19 @@ if __name__ == "__main__":
         cfg = replace(cfg, ssd_pressure_batch_sleep_s=args.ssd_pressure_batch_sleep_s)
     if args.disable_cudagraph:
         cfg = replace(cfg, disable_cudagraph=True)
+    if args.only_onboard:
+        cfg = replace(cfg, only_onboard=True)
     if args.ablation not in (None, "baseline"):
-        raise ValueError("This restored benchmark currently supports only --ablation baseline.")
+        raise ValueError(
+            "This restored benchmark currently supports only --ablation baseline."
+        )
+    if cfg.batch_size <= 0:
+        raise ValueError(f"--batch-size must be positive, got {cfg.batch_size}.")
+    if cfg.batch_size > cfg.max_batch_size:
+        raise ValueError(
+            f"--batch-size ({cfg.batch_size}) cannot exceed max_batch_size "
+            f"({cfg.max_batch_size})."
+        )
     BENCHMARK_CONFIG = cfg
 
     random.seed(cfg.seed)
@@ -709,10 +697,13 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(cfg.seed)
 
     history_len = cfg.history_len
-    scenarios = {scenario.strip() for scenario in args.scenarios.split(",") if scenario.strip()}
+    scenarios = parse_scenarios(args.scenarios)
+    mode = "only_onboard" if cfg.only_onboard else "end_to_end"
     print(
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
-        f"num_candidates={cfg.num_candidates}, disable_cudagraph={cfg.disable_cudagraph}, "
+        f"num_candidates={cfg.num_candidates}, batch_size={cfg.batch_size}, "
+        f"disable_cudagraph={cfg.disable_cudagraph}, "
+        f"mode={mode}, "
         f"scenarios={','.join(sorted(scenarios))}"
     )
     model_predict, page_size, max_seqlen = build_model(cfg, history_len)
@@ -720,7 +711,7 @@ if __name__ == "__main__":
 
     try:
         with torch.inference_mode():
-            if "1" in scenarios:
+            if "gpu_hit" in scenarios:
                 run_scenario_gpu_hit(
                     model_predict=model_predict,
                     history_len=history_len,
@@ -729,9 +720,10 @@ if __name__ == "__main__":
                     max_seqlen=max_seqlen,
                     warmup_iters=cfg.warmup_iters,
                     timed_iters=cfg.timed_iters,
+                    batch_size=cfg.batch_size,
                     offload_wait_timeout_s=cfg.offload_wait_timeout_s,
                 )
-            if "2" in scenarios:
+            if "cpu_hit" in scenarios:
                 run_scenario_gpu_miss_host_hit(
                     model_predict=model_predict,
                     history_len=history_len,
@@ -740,9 +732,10 @@ if __name__ == "__main__":
                     max_seqlen=max_seqlen,
                     warmup_iters=cfg.warmup_iters,
                     timed_iters=cfg.timed_iters,
+                    batch_size=cfg.batch_size,
                     offload_wait_timeout_s=cfg.offload_wait_timeout_s,
                 )
-            if "3" in scenarios:
+            if "ssd_hit" in scenarios:
                 run_scenario_gpu_cpu_miss_ssd_hit(
                     model_predict=model_predict,
                     history_len=history_len,
@@ -751,6 +744,7 @@ if __name__ == "__main__":
                     max_seqlen=max_seqlen,
                     page_size=page_size,
                     timed_iters=cfg.timed_iters,
+                    batch_size=cfg.batch_size,
                     offload_wait_timeout_s=cfg.offload_wait_timeout_s,
                     ssd_pressure_users=cfg.ssd_pressure_users,
                     ssd_pressure_batch_size=cfg.ssd_pressure_batch_size,
