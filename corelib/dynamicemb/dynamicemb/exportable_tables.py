@@ -10,7 +10,6 @@ This module owns:
 """
 
 import itertools
-import os
 from typing import Dict, List, Optional
 
 import pynve.torch.nve_layers as nve_layers
@@ -24,6 +23,7 @@ from dynamicemb.batched_dynamicemb_tables import (
     encode_meta_json_file_path,
     get_loading_files,
 )
+from dynamicemb.filesystem import get_filesystem
 from dynamicemb.key_value_table import _iter_batches_from_files, load_from_json
 from dynamicemb.scored_hashtable import ScorePolicy
 from dynamicemb_extensions import table_insert
@@ -380,7 +380,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         save_dir: str,
         table_names: Optional[List[str]] = None,
     ) -> None:
-        if not os.path.exists(save_dir):
+        if not get_filesystem(save_dir).exists(save_dir):
             raise RuntimeError(f"Save directory does not exist: {save_dir}")
 
         if (
@@ -409,7 +409,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 continue
 
             meta_json_file = encode_meta_json_file_path(save_dir, table_name)
-            if os.path.exists(meta_json_file):
+            if get_filesystem(meta_json_file).exists(meta_json_file):
                 try:
                     _ = load_from_json(meta_json_file)
                 except Exception as e:

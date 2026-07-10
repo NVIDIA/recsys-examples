@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.filesystem import get_filesystem
 from torch import nn
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
@@ -142,15 +143,16 @@ def DynamicEmbDump(
         torch.cuda.synchronize()
     # create path
     created_dirs = []
-    if not os.path.exists(path):
+    fs = get_filesystem(path)
+    if not fs.exists(path):
         created_dirs.append(path)
         try:
-            os.makedirs(path, exist_ok=True)
+            fs.makedirs(path, exist_ok=True)
         except Exception as e:
             raise Exception("can't build path:", path) from e
     else:
-        if os.path.isdir(path):
-            if not os.listdir(path):
+        if fs.isdir(path):
+            if not fs.ls(path):
                 pass
             elif not allow_overwrite:
                 raise Exception(
@@ -174,8 +176,9 @@ def DynamicEmbDump(
 
     for collection_path, _, _ in collections_list:
         full_collection_path = os.path.join(path, collection_path)
-        if not os.path.exists(full_collection_path):
-            os.makedirs(full_collection_path, exist_ok=True)
+        col_fs = get_filesystem(full_collection_path)
+        if not col_fs.exists(full_collection_path):
+            col_fs.makedirs(full_collection_path, exist_ok=True)
     dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
 
     for collection_path, _, current_collection_module in collections_list:
@@ -246,7 +249,7 @@ def DynamicEmbLoad(
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    if not os.path.exists(path):
+    if not get_filesystem(path).exists(path):
         raise Exception("can't find path to load, path:", path)
 
     collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
