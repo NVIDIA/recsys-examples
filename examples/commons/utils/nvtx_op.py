@@ -13,25 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from functools import partial, wraps
 
 import torch
 
+_NVTX_HOOKS_ENABLED = os.environ.get("ENABLE_NVTX_HOOKS", "1") == "1"
+
+
+def set_nvtx_hooks_enabled(enabled: bool) -> None:
+    """Globally enable or disable NVTX hooks in this process."""
+    global _NVTX_HOOKS_ENABLED
+    _NVTX_HOOKS_ENABLED = enabled
+
+
+def nvtx_hooks_enabled() -> bool:
+    return _NVTX_HOOKS_ENABLED
+
 
 def forward_nvtx_push_hook(module, input, msg=""):
-    torch.cuda.nvtx.range_push(msg)
+    if _NVTX_HOOKS_ENABLED:
+        torch.cuda.nvtx.range_push(msg)
 
 
 def forward_nvtx_pop_hook(module, input, output):
-    torch.cuda.nvtx.range_pop()
+    if _NVTX_HOOKS_ENABLED:
+        torch.cuda.nvtx.range_pop()
 
 
 def backward_nvtx_push_hook(module, grad_output, msg=""):
-    torch.cuda.nvtx.range_push(msg)
+    if _NVTX_HOOKS_ENABLED:
+        torch.cuda.nvtx.range_push(msg)
 
 
 def backward_nvtx_pop_hook(module, grad_input, grad_output):
-    torch.cuda.nvtx.range_pop()
+    if _NVTX_HOOKS_ENABLED:
+        torch.cuda.nvtx.range_pop()
 
 
 def register_nvtx_for_module(module: torch.nn.Module, msg=""):
@@ -159,6 +176,8 @@ def output_nvtx_hook(nvtx_tag, backward=True, hook_key_or_attr_name="data"):
     def decorator_forward_only(module):
         @wraps(module)
         def forward(*args, **kwags):
+            if not _NVTX_HOOKS_ENABLED:
+                return module(*args, **kwags)
             torch.cuda.nvtx.range_push(nvtx_tag)
             output = module(*args, **kwags)
             torch.cuda.nvtx.range_pop()
@@ -169,6 +188,8 @@ def output_nvtx_hook(nvtx_tag, backward=True, hook_key_or_attr_name="data"):
     def decorator_nvtx(module_or_func):
         @wraps(module_or_func)
         def wrapper(*args, **kwargs):
+            if not _NVTX_HOOKS_ENABLED:
+                return module_or_func(*args, **kwargs)
             _placeholder = torch.empty(1, device="cuda").requires_grad_()
             hook_r = NvtxRangePush(_placeholder, nvtx_tag + " forward")
             output = module_or_func(*args, **kwargs)
