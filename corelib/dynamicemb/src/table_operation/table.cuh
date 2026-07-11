@@ -70,7 +70,14 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage = std::nullopt,
              int64_t ovf_bucket_capacity = 0,
-             std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
+             std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
+             std::optional<at::Tensor> active_mask = std::nullopt,
+             std::optional<at::Tensor> active_count = std::nullopt,
+             std::optional<at::Tensor> score_output = std::nullopt,
+             std::optional<at::Tensor> founds_output = std::nullopt,
+             std::optional<at::Tensor> indices_output = std::nullopt,
+             std::optional<at::Tensor> acquire_counter = std::nullopt,
+             std::optional<at::Tensor> acquire_ovf_counter = std::nullopt);
 
 at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor table_bucket_offsets,
@@ -79,7 +86,11 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
-                        std::optional<at::Tensor> score_output = std::nullopt);
+                        std::optional<at::Tensor> score_output = std::nullopt,
+                        std::optional<at::Tensor> active_mask = std::nullopt,
+                        std::optional<at::Tensor> active_count = std::nullopt,
+                        std::optional<at::Tensor> row_counters = std::nullopt,
+                        bool publish_and_acquire = false);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -96,10 +107,74 @@ table_insert_and_evict(
     std::optional<at::Tensor> ovf_counter = std::nullopt,
     std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor>
+table_find_or_insert(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    at::Tensor table_ids, std::optional<at::Tensor> score_input,
+    ScorePolicyType policy_type, at::Tensor counter,
+    int64_t max_cooperative_blocks,
+    std::optional<at::Tensor> insert_results = std::nullopt,
+    std::optional<at::Tensor> score_output = std::nullopt,
+    std::optional<at::Tensor> active_mask = std::nullopt,
+    std::optional<at::Tensor> active_count = std::nullopt,
+    std::optional<at::Tensor> indices_output = std::nullopt,
+    std::optional<at::Tensor> founds_output = std::nullopt,
+    std::optional<at::Tensor> evicted_keys_output = std::nullopt,
+    std::optional<at::Tensor> evicted_indices_output = std::nullopt,
+    std::optional<at::Tensor> evicted_scores_output = std::nullopt,
+    std::optional<at::Tensor> evicted_table_ids_output = std::nullopt,
+    std::optional<at::Tensor> evicted_mask_output = std::nullopt,
+    std::optional<at::Tensor> ovf_storage = std::nullopt,
+    int64_t ovf_bucket_capacity = 0,
+    std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
+    std::optional<at::Tensor> ovf_counter = std::nullopt,
+    std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
+
+int64_t table_find_or_insert_max_cooperative_blocks(
+    at::Tensor key_type_device_ref, ScorePolicyType policy_type,
+    bool output_score, bool enable_overflow);
+
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices);
+                 std::optional<at::Tensor> indices,
+                 std::optional<at::Tensor> active_mask = std::nullopt,
+                 std::optional<at::Tensor> active_count = std::nullopt);
+
+void table_reclaim_by_slot(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    at::Tensor table_ids, at::Tensor slot_indices,
+    at::Tensor counter, std::optional<at::Tensor> mask = std::nullopt,
+    std::optional<at::Tensor> ovf_storage = std::nullopt,
+    int64_t ovf_bucket_capacity = 0,
+    std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
+    std::optional<at::Tensor> ovf_counter = std::nullopt,
+    std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
+
+void table_rollback_failed_evictions(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor incoming_keys,
+    at::Tensor table_ids, at::Tensor cache_slot_indices,
+    at::Tensor evicted_keys, at::Tensor evicted_scores,
+    at::Tensor evicted_mask, at::Tensor storage_insert_slots,
+    at::Tensor counter,
+    std::optional<at::Tensor> overflow_storage = std::nullopt,
+    int64_t overflow_bucket_capacity = 0,
+    std::optional<at::Tensor> overflow_counter = std::nullopt,
+    std::optional<at::Tensor> overflow_output_offsets = std::nullopt);
+
+void table_update_score_by_slot(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor keys, at::Tensor slot_indices,
+    at::Tensor table_ids, at::Tensor scores,
+    std::optional<at::Tensor> active_mask = std::nullopt,
+    std::optional<at::Tensor> active_count = std::nullopt,
+    std::optional<at::Tensor> ovf_storage = std::nullopt,
+    int64_t ovf_bucket_capacity = 0,
+    std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
@@ -129,11 +204,21 @@ void table_update_counter_with_layout(
     at::Tensor counter, at::Tensor slot_indices, int32_t delta,
     at::Tensor table_bucket_offsets, int64_t bucket_capacity,
     int64_t main_capacity, int64_t num_tables,
-    c10::optional<at::Tensor> table_ids,
-    c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity);
+    c10::optional<at::Tensor> table_ids = c10::nullopt,
+    c10::optional<at::Tensor> overflow_output_offsets = c10::nullopt,
+    int64_t overflow_bucket_capacity = 0,
+    c10::optional<at::Tensor> fallback_counter = c10::nullopt,
+    c10::optional<at::Tensor> fallback_slot_indices = c10::nullopt,
+    c10::optional<at::Tensor> fallback_table_bucket_offsets = c10::nullopt,
+    int64_t fallback_bucket_capacity = 0,
+    int64_t fallback_main_capacity = 0,
+    int64_t fallback_num_tables = 0,
+    c10::optional<at::Tensor> fallback_overflow_output_offsets = c10::nullopt,
+    int64_t fallback_overflow_bucket_capacity = 0);
 
-at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
-                                     at::Tensor table_ids);
+at::Tensor no_eviction_assign_scores(
+    at::Tensor no_eviction_next_index_dev, at::Tensor table_ids,
+    std::optional<at::Tensor> active_mask = std::nullopt,
+    std::optional<at::Tensor> active_count = std::nullopt);
 
 } // namespace dyn_emb

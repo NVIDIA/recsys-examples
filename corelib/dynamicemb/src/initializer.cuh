@@ -28,6 +28,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <optional>
 #include <random>
 
 namespace dyn_emb {

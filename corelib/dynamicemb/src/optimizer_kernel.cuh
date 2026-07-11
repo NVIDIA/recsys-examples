@@ -409,30 +409,49 @@ template <typename wgrad_t, typename weight_t, typename index_t,
 __global__ void update4_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
     const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
+    const index_t *fallback_indices, const int64_t *fallback_table_ptrs,
     const int64_t *table_ids, const int64_t *table_value_dims,
     const int64_t *table_emb_dims, OptimizerFunc optimizer) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
   const int warp_id_in_block = threadIdx.x / kWarpSize;
+  bool wrote_fallback = false;
 
   for (uint32_t ev_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
        ev_id < num_keys; ev_id += gridDim.x * warp_num_per_block) {
-    index_t const index = indices[ev_id];
-    if (index == -1)
-      continue;
+    index_t index = indices[ev_id];
+    const int64_t *selected_table_ptrs = table_ptrs;
+    bool use_fallback = false;
+    if (index == static_cast<index_t>(-1)) {
+      if (fallback_indices == nullptr || fallback_table_ptrs == nullptr)
+        continue;
+      index = fallback_indices[ev_id];
+      if (index == static_cast<index_t>(-1))
+        continue;
+      selected_table_ptrs = fallback_table_ptrs;
+      use_fallback = true;
+    }
 
     int64_t table_id = table_ids[ev_id];
     int64_t vdim = table_value_dims[table_id];
     int64_t edim = table_emb_dims[table_id];
 
-    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
-                           static_cast<int64_t>(index) * vdim;
+    weight_t *weight_ptr =
+        reinterpret_cast<weight_t *>(selected_table_ptrs[table_id]) +
+        static_cast<int64_t>(index) * vdim;
     const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
                                              (uint32_t)edim, (uint32_t)edim};
     optimizer.update4(input);
+    wrote_fallback |= use_fallback;
   }
+
+  // Fallback rows may reside in mapped host memory. Every lane that could
+  // have written one publishes all of its writes at system scope before the
+  // kernel completes.
+  if (wrote_fallback)
+    __threadfence_system();
 }
 
 template <typename wgrad_t, typename weight_t, typename index_t,
@@ -440,26 +459,42 @@ template <typename wgrad_t, typename weight_t, typename index_t,
 __global__ void update_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
     const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
+    const index_t *fallback_indices, const int64_t *fallback_table_ptrs,
     const int64_t *table_ids, const int64_t *table_value_dims,
     const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+  bool wrote_fallback = false;
 
   for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
-    index_t const index = indices[ev_id];
-    if (index == -1)
-      continue;
+    index_t index = indices[ev_id];
+    const int64_t *selected_table_ptrs = table_ptrs;
+    bool use_fallback = false;
+    if (index == static_cast<index_t>(-1)) {
+      if (fallback_indices == nullptr || fallback_table_ptrs == nullptr)
+        continue;
+      index = fallback_indices[ev_id];
+      if (index == static_cast<index_t>(-1))
+        continue;
+      selected_table_ptrs = fallback_table_ptrs;
+      use_fallback = true;
+    }
 
     int64_t table_id = table_ids[ev_id];
     int64_t vdim = table_value_dims[table_id];
     int64_t edim = table_emb_dims[table_id];
 
-    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
-                           static_cast<int64_t>(index) * vdim;
+    weight_t *weight_ptr =
+        reinterpret_cast<weight_t *>(selected_table_ptrs[table_id]) +
+        static_cast<int64_t>(index) * vdim;
     const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
                                              (uint32_t)edim, (uint32_t)edim};
     optimizer.update(input);
+    wrote_fallback |= use_fallback;
   }
+
+  if (wrote_fallback)
+    __threadfence_system();
 }
 
 // The padded buffer reserves `max_emb_dim` for the embedding region of every

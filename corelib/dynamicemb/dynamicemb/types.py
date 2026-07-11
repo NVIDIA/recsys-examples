@@ -16,10 +16,17 @@
 import abc
 import enum
 from dataclasses import dataclass
-from typing import Generic, Iterator, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Iterator, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
+    from dynamicemb.extendable_tensor import ExtendableBuffer
+    from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+    from dynamicemb.scored_hashtable import ScoreSpec
+    from dynamicemb_extensions import EvictStrategy
 
 
 @enum.unique
@@ -146,8 +153,153 @@ class CopyMode(enum.Enum):
     VALUE = "value"
 
 
+# ---------------------------------------------------------------------------
+# DynamicEmbTableState – shared state dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DynamicEmbTableState:
+    options_list: List["DynamicEmbTableOptions"]
+    num_tables: int
+    device: torch.device
+    score_policy: "ScoreSpec"
+    evict_strategy: "EvictStrategy"
+    key_index_map: Any
+    capacity: int
+    tables: List["ExtendableBuffer"]
+    # Per-table value buffer base pointers on ``device``; refreshed on init and expand.
+    table_ptrs_dev: torch.Tensor
+    table_emb_dims: torch.Tensor
+    # Persistent host tensor counterpart. ``table_emb_dims_cpu`` remains the
+    # Python integer list used for individual dimension lookups.
+    table_emb_dims_host: torch.Tensor
+    table_value_dims: torch.Tensor
+    table_emb_dims_cpu: List[int]
+    table_value_dims_cpu: List[int]
+    max_emb_dim: int
+    emb_dim: int
+    value_dim: int
+    emb_dtype: torch.dtype
+    all_dims_vec4: bool
+    optimizer: "BaseDynamicEmbeddingOptimizer"
+    initial_optim_state: float
+    threads_in_wave: int
+    # Computed from device properties during state construction; avoids a
+    # device-property query in the value-exchange hot path.
+    exchange_target_grid_size: int
+    score: Optional[int] = None
+    training: bool = False
+    # Overflow region fields (per-table, only set when overflow is enabled)
+    overflow_caps: Optional[List[int]] = None
+    # NO_EVICTION: per-table auto-increment index used as insert score (internal only).
+    # no_eviction_next_index: CPU pinned tensor (num_tables,); no_eviction_next_index_dev: same on state.device.
+    no_eviction_next_index: Optional[torch.Tensor] = None
+    no_eviction_next_index_dev: Optional[torch.Tensor] = None
+    # Estimated per-table size (last_collected + accumulated unique since collection);
+    # CPU tensor of shape (num_tables,), used to avoid key_index_map.size() when not needed.
+    estimated_table_sizes: Optional[torch.Tensor] = None
+    collect_table_sizes_flag: bool = False
+
+
+@dataclass
+class CacheFindOrInsertResult:
+    """Device-resident metadata produced by fused cache find-or-insert.
+
+    Every eviction tensor is aligned with the input keys. ``evicted_mask``
+    selects positions whose provisional cache insertion displaced an old row;
+    values at unselected positions are unspecified.
+    """
+
+    indices: torch.Tensor
+    founds: torch.Tensor
+    evicted_keys: torch.Tensor
+    evicted_indices: torch.Tensor
+    evicted_scores: torch.Tensor
+    evicted_table_ids: torch.Tensor
+    evicted_mask: torch.Tensor
+
+
+@dataclass
+class CacheExchangeRequest:
+    """Full-layout cache/storage exchange request.
+
+    ``cache_state`` is the shared, concretely typed cache value-buffer
+    descriptor used by built-in and external storage implementations. The
+    eviction tensors use the same layout as ``keys`` and are selected by
+    ``evicted_mask``. The request must be consumed on the same CUDA stream as
+    the cache ``find_or_insert`` that produced it; published provisional rows
+    are not a cross-stream readiness signal.
+    """
+
+    cache_state: DynamicEmbTableState
+    keys: torch.Tensor
+    table_ids: torch.Tensor
+    scores: Optional[torch.Tensor]
+    cache_founds: torch.Tensor
+    cache_indices: torch.Tensor
+    evicted_keys: torch.Tensor
+    evicted_indices: torch.Tensor
+    evicted_scores: torch.Tensor
+    evicted_table_ids: torch.Tensor
+    evicted_mask: torch.Tensor
+
+
+@dataclass
+class CacheExchangeResult:
+    """Full-layout storage lookup metadata after exchange.
+
+    ``direct_storage_rows`` and ``direct_storage_slots`` are ``-1`` for rows
+    materialized in cache. A non-negative pair identifies a storage hit whose
+    provisional cache placement was rolled back after backing storage could
+    not preserve its eviction victim. The storage reference remains acquired
+    so forward/backward can consume that row directly without a host sync or
+    an embedding staging buffer. ``direct_storage_table_ptrs`` names the
+    backing value buffers for those physical rows and must have the same table
+    layout and physical row widths as ``CacheExchangeRequest.cache_state``.
+    """
+
+    founds: torch.Tensor
+    storage_founds: torch.Tensor
+    storage_scores: torch.Tensor
+    direct_storage_rows: torch.Tensor
+    direct_storage_slots: torch.Tensor
+    direct_storage_table_ptrs: torch.Tensor
+
+
 # make it standalone to avoid recursive references.
 class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
+    def exchange(self, request: CacheExchangeRequest) -> CacheExchangeResult:
+        """Exchange cache misses and displaced rows with backing storage.
+
+        Every storage implementation configured behind a cache must override
+        this method. There is deliberately no orchestration fallback to
+        ``find`` plus ``insert`` in the prefetch path. If cache placement can
+        fail, the backend must return addressable direct rows and retain their
+        ownership until :meth:`release_cache_exchange_refs` is called.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement exchange() for caching mode"
+        )
+
+    def release_cache_exchange_refs(
+        self,
+        cache: "Cache",
+        cache_slots: torch.Tensor,
+        storage_slots: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        """Release aligned cache/direct-storage refs after optimizer update.
+
+        Backends configured behind a cache must implement this together with
+        :meth:`exchange`. Built-in storage releases both layouts in one kernel;
+        opaque backends may use their own reference layout.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement "
+            "release_cache_exchange_refs() for caching mode"
+        )
+
     @abc.abstractmethod
     def find(
         self,
@@ -281,6 +433,51 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
 
 class Cache(abc.ABC):
     @abc.abstractmethod
+    def decrement_counter(
+        self,
+        slot_indices: torch.Tensor,
+        table_ids: torch.Tensor,
+        *,
+        fallback_slot_indices: Optional[torch.Tensor] = None,
+        fallback_storage: Optional[Storage] = None,
+    ) -> None:
+        """Release aligned cache refs and optional storage fallbacks."""
+        ...
+
+    @abc.abstractmethod
+    def find_or_insert(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> CacheFindOrInsertResult:
+        """Find existing keys or provision cache slots in one operation."""
+        ...
+
+    @abc.abstractmethod
+    def reclaim(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        slot_indices: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        """Release provisional slots selected by ``mask`` for immediate reuse."""
+        ...
+
+    @abc.abstractmethod
+    def update_scores(
+        self,
+        keys: torch.Tensor,
+        slot_indices: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        """Replace scores at known slots still owned by the expected keys."""
+        ...
+
+    @abc.abstractmethod
     def lookup(
         self,
         unique_keys: torch.Tensor,
@@ -342,28 +539,40 @@ class Counter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        founds: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
+        Add missing keys with frequencies to the `Counter` and get accumulated
+        counters in the original input layout.
 
         Args:
             keys (torch.Tensor): The input keys, should be unique keys.
             table_ids (torch.Tensor): The table id for each key.
             frequencies (torch.Tensor): The input frequencies.
+            founds (torch.Tensor): Full-length boolean mask. Positions where
+                ``founds`` is true are skipped.
 
         Returns:
-            accumulated_frequencies (torch.Tensor): the frequencies' state for the input keys.
+            accumulated_frequencies (torch.Tensor): Full-length accumulated
+                frequencies. Skipped positions are zero.
         """
         ...
 
     @abc.abstractmethod
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
+    def erase(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
         """
-        Erase keys from the `Counter`.
+        Erase selected keys from the `Counter` without compacting the inputs.
 
         Args:
             keys (torch.Tensor): The input keys to be erased.
             table_ids (torch.Tensor): The table id for each key.
+            mask (torch.Tensor): Full-length boolean mask. Positions where
+                ``mask`` is true are erased.
         """
 
     @abc.abstractmethod
@@ -404,17 +613,19 @@ class AdmissionStrategy(abc.ABC):
         self,
         keys: torch.Tensor,
         frequencies: torch.Tensor,
+        founds: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Admit keys with frequencies >= threshold.
+        Return a full-length admission mask for positions not already found.
         """
 
     @abc.abstractmethod
     def initialize_non_admitted_embeddings(
         self,
         buffer: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> None:
+        mask: torch.Tensor,
+    ) -> bool:
         """
-        Initialize the embeddings for the keys that are not admitted.
+        Initialize rows selected by a full-length boolean mask and return
+        whether an initializer was configured.
         """

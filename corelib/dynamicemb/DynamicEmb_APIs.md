@@ -512,8 +512,9 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             Keys that don't meet the criteria will still be initialized and used in the forward pass,
             but won't be stored in the table. Default is None (all keys are admitted).
         admission_counter : Optional[Counter], optional
-            Counter for tracking the number of keys that have been admitted to the embedding table.
-            If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
+            Counter for accumulating frequencies of keys that are still subject
+            to admission. Keys already found in cache or storage are skipped,
+            and keys are removed from the counter when they are admitted.
             Default is None (no counter is used).    
         
         Notes
@@ -742,39 +743,59 @@ Setting the environment variable DYNAMICEMB_CSTM_SCORE_CHECK to 0 will not throw
 
 ## Counter
 
-**dynamicemb** provides an interface to the Counter which will be used in the embedding admission, and the users can customize the counter implementation by inherit the class `Counter`.
+**dynamicemb** provides a multi-table `Counter` interface for embedding
+admission. Cache prefetch passes tensors in their original, full layout. Other
+storage paths may invoke the same API on an already-compacted missing-key
+subset, with an all-false `founds` mask. Implementations must apply the supplied
+boolean masks directly rather than requiring an additional compaction.
 
 
 ```python
 class Counter(abc.ABC):
     """
     Interface of a counter table which maps a key to a counter.
+    Supports multiple logical tables through table_ids.
     """
 
     @abc.abstractmethod
     def add(
-        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: torch.Tensor,
+        founds: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
-        For not existed keys, the frequencies will be assigned directly.
-        For existing keys, the frequencies will be accumulated.
+        Accumulate frequencies for keys that are not already found.
+
         Args:
-            keys (torch.Tensor): The input keys, should be unique keys.
-            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
-            inplace: If true then store the accumulated_frequencies to counter.
+            keys (torch.Tensor): Full-length unique input keys.
+            table_ids (torch.Tensor): Logical table ID for every key.
+            frequencies (torch.Tensor): Frequency increment for every key.
+            founds (torch.Tensor): Full-length boolean mask. A true element
+                means the key was found in cache or storage and must be skipped.
+
         Returns:
-            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
+            torch.Tensor: Full-length accumulated frequencies. Positions
+                skipped by founds are zero.
         """
-        accumulated_frequencies: torch.Tensor
-        return accumulated_frequencies
+        ...
 
     @abc.abstractmethod
-    def erase(self, keys) -> None:
+    def erase(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
         """
-        Erase keys form the `Counter`.
+        Erase selected keys without compacting the input tensors.
+
         Args:
-            keys (torch.Tensor): The input keys to be erased.
+            keys (torch.Tensor): Full-length input keys.
+            table_ids (torch.Tensor): Logical table ID for every key.
+            mask (torch.Tensor): Full-length boolean mask. True positions are
+                erased; false positions are ignored.
         """
 
     @abc.abstractmethod
@@ -786,36 +807,37 @@ class Counter(abc.ABC):
         """
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file) -> None:
+    def load(self, key_file, counter_file, table_id: int) -> None:
         """
         Load keys and frequencies from input file path.
+
         Args:
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
+            table_id (int): the logical table to load into.
         """
 
     @abc.abstractmethod
-    def dump(self, key_file, counter_file) -> None:
+    def dump(self, key_file, counter_file, table_id: int) -> None:
         """
         Dump keys and frequencies to output file path.
+
         Args:
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
-        """
-        
-    @abc.abstractmethod
-    def create(self, device: torch.device) -> "Counter":
-        """
-        Create the counter table on the specified device.
+            table_id (int): the logical table to dump.
         """
 ```
 
-**dynamicemb** also provides a built-in counter implementation named `KVCounter`.
-There is as capacity limit of `KVCounter` which is bucketized, and the key with the smallest frequency will be evicted from the bucket for a new key if the bucket is full. 
+**dynamicemb** provides `KVCounter` as the per-table user configuration for
+the built-in counter. At runtime, the table group combines these configurations
+into a multi-table counter. Its storage is bucketized and capacity-limited; if a
+bucket is full, inserting another key can evict the key with the smallest
+frequency in that bucket.
 
 ```python
 
-class KVCounter(Counter):
+class KVCounter:
     """
     Interface of a counter table which maps a key to a counter.
     """
@@ -831,7 +853,12 @@ class KVCounter(Counter):
 ## AdmissionStrategy
 
 **AdmissionStrategy** is another component for implementing embedding admission.
-The keys not in the dynamic embedding table, will first be passed to the `Counter`, after get the accumulated frequencies among the previous training process, the `AdmissionStrategy` will determine which keys will be admitted into the dynamic embedding table.
+In cache prefetch, the cache/storage lookup result is carried in the original
+layout as a full-length `founds` mask. Other storage paths may pass an
+already-compacted missing-key subset with an all-false mask. In either case,
+only positions where `founds` is false are accumulated by the `Counter` and
+considered by the strategy, so the cache path does not need another compaction
+for globally new keys.
 
 ```python
 class AdmissionStrategy(abc.ABC):
@@ -840,19 +867,31 @@ class AdmissionStrategy(abc.ABC):
         self,
         keys: torch.Tensor,
         frequencies: torch.Tensor,
+        founds: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Admit keys with frequencies >= threshold.
+        Return a full-length boolean admission mask.
+
+        Positions where founds is true must be false in the returned mask.
         """
 
     @abc.abstractmethod
-    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
+    def initialize_non_admitted_embeddings(
+        self,
+        buffer: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> bool:
         """
-        Get the initializer args for keys that are not admitted.
+        Initialize buffer rows selected by a full-length boolean mask.
+
+        Returns true when a non-admitted initializer is configured and was run.
         """
 ```
 
-**dynamicemb** provides built-in `FrequencyAdmissionStrategy`, which will return keys whose frequencies are not less than the threshold.
+**dynamicemb** provides `FrequencyAdmissionStrategy`, which returns a
+full-length mask selecting only previously unfound keys whose accumulated
+frequency is at least the configured threshold. Admitted positions can then be
+erased from the counter with the same full-layout tensors and admission mask.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):

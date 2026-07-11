@@ -15,6 +15,9 @@
 
 import os
 import random
+import subprocess
+import sys
+import textwrap
 from typing import List
 
 import pytest
@@ -1022,3 +1025,65 @@ def test_overflow_with_counter(key_type, table_config):
 
     print("Phase 7 passed: reset verified")
     print("test_overflow_with_counter PASSED")
+
+
+def test_find_or_insert_traps_after_overflow_exhaustion():
+    """Final cache Busy is fatal, but main-to-overflow fallback still works.
+
+    The intentional device trap must run in a child process because it poisons
+    that process's CUDA context. The sentinel proves all main and overflow rows
+    were provisioned successfully before the one extra insertion trapped.
+    """
+    assert torch.cuda.is_available()
+    child = textwrap.dedent(
+        """
+        import os
+
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+
+        import torch
+        from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
+        from dynamicemb_extensions import ScorePolicy
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        table = get_scored_table(
+            capacity=[16],
+            bucket_capacity=16,
+            key_type=torch.int64,
+            score_specs=[ScoreSpec(name="score", policy=ScorePolicy.ASSIGN)],
+            device=device,
+            enable_overflow=True,
+        )
+
+        def find_or_insert(begin, end):
+            keys = torch.arange(begin, end, dtype=torch.int64, device=device)
+            table_ids = torch.zeros(keys.numel(), dtype=torch.int64, device=device)
+            scores = ScoreArg(
+                name="score",
+                value=torch.ones(keys.numel(), dtype=torch.uint64, device=device),
+                policy=ScorePolicy.ASSIGN,
+            )
+            return table.find_or_insert(keys, table_ids, scores)
+
+        indices, *_ = find_or_insert(1, 65)
+        torch.cuda.synchronize()
+        assert bool((indices >= 0).all().item())
+        print("FIND_OR_INSERT_OVERFLOW_FULL", flush=True)
+
+        find_or_insert(65, 66)
+        torch.cuda.synchronize()
+        raise RuntimeError("final cache Busy did not trap")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert "FIND_OR_INSERT_OVERFLOW_FULL" in output, output
+    assert result.returncode != 0, output
+    assert "final cache Busy did not trap" not in output, output

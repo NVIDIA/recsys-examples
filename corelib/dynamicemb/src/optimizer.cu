@@ -29,10 +29,44 @@ constexpr int WARPSIZE = 32;
 constexpr int OPTIMIZER_BLOCKSIZE_VEC = 64;
 constexpr int OPTIMIZER_BLOCKSIZE = 1024;
 
+void validate_flat_table_fallback(
+    const at::Tensor &indices, const at::Tensor &table_ptrs,
+    const std::optional<at::Tensor> &fallback_indices,
+    const std::optional<at::Tensor> &fallback_table_ptrs) {
+  TORCH_CHECK(fallback_indices.has_value() == fallback_table_ptrs.has_value(),
+              "fallback_indices and fallback_table_ptrs must be provided "
+              "together");
+  if (!fallback_indices.has_value())
+    return;
+
+  TORCH_CHECK(fallback_indices->defined() && fallback_table_ptrs->defined(),
+              "fallback_indices and fallback_table_ptrs must be defined");
+  TORCH_CHECK(fallback_indices->is_cuda() && fallback_table_ptrs->is_cuda(),
+              "fallback_indices and fallback_table_ptrs must be CUDA tensors");
+  TORCH_CHECK(fallback_indices->scalar_type() == indices.scalar_type(),
+              "fallback_indices must have the same dtype as indices");
+  TORCH_CHECK(fallback_table_ptrs->scalar_type() == table_ptrs.scalar_type(),
+              "fallback_table_ptrs must have the same dtype as table_ptrs");
+  TORCH_CHECK(fallback_indices->numel() == indices.numel(),
+              "fallback_indices must have the same number of elements as "
+              "indices");
+  TORCH_CHECK(fallback_table_ptrs->numel() == table_ptrs.numel(),
+              "fallback_table_ptrs must have the same number of elements as "
+              "table_ptrs");
+  TORCH_CHECK(fallback_indices->get_device() == indices.get_device() &&
+                  fallback_table_ptrs->get_device() == table_ptrs.get_device(),
+              "fallback tensors must be on the same device as their primary "
+              "tensors");
+  TORCH_CHECK(fallback_indices->is_contiguous() &&
+                  fallback_table_ptrs->is_contiguous(),
+              "fallback_indices and fallback_table_ptrs must be contiguous");
+}
+
 template <typename GradType, typename WeightType, typename IndexType,
           typename OptimizerType>
 void launch_update_kernel_for_flat_table(
     GradType *grads, int64_t *table_ptrs, IndexType *indices,
+    IndexType *fallback_indices, int64_t *fallback_table_ptrs,
     int64_t *table_ids, int64_t *table_value_dims, int64_t *table_emb_dims,
     OptimizerType opt, int64_t const ev_nums, uint32_t const grad_stride,
     uint32_t const max_emb_dim, bool all_dims_vec4, int device_id,
@@ -58,8 +92,8 @@ void launch_update_kernel_for_flat_table(
         update4_with_index_flat_table_kernel<GradType, WeightType, IndexType,
                                              OptimizerType>;
     kernel<<<grid_size, OPTIMIZER_BLOCKSIZE_VEC, 0, stream>>>(
-        ev_nums, grad_stride, grads, table_ptrs, indices, table_ids,
-        table_value_dims, table_emb_dims, opt);
+        ev_nums, grad_stride, grads, table_ptrs, indices, fallback_indices,
+        fallback_table_ptrs, table_ids, table_value_dims, table_emb_dims, opt);
   } else {
     int block_size =
         max_emb_dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : max_emb_dim;
@@ -68,8 +102,8 @@ void launch_update_kernel_for_flat_table(
     auto kernel = update_with_index_flat_table_kernel<GradType, WeightType,
                                                       IndexType, OptimizerType>;
     kernel<<<grid_size, block_size, smem_size_f(block_size), stream>>>(
-        ev_nums, grad_stride, grads, table_ptrs, indices, table_ids,
-        table_value_dims, table_emb_dims, opt);
+        ev_nums, grad_stride, grads, table_ptrs, indices, fallback_indices,
+        fallback_table_ptrs, table_ids, table_value_dims, table_emb_dims, opt);
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -79,13 +113,17 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                at::Tensor table_value_dims,
                                at::Tensor table_emb_dims, int64_t max_emb_dim,
                                bool all_dims_vec4, float const lr,
-                               int64_t table_dtype) {
+                               int64_t table_dtype,
+                               std::optional<at::Tensor> fallback_indices,
+                               std::optional<at::Tensor> fallback_table_ptrs) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
+  validate_flat_table_fallback(indices, table_ptrs, fallback_indices,
+                               fallback_table_ptrs);
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -100,6 +138,9 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto grad_ptr = get_pointer<g_t>(grads);
         auto table_ptrs_ptr = get_pointer<int64_t>(table_ptrs);
         auto index_ptr = get_pointer<i_t>(indices);
+        auto fallback_index_ptr = get_pointer<i_t>(fallback_indices);
+        auto fallback_table_ptrs_ptr =
+            get_pointer<int64_t>(fallback_table_ptrs);
         auto tid_ptr = get_pointer<int64_t>(table_ids);
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
@@ -107,8 +148,9 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         SgdVecOptimizer<g_t, w_t> opt{lr};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
+            grad_ptr, table_ptrs_ptr, index_ptr, fallback_index_ptr,
+            fallback_table_ptrs_ptr, tid_ptr, tvd_ptr, ted_ptr, opt, ev_nums,
+            grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
       });
     });
   });
@@ -121,13 +163,17 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float beta1, const float beta2,
                                 const float eps, const float weight_decay,
                                 const uint32_t iter_num, int64_t max_emb_dim,
-                                bool all_dims_vec4, int64_t table_dtype) {
+                                bool all_dims_vec4, int64_t table_dtype,
+                                std::optional<at::Tensor> fallback_indices,
+                                std::optional<at::Tensor> fallback_table_ptrs) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
+  validate_flat_table_fallback(indices, table_ptrs, fallback_indices,
+                               fallback_table_ptrs);
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -142,6 +188,9 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto grad_ptr = get_pointer<g_t>(grads);
         auto table_ptrs_ptr = get_pointer<int64_t>(table_ptrs);
         auto index_ptr = get_pointer<i_t>(indices);
+        auto fallback_index_ptr = get_pointer<i_t>(fallback_indices);
+        auto fallback_table_ptrs_ptr =
+            get_pointer<int64_t>(fallback_table_ptrs);
         auto tid_ptr = get_pointer<int64_t>(table_ids);
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
@@ -150,8 +199,9 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                        eps, weight_decay, iter_num};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
+            grad_ptr, table_ptrs_ptr, index_ptr, fallback_index_ptr,
+            fallback_table_ptrs_ptr, tid_ptr, tvd_ptr, ted_ptr, opt, ev_nums,
+            grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
       });
     });
   });
@@ -162,13 +212,17 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                    at::Tensor table_value_dims,
                                    at::Tensor table_emb_dims, const float lr,
                                    const float eps, int64_t max_emb_dim,
-                                   bool all_dims_vec4, int64_t table_dtype) {
+                                   bool all_dims_vec4, int64_t table_dtype,
+                                   std::optional<at::Tensor> fallback_indices,
+                                   std::optional<at::Tensor> fallback_table_ptrs) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
+  validate_flat_table_fallback(indices, table_ptrs, fallback_indices,
+                               fallback_table_ptrs);
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -183,6 +237,9 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto grad_ptr = get_pointer<g_t>(grads);
         auto table_ptrs_ptr = get_pointer<int64_t>(table_ptrs);
         auto index_ptr = get_pointer<i_t>(indices);
+        auto fallback_index_ptr = get_pointer<i_t>(fallback_indices);
+        auto fallback_table_ptrs_ptr =
+            get_pointer<int64_t>(fallback_table_ptrs);
         auto tid_ptr = get_pointer<int64_t>(table_ids);
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
@@ -190,8 +247,9 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         AdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
+            grad_ptr, table_ptrs_ptr, index_ptr, fallback_index_ptr,
+            fallback_table_ptrs_ptr, tid_ptr, tvd_ptr, ted_ptr, opt, ev_nums,
+            grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
       });
     });
   });
@@ -202,13 +260,17 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
                                     at::Tensor table_value_dims,
                                     at::Tensor table_emb_dims, const float lr,
                                     const float eps, int64_t max_emb_dim,
-                                    bool all_dims_vec4, int64_t table_dtype) {
+                                    bool all_dims_vec4, int64_t table_dtype,
+                                    std::optional<at::Tensor> fallback_indices,
+                                    std::optional<at::Tensor> fallback_table_ptrs) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
+  validate_flat_table_fallback(indices, table_ptrs, fallback_indices,
+                               fallback_table_ptrs);
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -223,6 +285,9 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto grad_ptr = get_pointer<g_t>(grads);
         auto table_ptrs_ptr = get_pointer<int64_t>(table_ptrs);
         auto index_ptr = get_pointer<i_t>(indices);
+        auto fallback_index_ptr = get_pointer<i_t>(fallback_indices);
+        auto fallback_table_ptrs_ptr =
+            get_pointer<int64_t>(fallback_table_ptrs);
         auto tid_ptr = get_pointer<int64_t>(table_ids);
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
@@ -230,8 +295,9 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
         RowWiseAdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
+            grad_ptr, table_ptrs_ptr, index_ptr, fallback_index_ptr,
+            fallback_table_ptrs_ptr, tid_ptr, tvd_ptr, ted_ptr, opt, ev_nums,
+            grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
             [](int block_size) { return block_size * sizeof(float); });
       });
     });
@@ -418,7 +484,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("indices"), py::arg("table_ptrs"), py::arg("table_ids"),
         py::arg("table_value_dims"), py::arg("table_emb_dims"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("lr"),
-        py::arg("table_dtype"));
+        py::arg("table_dtype"), py::arg("fallback_indices") = py::none(),
+        py::arg("fallback_table_ptrs") = py::none());
 
   m.def("adam_update_for_flat_table", &dyn_emb::adam_update_for_flat_table,
         "Adam optimizer for multi-table buffer via table_ptrs",
@@ -427,7 +494,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("beta1"),
         py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"),
         py::arg("iter_num"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"));
+        py::arg("table_dtype"), py::arg("fallback_indices") = py::none(),
+        py::arg("fallback_table_ptrs") = py::none());
 
   m.def(
       "adagrad_update_for_flat_table", &dyn_emb::adagrad_update_for_flat_table,
@@ -435,7 +503,9 @@ void bind_optimizer_kernel_op(py::module &m) {
       py::arg("grads"), py::arg("indices"), py::arg("table_ptrs"),
       py::arg("table_ids"), py::arg("table_value_dims"),
       py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
-      py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("table_dtype"));
+      py::arg("max_emb_dim"), py::arg("all_dims_vec4"), py::arg("table_dtype"),
+      py::arg("fallback_indices") = py::none(),
+      py::arg("fallback_table_ptrs") = py::none());
 
   m.def("rowwise_adagrad_for_flat_table",
         &dyn_emb::rowwise_adagrad_for_flat_table,
@@ -444,7 +514,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_ids"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"));
+        py::arg("table_dtype"), py::arg("fallback_indices") = py::none(),
+        py::arg("fallback_table_ptrs") = py::none());
 
   m.def("sgd_update_for_padded_buffer", &dyn_emb::sgd_update_for_padded_buffer,
         "SGD optimizer for contiguous padded buffer", py::arg("grads"),
