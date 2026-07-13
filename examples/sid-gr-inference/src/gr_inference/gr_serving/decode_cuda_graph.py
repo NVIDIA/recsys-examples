@@ -235,6 +235,12 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
             (int(graph.active_beam_width), int(graph.beam_token_ids.shape[0]))
             for graph in self._graphs.values()
         }
+        # The caller replays the just-captured graph immediately after _capture,
+        # so keep its output buffer alive even when the base store did not retain
+        # the entry (max_entries <= 0 clears _graphs and drops the new entry).
+        live_shapes.add(
+            (int(entry.active_beam_width), int(entry.beam_token_ids.shape[0]))
+        )
         for shape in list(self._shared_logits):
             if shape not in live_shapes:
                 del self._shared_logits[shape]

@@ -145,3 +145,18 @@ def test_shared_logits_buffer_kept_until_last_live_graph_evicted():
     runner._shared_logits_for(_beam_token_ids(3), active_beam_width=1024)
     runner._store_graph(("d",), _decode_entry(1024, 3))  # evicts ("b",); no live (1024,1)
     assert (1024, 1) not in runner._shared_logits
+
+
+def test_shared_logits_buffer_kept_for_just_captured_entry_when_caching_disabled():
+    runner = _runner()
+    runner.max_entries = 0  # base _store_graph retains no graph entries
+
+    buf = runner._shared_logits_for(_beam_token_ids(1), active_beam_width=1024)
+    runner._store_graph(("a",), _decode_entry(1024, 1))
+
+    # max_entries=0 leaves _graphs empty, but the caller replays the just-captured
+    # graph immediately after _capture, so its output buffer must stay alive (and
+    # is reused by the next same-shape capture instead of being re-allocated).
+    assert (1024, 1) in runner._shared_logits
+    assert runner._shared_logits[(1024, 1)] is buf
+    assert runner._shared_logits_for(_beam_token_ids(1), active_beam_width=1024) is buf
