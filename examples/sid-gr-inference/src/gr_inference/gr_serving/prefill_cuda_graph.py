@@ -44,6 +44,8 @@ class GRPrefillCudaGraphRunner(CudaGraphCacheMixin):
     to the same pool slice that downstream decode will read.
     """
 
+    _separate_pools_env = "GR_INFERENCE_PREFILL_CUDA_GRAPH_SEPARATE_POOLS"
+
     def __init__(self, model: Any) -> None:
         self.model = model
         self.max_entries = _env_int("GR_INFERENCE_PREFILL_CUDA_GRAPH_MAX_ENTRIES", 32)
@@ -350,16 +352,6 @@ class GRPrefillCudaGraphRunner(CudaGraphCacheMixin):
         self.captures += 1
         self.piecewise_captures += 1
         return entry
-
-    def _graph_capture_kwargs(self, torch) -> dict[str, Any]:
-        if _env_flag("GR_INFERENCE_PREFILL_CUDA_GRAPH_SEPARATE_POOLS"):
-            return {}
-        graph_pool_handle = getattr(torch.cuda, "graph_pool_handle", None)
-        if self._graph_pool is None and callable(graph_pool_handle):
-            self._graph_pool = graph_pool_handle()
-        if self._graph_pool is None:
-            return {}
-        return {"pool": self._graph_pool}
 
     def _can_capture_piecewise(self) -> bool:
         return (

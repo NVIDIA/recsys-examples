@@ -168,6 +168,9 @@ Core implementation points:
   small inputs such as beam token IDs and topK indices.
 - Decode graph cache uses an entry limit, LRU eviction, and pointer guards. A
   graph is not reused if pool slice addresses do not match.
+- Decode-graph captures share a single CUDA-graph private pool and one logits
+  output buffer per `(beam_width, bucket)`, so capture memory stays roughly
+  flat as the number of captured graphs grows.
 - Online serving warms up the common batch, pool-window, and `/generate
   ignore_eos` shapes at startup, then freezes new graph capture by default.
 - QK norm and RoPE prefer the fastest available SGLang-style in-place kernels,
@@ -196,6 +199,18 @@ Decode graph cache size can be configured with:
 
 ```bash
 GR_INFERENCE_DECODE_CUDA_GRAPH_MAX_ENTRIES=32
+```
+
+By default, decode-graph (and prefill piecewise) captures share one private
+graph pool, and decode captures share one `[batch, beam, vocab]` logits
+output buffer per `(beam_width, bucket)`. To opt out and give each capture
+its own private pool / per-entry logits (for debugging or A/B comparison),
+set:
+
+```bash
+GR_INFERENCE_DECODE_CUDA_GRAPH_SEPARATE_POOLS=1
+GR_INFERENCE_PREFILL_CUDA_GRAPH_SEPARATE_POOLS=1
+GR_INFERENCE_DECODE_CUDA_GRAPH_SEPARATE_LOGITS=1
 ```
 
 ## 5. Baseline
