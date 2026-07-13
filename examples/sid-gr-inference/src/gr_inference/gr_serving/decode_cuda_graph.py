@@ -224,6 +224,21 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
             self._shared_logits[key] = buf
         return buf
 
+    def _store_graph(self, key: tuple[Any, ...], entry: Any) -> None:
+        super()._store_graph(key, entry)
+        # The shared logits buffers are keyed by (beam_width, bucket), which is
+        # independent of the graph LRU. After the base store (which may evict the
+        # least-recently-used graph), drop buffers whose shape no longer has any
+        # live graph entry, so a large transient capture cannot stay resident
+        # after its graphs are evicted (which would re-grow idle memory).
+        live_shapes = {
+            (int(graph.active_beam_width), int(graph.beam_token_ids.shape[0]))
+            for graph in self._graphs.values()
+        }
+        for shape in list(self._shared_logits):
+            if shape not in live_shapes:
+                del self._shared_logits[shape]
+
     def _capture(
         self,
         key: tuple[Any, ...],

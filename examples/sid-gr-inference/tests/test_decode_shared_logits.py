@@ -12,6 +12,8 @@ Covers:
 CPU-only (no GPU required).
 """
 
+import types
+
 import torch
 
 from gr_inference.gr_models.qwen3.model import _linear_project
@@ -98,3 +100,48 @@ def test_shared_logits_for_matches_lm_head_dtype_and_vocab():
 
     assert tuple(buf.shape) == (4, 1024, 32)
     assert buf.dtype == runner.model.lm_head.weight.dtype
+
+
+def _beam_token_ids(bucket: int):
+    return torch.empty((bucket, 1024), dtype=torch.long)
+
+
+def _decode_entry(beam_width: int, bucket: int):
+    """Minimal stand-in for ``_DecodeGraphEntry`` for store/eviction tests."""
+    return types.SimpleNamespace(
+        active_beam_width=beam_width,
+        beam_token_ids=torch.empty((bucket, beam_width), dtype=torch.long),
+    )
+
+
+def test_shared_logits_buffer_freed_when_its_shape_is_evicted():
+    runner = _runner()
+    runner.max_entries = 1  # only one live graph: storing a 2nd evicts the 1st
+
+    runner._shared_logits_for(_beam_token_ids(1), active_beam_width=1024)
+    runner._store_graph(("a",), _decode_entry(1024, 1))
+    assert (1024, 1) in runner._shared_logits
+
+    runner._shared_logits_for(_beam_token_ids(2), active_beam_width=1024)
+    runner._store_graph(("b",), _decode_entry(1024, 2))  # evicts ("a",)
+
+    assert (1024, 1) not in runner._shared_logits  # evicted shape -> buffer freed
+    assert (1024, 2) in runner._shared_logits       # live shape -> buffer kept
+    assert len(runner._shared_logits) == 1
+
+
+def test_shared_logits_buffer_kept_until_last_live_graph_evicted():
+    runner = _runner()
+    runner.max_entries = 2
+
+    runner._shared_logits_for(_beam_token_ids(1), active_beam_width=1024)
+    runner._store_graph(("a",), _decode_entry(1024, 1))
+    runner._store_graph(("b",), _decode_entry(1024, 1))  # two live, same shape
+
+    runner._shared_logits_for(_beam_token_ids(2), active_beam_width=1024)
+    runner._store_graph(("c",), _decode_entry(1024, 2))  # evicts ("a",); ("b",) keeps (1024,1)
+    assert (1024, 1) in runner._shared_logits
+
+    runner._shared_logits_for(_beam_token_ids(3), active_beam_width=1024)
+    runner._store_graph(("d",), _decode_entry(1024, 3))  # evicts ("b",); no live (1024,1)
+    assert (1024, 1) not in runner._shared_logits
