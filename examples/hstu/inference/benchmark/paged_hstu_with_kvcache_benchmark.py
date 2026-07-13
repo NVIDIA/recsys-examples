@@ -429,7 +429,8 @@ def run_single_bench(
 
 
 def run_benchmark():
-    page_size = 128 if torch.cuda.get_device_capability()[0] >= 10 else 32
+    sm_major = torch.cuda.get_device_capability()[0]
+    page_size = 128 if sm_major >= 10 and sm_major < 12 else 32
     num_pages = math.ceil(10240 * 32 / page_size)
     kwargs = {
         # model config

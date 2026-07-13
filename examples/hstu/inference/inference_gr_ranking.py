@@ -400,7 +400,7 @@ def run_ranking_gr_evaluate(
             shuffle=False,
             random_seed=0,
             eval_batch_size=max_batch_size,
-            load_candidate_action=False,
+            load_candidate_action=True,
         )
 
         dataloader = get_data_loader(dataset=eval_dataset)

@@ -1,8 +1,8 @@
 # Triton PyTorch AOTI backend config
-# Model input  slots: input__0 (values), input__1 (lengths), input__2 (num_candidates), input__3 (user_ids), input__4 (total_history_lengths)
-#       output slots: output__0 (logits), output__1 (kvcache_task_ids)
+# Model input  slots: input__0 (values), input__1 (lengths), input__2 (num_candidates)
+#       output slots: output__0 (logits)
 
-name: "hstu_gr_ranking_kvcache"
+name: "hstu_gr_ranking"
 platform: "torch_aoti"
 max_batch_size: 0
 
@@ -21,16 +21,6 @@ input [
     name: "INPUT__2"
     data_type: TYPE_INT64
     dims: [ -1 ]
-  },
-  {
-    name: "INPUT__3"
-    data_type: TYPE_INT64
-    dims: [ -1 ]
-  },
-  {
-    name: "INPUT__4"
-    data_type: TYPE_INT64
-    dims: [ -1 ]
   }
 ]
 
@@ -39,11 +29,6 @@ output [
     name: "OUTPUT__0"
     data_type: TYPE_FP32
     dims: [ -1, 8 ]
-  },
-  {
-    name: "OUTPUT__1"
-    data_type: TYPE_INT64
-    dims: [ -1 ]
   }
 ]
 
@@ -60,5 +45,5 @@ instance_group [
 # process-global registry. Replaces the old LD_PRELOAD nve_load_shim.so.
 parameters {
   key: "MODEL_INIT_LIBRARY"
-  value: { string_value: "/home/junyiq/newscratch/spring26/recsys-examples/examples/hstu/nve_init_hook/build/libnve_init_hook.so" }
+  value: { string_value: "/workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so" }
 }

@@ -571,12 +571,16 @@ def export_inference_gr_ranking(
             example_values = batch.features.values()
             example_lengths = batch.features.lengths()
             example_num_candidates = batch.num_candidates
+            user_ids_cuda, total_history_lengths_cuda = (
+                user_ids.cuda(),
+                total_history_lengths.cuda(),
+            )
             example_inputs = (
                 example_values,
                 example_lengths,
                 example_num_candidates,
-                user_ids,
-                total_history_lengths,
+                user_ids_cuda,
+                total_history_lengths_cuda,
             )
 
             with torch.inference_mode():
@@ -592,13 +596,13 @@ def export_inference_gr_ranking(
             sc[example_values] = {0: Dim("tokens", min=1, max=40000)}
             sc[example_lengths] = {0: dim_batch * num_features}
             sc[example_num_candidates] = {0: dim_batch}
-            sc[user_ids] = {0: dim_batch}
-            sc[total_history_lengths] = {0: dim_batch}
+            sc[user_ids_cuda] = {0: dim_batch}
+            sc[total_history_lengths_cuda] = {0: dim_batch}
             dynamic_shapes = sc.dynamic_shapes(export_model, example_inputs)
             print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
             # export & aoti_compile_and_package
-            export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
+            export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_kvcache_model")
             export_aot(
                 export_model,
                 example_inputs,

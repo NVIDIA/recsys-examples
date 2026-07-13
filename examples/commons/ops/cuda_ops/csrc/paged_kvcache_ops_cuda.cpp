@@ -127,7 +127,7 @@ void check_cuda_status(cudaError_t status, const char* message) {
 
 at::Tensor append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
                                  at::Tensor positions, at::Tensor seqlen_offsets, 
-                                 at::Tensor nnz_cuda,
+                                 at::Tensor nnz_cuda, int64_t max_nnz,
                                  at::Tensor kv_cache_table,
                                  at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
                                  int64_t kv_layout) {
@@ -137,7 +137,10 @@ at::Tensor append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value,
   TORCH_CHECK(nnz_cuda.numel() == 1, "nnz_cuda must contain exactly one element");
   auto paged_k_cache = kv_cache_table.select(1, 0);
   auto paged_v_cache = kv_cache_table.select(1, 1);
-  const auto nnz = static_cast<unsigned int>(nnz_cuda.item<int32_t>());
+  auto nnz = max_nnz;
+  if (max_nnz == 0) {
+    nnz = static_cast<unsigned int>(nnz_cuda.item<int32_t>());
+  }
   if (nnz == 0) {
     return kv_cache_table;
   }
@@ -326,7 +329,7 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
 #endif
 
 TORCH_LIBRARY_FRAGMENT(paged_kvcache_ops, m) {
-  m.def("append_kvcache(Tensor append_key, Tensor append_value, Tensor batch_indices, Tensor positions, Tensor seqlen_offsets, Tensor nnz_cuda, Tensor kv_cache_table, Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len, int kv_layout) -> Tensor");
+  m.def("append_kvcache(Tensor append_key, Tensor append_value, Tensor batch_indices, Tensor positions, Tensor seqlen_offsets, Tensor nnz_cuda, int max_nnz, Tensor kv_cache_table, Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len, int kv_layout) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(paged_kvcache_ops, CUDA, m) {

@@ -8,6 +8,7 @@ def _append_kvcache_fake(
     positions,
     seqlen_offsets,
     nnz_cuda,
+    nnz: int,
     kv_cache_table,
     kv_indices,
     kv_indptr,

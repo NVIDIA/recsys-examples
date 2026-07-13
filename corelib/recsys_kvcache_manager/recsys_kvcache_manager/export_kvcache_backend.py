@@ -160,6 +160,9 @@ class ExportKVCacheBackend(KVCacheBackend):
 	
 	def offload_reap_completed(self) -> None:
 		torch.ops.kvcache_manager_ops.offload_reap_completed()
+	
+	def offload_flush(self) -> None:
+		raise NotImplementedError("ExportKVCacheBackend.offload_flush is not implemented yet.")
 
 	def evict(
 		self, user_ids: torch.Tensor, for_gpu: bool = False, for_host: bool = False

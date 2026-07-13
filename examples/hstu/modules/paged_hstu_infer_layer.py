@@ -346,6 +346,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 kv_cache_metadata.position,
                 jd.num_candidates_offsets[: batch_size + 1],
                 kv_cache_metadata.new_history_nnz_cuda,
+                0,  # max_nnz, 0 means use nnz_cuda
                 kv_cache_table,
                 kv_cache_metadata.kv_indices,
                 kv_cache_metadata.kv_indptr,
@@ -441,6 +442,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 kv_cache_metadata.position,
                 jd.num_candidates_offsets[: batch_size + 1],
                 kv_cache_metadata.new_history_nnz_cuda,
+                kv_cache_metadata.new_history_nnz,
                 kv_cache_table,
                 kv_cache_metadata.kv_indices,
                 kv_cache_metadata.kv_indptr,

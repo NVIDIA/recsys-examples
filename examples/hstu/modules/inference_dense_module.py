@@ -374,7 +374,8 @@ class InferenceDenseModule(torch.nn.Module):
                 finally:
                     torch.cuda.nvtx.range_pop()
 
-            num_tokens = batch.features.values().shape[0]
+            # num_tokens = batch.features.values().shape[0]
+            num_tokens = jagged_data.values.shape[0]
             if self.use_cudagraph:
                 self._hidden_states[:num_tokens, ...].copy_(
                     jagged_data.values, non_blocking=True
@@ -420,7 +421,8 @@ class InferenceDenseModule(torch.nn.Module):
             )
             jagged_data.scaling_seqlen = self._scaling_seqlen
 
-            num_tokens = batch.features.values().shape[0]
+            # num_tokens = batch.features.values().shape[0]
+            num_tokens = jagged_data.values.shape[0]
             if self.use_cudagraph:
                 self._hidden_states[:num_tokens, ...].copy_(
                     jagged_data.values, non_blocking=True

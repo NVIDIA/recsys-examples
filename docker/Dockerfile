@@ -157,10 +157,10 @@ RUN cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
     cmake .. && make -j
 
 RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')" && \
-    cmake -S "./examples/hstu/inference/cpp_inference" -B "./examples/hstu/inference/cpp_inference/build" && \
-    cmake --build "./examples/hstu/inference/cpp_inference/build" -j 8 && \
-    cmake -S "./examples/hstu/inference/nve_init_hook" -B "./examples/hstu/inference/nve_init_hook/build" && \
-    cmake --build "./examples/hstu/inference/nve_init_hook/build" -j 8
+    cmake -S "./examples/hstu/inference_aoti/cpp_inference" -B "./examples/hstu/inference_aoti/cpp_inference/build" && \
+    cmake --build "./examples/hstu/inference_aoti/cpp_inference/build" -j 8 && \
+    cmake -S "./examples/hstu/inference_aoti/nve_init_hook" -B "./examples/hstu/inference_aoti/nve_init_hook/build" && \
+    cmake --build "./examples/hstu/inference_aoti/nve_init_hook/build" -j 8
 
 RUN python3 -m pip install --no-cache-dir --upgrade "cmake>=3.31.8" && \
     cp /usr/local/lib/libjpeg.so.62 /usr/local/lib/python3.12/dist-packages/torch/lib/libjpeg.so.62 && \
@@ -191,14 +191,14 @@ RUN cd ./examples/hstu && \
       triton_libs/system && \
     cp -P /workspace/recsys-examples/corelib/dynamicemb/torch_binding_build/inference_emb_ops.so triton_libs/emb/ && \
     cp -P /usr/local/lib/python3.12/dist-packages/recsys_kvcache_manager/kvcache_manager_ops.so triton_libs/recsys_kvcache_manager/ && \
-    cp -P /workspace/recsys-examples/examples/hstu/inference/cpp_inference/build/libhstu_cuda_ops_runtime.so triton_libs/ && \
-    cp -P /workspace/recsys-examples/examples/hstu/inference/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
+    cp -P /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so triton_libs/ && \
+    cp -P /workspace/recsys-examples/examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/hstu/. triton_libs/hstu_attn/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/fbgemm_gpu/. triton_libs/fbgemm_gpu/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/pynve/. triton_libs/pynve/ && \
     find /usr/local/lib -maxdepth 1 \( -type f -o -type l \) \( -name '*.so' -o -name '*.so.*' \) -exec cp -P {} triton_libs/lib/ \; && \
     cp -P /usr/lib/$(uname -m)-linux-gnu/libpng16.so.16* triton_libs/system/ && \
-    sed -i 's#string_value: ".*libnve_init_hook.so"#string_value: "/workspace/recsys-examples/examples/hstu/inference/nve_init_hook/build/libnve_init_hook.so"#' \
-      inference/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt
+    sed -i 's#string_value: ".*libnve_init_hook.so"#string_value: "/workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so"#' \
+      inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt
 
 WORKDIR /workspace/recsys-examples/

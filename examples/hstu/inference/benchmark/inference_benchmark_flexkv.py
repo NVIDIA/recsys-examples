@@ -170,7 +170,7 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     )
 
     sm_major = torch.cuda.get_device_capability()[0]
-    page_size = 128 if sm_major >= 10 else 32
+    page_size = 128 if sm_major >= 10 and sm_major < 12 else 32
     offload_chunksize = 8192
     base_cache_tokens = 10240 * 32
     num_primary_cache_pages = math.ceil(base_cache_tokens / page_size)

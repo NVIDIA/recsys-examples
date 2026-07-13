@@ -12,7 +12,7 @@ The workflow covers the following 5 steps:
 4. Running the C++ replay executable against exported artifacts and dumped tensors
 5. Running the Triton Server demo path for the exported AOTI model
 
-This guide is based on the checked-in workflow in [examples/hstu/inference/exported_with_kvcache_running_guide.sh](./exported_with_kvcache_running_guide.sh) and the container-oriented operational style in the local Triton/PyTorch guidebook.
+This guide is based on the checked-in workflow in [examples/hstu/inference_aoti/exported_with_kvcache_running_guide.sh](./exported_with_kvcache_running_guide.sh) and the container-oriented operational style in the local Triton/PyTorch guidebook.
 
 ---
 
@@ -29,8 +29,8 @@ C++ aoti testing demos:
 - `cpp_inference/inference_hstu_gr_ranking_kvcache_exported_model.cpp`
 
 Triton server aoti model testing demos:
-- `nve_init_hook/`
-- `inference/triton_aoti/`
+- `inference_aoti/nve_init_hook/`
+- `inference_aoti/triton_aoti/`
 - triton client script: `send_one_kvcache_triton_request.py`
 
 Flexkv Server launcher:
@@ -41,9 +41,9 @@ It covers export, runtime setup, native C++ validation, and Triton Server deploy
 
 At the end of the workflow, the following key **artifacts** are expected:
 
-1. Exported AOTI package in `examples/hstu/inference/hstu_gr_ranking_model/`
-2. Replay tensors in `examples/hstu/inference/export_test_dump/`
-3. C++ executable at `examples/hstu/inference/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
+1. Exported AOTI package in `examples/hstu/inference_aoti/hstu_gr_ranking_model/`
+2. Replay tensors in `examples/hstu/inference_aoti/export_test_dump/`
+3. C++ executable at `examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
 4. AOTI/Triton runtime libraries under `examples/hstu/triton_libs/`
 
 ---
@@ -101,7 +101,7 @@ mkdir -p build && cd build
 cmake .. && make -j 
 ```
 
-For HSTU runtime op and Paged KV-cache ops from `examples/commons`, their torch bindings are built in `inference/cpp_inference` together with C++ reply Executable (see step 3).
+For HSTU runtime op and Paged KV-cache ops from `examples/commons`, their torch bindings are built in `inference_aoti/cpp_inference` together with C++ reply Executable (see step 3).
 
 Expected output:
 
@@ -115,7 +115,7 @@ Run the export workflow from the HSTU directory:
 
 ```bash
 cd ${HSTU_DIR}
-python3 inference/export_inference_gr_ranking_kvcache.py \
+python3 inference_aoti/export_inference_gr_ranking_kvcache.py \
   --gin_config_file ${GIN} \
   --checkpoint_dir ${CKPT} \
   --max_bs 2
@@ -125,8 +125,8 @@ This step performs all of the following:
 
 1. Builds the exportable model wrapper for KV-cache inference
 2. Exports the model through `torch.export`
-3. Produces the packaged AOTI archive under `inference/hstu_gr_ranking_model/`
-4. Produces replay tensors under `inference/export_test_dump/`
+3. Produces the packaged AOTI archive under `inference_aoti/hstu_gr_ranking_model/`
+4. Produces replay tensors under `inference_aoti/export_test_dump/`
 
 
 ### Step 3: Build the C++ Replay Executable
@@ -135,15 +135,15 @@ This step performs all of the following:
 export PATH=/usr/local/cuda/bin:${PATH}
 export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')"
 
-cmake -S "${HSTU_DIR}/inference/cpp_inference" -B "${HSTU_DIR}/inference/cpp_inference/build"
-cmake --build "${HSTU_DIR}/inference/cpp_inference/build" --target inference_hstu_gr_ranking_kvcache_exported_model -j 8
+cmake -S "${HSTU_DIR}/inference_aoti/cpp_inference" -B "${HSTU_DIR}/inference_aoti/cpp_inference/build"
+cmake --build "${HSTU_DIR}/inference_aoti/cpp_inference/build" -j 8
 ```
 
 Expected outputs:
 
-1. `examples/hstu/inference/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
-2. `examples/hstu/inference/cpp_inference/build/libhstu_cuda_ops_runtime.so`
-2. `examples/hstu/inference/cpp_inference/build/libpaged_kvcache_ops_runtime.so`
+1. `examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
+2. `examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so`
+2. `examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so`
 
 
 ### Step 4: Verify with the C++ AOTI Replay
@@ -157,7 +157,7 @@ Setup the KVCache config in `setup_kvcache_cpp_runtime_env.sh` in environment va
 cd ${HSTU_DIR}
 rm -f ${ENV_FILE}
 source setup_kvcache_cpp_runtime_env.sh
-python3 inference/start_flexkv_server_for_kvcache_cpp.py --env_file ${ENV_FILE} > kv.log 2>&1 &
+python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --env_file ${ENV_FILE} > kv.log 2>&1 &
 ```
 
 Verify the environment file created, and load the runtime server variables into the current shell:
@@ -172,9 +172,9 @@ source ${ENV_FILE}
 Run the replay executable against the exported package and dumped tensors:
 
 ```bash
-${HSTU_DIR}/inference/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
-  ${HSTU_DIR}/inference/hstu_gr_ranking_model \
-  ${HSTU_DIR}/inference/export_test_dump
+${HSTU_DIR}/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
+  ${HSTU_DIR}/inference_aoti/hstu_gr_ranking_model \
+  ${HSTU_DIR}/inference_aoti/export_test_dump
 ```
 
 The executable will:
@@ -280,14 +280,14 @@ After completing the export flow from Step 2, copy the generated AOTI package in
 
 ```bash
 cd ${HSTU_DIR}
-rm -rf inference/triton_aoti/hstu_gr_ranking_kvcache/1/
-cp -apr inference/hstu_gr_ranking_model inference/triton_aoti/hstu_gr_ranking_kvcache/1
+rm -rf inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/1/
+cp -apr inference_aoti/hstu_gr_ranking_model inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/1
 ```
 
 This layout is required because Triton expects a versioned model directory under the repository.
 
 The Triton model config must remain aligned with the export contract.
-If the export wrapper changes its output contract, update triton model configs ([inference/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt](./inference/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt)) accordingly.
+If the export wrapper changes its output contract, update triton model configs ([inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt](./inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt)) accordingly.
 
 The HSTU aoti model also expects following runtime libraries set in `LD_LIBRARY_PATH` and `LD_PRELOAD`:
 
@@ -327,8 +327,8 @@ The libraries are gather from the **nvidia pytorch container used in step 1~4**:
 3. `fbgemm_gpu/`: from `/usr/local/lib/python3.12/dist-packages/fbgemm_gpu/`
 4. `hstu_attn/`: from `/usr/local/lib/python3.12/dist-packages/hstu/`
 5. `pynve/`: from `/usr/local/lib/python3.12/dist-packages/pynve/`
-6. `libhstu_cuda_ops_runtime.so`: from `${HSTU_DIR}/inference/cpp_inference/build`
-7. `libpaged_kvcache_ops_runtime.so`: from `${HSTU_DIR}/inference/cpp_inference/build`
+6. `libhstu_cuda_ops_runtime.so`: from `${HSTU_DIR}/inference_aoti/cpp_inference/build`
+7. `libpaged_kvcache_ops_runtime.so`: from `${HSTU_DIR}/inference_aoti/cpp_inference/build`
 8. `libpng16.so.16`: from `/usr/lib/x86_64-linux-gnu/`
 9. `lib/`: from `/usr/local/lib/`
 
@@ -358,7 +358,7 @@ Start the FlexKV server runtime in background:
 cd ${HSTU_DIR}
 rm -f ${ENV_FILE}
 
-python3 inference/start_flexkv_server_for_kvcache_cpp.py --env_file ${ENV_FILE} > kvcache_server.log 2>&1 &
+python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --env_file ${ENV_FILE} > kvcache_server.log 2>&1 &
 cat ${ENV_FILE} && source ${ENV_FILE}
 ```
 
@@ -373,7 +373,7 @@ export TRITON_LIBS=${HSTU_DIR}/triton_libs
 
 LD_PRELOAD="$TRITON_LIBS/pynve/libnve-common.so:$TRITON_LIBS/pynve/libnve-torch-ops.so:$TRITON_LIBS/emb/inference_emb_ops.so:$TRITON_LIBS/recsys_kvcache_manager/kcache_manager_ops.so:$TRITON_LIBS/libhstu_cuda_ops_runtime.so:$TRITON_LIBS/libpaged_kvcache_ops_runtime.so:$TRITON_LIBS/hstu_attn/fbgemm_gpu_experimental_hstu.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_py.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so" \
 LD_LIBRARY_PATH="/usr/local/cuda/compat/lib.real:/opt/hpcx/ucc/lib/:/opt/hpcx/ucx/lib/:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/lib/python3.12/dist-packages/torch/lib/:$TRITON_LIBS/fbgemm_gpu/:$TRITON_LIBS/lib:$TRITON_LIBS" \
-tritonserver --model-repository=${HSTU_DIR}/inference/triton_aoti/ > triton_server.log 2>&1 &
+tritonserver --model-repository=${HSTU_DIR}/inference_aoti/triton_aoti/ > triton_server.log 2>&1 &
 ```
 
 Check `triton_server.log` for the status.
@@ -382,8 +382,8 @@ Run the request sender against from the dumped replay tensors:
 
 ```bash
 cd ${HSTU_DIR}
-python3 inference/send_one_kvcache_triton_request.py \
-  --dump_dir inference/export_test_dump \
+python3 inference_aoti/send_one_kvcache_triton_request.py \
+  --dump_dir inference_aoti/export_test_dump \
   --batch_index 0 \
   --url localhost:8000 \
   --model_name hstu_gr_ranking_kvcache

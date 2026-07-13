@@ -14,8 +14,8 @@ from flexkv.common.config import (
     GLOBAL_CONFIG_FROM_ENV,
 )
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-if str(PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_ROOT))
+# if str(PACKAGE_ROOT) not in sys.path:
+#     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from recsys_kvcache_manager import (
     load_kvcache_manager_ops,
@@ -209,7 +209,7 @@ def test_print(
     uids, lookup_res, alloc_result, offload_task_ids, reap_result, reap_result2, lookup_res_, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
 ):
     # Lookup
-    print("[DEV] Lookup result:")
+    print("[CHECK] Lookup result:")
     print(f"\tMerged cached startpos: {lookup_res[0]}")
     print(f"\tMerged cached lengths: {lookup_res[1]}")
     print(f"\tGPU cached startpos: {lookup_res[2]}")
@@ -218,20 +218,20 @@ def test_print(
     print(f"\tHost cached lengths: {lookup_res[5]}")
             
     # Allocate
-    print(f"[DEV] Allocate result:")
+    print(f"[CHECK] Allocate result:")
     print(f"\tPage indices: {alloc_result[0]}")
     print(f"\tPage indptr: {alloc_result[2]}")
 
     # Offload launch
-    print(f"[DEV] Offload result:")
+    print(f"[CHECK] Offload result:")
     print(f"\tTask IDs: {offload_task_ids}")
 
     # Reap completed offload tasks
-    print(f"[DEV] Offload reap result: {reap_result}, shape: {reap_result.shape}")
-    print(f"[DEV] Offload reap result: {reap_result2}, shape: {reap_result2.shape}")
+    print(f"[CHECK] Offload reap result: {reap_result}, shape: {reap_result.shape}")
+    print(f"[CHECK] Offload reap result: {reap_result2}, shape: {reap_result2.shape}")
             
     # Lookup
-    print("[DEV] Lookup result:")
+    print("[CHECK] Lookup result:")
     print(f"\tMerged cached startpos: {lookup_res_[0]}")
     print(f"\tMerged cached lengths: {lookup_res_[1]}")
 
@@ -242,10 +242,10 @@ def test_print(
     print(f"\tHost cached lengths: {lookup_res_[5]}")
 
     # Evict GPU cache only
-    print("[DEV] Evicted GPU cache for user_ids:", uids)
+    print("[CHECK] Evicted GPU cache for user_ids:", uids)
 
     # Lookup
-    print("[DEV] Lookup result:")
+    print("[CHECK] Lookup result:")
     print(f"\tMerged cached startpos: {lookup_res2[0]}")
     print(f"\tMerged cached lengths: {lookup_res2[1]}")
     print(f"\tGPU cached startpos: {lookup_res2[2]}")
@@ -254,18 +254,18 @@ def test_print(
     print(f"\tHost cached lengths: {lookup_res2[5]}")
 
     # Allocate (new)
-    print(f"[DEV] Allocate result:")
+    print(f"[CHECK] Allocate result:")
     print(f"\tPage indices: {alloc_result2[0]}")
     print(f"\tPage indptr: {alloc_result2[2]}")
 
     # Onboard launch
-    print(f"[DEV] Onboard result:")
+    print(f"[CHECK] Onboard result:")
     print(f"\tLaunched tasks: {lookup_res2[6]}")  # Onboard task IDs returned in lookup result
     print(f"\tSlot mappings: {onboard_slot_mappings}")
 
     # Onboard wait
-    print(f"[DEV] Onboard tasks completed: {lookup_res2[6]}")
-    print(f"[DEV] Cache tables after onboard wait: {len(cache_tables)} tensors")
+    print(f"[CHECK] Onboard tasks completed: {lookup_res2[6]}")
+    print(f"[CHECK] Cache tables after onboard wait: {len(cache_tables)} tensors")
     return
 
 
@@ -284,7 +284,7 @@ if __name__ == "__main__":
         server_recv_port=server_recv_port,
         total_clients=1,
         inherit_env=True)
-    print("[DEV] Started KVServer")
+    print("[CHECK] Started KVServer")
     time.sleep(3)  # Wait a bit for server to be fully ready
 
     test_model = KVCacheManagerTestModel()
@@ -305,7 +305,6 @@ if __name__ == "__main__":
         alloc_result, offload_task_ids, reap_result, reap_result2,
         lookup_res_, lookup_res2, alloc_result2, onboard_slot_mappings, cache_tables
     )
-    print("\n" * 5)
 
     # Export
     register_fake_kvcache_manager_ops()
@@ -326,15 +325,14 @@ if __name__ == "__main__":
         package_path=os.path.join(save_dir, "model.pt2"),
         inductor_configs={},
     )
-    print(f"[DEV] Exported and compiled model to {os.path.join(save_dir, 'model.pt2')}.")
-    print("\n" * 5)
+    print(f"[CHECK] Exported and compiled model to {os.path.join(save_dir, 'model.pt2')}.")
 
     # Test
     export_dir = PACKAGE_ROOT
     compiled_model = torch._inductor.aoti_load_package(
         os.path.join(export_dir, "model.pt2")
     )
-    print(f"[DEV] Loaded compiled model from {os.path.join(export_dir, 'model.pt2')}.")
+    print(f"[CHECK] Loaded compiled model from {os.path.join(export_dir, 'model.pt2')}.")
 
     seqlens = torch.tensor([100], dtype=torch.int64)
     uids = torch.tensor([37], dtype=torch.int64)
@@ -358,4 +356,4 @@ if __name__ == "__main__":
         if time.time() - start_time > 10:
             print("[ERROR] Server did not shut down within 10 seconds, forcing exit")
             break
-    print("[DEV] KVServer shutdown complete")
+    print("[CHECK] KVServer shutdown complete")
