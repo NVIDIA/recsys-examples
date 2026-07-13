@@ -17,12 +17,18 @@ import os
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
 from modules.inference_dense_module import InferenceDenseModule
+from recsys_kvcache_manager import load_kvcache_manager_ops
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from recsys_kvcache_manager.kvcache_metadata import KVCacheMetadata
 from recsys_kvcache_manager.kvcache_utils import KVLookupResult
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from model.inference_ranking_gr import _STRIP_CACHED_TOKENS_OP
+
+
+# Export kvcache flow calls torch.ops.kvcache_manager_ops.* directly in forward,
+# so the runtime op library must be present for this module to be usable.
+load_kvcache_manager_ops(strict=True)
 
 
 class ExportKVCachedInferenceRankingGR(torch.nn.Module):

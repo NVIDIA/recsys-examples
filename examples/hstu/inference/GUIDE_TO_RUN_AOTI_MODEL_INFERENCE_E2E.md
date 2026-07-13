@@ -252,7 +252,7 @@ docker run --rm -it \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
   --tmpfs /tmp:exec \
   --name triton_hstu \
-  nvcr.io/nvidia/tritonserver:26.05-py3
+  nvcr.io/nvidia/tritonserver:26.06-py3
 ```
 
 Inside the triton server runtime container:

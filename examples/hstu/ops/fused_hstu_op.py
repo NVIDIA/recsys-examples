@@ -42,7 +42,7 @@ def _get_addmm_silu_fwd_impl(device: torch.device):
     sm = torch.cuda.get_device_properties(device).major
     if sm == 8:
         return triton_addmm_silu_fwd
-    if sm in (9, 10):
+    if sm in (9, 10, 12):
         return torch_addmm_silu_fwd
     raise ValueError(f"Unsupported SM major version: {sm}")
 
@@ -315,7 +315,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             num_targets = (
                 num_targets.to(torch.int32) if num_targets is not None else None
             )
-            if sm_major_version == 8:
+            if sm_major_version in (8, 12):
                 jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
                     q,
                     k,
@@ -679,7 +679,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         ):
             sm_major_version = torch.cuda.get_device_properties(0).major
             assert dout.dim() == 3
-            if sm_major_version == 8:
+            if sm_major_version in (8, 12):
                 dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_80(
                     dout,
                     q,

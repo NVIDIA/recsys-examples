@@ -37,14 +37,14 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     if(DEFINED SM)
         set(CMAKE_CUDA_ARCHITECTURES ${SM})
     else()
-        set(CMAKE_CUDA_ARCHITECTURES 70 75 80 89 90)
+        set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89 90 100 120)
     endif()
 endif()
 
 message(STATUS "Found Torch ${TORCH_VERSION}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
-set(INFERENCE_EMB_SOURCES
+set(KVCACHE_MANAGER_OPS_SOURCES
     src/torch_binding/kvcache_manager_ops.cpp
     src/torch_binding/kvcache_manager_context.cpp
     src/runtime/export_kvcache_runtime.cpp
@@ -55,14 +55,14 @@ set(INFERENCE_EMB_SOURCES
     src/gather_scatter_kernels.cu
 )
 
-add_library(kcache_manager_ops SHARED ${INFERENCE_EMB_SOURCES})
+add_library(kvcache_manager_ops SHARED ${KVCACHE_MANAGER_OPS_SOURCES})
 
 separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 if(TORCH_CXX_FLAGS_LIST)
-    target_compile_options(kcache_manager_ops PRIVATE ${TORCH_CXX_FLAGS_LIST})
+    target_compile_options(kvcache_manager_ops PRIVATE ${TORCH_CXX_FLAGS_LIST})
 endif()
 
-target_include_directories(kcache_manager_ops PRIVATE
+target_include_directories(kvcache_manager_ops PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/src/torch_binding
@@ -70,7 +70,7 @@ target_include_directories(kcache_manager_ops PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-target_compile_options(kcache_manager_ops PRIVATE
+target_compile_options(kvcache_manager_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:
         -O3
         -fdiagnostics-color=always
@@ -91,23 +91,23 @@ target_compile_options(kcache_manager_ops PRIVATE
     >
 )
 
-target_compile_definitions(kcache_manager_ops PRIVATE
-    TORCH_EXTENSION_NAME=kcache_manager_ops
+target_compile_definitions(kvcache_manager_ops PRIVATE
+    TORCH_EXTENSION_NAME=kvcache_manager_ops
 )
 
-target_link_libraries(kcache_manager_ops PRIVATE
+target_link_libraries(kvcache_manager_ops PRIVATE
     ${TORCH_LIBRARIES}
     CUDA::cudart
     zmq
 )
 
-set_target_properties(kcache_manager_ops PROPERTIES
+set_target_properties(kvcache_manager_ops PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "kcache_manager_ops"
+    OUTPUT_NAME "kvcache_manager_ops"
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
-install(TARGETS kcache_manager_ops
+install(TARGETS kvcache_manager_ops
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

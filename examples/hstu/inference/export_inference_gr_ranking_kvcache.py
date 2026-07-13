@@ -23,16 +23,6 @@ import warnings
 from pathlib import Path
 from typing import Dict, Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DYNAMICEMB_ROOT = REPO_ROOT / "corelib" / "dynamicemb"
-KVCACHE_MANAGER_ROOT = REPO_ROOT / "corelib" / "recsys_kvcache_manager"
-HSTU_ROOT = REPO_ROOT / "examples" / "hstu"
-COMMONS_ROOT = REPO_ROOT / "examples" / "commons"
-
-sys.path.insert(0, str(COMMONS_ROOT))
-sys.path.insert(0, str(KVCACHE_MANAGER_ROOT))
-sys.path.insert(0, str(DYNAMICEMB_ROOT))
-sys.path.insert(0, str(HSTU_ROOT))
 
 import gin
 import torch
@@ -51,7 +41,6 @@ from model.export_kvcached_inference_ranking_gr import ExportKVCachedInferenceRa
 from modules.inference_dense_module import InferenceDenseModule
 from modules.metrics import get_multi_event_metric_module
 from pynve.torch.nve_export import export_aot
-from recsys_kvcache_manager import register_fake_kvcache_manager_ops
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig, get_kvcache_config
 from torch.export import Dim, ShapesCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -63,18 +52,6 @@ from trainer.utils import create_hstu_config, get_dataset_and_embedding_args
 
 warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
-
-
-KVCACHE_MANAGER_OPS_LIBRARY = KVCACHE_MANAGER_ROOT / "build" / "kcache_manager_ops.so"
-
-
-def load_kvcache_manager_ops() -> None:
-    if not KVCACHE_MANAGER_OPS_LIBRARY.exists():
-        raise FileNotFoundError(
-            f"KVCache manager ops library does not exist: {KVCACHE_MANAGER_OPS_LIBRARY}"
-        )
-    torch.ops.load_library(str(KVCACHE_MANAGER_OPS_LIBRARY))
-    register_fake_kvcache_manager_ops()
 
 
 def _ipc_endpoint(name: str) -> str:
@@ -348,8 +325,6 @@ def get_exportable_model_for_inference(
     total_max_seqlen,
     num_contextual_features,
 ):
-    load_kvcache_manager_ops()
-
     from dynamicemb.exportable_tables import apply_inference_embedding_collection
     from modules.exportable_embedding import apply_inference_sparse
 

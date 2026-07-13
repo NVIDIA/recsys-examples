@@ -28,7 +28,7 @@ RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
     git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
     cd fbgemm/fbgemm_gpu && \
-    python3 setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0"
+    python3 setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0 12.0"
 
 # Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
 RUN pip install --no-deps tensordict orjson && \
@@ -47,6 +47,7 @@ ARG TRITONSERVER_BUILD
 WORKDIR /workspace/deps
 
 # -- Layer 1: system setup + arch symlinks.
+
 RUN apt-get update -y --fix-missing && apt-get install -y liburing-dev libxxhash-dev libssl-dev libzmq3-dev && \
     ARCH=$([ "${TARGETPLATFORM}" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
     rm -rf /usr/lib/${ARCH}-linux-gnu/libnvidia-ml.so.1 && \
@@ -89,28 +90,29 @@ RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attenti
 # leave it unset on arm64 (AVX512 doesn't exist there).
 COPY third_party/FlexKV /workspace/deps/FlexKV
 RUN cd FlexKV && mkdir -p build && cd build && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" cmake .. && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" cmake --build . -j8 && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" cmake .. && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" cmake --build . -j8 && \
     cd .. && mkdir -p flexkv/lib && cp -P build/lib/*.so* flexkv/lib/ && \
-    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python3 setup.py install && \
+    MAX_JOBS=8 FLEXKV_DEBUG=0 TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
     cd /workspace/deps && \
     git clone -b v26.05 --recursive https://github.com/NVIDIA/nv-embedding-cache.git nve && \
     cd nve && git submodule update --init --recursive && \
     cd third_party/ && git clone https://github.com/NVIDIA/NVTX.git NVTX && cd .. && \
     if [ "${TARGETPLATFORM}" = "linux/arm64" ]; then AVX512_ENV=""; else AVX512_ENV="PYNVE_DISABLE_AVX512=1"; fi && \
-    env TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" PYNVE_WITH_TORCH_BINDINGS=1 ${AVX512_ENV} \
+    env TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" PYNVE_WITH_TORCH_BINDINGS=1 ${AVX512_ENV} \
     CPLUS_INCLUDE_PATH=$(realpath ./third_party/NVTX/c/include/):${CPLUS_INCLUDE_PATH} pip install --no-deps .
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_86OR89=FALSE \
+    HSTU_DISABLE_120=TRUE \
     HSTU_DISABLE_ARBITRARY=TRUE \
     HSTU_DISABLE_LOCAL=TRUE \
     HSTU_DISABLE_RAB=TRUE \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
-    HSTU_ARCH_LIST="8.0 9.0 10.0" \
+    HSTU_ARCH_LIST="8.0 9.0 10.0 12.0" \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
@@ -126,7 +128,7 @@ WORKDIR /workspace/recsys-examples
 COPY . .
 
 RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python setup.py install && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python setup.py install && \
     cd /workspace/deps && rm -rf nvcomp && \
     NVCOMP_ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "linux-sbsa" || echo "linux-x86_64") && \
     wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/${NVCOMP_ARCH}/nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive.tar.xz && \
@@ -134,13 +136,13 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     mv nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive nvcomp && \
     rm nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive.tar.xz && \
     cd /workspace/recsys-examples/examples/commons && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" python3 setup.py install && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
     cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0" pip3 install --no-build-isolation . && \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" pip3 install --no-build-isolation . && \
     if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
       rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
-      test -e /usr/local/cuda-13.2/compat/lib.real/libcuda.so.1 && \
-      ln -s /usr/local/cuda-13.2/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+      test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
+      ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
       cd /workspace/recsys-examples/corelib/dynamicemb && \
       mkdir -p torch_binding_build && cd torch_binding_build && \
       cmake .. && make -j; \
@@ -156,7 +158,7 @@ RUN cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
 
 RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "share", "cmake"))')" && \
     cmake -S "./examples/hstu/inference/cpp_inference" -B "./examples/hstu/inference/cpp_inference/build" && \
-    cmake --build "./examples/hstu/inference/cpp_inference/build" --target inference_hstu_gr_ranking_kvcache_exported_model -j 8 && \
+    cmake --build "./examples/hstu/inference/cpp_inference/build" -j 8 && \
     cmake -S "./examples/hstu/inference/nve_init_hook" -B "./examples/hstu/inference/nve_init_hook/build" && \
     cmake --build "./examples/hstu/inference/nve_init_hook/build" -j 8
 
@@ -188,7 +190,7 @@ RUN cd ./examples/hstu && \
       triton_libs/lib \
       triton_libs/system && \
     cp -P /workspace/recsys-examples/corelib/dynamicemb/torch_binding_build/inference_emb_ops.so triton_libs/emb/ && \
-    cp -P /workspace/recsys-examples/corelib/recsys_kvcache_manager/build/kcache_manager_ops.so triton_libs/recsys_kvcache_manager/ && \
+    cp -P /usr/local/lib/python3.12/dist-packages/recsys_kvcache_manager/kvcache_manager_ops.so triton_libs/recsys_kvcache_manager/ && \
     cp -P /workspace/recsys-examples/examples/hstu/inference/cpp_inference/build/libhstu_cuda_ops_runtime.so triton_libs/ && \
     cp -P /workspace/recsys-examples/examples/hstu/inference/cpp_inference/build/libpaged_kvcache_ops_runtime.so triton_libs/ && \
     cp -a /usr/local/lib/python3.12/dist-packages/hstu/. triton_libs/hstu_attn/ && \

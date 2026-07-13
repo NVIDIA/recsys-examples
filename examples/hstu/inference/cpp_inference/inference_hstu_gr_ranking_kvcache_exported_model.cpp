@@ -65,10 +65,23 @@ std::string infer_default_inference_emb_ops_path(const char* argv0) {
 }
 
 std::string infer_default_kvcache_manager_ops_path(const char* argv0) {
-  return (std::filesystem::path(infer_repo_root(argv0)) /
-          "corelib/recsys_kvcache_manager/build/kcache_manager_ops.so")
-      .lexically_normal()
-      .string();
+  std::filesystem::path exe_path = std::filesystem::absolute(argv0);
+  const std::vector<std::filesystem::path> candidates = {
+      exe_path.parent_path() / "kvcache_manager_ops.so",
+      "/usr/local/lib/python3.12/dist-packages/recsys_kvcache_manager/kvcache_manager_ops.so",
+      std::filesystem::path(infer_repo_root(argv0)) /
+          "corelib/recsys_kvcache_manager/build/kvcache_manager_ops.so",
+      std::filesystem::path(infer_repo_root(argv0)) /
+          "corelib/recsys_kvcache_manager/kvcache_manager_ops.so",
+  };
+
+  for (const auto& candidate : candidates) {
+    if (std::filesystem::exists(candidate)) {
+      return candidate.lexically_normal().string();
+    }
+  }
+
+  return candidates.front().string();
 }
 
 std::string infer_default_hstu_runtime_ops_path(const char* argv0) {
@@ -173,7 +186,7 @@ DemoConfig parse_args(int argc, char** argv) {
     throw std::invalid_argument(
         "Usage: inference_hstu_gr_ranking_kvcache_exported_model <hstu_gr_ranking_model_dir> <dump_dir> "
         "[model_name] [device_index] [batch_index] "
-        "[inference_emb_ops.so] [libhstu_cuda_ops_runtime.so] [kcache_manager_ops.so] [paged_kvcache_ops.so]\n"
+        "[inference_emb_ops.so] [libhstu_cuda_ops_runtime.so] [kvcache_manager_ops.so] [paged_kvcache_ops.so]\n"
         "Before running, start start_flexkv_server_for_kvcache_cpp.py and source its env file.");
   }
 

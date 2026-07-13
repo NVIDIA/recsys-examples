@@ -30,7 +30,7 @@ from .debug.debug_paged_hstu_layer import dump, dump_paged_hstu_forward_naive
 def _select_addmm_silu_impl(sm: int):
     if sm == 8:
         return triton_addmm_silu_fwd
-    if sm in (9, 10):
+    if sm in (9, 10, 12):
         return torch_addmm_silu_fwd
     raise ValueError(f"Unsupported SM major version: {sm}")
 
@@ -264,11 +264,9 @@ class PagedHSTUInferLayer(torch.nn.Module):
         batch_size: int,
     ):
         sm_major_version = torch.cuda.get_device_properties(0).major
-        if sm_major_version != 8:
+        if sm_major_version not in (8, 12):
             raise RuntimeError(
-                "Export-mode paged-KV HSTU attention currently calls "
-                "torch.ops.fbgemm.hstu_varlen_fwd_80 directly. Add the matching "
-                "direct dispatcher path before exporting this on non-sm80 GPUs."
+                "Export-mode paged-KV HSTU attention currently supports sm80 and sm120 GPUs only."
             )
         jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
             query,

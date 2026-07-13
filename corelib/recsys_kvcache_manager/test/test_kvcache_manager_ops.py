@@ -17,9 +17,12 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from recsys_kvcache_manager import register_fake_kvcache_manager_ops
+from recsys_kvcache_manager import (
+    load_kvcache_manager_ops,
+    register_fake_kvcache_manager_ops,
+)
 
-torch.ops.load_library(PACKAGE_ROOT / "build" / "kcache_manager_ops.so")
+load_kvcache_manager_ops(strict=True)
 
 
 def _dtype_env_value(dtype: torch.dtype) -> str:
