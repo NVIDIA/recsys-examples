@@ -24,7 +24,14 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage,
              int64_t ovf_bucket_capacity,
-             std::optional<at::Tensor> ovf_output_offsets);
+             std::optional<at::Tensor> ovf_output_offsets,
+             std::optional<at::Tensor> active_mask,
+             std::optional<at::Tensor> active_count,
+             std::optional<at::Tensor> score_output,
+             std::optional<at::Tensor> founds_output,
+             std::optional<at::Tensor> indices_output,
+             std::optional<at::Tensor> acquire_counter,
+             std::optional<at::Tensor> acquire_ovf_counter);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets,
@@ -52,7 +59,9 @@ table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets
     return table_lookup(
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, static_cast<ScorePolicyType>(policy),
-        ovf_storage, ovf_bucket_capacity, ovf_output_offsets);
+        ovf_storage, ovf_bucket_capacity, ovf_output_offsets, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>

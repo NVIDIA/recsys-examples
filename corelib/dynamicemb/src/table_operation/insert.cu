@@ -20,27 +20,33 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-template <typename Table, ScorePolicyType PolicyTypeV, bool OutputScoreV>
+template <typename Table, ScorePolicyType PolicyTypeV, bool OutputScoreV,
+          bool PublishAndAcquireV>
 void launch_table_insert_kernel(
     Table table, int64_t *table_bucket_offsets_ptr, int *bucket_sizes_ptr,
     int64_t num_total, typename Table::KeyType *keys_ptr,
     int64_t *table_ids_ptr, InsertResult *insert_results_ptr,
     IndexType *indices_ptr, ScoreType *score_input_ptr,
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
-    int32_t *counter_ptr, cudaStream_t stream) {
+    int32_t *counter_ptr, bool const *active_mask_ptr,
+    int64_t const *active_count_ptr, int64_t *row_counters_ptr,
+    cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits =
       InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8, PolicyTypeV, OutputScoreV>;
 
-  table_insert_kernel<Table, KernelTraits>
+  table_insert_kernel<Table, KernelTraits, PublishAndAcquireV>
       <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
           table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
           keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
-          score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr);
+          score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
+          active_mask_ptr, active_count_ptr, row_counters_ptr);
 
-  table_unlock_kernel<Table>
-      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, num_total, keys_ptr, table_key_slots_ptr);
+  if constexpr (!PublishAndAcquireV) {
+    table_unlock_kernel<Table>
+        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table, num_total, keys_ptr, table_key_slots_ptr);
+  }
 }
 
 void table_insert_single_score(at::Tensor table_storage,
@@ -51,7 +57,11 @@ void table_insert_single_score(at::Tensor table_storage,
                                ScorePolicyType policy_type, at::Tensor indices,
                                std::optional<at::Tensor> insert_results,
                                std::optional<at::Tensor> score_output,
-                               at::Tensor counter) {
+                               at::Tensor counter,
+                               std::optional<at::Tensor> active_mask,
+                               std::optional<at::Tensor> active_count,
+                               std::optional<at::Tensor> row_counters,
+                               bool publish_and_acquire) {
 
   auto key_type = get_data_type(keys);
 
@@ -78,19 +88,27 @@ void table_insert_single_score(at::Tensor table_storage,
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
   auto counter_ptr = counter.data_ptr<int32_t>();
+  auto active_mask_ptr = get_pointer<bool>(active_mask);
+  auto active_count_ptr = get_pointer<int64_t>(active_count);
+  auto row_counters_ptr = get_pointer<int64_t>(row_counters);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   int64_t num_total = keys.size(0);
 
-  auto table_key_slots = at::zeros(
-      num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
+  at::Tensor table_key_slots;
+  if (!publish_and_acquire) {
+    table_key_slots = at::zeros(
+        num_total, at::TensorOptions().dtype(at::kLong).device(keys.device()));
+  }
 
   bool output_score = (score_output_ptr != nullptr);
 
   DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
     auto keys_ptr = get_pointer<KeyType>(keys);
-    auto table_key_slots_ptr = get_pointer<KeyType *>(table_key_slots);
+    auto table_key_slots_ptr = publish_and_acquire
+                                   ? nullptr
+                                   : get_pointer<KeyType *>(table_key_slots);
 
     constexpr int64_t total_size =
         sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
@@ -105,17 +123,30 @@ void table_insert_single_score(at::Tensor table_storage,
                        num_buckets, bucket_capacity);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      if (output_score) {
-        launch_table_insert_kernel<Table, PolicyTypeV, true>(
+      if (output_score && publish_and_acquire) {
+        launch_table_insert_kernel<Table, PolicyTypeV, true, true>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
-            stream);
-      } else {
-        launch_table_insert_kernel<Table, PolicyTypeV, false>(
+            active_mask_ptr, active_count_ptr, row_counters_ptr, stream);
+      } else if (output_score) {
+        launch_table_insert_kernel<Table, PolicyTypeV, true, false>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
-            score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr, stream);
+            score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
+            active_mask_ptr, active_count_ptr, row_counters_ptr, stream);
+      } else if (publish_and_acquire) {
+        launch_table_insert_kernel<Table, PolicyTypeV, false, true>(
+            table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
+            keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
+            score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr,
+            active_mask_ptr, active_count_ptr, row_counters_ptr, stream);
+      } else {
+        launch_table_insert_kernel<Table, PolicyTypeV, false, false>(
+            table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
+            keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
+            score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr,
+            active_mask_ptr, active_count_ptr, row_counters_ptr, stream);
       }
     });
   });
@@ -129,7 +160,11 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results,
-                        std::optional<at::Tensor> score_output) {
+                        std::optional<at::Tensor> score_output,
+                        std::optional<at::Tensor> active_mask,
+                        std::optional<at::Tensor> active_count,
+                        std::optional<at::Tensor> row_counters,
+                        bool publish_and_acquire) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -137,12 +172,39 @@ at::Tensor table_insert(at::Tensor table_storage,
   }
 
   at::Tensor indices =
-      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+      ((active_mask.has_value() && active_mask->defined()) ||
+       (active_count.has_value() && active_count->defined()))
+          ? torch::full({num_total}, -1, keys.options().dtype(torch::kInt64))
+          : torch::empty({num_total}, keys.options().dtype(torch::kInt64));
+
+  if (row_counters.has_value() && row_counters->defined()) {
+    TORCH_CHECK(policy_type == ScorePolicyType::Const,
+                "row_counters requires the CONST score policy");
+    TORCH_CHECK(row_counters->is_cuda(), "row_counters must be a CUDA tensor");
+    TORCH_CHECK(row_counters->device() == keys.device(),
+                "row_counters must be on the same device as keys");
+    TORCH_CHECK(row_counters->scalar_type() == torch::kInt64,
+                "row_counters must have dtype int64");
+    TORCH_CHECK(row_counters->dim() == 1 && row_counters->is_contiguous(),
+                "row_counters must be a contiguous one-dimensional tensor");
+    TORCH_CHECK(row_counters->numel() + 1 == table_bucket_offsets.numel(),
+                "row_counters must contain one counter per table");
+    TORCH_CHECK(score_output.has_value() && score_output->defined(),
+                "row_counters requires a caller-provided score_output");
+    TORCH_CHECK(score_output->is_cuda() &&
+                    score_output->device() == keys.device() &&
+                    score_output->scalar_type() == torch::kInt64 &&
+                    score_output->dim() == 1 && score_output->is_contiguous() &&
+                    score_output->numel() == num_total,
+                "row_counters requires a contiguous int64 score_output on "
+                "the keys device with one element per key");
+  }
 
   table_insert_single_score(table_storage, table_bucket_offsets,
                             bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
-                            score_output, counter);
+                            score_output, counter, active_mask, active_count,
+                            row_counters, publish_and_acquire);
 
   return indices;
 }

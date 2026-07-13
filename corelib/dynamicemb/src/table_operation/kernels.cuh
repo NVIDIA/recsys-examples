@@ -30,7 +30,8 @@ namespace dyn_emb {
 template <int ThreadBlockDim_, int ProbingGroupSize_, int ReductionGroupSize_,
           int CompactTileSize_, int NumScorePerThread_,
           ScorePolicyType PolicyType_ = ScorePolicyType::Const,
-          bool OutputScore_ = false, bool EnableOverflow_ = false>
+          bool OutputScore_ = false, bool EnableOverflow_ = false,
+          bool FindOrInsert_ = false>
 struct InsertKernelTraits {
   static constexpr int ThreadBlockDim = ThreadBlockDim_;
   static constexpr int ProbingGroupSize = ProbingGroupSize_;
@@ -40,6 +41,7 @@ struct InsertKernelTraits {
   static constexpr ScorePolicyType PolicyType = PolicyType_;
   static constexpr bool OutputScore = OutputScore_;
   static constexpr bool EnableOverflow = EnableOverflow_;
+  static constexpr bool FindOrInsert = FindOrInsert_;
 };
 
 template <bool Pred> struct ExportPredFunctor {
@@ -86,7 +88,11 @@ __global__ void table_lookup_kernel(
     int64_t const *__restrict__ table_ids, bool *__restrict__ founds,
     IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
     int64_t *__restrict__ score_output, Table ovf_table,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t const *__restrict__ ovf_output_offsets,
+    bool const *__restrict__ active_mask,
+    int64_t const *__restrict__ active_count,
+    int32_t *__restrict__ acquire_counter,
+    int32_t *__restrict__ acquire_ovf_counter) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -95,6 +101,14 @@ __global__ void table_lookup_kernel(
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+
+    if ((active_count != nullptr && i >= *active_count) ||
+        (active_mask != nullptr && !active_mask[i])) {
+      score_output[i] = 0;
+      founds[i] = false;
+      indices[i] = -1;
+      continue;
+    }
 
     KeyType key = input_keys[i];
     ScoreType score = ScorePolicy<PolicyType>::get(score_input, i);
@@ -129,11 +143,28 @@ __global__ void table_lookup_kernel(
     IndexType index = -1;
     if (found) {
       if constexpr (PolicyType == ScorePolicyType::Const) {
-        score = *bucket.scores(iter);
+        if (acquire_counter != nullptr) {
+          KeyType expected_key = key;
+          if (bucket.try_lock(iter, expected_key)) {
+            score = *bucket.scores(iter);
+            atomicAdd(acquire_counter + bucket_id * bucket.capacity() + iter,
+                      1);
+            bucket.unlock(iter, key);
+          } else {
+            found = false;
+            score = ScoreType();
+          }
+        } else {
+          score = *bucket.scores(iter);
+        }
       } else {
         KeyType expected_key = key;
         if (bucket.try_lock(iter, expected_key)) {
           score = ScorePolicy<PolicyType>::update(bucket.scores(iter), score);
+          if (acquire_counter != nullptr) {
+            atomicAdd(acquire_counter + bucket_id * bucket.capacity() + iter,
+                      1);
+          }
           bucket.unlock(iter, key);
         } else {
           found = false;
@@ -156,9 +187,40 @@ __global__ void table_lookup_kernel(
         if (ovf_found) {
           found = true;
           index = ovf_out_iter;
+          Iter local = ovf_out_iter - ovf_output_offsets[t_id];
           if constexpr (PolicyType == ScorePolicyType::Const) {
-            Iter local = ovf_out_iter - ovf_output_offsets[t_id];
-            score = *ovf_bucket.scores(local);
+            if (acquire_ovf_counter != nullptr) {
+              KeyType expected_key = key;
+              if (ovf_bucket.try_lock(local, expected_key)) {
+                score = *ovf_bucket.scores(local);
+                atomicAdd(acquire_ovf_counter +
+                              t_id * ovf_table.bucket_capacity() + local,
+                          1);
+                ovf_bucket.unlock(local, key);
+              } else {
+                found = false;
+              }
+            } else {
+              score = *ovf_bucket.scores(local);
+            }
+          } else {
+            KeyType expected_key = key;
+            if (ovf_bucket.try_lock(local, expected_key)) {
+              score = ScorePolicy<PolicyType>::update(
+                  ovf_bucket.scores(local), score);
+              if (acquire_ovf_counter != nullptr) {
+                atomicAdd(acquire_ovf_counter +
+                              t_id * ovf_table.bucket_capacity() + local,
+                          1);
+              }
+              ovf_bucket.unlock(local, key);
+            } else {
+              found = false;
+            }
+          }
+          if (!found) {
+            index = -1;
+            score = ScoreType();
           }
         }
       }
@@ -266,7 +328,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
   *result_out = result;
 }
 
-template <typename Table, typename KernelTraits>
+template <typename Table, typename KernelTraits, bool PublishAndAcquire = false>
 __global__ void table_insert_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int *__restrict__ bucket_sizes, int64_t batch,
@@ -275,7 +337,9 @@ __global__ void table_insert_kernel(
     InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
     ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
     typename Table::KeyType **__restrict__ table_key_slots,
-    int32_t *__restrict__ counter) {
+    int32_t *__restrict__ counter, bool const *__restrict__ active_mask,
+    int64_t const *__restrict__ active_count,
+    int64_t *__restrict__ row_counters) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -297,6 +361,20 @@ __global__ void table_insert_kernel(
 
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
 
+    if ((active_count != nullptr && i >= *active_count) ||
+        (active_mask != nullptr && !active_mask[i])) {
+      // Sparse score callers may provide uninitialized output storage.  The
+      // generic score contract uses zero for skipped positions.  NO_EVICTION
+      // row assignment and publish/acquire waves retain caller-owned output
+      // so later deterministic waves cannot overwrite earlier results.
+      if constexpr (OutputScore) {
+        if (row_counters == nullptr && !PublishAndAcquire) {
+          score_output[i] = 0;
+        }
+      }
+      continue;
+    }
+
     KeyType key = input_keys[i];
     ScoreType score = Policy::get(score_input, i);
 
@@ -304,9 +382,10 @@ __global__ void table_insert_kernel(
     int64_t bucket_id = 0;
     int64_t bkt_begin = 0;
     int64_t table_cap = 0;
+    int64_t t_id = 0;
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
-      int64_t t_id = table_ids[i];
+      t_id = table_ids[i];
       bkt_begin = table_bucket_offsets[t_id];
       int64_t bkt_end = table_bucket_offsets[t_id + 1];
       table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
@@ -317,9 +396,10 @@ __global__ void table_insert_kernel(
     }
     if (table_cap == 0) {
       if constexpr (OutputScore) {
-        score_output[i] = static_cast<int64_t>(score);
+        score_output[i] = row_counters == nullptr
+                              ? static_cast<int64_t>(score)
+                              : static_cast<int64_t>(-1);
       }
-      table_key_slots[i] = nullptr;
       indices[i] = -1;
       if (insert_results) {
         insert_results[i] = InsertResult::Illegal;
@@ -332,7 +412,7 @@ __global__ void table_insert_kernel(
     Iter iter = Iter(hashcode % table.bucket_capacity());
     insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
                                    &iter, &result);
-    int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
+    int64_t counter_offset = bucket_id * bucket.capacity();
     insert<ReductionGroupSize, BufferDim, Policy>(
         bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores, result,
         &iter, &result, static_cast<KeyType *>(nullptr),
@@ -341,17 +421,46 @@ __global__ void table_insert_kernel(
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
-      score = Policy::update(bucket.scores(iter), score);
+      if (row_counters != nullptr) {
+        if (result == InsertResult::Assign) {
+          // Existing NO_EVICTION keys keep their stable physical row.
+          score = *bucket.scores(iter);
+        } else {
+          // Allocate and publish the physical row while the key slot remains
+          // locked.  This replaces the former insert -> assign -> score-update
+          // sequence with one metadata kernel.
+          int64_t row = atomicAdd(row_counters + t_id, int64_t{1});
+          score = static_cast<ScoreType>(row);
+          *bucket.scores(iter) = score;
+        }
+      } else {
+        score = Policy::update(bucket.scores(iter), score);
+      }
       index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
-      table_key_slot = bucket.keys(iter);
+      if constexpr (PublishAndAcquire) {
+        // Pin the destination before making the key visible.  The exchange
+        // value kernel releases this temporary ownership after its outbound
+        // write, so another insertion cannot recycle the row in between.
+        atomicAdd(counter + bucket_id * bucket.capacity() + iter, 1);
+        auto atomic_key = reinterpret_cast<typename Bucket::AtomicKey *>(
+            bucket.keys(iter));
+        atomic_key->store(key, cuda::std::memory_order_release);
+      } else {
+        table_key_slot = bucket.keys(iter);
+      }
     }
     if constexpr (OutputScore) {
-      score_output[i] = static_cast<int64_t>(score);
+      score_output[i] =
+          (row_counters != nullptr && !isInsertSuccess(result))
+              ? static_cast<int64_t>(-1)
+              : static_cast<int64_t>(score);
     }
-    table_key_slots[i] = table_key_slot;
     indices[i] = index;
     if (insert_results) {
       insert_results[i] = result;
+    }
+    if constexpr (!PublishAndAcquire) {
+      table_key_slots[i] = table_key_slot;
     }
   }
 }
@@ -372,7 +481,10 @@ __global__ void table_insert_and_evict_kernel(
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t const *__restrict__ ovf_output_offsets,
+    bool *__restrict__ founds, bool *__restrict__ evicted_mask,
+    bool const *__restrict__ active_mask,
+    int64_t const *__restrict__ active_count) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -386,6 +498,7 @@ __global__ void table_insert_and_evict_kernel(
   static constexpr ScorePolicyType PolicyType = KernelTraits::PolicyType;
   static constexpr bool OutputScore = KernelTraits::OutputScore;
   static constexpr bool UseOverflow = KernelTraits::EnableOverflow;
+  static constexpr bool FindOrInsert = KernelTraits::FindOrInsert;
 
   using Policy = ScorePolicy<PolicyType>;
 
@@ -393,17 +506,130 @@ __global__ void table_insert_and_evict_kernel(
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
+  if constexpr (FindOrInsert) {
+    // Phase 1: find and protect every hit before any thread may select an
+    // eviction victim. This kernel is launched cooperatively so the grid-wide
+    // barrier preserves lookup-all -> pin-hits -> insert-misses ordering.
+    for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+      bool active = (active_count == nullptr || i < *active_count) &&
+                    (active_mask == nullptr || active_mask[i]);
+      if (!active) {
+        continue;
+      }
+
+      KeyType key = input_keys[i];
+      ScoreType score = Policy::get(score_input, i);
+      int64_t hashcode = 0;
+      int64_t bucket_id = 0;
+      int64_t bkt_begin = 0;
+      int64_t table_cap = 0;
+      int64_t t_id = 0;
+      if (Bucket::is_valid(key)) {
+        hashcode = Table::hash(key);
+        t_id = table_ids[i];
+        bkt_begin = table_bucket_offsets[t_id];
+        int64_t bkt_end = table_bucket_offsets[t_id + 1];
+        table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
+        if (table_cap > 0) {
+          int64_t local_idx = hashcode % table_cap;
+          bucket_id = bkt_begin + local_idx / table.bucket_capacity();
+        }
+      }
+
+      bool found = false;
+      IndexType index = -1;
+      if (table_cap > 0) {
+        Bucket bucket = table[bucket_id];
+        Iter iter = Iter(hashcode % table.bucket_capacity());
+        int64_t step = 0;
+        auto probe_res = bucket.template probe<ProbingGroupSize>(
+            key, iter, step);
+        found = probe_res == Bucket::ProbeResult::Existed;
+        if (found) {
+          KeyType expected_key = key;
+          if (bucket.try_lock(iter, expected_key)) {
+            if constexpr (PolicyType == ScorePolicyType::Const) {
+              score = *bucket.scores(iter);
+            } else {
+              score = Policy::update(bucket.scores(iter), score);
+            }
+            atomicAdd(counter + bucket_id * bucket.capacity() + iter, 1);
+            bucket.unlock(iter, key);
+            index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
+          } else {
+            found = false;
+          }
+        }
+
+        if constexpr (UseOverflow) {
+          if (!found && Bucket::is_valid(key)) {
+            Bucket ovf_bucket = ovf_table[t_id];
+            Iter ovf_iter = Iter(hashcode % ovf_bucket.capacity());
+            Iter ovf_out_iter;
+            found = overflow_find(ovf_bucket, key, ovf_output_offsets[t_id],
+                                  ovf_iter, &ovf_out_iter);
+            if (found) {
+              Iter local = ovf_out_iter - ovf_output_offsets[t_id];
+              KeyType expected_key = key;
+              if (ovf_bucket.try_lock(local, expected_key)) {
+                if constexpr (PolicyType == ScorePolicyType::Const) {
+                  score = *ovf_bucket.scores(local);
+                } else {
+                  score = Policy::update(ovf_bucket.scores(local), score);
+                }
+                atomicAdd(ovf_counter +
+                              t_id * ovf_table.bucket_capacity() + local,
+                          1);
+                ovf_bucket.unlock(local, key);
+                index = ovf_out_iter;
+              } else {
+                found = false;
+              }
+            }
+          }
+        }
+      }
+
+      founds[i] = found;
+      if (found) {
+        indices[i] = index;
+        if constexpr (OutputScore) {
+          score_output[i] = static_cast<int64_t>(score);
+        }
+        if (insert_results) {
+          insert_results[i] = InsertResult::Assign;
+        }
+      } else {
+        indices[i] = -1;
+      }
+    }
+    cg::this_grid().sync();
+  }
+
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
 
-    KeyType key = input_keys[i];
-    ScoreType score = Policy::get(score_input, i);
+    // Do not early-return here: CompactTileSize may be a warp, and every lane
+    // must reach the eviction ballot even when sparse masking is enabled.
+    bool active = (active_count == nullptr || i < *active_count) &&
+                  (active_mask == nullptr || active_mask[i]);
+    if constexpr (FindOrInsert) {
+      // find_or_insert may reuse one output buffer across deterministic waves.
+      // Clear only this wave's active positions so earlier waves remain intact.
+      if (active) {
+        evicted_mask[i] = false;
+      }
+      active = active && !founds[i];
+    }
+
+    KeyType key = active ? input_keys[i] : Bucket::empty_key();
+    ScoreType score = active ? Policy::get(score_input, i) : ScoreType();
 
     int64_t hashcode = 0;
     int64_t bucket_id = 0;
     int64_t bkt_begin = 0;
     int64_t table_cap = 0;
     int64_t t_id = 0;
-    if (Bucket::is_valid(key)) {
+    if (active && Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       t_id = table_ids[i];
       bkt_begin = table_bucket_offsets[t_id];
@@ -426,7 +652,7 @@ __global__ void table_insert_and_evict_kernel(
                                      &iter, &result);
 
       {
-        int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
+        int64_t counter_offset = bucket_id * bucket.capacity();
         insert<ReductionGroupSize, BufferDim, Policy>(
             bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores,
             result, &iter, &result, &evict_key, &evict_score, counter,
@@ -464,16 +690,15 @@ __global__ void table_insert_and_evict_kernel(
         if (isInsertSuccess(ovf_result)) {
           index = ovf_iter;
           final_result = ovf_result;
-          table_key_slot = nullptr;
+          Iter local = ovf_iter - ovf_output_offsets[t_id];
+          table_key_slot = ovf_bucket.keys(local);
           if (ovf_result == InsertResult::Evict) {
-            Iter local = ovf_iter - ovf_output_offsets[t_id];
-            table_key_slot = ovf_bucket.keys(local);
             final_evict_key = ovf_evict_key;
+            final_evict_score = *ovf_bucket.scores(local);
+            *ovf_bucket.scores(local) = ScoreType();
             final_evict_index = ovf_iter;
-          } else if (ovf_result == InsertResult::Insert) {
-            Iter local = ovf_iter - ovf_output_offsets[t_id];
-            table_key_slot = ovf_bucket.keys(local);
           }
+          score = Policy::update(ovf_bucket.scores(local), score);
         }
       }
 
@@ -482,49 +707,113 @@ __global__ void table_insert_and_evict_kernel(
       }
     }
 
-    // Eviction compaction -- all threads participate in ballot
     {
-      auto g = cg::tiled_partition<KernelTraits::CompactTileSize>(
-          cg::this_thread_block());
-
       InsertResult cmp_result = UseOverflow ? final_result : result;
-      bool evicted = (cmp_result == InsertResult::Evict ||
-                      cmp_result == InsertResult::Busy);
-      uint32_t vote = g.ballot(evicted);
-      int group_cnt = __popc(vote);
-      CounterType group_offset = 0;
-      if (g.thread_rank() == 0) {
-        group_offset =
-            atomicAdd(evicted_counter, static_cast<CounterType>(group_cnt));
-      }
-      group_offset = g.shfl(group_offset, 0);
-      int previous_cnt = group_cnt - __popc(vote >> g.thread_rank());
-      int64_t out_id = group_offset + previous_cnt;
-      if (evicted) {
-        if constexpr (UseOverflow) {
-          evicted_keys[out_id] = final_evict_key;
-          evicted_scores[out_id] = static_cast<int64_t>(final_evict_score);
-          evicted_indices[out_id] = final_evict_index;
-        } else {
-          evicted_keys[out_id] = evict_key;
-          evicted_scores[out_id] = static_cast<int64_t>(evict_score);
-          IndexType evict_idx =
-              (result == InsertResult::Evict)
-                  ? (bucket_id - bkt_begin) * bucket.capacity() + iter
-                  : -static_cast<IndexType>(i + 1);
-          evicted_indices[out_id] = evict_idx;
+      // Fused exchange consumes input-aligned sparse eviction metadata. Legacy
+      // insert_and_evict retains compact output and its Busy convention.
+      bool evicted = active &&
+                     (cmp_result == InsertResult::Evict ||
+                      (!FindOrInsert && cmp_result == InsertResult::Busy));
+      if constexpr (FindOrInsert) {
+        if (evicted) {
+          if constexpr (UseOverflow) {
+            evicted_keys[i] = final_evict_key;
+            evicted_scores[i] = static_cast<int64_t>(final_evict_score);
+            evicted_indices[i] = final_evict_index;
+          } else {
+            evicted_keys[i] = evict_key;
+            evicted_scores[i] = static_cast<int64_t>(evict_score);
+            evicted_indices[i] =
+                (bucket_id - bkt_begin) * bucket.capacity() + iter;
+          }
+          evicted_table_ids[i] = table_ids[i];
+          evicted_mask[i] = true;
         }
-        evicted_table_ids[out_id] = table_ids[i];
+      } else {
+        // All lanes participate because CompactTileSize may be a warp.
+        auto g = cg::tiled_partition<KernelTraits::CompactTileSize>(
+            cg::this_thread_block());
+        uint32_t vote = g.ballot(evicted);
+        int group_cnt = __popc(vote);
+        CounterType group_offset = 0;
+        if (g.thread_rank() == 0 && group_cnt != 0) {
+          group_offset =
+              atomicAdd(evicted_counter, static_cast<CounterType>(group_cnt));
+        }
+        group_offset = g.shfl(group_offset, 0);
+        int previous_cnt = group_cnt - __popc(vote >> g.thread_rank());
+        int64_t out_id = group_offset + previous_cnt;
+        if (evicted) {
+          if constexpr (UseOverflow) {
+            evicted_keys[out_id] = final_evict_key;
+            evicted_scores[out_id] = static_cast<int64_t>(final_evict_score);
+            evicted_indices[out_id] = final_evict_index;
+          } else {
+            evicted_keys[out_id] = evict_key;
+            evicted_scores[out_id] = static_cast<int64_t>(evict_score);
+            IndexType evict_idx =
+                (result == InsertResult::Evict)
+                    ? (bucket_id - bkt_begin) * bucket.capacity() + iter
+                    : -static_cast<IndexType>(i + 1);
+            evicted_indices[out_id] = evict_idx;
+          }
+          evicted_table_ids[out_id] = table_ids[i];
+        }
       }
     }
 
-    if constexpr (OutputScore) {
-      score_output[i] = static_cast<int64_t>(score);
-    }
-    table_key_slots[i] = table_key_slot;
-    indices[i] = index;
-    if (insert_results) {
-      insert_results[i] = UseOverflow ? final_result : result;
+    if (active) {
+      if constexpr (FindOrInsert) {
+        InsertResult observed_result = UseOverflow ? final_result : result;
+        // A fused cache lookup must always provision a protected row. The
+        // main-bucket Busy result has already had its overflow fallback above;
+        // reaching Busy here means both tiers are unavailable. Continuing
+        // would produce an untracked/transient update for a globally new key,
+        // so make this violated cache-capacity invariant fatal. Use __trap()
+        // rather than assert so release builds compiled with NDEBUG retain the
+        // check.
+        if (observed_result == InsertResult::Busy) {
+          __trap();
+        }
+        founds[i] = observed_result == InsertResult::Assign;
+        if (isInsertSuccess(observed_result)) {
+          if constexpr (UseOverflow) {
+            if (result == InsertResult::Busy) {
+              int64_t local = index - ovf_output_offsets[t_id];
+              atomicAdd(ovf_counter + t_id * ovf_table.bucket_capacity() + local,
+                        1);
+            } else {
+              atomicAdd(counter + bucket_id * bucket.capacity() + iter, 1);
+            }
+          } else {
+            atomicAdd(counter + bucket_id * bucket.capacity() + iter, 1);
+          }
+        }
+      }
+      if constexpr (OutputScore) {
+        score_output[i] = static_cast<int64_t>(score);
+      }
+      if constexpr (!FindOrInsert) {
+        table_key_slots[i] = table_key_slot;
+      }
+      indices[i] = index;
+      if (insert_results) {
+        insert_results[i] = UseOverflow ? final_result : result;
+      }
+      if constexpr (FindOrInsert) {
+        // Counter ownership and eviction metadata are visible before the key
+        // is published.  This keeps find_or_insert a single GPU kernel while
+        // preserving the lock's release ordering.
+        if (table_key_slot != nullptr) {
+          auto atomic_key =
+              reinterpret_cast<typename Bucket::AtomicKey *>(table_key_slot);
+          atomic_key->store(key, cuda::std::memory_order_release);
+        }
+      }
+    } else {
+      if constexpr (!FindOrInsert) {
+        table_key_slots[i] = nullptr;
+      }
     }
   }
 }
@@ -552,7 +841,9 @@ __global__ void table_erase_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int *__restrict__ bucket_sizes, int64_t batch,
     typename Table::KeyType const *__restrict__ input_keys,
-    int64_t const *__restrict__ table_ids, IndexType *__restrict__ indices) {
+    int64_t const *__restrict__ table_ids, IndexType *__restrict__ indices,
+    bool const *__restrict__ active_mask,
+    int64_t const *__restrict__ active_count) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -561,6 +852,11 @@ __global__ void table_erase_kernel(
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
   for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+
+    if ((active_count != nullptr && i >= *active_count) ||
+        (active_mask != nullptr && !active_mask[i])) {
+      continue;
+    }
 
     KeyType key = input_keys[i];
 
@@ -610,6 +906,147 @@ __global__ void table_erase_kernel(
     }
     if (indices) {
       indices[i] = index;
+    }
+  }
+}
+
+// Reclaim provisional entries by their already-known per-table slot.  This
+// avoids a second hash probe after admission and is safe for main-table probe
+// chains because the slot is published as a tombstone, not an empty key.
+template <typename Table, bool EnableOverflow = false>
+__global__ void table_reclaim_by_slot_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int *__restrict__ bucket_sizes, int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    int64_t const *__restrict__ table_ids,
+    IndexType *__restrict__ slot_indices, bool const *__restrict__ mask,
+    int32_t *__restrict__ counter, Table ovf_table,
+    int *__restrict__ ovf_bucket_sizes, int32_t *__restrict__ ovf_counter,
+    int64_t const *__restrict__ ovf_output_offsets) {
+  using KeyType = typename Table::KeyType;
+  using Bucket = typename Table::BucketType;
+  using Iter = typename Bucket::Iterator;
+
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= batch || (mask != nullptr && !mask[i]))
+    return;
+
+  IndexType slot = slot_indices[i];
+  if (slot < 0) {
+    slot_indices[i] = -1;
+    return;
+  }
+
+  int64_t t_id = table_ids[i];
+  int64_t bkt_begin = table_bucket_offsets[t_id];
+  int64_t bkt_end = table_bucket_offsets[t_id + 1];
+  int64_t table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
+  KeyType key = input_keys[i];
+
+  if (slot < table_cap) {
+    int64_t bucket_id = bkt_begin + slot / table.bucket_capacity();
+    Iter iter = slot % table.bucket_capacity();
+    Bucket bucket = table[bucket_id];
+    KeyType expected = key;
+    if (bucket.try_lock(iter, expected)) {
+      *bucket.scores(iter) = ScoreType();
+      *bucket.digests(iter) = Bucket::empty_digest();
+      ::atomicExch(counter + bucket_id * table.bucket_capacity() + iter, 0);
+      bucket.unlock(iter, Bucket::reclaimed_key());
+      atomicSub(bucket_sizes + bucket_id, 1);
+    }
+  } else if constexpr (EnableOverflow) {
+    int64_t local = slot - ovf_output_offsets[t_id];
+    if (local >= 0 && local < ovf_table.bucket_capacity()) {
+      Bucket bucket = ovf_table[t_id];
+      Iter iter = local;
+      KeyType expected = key;
+      if (bucket.try_lock(iter, expected)) {
+        *bucket.scores(iter) = ScoreType();
+        *bucket.digests(iter) = Bucket::empty_digest();
+        ::atomicExch(ovf_counter + t_id * ovf_table.bucket_capacity() + local,
+                     0);
+        bucket.unlock(iter, Bucket::reclaimed_key());
+        atomicSub(ovf_bucket_sizes + t_id, 1);
+      }
+    }
+  }
+  slot_indices[i] = -1;
+}
+
+// Replace scores using known cache slots.  Storage exchange uses this for LFU
+// hits so the cumulative backing-store score replaces the provisional cache
+// score without another hash lookup.
+template <typename Bucket>
+__forceinline__ __device__ bool lock_expected_key_with_backoff(
+    Bucket bucket, typename Bucket::Iterator iter,
+    typename Bucket::KeyType key) {
+  using KeyType = typename Bucket::KeyType;
+  constexpr int kMaxAttempts = 32;
+#pragma unroll 1
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    KeyType expected = key;
+    if (bucket.try_lock(iter, expected))
+      return true;
+    // A different published key means the known slot is stale. Only a
+    // transient lock is retryable; never write a replacement occupant's
+    // score.
+    if (expected != static_cast<KeyType>(Bucket::LockedKey))
+      return false;
+    const unsigned int backoff =
+        32U << static_cast<unsigned int>(attempt < 5 ? attempt : 5);
+    __nanosleep(backoff);
+  }
+  return false;
+}
+
+template <typename Table, bool EnableOverflow = false>
+__global__ void table_update_score_by_slot_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    IndexType const *__restrict__ slot_indices,
+    int64_t const *__restrict__ table_ids,
+    ScoreType const *__restrict__ input_scores,
+    bool const *__restrict__ active_mask,
+    int64_t const *__restrict__ active_count, Table ovf_table,
+    int64_t const *__restrict__ ovf_output_offsets) {
+  using KeyType = typename Table::KeyType;
+  using Bucket = typename Table::BucketType;
+  using Iter = typename Bucket::Iterator;
+
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= batch ||
+      (active_count != nullptr && i >= *active_count) ||
+      (active_mask != nullptr && !active_mask[i]))
+    return;
+
+  IndexType slot = slot_indices[i];
+  if (slot < 0)
+    return;
+  int64_t t_id = table_ids[i];
+  int64_t bkt_begin = table_bucket_offsets[t_id];
+  int64_t bkt_end = table_bucket_offsets[t_id + 1];
+  int64_t table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
+  if (slot < table_cap) {
+    int64_t bucket_id = bkt_begin + slot / table.bucket_capacity();
+    auto bucket = table[bucket_id];
+    Iter iter = slot % table.bucket_capacity();
+    KeyType key = input_keys[i];
+    if (lock_expected_key_with_backoff(bucket, iter, key)) {
+      *bucket.scores(iter) = input_scores[i];
+      bucket.unlock(iter, key);
+    }
+  } else if constexpr (EnableOverflow) {
+    int64_t local = slot - ovf_output_offsets[t_id];
+    if (local >= 0 && local < ovf_table.bucket_capacity()) {
+      auto bucket = ovf_table[t_id];
+      Iter iter = local;
+      KeyType key = input_keys[i];
+      if (lock_expected_key_with_backoff(bucket, iter, key)) {
+        *bucket.scores(iter) = input_scores[i];
+        bucket.unlock(iter, key);
+      }
     }
   }
 }
@@ -713,22 +1150,8 @@ __forceinline__ __device__ void overflow_insert_and_evict(
     KeyType k = key_slot->load(cuda::std::memory_order_relaxed);
 
     if (k == key) {
-      *iter_out = pos + output_offset;
-      *result_out = InsertResult::Assign;
-      return;
-    }
-
-    if (k == Bucket::empty_key()) {
-      KeyType expected = Bucket::empty_key();
+      KeyType expected = key;
       if (bucket.try_lock(pos, expected)) {
-        *bucket.digests(pos) = Bucket::key_to_digest(key);
-        atomicAdd(&bucket_sizes[bucket_id], 1);
-        *iter_out = pos + output_offset;
-        *result_out = InsertResult::Insert;
-        return;
-      }
-      k = key_slot->load(cuda::std::memory_order_relaxed);
-      if (k == key) {
         *iter_out = pos + output_offset;
         *result_out = InsertResult::Assign;
         return;
@@ -736,7 +1159,29 @@ __forceinline__ __device__ void overflow_insert_and_evict(
       continue;
     }
 
-    if (k == Bucket::LockedKey || k == Bucket::reclaimed_key())
+    if (k == Bucket::empty_key() || k == Bucket::reclaimed_key()) {
+      KeyType expected = k;
+      if (bucket.try_lock(pos, expected)) {
+        *bucket.digests(pos) = Bucket::key_to_digest(key);
+        atomicAdd(&bucket_sizes[bucket_id], 1);
+        *iter_out = pos + output_offset;
+        *result_out = (k == Bucket::empty_key()) ? InsertResult::Insert
+                                                : InsertResult::Reclaim;
+        return;
+      }
+      k = key_slot->load(cuda::std::memory_order_relaxed);
+      if (k == key) {
+        expected = key;
+        if (bucket.try_lock(pos, expected)) {
+          *iter_out = pos + output_offset;
+          *result_out = InsertResult::Assign;
+          return;
+        }
+      }
+      continue;
+    }
+
+    if (k == Bucket::LockedKey)
       continue;
 
     if (counter[pos] == 0) {

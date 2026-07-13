@@ -699,6 +699,20 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     if PS
                     else DynamicEmbStorage(storage_options, self._optimizer)
                 )
+                if type(self._storage).exchange is Storage.exchange:
+                    raise TypeError(
+                        f"Caching storage {type(self._storage).__name__} must "
+                        "implement Storage.exchange(); the cache prefetch path "
+                        "has no find/insert fallback"
+                    )
+                if (
+                    type(self._storage).release_cache_exchange_refs
+                    is Storage.release_cache_exchange_refs
+                ):
+                    raise TypeError(
+                        f"Caching storage {type(self._storage).__name__} must "
+                        "implement Storage.release_cache_exchange_refs()"
+                    )
                 self._storage_layout = (
                     StorageLayout.CACHING_PS if PS else StorageLayout.CACHING
                 )
@@ -954,6 +968,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if self._caching and self._cache is not None:
             flush_cache(self._cache, self._storage)
 
+    def close(self) -> None:
+        """Drain host-staged work while both cache and storage owners exist."""
+        storage = getattr(self, "_storage", None)
+        close = getattr(storage, "close", None)
+        if close is not None:
+            close()
+
+    def __del__(self) -> None:
+        # Attribute teardown order must not free cache/HostVMM buffers before
+        # the storage-owned native exchange engine has drained its raw pointers.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
             self._cache.reset()
@@ -1095,15 +1124,26 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     ) -> None:
         if not self.training:
             return
-        if self.prefetch_stream is None and forward_stream is not None:
-            self.prefetch_stream = torch.cuda.current_stream()
-            assert (
-                self.prefetch_stream != forward_stream
-            ), "prefetch_stream and forward_stream should not be the same stream"
-
-            current_stream = torch.cuda.current_stream()
+        current_stream = torch.cuda.current_stream()
+        if forward_stream is not None:
+            if forward_stream.device != current_stream.device:
+                raise RuntimeError(
+                    "prefetch_stream and forward_stream must be on the same device"
+                )
+            if current_stream == forward_stream:
+                raise RuntimeError(
+                    "prefetch_stream and forward_stream must be different"
+                )
             indices.record_stream(current_stream)
             offsets.record_stream(current_stream)
+        if self._cache is not None:
+            if self.prefetch_stream is None:
+                self.prefetch_stream = current_stream
+            elif current_stream != self.prefetch_stream:
+                raise RuntimeError(
+                    "cache prefetch metadata operations must use the same "
+                    "CUDA stream for the module lifetime"
+                )
 
         scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(scores)

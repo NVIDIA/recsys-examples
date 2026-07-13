@@ -85,14 +85,39 @@ class MultiTableKVCounter(Counter):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        founds: torch.Tensor,
     ) -> torch.Tensor:
+        if not (
+            keys.shape == table_ids.shape == frequencies.shape == founds.shape
+        ):
+            raise ValueError(
+                "keys, table_ids, frequencies, and founds must have the same shape"
+            )
+        if founds.dtype != torch.bool:
+            raise TypeError(f"founds must be torch.bool, got {founds.dtype}")
+
         self.score_arg_.value = frequencies
         scores_out = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
-        self.table_.insert(keys, table_ids, self.score_arg_, score_out=scores_out)
+        self.table_.insert(
+            keys,
+            table_ids,
+            self.score_arg_,
+            score_out=scores_out,
+            mask=~founds,
+        )
         return scores_out
 
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
-        self.table_.erase(keys, table_ids)
+    def erase(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        if not (keys.shape == table_ids.shape == mask.shape):
+            raise ValueError("keys, table_ids, and mask must have the same shape")
+        if mask.dtype != torch.bool:
+            raise TypeError(f"mask must be torch.bool, got {mask.dtype}")
+        self.table_.erase(keys, table_ids, mask=mask)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         return self.table_.memory_usage(mem_type)
@@ -128,11 +153,13 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
 
         self.threshold = threshold
         self.initializer_args = initializer_args
+        self._non_admit_initializer = None
 
     def admit(
         self,
         keys: torch.Tensor,
         frequencies: torch.Tensor,
+        founds: torch.Tensor,
     ) -> torch.Tensor:
         """
         Admit keys with frequencies >= threshold.
@@ -143,25 +170,30 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
             Keys to evaluate (shape: [N])
         frequencies : torch.Tensor
             Frequency counts for each key (shape: [N])
+        founds : torch.Tensor
+            Boolean mask identifying keys already found in cache or storage.
 
         Returns
         -------
         torch.Tensor
             Boolean mask (shape: [N]) where True indicates admission
         """
-        if keys.shape[0] != frequencies.shape[0]:
+        if not (keys.shape == frequencies.shape == founds.shape):
             raise ValueError(
-                f"Keys and frequencies must have same length, got {keys.shape[0]} and {frequencies.shape[0]}"
+                "keys, frequencies, and founds must have the same shape"
             )
+        if founds.dtype != torch.bool:
+            raise TypeError(f"founds must be torch.bool, got {founds.dtype}")
 
-        # Admit keys whose frequency meets or exceeds threshold
-        admit_mask = frequencies >= self.threshold
+        # Found keys need no admission decision. Keep them false so callers can
+        # consume this as a sparse action mask without compacting first.
+        admit_mask = (~founds) & (frequencies >= self.threshold)
         return admit_mask
 
     def initialize_non_admitted_embeddings(
         self,
         buffer: torch.Tensor,
-        indices: torch.Tensor,
+        mask: torch.Tensor,
     ) -> bool:
         """
         Initialize the embeddings for the keys that are not admitted.
@@ -171,10 +203,19 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         """
         if self.initializer_args is None:
             return False
-        non_admit_initializer = create_initializer_from_args(self.initializer_args)
-        non_admit_initializer(
+        if mask.dtype != torch.bool:
+            raise TypeError(f"mask must be torch.bool, got {mask.dtype}")
+        if mask.dim() != 1 or mask.numel() != buffer.shape[0]:
+            raise ValueError(
+                "mask must be one-dimensional and match the first buffer dimension"
+            )
+        if self._non_admit_initializer is None:
+            self._non_admit_initializer = create_initializer_from_args(
+                self.initializer_args
+            )
+        self._non_admit_initializer(
             buffer,
-            indices,
+            mask,
             None,
         )
         return True

@@ -106,10 +106,17 @@ def get_version():
 def get_extensions():
     extra_link_args = [
         "-Wl,--no-as-needed",
-        "-lcuda",  # CUDA drive API
+        "-lcuda",  # CUDA driver API (VMM allocation in vmm_tensor.cu)
+        "-pthread",
     ]
     extra_compile_args = {
-        "cxx": ["-O3", "-fdiagnostics-color=always", "-w", "-DDEMB_USE_PYBIND11"],
+        "cxx": [
+            "-O3",
+            "-fdiagnostics-color=always",
+            "-pthread",
+            "-w",
+            "-DDEMB_USE_PYBIND11",
+        ],
         "nvcc": [
             "-O3",
             # SASS<->source line mapping for ncu's Source page / --import-source.
@@ -119,6 +126,8 @@ def get_extensions():
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "--use_fast_math",
+            "-Xcompiler",
+            "-pthread",
             "-gencode",
             "arch=compute_75,code=sm_75",
             "-gencode",

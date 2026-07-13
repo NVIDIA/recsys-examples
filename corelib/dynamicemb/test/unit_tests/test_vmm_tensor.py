@@ -212,6 +212,7 @@ def test_is_device_buffer_device_vs_host():
     assert host_buf.is_device_buffer() is False
 
 
+@requires_cuda
 def _vmm_stress_full_matrix() -> bool:
     """Set DYNAMICEMB_VMM_STRESS_FULL=1 to run the old wide param grid (very slow)."""
     return os.environ.get("DYNAMICEMB_VMM_STRESS_FULL", "").strip().lower() in (

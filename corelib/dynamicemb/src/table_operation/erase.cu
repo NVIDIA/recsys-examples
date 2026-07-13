@@ -23,7 +23,9 @@ namespace dyn_emb {
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices) {
+                 std::optional<at::Tensor> indices,
+                 std::optional<at::Tensor> active_mask,
+                 std::optional<at::Tensor> active_count) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0)
@@ -34,6 +36,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
   auto indices_ = get_pointer<IndexType>(indices);
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
+  auto active_mask_ptr = get_pointer<bool>(active_mask);
+  auto active_count_ptr = get_pointer<int64_t>(active_count);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -57,7 +61,7 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
     table_erase_kernel<Table, 1>
         <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
             table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
-            table_ids_ptr, indices_);
+            table_ids_ptr, indices_, active_mask_ptr, active_count_ptr);
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

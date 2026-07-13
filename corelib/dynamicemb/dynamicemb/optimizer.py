@@ -135,6 +135,8 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        fallback_indices: Optional[torch.Tensor] = None,
+        fallback_table_ptrs: Optional[torch.Tensor] = None,
     ) -> None:
         ...
 
@@ -231,6 +233,8 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        fallback_indices: Optional[torch.Tensor] = None,
+        fallback_table_ptrs: Optional[torch.Tensor] = None,
     ) -> None:
         sgd_update_for_flat_table(
             grads,
@@ -243,6 +247,8 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             self._opt_args.learning_rate,
             torch_to_dyn_emb(table_dtype).value,
+            fallback_indices,
+            fallback_table_ptrs,
         )
 
     def get_opt_args(self):
@@ -308,6 +314,8 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        fallback_indices: Optional[torch.Tensor] = None,
+        fallback_table_ptrs: Optional[torch.Tensor] = None,
     ) -> None:
         adam_update_for_flat_table(
             grads,
@@ -325,6 +333,8 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             max_emb_dim,
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
+            fallback_indices,
+            fallback_table_ptrs,
         )
 
     def get_opt_args(self):
@@ -392,6 +402,8 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        fallback_indices: Optional[torch.Tensor] = None,
+        fallback_table_ptrs: Optional[torch.Tensor] = None,
     ) -> None:
         adagrad_update_for_flat_table(
             grads,
@@ -405,6 +417,8 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             max_emb_dim,
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
+            fallback_indices,
+            fallback_table_ptrs,
         )
 
     def get_opt_args(self):
@@ -469,6 +483,8 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        fallback_indices: Optional[torch.Tensor] = None,
+        fallback_table_ptrs: Optional[torch.Tensor] = None,
     ) -> None:
         rowwise_adagrad_for_flat_table(
             grads,
@@ -482,6 +498,8 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             max_emb_dim,
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
+            fallback_indices,
+            fallback_table_ptrs,
         )
 
     def get_opt_args(self):

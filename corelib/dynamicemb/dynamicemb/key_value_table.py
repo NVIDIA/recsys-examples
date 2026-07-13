@@ -49,11 +49,20 @@ from dynamicemb.types import (
     OPT_STATE_TYPE,
     SCORE_TYPE,
     Cache,
+    CacheExchangeRequest,
+    CacheExchangeResult,
+    CacheFindOrInsertResult,
     CopyMode,
+    DynamicEmbTableState,
     Storage,
     torch_dtype_to_np_dtype,
 )
-from dynamicemb_extensions import EvictStrategy, flagged_compact
+from dynamicemb.utils import torch_to_dyn_emb
+from dynamicemb_extensions import (
+    EvictStrategy,
+    exchange_cache_storage_values,
+    flagged_compact,
+)
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
@@ -171,52 +180,6 @@ def get_table_ptrs(
         dtype=torch.int64,
         device=device,
     )
-
-
-# ---------------------------------------------------------------------------
-# DynamicEmbTableState – shared state dataclass
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class DynamicEmbTableState:
-    options_list: List[DynamicEmbTableOptions]
-    num_tables: int
-    device: torch.device
-    score_policy: ScoreSpec
-    evict_strategy: EvictStrategy
-    key_index_map: Any
-    capacity: int
-    tables: List[ExtendableBuffer]
-    # Per-table value buffer base pointers on ``device``; refreshed on init and expand.
-    table_ptrs_dev: torch.Tensor
-    table_emb_dims: torch.Tensor
-    # Persistent host (CPU) copy of table_emb_dims as a tensor (the ``_cpu`` field
-    # below is the Python int list); long-lived so callers get a stable host tensor.
-    table_emb_dims_host: torch.Tensor
-    table_value_dims: torch.Tensor
-    table_emb_dims_cpu: List[int]
-    table_value_dims_cpu: List[int]
-    max_emb_dim: int
-    emb_dim: int
-    value_dim: int
-    emb_dtype: torch.dtype
-    all_dims_vec4: bool
-    optimizer: BaseDynamicEmbeddingOptimizer
-    initial_optim_state: float
-    threads_in_wave: int
-    score: Optional[int] = None
-    training: bool = False
-    # Overflow region fields (per-table, only set when overflow is enabled)
-    overflow_caps: Optional[List[int]] = None
-    # NO_EVICTION: per-table auto-increment index used as insert score (internal only).
-    # no_eviction_next_index: CPU pinned tensor (num_tables,); no_eviction_next_index_dev: same on state.device.
-    no_eviction_next_index: Optional[torch.Tensor] = None
-    no_eviction_next_index_dev: Optional[torch.Tensor] = None
-    # Estimated per-table size (last_collected + accumulated unique since collection);
-    # CPU tensor of shape (num_tables,), used to avoid key_index_map.size() when not needed.
-    estimated_table_sizes: Optional[torch.Tensor] = None
-    collect_table_sizes_flag: bool = False
 
 
 def create_table_state(
@@ -346,6 +309,13 @@ def create_table_state(
         optimizer=optimizer,
         initial_optim_state=optimizer.get_initial_optim_states(),
         threads_in_wave=threads_in_wave,
+        # The fused exchange is latency-bound on the sparse mapped-host access
+        # path, not SM-bound: ~SM/4 blocks already saturate the PCIe/DRAM request
+        # path (measured no slower -- slightly faster -- than an all-SM launch,
+        # which over-subscribes and adds DRAM bank/row contention). A small grid
+        # hands the remaining SMs back to the forward/backward compute that this
+        # prefetch overlaps in the training pipeline.
+        exchange_target_grid_size=max(1, props.multi_processor_count // 4),
         score=None,
         training=False,
         overflow_caps=overflow_caps_list,
@@ -399,6 +369,11 @@ def collect_table_sizes_for_state(
 # ---------------------------------------------------------------------------
 
 
+def _has_live_table_refs(state: DynamicEmbTableState) -> bool:
+    """Synchronously test refs only on the host-coordinated resize path."""
+    return bool(state.key_index_map._ref_counter.any().item())
+
+
 def _expand_tables_impl(
     state: DynamicEmbTableState,
     tables_to_expand: List[bool],
@@ -420,6 +395,11 @@ def _expand_tables_impl(
     copied directly from the old key_index_map (copy_table_from). Updates key_index_map,
     capacity; state.no_eviction_next_index is not changed (expansion
     does not change the key set). Mutates state."""
+    if _has_live_table_refs(state):
+        raise RuntimeError(
+            "cannot expand dynamic-embedding storage while lookup/update "
+            "references are live"
+        )
     base_opt = state.options_list[0]
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
@@ -597,6 +577,15 @@ def expand_if_need_impl(
         state, state.estimated_table_sizes, unique_size_per_table
     )
     if any(estimated_results):
+        # A rolled-back cache placement may retain a backing row through
+        # backward. A resize rehashes keys and can relocate physical rows,
+        # invalidating the full-layout direct row/slot metadata. Expansion is
+        # already a rare, host-coordinated path, so synchronize only here and
+        # defer while any lookup/update reference is live. The estimated size
+        # still advances; a later prefetch retries expansion after release.
+        if _has_live_table_refs(state):
+            state.estimated_table_sizes.add_(unique_size_per_table)
+            return
         if state.collect_table_sizes_flag:
             _expand_tables_impl(state, estimated_results, target_capacities)
             state.estimated_table_sizes.add_(unique_size_per_table)
@@ -1421,7 +1410,13 @@ class DynamicEmbCache(Cache):
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         self._state = create_table_state(options, optimizer, enable_overflow=True)
-        self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
+        # Keep optional metrics device-resident so recording does not force the
+        # prefetch stream to synchronize with the host. Consumers already use
+        # ``.item()`` when they need a host value, making that read the explicit
+        # synchronization point.
+        self._cache_metrics = torch.zeros(
+            10, dtype=torch.long, device=self._state.device
+        )
         self._record_cache_metrics = False
 
     # -- Cache interface --
@@ -1438,9 +1433,100 @@ class DynamicEmbCache(Cache):
         self,
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
+        *,
+        fallback_slot_indices: Optional[torch.Tensor] = None,
+        fallback_storage: Optional[Storage] = None,
     ) -> None:
-        """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
-        self._state.key_index_map.decrement_counter(slot_indices, table_ids)
+        """Release cache refs, falling back to storage for negative slots."""
+        self._state.key_index_map.decrement_counter(
+            slot_indices,
+            table_ids,
+            fallback_slot_indices=fallback_slot_indices,
+            fallback_table=(
+                fallback_storage.key_index_map
+                if fallback_storage is not None
+                else None
+            ),
+        )
+
+    def find_or_insert(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+    ) -> CacheFindOrInsertResult:
+        """Find cache hits and provision protected slots in one GPU operation."""
+        state = self._state
+        score_arg = get_find_score_arg(
+            state,
+            unique_keys.numel(),
+            unique_keys.device,
+            lfu_accumulated_frequency=scores,
+        )
+        (
+            indices,
+            founds,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+            evicted_table_ids,
+            evicted_mask,
+        ) = state.key_index_map.find_or_insert(
+            unique_keys,
+            table_ids,
+            score_arg,
+        )
+
+        if self._record_cache_metrics:
+            num_unique = unique_keys.numel()
+            num_found = founds.sum(dtype=torch.int64)
+            self._cache_metrics[0].fill_(num_unique)
+            self._cache_metrics[1].copy_(num_found)
+            self._cache_metrics[2].fill_(num_unique)
+            self._cache_metrics[2].sub_(num_found)
+            self._cache_metrics[3].copy_(evicted_mask.sum(dtype=torch.int64))
+
+        return CacheFindOrInsertResult(
+            indices=indices,
+            founds=founds,
+            evicted_keys=evicted_keys,
+            evicted_indices=evicted_indices,
+            evicted_scores=evicted_scores,
+            evicted_table_ids=evicted_table_ids,
+            evicted_mask=evicted_mask,
+        )
+
+    def reclaim(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        slot_indices: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        """Release masked provisional entries through their known slots."""
+        self._state.key_index_map.reclaim_by_slot(
+            keys,
+            table_ids,
+            slot_indices,
+            mask=mask,
+        )
+
+    def update_scores(
+        self,
+        keys: torch.Tensor,
+        slot_indices: torch.Tensor,
+        table_ids: torch.Tensor,
+        scores: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        """Replace masked scores when known slots still contain ``keys``."""
+        self._state.key_index_map.update_score_by_slot(
+            keys,
+            slot_indices,
+            table_ids,
+            scores,
+            mask=mask,
+        )
 
     def lookup(
         self,
@@ -1459,7 +1545,7 @@ class DynamicEmbCache(Cache):
         if self._record_cache_metrics:
             self._cache_metrics[0] = unique_keys.size(0)
             founds = result[1]
-            self._cache_metrics[1] = founds.sum().item()
+            self._cache_metrics[1].copy_(founds.sum(dtype=torch.int64))
         return result
 
     def insert_and_evict(
@@ -1695,6 +1781,152 @@ class DynamicEmbStorage(Storage):
         collect_table_sizes_for_state(self._state, non_blocking=non_blocking)
 
     # -- Storage interface --
+
+    def exchange(self, request: CacheExchangeRequest) -> CacheExchangeResult:
+        """Exchange sparse storage hits and cache evictions without value staging."""
+        state = self._state
+        cache_state = request.cache_state
+        if cache_state.num_tables != state.num_tables:
+            raise ValueError("cache and storage must have the same number of tables")
+        if cache_state.emb_dtype != state.emb_dtype:
+            raise ValueError("cache and storage must have the same value dtype")
+        if cache_state.table_value_dims_cpu != state.table_value_dims_cpu:
+            raise ValueError("cache and storage must have matching physical row widths")
+
+        num_keys = request.keys.numel()
+        device = request.keys.device
+        storage_scores = torch.zeros(num_keys, dtype=torch.int64, device=device)
+        storage_founds = torch.zeros(num_keys, dtype=torch.bool, device=device)
+        storage_slots = torch.full(
+            (num_keys,), -1, dtype=torch.int64, device=device
+        )
+        storage_lookup_score = get_find_score_arg(
+            state,
+            num_keys,
+            device,
+            lfu_accumulated_frequency=request.scores,
+        )
+        cache_misses = torch.logical_not(request.cache_founds)
+        storage_scores, storage_founds, storage_slots = state.key_index_map.lookup(
+            request.keys,
+            request.table_ids,
+            storage_lookup_score,
+            mask=cache_misses,
+            score_out=storage_scores,
+            founds_out=storage_founds,
+            indices_out=storage_slots,
+            acquire=True,
+        )
+
+        if state.no_eviction_next_index_dev is None:
+            storage_src_rows = storage_slots
+        else:
+            # NO_EVICTION stores its stable physical row in the hash-table score.
+            storage_src_rows = torch.where(
+                storage_founds,
+                storage_scores,
+                torch.full_like(storage_scores, -1),
+            )
+
+        if state.no_eviction_next_index_dev is None:
+            storage_insert_score = get_insert_score_arg(
+                state,
+                num_keys,
+                device,
+                scores=request.evicted_scores,
+                table_ids=request.evicted_table_ids,
+            )
+            evicted_storage_slots = state.key_index_map.insert(
+                request.evicted_keys,
+                request.evicted_table_ids,
+                storage_insert_score,
+                mask=request.evicted_mask,
+                publish_and_acquire=True,
+            )
+            evicted_storage_rows = evicted_storage_slots
+        else:
+            # The insert kernel returns an existing logical row for hits and
+            # atomically assigns/publishes a new per-table row for new keys.
+            # Inactive and failed positions stay -1 for exchange validation.
+            evicted_storage_rows = torch.full(
+                (num_keys,), -1, dtype=torch.int64, device=device
+            )
+            const_score = ScoreArg(
+                name=state.score_policy.name,
+                value=None,
+                policy=ScorePolicy.CONST,
+            )
+            evicted_storage_slots = state.key_index_map.insert(
+                request.evicted_keys,
+                request.evicted_table_ids,
+                const_score,
+                score_out=evicted_storage_rows,
+                mask=request.evicted_mask,
+                row_counters=state.no_eviction_next_index_dev,
+                publish_and_acquire=True,
+            )
+
+        # The cache find-or-insert has already replaced an eviction victim's
+        # key metadata. If backing storage cannot reserve the aligned row, put
+        # that metadata back before the value-exchange kernel can overwrite the
+        # cache row. This is device-side, sparse, and mutates cache_indices to
+        # -1 so the incoming key uses a direct storage row or a transient
+        # forward initialization instead of losing the evicted embedding.
+        cache_state.key_index_map.rollback_failed_evictions(
+            request.keys,
+            request.table_ids,
+            request.cache_indices,
+            request.evicted_keys,
+            request.evicted_scores,
+            request.evicted_mask,
+            evicted_storage_slots,
+        )
+
+        exchange_cache_storage_values(
+            cache_state.table_ptrs_dev,
+            cache_state.table_value_dims,
+            state.table_ptrs_dev,
+            state.table_value_dims,
+            state.key_index_map.table_bucket_offsets_,
+            state.key_index_map.bucket_capacity_,
+            state.key_index_map._ref_counter,
+            request.table_ids,
+            request.cache_indices,
+            storage_src_rows,
+            storage_slots,
+            storage_founds,
+            evicted_storage_slots,
+            evicted_storage_rows,
+            request.evicted_mask,
+            cache_state.exchange_target_grid_size,
+            torch_to_dyn_emb(state.emb_dtype),
+        )
+
+        return CacheExchangeResult(
+            founds=torch.logical_or(request.cache_founds, storage_founds),
+            storage_founds=storage_founds,
+            storage_scores=storage_scores,
+            direct_storage_rows=storage_src_rows,
+            direct_storage_slots=storage_slots,
+            direct_storage_table_ptrs=state.table_ptrs_dev,
+        )
+
+    def release_cache_exchange_refs(
+        self,
+        cache: Cache,
+        cache_slots: torch.Tensor,
+        storage_slots: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> None:
+        """Release cache or direct-storage ownership in one aligned kernel."""
+        if not isinstance(cache, DynamicEmbCache):
+            raise TypeError("DynamicEmbStorage requires DynamicEmbCache")
+        cache.decrement_counter(
+            cache_slots,
+            table_ids,
+            fallback_slot_indices=storage_slots,
+            fallback_storage=self,
+        )
 
     def find(
         self,
