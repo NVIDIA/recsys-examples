@@ -124,6 +124,7 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         as_batch: bool = True,
         hostkv_wait_timeout_ms: int = 0,
         host_kvstorage_fail_policy: str = "fail_open",
+        config_path: Optional[str] = None,
         enable_layerwise: Optional[bool] = None,
         layerwise_eventfd_socket: Optional[str] = None,
         layerwise_counter_id: int = 0,
@@ -142,6 +143,8 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         self.hostkv_wait_timeout_ms = int(hostkv_wait_timeout_ms)
         self.host_kvstorage_fail_policy = host_kvstorage_fail_policy
         self.enable_mps = bool(enable_mps)
+        self.as_batch = bool(as_batch)
+        self.config_path = config_path or ""
         self.enable_layerwise = enable_layerwise
         self.layerwise_eventfd_socket = (
             layerwise_eventfd_socket
@@ -233,6 +236,25 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
         if self.num_tmp_cpu_blocks > 0:
             cache_cfg_kwargs["num_tmp_cpu_blocks"] = self.num_tmp_cpu_blocks
         cache_cfg = CacheConfig(**cache_cfg_kwargs)
+        if self.config_path:
+            try:
+                from flexkv.common.config import (
+                    load_user_config_from_file,
+                    update_default_config_from_user_config,
+                )
+            except Exception as e:
+                raise RuntimeError(f"FlexKV config import failed: {e}") from e
+
+            user_cfg = load_user_config_from_file(self.config_path)
+            try:
+                from flexkv.common.config import RankInfo
+
+                rank_info_or_model_cfg = RankInfo(model_config=model_cfg)
+            except ImportError:
+                rank_info_or_model_cfg = model_cfg
+            update_default_config_from_user_config(
+                rank_info_or_model_cfg, cache_cfg, user_cfg
+            )
         if self.enable_layerwise is None:
             enable_layerwise_env = os.environ.get("RECSYS_FLEXKV_ENABLE_LAYERWISE", "0")
             self.enable_layerwise = enable_layerwise_env.strip().lower() in {
@@ -447,15 +469,22 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             },
         )
 
+        use_batch = self.as_batch and (
+            len(onboard_task_ids) > 1 or bool(self.enable_layerwise)
+        )
+        launch_kwargs = {"as_batch": use_batch}
         if self.enable_layerwise:
-            self._client.launch(
-                onload_handle.task_ids,
-                onload_handle.slot_mappings,
-                layerwise_transfer=True,
-                counter_id=self.layerwise_counter_id,
+            launch_kwargs.update(
+                {
+                    "layerwise_transfer": True,
+                    "counter_id": self.layerwise_counter_id,
+                }
             )
-        else:
-            self._client.launch(onload_handle.task_ids, onload_handle.slot_mappings)
+        self._client.launch(
+            onload_handle.task_ids,
+            onload_handle.slot_mappings,
+            **launch_kwargs,
+        )
         return onload_task_handle
 
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
@@ -530,7 +559,10 @@ class FlexKVStorageManager(HostKVStorageManagerBase):
             else self._build_slot_mappings(kvcache_metadata)
         )
 
-        use_batch = self.as_batch and offload_user_ids.size(0) > 1
+        # Keep offload on the direct put_async path while validating layerwise.
+        # This matches the known-good 2e259b0 behavior and isolates PR418's
+        # put_match/as_batch offload optimization from PR428 layerwise onboard.
+        use_batch = False
         task_ids: List[int] = []
         batch_slot_mappings: List[torch.Tensor] = []
         for idx in range(offload_user_ids.size(0)):
