@@ -166,6 +166,10 @@ SUPPORTED_COMPOUND_SCORE_STRATEGIES: Tuple[frozenset, ...] = (
 def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
     """Validate *score_strategy* and return it in canonical form.
 
+    ``None`` is passed through unchanged: it is the sentinel used by the planner /
+    sharding path for non-DynamicEmb (plain TorchRec) tables, which never build a
+    score policy (see :class:`~dynamicemb.shard.embedding` handling of a ``None``
+    score strategy).
     A single :class:`DynamicEmbScoreStrategy` is returned unchanged. A one-element
     tuple ``(X,)`` is unwrapped to the single strategy ``X`` (a single score column
     has no ordering to preserve). A multi-element tuple must form a supported
@@ -178,6 +182,8 @@ def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
     TypeError
         If *score_strategy* (or a tuple element) is not a ``DynamicEmbScoreStrategy``.
     """
+    if score_strategy is None:
+        return None
     if isinstance(score_strategy, tuple):
         for element in score_strategy:
             if not isinstance(element, DynamicEmbScoreStrategy):
@@ -461,7 +467,7 @@ class DynamicEmbTableOptions:
         int
     ] = None  # if not set then set to max_capcacity after sharded
     max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
-    score_strategy: ScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
+    score_strategy: Optional[ScoreStrategy] = DynamicEmbScoreStrategy.TIMESTAMP
     bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
     safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
     global_hbm_for_values: int = 0  # in bytes
