@@ -31,6 +31,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbEvictStrategy,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    ScoreStrategy,
     _sharded_table_bucket_layout,
 )
 from dynamicemb.key_value_table import HybridStorage
@@ -99,7 +100,7 @@ def _ensure_capacities_multiple_of_bucket(opt: DynamicEmbTableOptions) -> None:
 def _full_table_options(
     num_embeddings: int,
     embedding_dim: int,
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: ScoreStrategy,
     optimizer_type: EmbOptimType,
 ) -> DynamicEmbTableOptions:
     """Full-table footprint; local_hbm_for_values is set to total table bytes (matches Batched total_memory).
@@ -155,7 +156,7 @@ def _full_table_options(
 def _build_storage(
     num_embeddings: int,
     embedding_dim: int,
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: ScoreStrategy,
     local_hbm_budget_scale: float,
     optimizer_type: EmbOptimType,
 ) -> HybridStorage:
@@ -323,7 +324,7 @@ def export_embeddings_dict(
 @pytest.mark.parametrize("table_profile", ["small", "large"])
 def test_hybrid_storage_export_scores_and_embeddings(
     local_hbm_budget_scale: float,
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: ScoreStrategy,
     table_profile: str,
 ):
     """Exercise ``HybridStorage`` (two-tier HBM + host) without ``BatchedDynamicEmbeddingTablesV2``.

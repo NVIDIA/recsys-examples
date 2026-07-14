@@ -129,10 +129,14 @@ __global__ void table_lookup_kernel(
     IndexType index = -1;
     if (found) {
       if constexpr (PolicyType == ScorePolicyType::Const) {
-        score = *bucket.scores(iter);
+        // Return the reduction score (frequency for LruLfu; word 0 otherwise),
+        // not word 0 which for LruLfu is the timestamp.
+        score = *bucket.reduction_score(iter);
       } else {
         KeyType expected_key = key;
         if (bucket.try_lock(iter, expected_key)) {
+          // For LruLfu, update() writes both words (timestamp + frequency) and
+          // returns the frequency.
           score = ScorePolicy<PolicyType>::update(bucket.scores(iter), score);
           bucket.unlock(iter, key);
         } else {
@@ -156,9 +160,21 @@ __global__ void table_lookup_kernel(
         if (ovf_found) {
           found = true;
           index = ovf_out_iter;
+          Iter local = ovf_out_iter - ovf_output_offsets[t_id];
           if constexpr (PolicyType == ScorePolicyType::Const) {
-            Iter local = ovf_out_iter - ovf_output_offsets[t_id];
-            score = *ovf_bucket.scores(local);
+            // Reduction score (frequency for LruLfu), not word 0 (timestamp).
+            score = *ovf_bucket.reduction_score(local);
+          } else {
+            // Maintain the overflow entry's score on access (stamp timestamp /
+            // accumulate frequency), mirroring the main-table found path; for
+            // LruLfu update() writes both words. Lock the slot for a consistent
+            // write; skip if the entry moved out concurrently.
+            KeyType expected_key = key;
+            if (ovf_bucket.try_lock(local, expected_key)) {
+              score = ScorePolicy<PolicyType>::update(ovf_bucket.scores(local),
+                                                      score);
+              ovf_bucket.unlock(local, key);
+            }
           }
         }
       }
@@ -235,7 +251,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
             continue;
           }
         }
-        if (*bucket.scores(iter) != evict_score) {
+        if (*bucket.reduction_score(iter) != evict_score) {
           bucket.unlock(iter, evict_key);
         } else {
           *bucket.digests(iter) = Bucket::key_to_digest(key);
@@ -243,7 +259,11 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
             atomicAdd(&bucket_sizes[bucket_id], 1);
             result = InsertResult::Reclaim;
           } else {
-            *bucket.scores(iter) = ScoreType();
+            // Clear the evicted key's whole (AoS-contiguous) score block so the
+            // new occupant starts fresh (e.g. LruLfu frequency restarts at 0).
+            ScoreType *sblk = bucket.scores(iter);
+            for (int64_t s = 0; s < bucket.num_scores(); ++s)
+              sblk[s] = ScoreType();
             result = InsertResult::Evict;
           }
           if (evict_key_out)
@@ -341,6 +361,8 @@ __global__ void table_insert_kernel(
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
+      // For LruLfu, update() writes both words (timestamp + frequency); a freshly
+      // evicted slot already had its block cleared in insert().
       score = Policy::update(bucket.scores(iter), score);
       index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
@@ -437,6 +459,7 @@ __global__ void table_insert_and_evict_kernel(
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
     if (isInsertSuccess(result)) {
+      // For LruLfu, update() writes both words (timestamp + frequency).
       score = Policy::update(bucket.scores(iter), score);
       index = (bucket_id - bkt_begin) * bucket.capacity() + iter;
       table_key_slot = bucket.keys(iter);
@@ -465,14 +488,28 @@ __global__ void table_insert_and_evict_kernel(
           index = ovf_iter;
           final_result = ovf_result;
           table_key_slot = nullptr;
-          if (ovf_result == InsertResult::Evict) {
-            Iter local = ovf_iter - ovf_output_offsets[t_id];
+          Iter local = ovf_iter - ovf_output_offsets[t_id];
+          if (ovf_result == InsertResult::Insert ||
+              ovf_result == InsertResult::Evict) {
+            // Newly occupied overflow slot (locked until table_unlock_kernel):
+            // clear the whole score block so LruLfu frequency restarts at 0,
+            // then write the score words via the policy.
+            for (int64_t s = 0; s < ovf_bucket.num_scores(); ++s)
+              *ovf_bucket.scores(local, s) = ScoreType();
+            score = Policy::update(ovf_bucket.scores(local), score);
             table_key_slot = ovf_bucket.keys(local);
-            final_evict_key = ovf_evict_key;
-            final_evict_index = ovf_iter;
-          } else if (ovf_result == InsertResult::Insert) {
-            Iter local = ovf_iter - ovf_output_offsets[t_id];
-            table_key_slot = ovf_bucket.keys(local);
+            if (ovf_result == InsertResult::Evict) {
+              final_evict_key = ovf_evict_key;
+              final_evict_index = ovf_iter;
+            }
+          } else if (ovf_result == InsertResult::Assign) {
+            // Existing overflow key re-inserted: update its score under lock
+            // (accumulate for LruLfu). It is not locked by the find, so guard.
+            KeyType expected_key = key;
+            if (ovf_bucket.try_lock(local, expected_key)) {
+              score = Policy::update(ovf_bucket.scores(local), score);
+              ovf_bucket.unlock(local, key);
+            }
           }
         }
       }
@@ -619,7 +656,8 @@ __global__ void table_export_batch_kernel(
     Table table, IndexType begin, IndexType end, IndexType table_begin,
     CounterType *__restrict__ counter,
     typename Table::KeyType *__restrict__ keys, ScoreType *__restrict__ scores,
-    PredFunctor pred, IndexType *__restrict__ indices) {
+    PredFunctor pred, IndexType *__restrict__ indices,
+    int64_t score_index = 0) {
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
@@ -637,7 +675,10 @@ __global__ void table_export_batch_kernel(
     Iter iter = Iter(i % bucket.capacity());
 
     const KeyType key = *bucket.keys(iter);
-    const ScoreType score = *bucket.scores(iter);
+    // Predicate + exported score read from the selected column (score_index).
+    // col0 (default) is the reduction score; an auxiliary column (e.g. a
+    // last-access timestamp) is used for time-based incremental dump.
+    const ScoreType score = *bucket.scores(iter, score_index);
     const IndexType index = i - table_begin;
 
     bool valid = Bucket::is_valid(key);
@@ -761,7 +802,8 @@ __forceinline__ __device__ void overflow_insert_and_evict(
 
 template <typename Table, typename ExecFunctor, int TileSize>
 __global__ void table_traverse_kernel(Table table, IndexType begin,
-                                      IndexType end, ExecFunctor f) {
+                                      IndexType end, ExecFunctor f,
+                                      int64_t score_index = 0) {
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
@@ -780,11 +822,88 @@ __global__ void table_traverse_kernel(Table table, IndexType begin,
     Iter iter = Iter(i % bucket.capacity());
 
     const KeyType key = *bucket.keys(iter);
-    const ScoreType score = *bucket.scores(iter);
+    const ScoreType score = *bucket.scores(iter, score_index);
 
     bool valid = Bucket::is_valid(key);
     f.template operator()<TileSize>(score, g, valid);
   }
+}
+
+// Copy every score word for a set of (src_slot, dst_slot) key pairs from one
+// table to another. Used by rehash to preserve multi-word score layouts (e.g.
+// LruLfu's timestamp+frequency) that a single-value re-insert cannot restore.
+// Slots are table-relative flat indices ((local_bucket * bucket_capacity) +
+// iter); *_bkt_begin is the table's first global bucket. Reuses the AoS
+// Bucket::scores(iter, k) accessor so no layout math is duplicated.
+template <typename Table>
+__global__ void copy_score_blocks_kernel(
+    Table src_table, int64_t src_bkt_begin, Table dst_table,
+    int64_t dst_bkt_begin, int64_t n, const int64_t *__restrict__ src_slots,
+    const int64_t *__restrict__ dst_slots) {
+  using Bucket = typename Table::BucketType;
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  int64_t ss = src_slots[i];
+  int64_t ds = dst_slots[i];
+  if (ss < 0 || ds < 0)
+    return;
+  int64_t s_bc = src_table.bucket_capacity();
+  int64_t d_bc = dst_table.bucket_capacity();
+  Bucket sb = src_table[src_bkt_begin + ss / s_bc];
+  Bucket db = dst_table[dst_bkt_begin + ds / d_bc];
+  int64_t s_iter = ss % s_bc;
+  int64_t d_iter = ds % d_bc;
+  int64_t ns = dst_table.num_scores();
+  for (int64_t k = 0; k < ns; ++k) {
+    *db.scores(d_iter, k) = *sb.scores(s_iter, k);
+  }
+}
+
+// Gather all score words for a set of slots into a row-major [n, num_scores]
+// output. Used by dump to persist multi-word score layouts (LruLfu). Slots are
+// table-relative flat indices; bkt_begin is the table's first global bucket.
+template <typename Table>
+__global__ void gather_score_blocks_kernel(
+    Table table, int64_t bkt_begin, int64_t n,
+    const int64_t *__restrict__ slots, ScoreType *__restrict__ out) {
+  using Bucket = typename Table::BucketType;
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  int64_t ns = table.num_scores();
+  int64_t s = slots[i];
+  if (s < 0) {
+    for (int64_t k = 0; k < ns; ++k)
+      out[i * ns + k] = ScoreType();
+    return;
+  }
+  int64_t bc = table.bucket_capacity();
+  Bucket b = table[bkt_begin + s / bc];
+  int64_t it = s % bc;
+  for (int64_t k = 0; k < ns; ++k)
+    out[i * ns + k] = *b.scores(it, k);
+}
+
+// Scatter a row-major [n, num_scores] score block into a set of slots. Used by
+// load to restore multi-word score layouts (LruLfu) after the keys are placed.
+template <typename Table>
+__global__ void scatter_score_blocks_kernel(
+    Table table, int64_t bkt_begin, int64_t n,
+    const int64_t *__restrict__ slots, const ScoreType *__restrict__ vals) {
+  using Bucket = typename Table::BucketType;
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  int64_t s = slots[i];
+  if (s < 0)
+    return;
+  int64_t ns = table.num_scores();
+  int64_t bc = table.bucket_capacity();
+  Bucket b = table[bkt_begin + s / bc];
+  int64_t it = s % bc;
+  for (int64_t k = 0; k < ns; ++k)
+    *b.scores(it, k) = vals[i * ns + k];
 }
 
 } // namespace dyn_emb

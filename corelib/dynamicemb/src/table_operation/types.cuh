@@ -90,10 +90,11 @@ template <typename KeyType_,
                                       sizeof(KeyType_) == 8>>
 struct LinearBucket {
 
-  __forceinline__ __device__ LinearBucket(uint8_t *storage, int64_t capacity)
-      : storage_(storage), capacity_(capacity) {}
+  __forceinline__ __device__ LinearBucket(uint8_t *storage, int64_t capacity,
+                                          int64_t num_scores = 1)
+      : storage_(storage), capacity_(capacity), num_scores_(num_scores) {}
 
-  __forceinline__ __device__ LinearBucket() : LinearBucket(nullptr, 0) {}
+  __forceinline__ __device__ LinearBucket() : LinearBucket(nullptr, 0, 1) {}
 
   /*
   Iterator:
@@ -241,10 +242,19 @@ struct LinearBucket {
   static constexpr int KeyOffset = 0;
   static constexpr int DigestOffset = KeyOffset + sizeof(KeyType);
   static constexpr int ScoreOffset = DigestOffset + sizeof(DigestType);
+  // Per-slot bytes for a single score column (num_scores == 1). Multi-column
+  // tables size the score region as num_scores * sizeof(ScoreType); see the
+  // num_scores overload of memory_usage().
   static constexpr int BucketBytes = ScoreOffset + sizeof(ScoreType);
 
-  static __device__ __forceinline__ uint64_t memory_usage(int64_t size) {
-    return BucketBytes * size;
+  // Bytes occupied by one bucket of `size` slots. With num_scores > 1 the score
+  // region holds num_scores words per key laid out AoS -- each key's words are
+  // contiguous: [key0: w0..w_{n-1}][key1: w0..w_{n-1}]... -- matching the
+  // scores(iter, k) accessor below (iter * num_scores_ + k). num_scores == 1
+  // reproduces BucketBytes * size exactly.
+  static __device__ __forceinline__ uint64_t
+  memory_usage(int64_t size, int64_t num_scores = 1) {
+    return (ScoreOffset + num_scores * sizeof(ScoreType)) * size;
   }
 
   __forceinline__ __device__ int64_t capacity() const { return capacity_; }
@@ -258,9 +268,29 @@ struct LinearBucket {
            iter;
   }
 
+  // AoS layout: a key's num_scores_ score words are contiguous, so key `iter`'s
+  // words start at iter * num_scores_. scores(iter) returns that base (word 0).
   __forceinline__ __device__ ScoreType *scores(const Iterator &iter) const {
     return reinterpret_cast<ScoreType *>(storage_ + ScoreOffset * capacity_) +
-           iter;
+           iter * num_scores_;
+  }
+
+  // Score word k of key `iter`. Word 0 aliases scores(iter). For the LruLfu
+  // 2-word layout: k==0 is the timestamp, k==1 is the frequency.
+  __forceinline__ __device__ ScoreType *scores(const Iterator &iter,
+                                               int64_t k) const {
+    return reinterpret_cast<ScoreType *>(storage_ + ScoreOffset * capacity_) +
+           iter * num_scores_ + k;
+  }
+
+  __forceinline__ __device__ int64_t num_scores() const { return num_scores_; }
+
+  // The word eviction ranks by: the last score word (word 0 for single-score;
+  // word 1 == frequency for the LruLfu 2-word layout). Kept in sync with the
+  // reduction column reduce() scans.
+  __forceinline__ __device__ ScoreType *
+  reduction_score(const Iterator &iter) const {
+    return scores(iter, num_scores_ - 1);
   }
 
   enum class ProbeResult : uint8_t {
@@ -382,48 +412,98 @@ struct LinearBucket {
 
     static constexpr int Stride = NumScorePerVector;
 
-    Iterator iter = 0;
     int rank = threadIdx.x;
 
+    if (num_scores_ == 1) {
+      // Single-score fast path: scores are one word per key and contiguous, so
+      // BulkDim consecutive words == BulkDim consecutive keys.
+      Iterator iter = 0;
+      async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
+                                                  scores(iter));
+      __pipeline_commit();
+
+      for (; iter < capacity_; iter += BulkDim) {
+        if (iter < capacity_ - BulkDim) {
+          async_copy_bulk<ScoreType, BulkDim, Stride>(
+              &sm_buffers[rank * BufferDim] + diff_buf(iter / BulkDim) * BulkDim,
+              scores(iter) + BulkDim);
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(1);
+        ScoreType temp_scores[Stride];
+        ScoreType *src =
+            sm_buffers + rank * BufferDim + same_buf(iter / BulkDim) * BulkDim;
+#pragma unroll
+        for (int k = 0; k < BulkDim; k += Stride) {
+          *reinterpret_cast<ScoreVector *>(temp_scores) =
+              *reinterpret_cast<ScoreVector *>(src + k);
+#pragma unroll
+          for (int j = 0; j < Stride; j += 1) {
+            ScoreType temp_score = temp_scores[j];
+            if (temp_score < dst_score) {
+              auto temp_key_slot =
+                  reinterpret_cast<AtomicKey *>(keys(iter + k + j));
+
+              auto temp_key =
+                  temp_key_slot->load(cuda::std::memory_order_relaxed);
+
+              if (temp_key != LockedKey && temp_key != EmptyKey) {
+                int64_t flat_idx = counter_offset + iter + k + j;
+                if (counter[flat_idx] > 0)
+                  continue;
+
+                dst_iter = iter + k + j;
+                dst_key = temp_key;
+                dst_score = temp_score;
+                succeed = true;
+              }
+            }
+          }
+        }
+      }
+      return succeed;
+    }
+
+    // Multi-score path (num_scores_ == 2, LruLfu): each key occupies two
+    // contiguous words [timestamp, frequency]. A ScoreVector (uint4 == 2
+    // ScoreType) therefore holds exactly one key's pair, so eviction ranks by
+    // word 1 (frequency, ScoreVector.y). We iterate over word offsets and map
+    // each pair back to its key index (word_offset / 2).
+    const int64_t total_words = capacity_ * num_scores_;
+    ScoreType *wbase = scores(Iterator(0)); // word 0 of key 0
     async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
-                                                scores(iter));
+                                                wbase);
     __pipeline_commit();
 
-    for (; iter < capacity_; iter += BulkDim) {
-      if (iter < capacity_ - BulkDim) {
+    for (int64_t w = 0; w < total_words; w += BulkDim) {
+      if (w < total_words - BulkDim) {
         async_copy_bulk<ScoreType, BulkDim, Stride>(
-            &sm_buffers[rank * BufferDim] + diff_buf(iter / BulkDim) * BulkDim,
-            scores(iter) + BulkDim);
+            &sm_buffers[rank * BufferDim] + diff_buf(w / BulkDim) * BulkDim,
+            wbase + w + BulkDim);
       }
       __pipeline_commit();
       __pipeline_wait_prior(1);
       ScoreType temp_scores[Stride];
       ScoreType *src =
-          sm_buffers + rank * BufferDim + same_buf(iter / BulkDim) * BulkDim;
+          sm_buffers + rank * BufferDim + same_buf(w / BulkDim) * BulkDim;
 #pragma unroll
       for (int k = 0; k < BulkDim; k += Stride) {
         *reinterpret_cast<ScoreVector *>(temp_scores) =
             *reinterpret_cast<ScoreVector *>(src + k);
-#pragma unroll
-        for (int j = 0; j < Stride; j += 1) {
-          ScoreType temp_score = temp_scores[j];
-          if (temp_score < dst_score) {
-            auto temp_key_slot =
-                reinterpret_cast<AtomicKey *>(keys(iter + k + j));
-
-            auto temp_key =
-                temp_key_slot->load(cuda::std::memory_order_relaxed);
-
-            if (temp_key != LockedKey && temp_key != EmptyKey) {
-              int64_t flat_idx = counter_offset + iter + k + j;
-              if (counter[flat_idx] > 0)
-                continue;
-
-              dst_iter = iter + k + j;
-              dst_key = temp_key;
-              dst_score = temp_score;
-              succeed = true;
-            }
+        ScoreType freq = temp_scores[1]; // word 1 == frequency
+        Iterator key_it = (w + k) / num_scores_;
+        if (freq < dst_score) {
+          auto temp_key =
+              reinterpret_cast<AtomicKey *>(keys(key_it))
+                  ->load(cuda::std::memory_order_relaxed);
+          if (temp_key != LockedKey && temp_key != EmptyKey) {
+            int64_t flat_idx = counter_offset + key_it;
+            if (counter[flat_idx] > 0)
+              continue;
+            dst_iter = key_it;
+            dst_key = temp_key;
+            dst_score = freq;
+            succeed = true;
           }
         }
       }
@@ -433,6 +513,9 @@ struct LinearBucket {
 
   uint8_t *__restrict__ storage_;
   int64_t capacity_;
+  // Number of score columns per slot (>= 1). col0 drives eviction; columns
+  // 1..num_scores_-1 are auxiliary and never participate in reduce().
+  int64_t num_scores_ = 1;
 };
 
 template <typename BucketType_> struct LinearBucketTable {
@@ -440,12 +523,13 @@ template <typename BucketType_> struct LinearBucketTable {
   using KeyType = typename BucketType::KeyType;
 
   LinearBucketTable()
-      : storage_(nullptr), num_buckets_(0), bucket_capacity_(0) {}
+      : storage_(nullptr), num_buckets_(0), bucket_capacity_(0),
+        num_scores_(1) {}
 
   LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
-                    int64_t bucket_capacity)
+                    int64_t bucket_capacity, int64_t num_scores = 1)
       : storage_(storage), num_buckets_(num_buckets),
-        bucket_capacity_(bucket_capacity) {}
+        bucket_capacity_(bucket_capacity), num_scores_(num_scores) {}
 
   static __device__ __forceinline__ int64_t hash(uint64_t key) {
     return BucketType::hash(key);
@@ -454,8 +538,8 @@ template <typename BucketType_> struct LinearBucketTable {
   __device__ __forceinline__ BucketType operator[](uint64_t idx) const {
     // assert(idx < num_buckets_);
     auto bucket_raw_data =
-        storage_ + BucketType::memory_usage(bucket_capacity_) * idx;
-    return BucketType(bucket_raw_data, bucket_capacity_);
+        storage_ + BucketType::memory_usage(bucket_capacity_, num_scores_) * idx;
+    return BucketType(bucket_raw_data, bucket_capacity_, num_scores_);
   }
 
   __device__ __forceinline__ uint64_t capacity() const {
@@ -466,17 +550,20 @@ template <typename BucketType_> struct LinearBucketTable {
     return bucket_capacity_;
   }
 
+  __device__ __forceinline__ int64_t num_scores() const { return num_scores_; }
+
   __device__ __forceinline__ BucketType get_bucket(KeyType key) const {
     auto hashcode = hash(key);
     auto idx = hashcode / bucket_capacity_;
     auto bucket_raw_data =
-        storage_ + BucketType::memory_usage(bucket_capacity_) * idx;
-    return BucketType(bucket_raw_data, bucket_capacity_);
+        storage_ + BucketType::memory_usage(bucket_capacity_, num_scores_) * idx;
+    return BucketType(bucket_raw_data, bucket_capacity_, num_scores_);
   }
 
   uint8_t *__restrict__ storage_;
   uint64_t num_buckets_;
   int64_t bucket_capacity_;
+  int64_t num_scores_;
 };
 
 } // namespace dyn_emb

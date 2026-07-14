@@ -19,7 +19,7 @@ import os
 import warnings
 from dataclasses import dataclass, field, replace
 from math import sqrt
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from dynamicemb.optimizer import get_optimizer_state_dim
@@ -145,6 +145,165 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     NO_EVICTION = 4
 
 
+# A score strategy is either a single :class:`DynamicEmbScoreStrategy` or a
+# *compound* strategy expressed as a tuple. In a compound tuple the element that
+# is ``TIMESTAMP`` provides the reduction score column used by
+# ``incremental_dump`` (a device timestamp), and the remaining element drives
+# eviction ranking. The user's tuple order is the *logical* order that
+# checkpoints are written in; the on-device *physical* layout stays fixed (see
+# :func:`get_physical_score_order`). The tuple form keeps the interface open for
+# future combinations; only ``(TIMESTAMP, LFU)`` (in either order) is supported
+# for now.
+ScoreStrategy = Union[DynamicEmbScoreStrategy, Tuple[DynamicEmbScoreStrategy, ...]]
+
+# Supported compound strategies, as unordered element sets. Both orderings of a
+# supported set are accepted; only the checkpoint column order differs.
+SUPPORTED_COMPOUND_SCORE_STRATEGIES: Tuple[frozenset, ...] = (
+    frozenset({DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}),
+)
+
+
+def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
+    """Validate *score_strategy* and return it in canonical form.
+
+    ``None`` is passed through unchanged: it is the sentinel used by the planner /
+    sharding path for non-DynamicEmb (plain TorchRec) tables, which never build a
+    score policy (see :class:`~dynamicemb.shard.embedding` handling of a ``None``
+    score strategy).
+    A single :class:`DynamicEmbScoreStrategy` is returned unchanged. A one-element
+    tuple ``(X,)`` is unwrapped to the single strategy ``X`` (a single score column
+    has no ordering to preserve). A multi-element tuple must form a supported
+    compound set (currently only ``{TIMESTAMP, LFU}``) and is returned as a tuple.
+
+    Raises
+    ------
+    NotImplementedError
+        If a tuple's element set is not a supported compound strategy.
+    TypeError
+        If *score_strategy* (or a tuple element) is not a ``DynamicEmbScoreStrategy``.
+    """
+    if score_strategy is None:
+        return None
+    if isinstance(score_strategy, tuple):
+        for element in score_strategy:
+            if not isinstance(element, DynamicEmbScoreStrategy):
+                raise TypeError(
+                    f"score_strategy tuple elements must be DynamicEmbScoreStrategy, "
+                    f"got {type(element)}."
+                )
+        if len(score_strategy) == 0:
+            raise NotImplementedError("score_strategy tuple must be non-empty.")
+        if len(score_strategy) == 1:
+            return score_strategy[0]
+        # Reject duplicate elements: comparing the frozenset alone would collapse
+        # duplicates (e.g. (TIMESTAMP, LFU, LFU) -> {TIMESTAMP, LFU}) and wrongly
+        # accept an over-long tuple, so require the element count to match the
+        # de-duplicated set exactly.
+        if len(score_strategy) != len(frozenset(score_strategy)) or (
+            frozenset(score_strategy) not in SUPPORTED_COMPOUND_SCORE_STRATEGIES
+        ):
+            raise NotImplementedError(
+                f"Unsupported compound score_strategy {score_strategy}. Supported "
+                f"compound strategies (any order): "
+                f"{[tuple(sorted(s, key=lambda e: e.value)) for s in SUPPORTED_COMPOUND_SCORE_STRATEGIES]}."
+            )
+        return tuple(score_strategy)
+    if not isinstance(score_strategy, DynamicEmbScoreStrategy):
+        raise TypeError(
+            f"score_strategy must be a DynamicEmbScoreStrategy or a tuple of them, "
+            f"got {type(score_strategy)}."
+        )
+    return score_strategy
+
+
+def validate_score_strategy(score_strategy: ScoreStrategy) -> None:
+    """Raise if *score_strategy* is not a supported single or compound strategy."""
+    normalize_score_strategy(score_strategy)
+
+
+def get_eviction_score_strategy(
+    score_strategy: ScoreStrategy,
+) -> DynamicEmbScoreStrategy:
+    """Return the strategy that drives eviction ranking.
+
+    For a single strategy this is the strategy itself. For a compound strategy the
+    ``TIMESTAMP`` element is only the incremental-dump reduction column, so eviction
+    is driven by the remaining (non-``TIMESTAMP``) element (e.g. ``LFU`` for
+    ``(TIMESTAMP, LFU)``).
+    """
+    if isinstance(score_strategy, tuple):
+        non_timestamp = [
+            s for s in score_strategy if s != DynamicEmbScoreStrategy.TIMESTAMP
+        ]
+        # Supported compounds always contain exactly one non-TIMESTAMP element.
+        return non_timestamp[0] if non_timestamp else DynamicEmbScoreStrategy.TIMESTAMP
+    return score_strategy
+
+
+def score_strategy_has_timestamp_column(score_strategy: ScoreStrategy) -> bool:
+    """Whether the score layout carries a device-timestamp reduction column.
+
+    ``True`` for the single ``TIMESTAMP`` strategy and for compound strategies that
+    include ``TIMESTAMP`` (e.g. ``(TIMESTAMP, LFU)``). Only such strategies produce a
+    *time-based* ``incremental_dump`` (items touched since the threshold time);
+    strategies without a timestamp column threshold on the absolute score value.
+    """
+    if isinstance(score_strategy, tuple):
+        return DynamicEmbScoreStrategy.TIMESTAMP in score_strategy
+    return score_strategy == DynamicEmbScoreStrategy.TIMESTAMP
+
+
+def get_physical_score_order(
+    score_strategy: ScoreStrategy,
+) -> Tuple[DynamicEmbScoreStrategy, ...]:
+    """Strategies in the order their score words are physically stored on device.
+
+    A single strategy occupies one word. The compound ``{TIMESTAMP, LFU}`` maps to
+    the underlying ``LruLfu`` policy whose physical layout is always
+    ``(TIMESTAMP, LFU)`` -- word 0 is the last-access timestamp, word 1 the
+    frequency -- regardless of the user's configured (logical) order.
+    """
+    if isinstance(score_strategy, tuple):
+        if frozenset(score_strategy) == frozenset(
+            {DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}
+        ):
+            return (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
+        raise NotImplementedError(
+            f"No physical score layout for compound score_strategy {score_strategy}."
+        )
+    return (score_strategy,)
+
+
+def score_dump_permutation(score_strategy: ScoreStrategy) -> List[int]:
+    """Column permutation to reorder a physical score block into logical order.
+
+    Given a device-order block ``phys`` of shape ``[N, W]``, the checkpoint block in
+    the user's configured order is ``phys[:, perm]``: ``out[:, j]`` is the physical
+    column holding ``score_strategy[j]``. Identity (``[0, 1, ...]``) for single
+    strategies and for compounds whose logical order already matches the physical
+    layout.
+    """
+    if not isinstance(score_strategy, tuple):
+        return [0]
+    physical = get_physical_score_order(score_strategy)
+    return [physical.index(s) for s in score_strategy]
+
+
+def score_load_permutation(score_strategy: ScoreStrategy) -> List[int]:
+    """Column permutation to reorder a logical (checkpoint) score block into physical order.
+
+    Inverse of :func:`score_dump_permutation`: given a checkpoint block ``logical`` of
+    shape ``[N, W]`` in the user's configured order, the device-order block is
+    ``logical[:, perm]``, where ``perm[p]`` is the logical column holding the strategy
+    stored at physical word ``p``.
+    """
+    if not isinstance(score_strategy, tuple):
+        return [0]
+    physical = get_physical_score_order(score_strategy)
+    logical = list(score_strategy)
+    return [logical.index(s) for s in physical]
+
+
 @dataclass
 class DynamicEmbTableOptions:
     """
@@ -225,13 +384,29 @@ class DynamicEmbTableOptions:
         The maximum load factor before rehashing occurs. Default is 0.5.
         In NO_EVICTION mode, this option is ignored; the implementation uses
         a fixed effective max load factor of 0.5 for the key_index_map.
-    score_strategy(DynamicEmbScoreStrategy):
+    score_strategy(DynamicEmbScoreStrategy or Tuple[DynamicEmbScoreStrategy, ...]):
         dynamicemb gives each key-value pair a score to represent its importance.
         Once there is insufficient space, the key-value pair will be evicted based on the score.
         The `score_strategy` is used to configure how to set the scores for keys in each batch.
         Default to DynamicEmbScoreStrategy.TIMESTAMP.
         For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
             as they are the same table, but stored on different ranks.
+        A *compound* score strategy may be given as a tuple. The ``TIMESTAMP`` element
+        provides a per-key last-access timestamp column used by ``incremental_dump``,
+        while the other element drives eviction ranking. The tuple form keeps the
+        interface open for future combinations; only
+        ``(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)`` (in either
+        order) is supported for now. It ranks eviction by an LFU access count while ALSO
+        storing a last-access timestamp (compound ``LruLfu`` policy: two score words per
+        key) so that keys touched since the last dump can be selected by a time-based
+        ``incremental_dump``; it costs an extra 8 bytes/key. The tuple order is the
+        *logical* order that checkpoints are written in (the on-device layout is fixed);
+        both orders behave identically at runtime and differ only in checkpoint column
+        order. A one-element tuple ``(X,)`` is treated as the single strategy ``X``.
+        Note: only score strategies that include ``TIMESTAMP`` produce a time-based
+        ``incremental_dump`` (items whose last-access time crosses the threshold). For
+        strategies without a timestamp column, ``incremental_dump`` instead thresholds
+        on the absolute score value.
     bucket_capacity : int
         Capacity of each bucket in the hash table, and default is 128 (using 1024 when the table serves as cache).
         A key will only be mapped to one bucket.
@@ -292,7 +467,7 @@ class DynamicEmbTableOptions:
         int
     ] = None  # if not set then set to max_capcacity after sharded
     max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
-    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
+    score_strategy: Optional[ScoreStrategy] = DynamicEmbScoreStrategy.TIMESTAMP
     bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
     safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
     global_hbm_for_values: int = 0  # in bytes
@@ -311,6 +486,10 @@ class DynamicEmbTableOptions:
                 f"Unsupported dist_type {self.dist_type!r}. "
                 f"Supported values: {SUPPORTED_DIST_TYPES}."
             )
+        # Validate and canonicalize score_strategy (unwrap one-element tuples,
+        # reject unsupported compound tuples) so all downstream code sees either a
+        # single strategy or a supported compound tuple.
+        self.score_strategy = normalize_score_strategy(self.score_strategy)
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):

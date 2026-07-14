@@ -101,7 +101,7 @@ void table_insert_and_evict_single_score(
     std::optional<at::Tensor> score_output, at::Tensor num_evicted,
     at::Tensor evicted_keys, at::Tensor evicted_indices,
     at::Tensor evicted_scores, at::Tensor evicted_table_ids,
-    at::Tensor counter) {
+    at::Tensor counter, int64_t num_scores) {
 
   auto key_type = get_data_type(keys);
 
@@ -147,8 +147,8 @@ void table_insert_and_evict_single_score(
     auto evicted_keys_ = get_pointer<KeyType>(evicted_keys);
     auto table_key_slots_ = get_pointer<KeyType *>(table_key_slots);
 
-    constexpr int64_t total_size =
-        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
     int64_t bucket_bytes = bucket_capacity * total_size;
     int64_t num_buckets =
         table_storage.numel() * table_storage.element_size() / bucket_bytes;
@@ -157,7 +157,7 @@ void table_insert_and_evict_single_score(
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity);
+                       num_buckets, bucket_capacity, num_scores);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       if (num_total % 32 == 0) {
@@ -210,7 +210,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     at::Tensor evicted_scores, at::Tensor evicted_table_ids, at::Tensor counter,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_bucket_sizes, at::Tensor ovf_counter,
-    at::Tensor ovf_output_offsets) {
+    at::Tensor ovf_output_offsets, int64_t num_scores) {
 
   auto key_type = get_data_type(keys);
 
@@ -259,8 +259,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     auto evicted_keys_ = get_pointer<KeyType>(evicted_keys);
     auto table_key_slots_ = get_pointer<KeyType *>(table_key_slots);
 
-    constexpr int64_t total_size =
-        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
     int64_t bucket_bytes = bucket_capacity * total_size;
     int64_t num_buckets =
         table_storage.numel() * table_storage.element_size() / bucket_bytes;
@@ -269,14 +269,14 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity);
+                       num_buckets, bucket_capacity, num_scores);
 
     int64_t ovf_bucket_bytes = ovf_bucket_capacity * total_size;
     int64_t ovf_num_buckets =
         ovf_storage.numel() * ovf_storage.element_size() / ovf_bucket_bytes;
 
     auto ovf_table = Table(reinterpret_cast<uint8_t *>(ovf_storage.data_ptr()),
-                           ovf_num_buckets, ovf_bucket_capacity);
+                           ovf_num_buckets, ovf_bucket_capacity, num_scores);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       if (num_total % 32 == 0) {
@@ -339,7 +339,8 @@ table_insert_and_evict(at::Tensor table_storage,
                        int64_t ovf_bucket_capacity,
                        std::optional<at::Tensor> ovf_bucket_sizes,
                        std::optional<at::Tensor> ovf_counter,
-                       std::optional<at::Tensor> ovf_output_offsets) {
+                       std::optional<at::Tensor> ovf_output_offsets,
+                       int64_t num_scores) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -380,13 +381,13 @@ table_insert_and_evict(at::Tensor table_storage,
         score_output, num_evicted, evicted_keys, evicted_indices,
         evicted_scores, evicted_table_ids, counter, ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
-        ovf_output_offsets.value());
+        ovf_output_offsets.value(), num_scores);
   } else {
     table_insert_and_evict_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,
         keys, table_ids, score_input, policy_type, indices, insert_results,
         score_output, num_evicted, evicted_keys, evicted_indices,
-        evicted_scores, evicted_table_ids, counter);
+        evicted_scores, evicted_table_ids, counter, num_scores);
   }
 
   return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,

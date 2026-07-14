@@ -475,13 +475,25 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         max_load_factor : float
             The maximum load factor before rehashing occurs. Default is 0.5.
             In NO_EVICTION mode, this option is ignored: the implementation uses a fixed effective max load factor of 0.5 for the key_index_map (initial sizing and expansion). See the "Table expansion" section for NO_EVICTION trigger conditions.
-        score_strategy(DynamicEmbScoreStrategy):
+        score_strategy(DynamicEmbScoreStrategy or Tuple[DynamicEmbScoreStrategy, ...]):
             dynamicemb gives each key-value pair a score to represent its importance.
             Once there is insufficient space, the key-value pair will be evicted based on the score.
             The `score_strategy` is used to configure how to set the scores for keys in each batch.
             Default to DynamicEmbScoreStrategy.TIMESTAMP.
             For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
                 as they are the same table, but stored on different ranks.
+            A *compound* score strategy may be given as a tuple. The `TIMESTAMP` element
+            provides a per-key last-access timestamp column used by `incremental_dump`,
+            while the other element drives eviction ranking. The tuple form keeps the
+            interface open for future combinations; only
+            `(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)` (in either
+            order) is supported for now: it ranks eviction by the LFU access count while
+            ALSO storing a last-access timestamp (compound `LruLfu` policy, two score
+            words per key, +8 bytes/key) so keys touched since the last dump can be
+            selected by a time-based `incremental_dump`. The tuple order is the logical
+            order that checkpoints are written in (the on-device layout is fixed); both
+            orders behave identically at runtime and differ only in checkpoint column
+            order. A one-element tuple `(X,)` is treated as the single strategy `X`.
         bucket_capacity : int
             Capacity of each bucket in the hash table, and default is 128 (using 1024 when the table serves as cache).
             A key will only be mapped to one bucket. 
@@ -543,7 +555,9 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             int
         ] = None  # if not set then set to max_capcacity after sharded
         max_load_factor: float = 0.5  # max load factor before rehash(double capacity)
-        score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.TIMESTAMP
+        score_strategy: Union[
+            DynamicEmbScoreStrategy, Tuple[DynamicEmbScoreStrategy, ...]
+        ] = DynamicEmbScoreStrategy.TIMESTAMP
         bucket_capacity: int = 128
         safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
         global_hbm_for_values: int = 0  # in bytes
@@ -639,6 +653,10 @@ The main purpose of incremental dump is to improve efficiency by reducing the am
 
 **Behavior**
 Given a model contains one or more `ShardedDynamicEmbeddingCollection`, this API will dump the eligible indices and embeddings of all ranks, based on the input `score_threshold`.
+
+The meaning of the threshold depends on the table's `score_strategy`:
+- Strategies that carry a device-timestamp column — the single `TIMESTAMP` strategy, or a compound strategy that includes `TIMESTAMP` such as `(TIMESTAMP, LFU)` — produce a **time-based** incremental dump: only items whose last-access timestamp crosses the threshold (i.e. items that were touched/changed since the reference time) are dumped. Use the value returned by `get_score` as the reference threshold.
+- Strategies without a timestamp column (e.g. `STEP`, single `LFU`, `NO_EVICTION`) instead threshold on the **absolute score value**: items whose score is not less than the threshold are dumped. This is not a time-based increment.
 
     ```python
     #How to import

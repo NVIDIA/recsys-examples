@@ -39,6 +39,7 @@ from dynamicemb.batched_dynamicemb_tables import (
 )
 from dynamicemb.dynamicemb_config import (
     DEBUG_EMB_INITIALIZER_MOD,
+    ScoreStrategy,
     _sharded_table_bucket_layout,
 )
 from dynamicemb.key_value_table import (
@@ -178,7 +179,7 @@ def _init_stbe_debug_embedding_weights(
 
 def _bdebt_forward_maybe_lfu(
     bdebt: BatchedDynamicEmbeddingTablesV2,
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: ScoreStrategy,
     indices: torch.Tensor,
     offsets: torch.Tensor,
     device: torch.device,
@@ -3009,7 +3010,7 @@ def test_multi_table_caching_flush(opt_type, opt_params):
     ],
 )
 def test_table_expansion_capacity_growth(
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: ScoreStrategy,
     caching: bool,
     hbm_budget_ratio: Optional[float],
     multi_table: bool,
@@ -3229,7 +3230,7 @@ def test_table_expansion_capacity_growth(
     ids=lambda s: s.name,
 )
 def test_fill_tables(
-    score_strategy: DynamicEmbScoreStrategy,
+    score_strategy: ScoreStrategy,
     load_factor: float,
     max_capacity: int,
 ) -> None:

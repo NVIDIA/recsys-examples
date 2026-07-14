@@ -82,6 +82,10 @@ def generate_sparse_feature(feature_num, batch, multi_hot_size):
         DynamicEmbScoreStrategy.TIMESTAMP,
         DynamicEmbScoreStrategy.STEP,
         DynamicEmbScoreStrategy.CUSTOMIZED,
+        # Compound (TIMESTAMP, LFU): incremental dump uses the auxiliary
+        # last-access timestamp column, so it behaves like TIMESTAMP for the
+        # "dump keys touched since last dump" check below (eviction still LFU).
+        (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU),
     ],
 )
 @pytest.mark.parametrize(
@@ -212,3 +216,71 @@ def test_without_eviction(
                 # must match
                 assert len(dumped_indices) == len(indices)
                 assert dumped_indices == indices
+
+
+def _feature_from_keys(keys, device):
+    """One SUM-pooled feature, one key per bag."""
+    indices = torch.tensor(keys, dtype=torch.int64, device=device)
+    offsets = torch.arange(0, len(keys) + 1, dtype=torch.int64, device=device)
+    return indices, offsets
+
+
+@pytest.mark.parametrize("caching", [False, True])
+def test_lfu_incremental_dump_retouch(current_device, caching):
+    """Compound (TIMESTAMP, LFU): incremental_dump must return exactly the keys
+    accessed since the last dump. A re-accessed (re-touched) key must be dumped
+    again (its timestamp advances), while keys not touched in the window must not,
+    and a window with no access dumps nothing."""
+    dim = 8
+    table_name = "t_0"
+    options_list = [
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=current_device,
+            dim=dim,
+            max_capacity=BATCH_SIZE_PER_DUMP * 8,
+            bucket_capacity=128,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=1024**3,
+            score_strategy=(
+                DynamicEmbScoreStrategy.TIMESTAMP,
+                DynamicEmbScoreStrategy.LFU,
+            ),
+            caching=caching,
+        )
+    ]
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=options_list,
+        output_dtype=torch.float32,
+        table_names=[table_name],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        use_index_dedup=False,
+    )
+    device = torch.device(f"cuda:{current_device}")
+
+    keys_a = list(range(1001, 1101))  # 100 fresh keys (window 1)
+    keys_b = list(range(1001, 1051))  # re-touched subset of A (window 2)
+    keys_c = list(range(2001, 2051))  # new keys (window 2)
+    untouched = set(range(1051, 1101))  # A \ B: not touched in window 2
+
+    score = model.get_score()
+
+    # Window 1: touch A -> dump returns exactly A.
+    indices, offsets = _feature_from_keys(keys_a, device)
+    model(indices, offsets)
+    ret_tensors, score = model.incremental_dump(score)
+    assert set(ret_tensors[table_name][0].tolist()) == set(keys_a)
+
+    # Window 2: re-touch B and touch new C; A\B left untouched.
+    indices, offsets = _feature_from_keys(keys_b + keys_c, device)
+    model(indices, offsets)
+    ret_tensors, score = model.incremental_dump(score)
+    dumped = set(ret_tensors[table_name][0].tolist())
+    assert dumped == set(keys_b) | set(keys_c)
+    assert dumped.isdisjoint(untouched)
+
+    # Window 3: no access -> empty dump.
+    ret_tensors, score = model.incremental_dump(score)
+    assert set(ret_tensors[table_name][0].tolist()) == set()
