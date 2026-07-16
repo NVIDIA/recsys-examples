@@ -120,7 +120,7 @@ def main() -> int:
 
     print(f"Loaded {len(input_cases)} input cases from {args.dump_dir}")
     warmup_case = input_cases[:1]
-    measured_input_cases = input_cases[1:-1]
+    measured_input_cases = input_cases[1:]
     if not measured_input_cases:
         raise RuntimeError("Need at least two input cases to warm up and measure")
 

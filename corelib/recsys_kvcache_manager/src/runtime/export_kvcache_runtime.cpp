@@ -192,6 +192,10 @@ std::vector<at::Tensor> ExportKVCacheRuntime::lookup_kvcache(
     auto merge_cached_lengths = at::where(gpu_cached_lengths > 0, 
         at::max(gpu_cached_startpos, host_cached_startpos) + gpu_cached_lengths - merge_cached_startpos,
         host_cached_lengths);
+    auto non_valid_caching = (gpu_cached_startpos > host_cached_lengths) & (gpu_cached_lengths > 0);
+    non_valid_caching = non_valid_caching | (merge_cached_startpos > 0);
+    merge_cached_lengths = at::where(non_valid_caching, 0, merge_cached_lengths);
+    merge_cached_startpos = at::where(non_valid_caching, 0, merge_cached_startpos);
 
     return {
         merge_cached_startpos,

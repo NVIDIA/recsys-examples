@@ -98,12 +98,6 @@ class KVCacheManager:
     def offload_try_wait(self) -> None:
         self.backend.offload_try_wait()
 
-    def offload_reap_completed(self) -> None:
-        self.backend.offload_reap_completed()
-
-    def offload_flush(self) -> None:
-        self.backend.offload_flush()
-
     def evict(
         self, user_ids: torch.Tensor, for_gpu: bool = False, for_host: bool = False
     ):
