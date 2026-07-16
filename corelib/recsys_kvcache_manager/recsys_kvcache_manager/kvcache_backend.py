@@ -69,6 +69,14 @@ class KVCacheBackend(ABC):
         ...
 
     @abstractmethod
+    def offload_reap_completed(self) -> None:
+        ...
+
+    @abstractmethod
+    def offload_flush(self) -> None:
+        ...
+
+    @abstractmethod
     def evict(
         self, user_ids: torch.Tensor, for_gpu: bool = False, for_host: bool = False
     ):
