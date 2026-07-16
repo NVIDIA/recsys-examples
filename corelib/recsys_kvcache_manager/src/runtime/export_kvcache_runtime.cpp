@@ -433,6 +433,10 @@ std::vector<at::Tensor> ExportKVCacheRuntime::get_kvcache_tables() {
     return cache_tables_;
 }
 
+int64_t ExportKVCacheRuntime::get_num_offload_tasks() {
+    return offload_tasks_.size();
+}
+
 void ExportKVCacheRuntime::evict_kvcache(at::Tensor user_ids, bool evict_gpu_only) {
     const auto batch_size = user_ids.size(0);
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {

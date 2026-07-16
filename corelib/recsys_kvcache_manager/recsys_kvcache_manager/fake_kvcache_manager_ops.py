@@ -236,9 +236,8 @@ def _get_cache_tables_fake(dummy: torch.Tensor) -> list[torch.Tensor]:
     ]
 
 
-def _offload_wait_fake(task_ids: torch.Tensor) -> torch.Tensor:
-    _check_1d_cpu_tensor(task_ids, "task_ids")
-    return _empty_cpu((task_ids.shape[0], 3), dtype=torch.int64)
+def _offload_flush_fake(ordering_tensor: torch.Tensor) -> torch.Tensor:
+    return _empty_cpu((_new_dynamic_size(), 3), dtype=torch.int64)
 
 
 def _evict_kvcache_fake(
@@ -275,7 +274,7 @@ def register_fake_kvcache_manager_ops() -> bool:
         "offload_launch",
         "offload_reap_completed",
         "get_cache_tables",
-        "offload_wait",
+        "offload_flush",
         "evict_kvcache",
     )
     if not all(_has_op(op_name) for op_name in required_ops):
@@ -290,7 +289,7 @@ def register_fake_kvcache_manager_ops() -> bool:
     _register_fake("offload_launch", _offload_launch_fake)
     _register_fake("offload_reap_completed", _offload_reap_completed_fake)
     _register_fake("get_cache_tables", _get_cache_tables_fake)
-    _register_fake("offload_wait", _offload_wait_fake)
+    _register_fake("offload_flush", _offload_flush_fake)
     _register_fake("evict_kvcache", _evict_kvcache_fake)
 
     _REGISTERED = True

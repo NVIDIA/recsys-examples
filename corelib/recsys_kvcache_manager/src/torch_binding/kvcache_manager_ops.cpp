@@ -21,7 +21,7 @@ TORCH_LIBRARY_FRAGMENT(kvcache_manager_ops, m) {
     m.def("offload_reap_completed(Tensor ordering_tensor) -> Tensor");
     m.def("get_cache_tables(Tensor ordering_tensor) -> Tensor[]");
 
-    m.def("offload_wait(Tensor task_ids) -> Tensor");
+    m.def("offload_flush(Tensor ordering_tensor) -> Tensor");
     m.def("evict_kvcache(Tensor user_ids, bool evict_gpu_only, Tensor ordering_tensor) -> Tensor");
 }
 
@@ -244,20 +244,16 @@ std::vector<at::Tensor> get_cache_tables_impl(at::Tensor ordering_tensor) {
 }
 
 
-at::Tensor offload_wait_impl(at::Tensor task_ids) {
-    log_op("offload_wait", "enter");
-    log_tensor("task_ids", task_ids);
+at::Tensor offload_flush_impl(at::Tensor ordering_tensor) {
+    log_op("offload_flush", "enter");
     auto runtime = KVCacheRuntimeContext::instance().manager();
     at::Tensor reap_result;
-    while (true) {
+    while (runtime->get_num_offload_tasks() > 0) {
         reap_result = runtime->offload_kvcache_reap_completed();
-        if (reap_result.size(0) == task_ids.size(0)) {
-            break;  // all tasks completed
-        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));  // sleep for a while before checking again
+        log_tensor("offload_flush_result", reap_result);
     }
-    log_tensor("offload_wait_result", reap_result);
-    log_op("offload_wait", "exit");
+    log_op("offload_flush", "exit");
     return reap_result;
 }
 
@@ -291,7 +287,7 @@ TORCH_LIBRARY_IMPL(kvcache_manager_ops, CUDA, m) {
     m.impl("offload_reap_completed", &kvcache_manager::offload_reap_completed_impl);
     m.impl("get_cache_tables", &kvcache_manager::get_cache_tables_impl);
 
-    m.impl("offload_wait", &kvcache_manager::offload_wait_impl);
+    m.impl("offload_flush", &kvcache_manager::offload_flush_impl);
     m.impl("evict_kvcache", &kvcache_manager::evict_kvcache_impl);
 }
 
@@ -306,6 +302,6 @@ TORCH_LIBRARY_IMPL(kvcache_manager_ops, CPU, m) {
     m.impl("offload_reap_completed", &kvcache_manager::offload_reap_completed_impl);
     m.impl("get_cache_tables", &kvcache_manager::get_cache_tables_impl);
 
-    m.impl("offload_wait", &kvcache_manager::offload_wait_impl);
+    m.impl("offload_flush", &kvcache_manager::offload_flush_impl);
     m.impl("evict_kvcache", &kvcache_manager::evict_kvcache_impl);
 }

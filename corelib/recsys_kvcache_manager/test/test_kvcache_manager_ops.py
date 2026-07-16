@@ -199,11 +199,11 @@ class KVCacheManagerTestModel(torch.nn.Module):
             reap_result = torch.ops.kvcache_manager_ops.offload_reap_completed(
                 self.dummy
             )
-            reap_result2 = torch.ops.kvcache_manager_ops.offload_wait(offload_task_ids)
+            flush_result = torch.ops.kvcache_manager_ops.offload_flush(reap_result)
 
             # Lookup
             lookup_res_ = torch.ops.kvcache_manager_ops.lookup(
-                uids, seqlens, reap_result2
+                uids, seqlens, flush_result
             )
 
             # Evict GPU cache only
@@ -235,7 +235,7 @@ class KVCacheManagerTestModel(torch.nn.Module):
             alloc_result,
             offload_task_ids,
             reap_result,
-            reap_result2,
+            flush_result,
             lookup_res_,
             evict_res,
             lookup_res2,
@@ -251,7 +251,7 @@ def test_print(
     alloc_result,
     offload_task_ids,
     reap_result,
-    reap_result2,
+    flush_result,
     lookup_res_,
     lookup_res2,
     alloc_result2,
@@ -278,7 +278,7 @@ def test_print(
 
     # Reap completed offload tasks
     print(f"[CHECK] Offload reap result: {reap_result}, shape: {reap_result.shape}")
-    print(f"[CHECK] Offload reap result: {reap_result2}, shape: {reap_result2.shape}")
+    # print(f"[CHECK] Offload flush result: {flush_result}, shape: {flush_result.shape}")
 
     # Lookup
     print("[CHECK] Lookup result:")
@@ -353,7 +353,7 @@ if __name__ == "__main__":
         alloc_result,
         offload_task_ids,
         reap_result,
-        reap_result2,
+        flush_result,
         lookup_res_,
         evict_res,
         lookup_res2,
@@ -368,7 +368,7 @@ if __name__ == "__main__":
         alloc_result,
         offload_task_ids,
         reap_result,
-        reap_result2,
+        flush_result,
         lookup_res_,
         lookup_res2,
         alloc_result2,

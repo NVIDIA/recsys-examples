@@ -48,6 +48,7 @@ public:
     ) override;
     at::Tensor offload_kvcache_reap_completed() override;
     std::vector<at::Tensor> get_kvcache_tables() override;
+    int64_t get_num_offload_tasks() override;
 
 public:
     void evict_kvcache(at::Tensor user_ids, bool evict_gpu_only) override;

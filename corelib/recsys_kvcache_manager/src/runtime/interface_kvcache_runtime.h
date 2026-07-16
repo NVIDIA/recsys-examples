@@ -45,6 +45,7 @@ public:
     ) = 0;
     virtual at::Tensor offload_kvcache_reap_completed() = 0;
     virtual std::vector<at::Tensor> get_kvcache_tables() = 0;
+    virtual int64_t get_num_offload_tasks() = 0;
 
 public:
     virtual void evict_kvcache(at::Tensor user_ids, bool evict_gpu_only) = 0;
