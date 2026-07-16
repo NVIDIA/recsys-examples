@@ -187,7 +187,7 @@ DemoConfig parse_args(int argc, char** argv) {
         "Usage: inference_hstu_gr_ranking_kvcache_exported_model <hstu_gr_ranking_model_dir> <dump_dir> "
         "[model_name] [device_index] [batch_index] "
         "[inference_emb_ops.so] [libhstu_cuda_ops_runtime.so] [kvcache_manager_ops.so] [paged_kvcache_ops.so]\n"
-        "Before running, start start_flexkv_server_for_kvcache_cpp.py and source its env file.");
+      "Before running, start start_flexkv_server_for_kvcache_cpp.py with the shared kvcache_cpp_runtime.yaml.");
   }
 
   DemoConfig cfg;
@@ -237,25 +237,33 @@ std::string batch_file(const std::string& dump_dir, int batch_idx, const std::st
   return (std::filesystem::path(dump_dir) / buffer).string();
 }
 
-void check_required_env() {
-  const char* names[] = {
-      "SERVER_RECV_PORT",
-      "GPU_REGISTER_PORT",
-      "KVCACHE_MANAGER_NUM_LAYERS",
-      "KVCACHE_MANAGER_NUM_KV_HEADS",
-      "KVCACHE_MANAGER_HEAD_SIZE",
-      "KVCACHE_MANAGER_TOKENS_PER_PAGE",
-      "KVCACHE_MANAGER_MAX_BATCH_SIZE",
-      "KVCACHE_MANAGER_MAX_SEQUENCE_LENGTH",
-      "KVCACHE_MANAGER_DTYPE",
+std::filesystem::path find_kvcache_config_path() {
+  const char* override_path = std::getenv("KVCACHE_MANAGER_CONFIG_FILE");
+  if (override_path != nullptr && std::string(override_path).size() > 0) {
+    return std::filesystem::path(override_path);
+  }
+
+  const std::vector<std::filesystem::path> candidates = {
+      "inference_aoti/kvcache_cpp_runtime.yaml",
+      "examples/hstu/inference_aoti/kvcache_cpp_runtime.yaml",
+      "kvcache_cpp_runtime.yaml",
   };
-  for (const char* name : names) {
-    const char* value = std::getenv(name);
-    TORCH_CHECK(value != nullptr && std::string(value).size() > 0, "Missing required env var: ", name);
-    if (std::string(name) == "SERVER_RECV_PORT" || std::string(name) == "GPU_REGISTER_PORT") {
-      log_demo_debug(std::string("[INFO] Env ") + name + "=" + value);
+  for (const auto& path : candidates) {
+    if (std::filesystem::exists(path)) {
+      return path;
     }
   }
+  return candidates.front();
+}
+
+void check_required_kvcache_config() {
+  auto config_path = find_kvcache_config_path();
+  TORCH_CHECK(
+      std::filesystem::exists(config_path),
+      "Missing KV-cache config YAML: ",
+      config_path.string(),
+      ". Set KVCACHE_MANAGER_CONFIG_FILE to the shared kvcache_cpp_runtime.yaml path.");
+  log_demo_debug(std::string("[INFO] KV-cache config=") + config_path.string());
 }
 
 void shutdown_kvcache_runtime() {
@@ -368,7 +376,7 @@ bool run_one_batch(
 }
 
 void load_required_libraries(const DemoConfig& cfg) {
-  check_required_env();
+  check_required_kvcache_config();
   try_load_fbgemm_operators();
   try_load_fbgemm_hstu_experimental_operators();
   TORCH_CHECK(load_shared_library("inference_emb_ops", cfg.inference_emb_ops_path),

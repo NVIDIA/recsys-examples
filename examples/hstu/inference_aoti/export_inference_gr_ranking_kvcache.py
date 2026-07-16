@@ -17,10 +17,8 @@ import gc
 import math
 import os
 import sys
-import tempfile
 import time
 import warnings
-from pathlib import Path
 from typing import Optional
 
 import gin
@@ -39,6 +37,16 @@ from flexkv.common.config import (
     update_default_config_from_user_config,
 )
 from flexkv.server.server import KVServer
+from kvcache_runtime_config import (
+    config_float,
+    config_int,
+    config_optional_int,
+    config_torch_dtype,
+    extra_flexkv_configs,
+    load_kvcache_runtime_yaml,
+    required_config,
+    reset_ipc_socket,
+)
 from megatron.core import parallel_state
 from model import get_ranking_model
 from model.export_kvcached_inference_ranking_gr import ExportKVCachedInferenceRankingGR
@@ -58,38 +66,13 @@ warnings.filterwarnings("default", category=UserWarning)
 torch.set_warn_always(False)
 
 
-def _ipc_endpoint(name: str) -> str:
-    temp_dir = Path(tempfile.mkdtemp(prefix=f"{name}_"))
-    return f"ipc://{temp_dir / 'sock'}"
+def start_flexkv_server(
+    kvcache_config: KVCacheConfig,
+    config_file: Optional[str] = None,
+):
+    runtime_config, resolved_config_file = load_kvcache_runtime_yaml(config_file)
+    os.environ["KVCACHE_MANAGER_CONFIG_FILE"] = str(resolved_config_file)
 
-
-def _dtype_env_value(dtype: torch.dtype) -> str:
-    if dtype == torch.bfloat16:
-        return "bfloat16"
-    if dtype == torch.float16:
-        return "float16"
-    raise ValueError(f"Unsupported kvcache dtype for export runtime: {dtype}")
-
-
-def set_export_kvcache_runtime_env(kvcache_config: KVCacheConfig) -> None:
-    env_values = {
-        "KVCACHE_MANAGER_NUM_LAYERS": kvcache_config.num_layers,
-        "KVCACHE_MANAGER_NUM_KV_HEADS": kvcache_config.num_heads,
-        "KVCACHE_MANAGER_HEAD_SIZE": kvcache_config.head_dim,
-        "KVCACHE_MANAGER_TOKENS_PER_PAGE": kvcache_config.page_size,
-        "KVCACHE_MANAGER_TOKENS_PER_CHUNK": kvcache_config.offload_chunksize,
-        "KVCACHE_MANAGER_NUM_PRIMARY_CACHE_PAGES": kvcache_config.num_primary_cache_pages,
-        "KVCACHE_MANAGER_NUM_BUFFER_PAGES": kvcache_config.num_buffer_pages,
-        "KVCACHE_MANAGER_MAX_BATCH_SIZE": kvcache_config.max_batch_size,
-        "KVCACHE_MANAGER_MAX_SEQUENCE_LENGTH": kvcache_config.max_seq_len,
-        "KVCACHE_MANAGER_DEVICE_IDX": kvcache_config.device,
-        "KVCACHE_MANAGER_DTYPE": _dtype_env_value(kvcache_config.dtype),
-    }
-    for name, value in env_values.items():
-        os.environ[name] = str(value)
-
-
-def start_flexkv_server(kvcache_config: KVCacheConfig):
     model_config = ModelConfig()
     cache_config = CacheConfig()
     user_config = UserConfig()
@@ -103,7 +86,9 @@ def start_flexkv_server(kvcache_config: KVCacheConfig):
     model_config.dp_size = 1
     cache_config.tokens_per_block = kvcache_config.page_size
 
-    user_config.cpu_cache_gb = max(
+    user_config.cpu_cache_gb = config_optional_int(
+        runtime_config, "cpu_cache_gb"
+    ) or max(
         1,
         math.ceil(
             kvcache_config.host_capacity_per_layer
@@ -111,7 +96,7 @@ def start_flexkv_server(kvcache_config: KVCacheConfig):
             / (1024**3)
         ),
     )
-    user_config.ssd_cache_gb = 0
+    user_config.ssd_cache_gb = config_optional_int(runtime_config, "ssd_cache_gb") or 0
     extra_configs = kvcache_config.extra_configs or {}
     for name in (
         "enable_p2p_cpu",
@@ -127,11 +112,10 @@ def start_flexkv_server(kvcache_config: KVCacheConfig):
 
     update_default_config_from_user_config(model_config, cache_config, user_config)
 
-    server_recv_port = _ipc_endpoint("flexkv_server_sock")
-    gpu_register_port = server_recv_port + "_gpu_register"
-    os.environ["SERVER_RECV_PORT"] = server_recv_port
-    os.environ["GPU_REGISTER_PORT"] = gpu_register_port
-    set_export_kvcache_runtime_env(kvcache_config)
+    server_recv_port = str(required_config(runtime_config, "server_recv_port"))
+    gpu_register_port = str(required_config(runtime_config, "gpu_register_port"))
+    reset_ipc_socket(server_recv_port)
+    reset_ipc_socket(gpu_register_port)
 
     server_handle = KVServer.create_server(
         model_config=model_config,
@@ -141,7 +125,9 @@ def start_flexkv_server(kvcache_config: KVCacheConfig):
         total_clients=1,
         inherit_env=True,
     )
-    print("[INFO] Started FlexKV server for kvcache export warmup")
+    print(
+        f"[INFO] Started FlexKV server for kvcache export warmup: {resolved_config_file}"
+    )
     time.sleep(3)
     return server_handle
 
@@ -288,40 +274,67 @@ def make_inference_hstu_config(
 
 def make_export_kvcache_config(
     hstu_config: InferenceHSTUConfig,
+    config_file: Optional[str] = None,
 ) -> KVCacheConfig:
-    page_size = 32
-    offload_chunksize = 1024
-    num_primary_cache_pages = 10240
-    host_capacity_per_layer = (
-        num_primary_cache_pages
-        * 2
-        * page_size
-        * (hstu_config.num_heads * hstu_config.head_dim)
-        * 2
-    )
-    dtype = (
+    config, config_path = load_kvcache_runtime_yaml(config_file)
+    expected_values = {
+        "num_layers": hstu_config.num_layers,
+        "num_kv_heads": hstu_config.num_heads,
+        "head_size": hstu_config.head_dim,
+        "max_batch_size": hstu_config.max_batch_size,
+        "max_sequence_length": hstu_config.max_seq_len,
+    }
+    for name, expected in expected_values.items():
+        actual = config_int(config, name)
+        if actual != expected:
+            raise ValueError(
+                f"{config_path} has {name}={actual}, but export HSTU config expects {expected}"
+            )
+
+    expected_dtype = (
         torch.bfloat16
         if hstu_config.bf16
         else torch.float16
         if hstu_config.fp16
         else torch.float32
     )
+    dtype = config_torch_dtype(config)
+    if dtype != expected_dtype:
+        raise ValueError(
+            f"{config_path} has dtype={dtype}, but export HSTU config expects {expected_dtype}"
+        )
+
+    page_size = config_int(config, "tokens_per_page")
+    offload_chunksize = config_int(config, "tokens_per_chunk")
+    num_primary_cache_pages = config_int(config, "num_primary_cache_pages")
+    num_heads = config_int(config, "num_kv_heads")
+    head_dim = config_int(config, "head_size")
+    host_capacity_per_layer = (
+        config_optional_int(config, "host_capacity_per_layer")
+        or num_primary_cache_pages * 2 * page_size * (num_heads * head_dim) * 2
+    )
+    print(f"[INFO] Loaded KV-cache runtime config: {config_path}")
     return get_kvcache_config(
-        num_layers=hstu_config.num_layers,
-        num_heads=hstu_config.num_heads,
-        head_dim=hstu_config.head_dim,
+        num_layers=config_int(config, "num_layers"),
+        num_heads=num_heads,
+        head_dim=head_dim,
         page_size=page_size,
         offload_chunksize=offload_chunksize,
         num_primary_cache_pages=num_primary_cache_pages,
-        num_buffer_pages=0,
+        num_buffer_pages=config_int(config, "num_buffer_pages"),
         host_capacity_per_layer=host_capacity_per_layer,
-        max_batch_size=hstu_config.max_batch_size,
-        max_seq_len=hstu_config.max_seq_len,
+        max_batch_size=config_int(config, "max_batch_size"),
+        max_seq_len=config_int(config, "max_sequence_length"),
         dtype=dtype,
-        device=torch.cuda.current_device(),
-        host_kvstorage_backend="flexkv",
-        offload_timeout_ms=100.0,
-        offload_mode="lazy",
+        device=config_int(config, "device_idx"),
+        host_kvstorage_backend=str(config.get("host_kvstorage_backend", "flexkv")),
+        onload_timeout_ms=config_float(config, "onload_timeout_ms", 0.0),
+        offload_timeout_ms=config_float(config, "offload_timeout_ms", 100.0),
+        offload_mode=str(config.get("offload_mode", "lazy")),
+        host_kvstorage_fail_policy=str(
+            config.get("host_kvstorage_fail_policy", "fail_open")
+        ),
+        extra_configs=extra_flexkv_configs(config),
     )
 
 
@@ -332,6 +345,7 @@ def get_exportable_model_for_inference(
     max_batch_size,
     total_max_seqlen,
     num_contextual_features,
+    kvcache_config_file: Optional[str] = None,
 ):
     from dynamicemb.exportable_tables import apply_inference_embedding_collection
     from modules.exportable_embedding import apply_inference_sparse
@@ -348,7 +362,9 @@ def get_exportable_model_for_inference(
         max_seq_len=total_max_seqlen,
         contextual_max_seqlen=num_contextual_features,
     )
-    kvcache_config = make_export_kvcache_config(inference_hstu_config)
+    kvcache_config = make_export_kvcache_config(
+        inference_hstu_config, kvcache_config_file
+    )
 
     sparse_module = apply_inference_sparse(model._embedding_collection)
     dense_module = InferenceDenseModule(
@@ -367,7 +383,9 @@ def get_exportable_model_for_inference(
         dense_module=dense_module,
         kvcache_config=kvcache_config,
     )
-    inference_model.flexkv_server_handle = start_flexkv_server(kvcache_config)
+    inference_model.flexkv_server_handle = start_flexkv_server(
+        kvcache_config, kvcache_config_file
+    )
     if model._hstu_config.bf16:
         inference_model.bfloat16()
     elif model._hstu_config.fp16:
@@ -381,6 +399,7 @@ def export_inference_gr_ranking(
     checkpoint_dir: str,
     max_bs: int = 1,
     stop_after_warmup: bool = False,
+    kvcache_config_file: Optional[str] = None,
 ):
     def _split_model_outputs(outputs):
         if isinstance(outputs, torch.Tensor):
@@ -455,6 +474,7 @@ def export_inference_gr_ranking(
                 config_max_batch_size,
                 total_max_seqlen,
                 num_contextual_features,
+                kvcache_config_file,
             )
 
             eval_module = get_multi_event_metric_module(
@@ -751,6 +771,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--max_bs", type=int, default=2)
+    parser.add_argument(
+        "--kvcache_config_file",
+        type=str,
+        default=None,
+        help="Static YAML config shared with the C++ KV-cache runtime.",
+    )
     parser.add_argument("--stop_after_warmup", action="store_true")
 
     args = parser.parse_args()
@@ -767,5 +793,6 @@ if __name__ == "__main__":
         checkpoint_dir=args.checkpoint_dir,
         max_bs=args.max_bs,
         stop_after_warmup=args.stop_after_warmup,
+        kvcache_config_file=args.kvcache_config_file,
     )
     print("[INFO] Finished.")

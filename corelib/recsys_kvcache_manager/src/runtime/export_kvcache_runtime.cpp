@@ -1,11 +1,10 @@
 #include "export_kvcache_runtime.h"
+#include "kvcache_runtime_config.h"
 
 #include <ATen/ATen.h>
-#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <thread>
-#include <utility>
 
 using namespace kvcache;
 
@@ -16,35 +15,6 @@ namespace {
 #ifndef KVCACHE_MANAGER_RUNTIME_DEBUG
 #define KVCACHE_MANAGER_RUNTIME_DEBUG 0
 #endif
-
-int get_env_int(const char* name, int default_value) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || std::string(value).empty()) {
-        return default_value;
-    }
-    return std::stoi(value);
-}
-
-std::string get_required_env_string(const char* name) {
-    const char* value = std::getenv(name);
-    TORCH_CHECK(value != nullptr && !std::string(value).empty(), "Missing required env var: ", name);
-    return std::string(value);
-}
-
-at::ScalarType get_env_dtype(const char* name, at::ScalarType default_value) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || std::string(value).empty()) {
-        return default_value;
-    }
-    std::string dtype(value);
-    if (dtype == "bfloat16" || dtype == "bf16") {
-        return at::kBFloat16;
-    }
-    if (dtype == "float16" || dtype == "fp16" || dtype == "half") {
-        return at::kHalf;
-    }
-    TORCH_CHECK(false, "Unsupported KVCACHE_MANAGER_DTYPE: ", dtype);
-}
 
 void log_runtime_message(const std::string& message) {
 #if KVCACHE_MANAGER_RUNTIME_DEBUG
@@ -60,21 +30,24 @@ ExportKVCacheRuntime::ExportKVCacheRuntime() {
     log_runtime_message(
         "thread=" + c10::str(std::this_thread::get_id()) + " constructor enter"
     );
-    const int num_layers = get_env_int("KVCACHE_MANAGER_NUM_LAYERS", 2);
-    const int num_kv_heads = get_env_int("KVCACHE_MANAGER_NUM_KV_HEADS", 32);
-    const int head_size = get_env_int("KVCACHE_MANAGER_HEAD_SIZE", 128);
-    const int tokens_per_page = get_env_int("KVCACHE_MANAGER_TOKENS_PER_PAGE", 32);
-    const int tokens_per_chunk = get_env_int("KVCACHE_MANAGER_TOKENS_PER_CHUNK", 1024);
-    const int num_primary_cache_pages = get_env_int("KVCACHE_MANAGER_NUM_PRIMARY_CACHE_PAGES", 10240);
-    const int num_buffer_pages = get_env_int("KVCACHE_MANAGER_NUM_BUFFER_PAGES", 1024);
-    const int max_batch_size = get_env_int("KVCACHE_MANAGER_MAX_BATCH_SIZE", 8);
-    const int max_sequence_length = get_env_int("KVCACHE_MANAGER_MAX_SEQUENCE_LENGTH", 4096);
-    const int device_idx = get_env_int("KVCACHE_MANAGER_DEVICE_IDX", 0);
-    const at::ScalarType cache_dtype = get_env_dtype("KVCACHE_MANAGER_DTYPE", at::kHalf);
+    const auto config_path = find_config_path();
+    const auto config = load_yaml_config(config_path);
+    const int num_layers = get_config_int(config, "num_layers");
+    const int num_kv_heads = get_config_int(config, "num_kv_heads");
+    const int head_size = get_config_int(config, "head_size");
+    const int tokens_per_page = get_config_int(config, "tokens_per_page");
+    const int tokens_per_chunk = get_config_int(config, "tokens_per_chunk");
+    const int num_primary_cache_pages = get_config_int(config, "num_primary_cache_pages");
+    const int num_buffer_pages = get_config_int(config, "num_buffer_pages");
+    const int max_batch_size = get_config_int(config, "max_batch_size");
+    const int max_sequence_length = get_config_int(config, "max_sequence_length");
+    const int device_idx = get_config_int(config, "device_idx");
+    const at::ScalarType cache_dtype = get_config_dtype(config);
     num_layers_ = num_layers;
 
     log_runtime_message(
-        "config layers=" + std::to_string(num_layers)
+        "config_path=" + config_path.string()
+        + " layers=" + std::to_string(num_layers)
         + " kv_heads=" + std::to_string(num_kv_heads)
         + " head_size=" + std::to_string(head_size)
         + " page=" + std::to_string(tokens_per_page)
@@ -100,8 +73,8 @@ ExportKVCacheRuntime::ExportKVCacheRuntime() {
         /*max_sequence_length=*/max_sequence_length,
         /*device_idx=*/device_idx);
 
-    auto server_recv_port = get_required_env_string("SERVER_RECV_PORT");
-    auto gpu_register_port = get_required_env_string("GPU_REGISTER_PORT");
+    auto server_recv_port = get_required_config_string(config, "server_recv_port");
+    auto gpu_register_port = get_required_config_string(config, "gpu_register_port");
     log_runtime_message(
         "creating FlexKVCppClient server_recv_port=" + server_recv_port
     );

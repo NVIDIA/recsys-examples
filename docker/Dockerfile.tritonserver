@@ -10,7 +10,7 @@ WORKDIR /workspace
 RUN ln -sf /bin/python3 /bin/python && \
     apt-get update -y --fix-missing && \
     apt-get install -y libssl-dev liburing-dev libxxhash-dev libzmq3-dev && \
-    pip3 install expiring_dict  psutil sympy zmq && \
+    pip3 install expiring_dict psutil sympy zmq PyYAML && \
     if [ ${ARCH} = "aarch64" ]; then \
       rm -rf /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1 && \
       ln -s /usr/local/cuda-13/targets/sbsa-linux/lib/stubs/libnvidia-ml.so  /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1; \

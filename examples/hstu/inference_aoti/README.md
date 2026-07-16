@@ -34,7 +34,6 @@ Triton server aoti model testing demos:
 - triton client script: `send_one_kvcache_triton_request.py`
 
 Flexkv Server launcher:
-- `setup_kvcache_config_for_tritonserver.sh`
 - `start_flexkv_server_for_kvcache_cpp.py`
 
 It covers export, runtime setup, native C++ validation, and Triton Server deployment and request-replay path for the same exported AOTI package.
@@ -66,11 +65,11 @@ export REPO=/workspace/recsys-examples
 export HSTU_DIR=${REPO}/examples/hstu
 export GIN=${HSTU_DIR}/inference/configs/kuairand_1k_inference_ranking.gin
 export CKPT=.../path/to/some/ckpt/...   # incomplete path
-export ENV_FILE=/tmp/kvcache_cpp_runtime.env
+export KVCACHE_CONFIG=${HSTU_DIR}/inference_aoti/kvcache_cpp_runtime.yaml
 export PYTORCH_BACKEND=.../path/to/tritonserver/pytorch_backend/...
 ```
 
-Adjust `REPO`, `GIN`, `CKPT`, `ENV_FILE` and `PYTORCH_BACKEND` for your environment.
+Adjust `REPO`, `GIN`, `CKPT`, `KVCACHE_CONFIG` and `PYTORCH_BACKEND` for your environment.
 
 ---
 
@@ -115,11 +114,16 @@ Run the export workflow from the HSTU directory:
 
 ```bash
 cd ${HSTU_DIR}
+export KVCACHE_MANAGER_CONFIG_FILE=${KVCACHE_CONFIG}
 python3 inference_aoti/export_inference_gr_ranking_kvcache.py \
   --gin_config_file ${GIN} \
   --checkpoint_dir ${CKPT} \
-  --max_bs 2
+  --max_bs 2 \
+  --kvcache_config_file ${KVCACHE_MANAGER_CONFIG_FILE}
 ```
+
+`KVCACHE_MANAGER_CONFIG_FILE` must be set before Python starts because the fake
+KV-cache ops used by `torch.export` read the YAML config during module import.
 
 This step performs all of the following:
 
@@ -151,20 +155,13 @@ Expected outputs:
 #### 4.1: Start the FlexKV Runtime Service
 
 The C++ replay executable demonstrates the deployment scenario that kvcache server is separated from the inference framework.
-Setup the KVCache config in `setup_kvcache_cpp_runtime_env.sh` in environment variables for FlexKV, and start the FlexKV server as follows:
+Setup the KVCache config in `inference_aoti/kvcache_cpp_runtime.yaml`, and start the FlexKV server as follows:
 
 ```bash
 cd ${HSTU_DIR}
-rm -f ${ENV_FILE}
-source setup_kvcache_cpp_runtime_env.sh
-python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --env_file ${ENV_FILE} > kv.log 2>&1 &
-```
-
-Verify the environment file created, and load the runtime server variables into the current shell:
-
-```bash
-cat ${ENV_FILE}
-source ${ENV_FILE}
+export FLEXKV_LOG_LEVEL=WARNING
+export KVCACHE_MANAGER_CONFIG_FILE=${KVCACHE_CONFIG}
+python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --config_file ${KVCACHE_MANAGER_CONFIG_FILE} > kv.log 2>&1 &
 ```
 
 #### Step 4.2: Run the C++ Replay Verification
@@ -356,10 +353,9 @@ Start the FlexKV server runtime in background:
 
 ```bash
 cd ${HSTU_DIR}
-rm -f ${ENV_FILE}
-
-python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --env_file ${ENV_FILE} > kvcache_server.log 2>&1 &
-cat ${ENV_FILE} && source ${ENV_FILE}
+export FLEXKV_LOG_LEVEL=WARNING
+export KVCACHE_MANAGER_CONFIG_FILE=${KVCACHE_CONFIG}
+python3 inference_aoti/start_flexkv_server_for_kvcache_cpp.py --config_file ${KVCACHE_MANAGER_CONFIG_FILE} > kvcache_server.log 2>&1 &
 ```
 
 Check `kvcache_server.log` for the status.

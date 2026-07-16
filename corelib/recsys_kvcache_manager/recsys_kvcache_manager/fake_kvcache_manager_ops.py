@@ -8,20 +8,32 @@ not model mutable cache state, task lifecycle, or host/device cache coherence.
 The goal is to preserve operator schemas and output structure closely enough for
 ``torch.export`` and other meta/fake tracing paths.
 
-The C++ runtime currently determines several output lengths from hidden runtime
+The C++ runtime currently determines several output lengths from runtime
 configuration, most notably the GPU page size and the number of newly allocated
-tokens. Those lengths are represented here with fresh symbolic sizes.
+tokens. Static cache-table dimensions are read from the shared YAML config at fake
+op registration time. Dynamic batch-dependent lengths are represented here with
+fresh symbolic sizes.
 """
 
 from __future__ import annotations
 
-import os
-from typing import Callable, Iterable, Sequence, Tuple
+from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 import torch
 
+from .kvcache_runtime_config import load_runtime_config_from_env
+
 _OPS_NAMESPACE = "kvcache_manager_ops"
 _REGISTERED = False
+_RUNTIME_CONFIG: Optional[dict[str, str]] = None
+_REQUIRED_CONFIG_KEYS = (
+    "num_layers",
+    "num_primary_cache_pages",
+    "tokens_per_page",
+    "num_kv_heads",
+    "head_size",
+    "dtype",
+)
 
 
 def _has_op(op_name: str) -> bool:
@@ -58,22 +70,41 @@ def _empty_cuda(shape: Sequence[int], *, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(tuple(shape), dtype=dtype, device="cuda")
 
 
+def _runtime_config() -> dict[str, str]:
+    if _RUNTIME_CONFIG is None:
+        raise RuntimeError("KV-cache runtime config must be loaded before fake ops run")
+    return _RUNTIME_CONFIG
+
+
+def _load_runtime_config_for_fake_ops() -> None:
+    global _RUNTIME_CONFIG
+
+    config = load_runtime_config_from_env()
+    missing = [key for key in _REQUIRED_CONFIG_KEYS if config.get(key) in (None, "")]
+    if missing:
+        raise ValueError(
+            "KV-cache YAML config is missing required fake-op keys: "
+            + ", ".join(missing)
+        )
+    _RUNTIME_CONFIG = config
+
+
+def _fake_config_value(config_name: str) -> str:
+    return _runtime_config()[config_name]
+
+
 def _fake_num_layers() -> int:
-    value = os.getenv("KVCACHE_MANAGER_NUM_LAYERS")
-    if value is None or value == "":
-        return 1
+    value = _fake_config_value("num_layers")
     return max(int(value), 1)
 
 
-def _fake_env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
+def _fake_config_int(config_name: str) -> int:
+    value = _fake_config_value(config_name)
     return max(int(value), 1)
 
 
 def _fake_cache_dtype() -> torch.dtype:
-    value = os.getenv("KVCACHE_MANAGER_DTYPE", "bfloat16").lower()
+    value = _fake_config_value("dtype").lower()
     if value in {"bfloat16", "bf16"}:
         return torch.bfloat16
     if value in {"float16", "fp16", "half"}:
@@ -83,11 +114,11 @@ def _fake_cache_dtype() -> torch.dtype:
 
 def _fake_cache_table_shape() -> tuple[int, int, int, int, int]:
     return (
-        _fake_env_int("KVCACHE_MANAGER_NUM_PRIMARY_CACHE_PAGES", 1),
+        _fake_config_int("num_primary_cache_pages"),
         2,
-        _fake_env_int("KVCACHE_MANAGER_TOKENS_PER_PAGE", 1),
-        _fake_env_int("KVCACHE_MANAGER_NUM_KV_HEADS", 1),
-        _fake_env_int("KVCACHE_MANAGER_HEAD_SIZE", 1),
+        _fake_config_int("tokens_per_page"),
+        _fake_config_int("num_kv_heads"),
+        _fake_config_int("head_size"),
     )
 
 
@@ -279,6 +310,8 @@ def register_fake_kvcache_manager_ops() -> bool:
     )
     if not all(_has_op(op_name) for op_name in required_ops):
         return False
+
+    _load_runtime_config_for_fake_ops()
 
     _register_fake("init_kvcache", _init_kvcache_fake)
     _register_fake("shutdown_runtime", _shutdown_runtime_fake)

@@ -47,6 +47,7 @@ message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 set(KVCACHE_MANAGER_OPS_SOURCES
     src/torch_binding/kvcache_manager_ops.cpp
     src/torch_binding/kvcache_manager_context.cpp
+    src/runtime/kvcache_runtime_config.cpp
     src/runtime/export_kvcache_runtime.cpp
     src/gpu_kvcache_manager_impl.cpp
     src/torch_binding/flexkv_cpp_client.cpp
