@@ -81,7 +81,6 @@ _LAZY_IMPORTS = {
     "KVCacheManager": (".kvcache_manager", "KVCacheManager"),
     "KVCacheBackend": (".kvcache_backend", "KVCacheBackend"),
     "DefaultKVCacheBackend": (".default_kvcache_backend", "DefaultKVCacheBackend"),
-    "ExportKVCacheBackend": (".export_kvcache_backend", "ExportKVCacheBackend"),
     "DeviceKVCache": (".gpu_kvcache_manager", "DeviceKVCache"),
     "GPUKVCacheManager": (".gpu_kvcache_manager", "GPUKVCacheManager"),
     "HostKVStorageBase": (".host_kvstorage_manager", "HostKVStorageBase"),
