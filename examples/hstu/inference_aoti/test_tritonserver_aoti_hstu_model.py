@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 INPUT_TENSORS = [
     ("INPUT__0", "values"),

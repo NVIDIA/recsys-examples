@@ -34,8 +34,12 @@ def _reference_strip_counts(lengths, origin_num_cached, feature_order, batch_siz
 
         item_row_idx = item_feature_idx * batch_size + batch_idx
         action_row_idx = action_feature_idx * batch_size + batch_idx
-        strip_counts[item_row_idx] = min(item_strip_count, int(lengths[item_row_idx].item()))
-        strip_counts[action_row_idx] = min(action_strip_count, int(lengths[action_row_idx].item()))
+        strip_counts[item_row_idx] = min(
+            item_strip_count, int(lengths[item_row_idx].item())
+        )
+        strip_counts[action_row_idx] = min(
+            action_strip_count, int(lengths[action_row_idx].item())
+        )
 
     return strip_counts
 
@@ -48,10 +52,22 @@ def _feature_label(feature_idx, feature_order):
     return "context"
 
 
-def _print_strip_debug(values, lengths, actual_values, actual_lengths, origin_num_cached, feature_order, batch_size):
+def _print_strip_debug(
+    values,
+    lengths,
+    actual_values,
+    actual_lengths,
+    origin_num_cached,
+    feature_order,
+    batch_size,
+):
     old_offsets = torch.cat([lengths.new_zeros((1,)), torch.cumsum(lengths, dim=0)])
-    actual_offsets = torch.cat([actual_lengths.new_zeros((1,)), torch.cumsum(actual_lengths, dim=0)])
-    strip_counts = _reference_strip_counts(lengths, origin_num_cached, feature_order, batch_size)
+    actual_offsets = torch.cat(
+        [actual_lengths.new_zeros((1,)), torch.cumsum(actual_lengths, dim=0)]
+    )
+    strip_counts = _reference_strip_counts(
+        lengths, origin_num_cached, feature_order, batch_size
+    )
 
     print("per-feature per-sequence strip detail:")
     for output_feature_idx, feature_idx in enumerate(feature_order):
@@ -75,12 +91,16 @@ def _print_strip_debug(values, lengths, actual_values, actual_lengths, origin_nu
             )
 
 
-def _reference_strip_cached_tokens(values, lengths, origin_num_cached, feature_order, batch_size):
+def _reference_strip_cached_tokens(
+    values, lengths, origin_num_cached, feature_order, batch_size
+):
     old_offsets = torch.cat([lengths.new_zeros((1,)), torch.cumsum(lengths, dim=0)])
     new_values = []
     new_lengths = []
 
-    strip_counts = _reference_strip_counts(lengths, origin_num_cached, feature_order, batch_size)
+    strip_counts = _reference_strip_counts(
+        lengths, origin_num_cached, feature_order, batch_size
+    )
 
     for feature_idx in feature_order:
         for batch_idx in range(batch_size):
@@ -113,7 +133,9 @@ def test_strip_cached_tokens_cpp_op(origin_num_cached):
 
     print(f"origin_num_cached: {origin_num_cached.tolist()}")
     print(f"original values: {values.tolist()}")
-    print(f"original lengths: {lengths.tolist()}, seqlen: {lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}")
+    print(
+        f"original lengths: {lengths.tolist()}, seqlen: {lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}"
+    )
 
     actual_values, actual_lengths = torch.ops.hstu_cuda_ops.strip_cached_tokens(
         values,
@@ -123,7 +145,9 @@ def test_strip_cached_tokens_cpp_op(origin_num_cached):
         list(range(num_context + 2)),
     )
     print(f"stripped values: {actual_values.tolist()}")
-    print(f"stripped lengths: {actual_lengths.tolist()}, , seqlen: {actual_lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}")
+    print(
+        f"stripped lengths: {actual_lengths.tolist()}, , seqlen: {actual_lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}"
+    )
 
     expected_values, expected_lengths = _reference_strip_cached_tokens(
         values,
@@ -133,7 +157,9 @@ def test_strip_cached_tokens_cpp_op(origin_num_cached):
         batch_size,
     )
     print(f"expected values: {expected_values.tolist()}")
-    print(f"expected lengths: {expected_lengths.tolist()}, seqlen: {expected_lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}")
+    print(
+        f"expected lengths: {expected_lengths.tolist()}, seqlen: {expected_lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}"
+    )
     _print_strip_debug(
         values,
         lengths,
@@ -202,11 +228,16 @@ def test_strip_cached_tokens_cpp_op_item_action_split_details():
     feature_order = list(range(num_context + 2))
     lengths = torch.tensor(
         [
-            1, 1,
-            1, 1,
-            1, 1,
-            5, 5,
-            5, 5,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            5,
+            5,
+            5,
+            5,
         ],
         dtype=torch.int64,
     )
@@ -227,17 +258,25 @@ def test_strip_cached_tokens_cpp_op_item_action_split_details():
         feature_order,
         batch_size,
     )
-    strip_counts = _reference_strip_counts(lengths, origin_num_cached, feature_order, batch_size)
+    strip_counts = _reference_strip_counts(
+        lengths, origin_num_cached, feature_order, batch_size
+    )
 
     item_feature_idx = feature_order[-2]
     action_feature_idx = feature_order[-1]
-    item_strip_counts = strip_counts[item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size]
-    action_strip_counts = strip_counts[action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size]
+    item_strip_counts = strip_counts[
+        item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size
+    ]
+    action_strip_counts = strip_counts[
+        action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size
+    ]
 
     print(f"origin_num_cached: {origin_num_cached.tolist()}")
     print(f"feature_order: {feature_order}")
     print(f"original values: {values.tolist()}")
-    print(f"original lengths: {lengths.tolist()}, seqlen: {lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}")
+    print(
+        f"original lengths: {lengths.tolist()}, seqlen: {lengths.view(num_context + 2, batch_size).sum(dim=0).tolist()}"
+    )
     print(f"item_strip_counts: {item_strip_counts.tolist()}")
     print(f"action_strip_counts: {action_strip_counts.tolist()}")
     print(f"actual values: {actual_values.tolist()}")
@@ -258,8 +297,16 @@ def test_strip_cached_tokens_cpp_op_item_action_split_details():
     assert item_strip_counts[1].item() == action_strip_counts[1].item() + 1
     assert torch.all(item_strip_counts > 0)
     assert torch.all(action_strip_counts > 0)
-    assert torch.all(item_strip_counts < lengths[item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size])
-    assert torch.all(action_strip_counts < lengths[action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size])
+    assert torch.all(
+        item_strip_counts
+        < lengths[item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size]
+    )
+    assert torch.all(
+        action_strip_counts
+        < lengths[
+            action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size
+        ]
+    )
     torch.testing.assert_close(actual_values, expected_values)
     torch.testing.assert_close(actual_lengths, expected_lengths)
 
@@ -272,11 +319,21 @@ def test_strip_cached_tokens_cpp_op_all_stripped():
     feature_order = list(range(num_context + 2))
     lengths = torch.tensor(
         [
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
         ],
         dtype=torch.int64,
     )
@@ -301,13 +358,23 @@ def test_strip_cached_tokens_cpp_op_all_stripped():
         feature_order,
         batch_size,
     )
-    strip_counts = _reference_strip_counts(lengths, origin_num_cached, feature_order, batch_size)
+    strip_counts = _reference_strip_counts(
+        lengths, origin_num_cached, feature_order, batch_size
+    )
     item_feature_idx = feature_order[-2]
     action_feature_idx = feature_order[-1]
-    item_strip_counts = strip_counts[item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size]
-    action_strip_counts = strip_counts[action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size]
-    item_lengths = lengths[item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size]
-    action_lengths = lengths[action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size]
+    item_strip_counts = strip_counts[
+        item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size
+    ]
+    action_strip_counts = strip_counts[
+        action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size
+    ]
+    item_lengths = lengths[
+        item_feature_idx * batch_size : (item_feature_idx + 1) * batch_size
+    ]
+    action_lengths = lengths[
+        action_feature_idx * batch_size : (action_feature_idx + 1) * batch_size
+    ]
 
     torch.testing.assert_close(item_strip_counts, item_lengths)
     torch.testing.assert_close(action_strip_counts, action_lengths)

@@ -63,8 +63,7 @@ def parse_scenarios(scenarios_arg: str) -> set[str]:
             continue
         if scenario not in SUPPORTED_SCENARIOS:
             raise ValueError(
-                f"Unsupported scenario '{scenario}'. "
-                "Use gpu_hit,cpu_hit,ssd_hit."
+                f"Unsupported scenario '{scenario}'. " "Use gpu_hit,cpu_hit,ssd_hit."
             )
         scenarios.add(scenario)
     return scenarios

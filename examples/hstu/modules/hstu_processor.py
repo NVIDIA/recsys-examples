@@ -14,10 +14,13 @@
 # limitations under the License.
 from typing import Dict, Optional, Union
 
+# isort: off
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
 from commons.ops.cuda_ops.JaggedTensorOpFunction import jagged_2D_tensor_concat
 import commons.ops.cuda_ops.fake_hstu_cuda_ops  # noqa: F401 - registers fake impls for torch.export
+
+# isort: on
 from commons.ops.length_to_offsets import length_to_complete_offsets
 from commons.ops.triton_ops.triton_jagged import triton_split_2D_jagged
 from commons.utils.nvtx_op import output_nvtx_hook
@@ -100,9 +103,9 @@ def hstu_preprocess_embeddings(
             )
             sequence_max_seqlen = sequence_max_seqlen * 2
         else:
-            assert batch.num_candidates is not None, (
-                "num_candidates should not be None during inference with action embeddings"
-            )
+            assert (
+                batch.num_candidates is not None
+            ), "num_candidates should not be None during inference with action embeddings"
             (
                 sequence_embeddings,
                 sequence_embeddings_lengths,

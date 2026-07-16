@@ -21,8 +21,7 @@ import tempfile
 import time
 import warnings
 from pathlib import Path
-from typing import Dict, Optional
-
+from typing import Optional
 
 import gin
 import torch
@@ -33,7 +32,12 @@ from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
 from configs import HSTUConfig, InferenceHSTUConfig, get_inference_hstu_config
-from flexkv.common.config import CacheConfig, ModelConfig, UserConfig, update_default_config_from_user_config
+from flexkv.common.config import (
+    CacheConfig,
+    ModelConfig,
+    UserConfig,
+    update_default_config_from_user_config,
+)
 from flexkv.server.server import KVServer
 from megatron.core import parallel_state
 from model import get_ranking_model
@@ -143,14 +147,18 @@ def start_flexkv_server(kvcache_config: KVCacheConfig):
 
 
 def shutdown_flexkv_runtime_and_server(model: Optional[torch.nn.Module]) -> None:
-    server_handle = getattr(model, "flexkv_server_handle", None) if model is not None else None
+    server_handle = (
+        getattr(model, "flexkv_server_handle", None) if model is not None else None
+    )
     if model is not None and hasattr(model, "flexkv_server_handle"):
         model.flexkv_server_handle = None
 
     if hasattr(torch.ops, "kvcache_manager_ops") and hasattr(
         torch.ops.kvcache_manager_ops, "shutdown_runtime"
     ):
-        torch.ops.kvcache_manager_ops.shutdown_runtime(torch.zeros(0, dtype=torch.int64))
+        torch.ops.kvcache_manager_ops.shutdown_runtime(
+            torch.zeros(0, dtype=torch.int64)
+        )
 
     gc.collect()
     if torch.cuda.is_available():
@@ -480,9 +488,15 @@ def export_inference_gr_ranking(
                 if user_ids.shape[0] != b.batch_size:
                     b = strip_padding_batch(b, user_ids.shape[0])
                 total_history_lengths = (
-                    torch.sum(b.features.lengths().view(-1, b.batch_size), 0).view(-1)
-                    - b.num_candidates * 2
-                ).cpu().long()
+                    (
+                        torch.sum(b.features.lengths().view(-1, b.batch_size), 0).view(
+                            -1
+                        )
+                        - b.num_candidates * 2
+                    )
+                    .cpu()
+                    .long()
+                )
                 return b, user_ids, total_history_lengths
 
             # === Warmup ===
@@ -564,7 +578,9 @@ def export_inference_gr_ranking(
                     total_history_lengths,
                 ):
                     rebuilt = self._rebuild_batch(values, lengths, num_candidates)
-                    logits, task_ids = self.inner(rebuilt, user_ids.cpu(), total_history_lengths.cpu())
+                    logits, task_ids = self.inner(
+                        rebuilt, user_ids.cpu(), total_history_lengths.cpu()
+                    )
                     return logits.float().cpu(), task_ids.long().cpu()
 
             export_model = _PlainInputWrapper(model, batch)
@@ -602,7 +618,9 @@ def export_inference_gr_ranking(
             print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
             # export & aoti_compile_and_package
-            export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_kvcache_model")
+            export_dir = os.path.join(
+                os.path.dirname(__file__), "hstu_gr_ranking_kvcache_model"
+            )
             export_aot(
                 export_model,
                 example_inputs,

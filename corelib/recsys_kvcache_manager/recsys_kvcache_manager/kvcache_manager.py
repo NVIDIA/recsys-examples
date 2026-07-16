@@ -18,11 +18,8 @@ from typing import Optional, Tuple
 import torch
 
 from .default_kvcache_backend import DefaultKVCacheBackend
+from .host_kvstorage_manager import HostKVTaskHandle, HostKVWaitResult
 from .kvcache_backend import KVCacheBackend
-from .host_kvstorage_manager import (
-    HostKVTaskHandle,
-    HostKVWaitResult,
-)
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
 
@@ -35,11 +32,11 @@ class KVCacheManager:
 
     def __init__(self, backend: KVCacheBackend):
         self.backend = backend
-    
+
     @property
     def gpu_kvcache_mgr(self):
         return self.backend.gpu_kvcache_mgr
-    
+
     @gpu_kvcache_mgr.setter
     def gpu_kvcache_mgr(self, gpu_kvcache_mgr):
         self.backend.gpu_kvcache_mgr = gpu_kvcache_mgr
@@ -47,7 +44,7 @@ class KVCacheManager:
     @property
     def host_kvstorage_manager(self):
         return self.backend.host_kvstorage_manager
-    
+
     @host_kvstorage_manager.setter
     def host_kvstorage_manager(self, host_kvstorage_manager):
         self.backend.host_kvstorage_manager = host_kvstorage_manager
@@ -100,10 +97,10 @@ class KVCacheManager:
 
     def offload_try_wait(self) -> None:
         self.backend.offload_try_wait()
-    
+
     def offload_reap_completed(self) -> None:
         self.backend.offload_reap_completed()
-    
+
     def offload_flush(self) -> None:
         self.backend.offload_flush()
 

@@ -101,8 +101,9 @@ def _reference_inference_preprocess(
     contextual_lengths,
     num_candidates,
 ):
+    action_lengths = item_lengths
     item_offsets = _offsets(item_lengths).cpu()
-    action_offsets = _offsets(item_lengths).cpu()
+    action_offsets = _offsets(action_lengths).cpu()
     contextual_offsets = _offsets(contextual_lengths).cpu()
     num_candidates_cpu = num_candidates.cpu()
 
@@ -127,7 +128,9 @@ def _reference_inference_preprocess(
         )
         sample_rows.append(item_values[item_start + history_len : item_end])
         rows.extend(sample_rows)
-        lengths.append(contextual_end - contextual_start + history_len * 2 + num_candidate)
+        lengths.append(
+            contextual_end - contextual_start + history_len * 2 + num_candidate
+        )
 
     expected_lengths = torch.tensor(
         lengths, dtype=torch.int32, device=item_values.device
@@ -330,7 +333,11 @@ def test_hstu_preprocess_inference_drops_candidate_actions():
         is_inference=True,
     )
 
-    expected_values, expected_lengths, expected_offsets = _reference_inference_preprocess(
+    (
+        expected_values,
+        expected_lengths,
+        expected_offsets,
+    ) = _reference_inference_preprocess(
         item_values=item_values,
         item_lengths=item_lengths,
         action_values=action_values,
@@ -364,9 +371,16 @@ def test_hstu_preprocess_inference_export_dynamic_batch():
     args = (
         _make_values(int(item_lengths.sum().item()), embedding_dim, device=device),
         item_lengths,
-        _make_values(int(action_lengths.sum().item()), embedding_dim, device=device, start=1000),
+        _make_values(
+            int(action_lengths.sum().item()), embedding_dim, device=device, start=1000
+        ),
         action_lengths,
-        _make_values(int(contextual_lengths.sum().item()), embedding_dim, device=device, start=2000),
+        _make_values(
+            int(contextual_lengths.sum().item()),
+            embedding_dim,
+            device=device,
+            start=2000,
+        ),
         contextual_lengths,
         num_candidates,
     )
@@ -396,19 +410,32 @@ def test_hstu_preprocess_inference_export_dynamic_batch():
         _make_values(int(new_item_lengths.sum().item()), embedding_dim, device=device),
         new_item_lengths,
         _make_values(
-            int(new_action_lengths.sum().item()), embedding_dim, device=device, start=1000
+            int(new_action_lengths.sum().item()),
+            embedding_dim,
+            device=device,
+            start=1000,
         ),
         new_action_lengths,
         _make_values(
-            int(new_contextual_lengths.sum().item()), embedding_dim, device=device, start=2000
+            int(new_contextual_lengths.sum().item()),
+            embedding_dim,
+            device=device,
+            start=2000,
         ),
         new_contextual_lengths,
         new_num_candidates,
     )
-    actual_values, actual_lengths, actual_offsets, actual_candidate_offsets = (
-        exported.module()(*new_args)
-    )
-    expected_values, expected_lengths, expected_offsets = _reference_inference_preprocess(
+    (
+        actual_values,
+        actual_lengths,
+        actual_offsets,
+        actual_candidate_offsets,
+    ) = exported.module()(*new_args)
+    (
+        expected_values,
+        expected_lengths,
+        expected_offsets,
+    ) = _reference_inference_preprocess(
         item_values=new_args[0],
         item_lengths=new_item_lengths,
         action_values=new_args[2],

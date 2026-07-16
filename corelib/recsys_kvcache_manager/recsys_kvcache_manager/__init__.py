@@ -3,8 +3,8 @@
 
 """Recsys KVCache Manager - Dynamic KV-cache management for LLM inference."""
 
-from importlib import import_module
 import os
+from importlib import import_module
 from pathlib import Path
 
 import torch
@@ -26,9 +26,8 @@ def load_kvcache_manager_ops(strict: bool = False) -> bool:
     if env_dir:
         candidate_paths.append(Path(env_dir) / _RUNTIME_OPS_BASENAME)
 
-    env_path = (
-        os.getenv("KVCACHE_MANAGER_OPS_LIB")
-        or os.getenv("KVCACHE_MANAGER_OPS_LIBRARY")
+    env_path = os.getenv("KVCACHE_MANAGER_OPS_LIB") or os.getenv(
+        "KVCACHE_MANAGER_OPS_LIBRARY"
     )
     if env_path:
         candidate_paths.append(Path(env_path))
@@ -65,7 +64,6 @@ __all__ = [
     "KVCacheManager",
     "KVCacheBackend",
     "DefaultKVCacheBackend",
-    "ExportKVCacheBackend",
     "DeviceKVCache",
     "HostKVStorageBase",
     "NativeHostKVStorage",
@@ -88,7 +86,10 @@ _LAZY_IMPORTS = {
     "GPUKVCacheManager": (".gpu_kvcache_manager", "GPUKVCacheManager"),
     "HostKVStorageBase": (".host_kvstorage_manager", "HostKVStorageBase"),
     "HostKVStorageManagerBase": (".host_kvstorage_manager", "HostKVStorageManagerBase"),
-    "NativeHostKVCacheManager": (".native_host_kvcache_manager", "NativeHostKVCacheManager"),
+    "NativeHostKVCacheManager": (
+        ".native_host_kvcache_manager",
+        "NativeHostKVCacheManager",
+    ),
     "NativeHostKVStorage": (".native_host_kvcache_manager", "NativeHostKVStorage"),
     "KVCacheConfig": (".kvcache_config", "KVCacheConfig"),
     "KVCacheOffloadMode": (".kvcache_utils", "KVCacheOffloadMode"),
@@ -103,6 +104,7 @@ def __getattr__(name):
     value = getattr(import_module(module_name, __name__), attr_name)
     globals()[name] = value
     return value
+
 
 if _OPS_LOADED:
     register_fake_kvcache_manager_ops()

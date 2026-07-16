@@ -16,10 +16,9 @@ Goals:
 1. `KVCacheManager`: user-facing API (kept for compatibility).
 2. `KVCacheBackend`: abstract backend interface.
 3. `DefaultKVCacheBackend`: default implementation using current Python manager stack.
-4. `ExportKVCacheBackend`: export implementation that calls torch custom ops.
-5. `DeviceKVCache`: device-side KV cache component.
-6. `NativeHostKVStorage`: native host storage component.
-7. `FlexKVStorage`: FlexKV-backed host storage component.
+4. `DeviceKVCache`: device-side KV cache component.
+5. `NativeHostKVStorage`: native host storage component.
+6. `FlexKVStorage`: FlexKV-backed host storage component.
 
 ### 2.2 C++ layer
 1. `KVCacheRuntimeContext`: thread-local context holder for current runtime instance.
@@ -41,15 +40,11 @@ Goals:
 - Uses current Python components (`DeviceKVCache`, `NativeHostKVStorage` or `FlexKVStorage`).
 - Preserves current behavior as the default path.
 
-4. `ExportKVCacheBackend`
-- Calls `torch.ops.kvcache_manager_ops.*` only.
-- Does not duplicate stateful policy logic in Python.
-
-5. `ExportKVCacheRuntime`
+4. `ExportKVCacheRuntime`
 - Owns runtime state and policy in C++.
 - Owns references to device and host storage runtime components.
 
-6. `KVCacheRuntimeContext`
+5. `KVCacheRuntimeContext`
 - Holds the current `IKVCacheRuntime` pointer in `thread_local` storage.
 - Serves runtime resolution for all kvcache torch ops on the active thread.
 
@@ -63,7 +58,7 @@ Goals:
 ## 4. Key Relations (Composition + Shared Workflow)
 1. `KVCacheManager` has-a `KVCacheBackend`.
 2. `DefaultKVCacheBackend` has-a `DeviceKVCache` and host storage component.
-3. `ExportKVCacheBackend` has access to runtime setup utilities and torch ops only.
+3. Export path calls ops from `torch.ops.kvcache_manager_ops`
 4. `ExportKVCacheRuntime` implements `IKVCacheRuntime`.
 5. `KVCacheRuntimeContext` stores `std::shared_ptr<IKVCacheRuntime>` per thread.
 
@@ -81,27 +76,19 @@ Goals:
 
 ## 5.3 Export path (AOTI and torch.export focus)
 1. Inference initialization sets `ExportKVCacheRuntime` into `KVCacheRuntimeContext`.
-2. `KVCacheManager.lookup_kvcache` delegates to `ExportKVCacheBackend.lookup_kvcache`.
-3. Backend calls `torch.ops.kvcache_manager_ops.lookup_kvcache(...)`.
-4. C++ op shim resolves runtime from `KVCacheRuntimeContext`.
-5. C++ op shim calls `ExportKVCacheRuntime::lookup_kvcache(...)`.
-6. Runtime performs device lookup and host lookup, merges outputs.
-7. Runtime returns tensor-only outputs to op shim.
-8. Op shim returns outputs to Python backend.
-9. `ExportKVCacheBackend` maps tensor outputs into Python-level lookup result structures.
-10. `KVCacheManager` continues with shared orchestration flow.
+2. Lookup in model forward calls `torch.ops.kvcache_manager_ops.lookup_kvcache(...)`.
+3. C++ op shim resolves runtime from `KVCacheRuntimeContext`.
+4. C++ op shim calls `ExportKVCacheRuntime::lookup_kvcache(...)`.
+5. Runtime performs device lookup and host lookup, merges outputs.
+6. Runtime returns tensor-only outputs to op shim.
+7. Op shim returns outputs to Python backend.
 
 ## 5.4 Export path pseudocode
 ```python
 # Python
-class KVCacheManager:
-    def lookup_kvcache(self, user_ids, sequence_lengths):
-        return self.backend.lookup_kvcache(user_ids, sequence_lengths)
-
-class ExportKVCacheBackend(KVCacheBackend):
-    def lookup_kvcache(self, user_ids, sequence_lengths):
-        outs = torch.ops.kvcache_manager_ops.lookup_kvcache(user_ids, sequence_lengths)
-        return adapt_lookup_outputs(outs, user_ids, sequence_lengths)
+class ExportableModel:
+    def forward(self, user_ids, sequence_lengths, ...):
+        lookup_results = torch.ops.kvcache_manager_ops.lookup_kvcache(user_ids, sequence_lengths, ordering_tensor)
 ```
 
 ```cpp

@@ -16,15 +16,13 @@ import os
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
+from model.inference_ranking_gr import _STRIP_CACHED_TOKENS_OP
 from modules.inference_dense_module import InferenceDenseModule
 from recsys_kvcache_manager import load_kvcache_manager_ops
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from recsys_kvcache_manager.kvcache_metadata import KVCacheMetadata
 from recsys_kvcache_manager.kvcache_utils import KVLookupResult
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-
-from model.inference_ranking_gr import _STRIP_CACHED_TOKENS_OP
-
 
 # Export kvcache flow calls torch.ops.kvcache_manager_ops.* directly in forward,
 # so the runtime op library must be present for this module to be usable.
@@ -167,7 +165,9 @@ class ExportKVCachedInferenceRankingGR(torch.nn.Module):
             onboard_task_ids = onboard_slot_mappings[2]
 
             lookup_result = self._lookup_result_from_ops(user_ids, lookup_res)
-            striped_batch = self._strip_cached_tokens(batch, lookup_result.cached_lengths)
+            striped_batch = self._strip_cached_tokens(
+                batch, lookup_result.cached_lengths
+            )
             embeddings = self.sparse_module(striped_batch.features)
 
             jagged_data = self.dense_module._hstu_block._preprocessor(
@@ -183,9 +183,11 @@ class ExportKVCachedInferenceRankingGR(torch.nn.Module):
             kvcache_metadata.kv_seqlens = (
                 kvcache_metadata.total_history_lengths + jagged_data.num_candidates
             )
-            kvcache_metadata.kv_cache_table = torch.ops.kvcache_manager_ops.onboard_wait(
-                onboard_task_ids,
-                jagged_data.values,
+            kvcache_metadata.kv_cache_table = (
+                torch.ops.kvcache_manager_ops.onboard_wait(
+                    onboard_task_ids,
+                    jagged_data.values,
+                )
             )
 
             num_tokens = striped_batch.features.values().shape[0]

@@ -1,19 +1,22 @@
 import os
+
 # import sys
 import tempfile
+
 # import threading
-import time
 from pathlib import Path
 
 import torch
-from torch.utils.cpp_extension import load
-
-from flexkv.server.server import KVServer
 from flexkv.common.config import (
-    ModelConfig, CacheConfig, UserConfig,
-    update_default_config_from_user_config, parse_path_list,
     GLOBAL_CONFIG_FROM_ENV,
+    CacheConfig,
+    ModelConfig,
+    UserConfig,
+    parse_path_list,
+    update_default_config_from_user_config,
 )
+from flexkv.server.server import KVServer
+from torch.utils.cpp_extension import load
 
 KVCCACHE_ROOT = Path(__file__).resolve().parents[1]
 # REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +28,7 @@ TORCH_BINDING_ROOT = SRC_ROOT / "torch_binding"
 def _ipc_endpoint(name: str) -> str:
     temp_dir = Path(tempfile.mkdtemp(prefix=f"{name}_"))
     return f"ipc://{temp_dir / 'sock'}"
+
 
 def get_config(config_path: str):
     """Load config with distributed KVCache support.
@@ -86,13 +90,18 @@ def get_config(config_path: str):
     if config.get("enable_p2p_cpu", False) or config.get("enable_p2p_ssd", False):
         if "MOONCAKE_CONFIG_PATH" not in os.environ:
             mooncake_config = {
-                "engine_ip": config.get("mooncake_engine_ip", config.get("local_ip", "127.0.0.1")),
+                "engine_ip": config.get(
+                    "mooncake_engine_ip", config.get("local_ip", "127.0.0.1")
+                ),
                 "engine_port": config.get("mooncake_engine_port", 5555),
                 "metadata_backend": config.get("mooncake_metadata_backend", "redis"),
-                "metadata_server": config.get("mooncake_metadata_server",
-                    f"redis://{config.get('redis_host', '127.0.0.1')}:{config.get('redis_port', 6379)}"),
-                "metadata_server_auth": config.get("mooncake_metadata_server_auth",
-                    config.get("redis_password", "")),
+                "metadata_server": config.get(
+                    "mooncake_metadata_server",
+                    f"redis://{config.get('redis_host', '127.0.0.1')}:{config.get('redis_port', 6379)}",
+                ),
+                "metadata_server_auth": config.get(
+                    "mooncake_metadata_server_auth", config.get("redis_password", "")
+                ),
                 "protocol": config.get("mooncake_protocol", "tcp"),
                 "device_name": config.get("mooncake_device_name", ""),
             }
@@ -106,7 +115,7 @@ def get_config(config_path: str):
             print(f"[INFO] Auto-generated mooncake config at: {mooncake_config_path}")
             print(f"[INFO] Mooncake config: {json.dumps(mooncake_config, indent=2)}")
         else:
-            mooncake_config_path = os.environ['MOONCAKE_CONFIG_PATH']
+            mooncake_config_path = os.environ["MOONCAKE_CONFIG_PATH"]
             print(f"[INFO] Using existing MOONCAKE_CONFIG_PATH: {mooncake_config_path}")
 
         # Store mooncake_config_path in cache_config so it survives spawn subprocesses via pickle
@@ -121,10 +130,15 @@ def get_config(config_path: str):
 
     return model_config, cache_config
 
-if __name__ == "__main__":
-    assert torch.cuda.is_available(), "CUDA is required for FlexKVGPURegistrator smoke test"
 
-    with open(str(KVCCACHE_ROOT / "test" / "pytest_flexkv_cpp_client_ops.cpp"), "r") as fcode:
+if __name__ == "__main__":
+    assert (
+        torch.cuda.is_available()
+    ), "CUDA is required for FlexKVGPURegistrator smoke test"
+
+    with open(
+        str(KVCCACHE_ROOT / "test" / "pytest_flexkv_cpp_client_ops.cpp"), "r"
+    ) as fcode:
         cpp_codes = fcode.readlines()
 
     build_dir = Path(tempfile.mkdtemp("flexkv_cpp_client_ext"))
@@ -149,8 +163,9 @@ if __name__ == "__main__":
         verbose=False,
     )
 
-
-    model_config, cache_config = get_config(str(KVCCACHE_ROOT / "test" / "bindings_test_config.yml"))
+    model_config, cache_config = get_config(
+        str(KVCCACHE_ROOT / "test" / "bindings_test_config.yml")
+    )
     server_recv_port = _ipc_endpoint("flexkv_server_sock")
     gpu_register_port = server_recv_port + "_gpu_register"
     print("server_recv_port: ", server_recv_port)
@@ -162,7 +177,8 @@ if __name__ == "__main__":
         gpu_register_port=gpu_register_port,
         server_recv_port=server_recv_port,
         total_clients=1,
-        inherit_env=False)
+        inherit_env=False,
+    )
     print("[DEV] Started KVServer")
 
     result = flexkv_cpp_test_ext.run_cpp_client_smoke(

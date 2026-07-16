@@ -5,6 +5,7 @@ import argparse
 import math
 import os
 import signal
+import sys
 import tempfile
 import time
 import traceback
@@ -87,7 +88,9 @@ def _write_env_file(path: Path, env_values: Optional[Dict[str, Any]] = None) -> 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as env_file:
         for name in _ENV_FILE_NAMES:
-            value = env_values.get(name) if env_values is not None else os.environ.get(name)
+            value = (
+                env_values.get(name) if env_values is not None else os.environ.get(name)
+            )
             if value is not None:
                 env_file.write(f"export {name}={value!r}\n")
 
@@ -103,7 +106,9 @@ def _env_int(name: str) -> int:
     try:
         return int(_required_env(name))
     except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {os.environ.get(name)!r}") from exc
+        raise ValueError(
+            f"{name} must be an integer, got {os.environ.get(name)!r}"
+        ) from exc
 
 
 def _env_optional_int(name: str) -> Optional[int]:
@@ -185,9 +190,9 @@ def _extra_flexkv_configs() -> Dict[str, Any]:
         "FLEXKV_REDIS_PASSWORD": "redis_password",
     }
     for env_name, config_name in string_envs.items():
-        value = os.environ.get(env_name)
-        if value:
-            configs[config_name] = value
+        str_value = os.environ.get(env_name)
+        if str_value:
+            configs[config_name] = str_value
 
     redis_port = _env_optional_int("FLEXKV_REDIS_PORT")
     if redis_port is not None:
@@ -207,7 +212,9 @@ def _runtime_env_values(kvcache_config: KVCacheConfig) -> Dict[str, Any]:
         "KVCACHE_MANAGER_MAX_BATCH_SIZE": kvcache_config.max_batch_size,
         "KVCACHE_MANAGER_MAX_SEQUENCE_LENGTH": kvcache_config.max_seq_len,
         "KVCACHE_MANAGER_DEVICE_IDX": kvcache_config.device,
-        "KVCACHE_MANAGER_DTYPE": "bfloat16" if kvcache_config.dtype == torch.bfloat16 else "float16",
+        "KVCACHE_MANAGER_DTYPE": "bfloat16"
+        if kvcache_config.dtype == torch.bfloat16
+        else "float16",
         "KVCACHE_MANAGER_HOST_CAPACITY_PER_LAYER": kvcache_config.host_capacity_per_layer,
         "KVCACHE_MANAGER_ONLOAD_TIMEOUT_MS": kvcache_config.onload_timeout_ms,
         "KVCACHE_MANAGER_OFFLOAD_TIMEOUT_MS": kvcache_config.offload_timeout_ms,
@@ -336,15 +343,22 @@ def main() -> int:
     args = parse_args()
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to start the FlexKV export runtime server.")
+        raise RuntimeError(
+            "CUDA is required to start the FlexKV export runtime server."
+        )
 
     server_handle = None
     try:
         kvcache_config = _make_kvcache_config_from_env()
         env_file = Path(args.env_file).resolve()
         server_handle = _start_flexkv_server(kvcache_config, env_file)
-        print(f"[INFO] SERVER_RECV_PORT={os.environ.get('SERVER_RECV_PORT')}", flush=True)
-        print(f"[INFO] GPU_REGISTER_PORT={os.environ.get('GPU_REGISTER_PORT')}", flush=True)
+        print(
+            f"[INFO] SERVER_RECV_PORT={os.environ.get('SERVER_RECV_PORT')}", flush=True
+        )
+        print(
+            f"[INFO] GPU_REGISTER_PORT={os.environ.get('GPU_REGISTER_PORT')}",
+            flush=True,
+        )
         print("[INFO] Source this file before running the C++ demo:", flush=True)
         print(f"       source {env_file}", flush=True)
         print("[INFO] FlexKV server is running. Press Ctrl+C to stop.", flush=True)
@@ -353,7 +367,10 @@ def main() -> int:
 
         def _handle_signal(signum, _frame):
             nonlocal stop
-            print(f"[INFO] Received signal {signum}; shutting down FlexKV server.", flush=True)
+            print(
+                f"[INFO] Received signal {signum}; shutting down FlexKV server.",
+                flush=True,
+            )
             stop = True
 
         signal.signal(signal.SIGINT, _handle_signal)
@@ -363,7 +380,9 @@ def main() -> int:
         while not stop:
             time.sleep(1)
             if time.time() - start_time >= 10:
-                print("[INFO] FlexKV server has been running for 10 seconds.", flush=True)
+                print(
+                    "[INFO] FlexKV server has been running for 10 seconds.", flush=True
+                )
                 start_time = time.time()
 
         if server_handle is not None:
@@ -374,7 +393,10 @@ def main() -> int:
         traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
         if server_handle is not None:
             try:
-                print("[INFO] Attempting to shut down FlexKV server after error.", flush=True)
+                print(
+                    "[INFO] Attempting to shut down FlexKV server after error.",
+                    flush=True,
+                )
                 server_handle.shutdown()
             except BaseException as shutdown_exc:
                 print("[ERROR] FlexKV server shutdown also failed:", flush=True)

@@ -20,7 +20,6 @@ from typing import Callable, Iterable, Sequence, Tuple
 
 import torch
 
-
 _OPS_NAMESPACE = "kvcache_manager_ops"
 _REGISTERED = False
 
@@ -38,7 +37,9 @@ def _check_1d_cpu_tensor(tensor: torch.Tensor, name: str) -> None:
     torch._check(not tensor.is_cuda, lambda: f"{name} must be a CPU tensor")
 
 
-def _check_same_length(lhs: torch.Tensor, rhs: torch.Tensor, lhs_name: str, rhs_name: str) -> None:
+def _check_same_length(
+    lhs: torch.Tensor, rhs: torch.Tensor, lhs_name: str, rhs_name: str
+) -> None:
     torch._check(
         lhs.shape[0] == rhs.shape[0],
         lambda: f"{lhs_name} and {rhs_name} must have the same batch dimension",
@@ -90,7 +91,9 @@ def _fake_cache_table_shape() -> tuple[int, int, int, int, int]:
     )
 
 
-def _lookup_fake(user_ids: torch.Tensor, seqlens: torch.Tensor, sync_point: torch.Tensor) -> list[torch.Tensor]:
+def _lookup_fake(
+    user_ids: torch.Tensor, seqlens: torch.Tensor, sync_point: torch.Tensor
+) -> list[torch.Tensor]:
     # _check_1d_cpu_tensor(user_ids, "user_ids")
     # _check_1d_cpu_tensor(seqlens, "seqlens")
     # _check_same_length(user_ids, seqlens, "user_ids", "seqlens")
@@ -155,7 +158,9 @@ def _onboard_launch_fake(
     _check_1d_cpu_tensor(user_ids, "user_ids")
     _check_1d_cpu_tensor(seqlens, "seqlens")
     # _check_same_length(user_ids, seqlens, "user_ids", "seqlens")
-    torch._check(len(lookup_results) == 7, lambda: "lookup_results must contain 7 tensors")
+    torch._check(
+        len(lookup_results) == 7, lambda: "lookup_results must contain 7 tensors"
+    )
     _check_1d_cpu_tensor(lookup_results[6], "lookup_results[6]")
     torch._check(kv_page_indices.dim() == 1, lambda: "kv_page_indices must be 1-D")
     torch._check(kv_page_indptr.dim() == 1, lambda: "kv_page_indptr must be 1-D")
@@ -236,7 +241,9 @@ def _offload_wait_fake(task_ids: torch.Tensor) -> torch.Tensor:
     return _empty_cpu((task_ids.shape[0], 3), dtype=torch.int64)
 
 
-def _evict_kvcache_fake(user_ids: torch.Tensor, evict_gpu_only: bool, sync_point: torch.Tensor) -> torch.Tensor:
+def _evict_kvcache_fake(
+    user_ids: torch.Tensor, evict_gpu_only: bool, sync_point: torch.Tensor
+) -> torch.Tensor:
     del evict_gpu_only
     _check_1d_cpu_tensor(user_ids, "user_ids")
     return _empty_cpu((1,), dtype=torch.int32)

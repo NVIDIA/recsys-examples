@@ -238,7 +238,7 @@ ${HSTU_DIR}/nve_init_hook/build/libnve_init_hook.so
 
 #### Step 5.2: Setup the Triton Server Container
 
-Copy the preivously built `libtriton_pytorch.so` into the container. Or,
+Copy the previously built `libtriton_pytorch.so` into the container. Or,
 mount the install dir of pytorch backend to the container. (omitted here)
 
 On the host:

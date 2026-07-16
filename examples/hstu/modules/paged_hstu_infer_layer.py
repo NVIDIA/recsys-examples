@@ -12,10 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import paged_kvcache_ops
+# isort: off
+import paged_kvcache_ops  # noqa: F401
+import commons.ops.cuda_ops.fake_paged_kvcache_ops  # noqa: F401
+
+# isort: on
 import torch
 import torch.nn.functional as F
-import commons.ops.cuda_ops.fake_paged_kvcache_ops  # noqa: F401
 from configs import InferenceHSTUConfig
 from hstu import hstu_attn_varlen_func
 from modules.jagged_data import JaggedData
@@ -333,9 +336,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
 
         if self._export_mode:
             if kv_cache_metadata is None:
-                raise RuntimeError(
-                    "kv_cache_metadata must not be None in export mode"
-                )
+                raise RuntimeError("kv_cache_metadata must not be None in export mode")
 
         if kv_cache_metadata is not None:
             kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
@@ -429,13 +430,13 @@ class PagedHSTUInferLayer(torch.nn.Module):
 
         if self._export_mode:
             if kv_cache_metadata is None:
-                raise RuntimeError(
-                    "kv_cache_metadata must not be None in export mode"
-                )
+                raise RuntimeError("kv_cache_metadata must not be None in export mode")
 
         if kv_cache_metadata is not None:
             kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
-            kv_cache_metadata.kv_cache_table[self.layer_idx] = torch.ops.paged_kvcache_ops.append_kvcache(
+            kv_cache_metadata.kv_cache_table[
+                self.layer_idx
+            ] = torch.ops.paged_kvcache_ops.append_kvcache(
                 key,
                 value,
                 kv_cache_metadata.batch_indices,
@@ -473,9 +474,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
 
         if self._export_mode:
             if kv_cache_metadata is None:
-                raise RuntimeError(
-                    "kv_cache_metadata must not be None in export mode"
-                )
+                raise RuntimeError("kv_cache_metadata must not be None in export mode")
 
         use_kvcache = True if self._export_mode else kv_cache_metadata is not None
         kv_cache_table = (

@@ -174,9 +174,7 @@ class NinjaBuildExtension(BuildExtension):
         ]
         cmake_arches = parse_torch_cuda_arch_list()
         if cmake_arches:
-            cmake_configure_cmd.append(
-                f"-DCMAKE_CUDA_ARCHITECTURES={cmake_arches}"
-            )
+            cmake_configure_cmd.append(f"-DCMAKE_CUDA_ARCHITECTURES={cmake_arches}")
 
         subprocess.check_call(cmake_configure_cmd, cwd=str(root_path))
 

@@ -61,7 +61,7 @@ private:
 
 private:
     at::Tensor lookup_token_index_;  // in recsys only namespace matters, so we can pre-allocate a tensor for the token index in get_match.
-    at::Tensor token_slot_mappings_in_page_;  // re-use for slot mapping building in onboard_kvcache_launch
+    at::Tensor token_slot_mappings_in_page_;  // reuse for slot mapping building in onboard_kvcache_launch
     at::Tensor cache_tensor_;
     std::vector<at::Tensor> cache_tables_;
     int num_layers_;

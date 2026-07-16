@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from .host_kvstorage_manager import HostKVStorageBase, HostKVTaskHandle, HostKVWaitResult
+from .host_kvstorage_manager import HostKVTaskHandle, HostKVWaitResult
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
 

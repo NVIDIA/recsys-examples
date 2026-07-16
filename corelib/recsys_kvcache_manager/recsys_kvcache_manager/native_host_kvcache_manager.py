@@ -255,4 +255,3 @@ class NativeHostKVStorage(HostKVStorageBase):
 
 # Backward compatibility alias; prefer NativeHostKVStorage.
 NativeHostKVCacheManager = NativeHostKVStorage
-    
