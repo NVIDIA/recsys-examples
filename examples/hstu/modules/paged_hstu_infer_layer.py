@@ -275,15 +275,15 @@ class PagedHSTUInferLayer(torch.nn.Module):
             query,
             key,
             value,
-            jd.seqlen_offsets[: batch_size + 1],
-            kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1],
+            jd.seqlen_offsets,
+            kv_cache_metadata.kv_seqlen_offsets,
             None,
             None,  # seqused_q, seqused_k
             jd.max_seqlen,
             jd.max_seqlen,
             jd.scaling_seqlen,
             None,  # num_contexts
-            jd.num_candidates[:batch_size],
+            jd.num_candidates,
             self._target_group_size,
             -1,
             0,
@@ -345,7 +345,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 value,
                 kv_cache_metadata.batch_indices,
                 kv_cache_metadata.position,
-                jd.num_candidates_offsets[: batch_size + 1],
+                jd.num_candidates_offsets,
                 kv_cache_metadata.new_history_nnz_cuda,
                 0,  # max_nnz, 0 means use nnz_cuda
                 kv_cache_table,

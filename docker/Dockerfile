@@ -7,22 +7,8 @@ ARG DEVEL_IMAGE=devel
 # Override BASE_FBGEMM_IMAGE to consume a pre-built image and skip the build.
 # ============================================================================
 FROM ${BASE_IMAGE} AS base_fbgemm
-ARG TRITONSERVER_BUILD
 
 WORKDIR /workspace/deps
-
-# Layer 0-pre: bootstrap when base is nvcr/tritonserver. pytorch base ships
-# all these (python alias, cmake/patchelf, ninja, torch, tabulate) — branch skips.
-# tabulate is a FBGEMM v1.5.0 setup.py import; only missing on tritonserver.
-# ninja: without it torch BuildExtension serial-fallbacks → HSTU build ~3h vs ~10min.
-RUN if [ "${TRITONSERVER_BUILD}" = "1" ]; then \
-      ln /bin/python3 /bin/python && \
-      apt-get update -y --fix-missing && \
-      apt-get install -y cmake patchelf && \
-      pip3 install --no-cache-dir pandas rich cloudpickle psutil cython tabulate ninja && \
-      pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 && \
-      apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*; \
-    fi
 
 # Layer 0a: FBGEMM Path A (slow ~55min nvcc compile).
 RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
@@ -42,7 +28,6 @@ RUN pip install --no-deps tensordict orjson && \
 # ============================================================================
 FROM ${BASE_FBGEMM_IMAGE} AS devel
 ARG TARGETPLATFORM
-ARG TRITONSERVER_BUILD
 
 WORKDIR /workspace/deps
 
@@ -124,7 +109,6 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
 # kvcache_manager) and runtime libcuda link.
 # ============================================================================
 FROM ${DEVEL_IMAGE} AS build
-ARG TRITONSERVER_BUILD
 
 RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
@@ -142,14 +126,12 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
     cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" pip3 install --no-build-isolation . && \
-    if [ "${TRITONSERVER_BUILD}" != "1" ]; then \
-      rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
-      test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
-      ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
-      cd /workspace/recsys-examples/corelib/dynamicemb && \
-      mkdir -p torch_binding_build && cd torch_binding_build && \
-      cmake .. && make -j; \
-    fi
+    rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+    test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
+    ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+    cd /workspace/recsys-examples/corelib/dynamicemb && \
+    mkdir -p torch_binding_build && cd torch_binding_build && \
+    cmake .. && make -j
 
 # ============================================================================
 # AOTI additions: C++ replay executable, NVE init hook, Triton backend prep,
