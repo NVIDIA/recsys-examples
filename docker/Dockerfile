@@ -105,14 +105,17 @@ RUN cd FlexKV && mkdir -p build && cd build && \
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
+    export HSTU_ARCH_LIST="8.0 9.0 10.0" && \
+    if [ "${TARGETPLATFORM}" = "linux/amd64" ]; then \
+      export HSTU_DISABLE_120=TRUE; \
+      export HSTU_ARCH_LIST="8.0 9.0 10.0 12.0"; \
+    fi && \
     HSTU_DISABLE_86OR89=FALSE \
-    HSTU_DISABLE_120=TRUE \
     HSTU_DISABLE_ARBITRARY=TRUE \
     HSTU_DISABLE_LOCAL=TRUE \
     HSTU_DISABLE_RAB=TRUE \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
-    HSTU_ARCH_LIST="8.0 9.0 10.0 12.0" \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
