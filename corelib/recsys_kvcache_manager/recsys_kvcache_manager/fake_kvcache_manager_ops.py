@@ -10,8 +10,8 @@ The goal is to preserve operator schemas and output structure closely enough for
 
 The C++ runtime currently determines several output lengths from runtime
 configuration, most notably the GPU page size and the number of newly allocated
-tokens. Static cache-table dimensions are read from the shared YAML config at fake
-op registration time. Dynamic batch-dependent lengths are represented here with
+tokens. Static cache-table dimensions are read lazily from the shared YAML config
+on the first fake op invocation. Dynamic batch-dependent lengths are represented here with
 fresh symbolic sizes.
 """
 
@@ -71,13 +71,10 @@ def _empty_cuda(shape: Sequence[int], *, dtype: torch.dtype) -> torch.Tensor:
 
 
 def _runtime_config() -> dict[str, str]:
-    if _RUNTIME_CONFIG is None:
-        raise RuntimeError("KV-cache runtime config must be loaded before fake ops run")
-    return _RUNTIME_CONFIG
-
-
-def _load_runtime_config_for_fake_ops() -> None:
     global _RUNTIME_CONFIG
+
+    if _RUNTIME_CONFIG is not None:
+        return _RUNTIME_CONFIG
 
     config = load_runtime_config_from_env()
     missing = [key for key in _REQUIRED_CONFIG_KEYS if config.get(key) in (None, "")]
@@ -87,6 +84,7 @@ def _load_runtime_config_for_fake_ops() -> None:
             + ", ".join(missing)
         )
     _RUNTIME_CONFIG = config
+    return _RUNTIME_CONFIG
 
 
 def _fake_config_value(config_name: str) -> str:
@@ -310,8 +308,6 @@ def register_fake_kvcache_manager_ops() -> bool:
     )
     if not all(_has_op(op_name) for op_name in required_ops):
         return False
-
-    _load_runtime_config_for_fake_ops()
 
     _register_fake("init_kvcache", _init_kvcache_fake)
     _register_fake("shutdown_runtime", _shutdown_runtime_fake)
