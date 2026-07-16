@@ -169,6 +169,11 @@ class PagedHSTUInferLayer(torch.nn.Module):
     def _resolve_export_mode(config: InferenceHSTUConfig) -> bool:
         return getattr(config, "export_mode", False)
 
+    def _metadata_batch_view(self, tensor, batch_size: int, is_offsets: bool = False):
+        if self._export_mode:
+            return tensor
+        return tensor[: batch_size + 1] if is_offsets else tensor[:batch_size]
+
     def uvqk_addmm_impl(self, input_data, num_tokens):
         if not self._export_mode and num_tokens >= 2048:  # fusion impl
             _, silu_output_data = self.addmm_silu_impl(
@@ -275,15 +280,17 @@ class PagedHSTUInferLayer(torch.nn.Module):
             query,
             key,
             value,
-            jd.seqlen_offsets,
-            kv_cache_metadata.kv_seqlen_offsets,
+            self._metadata_batch_view(jd.seqlen_offsets, batch_size, is_offsets=True),
+            self._metadata_batch_view(
+                kv_cache_metadata.kv_seqlen_offsets, batch_size, is_offsets=True
+            ),
             None,
             None,  # seqused_q, seqused_k
             jd.max_seqlen,
             jd.max_seqlen,
             jd.scaling_seqlen,
             None,  # num_contexts
-            jd.num_candidates,
+            self._metadata_batch_view(jd.num_candidates, batch_size),
             self._target_group_size,
             -1,
             0,
@@ -345,7 +352,9 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 value,
                 kv_cache_metadata.batch_indices,
                 kv_cache_metadata.position,
-                jd.num_candidates_offsets,
+                self._metadata_batch_view(
+                    jd.num_candidates_offsets, batch_size, is_offsets=True
+                ),
                 kv_cache_metadata.new_history_nnz_cuda,
                 0,  # max_nnz, 0 means use nnz_cuda
                 kv_cache_table,
