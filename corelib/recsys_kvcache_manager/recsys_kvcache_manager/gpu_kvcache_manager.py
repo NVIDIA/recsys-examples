@@ -163,6 +163,7 @@ class DeviceKVCache:
             if append_offsets is not None
             else torch.zeros((batch_size,), dtype=torch.int32, device=self.device_idx),
             kvcache_metadata.new_history_nnz_cuda,
+            0,
             kv_cache_table,
             kvcache_metadata.kv_indices,
             kvcache_metadata.kv_indptr,
