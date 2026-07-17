@@ -82,7 +82,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt,
-                        int64_t num_scores = 1);
+                        int64_t num_scores = 1, int64_t score_fn_key = 0);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>

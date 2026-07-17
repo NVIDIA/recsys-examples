@@ -25,9 +25,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //
 // KeyType/IndexType/CounterType are all int64, ScoreType is uint64, InsertResult
 // is a uint8 enum -- fixed for LruLfu (§11.2), so this ABI is monomorphic. The
-// cubin exposes exactly two entry points (one EnableOverflow variant each):
-//   dyn_emb_evict_entry_ovf(EvictParams)     -- overflow-enabled tables
-//   dyn_emb_evict_entry_noovf(EvictParams)   -- no-overflow tables
+// cubin exposes three entry points (all take EvictParams by value):
+//   dyn_emb_evict_entry_ovf(EvictParams)     -- insert_and_evict, overflow tier
+//   dyn_emb_evict_entry_noovf(EvictParams)   -- insert_and_evict, no overflow
+//   dyn_emb_insert_entry(EvictParams)        -- plain insert (evicts a full
+//       bucket via the ranked comparator but collects no evicted output;
+//       the evicted_* and ovf_* fields are unused / may be null).
 #pragma once
 
 #include <cstdint>

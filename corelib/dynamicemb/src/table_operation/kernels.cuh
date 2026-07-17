@@ -319,16 +319,25 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
   *result_out = result;
 }
 
-template <typename Table, typename KernelTraits>
-__global__ void table_insert_kernel(
-    Table table, int64_t const *__restrict__ table_bucket_offsets,
-    int *__restrict__ bucket_sizes, int64_t batch,
-    typename Table::KeyType const *__restrict__ input_keys,
-    int64_t const *__restrict__ table_ids,
-    InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
-    ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
-    typename Table::KeyType **__restrict__ table_key_slots,
-    int32_t *__restrict__ counter) {
+// Shared plain-insert body, pluggable on Evictor (mirrors insert_and_evict_body).
+// DefaultEvictor (AoT) uses the single-score reduce(); the LruLfu insert cubin
+// (evict_lrulfu.cu) instantiates it with RankedEvictor<Comparator> so a full
+// bucket on a 2-word table evicts by the same comparator as insert_and_evict,
+// never the single-score reduce(). Plain insert drops the evicted key (no
+// evicted-output collection), so cur_ts is the only extra input the ranked
+// evictor needs.
+template <typename Table, typename KernelTraits,
+          typename Evictor = DefaultEvictor>
+__device__ __forceinline__ void
+insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
+            int *__restrict__ bucket_sizes, int64_t batch,
+            typename Table::KeyType const *__restrict__ input_keys,
+            int64_t const *__restrict__ table_ids,
+            InsertResult *__restrict__ insert_results,
+            IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
+            int64_t *__restrict__ score_output,
+            typename Table::KeyType **__restrict__ table_key_slots,
+            int32_t *__restrict__ counter, uint64_t cur_ts = 0) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -386,10 +395,10 @@ __global__ void table_insert_kernel(
     insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
                                    &iter, &result);
     int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
-    insert<ReductionGroupSize, BufferDim, Policy>(
+    insert<ReductionGroupSize, BufferDim, Policy, Evictor>(
         bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores, result,
         &iter, &result, static_cast<KeyType *>(nullptr),
-        static_cast<ScoreType *>(nullptr), counter, counter_offset);
+        static_cast<ScoreType *>(nullptr), counter, counter_offset, cur_ts);
 
     IndexType index = -1;
     KeyType *table_key_slot = nullptr;
@@ -401,7 +410,7 @@ __global__ void table_insert_kernel(
       table_key_slot = bucket.keys(iter);
     }
     if constexpr (OutputScore) {
-      // Null-safe so the LruLfu evict cubin can fix OutputScore=true and decide
+      // Null-safe so the LruLfu insert cubin can fix OutputScore=true and decide
       // at runtime (score_output may be null). For AoT, OutputScore=true always
       // pairs with a non-null score_output, so the check is free there.
       if (score_output != nullptr)
@@ -413,6 +422,25 @@ __global__ void table_insert_kernel(
       insert_results[i] = result;
     }
   }
+}
+
+// AoT entry: plain insert with the single-score reduce (DefaultEvictor). The
+// LruLfu insert cubin provides its own __global__ that calls insert_body with
+// RankedEvictor<Comparator> (see evict_lrulfu.cu).
+template <typename Table, typename KernelTraits>
+__global__ void table_insert_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int *__restrict__ bucket_sizes, int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    int64_t const *__restrict__ table_ids,
+    InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
+    ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
+    typename Table::KeyType **__restrict__ table_key_slots,
+    int32_t *__restrict__ counter) {
+  insert_body<Table, KernelTraits, DefaultEvictor>(
+      table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
+      insert_results, indices, score_input, score_output, table_key_slots,
+      counter, /*cur_ts=*/0);
 }
 
 template <typename Table, typename KernelTraits, typename Evictor>

@@ -80,4 +80,29 @@ extern "C" __global__ void dyn_emb_evict_entry_noovf(EvictParams p) {
   run_evict<false>(p, read_globaltimer());
 }
 
+// Plain insert (no overflow tier, no evicted-output collection). A full bucket
+// still evicts, but via RankedEvictor<Comparator> -- so a 2-word LruLfu table
+// never falls back to the single-score reduce() in table_insert_kernel. Reuses
+// EvictParams (evicted_* / ovf_* fields unused here).
+__device__ __forceinline__ void run_insert(const EvictParams &p,
+                                           uint64_t cur_ts) {
+  using KernelTraits =
+      InsertKernelTraits<256, 1, 1, /*CompactTileSize=*/1,
+                         /*NumScorePerThread=*/8, ScorePolicyType::LruLfu,
+                         /*OutputScore=*/true>;
+
+  EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
+                   p.num_scores);
+
+  insert_body<EvictTable, KernelTraits, RankedEvictor<EvictComparator>>(
+      table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
+      p.table_ids, reinterpret_cast<InsertResult *>(p.insert_results),
+      p.indices, p.score_input, p.score_output, p.table_key_slots, p.counter,
+      cur_ts);
+}
+
+extern "C" __global__ void dyn_emb_insert_entry(EvictParams p) {
+  run_insert(p, read_globaltimer());
+}
+
 } // namespace dyn_emb

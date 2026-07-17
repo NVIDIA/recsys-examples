@@ -792,3 +792,59 @@ def test_lru_lfu_default_evictor_timestamp_tiebreak(current_device):
     assert (
         actual == predicted
     ), "default Lex evictor must break equal-frequency ties by evicting oldest timestamps"
+
+
+def test_lru_lfu_plain_insert_evicts_via_cubin(current_device):
+    """Plain table.insert() (NOT insert_and_evict) on a full LruLfu bucket must
+    evict via the ranked comparator / custom score_function through the cubin, not
+    the single-score DefaultEvictor reduce() (which cannot even read the 2-word
+    layout). Uses _evict_high_freq_first (evict HIGHEST frequency): the default
+    min-frequency reduce() would KEEP the hot keys, so the hot keys being gone
+    proves the plain-insert path drove eviction through the custom cubin."""
+    device = torch.cuda.current_device()
+    bc = 128
+    table = _custom_table(_evict_high_freq_first, LRU_LFU_TS_FIRST, bc=bc)
+    assert table.score_fn_key_ != 0
+
+    # Fill the single bucket exactly with frequency-1 keys (no eviction yet).
+    n = bc
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    ones = torch.ones(n, dtype=torch.uint64, device=device)
+    idx, _ = _insert(table, keys, tids, ones)  # _insert uses plain table.insert()
+
+    # Boost a small hot subset to high frequency.
+    n_hot = 10
+    hot = keys[:n_hot]
+    hot_tids = tids[:n_hot]
+    hot_ones = ones[:n_hot]
+    for _ in range(20):
+        table.lookup(
+            hot,
+            hot_tids,
+            ScoreArg(name="frequency", value=hot_ones, policy=ScorePolicy.LRU_LFU),
+        )
+    torch.cuda.synchronize()
+    assert torch.all(
+        table.gather_score_blocks(0, idx[:n_hot])[:, 1] == 21
+    ), "hot keys should be at frequency 1 + 20"
+
+    # Plain insert new keys: the bucket is full, so each insertion evicts a victim.
+    # With _evict_high_freq_first the highest-frequency (hot) keys go first.
+    n_new = 40
+    new_keys = torch.arange(100000, 100000 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    new_ones = torch.ones(n_new, dtype=torch.uint64, device=device)
+    table.insert(
+        new_keys,
+        new_tids,
+        ScoreArg(name="frequency", value=new_ones, policy=ScorePolicy.LRU_LFU),
+    )
+    torch.cuda.synchronize()
+
+    _, founds, _ = table.lookup(
+        hot, hot_tids, ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+    )
+    assert not bool(
+        founds.any()
+    ), "plain insert must evict the high-freq keys via the custom cubin (DefaultEvictor would have kept them)"

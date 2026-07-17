@@ -612,6 +612,7 @@ class LinearBucketTable(ScoredHashTable):
             insert_results,
             score_out,
             num_scores=num_scores,
+            score_fn_key=self.score_fn_key_,
         )
         return indices
 
