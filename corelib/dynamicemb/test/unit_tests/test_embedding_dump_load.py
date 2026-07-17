@@ -38,6 +38,7 @@ from dynamicemb.dump_load import (
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    ScoreStrategy,
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
@@ -277,7 +278,7 @@ def apply_dmp(
     model: torch.nn.Module,
     optimizer_kwargs: Dict[str, Any],
     device: torch.device,
-    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    score_strategy: ScoreStrategy = DynamicEmbScoreStrategy.LFU,
     dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,
@@ -357,7 +358,7 @@ def create_model(
     num_embeddings: List[int],
     embedding_dim: int,
     optimizer_kwargs: Dict[str, Any],
-    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    score_strategy: ScoreStrategy = DynamicEmbScoreStrategy.LFU,
     dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,

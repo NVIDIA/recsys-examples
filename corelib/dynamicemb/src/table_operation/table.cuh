@@ -58,6 +58,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
     CASE_ENUM_USING_HINT(ScorePolicyType::Assign, HINT, __VA_ARGS__)           \
     CASE_ENUM_USING_HINT(ScorePolicyType::Accumulate, HINT, __VA_ARGS__)       \
     CASE_ENUM_USING_HINT(ScorePolicyType::GlobalTimer, HINT, __VA_ARGS__)      \
+    CASE_ENUM_USING_HINT(ScorePolicyType::LruLfu, HINT, __VA_ARGS__)           \
   default:                                                                     \
     throw std::runtime_error("Not supported score policy.");                   \
   }
@@ -70,7 +71,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage = std::nullopt,
              int64_t ovf_bucket_capacity = 0,
-             std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
+             std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
+             int64_t num_scores = 1);
 
 at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor table_bucket_offsets,
@@ -79,7 +81,8 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
-                        std::optional<at::Tensor> score_output = std::nullopt);
+                        std::optional<at::Tensor> score_output = std::nullopt,
+                        int64_t num_scores = 1);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -94,22 +97,41 @@ table_insert_and_evict(
     int64_t ovf_bucket_capacity = 0,
     std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
     std::optional<at::Tensor> ovf_counter = std::nullopt,
-    std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
+    std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
+    int64_t num_scores = 1);
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices);
+                 std::optional<at::Tensor> indices, int64_t num_scores = 1);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
                    int64_t batch, int64_t offset, torch::Dtype key_dtype,
                    std::optional<ScoreType> threshold = std::nullopt,
-                   int64_t table_begin = 0);
+                   int64_t table_begin = 0, int64_t num_scores = 1,
+                   int64_t score_index = 0);
 
 at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
                                int64_t bucket_capacity, ScoreType threshold,
-                               int64_t begin = -1, int64_t end = -1);
+                               int64_t begin = -1, int64_t end = -1,
+                               int64_t num_scores = 1, int64_t score_index = 0);
+
+void table_copy_score_blocks(at::Tensor src_storage, int64_t src_bucket_capacity,
+                             at::Tensor dst_storage, int64_t dst_bucket_capacity,
+                             int64_t num_scores, int64_t src_bkt_begin,
+                             int64_t dst_bkt_begin, at::Tensor src_slots,
+                             at::Tensor dst_slots, torch::Dtype key_dtype);
+
+at::Tensor table_gather_score_blocks(at::Tensor table_storage,
+                                     int64_t bucket_capacity, int64_t num_scores,
+                                     int64_t bkt_begin, at::Tensor slots,
+                                     torch::Dtype key_dtype);
+
+void table_scatter_score_blocks(at::Tensor table_storage,
+                                int64_t bucket_capacity, int64_t num_scores,
+                                int64_t bkt_begin, at::Tensor slots,
+                                at::Tensor values, torch::Dtype key_dtype);
 
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,

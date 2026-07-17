@@ -24,7 +24,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage,
              int64_t ovf_bucket_capacity,
-             std::optional<at::Tensor> ovf_output_offsets);
+             std::optional<at::Tensor> ovf_output_offsets,
+             int64_t num_scores);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets,

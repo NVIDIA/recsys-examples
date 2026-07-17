@@ -100,14 +100,14 @@ void bind_table_operation(py::module &m) {
         py::arg("bucket_capacity"), py::arg("keys"), py::arg("table_ids"),
         py::arg("score_input"), py::arg("policy_type"),
         py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
-        py::arg("ovf_output_offsets") = py::none());
+        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1);
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
         py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
         py::arg("counter"), py::arg("insert_results") = py::none(),
-        py::arg("score_output") = py::none());
+        py::arg("score_output") = py::none(), py::arg("num_scores") = 1);
 
   m.def("table_insert_and_evict", &dyn_emb::table_insert_and_evict,
         "insert into the table", py::arg("table_storage"),
@@ -119,24 +119,47 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
         py::arg("ovf_bucket_sizes") = py::none(),
         py::arg("ovf_counter") = py::none(),
-        py::arg("ovf_output_offsets") = py::none());
+        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1);
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
-        py::arg("table_ids"), py::arg("indices") = py::none());
+        py::arg("table_ids"), py::arg("indices") = py::none(),
+        py::arg("num_scores") = 1);
 
   m.def("table_export_batch", &dyn_emb::table_export_batch,
         "export items[offset, offset + batch) from the table",
         py::arg("table_storage"), py::arg("bucket_capacity"), py::arg("batch"),
         py::arg("offset"), py::arg("key_dtype"),
-        py::arg("threshold") = py::none(), py::arg("table_begin") = 0);
+        py::arg("threshold") = py::none(), py::arg("table_begin") = 0,
+        py::arg("num_scores") = 1, py::arg("score_index") = 0);
 
   m.def("table_count_matched", &dyn_emb::table_count_matched,
         "count number of items in the table whose scores >= threshold",
         py::arg("table_storage"), py::arg("key_dtype"),
         py::arg("bucket_capacity"), py::arg("threshold"), py::arg("begin") = -1,
-        py::arg("end") = -1);
+        py::arg("end") = -1, py::arg("num_scores") = 1,
+        py::arg("score_index") = 0);
+
+  m.def("table_copy_score_blocks", &dyn_emb::table_copy_score_blocks,
+        "copy all score words for aligned (src_slot, dst_slot) pairs between "
+        "two tables (used by rehash to preserve multi-word LruLfu scores)",
+        py::arg("src_storage"), py::arg("src_bucket_capacity"),
+        py::arg("dst_storage"), py::arg("dst_bucket_capacity"),
+        py::arg("num_scores"), py::arg("src_bkt_begin"), py::arg("dst_bkt_begin"),
+        py::arg("src_slots"), py::arg("dst_slots"), py::arg("key_dtype"));
+
+  m.def("table_gather_score_blocks", &dyn_emb::table_gather_score_blocks,
+        "gather all score words at the given slots into a [n, num_scores] tensor",
+        py::arg("table_storage"), py::arg("bucket_capacity"),
+        py::arg("num_scores"), py::arg("bkt_begin"), py::arg("slots"),
+        py::arg("key_dtype"));
+
+  m.def("table_scatter_score_blocks", &dyn_emb::table_scatter_score_blocks,
+        "scatter a [n, num_scores] score block into the given slots",
+        py::arg("table_storage"), py::arg("bucket_capacity"),
+        py::arg("num_scores"), py::arg("bkt_begin"), py::arg("slots"),
+        py::arg("values"), py::arg("key_dtype"));
 
   m.def("bucketize_keys", &dyn_emb::bucketize_keys,
         "bucketize input keys into a dense tensor, and return the output keys, "
@@ -165,6 +188,7 @@ void bind_table_operation(py::module &m) {
       .value("ASSIGN", dyn_emb::ScorePolicyType::Assign)
       .value("ACCUMULATE", dyn_emb::ScorePolicyType::Accumulate)
       .value("GLOBAL_TIMER", dyn_emb::ScorePolicyType::GlobalTimer)
+      .value("LRU_LFU", dyn_emb::ScorePolicyType::LruLfu)
       .export_values();
 
   py::enum_<dyn_emb::InsertResult>(m, "InsertResult")

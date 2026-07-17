@@ -32,7 +32,21 @@ enum class ScorePolicyType : uint8_t {
   Assign = 1,
   Accumulate = 2,
   GlobalTimer = 3,
+  // Compound policy occupying two contiguous (AoS) score words per key:
+  //   word 0 = last-access timestamp (device global timer)
+  //   word 1 = access frequency (accumulated)
+  // Eviction ranks by the frequency word; the timestamp word is used only to
+  // select keys for time-based incremental dump. Used for the compound
+  // (TIMESTAMP, LFU) score strategy.
+  LruLfu = 4,
 };
+
+// Number of contiguous score words a policy occupies per key. LruLfu stores a
+// (timestamp, frequency) pair; every other policy is a single word.
+static __host__ __device__ __forceinline__ int
+score_policy_num_scores(ScorePolicyType policy) {
+  return policy == ScorePolicyType::LruLfu ? 2 : 1;
+}
 
 template <ScorePolicyType PolicyType> struct ScorePolicy {
 
@@ -45,6 +59,8 @@ template <ScorePolicyType PolicyType> struct ScorePolicy {
       asm volatile("mov.u64 %0,%%globaltimer;" : "=l"(score));
       return score;
     } else {
+      // Assign / Accumulate / LruLfu all take their input from `scores`
+      // (LruLfu: the per-key frequency delta).
       return scores[index];
     }
   }
@@ -54,7 +70,8 @@ template <ScorePolicyType PolicyType> struct ScorePolicy {
     return UINT64_MAX;
   }
 
-  // Updates table slot and returns the output score.
+  // Update the slot and return the output score. `table_score` points to the
+  // key's first score word (AoS base); LruLfu writes both words.
   static __device__ __forceinline__ ScoreType update(ScoreType *table_score,
                                                      ScoreType score) {
     if constexpr (PolicyType == ScorePolicyType::Const) {
@@ -63,6 +80,13 @@ template <ScorePolicyType PolicyType> struct ScorePolicy {
       score += *table_score;
       *table_score = score;
       return score;
+    } else if constexpr (PolicyType == ScorePolicyType::LruLfu) {
+      ScoreType ts;
+      asm volatile("mov.u64 %0,%%globaltimer;" : "=l"(ts));
+      table_score[0] = ts;         // word 0: last-access timestamp
+      score += table_score[1];     // word 1: accumulated frequency
+      table_score[1] = score;
+      return score;                // output = frequency
     } else {
       *table_score = score;
       return score;

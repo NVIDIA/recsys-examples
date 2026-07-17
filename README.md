@@ -17,6 +17,11 @@ The project is organized into two parts:
 - [Beam search decode attention](./corelib/gr_decode_atten/README.md) kernels for SID-GR KV-cache generation, with fused and 3-kernel paths across SM8x, SM90, SM100, and SM120 GPUs
 
 # What's New
+- **[2026/7/14]** 🎉v26.06 released!
+  - Optimizes the RecSys-FlexKV inference path (bulk `slot_mapping` device-to-host copy, vectorized slot expansion, batched onboarding, and SSD tier) and adds a FlexKV inference benchmark covering the three cache-tier hit paths (GPU-hit, host/CPU-hit, and SSD-hit). See [RecSys KVCache Manager](./corelib/recsys_kvcache_manager/README.md) and the [FlexKV CPU breakdown](./corelib/recsys_kvcache_manager/test/FLEXKV_CPU_BREAKDOWN.md).
+  - Adds DynamicEmb incremental dump for LFU tables via a compound `LruLfu` score policy, and fixes the padded-buffer optimizer for mixed embedding dimensions and host VMM tensor sizing to avoid virtual-address-space exhaustion. See [DynamicEmb](./corelib/dynamicemb/README.md).
+  - Updates FBGEMM for Blackwell HSTU attention and adds phase-selective CUDA-graph benchmark profiling with percentile (P10) reporting and attention heatmaps. See the [HSTU inference benchmark](./examples/hstu/inference/benchmark/README.md).
+  - Extends [SID-GR inference](./examples/sid-gr-inference/README.md) with a shared-prefix-length argument and an environment-variable control for GR decode attention.
 - **[2026/6/15]** 🎉v26.05 released!
   - Adds a new [SID-GR inference example](./examples/sid-gr-inference/README.md) for large-beam generative retrieval serving and benchmarking.
   - Enables HSTU + DynamicEmb end-to-end training on Blackwell (`sm_100`) and refreshes HSTU benchmark fixes, docs, and training examples.
@@ -24,14 +29,15 @@ The project is organized into two parts:
 - **[2026/5/20]** 🎉v26.04 released!
   - Refactors the previous async KV-cache manager into a standalone [RecSys KVCache Manager package](corelib/recsys_kvcache_manager/), a new FlexKV backend for multi-node/multi-tier KV storage, LLM-style KV APIs, and updated HSTU inference examples.
   - Introduces a new [beam-search decode attention kernel](./corelib/gr_decode_atten/) and CuTe kernels plus a `generate_beam_decode()` entry point, enabling more efficient KV-cache-based beam generation for the SID-GR model with vectorized masking utilities.
+<details>
+<summary>More</summary>
+
 - **[2026/4/14]** 🎉v26.03 released!
   - We added Torch export and AOTInductor packaging for end-to-end HSTU C++ inference. See the [HSTU inference overview](./examples/hstu/inference/README.md) and the [C++ inference guide](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md).
   - We improved DynamicEmb with table fusion and expansion, relaxed embedding-table alignment (no longer power-of-two), and capacity sizing aligned to `bucket_capacity`. See [DynamicEmb](./corelib/dynamicemb/README.md).
   - We added an HSTU end-to-end training benchmark suite with progressive optimizations. See the [HSTU training benchmark](./examples/hstu/training/benchmark/README.md) and [E2E benchmark notes](./examples/hstu/training/benchmark/E2E_BENCHMARK.md).
   - We published HSTU inference benchmark results on B200 in the [HSTU inference benchmark](./examples/hstu/inference/benchmark/README.md).
   - We migrated HSTU attention to `fbgemm_gpu_hstu`, removed the legacy compatibility layer, and improved the training stack (fewer device-to-host syncs in jagged tensor handling, balancer tuning, and debug logging). See [HSTU training setup](./examples/hstu/training/README.md).
-<details>
-<summary>More</summary>
 
 - **[2026/2/13]** 🎉v26.01 released!
   - We optimized HSTU KVCacheManager, moving Python-based KV cache management to optimized C++ implementation with asynchronous onload/offload operation and compression support. [Benchmark](https://github.com/NVIDIA/recsys-examples/tree/main/examples/hstu/inference/benchmark#1-end-to-end-inference-performance) shows onload and offload latency can be fully hidden under HSTU inference.
