@@ -70,16 +70,3 @@ Notice: In the L20 benchmark, the page size of KV cache is 32 tokens. The head d
 When the input sequence has 4096 tokens in which 3968 tokens have KV data cached, we can achieve on HSTU block a speedup of **3.3 ~ 7.7x** with extra 256 candidates for each sequence (for batch size = 1 and 8 respectively).
 
 Notice: In the B200 benchmark, the page size of KV cache is 128 tokens. The head dim of the HSTU attention kernel is 128. This is limited by current kernel implementations.
-
-### 3. HSTU model (training version) performance with Torch C++ Runtime
-
-Benchmark results are measured in the model [exporting script](../export_inference_gr_ranking.py).
-Here we present the benchmark results on the evaluation dataset **Kuairand-1k**.
-
-* **Performance Results with Torch C++ Runtime:**
-
-| Hardware   | Python Runtime E2E Time (s) | C++ Runtime E2E Time (s) | Speedup    |
-| ---------- | --------------------------- | ------------------------ | ---------- |
-| L20        |   1.755                     | 1.079                    | **1.63x**  |
-| L40        |   1.416                     | 0.850                    | **1.66x**  |
-| L40S       |   1.340                     | 0.704                    | **1.90x**  |

@@ -31,14 +31,14 @@ from dynamicemb_extensions import (
     device_timestamp,
     table_copy_score_blocks,
     table_count_matched,
-    table_gather_score_blocks,
-    table_scatter_score_blocks,
     table_erase,
     table_export_batch,
+    table_gather_score_blocks,
     table_insert,
     table_insert_and_evict,
     table_lookup,
     table_partition,
+    table_scatter_score_blocks,
     table_update_counter_with_layout,
 )
 

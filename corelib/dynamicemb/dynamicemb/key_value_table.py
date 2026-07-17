@@ -1116,7 +1116,9 @@ def export_keys_values_iter(
             # (logical) score-column order so both the checkpoint and callers of
             # export_keys_values see scores in the order they configured. Identity
             # when the logical order matches the physical layout.
-            dump_perm = score_dump_permutation(state.options_list[table_id].score_strategy)
+            dump_perm = score_dump_permutation(
+                state.options_list[table_id].score_strategy
+            )
             if dump_perm != list(range(out_scores.size(1))):
                 out_scores = out_scores[:, dump_perm].contiguous()
         else:
