@@ -345,13 +345,19 @@ at::Tensor ExportKVCacheRuntime::offload_kvcache_launch(
     auto batch_size = user_ids.size(0);
     at::Tensor offload_task_ids = at::empty({batch_size}, at::dtype(torch::kInt64).device(at::kCPU));
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
+        int64_t uid = user_ids.data_ptr<int64_t>()[seq_idx];
         int64_t seqlen = seqlens.data_ptr<int64_t>()[seq_idx];
         int64_t valid_len = int64_t(seqlen / this->gpu_kvcache_->num_tokens_per_page) * this->gpu_kvcache_->num_tokens_per_page; // align to page boundary
         if (valid_len == 0) {
             offload_task_ids.data_ptr<int64_t>()[seq_idx] = -1;  // -1 indicates no cache to offload for this sequence
+            this->gpu_kvcache_->release_offload_pages(
+                at::from_blob(&uid, {1}, at::dtype(torch::kInt64).device(at::kCPU)),
+                at::from_blob(&offload_start_indices.data_ptr<int>()[seq_idx], {1}, at::dtype(torch::kInt32).device(at::kCPU)),
+                at::from_blob(&valid_len, {1}, at::dtype(torch::kInt32).device(at::kCPU)),
+                { true, }
+            );
             continue;
         }  // skip sequences without cache to offload for this sequence
-        int64_t uid = user_ids.data_ptr<int64_t>()[seq_idx];
         auto user_namespace = "uid:" + std::to_string(uid);
         int64_t task_id = flexkv_client_->put_async(
             lookup_token_index_.slice(0, 0, valid_len),
