@@ -87,7 +87,7 @@ ExportKVCacheRuntime::ExportKVCacheRuntime() {
     log_runtime_message(
         "creating GPU registrator port=" + gpu_register_port
     );
-    flexkv_gpu_registrator_ = std::make_unique<FlexKVGPURegistrator>(gpu_register_port, /*dpClientId=*/0, /*device_id=*/0);
+    flexkv_gpu_registrator_ = std::make_unique<FlexKVGPURegistrator>(gpu_register_port, /*dpClientId=*/0, /*device_id=*/device_idx);
     FlexKVCacheLayoutSpec layout{
         FlexKVLayoutType::LayerFirst,
         num_layers, num_primary_cache_pages, tokens_per_page, num_kv_heads, head_size,
