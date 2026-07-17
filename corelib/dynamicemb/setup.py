@@ -103,10 +103,30 @@ def get_version():
     return version, sha
 
 
+# Target GPU compute capabilities (no dot). Parsed in two places: the main
+# extension's -gencode flags and the LruLfu evict fatbins. Override with
+# DEMB_ARCHS="80;90;100".
+DEMB_ARCHS = [
+    a.strip()
+    for a in os.environ.get("DEMB_ARCHS", "75;80;90;100").replace(",", ";").split(";")
+    if a.strip()
+]
+
+
+def _gencode_flags(code_kind):
+    """nvcc -gencode flags for DEMB_ARCHS. code_kind is 'sm' (complete SASS) or
+    'lto' (LTO-IR, for the custom evict fatbin linked at runtime)."""
+    flags = []
+    for a in DEMB_ARCHS:
+        flags += ["-gencode", f"arch=compute_{a},code={code_kind}_{a}"]
+    return flags
+
+
 def get_extensions():
     extra_link_args = [
         "-Wl,--no-as-needed",
         "-lcuda",  # CUDA drive API
+        "-lnvJitLink",  # runtime link of numba LTO-IR into the LruLfu evict cubin
     ]
     extra_compile_args = {
         "cxx": ["-O3", "-fdiagnostics-color=always", "-w", "-DDEMB_USE_PYBIND11"],
@@ -119,14 +139,7 @@ def get_extensions():
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "--use_fast_math",
-            "-gencode",
-            "arch=compute_75,code=sm_75",
-            "-gencode",
-            "arch=compute_80,code=sm_80",
-            "-gencode",
-            "arch=compute_90,code=sm_90",
-            "-gencode",
-            "arch=compute_100,code=sm_100",
+            *_gencode_flags("sm"),
             "-w",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -143,6 +156,9 @@ def get_extensions():
             "lookup_torch_binding.cu",
             "get_table_range_torch_binding.cu",
             "expand_table_ids_torch_binding.cu",
+            # Built separately into standalone fatbins (Lex + custom LTO-IR),
+            # shipped as package_data; NOT linked into the .so.
+            "evict_lrulfu.cu",
         ],
     )
 
@@ -173,6 +189,40 @@ with open(os.path.join(os.path.dirname(__file__), "README.md"), encoding="utf8")
 import time
 
 
+EVICT_TU = "src/jit/evict_lrulfu.cu"
+
+
+def compile_evict_fatbins():
+    """Build the two LruLfu eviction fatbins shipped as package_data (for
+    DEMB_ARCHS):
+      - evict_lrulfu_lex.fatbin    : complete SASS fatbin (LexFreqTsComparator),
+                                     the default evictor, no numba at runtime.
+      - evict_lrulfu_custom.fatbin : multi-arch LTO-IR fatbin (UserFnComparator,
+                                     user_score_fn undefined) for nvJitLink to
+                                     link the numba-compiled score_function into.
+    Both come from the same TU, selected by -DDEMB_EVICT_COMPARATOR."""
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    nvcc = os.path.join(CUDA_HOME or "/usr/local/cuda", "bin", "nvcc")
+    src = str(root_path / EVICT_TU)
+    out_dir = root_path / library_name / "jit"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    common = ["-std=c++17", "-O3", "--use_fast_math",
+              f"-I{root_path / 'src'}"]
+
+    variants = [
+        ("LexFreqTsComparator", "evict_lrulfu_lex.fatbin", "sm"),
+        ("UserFnComparator", "evict_lrulfu_custom.fatbin", "lto"),
+    ]
+    for comparator, out_name, code_kind in variants:
+        out = str(out_dir / out_name)
+        cmd = ([nvcc, "--fatbin", *_gencode_flags(code_kind), *common,
+                f"-DDEMB_EVICT_COMPARATOR={comparator}", src, "-o", out])
+        print(f"[dynamicemb] nvcc evict fatbin ({comparator}): {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+        print(f"[dynamicemb] {out_name}: {os.path.getsize(out)} bytes")
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
@@ -197,7 +247,21 @@ class NinjaBuildExtension(BuildExtension):
 
     def run(self):
         start_time = time.time()
+        compile_evict_fatbins()
         super().run()
+        # build_py (which collects package_data) runs BEFORE build_ext, so the
+        # fatbins we just generated are not yet staged into build_lib for a
+        # wheel/install -- copy them in now. Inplace builds import straight from
+        # the source tree and don't need this.
+        if not self.inplace:
+            import shutil
+
+            src_dir = root_path / library_name / "jit"
+            dst_dir = os.path.join(self.build_lib, library_name, "jit")
+            os.makedirs(dst_dir, exist_ok=True)
+            for fb in sorted(src_dir.glob("*.fatbin")):
+                shutil.copy2(str(fb), dst_dir)
+                print(f"[dynamicemb] staged {fb.name} -> {dst_dir}")
         end_time = time.time()
         compilation_time = end_time - start_time
         print(f"compilation_time: {compilation_time}")
@@ -214,6 +278,7 @@ setup(
     description="Plugin for Dynamic Embedding in TorchREC",
     packages=package,
     ext_modules=get_extensions(),
+    package_data={f"{library_name}.jit": ["*.fatbin"]},
     license="BSD-3",
     keywords=[
         "pytorch",

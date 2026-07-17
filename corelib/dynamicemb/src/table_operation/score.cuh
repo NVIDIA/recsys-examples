@@ -36,8 +36,8 @@ enum class ScorePolicyType : uint8_t {
   //   word 0 = last-access timestamp (device global timer)
   //   word 1 = access frequency (accumulated)
   // Eviction ranks by the frequency word; the timestamp word is used only to
-  // select keys for time-based incremental dump. Used for the compound
-  // (TIMESTAMP, LFU) score strategy.
+  // select keys for time-based incremental dump. Used for LFU tables created
+  // with need_incremental_dump=True.
   LruLfu = 4,
 };
 

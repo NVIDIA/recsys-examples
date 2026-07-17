@@ -414,63 +414,86 @@ struct LinearBucket {
 
     int rank = threadIdx.x;
 
-    if (num_scores_ == 1) {
-      // Single-score fast path: scores are one word per key and contiguous, so
-      // BulkDim consecutive words == BulkDim consecutive keys.
-      Iterator iter = 0;
-      async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
-                                                  scores(iter));
+    // reduce() is single-score only: one word per key, contiguous, so BulkDim
+    // consecutive words == BulkDim consecutive keys. The LruLfu 2-word layout
+    // (num_scores_ == 2) evicts through reduce_ranked() in the driver-launched
+    // cubin, so it never reaches here (decision Q in the design doc); no
+    // num_scores_ branch is needed.
+    Iterator iter = 0;
+    async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
+                                                scores(iter));
+    __pipeline_commit();
+
+    for (; iter < capacity_; iter += BulkDim) {
+      if (iter < capacity_ - BulkDim) {
+        async_copy_bulk<ScoreType, BulkDim, Stride>(
+            &sm_buffers[rank * BufferDim] + diff_buf(iter / BulkDim) * BulkDim,
+            scores(iter) + BulkDim);
+      }
       __pipeline_commit();
-
-      for (; iter < capacity_; iter += BulkDim) {
-        if (iter < capacity_ - BulkDim) {
-          async_copy_bulk<ScoreType, BulkDim, Stride>(
-              &sm_buffers[rank * BufferDim] + diff_buf(iter / BulkDim) * BulkDim,
-              scores(iter) + BulkDim);
-        }
-        __pipeline_commit();
-        __pipeline_wait_prior(1);
-        ScoreType temp_scores[Stride];
-        ScoreType *src =
-            sm_buffers + rank * BufferDim + same_buf(iter / BulkDim) * BulkDim;
+      __pipeline_wait_prior(1);
+      ScoreType temp_scores[Stride];
+      ScoreType *src =
+          sm_buffers + rank * BufferDim + same_buf(iter / BulkDim) * BulkDim;
 #pragma unroll
-        for (int k = 0; k < BulkDim; k += Stride) {
-          *reinterpret_cast<ScoreVector *>(temp_scores) =
-              *reinterpret_cast<ScoreVector *>(src + k);
+      for (int k = 0; k < BulkDim; k += Stride) {
+        *reinterpret_cast<ScoreVector *>(temp_scores) =
+            *reinterpret_cast<ScoreVector *>(src + k);
 #pragma unroll
-          for (int j = 0; j < Stride; j += 1) {
-            ScoreType temp_score = temp_scores[j];
-            if (temp_score < dst_score) {
-              auto temp_key_slot =
-                  reinterpret_cast<AtomicKey *>(keys(iter + k + j));
+        for (int j = 0; j < Stride; j += 1) {
+          ScoreType temp_score = temp_scores[j];
+          if (temp_score < dst_score) {
+            auto temp_key_slot =
+                reinterpret_cast<AtomicKey *>(keys(iter + k + j));
 
-              auto temp_key =
-                  temp_key_slot->load(cuda::std::memory_order_relaxed);
+            auto temp_key =
+                temp_key_slot->load(cuda::std::memory_order_relaxed);
 
-              if (temp_key != LockedKey && temp_key != EmptyKey) {
-                int64_t flat_idx = counter_offset + iter + k + j;
-                if (counter[flat_idx] > 0)
-                  continue;
+            if (temp_key != LockedKey && temp_key != EmptyKey) {
+              int64_t flat_idx = counter_offset + iter + k + j;
+              if (counter[flat_idx] > 0)
+                continue;
 
-                dst_iter = iter + k + j;
-                dst_key = temp_key;
-                dst_score = temp_score;
-                succeed = true;
-              }
+              dst_iter = iter + k + j;
+              dst_key = temp_key;
+              dst_score = temp_score;
+              succeed = true;
             }
           }
         }
       }
-      return succeed;
     }
+    return succeed;
+  }
 
-    // Multi-score path (num_scores_ == 2, LruLfu): each key occupies two
-    // contiguous words [timestamp, frequency]. A ScoreVector (uint4 == 2
-    // ScoreType) therefore holds exactly one key's pair, so eviction ranks by
-    // word 1 (frequency, ScoreVector.y). We iterate over word offsets and map
-    // each pair back to its key index (word_offset / 2).
+  // Comparator-ranked eviction scan for the LruLfu 2-score layout. Same
+  // async-prefetch pipeline as the num_scores==2 path of reduce(), but the
+  // ranking is delegated to Comparator, which is handed a pointer to the key's
+  // prefetched [ts, freq] pair IN SHARED MEMORY (so the bulk prefetch is
+  // preserved). Tracks the Comparator::less() minimum. dst_score is set to the
+  // winner's frequency (reduction word) for the caller's post-lock race check.
+  // Used only by the LruLfu evict cubin (evict_lrulfu.cu); num_scores_ must be 2.
+  template <typename Comparator, int GroupSize, int BufferDim>
+  __forceinline__ __device__ bool
+  reduce_ranked(Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
+                ScoreType *sm_buffers, int32_t const *__restrict__ counter,
+                int64_t counter_offset, uint64_t cur_ts) const {
+    static_assert(GroupSize == 1);
+    bool succeed = false;
+    if (storage_ == nullptr or capacity_ == 0) {
+      return false;
+    }
+    static constexpr int BulkDim = BufferDim / 2;
+    static_assert(BulkDim == 4);
+    static constexpr int Stride = NumScorePerVector; // 2 words == 1 key
+    int rank = threadIdx.x;
+
+    using Rank = typename Comparator::Rank;
+    Comparator cmp;
+    Rank dst_rank = Comparator::worst();
+
     const int64_t total_words = capacity_ * num_scores_;
-    ScoreType *wbase = scores(Iterator(0)); // word 0 of key 0
+    ScoreType *wbase = scores(Iterator(0));
     async_copy_bulk<ScoreType, BulkDim, Stride>(&sm_buffers[rank * BufferDim],
                                                 wbase);
     __pipeline_commit();
@@ -483,26 +506,25 @@ struct LinearBucket {
       }
       __pipeline_commit();
       __pipeline_wait_prior(1);
-      ScoreType temp_scores[Stride];
       ScoreType *src =
           sm_buffers + rank * BufferDim + same_buf(w / BulkDim) * BulkDim;
 #pragma unroll
       for (int k = 0; k < BulkDim; k += Stride) {
-        *reinterpret_cast<ScoreVector *>(temp_scores) =
-            *reinterpret_cast<ScoreVector *>(src + k);
-        ScoreType freq = temp_scores[1]; // word 1 == frequency
+        // Shared-memory pointer to this key's [ts, freq] pair.
+        const ScoreType *pair = src + k;
+        Rank r = cmp.rank(pair, cur_ts);
         Iterator key_it = (w + k) / num_scores_;
-        if (freq < dst_score) {
-          auto temp_key =
-              reinterpret_cast<AtomicKey *>(keys(key_it))
-                  ->load(cuda::std::memory_order_relaxed);
+        if (Comparator::less(r, dst_rank)) {
+          auto temp_key = reinterpret_cast<AtomicKey *>(keys(key_it))
+                              ->load(cuda::std::memory_order_relaxed);
           if (temp_key != LockedKey && temp_key != EmptyKey) {
             int64_t flat_idx = counter_offset + key_it;
             if (counter[flat_idx] > 0)
               continue;
             dst_iter = key_it;
             dst_key = temp_key;
-            dst_score = freq;
+            dst_rank = r;
+            dst_score = pair[1]; // frequency == reduction word
             succeed = true;
           }
         }
@@ -522,12 +544,16 @@ template <typename BucketType_> struct LinearBucketTable {
   using BucketType = BucketType_;
   using KeyType = typename BucketType::KeyType;
 
-  LinearBucketTable()
+  // __host__ __device__ so the AoT path can build the table on the host (and
+  // pass it by value) while the LruLfu evict cubin reconstructs it on the device
+  // from the raw pointers in EvictParams. Just member init -- safe on both.
+  __host__ __device__ LinearBucketTable()
       : storage_(nullptr), num_buckets_(0), bucket_capacity_(0),
         num_scores_(1) {}
 
-  LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
-                    int64_t bucket_capacity, int64_t num_scores = 1)
+  __host__ __device__ LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
+                                        int64_t bucket_capacity,
+                                        int64_t num_scores = 1)
       : storage_(storage), num_buckets_(num_buckets),
         bucket_capacity_(bucket_capacity), num_scores_(num_scores) {}
 

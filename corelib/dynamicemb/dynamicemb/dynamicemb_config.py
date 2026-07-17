@@ -19,7 +19,7 @@ import os
 import warnings
 from dataclasses import dataclass, field, replace
 from math import sqrt
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 from dynamicemb.optimizer import get_optimizer_state_dim
@@ -304,6 +304,24 @@ def score_load_permutation(score_strategy: ScoreStrategy) -> List[int]:
     return [logical.index(s) for s in physical]
 
 
+def _score_function_group_key(fn: Optional[Callable]):
+    """Stable, hashable identity for a score_function (for table grouping).
+
+    (module, qualname, source-hash) so two references to the same function group
+    together and different sources stay separate; falls back to object identity
+    when the source cannot be read."""
+    if fn is None:
+        return None
+    try:
+        import hashlib
+        import inspect
+
+        digest = hashlib.md5(inspect.getsource(fn).encode("utf-8")).hexdigest()
+        return (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), digest)
+    except (OSError, TypeError):
+        return (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), id(fn))
+
+
 @dataclass
 class DynamicEmbTableOptions:
     """
@@ -477,6 +495,20 @@ class DynamicEmbTableOptions:
     admit_strategy: Optional[AdmissionStrategy] = None
     admission_counter: Optional[Any] = None
 
+    score_function: Optional[Callable] = None
+    """Optional custom eviction ranking for the compound LruLfu strategy
+    (``score_strategy=(TIMESTAMP, LFU)`` in either order). A numba-compilable
+    Python function ``(scores, cur_timestamp) -> float64`` where ``scores`` is
+    indexed in the *logical* (tuple) order -- ``scores[i]`` is the word for
+    ``score_strategy[i]`` -- and ``cur_timestamp`` is the device ``%globaltimer``
+    at eviction. Any decay constant (e.g. gamma) is written directly into the
+    function body. It is JIT-compiled (numba) and linked into the eviction kernel
+    (nvJitLink); eviction removes the key(s) with the LOWEST returned score. Index
+    ``scores`` only with integer constants (the logical->physical remap requires
+    it). When None, LruLfu uses the default policy (frequency, ties broken by older
+    timestamp), no numba. Only valid with the ``(TIMESTAMP, LFU)`` compound
+    strategy."""
+
     def __post_init__(self):
         assert (
             self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
@@ -490,6 +522,17 @@ class DynamicEmbTableOptions:
         # reject unsupported compound tuples) so all downstream code sees either a
         # single strategy or a supported compound tuple.
         self.score_strategy = normalize_score_strategy(self.score_strategy)
+        # A custom eviction score_function needs both frequency and timestamp, so
+        # it requires the 2-word LruLfu layout -- i.e. the {TIMESTAMP, LFU}
+        # compound. After normalization that is the only strategy left as a tuple.
+        if self.score_function is not None and not isinstance(
+            self.score_strategy, tuple
+        ):
+            raise ValueError(
+                "score_function is only supported for the compound LruLfu score "
+                "strategy (TIMESTAMP, LFU) in either order; got "
+                f"score_strategy={self.score_strategy}."
+            )
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
@@ -512,6 +555,10 @@ class DynamicEmbTableOptions:
         grouped_key["dist_type"] = self.dist_type
         grouped_key["score_strategy"] = self.score_strategy
         grouped_key["admit_strategy"] = self.admit_strategy
+        # Tables with different eviction functions / decay must not be merged. The
+        # tuple order (logical score order, which the score_function is written
+        # against) is already captured by score_strategy above.
+        grouped_key["score_function"] = _score_function_group_key(self.score_function)
         return grouped_key
 
     def __hash__(self):

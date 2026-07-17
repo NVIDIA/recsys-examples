@@ -223,8 +223,39 @@ insert_probe(Bucket &bucket, KeyType key, int *__restrict__ bucket_sizes,
   *result_out = result;
 }
 
+// Eviction victim selection, pluggable so the same insert()/kernel body serves
+// both the AoT build and the LruLfu evict cubin. DefaultEvictor is the existing
+// score-word reduce() (used by every AoT instantiation; cur_ts/gamma ignored).
+// RankedEvictor<Comparator> drives reduce_ranked<Comparator>() (the LruLfu cubin;
+// e.g. LexFreqTsComparator or UserFnComparator).
+struct DefaultEvictor {
+  template <int ReductionGroupSize, int BufferDim, typename Bucket>
+  __forceinline__ __device__ bool
+  operator()(Bucket &bucket, typename Bucket::Iterator &iter,
+             typename Bucket::KeyType &evict_key, ScoreType &evict_score,
+             ScoreType *sm_scores, int32_t const *__restrict__ counter,
+             int64_t counter_offset, uint64_t /*cur_ts*/) const {
+    return bucket.template reduce<ReductionGroupSize, BufferDim>(
+        iter, evict_key, evict_score, sm_scores, counter, counter_offset);
+  }
+};
+
+template <typename Comparator> struct RankedEvictor {
+  template <int ReductionGroupSize, int BufferDim, typename Bucket>
+  __forceinline__ __device__ bool
+  operator()(Bucket &bucket, typename Bucket::Iterator &iter,
+             typename Bucket::KeyType &evict_key, ScoreType &evict_score,
+             ScoreType *sm_scores, int32_t const *__restrict__ counter,
+             int64_t counter_offset, uint64_t cur_ts) const {
+    return bucket.template reduce_ranked<Comparator, ReductionGroupSize,
+                                         BufferDim>(
+        iter, evict_key, evict_score, sm_scores, counter, counter_offset,
+        cur_ts);
+  }
+};
+
 template <int ReductionGroupSize, int BufferDim, typename Policy,
-          typename Bucket, typename KeyType>
+          typename Evictor = DefaultEvictor, typename Bucket, typename KeyType>
 __forceinline__ __device__ void
 insert(Bucket &bucket, KeyType key, ScoreType score,
        int *__restrict__ bucket_sizes, int64_t bucket_id,
@@ -232,15 +263,17 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
        InsertResult result_in, typename Bucket::Iterator *iter_out,
        InsertResult *result_out, KeyType *evict_key_out,
        ScoreType *evict_score_out, int32_t *__restrict__ counter,
-       int64_t counter_offset) {
+       int64_t counter_offset, uint64_t cur_ts = 0) {
   auto iter = iter_in;
   auto result = result_in;
+  Evictor evictor;
   while (result == InsertResult::Init) {
     KeyType evict_key;
     ScoreType evict_score = Policy::score_for_compare(score);
 
-    bool succeed = bucket.template reduce<ReductionGroupSize, BufferDim>(
-        iter, evict_key, evict_score, sm_scores, counter, counter_offset);
+    bool succeed = evictor.template operator()<ReductionGroupSize, BufferDim>(
+        bucket, iter, evict_key, evict_score, sm_scores, counter,
+        counter_offset, cur_ts);
 
     if (succeed) {
       if (bucket.try_lock(iter, evict_key)) {
@@ -368,7 +401,11 @@ __global__ void table_insert_kernel(
       table_key_slot = bucket.keys(iter);
     }
     if constexpr (OutputScore) {
-      score_output[i] = static_cast<int64_t>(score);
+      // Null-safe so the LruLfu evict cubin can fix OutputScore=true and decide
+      // at runtime (score_output may be null). For AoT, OutputScore=true always
+      // pairs with a non-null score_output, so the check is free there.
+      if (score_output != nullptr)
+        score_output[i] = static_cast<int64_t>(score);
     }
     table_key_slots[i] = table_key_slot;
     indices[i] = index;
@@ -378,8 +415,8 @@ __global__ void table_insert_kernel(
   }
 }
 
-template <typename Table, typename KernelTraits>
-__global__ void table_insert_and_evict_kernel(
+template <typename Table, typename KernelTraits, typename Evictor>
+__device__ __forceinline__ void insert_and_evict_body(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int *__restrict__ bucket_sizes, int64_t batch,
     typename Table::KeyType const *__restrict__ input_keys,
@@ -394,7 +431,7 @@ __global__ void table_insert_and_evict_kernel(
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -449,10 +486,10 @@ __global__ void table_insert_and_evict_kernel(
 
       {
         int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
-        insert<ReductionGroupSize, BufferDim, Policy>(
+        insert<ReductionGroupSize, BufferDim, Policy, Evictor>(
             bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores,
             result, &iter, &result, &evict_key, &evict_score, counter,
-            counter_offset);
+            counter_offset, cur_ts);
       }
     }
 
@@ -556,7 +593,11 @@ __global__ void table_insert_and_evict_kernel(
     }
 
     if constexpr (OutputScore) {
-      score_output[i] = static_cast<int64_t>(score);
+      // Null-safe so the LruLfu evict cubin can fix OutputScore=true and decide
+      // at runtime (score_output may be null). For AoT, OutputScore=true always
+      // pairs with a non-null score_output, so the check is free there.
+      if (score_output != nullptr)
+        score_output[i] = static_cast<int64_t>(score);
     }
     table_key_slots[i] = table_key_slot;
     indices[i] = index;
@@ -564,6 +605,35 @@ __global__ void table_insert_and_evict_kernel(
       insert_results[i] = UseOverflow ? final_result : result;
     }
   }
+}
+
+// AoT entry: the existing insert-and-evict kernel, using the score-word reduce
+// (DefaultEvictor). Unchanged ABI for all existing instantiations. The LruLfu
+// evict cubin provides its own __global__ that calls insert_and_evict_body with
+// RankedEvictor<Comparator> (see evict_lrulfu.cu).
+template <typename Table, typename KernelTraits>
+__global__ void table_insert_and_evict_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int *__restrict__ bucket_sizes, int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    int64_t const *__restrict__ table_ids,
+    InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
+    ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
+    typename Table::KeyType **__restrict__ table_key_slots,
+    CounterType *evicted_counter,
+    typename Table::KeyType *__restrict__ evicted_keys,
+    int64_t *__restrict__ evicted_scores,
+    IndexType *__restrict__ evicted_indices,
+    int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
+    Table ovf_table, int *__restrict__ ovf_bucket_sizes,
+    int32_t *__restrict__ ovf_counter,
+    int64_t const *__restrict__ ovf_output_offsets) {
+  insert_and_evict_body<Table, KernelTraits, DefaultEvictor>(
+      table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
+      insert_results, indices, score_input, score_output, table_key_slots,
+      evicted_counter, evicted_keys, evicted_scores, evicted_indices,
+      evicted_table_ids, counter, ovf_table, ovf_bucket_sizes, ovf_counter,
+      ovf_output_offsets, /*cur_ts=*/0);
 }
 
 template <typename Table>

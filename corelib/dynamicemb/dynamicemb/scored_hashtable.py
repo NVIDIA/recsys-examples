@@ -300,6 +300,7 @@ class LinearBucketTable(ScoredHashTable):
         bucket_capacity: Optional[int] = None,
         device: torch.device = None,
         enable_overflow: bool = False,
+        score_fn_key: int = 0,
     ):
         """
         Args:
@@ -347,6 +348,17 @@ class LinearBucketTable(ScoredHashTable):
                 [score_spec.dtype] * score_policy_num_scores(score_spec.policy)
             )
             self.score_names_.append(score_spec.name)
+
+        # LruLfu eviction routing: score_fn_key selects the evict cubin
+        # (0 = default Lex; nonzero = a registered custom score_function).
+        self.score_fn_key_ = score_fn_key
+        # LruLfu (num_scores == 2) routes insert-and-evict through the eviction
+        # cubin; ensure the packaged fatbins are loaded into the C++ side before
+        # any eviction. The default (Lex) evictor needs no numba.
+        if len(self.score_types_) > 1:
+            from dynamicemb.jit.score_jit import ensure_lex_fatbin_loaded
+
+            ensure_lex_fatbin_loaded()
 
         # digest type
         self.digest_type_ = torch.uint8
@@ -653,6 +665,7 @@ class LinearBucketTable(ScoredHashTable):
             insert_results,
             score_out,
             num_scores=num_scores,
+            score_fn_key=self.score_fn_key_,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -813,6 +826,7 @@ class LinearBucketTable(ScoredHashTable):
             ovf_counter=self._ovf_counter,
             ovf_output_offsets=self.overflow_output_offsets_,
             num_scores=num_scores,
+            score_fn_key=self.score_fn_key_,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -1743,6 +1757,7 @@ def get_scored_table(
     reduction_type=ReductionType.LINEAR,
     bucket_load_factor=0.5,  # used when probing_type=ProbingType.CHAINED
     enable_overflow: bool = False,
+    score_fn_key: int = 0,
 ) -> ScoredHashTable:
     if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
         return LinearBucketTable(
@@ -1752,6 +1767,7 @@ def get_scored_table(
             bucket_capacity=bucket_capacity,
             device=device,
             enable_overflow=enable_overflow,
+            score_fn_key=score_fn_key,
         )
     else:
         raise NotImplementedError
