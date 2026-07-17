@@ -1,29 +1,29 @@
-# HSTU inference benchmark
+# HSTU AOTI Inference Benchmarks
 
-We provide tests for difference scenarios of HSTU inference with Pytorch AOTI.
+This benchmark note summarizes the checked-in HSTU ranking inference paths that use PyTorch AOTInductor (AOTI), native C++ replay, Triton Server, and the KV-cache runtime.
 
-- [Pytorch Export (no cache)] inference_aoti/export_inference_gr_ranking.py
-- [Pytorch Export (with kvcache)] inference_aoti/export_inference_gr_ranking_kvcache.py
-- [C++ Torch (no cache)] inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_exported_model
-- [C++ Torch (with kvcache)] inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model
-- [Triton Deploy Config] inference_aoti/triton_aoti
-- [Triton Client] inference_aoti/test_tritonserver_aoti_hstu_model.py
+Covered paths:
 
+- [PyTorch export, no cache](../export_inference_gr_ranking.py)
+- [PyTorch export, with KV cache](../export_inference_gr_ranking_kvcache.py)
+- C++ Torch replay, no cache: `../cpp_inference/build/inference_hstu_gr_ranking_exported_model`
+- C++ Torch replay, with KV cache: `../cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
+- [Triton deployment config](../triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt)
+- [Triton request replay client](../test_tritonserver_aoti_hstu_model.py)
 
 ## Benchmark results
 
-Here we present the benchmark results of the HSTU layers with KV cache on a single L20 GPU.
+The tables below report single-GPU KuaiRand-1K ranking measurements from the checked-in export and replay flows.
 
-HSTU Setup: Kuairand-1k-ranking
+HSTU setup: KuaiRand-1K ranking.
 
-Notice: This config is for all following benchmarks (unless otherwise specified).
+Unless otherwise specified, all results use the same model and dataset configuration.
 
-### 1. HSTU model (training version, no cache) performance with Torch C++ Runtime
+### 1. No-cache HSTU model with Torch C++ runtime
 
-Benchmark results are measured in the model [exporting script](../export_inference_gr_ranking.py).
-Here we present the benchmark results on the evaluation dataset **Kuairand-1k**.
+These results are emitted by the no-cache [export script](../export_inference_gr_ranking.py), which exports the model, loads the packaged AOTI artifact, and compares Python runtime time against the native C++ replay executable on the KuaiRand-1K evaluation data.
 
-* **Performance Results with Torch C++ Runtime:**
+**Performance results:**
 
 | Hardware   | Python Runtime E2E Time (s) | C++ Runtime E2E Time (s) | Speedup    |
 | ---------- | --------------------------- | ------------------------ | ---------- |
@@ -32,17 +32,16 @@ Here we present the benchmark results on the evaluation dataset **Kuairand-1k**.
 | L40S       |   1.340                     | 0.704                    | **1.90x**  |
 | RTX PRO 6000 Blackwell<br>Workstation Edition |   0.688                   |  0.498               | **1.38x**  |
 
-### 2. HSTU model (with kvcache) performance on Triton Server
+### 2. KV-cache HSTU model on Triton Server
 
-Benchmark results are measured in the model exported by [exporting script](../export_inference_gr_ranking_kvcache.py),
-and deployed by Triton Server via [config](../triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt).
+These results use the model exported by [export_inference_gr_ranking_kvcache.py](../export_inference_gr_ranking_kvcache.py) and deployed with the Triton [AOTI model config](../triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt).
 
-Test with [test_tritonserver_aoti_hstu_model.py](../test_tritonserver_aoti_hstu_model.py). Here we present the benchmark results on the evaluation dataset **Kuairand-1k**.
+The Triton benchmark is driven by [test_tritonserver_aoti_hstu_model.py](../test_tritonserver_aoti_hstu_model.py). The client loads the dumped `export_test_dump/batch_*.pt` replay tensors, sends one warmup request, then runs the same measured cases twice. The second measured run represents the GPU KV-cache hit path.
 
-* **Performance Results with Triton Server Pytorch AOTI Backend:**
+**Performance results with Triton Server PyTorch AOTI backend:**
 
 | Hardware   | No KVCache Time (s) | GPU KVCache Hit E2E Time (s) | Speedup    |
 | ---------- | --------------------------- | ------------------------ | ---------- |
 | RTX PRO 6000 Blackwell<br>Workstation Edition |   1.065                 |  0.804              | **1.33x**  |
 
-Note: In the scenario with KV cache, we benchmark for requests all hit on GPU KV cache.
+Note: the KV-cache number assumes the measured requests hit GPU KV cache after the warmup/measured replay sequence.

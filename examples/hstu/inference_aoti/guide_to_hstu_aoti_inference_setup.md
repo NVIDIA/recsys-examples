@@ -1,8 +1,10 @@
 # HSTU KV-Cache AOTI End-to-End Build and Run Guide
 
+This guide expands the quick workflow in [README.md](./README.md). It follows the current repo layout for exporting `hstu_gr_ranking_kvcache_model`, replaying `export_test_dump`, and serving the exported package with Triton Server.
+
 ## Build
 
-### Step 1: Build & Install Custom Ops used in HSTU inference
+### Step 1: Build and Install Custom Ops Used by HSTU Inference
 
 The HSTU model inference relies on these custom torch ops:
 
@@ -12,8 +14,7 @@ The HSTU model inference relies on these custom torch ops:
 4. FBGEMM shared libraries
 5. KV-cache manager ops from `corelib/recsys_kvcache_manager`
 
-The python package version is built and installed according `docker/Dockerfile`.
-The torch bindings is built for aoti use.
+The Python package variants are built and installed by `docker/Dockerfile`. The commands below show the AOTI-oriented torch binding builds that are also performed by the Docker image.
 
 ```bash
 # DynamicEmb ops
@@ -27,12 +28,13 @@ mkdir -p build && cd build
 cmake .. && make -j 
 ```
 
-For HSTU runtime op and Paged KV-cache ops from `examples/commons`, their torch bindings are built in `inference_aoti/cpp_inference` together with C++ reply Executable (see step 3).
+The HSTU runtime op and paged KV-cache ops from `examples/commons` are built in `inference_aoti/cpp_inference` together with the C++ replay executables in step 3.
 
-Expected output:
+Expected outputs:
 
 ```text
 ${REPO}/corelib/dynamicemb/torch_binding_build/inference_emb_ops.so
+${REPO}/corelib/recsys_kvcache_manager/build/kvcache_manager_ops.so
 ```
 
 ### Step 2: Run Python Export for KV-Cache AOTI
@@ -56,7 +58,7 @@ This step performs all of the following:
 
 1. Builds the exportable model wrapper for KV-cache inference
 2. Exports the model through `torch.export`
-3. Produces the packaged AOTI archive under `inference_aoti/hstu_gr_ranking_model/`
+3. Produces the packaged KV-cache AOTI archive under `inference_aoti/hstu_gr_ranking_kvcache_model/`
 4. Produces replay tensors under `inference_aoti/export_test_dump/`
 
 
@@ -74,15 +76,14 @@ Expected outputs:
 
 1. `examples/hstu/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model`
 2. `examples/hstu/inference_aoti/cpp_inference/build/libhstu_cuda_ops_runtime.so`
-2. `examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so`
+3. `examples/hstu/inference_aoti/cpp_inference/build/libpaged_kvcache_ops_runtime.so`
 
 
 ### Step 4: Verify with the C++ AOTI Replay
 
-#### 4.1: Start the FlexKV Runtime Service
+#### Step 4.1: Start the FlexKV Runtime Service
 
-The C++ replay executable demonstrates the deployment scenario that kvcache server is separated from the inference framework.
-Setup the KVCache config in `inference_aoti/kvcache_cpp_runtime.yaml`, and start the FlexKV server as follows:
+The C++ replay executable demonstrates a deployment scenario where the KV-cache server is separate from the inference process. Configure the runtime in `inference_aoti/kvcache_cpp_runtime.yaml`, then start the FlexKV server:
 
 ```bash
 cd ${HSTU_DIR}
@@ -97,7 +98,7 @@ Run the replay executable against the exported package and dumped tensors:
 
 ```bash
 ${HSTU_DIR}/inference_aoti/cpp_inference/build/inference_hstu_gr_ranking_kvcache_exported_model \
-  ${HSTU_DIR}/inference_aoti/hstu_gr_ranking_model \
+  ${HSTU_DIR}/inference_aoti/hstu_gr_ranking_kvcache_model \
   ${HSTU_DIR}/inference_aoti/export_test_dump
 ```
 
@@ -111,13 +112,12 @@ The executable will:
 
 ### Step 5: Triton Server Demo for the KV-Cache AOTI Model
 
-This section show the deployment of export aoti model with Triton serving.
-It has four major parts:
+This section shows how to deploy the exported AOTI model with Triton Server. It has four major parts:
 
-1. (temporary) Build the PyTorch backend with the model init hook (required by NVE layer loading; not in formal released triton environment).
-2. Setup the dependency for triton server
-3. Setup the exported aoti model
-4. Launch Triton with the exported model, custom operator libraries, and FlexKV runtime
+1. Build the PyTorch backend with the model-init hook required by NVE layer loading.
+2. Set up the Triton Server runtime dependencies.
+3. Stage the exported AOTI model.
+4. Launch Triton with the exported model, custom operator libraries, and FlexKV runtime.
 
 
 #### Step 5.1: Build the Modified Triton PyTorch Backend
@@ -148,7 +148,7 @@ cmake --build . -j"$(nproc)" --target install
 
 
 ## nve init hook (nve layer loader) used by HSTU aoti model ##
-cd ${HSTU_DIR}/nve_init_hook
+cd ${HSTU_DIR}/inference_aoti/nve_init_hook
 mkdir -p build && cd build
 cmake .. && make -j
 ```
@@ -157,13 +157,12 @@ Expected backend output:
 
 ```text
 ${PYTORCH_BACKEND}/build/install/backends/pytorch
-${HSTU_DIR}/nve_init_hook/build/libnve_init_hook.so
+${HSTU_DIR}/inference_aoti/nve_init_hook/build/libnve_init_hook.so
 ```
 
 #### Step 5.2: Setup the Triton Server Container
 
-Copy the previously built `libtriton_pytorch.so` into the container. Or,
-mount the install dir of pytorch backend to the container. (omitted here)
+Copy the previously built `libtriton_pytorch.so` into the container, or mount the PyTorch backend install directory into the container.
 
 On the host:
 
@@ -186,8 +185,7 @@ cp ${PYTORCH_BACKEND}/build/install/backends/pytorch/libtriton_pytorch.so \
   /opt/tritonserver/backends/pytorch/libtriton_pytorch.so
 ```
 
-Install runtime dependencies expected by the HSTU KV-cache demo path.
-**Pytorch is required from FlexKV**.
+Install runtime dependencies expected by the HSTU KV-cache demo path. PyTorch is required by FlexKV.
 
 ```bash
 apt-get update -y --fix-missing
@@ -195,7 +193,7 @@ apt-get install -y libzmq3-dev liburing-dev libxxhash-dev libssl-dev
 apt-get install -y cmake patchelf
 pip3 install pandas rich cloudpickle psutil cython
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
-pip3 install pip3 install tritonclient[all]
+pip3 install 'tritonclient[all]'
 ```
 
 ### Step 5.3: Stage the Exported Model and Libraries for Triton Server
@@ -205,15 +203,15 @@ After completing the export flow from Step 2, copy the generated AOTI package in
 ```bash
 cd ${HSTU_DIR}
 rm -rf inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/1/
-cp -apr inference_aoti/hstu_gr_ranking_model inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/1
+cp -apr inference_aoti/hstu_gr_ranking_kvcache_model inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/1
 ```
 
 This layout is required because Triton expects a versioned model directory under the repository.
 
 The Triton model config must remain aligned with the export contract.
-If the export wrapper changes its output contract, update triton model configs ([inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt](./inference_aoti/triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt)) accordingly.
+If the export wrapper changes its output contract, update the Triton model config ([triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt](./triton_aoti/hstu_gr_ranking_kvcache/config.pbtxt)) accordingly.
 
-The HSTU aoti model also expects following runtime libraries set in `LD_LIBRARY_PATH` and `LD_PRELOAD`:
+The HSTU AOTI model also expects the following runtime libraries to be visible through `LD_LIBRARY_PATH` and `LD_PRELOAD`:
 
 
 ```text
@@ -223,7 +221,7 @@ ${HSTU_DIR}/triton_libs
 ├─── emb
 │    └─── inference_emb_ops.so
 ├─── recsys_kvcache_manager
-│    └─── kcache_manager_ops.so
+│    └─── kvcache_manager_ops.so
 ├─── hstu_attn
 │    └─── fbgemm_gpu_experimental_hstu.so
 ├─── fbgemm_gpu
@@ -241,13 +239,13 @@ Example LD_PRELOAD value:
 
 ```bash
 TRITON_LIBS=${HSTU_DIR}/triton_libs
-LD_PRELOAD="$TRITON_LIBS/pynve/libnve-common.so:$TRITON_LIBS/pynve/libnve-torch-ops.so:$TRITON_LIBS/emb/inference_emb_ops.so:$TRITON_LIBS/recsys_kvcache_manager/kcache_manager_ops.so:$TRITON_LIBS/libhstu_cuda_ops_runtime.so:$TRITON_LIBS/libpaged_kvcache_ops_runtime.so:$TRITON_LIBS/hstu_attn/fbgemm_gpu_experimental_hstu.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_py.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so"
+LD_PRELOAD="$TRITON_LIBS/pynve/libnve-common.so:$TRITON_LIBS/pynve/libnve-torch-ops.so:$TRITON_LIBS/emb/inference_emb_ops.so:$TRITON_LIBS/recsys_kvcache_manager/kvcache_manager_ops.so:$TRITON_LIBS/libhstu_cuda_ops_runtime.so:$TRITON_LIBS/libpaged_kvcache_ops_runtime.so:$TRITON_LIBS/hstu_attn/fbgemm_gpu_experimental_hstu.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_py.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so"
 ```
 
-The libraries are gather from the **nvidia pytorch container used in step 1~4**:
+The libraries are gathered from the NVIDIA PyTorch container used in steps 1-4:
 
 1. `emb/inference_emb_ops.so`: from `${REPO}/corelib/dynamicemb/torch_binding_build`
-2. `recsys_kvcache_manager/kcache_manager_ops.so`: from `${REPO}/corelib/recsys_kvcache_manager/build`
+2. `recsys_kvcache_manager/kvcache_manager_ops.so`: from `${REPO}/corelib/recsys_kvcache_manager/build` or the installed `recsys_kvcache_manager` package
 3. `fbgemm_gpu/`: from `/usr/local/lib/python3.12/dist-packages/fbgemm_gpu/`
 4. `hstu_attn/`: from `/usr/local/lib/python3.12/dist-packages/hstu/`
 5. `pynve/`: from `/usr/local/lib/python3.12/dist-packages/pynve/`
@@ -262,7 +260,7 @@ Before launching Triton, verify the expected critical files exist:
 export TRITON_LIBS=${HSTU_DIR}/triton_libs
 
 test -f ${TRITON_LIBS}/emb/inference_emb_ops.so
-test -f ${TRITON_LIBS}/recsys_kvcache_manager/kcache_manager_ops.so
+test -f ${TRITON_LIBS}/recsys_kvcache_manager/kvcache_manager_ops.so
 test -f ${TRITON_LIBS}/libhstu_cuda_ops_runtime.so
 test -f ${TRITON_LIBS}/libpaged_kvcache_ops_runtime.so
 test -f ${TRITON_LIBS}/hstu_attn/fbgemm_gpu_experimental_hstu.so
@@ -294,20 +292,19 @@ cd ${HSTU_DIR}
 rm -f triton_server.log
 export TRITON_LIBS=${HSTU_DIR}/triton_libs
 
-LD_PRELOAD="$TRITON_LIBS/pynve/libnve-common.so:$TRITON_LIBS/pynve/libnve-torch-ops.so:$TRITON_LIBS/emb/inference_emb_ops.so:$TRITON_LIBS/recsys_kvcache_manager/kcache_manager_ops.so:$TRITON_LIBS/libhstu_cuda_ops_runtime.so:$TRITON_LIBS/libpaged_kvcache_ops_runtime.so:$TRITON_LIBS/hstu_attn/fbgemm_gpu_experimental_hstu.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_py.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so" \
+LD_PRELOAD="$TRITON_LIBS/pynve/libnve-common.so:$TRITON_LIBS/pynve/libnve-torch-ops.so:$TRITON_LIBS/emb/inference_emb_ops.so:$TRITON_LIBS/recsys_kvcache_manager/kvcache_manager_ops.so:$TRITON_LIBS/libhstu_cuda_ops_runtime.so:$TRITON_LIBS/libpaged_kvcache_ops_runtime.so:$TRITON_LIBS/hstu_attn/fbgemm_gpu_experimental_hstu.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_py.so:$TRITON_LIBS/fbgemm_gpu/fbgemm_gpu_sparse_async_cumsum.so" \
 LD_LIBRARY_PATH="/usr/local/cuda/compat/lib.real:/opt/hpcx/ucc/lib/:/opt/hpcx/ucx/lib/:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/lib/python3.12/dist-packages/torch/lib/:$TRITON_LIBS/fbgemm_gpu/:$TRITON_LIBS/lib:$TRITON_LIBS" \
 tritonserver --model-repository=${HSTU_DIR}/inference_aoti/triton_aoti/ > triton_server.log 2>&1 &
 ```
 
 Check `triton_server.log` for the status.
 
-Run the request sender against from the dumped replay tensors:
+Run the request replay client against the dumped tensors:
 
 ```bash
 cd ${HSTU_DIR}
-python3 inference_aoti/send_one_kvcache_triton_request.py \
+python3 inference_aoti/test_tritonserver_aoti_hstu_model.py \
   --dump_dir inference_aoti/export_test_dump \
-  --batch_index 0 \
   --url localhost:8000 \
   --model_name hstu_gr_ranking_kvcache
 ```
