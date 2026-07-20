@@ -18,9 +18,10 @@
 - ``ensure_lex_fatbin_loaded()`` hands the default (Lex) evictor fatbin to the
   C++ loader once. The default eviction path needs only this -- no numba, and the
   custom fatbin is not read/required.
-- ``register_score_function(fn, score_strategy, cc)`` numba-compiles a user decay function to
-  LTO-IR, links it into the custom cubin (nvJitLink, C++ side), and returns an
-  integer key used to route inserts to that custom evictor. Cached per function.
+- ``register_score_function(fn, score_strategy, cc_major, cc_minor)`` numba-compiles
+  a user decay function to LTO-IR, links it into the custom cubin (nvJitLink, C++
+  side), and returns an integer key used to route inserts to that custom evictor.
+  Cached per function.
 """
 import ast
 import hashlib

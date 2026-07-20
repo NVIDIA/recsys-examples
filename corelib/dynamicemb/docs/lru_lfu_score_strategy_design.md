@@ -1,6 +1,24 @@
 # Design: `LRU_LFU` score strategy with configurable / JIT-compiled eviction
 
-Status: **proposal / analysis** — no code written yet.
+Status: **implemented** — this document is the original design; the **code is the
+source of truth**. Notable as-built deltas from this proposal:
+
+- **No `LRU_LFU` enum.** The strategy is expressed as the compound score tuple
+  `(TIMESTAMP, LFU)` / `(LFU, TIMESTAMP)`; `score_function` is a
+  `DynamicEmbTableOptions` field, valid when the strategy resolves to
+  `{TIMESTAMP, LFU}`. A logical→physical remap lets the function index `scores`
+  in the user's tuple order.
+- **No `gamma` / `lfu_decay_gamma`.** The `score_function` signature is
+  `(scores, cur_timestamp) -> float64`; any decay constant is written directly in
+  the function body.
+- **Three cubin entry points**, not one: `dyn_emb_evict_entry_ovf` /
+  `dyn_emb_evict_entry_noovf` (insert_and_evict, overflow on/off) and
+  `dyn_emb_insert_entry` (plain insert). References below to a single
+  `dyn_emb_evict_entry` / `"apply"` are historical.
+- **Plain `insert` also routes through the cubin**, not just `insert_and_evict`,
+  so a full-bucket eviction on the plain-insert path uses the ranked comparator
+  too — two call sites, not one.
+
 Scope: `corelib/dynamicemb`.
 
 ## 1. Goal

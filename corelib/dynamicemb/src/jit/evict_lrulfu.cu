@@ -21,11 +21,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   -DDEMB_EVICT_COMPARATOR=UserFnComparator      -> LTO-IR fatbin with
 //       user_score_fn undefined; nvJitLink links the numba-compiled user fn.
 //
-// It reuses the shared insert_and_evict_body<Table, KernelTraits, Evictor> from
-// kernels.cuh with RankedEvictor<Comparator>, so the insert/evict logic is not
-// duplicated. Traits are fixed for LruLfu: KeyType=int64, CompactTileSize=1
-// (always correct), OutputScore=true (score_output null-checked at runtime),
-// PolicyType=LruLfu. Only EnableOverflow varies, via two entry points.
+// It reuses the shared insert_and_evict_body / insert_body<Table, KernelTraits,
+// Evictor> from kernels.cuh with RankedEvictor<Comparator>, so the insert/evict
+// logic is not duplicated. Traits are fixed for LruLfu: KeyType=int64,
+// CompactTileSize=1 (always correct), OutputScore=true (score_output
+// null-checked at runtime), PolicyType=LruLfu. Three entry points:
+//   dyn_emb_evict_entry_ovf / _noovf -- insert_and_evict (EnableOverflow on/off)
+//   dyn_emb_insert_entry             -- plain insert (no overflow tier; a full
+//                                       bucket still evicts, but no evicted
+//                                       output is collected)
 
 #include "evict_abi.cuh"
 #include "evict_comparators.cuh"
