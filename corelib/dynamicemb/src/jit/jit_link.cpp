@@ -74,12 +74,19 @@ int current_device() {
 EvictModule load_from_image(const void *image, const char *ctx) {
   EvictModule m;
   cu_check(cuModuleLoadData(&m.module, image), ctx);
-  cu_check(cuModuleGetFunction(&m.ovf, m.module, "dyn_emb_evict_entry_ovf"),
-           "cuModuleGetFunction(ovf)");
-  cu_check(cuModuleGetFunction(&m.noovf, m.module, "dyn_emb_evict_entry_noovf"),
-           "cuModuleGetFunction(noovf)");
-  cu_check(cuModuleGetFunction(&m.insert, m.module, "dyn_emb_insert_entry"),
-           "cuModuleGetFunction(insert)");
+  // If any entry is missing (e.g. a stale/mismatched image), unload the module
+  // we just loaded before propagating -- otherwise it leaks.
+  try {
+    cu_check(cuModuleGetFunction(&m.ovf, m.module, "dyn_emb_evict_entry_ovf"),
+             "cuModuleGetFunction(ovf)");
+    cu_check(cuModuleGetFunction(&m.noovf, m.module, "dyn_emb_evict_entry_noovf"),
+             "cuModuleGetFunction(noovf)");
+    cu_check(cuModuleGetFunction(&m.insert, m.module, "dyn_emb_insert_entry"),
+             "cuModuleGetFunction(insert)");
+  } catch (...) {
+    cuModuleUnload(m.module);
+    throw;
+  }
   return m;
 }
 
@@ -105,6 +112,13 @@ EvictModule link_custom(const RegInfo &r) {
 
   if (nvJitLinkCreate(&handle, 2, opts) != NVJITLINK_SUCCESS)
     throw std::runtime_error("dynamicemb jit_link: nvJitLinkCreate failed");
+  // Destroy the linker handle on every exit path: jl_check throws on failure,
+  // and load_from_image can throw too. jl_check reads the error log off `handle`
+  // before it throws, so the handle is still live at that point.
+  struct HandleGuard {
+    nvJitLinkHandle &h;
+    ~HandleGuard() { nvJitLinkDestroy(&h); }
+  } handle_guard{handle};
   jl_check(nvJitLinkAddData(handle, NVJITLINK_INPUT_FATBIN, r.cust.data(),
                             r.cust.size(), "evict_custom"),
            "nvJitLinkAddData(custom fatbin)");
@@ -118,7 +132,6 @@ EvictModule link_custom(const RegInfo &r) {
   std::vector<char> cubin(cubin_size);
   jl_check(nvJitLinkGetLinkedCubin(handle, cubin.data()),
            "nvJitLinkGetLinkedCubin");
-  nvJitLinkDestroy(&handle);
   return load_from_image(cubin.data(), "cuModuleLoadData(custom cubin)");
 }
 

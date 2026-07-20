@@ -207,7 +207,12 @@ def compile_evict_fatbins():
     src = str(root_path / EVICT_TU)
     out_dir = root_path / library_name / "jit"
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Match the main extension's nvcc flags (get_extensions): the fatbin TU
+    # compiles the same kernels.cuh / <cub/cub.cuh> / cooperative_groups headers,
+    # so it needs the same relaxed-constexpr + extended-lambda support to stay
+    # buildable across CUDA versions.
     common = ["-std=c++17", "-O3", "--use_fast_math",
+              "--expt-relaxed-constexpr", "--expt-extended-lambda",
               f"-I{root_path / 'src'}"]
 
     variants = [
