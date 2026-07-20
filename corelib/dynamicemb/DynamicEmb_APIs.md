@@ -352,6 +352,57 @@ dynamicemb provides the following strategies to set the score.
 
     Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
 
+### Customized eviction via `score_function`
+
+`LFU` alone evicts by raw access frequency. For finer control — e.g. a
+time-decayed LFU that also favors recently-used keys — configure a table with the
+**compound** score strategy `(DynamicEmbScoreStrategy.TIMESTAMP,
+DynamicEmbScoreStrategy.LFU)` (either order) and pass a Python `score_function` in
+`DynamicEmbTableOptions`. When a bucket is full, the key(s) with the **lowest**
+returned score are evicted.
+
+**Signature:** `score_function(scores, cur_timestamp) -> float64`
+
+- `scores` indexes the table's two score words in the **logical (tuple) order** you
+  configured. For `(TIMESTAMP, LFU)`: `scores[0]` is the last-access timestamp
+  (device nanosecond timer) and `scores[1]` is the access frequency; for
+  `(LFU, TIMESTAMP)` the two are swapped. dynamicemb remaps your subscripts to the
+  fixed on-device layout automatically, so you always index in the order you wrote.
+- `cur_timestamp` is the current device nanosecond timer at eviction time.
+- The function is compiled to device code with **numba-cuda** (linked via
+  nvJitLink), so it must be numba-compilable: index `scores` with **integer
+  constants** only, and return a numeric value (the return is pinned to `float64`,
+  so an integer expression is cast). Any decay constant is written directly in the
+  body. If `score_function` is omitted, eviction uses the default frequency-ranked
+  evictor (ties broken by the older timestamp).
+
+**Constraints:** `score_function` is supported **only** for the two-word compound
+`{TIMESTAMP, LFU}` strategy — exactly one `TIMESTAMP` column plus one `LFU` column,
+so `scores` always has **length 2** (`scores[0]`/`scores[1]`). It is **not**
+available for single strategies (`TIMESTAMP`, `STEP`, `LFU`, `CUSTOMIZED`,
+`NO_EVICTION`) or any other score combination or count. Setting `score_function`
+with a non-compound `score_strategy` raises `ValueError`. `numba-cuda` must be
+installed.
+
+```python
+import math
+from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+
+def lru_lfu_decay_score(scores, cur_timestamp):
+    # scores[0] = last-access timestamp (ns), scores[1] = access frequency.
+    # Time-decayed LFU: reward frequency, penalize staleness (~0.9 per second).
+    age_seconds = (cur_timestamp - scores[0]) * 1e-9
+    return math.log(max(scores[1], 1)) + age_seconds * math.log(0.9)
+
+table_options = DynamicEmbTableOptions(
+    score_strategy=(
+        DynamicEmbScoreStrategy.TIMESTAMP,
+        DynamicEmbScoreStrategy.LFU,
+    ),
+    score_function=lru_lfu_decay_score,
+)
+```
+
 ## DynamicEmbPoolingMode
 
 DynamicEmb supports three pooling modes that determine how embedding lookups are aggregated. These modes correspond to how `EmbeddingCollection` (sequence) and `EmbeddingBagCollection` (pooled) work in TorchREC.
@@ -494,6 +545,17 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             order that checkpoints are written in (the on-device layout is fixed); both
             orders behave identically at runtime and differ only in checkpoint column
             order. A one-element tuple `(X,)` is treated as the single strategy `X`.
+        score_function(Optional[Callable]):
+            Optional custom eviction score for a compound `{TIMESTAMP, LFU}` table.
+            Signature `score_function(scores, cur_timestamp) -> float64`; `scores` is
+            indexed in the configured (logical) tuple order, and the key(s) with the
+            lowest returned score are evicted first. It is compiled to device code
+            with numba-cuda, so subscripts must be integer constants. Supported
+            **only** for the two-word `{TIMESTAMP, LFU}` compound strategy (`scores`
+            has length 2); any other (single or non-compound) `score_strategy` with a
+            `score_function` raises `ValueError`. Defaults to None (the built-in
+            frequency → older-timestamp evictor). See the "Customized eviction via
+            `score_function`" section under `DynamicEmbScoreStrategy`.
         bucket_capacity : int
             Capacity of each bucket in the hash table, and default is 128 (using 1024 when the table serves as cache).
             A key will only be mapped to one bucket. 
