@@ -1,61 +1,53 @@
 # Design: `LRU_LFU` score strategy with configurable / JIT-compiled eviction
 
-Status: **implemented** — this document is the original design; the **code is the
-source of truth**. Notable as-built deltas from this proposal:
-
-- **No `LRU_LFU` enum.** The strategy is expressed as the compound score tuple
-  `(TIMESTAMP, LFU)` / `(LFU, TIMESTAMP)`; `score_function` is a
-  `DynamicEmbTableOptions` field, valid when the strategy resolves to
-  `{TIMESTAMP, LFU}`. A logical→physical remap lets the function index `scores`
-  in the user's tuple order.
-- **No `gamma` / `lfu_decay_gamma`.** The `score_function` signature is
-  `(scores, cur_timestamp) -> float64`; any decay constant is written directly in
-  the function body.
-- **Three cubin entry points**, not one: `dyn_emb_evict_entry_ovf` /
-  `dyn_emb_evict_entry_noovf` (insert_and_evict, overflow on/off) and
-  `dyn_emb_insert_entry` (plain insert). References below to a single
-  `dyn_emb_evict_entry` / `"apply"` are historical.
-- **Plain `insert` also routes through the cubin**, not just `insert_and_evict`,
-  so a full-bucket eviction on the plain-insert path uses the ranked comparator
-  too — two call sites, not one.
+Status: **implemented** — updated to reflect the shipped implementation; the
+**code is the source of truth**. The original design's rationale (why a JIT/cubin
+eviction pipeline, the risk mitigations in §11) is preserved; the API and
+mechanism are described as built.
 
 Scope: `corelib/dynamicemb`.
 
 ## 1. Goal
 
-Add a first-class score strategy `DynamicEmbScoreStrategy.LRU_LFU` that stores
-**both** an access frequency and a last-access timestamp per key, and evicts by
-a policy that combines the two:
+Support an LRU+LFU eviction strategy that stores **both** an access frequency and
+a last-access timestamp per key, and evicts by a policy that combines the two. It
+is expressed as the **compound score strategy** `(TIMESTAMP, LFU)` (either tuple
+order) rather than a standalone enum: the `TIMESTAMP` element provides the
+last-access timestamp column (also used by time-based `incremental_dump`) and the
+`LFU` element drives eviction ranking.
 
 - **Default eviction:** rank by LFU (frequency). Break ties by the timestamp —
   when two keys have equal frequency, evict the one with the **older**
   (smaller) last-access timestamp.
 - **Custom eviction:** the user may pass a Python `score_function` (numba-style)
-  that computes a `float64` "decay" score per key from
-  `(scores, cur_timestamp, gamma)`; eviction then removes the key(s) with the
-  **lowest** computed score. `gamma` comes from a new `lfu_decay_gamma` option.
+  that computes a `float64` "decay" score per key from `(scores, cur_timestamp)`;
+  eviction then removes the key(s) with the **lowest** computed score. Any decay
+  constant (e.g. a `gamma`) is written directly in the function body — there is no
+  separate config option for it.
 
 Target usage:
 
 ```python
 import math
-from numba.types import float32, int64, float64
+from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 
-def compute_lfu_decay(scores, cur_timestamp: int64, gamma: float32) -> float64:
-    # scores[0] = last-access timestamp, scores[1] = frequency (raw uint64 AoS
-    # words, no remapping). Use (cur_timestamp - scores[0]) -- the elapsed time
-    # since last access -- NOT (scores[0] - cur_timestamp): the latter underflows
-    # in uint64 (last < now) AND has the wrong sign. With age >= 0 and gamma in
-    # (0, 1) (so log(gamma) < 0), age*log(gamma) grows more negative with
-    # staleness, so stale keys score lower and are evicted first.
-    return float64(math.log(max(scores[1], 1)) + (cur_timestamp - scores[0]) * math.log(gamma))
+def compute_lfu_decay(scores, cur_timestamp):
+    # `scores` is indexed in the LOGICAL (tuple) order. For (TIMESTAMP, LFU):
+    # scores[0] = last-access timestamp, scores[1] = frequency. Use
+    # (cur_timestamp - scores[0]) -- the elapsed time since last access -- with a
+    # decay constant baked in (0.9 per second here). Stale keys score lower and are
+    # evicted first. The return is pinned to float64.
+    age_seconds = (cur_timestamp - scores[0]) * 1e-9
+    return math.log(max(scores[1], 1)) + age_seconds * math.log(0.9)
 
 options = DynamicEmbTableOptions(
     dim=64,
     max_capacity=10_700_000,
-    score_strategy=DynamicEmbScoreStrategy.LRU_LFU,
+    score_strategy=(
+        DynamicEmbScoreStrategy.TIMESTAMP,
+        DynamicEmbScoreStrategy.LFU,
+    ),
     score_function=compute_lfu_decay,   # optional; omit for the default policy
-    lfu_decay_gamma=0.9,                # only consumed by score_function
 )
 ```
 
@@ -82,38 +74,42 @@ The heavy lifting is already in the tree from the `need_incremental_dump` work:
   from spec count; `get_score_policy()` builds the `LRU_LFU` spec; batched layer
   returns `device_timestamp()` for such tables.
 
-So `LRU_LFU` as a *strategy* is largely "expose the existing `LruLfu` *policy* as
-its own `DynamicEmbScoreStrategy`, plus (a) a timestamp tiebreak in eviction and
-(b) an optional JIT decay function." It is a **superset** of today's
-`LFU + need_incremental_dump=True`, which produces the same policy/layout.
+So the LRU+LFU strategy is largely "drive the existing `LruLfu` *policy* from the
+compound `(TIMESTAMP, LFU)` tuple, plus (a) a timestamp tiebreak in eviction and
+(b) an optional JIT decay function." It produces the same policy/layout as the
+earlier `LFU + need_incremental_dump=True` combination.
 
 ### Current strategy/policy/evict enums
 
 - `DynamicEmbScoreStrategy` (Python `IntEnum`): `TIMESTAMP=0, STEP=1,
-  CUSTOMIZED=2, LFU=3` (`dynamicemb_config.py:141`). **No `LRU_LFU` yet.**
+  CUSTOMIZED=2, LFU=3, NO_EVICTION=4`. There is **no `LRU_LFU` enum**; the
+  LRU+LFU strategy is the compound tuple `(TIMESTAMP, LFU)`.
 - `DynamicEmbEvictStrategy`: `LRU, LFU, EPOCH_LRU, EPOCH_LFU, CUSTOMIZED`.
 - `get_score_policy(score_strategy, need_incremental_dump)` maps strategy →
   `ScoreSpec(policy=...)`.
 
 ## 3. Design decisions (confirmed)
 
-### 3.1 Score-word ordering — `scores[0] = timestamp, scores[1] = frequency` ✅
+### 3.1 Score-word ordering — physical `word 0 = timestamp, word 1 = frequency` ✅
 
-The `score_function` contract is pinned to **`scores[0] = last-access timestamp,
-scores[1] = frequency`**, matching both the example's formula and the internal
-AoS layout (word 0 = ts, word 1 = freq). Consequences:
+The on-device AoS layout is fixed: **word 0 = last-access timestamp, word 1 =
+frequency** (so `reduction_score` == the last word == frequency, and
+`incremental_dump` thresholds on word 0). A user `score_function` indexes `scores`
+in the **logical (tuple) order** it configured, and dynamicemb statically
+**remaps** those subscripts to the physical words. Consequences:
 
-- The device call passes the raw AoS words to `user_fn` with **zero remapping**.
-- The example's formula `log(scores[1]) + (cur_ts - scores[0]) * log(gamma)`
-  decays `log(frequency)` by the elapsed time `age = cur_ts - scores[0] >= 0`.
-  With `gamma` in (0, 1) (so `log(gamma) < 0`), `age*log(gamma)` grows more
-  negative with staleness, so stale keys score lower and are evicted first.
-  NOTE: it must be `cur_ts - scores[0]`, not `scores[0] - cur_ts` -- the latter
-  underflows in uint64 (last < now) and has the wrong sign.
-- The internal layout is **unchanged** — word 0 stays the timestamp, so
-  `incremental_dump` (thresholds on word 0) and `reduction_score` (the *last*
-  word == frequency) keep working. The example's original comment
-  (`scores[0]=frequency`) was inconsistent with its formula and is corrected.
+- For `(TIMESTAMP, LFU)` the logical order already equals physical, so
+  `scores[0] = timestamp, scores[1] = frequency` under an identity remap. For
+  `(LFU, TIMESTAMP)`, `scores[0] = frequency, scores[1] = timestamp` and the remap
+  swaps them, so the function reads the correct physical words either way.
+- Subscripts must be **integer constants** (the remap is static) and in range;
+  otherwise registration raises.
+- The example's formula `log(scores[1]) + (cur_ts - scores[0]) * <decay>` decays
+  `log(frequency)` by the elapsed time `age = cur_ts - scores[0] >= 0` (for
+  TIMESTAMP-first). It must be `cur_ts - scores[0]`, not `scores[0] - cur_ts` --
+  the latter underflows in uint64 (last < now) and has the wrong sign.
+- The internal layout is **unchanged**, so `incremental_dump` and `reduction_score`
+  keep working.
 
 ### 3.2 Timestamp tiebreak applies to all `LruLfu` ✅
 
@@ -128,26 +124,29 @@ intentional behavior change to the existing path.
 
 `DynamicEmbTableOptions` (`dynamicemb_config.py`):
 
-- `score_strategy` gains `LRU_LFU`. Add `DynamicEmbScoreStrategy.LRU_LFU = 4`
-  (extend the `IntEnum`; keep existing values stable).
-- New `score_function: Optional[Callable] = None` — a numba-compilable Python
-  function `(scores, cur_timestamp: int64, gamma: float32) -> float64`. Only
-  valid with `score_strategy == LRU_LFU`. When `None`, use the default
-  freq+timestamp policy (no JIT).
-- New `lfu_decay_gamma: float = <default>` — passed to `score_function`; ignored
-  otherwise.
-- `get_grouped_key()` must include `score_function` identity (e.g. its
-  `__qualname__`/source hash) and `lfu_decay_gamma` so tables with different
-  eviction functions are not merged into one physical table.
+- `score_strategy` accepts a **compound tuple** `(TIMESTAMP, LFU)` (either order)
+  in addition to the single strategies. `normalize_score_strategy` validates it
+  (only `{TIMESTAMP, LFU}` is supported today); a one-element tuple collapses to
+  the single strategy.
+- `score_function: Optional[Callable] = None` — a numba-compilable Python function
+  `(scores, cur_timestamp) -> float64`. Valid **only** when the strategy resolves
+  to `{TIMESTAMP, LFU}` (a non-compound strategy with a `score_function` raises
+  `ValueError`). When `None`, eviction uses the default freq→timestamp policy (no
+  JIT). Any decay constant is written in the function body — there is no
+  `lfu_decay_gamma` option.
+- `get_grouped_key()` includes the `score_function` identity (module / qualname /
+  source hash + the physical remap order) so tables with different eviction
+  functions — or the same function under different tuple orders — are not merged
+  into one physical table.
 
 `get_score_policy()`:
 
-- `LRU_LFU` → `ScoreSpec(name="lru_lfu", policy=ScorePolicy.LRU_LFU, dtype=uint64,
-  is_reduction=True)` (same spec today's `LFU + need_incremental_dump` builds).
-- `evict_strategy` for such tables defaults to `LFU` (frequency-ranked reduce),
-  with the tiebreak/decay layered on top.
-- `LRU_LFU` tables implicitly support `incremental_dump` (word 0 is a timestamp),
-  so `need_incremental_dump` becomes redundant/implied for this strategy.
+- A `{TIMESTAMP, LFU}` strategy → `ScoreSpec(name="lru_lfu",
+  policy=ScorePolicy.LRU_LFU, dtype=uint64, is_reduction=True)` (the same spec the
+  earlier `LFU + need_incremental_dump` built).
+- `evict_strategy` for such tables is `LFU` (frequency-ranked reduce), with the
+  tiebreak/decay layered on top via the cubin.
+- These tables implicitly support `incremental_dump` (word 0 is a timestamp).
 
 ## 5. Eviction: one comparator-templated reduce for ALL LruLfu tables
 
@@ -170,9 +169,10 @@ comparator. Only the innermost compare varies:
   timestamp asc) on the shared pair. Pure C++, no `double`, **no precision loss**,
   no numba.
 - **`UserFnComparator` (custom):** calls
-  `extern "C" __device__ double user_score_fn(const uint64_t* scores, uint64_t cur_ts, double gamma)`
-  on the shared pointer and ranks by **min `double`**. `cur_ts` read once at kernel
-  entry (`%globaltimer`); `gamma` is a kernel parameter.
+  `extern "C" __device__ double user_score_fn(const uint64_t* scores, uint64_t cur_ts)`
+  and ranks by **min `double`**. `cur_ts` is read once at kernel entry
+  (`%globaltimer`); any decay constant lives inside the compiled `user_score_fn`
+  (there is no separate `gamma` kernel parameter).
 
 Because the comparator receives a **shared-memory** pointer into the prefetched
 buffer, the async-prefetch bulk reduce is **PRESERVED for both** (this is the R4
@@ -220,19 +220,23 @@ torch 2.12 / CUDA 13.2, **numba 0.64.0** (`numba.cuda.compile` supports
   ```python
   from numba import cuda, types
   ltoir, _ = cuda.compile(
-      score_function,
-      sig=(types.CPointer(types.uint64), types.uint64, types.float64),  # -> float64
+      remapped_score_function,   # subscripts already remapped logical -> physical
+      # return pinned to float64 to match `extern double user_score_fn(...)`;
+      # otherwise numba infers the type from the body and an integer return would
+      # miscompile the double ABI.
+      sig=types.float64(types.CPointer(types.uint64), types.uint64),
       device=True, output='ltoir', abi='c',
-      abi_info={'abi_name': 'user_score_fn'},
+      abi_info={'abi_name': 'user_score_fn'}, cc=(cc_major, cc_minor),
   )
   ```
-  (`CPointer(uint64)` maps to `const uint64_t*` so `scores[i]` indexes the raw
-  AoS words; pin the exact kwargs against numba 0.64 during impl.)
+  (`CPointer(uint64)` maps to `const uint64_t*` so `scores[i]` indexes the physical
+  AoS words after the remap; `cc` MUST be the device's — numba's default `sm_50`
+  is rejected by recent CUDA NVVM.)
 - **Link (Python `cuda.bindings.nvjitlink` or C++ `libnvJitLink`):**
   `nvJitLinkCreate(arch=sm_90, "-lto")` → add kernel fatbin (`INPUT_FATBIN`) +
   user `ltoir` (`INPUT_LTOIR`) → `Complete` → `GetLinkedCubin` →
-  `cuModuleLoadData` → `cuModuleGetFunction`. Cache the module keyed by (arch,
-  score_function identity, gamma dtype). Launch on the current stream.
+  `cuModuleLoadData` → `cuModuleGetFunction`. Cache the module keyed by
+  (device, score_function group key). Launch on the current stream.
 - **New deps:** `numba-cuda`, `cuda-python` (both present); native
   `libnvJitLink`, `libnvidia-nvvm`. The linked artifact is bound to (cpython,
   torch ABI, CUDA major).
@@ -276,23 +280,25 @@ Verbatim-shaped recipe from the reference:
   // apply(): pack void* args, cuLaunchKernel(..., getCurrentCUDAStream().stream())
   ```
 
-For dynamicemb the `apply` entry becomes our custom insert-and-evict kernel
-(§5.2); everything else (link/cache/launch) follows ext_jit as-is.
+For dynamicemb the reference `apply` entry becomes our three entries —
+`dyn_emb_evict_entry_ovf` / `dyn_emb_evict_entry_noovf` (insert_and_evict) and
+`dyn_emb_insert_entry` (plain insert) (§5.2, §11.2); everything else
+(link/cache/launch) follows ext_jit as-is.
 
 ## 6. Components to touch
 
 | Layer | File(s) | Change |
 |---|---|---|
-| Score policy | `score.cuh` | none for layout; (optional) document `LRU_LFU`-strategy reuse |
+| Score policy | `score.cuh` | none for layout; the `LruLfu` policy is reused as-is |
 | Eviction scan | `types.cuh` | make `reduce()` → `reduce<Comparator>()` (one skeleton, comparator sees the shared-mem `[ts,freq]` pair); retire the AoT 2-score reduce |
 | Comparators | new header | `LexFreqTsComparator` (exact freq→ts); `UserFnComparator` (calls `user_score_fn`, min double) |
 | Evict TU | new `src/.../evict_lrulfu.cu` + `setup.py` | instantiate insert_and_evict for both comparators; `user_score_fn` extern-undefined; build **prebuilt Lex cubin** + **custom LTO-IR fatbin** (`nvcc --fatbin code=lto_XX`), ship as package_data |
 | JIT link/launch | new `src/.../jit_link.{h,cpp}` (C++, `-lnvJitLink -lcuda`) | link user LTO-IR into fatbin → cubin; `cuModuleLoadData`/`cuModuleGetFunction`; per-(arch,fn) module cache; `cuLaunchKernel` on torch stream (both cubins) |
 | Bindings | `table.cu`/bindings | expose `link(fatbin, ltoir, cc)` + the driver-launched insert-and-evict entry |
-| Config | `dynamicemb_config.py` | `LRU_LFU` enum, `score_function`, `lfu_decay_gamma`, `get_grouped_key` |
-| Policy select | `key_value_table.py` `get_score_policy` | map `LRU_LFU`; route `num_scores==2` tables to the cubin (custom vs prebuilt Lex); `evict_strategy=LFU` |
-| Python JIT glue | new `dynamicemb/score_jit.py` | `torch.cuda.get_device_capability()`; numba `cuda.compile(...,output='ltoir')`; hand bytes to C++ `link`; module cache |
-| Batched | `batched_dynamicemb_tables.py` | `_create_score` LRU_LFU → evict=LFU/score=1; `get_score` returns `device_timestamp()` for LRU_LFU |
+| Config | `dynamicemb_config.py` | compound `(TIMESTAMP, LFU)` validation (`normalize_score_strategy`), `score_function`, `get_grouped_key` |
+| Policy select | `key_value_table.py` `get_score_policy` | map `{TIMESTAMP, LFU}` → `LruLfu`; route `num_scores==2` tables (plain insert AND insert_and_evict) to the cubin (custom vs prebuilt Lex); `evict_strategy=LFU` |
+| Python JIT glue | `dynamicemb/jit/score_jit.py` | logical→physical subscript remap; `torch.cuda.get_device_capability()`; numba `cuda.compile(...,output='ltoir')`; hand bytes to C++; module cache |
+| Batched | `batched_dynamicemb_tables.py` | `_create_score` compound `{TIMESTAMP,LFU}` → evict=LFU; `get_score` returns `device_timestamp()` for these tables |
 
 ## 7. Interactions / invariants preserved
 
@@ -389,9 +395,10 @@ verifiable:
    fatbin** (`user_score_fn` undefined), ship as package_data.
 4. **`jit_link.{h,cpp}` + bindings** — C++ nvJitLink link + module cache +
    `cuLaunchKernel`; expose `link(...)` and the driver-launched insert-and-evict.
-5. **Config + wiring** — `LRU_LFU` enum, `score_function`, `lfu_decay_gamma`,
-   `get_grouped_key`; `get_score_policy` mapping; `_create_score` / `get_score`;
-   route `num_scores==2` tables to the cubin (custom vs prebuilt Lex).
+5. **Config + wiring** — compound `(TIMESTAMP, LFU)` validation, `score_function`
+   (logical→physical remap), `get_grouped_key`; `get_score_policy` mapping;
+   `_create_score` / `get_score`; route `num_scores==2` tables (plain insert AND
+   insert_and_evict) to the cubin (custom vs prebuilt Lex).
 6. **`score_jit.py`** — numba compile + hand LTO-IR to C++ `link`; per-fn cache.
 7. **Tests** (§8) + EOS H100 end-to-end, incl. the `need_incremental_dump` 18+7
    regression (decision Q changed its launch path).
@@ -426,23 +433,29 @@ struct EvictParams {              // POD; layout is the ABI contract
   int64_t   counter_offset;
   int64_t   bucket_capacity;
   int64_t   num_scores;           // == 2 for LruLfu
-  double    gamma;                // consumed only by UserFnComparator
+  // (the shipped struct also carries the overflow-tier pointers and the
+  //  evicted-key/score/index output arrays; see src/jit/evict_abi.cuh. There is
+  //  NO gamma field -- any decay constant is baked into the linked user_score_fn.)
 };
-extern "C" __global__ void dyn_emb_evict_entry(EvictParams p);
+// Three entry points, all taking EvictParams by value:
+extern "C" __global__ void dyn_emb_evict_entry_ovf(EvictParams p);   // insert_and_evict, overflow
+extern "C" __global__ void dyn_emb_evict_entry_noovf(EvictParams p); // insert_and_evict, no overflow
+extern "C" __global__ void dyn_emb_insert_entry(EvictParams p);      // plain insert (drops evicted keys)
 ```
 
 - The entry is launched with **one argument** (`&p`), so `cuLaunchKernel`'s
   `kernelParams` is a single `void*` — no long hand-packed list to get wrong.
 - `OutputScore<true/false>` becomes a **runtime null check** on
   `evict_scores_out`/`evict_keys_out` → removes that template dimension.
-- `dyn_emb_evict_entry` unpacks `p`, builds the `Table`, reads `cur_ts` once
-  (`%globaltimer`), and calls the shared body
-  `insert_and_evict_body<Comparator>(p, cur_ts)`.
+- Each entry unpacks `p`, builds the `Table`, reads `cur_ts` once (`%globaltimer`),
+  and calls the shared body — `insert_and_evict_body` for the two evict entries,
+  `insert_body` for the plain-insert entry — with `RankedEvictor<Comparator>`.
 
 ### 11.2 One variant per cubin (kills the rest of R2)
 
-Fix all remaining compile-time knobs for LruLfu so each cubin has exactly **one**
-entry named `dyn_emb_evict_entry` (no C++ mangling to resolve, no matrix):
+Fix all remaining compile-time knobs for LruLfu so each cubin exposes a small
+**fixed set** of `extern "C"` entries (the three named above — no C++ mangling to
+resolve, no instantiation matrix):
 
 - **KeyType = int64** (LruLfu tables use `index_type=int64`). If another key type
   is ever needed, it is a *new named entry*, enumerated explicitly — never
@@ -454,16 +467,18 @@ entry named `dyn_emb_evict_entry` (no C++ mangling to resolve, no matrix):
   compiles it with `UserFnComparator` (leaves `user_score_fn` undefined → LTO-IR
   fatbin for nvJitLink). **Same `.cu`, selected by a `-D` macro.**
 
-`cuModuleGetFunction(mod, "dyn_emb_evict_entry")` — one stable name for both.
+`cuModuleGetFunction(mod, "dyn_emb_evict_entry_ovf" | "..._noovf" | "dyn_emb_insert_entry")`
+— stable names, resolved for both cubins.
 
 ### 11.3 Surgical launch swap, op stays multi-kernel (kills R3)
 
-Keep the existing `table_insert_and_evict` C++ launcher and ALL its orchestration
-(the `update_counter_with_layout_kernel` at `insert_and_evict.cu:424`, dispatch,
-overflow handling) **AoT and unchanged**. Only the single
-`table_insert_and_evict_kernel<<<>>>` launch is replaced, for `num_scores==2`
-tables, by a `cuLaunchKernel` of `dyn_emb_evict_entry`. One `if` at one call site;
-the helper kernels never move into the cubin (they don't call the comparator).
+Keep the existing `table_insert_and_evict` and `table_insert` C++ launchers and
+ALL their orchestration (dispatch, overflow handling, the AoT helper kernels)
+**AoT and unchanged**. Only the `num_scores==2` kernel launch is replaced — in
+BOTH launchers — by a `cuLaunchKernel` of the matching cubin entry
+(`dyn_emb_evict_entry_{ovf,noovf}` for insert_and_evict, `dyn_emb_insert_entry`
+for plain insert). One `if constexpr` at each of the two call sites; the helper
+kernels never move into the cubin (they don't call the comparator).
 
 ### 11.4 No module-local globals (kills R4-globals)
 
@@ -488,8 +503,8 @@ default `80;90;100`), mirroring ext_jit:
 the `.so`, from the same headers, with a **shared nvcc flag list** (a Python
 constant reused for `.so` and both fatbins). No stale cubin (prebuilt each build);
 flag parity guaranteed. A trivial build-time check loads each fatbin and asserts
-`dyn_emb_evict_entry` resolves, so a missing/misnamed entry fails the **build**,
-not runtime.
+its entry points (`dyn_emb_evict_entry_ovf` / `_noovf` / `dyn_emb_insert_entry`)
+resolve, so a missing/misnamed entry fails the **build**, not runtime.
 
 ### 11.7 Residual, accepted
 
@@ -497,6 +512,6 @@ not runtime.
   `float64(scores[i])` before subtraction; enforced in docs + the shipped example;
   a unit test compares device vs numpy over random `[ts,freq]`.
 - **First-use link latency (~100ms) + per-fn module cache** — acceptable; cache
-  keyed by `(arch, score_function group key)`.
+  keyed by `(device, score_function group key)`.
 - **numba dependency** — only when `score_function` is set; default LruLfu
   (incl. `need_incremental_dump`) loads the prebuilt Lex fatbin, no numba.
