@@ -352,6 +352,33 @@ dynamicemb provides the following strategies to set the score.
 
     Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
 
+### Compound (multi-score) strategies and score order
+
+A table normally keeps **one** score per key, but a **compound** `score_strategy`
+given as a tuple keeps **more than one**. The supported compound
+`(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)` keeps **two**
+scores per key — a last-access timestamp and an access frequency — so the table
+can rank eviction by frequency while still supporting a time-based
+`incremental_dump`.
+
+The **order** you write the tuple in does **not** change eviction behavior:
+`(TIMESTAMP, LFU)` and `(LFU, TIMESTAMP)` evict identically. It only controls the
+order of the score columns **as you see them**, in two places that always stay
+consistent with each other:
+
+1. **Scores dumped to file** (`DynamicEmbDump` / `load`): each key's scores are
+   written in the tuple order. `(TIMESTAMP, LFU)` writes `[timestamp, frequency]`
+   per key; `(LFU, TIMESTAMP)` writes `[frequency, timestamp]`. `load` reads them
+   back in the same order, so a checkpoint is interchangeable only between tables
+   configured with the same tuple order.
+2. **`score_function` indexing**: inside a `score_function`, `scores[0]`,
+   `scores[1]`, ... follow the same tuple order. For `(TIMESTAMP, LFU)`,
+   `scores[0]` is the timestamp and `scores[1]` the frequency; for
+   `(LFU, TIMESTAMP)` the two are swapped.
+
+Choose the order that matches how you want checkpoint columns laid out and how you
+index `scores` in your `score_function` — the two always agree.
+
 ### Customized eviction via `score_function`
 
 `LFU` alone evicts by raw access frequency. For finer control — e.g. a
@@ -363,18 +390,18 @@ returned score are evicted.
 
 **Signature:** `score_function(scores, cur_timestamp) -> float64`
 
-- `scores` indexes the table's two score words in the **logical (tuple) order** you
-  configured. For `(TIMESTAMP, LFU)`: `scores[0]` is the last-access timestamp
-  (device nanosecond timer) and `scores[1]` is the access frequency; for
-  `(LFU, TIMESTAMP)` the two are swapped. dynamicemb remaps your subscripts to the
-  fixed on-device layout automatically, so you always index in the order you wrote.
+- `scores` indexes the table's two scores in the **same order as your
+  `score_strategy` tuple** (see "Compound (multi-score) strategies and score order"
+  above). For `(TIMESTAMP, LFU)`: `scores[0]` is the last-access timestamp (device
+  nanosecond timer) and `scores[1]` is the access frequency; for `(LFU, TIMESTAMP)`
+  the two are swapped.
 - `cur_timestamp` is the current device nanosecond timer at eviction time.
-- The function is compiled to device code with **numba-cuda** (linked via
-  nvJitLink), so it must be numba-compilable: index `scores` with **integer
-  constants** only, and return a numeric value (the return is pinned to `float64`,
-  so an integer expression is cast). Any decay constant is written directly in the
-  body. If `score_function` is omitted, eviction uses the default frequency-ranked
-  evictor (ties broken by the older timestamp).
+- The function is compiled to device code with **numba-cuda**, so it must be
+  numba-compilable: index `scores` with **integer constants** only, and return a
+  numeric value (the return is treated as `float64`, so an integer expression is
+  cast). Any decay constant is written directly in the body. If `score_function` is
+  omitted, eviction uses the default frequency-ranked evictor (ties broken by the
+  older timestamp).
 
 **Constraints:** `score_function` is supported **only** for the two-word compound
 `{TIMESTAMP, LFU}` strategy — exactly one `TIMESTAMP` column plus one `LFU` column,
@@ -533,18 +560,17 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             Default to DynamicEmbScoreStrategy.TIMESTAMP.
             For the multi-GPUs scenario of model parallelism, every rank's score_strategy should keep the same for one table,
                 as they are the same table, but stored on different ranks.
-            A *compound* score strategy may be given as a tuple. The `TIMESTAMP` element
-            provides a per-key last-access timestamp column used by `incremental_dump`,
-            while the other element drives eviction ranking. The tuple form keeps the
-            interface open for future combinations; only
-            `(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)` (in either
-            order) is supported for now: it ranks eviction by the LFU access count while
-            ALSO storing a last-access timestamp (compound `LruLfu` policy, two score
-            words per key, +8 bytes/key) so keys touched since the last dump can be
-            selected by a time-based `incremental_dump`. The tuple order is the logical
-            order that checkpoints are written in (the on-device layout is fixed); both
-            orders behave identically at runtime and differ only in checkpoint column
-            order. A one-element tuple `(X,)` is treated as the single strategy `X`.
+            A *compound* score strategy may be given as a tuple to keep **more than
+            one** score per key. Only
+            `(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)` (in
+            either order) is supported for now: it ranks eviction by the LFU access
+            count while ALSO keeping a per-key last-access timestamp (two scores per
+            key, +8 bytes/key) so items touched since the last dump can be selected by
+            a time-based `incremental_dump`. Both tuple orders evict identically; the
+            order only controls how the score columns are laid out when dumped to file
+            and how `score_function` indexes them (see "Compound (multi-score)
+            strategies and score order" under `DynamicEmbScoreStrategy`). A one-element
+            tuple `(X,)` is treated as the single strategy `X`.
         score_function(Optional[Callable]):
             Optional custom eviction score for a compound `{TIMESTAMP, LFU}` table.
             Signature `score_function(scores, cur_timestamp) -> float64`; `scores` is

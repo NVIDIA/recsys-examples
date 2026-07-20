@@ -71,7 +71,7 @@ The heavy lifting is already in the tree from the `need_incremental_dump` work:
   gather/scatter/copy score-block kernels; dump/load and rehash preserve both
   words; `incremental_dump` thresholds on word 0 (timestamp).
 - **Python**: `score_policy_num_scores(policy)` decouples physical score words
-  from spec count; `get_score_policy()` builds the `LRU_LFU` spec; batched layer
+  from spec count; `get_score_policy()` builds the `LruLfu` spec; batched layer
   returns `device_timestamp()` for such tables.
 
 So the LRU+LFU strategy is largely "drive the existing `LruLfu` *policy* from the
@@ -151,7 +151,7 @@ intentional behavior change to the existing path.
 ## 5. Eviction: one comparator-templated reduce for ALL LruLfu tables
 
 **Scope decision (Q):** every table using the `LruLfu` policy (`num_scores == 2`)
-— both the new `LRU_LFU` strategy **and** the existing
+— both the compound `(TIMESTAMP, LFU)` strategy **and** the existing
 `LFU + need_incremental_dump` — routes insert-and-evict through a
 **driver-launched cubin**. The AoT 2-score `reduce()` path retires. This gives
 `need_incremental_dump` the deterministic freq→ts tiebreak too (honors R1) at the
@@ -193,7 +193,7 @@ generic addressing resolves shared on sm_90, but confirm).
   without a `score_function` (incl. existing `LFU + need_incremental_dump`).
 - **Custom cubin** — `reduce<UserFnComparator>`: the LTO-IR fatbin (built with the
   `user_score_fn` undefined) + numba's user LTO-IR, linked via `nvJitLink` at first
-  use, cached per (arch, fn identity). Used by `LRU_LFU` tables with a
+  use, cached per (device, fn identity). Used by compound `{TIMESTAMP, LFU}` tables with a
   `score_function`.
 - Both are loaded via `cuModuleLoadData` and launched via driver `cuLaunchKernel`
   on PyTorch's stream (ext_jit `binding.cpp` pattern) — **one launch code path**.
@@ -329,7 +329,7 @@ For dynamicemb the reference `apply` entry becomes our three entries —
     assert the device `user_score_fn` matches a CPU/numpy reference.
   - Eviction: construct keys where decay order ≠ frequency order; assert the
     lowest-decay key is evicted (not the lowest-frequency one).
-  - Guardrails: `score_function` without `LRU_LFU` → error; missing numba-cuda →
+  - Guardrails: `score_function` without a `{TIMESTAMP, LFU}` strategy → error; missing numba-cuda →
     actionable error; module cache hit across repeated calls / distinct fns kept
     separate.
   - End-to-end on EOS (H100) in the devel container.
