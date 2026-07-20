@@ -166,12 +166,17 @@ def register_score_function(
                 "default (frequency, older-timestamp tiebreak) evictor."
             ) from e
         # After remap, scores is indexed in PHYSICAL order (word 0 = timestamp,
-        # word 1 = frequency). Signature is (scores, cur_timestamp) -> float64; any
-        # decay constant is baked into the function body. cc MUST be the device's
-        # (numba's default sm_50 is rejected by recent CUDA NVVM).
+        # word 1 = frequency). The return type is PINNED to float64 to match the
+        # C++ `extern "C" __device__ double user_score_fn(...)` ABI: without it
+        # numba infers the return type from the body, so a function that returns
+        # an integer expression (e.g. `return -scores[1]`, no float() cast) would
+        # compile to an integer-register return that the caller reads as junk
+        # double bits -- a silent miscompile. Pinning float64 makes numba cast the
+        # integer result instead. Any decay constant is baked into the body; cc
+        # MUST be the device's (numba's default sm_50 is rejected by recent NVVM).
         ltoir, _ = cuda.compile(
             remapped,
-            sig=(types.CPointer(types.uint64), types.uint64),
+            sig=types.float64(types.CPointer(types.uint64), types.uint64),
             device=True,
             output="ltoir",
             abi="c",
