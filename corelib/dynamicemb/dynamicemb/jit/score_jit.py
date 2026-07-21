@@ -116,19 +116,25 @@ def _remap_score_function(fn, perm):
     return ns[func.name]
 
 
-def score_function_key(fn, perm) -> int:
-    """Stable non-zero int key for a (score_function, physical permutation).
+def score_function_key(fn, perm, cc_major: int, cc_minor: int) -> int:
+    """Stable non-zero int key for a (score_function, physical permutation, device
+    compute capability).
 
-    Derived from (module, qualname, source hash, perm) so the same function under
-    different logical score orders gets DIFFERENT keys/cubins (the remapped source
-    differs). Truncated to a positive int64."""
+    Derived from (module, qualname, source hash, perm, cc). Including the perm
+    means the same function under different logical score orders gets a DIFFERENT
+    key/cubin (the remapped source differs). Including cc is what makes
+    heterogeneous multi-GPU correct: a different-arch device gets a different key,
+    so it numba-compiles and registers its OWN LTO-IR (for its cc) instead of
+    reusing the first-registered arch's -- otherwise nvJitLink would link the wrong
+    arch and cuModuleLoadData would fail on the mismatched device. Same-arch devices
+    share the key (one compile, module cached per device). Positive int64."""
     try:
         src = inspect.getsource(fn)
     except (OSError, TypeError):
         src = repr(fn)
     ident = (
         f"{getattr(fn, '__module__', '')}.{getattr(fn, '__qualname__', '')}"
-        f":{tuple(perm)}:{src}"
+        f":{tuple(perm)}:sm{cc_major}{cc_minor}:{src}"
     )
     digest = hashlib.sha1(ident.encode("utf-8")).hexdigest()
     key = int(digest[:15], 16)  # 60 bits, always positive, nonzero in practice
@@ -148,9 +154,10 @@ def register_score_function(
     ensure_lex_fatbin_loaded()
     from dynamicemb.dynamicemb_config import score_dump_permutation
 
-    # perm[j] = physical word holding logical column j.
+    # perm[j] = physical word holding logical column j. The key includes the
+    # device cc so each arch registers its own (arch-specific) numba LTO-IR.
     perm = score_dump_permutation(score_strategy)
-    key = score_function_key(fn, perm)
+    key = score_function_key(fn, perm, cc_major, cc_minor)
     if key in _registered_keys:
         return key
     with _lock:

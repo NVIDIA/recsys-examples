@@ -373,11 +373,12 @@ Remaining open / to-verify during impl:
    within a rank (fine, eviction is per-table-shard). The evict-module cache is
    device-keyed (one CUmodule per (device, key), since a CUmodule is bound to its
    context), so multiple GPUs in one process are supported.
-7. ⚠️ **Heterogeneous multi-arch + custom score_function** — a registered custom
-   function links with the compute capability recorded at first registration (the
-   numba LTO-IR is arch-specific). If one process drives GPUs of *different* arch,
-   loading the module on a mismatched-arch device fails. Homogeneous GPUs (the
-   norm) are fine; heterogeneous would need per-arch numba compiles.
+7. ✅ **Heterogeneous multi-arch + custom score_function** — resolved: the
+   `score_function_key` includes the device compute capability, so each arch gets a
+   distinct key and registers its OWN (arch-specific) numba LTO-IR. Previously the
+   key ignored cc, so a different-arch device reused the first-registered arch's
+   LTO-IR and `cuModuleLoadData` failed on the mismatch. Same-arch devices still
+   share one key/compile (module cached per device).
 
 ## 10. Implementation order (single delivery, not phased)
 
