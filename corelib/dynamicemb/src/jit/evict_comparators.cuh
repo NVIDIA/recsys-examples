@@ -23,6 +23,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // async-prefetch scan skeleton is shared but the ranking differs.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 namespace dyn_emb {
@@ -31,7 +32,8 @@ namespace dyn_emb {
 // Left undefined in the LTO-IR fatbin build; nvJitLink links the user function.
 // Contract: scores[0] = last-access timestamp, scores[1] = frequency (raw uint64
 // AoS words in shared memory). The numba side must cast to float64 before any
-// subtraction (uint64 ts - cur_ts would underflow).
+// subtraction (uint64 ts - cur_ts would underflow). It should return a FINITE
+// value; a NaN return is clamped to -inf (evict-first) below.
 extern "C" __device__ double user_score_fn(const uint64_t *scores,
                                             uint64_t cur_ts);
 
@@ -64,7 +66,13 @@ struct UserFnComparator {
   __device__ __forceinline__ static bool less(Rank a, Rank b) { return a < b; }
   __device__ __forceinline__ Rank rank(const uint64_t *scores,
                                        uint64_t cur_ts) const {
-    return user_score_fn(scores, cur_ts);
+    double s = user_score_fn(scores, cur_ts);
+    // A NaN score (a misbehaving user function) compares false against every
+    // candidate, so it could never be selected as the eviction minimum -- and an
+    // all-NaN bucket would find no victim and silently drop the incoming key.
+    // Clamp NaN to -inf so a broken score ranks lowest (deterministically
+    // evict-first), keeping inserts making progress.
+    return isnan(s) ? __longlong_as_double(0xFFF0000000000000LL) : s;
   }
 };
 

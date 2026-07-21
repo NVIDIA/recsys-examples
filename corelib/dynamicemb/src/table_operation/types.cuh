@@ -18,6 +18,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <stddef.h>
 #include <type_traits>
@@ -409,6 +410,10 @@ struct LinearBucket {
 
     static constexpr int BulkDim = BufferDim / 2;
     static_assert(BulkDim == 4);
+    // Defensive: reduce() is the single-score evictor; a num_scores_ == 2 (LruLfu)
+    // table must evict through reduce_ranked() in the cubin. Fail loud on a
+    // misrouted call instead of silently misreading the 2-word AoS layout.
+    assert(num_scores_ == 1);
 
     static constexpr int Stride = NumScorePerVector;
 
@@ -485,6 +490,7 @@ struct LinearBucket {
     }
     static constexpr int BulkDim = BufferDim / 2;
     static_assert(BulkDim == 4);
+    assert(num_scores_ == 2); // ranked evictor is LruLfu-only (2-word AoS layout)
     static constexpr int Stride = NumScorePerVector; // 2 words == 1 key
     int rank = threadIdx.x;
 

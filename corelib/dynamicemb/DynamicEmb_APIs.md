@@ -399,9 +399,10 @@ returned score are evicted.
 - The function is compiled to device code with **numba-cuda**, so it must be
   numba-compilable: index `scores` with **integer constants** only, and return a
   numeric value (the return is treated as `float64`, so an integer expression is
-  cast). Any decay constant is written directly in the body. If `score_function` is
-  omitted, eviction uses the default frequency-ranked evictor (ties broken by the
-  older timestamp).
+  cast). It should return a **finite** value; a `NaN` return is treated as
+  evict-first. Any decay constant is written directly in the body. If
+  `score_function` is omitted, eviction uses the default frequency-ranked evictor
+  (ties broken by the older timestamp).
 
 **Constraints:** `score_function` is supported **only** for the two-word compound
 `{TIMESTAMP, LFU}` strategy — exactly one `TIMESTAMP` column plus one `LFU` column,
