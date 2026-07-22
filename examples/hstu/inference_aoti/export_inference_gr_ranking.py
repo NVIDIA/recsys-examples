@@ -307,9 +307,7 @@ def export_inference_gr_ranking(
                 )
                 self._item_feature_name = example_batch.item_feature_name
                 self._action_feature_name = example_batch.action_feature_name
-                self._feature_to_max_seqlen = dict(
-                    example_batch.feature_to_max_seqlen
-                )
+                self._feature_to_max_seqlen = dict(example_batch.feature_to_max_seqlen)
                 self._max_num_candidates = int(example_batch.max_num_candidates)
                 self._actual_batch_size = (
                     int(example_batch.actual_batch_size)
@@ -318,9 +316,7 @@ def export_inference_gr_ranking(
                 )
 
             def _rebuild_batch(self, values, lengths, num_candidates):
-                offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    lengths.long()
-                )
+                offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths.long())
                 features = KeyedJaggedTensor(
                     keys=self._keys,
                     values=values,

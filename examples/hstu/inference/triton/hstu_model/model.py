@@ -222,9 +222,7 @@ def get_inference_dense_model_with_feature_names(
     )
 
     # Include the exact maximum because it is not necessarily a multiple of 256.
-    cudagraph_lengths = sorted(
-        {128, max_seq_len, *range(256, max_seq_len, 256)}
-    )
+    cudagraph_lengths = sorted({128, max_seq_len, *range(256, max_seq_len, 256)})
     hstu_cudagraph_configs = {
         "batch_size": [1, 2],
         "length_per_sequence": cudagraph_lengths,

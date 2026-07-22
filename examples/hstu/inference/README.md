@@ -28,20 +28,10 @@ We utilize the graph capture and replay support in Torch for convenient CUDA gra
 The Triton path uses the Python backend to load and serve HSTU models. The model consists of a sparse module and a dense module.
 With the NVEmbedding backend, the sparse module creates GPU embedding tables or caches for each GPU while sharing the same local parameter-store data. The dense module is served as one instance per GPU. The current Triton dense path uses `forward_nokvcache`; KV-cache inference is available in the standalone Python inference path.
 
-6. End-to-end C++ inference with Torch Export and AOTInductor, covering inference with kvcache (based on `corelib/recsys_kvcache_manager`)
+6. [End-to-end C++ inference with Torch Export and AOTInductor](../inference_aoti/README.md)
 
-We support end-to-end C++ inference from a PyTorch Python model based on `torch.export` and `torch._inductor.aoti_compile_and_package`.
-
-For the embedding part, our implementation is based on `InferenceEmbeddingTable` from DynamicEmb, using DynamicEmb `ScoredHashTable` and NVEmbedding layers. NVEmbedding implements customized `export_and_aot`, which generates layer metadata and dumped embedding table files together with the model `.pt2` archive, in order to avoid multiple copies of embedding table while loading. The structure of the complete exported and packaged model archive is:
-
-```
-path/to/model_archive
-        ├── model.pt2                              # AOT-compiled model package for AOTIModelPackageLoader
-        ├── metadata.json                          # NVE layer metadata (id, num_embeddings, emb_size, etc.)
-        └── weights/{emb_layer_module_name}.nve    # NVE weight data (LinearUVM)
-```
-
-Start with the [guide](./GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md) for HSTU Python to C++ inference example.
+The dedicated AOTI guide covers model export, native C++ replay, FlexKV-backed
+KV cache, and Triton Server deployment.
 
 ## How to Setup
 
@@ -85,9 +75,11 @@ The workflow assumes an image built from this repository's Dockerfile with:
 - The repository available at `/workspace/recsys-examples`.
 - One GPU visible in the container, with sufficient shared memory.
 
-The client and server model configuration are fixed at batch size 2. The client
-sends one unmeasured warmup batch and then performs three measured runs for
-each dataset.
+The client uses batch size 2, while the server accepts batches up to 8. The
+dense model captures CUDA graphs for batch sizes 1, 2, and the configured
+maximum of 8; other supported batch sizes use the next available graph bucket.
+The client sends one unmeasured warmup batch and then performs three measured
+runs for each dataset.
 
 ### Input paths
 

@@ -77,17 +77,13 @@ def infer_batch(client, batch):
 
     request_start_time = time.perf_counter()
     inputs = [
-        httpclient.InferInput(
-            "USER_IDS", uids.shape, np_to_triton_dtype(uids.dtype)
-        ),
+        httpclient.InferInput("USER_IDS", uids.shape, np_to_triton_dtype(uids.dtype)),
         httpclient.InferInput(
             "TOKEN_LENGTHS",
             token_lens.shape,
             np_to_triton_dtype(token_lens.dtype),
         ),
-        httpclient.InferInput(
-            "TOKENS", tokens.shape, np_to_triton_dtype(tokens.dtype)
-        ),
+        httpclient.InferInput("TOKENS", tokens.shape, np_to_triton_dtype(tokens.dtype)),
         httpclient.InferInput(
             "NUM_CANDIDATES",
             num_candidates.shape,
@@ -100,9 +96,7 @@ def infer_batch(client, batch):
     inputs[3].set_data_from_numpy(num_candidates)
 
     outputs = [httpclient.InferRequestedOutput("OUTPUT")]
-    response = client.infer(
-        model_name, inputs, request_id=str(0), outputs=outputs
-    )
+    response = client.infer(model_name, inputs, request_id=str(0), outputs=outputs)
     elapsed_seconds = time.perf_counter() - request_start_time
     return batch, response, elapsed_seconds
 
@@ -154,14 +148,10 @@ def run_ranking_gr_evaluate(
             warmup_batch = next(iter(dataloader))
             warmup_batch, warmup_response, _ = infer_batch(client, warmup_batch)
             update_metrics(eval_module, warmup_batch, warmup_response)
-            print(
-                "Warmup: sent the first batch, skipping it in all measured runs"
-            )
+            print("Warmup: sent the first batch, skipping it in all measured runs")
             if post_warmup_sleep_seconds > 0:
                 time.sleep(post_warmup_sleep_seconds)
-                print(
-                    f"Slept {post_warmup_sleep_seconds:.3f} seconds after warmup"
-                )
+                print(f"Slept {post_warmup_sleep_seconds:.3f} seconds after warmup")
 
             run_elapsed_seconds = []
             for run_index in range(1, num_runs + 1):
