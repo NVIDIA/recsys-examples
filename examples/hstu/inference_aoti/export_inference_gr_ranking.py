@@ -22,6 +22,7 @@ import gin
 import torch
 import torch.distributed as dist
 from commons.datasets import get_data_loader
+from commons.datasets.hstu_batch import HSTUBatch
 from commons.datasets.hstu_sequence_dataset import get_dataset
 from commons.hstu_data_preprocessor import get_common_preprocessors
 from commons.utils.stringify import stringify_dict
@@ -290,15 +291,83 @@ def export_inference_gr_ranking(
         )
         batch.labels = None
 
-        # get dynamic shapes
+        # ---- Plain-tuple input wrapper (Triton AOTI call_spec compatibility) ----
+        # Triton's PyTorch AOTI backend accepts builtin pytree containers plus
+        # tensors, but rejects custom HSTUBatch / KeyedJaggedTensor nodes in the
+        # exported input spec. Export a thin wrapper with only tensor inputs and
+        # rebuild the HSTUBatch internally.
+        class _PlainInputWrapper(torch.nn.Module):
+            def __init__(self, inner, example_batch):
+                super().__init__()
+                self.inner = inner
+                self._batch_size = int(example_batch.batch_size)
+                self._keys = list(example_batch.features.keys())
+                self._contextual_feature_names = list(
+                    example_batch.contextual_feature_names
+                )
+                self._item_feature_name = example_batch.item_feature_name
+                self._action_feature_name = example_batch.action_feature_name
+                self._feature_to_max_seqlen = dict(
+                    example_batch.feature_to_max_seqlen
+                )
+                self._max_num_candidates = int(example_batch.max_num_candidates)
+                self._actual_batch_size = (
+                    int(example_batch.actual_batch_size)
+                    if example_batch.actual_batch_size is not None
+                    else None
+                )
+
+            def _rebuild_batch(self, values, lengths, num_candidates):
+                offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+                    lengths.long()
+                )
+                features = KeyedJaggedTensor(
+                    keys=self._keys,
+                    values=values,
+                    lengths=lengths,
+                    offsets=offsets,
+                )
+                return HSTUBatch(
+                    features=features,
+                    batch_size=self._batch_size,
+                    feature_to_max_seqlen=self._feature_to_max_seqlen,
+                    contextual_feature_names=self._contextual_feature_names,
+                    actual_batch_size=self._actual_batch_size,
+                    item_feature_name=self._item_feature_name,
+                    action_feature_name=self._action_feature_name,
+                    max_num_candidates=self._max_num_candidates,
+                    num_candidates=num_candidates,
+                )
+
+            def forward(
+                self,
+                values,
+                lengths,
+                num_candidates,
+            ):
+                rebuilt = self._rebuild_batch(values, lengths, num_candidates)
+                logits = self.inner(rebuilt)
+                return logits.float().cpu()
+
+        export_model = _PlainInputWrapper(model, batch)
+        example_values = batch.features.values()
+        example_lengths = batch.features.lengths()
+        example_num_candidates = batch.num_candidates
+        example_inputs = (
+            example_values,
+            example_lengths,
+            example_num_candidates,
+        )
+
+        # get dynamic shapes (now keyed on the plain tensor inputs)
         sc = ShapesCollection()
         dim_batch = Dim("batch_size", min=1, max=8)
 
         num_features = len(batch.features.keys())
-        sc[batch.features.values()] = {0: Dim("tokens", min=1, max=40000)}
-        sc[batch.features.lengths()] = {0: dim_batch * num_features}
-        sc[batch.num_candidates] = {0: dim_batch}
-        dynamic_shapes = sc.dynamic_shapes(model, (batch,))
+        sc[example_values] = {0: Dim("tokens", min=1, max=40000)}
+        sc[example_lengths] = {0: dim_batch * num_features}
+        sc[example_num_candidates] = {0: dim_batch}
+        dynamic_shapes = sc.dynamic_shapes(export_model, example_inputs)
         print(f"[INFO] Dynamic shapes: {dynamic_shapes}")
 
         if debug_flattened_inputs:
@@ -307,7 +376,12 @@ def export_inference_gr_ranking(
 
         # export & aoti_compile_and_package
         export_dir = os.path.join(os.path.dirname(__file__), "hstu_gr_ranking_model")
-        export_aot(model, (batch,), export_dir, dynamic_shapes=dynamic_shapes)
+        export_aot(
+            export_model,
+            example_inputs,
+            export_dir,
+            dynamic_shapes=dynamic_shapes,
+        )
         print(f"[INFO] Exported and packaged the model to:")
         print(f"       {export_dir}/")
         print(
@@ -346,6 +420,7 @@ def export_inference_gr_ranking(
                         )
                     )
                     ref_logits = model(batch)
+                    ref_logits_cpu = ref_logits.detach().cpu()
 
                     if not feature_keys_dumped:
                         torch.save(
@@ -369,17 +444,17 @@ def export_inference_gr_ranking(
                         ),
                     )
                     _save_tensor_cpp_compatible(
-                        ref_logits.detach().cpu(),
+                        ref_logits_cpu,
                         os.path.join(dump_dir, f"batch_{dump_idx:06d}_ref_logits.pt"),
                     )
                     dump_idx += 1
 
                     print(
                         f"    [Batch {dump_idx}] Check equal:",
-                        torch.max(torch.abs(logits - ref_logits)).item() <= 0.0625,
+                        torch.max(torch.abs(logits - ref_logits_cpu)).item() <= 0.0625,
                     )
 
-                eval_module(logits, batch.labels.values())
+                eval_module(logits.cuda(), batch.labels.values())
             except StopIteration:
                 break
         # torch.cuda.profiler.stop()
