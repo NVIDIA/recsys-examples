@@ -247,7 +247,8 @@ std::vector<at::Tensor> get_cache_tables_impl(at::Tensor ordering_tensor) {
 at::Tensor offload_flush_impl(at::Tensor ordering_tensor) {
     log_op("offload_flush", "enter");
     auto runtime = KVCacheRuntimeContext::instance().manager();
-    at::Tensor reap_result;
+    at::Tensor reap_result = at::empty(
+        {0, 3}, at::dtype(torch::kInt64).device(at::kCPU));
     while (runtime->get_num_offload_tasks() > 0) {
         reap_result = runtime->offload_kvcache_reap_completed();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));  // sleep for a while before checking again

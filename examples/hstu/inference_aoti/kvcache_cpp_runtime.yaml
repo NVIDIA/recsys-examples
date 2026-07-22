@@ -21,7 +21,7 @@ offload_timeout_ms: 100.0
 offload_mode: lazy
 host_kvstorage_fail_policy: fail_open
 
-cpu_cache_gb: 19
+cpu_cache_gb: 1
 ssd_cache_gb: 0
 enable_p2p_cpu: false
 enable_p2p_ssd: false
