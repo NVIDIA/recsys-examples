@@ -125,6 +125,43 @@ table_options = DynamicEmbTableOptions(
 # ...
 ```
 
+### Customized Eviction Score
+
+When a dynamic embedding table is full, DynamicEmb evicts keys by a per-key
+**score**. Beyond the built-in strategies (`TIMESTAMP`, `STEP`, `LFU`, ...), you
+can rank eviction with your own function: configure the compound score strategy
+`(TIMESTAMP, LFU)` (which keeps two scores per key — a last-access timestamp and an
+access frequency) and pass a `score_function` in `DynamicEmbTableOptions`. The
+function receives each key's scores plus the current time and returns a `float64`;
+the keys with the **lowest** scores are evicted first. This lets you express, for
+example, a time-decayed LFU that keeps keys which are both frequent and recently
+used.
+
+```python
+import math
+from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+
+def lru_lfu_decay_score(scores, cur_timestamp):
+    # scores are in the score_strategy tuple order:
+    # scores[0] = last-access timestamp, scores[1] = frequency.
+    age_seconds = (cur_timestamp - scores[0]) * 1e-9
+    return math.log(max(scores[1], 1)) + age_seconds * math.log(0.9)
+
+table_options = DynamicEmbTableOptions(
+    score_strategy=(
+        DynamicEmbScoreStrategy.TIMESTAMP,
+        DynamicEmbScoreStrategy.LFU,
+    ),
+    score_function=lru_lfu_decay_score,
+)
+```
+
+`score_function` requires `numba-cuda` and is supported only for the compound
+`(TIMESTAMP, LFU)` strategy. The tuple order also determines the score column order
+when dumping to file and how `score_function` indexes `scores`. See the "Customized
+eviction via `score_function`" and "Compound (multi-score) strategies and score
+order" sections in [DynamicEmb_APIs.md](./DynamicEmb_APIs.md) for details.
+
 ## Getting Started
 
 We provide benchmark and unit test code to demonstrate how to use DynamicEmb. Please visit the benchmark and test folders. Below is a pseudocode example demonstrating how to convert TorchREC code to use DynamicEmb.
