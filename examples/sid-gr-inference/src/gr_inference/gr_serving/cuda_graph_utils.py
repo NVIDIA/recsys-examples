@@ -19,6 +19,10 @@ class CudaGraphCacheMixin:
     miss_reasons: dict[str, int]
     fallback_eager_count: int
 
+    # Env var name that, when set, opts this runner out of pool sharing (each
+    # capture gets its own private pool). Subclasses override per runner.
+    _separate_pools_env: str = ""
+
     def _record_miss(self, reason: str, *, fallback: bool = False) -> None:
         self.miss_count += 1
         self.miss_reasons[reason] = self.miss_reasons.get(reason, 0) + 1
@@ -40,6 +44,25 @@ class CudaGraphCacheMixin:
         while len(self._graphs) > self.max_entries:
             self._graphs.popitem(last=False)
             self.evictions += 1
+
+    def _graph_capture_kwargs(self, torch) -> dict[str, Any]:
+        """Return ``torch.cuda.graph`` kwargs sharing one private pool.
+
+        By default each capture gets its own private pool, so capturing N graphs
+        reserves N high-water marks. Sharing one ``graph_pool_handle`` lets
+        transient allocations be reused across graphs, collapsing toward a
+        single high-water mark. The pool is lazily created and cached on
+        ``self._graph_pool``. Set the env var named by ``_separate_pools_env``
+        (a subclass class attribute) to opt out into per-capture private pools.
+        """
+        if self._separate_pools_env and env_flag(self._separate_pools_env):
+            return {}
+        graph_pool_handle = getattr(torch.cuda, "graph_pool_handle", None)
+        if getattr(self, "_graph_pool", None) is None and callable(graph_pool_handle):
+            self._graph_pool = graph_pool_handle()
+        if getattr(self, "_graph_pool", None) is None:
+            return {}
+        return {"pool": self._graph_pool}
 
 
 def env_int(name: str, default: int) -> int:

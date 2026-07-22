@@ -283,6 +283,7 @@ if nn is not None:
             return_lse: bool = False,
             backend_name: str = "dsl",
             timing_recorder: Any | None = None,
+            logits_out: Any | None = None,
         ):
             if beam_token_ids.shape[0] != generation.prefill.batch_size:
                 raise ValueError("beam_token_ids batch must match prefill batch")
@@ -330,7 +331,7 @@ if nn is not None:
                 if normed_hidden_states is not None
                 else self.norm(hidden_states)
             )
-            return _linear_project(self.lm_head, hidden_states)
+            return _linear_project(self.lm_head, hidden_states, out=logits_out)
 
         def generate_fixed_beam(
             self,
@@ -408,7 +409,17 @@ def _timed(timing_recorder, name: str):
     return timing_recorder.section(name)
 
 
-def _linear_project(linear, hidden_states):
+def _linear_project(linear, hidden_states, *, out=None):
+    if out is not None:
+        # Write the projection into a caller-supplied buffer (e.g. a CUDA-graph
+        # shared logits buffer) via matmul out=, so the output is not allocated
+        # fresh inside the graph's private pool on every captured shape. The
+        # caller (forward_decode_step) runs under @torch.no_grad(), which is
+        # required because matmul's out= form rejects autograd-tracked inputs.
+        flat_input = hidden_states.reshape(-1, hidden_states.shape[-1])
+        out_flat = out.reshape(-1, out.shape[-1])
+        torch.matmul(flat_input, linear.weight.t(), out=out_flat)
+        return out
     if (
         _flatten_linear_disabled()
         or not hasattr(hidden_states, "dim")

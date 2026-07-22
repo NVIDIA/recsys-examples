@@ -14,6 +14,7 @@ from gr_inference.gr_kv import BeamKV, ContextKV
 from gr_inference.gr_runtime import GRGenerationState
 from gr_inference.gr_runtime.generation import PrefillResult
 from gr_inference.gr_serving.cuda_graph_utils import CudaGraphCacheMixin
+from gr_inference.gr_serving.cuda_graph_utils import env_flag as _env_flag
 from gr_inference.gr_serving.cuda_graph_utils import env_int as _env_int
 from gr_inference.gr_serving.cuda_graph_utils import is_cuda_tensor as _is_cuda_tensor
 from gr_inference.gr_serving.cuda_graph_utils import tensor_data_ptr as _tensor_data_ptr
@@ -41,11 +42,15 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
     can reuse request-owned KV addresses without staging KV copies.
     """
 
+    _separate_pools_env = "GR_INFERENCE_DECODE_CUDA_GRAPH_SEPARATE_POOLS"
+
     def __init__(self, model: Any, decode_engine: Any) -> None:
         self.model = model
         self.decode_engine = decode_engine
         self.max_entries = _env_int("GR_INFERENCE_DECODE_CUDA_GRAPH_MAX_ENTRIES", 128)
         self.allow_captures = True
+        self._graph_pool: Any | None = None
+        self._shared_logits: dict[tuple[int, int], Any] = {}
         self._graphs: OrderedDict[tuple[Any, ...], _DecodeGraphEntry] = OrderedDict()
         self.replays = 0
         self.captures = 0
@@ -70,6 +75,8 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
         return {
             "decode_cuda_graph_entries": len(self._graphs),
             "decode_cuda_graph_captures_enabled": int(self.allow_captures),
+            "decode_cuda_graph_shared_pool": int(self._graph_pool is not None),
+            "decode_cuda_graph_shared_output_buffers": len(self._shared_logits),
             "decode_cuda_graph_captures": self.captures,
             "decode_cuda_graph_replays": self.replays,
             "decode_cuda_graph_failures": self.failures,
@@ -193,6 +200,51 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
         self._copy_written_beam_step(entry, generation)
         return entry.output
 
+    def _shared_logits_for(
+        self, beam_token_ids: Any, *, active_beam_width: int
+    ) -> Any:
+        """Return a shared ``[bucket, beam, vocab]`` logits buffer for this shape.
+
+        Keyed by ``(active_beam_width, bucket)`` so every captured graph of the
+        same decode shape reuses one buffer (allocated once, exactly sized)
+        rather than each graph stashing its own logits in its private pool.
+        """
+        import torch
+
+        bucket = int(beam_token_ids.shape[0])
+        key = (int(active_beam_width), bucket)
+        buf = self._shared_logits.get(key)
+        if buf is None:
+            vocab = int(self.model.lm_head.out_features)
+            buf = torch.empty(
+                (bucket, int(active_beam_width), vocab),
+                dtype=self.model.lm_head.weight.dtype,
+                device=beam_token_ids.device,
+            )
+            self._shared_logits[key] = buf
+        return buf
+
+    def _store_graph(self, key: tuple[Any, ...], entry: Any) -> None:
+        super()._store_graph(key, entry)
+        # The shared logits buffers are keyed by (beam_width, bucket), which is
+        # independent of the graph LRU. After the base store (which may evict the
+        # least-recently-used graph), drop buffers whose shape no longer has any
+        # live graph entry, so a large transient capture cannot stay resident
+        # after its graphs are evicted (which would re-grow idle memory).
+        live_shapes = {
+            (int(graph.active_beam_width), int(graph.beam_token_ids.shape[0]))
+            for graph in self._graphs.values()
+        }
+        # The caller replays the just-captured graph immediately after _capture,
+        # so keep its output buffer alive even when the base store did not retain
+        # the entry (max_entries <= 0 clears _graphs and drops the new entry).
+        live_shapes.add(
+            (int(entry.active_beam_width), int(entry.beam_token_ids.shape[0]))
+        )
+        for shape in list(self._shared_logits):
+            if shape not in live_shapes:
+                del self._shared_logits[shape]
+
     def _capture(
         self,
         key: tuple[Any, ...],
@@ -232,6 +284,19 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
             active_beam_width=active_beam_width,
         )
 
+        # Shared, reused logits output buffer keyed by (beam_width, bucket): all
+        # captured graphs of the same shape write their lm_head output here via
+        # matmul out=, so the [B, beam, vocab] logits is allocated ONCE per shape
+        # instead of being duplicated into every graph's private pool. Safe because
+        # each replay's output is consumed before the next replay overwrites it.
+        logits_out = (
+            None
+            if _env_flag("GR_INFERENCE_DECODE_CUDA_GRAPH_SEPARATE_LOGITS")
+            else self._shared_logits_for(
+                beam_token_ids, active_beam_width=active_beam_width
+            )
+        )
+
         def run_once():
             return self.model.forward_decode_step(
                 entry.beam_token_ids,
@@ -242,6 +307,7 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
                 topk_indices=entry.topk_indices,
                 decode_nums=decode_nums,
                 timing_recorder=None,
+                logits_out=logits_out,
             )
 
         # Warm up kernels and lazy imports outside capture.
@@ -252,7 +318,7 @@ class GRDecodeCudaGraphRunner(CudaGraphCacheMixin):
         torch.cuda.current_stream(device=beam_token_ids.device).wait_stream(side_stream)
         torch.cuda.synchronize(device=beam_token_ids.device)
 
-        with torch.cuda.graph(entry.graph):
+        with torch.cuda.graph(entry.graph, **self._graph_capture_kwargs(torch)):
             entry.output = run_once()
 
         self._store_graph(key, entry)
