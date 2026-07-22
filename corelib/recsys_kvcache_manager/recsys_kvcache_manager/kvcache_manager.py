@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -27,6 +28,15 @@ from .host_kvstorage_manager import (
 )
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVCacheOffloadMode, KVIndexMeta, KVLookupResult
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class KVCacheManager:
@@ -68,13 +78,18 @@ class KVCacheManager:
         user_ids: torch.Tensor,
         sequence_lengths: torch.Tensor,
     ) -> Tuple[KVIndexMeta, KVLookupResult]:
-        gpu_lookup_results = self.gpu_kvcache_mgr.lookup(user_ids)
-        index_meta = self.host_kvstorage_manager.build_index_meta(
-            user_ids, sequence_lengths
-        )
-        host_lookup_results = self.host_kvstorage_manager.lookup_kvcache(index_meta)
-
-        lookup_results = KVLookupResult.merge(gpu_lookup_results, host_lookup_results)
+        with _nvtx_range("recsys.kvcache.lookup.gpu"):
+            gpu_lookup_results = self.gpu_kvcache_mgr.lookup(user_ids)
+        with _nvtx_range("recsys.kvcache.lookup.build_index_meta"):
+            index_meta = self.host_kvstorage_manager.build_index_meta(
+                user_ids, sequence_lengths
+            )
+        with _nvtx_range("recsys.kvcache.lookup.host"):
+            host_lookup_results = self.host_kvstorage_manager.lookup_kvcache(index_meta)
+        with _nvtx_range("recsys.kvcache.lookup.merge"):
+            lookup_results = KVLookupResult.merge(
+                gpu_lookup_results, host_lookup_results
+            )
         return index_meta, lookup_results
 
     def allocate_kvcache(
@@ -83,12 +98,13 @@ class KVCacheManager:
         lookup_results: KVLookupResult,
         output_kvcache_metadata: Optional[KVCacheMetadata] = None,
     ) -> KVCacheMetadata:
-        return self.gpu_kvcache_mgr.allocate(
-            index_meta.user_ids,
-            index_meta.seq_lengths,
-            lookup_results,
-            output_kvcache_metadata=output_kvcache_metadata,
-        )
+        with _nvtx_range("recsys.kvcache.allocate"):
+            return self.gpu_kvcache_mgr.allocate(
+                index_meta.user_ids,
+                index_meta.seq_lengths,
+                lookup_results,
+                output_kvcache_metadata=output_kvcache_metadata,
+            )
 
     def onboard_launch(
         self,
@@ -96,12 +112,14 @@ class KVCacheManager:
         lookup_result: KVLookupResult,
         kvcache_metadata: KVCacheMetadata,
     ) -> HostKVTaskHandle:
-        task_handle = self.host_kvstorage_manager.onboard_kvcache_launch(
-            index_meta,
-            lookup_result,
-            kvcache_metadata,
-        )
-        kvcache_metadata.kv_onload_handle = task_handle
+        with _nvtx_range("recsys.kvcache.onboard_launch"):
+            task_handle = self.host_kvstorage_manager.onboard_kvcache_launch(
+                index_meta,
+                lookup_result,
+                kvcache_metadata,
+            )
+            task_handle.onboard_wait_by_layer = self.onboard_wait_by_layer
+            kvcache_metadata.kv_onload_handle = task_handle
 
         # Skip recording the ongoing onboard tasks. For now there should be only one task.
         # self.ongoing_onboard_tasks.append(task_handle)
@@ -112,17 +130,18 @@ class KVCacheManager:
         kv_index_meta: KVIndexMeta,
         task_handle: Optional[HostKVTaskHandle],
     ) -> Optional[HostKVWaitResult]:
-        if self.host_kvstorage_manager.backend_name == "native":
-            return self.host_kvstorage_manager.onboard_kvcache_wait(task_handle)
-        elif self.host_kvstorage_manager.backend_name == "flexkv":
-            print(
-                "[WARNING] onboard_try_wait is not implemented for flexkv backend currently. Calling onboard_wait instead."
-            )
-            return self.onboard_wait(kv_index_meta, task_handle)
-        else:
-            raise NotImplementedError(
-                f"Unknown host kvcache backend {self.host_kvstorage_manager.backend_name}"
-            )
+        with _nvtx_range("recsys.kvcache.onboard_try_wait"):
+            if self.host_kvstorage_manager.backend_name == "native":
+                return self.host_kvstorage_manager.onboard_kvcache_wait(task_handle)
+            elif self.host_kvstorage_manager.backend_name == "flexkv":
+                print(
+                    "[WARNING] onboard_try_wait is not implemented for flexkv backend currently. Calling onboard_wait instead."
+                )
+                return self.onboard_wait(kv_index_meta, task_handle)
+            else:
+                raise NotImplementedError(
+                    f"Unknown host kvcache backend {self.host_kvstorage_manager.backend_name}"
+                )
 
     def onboard_wait(
         self,
@@ -138,7 +157,8 @@ class KVCacheManager:
                 status=HostKVTaskStatus.UNINITIALIZED,
                 ready=False,
             )
-        wait_result = self.host_kvstorage_manager.onboard_kvcache_wait(task_handle)
+        with _nvtx_range("recsys.kvcache.onboard_wait"):
+            wait_result = self.host_kvstorage_manager.onboard_kvcache_wait(task_handle)
         # Note: wait_result.status == SKIPPED means waiting/sync here is not supported with backend in use.
 
         if wait_result.status in (
@@ -163,110 +183,143 @@ class KVCacheManager:
                     )
         return wait_result
 
-    def offload_launch(
+    def onboard_wait_by_layer(
         self,
-        index_meta: KVIndexMeta,
-        kvcache_metadata: Optional[KVCacheMetadata] = None,
-    ):
-        if self.host_kvstorage_manager.backend_name == "flexkv":
-            assert (
-                kvcache_metadata is not None
-            ), "flexkv offload requires kvcache_metadata"
-
-        # 1. Get the maximum batch for offloading from GPU
-        # 2. Lookup host again in case of multi-GPU instances
-        if self.host_kvstorage_manager.backend_name == "native":
-            uids_to_offload = self.gpu_kvcache_mgr.check_for_offload(
-                index_meta.user_ids
-            )
-            _index_meta = self.host_kvstorage_manager.build_index_meta(
-                uids_to_offload,
-                torch.empty(
-                    0, dtype=torch.int32
-                ),  # dummy seq lengths since they are not used for lookup
-            )
-            offloaded_lengths = self.host_kvstorage_manager.lookup_kvcache(
-                _index_meta
-            ).host_cached_lengths
-        else:
-            uids_to_offload = index_meta.user_ids
-            offloaded_lengths = self.dummy_empty_tensor
-
-        # 3. Acquire and lock GPU cache pages
-        (
-            offload_user_ids,
-            offload_start_indices,
-            offload_page_indices_list,
-        ) = self.gpu_kvcache_mgr.acquire_offload_pages(
-            uids_to_offload,
-            offloaded_lengths,
-            True if self.host_kvstorage_manager.backend_name == "flexkv" else False,
-        )
-        # returned with cache pages locked (per user).
-        if offload_user_ids.size(0) == 0:
-            return None
-
-        # 4. Launch the offloading thru Host
-        task_handle = self.host_kvstorage_manager.offload_kvcache_launch(
-            offload_user_ids,
-            offload_start_indices,
-            offload_page_indices_list,
-            index_meta=index_meta,
-            kvcache_metadata=kvcache_metadata,
-        )
+        task_handle: Optional[HostKVTaskHandle],
+        layer_idx: int,
+    ) -> Optional[HostKVWaitResult]:
         if (
             task_handle is None
             or task_handle.handle is None
             or task_handle.status == HostKVTaskStatus.SKIPPED
         ):
-            # offload is rejected on the host side (e.g., due to overload), release the locks immediately.
-            self.gpu_kvcache_mgr.release_offload_pages(
-                offload_user_ids,
-                offload_start_indices,
-                self.dummy_empty_tensor,
-                offloaded=[0 for _ in range(offload_user_ids.size(0))],
+            return HostKVWaitResult(
+                status=HostKVTaskStatus.UNINITIALIZED,
+                ready=False,
             )
-            return None
+        return self.host_kvstorage_manager.onboard_kvcache_wait_by_layer(
+            task_handle,
+            layer_idx,
+        )
 
-        # Launch failure is not resolved here
-        self.ongoing_offload_tasks.append(task_handle)
-        return task_handle
+    def offload_launch(
+        self,
+        index_meta: KVIndexMeta,
+        kvcache_metadata: Optional[KVCacheMetadata] = None,
+    ):
+        with _nvtx_range("recsys.kvcache.offload_launch"):
+            if self.host_kvstorage_manager.backend_name == "flexkv":
+                assert (
+                    kvcache_metadata is not None
+                ), "flexkv offload requires kvcache_metadata"
+
+            # 1. Get the maximum batch for offloading from GPU
+            # 2. Lookup host again in case of multi-GPU instances
+            if self.host_kvstorage_manager.backend_name == "native":
+                uids_to_offload = self.gpu_kvcache_mgr.check_for_offload(
+                    index_meta.user_ids
+                )
+                _index_meta = self.host_kvstorage_manager.build_index_meta(
+                    uids_to_offload,
+                    torch.empty(
+                        0, dtype=torch.int32
+                    ),  # dummy seq lengths since they are not used for lookup
+                )
+                offloaded_lengths = self.host_kvstorage_manager.lookup_kvcache(
+                    _index_meta
+                ).host_cached_lengths
+            else:
+                uids_to_offload = index_meta.user_ids
+                offloaded_lengths = self.dummy_empty_tensor
+
+            # 3. Acquire and lock GPU cache pages
+            with _nvtx_range("recsys.kvcache.offload_launch.acquire_pages"):
+                (
+                    offload_user_ids,
+                    offload_start_indices,
+                    offload_page_indices_list,
+                ) = self.gpu_kvcache_mgr.acquire_offload_pages(
+                    uids_to_offload,
+                    offloaded_lengths,
+                    True
+                    if self.host_kvstorage_manager.backend_name == "flexkv"
+                    else False,
+                )
+            # returned with cache pages locked (per user).
+            if offload_user_ids.size(0) == 0:
+                return None
+
+            # 4. Launch the offloading thru Host
+            with _nvtx_range("recsys.kvcache.offload_launch.launch"):
+                task_handle = self.host_kvstorage_manager.offload_kvcache_launch(
+                    offload_user_ids,
+                    offload_start_indices,
+                    offload_page_indices_list,
+                    index_meta=index_meta,
+                    kvcache_metadata=kvcache_metadata,
+                )
+            if (
+                task_handle is None
+                or task_handle.handle is None
+                or task_handle.status == HostKVTaskStatus.SKIPPED
+            ):
+                # offload is rejected on the host side (e.g., due to overload), release the locks immediately.
+                self.gpu_kvcache_mgr.release_offload_pages(
+                    offload_user_ids,
+                    offload_start_indices,
+                    self.dummy_empty_tensor,
+                    offloaded=[0 for _ in range(offload_user_ids.size(0))],
+                )
+                return None
+
+            # Launch failure is not resolved here
+            self.ongoing_offload_tasks.append(task_handle)
+            return task_handle
 
     def offload_try_wait(self) -> None:
-        remain_tasks = list()
-        for task_handle in self.ongoing_offload_tasks:
-            wait_result = self.host_kvstorage_manager.offload_kvcache_wait(task_handle)
-            if wait_result.status == HostKVTaskStatus.LAUNCHED:
-                remain_tasks.append(task_handle)
-                continue
-            if wait_result.status == HostKVTaskStatus.READY:
-                offload_success = self.host_kvstorage_manager.finish_task(task_handle)
-            elif wait_result.status == HostKVTaskStatus.SKIPPED:
-                # No need to release GPU pages since offload is skipped
-                print(f"Offload skipped for {task_handle.user_ids.tolist()}")
-                continue
-            elif wait_result.status in (
-                HostKVTaskStatus.FAILED,
-                HostKVTaskStatus.TIMEOUT,
-                HostKVTaskStatus.CANCELLED,
-            ):
-                should_raise = self.host_kvstorage_fail_policy == "fail_close"
-                if should_raise:
-                    raise RuntimeError(
-                        f"Offloading failed for {wait_result.failed_user_ids}, fail_policy={self.host_kvstorage_fail_policy}"
-                    )
-
-                offload_success = [0 for _ in range(task_handle.user_ids.size(0))]
-                self.host_kvstorage_manager.cancel_task(task_handle)
-            else:
-                raise RuntimeError(
-                    f"Unexpected offload wait result status: {wait_result.status.value}, msg={wait_result.message}"
+        with _nvtx_range("recsys.kvcache.offload_try_wait"):
+            remain_tasks = list()
+            for task_handle in self.ongoing_offload_tasks:
+                wait_result = self.host_kvstorage_manager.offload_kvcache_wait(
+                    task_handle
                 )
-            self.gpu_kvcache_mgr.release_offload_pages(
-                *(self.host_kvstorage_manager.get_offload_handle_metadata(task_handle)),
-                offloaded=offload_success,
-            )
-        self.ongoing_offload_tasks = remain_tasks
+                if wait_result.status == HostKVTaskStatus.LAUNCHED:
+                    remain_tasks.append(task_handle)
+                    continue
+                if wait_result.status == HostKVTaskStatus.READY:
+                    offload_success = self.host_kvstorage_manager.finish_task(
+                        task_handle
+                    )
+                elif wait_result.status == HostKVTaskStatus.SKIPPED:
+                    # No need to release GPU pages since offload is skipped
+                    print(f"Offload skipped for {task_handle.user_ids.tolist()}")
+                    continue
+                elif wait_result.status in (
+                    HostKVTaskStatus.FAILED,
+                    HostKVTaskStatus.TIMEOUT,
+                    HostKVTaskStatus.CANCELLED,
+                ):
+                    should_raise = self.host_kvstorage_fail_policy == "fail_close"
+                    if should_raise:
+                        raise RuntimeError(
+                            f"Offloading failed for {wait_result.failed_user_ids}, fail_policy={self.host_kvstorage_fail_policy}"
+                        )
+
+                    offload_success = [0 for _ in range(task_handle.user_ids.size(0))]
+                    self.host_kvstorage_manager.cancel_task(task_handle)
+                else:
+                    raise RuntimeError(
+                        f"Unexpected offload wait result status: {wait_result.status.value}, msg={wait_result.message}"
+                    )
+                self.gpu_kvcache_mgr.release_offload_pages(
+                    *(
+                        self.host_kvstorage_manager.get_offload_handle_metadata(
+                            task_handle
+                        )
+                    ),
+                    offloaded=offload_success,
+                )
+            self.ongoing_offload_tasks = remain_tasks
 
     def evict(
         self, user_ids: torch.Tensor, for_gpu: bool = False, for_host: bool = False
@@ -338,6 +391,22 @@ class KVCacheManager:
                 }
             else:
                 flexkv_as_batch = bool(flexkv_as_batch_raw)
+            flexkv_enable_layerwise = extra.get("flexkv_enable_layerwise", None)
+            if isinstance(flexkv_enable_layerwise, str):
+                flexkv_enable_layerwise = flexkv_enable_layerwise.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            elif flexkv_enable_layerwise is not None:
+                flexkv_enable_layerwise = bool(flexkv_enable_layerwise)
+            flexkv_layerwise_eventfd_socket = extra.get(
+                "flexkv_layerwise_eventfd_socket", None
+            )
+            flexkv_layerwise_counter_id = int(
+                extra.get("flexkv_layerwise_counter_id", 0)
+            )
 
             return FlexKVStorageManager(
                 mode=flexkv_mode,
@@ -356,6 +425,9 @@ class KVCacheManager:
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
                 config_path=flexkv_config_path,
+                enable_layerwise=flexkv_enable_layerwise,
+                layerwise_eventfd_socket=flexkv_layerwise_eventfd_socket,
+                layerwise_counter_id=flexkv_layerwise_counter_id,
             )
         else:
             raise NotImplementedError(

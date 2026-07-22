@@ -22,20 +22,19 @@ from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 
 
-def _get_flexkv_config_path() -> str:
-    return os.environ.get("RECSYS_FLEXKV_CONFIG_PATH", "")
+def _get_flexkv_enable_layerwise() -> str:
+    return os.environ.get("RECSYS_FLEXKV_ENABLE_LAYERWISE", "")
 
 
 def create_testing_kvcache_manager() -> KVCacheManager:
-    flexkv_config_path = _get_flexkv_config_path()
+    flexkv_enable_layerwise = _get_flexkv_enable_layerwise()
     extra_configs = {
         "flexkv_mode": "direct",
         "flexkv_host_kvstorage_fail_policy": "fail_open",
         "flexkv_enable_mps": 0,
-        "flexkv_as_batch": 1,
     }
-    if flexkv_config_path:
-        extra_configs["flexkv_config_path"] = flexkv_config_path
+    if flexkv_enable_layerwise:
+        extra_configs["flexkv_enable_layerwise"] = flexkv_enable_layerwise
 
     kvcache_config = get_kvcache_config(
         num_layers=3,
@@ -69,21 +68,15 @@ def create_testing_kvcache_manager() -> KVCacheManager:
     )
     print(f"[TEST] KVCache GPU Memory Usage: {gpu_gib} GiB.")
     print(f"[TEST] KVCache Host Memory Usage: {host_gib} GiB.")
-    if flexkv_config_path:
-        print(f"[TEST] FlexKV config path: {flexkv_config_path}")
     kvcache_mgr = KVCacheManager.from_config(kvcache_config)
     flexkv_mgr = kvcache_mgr.host_kvstorage_manager
-    cache_cfg = flexkv_mgr._client.cache_config
-    if cache_cfg.enable_ssd:
+    if flexkv_mgr.enable_layerwise:
         print(
-            "[TEST] Created KVCache Manager with FlexKV SSD tier: "
-            f"num_cpu_blocks={cache_cfg.num_cpu_blocks}, "
-            f"num_ssd_blocks={cache_cfg.num_ssd_blocks}, "
-            f"ssd_cache_dir={cache_cfg.ssd_cache_dir}, "
-            f"enable_gds={cache_cfg.enable_gds}"
+            "[TEST] FlexKV layerwise transfer enabled: "
+            f"eventfd_socket={flexkv_mgr.layerwise_eventfd_socket}, "
+            f"counter_id={flexkv_mgr.layerwise_counter_id}"
         )
-    else:
-        print("[TEST] Created KVCache Manager with FlexKV CPU tier only")
+    print("[TEST] Created KVCache Manager with FlexKV CPU tier only")
     return kvcache_mgr
 
 
@@ -273,7 +266,7 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     assert kvcache_metadata.kv_onload_handle.status == HostKVTaskStatus.SKIPPED
 
     for layer_idx in range(3):
-        kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
+        kvcache_metadata.kv_onload_handle.wait_layer(layer_idx)
     assert kvcache_metadata.kv_onload_handle.handle is None
 
     for layer_idx in range(3):
@@ -409,6 +402,9 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
         "phase3 onboard launch was not LAUNCHED, "
         f"status={onboard_task_handle.status}, metadata={onboard_task_handle.metadata}"
     )
+    if onboard_task_handle.is_layerwise:
+        for layer_idx in range(3):
+            onboard_task_handle.wait_layer(layer_idx)
 
     onboard_deadline = time.time() + 60.0
     onboard_ready = False
@@ -667,6 +663,9 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
         "phase5 onboard launch failed, "
         f"status={onboard_task_handle.status}, metadata={onboard_task_handle.metadata}"
     )
+    if onboard_task_handle.is_layerwise:
+        for layer_idx in range(3):
+            onboard_task_handle.wait_layer(layer_idx)
 
     onboard_deadline = time.time() + 60.0
     onboard_ready = False

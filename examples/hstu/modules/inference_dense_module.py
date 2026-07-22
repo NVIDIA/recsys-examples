@@ -336,6 +336,7 @@ class InferenceDenseModule(torch.nn.Module):
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
         kvcache_info: Tuple[KVIndexMeta, KVLookupResult, KVCacheMetadata],
+        skip_offload: bool = False,
     ):
         with torch.inference_mode():
             (
@@ -367,6 +368,7 @@ class InferenceDenseModule(torch.nn.Module):
                 and onboard_handle.handle is not None
                 and onboard_handle.status != HostKVTaskStatus.SKIPPED
                 and onboard_handle.backend == "flexkv"
+                and not onboard_handle.is_layerwise
             ):
                 torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
                 try:
@@ -400,8 +402,9 @@ class InferenceDenseModule(torch.nn.Module):
                 )
                 jagged_data.values = hstu_output
 
-            self.kvcache.offload_try_wait()
-            self.kvcache.offload_launch(kv_index_meta, kvcache_metadata)
+            if not skip_offload:
+                self.kvcache.offload_try_wait()
+                self.kvcache.offload_launch(kv_index_meta, kvcache_metadata)
 
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)
