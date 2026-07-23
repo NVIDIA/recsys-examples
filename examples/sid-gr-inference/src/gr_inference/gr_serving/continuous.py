@@ -79,6 +79,9 @@ from gr_inference.gr_serving.memory import (
 )
 from gr_inference.gr_serving.prefill_cuda_graph import GRPrefillCudaGraphRunner
 from gr_inference.gr_serving.prefix_cache import GRPrefixCacheMatch, GRPromptPrefixCache
+from gr_inference.gr_models.loader import HFCheckpointLoader
+from gr_inference.gr_models.qwen3.config import Qwen3GRConfig
+from gr_inference.gr_models.qwen3.weights import materialize_qwen3_checkpoint
 from gr_inference.gr_serving.queue import GRRequestQueue
 from gr_inference.gr_serving.request import GRServingRequest, GRServingResponse
 
@@ -806,6 +809,13 @@ class GRContinuousServingExecutor:
     max_prefill_cache_decode_extend_tokens: int | None = None
     prefill_ms: float = 0.0
     decode_ms: float = 0.0
+    # Weight hot-update bookkeeping (RL weight sync). ``weight_version`` and
+    # ``token_step`` are caller-supplied labels so a trainer can tell which
+    # policy produced each rollout; surfaced in status/metrics.
+    weight_version: str | None = None
+    token_step: int = 0
+    weight_update_count: int = 0
+    last_weight_update_ms: float = 0.0
     prefill_cache: GRPromptPrefixCache = field(default_factory=GRPromptPrefixCache)
     batched_prefill_cache: dict[tuple[str, ...], PrefillResult] = field(
         default_factory=dict
@@ -1006,10 +1016,174 @@ class GRContinuousServingExecutor:
             ticks += 1
         return tuple(self.scheduler.finished.values())
 
+    def update_weights_from_disk(
+        self,
+        model_dir: str,
+        *,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int = 0,
+    ) -> dict[str, Any]:
+        """Swap weights from an on-disk HF checkpoint without a process restart.
+
+        Cross-process RL weight sync path (Slime external-engine pattern): the
+        trainer writes an HF checkpoint to a path this engine can read, then calls
+        this method over HTTP. Validate-then-load for atomicity — a bad
+        checkpoint leaves the previous policy fully intact.
+        """
+
+        model = self._require_weight_model()
+        manifest = HFCheckpointLoader(model_dir).manifest()
+        new_config = Qwen3GRConfig.from_hf_config(manifest.config)
+        self._assert_compatible_config(model.config, new_config, model_dir)
+        weights = materialize_qwen3_checkpoint(model_dir)
+        model.validate_logical_weights(weights)
+        num_aborted = self._abort_in_flight(abort_all_requests)
+        start = time.perf_counter()
+        model.load_logical_weights(weights)
+        self._invalidate_weight_dependent_state(flush_cache)
+        self._synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self._record_weight_version(weight_version, token_step, elapsed_ms)
+        return {
+            "success": True,
+            "message": "Succeeded to update model weights from disk.",
+            "model_dir": str(model_dir),
+            "params_updated": len(weights),
+            "flushed_cache": bool(flush_cache),
+            "num_aborted_requests": num_aborted,
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: Any,
+        *,
+        strict: bool = True,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int = 0,
+    ) -> dict[str, Any]:
+        """Swap weights from in-process tensors keyed by module parameter name.
+
+        Internal primitive (model-level validate-then-copy is atomic). Kept for
+        testing and as the future hook for a colocate/same-GPU transport; the
+        HTTP surface exposes the disk path instead.
+        """
+
+        model = self._require_weight_model()
+        num_aborted = self._abort_in_flight(abort_all_requests)
+        start = time.perf_counter()
+        count = model.update_weights_from_tensor(named_tensors, strict=strict)
+        self._invalidate_weight_dependent_state(flush_cache)
+        self._synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self._record_weight_version(weight_version, token_step, elapsed_ms)
+        return {
+            "success": True,
+            "message": "Succeeded to update model weights from tensor.",
+            "params_updated": count,
+            "flushed_cache": bool(flush_cache),
+            "num_aborted_requests": num_aborted,
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def get_weights_by_name(self, name: str, truncate_size: int = 100) -> Any:
+        """Return a truncated CPU sample of a parameter (SGLang get_weights_by_name)."""
+
+        model = self._require_weight_model()
+        param = model.get_parameter_by_name(name)
+        flat = param.detach().reshape(-1)[:truncate_size].to(device="cpu")
+        return {
+            "name": name,
+            "shape": tuple(int(dim) for dim in param.shape),
+            "dtype": str(param.dtype),
+            "values": flat.tolist(),
+        }
+
+    def _require_weight_model(self) -> Any:
+        engine = getattr(self, "engine", None)
+        model = getattr(engine, "model", None) if engine is not None else None
+        if model is None or not callable(
+            getattr(model, "update_weights_from_tensor", None)
+        ):
+            raise RuntimeError(
+                "weight update requires a serving engine backed by a model"
+            )
+        return model
+
+    def _assert_compatible_config(
+        self, current: Any, new: Any, model_dir: str
+    ) -> None:
+        fields = (
+            "num_layers",
+            "hidden_size",
+            "num_attention_heads",
+            "num_kv_heads",
+            "head_dim",
+            "vocab_size",
+            "tie_word_embeddings",
+        )
+        for name in fields:
+            if getattr(current, name, None) != getattr(new, name, None):
+                raise ValueError(
+                    f"checkpoint at {model_dir} is structurally incompatible: "
+                    f"{name} current={getattr(current, name, None)!r} "
+                    f"new={getattr(new, name, None)!r}"
+                )
+        if current.resolved_intermediate_size != new.resolved_intermediate_size:
+            raise ValueError(
+                f"checkpoint at {model_dir} is structurally incompatible: "
+                f"intermediate_size current={current.resolved_intermediate_size} "
+                f"new={new.resolved_intermediate_size}"
+            )
+
+    def _abort_in_flight(self, abort_all_requests: bool) -> int:
+        if not abort_all_requests:
+            return 0
+        failed_ids = self.scheduler.fail_unfinished(reason="weight_update")
+        if failed_ids:
+            self._attach_execution_metadata(failed_ids)
+        return len(failed_ids)
+
+    def _record_weight_version(
+        self,
+        weight_version: str | None,
+        token_step: int,
+        elapsed_ms: float,
+    ) -> None:
+        if weight_version is not None:
+            self.weight_version = weight_version
+        # token_step is always carried by the caller (0 is a valid step id).
+        self.token_step = int(token_step)
+        self.weight_update_count += 1
+        self.last_weight_update_ms = float(elapsed_ms)
+
+    def _invalidate_weight_dependent_state(self, flush_cache: bool) -> None:
+        if not flush_cache:
+            return
+        # Stale logits/KV were computed with the previous weights; drop them.
+        self.prefill_cache.clear()
+        self.batched_prefill_cache.clear()
+        self.prefill_cache_hits = 0
+        self.prefill_cache_exact_hits = 0
+        self.prefill_cache_prefix_hits = 0
+        self.prefill_cache_misses = 0
+        self.prefill_cache_skips = 0
+        self.prefill_cache_prefix_tokens = 0
+        self.prefill_cache_extend_tokens = 0
+
     def status(self) -> dict[str, Any]:
         status = self.scheduler.status()
         status.update(self._execution_status())
         status["prefill_cache"] = self._prefill_cache_status()
+        status["weights"] = self._weights_status()
         status["topk_indices_cache"] = _cache_status(
             self.topk_indices_cache,
             hits=self.topk_indices_cache_hits,
@@ -1108,12 +1282,23 @@ class GRContinuousServingExecutor:
             "total_ms": self.prefill_ms + self.decode_ms,
         }
 
+    def _weights_status(self) -> dict[str, Any]:
+        return {
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "weight_update_count": self.weight_update_count,
+            "last_weight_update_ms": self.last_weight_update_ms,
+        }
+
     def _execution_metrics(self) -> dict[str, float | int]:
         return {
             "prefill_ms": self.prefill_ms,
             "decode_ms": self.decode_ms,
             "total_ms": self.prefill_ms + self.decode_ms,
             "sync_timing_enabled": int(self.sync_timing),
+            "weight_update_count": self.weight_update_count,
+            "weight_token_step": self.token_step,
+            "last_weight_update_ms": self.last_weight_update_ms,
         }
 
     def _prefill_cache_status(self) -> dict[str, Any]:
