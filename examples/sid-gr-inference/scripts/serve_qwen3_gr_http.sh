@@ -93,6 +93,7 @@ gr_append_option_if_env_set args GR_PREFILL_CACHE_MIN_PREFIX_TOKENS --prefill-ca
 gr_append_option_if_env_set args GR_PREFILL_CACHE_MAX_DECODE_EXTEND_TOKENS --prefill-cache-max-decode-extend-tokens
 gr_append_flag_if_env_one args GR_ALLOW_MANUAL_TICK --allow-manual-tick
 gr_append_flag_if_env_one args GR_ALLOW_CATALOG_RELOAD --allow-catalog-reload
+gr_append_flag_if_env_one args GR_ALLOW_WEIGHT_UPDATE --allow-weight-update
 gr_append_flag_if_env_one args GR_DISABLE_BACKGROUND_WORKER --disable-background-worker
 if [[ "${GR_WARMUP_ONLINE_SHAPES:-1}" == "0" ]]; then
   args+=(--no-warmup-online-shapes)

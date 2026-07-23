@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import metadata as importlib_metadata
 from typing import Any, Callable, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from gr_inference.gr_runtime import logits_processors_from_specs
 from gr_inference.gr_scheduler import ScheduledBeamPolicy, ScoreMarginBeamPolicy
@@ -51,6 +51,7 @@ class GRHTTPValidationPolicy:
     max_timeout_ticks: int | None = None
     allow_manual_tick: bool = True
     allow_catalog_reload: bool = True
+    allow_weight_update: bool = True
 
     def validate(self) -> None:
         for name, value in (
@@ -122,6 +123,10 @@ class GRHTTPServingAdapter:
             self._validate_auth(method, route, headers or {})
             self._validate_body_size(body)
             payload = _json_payload(body)
+            if not payload:
+                # GET routes (e.g. /get_weights_by_name?name=...) carry args in the
+                # query string rather than a JSON body.
+                payload = _query_params(path)
             response = self._dispatch(method, route, payload)
         except GRHTTPAdapterError as exc:
             response = _error_response(
@@ -310,7 +315,57 @@ class GRHTTPServingAdapter:
                 )
             version = self.facade.rollback_item_catalog()
             return _ok({"version": version, "catalog": self.facade.catalog_status()})
+        if method == "POST" and route == ("update_weights_from_disk",):
+            return self._handle_update_weights_from_disk(payload)
+        if route == ("get_weights_by_name",) and method in {"GET", "POST"}:
+            return self._handle_get_weights_by_name(payload)
         return _error_response(404, f"unknown route: {method} /{'/'.join(route)}")
+
+    def _handle_update_weights_from_disk(
+        self, payload: Mapping[str, Any]
+    ) -> GRHTTPResponse:
+        if not self.validation_policy.allow_weight_update:
+            raise GRHTTPAdapterError(
+                403,
+                "weight update is disabled",
+                code="route_disabled",
+            )
+        model_path = payload.get("model_path") or payload.get("model_dir")
+        if not model_path:
+            raise GRHTTPAdapterError(
+                400,
+                "model_path (or model_dir) is required",
+                code="validation_error",
+            )
+        result = self.facade.update_weights_from_disk(
+            str(model_path),
+            flush_cache=bool(payload.get("flush_cache", True)),
+            abort_all_requests=bool(payload.get("abort_all_requests", False)),
+            weight_version=payload.get("weight_version"),
+            token_step=int(payload.get("token_step", 0) or 0),
+        )
+        return _ok(result)
+
+    def _handle_get_weights_by_name(
+        self, payload: Mapping[str, Any]
+    ) -> GRHTTPResponse:
+        if not self.validation_policy.allow_weight_update:
+            raise GRHTTPAdapterError(
+                403,
+                "weight lookup is disabled",
+                code="route_disabled",
+            )
+        name = payload.get("name")
+        if not name:
+            raise GRHTTPAdapterError(
+                400,
+                "name is required",
+                code="validation_error",
+            )
+        truncate_size = int(payload.get("truncate_size", 100) or 100)
+        return _ok(
+            self.facade.get_weights_by_name(str(name), truncate_size=truncate_size)
+        )
 
     def _emit_request_log(
         self,
@@ -744,6 +799,11 @@ def _route_path(path: str) -> tuple[str, ...]:
     return tuple(part for part in parsed.path.split("/") if part)
 
 
+def _query_params(path: str) -> dict[str, str]:
+    parsed = urlparse(path)
+    return dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+
 def _json_payload(body: bytes | str | Mapping[str, Any] | None) -> Mapping[str, Any]:
     if body is None or body == b"" or body == "":
         return {}
@@ -872,6 +932,7 @@ def _validation_policy_payload(policy: GRHTTPValidationPolicy) -> dict[str, Any]
         "max_timeout_ticks": policy.max_timeout_ticks,
         "allow_manual_tick": policy.allow_manual_tick,
         "allow_catalog_reload": policy.allow_catalog_reload,
+        "allow_weight_update": policy.allow_weight_update,
     }
 
 
@@ -988,6 +1049,12 @@ def _route_manifest(policy: GRHTTPValidationPolicy) -> dict[str, tuple[str, ...]
         )
     else:
         routes["catalog"] = ("GET /catalog/status",)
+    if policy.allow_weight_update:
+        routes["weights"] = (
+            "POST /update_weights_from_disk",
+            "GET /get_weights_by_name",
+            "POST /get_weights_by_name",
+        )
     return routes
 
 
