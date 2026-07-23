@@ -139,6 +139,56 @@ def _hf_state_dict(model: Qwen3GRModel, cfg: Qwen3GRConfig) -> dict[str, torch.T
     return state
 
 
+def _hf_named_tensors(model: Qwen3GRModel, cfg: Qwen3GRConfig, perturb: float = 0.0):
+    """Build HF-named CPU tensors as a colocate trainer would send (split q/k/v)."""
+    q = cfg.num_attention_heads * cfg.head_dim
+    kv = cfg.num_kv_heads * cfg.head_dim
+    inter = cfg.resolved_intermediate_size
+    sd = {
+        "model.embed_tokens.weight": model.embed_tokens.weight.data.clone(),
+        "model.norm.weight": model.norm.weight.data.clone(),
+    }
+    if not cfg.tie_word_embeddings:
+        sd["lm_head.weight"] = model.lm_head.weight.data.clone()
+    for idx, layer in enumerate(model.layers):
+        ops = layer.ops
+        prefix = f"model.layers.{idx}"
+        sd[f"{prefix}.input_layernorm.weight"] = ops.input_layernorm.weight.data.clone()
+        sd[f"{prefix}.post_attention_layernorm.weight"] = (
+            ops.post_attention_layernorm.weight.data.clone()
+        )
+        sd[f"{prefix}.self_attn.o_proj.weight"] = ops.out_proj.weight.data.clone()
+        sd[f"{prefix}.mlp.down_proj.weight"] = ops.down_proj.weight.data.clone()
+        qkv = ops.qkv_proj.weight.data
+        sd[f"{prefix}.self_attn.q_proj.weight"] = qkv[:q].clone()
+        sd[f"{prefix}.self_attn.k_proj.weight"] = qkv[q : q + kv].clone()
+        sd[f"{prefix}.self_attn.v_proj.weight"] = qkv[q + kv :].clone()
+        gate_up = ops.gate_up_proj.weight.data
+        sd[f"{prefix}.mlp.gate_proj.weight"] = gate_up[:inter].clone()
+        sd[f"{prefix}.mlp.up_proj.weight"] = gate_up[inter:].clone()
+        sd[f"{prefix}.self_attn.q_norm.weight"] = ops.q_norm.weight.data.clone()
+        sd[f"{prefix}.self_attn.k_norm.weight"] = ops.k_norm.weight.data.clone()
+    if perturb:
+        sd = {name: tensor + perturb for name, tensor in sd.items()}
+    return list(sd.items())
+
+
+def _serialize_bucket(named_tensors):
+    from gr_inference.gr_serving.weight_ipc import (
+        FlattenedTensorBucket,
+        MultiprocessingSerializer,
+    )
+
+    bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+    return MultiprocessingSerializer.serialize(
+        {
+            "flattened_tensor": bucket.flattened_tensor,
+            "metadata": bucket.metadata,
+        },
+        output_str=True,
+    )
+
+
 def _write_checkpoint(
     model: Qwen3GRModel,
     cfg: Qwen3GRConfig,
@@ -330,27 +380,52 @@ def test_get_weights_by_name_returns_truncated_sample() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_facade_and_worker_delegate_weight_update(tmp_path) -> None:
+def test_facade_and_worker_delegate_weight_update() -> None:
     model, cfg = _model()
     executor = _executor(model, cfg)
     facade = GRInProcessServingFacade(executor)
     worker = GRServingWorker(facade, autostart=False)
 
+    payload = [_serialize_bucket(_hf_named_tensors(model, cfg))]
     r = facade.update_weights_from_tensor(
-        {"norm.weight": model.norm.weight.data + 0.1},
-        weight_version="f1",
-        token_step=3,
+        payload, load_format="flattened_bucket", weight_version="f1", token_step=3
     )
     assert r["success"] is True
     assert facade.status()["weights"]["weight_version"] == "f1"
 
+    payload2 = [_serialize_bucket(_hf_named_tensors(model, cfg))]
     r2 = worker.update_weights_from_tensor(
-        {"norm.weight": model.norm.weight.data + 0.2},
-        weight_version="w1",
-        token_step=4,
+        payload2, load_format="flattened_bucket", weight_version="w1", token_step=4
     )
     assert r2["success"] is True
     assert facade.status()["weights"]["weight_version"] == "w1"
+
+
+def test_weight_ipc_flattened_bucket_roundtrip() -> None:
+    from gr_inference.gr_serving.weight_ipc import reconstruct_named_tensors
+
+    named = [
+        ("model.norm.weight", torch.randn(8, dtype=torch.float32)),
+        ("lm_head.weight", torch.randn(4, 5, dtype=torch.float32)),
+    ]
+    serialized = _serialize_bucket(named)
+    out = reconstruct_named_tensors([serialized], load_format="flattened_bucket")
+    assert [name for name, _ in out] == [name for name, _ in named]
+    for (n_in, t_in), (n_out, t_out) in zip(named, out, strict=True):
+        assert n_in == n_out
+        assert torch.equal(t_in, t_out)
+
+
+def test_hf_to_logical_name_mapping() -> None:
+    from gr_inference.gr_serving.continuous import _hf_to_logical_name
+
+    assert _hf_to_logical_name("model.embed_tokens.weight") == "embed_tokens.weight"
+    assert _hf_to_logical_name("model.norm.weight") == "final_norm.weight"
+    assert _hf_to_logical_name("lm_head.weight") == "lm_head.weight"
+    assert (
+        _hf_to_logical_name("model.layers.0.self_attn.q_proj.weight")
+        == "layers.0.self_attn.q_proj.weight"
+    )
 
 
 def test_facade_requires_engine_for_weight_update() -> None:
@@ -441,6 +516,40 @@ def test_http_update_weights_from_disk_requires_model_path(tmp_path) -> None:
     assert resp.status == 400
 
 
+def test_http_update_weights_from_tensor() -> None:
+    model, cfg = _model()
+    adapter = _adapter(model, cfg)
+    lm_before = model.lm_head.weight.data.clone()
+
+    serialized = _serialize_bucket(_hf_named_tensors(model, cfg, perturb=0.5))
+    body = json.dumps(
+        {
+            "serialized_named_tensors": [serialized],
+            "load_format": "flattened_bucket",
+            "weight_version": "t1",
+            "token_step": 5,
+        }
+    ).encode("utf-8")
+    resp = adapter.handle("POST", "/update_weights_from_tensor", body)
+    assert resp.status == 200
+    assert resp.body["success"] is True
+    assert resp.body["params_updated"] > 0
+    assert not torch.allclose(model.lm_head.weight.data, lm_before, atol=1e-5)
+    assert adapter.facade.facade.executor.weight_version == "t1"
+
+    # missing payload -> 400; disabled -> 403
+    assert (
+        adapter.handle("POST", "/update_weights_from_tensor", json.dumps({}).encode())
+        .status
+        == 400
+    )
+    off = _adapter(model, cfg, allow_weight_update=False)
+    assert off.handle("POST", "/update_weights_from_tensor", body).status == 403
+
+    routes = adapter.handle("GET", "/config").body["routes"]
+    assert "POST /update_weights_from_tensor" in routes["weights"]
+
+
 # --------------------------------------------------------------------------- #
 # Disk coordination endpoints (SGLang pause/continue/flush_cache/get_weight_version)
 # --------------------------------------------------------------------------- #
@@ -472,8 +581,9 @@ def test_executor_pause_continue_flush_version() -> None:
     flush = executor.flush_cache()
     assert flush["success"] is True
 
+    serialized = _serialize_bucket(_hf_named_tensors(model, cfg))
     executor.update_weights_from_tensor(
-        {"norm.weight": model.norm.weight.data + 0.1}, weight_version="rl-9"
+        [serialized], load_format="flattened_bucket", weight_version="rl-9"
     )
     assert executor.get_weight_version()["weight_version"] == "rl-9"
 

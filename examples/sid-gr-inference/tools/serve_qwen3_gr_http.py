@@ -752,7 +752,8 @@ def main() -> None:
     print(
         "Routes: /health /ready /config /status /metrics /generate /submit "
         "/poll/{id} /result/{id} /update_weights_from_disk "
-        "/get_weights_by_name /drain /shutdown"
+        "/update_weights_from_tensor /get_weights_by_name /pause_generation "
+        "/continue_generation /flush_cache /get_weight_version /drain /shutdown"
     )
     for line in _startup_config_lines(adapter):
         print(line)

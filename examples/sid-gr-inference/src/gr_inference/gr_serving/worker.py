@@ -231,9 +231,9 @@ class GRServingWorker:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: Any,
+        serialized_named_tensors: Any,
         *,
-        strict: bool = True,
+        load_format: str | None = None,
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
@@ -241,8 +241,8 @@ class GRServingWorker:
     ) -> dict[str, Any]:
         with self._lock:
             return self.facade.update_weights_from_tensor(
-                named_tensors,
-                strict=strict,
+                serialized_named_tensors,
+                load_format=load_format,
                 flush_cache=flush_cache,
                 abort_all_requests=abort_all_requests,
                 weight_version=weight_version,

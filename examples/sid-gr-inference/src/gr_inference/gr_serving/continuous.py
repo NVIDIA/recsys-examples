@@ -1064,25 +1064,37 @@ class GRContinuousServingExecutor:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: Any,
+        serialized_named_tensors: Any,
         *,
-        strict: bool = True,
+        load_format: str | None = None,
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
         token_step: int = 0,
     ) -> dict[str, Any]:
-        """Swap weights from in-process tensors keyed by module parameter name.
+        """Colocate weight sync: receive SGLang serialized CUDA-IPC tensors.
 
-        Internal primitive (model-level validate-then-copy is atomic). Kept for
-        testing and as the future hook for a colocate/same-GPU transport; the
-        HTTP surface exposes the disk path instead.
+        Mirrors SGLang ``update_weights_from_tensor``: ``serialized_named_tensors``
+        is a per-TP-rank list of ForkingPickler-serialized payloads whose CUDA
+        tensors reduce to IPC handles (bytes travel zero-copy via CUDA IPC; both
+        sides must share the same GPU). We deserialize the flattened-bucket
+        (``load_format="flattened_bucket"``) or direct list, map HF tensor names
+        to the model's logical names, validate, then in-place load.
         """
 
+        from gr_inference.gr_serving.weight_ipc import reconstruct_named_tensors
+
         model = self._require_weight_model()
+        named_tensors = reconstruct_named_tensors(
+            serialized_named_tensors, load_format=load_format
+        )
+        logical = {
+            _hf_to_logical_name(name): tensor for name, tensor in named_tensors
+        }
+        model.validate_logical_weights(logical)
         num_aborted = self._abort_in_flight(abort_all_requests)
         start = time.perf_counter()
-        count = model.update_weights_from_tensor(named_tensors, strict=strict)
+        model.load_logical_weights(logical)
         self._invalidate_weight_dependent_state(flush_cache)
         self._synchronize()
         elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -1090,7 +1102,7 @@ class GRContinuousServingExecutor:
         return {
             "success": True,
             "message": "Succeeded to update model weights from tensor.",
-            "params_updated": count,
+            "params_updated": len(logical),
             "flushed_cache": bool(flush_cache),
             "num_aborted_requests": num_aborted,
             "weight_version": self.weight_version,
@@ -2773,6 +2785,24 @@ class GRContinuousServingExecutor:
             "beam_kv_pool_orphaned_lease_count": len(orphaned),
             "beam_kv_pool_missing_lease_count": len(missing),
         }
+
+
+def _hf_to_logical_name(name: str) -> str:
+    """Map a HuggingFace tensor name to the model's logical weight name.
+
+    Colocate tensors arrive with HF names (``model.embed_tokens.weight``,
+    ``model.layers.{i}.self_attn.q_proj.weight``, ...). The Qwen loader consumes
+    logical names; ``layers`` load_logical_weights handles both packed
+    (``qkv_proj``) and split (``q_proj``/``k_proj``/``v_proj``) variants.
+    """
+
+    if name == "model.embed_tokens.weight":
+        return "embed_tokens.weight"
+    if name == "model.norm.weight":
+        return "final_norm.weight"
+    if name.startswith("model.layers."):
+        return name[len("model."):]
+    return name
 
 
 def _request_context_tokens(request: GRServingRequest) -> int:

@@ -317,6 +317,8 @@ class GRHTTPServingAdapter:
             return _ok({"version": version, "catalog": self.facade.catalog_status()})
         if method == "POST" and route == ("update_weights_from_disk",):
             return self._handle_update_weights_from_disk(payload)
+        if method == "POST" and route == ("update_weights_from_tensor",):
+            return self._handle_update_weights_from_tensor(payload)
         if route == ("get_weights_by_name",) and method in {"GET", "POST"}:
             return self._handle_get_weights_by_name(payload)
         if method == "POST" and route == ("pause_generation",):
@@ -369,6 +371,32 @@ class GRHTTPServingAdapter:
             )
         result = self.facade.update_weights_from_disk(
             str(model_path),
+            flush_cache=bool(payload.get("flush_cache", True)),
+            abort_all_requests=bool(payload.get("abort_all_requests", False)),
+            weight_version=payload.get("weight_version"),
+            token_step=int(payload.get("token_step", 0) or 0),
+        )
+        return _ok(result)
+
+    def _handle_update_weights_from_tensor(
+        self, payload: Mapping[str, Any]
+    ) -> GRHTTPResponse:
+        if not self.validation_policy.allow_weight_update:
+            raise GRHTTPAdapterError(
+                403,
+                "weight update is disabled",
+                code="route_disabled",
+            )
+        serialized_named_tensors = payload.get("serialized_named_tensors")
+        if not serialized_named_tensors:
+            raise GRHTTPAdapterError(
+                400,
+                "serialized_named_tensors is required",
+                code="validation_error",
+            )
+        result = self.facade.update_weights_from_tensor(
+            serialized_named_tensors,
+            load_format=payload.get("load_format"),
             flush_cache=bool(payload.get("flush_cache", True)),
             abort_all_requests=bool(payload.get("abort_all_requests", False)),
             weight_version=payload.get("weight_version"),
@@ -1082,6 +1110,7 @@ def _route_manifest(policy: GRHTTPValidationPolicy) -> dict[str, tuple[str, ...]
     if policy.allow_weight_update:
         routes["weights"] = (
             "POST /update_weights_from_disk",
+            "POST /update_weights_from_tensor",
             "GET /get_weights_by_name",
             "POST /get_weights_by_name",
             "POST /pause_generation",
