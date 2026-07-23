@@ -456,8 +456,12 @@ if nn is not None:
             *,
             layer_idx: int,
             strict: bool = True,
+            dry_run: bool = False,
         ) -> None:
-            """Load logical tensors produced by Qwen3HFAdapter.load_plan()."""
+            """Load logical tensors produced by Qwen3HFAdapter.load_plan().
+
+            ``dry_run`` validates presence and shapes without copying.
+            """
 
             prefix = f"layers.{layer_idx}"
             required = {
@@ -469,29 +473,39 @@ if nn is not None:
                 f"{prefix}.mlp.down_proj.weight": self.down_proj.weight,
             }
             for name, param in required.items():
-                self._copy_weight(name, weights, param, strict=strict)
+                self._copy_weight(
+                    name, weights, param, strict=strict, dry_run=dry_run
+                )
 
             qkv_name = f"{prefix}.self_attn.qkv_proj.weight"
             if qkv_name in weights:
-                self._copy_tensor(self.qkv_proj.weight, weights[qkv_name], qkv_name)
+                self._copy_tensor(
+                    self.qkv_proj.weight,
+                    weights[qkv_name],
+                    qkv_name,
+                    dry_run=dry_run,
+                )
             else:
                 self._copy_weight(
                     f"{prefix}.self_attn.q_proj.weight",
                     weights,
                     self.qkv_proj.weight[: self.q_size],
                     strict=strict,
+                    dry_run=dry_run,
                 )
                 self._copy_weight(
                     f"{prefix}.self_attn.k_proj.weight",
                     weights,
                     self.qkv_proj.weight[self.q_size : self.q_size + self.kv_size],
                     strict=strict,
+                    dry_run=dry_run,
                 )
                 self._copy_weight(
                     f"{prefix}.self_attn.v_proj.weight",
                     weights,
                     self.qkv_proj.weight[self.q_size + self.kv_size :],
                     strict=strict,
+                    dry_run=dry_run,
                 )
 
             gate_up_name = f"{prefix}.mlp.gate_up_proj.weight"
@@ -500,6 +514,7 @@ if nn is not None:
                     self.gate_up_proj.weight,
                     weights[gate_up_name],
                     gate_up_name,
+                    dry_run=dry_run,
                 )
             else:
                 self._copy_weight(
@@ -507,12 +522,14 @@ if nn is not None:
                     weights,
                     self.gate_up_proj.weight[: self.intermediate_size],
                     strict=strict,
+                    dry_run=dry_run,
                 )
                 self._copy_weight(
                     f"{prefix}.mlp.up_proj.weight",
                     weights,
                     self.gate_up_proj.weight[self.intermediate_size :],
                     strict=strict,
+                    dry_run=dry_run,
                 )
 
             self._copy_weight(
@@ -520,30 +537,40 @@ if nn is not None:
                 weights,
                 self.q_norm.weight,
                 strict=False,
+                dry_run=dry_run,
             )
             self._copy_weight(
                 f"{prefix}.self_attn.k_norm.weight",
                 weights,
                 self.k_norm.weight,
                 strict=False,
+                dry_run=dry_run,
             )
 
         def _copy_weight(
-            self, name: str, weights: dict[str, Any], param, *, strict: bool
+            self,
+            name: str,
+            weights: dict[str, Any],
+            param,
+            *,
+            strict: bool,
+            dry_run: bool = False,
         ) -> None:
             if name not in weights:
                 if strict:
                     raise KeyError(f"missing logical tensor: {name}")
                 return
-            self._copy_tensor(param, weights[name], name)
+            self._copy_tensor(param, weights[name], name, dry_run=dry_run)
 
         @staticmethod
-        def _copy_tensor(param, tensor, name: str) -> None:
+        def _copy_tensor(param, tensor, name: str, *, dry_run: bool = False) -> None:
             if tuple(param.shape) != tuple(tensor.shape):
                 raise ValueError(
                     f"shape mismatch for {name}: expected {tuple(param.shape)}, "
                     f"got {tuple(tensor.shape)}"
                 )
+            if dry_run:
+                return
             with torch.no_grad():
                 param.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
