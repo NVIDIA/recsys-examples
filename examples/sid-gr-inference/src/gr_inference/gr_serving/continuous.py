@@ -1102,7 +1102,7 @@ class GRContinuousServingExecutor:
         flat = param.detach().reshape(-1)[:truncate_size].to(device="cpu")
         return {
             "name": name,
-            "shape": tuple(int(dim) for dim in param.shape),
+            "shape": [int(dim) for dim in param.shape],
             "dtype": str(param.dtype),
             "values": flat.tolist(),
         }
