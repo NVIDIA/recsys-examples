@@ -17,7 +17,7 @@ import os
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -32,7 +32,7 @@ except Exception:
     KVResponse = Any  # type: ignore
 
 from .host_kvstorage_manager import (
-    HostKVStorageManagerBase,
+    HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
     HostKVWaitResult,
@@ -53,14 +53,14 @@ class FlexKVIndexMeta(KVIndexMeta):
 
 @dataclass
 class _FlexKVOnloadHandle:
-    task_ids: List[int]
+    task_ids: Union[List[int], torch.Tensor]
     uids: torch.Tensor
     slot_mappings: List[torch.Tensor]
 
 
 @dataclass
 class _FlexKVOffloadHandle:
-    task_ids: List[int]
+    task_ids: Union[List[int], torch.Tensor]
     uids: torch.Tensor
     seqlens: torch.Tensor
     responses: Optional[Dict[int, Any]] = None
@@ -96,7 +96,7 @@ class FlexKVCacheLayout(KVCacheLayout):
         return self.kv_shape[3:].numel()
 
 
-class FlexKVStorageManager(HostKVStorageManagerBase):
+class FlexKVStorage(HostKVStorageBase):
     def __init__(
         self,
         mode: str = "direct",
@@ -684,3 +684,7 @@ class FlexKVClientAdapter:
                 }
             )
         return reqs
+
+
+# Backward compatibility alias; prefer FlexKVStorage.
+FlexKVStorageManager = FlexKVStorage

@@ -197,8 +197,12 @@ bool run_one_batch(
 
   std::vector<torch::Tensor> outputs = loader.run({values, lengths, num_candidates});
   TORCH_CHECK(!outputs.empty(), "Model returned no outputs.");
+  TORCH_CHECK(
+      outputs[0].device().is_cpu(),
+      "Expected exported model logits on CPU, got ",
+      outputs[0].device());
 
-  torch::Tensor logits_cpu = outputs[0].to(torch::kCPU).contiguous();
+  torch::Tensor logits_cpu = outputs[0].contiguous();
   torch::Tensor ref_cpu = ref_logits_cpu.to(logits_cpu.dtype()).contiguous();
 
   if (!logits_cpu.sizes().equals(ref_cpu.sizes())) {
@@ -207,19 +211,17 @@ bool run_one_batch(
     return false;
   }
 
-  // Compare only in bfloat16 on GPU.
-  torch::Tensor logits_bf16 = outputs[0].to(device, torch::kBFloat16).contiguous();
-  torch::Tensor ref_bf16 = ref_cpu.to(device, torch::kBFloat16).contiguous();
+  torch::Tensor diff = (logits_cpu.to(torch::kFloat32) - ref_cpu.to(torch::kFloat32)).abs();
+  torch::Tensor ref_abs = ref_cpu.to(torch::kFloat32).abs();
+  torch::Tensor rel_diff = diff / (ref_abs + 1e-8f);
 
-  torch::Tensor diff_bf16 = (logits_bf16.to(torch::kFloat32) - ref_bf16.to(torch::kFloat32)).abs();
-  torch::Tensor ref_abs_bf16 = ref_bf16.to(torch::kFloat32).abs();
-  torch::Tensor rel_diff_bf16 = diff_bf16 / (ref_abs_bf16 + 1e-8f);
-
-  const double max_abs_diff = diff_bf16.max().item<double>();
-  const double mean_rel_diff = rel_diff_bf16.mean().item<double>();
+  const double max_abs_diff = diff.max().item<double>();
+  const double mean_rel_diff = rel_diff.mean().item<double>();
   const bool pass_abs_threshold = max_abs_diff <= 0.0625;
 
-  std::cout << "[INFO] Batch " << batch_idx << ": [bf16 compare]"
+  std::cout << "[INFO] Batch " << batch_idx
+            << ": output_device=" << outputs[0].device()
+            << "; [cpu compare]"
             << " max_abs_diff=" << max_abs_diff << ";"
             << " mean_rel_diff=" << mean_rel_diff << ";"
             << " pass(max_abs_diff<=0.0625)=" << (pass_abs_threshold ? "True" : "False")
@@ -273,7 +275,12 @@ bool run_one_round(
       auto & num_candidates = num_candidates_list[idx];
       
       std::vector<torch::Tensor> outputs = loader.run({values, lengths, num_candidates});
-      outputs_list.push_back(outputs[0]);
+      TORCH_CHECK(!outputs.empty(), "Model returned no outputs.");
+      TORCH_CHECK(
+          outputs[0].device().is_cpu(),
+          "Expected exported model logits on CPU, got ",
+          outputs[0].device());
+      outputs_list.push_back(outputs[0].contiguous());
     }
     // current.synchronize();
     cudaDeviceSynchronize();

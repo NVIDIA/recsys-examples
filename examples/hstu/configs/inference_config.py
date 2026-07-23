@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from dataclasses import dataclass
 from enum import Enum, unique
 from typing import List, Optional
@@ -101,6 +102,7 @@ class InferenceHSTUConfig:
     contextual_max_seqlen: int = 0
     scaling_seqlen: int = -1
     embedding_backend: Optional[EmbeddingBackend] = None
+    export_mode: bool = False
 
     def __post_init__(self):
         assert self.is_causal
@@ -124,6 +126,7 @@ def get_inference_hstu_config(
     contextual_max_seqlen: int = 0,
     scaling_seqlen: int = -1,
     embedding_backend=None,
+    export_mode: Optional[bool] = None,
 ) -> InferenceHSTUConfig:
     """
     Create the HSTU configuration.
@@ -148,6 +151,13 @@ def get_inference_hstu_config(
     """
     is_bf16 = dtype == torch.bfloat16
     is_fp16 = dtype == torch.float16
+    if export_mode is None:
+        export_mode = os.getenv("HSTU_INFERENCE_EXPORT_MODE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
     return InferenceHSTUConfig(  # type: ignore
         hidden_size=hidden_size,
         num_layers=num_layers,
@@ -166,4 +176,5 @@ def get_inference_hstu_config(
         contextual_max_seqlen=contextual_max_seqlen,
         scaling_seqlen=scaling_seqlen,
         embedding_backend=embedding_backend,
+        export_mode=export_mode,
     )

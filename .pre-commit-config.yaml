@@ -29,6 +29,7 @@ repos:
         args: ["--ignore-missing-imports", 
                 "--explicit-package-bases", 
                 "--exclude=examples/hstu/inference/triton/hstu_.*/[0-9]*/model.py$",
+                "--exclude=examples/hstu/triton_libs/",
                 "--exclude=^examples/sid-gr-inference/"
             ]
         pass_filenames: false

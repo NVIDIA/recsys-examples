@@ -20,7 +20,7 @@ import torch
 from kvcache_cpp import HostKVStorageImpl, KVOffloadHandle, KVOnloadHandle
 
 from .host_kvstorage_manager import (
-    HostKVStorageManagerBase,
+    HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
     HostKVWaitResult,
@@ -29,7 +29,7 @@ from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
 
 
-class NativeHostKVCacheManager(HostKVStorageManagerBase):
+class NativeHostKVStorage(HostKVStorageBase):
     def __init__(
         self,
         num_layers: int,
@@ -251,3 +251,7 @@ class NativeHostKVCacheManager(HostKVStorageManagerBase):
             task_handle.handle.get_start_indices(),
             task_handle.handle.get_lengths(),
         )
+
+
+# Backward compatibility alias; prefer NativeHostKVStorage.
+NativeHostKVCacheManager = NativeHostKVStorage

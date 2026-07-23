@@ -89,3 +89,11 @@ parameters [
     value: { string_value: "8" }
   }
 ]
+parameters [
+  {
+    key: "HSTU_CHECKPOINT_DIR"
+    value: {
+      string_value: "/checkpoints/hstu"
+    }
+  }
+]

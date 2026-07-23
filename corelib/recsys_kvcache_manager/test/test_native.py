@@ -201,10 +201,7 @@ if __name__ == "__main__":
                 ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
         kvcache_mgr.offload_launch(index_meta)
-        while True:
-            kvcache_mgr.offload_try_wait()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
+        kvcache_mgr.offload_flush()
 
         host_len = [seqlen[i] // 32 * 32 for i in range(8)]
         for i, uid in enumerate(range(0, 8)):
@@ -339,10 +336,7 @@ if __name__ == "__main__":
                 ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
         kvcache_mgr.offload_launch(index_meta)
-        while True:
-            kvcache_mgr.offload_try_wait()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
+        kvcache_mgr.offload_flush()
 
         host_len = [seqlen[i] // 32 * 32 for i in range(8)]
         for i, uid in enumerate(range(0, 8)):
@@ -470,10 +464,7 @@ if __name__ == "__main__":
                 ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
         kvcache_mgr.offload_launch(index_meta)
-        while True:
-            kvcache_mgr.offload_try_wait()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
+        kvcache_mgr.offload_flush()
 
         host_len = [seqlen[i] // 32 * 32 for i in range(8)]
         for i, uid in enumerate(range(0, 8)):
@@ -597,10 +588,7 @@ if __name__ == "__main__":
                 ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
         kvcache_mgr.offload_launch(index_meta)
-        while True:
-            kvcache_mgr.offload_try_wait()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
+        kvcache_mgr.offload_flush()
 
         host_len = [seqlen[i] // 32 * 32 for i in range(8)]
         for i, uid in enumerate(range(8, 16)):
@@ -734,10 +722,7 @@ if __name__ == "__main__":
                 ), f"Layer {layer_idx} value mismatch for uid {user_ids[i].item()}"
 
         kvcache_mgr.offload_launch(index_meta)
-        while True:
-            kvcache_mgr.offload_try_wait()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
+        kvcache_mgr.offload_flush()
 
         host_len = [seqlen[i] // 32 * 32 for i in range(8)]
         for i, uid in enumerate(range(0, 8)):

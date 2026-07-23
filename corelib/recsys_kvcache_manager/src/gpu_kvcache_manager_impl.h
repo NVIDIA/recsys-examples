@@ -24,7 +24,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/ATen.h>
-#include <torch/extension.h>
+// #include <torch/extension.h>
 #include <torch/serialize/tensor.h>
 
 #include <barrier>

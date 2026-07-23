@@ -181,6 +181,7 @@ def get_inference_dense_model_with_feature_names(
     total_max_seqlen = (
         dataset_args.max_num_candidates + dataset_args.max_history_seqlen
     ) * 2 + num_contextual_features
+    max_seq_len = math.ceil(total_max_seqlen / 32) * 32
     feature_names = [ebc.feature_names[0] for ebc in emb_configs]
 
     network_args = NetworkArgs()
@@ -195,7 +196,7 @@ def get_inference_dense_model_with_feature_names(
         num_position_buckets=8192,
         num_time_buckets=2048,
         use_time_encoding=False,
-        static_max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
+        static_max_seq_len=max_seq_len,
     )
 
     hstu_config = get_inference_hstu_config(
@@ -204,7 +205,7 @@ def get_inference_dense_model_with_feature_names(
         num_attention_heads=network_args.num_attention_heads,
         head_dim=network_args.kv_channels,
         max_batch_size=max_batch_size,
-        max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
+        max_seq_len=max_seq_len,
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=num_contextual_features,
@@ -220,9 +221,11 @@ def get_inference_dense_model_with_feature_names(
         eval_metrics=ranking_args.eval_metrics,
     )
 
+    # Include the exact maximum because it is not necessarily a multiple of 256.
+    cudagraph_lengths = sorted({128, max_seq_len, *range(256, max_seq_len, 256)})
     hstu_cudagraph_configs = {
-        "batch_size": [1],
-        "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
+        "batch_size": [1, 2],
+        "length_per_sequence": cudagraph_lengths,
     }
 
     model = get_inference_dense_model(

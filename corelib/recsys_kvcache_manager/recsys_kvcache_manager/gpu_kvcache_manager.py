@@ -22,7 +22,7 @@ from .kvcache_metadata import KVCacheMetadata, get_kvcache_metadata_buffer
 from .kvcache_utils import KVLookupResult
 
 
-class GPUKVCacheManager:
+class DeviceKVCache:
     def __init__(
         self,
         num_layers: int,
@@ -148,14 +148,13 @@ class GPUKVCacheManager:
         ), f"key and value shape mismatch: {k.shape} vs {v.shape}"
         if k.size(0) == self.num_layers:
             raise NotImplementedError("Only support layer-wise in this implementation.")
-        (paged_k_cache, paged_v_cache) = self.gpu_kvcache_tables[layer_idx].unbind(
-            dim=1
-        )
+        kv_cache_table = self.gpu_kvcache_tables[layer_idx]
+        (paged_k_cache, _) = kv_cache_table.unbind(dim=1)
         assert (
             k.shape[-2:] == paged_k_cache.shape[-2:]
         ), f"input k/v shape {k.shape} mismatch with cache shape {paged_k_cache.shape}"
         batch_size = kvcache_metadata.kv_indptr.size(0) - 1
-        paged_kvcache_ops.append_kvcache(
+        self.gpu_kvcache_tables[layer_idx] = paged_kvcache_ops.append_kvcache(
             k,
             v,
             kvcache_metadata.batch_indices,
@@ -164,14 +163,12 @@ class GPUKVCacheManager:
             if append_offsets is not None
             else torch.zeros((batch_size,), dtype=torch.int32, device=self.device_idx),
             kvcache_metadata.new_history_nnz_cuda,
-            kvcache_metadata.new_history_nnz,
-            paged_k_cache,
-            paged_v_cache,
+            0,
+            kv_cache_table,
             kvcache_metadata.kv_indices,
             kvcache_metadata.kv_indptr,
             kvcache_metadata.kv_last_page_len,
             0,  # NHD layout
-            self.num_sms,
         )
 
     # debug use interface
@@ -218,3 +215,7 @@ class GPUKVCacheManager:
         return self.impl_.release_offload_pages(
             uids, offload_start_indices, offload_lengths, offloaded
         )
+
+
+# Backward compatibility alias; prefer DeviceKVCache.
+GPUKVCacheManager = DeviceKVCache

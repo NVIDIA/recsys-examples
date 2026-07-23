@@ -1,0 +1,32 @@
+# Static KV-cache runtime config shared by the FlexKV server helper and C++ runtime.
+server_recv_port: ipc:///tmp/recsys_kvcache_cpp_runtime/server.sock
+gpu_register_port: ipc:///tmp/recsys_kvcache_cpp_runtime/gpu_register.sock
+
+num_layers: 3
+num_kv_heads: 4
+head_size: 128
+tokens_per_page: 32
+tokens_per_chunk: 1024
+num_primary_cache_pages: 102400
+num_buffer_pages: 0
+max_batch_size: 8
+max_sequence_length: 8320
+device_idx: 0
+dtype: bfloat16
+
+host_capacity_per_layer: 6710886400
+host_kvstorage_backend: flexkv
+onload_timeout_ms: 0.0
+offload_timeout_ms: 100.0
+offload_mode: lazy
+host_kvstorage_fail_policy: fail_open
+
+cpu_cache_gb: 1
+ssd_cache_gb: 0
+enable_p2p_cpu: false
+enable_p2p_ssd: false
+enable_3rd_remote: false
+redis_host: ""
+redis_port:
+local_ip: ""
+redis_password: ""

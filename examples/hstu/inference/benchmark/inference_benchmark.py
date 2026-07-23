@@ -71,7 +71,7 @@ def run_ranking_gr_inference(disable_kvcache: bool):
     )
 
     sm_major = torch.cuda.get_device_capability()[0]
-    _page_size = 128 if sm_major >= 10 else 32
+    _page_size = 128 if sm_major >= 10 and sm_major < 12 else 32
     _offload_chunksize = 8192
     _base_cache_tokens = 10240 * 32
     _num_primary_cache_pages = math.ceil(_base_cache_tokens / _page_size)

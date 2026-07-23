@@ -14,14 +14,17 @@
 # limitations under the License.
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 library_name = "recsys_kvcache_manager"
 root_path: Path = Path(__file__).resolve().parent
+runtime_ops_name = "kvcache_manager_ops.so"
 
 
 def get_version():
@@ -47,6 +50,33 @@ def nvcc_threads_args():
     """Get NVCC threads configuration."""
     nvcc_threads = os.getenv("NVCC_THREADS") or "4"
     return ["--threads", nvcc_threads]
+
+
+def parse_torch_cuda_arch_list() -> Optional[str]:
+    arch_list = os.getenv("TORCH_CUDA_ARCH_LIST", "").replace(";", " ").split()
+    if not arch_list:
+        return None
+
+    arch_map = {
+        "7.0": "70",
+        "7.5": "75",
+        "8.0": "80",
+        "8.6": "86",
+        "8.9": "89",
+        "9.0": "90",
+        "9.0a": "90",
+        "10.0": "100",
+        "12.0": "120",
+    }
+
+    cmake_arches = []
+    for arch in arch_list:
+        normalized = arch.lower().removesuffix("+ptx")
+        mapped = arch_map.get(normalized)
+        if mapped and mapped not in cmake_arches:
+            cmake_arches.append(mapped)
+
+    return ";".join(cmake_arches) if cmake_arches else None
 
 
 def get_extensions():
@@ -76,6 +106,8 @@ def get_extensions():
 
     include_dirs = [
         str(root_path / "src"),
+        str(root_path / "src/runtime"),
+        str(root_path / "src/torch_binding"),
     ]
 
     ext_modules = [
@@ -92,6 +124,8 @@ def get_extensions():
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
             include_dirs=include_dirs,
+            libraries=["zmq"],
+            extra_link_args=["-lzmq"],
         ),
     ]
 
@@ -123,6 +157,51 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
+    def run(self):
+        super().run()
+        self._build_and_stage_runtime_ops()
+
+    def _build_and_stage_runtime_ops(self) -> None:
+        build_dir = Path(self.build_temp) / "kvcache_manager_ops"
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        cmake_configure_cmd = [
+            "cmake",
+            "-S",
+            str(root_path),
+            "-B",
+            str(build_dir),
+        ]
+        cmake_arches = parse_torch_cuda_arch_list()
+        if cmake_arches:
+            cmake_configure_cmd.append(f"-DCMAKE_CUDA_ARCHITECTURES={cmake_arches}")
+
+        subprocess.check_call(cmake_configure_cmd, cwd=str(root_path))
+
+        max_jobs = os.getenv("MAX_JOBS") or str(os.cpu_count() or 1)
+        subprocess.check_call(
+            [
+                "cmake",
+                "--build",
+                str(build_dir),
+                "--target",
+                "kvcache_manager_ops",
+                "-j",
+                max_jobs,
+            ],
+            cwd=str(root_path),
+        )
+
+        built_runtime_ops = build_dir / runtime_ops_name
+        if not built_runtime_ops.exists():
+            raise FileNotFoundError(
+                f"Expected built runtime ops library at {built_runtime_ops}"
+            )
+
+        package_output_dir = Path(self.build_lib) / library_name
+        package_output_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built_runtime_ops, package_output_dir / runtime_ops_name)
+
 
 package = find_packages(exclude=("*test",))
 version, sha = get_version()
@@ -139,6 +218,7 @@ setup(
     # long_description=readme,
     long_description_content_type="text/markdown",
     packages=package,
+    package_data={library_name: [runtime_ops_name]},
     ext_modules=get_extensions(),
     license="Apache-2.0",
     keywords=[

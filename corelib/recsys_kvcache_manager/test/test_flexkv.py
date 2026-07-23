@@ -180,10 +180,7 @@ def run_phase_1(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     assert task_handle is not None and task_handle.handle is not None
 
-    while True:
-        kvcache_mgr.offload_try_wait()
-        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-            break
+    kvcache_mgr.offload_flush()
 
     expected_host_lens = [s // 32 * 32 for s in seqlen]
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
@@ -315,10 +312,7 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     assert task_handle is not None and task_handle.handle is not None
 
-    while True:
-        kvcache_mgr.offload_try_wait()
-        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-            break
+    kvcache_mgr.offload_flush()
 
     expected_host_lens = [s // 32 * 32 for s in seqlen]
 
@@ -451,10 +445,7 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     assert task_handle is not None and task_handle.handle is not None
 
-    while True:
-        kvcache_mgr.offload_try_wait()
-        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-            break
+    kvcache_mgr.offload_flush()
 
     expected_host_lens = [s // 32 * 32 for s in seqlen]
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
@@ -570,10 +561,7 @@ def run_phase_4(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     )
     assert task_handle is not None and task_handle.handle is not None
 
-    while True:
-        kvcache_mgr.offload_try_wait()
-        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-            break
+    kvcache_mgr.offload_flush()
 
     expected_host_lens = [s // 32 * 32 for s in seqlen]
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)
@@ -716,10 +704,8 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
         kvcache_metadata=kvcache_metadata,
     )
     assert task_handle is not None and task_handle.handle is not None
-    while True:
-        kvcache_mgr.offload_try_wait()
-        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-            break
+
+    kvcache_mgr.offload_flush()
 
     expected_host_lens = [s // 32 * 32 for s in seqlen]
     _, post_lookup = kvcache_mgr.lookup_kvcache(user_ids, sequence_lengths)

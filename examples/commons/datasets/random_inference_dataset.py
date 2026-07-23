@@ -119,7 +119,11 @@ class RandomInferenceDataset(
                     item_seq.append(
                         self._item_history[uid][: seqlen_idx + self._max_num_candidates]
                     )
-                    action_seq.append(self._action_history[uid][:seqlen_idx])
+                    action_seq.append(
+                        self._action_history[uid][
+                            : seqlen_idx + self._max_num_candidates
+                        ]
+                    )
                 features = KeyedJaggedTensor.from_jt_dict(
                     {
                         self._item_fea_name: JaggedTensor.from_dense(item_seq),

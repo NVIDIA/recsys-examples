@@ -190,7 +190,7 @@ cudaError_t AppendPagedKVCache(DType* k_data,
                     (void*)&a};
     cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
   });
-  return cudaSuccess;
+  return cudaGetLastError();
 }
 
 template 

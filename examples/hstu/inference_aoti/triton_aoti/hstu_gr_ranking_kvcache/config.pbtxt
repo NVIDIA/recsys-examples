@@ -1,0 +1,64 @@
+# Triton PyTorch AOTI backend config
+# Model input  slots: input__0 (values), input__1 (lengths), input__2 (num_candidates), input__3 (user_ids), input__4 (total_history_lengths)
+#       output slots: output__0 (logits), output__1 (kvcache_task_ids)
+
+name: "hstu_gr_ranking_kvcache"
+platform: "torch_aoti"
+max_batch_size: 0
+
+input [
+  {
+    name: "INPUT__0"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "INPUT__1"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "INPUT__2"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "INPUT__3"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  },
+  {
+    name: "INPUT__4"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  }
+]
+
+output [
+  {
+    name: "OUTPUT__0"
+    data_type: TYPE_FP32
+    dims: [ -1, 8 ]
+  },
+  {
+    name: "OUTPUT__1"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+
+# Generic model-init hook (upstream pytorch_backend): at model load the backend
+# dlopen()s this .so and calls triton_pytorch_model_init(model_dir, device) to
+# load the NVE embedding weights (which live outside model.pt2) into the
+# process-global registry. Replaces the old LD_PRELOAD nve_load_shim.so.
+parameters {
+  key: "MODEL_INIT_LIBRARY"
+  value: { string_value: "/workspace/recsys-examples/examples/hstu/inference_aoti/nve_init_hook/build/libnve_init_hook.so" }
+}

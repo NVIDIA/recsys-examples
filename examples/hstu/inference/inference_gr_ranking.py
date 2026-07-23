@@ -188,7 +188,7 @@ def get_inference_hstu_model(
         "max_seq_len": kvcache_max_seq_len,
         "dtype": torch.bfloat16,
         "device": torch.cuda.current_device(),
-        "host_kvstorage_backend": "native",
+        "host_kvstorage_backend": "flexkv",
         "offload_timeout_ms": 100.0,
         "offload_mode": "lazy",
     }
@@ -400,7 +400,7 @@ def run_ranking_gr_evaluate(
             shuffle=False,
             random_seed=0,
             eval_batch_size=max_batch_size,
-            load_candidate_action=False,
+            load_candidate_action=True,
         )
 
         dataloader = get_data_loader(dataset=eval_dataset)

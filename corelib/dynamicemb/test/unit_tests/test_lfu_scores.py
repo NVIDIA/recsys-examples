@@ -308,9 +308,7 @@ def test_lfu_score_validation(
     else:
         print(f"  - Caching: DISABLED")
     print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
-    print(
-        f"  - compound (TIMESTAMP, LFU) score: {lru_lfu} (LruLfu 2-word score)"
-    )
+    print(f"  - compound (TIMESTAMP, LFU) score: {lru_lfu} (LruLfu 2-word score)")
     if not caching and global_hbm_budget_scale < 1.0:
         print(f"  - Storage path: expect HybridStorage (StorageMode DEFAULT)")
 

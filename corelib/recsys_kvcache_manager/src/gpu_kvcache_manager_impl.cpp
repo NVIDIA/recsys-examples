@@ -318,6 +318,18 @@ void GPUKVCacheManagerImpl::allocate(
     std::vector<int> cached_lengths;
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
         int64_t uid = user_ids_ptr[seq_idx];
+        int gpu_cached_startpos = 0;
+        int gpu_cached_length = 0;
+        if (_uid_to_paged_cache_startpos.find(uid) != _uid_to_paged_cache_startpos.end()) {
+            gpu_cached_startpos = _uid_to_paged_cache_startpos[uid];
+            gpu_cached_length = _uid_to_paged_cache_length[uid];
+        }
+        if (gpu_cached_length > 0 && host_cached_lengths_ptr[seq_idx] < gpu_cached_startpos) {
+            evict(uid);
+            cached_lengths.push_back(0);
+            continue;
+        }
+        
         cached_lengths.push_back(std::max(
             host_cached_lengths_ptr[seq_idx],
             _uid_to_paged_cache_startpos[uid] + _uid_to_paged_cache_length[uid]
