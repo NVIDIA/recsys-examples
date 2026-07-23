@@ -210,6 +210,51 @@ class GRServingWorker:
                 allow_duplicate_token_paths=allow_duplicate_token_paths,
             )
 
+    def update_weights_from_disk(
+        self,
+        model_dir: str | Path,
+        *,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int = 0,
+    ) -> dict[str, Any]:
+        # Hold the worker lock so the in-place swap cannot overlap a tick.
+        with self._lock:
+            return self.facade.update_weights_from_disk(
+                model_dir,
+                flush_cache=flush_cache,
+                abort_all_requests=abort_all_requests,
+                weight_version=weight_version,
+                token_step=token_step,
+            )
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: Any,
+        *,
+        strict: bool = True,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int = 0,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self.facade.update_weights_from_tensor(
+                named_tensors,
+                strict=strict,
+                flush_cache=flush_cache,
+                abort_all_requests=abort_all_requests,
+                weight_version=weight_version,
+                token_step=token_step,
+            )
+
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self.facade.get_weights_by_name(name, truncate_size=truncate_size)
+
     def worker_status(self) -> dict[str, Any]:
         return {
             "running": self.running,

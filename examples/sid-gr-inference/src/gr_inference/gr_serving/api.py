@@ -167,6 +167,56 @@ class GRInProcessServingFacade:
             raise RuntimeError("item_mask_provider_store does not support rollback")
         return int(rollback())
 
+    def update_weights_from_disk(
+        self,
+        model_dir: str | Path,
+        *,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int = 0,
+    ) -> dict[str, Any]:
+        method = getattr(self.executor, "update_weights_from_disk", None)
+        if method is None:
+            raise RuntimeError("weight update requires a serving engine")
+        return method(
+            str(model_dir),
+            flush_cache=flush_cache,
+            abort_all_requests=abort_all_requests,
+            weight_version=weight_version,
+            token_step=token_step,
+        )
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: Any,
+        *,
+        strict: bool = True,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int = 0,
+    ) -> dict[str, Any]:
+        method = getattr(self.executor, "update_weights_from_tensor", None)
+        if method is None:
+            raise RuntimeError("weight update requires a serving engine")
+        return method(
+            named_tensors,
+            strict=strict,
+            flush_cache=flush_cache,
+            abort_all_requests=abort_all_requests,
+            weight_version=weight_version,
+            token_step=token_step,
+        )
+
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100
+    ) -> dict[str, Any]:
+        method = getattr(self.executor, "get_weights_by_name", None)
+        if method is None:
+            raise RuntimeError("weight lookup requires a serving engine")
+        return method(name, truncate_size=truncate_size)
+
     def lifecycle_status(self) -> dict[str, Any]:
         return self._lifecycle_status_from_status(dict(self.executor.status()))
 
