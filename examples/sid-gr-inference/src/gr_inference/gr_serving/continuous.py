@@ -816,6 +816,10 @@ class GRContinuousServingExecutor:
     token_step: int = 0
     weight_update_count: int = 0
     last_weight_update_ms: float = 0.0
+    # Paused state for RL weight-sync coordination (SGLang pause/continue_generation).
+    # When True the background worker skips inference ticks so a trainer can drive
+    # pause_generation -> flush_cache -> update_weights_from_* -> continue_generation.
+    is_paused: bool = False
     prefill_cache: GRPromptPrefixCache = field(default_factory=GRPromptPrefixCache)
     batched_prefill_cache: dict[tuple[str, ...], PrefillResult] = field(
         default_factory=dict
@@ -1107,6 +1111,57 @@ class GRContinuousServingExecutor:
             "values": flat.tolist(),
         }
 
+    def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
+        """Pause inference for RL weight-sync coordination (SGLang pause_generation).
+
+        ``abort`` (default, the mode Slime's disk path uses) fails all in-flight
+        requests; ``in_place``/``retract`` pause without aborting (in-flight decode
+        finishes on its own; we have no re-queue, so retract degrades to in_place).
+        Sets ``is_paused`` so the background worker stops advancing ticks until
+        ``continue_generation``.
+        """
+
+        aborted = 0
+        if mode == "abort":
+            failed_ids = self.scheduler.fail_unfinished(reason="pause_generation")
+            if failed_ids:
+                self._attach_execution_metadata(failed_ids)
+            aborted = len(failed_ids)
+        self.is_paused = True
+        return {
+            "paused": True,
+            "mode": mode,
+            "num_aborted_requests": aborted,
+        }
+
+    def continue_generation(self) -> dict[str, Any]:
+        """Resume inference after ``pause_generation`` (SGLang continue_generation)."""
+
+        self.is_paused = False
+        return {"paused": False}
+
+    def flush_cache(self, timeout_s: float | None = None) -> dict[str, Any]:
+        """Drop prefix/prefill cache entries (SGLang flush_cache).
+
+        Unlike the weight-update invalidation this only clears entries, not the
+        cache hit/miss counters. Safe to call with in-flight requests: those hold
+        their own KV leases, independent of the prompt prefix cache.
+        """
+
+        entries = len(self.prefill_cache) + len(self.batched_prefill_cache)
+        self.prefill_cache.clear()
+        self.batched_prefill_cache.clear()
+        return {"success": True, "entries_cleared": entries}
+
+    def get_weight_version(self) -> dict[str, Any]:
+        """Return the current weight version label (SGLang get_weight_version)."""
+
+        return {
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "weight_update_count": self.weight_update_count,
+        }
+
     def _require_weight_model(self) -> Any:
         engine = getattr(self, "engine", None)
         model = getattr(engine, "model", None) if engine is not None else None
@@ -1280,6 +1335,7 @@ class GRContinuousServingExecutor:
             "prefill_ms": self.prefill_ms,
             "decode_ms": self.decode_ms,
             "total_ms": self.prefill_ms + self.decode_ms,
+            "paused": self.is_paused,
         }
 
     def _weights_status(self) -> dict[str, Any]:

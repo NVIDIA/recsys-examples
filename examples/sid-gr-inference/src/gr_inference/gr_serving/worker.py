@@ -255,6 +255,22 @@ class GRServingWorker:
         with self._lock:
             return self.facade.get_weights_by_name(name, truncate_size=truncate_size)
 
+    def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
+        with self._lock:
+            return self.facade.pause_generation(mode=mode)
+
+    def continue_generation(self) -> dict[str, Any]:
+        with self._lock:
+            return self.facade.continue_generation()
+
+    def flush_cache(self, timeout_s: float | None = None) -> dict[str, Any]:
+        with self._lock:
+            return self.facade.flush_cache(timeout_s=timeout_s)
+
+    def get_weight_version(self) -> dict[str, Any]:
+        with self._lock:
+            return self.facade.get_weight_version()
+
     def worker_status(self) -> dict[str, Any]:
         return {
             "running": self.running,
@@ -275,7 +291,7 @@ class GRServingWorker:
                     self._stop_event.wait(self.tick_interval_s)
                 with self._lock:
                     has_work = self._has_work_unlocked()
-                    if has_work:
+                    if has_work and not self.facade.is_paused:
                         self._tick_unlocked()
                 self._stop_event.wait(
                     self.tick_interval_s if has_work else self.idle_sleep_s

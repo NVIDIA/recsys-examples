@@ -319,6 +319,36 @@ class GRHTTPServingAdapter:
             return self._handle_update_weights_from_disk(payload)
         if route == ("get_weights_by_name",) and method in {"GET", "POST"}:
             return self._handle_get_weights_by_name(payload)
+        if method == "POST" and route == ("pause_generation",):
+            if not self.validation_policy.allow_weight_update:
+                raise GRHTTPAdapterError(
+                    403, "pause_generation is disabled", code="route_disabled"
+                )
+            mode = str(payload.get("mode", "abort"))
+            if mode not in {"abort", "retract", "in_place"}:
+                raise GRHTTPAdapterError(
+                    400, f"invalid pause mode: {mode}", code="validation_error"
+                )
+            return _ok(self.facade.pause_generation(mode=mode))
+        if method == "POST" and route == ("continue_generation",):
+            if not self.validation_policy.allow_weight_update:
+                raise GRHTTPAdapterError(
+                    403, "continue_generation is disabled", code="route_disabled"
+                )
+            return _ok(self.facade.continue_generation())
+        if route == ("flush_cache",) and method in {"GET", "POST"}:
+            timeout_s = payload.get("timeout_s")
+            return _ok(
+                self.facade.flush_cache(
+                    timeout_s=float(timeout_s) if timeout_s is not None else None
+                )
+            )
+        if method == "GET" and route == ("get_weight_version",):
+            if not self.validation_policy.allow_weight_update:
+                raise GRHTTPAdapterError(
+                    403, "get_weight_version is disabled", code="route_disabled"
+                )
+            return _ok(self.facade.get_weight_version())
         return _error_response(404, f"unknown route: {method} /{'/'.join(route)}")
 
     def _handle_update_weights_from_disk(
@@ -1054,7 +1084,11 @@ def _route_manifest(policy: GRHTTPValidationPolicy) -> dict[str, tuple[str, ...]
             "POST /update_weights_from_disk",
             "GET /get_weights_by_name",
             "POST /get_weights_by_name",
+            "POST /pause_generation",
+            "POST /continue_generation",
+            "GET /get_weight_version",
         )
+    routes["cache"] = ("GET /flush_cache", "POST /flush_cache")
     return routes
 
 

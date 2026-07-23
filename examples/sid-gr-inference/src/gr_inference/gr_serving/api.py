@@ -217,6 +217,34 @@ class GRInProcessServingFacade:
             raise RuntimeError("weight lookup requires a serving engine")
         return method(name, truncate_size=truncate_size)
 
+    @property
+    def is_paused(self) -> bool:
+        return bool(getattr(self.executor, "is_paused", False))
+
+    def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
+        method = getattr(self.executor, "pause_generation", None)
+        if method is None:
+            raise RuntimeError("pause_generation requires a serving engine")
+        return method(mode=mode)
+
+    def continue_generation(self) -> dict[str, Any]:
+        method = getattr(self.executor, "continue_generation", None)
+        if method is None:
+            raise RuntimeError("continue_generation requires a serving engine")
+        return method()
+
+    def flush_cache(self, timeout_s: float | None = None) -> dict[str, Any]:
+        method = getattr(self.executor, "flush_cache", None)
+        if method is None:
+            return {"success": True, "entries_cleared": 0}
+        return method(timeout_s=timeout_s)
+
+    def get_weight_version(self) -> dict[str, Any]:
+        method = getattr(self.executor, "get_weight_version", None)
+        if method is None:
+            return {"weight_version": None}
+        return method()
+
     def lifecycle_status(self) -> dict[str, Any]:
         return self._lifecycle_status_from_status(dict(self.executor.status()))
 

@@ -439,3 +439,94 @@ def test_http_update_weights_from_disk_requires_model_path(tmp_path) -> None:
         "POST", "/update_weights_from_disk", json.dumps({}).encode("utf-8")
     )
     assert resp.status == 400
+
+
+# --------------------------------------------------------------------------- #
+# Disk coordination endpoints (SGLang pause/continue/flush_cache/get_weight_version)
+# --------------------------------------------------------------------------- #
+
+
+def test_executor_pause_continue_flush_version() -> None:
+    model, cfg = _model()
+    executor = _executor(model, cfg)
+    executor.submit(
+        GRServingRequest(
+            request_id="r1",
+            input_ids=torch.randint(0, cfg.vocab_size, (1, 4)),
+            max_decode_steps=1,
+            beam_width=1,
+        )
+    )
+
+    paused = executor.pause_generation(mode="abort")
+    assert paused["paused"] is True
+    assert paused["num_aborted_requests"] >= 1
+    assert executor.is_paused is True
+    assert len(executor.scheduler.decoding) == 0
+    assert executor.status()["paused"] is True
+
+    cont = executor.continue_generation()
+    assert cont["paused"] is False
+    assert executor.is_paused is False
+
+    flush = executor.flush_cache()
+    assert flush["success"] is True
+
+    executor.update_weights_from_tensor(
+        {"norm.weight": model.norm.weight.data + 0.1}, weight_version="rl-9"
+    )
+    assert executor.get_weight_version()["weight_version"] == "rl-9"
+
+
+def test_http_slime_disk_coordination_flow(tmp_path) -> None:
+    """Mirror slime actor_group._reload_rollout_weights_from_disk over HTTP."""
+    model, cfg = _model()
+    adapter = _adapter(model, cfg)
+    checkpoint = _write_checkpoint(model, cfg, tmp_path / "ckpt", perturb=0.5)
+    executor = adapter.facade.facade.executor  # worker.facade.executor
+
+    executor.submit(
+        GRServingRequest(
+            request_id="r1",
+            input_ids=torch.randint(0, cfg.vocab_size, (1, 4)),
+            max_decode_steps=1,
+            beam_width=1,
+        )
+    )
+
+    pause = adapter.handle("POST", "/pause_generation", json.dumps({"mode": "abort"}).encode())
+    assert pause.status == 200 and pause.body["paused"] is True
+    assert pause.body["num_aborted_requests"] >= 1
+
+    flush = adapter.handle("POST", "/flush_cache", json.dumps({}).encode())
+    assert flush.status == 200 and flush.body["success"] is True
+
+    update = adapter.handle(
+        "POST",
+        "/update_weights_from_disk",
+        json.dumps({"model_path": checkpoint, "weight_version": "rl-1"}).encode(),
+    )
+    assert update.status == 200 and update.body["success"] is True
+
+    cont = adapter.handle("POST", "/continue_generation", json.dumps({}).encode())
+    assert cont.status == 200 and cont.body["paused"] is False
+
+    version = adapter.handle("GET", "/get_weight_version").body
+    assert version["weight_version"] == "rl-1"
+
+
+def test_http_coordination_endpoints_gated_and_validated(tmp_path) -> None:
+    model, cfg = _model()
+    adapter = _adapter(model, cfg, allow_weight_update=False)
+    # pause/continue/get_weight_version are gated by allow_weight_update.
+    assert adapter.handle("POST", "/pause_generation", b"{}").status == 403
+    assert adapter.handle("POST", "/continue_generation", b"{}").status == 403
+    assert adapter.handle("GET", "/get_weight_version").status == 403
+    # flush_cache stays open (SGLang parity).
+    assert adapter.handle("POST", "/flush_cache", b"{}").status == 200
+
+    on = _adapter(model, cfg, allow_weight_update=True)
+    assert on.handle("POST", "/pause_generation", json.dumps({"mode": "bogus"}).encode()).status == 400
+    routes = on.handle("GET", "/config").body["routes"]
+    assert "POST /pause_generation" in routes["weights"]
+    assert "GET /flush_cache" in routes["cache"]
