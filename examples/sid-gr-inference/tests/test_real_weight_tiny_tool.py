@@ -950,6 +950,7 @@ def test_http_serving_builds_validation_policy() -> None:
             max_http_timeout_ticks=32,
             allow_manual_tick=False,
             allow_catalog_reload=True,
+            allow_weight_update=False,
         )
     )
 
@@ -962,6 +963,7 @@ def test_http_serving_builds_validation_policy() -> None:
     assert policy.max_timeout_ticks == 32
     assert policy.allow_manual_tick is False
     assert policy.allow_catalog_reload is True
+    assert policy.allow_weight_update is False
 
 
 def test_http_serving_builds_adapter_without_loading_real_model(monkeypatch) -> None:
@@ -1027,6 +1029,7 @@ def test_http_serving_builds_adapter_without_loading_real_model(monkeypatch) -> 
             max_finished_requests=2,
             allow_manual_tick=False,
             allow_catalog_reload=False,
+            allow_weight_update=False,
             api_key="secret",
             enable_log_requests=True,
             log_requests_level="summary",
