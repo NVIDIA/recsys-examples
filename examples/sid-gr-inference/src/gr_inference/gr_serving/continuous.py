@@ -1076,21 +1076,24 @@ class GRContinuousServingExecutor:
         weight_version: str | None = None,
         token_step: int | None = None,
     ) -> dict[str, Any]:
-        """Colocate weight sync: receive SGLang serialized CUDA-IPC tensors.
+        """Colocate weight sync: reconstruct tensors from the trainer's IPC handles.
 
-        Mirrors SGLang ``update_weights_from_tensor``: ``serialized_named_tensors``
-        is a per-TP-rank list of ForkingPickler-serialized payloads whose CUDA
-        tensors reduce to IPC handles (bytes travel zero-copy via CUDA IPC; both
-        sides must share the same GPU). We deserialize the flattened-bucket
+        This engine plays the rollout-engine role that SGLang plays in slime's
+        native setup, so it speaks SGLang's ``update_weights_from_tensor`` wire
+        format: a slime trainer (separate process, same GPU) serializes CUDA
+        tensors as **IPC handles** (a pointer, not the bytes) via ForkingPickler
+        and POSTs them; we reconstruct the tensors locally via zero-copy CUDA IPC
+        (both sides must share the same GPU). ``serialized_named_tensors`` is the
+        per-TP-rank list of those payloads. We deserialize the flattened-bucket
         (``load_format="flattened_bucket"``) or direct list, map HF tensor names
-        to the model's logical names, then **partially** load.
+        to the model's logical names, and **partially** load.
 
         Slime pushes the model in multiple chunks (one POST per chunk) plus empty
         alignment buckets, so this path does NOT require the full tensor set: it
         validates + copies only the tensors present in this payload (per-chunk,
         like SGLang's model.load_weights). Atomic full-set validation is the disk
-        path's job. ``flush_cache`` defaults True but slime sends False per chunk
-        and flushes separately after pause.
+        path's job. ``flush_cache`` defaults True but the trainer sends False per
+        chunk and flushes separately after pause.
         """
 
         from gr_inference.gr_serving.weight_ipc import reconstruct_named_tensors
@@ -1180,10 +1183,11 @@ class GRContinuousServingExecutor:
         """Drop prefix/prefill cache entries (SGLang flush_cache semantics).
 
         Returns ``success=False`` (HTTP 400) when there are running or waiting
-        requests -- SGLang refuses to flush in that state, and slime's disk/tensor
-        flows rely on the non-200 to retry (sglang_engine.py flush_cache loops up
-        to 60x until 200). Under the slime flow pause(abort) clears in-flight first,
-        so this returns 200. Only clears entries, not the hit/miss counters.
+        requests -- SGLang's flush_cache refuses in that state, and slime's
+        disk/tensor flows rely on the non-200 to retry (sglang_engine.py
+        flush_cache loops up to 60x until 200). Under the slime flow pause(abort)
+        clears in-flight first, so this returns 200. Only clears entries, not the
+        hit/miss counters.
         """
 
         in_flight = len(self.scheduler.waiting_prefill) + len(self.scheduler.decoding)

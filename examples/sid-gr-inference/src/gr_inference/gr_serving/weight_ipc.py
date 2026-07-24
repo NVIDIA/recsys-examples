@@ -4,8 +4,8 @@
 """CUDA-IPC weight-tensor serialization for colocate weight sync.
 
 This mirrors SGLang's colocate ``update_weights_from_tensor`` wire format so a
-SGLang/Slime trainer (separate process, same GPU) can push weights to this
-engine over HTTP with zero-copy GPU transfer:
+slime trainer (separate process, same GPU) can push weights to this engine --
+which plays the rollout-engine role that SGLang plays in slime's native setup:
 
 - The trainer flattens same-dtype tensors into one buffer, then serializes the
   bucket with ``ForkingPickler``. CUDA tensors reduce to a **CUDA IPC handle**
@@ -57,7 +57,7 @@ def monkey_patch_torch_reductions() -> None:
     """Patch torch multiprocessing reductions to carry the device as a UUID.
 
     Idempotent. Mirrors SGLang's ``monkey_patch_torch_reductions`` so that
-    tensors serialized by a SGLang/Slime trainer (device encoded as UUID) can be
+    tensors serialized by a slime trainer (device encoded as UUID) can be
     reconstructed here against this process's own device index.
 
     Process-global and effectively irreversible: it mutates

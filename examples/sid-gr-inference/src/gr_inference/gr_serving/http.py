@@ -348,8 +348,8 @@ class GRHTTPServingAdapter:
             result = self.facade.flush_cache(
                 timeout_s=float(timeout) if timeout is not None else None
             )
-            # SGLang returns 200 only when idle; 400 (running/waiting) drives
-            # slime's flush retry loop.
+            # SGLang's flush_cache returns 200 only when idle; 400
+            # (running/waiting) is what slime's flush retry loop keys on.
             return _ok(result, status=200 if result.get("success", True) else 400)
         if method == "GET" and route == ("get_weight_version",):
             if not self.validation_policy.allow_weight_update:
