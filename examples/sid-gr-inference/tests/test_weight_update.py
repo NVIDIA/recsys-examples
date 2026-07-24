@@ -272,7 +272,7 @@ def test_update_weights_from_tensor_is_atomic_on_failure() -> None:
 
 def test_validate_logical_weights_does_not_mutate(tmp_path) -> None:
     model, cfg = _model()
-    checkpoint = _write_checkpoint(model, cfg, tmp_path / "ckpt")
+    checkpoint = _write_checkpoint(model, cfg, tmp_path / "ckpt", perturb=0.5)
     logical = materialize_qwen3_checkpoint(checkpoint)
 
     snapshot = {
@@ -282,11 +282,14 @@ def test_validate_logical_weights_does_not_mutate(tmp_path) -> None:
     for name, tensor in model.named_parameters():
         assert torch.allclose(tensor, snapshot[name])
 
-    # A real load then round-trips back to the same logical tensors.
+    # A real load actually applies the checkpoint (params diverge from snapshot).
     model.load_logical_weights(logical)
-    again = materialize_qwen3_checkpoint(checkpoint)
-    for name, tensor in again.items():
-        assert torch.allclose(tensor, again[name])  # sanity: materialize is stable
+    changed = [
+        name
+        for name, tensor in model.named_parameters()
+        if not torch.allclose(tensor, snapshot[name])
+    ]
+    assert changed, "load_logical_weights did not apply any weights"
 
 
 # --------------------------------------------------------------------------- #
@@ -370,9 +373,13 @@ def test_get_weights_by_name_returns_truncated_sample() -> None:
     model, cfg = _model()
     executor = _executor(model, cfg)
     sample = executor.get_weights_by_name("lm_head.weight", truncate_size=3)
-    assert sample["name"] == "lm_head.weight"
-    assert sample["shape"] == [cfg.vocab_size, cfg.hidden_size]
-    assert len(sample["values"]) == 3
+    # SGLang shape: {"parameter": [first truncate_size rows along dim0]}.
+    assert "parameter" in sample
+    assert len(sample["parameter"]) == 3  # 3 rows
+    assert len(sample["parameter"][0]) == cfg.hidden_size
+    # Matches the model's actual lm_head rows.
+    expected = model.lm_head.weight.detach()[:3].tolist()
+    assert sample["parameter"] == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -482,9 +489,9 @@ def test_http_get_weights_by_name(tmp_path) -> None:
         "GET", "/get_weights_by_name?name=lm_head.weight&truncate_size=2"
     )
     assert resp.status == 200
-    assert resp.body["name"] == "lm_head.weight"
-    assert resp.body["shape"] == [cfg.vocab_size, cfg.hidden_size]
-    assert len(resp.body["values"]) == 2
+    assert "parameter" in resp.body
+    assert len(resp.body["parameter"]) == 2  # 2 rows along dim0
+    assert len(resp.body["parameter"][0]) == cfg.hidden_size
 
     post = adapter.handle(
         "POST",
@@ -492,7 +499,8 @@ def test_http_get_weights_by_name(tmp_path) -> None:
         json.dumps({"name": "norm.weight", "truncate_size": 1}).encode("utf-8"),
     )
     assert post.status == 200
-    assert post.body["shape"] == [cfg.hidden_size]
+    # norm.weight is 1-D [hidden_size]; one "row" is a single scalar.
+    assert len(post.body["parameter"]) == 1
 
 
 def test_http_weight_routes_respect_allow_flag(tmp_path) -> None:
@@ -737,3 +745,88 @@ def test_update_rejects_in_flight_without_abort() -> None:
     )
     assert result["success"] is True
     assert result["num_aborted_requests"] >= 1
+
+
+def test_flush_cache_returns_400_with_in_flight() -> None:
+    """SGLang semantics: flush returns non-200 with running/waiting requests."""
+    model, cfg = _model()
+    adapter = _adapter(model, cfg)
+    executor = adapter.facade.facade.executor
+    executor.submit(
+        GRServingRequest(
+            request_id="r1",
+            input_ids=torch.randint(0, cfg.vocab_size, (1, 4)),
+            max_decode_steps=1,
+            beam_width=1,
+        )
+    )
+    resp = adapter.handle("POST", "/flush_cache", json.dumps({}).encode())
+    assert resp.status == 400
+    assert resp.body["success"] is False
+
+    # After pause(abort) clears in-flight, flush succeeds (200) -- the slime flow.
+    adapter.handle("POST", "/pause_generation", json.dumps({"mode": "abort"}).encode())
+    resp2 = adapter.handle("POST", "/flush_cache", json.dumps({}).encode())
+    assert resp2.status == 200
+
+
+# --------------------------------------------------------------------------- #
+# Real CUDA IPC cross-process round-trip
+# (exercises reduce_tensor's CUDA branch + device-UUID remap; CPU tests cannot)
+# --------------------------------------------------------------------------- #
+
+
+def _cuda_ipc_producer(conn):
+    """Subprocess: serialize a CUDA tensor to an IPC handle, stay alive until told."""
+    import torch
+    from gr_inference.gr_serving.weight_ipc import (
+        FlattenedTensorBucket,
+        MultiprocessingSerializer,
+        monkey_patch_torch_reductions,
+    )
+
+    monkey_patch_torch_reductions()
+    torch.manual_seed(42)
+    tensor = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    bucket = FlattenedTensorBucket(named_tensors=[("model.norm.weight", tensor)])
+    serialized = MultiprocessingSerializer.serialize(
+        {"flattened_tensor": bucket.flattened_tensor, "metadata": bucket.metadata},
+        output_str=True,
+    )
+    conn.send(serialized)
+    conn.recv()  # block so the process (and its IPC memory) stays alive
+
+
+def test_cuda_ipc_roundtrip_cross_process() -> None:
+    """Producer serializes a CUDA tensor as an IPC handle; this process reconstructs
+    it via CUDA IPC and verifies equality. This is the only test that exercises
+    reduce_tensor's CUDA branch and the device-UUID remap (CPU-only tests serialize
+    bytes inline and never hit it)."""
+    import multiprocessing as mp
+
+    from gr_inference.gr_serving.weight_ipc import (
+        monkey_patch_torch_reductions,
+        reconstruct_named_tensors,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for the IPC round-trip test")
+    monkey_patch_torch_reductions()
+    torch.manual_seed(42)
+    expected = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(target=_cuda_ipc_producer, args=(child,))
+    proc.start()
+    try:
+        serialized = parent.recv()
+        out = reconstruct_named_tensors([serialized], load_format="flattened_bucket")
+        parent.send("done")  # release the producer
+        assert out[0][0] == "model.norm.weight"
+        assert torch.equal(out[0][1], expected)
+    finally:
+        proc.join(timeout=30)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()

@@ -217,7 +217,7 @@ class GRServingWorker:
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
-        token_step: int = 0,
+        token_step: int | None = None,
     ) -> dict[str, Any]:
         # Hold the worker lock so the in-place swap cannot overlap a tick.
         with self._lock:
@@ -237,7 +237,7 @@ class GRServingWorker:
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
-        token_step: int = 0,
+        token_step: int | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             return self.facade.update_weights_from_tensor(

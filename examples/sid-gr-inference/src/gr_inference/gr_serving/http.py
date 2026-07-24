@@ -343,12 +343,14 @@ class GRHTTPServingAdapter:
                 )
             return _ok(self.facade.continue_generation())
         if route == ("flush_cache",) and method in {"GET", "POST"}:
-            timeout_s = payload.get("timeout_s")
-            return _ok(
-                self.facade.flush_cache(
-                    timeout_s=float(timeout_s) if timeout_s is not None else None
-                )
+            # SGLang query key is `timeout` (io_struct field is timeout_s).
+            timeout = payload.get("timeout")
+            result = self.facade.flush_cache(
+                timeout_s=float(timeout) if timeout is not None else None
             )
+            # SGLang returns 200 only when idle; 400 (running/waiting) drives
+            # slime's flush retry loop.
+            return _ok(result, status=200 if result.get("success", True) else 400)
         if method == "GET" and route == ("get_weight_version",):
             if not self.validation_policy.allow_weight_update:
                 raise GRHTTPAdapterError(
@@ -378,7 +380,7 @@ class GRHTTPServingAdapter:
             flush_cache=bool(payload.get("flush_cache", True)),
             abort_all_requests=bool(payload.get("abort_all_requests", False)),
             weight_version=payload.get("weight_version"),
-            token_step=int(payload.get("token_step", 0) or 0),
+            token_step=payload.get("token_step"),
         )
         return _ok(result)
 
@@ -404,7 +406,7 @@ class GRHTTPServingAdapter:
             flush_cache=bool(payload.get("flush_cache", True)),
             abort_all_requests=bool(payload.get("abort_all_requests", False)),
             weight_version=payload.get("weight_version"),
-            token_step=int(payload.get("token_step", 0) or 0),
+            token_step=payload.get("token_step"),
         )
         return _ok(result)
 

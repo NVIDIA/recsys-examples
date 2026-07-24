@@ -59,6 +59,13 @@ def monkey_patch_torch_reductions() -> None:
     Idempotent. Mirrors SGLang's ``monkey_patch_torch_reductions`` so that
     tensors serialized by a SGLang/Slime trainer (device encoded as UUID) can be
     reconstructed here against this process's own device index.
+
+    Process-global and effectively irreversible: it mutates
+    ``torch.multiprocessing.reductions`` in place and re-runs
+    ``init_reductions()``. The ``hasattr(..., "_reduce_tensor_original")`` guard
+    keeps it a no-op if a co-resident SGLang already patched (or we already did),
+    so the two can coexist, but the patch itself cannot be cleanly undone in a
+    running process.
     """
 
     global _PATCHED

@@ -174,7 +174,7 @@ class GRInProcessServingFacade:
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
-        token_step: int = 0,
+        token_step: int | None = None,
     ) -> dict[str, Any]:
         method = getattr(self.executor, "update_weights_from_disk", None)
         if method is None:
@@ -195,7 +195,7 @@ class GRInProcessServingFacade:
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
-        token_step: int = 0,
+        token_step: int | None = None,
     ) -> dict[str, Any]:
         method = getattr(self.executor, "update_weights_from_tensor", None)
         if method is None:

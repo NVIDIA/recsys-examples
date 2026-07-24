@@ -1027,7 +1027,7 @@ class GRContinuousServingExecutor:
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
-        token_step: int = 0,
+        token_step: int | None = None,
     ) -> dict[str, Any]:
         """Swap weights from an on-disk HF checkpoint without a process restart.
 
@@ -1035,6 +1035,9 @@ class GRContinuousServingExecutor:
         trainer writes an HF checkpoint to a path this engine can read, then calls
         this method over HTTP. Validate-then-load for atomicity — a bad
         checkpoint leaves the previous policy fully intact.
+
+        Memory: ``materialize_qwen3_checkpoint`` reads the whole checkpoint into
+        host memory before validating, so peak CPU RAM ~= checkpoint size.
         """
 
         model = self._require_weight_model()
@@ -1071,7 +1074,7 @@ class GRContinuousServingExecutor:
         flush_cache: bool = True,
         abort_all_requests: bool = False,
         weight_version: str | None = None,
-        token_step: int = 0,
+        token_step: int | None = None,
     ) -> dict[str, Any]:
         """Colocate weight sync: receive SGLang serialized CUDA-IPC tensors.
 
@@ -1128,17 +1131,19 @@ class GRContinuousServingExecutor:
         }
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100) -> Any:
-        """Return a truncated CPU sample of a parameter (SGLang get_weights_by_name)."""
+        """Return a parameter as ``{"parameter": [...]}`` (SGLang get_weights_by_name).
+
+        Truncates to the first ``truncate_size`` rows along dim 0 (matches upstream).
+        ``name`` is the model's parameter name (module path, e.g.
+        ``layers.0.ops.qkv_proj.weight``); upstream accepts HF names, but our qkv /
+        gate_up are packed, so HF split names do not map 1:1. Diagnostic only --
+        slime does not call this endpoint.
+        """
 
         model = self._require_weight_model()
         param = model.get_parameter_by_name(name)
-        flat = param.detach().reshape(-1)[:truncate_size].to(device="cpu")
-        return {
-            "name": name,
-            "shape": [int(dim) for dim in param.shape],
-            "dtype": str(param.dtype),
-            "values": flat.tolist(),
-        }
+        rows = param.detach()[:truncate_size].to(device="cpu")
+        return {"parameter": rows.tolist()}
 
     def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
         """Pause inference for RL weight-sync coordination (SGLang pause_generation).
@@ -1172,13 +1177,23 @@ class GRContinuousServingExecutor:
         return {"paused": False}
 
     def flush_cache(self, timeout_s: float | None = None) -> dict[str, Any]:
-        """Drop prefix/prefill cache entries (SGLang flush_cache).
+        """Drop prefix/prefill cache entries (SGLang flush_cache semantics).
 
-        Unlike the weight-update invalidation this only clears entries, not the
-        cache hit/miss counters. Safe to call with in-flight requests: those hold
-        their own KV leases, independent of the prompt prefix cache.
+        Returns ``success=False`` (HTTP 400) when there are running or waiting
+        requests -- SGLang refuses to flush in that state, and slime's disk/tensor
+        flows rely on the non-200 to retry (sglang_engine.py flush_cache loops up
+        to 60x until 200). Under the slime flow pause(abort) clears in-flight first,
+        so this returns 200. Only clears entries, not the hit/miss counters.
         """
 
+        in_flight = len(self.scheduler.waiting_prefill) + len(self.scheduler.decoding)
+        if in_flight:
+            return {
+                "success": False,
+                "message": (
+                    "Cannot flush cache while there are running or waiting requests."
+                ),
+            }
         entries = len(self.prefill_cache) + len(self.batched_prefill_cache)
         self.prefill_cache.clear()
         self.batched_prefill_cache.clear()
@@ -1261,13 +1276,14 @@ class GRContinuousServingExecutor:
     def _record_weight_version(
         self,
         weight_version: str | None,
-        token_step: int,
+        token_step: int | None,
         elapsed_ms: float,
     ) -> None:
+        # Symmetric: preserve the previous label when the caller omits the field.
         if weight_version is not None:
             self.weight_version = weight_version
-        # token_step is always carried by the caller (0 is a valid step id).
-        self.token_step = int(token_step)
+        if token_step is not None:
+            self.token_step = int(token_step)
         self.weight_update_count += 1
         self.last_weight_update_ms = float(elapsed_ms)
 
