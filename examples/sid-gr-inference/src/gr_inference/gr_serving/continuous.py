@@ -1058,7 +1058,7 @@ class GRContinuousServingExecutor:
             "success": True,
             "message": "Succeeded to update model weights from disk.",
             "model_dir": str(model_dir),
-            "params_updated": len(weights),
+            "tensors_loaded": len(weights),
             "flushed_cache": bool(flush_cache),
             "num_aborted_requests": num_aborted,
             "weight_version": self.weight_version,
@@ -1100,9 +1100,19 @@ class GRContinuousServingExecutor:
 
         model = self._require_weight_model()
         self._reject_in_flight_without_abort(abort_all_requests)
-        named_tensors = reconstruct_named_tensors(
-            serialized_named_tensors, load_format=load_format
-        )
+        # Deserialization is the untrusted-input boundary: malformed pickle, bad
+        # base64, the allowlist reject, or a CUDA-IPC rebuild failure can raise
+        # types the HTTP handler does not catch. Convert them to ValueError so
+        # the caller gets a 400 (not a connection reset).
+        try:
+            named_tensors = reconstruct_named_tensors(
+                serialized_named_tensors, load_format=load_format
+            )
+        except Exception as exc:  # noqa: BLE001 - surface all decode failures as 400
+            raise ValueError(
+                f"failed to deserialize weight payload: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         logical = {
             _hf_to_logical_name(name): tensor for name, tensor in named_tensors
         }
@@ -1125,7 +1135,9 @@ class GRContinuousServingExecutor:
         return {
             "success": True,
             "message": "Succeeded to update model weights from tensor.",
-            "params_updated": len(logical),
+            # Count of tensors in this payload, NOT distinct model parameters
+            # (q/k/v arrive split and load into one packed qkv_proj).
+            "tensors_loaded": len(logical),
             "flushed_cache": bool(flush_cache),
             "num_aborted_requests": num_aborted,
             "weight_version": self.weight_version,

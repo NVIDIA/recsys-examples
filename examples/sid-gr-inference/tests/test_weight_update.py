@@ -310,7 +310,7 @@ def test_update_weights_from_disk_swaps_and_versions(tmp_path) -> None:
     )
 
     assert result["success"] is True
-    assert result["params_updated"] > 0
+    assert result["tensors_loaded"] > 0
     assert result["flushed_cache"] is True
     assert not torch.allclose(model.lm_head.weight.data, lm_before, atol=1e-5)
     assert executor.weight_version == "v1"
@@ -471,7 +471,7 @@ def test_http_update_weights_from_disk(tmp_path) -> None:
     resp = adapter.handle("POST", "/update_weights_from_disk", body)
     assert resp.status == 200
     assert resp.body["success"] is True
-    assert resp.body["params_updated"] > 0
+    assert resp.body["tensors_loaded"] > 0
     assert not torch.allclose(model.lm_head.weight.data, lm_before, atol=1e-5)
 
     status = adapter.handle("GET", "/status").body
@@ -541,7 +541,7 @@ def test_http_update_weights_from_tensor() -> None:
     resp = adapter.handle("POST", "/update_weights_from_tensor", body)
     assert resp.status == 200
     assert resp.body["success"] is True
-    assert resp.body["params_updated"] > 0
+    assert resp.body["tensors_loaded"] > 0
     assert not torch.allclose(model.lm_head.weight.data, lm_before, atol=1e-5)
     assert adapter.facade.facade.executor.weight_version == "t1"
 
@@ -693,7 +693,7 @@ def test_tensor_path_empty_bucket_is_noop() -> None:
         [serialized], load_format="flattened_bucket", flush_cache=False
     )
     assert result["success"] is True
-    assert result["params_updated"] == 0
+    assert result["tensors_loaded"] == 0
     assert torch.allclose(model.embed_tokens.weight.data, embed_before)
 
 
@@ -830,3 +830,60 @@ def test_cuda_ipc_roundtrip_cross_process() -> None:
         if proc.is_alive():
             proc.terminate()
             proc.join()
+
+
+# --------------------------------------------------------------------------- #
+# Security / error-handling on the tensor endpoint
+# --------------------------------------------------------------------------- #
+
+_RCE_HIT: list[bool] = []
+
+
+def _rce_canary(*args, **kwargs):  # noqa: ANN001 - pickle probe target
+    """If the allowlist is bypassed, unpickling would call this."""
+    _RCE_HIT.append(True)
+    return None
+
+
+def test_tensor_endpoint_blocks_pickle_rce() -> None:
+    """A crafted pickle must be blocked by the allowlist -> 400, never executed."""
+    import base64
+    import pickle
+
+    model, cfg = _model()
+    adapter = _adapter(model, cfg)
+    _RCE_HIT.clear()
+    # A pickle whose unpickling would call _rce_canary(...) -- the allowlist must
+    # reject its module before the callable is ever invoked.
+    payload = {
+        "serialized_named_tensors": [
+            base64.b64encode(pickle.dumps((_rce_canary, ("x",)))).decode()
+        ]
+    }
+    resp = adapter.handle(
+        "POST", "/update_weights_from_tensor", json.dumps(payload).encode()
+    )
+    assert resp.status == 400
+    assert _RCE_HIT == [], "allowlist bypassed: pickle RCE probe was executed"
+
+
+def test_tensor_endpoint_malformed_payload_is_400() -> None:
+    """Malformed payloads return 400 (not a connection reset)."""
+    import base64
+
+    model, cfg = _model()
+    adapter = _adapter(model, cfg)
+    bad_base64 = adapter.handle(
+        "POST",
+        "/update_weights_from_tensor",
+        json.dumps({"serialized_named_tensors": ["!!!not-base64!!!"]}).encode(),
+    )
+    assert bad_base64.status == 400
+    not_pickle = adapter.handle(
+        "POST",
+        "/update_weights_from_tensor",
+        json.dumps(
+            {"serialized_named_tensors": [base64.b64encode(b"not a pickle").decode()]}
+        ).encode(),
+    )
+    assert not_pickle.status == 400

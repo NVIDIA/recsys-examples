@@ -109,8 +109,18 @@ def _reduce_tensor_modified(*args, **kwargs):
         *args, **kwargs
     )
     # Only CUDA tensors carry the device at this index; CPU/other reductions use
-    # a different (shorter) tuple, so leave them untouched.
+    # a different (shorter) tuple, so leave them untouched. Guard with an
+    # isinstance check so a future PyTorch reduce-protocol change (reordered or
+    # added args) fails loud instead of silently UUID-encoding the wrong element
+    # and misrouting the CUDA device.
     if len(output_args) > _REDUCE_TENSOR_ARG_DEVICE_INDEX:
+        device_arg = output_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX]
+        if not isinstance(device_arg, int):
+            raise RuntimeError(
+                f"reduce_tensor protocol drift: expected int CUDA device at "
+                f"index {_REDUCE_TENSOR_ARG_DEVICE_INDEX}, got "
+                f"{type(device_arg).__name__} ({device_arg!r})"
+            )
         output_args = _modify_tuple(
             output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
         )
@@ -189,23 +199,69 @@ class FlattenedTensorBucket:
 
 
 # --------------------------------------------------------------------------- #
-# MultiprocessingSerializer (SGLang common.py) + metadata-remapping unpickler
+# MultiprocessingSerializer (SGLang common.py) + allowlisted, metadata-remapping
+# unpickler
 # --------------------------------------------------------------------------- #
+
+# The wire payload is untrusted (any caller with the API key can POST). Restrict
+# unpickling to exactly the modules a legitimate weight bucket needs: torch
+# tensors + their multiprocessing CUDA-IPC rebuild functions, plain builtins /
+# collections, and our metadata class (remapped by name below). Anything else --
+# e.g. os.system, subprocess -- is rejected so a crafted payload cannot trigger
+# arbitrary class instantiation (pickle RCE). Mirrors SGLang's SafeUnpickler.
+# Roots: a module is allowed if it equals a root or is a submodule
+# (root + "."), so "torch" covers "torch.Tensor" and "torch.storage.UntypedStorage".
+_ALLOWED_UNPICKLE_ROOTS = frozenset(
+    {
+        "builtins",
+        "collections",
+        "copyreg",
+        "functools",
+        "itertools",
+        "operator",
+        "types",
+        "weakref",
+        "pickletools",
+        "torch",
+        "numpy",
+        "multiprocessing.reduction",
+        "multiprocessing.resource_sharer",
+    }
+)
+
+
+def _module_allowed(module: str) -> bool:
+    return module in _ALLOWED_UNPICKLE_ROOTS or any(
+        module.startswith(root + ".") for root in _ALLOWED_UNPICKLE_ROOTS
+    )
 
 
 class _WeightUnpickler(pickle.Unpickler):
-    """Unpickle trainer payloads, mapping any ``FlattenedTensorMetadata`` to ours.
+    """Allowlisted unpickler for trainer payloads.
 
-    SGLang's bucket metadata pickles by qualified name; the class lives at
-    different module paths across SGLang versions. Remap by class name so we do
-    not depend on SGLang being installed. Everything else (torch tensors, CUDA
-    IPC rebuild functions, builtins) resolves normally.
+    Maps any ``FlattenedTensorMetadata`` (pickled by qualified name; the class
+    lives at different module paths across SGLang versions) to ours, and rejects
+    every class whose module is not on the allowlist -- so we never depend on
+    SGLang being installed, and a crafted payload cannot instantiate arbitrary
+    classes.
     """
 
     def find_class(self, module: str, name: str):
         if name == "FlattenedTensorMetadata":
             return FlattenedTensorMetadata
-        return super().find_class(module, name)
+        # The CUDA rebuild callable lives in whatever module patched reductions
+        # (ours, SGLang's, or a slime-vendored copy). Always resolve it to OUR
+        # reviewed version, so the producer's module is irrelevant and a crafted
+        # payload cannot substitute a malicious rebuild callable. The unpatched
+        # rebuild_cuda_tensor is in torch.multiprocessing.reductions (allowed).
+        if name == "_rebuild_cuda_tensor_modified":
+            return _rebuild_cuda_tensor_modified
+        if _module_allowed(module):
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(
+            f"blocked unpickle of {module}.{name}: module not in the "
+            "weight-payload allowlist"
+        )
 
 
 class MultiprocessingSerializer:
