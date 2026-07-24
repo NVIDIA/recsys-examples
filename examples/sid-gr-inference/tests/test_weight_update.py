@@ -640,3 +640,70 @@ def test_http_coordination_endpoints_gated_and_validated(tmp_path) -> None:
     routes = on.handle("GET", "/config").body["routes"]
     assert "POST /pause_generation" in routes["weights"]
     assert "GET /flush_cache" in routes["cache"]
+
+
+# --------------------------------------------------------------------------- #
+# Colocate chunked / partial semantics
+# (slime POSTs the model in multiple chunks + empty alignment buckets)
+# --------------------------------------------------------------------------- #
+
+
+def test_tensor_path_chunked_applies_full_model() -> None:
+    """Slime POSTs in multiple chunks; each chunk must apply partially."""
+    model, cfg = _model()
+    executor = _executor(model, cfg)
+    orig = {n: t.clone() for n, t in model.named_parameters()}
+
+    all_named = _hf_named_tensors(model, cfg, perturb=1.0)
+    mid = len(all_named) // 2
+    for chunk in (all_named[:mid], all_named[mid:]):
+        serialized = _serialize_bucket(chunk)
+        result = executor.update_weights_from_tensor(
+            [serialized], load_format="flattened_bucket", flush_cache=False
+        )
+        assert result["success"] is True
+
+    # Both chunks together updated every parameter by +1.0.
+    for name, tensor in model.named_parameters():
+        assert torch.allclose(tensor, orig[name] + 1.0, atol=1e-5), name
+    assert executor.weight_update_count == 2
+
+
+def test_tensor_path_empty_bucket_is_noop() -> None:
+    """Empty alignment buckets (slime _empty_flattened_tensor_data) must not error."""
+    from gr_inference.gr_serving.weight_ipc import MultiprocessingSerializer
+
+    model, cfg = _model()
+    executor = _executor(model, cfg)
+    embed_before = model.embed_tokens.weight.data.clone()
+
+    serialized = MultiprocessingSerializer.serialize(
+        {"flattened_tensor": torch.empty(0, dtype=torch.uint8), "metadata": []},
+        output_str=True,
+    )
+    result = executor.update_weights_from_tensor(
+        [serialized], load_format="flattened_bucket", flush_cache=False
+    )
+    assert result["success"] is True
+    assert result["params_updated"] == 0
+    assert torch.allclose(model.embed_tokens.weight.data, embed_before)
+
+
+def test_tensor_path_partial_chunk_is_atomic_on_bad_shape() -> None:
+    """A bad-shape tensor fails the chunk's validation before any tensor is copied."""
+    model, cfg = _model()
+    executor = _executor(model, cfg)
+    named = _hf_named_tensors(model, cfg)
+    bad = list(named)
+    bad[0] = (bad[0][0], torch.zeros(1, 1))  # wrong shape for its name
+    serialized = _serialize_bucket(bad)
+
+    sentinel = model.get_parameter_by_name("layers.0.ops.down_proj.weight").clone()
+    with pytest.raises(ValueError):
+        executor.update_weights_from_tensor(
+            [serialized], load_format="flattened_bucket", flush_cache=False
+        )
+    # validate-then-copy: the chunk's other (valid) tensors were not written.
+    assert torch.allclose(
+        model.get_parameter_by_name("layers.0.ops.down_proj.weight"), sentinel
+    )

@@ -1079,7 +1079,14 @@ class GRContinuousServingExecutor:
         tensors reduce to IPC handles (bytes travel zero-copy via CUDA IPC; both
         sides must share the same GPU). We deserialize the flattened-bucket
         (``load_format="flattened_bucket"``) or direct list, map HF tensor names
-        to the model's logical names, validate, then in-place load.
+        to the model's logical names, then **partially** load.
+
+        Slime pushes the model in multiple chunks (one POST per chunk) plus empty
+        alignment buckets, so this path does NOT require the full tensor set: it
+        validates + copies only the tensors present in this payload (per-chunk,
+        like SGLang's model.load_weights). Atomic full-set validation is the disk
+        path's job. ``flush_cache`` defaults True but slime sends False per chunk
+        and flushes separately after pause.
         """
 
         from gr_inference.gr_serving.weight_ipc import reconstruct_named_tensors
@@ -1091,10 +1098,18 @@ class GRContinuousServingExecutor:
         logical = {
             _hf_to_logical_name(name): tensor for name, tensor in named_tensors
         }
-        model.validate_logical_weights(logical)
+        # Partial / chunked semantics: slime POSTs the model in multiple chunks
+        # (update_weight_from_tensor.py, one bucket per chunk) and sends empty
+        # alignment buckets (_empty_flattened_tensor_data), so we must NOT require
+        # the full logical tensor set here. Validate the shapes of the tensors
+        # PRESENT in this payload (dry-run; strict=False skips missing names),
+        # then copy only those -- mirrors SGLang's per-chunk model.load_weights.
+        # Full all-or-nothing validation stays on the disk path. Empty bucket is
+        # a no-op success.
+        model.load_logical_weights(logical, strict=False, dry_run=True)
         num_aborted = self._abort_in_flight(abort_all_requests)
         start = time.perf_counter()
-        model.load_logical_weights(logical)
+        model.load_logical_weights(logical, strict=False)
         self._invalidate_weight_dependent_state(flush_cache)
         self._synchronize()
         elapsed_ms = (time.perf_counter() - start) * 1000.0
