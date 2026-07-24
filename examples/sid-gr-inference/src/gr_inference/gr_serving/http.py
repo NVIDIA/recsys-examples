@@ -51,7 +51,11 @@ class GRHTTPValidationPolicy:
     max_timeout_ticks: int | None = None
     allow_manual_tick: bool = True
     allow_catalog_reload: bool = True
-    allow_weight_update: bool = True
+    # Opt-in: weight update loads an arbitrary caller-supplied checkpoint path
+    # and the tensor endpoint unpickles CUDA-IPC handles, so it is a privileged
+    # surface. Default off; enable only on a trusted intranet and behind --api-key
+    # (the serve tool gates it via --allow-weight-update / GR_ALLOW_WEIGHT_UPDATE).
+    allow_weight_update: bool = False
 
     def validate(self) -> None:
         for name, value in (

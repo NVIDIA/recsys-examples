@@ -707,3 +707,33 @@ def test_tensor_path_partial_chunk_is_atomic_on_bad_shape() -> None:
     assert torch.allclose(
         model.get_parameter_by_name("layers.0.ops.down_proj.weight"), sentinel
     )
+
+
+def test_update_rejects_in_flight_without_abort() -> None:
+    """Without pause/abort, updating with in-flight requests is refused."""
+    model, cfg = _model()
+    executor = _executor(model, cfg)
+    executor.submit(
+        GRServingRequest(
+            request_id="r1",
+            input_ids=torch.randint(0, cfg.vocab_size, (1, 4)),
+            max_decode_steps=1,
+            beam_width=1,
+        )
+    )
+
+    # Guard fires before any disk IO, so a bogus path is fine.
+    with pytest.raises(RuntimeError, match="in-flight"):
+        executor.update_weights_from_disk("/nonexistent")
+    serialized = _serialize_bucket(_hf_named_tensors(model, cfg))
+    with pytest.raises(RuntimeError, match="in-flight"):
+        executor.update_weights_from_tensor(
+            [serialized], load_format="flattened_bucket"
+        )
+
+    # abort_all_requests=True bypasses the guard and clears in-flight first.
+    result = executor.update_weights_from_tensor(
+        [serialized], load_format="flattened_bucket", abort_all_requests=True
+    )
+    assert result["success"] is True
+    assert result["num_aborted_requests"] >= 1

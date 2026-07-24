@@ -1038,6 +1038,7 @@ class GRContinuousServingExecutor:
         """
 
         model = self._require_weight_model()
+        self._reject_in_flight_without_abort(abort_all_requests)
         manifest = HFCheckpointLoader(model_dir).manifest()
         new_config = Qwen3GRConfig.from_hf_config(manifest.config)
         self._assert_compatible_config(model.config, new_config, model_dir)
@@ -1092,6 +1093,7 @@ class GRContinuousServingExecutor:
         from gr_inference.gr_serving.weight_ipc import reconstruct_named_tensors
 
         model = self._require_weight_model()
+        self._reject_in_flight_without_abort(abort_all_requests)
         named_tensors = reconstruct_named_tensors(
             serialized_named_tensors, load_format=load_format
         )
@@ -1141,11 +1143,13 @@ class GRContinuousServingExecutor:
     def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
         """Pause inference for RL weight-sync coordination (SGLang pause_generation).
 
-        ``abort`` (default, the mode Slime's disk path uses) fails all in-flight
-        requests; ``in_place``/``retract`` pause without aborting (in-flight decode
-        finishes on its own; we have no re-queue, so retract degrades to in_place).
-        Sets ``is_paused`` so the background worker stops advancing ticks until
-        ``continue_generation``.
+        ``abort`` (default; the mode slime's disk/tensor flows use) fails all
+        in-flight requests. ``in_place``/``retract`` set ``is_paused`` WITHOUT
+        aborting: in-flight requests are **frozen** (the worker stops advancing
+        ticks, so their decode does not progress) and resume on
+        ``continue_generation`` -- they do NOT finish on their own. (SGLang's
+        retract re-queues running requests to waiting for KV recompute; we have
+        no re-queue, so retract degrades to in_place.)
         """
 
         aborted = 0
@@ -1224,6 +1228,26 @@ class GRContinuousServingExecutor:
                 f"checkpoint at {model_dir} is structurally incompatible: "
                 f"intermediate_size current={current.resolved_intermediate_size} "
                 f"new={new.resolved_intermediate_size}"
+            )
+
+    def _reject_in_flight_without_abort(self, abort_all_requests: bool) -> None:
+        """Refuse to swap weights while requests are mid-flight and not aborted.
+
+        Without pause/abort, an in-flight request prefilled with the old weights
+        would keep decoding against the new weights (old KV + new policy) and emit
+        a mixed-policy output. slime always pause(abort)s first, so this never
+        fires for it; a bare caller must too. Caller resolves it by passing
+        ``abort_all_requests=true`` or calling ``pause_generation`` first.
+        """
+
+        if abort_all_requests:
+            return
+        in_flight = len(self.scheduler.waiting_prefill) + len(self.scheduler.decoding)
+        if in_flight:
+            raise RuntimeError(
+                f"cannot update weights with {in_flight} in-flight request(s); "
+                "call pause_generation(mode='abort') or pass abort_all_requests=true "
+                "first (updating mid-decode mixes old KV with new weights)"
             )
 
     def _abort_in_flight(self, abort_all_requests: bool) -> int:
