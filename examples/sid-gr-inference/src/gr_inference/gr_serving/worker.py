@@ -255,6 +255,13 @@ class GRServingWorker:
         with self._lock:
             return self.facade.get_weights_by_name(name, truncate_size=truncate_size)
 
+    @property
+    def is_paused(self) -> bool:
+        # Proxy so the HTTP adapter (which holds the worker as its facade) can
+        # read the executor's pause state directly, mirroring
+        # GRInProcessServingFacade.is_paused.
+        return bool(self.facade.is_paused)
+
     def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
         with self._lock:
             return self.facade.pause_generation(mode=mode)

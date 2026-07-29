@@ -118,3 +118,35 @@ def test_flush_cache_returns_400_with_in_flight() -> None:
     adapter.handle("POST", "/pause_generation", json.dumps({"mode": "abort"}).encode())
     resp2 = adapter.handle("POST", "/flush_cache", json.dumps({}).encode())
     assert resp2.status == 200
+
+
+def test_http_pause_rejects_new_inference_until_continue(tmp_path) -> None:
+    """While paused for a weight update, new inference requests get 503
+    (retryable) instead of silently queueing behind the swap, and /ready
+    surfaces 'paused' so callers can drain traffic until continue_generation.
+
+    Exercises the full path through GRServingWorker.is_paused -> facade ->
+    executor, driven by the real /pause_generation endpoint.
+    """
+    model, cfg = h.model()
+    adapter = h.adapter(model, cfg)
+
+    adapter.handle("POST", "/pause_generation", json.dumps({"mode": "abort"}).encode())
+
+    generate = adapter.handle("POST", "/generate", b"{}")
+    assert generate.status == 503
+    assert generate.body["error"]["code"] == "paused"
+    assert generate.body["error"]["retryable"] is True
+
+    submit = adapter.handle("POST", "/submit", b"{}")
+    assert submit.status == 503
+    assert submit.body["error"]["code"] == "paused"
+
+    ready = adapter.handle("GET", "/ready")
+    assert ready.body["ready"] is False
+    assert "paused" in ready.body["reasons"]
+
+    # continue_generation re-enables inference admission.
+    adapter.handle("POST", "/continue_generation", json.dumps({}).encode())
+    ready_after = adapter.handle("GET", "/ready")
+    assert "paused" not in ready_after.body["reasons"]

@@ -210,6 +210,7 @@ class GRHTTPServingAdapter:
         if method == "GET" and route == ("kv", "events"):
             return _ok(_kv_events_payload(self.facade.status()))
         if method == "POST" and route == ("submit",):
+            self._reject_if_paused()
             self._validate_admission(1)
             request = self._make_request(payload)
             self._validate_request(request)
@@ -226,6 +227,7 @@ class GRHTTPServingAdapter:
                     f"requests exceeds max_submit_many={self.validation_policy.max_submit_many}",
                     code="too_many_requests",
                 )
+            self._reject_if_paused()
             self._validate_admission(len(rows))
             requests = tuple(self._make_request(row) for row in rows)
             for request in requests:
@@ -485,6 +487,7 @@ class GRHTTPServingAdapter:
             )
 
     def _handle_sglang_generate(self, payload: Mapping[str, Any]) -> GRHTTPResponse:
+        self._reject_if_paused()
         self._validate_admission(1)
         request_payload = _sglang_generate_payload_to_gr_payload(payload)
         request = self._make_request(request_payload)
@@ -529,6 +532,21 @@ class GRHTTPServingAdapter:
                 413,
                 f"request body exceeds {limit} bytes",
                 code="payload_too_large",
+            )
+
+    def _reject_if_paused(self) -> None:
+        # Generation pause is a transient weight-update window
+        # (pause_generation -> flush_cache -> update -> continue_generation).
+        # Accepting inference here would silently queue requests that cannot
+        # progress until continue_generation, risking client timeouts. Reject
+        # with 503 (retryable) so callers/load balancers retry shortly, and so a
+        # polling /ready probe (which also reports this state) can drain traffic.
+        if self.facade.is_paused:
+            raise GRHTTPAdapterError(
+                503,
+                "generation is paused for a weight update; retry shortly",
+                code="paused",
+                retryable=True,
             )
 
     def _validate_admission(self, new_requests: int) -> None:
@@ -591,6 +609,8 @@ class GRHTTPServingAdapter:
         lifecycle = status.get("lifecycle", {})
         admission = self._admission_payload(status)
         reasons: list[str] = []
+        if self.facade.is_paused:
+            reasons.append("paused")
         if isinstance(lifecycle, Mapping) and lifecycle.get("draining", False):
             reasons.append("draining")
         if admission["queue_full"]:
