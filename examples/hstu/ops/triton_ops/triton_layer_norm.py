@@ -478,6 +478,9 @@ def triton_weighted_layer_norm_bwd(
             BLOCK_D=BLOCK_D,
             num_warps=num_warps,
         )
+        # Accumulate the residual branch gradient for fused HSTU backward.
+        if dx_accumulate is not None:
+            dx.add_(dx_accumulate)
         return dx, None, None
 
 
