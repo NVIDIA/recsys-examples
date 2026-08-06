@@ -139,9 +139,12 @@ def _layer_norm_bwd_dx(
     stride_dx,
     stride_dy,
     stride_x,
+    stride_acc,
     D,
     eps,
+    DX_ACC,
     BLOCK_D: tl.constexpr,
+    DGRAD_ACCUM: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_D)
@@ -149,10 +152,14 @@ def _layer_norm_bwd_dx(
     X += row.to(tl.int64) * stride_x
     DY += row.to(tl.int64) * stride_dy
     DX += row.to(tl.int64) * stride_dx
+    if DGRAD_ACCUM:
+        dx_acc_ptrs = DX_ACC + row.to(tl.int64) * stride_acc
 
     # Load data to SRAM
     x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
     dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+    if DGRAD_ACCUM:
+        dx_acc = tl.load(dx_acc_ptrs + cols, mask=mask, other=0).to(tl.float32)
     mean = tl.load(Mean + row)
     rstd = tl.load(Rstd + row)
 
@@ -163,6 +170,8 @@ def _layer_norm_bwd_dx(
     c1 = tl.sum(xhat * dy, axis=0) / D
     c2 = tl.sum(dy, axis=0) / D
     dx = (dy - (xhat * c1 + c2)) * rstd
+    if DGRAD_ACCUM:
+        dx += dx_acc
     # Write dx
     tl.store(DX + cols, dx.to(DX.dtype.element_ty), mask=mask)
 
@@ -473,10 +482,15 @@ def triton_weighted_layer_norm_bwd(
             dx.stride(0),
             dy.stride(0),
             x.stride(0),
+            dx_accumulate.stride(0)
+            if dx_accumulate is not None
+            else 0,  # pyre-ignore [16]
             D,
             eps,
+            DX_ACC=dx_accumulate,  # pyre-ignore [16]
             BLOCK_D=BLOCK_D,
             num_warps=num_warps,
+            DGRAD_ACCUM=dx_accumulate is not None,
         )
         return dx, None, None
 
