@@ -429,6 +429,7 @@ def _make_http_validation_policy(args) -> GRHTTPValidationPolicy:
         max_timeout_ticks=args.max_http_timeout_ticks,
         allow_manual_tick=args.allow_manual_tick,
         allow_catalog_reload=args.allow_catalog_reload,
+        allow_weight_update=args.allow_weight_update,
     )
 
 
@@ -723,6 +724,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-manual-tick", action="store_true")
     parser.add_argument("--allow-catalog-reload", action="store_true")
     parser.add_argument(
+        "--allow-weight-update",
+        action="store_true",
+        help=(
+            "Expose /update_weights_from_disk and /get_weights_by_name for online "
+            "RL weight sync. Also enabled by GR_ALLOW_WEIGHT_UPDATE=1."
+        ),
+    )
+    parser.add_argument(
         "--api-key",
         help="Optional API key. When set, non-probe routes require Bearer or X-GR-API-Key auth.",
     )
@@ -742,7 +751,9 @@ def main() -> None:
     print(f"Qwen3 GR HTTP serving on http://{args.host}:{args.port}")
     print(
         "Routes: /health /ready /config /status /metrics /generate /submit "
-        "/poll/{id} /result/{id} /drain /shutdown"
+        "/poll/{id} /result/{id} /update_weights_from_disk "
+        "/update_weights_from_tensor /get_weights_by_name /pause_generation "
+        "/continue_generation /flush_cache /get_weight_version /drain /shutdown"
     )
     for line in _startup_config_lines(adapter):
         print(line)

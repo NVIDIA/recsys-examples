@@ -15,6 +15,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
+#include "jit/jit_link.h"
 #include "table.cuh"
 
 namespace dyn_emb {
@@ -107,7 +108,8 @@ void bind_table_operation(py::module &m) {
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
         py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
         py::arg("counter"), py::arg("insert_results") = py::none(),
-        py::arg("score_output") = py::none(), py::arg("num_scores") = 1);
+        py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
+        py::arg("score_fn_key") = 0);
 
   m.def("table_insert_and_evict", &dyn_emb::table_insert_and_evict,
         "insert into the table", py::arg("table_storage"),
@@ -119,7 +121,8 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
         py::arg("ovf_bucket_sizes") = py::none(),
         py::arg("ovf_counter") = py::none(),
-        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1);
+        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
+        py::arg("score_fn_key") = 0);
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
@@ -182,6 +185,30 @@ void bind_table_operation(py::module &m) {
         "Assign per-table monotonic scores via atomicAdd on "
         "no_eviction_next_index_dev; mutates no_eviction_next_index_dev.",
         py::arg("no_eviction_next_index_dev"), py::arg("table_ids"));
+
+  // --- LruLfu eviction JIT (see jit_link.h) ---
+  m.def(
+      "demb_set_lex_fatbin",
+      [](py::bytes lex) {
+        std::string lex_s = lex;
+        dyn_emb::demb_set_lex_fatbin(lex_s.data(), lex_s.size());
+      },
+      "Register the packaged default (Lex) LruLfu evict fatbin.",
+      py::arg("lex"));
+  m.def(
+      "demb_register_score_function",
+      [](int64_t key, py::bytes ltoir, py::bytes custom, int cc_major,
+         int cc_minor) {
+        std::string ltoir_s = ltoir, custom_s = custom;
+        dyn_emb::demb_register_score_function(key, ltoir_s.data(),
+                                              ltoir_s.size(), custom_s.data(),
+                                              custom_s.size(), cc_major,
+                                              cc_minor);
+      },
+      "Link a numba user_score_fn LTO-IR into the custom evict fatbin and cache "
+      "it under key.",
+      py::arg("key"), py::arg("ltoir"), py::arg("custom"), py::arg("cc_major"),
+      py::arg("cc_minor"));
 
   py::enum_<dyn_emb::ScorePolicyType>(m, "ScorePolicy")
       .value("CONST", dyn_emb::ScorePolicyType::Const)

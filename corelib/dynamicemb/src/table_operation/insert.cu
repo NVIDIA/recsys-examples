@@ -15,6 +15,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
+#include "jit/jit_link.h"
 #include "kernels.cuh"
 #include "table.cuh"
 
@@ -27,16 +28,43 @@ void launch_table_insert_kernel(
     int64_t *table_ids_ptr, InsertResult *insert_results_ptr,
     IndexType *indices_ptr, ScoreType *score_input_ptr,
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
-    int32_t *counter_ptr, cudaStream_t stream) {
+    int32_t *counter_ptr, int64_t score_fn_key, cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits =
       InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8, PolicyTypeV, OutputScoreV>;
 
-  table_insert_kernel<Table, KernelTraits>
-      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
-          keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
-          score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr);
+  if constexpr (PolicyTypeV == ScorePolicyType::LruLfu) {
+    // Route the plain insert through the LruLfu cubin (default Lex when
+    // score_fn_key == 0, else the nvJitLink-linked custom evictor) so a full
+    // bucket evicts by the ranked comparator, not the single-score reduce().
+    // Reuses EvictParams; evicted_* / ovf_* stay null (dyn_emb_insert_entry
+    // collects no evicted output).
+    EvictParams p{};
+    p.table_storage = table.storage_;
+    p.num_buckets = table.num_buckets_;
+    p.bucket_capacity = table.bucket_capacity_;
+    p.num_scores = table.num_scores_;
+    p.table_bucket_offsets = table_bucket_offsets_ptr;
+    p.bucket_sizes = bucket_sizes_ptr;
+    p.batch = num_total;
+    p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
+    p.table_ids = table_ids_ptr;
+    p.insert_results = reinterpret_cast<uint8_t *>(insert_results_ptr);
+    p.indices = indices_ptr;
+    p.score_input = score_input_ptr;
+    p.score_output = OutputScoreV ? score_output_ptr : nullptr;
+    p.table_key_slots = reinterpret_cast<int64_t **>(table_key_slots_ptr);
+    p.counter = counter_ptr;
+    CUfunction fn = demb_get_insert_fn(score_fn_key);
+    demb_launch_evict(fn, p, num_total, stream);
+  } else {
+    table_insert_kernel<Table, KernelTraits>
+        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
+            keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
+            score_input_ptr, score_output_ptr, table_key_slots_ptr,
+            counter_ptr);
+  }
 
   table_unlock_kernel<Table>
       <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -51,7 +79,8 @@ void table_insert_single_score(at::Tensor table_storage,
                                ScorePolicyType policy_type, at::Tensor indices,
                                std::optional<at::Tensor> insert_results,
                                std::optional<at::Tensor> score_output,
-                               at::Tensor counter, int64_t num_scores) {
+                               at::Tensor counter, int64_t num_scores,
+                               int64_t score_fn_key) {
 
   auto key_type = get_data_type(keys);
 
@@ -110,12 +139,13 @@ void table_insert_single_score(at::Tensor table_storage,
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
-            stream);
+            score_fn_key, stream);
       } else {
         launch_table_insert_kernel<Table, PolicyTypeV, false>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
-            score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr, stream);
+            score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr,
+            score_fn_key, stream);
       }
     });
   });
@@ -130,7 +160,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results,
                         std::optional<at::Tensor> score_output,
-                        int64_t num_scores) {
+                        int64_t num_scores, int64_t score_fn_key) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -143,7 +173,7 @@ at::Tensor table_insert(at::Tensor table_storage,
   table_insert_single_score(table_storage, table_bucket_offsets,
                             bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
-                            score_output, counter, num_scores);
+                            score_output, counter, num_scores, score_fn_key);
 
   return indices;
 }

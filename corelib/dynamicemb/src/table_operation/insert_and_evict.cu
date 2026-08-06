@@ -15,6 +15,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
+#include "jit/jit_link.h"
 #include "kernels.cuh"
 #include "table.cuh"
 
@@ -72,20 +73,57 @@ void launch_table_insert_and_evict_kernel(
     int64_t *evicted_table_ids_ptr, int32_t *counter_ptr, cudaStream_t stream,
     Table ovf_table = Table(), int *ovf_bucket_sizes_ptr = nullptr,
     int32_t *ovf_counter_ptr = nullptr,
-    int64_t *ovf_output_offsets_ptr = nullptr) {
+    int64_t *ovf_output_offsets_ptr = nullptr, int64_t score_fn_key = 0) {
   constexpr int BLOCK_SIZE = 256;
-  using KernelTraits =
-      InsertKernelTraits<BLOCK_SIZE, 1, 1, CompactTileSize, 8, PolicyTypeV,
-                         OutputScoreV, EnableOverflowV>;
 
-  table_insert_and_evict_kernel<Table, KernelTraits>
-      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
-          keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
-          score_input_ptr, score_output_ptr, table_key_slots_ptr,
-          evict_counter_ptr, evicted_keys_ptr, evicted_scores_ptr,
-          evicted_indices_ptr, evicted_table_ids_ptr, counter_ptr, ovf_table,
-          ovf_bucket_sizes_ptr, ovf_counter_ptr, ovf_output_offsets_ptr);
+  if constexpr (PolicyTypeV == ScorePolicyType::LruLfu) {
+    // LruLfu (num_scores == 2) routes eviction through the driver-launched cubin
+    // (default Lex cubin when score_fn_key == 0, else the nvJitLink-linked custom
+    // cubin). The scan/insert/overflow logic is the shared insert_and_evict_body;
+    // only victim selection differs (see §11 in the design doc). The surrounding
+    // unlock kernel stays AoT.
+    EvictParams p{};
+    p.table_storage = table.storage_;
+    p.num_buckets = table.num_buckets_;
+    p.bucket_capacity = table.bucket_capacity_;
+    p.num_scores = table.num_scores_;
+    p.table_bucket_offsets = table_bucket_offsets_ptr;
+    p.bucket_sizes = bucket_sizes_ptr;
+    p.batch = num_total;
+    p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
+    p.table_ids = table_ids_ptr;
+    p.insert_results = reinterpret_cast<uint8_t *>(insert_results_ptr);
+    p.indices = indices_ptr;
+    p.score_input = score_input_ptr;
+    p.score_output = OutputScoreV ? score_output_ptr : nullptr;
+    p.table_key_slots = reinterpret_cast<int64_t **>(table_key_slots_ptr);
+    p.evicted_counter = evict_counter_ptr;
+    p.evicted_keys = reinterpret_cast<int64_t *>(evicted_keys_ptr);
+    p.evicted_scores = evicted_scores_ptr;
+    p.evicted_indices = evicted_indices_ptr;
+    p.evicted_table_ids = evicted_table_ids_ptr;
+    p.counter = counter_ptr;
+    p.ovf_storage = ovf_table.storage_;
+    p.ovf_num_buckets = ovf_table.num_buckets_;
+    p.ovf_bucket_capacity = ovf_table.bucket_capacity_;
+    p.ovf_bucket_sizes = ovf_bucket_sizes_ptr;
+    p.ovf_counter = ovf_counter_ptr;
+    p.ovf_output_offsets = ovf_output_offsets_ptr;
+    CUfunction fn = demb_get_evict_fn(score_fn_key, EnableOverflowV);
+    demb_launch_evict(fn, p, num_total, stream);
+  } else {
+    using KernelTraits =
+        InsertKernelTraits<BLOCK_SIZE, 1, 1, CompactTileSize, 8, PolicyTypeV,
+                           OutputScoreV, EnableOverflowV>;
+    table_insert_and_evict_kernel<Table, KernelTraits>
+        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
+            keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
+            score_input_ptr, score_output_ptr, table_key_slots_ptr,
+            evict_counter_ptr, evicted_keys_ptr, evicted_scores_ptr,
+            evicted_indices_ptr, evicted_table_ids_ptr, counter_ptr, ovf_table,
+            ovf_bucket_sizes_ptr, ovf_counter_ptr, ovf_output_offsets_ptr);
+  }
 
   table_unlock_kernel<Table>
       <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
@@ -101,7 +139,7 @@ void table_insert_and_evict_single_score(
     std::optional<at::Tensor> score_output, at::Tensor num_evicted,
     at::Tensor evicted_keys, at::Tensor evicted_indices,
     at::Tensor evicted_scores, at::Tensor evicted_table_ids,
-    at::Tensor counter, int64_t num_scores) {
+    at::Tensor counter, int64_t num_scores, int64_t score_fn_key) {
 
   auto key_type = get_data_type(keys);
 
@@ -167,14 +205,16 @@ void table_insert_and_evict_single_score(
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream);
+              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
+              score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32>(
               table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream);
+              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
+              score_fn_key);
         }
       } else {
         if (output_score) {
@@ -183,14 +223,16 @@ void table_insert_and_evict_single_score(
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream);
+              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
+              score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1>(
               table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream);
+              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
+              score_fn_key);
         }
       }
     });
@@ -210,7 +252,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     at::Tensor evicted_scores, at::Tensor evicted_table_ids, at::Tensor counter,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_bucket_sizes, at::Tensor ovf_counter,
-    at::Tensor ovf_output_offsets, int64_t num_scores) {
+    at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key) {
 
   auto key_type = get_data_type(keys);
 
@@ -288,7 +330,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
               counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr);
+              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32,
                                                true>(
@@ -297,7 +339,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
               counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr);
+              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
         }
       } else {
         if (output_score) {
@@ -308,7 +350,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
               counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr);
+              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1,
                                                true>(
@@ -317,7 +359,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
               counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr);
+              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
         }
       }
     });
@@ -340,7 +382,7 @@ table_insert_and_evict(at::Tensor table_storage,
                        std::optional<at::Tensor> ovf_bucket_sizes,
                        std::optional<at::Tensor> ovf_counter,
                        std::optional<at::Tensor> ovf_output_offsets,
-                       int64_t num_scores) {
+                       int64_t num_scores, int64_t score_fn_key) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -381,13 +423,13 @@ table_insert_and_evict(at::Tensor table_storage,
         score_output, num_evicted, evicted_keys, evicted_indices,
         evicted_scores, evicted_table_ids, counter, ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
-        ovf_output_offsets.value(), num_scores);
+        ovf_output_offsets.value(), num_scores, score_fn_key);
   } else {
     table_insert_and_evict_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,
         keys, table_ids, score_input, policy_type, indices, insert_results,
         score_output, num_evicted, evicted_keys, evicted_indices,
-        evicted_scores, evicted_table_ids, counter, num_scores);
+        evicted_scores, evicted_table_ids, counter, num_scores, score_fn_key);
   }
 
   return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,

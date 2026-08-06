@@ -279,6 +279,23 @@ def create_table_state(
     # timestamp -- for the compound LruLfu policy).
     incremental_score_name = score_policy.name
 
+    # LruLfu custom eviction: numba-compile + nvJitLink-link the user
+    # score_function and route its inserts to that cubin via score_fn_key. Key 0
+    # (no score_function) selects the default freq->ts Lex evictor (no numba).
+    # The score_function is indexed in logical (tuple) order, so the compiler is
+    # given score_strategy to remap logical->physical.
+    score_fn_key = 0
+    if (
+        score_policy.policy == ScorePolicy.LRU_LFU
+        and base_opt.score_function is not None
+    ):
+        from dynamicemb.jit.score_jit import register_score_function
+
+        cc_major, cc_minor = torch.cuda.get_device_capability(device_idx)
+        score_fn_key = register_score_function(
+            base_opt.score_function, base_opt.score_strategy, cc_major, cc_minor
+        )
+
     # NO_EVICTION: key_index_map uses max_load_factor=0.5 to avoid eviction; table uses init_capacity.
     bucket_capacity = base_opt.bucket_capacity
     if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
@@ -303,6 +320,7 @@ def create_table_state(
         score_specs=[score_policy],
         device=device,
         enable_overflow=enable_overflow,
+        score_fn_key=score_fn_key,
     )
     capacity = key_index_map.capacity()
 
@@ -482,6 +500,9 @@ def _expand_tables_impl(
         score_specs=[state.score_policy],
         device=device,
         enable_overflow=enable_overflow,
+        # Preserve the eviction routing (default Lex or custom score_function)
+        # across rehash.
+        score_fn_key=state.key_index_map.score_fn_key_,
     )
     for i in range(state.num_tables):
         if tables_to_expand[i]:

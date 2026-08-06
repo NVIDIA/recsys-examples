@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import metadata as importlib_metadata
 from typing import Any, Callable, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from gr_inference.gr_runtime import logits_processors_from_specs
 from gr_inference.gr_scheduler import ScheduledBeamPolicy, ScoreMarginBeamPolicy
@@ -51,6 +51,11 @@ class GRHTTPValidationPolicy:
     max_timeout_ticks: int | None = None
     allow_manual_tick: bool = True
     allow_catalog_reload: bool = True
+    # Opt-in: weight update loads an arbitrary caller-supplied checkpoint path
+    # and the tensor endpoint unpickles CUDA-IPC handles, so it is a privileged
+    # surface. Default off; enable only on a trusted intranet and behind --api-key
+    # (the serve tool gates it via --allow-weight-update / GR_ALLOW_WEIGHT_UPDATE).
+    allow_weight_update: bool = False
 
     def validate(self) -> None:
         for name, value in (
@@ -122,6 +127,10 @@ class GRHTTPServingAdapter:
             self._validate_auth(method, route, headers or {})
             self._validate_body_size(body)
             payload = _json_payload(body)
+            if not payload:
+                # GET routes (e.g. /get_weights_by_name?name=...) carry args in the
+                # query string rather than a JSON body.
+                payload = _query_params(path)
             response = self._dispatch(method, route, payload)
         except GRHTTPAdapterError as exc:
             response = _error_response(
@@ -201,6 +210,7 @@ class GRHTTPServingAdapter:
         if method == "GET" and route == ("kv", "events"):
             return _ok(_kv_events_payload(self.facade.status()))
         if method == "POST" and route == ("submit",):
+            self._reject_if_paused()
             self._validate_admission(1)
             request = self._make_request(payload)
             self._validate_request(request)
@@ -217,6 +227,7 @@ class GRHTTPServingAdapter:
                     f"requests exceeds max_submit_many={self.validation_policy.max_submit_many}",
                     code="too_many_requests",
                 )
+            self._reject_if_paused()
             self._validate_admission(len(rows))
             requests = tuple(self._make_request(row) for row in rows)
             for request in requests:
@@ -310,7 +321,117 @@ class GRHTTPServingAdapter:
                 )
             version = self.facade.rollback_item_catalog()
             return _ok({"version": version, "catalog": self.facade.catalog_status()})
+        if method == "POST" and route == ("update_weights_from_disk",):
+            return self._handle_update_weights_from_disk(payload)
+        if method == "POST" and route == ("update_weights_from_tensor",):
+            return self._handle_update_weights_from_tensor(payload)
+        if route == ("get_weights_by_name",) and method in {"GET", "POST"}:
+            return self._handle_get_weights_by_name(payload)
+        if method == "POST" and route == ("pause_generation",):
+            if not self.validation_policy.allow_weight_update:
+                raise GRHTTPAdapterError(
+                    403, "pause_generation is disabled", code="route_disabled"
+                )
+            mode = str(payload.get("mode", "abort"))
+            if mode not in {"abort", "retract", "in_place"}:
+                raise GRHTTPAdapterError(
+                    400, f"invalid pause mode: {mode}", code="validation_error"
+                )
+            return _ok(self.facade.pause_generation(mode=mode))
+        if method == "POST" and route == ("continue_generation",):
+            if not self.validation_policy.allow_weight_update:
+                raise GRHTTPAdapterError(
+                    403, "continue_generation is disabled", code="route_disabled"
+                )
+            return _ok(self.facade.continue_generation())
+        if route == ("flush_cache",) and method in {"GET", "POST"}:
+            # SGLang query key is `timeout` (io_struct field is timeout_s).
+            timeout = payload.get("timeout")
+            result = self.facade.flush_cache(
+                timeout_s=float(timeout) if timeout is not None else None
+            )
+            # SGLang's flush_cache returns 200 only when idle; 400
+            # (running/waiting) is what slime's flush retry loop keys on.
+            return _ok(result, status=200 if result.get("success", True) else 400)
+        if method == "GET" and route == ("get_weight_version",):
+            if not self.validation_policy.allow_weight_update:
+                raise GRHTTPAdapterError(
+                    403, "get_weight_version is disabled", code="route_disabled"
+                )
+            return _ok(self.facade.get_weight_version())
         return _error_response(404, f"unknown route: {method} /{'/'.join(route)}")
+
+    def _handle_update_weights_from_disk(
+        self, payload: Mapping[str, Any]
+    ) -> GRHTTPResponse:
+        if not self.validation_policy.allow_weight_update:
+            raise GRHTTPAdapterError(
+                403,
+                "weight update is disabled",
+                code="route_disabled",
+            )
+        model_path = payload.get("model_path") or payload.get("model_dir")
+        if not model_path:
+            raise GRHTTPAdapterError(
+                400,
+                "model_path (or model_dir) is required",
+                code="validation_error",
+            )
+        result = self.facade.update_weights_from_disk(
+            str(model_path),
+            flush_cache=bool(payload.get("flush_cache", True)),
+            abort_all_requests=bool(payload.get("abort_all_requests", False)),
+            weight_version=payload.get("weight_version"),
+            token_step=payload.get("token_step"),
+        )
+        return _ok(result)
+
+    def _handle_update_weights_from_tensor(
+        self, payload: Mapping[str, Any]
+    ) -> GRHTTPResponse:
+        if not self.validation_policy.allow_weight_update:
+            raise GRHTTPAdapterError(
+                403,
+                "weight update is disabled",
+                code="route_disabled",
+            )
+        serialized_named_tensors = payload.get("serialized_named_tensors")
+        if not serialized_named_tensors:
+            raise GRHTTPAdapterError(
+                400,
+                "serialized_named_tensors is required",
+                code="validation_error",
+            )
+        result = self.facade.update_weights_from_tensor(
+            serialized_named_tensors,
+            load_format=payload.get("load_format"),
+            flush_cache=bool(payload.get("flush_cache", True)),
+            abort_all_requests=bool(payload.get("abort_all_requests", False)),
+            weight_version=payload.get("weight_version"),
+            token_step=payload.get("token_step"),
+        )
+        return _ok(result)
+
+    def _handle_get_weights_by_name(
+        self, payload: Mapping[str, Any]
+    ) -> GRHTTPResponse:
+        if not self.validation_policy.allow_weight_update:
+            raise GRHTTPAdapterError(
+                403,
+                "weight lookup is disabled",
+                code="route_disabled",
+            )
+        name = payload.get("name")
+        if not name:
+            raise GRHTTPAdapterError(
+                400,
+                "name is required",
+                code="validation_error",
+            )
+        truncate_size = int(payload.get("truncate_size", 100) or 100)
+        return _ok(
+            self.facade.get_weights_by_name(str(name), truncate_size=truncate_size)
+        )
 
     def _emit_request_log(
         self,
@@ -366,6 +487,7 @@ class GRHTTPServingAdapter:
             )
 
     def _handle_sglang_generate(self, payload: Mapping[str, Any]) -> GRHTTPResponse:
+        self._reject_if_paused()
         self._validate_admission(1)
         request_payload = _sglang_generate_payload_to_gr_payload(payload)
         request = self._make_request(request_payload)
@@ -410,6 +532,21 @@ class GRHTTPServingAdapter:
                 413,
                 f"request body exceeds {limit} bytes",
                 code="payload_too_large",
+            )
+
+    def _reject_if_paused(self) -> None:
+        # Generation pause is a transient weight-update window
+        # (pause_generation -> flush_cache -> update -> continue_generation).
+        # Accepting inference here would silently queue requests that cannot
+        # progress until continue_generation, risking client timeouts. Reject
+        # with 503 (retryable) so callers/load balancers retry shortly, and so a
+        # polling /ready probe (which also reports this state) can drain traffic.
+        if self.facade.is_paused:
+            raise GRHTTPAdapterError(
+                503,
+                "generation is paused for a weight update; retry shortly",
+                code="paused",
+                retryable=True,
             )
 
     def _validate_admission(self, new_requests: int) -> None:
@@ -472,6 +609,8 @@ class GRHTTPServingAdapter:
         lifecycle = status.get("lifecycle", {})
         admission = self._admission_payload(status)
         reasons: list[str] = []
+        if self.facade.is_paused:
+            reasons.append("paused")
         if isinstance(lifecycle, Mapping) and lifecycle.get("draining", False):
             reasons.append("draining")
         if admission["queue_full"]:
@@ -744,6 +883,11 @@ def _route_path(path: str) -> tuple[str, ...]:
     return tuple(part for part in parsed.path.split("/") if part)
 
 
+def _query_params(path: str) -> dict[str, str]:
+    parsed = urlparse(path)
+    return dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+
 def _json_payload(body: bytes | str | Mapping[str, Any] | None) -> Mapping[str, Any]:
     if body is None or body == b"" or body == "":
         return {}
@@ -872,6 +1016,7 @@ def _validation_policy_payload(policy: GRHTTPValidationPolicy) -> dict[str, Any]
         "max_timeout_ticks": policy.max_timeout_ticks,
         "allow_manual_tick": policy.allow_manual_tick,
         "allow_catalog_reload": policy.allow_catalog_reload,
+        "allow_weight_update": policy.allow_weight_update,
     }
 
 
@@ -988,6 +1133,17 @@ def _route_manifest(policy: GRHTTPValidationPolicy) -> dict[str, tuple[str, ...]
         )
     else:
         routes["catalog"] = ("GET /catalog/status",)
+    if policy.allow_weight_update:
+        routes["weights"] = (
+            "POST /update_weights_from_disk",
+            "POST /update_weights_from_tensor",
+            "GET /get_weights_by_name",
+            "POST /get_weights_by_name",
+            "POST /pause_generation",
+            "POST /continue_generation",
+            "GET /get_weight_version",
+        )
+    routes["cache"] = ("GET /flush_cache", "POST /flush_cache")
     return routes
 
 

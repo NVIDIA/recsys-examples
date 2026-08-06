@@ -79,6 +79,9 @@ from gr_inference.gr_serving.memory import (
 )
 from gr_inference.gr_serving.prefill_cuda_graph import GRPrefillCudaGraphRunner
 from gr_inference.gr_serving.prefix_cache import GRPrefixCacheMatch, GRPromptPrefixCache
+from gr_inference.gr_models.loader import HFCheckpointLoader
+from gr_inference.gr_models.qwen3.config import Qwen3GRConfig
+from gr_inference.gr_models.qwen3.weights import materialize_qwen3_checkpoint
 from gr_inference.gr_serving.queue import GRRequestQueue
 from gr_inference.gr_serving.request import GRServingRequest, GRServingResponse
 
@@ -806,6 +809,17 @@ class GRContinuousServingExecutor:
     max_prefill_cache_decode_extend_tokens: int | None = None
     prefill_ms: float = 0.0
     decode_ms: float = 0.0
+    # Weight hot-update bookkeeping (RL weight sync). ``weight_version`` and
+    # ``token_step`` are caller-supplied labels so a trainer can tell which
+    # policy produced each rollout; surfaced in status/metrics.
+    weight_version: str | None = None
+    token_step: int = 0
+    weight_update_count: int = 0
+    last_weight_update_ms: float = 0.0
+    # Paused state for RL weight-sync coordination (SGLang pause/continue_generation).
+    # When True the background worker skips inference ticks so a trainer can drive
+    # pause_generation -> flush_cache -> update_weights_from_* -> continue_generation.
+    is_paused: bool = False
     prefill_cache: GRPromptPrefixCache = field(default_factory=GRPromptPrefixCache)
     batched_prefill_cache: dict[tuple[str, ...], PrefillResult] = field(
         default_factory=dict
@@ -1006,10 +1020,308 @@ class GRContinuousServingExecutor:
             ticks += 1
         return tuple(self.scheduler.finished.values())
 
+    def update_weights_from_disk(
+        self,
+        model_dir: str,
+        *,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int | None = None,
+    ) -> dict[str, Any]:
+        """Swap weights from an on-disk HF checkpoint without a process restart.
+
+        Cross-process RL weight sync path (Slime external-engine pattern): the
+        trainer writes an HF checkpoint to a path this engine can read, then calls
+        this method over HTTP. Validate-then-load for atomicity — a bad
+        checkpoint leaves the previous policy fully intact.
+
+        Memory: ``materialize_qwen3_checkpoint`` reads the whole checkpoint into
+        host memory before validating, so peak CPU RAM ~= checkpoint size.
+        """
+
+        model = self._require_weight_model()
+        self._reject_in_flight_without_abort(abort_all_requests)
+        manifest = HFCheckpointLoader(model_dir).manifest()
+        new_config = Qwen3GRConfig.from_hf_config(manifest.config)
+        self._assert_compatible_config(model.config, new_config, model_dir)
+        weights = materialize_qwen3_checkpoint(model_dir)
+        model.validate_logical_weights(weights)
+        num_aborted = self._abort_in_flight(abort_all_requests)
+        start = time.perf_counter()
+        model.load_logical_weights(weights)
+        self._invalidate_weight_dependent_state(flush_cache)
+        self._synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self._record_weight_version(weight_version, token_step, elapsed_ms)
+        return {
+            "success": True,
+            "message": "Succeeded to update model weights from disk.",
+            "model_dir": str(model_dir),
+            "tensors_loaded": len(weights),
+            "flushed_cache": bool(flush_cache),
+            "num_aborted_requests": num_aborted,
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def update_weights_from_tensor(
+        self,
+        serialized_named_tensors: Any,
+        *,
+        load_format: str | None = None,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int | None = None,
+    ) -> dict[str, Any]:
+        """Colocate weight sync: reconstruct tensors from the trainer's IPC handles.
+
+        This engine plays the rollout-engine role that SGLang plays in slime's
+        native setup, so it speaks SGLang's ``update_weights_from_tensor`` wire
+        format: a slime trainer (separate process, same GPU) serializes CUDA
+        tensors as **IPC handles** (a pointer, not the bytes) via ForkingPickler
+        and POSTs them; we reconstruct the tensors locally via zero-copy CUDA IPC
+        (both sides must share the same GPU). ``serialized_named_tensors`` is the
+        per-TP-rank list of those payloads. We deserialize the flattened-bucket
+        (``load_format="flattened_bucket"``) or direct list, map HF tensor names
+        to the model's logical names, and **partially** load.
+
+        Slime pushes the model in multiple chunks (one POST per chunk) plus empty
+        alignment buckets, so this path does NOT require the full tensor set: it
+        validates + copies only the tensors present in this payload (per-chunk,
+        like SGLang's model.load_weights). Atomic full-set validation is the disk
+        path's job. ``flush_cache`` defaults True but the trainer sends False per
+        chunk and flushes separately after pause.
+        """
+
+        from gr_inference.gr_serving.weight_ipc import reconstruct_named_tensors
+
+        model = self._require_weight_model()
+        self._reject_in_flight_without_abort(abort_all_requests)
+        # Deserialization is the untrusted-input boundary: malformed pickle, bad
+        # base64, the allowlist reject, or a CUDA-IPC rebuild failure can raise
+        # types the HTTP handler does not catch. Convert them to ValueError so
+        # the caller gets a 400 (not a connection reset).
+        try:
+            named_tensors = reconstruct_named_tensors(
+                serialized_named_tensors, load_format=load_format
+            )
+        except Exception as exc:  # noqa: BLE001 - surface all decode failures as 400
+            raise ValueError(
+                f"failed to deserialize weight payload: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        logical = {
+            _hf_to_logical_name(name): tensor for name, tensor in named_tensors
+        }
+        # Partial / chunked semantics: slime POSTs the model in multiple chunks
+        # (update_weight_from_tensor.py, one bucket per chunk) and sends empty
+        # alignment buckets (_empty_flattened_tensor_data), so we must NOT require
+        # the full logical tensor set here. Validate the shapes of the tensors
+        # PRESENT in this payload (dry-run; strict=False skips missing names),
+        # then copy only those -- mirrors SGLang's per-chunk model.load_weights.
+        # Full all-or-nothing validation stays on the disk path. Empty bucket is
+        # a no-op success.
+        model.load_logical_weights(logical, strict=False, dry_run=True)
+        num_aborted = self._abort_in_flight(abort_all_requests)
+        start = time.perf_counter()
+        model.load_logical_weights(logical, strict=False)
+        self._invalidate_weight_dependent_state(flush_cache)
+        self._synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self._record_weight_version(weight_version, token_step, elapsed_ms)
+        return {
+            "success": True,
+            "message": "Succeeded to update model weights from tensor.",
+            # Count of tensors in this payload, NOT distinct model parameters
+            # (q/k/v arrive split and load into one packed qkv_proj).
+            "tensors_loaded": len(logical),
+            "flushed_cache": bool(flush_cache),
+            "num_aborted_requests": num_aborted,
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def get_weights_by_name(self, name: str, truncate_size: int = 100) -> Any:
+        """Return a parameter as ``{"parameter": [...]}`` (SGLang get_weights_by_name).
+
+        Truncates to the first ``truncate_size`` rows along dim 0 (matches upstream).
+        ``name`` is the model's parameter name (module path, e.g.
+        ``layers.0.ops.qkv_proj.weight``); upstream accepts HF names, but our qkv /
+        gate_up are packed, so HF split names do not map 1:1. Diagnostic only --
+        slime does not call this endpoint.
+        """
+
+        model = self._require_weight_model()
+        param = model.get_parameter_by_name(name)
+        rows = param.detach()[:truncate_size].to(device="cpu")
+        return {"parameter": rows.tolist()}
+
+    def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
+        """Pause inference for RL weight-sync coordination (SGLang pause_generation).
+
+        ``abort`` (default; the mode slime's disk/tensor flows use) fails all
+        in-flight requests. ``in_place``/``retract`` set ``is_paused`` WITHOUT
+        aborting: in-flight requests are **frozen** (the worker stops advancing
+        ticks, so their decode does not progress) and resume on
+        ``continue_generation`` -- they do NOT finish on their own. (SGLang's
+        retract re-queues running requests to waiting for KV recompute; we have
+        no re-queue, so retract degrades to in_place.)
+        """
+
+        aborted = 0
+        if mode == "abort":
+            failed_ids = self.scheduler.fail_unfinished(reason="pause_generation")
+            if failed_ids:
+                self._attach_execution_metadata(failed_ids)
+            aborted = len(failed_ids)
+        self.is_paused = True
+        return {
+            "paused": True,
+            "mode": mode,
+            "num_aborted_requests": aborted,
+        }
+
+    def continue_generation(self) -> dict[str, Any]:
+        """Resume inference after ``pause_generation`` (SGLang continue_generation)."""
+
+        self.is_paused = False
+        return {"paused": False}
+
+    def flush_cache(self, timeout_s: float | None = None) -> dict[str, Any]:
+        """Drop prefix/prefill cache entries (SGLang flush_cache semantics).
+
+        Returns ``success=False`` (HTTP 400) when there are running or waiting
+        requests -- SGLang's flush_cache refuses in that state, and slime's
+        disk/tensor flows rely on the non-200 to retry (sglang_engine.py
+        flush_cache loops up to 60x until 200). Under the slime flow pause(abort)
+        clears in-flight first, so this returns 200. Only clears entries, not the
+        hit/miss counters.
+        """
+
+        in_flight = len(self.scheduler.waiting_prefill) + len(self.scheduler.decoding)
+        if in_flight:
+            return {
+                "success": False,
+                "message": (
+                    "Cannot flush cache while there are running or waiting requests."
+                ),
+            }
+        entries = len(self.prefill_cache) + len(self.batched_prefill_cache)
+        self.prefill_cache.clear()
+        self.batched_prefill_cache.clear()
+        return {"success": True, "entries_cleared": entries}
+
+    def get_weight_version(self) -> dict[str, Any]:
+        """Return the current weight version label (SGLang get_weight_version)."""
+
+        return {
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "weight_update_count": self.weight_update_count,
+        }
+
+    def _require_weight_model(self) -> Any:
+        engine = getattr(self, "engine", None)
+        model = getattr(engine, "model", None) if engine is not None else None
+        if model is None or not callable(
+            getattr(model, "update_weights_from_tensor", None)
+        ):
+            raise RuntimeError(
+                "weight update requires a serving engine backed by a model"
+            )
+        return model
+
+    def _assert_compatible_config(
+        self, current: Any, new: Any, model_dir: str
+    ) -> None:
+        fields = (
+            "num_layers",
+            "hidden_size",
+            "num_attention_heads",
+            "num_kv_heads",
+            "head_dim",
+            "vocab_size",
+            "tie_word_embeddings",
+        )
+        for name in fields:
+            if getattr(current, name, None) != getattr(new, name, None):
+                raise ValueError(
+                    f"checkpoint at {model_dir} is structurally incompatible: "
+                    f"{name} current={getattr(current, name, None)!r} "
+                    f"new={getattr(new, name, None)!r}"
+                )
+        if current.resolved_intermediate_size != new.resolved_intermediate_size:
+            raise ValueError(
+                f"checkpoint at {model_dir} is structurally incompatible: "
+                f"intermediate_size current={current.resolved_intermediate_size} "
+                f"new={new.resolved_intermediate_size}"
+            )
+
+    def _reject_in_flight_without_abort(self, abort_all_requests: bool) -> None:
+        """Refuse to swap weights while requests are mid-flight and not aborted.
+
+        Without pause/abort, an in-flight request prefilled with the old weights
+        would keep decoding against the new weights (old KV + new policy) and emit
+        a mixed-policy output. slime always pause(abort)s first, so this never
+        fires for it; a bare caller must too. Caller resolves it by passing
+        ``abort_all_requests=true`` or calling ``pause_generation`` first.
+        """
+
+        if abort_all_requests:
+            return
+        in_flight = len(self.scheduler.waiting_prefill) + len(self.scheduler.decoding)
+        if in_flight:
+            raise RuntimeError(
+                f"cannot update weights with {in_flight} in-flight request(s); "
+                "call pause_generation(mode='abort') or pass abort_all_requests=true "
+                "first (updating mid-decode mixes old KV with new weights)"
+            )
+
+    def _abort_in_flight(self, abort_all_requests: bool) -> int:
+        if not abort_all_requests:
+            return 0
+        failed_ids = self.scheduler.fail_unfinished(reason="weight_update")
+        if failed_ids:
+            self._attach_execution_metadata(failed_ids)
+        return len(failed_ids)
+
+    def _record_weight_version(
+        self,
+        weight_version: str | None,
+        token_step: int | None,
+        elapsed_ms: float,
+    ) -> None:
+        # Symmetric: preserve the previous label when the caller omits the field.
+        if weight_version is not None:
+            self.weight_version = weight_version
+        if token_step is not None:
+            self.token_step = int(token_step)
+        self.weight_update_count += 1
+        self.last_weight_update_ms = float(elapsed_ms)
+
+    def _invalidate_weight_dependent_state(self, flush_cache: bool) -> None:
+        if not flush_cache:
+            return
+        # Stale logits/KV were computed with the previous weights; drop them.
+        self.prefill_cache.clear()
+        self.batched_prefill_cache.clear()
+        self.prefill_cache_hits = 0
+        self.prefill_cache_exact_hits = 0
+        self.prefill_cache_prefix_hits = 0
+        self.prefill_cache_misses = 0
+        self.prefill_cache_skips = 0
+        self.prefill_cache_prefix_tokens = 0
+        self.prefill_cache_extend_tokens = 0
+
     def status(self) -> dict[str, Any]:
         status = self.scheduler.status()
         status.update(self._execution_status())
         status["prefill_cache"] = self._prefill_cache_status()
+        status["weights"] = self._weights_status()
         status["topk_indices_cache"] = _cache_status(
             self.topk_indices_cache,
             hits=self.topk_indices_cache_hits,
@@ -1106,6 +1418,15 @@ class GRContinuousServingExecutor:
             "prefill_ms": self.prefill_ms,
             "decode_ms": self.decode_ms,
             "total_ms": self.prefill_ms + self.decode_ms,
+            "paused": self.is_paused,
+        }
+
+    def _weights_status(self) -> dict[str, Any]:
+        return {
+            "weight_version": self.weight_version,
+            "token_step": self.token_step,
+            "weight_update_count": self.weight_update_count,
+            "last_weight_update_ms": self.last_weight_update_ms,
         }
 
     def _execution_metrics(self) -> dict[str, float | int]:
@@ -1114,6 +1435,9 @@ class GRContinuousServingExecutor:
             "decode_ms": self.decode_ms,
             "total_ms": self.prefill_ms + self.decode_ms,
             "sync_timing_enabled": int(self.sync_timing),
+            "weight_update_count": self.weight_update_count,
+            "weight_token_step": self.token_step,
+            "last_weight_update_ms": self.last_weight_update_ms,
         }
 
     def _prefill_cache_status(self) -> dict[str, Any]:
@@ -2532,6 +2856,24 @@ class GRContinuousServingExecutor:
             "beam_kv_pool_orphaned_lease_count": len(orphaned),
             "beam_kv_pool_missing_lease_count": len(missing),
         }
+
+
+def _hf_to_logical_name(name: str) -> str:
+    """Map a HuggingFace tensor name to the model's logical weight name.
+
+    Colocate tensors arrive with HF names (``model.embed_tokens.weight``,
+    ``model.layers.{i}.self_attn.q_proj.weight``, ...). The Qwen loader consumes
+    logical names; ``layers`` load_logical_weights handles both packed
+    (``qkv_proj``) and split (``q_proj``/``k_proj``/``v_proj``) variants.
+    """
+
+    if name == "model.embed_tokens.weight":
+        return "embed_tokens.weight"
+    if name == "model.norm.weight":
+        return "final_norm.weight"
+    if name.startswith("model.layers."):
+        return name[len("model."):]
+    return name
 
 
 def _request_context_tokens(request: GRServingRequest) -> int:

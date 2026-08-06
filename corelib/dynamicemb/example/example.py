@@ -1,5 +1,6 @@
 import argparse
 import builtins
+import math
 import os
 import shutil
 import urllib.request
@@ -149,6 +150,22 @@ def download_movielens(runtime: RuntimeContext, data_dir="./ml-1m"):
     return data_dir
 
 
+def lru_lfu_decay_score(scores, cur_timestamp):
+    """Example custom eviction score for a compound ``(TIMESTAMP, LFU)`` table.
+
+    ``scores`` is indexed in the logical (tuple) order, so for ``(TIMESTAMP, LFU)``
+    ``scores[0]`` is the last-access timestamp (device nanosecond timer) and
+    ``scores[1]`` is the access frequency. The key(s) with the LOWEST returned
+    score are evicted first, so this time-decayed LFU keeps keys that are both
+    frequent and recently used: the log term rewards frequency, the age term
+    penalizes staleness (~0.9 per second). The function is JIT-compiled to device
+    code with numba-cuda, so subscripts must be integer constants; the decay
+    constant is written directly in the body.
+    """
+    age_seconds = (cur_timestamp - scores[0]) * 1e-9
+    return math.log(max(scores[1], 1)) + age_seconds * math.log(0.9)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="TorchRec MovieLens with dynamicemb")
     parser.add_argument("--train", action="store_true")
@@ -159,6 +176,15 @@ def parse_args():
     parser.add_argument("--caching", action="store_true")
     parser.add_argument("--prefetch_pipeline", action="store_true")
     parser.add_argument("--external_storage", action="store_true")
+    parser.add_argument(
+        "--score_strategy",
+        type=str,
+        default="step",
+        choices=["step", "timestamp", "lru_lfu"],
+        help="Per-table eviction score strategy. 'lru_lfu' uses the compound "
+        "(TIMESTAMP, LFU) tuple with the custom time-decayed-LFU score_function "
+        "(requires numba-cuda).",
+    )
 
     parser.add_argument(
         "--data_path",
@@ -570,6 +596,22 @@ def get_planner(
                 ),
             )
 
+        # Select the eviction score strategy. 'lru_lfu' uses the compound
+        # (TIMESTAMP, LFU) tuple with a custom time-decayed-LFU score_function;
+        # 'timestamp'/'step' use a single built-in strategy (no score_function).
+        if args.score_strategy == "lru_lfu":
+            score_strategy = (
+                DynamicEmbScoreStrategy.TIMESTAMP,
+                DynamicEmbScoreStrategy.LFU,
+            )
+            score_function = lru_lfu_decay_score
+        elif args.score_strategy == "timestamp":
+            score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+            score_function = None
+        else:
+            score_strategy = DynamicEmbScoreStrategy.STEP
+            score_function = None
+
         const = DynamicEmbParameterConstraints(
             sharding_types=[
                 ShardingType.ROW_WISE.value,  # dynamicemb embedding table only support to be sharded in row-wise.
@@ -581,7 +623,8 @@ def get_planner(
                     mode=DynamicEmbInitializerMode.NORMAL
                 ),
                 dist_type=args.dist_type,
-                score_strategy=DynamicEmbScoreStrategy.STEP,
+                score_strategy=score_strategy,
+                score_function=score_function,
                 caching=caching,
                 training=training,
                 bucket_capacity=bucket_capacity,

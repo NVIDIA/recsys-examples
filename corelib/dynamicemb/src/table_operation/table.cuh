@@ -82,7 +82,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt,
-                        int64_t num_scores = 1);
+                        int64_t num_scores = 1, int64_t score_fn_key = 0);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -98,7 +98,7 @@ table_insert_and_evict(
     std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
     std::optional<at::Tensor> ovf_counter = std::nullopt,
     std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
-    int64_t num_scores = 1);
+    int64_t num_scores = 1, int64_t score_fn_key = 0);
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,

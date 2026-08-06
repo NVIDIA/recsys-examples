@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
 
@@ -360,28 +361,125 @@ if nn is not None:
             )
 
         def load_logical_weights(
-            self, weights: dict[str, Any], *, strict: bool = True
+            self,
+            weights: dict[str, Any],
+            *,
+            strict: bool = True,
+            dry_run: bool = False,
         ) -> None:
-            """Load model-level logical tensors produced by Qwen3HFAdapter."""
+            """Load model-level logical tensors produced by Qwen3HFAdapter.
+
+            When ``dry_run`` is set, only validate that every logical tensor is
+            present and shape-compatible with the target parameter; do not mutate
+            any weight. This makes checkpoint swaps atomic (validate-then-copy).
+            """
 
             self._copy_tensor(
-                self.embed_tokens.weight, weights, "embed_tokens.weight", strict=strict
+                self.embed_tokens.weight,
+                weights,
+                "embed_tokens.weight",
+                strict=strict,
+                dry_run=dry_run,
             )
             self._copy_tensor(
-                self.norm.weight, weights, "final_norm.weight", strict=strict
+                self.norm.weight,
+                weights,
+                "final_norm.weight",
+                strict=strict,
+                dry_run=dry_run,
             )
             if not self.config.tie_word_embeddings:
                 self._copy_tensor(
-                    self.lm_head.weight, weights, "lm_head.weight", strict=strict
+                    self.lm_head.weight,
+                    weights,
+                    "lm_head.weight",
+                    strict=strict,
+                    dry_run=dry_run,
                 )
             for layer_idx, layer in enumerate(self.layers):
                 layer.ops.load_logical_weights(
-                    weights, layer_idx=layer_idx, strict=strict
+                    weights,
+                    layer_idx=layer_idx,
+                    strict=strict,
+                    dry_run=dry_run,
                 )
+
+        def validate_logical_weights(
+            self, weights: dict[str, Any], *, strict: bool = True
+        ) -> None:
+            """Validate logical tensors without copying (atomicity for disk path)."""
+
+            self.load_logical_weights(weights, strict=strict, dry_run=True)
+
+        def update_weights_from_tensor(
+            self,
+            named_tensors: "dict[str, Any] | list[tuple[str, Any]]",
+            *,
+            strict: bool = True,
+        ) -> int:
+            """In-place update of parameters identified by module parameter name.
+
+            ``named_tensors`` mirrors SGLang's ``load_format="direct"`` contract: a
+            ``{module_param_name: tensor}`` mapping (or a list of ``(name, tensor)``
+            pairs) where the names are exactly what ``self.named_parameters()``
+            yields (e.g. ``layers.0.ops.qkv_proj.weight``, ``lm_head.weight``).
+
+            Validation runs for every entry before any copy, so a bad update leaves
+            the previous weights fully intact. Returns the number of parameters
+            copied. Tied weights (``lm_head.weight`` == ``embed_tokens.weight``)
+            update together automatically because they share storage.
+            """
+
+            items = self._normalize_named_tensors(named_tensors)
+            params = dict(self.named_parameters())
+
+            # Validate-then-copy for atomicity.
+            resolved: list[tuple[Any, Any, str]] = []
+            for name, tensor in items:
+                if name not in params:
+                    if strict:
+                        raise KeyError(f"unknown parameter name: {name}")
+                    continue
+                param = params[name]
+                if tuple(param.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"shape mismatch for {name}: expected "
+                        f"{tuple(param.shape)}, got {tuple(tensor.shape)}"
+                    )
+                resolved.append((param, tensor, name))
+            with torch.no_grad():
+                for param, tensor, name in resolved:
+                    param.copy_(tensor.to(device=param.device, dtype=param.dtype))
+            return len(resolved)
+
+        def get_parameter_by_name(self, name: str) -> Any:
+            """Return the parameter registered under ``name`` or raise KeyError."""
+
+            params = dict(self.named_parameters())
+            if name not in params:
+                raise KeyError(f"unknown parameter name: {name}")
+            return params[name]
+
+        @staticmethod
+        def _normalize_named_tensors(
+            named_tensors: "dict[str, Any] | list[tuple[str, Any]]",
+        ) -> list[tuple[str, Any]]:
+            if isinstance(named_tensors, Mapping):
+                return list(named_tensors.items())
+            return [
+                (str(name), tensor)
+                for name, tensor in named_tensors
+                if name is not None
+            ]
 
         @staticmethod
         def _copy_tensor(
-            param, weights: dict[str, Any], name: str, *, strict: bool
+            param,
+            weights: dict[str, Any],
+            name: str,
+            *,
+            strict: bool,
+            dry_run: bool = False,
         ) -> None:
             if name not in weights:
                 if strict:
@@ -393,6 +491,8 @@ if nn is not None:
                     f"shape mismatch for {name}: expected {tuple(param.shape)}, "
                     f"got {tuple(tensor.shape)}"
                 )
+            if dry_run:
+                return
             with torch.no_grad():
                 param.copy_(tensor.to(device=param.device, dtype=param.dtype))
 

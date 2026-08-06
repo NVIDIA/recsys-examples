@@ -167,6 +167,84 @@ class GRInProcessServingFacade:
             raise RuntimeError("item_mask_provider_store does not support rollback")
         return int(rollback())
 
+    def update_weights_from_disk(
+        self,
+        model_dir: str | Path,
+        *,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int | None = None,
+    ) -> dict[str, Any]:
+        method = getattr(self.executor, "update_weights_from_disk", None)
+        if method is None:
+            raise RuntimeError("weight update requires a serving engine")
+        return method(
+            str(model_dir),
+            flush_cache=flush_cache,
+            abort_all_requests=abort_all_requests,
+            weight_version=weight_version,
+            token_step=token_step,
+        )
+
+    def update_weights_from_tensor(
+        self,
+        serialized_named_tensors: Any,
+        *,
+        load_format: str | None = None,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        weight_version: str | None = None,
+        token_step: int | None = None,
+    ) -> dict[str, Any]:
+        method = getattr(self.executor, "update_weights_from_tensor", None)
+        if method is None:
+            raise RuntimeError("weight update requires a serving engine")
+        return method(
+            serialized_named_tensors,
+            load_format=load_format,
+            flush_cache=flush_cache,
+            abort_all_requests=abort_all_requests,
+            weight_version=weight_version,
+            token_step=token_step,
+        )
+
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100
+    ) -> dict[str, Any]:
+        method = getattr(self.executor, "get_weights_by_name", None)
+        if method is None:
+            raise RuntimeError("weight lookup requires a serving engine")
+        return method(name, truncate_size=truncate_size)
+
+    @property
+    def is_paused(self) -> bool:
+        return bool(getattr(self.executor, "is_paused", False))
+
+    def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
+        method = getattr(self.executor, "pause_generation", None)
+        if method is None:
+            raise RuntimeError("pause_generation requires a serving engine")
+        return method(mode=mode)
+
+    def continue_generation(self) -> dict[str, Any]:
+        method = getattr(self.executor, "continue_generation", None)
+        if method is None:
+            raise RuntimeError("continue_generation requires a serving engine")
+        return method()
+
+    def flush_cache(self, timeout_s: float | None = None) -> dict[str, Any]:
+        method = getattr(self.executor, "flush_cache", None)
+        if method is None:
+            return {"success": True, "entries_cleared": 0}
+        return method(timeout_s=timeout_s)
+
+    def get_weight_version(self) -> dict[str, Any]:
+        method = getattr(self.executor, "get_weight_version", None)
+        if method is None:
+            return {"weight_version": None}
+        return method()
+
     def lifecycle_status(self) -> dict[str, Any]:
         return self._lifecycle_status_from_status(dict(self.executor.status()))
 

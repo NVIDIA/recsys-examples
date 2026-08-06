@@ -451,6 +451,43 @@ def test_http_adapter_drain_rejects_new_requests_and_marks_not_ready() -> None:
     assert submit.body["error"]["retryable"] is True
 
 
+def test_http_adapter_pause_rejects_inference_and_marks_not_ready() -> None:
+    """While generation is paused, new inference requests get 503 (retryable)
+    instead of silently queueing behind a weight update, and /ready reports the
+    paused reason so a load balancer can drain traffic."""
+    adapter = make_adapter()
+    adapter.facade.executor.is_paused = True  # simulate a weight-update pause
+
+    submit = adapter.handle("POST", "/submit", request_payload("paused"))
+    assert submit.status == 503
+    assert submit.body["error"]["code"] == "paused"
+    assert submit.body["error"]["retryable"] is True
+
+    submit_many = adapter.handle(
+        "POST",
+        "/submit_many",
+        {"requests": [request_payload("p1"), request_payload("p2")]},
+    )
+    assert submit_many.status == 503
+    assert submit_many.body["error"]["code"] == "paused"
+
+    generate = adapter.handle("POST", "/generate", request_payload("gen"))
+    assert generate.status == 503
+    assert generate.body["error"]["code"] == "paused"
+
+    ready = adapter.handle("GET", "/ready")
+    assert ready.body["ready"] is False
+    assert ready.body["reasons"] == ["paused"]
+
+    # Resuming clears the rejection and readiness reflects a serving engine.
+    adapter.facade.executor.is_paused = False
+    recovered = adapter.handle("POST", "/submit", request_payload("recovered"))
+    assert recovered.status == 202
+    ready_after = adapter.handle("GET", "/ready")
+    assert ready_after.body["ready"] is True
+    assert ready_after.body["reasons"] == []
+
+
 def test_http_adapter_shutdown_drains_and_times_out_unfinished_requests() -> None:
     adapter = make_adapter()
     adapter.handle(
