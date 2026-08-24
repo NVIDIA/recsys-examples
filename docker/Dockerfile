@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG BASE_TRITON_IMAGE=base_triton
 ARG DEVEL_IMAGE=devel
@@ -8,30 +8,52 @@ ARG DEVEL_IMAGE=devel
 #   1. UPSTREAM_PYTORCH_CONTAINER_VERSION when explicitly supplied
 #   2. Version parsed from nvcr.io/nvidia/pytorch:xx.xx-py3 BASE_IMAGE
 #   3. DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION
-ARG TRITON_SERVER_VERSION=26.06
-ARG TRITON_CLIENT_VERSION=2.69.0
+ARG TRITON_SERVER_VERSION=26.07
+ARG TRITON_CLIENT_VERSION=2.71.0
 ARG UPSTREAM_PYTORCH_CONTAINER_VERSION=
-ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.05
+ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.07
 ARG TRITON_BUILD_JOBS=8
 
 # ============================================================================
-# Stage 1: base_fbgemm — FBGEMM Path A + TorchRec (version-coupled with FBGEMM).
+# Stage 1: base_fbgemm — FBGEMM GPU + TorchRec (version-coupled with FBGEMM).
 # Override BASE_FBGEMM_IMAGE to consume a pre-built image and skip the build.
 # ============================================================================
 FROM ${BASE_IMAGE} AS base_fbgemm
 
+ARG TARGETPLATFORM
+
 WORKDIR /workspace/deps
 
-# Layer 0a: FBGEMM Path A (slow ~55min nvcc compile).
-RUN pip install --no-cache-dir setuptools-git-versioning scikit-build && \
-    git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm && \
-    cd fbgemm/fbgemm_gpu && \
-    python3 setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0 10.0 12.0"
+# Keep this tag marker for the distributed-recommender CI image-tag parser:
+# git clone --recursive -b v1.8.0 https://github.com/pytorch/FBGEMM.git
+COPY docker/install_fbgemm_gpu_arm64.sh /usr/local/bin/install_fbgemm_gpu_arm64.sh
+
+# Layer 0a: FBGEMM GPU. The official CUDA 13.0 wheel is version-matched to
+# PyTorch 2.13 and includes the SM80, SM90a, and SM100a targets needed here.
+# Using the wheel also avoids CUDA 13.3 source-compiler issues in this image.
+# The CUDA wheel is not published for aarch64, so retain the source build there.
+RUN set -eux; \
+    case "${TARGETPLATFORM}" in \
+      linux/amd64) \
+        pip install --no-cache-dir --no-deps \
+          'https://download.pytorch.org/whl/cu130/fbgemm_gpu-1.8.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=b5a98aad7c662c84e04a005d0656a7da99da15bd70c7aa1cb04bfc1e868a0b48'; \
+        ;; \
+      linux/arm64) \
+        bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
+        ;; \
+      *) \
+        echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; \
+        exit 1; \
+        ;; \
+    esac; \
+    python3 -c 'import importlib.metadata as m; assert m.version("fbgemm-gpu").startswith("1.8.0")'
 
 # Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
 RUN pip install --no-deps tensordict orjson && \
-    git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec && \
+    git clone --recursive --depth 1 --branch v1.8.0-rc1 \
+      https://github.com/meta-pytorch/torchrec.git torchrec && \
     cd torchrec && \
+    test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v1.8.0-rc1)" && \
     pip install --no-deps .
 
 # ============================================================================
@@ -64,14 +86,15 @@ RUN apt-get update -y --fix-missing && \
 
 # Triton invokes /usr/bin/python3 to build its wheels. Install into that exact
 # interpreter and bypass the NGC pip constraint only for these build tools.
-RUN env -u PIP_CONSTRAINT /usr/bin/python3 -m pip install \
+RUN python3 -m pip install --no-cache-dir distro && \
+    env -u PIP_CONSTRAINT /usr/bin/python3 -m pip install \
       --break-system-packages --no-cache-dir --upgrade \
       auditwheel build "cmake==3.31.10" "patchelf==0.17.2" pybind11 \
       setuptools virtualenv wheel && \
     cmake --version && \
     /usr/bin/python3 -c "import build, wheel, setuptools"
 
-# Triton r26.06 requires Boost >= 1.78. Use the same Boost 1.80 headers and
+# Triton r26.07 requires Boost >= 1.78. Use the same Boost 1.80 headers and
 # checksum encoded by Triton's build.py instead of relying on distro version.
 RUN wget -O /tmp/boost.tar.gz \
       https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz && \
@@ -86,13 +109,6 @@ RUN wget -O /tmp/boost.tar.gz \
 # Build Triton directly against the PyTorch installation in this image.
 # Torch-TensorRT, TorchVision custom operators, and NVSHMEM are deliberately
 # disabled so their additional libraries and headers do not have to be staged.
-# Temporary customized PyTorch backend build:
-# ceeecb7 adds model-initialization-hook support for the PyTorch PT2 (AOTI)
-# backend. This feature is not included in Triton releases through 26.07.
-# Once it is included in release 26.08 or later, remove this override and use
-# only the standard, release-aligned PyTorch backend produced by build.py.
-# Until then, build ceeecb7 against the same backend/core/common release as the
-# Triton server and install it over the standard /opt/tritonserver backend.
 RUN set -eux; \
     parsed_upstream=; \
     case "${BASE_IMAGE}" in \
@@ -128,40 +144,8 @@ RUN set -eux; \
       --override-backend-cmake-arg=pytorch:TRITON_PYTORCH_ENABLE_TORCHTRT=OFF \
       --extra-backend-cmake-arg=pytorch:TRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
       --extra-backend-cmake-arg=pytorch:TRITON_PYTORCH_NVSHMEM=OFF; \
-    standard_backend=/opt/tritonserver/backends/pytorch/libtriton_pytorch.so; \
-    test -f "${standard_backend}"; \
-    standard_backend_sha256="$(sha256sum "${standard_backend}" | awk '{print $1}')"; \
-    cd /workspace/deps; rm -rf pytorch_backend; \
-    git clone --depth 1 \
-      https://github.com/triton-inference-server/pytorch_backend.git pytorch_backend; \
-    cd pytorch_backend; \
-    git fetch --depth 1 origin ceeecb748caa785b359095a74c05d55dace2591a; \
-    git checkout --detach FETCH_HEAD; \
-    pinned_backend_commit="$(git rev-parse HEAD)"; \
-    test "${pinned_backend_commit}" = ceeecb748caa785b359095a74c05d55dace2591a; \
-    mkdir -p build; cd build; \
-    cmake \
-      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH="$PWD/install" \
-      -DTRITON_PYTORCH_INCLUDE_PATHS="${pytorch_includes};/opt/pytorch/vision/torchvision/csrc" \
-      -DTRITON_PYTORCH_LIB_PATHS=/opt/triton-pytorch-libs \
-      -DTRITON_PYTORCH_ENABLE_TORCHTRT=OFF -DTRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
-      -DTRITON_PYTORCH_NVSHMEM=OFF \
-      -DTRITON_BACKEND_REPO_TAG="r${TRITON_SERVER_VERSION}" \
-      -DTRITON_CORE_REPO_TAG="r${TRITON_SERVER_VERSION}" \
-      -DTRITON_COMMON_REPO_TAG="r${TRITON_SERVER_VERSION}" \
-      ..; \
-    cmake --build . --parallel "${TRITON_BUILD_JOBS}" --target install; \
-    pinned_backend="$PWD/install/backends/pytorch/libtriton_pytorch.so"; \
-    test -f "${pinned_backend}"; install -m 0755 "${pinned_backend}" "${standard_backend}"; \
-    pinned_backend_sha256="$(sha256sum "${standard_backend}" | awk '{print $1}')"; \
-    test "${pinned_backend_sha256}" = "$(sha256sum "${pinned_backend}" | awk '{print $1}')"; \
-    provenance=/opt/tritonserver/backends/pytorch/pinned-backend-build.txt; \
-    printf '%s\n' \
-      "commit=${pinned_backend_commit}" \
-      "repository_tags=r${TRITON_SERVER_VERSION}" \
-      "replaced_sha256=${standard_backend_sha256}" \
-      "installed_sha256=${pinned_backend_sha256}" \
-      > "${provenance}"; \
+    test -f /opt/tritonserver/backends/pytorch/libtriton_pytorch.so; \
+    test -f /opt/tritonserver/backends/python/libtriton_python.so; \
     printf '%s\n' "${effective_upstream}" > /opt/tritonserver/upstream-pytorch-container-version; \
     rm -rf /workspace/triton-build /workspace/deps/triton-server-src /opt/triton-pytorch-libs
 
@@ -170,20 +154,17 @@ ENV NVIDIA_TRITON_SERVER_VERSION=${TRITON_SERVER_VERSION}
 ENV PATH=/opt/tritonserver/bin:${PATH}
 ENV LD_LIBRARY_PATH=/opt/tritonserver/lib:/opt/tritonserver/backends/pytorch:${LD_LIBRARY_PATH}
 
-# Triton release 26.06 corresponds to server/client version 2.69.0. Install
+# Triton release 26.07 corresponds to server/client version 2.71.0. Install
 # only the HTTP client required by the same-container HSTU test workflow.
 RUN env -u PIP_CONSTRAINT /usr/bin/python3 -m pip install \
       --break-system-packages --no-cache-dir "tritonclient[http]==${TRITON_CLIENT_VERSION}" && \
     /usr/bin/python3 -c "import tritonclient.http; print(tritonclient.http.__file__)"
 
 # Keep runtime verification separate so an assertion failure does not invalidate
-# the expensive Triton compilation layer above. Triton --help returns 1 in r26.06.
+# the expensive Triton compilation layer above. Triton --help may return 1.
 RUN set -eux; \
-    provenance=/opt/tritonserver/backends/pytorch/pinned-backend-build.txt; \
     test -x /opt/tritonserver/bin/tritonserver \
       && test -f /opt/tritonserver/backends/pytorch/libtriton_pytorch.so; \
-    grep -q '^commit=ceeecb7' "${provenance}"; \
-    grep -q "^repository_tags=r${TRITON_SERVER_VERSION}$" "${provenance}"; \
     test -f /opt/tritonserver/backends/python/libtriton_python.so \
       && test -x /opt/tritonserver/backends/python/triton_python_backend_stub; \
     export LD_LIBRARY_PATH="/opt/tritonserver/lib:/opt/tritonserver/backends/pytorch:${LD_LIBRARY_PATH:-}"; \
@@ -208,6 +189,7 @@ RUN set -eux; \
 # ============================================================================
 FROM ${BASE_TRITON_IMAGE} AS devel
 ARG TARGETPLATFORM
+ARG HSTU_BUILD_JOBS=4
 
 WORKDIR /workspace/deps
 
@@ -239,12 +221,20 @@ RUN apt-get update -y --fix-missing && \
 # -- Layer 2: pip dependencies + Megatron-LM ---
 # core_v0.13.1 picks up an optional skip for count_zeros_in_grad in
 # ChainedOptimizer.step (~4 ms / step under HSTU bf16 when the stat is unused).
+# TorchX 0.7 requires urllib3<1.27, while Triton client 2.71 requires
+# urllib3>=2.0.7, so keep the TorchX launcher in an isolated virtualenv.
 RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install --no-deps -e ./megatron-lm && \
-    pip install --no-cache-dir torchx gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
-        cloudpickle \
+    pip install --no-cache-dir gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
+        cloudpickle pyre-extensions \
         'quack-kernels>=0.3.3,<0.5' 'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
-        pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder
+        pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder && \
+    python3 -m venv /opt/torchx && \
+    /opt/torchx/bin/python -m pip install --no-cache-dir 'torchx==0.7.0' && \
+    ln -sf /opt/torchx/bin/torchx /usr/local/bin/torchx && \
+    python3 -c 'import importlib.metadata as m, urllib3; assert m.version("tritonclient") == "2.71.0"; assert tuple(map(int, urllib3.__version__.split(".")[:2])) >= (2, 0)' && \
+    /opt/torchx/bin/python -c 'import importlib.metadata as m, urllib3; assert m.version("torchx") == "0.7.0"; assert tuple(map(int, urllib3.__version__.split(".")[:2])) < (1, 27)' && \
+    torchx --help >/dev/null
 
 # -- Layer 3: FlashAttention --
 ARG FLASH_ATTN_ARBITRARY_MASK_COMMIT=b56db721d65afadd8cfe154cd12e83693bf0aba3
@@ -294,6 +284,8 @@ RUN set -eux; \
 ENV PYTHONPATH=/opt/nve/default/python:.:/workspace/recsys-examples/examples:/workspace/recsys-examples/examples/hstu
 
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
+# Each HSTU CUDA compile job can peak at 8-9 GiB of host memory, so use a
+# conservative default that also fits the 128 GiB A100 CI builders.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     export HSTU_ARCH_LIST="8.0 9.0 10.0" && \
@@ -307,6 +299,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_RAB=TRUE \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
+    MAX_JOBS="${HSTU_BUILD_JOBS}" \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
@@ -320,7 +313,10 @@ RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
 COPY . .
 
-RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
+RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+    test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
+    ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+    cd /workspace/recsys-examples/corelib/dynamicemb && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python setup.py install && \
     cd /workspace/deps && rm -rf nvcomp && \
     NVCOMP_ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "linux-sbsa" || echo "linux-x86_64") && \
@@ -332,9 +328,6 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
     cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" pip3 install --no-build-isolation . && \
-    rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
-    test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
-    ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     cd /workspace/recsys-examples/corelib/dynamicemb && \
     mkdir -p torch_binding_build && cd torch_binding_build && \
     cmake .. && make -j
