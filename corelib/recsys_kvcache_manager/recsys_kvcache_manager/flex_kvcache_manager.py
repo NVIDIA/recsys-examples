@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from flexkv.common.config import LayerGroupSpec
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.server.client import KVTPClient
 
@@ -31,6 +32,10 @@ except Exception:
 
     KVResponse = Any  # type: ignore
 
+from .flexkv_layerwise import (
+    FlexKVLayerwiseEventfdSender,
+    create_layerwise_eventfd_socket_path,
+)
 from .host_kvstorage_manager import (
     HostKVStorageBase,
     HostKVTaskHandle,
@@ -39,10 +44,6 @@ from .host_kvstorage_manager import (
 )
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
-from .flexkv_layerwise import (
-    DEFAULT_LAYERWISE_EVENTFD_SOCKET,
-    FlexKVLayerwiseEventfdSender,
-)
 
 
 @dataclass
@@ -148,10 +149,8 @@ class FlexKVStorage(HostKVStorageBase):
         self.enable_layerwise = enable_layerwise
         self.layerwise_eventfd_socket = (
             layerwise_eventfd_socket
-            or os.environ.get(
-                "FLEXKV_LAYERWISE_EVENTFD_SOCKET",
-                DEFAULT_LAYERWISE_EVENTFD_SOCKET,
-            )
+            or os.environ.get("FLEXKV_LAYERWISE_EVENTFD_SOCKET")
+            or create_layerwise_eventfd_socket_path()
         )
         self.layerwise_counter_id = int(layerwise_counter_id)
         self.backend_name = "flexkv"
@@ -190,16 +189,38 @@ class FlexKVStorage(HostKVStorageBase):
             tokens_per_block=int(first_table.shape[2]),
             num_head=int(first_table.shape[3]),
             head_size=int(first_table.shape[4]),
-            is_mla=False,
         )
         tp_client = KVTPClient(
             gpu_register_port=self._gpu_register_port,
             dp_client_id=0,
             device_id=device_id,
         )
+        register_kwargs: Dict[str, Any] = {}
+        if self.enable_layerwise:
+            # FlexKV main's multi-group path is also its public representation
+            # for a uniform cache with one member per layer. Registering HSTU as
+            # one group keeps the layout unchanged while avoiding assumptions in
+            # the legacy single-group layerwise constructor.
+            register_kwargs.update(
+                layer_groups=[
+                    LayerGroupSpec(
+                        num_layers=gpu_layout.num_layer,
+                        num_kv_heads=gpu_layout.num_head,
+                        head_size=gpu_layout.head_size,
+                        layer_indices=list(range(gpu_layout.num_layer)),
+                        dtype=self.dtype,
+                    )
+                ],
+                gpu_layouts=[gpu_layout],
+                handles_per_group=[self._gpu_cache_table_list],
+            )
         tp_client.register_to_server(
-            kv_caches=self._gpu_cache_table_list, kv_layout=gpu_layout
+            kv_caches=self._gpu_cache_table_list,
+            kv_layout=gpu_layout,
+            **register_kwargs,
         )
+        if self.enable_layerwise and self._layerwise_eventfd_sender is not None:
+            self._layerwise_eventfd_sender.wait_until_ready()
         self._registered = True
 
         # Client becomes operational only after transfer manager is ready.
@@ -559,9 +580,6 @@ class FlexKVStorage(HostKVStorageBase):
             else self._build_slot_mappings(kvcache_metadata)
         )
 
-        # Keep offload on the direct put_async path while validating layerwise.
-        # This matches the known-good 2e259b0 behavior and isolates PR418's
-        # put_match/as_batch offload optimization from PR428 layerwise onboard.
         use_batch = False
         task_ids: List[int] = []
         batch_slot_mappings: List[torch.Tensor] = []

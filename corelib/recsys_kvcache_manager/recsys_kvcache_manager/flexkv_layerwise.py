@@ -15,7 +15,9 @@
 
 import os
 import socket
+import stat
 import struct
+import tempfile
 import threading
 import time
 from array import array
@@ -26,8 +28,16 @@ from typing import List, Optional
 DEFAULT_LAYERWISE_EVENTFD_SOCKET = "/tmp/flexkv_layerwise_eventfd.sock"
 
 
+def create_layerwise_eventfd_socket_path() -> str:
+    socket_directory = tempfile.mkdtemp(
+        prefix=f"recsys-flexkv-layerwise-{os.geteuid()}-"
+    )
+    os.chmod(socket_directory, 0o700)
+    return os.path.join(socket_directory, "eventfd.sock")
+
+
 class FlexKVLayerwiseEventfdSender:
-    """Creates mock layerwise eventfds and sends them to FlexKV's worker."""
+    """Creates layerwise eventfds and sends them to FlexKV's worker."""
 
     def __init__(
         self,
@@ -42,6 +52,8 @@ class FlexKVLayerwiseEventfdSender:
         self.timeout_s = float(timeout_s)
         self._eventfds: Optional[List[List[int]]] = None
         self._thread: Optional[threading.Thread] = None
+        self._handoff_done = threading.Event()
+        self._handoff_error: Optional[BaseException] = None
 
     @staticmethod
     def _create_eventfd() -> int:
@@ -76,11 +88,76 @@ class FlexKVLayerwiseEventfdSender:
             return
         self.create_eventfds()
         self._thread = threading.Thread(
-            target=self._send_eventfds,
+            target=self._run_sender,
             name="flexkv-layerwise-eventfd-sender",
             daemon=True,
         )
         self._thread.start()
+
+    def wait_until_ready(self, timeout_s: Optional[float] = None) -> None:
+        timeout = self.timeout_s + 1.0 if timeout_s is None else float(timeout_s)
+        if not self._handoff_done.wait(timeout):
+            raise TimeoutError(
+                "Timed out waiting for FlexKV layerwise eventfd handoff "
+                f"on socket {self.socket_path}"
+            )
+        if self._handoff_error is not None:
+            raise RuntimeError(
+                "FlexKV layerwise eventfd handoff failed"
+            ) from self._handoff_error
+
+    def _run_sender(self) -> None:
+        try:
+            self._send_eventfds()
+        except BaseException as error:
+            self._handoff_error = error
+        finally:
+            self._handoff_done.set()
+
+    @staticmethod
+    def _is_process_descendant(process_id: int, ancestor_id: int) -> bool:
+        current_id = int(process_id)
+        ancestor_id = int(ancestor_id)
+        visited = set()
+        while current_id > 1 and current_id not in visited:
+            if current_id == ancestor_id:
+                return True
+            visited.add(current_id)
+            try:
+                with open(f"/proc/{current_id}/stat", encoding="utf-8") as stat_file:
+                    process_stat = stat_file.read()
+                fields_after_name = process_stat[process_stat.rfind(")") + 1 :].split()
+                current_id = int(fields_after_name[1])
+            except (OSError, IndexError, ValueError):
+                return False
+        return current_id == ancestor_id
+
+    def _authenticate_peer(self, sock: socket.socket) -> None:
+        socket_stat = os.stat(self.socket_path, follow_symlinks=False)
+        if not stat.S_ISSOCK(socket_stat.st_mode):
+            raise PermissionError(
+                f"Layerwise eventfd path is not a socket: {self.socket_path}"
+            )
+        if socket_stat.st_uid != os.geteuid():
+            raise PermissionError(
+                "FlexKV layerwise socket owner does not match the current user"
+            )
+
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise RuntimeError("SO_PEERCRED is required for layerwise eventfd handoff")
+        credentials_size = struct.calcsize("3i")
+        peer_pid, peer_uid, peer_gid = struct.unpack(
+            "3i",
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, credentials_size),
+        )
+        if peer_uid != os.geteuid() or peer_gid != os.getegid():
+            raise PermissionError(
+                "FlexKV layerwise peer credentials do not match the current process"
+            )
+        if not self._is_process_descendant(peer_pid, os.getpid()):
+            raise PermissionError(
+                f"FlexKV layerwise peer pid {peer_pid} is outside the current process tree"
+            )
 
     def _send_eventfds(self) -> None:
         eventfds = self.create_eventfds()
@@ -89,7 +166,9 @@ class FlexKVLayerwiseEventfdSender:
         while time.time() < deadline:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
+                sock.settimeout(min(1.0, max(deadline - time.time(), 0.01)))
                 sock.connect(self.socket_path)
+                self._authenticate_peer(sock)
                 metadata = struct.pack(
                     "iiii",
                     0,
@@ -116,12 +195,12 @@ class FlexKVLayerwiseEventfdSender:
                         f"FlexKV layerwise eventfd receiver returned ack={ack!r}"
                     )
                 return
-            except (FileNotFoundError, ConnectionRefusedError, socket.timeout) as e:
+            except (OSError, RuntimeError) as e:
                 last_error = e
                 time.sleep(0.05)
             finally:
                 sock.close()
         raise RuntimeError(
-            "Timed out sending mock layerwise eventfds to FlexKV "
+            "Timed out sending layerwise eventfds to FlexKV "
             f"socket {self.socket_path}: {last_error}"
         )

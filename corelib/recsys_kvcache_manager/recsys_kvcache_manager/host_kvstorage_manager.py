@@ -119,11 +119,14 @@ class HostKVStorageBase(ABC):
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         ...
 
-    @abstractmethod
     def onboard_kvcache_wait_by_layer(
         self, task_handle: HostKVTaskHandle, layer_idx: int
     ) -> HostKVWaitResult:
-        ...
+        return HostKVWaitResult(
+            status=HostKVTaskStatus.SKIPPED,
+            ready=False,
+            message="Layerwise onboard wait is not supported by this backend.",
+        )
 
     @abstractmethod
     def offload_kvcache_launch(
