@@ -290,6 +290,9 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
           *bucket.digests(iter) = Bucket::key_to_digest(key);
           if (evict_key == Bucket::reclaimed_key()) {
             atomicAdd(&bucket_sizes[bucket_id], 1);
+	    ScoreType *sblk = bucket.scores(iter);
+	    for (int64_t s = 0; s < bucket.num_scores(); ++s)
+              sblk[s] = ScoreType();
             result = InsertResult::Reclaim;
           } else {
             // Clear the evicted key's whole (AoS-contiguous) score block so the

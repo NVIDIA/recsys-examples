@@ -868,3 +868,42 @@ def test_lru_lfu_plain_insert_evicts_via_cubin(current_device):
     assert not bool(
         founds.any()
     ), "plain insert must evict the high-freq keys via the custom cubin (DefaultEvictor would have kept them)"
+
+def test_lru_lfu_insert_after_erase_no_phantom_frequency(current_device):
+    """A new key taking over a slot reclaimed by erase() must start with a clean
+    score block. erase() resets word 0 only; word 1 (frequency) stays stale, and
+    the Reclaim branch must clear it before Policy::update() accumulates."""
+    device = torch.cuda.current_device()
+    bc = 128
+    table = _lru_lfu_table(bc, bucket_capacity=bc)  # single bucket
+
+    # Fill the bucket completely; every key lands at frequency 2.
+    n = bc
+    keys = torch.arange(1, 1 + n, dtype=torch.int64, device=device)
+    tids = torch.zeros(n, dtype=torch.int64, device=device)
+    freq = torch.full((n,), 2, dtype=torch.uint64, device=device)
+    idx, _ = _insert(table, keys, tids, freq)
+
+    # Erase one key: its slot becomes reclaimed with word1 == 2 left stale.
+    table.erase(keys[:1], tids[:1])
+    torch.cuda.synchronize()
+
+    # Insert a new key (delta 1). Probing skips the reclaimed slot, so the
+    # default Lex evictor picks the victim: all live keys tie at frequency 2,
+    # but the reclaimed slot's timestamp is 0 (oldest) -> it wins the tie and
+    # is reclaimed.
+    new_key = torch.tensor([1_000_000], dtype=torch.int64, device=device)
+    new_tid = torch.tensor([0], dtype=torch.int64, device=device)
+    new_freq = torch.ones(1, dtype=torch.uint64, device=device)
+    new_idx, new_score_out = _insert(table, new_key, new_tid, new_freq)
+
+    # Frequency must be the new key's own delta (1), not 1 + stale 2 == 3.
+    blocks = table.gather_score_blocks(0, new_idx)
+    assert int(blocks[0, 1].item()) == 1, (
+        f"phantom frequency: new key in reclaimed slot has frequency "
+        f"{int(blocks[0, 1].item())}, expected 1"
+    )
+    assert int(new_score_out[0].item()) == 1, (
+        f"phantom frequency: insert returned frequency "
+        f"{int(new_score_out[0].item())}, expected 1"
+    )
