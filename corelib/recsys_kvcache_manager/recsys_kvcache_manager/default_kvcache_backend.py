@@ -313,6 +313,22 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 }
             else:
                 flexkv_as_batch = bool(flexkv_as_batch_raw)
+            flexkv_enable_layerwise = extra.get("flexkv_enable_layerwise", None)
+            if isinstance(flexkv_enable_layerwise, str):
+                flexkv_enable_layerwise = flexkv_enable_layerwise.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            elif flexkv_enable_layerwise is not None:
+                flexkv_enable_layerwise = bool(flexkv_enable_layerwise)
+            flexkv_layerwise_eventfd_socket = extra.get(
+                "flexkv_layerwise_eventfd_socket", None
+            )
+            flexkv_layerwise_counter_id = int(
+                extra.get("flexkv_layerwise_counter_id", 0)
+            )
 
             return FlexKVStorage(
                 mode=flexkv_mode,
@@ -331,6 +347,9 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
                 config_path=flexkv_config_path,
+                enable_layerwise=flexkv_enable_layerwise,
+                layerwise_eventfd_socket=flexkv_layerwise_eventfd_socket,
+                layerwise_counter_id=flexkv_layerwise_counter_id,
             )
         else:
             raise NotImplementedError(
