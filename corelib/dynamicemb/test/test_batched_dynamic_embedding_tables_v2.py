@@ -188,7 +188,7 @@ def _bdebt_forward_maybe_lfu(
         return bdebt(
             indices,
             offsets,
-            per_sample_weights=_lfu_per_sample_weights(indices, device),
+            frequency_counters=_lfu_per_sample_weights(indices, device),
         )
     return bdebt(indices, offsets)
 

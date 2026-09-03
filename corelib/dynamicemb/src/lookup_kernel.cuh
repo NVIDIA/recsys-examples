@@ -874,11 +874,12 @@ __global__ void multi_to_one_cta_per_ev_kernel(CopyDesc copy_desc) {
     float accum[kMaxElemPerThread] = {0.f};
     for (int r = 0; r < (end - start); ++r) {
       const src_type *src_ev = copy_desc.get_src_ptr(r + start);
+      float w = copy_desc.get_weight(r + start);
 #pragma unroll kMaxElemPerThread
       for (int i = 0;
            i < kMaxElemPerThread && blockDim.x * i + threadIdx.x < vec_length;
            ++i) {
-        accum[i] += (float)(src_ev[blockDim.x * i + threadIdx.x]);
+        accum[i] += w * (float)(src_ev[blockDim.x * i + threadIdx.x]);
       }
     }
     if (average_pooling_factor > 0) {
@@ -926,6 +927,7 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
       for (int j = 0; j < kWarpSize && r + j < L; ++j) {
         int j_ev = __shfl_sync(0xFFFFFFFF, l, j);
         const src_type *src_ev = copy_desc.get_src_ptr(j_ev);
+	float w = copy_desc.get_weight(j_ev);
 
 #pragma unroll kMaxElemPerThread
         for (int i = 0; i < kMaxElemPerThread &&
@@ -935,7 +937,7 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
           int idx4 = 4 * kWarpSize * i + 4 * lane_id;
           int n = min(vec_length - idx4, copy_width);
           src_elem.load(src_ev + idx4, n);
-          accum[i].accumulate(src_elem);
+          accum[i].accumulate(src_elem, w);
         }
       }
     }

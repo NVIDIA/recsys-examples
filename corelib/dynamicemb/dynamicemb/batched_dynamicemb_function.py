@@ -1109,6 +1109,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         dims: Optional[List[int]] = None,
         max_D: int = 0,
         D_offsets: Optional[torch.Tensor] = None,
+        pooling_weights: Optional[torch.Tensor] = None,
         *args,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
@@ -1117,6 +1118,27 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             emb_dtype = storage.embedding_dtype()
 
             is_pooling = pooling_mode != DynamicEmbPoolingMode.NONE
+            if pooling_weights is not None:
+                if pooling_mode != DynamicEmbPoolingMode.SUM:
+                    raise ValueError(
+                        "pooling_weights requires pooling_mode=SUM (weighted "
+                        f"pooling is only supported for SUM, got {pooling_mode})."
+                    )
+                if pooling_weights.dtype != torch.float32:
+                    raise ValueError(
+                        "pooling_weights must be float32, got "
+                        f"{pooling_weights.dtype}."
+                    )
+                if (
+                    pooling_weights.numel()
+                    != prefetch_state.reverse_indices.numel()
+                ):
+                    raise ValueError(
+                        "pooling_weights.numel() "
+                        f"({pooling_weights.numel()}) must equal "
+                        "reverse_indices.numel() "
+                        f"({prefetch_state.reverse_indices.numel()})."
+                    )
             mixed_D = is_pooling and dims is not None and max_D > min(dims)
             out_dim = max_D if mixed_D else emb_dim
 
@@ -1189,6 +1211,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         batch_size,
                         D_offsets,
                         max_D,
+                        pooling_weights,
                     )
             else:
                 combiner = -1
@@ -1226,6 +1249,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.dims = dims
             ctx.max_D = max_D
             ctx.D_offsets = D_offsets
+            ctx.pooling_weights = pooling_weights
             ctx.num_features = (
                 (offsets.shape[0] - 1) // batch_size if batch_size > 0 else 0
             )
@@ -1269,6 +1293,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         ctx.D_offsets,
                         ctx.combiner,
                         ctx.total_D,
+                        ctx.pooling_weights,
                     )
             else:
                 with torch.cuda.nvtx.range("op:reduce_grads"):
@@ -1353,4 +1378,4 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                                 preserve_existing=True,
                             )
 
-            return (None,) * 17
+            return (None,) * 18
