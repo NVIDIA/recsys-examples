@@ -592,7 +592,7 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
                                const std::optional<at::Tensor> &D_offsets,
                                const std::optional<at::Tensor> &offsets, int B,
                                int F, int total_D, int combiner,
-			       const std::optional<at::Tensor> &weights) {
+                               const std::optional<at::Tensor> &weights) {
   if (num_key_ == 0)
     return;
   auto scalar_type = out_grads.dtype().toScalarType();
@@ -636,7 +636,7 @@ void LocalReduce::local_reduce(const at::Tensor &in_grads,
                 unique_key_ids, partial_buffer, partial_unique_ids, stream,
                 d_D_ptr, total_D, F,
                 reinterpret_cast<const offset_t *>(offsets.value().data_ptr()),
-                B, combiner);
+                B, combiner, d_w);
           });
         } else {
           multi_to_one_reduce<grad_t, accum_t, id_t, int64_t, WarpSize>(

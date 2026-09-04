@@ -937,7 +937,7 @@ __global__ void multi_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
           int idx4 = 4 * kWarpSize * i + 4 * lane_id;
           int n = min(vec_length - idx4, copy_width);
           src_elem.load(src_ev + idx4, n);
-          accum[i].accumulate(src_elem, w);
+          accum[i].accumulate_multiply(src_elem, w);
         }
       }
     }

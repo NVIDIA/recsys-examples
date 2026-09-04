@@ -110,10 +110,22 @@ void gather_embedding_pooled(
     const std::optional<at::Tensor> &weights = std::nullopt) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   int num_slots = offsets.size(0) - 1;
-  ...
+
+  auto src_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(input.dtype()));
+  auto dst_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(output.dtype()));
+  auto offset_type =
+      scalartype_to_datatype(convertTypeMetaToScalarType(offsets.dtype()));
+
+  int dim = D_offsets.has_value() ? max_D : static_cast<int>(input.size(1));
+  int src_stride = static_cast<int>(input.stride(0));
   const int *d_D_offsets = nullptr;
   if (D_offsets.has_value()) {
-    ...
+    TORCH_CHECK(D_offsets.value().scalar_type() == at::kInt,
+                "D_offsets must be int32, got ",
+                D_offsets.value().scalar_type());
+    d_D_offsets = reinterpret_cast<const int *>(D_offsets.value().data_ptr());
   }
   const float *d_weights = nullptr;
   if (weights.has_value()) {
@@ -131,7 +143,6 @@ void gather_embedding_pooled(
       combiner, total_D, /*accum_D=*/0, dim, src_stride, num_slots, batch_size,
       src_type, dst_type, offset_type, stream, d_D_offsets, d_weights);
 }
-
 // Generate permutation-aware gather_ids from CSR offsets.
 // grads is [B*F, D] batch-first (row r → b=r/F, f=r%F).
 // Each thread processes one slot (bucket) s; slot s owns indices
@@ -861,7 +872,8 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
         py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
-        py::arg("combiner") = -1, py::arg("total_D") = 0);
+        py::arg("combiner") = -1, py::arg("total_D") = 0,
+	py::arg("weights") = py::none());
 
   m.def("gather_embedding", &gather_embedding,
         "Gather embedding based on index.", py::arg("input"), py::arg("output"),
@@ -872,7 +884,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("input"), py::arg("output"), py::arg("index"),
         py::arg("offsets"), py::arg("combiner"), py::arg("total_D"),
         py::arg("batch_size"), py::arg("D_offsets") = py::none(),
-        py::arg("max_D") = 0);
+        py::arg("max_D") = 0, py::arg("weights") = py::none());
 
   m.def("load_from_flat_table_contiguous", &load_from_flat_table_contiguous,
         "Load from flat table: contiguous copy (NumRegions=0, single-table "
