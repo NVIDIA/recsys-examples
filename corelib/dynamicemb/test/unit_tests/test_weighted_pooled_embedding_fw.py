@@ -126,7 +126,7 @@ def main(argv: List[str]) -> None:
         )
         for f in range(args.num_embedding_table)
     ]
-    ebc = torchrec.EmbeddingBagCollection(tables=eb_configs, device=torch.device("meta"))
+    ebc = torchrec.EmbeddingBagCollection(tables=eb_configs, device=torch.device("meta"), is_weighted=True,)
 
     dict_const = {}
     for i in range(args.num_embedding_table):

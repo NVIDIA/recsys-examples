@@ -88,9 +88,6 @@ __global__ void multi_to_one_reduce_kernel1_no_vec(
     if (threadIdx.x < vec_length)
       accum += (accum_t)(tmp_src[threadIdx.x]) * (accum_t)scale;
 
-    if (threadIdx.x < vec_length)
-      accum += (accum_t)(tmp_src[threadIdx.x]) * (accum_t)scale;
-
     // when key changes, write to dst and reset
     if (sp < local_sample_num - 1) {
       id_t new_id = unique_ids[global_index + 1];

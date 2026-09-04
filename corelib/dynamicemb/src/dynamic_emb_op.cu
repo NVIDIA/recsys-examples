@@ -128,6 +128,7 @@ void gather_embedding_pooled(
     d_D_offsets = reinterpret_cast<const int *>(D_offsets.value().data_ptr());
   }
   const float *d_weights = nullptr;
+  at::Tensor w;
   if (weights.has_value()) {
     auto w = weights.value().contiguous();
     TORCH_CHECK(w.scalar_type() == at::kFloat,
