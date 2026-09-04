@@ -276,7 +276,7 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
 
   // --- Sort weights with the same keys (radix sort is stable, so this
   //     yields the identical permutation as the gather_ids sort) ---
-  at::Tensor sorted_weights;
+  std::optional<at::Tensor> sorted_weights;
   if (weights.has_value()) {
     auto w = weights.value().contiguous();
     TORCH_CHECK(w.scalar_type() == at::kFloat,
@@ -287,7 +287,7 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
                 ") must equal reverse_indices.numel() (", num_keys, ")");
     TORCH_CHECK(offsets.has_value(),
                 "weights are only supported for pooled (offsets) reduce");
-    sorted_weights = at::empty_like(w);
+    at::Tensor sw = at::empty_like(w);
     DISPATCH_INTEGER_DATATYPE_FUNCTION(id_dtype, id_t, [&] {
       size_t w_temp_bytes = 0;
       cub::DeviceRadixSort::SortPairs(
@@ -295,8 +295,8 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
           reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
           reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
           reinterpret_cast<float *>(w.data_ptr()),
-          reinterpret_cast<float *>(sorted_weights.data_ptr()), num_keys, 0,
-          end_bit, stream);
+          reinterpret_cast<float *>(sw.data_ptr()), num_keys, 0, end_bit,
+          stream);
       auto w_temp = at::empty({static_cast<int64_t>(w_temp_bytes)},
                               at::TensorOptions().dtype(at::kByte).device(device_));
       cub::DeviceRadixSort::SortPairs(
@@ -304,11 +304,11 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
           reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
           reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
           reinterpret_cast<float *>(w.data_ptr()),
-          reinterpret_cast<float *>(sorted_weights.data_ptr()), num_keys, 0,
-          end_bit, stream);
+          reinterpret_cast<float *>(sw.data_ptr()), num_keys, 0, end_bit,
+          stream);
     });
+    sorted_weights = sw;
   }
-
   // --- LocalReduce ---
   // MEAN scaling is fused inside the reduce kernel for both uniform and
   // multi-dim modes, so no separate scaling pass is needed.

@@ -51,7 +51,7 @@ def feature_idx_to_name(i):
 
 def generate_sparse_feature_with_weights(
     feature_num, num_embeddings_list, multi_hot_sizes, local_batch_size
-) -> Tuple[torchrec.KeyedJaggedTensor, torchrec.KeyedJaggedTensor]:
+) -> torchrec.KeyedJaggedTensor:
     feature_batch = feature_num * local_batch_size
     indices, lengths, weights = [], [], []
     for i in range(feature_batch):
@@ -65,25 +65,19 @@ def generate_sparse_feature_with_weights(
             weights.append(random.uniform(0.5, 2.0))
         lengths.append(cur_bag_size)
     keys = [feature_idx_to_name(f) for f in range(feature_num)]
-    features = torchrec.KeyedJaggedTensor(
+    return torchrec.KeyedJaggedTensor(
         keys=keys,
         values=torch.tensor(indices, dtype=torch.int64).cuda(),
+        weights=torch.tensor(weights, dtype=torch.float32).cuda(),
         lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
     )
-    weights_kjt = torchrec.KeyedJaggedTensor(
-        keys=keys,
-        values=torch.tensor(weights, dtype=torch.float32).cuda(),
-        lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
-    )
-    return features, weights_kjt
 
-
-def reference_weighted_sum(features, weights_kjt, local_batch_size):
+def reference_weighted_sum(features, local_batch_size):
     """Reference per local slot: slot s = f*B + b -> sum w * (idx % MOD)."""
     F = len(features.keys())
     out = torch.zeros(local_batch_size, F, device=features.values().device)
     offsets = features.offsets().view(-1)
-    w_values = weights_kjt.values()
+    w_values = features.weights()
     for s in range(F * local_batch_size):
         f, b = s // local_batch_size, s % local_batch_size
         acc = 0.0
@@ -93,7 +87,6 @@ def reference_weighted_sum(features, weights_kjt, local_batch_size):
             )
         out[b, f] = acc
     return out
-
 
 @record
 def main(argv: List[str]) -> None:
@@ -130,7 +123,6 @@ def main(argv: List[str]) -> None:
             num_embeddings=num_embeddings_per_feature[f],
             feature_names=[feature_idx_to_name(f)],
             pooling=PoolingType.SUM,
-            weighted=True,
         )
         for f in range(args.num_embedding_table)
     ]
@@ -192,15 +184,15 @@ def main(argv: List[str]) -> None:
     ]
 
     for _ in range(args.num_iterations):
-        features, weights_kjt = generate_sparse_feature_with_weights(
+        features = generate_sparse_feature_with_weights(
             args.num_embedding_table,
             num_embeddings_per_feature,
             multi_hot_sizes,
             local_batch_size,
         )
-        ret = model(features, weights_kjt)
+        ret = model(features)
         kt = ret.values()  # [B_local, F * embedding_dim]
-        ref = reference_weighted_sum(features, weights_kjt, local_batch_size)
+        ref = reference_weighted_sum(features, local_batch_size)
 
         for f in range(args.num_embedding_table):
             col = prefix_dims[f]
