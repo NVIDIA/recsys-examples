@@ -101,7 +101,9 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 4. The lookup process for each dynamic embedding table incurs additional overhead from unique or radix sort operations. Therefore, if you request a large number of small dynamic embedding tables for lookup, the performance will be poor. Since the lookup range of dynamic embedding tables is particularly large (using the entire range of `int64_t`), it is recommended to create one large embedding table and perform a fused lookup for multiple features.
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
 6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
-7. DynamicEmb supports Torch-exportable embedding tables through `InferenceEmbeddingTable`. It uses DynamicEmb `ScoredHashTable` metadata frozen at export/inference time and `LinearUVMEmbedding` from [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache), supporting sequence mode and pooling mode (`SUM`, `MEAN`). It is initialized from `DynamicEmbTableOptions` and loads from DynamicEmb dumped embedding files.
+7. DynamicEmb supports exportable inference embedding collections with configurable indexing and NVE GPU, LinearUVM, or hierarchical storage. Data-backed indexer state and volatile NVHashMap contents are exported as sidecars, while Redis-backed hierarchical collections support incremental load.
+
+   See the [verified example](./example/exportable_embedding/README.md).
 
 ### DynamicEmb Insertion Behavior Checking Modes
 

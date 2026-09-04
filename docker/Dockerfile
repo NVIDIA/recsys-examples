@@ -269,7 +269,7 @@ RUN git clone --recursive -b v26.05 \
     git clone -b v3.5.0 https://github.com/NVIDIA/NVTX.git NVTX
 
 # Build into two isolated Python prefixes. NVE's upstream default feature set
-# is used for both builds and includes libnve-plugin-nvhm.so.
+# includes the NVHashMap and Redis plugins used by the exportable example.
 RUN set -eux; \
     if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
       export PYNVE_DISABLE_AVX512=1; \
@@ -316,6 +316,11 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
 # ============================================================================
 FROM ${DEVEL_IMAGE} AS build
 
+RUN apt-get update -y --fix-missing && \
+    apt-get install -y --no-install-recommends redis-server redis-tools && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
 COPY . .
@@ -337,7 +342,22 @@ RUN cd /workspace/recsys-examples/corelib/dynamicemb && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     cd /workspace/recsys-examples/corelib/dynamicemb && \
     mkdir -p torch_binding_build && cd torch_binding_build && \
-    cmake .. && make -j
+    cmake .. \
+      -DDYNAMICEMB_BUILD_NVE_UPDATE=ON \
+      -DNVE_ROOT=/workspace/deps/nve \
+      -DNVE_LIB_DIR=/opt/nve/default/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include && \
+    make -j
+
+RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')" && \
+    cmake -S ./corelib/dynamicemb/example/exportable_embedding/cpp \
+      -B ./corelib/dynamicemb/example/exportable_embedding/cpp/build \
+      -DNVE_VERSION=26.07 \
+      -DNVE_ROOT=/workspace/deps/nve \
+      -DNVE_LIB_DIR=/opt/nve/default/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include \
+      -DDYNAMICEMB_LIB_DIR=/workspace/recsys-examples/corelib/dynamicemb/torch_binding_build && \
+    cmake --build ./corelib/dynamicemb/example/exportable_embedding/cpp/build -j 8
 
 # ============================================================================
 # AOTI additions: version-independent C++ replay, two NVE loader

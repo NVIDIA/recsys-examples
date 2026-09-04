@@ -158,6 +158,9 @@ def get_extensions():
             "lookup_torch_binding.cu",
             "get_table_range_torch_binding.cu",
             "expand_table_ids_torch_binding.cu",
+            "indexer_directory.cpp",
+            "indexer_ops.cu",
+            "incremental_update.cpp",
             # Built separately into standalone fatbins (Lex + custom LTO-IR),
             # shipped as package_data; NOT linked into the .so.
             "evict_lrulfu.cu",

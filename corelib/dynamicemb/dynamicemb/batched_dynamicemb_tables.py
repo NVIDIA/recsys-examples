@@ -927,7 +927,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
         self._optimizer_args = optimizer_args
 
-        if optimizer_type == EmbOptimType.SGD:
+        if optimizer_type in (EmbOptimType.NONE, EmbOptimType.SGD):
             optimizer = SGDDynamicEmbeddingOptimizer(
                 optimizer_args,
             )

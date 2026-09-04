@@ -12,8 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import os
-from typing import Dict
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 from commons.datasets.hstu_batch import HSTUBatch
@@ -22,6 +25,9 @@ from modules.inference_dense_module import InferenceDenseModule
 from modules.inference_embedding import InferenceEmbedding
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+if TYPE_CHECKING:
+    from dynamicemb.exportable_tables import InferenceEmbeddingCollectionConfig
 
 try:
     import hstu_cuda_ops  # noqa: F401 - registers torch.ops.hstu_cuda_ops.*
@@ -223,10 +229,12 @@ def get_inference_ranking_gr(
 
 def apply_inference(
     training_model: torch.nn.Module,
-    dynamic_table_configs: Dict[str, int],
-    trained_emb_table_sizes: Dict[str, int],
+    embedding_collection_configs: Mapping[
+        str, InferenceEmbeddingCollectionConfig
+    ],
+    trained_emb_table_sizes: Mapping[str, int],
     checkpoint_dir: str,
-):
+) -> InferenceRankingGR:
     from dynamicemb.exportable_tables import apply_inference_embedding_collection
     from modules.exportable_embedding import apply_inference_sparse
     from modules.inference_dense_module import apply_inference_hstu_dense
@@ -234,8 +242,8 @@ def apply_inference(
     # Step.1 - [General] Convert ModuleDict[Embedding] to InferenceEmbeddingCollection
     model = apply_inference_embedding_collection(
         training_model,
-        dynamic_table_configs,
-        trained_emb_table_sizes,
+        embedding_collection_configs=embedding_collection_configs,
+        trained_emb_table_sizes=trained_emb_table_sizes,
     )
 
     # Step.2 - [Recsys Example Structure Specific] Apply model specific training to inference conversion
@@ -262,6 +270,4 @@ def apply_inference(
         inference_model.half()
 
     inference_model.load_checkpoint(checkpoint_dir)
-    inference_model = inference_model.eval()
-
-    return inference_model
+    return inference_model.eval()
