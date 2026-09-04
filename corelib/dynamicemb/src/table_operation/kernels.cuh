@@ -1064,4 +1064,102 @@ __global__ void scatter_score_blocks_kernel(
     *b.scores(it, k) = vals[i * ns + k];
 }
 
+// Write (key, score words) at an EXACT table-relative slot -- the "precise
+// write-back" primitive behind replay_increment. Unlike insert(), the slot is
+// dictated by the caller (it comes from the source table's dump) instead of
+// being probed for.
+//
+// A key is only ever findable inside its own home bucket, so a slot from a
+// source table is usable only when this table's capacity/bucket_capacity match
+// the source's. That is verified per key here; a key whose slot falls outside
+// its home bucket is reported with status -1 and left untouched, and the caller
+// raises -- placing it anywhere else would make it unreachable.
+//
+// status[i]   = the slot written, or -1 when this key was not placed.
+// same_key[i] = true when the slot's previous occupant was this very key, i.e.
+//               the value row already belongs to it (its optimizer state can be
+//               kept); false means the row must be re-initialised.
+template <typename Table, int ProbingGroupSize>
+__global__ void scatter_keys_at_slots_kernel(
+    Table table, int64_t const *__restrict__ table_bucket_offsets,
+    int *__restrict__ bucket_sizes, int64_t batch,
+    typename Table::KeyType const *__restrict__ input_keys,
+    int64_t const *__restrict__ table_ids, int64_t const *__restrict__ slots,
+    ScoreType const *__restrict__ scores, int64_t *__restrict__ status,
+    bool *__restrict__ same_key) {
+
+  using KeyType = typename Table::KeyType;
+  using Bucket = typename Table::BucketType;
+  using Iter = typename Bucket::Iterator;
+
+  auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+    status[i] = -1;
+    same_key[i] = false;
+
+    KeyType key = input_keys[i];
+    int64_t slot = slots[i];
+    if (!Bucket::is_valid(key) || slot < 0)
+      continue;
+
+    int64_t bc = table.bucket_capacity();
+    int64_t t_id = table_ids[i];
+    int64_t bkt_begin = table_bucket_offsets[t_id];
+    int64_t bkt_end = table_bucket_offsets[t_id + 1];
+    int64_t table_cap = (bkt_end - bkt_begin) * bc;
+    if (table_cap <= 0 || slot >= table_cap)
+      continue;
+
+    // The slot must land in the key's home bucket, otherwise no lookup would
+    // ever probe it. This is the per-key half of the layout-compatibility check.
+    int64_t hashcode = Table::hash(key);
+    int64_t home_local = (hashcode % table_cap) / bc;
+    if (home_local != slot / bc)
+      continue;
+
+    int64_t bucket_id = bkt_begin + home_local;
+    Bucket bucket = table[bucket_id];
+    int64_t ns = table.num_scores();
+    Iter target = static_cast<Iter>(slot % bc);
+
+    // The key is not searched for first: a replayed table is written only by
+    // replay from one source, so a key is either absent or already at the slot
+    // the source gives, never at some other slot in this bucket. Probing to rule
+    // that out would cost a probe per key to find nothing.
+    //
+    // Take the target slot under the bucket's lock, as any writer must. One
+    // attempt, no spin: a replay has the table to itself -- it cannot run
+    // alongside a forward pass, whose prefetch state holds row indices this very
+    // write invalidates -- and a delta's slots are distinct, one slot having
+    // held one key in the source, so no other thread in this launch is aiming
+    // here either. Finding the slot locked, or changed underfoot, therefore does
+    // not mean "wait"; it means that assumption did not hold and this replay is
+    // not safe. Leave status[i] at -1 and let the host raise.
+    auto key_slot =
+        reinterpret_cast<typename Bucket::AtomicKey *>(bucket.keys(target));
+    KeyType old_key = key_slot->load(cuda::std::memory_order_relaxed);
+    // Checked before the CAS, not folded into it: locking a slot that already
+    // reads LockedKey would swap it for itself and report success.
+    if (old_key == static_cast<KeyType>(Bucket::LockedKey))
+      continue;
+    KeyType expected_key = old_key;
+    if (!bucket.try_lock(target, expected_key))
+      continue;
+
+    for (int64_t k = 0; k < ns; ++k)
+      *bucket.scores(target, k) = scores[i * ns + k];
+    *bucket.digests(target) = Bucket::key_to_digest(key);
+    // Key last, with release: whoever reads this key afterwards sees the score
+    // words and digest that belong to it.
+    bucket.unlock(target, key);
+
+    if (!Bucket::is_valid(old_key))
+      atomicAdd(bucket_sizes + bucket_id, 1);
+
+    status[i] = slot;
+    same_key[i] = (old_key == key);
+  }
+}
+
 } // namespace dyn_emb

@@ -22,6 +22,7 @@ from .dynamicemb_config import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EvictedItemMode,
+    ReplayContent,
     ScoreStrategy,
     align_to_table_size,
     data_type_to_dtype,
@@ -32,7 +33,12 @@ from .dynamicemb_config import (
     string_to_evict_strategy,
 )
 from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
-from .incremental_dump import DeltaDumpResult, pop_evicted_keys
+from .incremental_dump import (
+    DeltaDumpResult,
+    pop_erased_keys,
+    pop_evicted_keys,
+    replay_increment,
+)
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (
     BUCKET_ALIGNMENT,
@@ -42,6 +48,7 @@ from .types import (
     Counter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    ReplayStats,
 )
 from .utils import torch_to_dyn_emb
 
@@ -64,6 +71,7 @@ __all__ = [
     "DynamicEmbEvictStrategy",
     "DynamicEmbScoreStrategy",
     "EvictedItemMode",
+    "ReplayContent",
     "ScoreStrategy",
     "BATCH_SIZE_PER_DUMP",
     "data_type_to_dyn_emb",
@@ -74,7 +82,10 @@ __all__ = [
     "DynamicEmbDump",
     "DynamicEmbLoad",
     "DeltaDumpResult",
+    "ReplayStats",
+    "pop_erased_keys",
     "pop_evicted_keys",
+    "replay_increment",
     "EmbOptimType",
     "OptimizerArgs",
 ]

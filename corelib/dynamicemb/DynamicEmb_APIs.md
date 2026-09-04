@@ -17,7 +17,9 @@ This document consists of two parts, one is the introduction to the API, which c
 - [DynamicEmbDump](#dynamicembdump)
 - [DynamicEmbLoad](#dynamicembload)
 - [incremental_dump](#incremental_dump)
+- [replay_increment](#replay_increment)
 - [pop_evicted_keys](#pop_evicted_keys)
+- [pop_erased_keys](#pop_erased_keys)
 - [get_score](#get_score)
 - [set_score](#set_score)
 - [Counter](#counter)
@@ -787,7 +789,28 @@ The meaning of the threshold depends on the table's `score_strategy`:
 
             - ``table_names: List[str]`` -- the dumped table names.
             - ``keys: List[torch.Tensor]`` -- per-table matched keys on host.
-            - ``values: List[torch.Tensor]`` -- per-table matched values on host.
+            - ``values: List[torch.Tensor]`` -- per-table `[N, dim]` embeddings on
+              host. **Embeddings only**: the rest of the stored row is in
+              `optimizer_states`, and concatenating the two along dim 1
+              reproduces the row as the table holds it.
+            - ``optimizer_states: List[Optional[torch.Tensor]]`` -- per-table
+              optimizer state on host, at the **same width the file checkpoint
+              uses** — narrower than the runtime row for rowwise Adagrad, whose
+              fused layout reserves 16 bytes per row but fills one scalar.
+              ``None`` for a table whose optimizer keeps no per-row state, e.g.
+              plain SGD.
+            - ``scores: List[torch.Tensor]`` -- per-table `[N, num_scores]` score
+              words on host, in the table's configured (logical) column order.
+              Timestamp columns hold an **age** (`current_score - score`), not a
+              raw timestamp, since `%globaltimer` is per device and resets across
+              boots; a consumer rebases them onto its own clock. Every other
+              column (LFU frequency, STEP, CUSTOMIZED, NO_EVICTION row) is
+              carried verbatim.
+            - ``erased_keys: List[Optional[torch.Tensor]]`` -- per-table keys an
+              explicit erase removed, for tables whose ``evicted_item_mode``
+              erase asked to have recorded (each `erase` call passes its own
+              `EvictedItemMode`), so always present and possibly empty. These
+              are the removals `replay_increment` applies.
             - ``evicted_keys: List[Optional[torch.Tensor]]`` -- per-table retained
               evicted keys on host for tables with ``evicted_item_mode=RETAIN_KEY``,
               else ``None``. Returning them drains that table's retained-evicted
@@ -800,12 +823,87 @@ The meaning of the threshold depends on the table's `score_strategy`:
                   ``keys``; the storage slot each dumped key occupies (for
                   ``replay_increment``).
                 - ``"current_capacity": int`` -- the table's current capacity.
+                - ``"bucket_capacity": int`` -- slots per hash bucket.
+                - ``"num_scores": int`` -- score words per key; part of the
+                  slot layout ``replay_increment`` compares against.
                 - ``"world_size": int`` -- ranks the table was sharded across.
                 - ``"table_options": DynamicEmbTableOptions`` -- the table config.
         """
     ```
 
 More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main/corelib/dynamicemb/test/unit_tests/incremental_dump/test_distributed_dynamicemb.py)
+
+## replay_increment
+
+**Background**
+`incremental_dump` produces a delta; `replay_increment` is the other half of that pipeline — it writes the delta back into a model. The typical deployment is delta replication: a training job dumps periodically, the delta is shipped to a serving replica, and the replica replays it to catch up without reloading a full checkpoint.
+
+**Behavior**
+For every table in the delta, `replay_increment` erases the table's `erased_keys` (so the target converges to the source) and then upserts `keys` / `values` at the slots in `meta["slot_index"]`. `evicted_keys` is never applied: the key that took an evicted key's slot is in the same delta and overwrites it.
+
+*Write-back is by slot.* Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it. A key can only be found inside its own home bucket, and that bucket is `hash(key) % capacity / bucket_capacity`, so this requires the target's layout to match the source's. `replay_increment` compares the delta's `meta` (`current_capacity`, `bucket_capacity`, `num_scores`, `world_size`, and the `table_options` fields `score_strategy` / `dim` / `dist_type`) against the target table, and a mismatch raises `ValueError` naming the first mismatching field, **before anything is written**. Configure the target to match the source, or rebuild it from a full checkpoint (`DynamicEmbLoad`) instead.
+
+The same rule is enforced per key inside the kernel — a slot that does not land in its key's home bucket raises rather than dropping the key.
+
+> **Precondition:** writing a key at its source slot **overwrites whatever occupies that slot** in the target. That is what makes a replica converge — if the source evicted key `B` to make room for `A`, a same-capacity replica must do the same. It also means a replayed table must be built *only* by loading/replaying from its source: a table that also takes independent writes can lose a key whose slot a delta key claims.
+
+*Scores and optimizer state are dumped but not yet replayed.* `DeltaDumpResult.scores` and `.optimizer_states` carry them, but `replay_increment` ignores both for now: a restored key is scored as if it had just been inserted into the target, and keeps its optimizer state only if it already occupies the target row. So the replica ranks its own future evictions by when it received each key rather than by how the source ranked it. Embeddings are unaffected — the two models can evict in different orders, but never disagree on the value of a key they both hold. NO_EVICTION is the exception and is exact: its score word is a value row, not a score.
+
+*Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's world size. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin` and `hash_roundrobin` are supported; `continuous` raises `NotImplementedError`.
+
+*Optimizer state* is not part of a delta. A key that already occupies its target row keeps its optimizer state; a row taken over from another key (or a brand-new one) is reset to the table's initial optimizer state.
+
+    ```python
+    #How to import
+    from dynamicemb import replay_increment
+
+    #API arguments
+    def replay_increment(
+        model: torch.nn.Module,
+        deltas: Dict[str, "DeltaDumpResult"],
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> Dict[str, Dict[str, "ReplayStats"]]:
+        """Write incremental_dump results back into a model's dynamic embedding tables.
+
+        Args:
+            model(nn.Module): The model containing dynamic embedding tables.
+            deltas(Dict[str, DeltaDumpResult]): `incremental_dump`'s return value, keyed by embedding-collection path. Collections or tables the model does not have are skipped with a warning.
+            pg(Optional[dist.ProcessGroup]): optional. The process group defining this model's shard fan-out. Defaults to the world the tables were created against.
+
+        Returns
+        -------
+        Dict[str, Dict[str, ReplayStats]]:
+            `{collection_path: {table_name: ReplayStats}}`, where `ReplayStats` has:
+
+            - `upserted: int` -- keys written back at their source slot.
+            - `erased: int` -- keys actually removed before the upsert, counted as really removed (a delta can name keys this replica never held).
+            - `skipped: int` -- delta keys this rank does not own.
+
+        Raises
+        ------
+        ValueError: a target table's layout does not match the source's, or a delta is missing the per-key data replay needs.
+        NotImplementedError: a table is sharded with `dist_type="continuous"`.
+        """
+    ```
+
+Example — replicate a training model's deltas into a serving model:
+
+    ```python
+    from dynamicemb import replay_increment
+    from dynamicemb.incremental_dump import get_score, incremental_dump
+
+    threshold = get_score(train_model)          # reference point for the next window
+    ...                                          # train for a while
+    deltas = incremental_dump(train_model, threshold, pg)
+    threshold = {c: {r.table_names[i]: r.meta[i]["current_score"]
+                     for i in range(len(r.table_names))}
+                 for c, r in deltas.items()}     # threshold for the NEXT dump
+
+    stats = replay_increment(serve_model, deltas, pg)   # raises if layouts differ
+    for collection, per_table in stats.items():
+        for name, s in per_table.items():
+            print(collection, name, s.upserted, "keys replayed at their source slot")
+    ```
 
 ## pop_evicted_keys
 
@@ -814,6 +912,8 @@ When a table's last-tier storage is full, evicting a key drops it from the syste
 
 **Behavior**
 Returns, per table, the keys evicted since the previous call, deduplicated within a table. This is a read-and-clear (incremental) operation: each evicted key is reported exactly once across successive calls, and returning a table's keys drains its retained-evicted buffer on this rank. Tables without `evicted_item_mode=RETAIN_KEY` are omitted from the result.
+
+Keys removed by an *explicit erase* are not here — they live in a separate buffer read by [pop_erased_keys](#pop_erased_keys). The two are kept apart because a consumer usually wants different things from them: an eviction says the table ran out of room, an erase says someone asked for the key to go.
 
     ```python
     #How to import
@@ -843,9 +943,39 @@ Returns, per table, the keys evicted since the previous call, deduplicated withi
         Returns
         -------
         Dict[str, Dict[str, torch.Tensor]]:
-            {collection_path: {table_name: keys}} where keys is a 1-D int64 host
+            {collection_path: {table_name: keys}} where keys is a 1-D host
             tensor of table-unique evicted keys. Empty dict if the model has no
-            retain-enabled dynamic embedding tables.
+            tables retaining evictions.
+        """
+    ```
+
+## pop_erased_keys
+
+**Background**
+The counterpart of [pop_evicted_keys](#pop_evicted_keys) for the other way a key leaves a table: an explicit removal, rather than the table running out of room.
+
+Unlike evictions, this is **not** a table setting. Retaining evictions has to be decided up front — it swaps in a collecting insert kernel and costs an extra kernel output plus a device sync on every evicting insert. An erase already holds its keys, so recording them costs a copy and nothing has to be prepared; each `erase` call therefore passes its own `EvictedItemMode` and decides for itself.
+
+**Behavior**
+Same arguments and the same read-and-clear semantics as `pop_evicted_keys`, draining the erased-key buffer instead. Tables whose mode retains no erases are omitted.
+
+Only these keys are removals a replica has to perform for itself, which is why `replay_increment` applies `erased_keys` and never `evicted_keys`.
+
+    ```python
+    #How to import
+    from dynamicemb import pop_erased_keys
+
+    #API arguments
+    def pop_erased_keys(
+        model: torch.nn.Module,
+        table_names: Optional[Dict[str, List[str]]] = None,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Return (and clear) the keys an explicit erase removed, per table.
+
+        Every table is included -- whether an erase was recorded is that
+        erase call's decision, not the table's, so there is nothing to
+        filter on. Arguments are identical to pop_evicted_keys.
         """
     ```
 

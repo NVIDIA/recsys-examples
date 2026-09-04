@@ -110,20 +110,71 @@ class DynamicEmbEvictStrategy(enum.Enum):
     CUSTOMIZED = EvictStrategy.KCustomized
 
 
-class EvictedItemMode(enum.Enum):
-    """How the *last-tier* storage handles an item it evicts.
+class EvictedItemMode(enum.Flag):
+    """What a *last-tier* table keeps about an item on its way out.
 
-    - ``DISCARD`` (default): the evicted key is dropped (existing behavior, zero
-      overhead).
-    - ``RETAIN_KEY``: the evicted keys are retained so they can be read back with
-      ``pop_evicted_keys``.
+    - ``DISCARD``: nothing is kept.
+    - ``RETAIN_KEY``: the key is kept, to be read back later.
 
-    Additional modes (e.g. retaining values) can be added later without changing
-    this option's type.
+    What "on the way out" means is the caller's business, not this type's:
+    ``DynamicEmbTableOptions.evicted_item_mode`` sets it for keys the table
+    evicts to make room, and ``erase`` takes it per call for keys it removes.
+    (The name predates the second use.)
+
+    A flag rather than a plain enum so further kinds of retention -- values,
+    scores -- can be added and combined without revisiting every call site. Test
+    for one with ``in``::
+
+        if EvictedItemMode.RETAIN_KEY in mode: ...
+
+    ``DISCARD`` is the empty set rather than a peer of the others, so "discard
+    *and* retain" is not something the type can express: ``|`` absorbs it
+    (``DISCARD | RETAIN_KEY is RETAIN_KEY``), and any combination that cancels
+    out is ``DISCARD`` again. Test for it as emptiness -- ``not mode``, or
+    ``mode is EvictedItemMode.DISCARD`` -- and **not** with ``in``, which is
+    subset containment and so reports the empty set as present in everything::
+
+        EvictedItemMode.DISCARD in EvictedItemMode.RETAIN_KEY   # True, always
     """
 
     DISCARD = 0
-    RETAIN_KEY = 1
+    RETAIN_KEY = enum.auto()
+
+
+class ReplayContent(enum.Flag):
+    """Which parts of a dumped row ``replay_increment`` writes back.
+
+    A delta carries an embedding, the optimizer state that shares its value row,
+    and every score word (see :class:`DeltaDumpResult`). Which of them a replica
+    wants depends on what it is for: a serving replica needs the embedding and
+    nothing else, while a training replica that has to resume from the source's
+    exact state wants all three.
+
+    Combine with ``|`` and test with ``in``::
+
+        replay_increment(model, deltas)                       # ALL, the default
+        replay_increment(model, deltas, content=ReplayContent.EMBEDDING)
+        replay_increment(
+            model, deltas,
+            content=ReplayContent.EMBEDDING | ReplayContent.SCORE,
+        )
+
+    The key itself is always written at its source slot -- that is what a replay
+    *is*, and the flags only choose what travels with it. Removals
+    (``DeltaDumpResult.erased_keys``) are likewise always applied; they are the
+    source telling the replica a key is gone, not a payload to opt out of.
+
+    Omitting ``EMBEDDING`` is only meaningful for a replica already aligned with
+    its source, where every key still occupies the row it held there. A key that
+    lands on a row it did not already own has no embedding to keep, and serving
+    the previous occupant's vector under a new key would be silent corruption --
+    so ``replay_increment`` raises instead.
+    """
+
+    EMBEDDING = enum.auto()
+    OPTIMIZER_STATE = enum.auto()
+    SCORE = enum.auto()
+    ALL = EMBEDDING | OPTIMIZER_STATE | SCORE
 
 
 class DynamicEmbScoreStrategy(enum.IntEnum):
@@ -534,9 +585,20 @@ class DynamicEmbTableOptions:
     strategy."""
 
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
-    """How the *last-tier* storage handles an item it evicts. ``DISCARD`` (default)
-    drops evicted keys with zero overhead. ``RETAIN_KEY`` retains the keys it
-    evicts so they can be read back with ``pop_evicted_keys``. Only the final tier
+    """How the *last-tier* storage handles an item it **evicts** to make room.
+    ``DISCARD`` (default) drops evicted keys with zero overhead. ``RETAIN_KEY``
+    retains them, to be read back with ``pop_evicted_keys``.
+
+    Evictions have to be decided here, up front, because retaining them swaps in
+    a collecting insert kernel and costs an extra kernel output plus a device
+    sync on every evicting insert -- a price the table pays for its whole life.
+    Removing a key with ``erase`` is the other way a key leaves, and it is not
+    covered by this setting: an erase already holds its keys, so recording them
+    costs a copy and nothing has to be prepared, which lets each ``erase`` call
+    take its own :class:`EvictedItemMode` instead. The two land in separate
+    buffers (``pop_evicted_keys`` / ``pop_erased_keys``).
+
+    Only the final tier
     that truly discards a key records it -- intermediate cache / HBM tiers spill
     their evictions to the next tier and are NOT recorded. Records the
     (key, table_id) only, no value/score. Tables differing in this mode are not

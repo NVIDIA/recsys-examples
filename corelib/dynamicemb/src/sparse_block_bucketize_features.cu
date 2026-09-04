@@ -19,6 +19,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <tuple>
 #include <type_traits>
 
+#include "murmur_hash.cuh"
 #include "sparse_block_bucketize_features_utils.h"
 #include "utils.h"
 
@@ -29,12 +30,7 @@ namespace dyn_emb {
 // Hash function for load-balanced key distribution
 // Uses MurmurHash3 finalizer for good avalanche properties
 __forceinline__ __device__ uint64_t hash_key(uint64_t key) {
-  key ^= key >> 33;
-  key *= 0xff51afd7ed558ccdULL;
-  key ^= key >> 33;
-  key *= 0xc4ceb9fe1a85ec53ULL;
-  key ^= key >> 33;
-  return key;
+  return murmur3_fmix64(key);
 }
 
 __forceinline__ __device__ int atomicAdd(int *address, int val) {

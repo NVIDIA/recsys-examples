@@ -336,6 +336,67 @@ def _storage_insert(storage, keys, dim, device):
     torch.cuda.synchronize()
 
 
+def test_erased_and_evicted_use_separate_buffers(current_device):
+    """An erase and an eviction are recorded in different buffers.
+
+    They mean different things to a consumer -- an eviction is the table running
+    out of room, an erase is somebody asking for the key to go, and only the
+    latter is a removal a replica has to perform for itself. Mixing them would
+    make a replay erase keys that were merely evicted, dropping live data.
+    """
+    device = current_device
+    dim = 8
+    # Same full-bucket overflow as test_storage_retain_end_to_end: 128 keys fill
+    # the single bucket, then 58 newer ones evict the 58 oldest.
+    storage = _retain_storage(
+        dim=dim, max_capacity=128, bucket_capacity=128, retain=True
+    )
+    _storage_insert(
+        storage, torch.arange(1, 129, dtype=torch.int64, device=device), dim, device
+    )
+    _storage_insert(
+        storage, torch.arange(1000, 1058, dtype=torch.int64, device=device), dim, device
+    )
+
+    evicted = storage.pop_evicted_keys(0)
+    assert evicted.numel() > 0, "a full-bucket overflow must have evicted something"
+    assert storage.pop_erased_keys(0).numel() == 0, "no erase happened yet"
+
+    # Erase a key that is still resident, i.e. one that was NOT evicted.
+    resident = torch.tensor([1000], dtype=torch.int64, device=device)
+    assert not bool(torch.isin(resident, evicted).any())
+    assert storage.erase_keys(0, resident, EvictedItemMode.RETAIN_KEY) == 1
+
+    erased = storage.pop_erased_keys(0)
+    assert erased.tolist() == resident.tolist()
+    # The erase must not have leaked into the eviction buffer, and both buffers
+    # are read-and-clear.
+    assert storage.pop_evicted_keys(0).numel() == 0
+    assert storage.pop_erased_keys(0).numel() == 0
+
+
+def test_erase_retention_is_per_call_not_per_table(current_device):
+    """Whether an erase is recorded is the call's decision, not the table's.
+
+    Retaining evictions has to be configured up front (it swaps the insert
+    kernel), but an erase already holds its keys, so nothing has to be prepared
+    -- which is why the same table can record one erase and not the next, and
+    why a table configured to DISCARD evictions can still report its erases.
+    """
+    device = current_device
+    dim = 8
+    storage = _retain_storage(dim=dim, retain=False)  # DISCARD: no eviction retention
+    keys = torch.arange(1, 9, dtype=torch.int64, device=device)
+    _storage_insert(storage, keys, dim, device)
+
+    assert storage.erase_keys(0, keys[:3], EvictedItemMode.DISCARD) == 3
+    assert storage.pop_erased_keys(0).numel() == 0, "DISCARD must record nothing"
+
+    assert storage.erase_keys(0, keys[3:6], EvictedItemMode.RETAIN_KEY) == 3
+    assert storage.pop_erased_keys(0).tolist() == keys[3:6].tolist()
+    assert storage.pop_evicted_keys(0).numel() == 0
+
+
 def test_storage_retain_end_to_end(current_device):
     """DynamicEmbStorage (a last tier) with evicted_item_mode=RETAIN_KEY: a full-bucket
     insert evicts; pop returns the unique evicted keys; those keys are gone from the

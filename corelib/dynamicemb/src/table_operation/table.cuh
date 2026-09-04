@@ -146,6 +146,16 @@ void table_scatter_score_blocks(at::Tensor table_storage,
                                 int64_t bkt_begin, at::Tensor slots,
                                 at::Tensor values, torch::Dtype key_dtype);
 
+// Write-back for replay_increment: place (key, score words) at the given
+// table-relative slots. Returns (status, same_key) -- status is the slot
+// written, or -1 when the key's home bucket does not contain that slot (the
+// caller raises), same_key marks slots that already held the same key.
+std::tuple<at::Tensor, at::Tensor> table_scatter_keys_at_slots(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    at::Tensor table_ids, at::Tensor slots, at::Tensor scores,
+    int64_t num_scores = 1);
+
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,
                                         int64_t bucket_capacity,

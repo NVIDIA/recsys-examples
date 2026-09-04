@@ -39,6 +39,7 @@ from dynamicemb_extensions import (
     table_insert_collect_evicted,
     table_lookup,
     table_partition,
+    table_scatter_keys_at_slots,
     table_scatter_score_blocks,
     table_update_counter_with_layout,
 )
@@ -277,19 +278,40 @@ def uint64_to_int64(x):
     return x if x < (1 << 63) else x - (1 << 64)
 
 
-def murmur3_hash_64bits(key: int) -> int:
-    """ """
-    k = key & 0xFFFFFFFFFFFFFFFF
+def murmur3_fmix64(keys):
+    """MurmurHash3's 64-bit finalizer -- the host twin of ``murmur3_fmix64`` in
+    ``src/murmur_hash.cuh``, and the only host copy of it.
 
-    k ^= k >> 33
-    k = (k * 0xFF51AFD7ED558CCD) & 0xFFFFFFFFFFFFFFFF
+    Takes a Python int or anything ``np.asarray`` accepts, and returns the same
+    shape as ``uint64``. Only the avalanche step is here: callers narrow the
+    result themselves -- modulo the world size to pick an owning rank, masked to
+    a non-negative int64 to pick a hash bucket -- exactly as the two device
+    callers do.
 
-    k ^= k >> 33
-    k = (k * 0xC4CEB9FE1A85EC53) & 0xFFFFFFFFFFFFFFFF
-
-    k ^= k >> 33
-
+    A key is a bit pattern here, not a magnitude, so a negative one is
+    reinterpreted rather than rejected -- ``numpy`` refuses to build a ``uint64``
+    from a negative Python int, while ``astype`` on an array wraps the way C
+    would. Wrapping is likewise the algorithm and not an error for the
+    multiplies, which numpy is silent about for arrays but warns about for
+    scalars; the warning is turned off rather than left to depend on the input's
+    shape.
+    """
+    if isinstance(keys, (int, np.integer)):
+        k = np.uint64(int(keys) & 0xFFFFFFFFFFFFFFFF)
+    else:
+        k = np.asarray(keys).astype(np.uint64, copy=False)
+    with np.errstate(over="ignore"):
+        k = k ^ (k >> np.uint64(33))
+        k = k * np.uint64(0xFF51AFD7ED558CCD)
+        k = k ^ (k >> np.uint64(33))
+        k = k * np.uint64(0xC4CEB9FE1A85EC53)
+        k = k ^ (k >> np.uint64(33))
     return k
+
+
+def murmur3_hash_64bits(key: int) -> int:
+    """Scalar :func:`murmur3_fmix64`, for constants computed once at import."""
+    return int(murmur3_fmix64(key))
 
 
 class LinearBucketTable(ScoredHashTable):
@@ -871,12 +893,25 @@ class LinearBucketTable(ScoredHashTable):
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
-    ) -> None:
+        return_indices: bool = False,
+    ) -> Optional[torch.Tensor]:
         """
         Erase Keys
         Args:
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
+            return_indices: also report which keys were actually present. Costs
+                one int64 tensor of ``keys.numel()``; callers that only need the
+                erase itself should leave it False.
+
+        Returns:
+            ``None`` unless *return_indices*, else the slot each key was erased
+            from, or ``-1`` where the key was not in the table.
         """
+        indices = (
+            torch.empty(keys.numel(), dtype=self.index_type, device=keys.device)
+            if return_indices
+            else None
+        )
         table_erase(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -884,8 +919,10 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_sizes,
             keys,
             table_ids,
+            indices=indices,
             num_scores=self.num_scores_,
         )
+        return indices
 
     def load(
         self,
@@ -1416,6 +1453,53 @@ class LinearBucketTable(ScoredHashTable):
             slots,
             values,
             self.key_type_,
+        )
+
+    def scatter_keys_at_slots(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        slots: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Place ``keys`` (with their full score blocks) at exact ``slots``.
+
+        The precise write-back behind ``replay_increment``: ``slots`` are
+        table-relative flat slot indices taken from the source table's
+        ``incremental_dump``, and are only usable when this table's capacity and
+        bucket_capacity match the source's -- a key can only ever be found inside
+        its own home bucket.
+
+        Args:
+            keys: 1-D key tensor on device.
+            table_ids: int64 tensor aligned with ``keys``.
+            slots: int64 table-relative flat slot per key.
+            scores: ``[N, num_scores_]`` score words (physical column order).
+
+        Returns:
+            (status, same_key): ``status[i]`` is the slot written, or ``-1`` when
+            the key was NOT placed because its home bucket does not contain that
+            slot. The caller treats that as a fatal layout divergence and raises
+            -- the key cannot be reached from anywhere else, so writing it
+            elsewhere would silently lose it.
+            ``same_key[i]`` is True when the slot already held this very key, so
+            its value row (and optimizer state) can be kept.
+        """
+        if scores.dim() != 2 or scores.size(1) != self.num_scores_:
+            raise ValueError(
+                f"scatter_keys_at_slots expects [{keys.numel()}, "
+                f"{self.num_scores_}] scores, got {tuple(scores.shape)}"
+            )
+        return table_scatter_keys_at_slots(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            slots,
+            scores,
+            num_scores=self.num_scores_,
         )
 
     def capacity(self, table_id: Optional[int] = None) -> int:

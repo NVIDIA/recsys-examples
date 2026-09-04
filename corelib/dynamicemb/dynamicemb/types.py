@@ -146,6 +146,41 @@ class CopyMode(enum.Enum):
     VALUE = "value"
 
 
+@dataclass
+class ReplayStats:
+    """What a ``replay_increment`` did to one table.
+
+    Replay is all-or-nothing for the keys this rank owns: each of them is written
+    back at the slot and value row it occupied in the source table, or the call
+    raises. ``skipped`` counts the rest of the delta -- the keys another rank
+    owns, which this rank deliberately ignores.
+
+    Attributes
+    ----------
+    upserted : int
+        Keys written back at their source slot.
+    erased : int
+        Keys removed before the upsert, counted as *actually removed* -- a delta
+        can name keys this replica never held. Counts only the delta's
+        ``erased_keys``; an eviction is reproduced by overwriting its slot and
+        costs no removal.
+    skipped : int
+        Delta keys this rank does not own (row-wise sharding) and so ignored.
+        Always 0 on a single rank, where the whole delta is this rank's.
+    """
+
+    upserted: int = 0
+    erased: int = 0
+    skipped: int = 0
+
+    def merge(self, other: "ReplayStats") -> "ReplayStats":
+        """Accumulate *other* into self (used to fold per-batch / per-tier runs)."""
+        self.upserted += other.upserted
+        self.erased += other.erased
+        self.skipped += other.skipped
+        return self
+
+
 # make it standalone to avoid recursive references.
 class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
     @abc.abstractmethod

@@ -20,8 +20,9 @@ from copy import deepcopy
 from enum import Enum
 from functools import partial
 from itertools import accumulate
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import (
@@ -36,7 +37,9 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EvictedItemMode,
+    ReplayContent,
     get_eviction_score_strategy,
+    get_physical_score_order,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
@@ -60,6 +63,8 @@ from dynamicemb.optimizer import (
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
 )
+from dynamicemb.scored_hashtable import murmur3_fmix64
+from dynamicemb.types import ReplayStats
 from dynamicemb.utils import DTYPE_NUM_BYTES
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
@@ -129,6 +134,45 @@ def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str],
             )
 
     return files, len(files)
+
+
+def owned_key_mask(
+    keys: torch.Tensor,
+    rank: int,
+    world_size: int,
+    dist_type: str,
+) -> Optional[torch.Tensor]:
+    """Boolean mask selecting the keys *rank* owns under row-wise sharding.
+
+    ``incremental_dump`` all-gathers within its process group, so every rank holds
+    the whole delta; replay keeps only its own shard. Ownership is recomputed from
+    the key with the **target's** fan-out, which is what lets a globally gathered
+    delta be replayed into a differently sized world.
+
+    Returns ``None`` when no filtering is needed (single rank), so callers can
+    skip the mask entirely.
+
+    Ownership is computed in ``uint64``, matching the device kernel for the
+    64-bit index types everyone uses. The kernel actually takes the hash modulo
+    in ``make_unsigned_t<index_t>``, so a 32-bit index type would truncate first
+    and disagree here -- for a world size that is not a power of two, where the
+    high bits reach the result. Not handled: 32-bit keys are not a configuration
+    this is built for.
+    """
+    if world_size <= 1:
+        return None
+    if dist_type == "continuous":
+        raise NotImplementedError(
+            "replay_increment does not support dist_type 'continuous': its "
+            "key->rank mapping is range-based and cannot be reconstructed from a "
+            "key alone. Use 'roundrobin' or 'hash_roundrobin'."
+        )
+    keys_np = keys.detach().cpu().numpy().astype(np.uint64, copy=False)
+    if dist_type == "hash_roundrobin":
+        owners = murmur3_fmix64(keys_np) % np.uint64(world_size)
+    else:  # roundrobin
+        owners = keys_np % np.uint64(world_size)
+    return torch.from_numpy(owners == np.uint64(rank))
 
 
 def get_loading_files(
@@ -1449,38 +1493,74 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     ) -> Dict[str, Tensor]:
         """Return + clear this rank's retained evicted keys, per table.
 
-        Only tables configured with ``evicted_item_mode=RETAIN_KEY`` are included;
-        others are omitted. Returns ``{table_name: 1-D unique int64 keys on
-        device}``. The keys are this rank's local shard only (row-wise sharded, so
-        disjoint across ranks); cross-rank aggregation is the model-level
-        ``pop_evicted_keys``'s job via ``pg``. Clearing affects only this rank.
+        Only tables configured with ``evicted_item_mode=RETAIN_KEY`` are
+        included; others are omitted. Returns
+        ``{table_name: 1-D unique keys}`` on host. The keys are this rank's local
+        shard only (row-wise sharded, so disjoint across ranks); cross-rank
+        aggregation is the model-level ``pop_evicted_keys``'s job via ``pg``.
+        Clearing affects only this rank.
+
+        Keys removed by an explicit erase are **not** here -- see
+        :meth:`pop_erased_keys`.
         """
+        return self._pop_retained(
+            "pop_evicted_keys",
+            lambda mode: EvictedItemMode.RETAIN_KEY in mode,
+            table_names,
+        )
+
+    def pop_erased_keys(
+        self, table_names: Optional[List[str]] = None
+    ) -> Dict[str, Tensor]:
+        """Return + clear the keys an explicit erase removed, per table.
+
+        The counterpart of :meth:`pop_evicted_keys`, kept apart from it because
+        the two mean different things to a consumer: an eviction is reproduced by
+        whoever takes over the slot, while an erase leaves the slot to nobody and
+        has to be replayed as a removal.
+
+        Every table is included, unlike :meth:`pop_evicted_keys`: whether an
+        erase was recorded is that ``erase`` call's decision, not the table's, so
+        there is no configuration to filter on -- a table nobody asked to record
+        simply returns an empty tensor.
+        """
+        return self._pop_retained("pop_erased_keys", lambda mode: True, table_names)
+
+    def _pop_retained(
+        self,
+        method: str,
+        wanted: Callable[[EvictedItemMode], bool],
+        table_names: Optional[List[str]],
+    ) -> Dict[str, Tensor]:
+        """Drain one of the storage's retained-key buffers, per table."""
         storage = self._storage
-        if not hasattr(storage, "pop_evicted_keys"):
+        if not hasattr(storage, method):
             return {}
+        pop = getattr(storage, method)
         result: Dict[str, Tensor] = {}
         for i, name in enumerate(self._table_names):
-            if (
-                self._dynamicemb_options[i].evicted_item_mode
-                != EvictedItemMode.RETAIN_KEY
-            ):
+            if not wanted(self._dynamicemb_options[i].evicted_item_mode):
                 continue
             if table_names is not None and name not in table_names:
                 continue
-            result[name] = storage.pop_evicted_keys(i).cpu()  # host tensor
+            result[name] = pop(i).cpu()  # host tensor
         return result
 
     def incremental_dump(
         self,
-        named_thresholds: Dict[str, int] = None,
+        named_thresholds: Dict[str, int],
         pg: Optional[dist.ProcessGroup] = None,
     ) -> "DeltaDumpResult":
         """Dump keys/values (+ evicted keys + meta) whose score crosses the threshold.
 
         Returns a :class:`DeltaDumpResult` for this module (column-aligned lists by
-        table). ``meta[i]`` carries current_score / slot_index / current_capacity /
-        world_size / table_options; ``evicted_keys[i]`` is the retained evicted keys
-        for an ``evicted_item_mode=RETAIN_KEY`` table (drained here) else ``None``.
+        table). ``values[i]`` is embeddings only, with the rest of each stored
+        row in ``optimizer_states[i]`` and every score word in ``scores[i]``;
+        ``meta[i]`` carries current_score / slot_index / current_capacity /
+        bucket_capacity / num_scores / world_size / table_options; ``evicted_keys[i]`` is the keys this table
+        retained since the last dump -- evictions and explicit erases under
+        ``RETAIN_KEY`` -- and ``erased_keys[i]`` the keys an explicit erase
+        asked to have recorded. Both are drained here.
 
         The meaning of the threshold depends on the table's score strategy:
 
@@ -1497,7 +1577,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """
         from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
             DeltaDumpResult,
-            _all_gather_evicted_keys,
         )
 
         storage = self._storage
@@ -1509,7 +1588,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if self._cache is not None and isinstance(storage, DynamicEmbStorage):
             flush_cache(self._cache, storage)
         res = DeltaDumpResult()
-        ts: Optional[int] = None
+        # One reference timestamp for the whole call: the age baseline for the
+        # dumped timestamp score columns, and the returned current_score.
+        # Sampled BEFORE the dump so a key touched *during* the dump falls into
+        # the next window (at-least-once) instead of being missed.
+        ts = device_timestamp()
         for table_name, threshold in named_thresholds.items():
             if table_name not in self._table_names:
                 warnings.warn(
@@ -1520,27 +1603,30 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
                 continue
             table_id = self._table_names.index(table_name)
-            keys_cat, values_cat, slot_index = storage.incremental_dump(
-                table_id, threshold, pg
-            )
+            (
+                keys_cat,
+                values_cat,
+                slot_index,
+                opt_states,
+                scores,
+            ) = storage.incremental_dump(table_id, threshold, pg, timestamp=ts)
             option = self._dynamicemb_options[table_id]
             if score_strategy_has_timestamp_column(option.score_strategy):
-                if ts is None:
-                    ts = device_timestamp()
                 current_score = ts
             else:
                 current_score = self._scores[table_name]
-            # evicted keys: only retain-enabled tables; drain the buffer, aggregate
-            # within the SAME pg as keys/values, return on host.
-            if option.evicted_item_mode == EvictedItemMode.RETAIN_KEY and hasattr(
-                storage, "pop_evicted_keys"
-            ):
-                ev = storage.pop_evicted_keys(table_id)
-                if pg is not None:
-                    ev = _all_gather_evicted_keys(ev, pg)
-                ev = ev.cpu()
-            else:
-                ev = None
+            # Drain both retained-key buffers, each gated by what its table
+            # actually retains, and aggregate within the SAME pg as keys/values.
+            ev = self._drain_retained(
+                storage,
+                "pop_evicted_keys",
+                EvictedItemMode.RETAIN_KEY in option.evicted_item_mode,
+                table_id,
+                pg,
+            )
+            # Always drained: recording an erase is the erase call's decision,
+            # so there is no table setting to gate on here.
+            er = self._drain_retained(storage, "pop_erased_keys", True, table_id, pg)
             # current_capacity: DynamicEmbStorage has one key_index_map; a
             # HybridStorage sums its tiers.
             if hasattr(storage, "key_index_map"):
@@ -1552,14 +1638,339 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             res.table_names.append(table_name)
             res.keys.append(keys_cat)
             res.values.append(values_cat)
+            res.optimizer_states.append(opt_states)
+            res.scores.append(scores)
             res.evicted_keys.append(ev)
+            res.erased_keys.append(er)
             res.meta.append(
                 {
                     "current_score": current_score,
                     "slot_index": slot_index,
                     "current_capacity": current_capacity,
+                    "bucket_capacity": self._bucket_capacity_of(storage),
+                    "num_scores": self._num_scores_of(storage),
                     "world_size": self._shard_world_size,
                     "table_options": option,
                 }
             )
         return res
+
+    def _replay_compatibility(
+        self, table_id: int, meta: Dict[str, Any]
+    ) -> Optional[str]:
+        """Why this table cannot take a slot-for-slot replay, or ``None``.
+
+        A key is only ever probed inside its own home bucket, and that bucket is
+        ``hash(key) % table_capacity / bucket_capacity`` -- so a source slot is
+        only meaningful when the target's capacity and bucket layout match the
+        source's. Everything compared here comes from the delta's ``meta``.
+
+        ``score_strategy`` is compared by its **physical** word order, not the
+        configured tuple: what a slot write depends on is how the score words are
+        laid out on device, and ``(TIMESTAMP, LFU)`` and ``(LFU, TIMESTAMP)`` are
+        the same layout -- the tuple order only ever decided checkpoint column
+        order. Two genuinely different strategies still differ physically and are
+        still rejected.
+        """
+        storage = self._storage
+        option = self._dynamicemb_options[table_id]
+        src_options = meta.get("table_options")
+        if src_options is None:
+            return "delta carries no 'table_options' (dumped by an older version)"
+
+        if hasattr(storage, "key_index_map"):
+            capacity = storage.key_index_map.capacity(table_id)
+        else:
+            capacity = sum(s.key_index_map.capacity(table_id) for s in storage.tables)
+        checks = [
+            ("capacity", meta.get("current_capacity"), capacity),
+            (
+                "bucket_capacity",
+                meta.get("bucket_capacity"),
+                self._bucket_capacity_of(storage),
+            ),
+            ("num_scores", meta.get("num_scores"), self._num_scores_of(storage)),
+            ("world_size", meta.get("world_size"), self._shard_world_size),
+            # Compared by physical layout -- see the note above.
+            (
+                "score_strategy",
+                get_physical_score_order(src_options.score_strategy),
+                get_physical_score_order(option.score_strategy),
+            ),
+            ("dim", src_options.dim, option.dim),
+            ("dist_type", src_options.dist_type, option.dist_type),
+        ]
+        for name, src, dst in checks:
+            if src is None:
+                return f"delta carries no '{name}' (dumped by an older version)"
+            if src != dst:
+                return f"{name} mismatch (source {src} vs target {dst})"
+        return None
+
+    def replay_increment(
+        self,
+        delta: "DeltaDumpResult",
+        pg: Optional[dist.ProcessGroup] = None,
+        content: ReplayContent = ReplayContent.ALL,
+    ) -> Dict[str, ReplayStats]:
+        """Write an ``incremental_dump`` delta back into this module's tables.
+
+        Replay is exact in *layout*: every key is written at the slot and value
+        row it held in the source table, so the target ends up layout-identical
+        to it. A table whose layout does not match the source's is rejected with
+        a ``ValueError`` rather than written some other way -- see
+        :meth:`_replay_compatibility`.
+
+        *content* selects which parts of each row are written -- embedding,
+        optimizer state, score -- and defaults to all three, i.e. the replica
+        ends up holding what the source held. Dropping ``SCORE`` leaves restored
+        keys scored as if freshly inserted here, so the replica orders its own
+        future evictions by when it received each key rather than by how the
+        source ranked it; dropping ``OPTIMIZER_STATE`` keeps the state of a key
+        already on its target row and initialises any other. See
+        :class:`ReplayContent`.
+
+        ``delta.erased_keys`` is applied whenever it holds anything: those keys
+        were explicitly removed at the source and nothing else will remove them
+        here. ``delta.evicted_keys`` is never applied -- writing the delta's
+        slots already reproduces an eviction, because the key that took the
+        evicted one's slot is in the delta. A table retaining evictions for some
+        other consumer therefore costs a replay nothing.
+
+        Only the keys this rank owns are replayed, with ownership recomputed
+        from the key using *this* model's world size. A delta gathered over a
+        process group therefore fans out correctly when handed to every rank; a
+        per-rank delta (``incremental_dump`` with ``pg=None``) should be replayed
+        on the rank that produced it, or the filter drops all of it -- visible as
+        ``ReplayStats.skipped``.
+
+        Args:
+            delta: one collection's :class:`DeltaDumpResult`. Tables not present
+                in this module are skipped with a warning.
+            pg: process group used to size this model's shard fan-out. Defaults
+                to the world the tables were created against.
+
+        Returns:
+            ``{table_name: ReplayStats}`` -- keys written / removed / skipped
+            per table.
+
+        Raises:
+            ValueError: a table's layout does not match the source's, or the
+                delta is missing the per-key data replay needs. Raised before
+                anything is written.
+            TypeError: this module's storage is neither ``DynamicEmbStorage`` nor
+                ``HybridStorage``.
+            NotImplementedError: a table is sharded with
+                ``dist_type="continuous"`` across more than one rank.
+            RuntimeError: a key could not be written at its source slot even
+                though the metadata matched. Unlike the checks above this fires
+                mid-write, so the table may hold a partial replay.
+        """
+        storage = self._storage
+        if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
+            raise TypeError(
+                f"replay_increment requires DynamicEmbStorage or HybridStorage, "
+                f"got {type(storage).__name__}"
+            )
+        rank = dist.get_rank(group=pg) if dist.is_initialized() else 0
+        world_size = (
+            dist.get_world_size(group=pg)
+            if (pg is not None and dist.is_initialized())
+            else self._shard_world_size
+        )
+        if self._cache is not None and isinstance(storage, DynamicEmbStorage):
+            # Push dirty cache entries down first so the storage copy this replay
+            # is about to overwrite is the authoritative one.
+            flush_cache(self._cache, storage)
+
+        ts = device_timestamp()
+        results: Dict[str, ReplayStats] = {}
+        for i, table_name in enumerate(delta.table_names):
+            if table_name not in self._table_names:
+                warnings.warn(
+                    f"replay_increment: table_name '{table_name}' is not in this "
+                    f"module (available: {self._table_names}); skipping.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+            table_id = self._table_names.index(table_name)
+            meta = delta.meta[i]
+            option = self._dynamicemb_options[table_id]
+            stats = ReplayStats()
+
+            keys = delta.keys[i]
+            values = delta.values[i]
+            opt_states = (
+                delta.optimizer_states[i]
+                if ReplayContent.OPTIMIZER_STATE in content
+                else None
+            )
+            scores = delta.scores[i] if ReplayContent.SCORE in content else None
+            slot_index = meta.get("slot_index")
+            widths = {"values": values.size(0)}
+            if opt_states is not None:
+                widths["optimizer_states"] = opt_states.size(0)
+            if scores is not None:
+                widths["scores"] = scores.size(0)
+            if any(w != keys.numel() for w in widths.values()):
+                raise ValueError(
+                    f"replay_increment: delta columns for table '{table_name}' are "
+                    f"not row-aligned (keys={keys.numel()}, "
+                    + ", ".join(f"{k}={v}" for k, v in widths.items())
+                    + ")."
+                )
+
+            if slot_index is None:
+                raise ValueError(
+                    f"replay_increment: delta for table '{table_name}' carries no "
+                    "slot_index; it was produced by an incompatible version of "
+                    "incremental_dump."
+                )
+            mismatch = self._replay_compatibility(table_id, meta)
+            if mismatch is not None:
+                raise ValueError(
+                    f"replay_increment: cannot replay table '{table_name}' -- "
+                    f"{mismatch}. Replay writes every key back at the slot it "
+                    "held in the source table, which is only meaningful when the "
+                    "two tables share a layout; configure the target to match the "
+                    "source, or rebuild it from a full checkpoint instead."
+                )
+
+            # Only ``erased_keys`` is ever replayed. ``evicted_keys`` is not a
+            # removal a replica has to perform: the key that took the evicted
+            # one's slot is in this very delta and overwrites it. That list
+            # exists for other consumers of the dump, and replay ignores it.
+            # An empty or absent list is normal -- nothing was erased, or rank
+            # filtering left this rank none of them.
+            erased = delta.erased_keys[i]
+            # Not replayed as a removal -- the delta's own writes reproduce an
+            # eviction in the storage -- but still needed to invalidate the
+            # cache, which those writes do not reach. See below.
+            evicted = delta.evicted_keys[i]
+            mask = owned_key_mask(keys, rank, world_size, option.dist_type)
+            if mask is not None:
+                stats.skipped = int(keys.numel() - mask.sum().item())
+                keys, values = keys[mask], values[mask]
+                if opt_states is not None:
+                    opt_states = opt_states[mask]
+                if scores is not None:
+                    scores = scores[mask]
+                slot_index = slot_index[mask]
+                if erased is not None and erased.numel() > 0:
+                    er_mask = owned_key_mask(erased, rank, world_size, option.dist_type)
+                    erased = erased[er_mask]
+                if evicted is not None and evicted.numel() > 0:
+                    ev_mask = owned_key_mask(
+                        evicted, rank, world_size, option.dist_type
+                    )
+                    evicted = evicted[ev_mask]
+
+            # Erase first: a key erased and then re-inserted inside the same
+            # window appears in BOTH lists, and must survive the replay.
+            if erased is not None and erased.numel() > 0:
+                # Not recorded into this model's own erased buffer: these
+                # removals came from upstream, and re-reporting them would make
+                # a chained replica replay what it already received. A model
+                # that is itself a dump source for someone further down would
+                # want the opposite -- say so when that case turns up.
+                stats.erased = storage.erase_keys(table_id, erased)
+
+            # Adopt the source's score bookkeeping BEFORE writing, so a
+            # restored key lands on the same scale the replica will later
+            # threshold its own incremental_dump against. Timestamp-based tables
+            # read their score off the device clock, so there is nothing to
+            # carry -- their restored keys are stamped with ``ts``.
+            current_score = meta.get("current_score")
+            if (
+                current_score is not None
+                and not score_strategy_has_timestamp_column(option.score_strategy)
+                and table_name in self._scores
+            ):
+                self._scores[table_name] = current_score
+            stats.merge(
+                storage.replay_increment(
+                    table_id,
+                    keys,
+                    values,
+                    opt_states,
+                    scores,
+                    slot_index,
+                    self._scores.get(table_name, 0),
+                    content=content,
+                    timestamp=ts,
+                )
+            )
+            if self._cache is not None:
+                # The cache is a second index that writing a slot does not reach,
+                # so everything the storage just stopped holding has to be dropped
+                # from it explicitly:
+                #   upserted keys -- the next lookup must see the value just
+                #     written into the storage, not the cached one;
+                #   erased keys   -- a cached copy would resurrect them;
+                #   evicted keys  -- these lost their slot to a delta key. Replay
+                #     ignores them as removals, precisely because the write
+                #     reproduces the eviction *in the storage* -- but a cached
+                #     copy survives that, and ``flush_cache`` would write it back
+                #     down on the next dump, undoing the eviction.
+                #
+                # A source table that does not retain evictions (``DISCARD``)
+                # cannot report that last group, so a caching replica that has to
+                # converge exactly wants ``evicted_item_mode=RETAIN_KEY``.
+                parts = [keys]
+                for extra in (erased, evicted):
+                    if extra is not None and extra.numel() > 0:
+                        parts.append(extra.to(keys.dtype))
+                stale = torch.cat(parts) if len(parts) > 1 else keys
+                if stale.numel() > 0:
+                    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                    self._cache.key_index_map.erase(
+                        stale.to(device=device),
+                        torch.full(
+                            (stale.numel(),),
+                            table_id,
+                            dtype=torch.int64,
+                            device=device,
+                        ),
+                    )
+            results[table_name] = stats
+        return results
+
+    @staticmethod
+    def _drain_retained(
+        storage: Union[DynamicEmbStorage, HybridStorage],
+        method: str,
+        wanted: bool,
+        table_id: int,
+        pg: Optional[dist.ProcessGroup],
+    ) -> Optional[Tensor]:
+        """Drain one retained-key buffer for one table, gathered and on host.
+
+        ``None`` -- rather than an empty tensor -- when the table does not retain
+        this kind of key at all, so a consumer can tell "nothing was removed"
+        from "this table does not record removals".
+        """
+        from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
+            _all_gather_evicted_keys,
+        )
+
+        if not wanted or not hasattr(storage, method):
+            return None
+        out = getattr(storage, method)(table_id)
+        if pg is not None:
+            out = _all_gather_evicted_keys(out, pg)
+        return out.cpu()
+
+    @staticmethod
+    def _bucket_capacity_of(storage: Union[DynamicEmbStorage, HybridStorage]) -> int:
+        """The storage's hash-bucket capacity (HBM tier for a hybrid storage)."""
+        if hasattr(storage, "key_index_map"):
+            return storage.key_index_map.bucket_capacity_
+        return storage.tables[0].key_index_map.bucket_capacity_
+
+    @staticmethod
+    def _num_scores_of(storage: Union[DynamicEmbStorage, HybridStorage]) -> int:
+        """Score words per key (HBM tier for a hybrid storage)."""
+        if hasattr(storage, "key_index_map"):
+            return storage.key_index_map.num_scores_
+        return storage.tables[0].key_index_map.num_scores_

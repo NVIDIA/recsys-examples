@@ -521,10 +521,21 @@ def test_hybrid_incremental_dump_slot_index_tier():
     storage.insert(keys, tids, vals)
     torch.cuda.synchronize()
 
-    dump_keys, _, slot_index = storage.incremental_dump(0, 0, None)
+    (
+        dump_keys,
+        dump_values,
+        slot_index,
+        dump_opts,
+        dump_scores,
+    ) = storage.incremental_dump(0, 0, None)
     assert dump_keys.numel() > 0
     assert slot_index.numel() == dump_keys.numel()
     assert slot_index.dtype == torch.int64
+    # values/optimizer_states split the same stored row, scores carry every word
+    assert dump_values.shape == (dump_keys.numel(), embedding_dim)
+    assert dump_scores.shape == (dump_keys.numel(), 1)
+    if dump_opts is not None:
+        assert dump_opts.size(0) == dump_keys.numel()
 
     # bit 63 = tier: the host tier sets it, so those entries are negative int64;
     # the HBM tier leaves it 0 (non-negative). Both tiers must be present.

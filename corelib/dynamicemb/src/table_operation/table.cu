@@ -173,6 +173,15 @@ void bind_table_operation(py::module &m) {
         py::arg("num_scores"), py::arg("bkt_begin"), py::arg("slots"),
         py::arg("values"), py::arg("key_dtype"));
 
+  m.def("table_scatter_keys_at_slots", &dyn_emb::table_scatter_keys_at_slots,
+        "write (key, score words) at exact table-relative slots; returns "
+        "(status, same_key) where status is the slot written or -1 when the "
+        "key's home bucket does not contain that slot",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
+        py::arg("table_ids"), py::arg("slots"), py::arg("scores"),
+        py::arg("num_scores") = 1);
+
   m.def("bucketize_keys", &dyn_emb::bucketize_keys,
         "bucketize input keys into a dense tensor, and return the output keys, "
         "buckets offset, inverse indices. num_buckets must equal "

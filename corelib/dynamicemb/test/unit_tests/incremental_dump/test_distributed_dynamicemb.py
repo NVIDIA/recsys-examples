@@ -29,7 +29,12 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.dynamicemb_config import ScoreStrategy
-from dynamicemb.incremental_dump import get_score, incremental_dump, set_score
+from dynamicemb.incremental_dump import (
+    get_score,
+    incremental_dump,
+    replay_increment,
+    set_score,
+)
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -106,6 +111,7 @@ def get_planner(
     batch_size: int,
     multi_hot_sizes: List[int],
     device,
+    training: bool = True,
 ):
     dict_const = {}
     for i in range(len(table_names)):
@@ -121,6 +127,7 @@ def get_planner(
             dynamicemb_options=DynamicEmbTableOptions(
                 global_hbm_for_values=1024**3,
                 score_strategy=score_strategies[i],
+                training=training,
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.DEBUG,
                 ),
@@ -427,3 +434,103 @@ def test_incremental_dump_api(
                 dump_keys = dump_keys % 100000
                 dump_vals = dump_vals.to(dump_keys.dtype)
                 assert torch.all(dump_keys.unsqueeze(1).expand(-1, dim) == dump_vals)
+
+
+def _build_sharded_model(
+    table_names, eb_configs, score_strategies, batch, dim, device, training=True
+):
+    """One row-wise sharded EmbeddingCollection over dynamic embedding tables.
+
+    ``training=False`` builds a serving replica: the table option (not
+    ``nn.Module.training``) is what drops the optimizer, so the value row is the
+    embedding alone and there is no per-row state for a replay to restore.
+    """
+    ebc = torchrec.EmbeddingCollection(device=torch.device("meta"), tables=eb_configs)
+    planner = get_planner(
+        table_names,
+        eb_configs,
+        [True] * len(table_names),
+        score_strategies,
+        batch,
+        [1] * len(table_names),
+        device,
+        training=training,
+    )
+    sharder = DynamicEmbeddingCollectionSharder(
+        fused_params={"optimizer": EmbOptimType.SGD, "learning_rate": 0.1},
+        use_index_dedup=False,
+    )
+    plan = planner.collective_plan(ebc, [sharder], dist.GroupMember.WORLD)
+    return DistributedModelParallel(
+        module=ebc, device=device, sharders=[sharder], plan=plan
+    )
+
+
+@pytest.mark.parametrize("table_num, dim, local_batch", [(2, 8, 64)])
+def test_replay_increment_distributed(
+    request, table_num, dim, local_batch, backend_session
+):
+    """A globally gathered delta replayed into a second sharded model: every rank
+    keeps only the keys it owns, and together they restore the whole delta."""
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
+    prefix_path = "model"
+
+    table_names = [f"t_{t}" for t in range(table_num)]
+    eb_configs = [
+        torchrec.EmbeddingConfig(
+            name=table_names[t],
+            embedding_dim=dim,
+            num_embeddings=BATCH_SIZE_PER_DUMP * 8,
+            feature_names=[f"f_{t}"],
+        )
+        for t in range(table_num)
+    ]
+    strategies = [DynamicEmbScoreStrategy.TIMESTAMP] * table_num
+
+    train_model = _build_sharded_model(
+        table_names, eb_configs, strategies, local_batch, dim, device
+    )
+    # A serving replica: no optimizer state in the value row, and eval forwards
+    # that neither insert nor admit, so everything it holds came from the delta.
+    serve_model = _build_sharded_model(
+        table_names, eb_configs, strategies, local_batch, dim, device, training=False
+    )
+    serve_model.eval()
+
+    unique_indices = [set({}) for _ in table_names]
+    sparse_feature = generate_sparse_feature(
+        [f"f_{t}" for t in range(table_num)],
+        [1] * table_num,
+        local_batch,
+        unique_indices,
+        [True] * table_num,
+        [BATCH_SIZE_PER_DUMP * 8] * table_num,
+    )
+    trained = {k: v.values().clone() for k, v in train_model(sparse_feature).items()}
+
+    pg = intra_and_cross_node_pg()[0]
+    deltas = incremental_dump(train_model, 0, pg)
+    stats = replay_increment(serve_model, deltas, pg)
+
+    delta = deltas[prefix_path]
+    for j, table_name in enumerate(delta.table_names):
+        s = stats[prefix_path][table_name]
+        total = delta.keys[j].numel()
+        assert s.upserted + s.skipped == total
+
+        # Row-wise sharding is a partition: the ranks' shares must sum to the
+        # whole delta, with no key landing on two ranks.
+        counted = torch.tensor([s.upserted], dtype=torch.int64, device=device)
+        dist.all_reduce(counted, group=pg)
+        assert int(counted.item()) == total, (int(counted.item()), total)
+
+    # What the replica is for: serving the same batch and returning what the
+    # source would. Comparing forward outputs rather than a dump of the replica
+    # exercises the path a replica is actually used through -- input dist,
+    # lookup, pooling -- instead of re-reading the table the replay just wrote.
+    served = {k: v.values() for k, v in serve_model(sparse_feature).items()}
+    assert set(served.keys()) == set(trained.keys())
+    for feature in trained:
+        torch.testing.assert_close(served[feature], trained[feature])

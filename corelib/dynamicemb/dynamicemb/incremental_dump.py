@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+from dynamicemb.dynamicemb_config import ReplayContent
+from dynamicemb.types import ReplayStats
 from torch import nn
 
 
@@ -38,14 +40,52 @@ class DeltaDumpResult:
     keys : List[torch.Tensor]
         Per-table matched keys on host (created/modified keys to upsert).
     values : List[torch.Tensor]
-        Per-table matched values on host, aligned with ``keys``.
+        Per-table ``[N, dim]`` embeddings on host, aligned with ``keys``.
+        **Embeddings only**: the rest of each stored row is in
+        ``optimizer_states``, and concatenating the two along dim 1 reproduces
+        the row as the table holds it.
+    optimizer_states : List[Optional[torch.Tensor]]
+        Per-table optimizer state on host, aligned with ``keys`` -- the trailing
+        part of the same value row as ``values``, at the **same width the file
+        checkpoint uses**, so a delta and a checkpoint describe a row
+        identically. That is narrower than the runtime row for rowwise Adagrad,
+        which reserves a fixed 16 bytes per row in the fused layout but fills
+        only one accumulator scalar; ``replay_increment`` pads it back out.
+        ``None`` for a table whose optimizer keeps no per-row state, e.g. plain
+        SGD.
+    scores : List[torch.Tensor]
+        Per-table ``[N, num_scores]`` score words on host, aligned with ``keys``,
+        in the table's configured (logical) column order. Timestamp columns hold
+        an **age** (``meta[i]["current_score"] - score``) rather than a raw
+        timestamp, because ``%globaltimer`` is per device and resets across
+        boots; a consumer rebases them onto its own clock. Every other column
+        (LFU frequency, STEP, CUSTOMIZED, NO_EVICTION row) is carried verbatim.
     evicted_keys : List[Optional[torch.Tensor]]
-        Per-table evicted keys on host (keys only, no value/score) retained since
-        the last ``incremental_dump``. ``evicted_keys[i]`` is ``None`` for a table
-        without ``evicted_item_mode=RETAIN_KEY``; otherwise it holds that table's
-        retained evicted keys, and returning them drains and releases the table's
-        retained-evicted-keys buffer (each evicted key is reported exactly once
-        across successive ``incremental_dump`` calls).
+        Per-table keys on host (keys only, no value/score) that the table
+        **evicted** to make room since the last ``incremental_dump``. ``None``
+        unless the table was configured with ``evicted_item_mode=RETAIN_KEY`` --
+        retaining evictions has to be decided up front, since it swaps in a
+        collecting insert kernel.
+
+        ``replay_increment`` never applies this list: the key that took an
+        evicted key's slot is in the same delta and overwrites it, so the
+        eviction is reproduced by the write. It is here for other consumers of
+        the dump.
+    erased_keys : List[Optional[torch.Tensor]]
+        Per-table keys on host that an **explicit erase** removed since the last
+        ``incremental_dump`` *and asked to have recorded* -- that is each
+        ``erase`` call's decision (its own ``EvictedItemMode``), not a table
+        setting, so this is always populated, with an empty tensor when nothing
+        was recorded. ``replay_increment`` reads ``None`` as empty too, for
+        deltas assembled by hand.
+
+        These are the removals a replica has to perform for itself -- nothing
+        takes over the slot, so no write reproduces them. Whether
+        ``replay_increment`` applies them is ``meta[i]["replay_mode"]``'s call.
+
+    Both lists drain and release their buffer, so each key is reported exactly
+    once across successive ``incremental_dump`` calls, and both hold only keys
+    that were really in the table.
     meta : List[Dict[str, Any]]
         Per-table dump metadata, aligned with ``table_names``. A flat dict with:
             meta[i]["current_score"]:    int  -- table's score after this dump;
@@ -56,6 +96,10 @@ class DeltaDumpResult:
                 by ``replay_increment``. For NO_EVICTION tables it packs the key
                 slot (high 32 bits) and value row (low 32 bits) into one int64.
             meta[i]["current_capacity"]: int  -- table's current capacity (slots).
+            meta[i]["bucket_capacity"]:  int  -- slots per hash bucket; replay
+                compares it to decide whether the source slots are usable.
+            meta[i]["num_scores"]:       int  -- score words per key; part of the
+                slot layout replay compares against.
             meta[i]["world_size"]:       int  -- ranks the source table was
                 sharded across at creation (global WORLD), used by replay to
                 reconstruct key->rank. NOT the gather ``pg`` (a comm scope only).
@@ -66,7 +110,10 @@ class DeltaDumpResult:
     table_names: List[str] = field(default_factory=list)
     keys: List[torch.Tensor] = field(default_factory=list)
     values: List[torch.Tensor] = field(default_factory=list)
+    optimizer_states: List[Optional[torch.Tensor]] = field(default_factory=list)
+    scores: List[torch.Tensor] = field(default_factory=list)
     evicted_keys: List[Optional[torch.Tensor]] = field(default_factory=list)
+    erased_keys: List[Optional[torch.Tensor]] = field(default_factory=list)
     meta: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -283,16 +330,10 @@ def incremental_dump(
 
     Returns
     -------
-    Tuple:
-        Dict[str, Dict[str, Tuple[torch.Tensor, torch.Tensor]]]:
-            The first 'str' is the name of embedding collection.
-            The second 'str' is the name of embedding table.
-            The first tensor in the Tuple is matched keys on hosts.
-            The second tensor in the Tuple is matched values on hosts.
-        Dict[str, Dict[str, int]]:
-            The first 'str' is the name of embedding collection.
-            The second 'str' is the name of embedding table.
-            `int` is the current score after finishing the dumping process, which will be used as the score for the next forward pass, and can also be used as the input of the next incremental_dump. If input score_threshold is `int`, the Dict will contain all dynamic embedding tables' current score, otherwise only dumped tables' current score will be returned.
+    Dict[str, DeltaDumpResult]:
+        One :class:`DeltaDumpResult` per embedding collection, keyed by the
+        collection's module path. See that class for the per-table columns and
+        the ``meta`` keys.
     """
 
     if isinstance(score_threshold, int):
@@ -388,12 +429,170 @@ def incremental_dump(
             collection_result.table_names.extend(module_result.table_names)
             collection_result.keys.extend(module_result.keys)
             collection_result.values.extend(module_result.values)
+            collection_result.optimizer_states.extend(module_result.optimizer_states)
+            collection_result.scores.extend(module_result.scores)
             collection_result.evicted_keys.extend(module_result.evicted_keys)
+            collection_result.erased_keys.extend(module_result.erased_keys)
             collection_result.meta.extend(module_result.meta)
 
         ret[collection_path] = collection_result
 
     return ret
+
+
+def replay_increment(
+    model: torch.nn.Module,
+    deltas: Dict[str, DeltaDumpResult],
+    pg: Optional[dist.ProcessGroup] = None,
+    content: ReplayContent = ReplayContent.ALL,
+) -> Dict[str, Dict[str, ReplayStats]]:
+    """Write ``incremental_dump`` results back into a model's dynamic embedding tables.
+
+    The inverse of :func:`incremental_dump`: it takes that call's
+    ``{collection_path: DeltaDumpResult}`` and restores every key's embedding and
+    score into *model*. Typical use is delta replication -- train on one job,
+    dump periodically, ship the delta, replay it into a serving replica.
+
+    **Write-back is by slot.** Every key is written at the slot and value row it
+    occupied in the source table, leaving the target layout-identical to it. That
+    is only meaningful when the two tables share a layout, so the target is
+    checked against the delta's ``meta`` (capacity, bucket capacity, score
+    layout, dim, dist_type, world size) and a mismatch raises
+    :class:`ValueError` before anything is written.
+
+    Writing at the source's slot **overwrites whatever occupies it** -- that is
+    what makes a replica converge (the source evicted that occupant to make
+    room). It also means a replayed table must be built *only* by
+    loading/replaying from its source: a table that also takes independent writes
+    can lose a key whose slot a delta key claims.
+
+    **What gets written** is *content*'s call -- embedding, optimizer state,
+    score, or any combination (see :class:`ReplayContent`). The default is all
+    three, so the replica ends up holding what the source held.
+
+    Dropping ``SCORE`` leaves a restored key scored as if it had just been
+    inserted here, so the replica orders its own future evictions by when it
+    received a key rather than by how the source ranked it -- the two can evict
+    in different orders, but never hold a wrong embedding for a key they share.
+    (NO_EVICTION is unaffected either way: its score word is a value row, not a
+    score, and is restored exactly.)
+
+    **Sharding.** Replay always keeps only the keys this rank owns, recomputing
+    ownership from the key with *this* model's world size. What that filter does
+    depends on how the delta was produced:
+
+    - ``incremental_dump(..., pg)`` all-gathers, so every rank holds the whole
+      group's keys; hand the same delta to every rank and each takes its share.
+    - ``incremental_dump(..., pg=None)`` leaves each rank with only its own keys;
+      replay it on the rank that produced it, where the filter is a no-op.
+      Replaying it on a *different* rank is not an error -- every key simply
+      belongs to someone else and is skipped, which ``ReplayStats.skipped``
+      makes visible.
+
+    Only ``roundrobin`` and ``hash_roundrobin`` tables can be replayed:
+    ``continuous`` has no per-key rank mapping to reconstruct, so it raises
+    whenever the fan-out is more than one rank (``incremental_dump`` already
+    refuses to dump such a table at all).
+
+    **Optimizer state** is not part of a delta. A key that already occupies its
+    target row keeps its optimizer state; a row taken over from another key (or a
+    brand-new one) is reset to the table's initial optimizer state. This is what
+    happens when *content* omits ``OPTIMIZER_STATE``; including it writes the
+    state the source dumped, for every key.
+
+    Args:
+        model (nn.Module): the model containing dynamic embedding tables.
+        deltas (Dict[str, DeltaDumpResult]): ``incremental_dump``'s return value,
+            keyed by embedding-collection path. Collections or tables that the
+            model does not have are skipped with a warning.
+        pg (Optional[dist.ProcessGroup]): process group defining this model's
+            shard fan-out. Defaults to the world the tables were created against.
+        content (ReplayContent): which parts of each dumped row to write back --
+            embedding, optimizer state, score, or any combination. Defaults to
+            all three.
+
+    Returns:
+        Dict[str, Dict[str, ReplayStats]]:
+            ``{collection_path: {table_name: ReplayStats}}`` -- keys written,
+            removed and skipped per table. Empty dict when the model has no
+            dynamic embedding tables.
+
+    Raises:
+        ValueError: a target table's layout does not match the source's, or a
+            delta is missing the per-key data replay needs. Raised before
+            anything is written.
+        TypeError: a module's storage is neither ``DynamicEmbStorage`` nor
+            ``HybridStorage``.
+        NotImplementedError: a table is sharded with ``dist_type="continuous"``
+            across more than one rank.
+        RuntimeError: a key could not be written at its source slot even though
+            the metadata matched. Unlike the checks above this fires mid-write,
+            so that table may hold a partial replay.
+    """
+    collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
+    if len(collections_list) == 0:
+        warnings.warn(
+            "Input model don't have any TorchREC ShardedEmbeddingCollection or "
+            "ShardedEmbeddingBagCollection module, can't replay increment!",
+            UserWarning,
+        )
+        return {}
+
+    collections_by_path = {path: module for path, _, module in collections_list}
+    for collection_path in deltas.keys():
+        if collection_path not in collections_by_path:
+            warnings.warn(
+                f"sharded module '{collection_path}' present in the delta was not "
+                "found in the model; skipping it.",
+                UserWarning,
+            )
+
+    ret: Dict[str, Dict[str, ReplayStats]] = {}
+    for collection_path, delta in deltas.items():
+        collection_module = collections_by_path.get(collection_path)
+        if collection_module is None:
+            continue
+        collection_stats: Dict[str, ReplayStats] = {}
+        for dynamic_emb_module in get_dynamic_emb_module(collection_module):
+            # Each module owns a subset of the collection's tables and skips the
+            # rest, so the delta can be handed to all of them unchanged.
+            module_delta = _select_tables(delta, dynamic_emb_module.table_names)
+            if not module_delta.table_names:
+                continue
+            collection_stats.update(
+                dynamic_emb_module.replay_increment(
+                    module_delta,
+                    pg=pg,
+                    content=content,
+                )
+            )
+        ret[collection_path] = collection_stats
+
+    if not ret:
+        warnings.warn(
+            "Input model don't have any Dynamic embedding tables, can't replay "
+            "increment!",
+            UserWarning,
+        )
+    return ret
+
+
+def _select_tables(delta: DeltaDumpResult, table_names: List[str]) -> DeltaDumpResult:
+    """The sub-delta covering only *table_names*, keeping all lists column-aligned."""
+    wanted = set(table_names)
+    out = DeltaDumpResult()
+    for i, name in enumerate(delta.table_names):
+        if name not in wanted:
+            continue
+        out.table_names.append(name)
+        out.keys.append(delta.keys[i])
+        out.values.append(delta.values[i])
+        out.optimizer_states.append(delta.optimizer_states[i])
+        out.scores.append(delta.scores[i])
+        out.evicted_keys.append(delta.evicted_keys[i])
+        out.erased_keys.append(delta.erased_keys[i])
+        out.meta.append(delta.meta[i])
+    return out
 
 
 def _all_gather_evicted_keys(
@@ -431,17 +630,65 @@ def _all_gather_evicted_keys(
     return torch.unique(torch.cat(parts)).cpu()
 
 
+def _pop_retained_keys(
+    model: torch.nn.Module,
+    method: str,
+    what: str,
+    table_names: Optional[Dict[str, List[str]]],
+    pg: Optional[dist.ProcessGroup],
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Shared body of :func:`pop_evicted_keys` / :func:`pop_erased_keys`.
+
+    The two differ only in which buffer they drain; *method* names the module
+    method and *what* is the noun used in the "no such tables" warning.
+    """
+    collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
+    if len(collections_list) == 0:
+        warnings.warn(
+            "Input model don't have any TorchREC ShardedEmbeddingCollection or "
+            f"ShardedEmbeddingBagCollection module, can't pop {what} keys!",
+            UserWarning,
+        )
+        return {}
+
+    ret: Dict[str, Dict[str, torch.Tensor]] = {}
+    for collection_path, _collection_name, collection_module in collections_list:
+        if table_names is not None and collection_path not in table_names:
+            continue
+        wanted = table_names.get(collection_path) if table_names is not None else None
+
+        collection_result: Dict[str, torch.Tensor] = {}
+        for dynamic_emb_module in get_dynamic_emb_module(collection_module):
+            if not hasattr(dynamic_emb_module, method):
+                continue
+            local = getattr(dynamic_emb_module, method)(wanted)
+            for tname, keys in local.items():
+                if pg is not None:
+                    keys = _all_gather_evicted_keys(keys, pg)
+                collection_result[tname] = keys
+
+        if collection_result:
+            ret[collection_path] = collection_result
+
+    return ret
+
+
 def pop_evicted_keys(
     model: torch.nn.Module,
     table_names: Optional[Dict[str, List[str]]] = None,
     pg: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Return + clear the keys evicted (and retained) by last-tier storage, per table.
+    """Return + clear the keys last-tier storage **evicted** to make room, per table.
 
-    Only tables created with ``evicted_item_mode=RETAIN_KEY`` are included; all other
-    tables are omitted from the result. This is the incremental "pop" of keys
-    evicted since the previous call -- the retained buffers are cleared on this
-    rank as they are read.
+    Only tables configured with ``evicted_item_mode=RETAIN_KEY`` are included;
+    all other tables are omitted from the result. This is the
+    incremental "pop" of keys evicted since the previous call -- the retained
+    buffers are cleared on this rank as they are read.
+
+    Keys removed by an explicit erase are reported separately, by
+    :func:`pop_erased_keys`. The two are kept apart because a consumer usually
+    wants different things from them: an eviction says the table ran out of room,
+    an erase says someone asked for the key to go.
 
     Args:
         model (nn.Module): the model containing dynamic embedding tables.
@@ -458,35 +705,29 @@ def pop_evicted_keys(
     Returns:
         Dict[str, Dict[str, torch.Tensor]]:
             ``{collection_path: {table_name: keys}}`` where ``keys`` is a 1-D
-            int64 tensor of table-unique evicted keys. Empty dict when the model
-            has no retain-enabled dynamic embedding tables (or none matched).
+            tensor of table-unique evicted keys. Empty dict when the model has no
+            tables retaining evictions (or none matched).
     """
-    collections_list: List[Tuple[str, str, nn.Module]] = find_sharded_modules(model, "")
-    if len(collections_list) == 0:
-        warnings.warn(
-            "Input model don't have any TorchREC ShardedEmbeddingCollection or "
-            "ShardedEmbeddingBagCollection module, can't pop evicted keys!",
-            UserWarning,
-        )
-        return {}
+    return _pop_retained_keys(model, "pop_evicted_keys", "evicted", table_names, pg)
 
-    ret: Dict[str, Dict[str, torch.Tensor]] = {}
-    for collection_path, _collection_name, collection_module in collections_list:
-        if table_names is not None and collection_path not in table_names:
-            continue
-        wanted = table_names.get(collection_path) if table_names is not None else None
 
-        collection_result: Dict[str, torch.Tensor] = {}
-        for dynamic_emb_module in get_dynamic_emb_module(collection_module):
-            if not hasattr(dynamic_emb_module, "pop_evicted_keys"):
-                continue
-            local = dynamic_emb_module.pop_evicted_keys(wanted)
-            for tname, keys in local.items():
-                if pg is not None:
-                    keys = _all_gather_evicted_keys(keys, pg)
-                collection_result[tname] = keys
+def pop_erased_keys(
+    model: torch.nn.Module,
+    table_names: Optional[Dict[str, List[str]]] = None,
+    pg: Optional[dist.ProcessGroup] = None,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Return + clear the keys an **explicit erase** removed, per table.
 
-        if collection_result:
-            ret[collection_path] = collection_result
+    The counterpart of :func:`pop_evicted_keys`, with the same arguments and the
+    same drain-on-read semantics. Every table is included, unlike
+    ``pop_evicted_keys``: whether an erase was recorded is that ``erase`` call's
+    decision, not the table's, so there is no configuration to filter on -- a
+    table nobody asked to record simply returns an empty tensor.
 
-    return ret
+    Returns:
+        Dict[str, Dict[str, torch.Tensor]]:
+            ``{collection_path: {table_name: keys}}`` where ``keys`` is a 1-D
+            tensor of table-unique erased keys. Empty dict when the model has no
+            tables retaining erases (or none matched).
+    """
+    return _pop_retained_keys(model, "pop_erased_keys", "erased", table_names, pg)

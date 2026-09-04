@@ -14,6 +14,13 @@ KUAIRAND_1K_FEATURES = {
 
 
 def hash_key_cpu(keys_np: np.ndarray) -> np.ndarray:
+    """Deliberately a second implementation, not an import.
+
+    This oracle exists to check the CUDA bucketize kernel's key->rank mapping.
+    Calling the production ``murmur3_fmix64`` here would compare that host code
+    against itself and stop testing the device at all, so the duplication is the
+    point -- do not "unify" it away.
+    """
     k = np.asarray(keys_np, dtype=np.uint64)
     k = k ^ (k >> np.uint64(33))
     k = k * np.uint64(0xFF51AFD7ED558CCD)

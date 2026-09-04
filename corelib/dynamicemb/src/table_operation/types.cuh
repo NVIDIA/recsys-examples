@@ -20,6 +20,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <array>
 #include <cassert>
 #include <cstdint>
+
+#include "../murmur_hash.cuh"
 #include <stddef.h>
 #include <type_traits>
 #include <utility>
@@ -122,13 +124,9 @@ struct LinearBucket {
   static constexpr uint64_t ReserveKeyMask = UINT64_C(0xFFFFFFFFFFFFFFFC);
 
   static __device__ __forceinline__ int64_t hash(uint64_t key) {
-    uint64_t k = key;
-    k ^= k >> 33;
-    k *= UINT64_C(0xff51afd7ed558ccd);
-    k ^= k >> 33;
-    k *= UINT64_C(0xc4ceb9fe1a85ec53);
-    k ^= k >> 33;
-    return static_cast<int64_t>(k & INT64_MAX); // avoid overflow
+    // Shared avalanche, local tail: the mask keeps the result a non-negative
+    // int64 so it can index a bucket without overflowing.
+    return static_cast<int64_t>(murmur3_fmix64(key) & INT64_MAX);
   }
 
   static __device__ __forceinline__ KeyType empty_key() { return EmptyKey; }

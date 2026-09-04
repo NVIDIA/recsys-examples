@@ -691,7 +691,7 @@ def _prefetch_hbm_direct_path(
                 # victims are dropped here (unlike the cache path, which spills
                 # to storage). Retain them when configured -- this is the
                 # forward-path analogue of the _insert_key_values collection.
-                if state.evicted_item_mode == EvictedItemMode.RETAIN_KEY:
+                if EvictedItemMode.RETAIN_KEY in state.evicted_item_mode:
                     (
                         new_indices,
                         num_evicted,
