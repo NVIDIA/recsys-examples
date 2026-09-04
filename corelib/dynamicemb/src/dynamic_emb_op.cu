@@ -130,7 +130,7 @@ void gather_embedding_pooled(
   const float *d_weights = nullptr;
   at::Tensor w;
   if (weights.has_value()) {
-    auto w = weights.value().contiguous();
+    w = weights.value().contiguous();
     TORCH_CHECK(w.scalar_type() == at::kFloat,
                 "weights must be float32, got ", w.scalar_type());
     TORCH_CHECK(w.is_cuda(), "weights must be a CUDA tensor");
