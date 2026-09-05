@@ -1015,7 +1015,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self,
         indices: Tensor,
         offsets: Tensor,
-        per_sample_weights: Optional[Tensor] = None,
+        frequency_counters: Optional[Tensor] = None,
+        pooling_weights: Optional[Tensor] = None,
         feature_requires_grad: Optional[Tensor] = None,
         # 2D tensor of batch size for each rank and feature.
         # Shape (number of features, number of ranks)
@@ -1039,6 +1040,27 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size = (
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
+        if pooling_weights is not None:
+            if self.pooling_mode != DynamicEmbPoolingMode.SUM:
+                raise ValueError(
+                    "pooling_weights requires pooling_mode=SUM (weighted pooling "
+                    f"is only supported for SUM, got {self.pooling_mode})."
+                )
+            if not self.training:
+                raise ValueError(
+                    "pooling_weights is only supported in training mode."
+                )
+            if pooling_weights.dtype != torch.float32:
+                raise ValueError(
+                    "pooling_weights must be float32, got "
+                    f"{pooling_weights.dtype}."
+                )
+            if pooling_weights.numel() != indices.numel():
+                raise ValueError(
+                    "pooling_weights.numel() "
+                    f"({pooling_weights.numel()}) must equal indices.numel() "
+                    f"({indices.numel()})."
+                )
 
         if not self.training:
             scores = [self._scores[name] for name in self._table_names]
@@ -1058,7 +1080,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self.output_dtype,
                 self._eval_initializers,
                 self._evict_strategy,
-                per_sample_weights,
+                frequency_counters,
                 self.pooling_mode,
                 self.total_D,
                 batch_size,
@@ -1073,7 +1095,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
         if not self._prefetch_states:
-            self.prefetch(indices, offsets, frequency_counters=per_sample_weights)
+            self.prefetch(indices, offsets, frequency_counters=frequency_counters)
         prefetch_state = self._prefetch_states.popleft()
 
         res = DynamicEmbeddingFunction.apply(
@@ -1093,6 +1115,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self.dims,
             self.max_D,
             self.D_offsets_t,
+            pooling_weights,
             self._empty_tensor,
         )
         if isinstance(self._cache, DynamicEmbCache):

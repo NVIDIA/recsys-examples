@@ -30,7 +30,8 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      int accum_D, int ev_size, int src_stride, int num_vec,
                      int batch_size, DataType src_type, DataType dst_type,
                      DataType offset_type, cudaStream_t stream,
-                     const int *D_offsets_ptr = nullptr);
+                     const int *D_offsets_ptr = nullptr,
+		     const float *weights_ptr = nullptr);
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
                    int num_emb, int ev_size, int src_stride, DataType src_type,

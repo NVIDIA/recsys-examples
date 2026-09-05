@@ -46,6 +46,10 @@ struct ForwardMultiToOneFMLayoutDesc {
     int pooling_factor = static_cast<int>(offset_ptr[i + 1] - offset_ptr[i]);
     return combiner == 1 ? pooling_factor : 1;
   }
+  HOST_DEVICE_INLINE float get_weight(int i) {
+    // nullptr => unweighted pooling (identical to the old path).
+    return weights_ptr ? weights_ptr[i] : 1.0f;
+  }
   HOST_DEVICE_INLINE const SrcType *get_src_ptr(int i) {
     int idx = reverse_idx_ptr[i];
     return src_ptr + (int64_t)src_stride * idx;
@@ -72,6 +76,7 @@ struct ForwardMultiToOneFMLayoutDesc {
   int batch_size;
   int total_D;
   int accum_D;
+  const float *__restrict__ weights_ptr; // nullptr -> unweighted
 };
 
 void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
@@ -79,7 +84,7 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                      int accum_D, int ev_size, int src_stride, int num_vec,
                      int batch_size, DataType src_type, DataType dst_type,
                      DataType offset_type, cudaStream_t stream,
-                     const int *D_offsets_ptr) {
+                     const int *D_offsets_ptr, const float *weights_ptr) {
 
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
@@ -96,7 +101,8 @@ void scatter_combine(void *src_ptr, void *dst_ptr, void *offset_ptr,
                                    (dst_t *)dst_ptr,
                                    batch_size,
                                    total_D,
-                                   accum_D};
+                                   accum_D,
+                                   weights_ptr};
         copy_multi_to_one(multi_to_one_desc, ev_size, stream);
       });
     });

@@ -50,7 +50,8 @@ public:
                     const at::Tensor &unique_key_ids, cudaStream_t &stream,
                     const std::optional<at::Tensor> &D_offsets = std::nullopt,
                     const std::optional<at::Tensor> &offsets = std::nullopt,
-                    int B = 0, int F = 0, int total_D = 0, int combiner = 0);
+                    int B = 0, int F = 0, int total_D = 0, int combiner = 0,
+                    const std::optional<at::Tensor> &weights = std::nullopt);
 };
 
 } // namespace dyn_emb

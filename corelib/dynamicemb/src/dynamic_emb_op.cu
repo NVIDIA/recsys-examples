@@ -106,7 +106,8 @@ void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
 void gather_embedding_pooled(
     at::Tensor input, at::Tensor output, at::Tensor index, at::Tensor offsets,
     int combiner, int total_D, int batch_size,
-    const std::optional<at::Tensor> &D_offsets = std::nullopt, int max_D = 0) {
+    const std::optional<at::Tensor> &D_offsets = std::nullopt, int max_D = 0,
+    const std::optional<at::Tensor> &weights = std::nullopt) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   int num_slots = offsets.size(0) - 1;
 
@@ -126,12 +127,23 @@ void gather_embedding_pooled(
                 D_offsets.value().scalar_type());
     d_D_offsets = reinterpret_cast<const int *>(D_offsets.value().data_ptr());
   }
+  const float *d_weights = nullptr;
+  at::Tensor w;
+  if (weights.has_value()) {
+    w = weights.value().contiguous();
+    TORCH_CHECK(w.scalar_type() == at::kFloat,
+                "weights must be float32, got ", w.scalar_type());
+    TORCH_CHECK(w.is_cuda(), "weights must be a CUDA tensor");
+    TORCH_CHECK(w.numel() == index.numel(),
+                "weights.numel() (", w.numel(),
+                ") must equal index.numel() (", index.numel(), ")");
+    d_weights = reinterpret_cast<const float *>(w.data_ptr());
+  }
   dyn_emb::scatter_combine(
       input.data_ptr(), output.data_ptr(), offsets.data_ptr(), index.data_ptr(),
       combiner, total_D, /*accum_D=*/0, dim, src_stride, num_slots, batch_size,
-      src_type, dst_type, offset_type, stream, d_D_offsets);
+      src_type, dst_type, offset_type, stream, d_D_offsets, d_weights);
 }
-
 // Generate permutation-aware gather_ids from CSR offsets.
 // grads is [B*F, D] batch-first (row r → b=r/F, f=r%F).
 // Each thread processes one slot (bucket) s; slot s owns indices
@@ -161,7 +173,8 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
              int batch_size, int64_t out_dim,
              const std::optional<at::Tensor> &offsets = std::nullopt,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
-             int combiner = -1, int total_D = 0) {
+             int combiner = -1, int total_D = 0,
+	     const std::optional<at::Tensor> &weights = std::nullopt) {
   // When D_offsets is provided (multi-dim pooling):
   //   grads is [B, total_D].  Permutation-aware gather_ids are generated,
   //   sorted with reverse_indices, then a multi-dim variant of LocalReduce
@@ -262,6 +275,41 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
         end_bit, stream);
   });
 
+  // --- Sort weights with the same keys (radix sort is stable, so this
+  //     yields the identical permutation as the gather_ids sort) ---
+  std::optional<at::Tensor> sorted_weights;
+  if (weights.has_value()) {
+    auto w = weights.value().contiguous();
+    TORCH_CHECK(w.scalar_type() == at::kFloat,
+                "weights must be float32, got ", w.scalar_type());
+    TORCH_CHECK(w.is_cuda(), "weights must be a CUDA tensor");
+    TORCH_CHECK(w.numel() == num_keys,
+                "weights.numel() (", w.numel(),
+                ") must equal reverse_indices.numel() (", num_keys, ")");
+    TORCH_CHECK(offsets.has_value(),
+                "weights are only supported for pooled (offsets) reduce");
+    at::Tensor sw = at::empty_like(w);
+    DISPATCH_INTEGER_DATATYPE_FUNCTION(id_dtype, id_t, [&] {
+      size_t w_temp_bytes = 0;
+      cub::DeviceRadixSort::SortPairs(
+          nullptr, w_temp_bytes,
+          reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
+          reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
+          reinterpret_cast<float *>(w.data_ptr()),
+          reinterpret_cast<float *>(sw.data_ptr()), num_keys, 0, end_bit,
+          stream);
+      auto w_temp = at::empty({static_cast<int64_t>(w_temp_bytes)},
+                              at::TensorOptions().dtype(at::kByte).device(device_));
+      cub::DeviceRadixSort::SortPairs(
+          w_temp.data_ptr(), w_temp_bytes,
+          reinterpret_cast<id_t *>(reverse_indices.data_ptr()),
+          reinterpret_cast<id_t *>(sorted_reverse_indices.data_ptr()),
+          reinterpret_cast<float *>(w.data_ptr()),
+          reinterpret_cast<float *>(sw.data_ptr()), num_keys, 0, end_bit,
+          stream);
+    });
+    sorted_weights = sw;
+  }
   // --- LocalReduce ---
   // MEAN scaling is fused inside the reduce kernel for both uniform and
   // multi-dim modes, so no separate scaling pass is needed.
@@ -275,7 +323,9 @@ reduce_grads(at::Tensor reverse_indices, at::Tensor grads, int64_t num_unique,
 
     localReduceOp.local_reduce(grads, unique_grads, sorted_gather_ids,
                                sorted_reverse_indices, stream, D_offsets, offs,
-                               batch_size, num_features, total_D, combiner);
+                               batch_size, num_features, total_D, combiner,
+                               sorted_weights);
+
   } else {
     localReduceOp.local_reduce(grads, unique_grads, sorted_gather_ids,
                                sorted_reverse_indices, stream);
@@ -823,7 +873,8 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
         py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
-        py::arg("combiner") = -1, py::arg("total_D") = 0);
+        py::arg("combiner") = -1, py::arg("total_D") = 0,
+	py::arg("weights") = py::none());
 
   m.def("gather_embedding", &gather_embedding,
         "Gather embedding based on index.", py::arg("input"), py::arg("output"),
@@ -834,7 +885,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("input"), py::arg("output"), py::arg("index"),
         py::arg("offsets"), py::arg("combiner"), py::arg("total_D"),
         py::arg("batch_size"), py::arg("D_offsets") = py::none(),
-        py::arg("max_D") = 0);
+        py::arg("max_D") = 0, py::arg("weights") = py::none());
 
   m.def("load_from_flat_table_contiguous", &load_from_flat_table_contiguous,
         "Load from flat table: contiguous copy (NumRegions=0, single-table "
@@ -876,4 +927,18 @@ void bind_dyn_emb_op(py::module &m) {
   m.def("select_insert_failed_values", &select_insert_failed_values,
         "select_insert_failed_values", py::arg("indices"),
         py::arg("input_values"), py::arg("evicted_values"));
+
+  m.def("reduce_grads", &reduce_grads, "reduce grads",
+        py::arg("reverse_indices"), py::arg("grads"), py::arg("num_unique"),
+        py::arg("batch_size"), py::arg("out_dim"),
+        py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
+        py::arg("combiner") = -1, py::arg("total_D") = 0,
+        py::arg("weights") = py::none());
+
+  m.def("gather_embedding_pooled", &gather_embedding_pooled,
+        "Gather embedding with pooling (SUM/MEAN) based on index and offsets.",
+        py::arg("input"), py::arg("output"), py::arg("index"),
+        py::arg("offsets"), py::arg("combiner"), py::arg("total_D"),
+        py::arg("batch_size"), py::arg("D_offsets") = py::none(),
+        py::arg("max_D") = 0, py::arg("weights") = py::none());
 }
