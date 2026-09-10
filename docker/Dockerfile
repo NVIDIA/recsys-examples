@@ -223,12 +223,26 @@ RUN apt-get update -y --fix-missing && \
 # ChainedOptimizer.step (~4 ms / step under HSTU bf16 when the stat is unused).
 # TorchX 0.7 requires urllib3<1.27, while Triton client 2.71 requires
 # urllib3>=2.0.7, so keep the TorchX launcher in an isolated virtualenv.
-RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
+# The arbitrary-mask FlashAttention revision below uses the CUTLASS DSL 4.4.1
+# API. The 4.4.1 base and cu13 payload wheels overlap paths, so install only
+# the base payload to avoid order-dependent file replacement.
+RUN pip uninstall -y \
+      nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+      nvidia-cutlass-dsl-libs-cu13 || true && \
+    rm -rf /usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl* && \
+    pip install --no-cache-dir --no-deps \
+      'nvidia-cutlass-dsl==4.4.1' \
+      'nvidia-cutlass-dsl-libs-base==4.4.1' && \
+    python3 -c 'import importlib.metadata as m; assert m.version("nvidia-cutlass-dsl") == m.version("nvidia-cutlass-dsl-libs-base") == "4.4.1"; assert not any(d.metadata["Name"] == "nvidia-cutlass-dsl-libs-cu13" for d in m.distributions()); from cutlass.cute.arch import ProxyKind, SharedSpace' && \
+    git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install --no-deps -e ./megatron-lm && \
     pip install --no-cache-dir gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
         cloudpickle pyre-extensions \
-        'quack-kernels>=0.3.3,<0.5' 'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
+        'nvidia-cutlass-dsl==4.4.1' 'nvidia-cutlass-dsl-libs-base==4.4.1' \
+        'quack-kernels==0.3.3' \
+        'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
         pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder && \
+    python3 -c 'import importlib.metadata as m; assert m.version("nvidia-cutlass-dsl") == m.version("nvidia-cutlass-dsl-libs-base") == "4.4.1"; assert m.version("quack-kernels") == "0.3.3"; assert not any(d.metadata["Name"] == "nvidia-cutlass-dsl-libs-cu13" for d in m.distributions())' && \
     python3 -m venv /opt/torchx && \
     /opt/torchx/bin/python -m pip install --no-cache-dir 'torchx==0.7.0' && \
     ln -sf /opt/torchx/bin/torchx /usr/local/bin/torchx && \
@@ -241,7 +255,8 @@ ARG FLASH_ATTN_ARBITRARY_MASK_COMMIT=b56db721d65afadd8cfe154cd12e83693bf0aba3
 RUN git clone https://github.com/jiayus-nvidia/flash-attention.git flash-attention && \
     cd flash-attention && \
     git checkout ${FLASH_ATTN_ARBITRARY_MASK_COMMIT} && \
-    pip install --no-deps --no-build-isolation -e ./flash_attn/cute
+    pip install --no-deps --no-build-isolation -e ./flash_attn/cute && \
+    python3 -c 'from flash_attn.cute.interface import flash_attn_func'
 
 # -- Layer 4: FlexKV.
 COPY third_party/FlexKV /workspace/deps/FlexKV
