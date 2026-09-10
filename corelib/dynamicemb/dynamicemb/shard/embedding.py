@@ -70,9 +70,14 @@ class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
         frequency_counters: Optional[List[torch.Tensor]] = None,
     ) -> None:
         super().__init__(
-            sharding_contexts, input_features, reverse_indices, seq_vbe_ctx
+            sharding_contexts=[] if sharding_contexts is None else sharding_contexts,
+            input_features=[] if input_features is None else input_features,
+            reverse_indices=[] if reverse_indices is None else reverse_indices,
+            seq_vbe_ctx=[] if seq_vbe_ctx is None else seq_vbe_ctx,
         )
-        self.frequency_counters: List[torch.Tensor] = frequency_counters or []
+        self.frequency_counters: List[torch.Tensor] = (
+            [] if frequency_counters is None else frequency_counters
+        )
 
 
 class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):

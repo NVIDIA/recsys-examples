@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.planner import utils as planner_utils
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.enumerators import (
     GUARDED_COMPUTE_KERNELS,
@@ -244,6 +245,11 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
         self._sharder_map = {
             sharder_name(sharder.module_type): sharder for sharder in sharders
         }
+        # TorchRec >= 1.7 estimators consume a snapshot of sharder metadata
+        # instead of the live ModuleSharder instances used by older releases.
+        build_sharder_data_map = getattr(planner_utils, "build_sharder_data_map", None)
+        if build_sharder_data_map is not None:
+            self._sharder_data_map = build_sharder_data_map(self._sharder_map)
         sharding_options: List[ShardingOption] = []
 
         named_modules_queue = [("", module)]

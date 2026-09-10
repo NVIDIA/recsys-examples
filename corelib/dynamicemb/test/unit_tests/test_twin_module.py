@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 import torchrec
 from dynamicemb.construct_twin_module import ConstructTwinModule
+from dynamicemb.shard.embedding import DynamicEmbeddingCollectionContext
 from torchrec.modules.embedding_configs import PoolingType
 
 
@@ -119,6 +120,23 @@ optimizer_dict = {
         "weight_decay": 0.1,
     },
 }
+
+
+def test_dynamic_embedding_collection_context_initializes_fresh_lists():
+    field_names = (
+        "sharding_contexts",
+        "input_features",
+        "reverse_indices",
+        "seq_vbe_ctx",
+        "frequency_counters",
+    )
+
+    first = DynamicEmbeddingCollectionContext()
+    second = DynamicEmbeddingCollectionContext()
+
+    for field_name in field_names:
+        assert getattr(first, field_name) == []
+        assert getattr(first, field_name) is not getattr(second, field_name)
 
 
 @pytest.fixture
