@@ -7,19 +7,16 @@
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 """
-Benchmark: SIDGRModel.generate (arbitrary-mask FlashAttention) vs
-           SIDGRModel.generate_beam_decode (CuTe beam_decode_attn kernel).
+Benchmark the default SID-GR FA2 + gr_decode_atten generation backend.
 
-Both paths share the same model weights (use_jagged_flash_attn=True). The
-difference is the attention path during generation:
-  - generate(): re-runs full transformer over [history + all_generated]
-    every hierarchy step, with arbitrary_func mask isolating beams.
-  - generate_beam_decode(): prefill once → KV cache; per-step decode reuses
-    cached context KV and accumulates beam KV via topk_indices.
+The primary comparison is between padded context K/V (``seqused_k``) and the
+default packed context K/V (``cu_seqlens_k``). Both variants prefill once with
+standard FA2 and use the same CuTe beam-decode kernel; there is no
+arbitrary-mask or full-prefix jagged compatibility path.
 
 Run inside the recsys-examples Docker container (commons + dynamicemb +
 megatron + torchrec must import cleanly). The CuTe kernel is vendored at
-corelib/gr_decode_atten/; the Dockerfile adds it to PYTHONPATH
+corelib/gr_decode_atten/ and the SID-GR model resolves that in-repo path
 automatically.
 
 Example:
@@ -27,6 +24,7 @@ Example:
   torchrun --nproc_per_node 1 benchmark/benchmark_beam_decode.py \
     --max_hist_len 128 --beam_width 10 --num_layers 4
 """
+
 from __future__ import annotations
 
 import argparse
@@ -227,8 +225,12 @@ def run_one_config(args) -> None:
 
     # Functions to time
     @torch.no_grad()
-    def run_original():
-        sids, _ = model_unwrapped.generate(batch)
+    def run_padded_kv():
+        sids, _ = model_unwrapped.generate_beam_decode(
+            batch,
+            backend="3kernel",
+            use_jagged_kv=False,
+        )
         return sids
 
     @torch.no_grad()
@@ -241,11 +243,11 @@ def run_one_config(args) -> None:
         return sids
 
     # Sanity: both produce valid outputs
-    sids_a = run_original()
+    sids_a = run_padded_kv()
     sids_b = run_beam_decode()
-    assert (
-        sids_a.shape == sids_b.shape
-    ), f"shape mismatch: orig={sids_a.shape}, decode={sids_b.shape}"
+    assert sids_a.shape == sids_b.shape, (
+        f"shape mismatch: padded={sids_a.shape}, selected={sids_b.shape}"
+    )
 
     print("=" * 80)
     print(
@@ -258,8 +260,8 @@ def run_one_config(args) -> None:
     print(f"warmup={args.num_warmup}, iter={args.num_iter}")
     print("-" * 80)
 
-    print("[1/2] Timing generate() (arbitrary-mask FlashAttention)...")
-    stats_orig = time_fn(run_original, args.num_warmup, args.num_iter)
+    print("[1/2] Timing padded context KV (3kernel + seqused_k)...")
+    stats_orig = time_fn(run_padded_kv, args.num_warmup, args.num_iter)
     print(
         f"  median={stats_orig['median_ms']:.3f} ms, "
         f"mean={stats_orig['mean_ms']:.3f} ms, "
@@ -295,7 +297,7 @@ def run_one_config(args) -> None:
 
     speedup = stats_orig["median_ms"] / stats_decode["median_ms"]
     print("-" * 80)
-    print(f"Speedup (median orig / median decode) = {speedup:.2f}x")
+    print(f"Speedup (median padded / selected) = {speedup:.2f}x")
     print("=" * 80)
 
 
@@ -327,7 +329,11 @@ def run_sweep(base_args) -> None:
                 model, optimizer, model_unwrapped, batch = build_model(cfg, dtype)
 
                 with torch.no_grad():
-                    sids_a, _ = model_unwrapped.generate(batch)
+                    sids_a, _ = model_unwrapped.generate_beam_decode(
+                        batch,
+                        backend="3kernel",
+                        use_jagged_kv=False,
+                    )
                     sids_b, _ = model_unwrapped.generate_beam_decode(
                         batch,
                         backend=cfg.backend,
@@ -341,7 +347,11 @@ def run_sweep(base_args) -> None:
 
                 @torch.no_grad()
                 def run_orig():
-                    model_unwrapped.generate(batch)
+                    model_unwrapped.generate_beam_decode(
+                        batch,
+                        backend="3kernel",
+                        use_jagged_kv=False,
+                    )
 
                 @torch.no_grad()
                 def run_decode():
@@ -374,8 +384,8 @@ def run_sweep(base_args) -> None:
                 )
                 line = (
                     f"[dtype={dtype_name} hl={hl} bw={bw}]  "
-                    f"orig={stats_o['median_ms']:.2f} ms, "
-                    f"decode={stats_d['median_ms']:.2f} ms "
+                    f"padded={stats_o['median_ms']:.2f} ms, "
+                    f"selected={stats_d['median_ms']:.2f} ms "
                     f"(prefill={phase['prefill_ms_median']:.2f} + "
                     f"decode_loop={phase['decode_loop_ms_median']:.2f}), "
                     f"speedup={rows[-1]['speedup']:.2f}x"
@@ -399,8 +409,8 @@ def run_sweep(base_args) -> None:
     )
     print()
     print(
-        "| dtype | hist_len | beam_w | generate (ms) | "
-        "decode total (ms) | prefill (ms) | decode_loop (ms) | speedup |"
+        "| dtype | hist_len | beam_w | padded KV (ms) | "
+        "selected (ms) | prefill (ms) | decode_loop (ms) | speedup |"
     )
     print(
         "|-------|---------:|-------:|--------------:|"
@@ -426,7 +436,7 @@ def run_sweep(base_args) -> None:
         if not getattr(base_args, "allow_validation_fail", False):
             raise RuntimeError(
                 f"Validation detected {len(val_fails)}/{total} configs "
-                f"where generate() and generate_beam_decode() disagree on "
+                f"where padded and selected context-KV modes disagree on "
                 f"more than 30% of the top-K beam set. Pass "
                 f"--allow_validation_fail to continue anyway."
             )
@@ -438,10 +448,11 @@ def run_sweep(base_args) -> None:
 
 
 def run_compare_kv_modes(base_args) -> None:
-    """3-way sweep: generate() vs generate_beam_decode(use_jagged_kv=False)
-    vs generate_beam_decode(use_jagged_kv=True). Reports per-config
-    timings and a markdown table that maps to the "Jagged-native vs
-    dense" section in RESULTS.md.
+    """3-way sweep: public generate() dispatch vs padded and packed context KV.
+
+    The public call and explicit packed call should be identical. Reports
+    per-config timings and a markdown table for the packed-vs-padded section in
+    RESULTS.md.
 
     Each config is validated for output equivalence before timing
     (top-K beam set overlap >= 70% across all 3 pairs). Any failure raises
@@ -655,14 +666,14 @@ def main():
         default=True,
         help="Pack history as [total_tokens, D] + cu_seqlens_k through "
         "FA's varlen+causal fast path (default). Pass "
-        "--no-use_jagged_kv to fall back to dense + seqused_k (legacy, "
+        "--no-use_jagged_kv to compare dense + seqused_k ("
         "17 - 48%% slower at B=16). Only valid with backend='3kernel'.",
     )
     parser.add_argument(
         "--compare_kv_modes",
         action="store_true",
-        help="Time generate(), generate_beam_decode(use_jagged_kv=False) "
-        "and generate_beam_decode(use_jagged_kv=True) side by side. "
+        help="Check the public generate() dispatch and time "
+        "generate_beam_decode with padded and packed context KV side by side. "
         "Implies sweep semantics; uses --sweep_hist/--sweep_beam.",
     )
     parser.add_argument(

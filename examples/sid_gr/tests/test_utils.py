@@ -15,8 +15,7 @@ if TYPE_CHECKING:
 def is_sm90_or_above() -> bool:
     """True if a CUDA device with compute capability >= 9.0 is visible.
 
-    Used by tests gated on Hopper-only kernels (cute FA arbitrary mask,
-    Mode-3 dense prefill).
+    Used by tests gated on Hopper-only kernels such as Mode-3 dense prefill.
     """
     if not torch.cuda.is_available():
         return False
@@ -151,7 +150,7 @@ def create_sid_gr_model_and_optimizer(
     optimizer_type_str: str = "adam",
     pipeline_type: str = "none",
     device: torch.device = None,
-    use_jagged_flash_attn: bool = False,
+    use_jagged_flash_attn: bool = True,
 ):
     # Lazy imports of the heavy stack — see module-level comment.
     from commons.distributed.sharding import make_optimizer_and_shard

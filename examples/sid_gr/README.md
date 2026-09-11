@@ -167,40 +167,11 @@ The four leaves at the bottom are the recommended SID tuples for this sample.
 
 ### Generation APIs
 
-The model exposes two generation entry points, both producing top-K beams of full SID tuples. The diagram below contrasts the per-step work (example shapes: `hist=15`, `BOS=1`, `W=4`, `H=3`):
-
-<table width="100%">
-<tr>
-<th width="50%" align="center"><code>generate()</code> — no KV cache</th>
-<th width="50%" align="center"><code>generate_beam_decode()</code> — KV cache</th>
-</tr>
-<tr>
-<td width="50%" align="center">
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'primaryColor': '#ffffff',
-    'primaryBorderColor': '#222222',
-    'primaryTextColor': '#111111',
-    'lineColor': '#555555',
-    'fontSize': '14px'
-  }
-}}%%
-flowchart TB
-    N0["forward<br/>seqlen = 16<br/>(hist + BOS)<br/>recompute all K/V"]
-    N1["forward<br/>seqlen = 20<br/>(hist + BOS + 4 codes)<br/>recompute all K/V"]
-    N2["forward<br/>seqlen = 24<br/>(hist + BOS + 8 codes)<br/>recompute all K/V"]
-    N0 -- "propagate → SID #1" --> N1
-    N1 -- "propagate → SID #2" --> N2
-    N2 -- "propagate → SID #3" --> Ne["done"]
-
-    linkStyle default stroke:#444,stroke-width:1.5px;
-```
-
-</td>
-<td width="50%" align="center">
+`generate()` is the production entry point. With the default
+`use_jagged_flash_attn=True` backend it dispatches directly to
+`generate_beam_decode()`: standard FA2 varlen causal prefill followed by
+incremental beam decode through the vendored `gr_decode_atten` CuTe kernel.
+The fixed context K/V is computed once and shared across beams.
 
 ```mermaid
 %%{init: {
@@ -224,15 +195,15 @@ flowchart TB
     linkStyle default stroke:#444,stroke-width:1.5px;
 ```
 
-</td>
-</tr>
-</table>
+`generate_beam_decode()` remains public for benchmark/debug callers that need
+to select a specific kernel or context-KV layout. Normal callers should use
+`generate()`.
 
-`generate()` reruns the full transformer over a growing `[hist + already-generated]` sequence at every step. `generate_beam_decode()` pays the history cost once during prefill and then each decode step runs only the new token per beam, attending into the cached K/V.
-
-1. **`generate()`** — baseline path. At every hierarchy step it re-runs the transformer over `[history + generated_prefix]` with a beam-isolating attention mask so beams do not cross-attend within a step. Works with either decoder backend (Megatron-Core `TransformerBlock` or `JaggedTransformerBlock`). Per-step cost grows with the running prefix length.
-
-2. **`generate_beam_decode()`** — KV-cache path. Runs a single prefill over `[history + BOS]` to populate a per-layer context K/V cache, then performs incremental beam decode using the `beam_decode_attn` kernel. The fixed context K/V is shared across beams; per-step beam K/V is appended to the cache and parent-beam ancestry is tracked through `topk_indices` rather than by reshuffling the cache. Requires `use_jagged_flash_attn=True`; the kernel is vendored at [`corelib/gr_decode_atten/`](../../corelib/gr_decode_atten/) and is on `PYTHONPATH` automatically in the Docker image. Per-step decode no longer reruns the full transformer over the growing prefix — context-side attention remains linear in history length, but full-prefix recomputation at every hierarchy step is avoided, which is where the long-history speedup comes from.
+Set `NetworkArgs.use_jagged_flash_attn = False` to select the Megatron-Core
+reference backend. Its `generate()` implementation uses a dense,
+beam-isolating attention mask and recomputes the full prefix at each hierarchy
+step. This path is retained for reference, tensor-parallel execution, and
+Megatron checkpoint compatibility; it is not the default inference path.
 
 The KV cache in `generate_beam_decode()` is split into two parts, with different sharing and indexing semantics:
 

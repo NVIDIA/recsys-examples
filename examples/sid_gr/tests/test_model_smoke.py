@@ -7,17 +7,13 @@ from commons.checkpoint import get_unwrapped_module
 from commons.datasets.gpt_sid_batch import FeatureConfig, GPTSIDBatch
 from commons.modules.embedding import ShardedEmbeddingConfig
 from commons.ops.length_to_offsets import length_to_complete_offsets
-from tests.test_utils import create_sid_gr_model_and_optimizer, is_sm90_or_above
+from tests.test_utils import create_sid_gr_model_and_optimizer
 
-# Both tests forward through SIDGRModel, which goes through the cute FA
-# arbitrary-mask path. cute asserts SM90+, so the whole file is gated on
-# Hopper-or-newer hardware.
+# Both backends require CUDA. The default path uses standard FA2 (SM80+), not
+# the removed arbitrary-mask CuTe attention implementation.
 pytestmark = pytest.mark.skipif(
-    not is_sm90_or_above(),
-    reason=(
-        "test_model_smoke forwards through cute FA arbitrary-mask path "
-        "(SM90+); current device compute capability < 9.0"
-    ),
+    not torch.cuda.is_available(),
+    reason="SID-GR model smoke tests require CUDA",
 )
 
 
@@ -178,6 +174,7 @@ def test_model_decoder_step(
             num_hierarchies=num_hierarchies,
             codebook_embedding_config=codebook_embedding_config,
             codebook_sizes=codebook_sizes,
+            use_jagged_flash_attn=False,
         )
         optimizer.reload_model_params()
         model = get_unwrapped_module(model)

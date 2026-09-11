@@ -10,6 +10,8 @@ the canonical source and the location for ongoing kernel development.
 
 - **Source repo**: `ssh://git@gitlab-master.nvidia.com:12051/cjerry/gr-decode_atten.git`
 - **Pinned commit**: `1c540f6` (upstream `master`, includes `seqused_k` and `cu_seqlens_k` support)
+- **Local runtime baseline**: CUTLASS DSL 4.5.2 and Quack 0.4.1, matching
+  the NVIDIA PyTorch 26.07 base image
 - **Initial import date**: 2026-05-13
 
 ### Sync policy
@@ -31,8 +33,10 @@ Range:  <prev_sha>..<sha>
 Reason: <feature or fix that triggered the sync>
 ```
 
-Do not make in-place edits to this directory that are not also upstreamed
-to `cjerry/gr-decode_atten`; otherwise the two will drift.
+Kernel source edits should also be upstreamed to `cjerry/gr-decode_atten` so
+the implementations do not drift. This repository may update packaging pins
+in `requirements.txt` to match its container runtime; record that baseline in
+this provenance section.
 
 ## Overview
 

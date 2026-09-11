@@ -78,12 +78,11 @@ _E2E_SKIP_REASON = (
 )
 
 
-# Some paths still go through `flash_attn.cute` (target-aware arbitrary
-# mask in baseline `generate()` and the Mode-3 dense prefill fallback),
-# which asserts SM90+. Tests that exercise either are gated on this.
+# These end-to-end cases remain gated on their currently validated SM90 target.
+# Training and prefill use standard FA2; beam decode uses gr_decode_atten.
 _SM90_AVAILABLE = is_sm90_or_above()
 _SM90_SKIP_REASON = (
-    "requires SM90+ (cute FA arbitrary-mask path / dense Mode-3 prefill); "
+    "requires the currently validated SM90+ SID-GR test target; "
     "current device compute capability < 9.0"
 )
 
@@ -556,33 +555,14 @@ def test_generate_beam_decode_e2e(
 @pytest.mark.parametrize("num_layers", [2])
 @pytest.mark.parametrize("codebook_sizes", [[128, 128, 128]])
 @pytest.mark.parametrize("batchsize", [4])
-def test_generate_vs_generate_beam_decode_regression_guard(
+def test_generate_dispatches_to_generate_beam_decode(
     dtype,
     max_history_length,
     num_layers,
     codebook_sizes,
     batchsize,
 ):
-    """Regression guard between generate() and generate_beam_decode().
-
-    Both paths implement the same beam-isolated attention semantics by
-    different means (full-sequence rerun with arbitrary mask vs
-    prefill+incremental decode with topk_indices). They should produce
-    very close results, but bf16 attention's per-layer rounding plus
-    beam-search's topk decision boundary make bit-exact match impossible.
-
-    This is a regression GUARD — it catches a path going significantly off
-    spec. It is NOT a mathematical equivalence proof; for that, see the
-    kernel-level reference oracle in
-    `corelib/gr_decode_atten/tests/test_fwd.py`, which compares the CuTe
-    kernel against a fp32 PyTorch reference at the attention-call level.
-
-    Thresholds:
-      - top-1 SID per sample matches exactly (small bf16 noise should not
-        flip the argmax of accumulated log-probs)
-      - per-position |log_prob delta| < 0.15
-      - top-K beam SID set overlap >= 70%
-    """
+    """The default generate() API must use the optimized beam-decode path."""
     hidden_size = 256
     num_attention_heads = 4
     kv_channels = 64
@@ -636,58 +616,8 @@ def test_generate_vs_generate_beam_decode_regression_guard(
             sids_a, lp_a = model_unwrapped.generate(batch)
             sids_b, lp_b = model_unwrapped.generate_beam_decode(batch)
 
-        assert sids_a.shape == sids_b.shape
-        assert lp_a.shape == lp_b.shape
-
-        # Both paths use beam-isolating attention (generate() builds
-        # padded_target_aware_causal_mask which is then converted to the
-        # jagged arbitrary_func; generate_beam_decode uses topk_indices for
-        # the same isolation). With both paths mathematically equivalent,
-        # the only differences are bf16 layout/order rounding.
-
-        # 1. Top-1 beam's full SID tuple must match (this is THE selection
-        #    that downstream consumers use; tiny rounding usually cannot
-        #    flip the argmax of accumulated log-probs).
-        top1_a = sids_a[:, 0, :]
-        top1_b = sids_b[:, 0, :]
-        per_sample_match = (top1_a == top1_b).all(dim=-1)
-        assert per_sample_match.all(), (
-            f"Top-1 SIDs differ on samples "
-            f"{(~per_sample_match).nonzero(as_tuple=True)[0].tolist()}:\n"
-            f"  generate: {top1_a.tolist()}\n"
-            f"  decode:   {top1_b.tolist()}"
-        )
-
-        # 2. Per-position log_prob differences are within bf16 rounding —
-        #    a few times the typical attention rounding error.
-        lp_diff = (lp_a - lp_b).abs().max().item()
-        assert lp_diff < 0.15, (
-            f"log_probs differ by {lp_diff:.4f} (limit 0.15):\n"
-            f"  generate: {lp_a.tolist()}\n"
-            f"  decode:   {lp_b.tolist()}"
-        )
-
-        # 3. The top-K SIDs as sets must overlap by ≥ 70% per sample
-        #    (some beams at lower ranks may swap positions due to bf16
-        #    rounding when their log-probs are within ~lp_diff of each other).
-        top_k = sids_a.shape[1]
-
-        def _to_set_per_sample(sids):
-            return [
-                {tuple(sids[b, k].tolist()) for k in range(top_k)}
-                for b in range(sids.shape[0])
-            ]
-
-        sets_a = _to_set_per_sample(sids_a)
-        sets_b = _to_set_per_sample(sids_b)
-        for b, (sa, sb) in enumerate(zip(sets_a, sets_b)):
-            overlap = len(sa & sb) / len(sa)
-            assert overlap >= 0.7, (
-                f"Sample {b}: top-{top_k} beam overlap {overlap*100:.0f}% "
-                f"is below 70% threshold.\n"
-                f"  generate beams: {sorted(sa)}\n"
-                f"  decode beams:   {sorted(sb)}"
-            )
+        assert torch.equal(sids_a, sids_b)
+        torch.testing.assert_close(lp_a, lp_b, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
@@ -704,12 +634,11 @@ def test_generate_beam_decode_jagged_kv_matches_dense(
     codebook_sizes,
     batchsize,
 ):
-    """Cross-check use_jagged_kv=True vs the default dense+seqused_k path.
+    """Cross-check default packed K/V against the padded-K/V variant.
 
     Both should produce the same top-1 SID tuple per sample. Lower-ranked
-    beams may swap due to bf16 reduction-order differences (jagged prefill
-    runs FA with arbitrary_func instead of causal=True), so we use the same
-    relaxed thresholds as the generate() regression guard.
+    beams may swap due to bf16 reduction-order differences between dense and
+    varlen FA2, so we use relaxed thresholds.
     """
     init = _E2E_DEPS["init"]
     get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
@@ -1145,112 +1074,10 @@ class TestBeamIsolationMask:
                 ), f"target at pos {target_pos} can't see all history: {hist_visible.tolist()}"
 
 
-def _arbitrary_func_to_dense_jagged(
-    af: torch.Tensor, total_tokens: int
-) -> torch.Tensor:
-    """Expand a flattened (B=1) arbitrary_func tensor to a dense
-    [total_tokens, total_tokens] bool mask using the interval semantics:
-        valid(q, k) = (k < F0[q]) OR (F1[q] <= k < F2[q]) OR ...
-    """
-    assert af.dim() == 4 and af.shape[0] == 1 and af.shape[1] == 1
-    n_func = af.shape[2]
-    device = af.device
-    mask = torch.zeros(total_tokens, total_tokens, dtype=torch.bool, device=device)
-    kv_idx = torch.arange(total_tokens, device=device)
-    af2d = af[0, 0, :, :total_tokens]  # [n_func, total_tokens]
-    for q in range(total_tokens):
-        f0 = af2d[0, q].item()
-        row = kv_idx < f0
-        for iv in range((n_func - 1) // 2):
-            f_start = af2d[2 * iv + 1, q].item()
-            f_end = af2d[2 * iv + 2, q].item()
-            row = row | ((kv_idx >= f_start) & (kv_idx < f_end))
-        mask[q] = row
-    return mask
-
-
-@pytest.mark.parametrize("history_seqlens", [[4, 4], [3, 5], [1, 6, 4]])
-@pytest.mark.parametrize("num_target_region", [0, 2, 3])
-@pytest.mark.parametrize("candidate_length", [1, 3])
-def test_jagged_target_aware_builder_matches_dense(
-    history_seqlens, num_target_region, candidate_length
-):
-    """Vectorised builder must produce the same flattened mask as the
-    dense path (padded_target_aware_causal_mask + dense_to_jagged).
-
-    Covers variable-length history, beam_width 0/2/3, candidate_length 1/3.
-    """
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
-    try:
-        from attention_mask import (
-            build_jagged_target_aware_arbitrary_func,
-            dense_mask_to_jagged_arbitrary_func,
-            padded_target_aware_causal_mask,
-        )
-    finally:
-        sys.path.pop(0)
-
-    device = "cuda"
-    len(history_seqlens)
-    cl = candidate_length
-    W = num_target_region
-
-    # Per-sample concatenated layout: [hist_b, beam0(cl), ..., beam_{W-1}(cl)]
-    # Total per sample = hist_seqlen[b] + W * cl.
-    sample_lens = [hl + W * cl for hl in history_seqlens]
-    offsets = torch.tensor(
-        [0] + list(torch.tensor(sample_lens).cumsum(0).tolist()),
-        device=device,
-        dtype=torch.long,
-    )
-    total_tokens = int(offsets[-1].item())
-    history_t = torch.tensor(history_seqlens, device=device, dtype=torch.long)
-
-    # Vectorised path
-    af_fast = build_jagged_target_aware_arbitrary_func(
-        history_seqlen=history_t,
-        num_target_region=W,
-        target_max_seqlen_per_region=cl,
-        offsets=offsets,
-        total_tokens=total_tokens,
-    )
-
-    # Reference: build dense mask, then convert via dense_to_jagged.
-    # padded_target_aware_causal_mask uses a uniform max_history_seqlen,
-    # so we pad each sample to max(history_seqlens) + W*cl.
-    max_hist = max(history_seqlens)
-    dense_mask = padded_target_aware_causal_mask(
-        history_t,
-        max_hist,
-        W,
-        cl,
-    )
-    valid_dense = ~dense_mask  # [B, 1, max_hist+W*cl, max_hist+W*cl]
-    af_ref = dense_mask_to_jagged_arbitrary_func(
-        valid_dense,
-        offsets,
-        total_tokens,
-    )
-
-    fast_dense = _arbitrary_func_to_dense_jagged(af_fast, total_tokens)
-    ref_dense = _arbitrary_func_to_dense_jagged(af_ref, total_tokens)
-    assert torch.equal(fast_dense, ref_dense), (
-        f"vectorised builder mask differs from dense oracle.\n"
-        f"  diff at: {(fast_dense != ref_dense).nonzero(as_tuple=False).tolist()}"
-    )
-
-
 @pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
 @pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
 def test_generate_is_deterministic():
-    """generate() called twice on the same batch must produce identical SIDs.
-
-    A determinism prerequisite for any beam-level perturbation argument
-    (which would otherwise see noise from non-determinism). This is NOT
-    an actual perturbation invariance test — for that, see the
-    TestBeamIsolationMask geometric checks plus the equivalence-vs-decode
-    regression guard.
-    """
+    """Optimized generate() called twice must produce identical SIDs."""
     init = _E2E_DEPS["init"]
     get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
     ShardedEmbeddingConfig = _E2E_DEPS["ShardedEmbeddingConfig"]
@@ -1288,26 +1115,10 @@ def test_generate_is_deterministic():
         batch = _generate_random_batch(2, 32, cs, "hist_sids", "cand_sids")
         batch.to(torch.cuda.current_device())
 
-        # Run generate twice on the same batch — should be deterministic.
+        # generate() dispatches to generate_beam_decode() for this backend.
         with torch.no_grad():
             sids_a, _ = m.generate(batch)
             sids_b, _ = m.generate(batch)
         assert torch.equal(
             sids_a, sids_b
-        ), "generate is non-deterministic, perturbation test would be invalid"
-
-        # Test: replace each beam's first-step code with a different code and
-        # verify the other beams' final SIDs don't change. We simulate this
-        # by re-running generate but injecting a different selection at step 0
-        # for ONE specific beam, then comparing the OTHER beams' outputs.
-        # For simplicity here we do a structural check: the mask used in
-        # generate() must be padded_target_aware_causal_mask (verified by the
-        # mask unit test above), and we already test that
-        # generate_beam_decode produces equivalent results — which only works
-        # under proper beam isolation. So this test is a smoke check that
-        # generate() itself is deterministic, which is required for the
-        # perturbation argument to even make sense.
-        # If beam isolation is broken, generate is still deterministic but
-        # the per-beam outputs would be cross-contaminated; that case is
-        # caught by the structural mask unit test above and by the
-        # equivalence test (which compares to the truly isolated decode path).
+        ), "optimized generate() is non-deterministic"
