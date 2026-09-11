@@ -3,6 +3,8 @@ project(DynamicEmbInferenceOps LANGUAGES CXX CUDA)
 
 include(GNUInstallDirs)
 
+set(NVE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/nv-embedding-cache" CACHE PATH "NVE source root")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -42,6 +44,8 @@ message(STATUS "Found Torch ${TORCH_VERSION}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 set(INFERENCE_EMB_SOURCES
+    src/exportable_embedding/indexer_directory.cpp
+    src/exportable_embedding/indexer_ops.cu
     src/table_operation/lookup_torch_binding.cu
     src/table_operation/get_table_range_torch_binding.cu
     src/table_operation/expand_table_ids_torch_binding.cu
@@ -61,8 +65,10 @@ if(TORCH_CXX_FLAGS_LIST)
 endif()
 
 target_include_directories(inference_emb_ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/table_operation
+    ${NVE_ROOT}/third_party/json/include
     ${Python3_INCLUDE_DIRS}
     ${TORCH_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
@@ -111,3 +117,73 @@ install(TARGETS inference_emb_ops
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+option(DYNAMICEMB_BUILD_NVE_UPDATE "Build the NVE 26.07 Redis update runtime" OFF)
+if(DYNAMICEMB_BUILD_NVE_UPDATE)
+    set(NVE_LIB_DIR "/opt/nve/default/python/pynve" CACHE PATH "NVE 26.07 library directory")
+    set(NVTX_INCLUDE_DIR "/workspace/deps/NVTX/c/include" CACHE PATH "NVTX include directory")
+    find_library(NVE_TORCH_OPS_LIB nve-torch-ops PATHS "${NVE_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+    find_library(NVE_COMMON_LIB nve-common PATHS "${NVE_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+    if(NOT NVE_CACHE_LINE_SIZE)
+        execute_process(
+            COMMAND getconf LEVEL1_DCACHE_LINESIZE
+            OUTPUT_VARIABLE NVE_CACHE_LINE_SIZE
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+    endif()
+
+    add_library(inference_emb_update SHARED
+        src/exportable_embedding/incremental_update.cpp
+    )
+    set_source_files_properties(
+        src/exportable_embedding/incremental_update.cpp
+        PROPERTIES LANGUAGE CUDA
+    )
+    target_include_directories(inference_emb_update PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        "${NVE_ROOT}"
+        "${NVE_ROOT}/include"
+        "${NVE_ROOT}/third_party/json/include"
+        "${NVTX_INCLUDE_DIR}"
+        ${TORCH_INCLUDE_DIRS}
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    if(TORCH_CXX_FLAGS_LIST)
+        target_compile_options(inference_emb_update PRIVATE ${TORCH_CXX_FLAGS_LIST})
+    endif()
+    target_link_options(inference_emb_update PRIVATE "LINKER:--no-as-needed")
+    target_compile_definitions(inference_emb_update PRIVATE
+        NVE_FEATURE_HT_PART_FNV1A=1
+        NVE_FEATURE_HT_PART_MURMUR=1
+        NVE_FEATURE_HT_PART_RRXMRRXMSX0=1
+        NVE_FEATURE_HT_PART_STD_HASH=1
+        NVE_FEATURE_HT_MASK_64=1
+        NVE_FEATURE_HT_MASK_32=1
+        NVE_FEATURE_HT_MASK_16=1
+        NVE_FEATURE_HT_MASK_8=1
+        NVE_FEATURE_HT_KEY_64=1
+        NVE_FEATURE_HT_KEY_32=1
+        NVE_FEATURE_HT_KEY_16=1
+        NVE_FEATURE_HT_KEY_8=1
+        NVE_CACHE_LINE_SIZE=${NVE_CACHE_LINE_SIZE}
+    )
+    target_link_libraries(inference_emb_update PRIVATE
+        inference_emb_ops
+        ${TORCH_LIBRARIES}
+        CUDA::cudart
+        CUDA::cuda_driver
+        "${NVE_TORCH_OPS_LIB}"
+        "${NVE_COMMON_LIB}"
+    )
+    set_target_properties(inference_emb_update PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "inference_emb_update"
+    )
+    install(TARGETS inference_emb_update
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
