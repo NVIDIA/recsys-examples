@@ -1,4 +1,4 @@
-nvidia-cutlass-dsl==4.4.1
-quack-kernels==0.3.3
+nvidia-cutlass-dsl==4.5.2
+quack-kernels==0.4.1
 apache-tvm-ffi>=0.1.6
 torch-c-dlpack-ext
