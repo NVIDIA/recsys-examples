@@ -13,20 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-JaggedFlashAttnBlock: a self-contained GPT Transformer block that uses
-the arbitrary-mask FlashAttention CuTe path (`flash_attn.cute`) with
-``arbitrary_func`` mask encoding.
+JaggedFlashAttnBlock: the default single-GPU GPT Transformer block for SID-GR.
 
-This replaces Megatron-Core's TransformerBlock for the inference path
-used by ``SIDGRModel.generate_beam_decode``.
+Training and prefill use standard FA2 causal attention. Cached beam decode
+uses the repo-vendored ``gr_decode_atten`` CuTe kernel.
 
 Architecture per layer (standard pre-norm GPT):
-  Input → LayerNorm → QKV Projection → Flash Attention (arbitrary mask)
+  Input → LayerNorm → QKV Projection → Attention
         → Output Projection → Residual
         → LayerNorm → FFN → Residual → Output
 
+Causal training and prefill use the standard FA2 operators shipped in the
+base image. The optimized decode step calls the repo-vendored
+``gr_decode_atten`` CuTe DSL kernel directly.
+
 Reference: examples/hstu/modules/native_hstu_layer.py
 """
+
 import os
 import sys
 from typing import List, Optional, Tuple
@@ -35,12 +38,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# flash_attn imports are deferred to runtime (inside functions / __init__)
-# so that the module can be imported even without flash_attn installed.
+# Standard flash_attn imports are deferred to runtime so this module can be
+# imported in CPU-only development environments.
 
 # beam_decode_attn kernel import — deferred so module loads without the kernel.
 # Falls back to a pure-PyTorch reference implementation when the CuTe kernel
-# is not installed (requires ``quack`` / flash_attn CuTe DSL environment).
+# is not installed (the real kernel requires ``cutlass`` and ``quack``).
 _beam_decode_attn = None
 _beam_decode_attn_import_error: Optional[ImportError] = None
 
@@ -189,96 +192,6 @@ def _build_padded_context_kv(
     return k, v
 
 
-def build_block_sparsity(
-    arbitrary_func: torch.Tensor,
-    seqlen_q: int,
-    seqlen_k: int,
-    headdim: int,
-) -> Tuple[Optional[object], Optional[object]]:
-    """
-    Build forward (Q2K) and backward (K2Q) block sparsity indices from an
-    arbitrary_func tensor.
-
-    Returns (linear_k, linear_q) — either can be None if the CUDA extension
-    is not available (falls back to dense attention).
-    """
-    try:
-        import create_block_mask_cuda
-        from flash_attn.cute.block_sparsity import LinearBlockSparseTensorsTorch
-        from flash_attn.utils.tile_size import get_arch, get_tile_sizes_by_backend
-    except ImportError:
-        return None, None
-
-    arch = get_arch()
-    fwd_q_block, fwd_kv_block = get_tile_sizes_by_backend(
-        backend="dsl",
-        pass_type="forward",
-        arch=arch,
-        headdim=headdim,
-        is_causal=False,
-        is_local=False,
-        is_arbitrary=True,
-    )
-    bwd_q_block, bwd_kv_block = get_tile_sizes_by_backend(
-        backend="dsl",
-        pass_type="backward",
-        arch=arch,
-        headdim=headdim,
-        is_causal=False,
-        is_local=False,
-        is_arbitrary=True,
-    )
-
-    (
-        k_cnt,
-        k_off,
-        k_idx,
-        k_fcnt,
-        k_foff,
-        k_fidx,
-    ) = create_block_mask_cuda.create_q2k_csr_sparse_from_func(
-        arbitrary_func,
-        seqlen_q,
-        seqlen_k,
-        Q_BLOCK_SIZE=fwd_q_block,
-        KV_BLOCK_SIZE=fwd_kv_block,
-        check_q_boundary=True,
-    )
-    linear_k = LinearBlockSparseTensorsTorch(
-        mask_block_cnt=k_cnt,
-        mask_block_offset=k_off,
-        mask_block_idx=k_idx,
-        full_block_cnt=k_fcnt,
-        full_block_offset=k_foff,
-        full_block_idx=k_fidx,
-    )
-
-    (
-        q_cnt,
-        q_off,
-        q_idx,
-        q_fcnt,
-        q_foff,
-        q_fidx,
-    ) = create_block_mask_cuda.create_k2q_csr_sparse_from_func(
-        arbitrary_func,
-        seqlen_q,
-        seqlen_k,
-        Q_BLOCK_SIZE=bwd_q_block,
-        KV_BLOCK_SIZE=bwd_kv_block,
-    )
-    linear_q = LinearBlockSparseTensorsTorch(
-        mask_block_cnt=q_cnt,
-        mask_block_offset=q_off,
-        mask_block_idx=q_idx,
-        full_block_cnt=q_fcnt,
-        full_block_offset=q_foff,
-        full_block_idx=q_fidx,
-    )
-
-    return linear_k, linear_q
-
-
 class JaggedGPTLayer(nn.Module):
     """
     One Transformer layer with jagged Flash Attention.
@@ -288,11 +201,10 @@ class JaggedGPTLayer(nn.Module):
       x = x + FFN(LayerNorm(x))
 
     Q/K/V are produced by a single fused linear (same pattern as HSTU's
-    ``linear_uvqk``). Flash Attention is called with arbitrary_func for
-    tree-shaped beam search masks.
+    ``linear_uvqk``). Standard FA2 handles dense or varlen causal attention.
 
     Scope:
-        This is a self-contained, inference-only block. It owns its own
+        This is the default single-GPU SID-GR transformer block. It owns its own
         ``nn.Linear`` weights for Q/K/V/output/MLP and is **not** a
         drop-in replacement for Megatron-Core's ``TransformerBlock``.
         In particular it does not support tensor parallelism, sequence
@@ -301,11 +213,9 @@ class JaggedGPTLayer(nn.Module):
 
         Existing SID-GR checkpoints trained against Megatron-Core need
         weight migration before this block can be substituted in. That
-        migration is intentionally out of scope here — the goal of this
-        block is to give ``generate_beam_decode`` a fast,
-        kernel-friendly forward path on a single GPU. Production
-        deployment that needs TP/SP/FP8 should keep using the
-        Megatron-Core path or do the migration in a follow-up.
+        migration is intentionally out of scope here. Select the Megatron
+        reference backend when TP/SP/FP8 or Megatron checkpoint compatibility
+        is required.
     """
 
     def __init__(
@@ -313,26 +223,43 @@ class JaggedGPTLayer(nn.Module):
         hidden_size: int,
         num_attention_heads: int,
         ffn_hidden_size: int,
+        kv_channels: Optional[int] = None,
+        normalization: str = "LayerNorm",
         layernorm_epsilon: float = 1e-5,
         hidden_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
         activation: str = "gelu",
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = hidden_size // num_attention_heads
+        self.head_dim = (
+            kv_channels
+            if kv_channels is not None
+            else hidden_size // num_attention_heads
+        )
+        self.attention_size = self.num_heads * self.head_dim
         self.ffn_hidden_size = ffn_hidden_size
+        if normalization == "RMSNorm":
+            norm_cls = nn.RMSNorm
+        elif normalization == "LayerNorm":
+            norm_cls = nn.LayerNorm
+        else:
+            raise ValueError(f"Unsupported normalization: {normalization!r}")
+        self.attention_dropout = attention_dropout
 
         # --- Attention sub-layers ---
-        self.input_layernorm = nn.LayerNorm(hidden_size, eps=layernorm_epsilon)
-        # Fused QKV projection: hidden_size → 3 * hidden_size
-        self.linear_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.input_layernorm = norm_cls(hidden_size, eps=layernorm_epsilon)
+        # Fused QKV projection: hidden_size → 3 * heads * head_dim
+        self.linear_qkv = nn.Linear(
+            hidden_size, 3 * self.attention_size, bias=False
+        )
         # Output projection after attention
-        self.linear_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.linear_proj = nn.Linear(self.attention_size, hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(hidden_dropout)
 
         # --- FFN sub-layers ---
-        self.pre_mlp_layernorm = nn.LayerNorm(hidden_size, eps=layernorm_epsilon)
+        self.pre_mlp_layernorm = norm_cls(hidden_size, eps=layernorm_epsilon)
         self.mlp_fc1 = nn.Linear(hidden_size, ffn_hidden_size, bias=False)
         self.mlp_fc2 = nn.Linear(ffn_hidden_size, hidden_size, bias=False)
         self.mlp_dropout = nn.Dropout(hidden_dropout)
@@ -347,55 +274,53 @@ class JaggedGPTLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        arbitrary_func: Optional[torch.Tensor] = None,
-        linear_k: Optional[object] = None,
-        linear_q: Optional[object] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
-            hidden_states: [batch, seqlen, hidden_size]
-            arbitrary_func: [batch, 1, n_func, seqlen+256] int32 mask encoding.
-            linear_k: forward block sparsity (Q2K).
-            linear_q: backward block sparsity (K2Q).
+            hidden_states: ``[1, total_tokens, hidden_size]`` when
+                ``cu_seqlens`` is set, otherwise dense
+                ``[batch, seqlen, hidden_size]``.
+            cu_seqlens: ``[batch + 1]`` int32 offsets for varlen causal FA2.
+            max_seqlen: maximum sequence length, required with ``cu_seqlens``.
 
         Returns:
             hidden_states: [batch, seqlen, hidden_size]
         """
-        # ---- Attention block ----
-        residual = hidden_states
-        x = self.input_layernorm(hidden_states)
-
-        # QKV projection: [B, S, H] → [B, S, 3*H]
-        qkv = self.linear_qkv(x)
-        # Reshape to [B, S, 3, num_heads, head_dim] and unbind
-        B, S, _ = qkv.shape
-        qkv = qkv.view(B, S, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)  # each [B, S, num_heads, head_dim]
-
-        # Flash Attention requires fp16/bf16 inputs
-        from flash_attn.cute.interface import flash_attn_func
+        residual, q, k, v = self._qkv_projection(hidden_states)
 
         input_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
             q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
 
-        if arbitrary_func is not None:
-            attn_out, _ = flash_attn_func(
-                q,
-                k,
-                v,
+        if cu_seqlens is not None:
+            if q.shape[0] != 1:
+                raise ValueError("cu_seqlens mode expects B=1 flattened input")
+            if max_seqlen is None:
+                raise ValueError("max_seqlen is required when cu_seqlens is set")
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+            attn_out = flash_attn_varlen_func(
+                q.squeeze(0),
+                k.squeeze(0),
+                v.squeeze(0),
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                dropout_p=self.attention_dropout if self.training else 0.0,
                 softmax_scale=self.head_dim ** (-0.5),
-                causal=False,
-                arbitrary=True,
-                linear_k_block_sparse_tensors=linear_k,
-                linear_q_block_sparse_tensors=linear_q,
-                aux_tensors=[arbitrary_func],
-            )
+                causal=True,
+            ).unsqueeze(0)
         else:
-            attn_out, _ = flash_attn_func(
+            from flash_attn.flash_attn_interface import flash_attn_func
+
+            attn_out = flash_attn_func(
                 q,
                 k,
                 v,
+                dropout_p=self.attention_dropout if self.training else 0.0,
                 softmax_scale=self.head_dim ** (-0.5),
                 causal=True,
             )
@@ -403,22 +328,7 @@ class JaggedGPTLayer(nn.Module):
         if attn_out.dtype != input_dtype:
             attn_out = attn_out.to(input_dtype)
 
-        # attn_out: [B, S, num_heads, head_dim] → [B, S, hidden_size]
-        attn_out = attn_out.reshape(B, S, self.hidden_size)
-        attn_out = self.linear_proj(attn_out)
-        attn_out = self.attn_dropout(attn_out)
-        hidden_states = residual + attn_out
-
-        # ---- FFN block ----
-        residual = hidden_states
-        x = self.pre_mlp_layernorm(hidden_states)
-        x = self.mlp_fc1(x)
-        x = self.activation_fn(x)
-        x = self.mlp_fc2(x)
-        x = self.mlp_dropout(x)
-        hidden_states = residual + x
-
-        return hidden_states
+        return self._post_attention(residual, attn_out)
 
     def _qkv_projection(
         self, hidden_states: torch.Tensor
@@ -441,7 +351,7 @@ class JaggedGPTLayer(nn.Module):
     ) -> torch.Tensor:
         """Shared post-attention: output proj → residual → FFN."""
         leading = attn_out.shape[:-2]
-        attn_out = attn_out.reshape(*leading, self.hidden_size)
+        attn_out = attn_out.reshape(*leading, self.attention_size)
         attn_out = self.linear_proj(attn_out)
         attn_out = self.attn_dropout(attn_out)
         hidden_states = residual + attn_out
@@ -457,30 +367,24 @@ class JaggedGPTLayer(nn.Module):
     def prefill(
         self,
         hidden_states: torch.Tensor,
-        arbitrary_func: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
-        linear_k: Optional[object] = None,
-        linear_q: Optional[object] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass that also returns the K/V cache for this layer.
 
-        Three mutually exclusive attention modes:
+        Two attention modes:
           1. ``cu_seqlens`` is set → flattened jagged input, plain
              per-sample causal. Uses upstream Tri Dao FA2
              ``flash_attn_varlen_func`` (``flash_attn.flash_attn_interface``),
              which is shipped pre-built in the nvcr base image and
              supports SM80+. ``max_seqlen`` must be supplied (FA2
              requires it; cute could infer but we don't use cute here).
-          2. ``arbitrary_func`` is set → generic mask (e.g. beam
-             isolation in ``generate()``). Uses the cute FA
-             arbitrary-mask path (SM90+ only).
-          3. Neither → dense per-batch causal (``[B, S, ...]`` input,
-             padded). Uses cute FA ``causal=True`` (SM90+ only).
+          2. Otherwise → dense per-batch causal (``[B, S, ...]`` input,
+             padded). Uses standard FA2 ``flash_attn_func``.
 
         Args:
             hidden_states: ``[1, total_tokens, hidden]`` for mode 1,
-                ``[B, S, hidden]`` for modes 2/3.
+                ``[B, S, hidden]`` for mode 2.
             cu_seqlens: ``[B + 1]`` int32 offsets for mode 1.
             max_seqlen: max sequence length across the batch, required
                 in mode 1.
@@ -489,9 +393,6 @@ class JaggedGPTLayer(nn.Module):
             hidden_states: same leading shape as input.
             (k_cache, v_cache): each ``[..., num_heads, head_dim]``.
         """
-        assert not (
-            arbitrary_func is not None and cu_seqlens is not None
-        ), "arbitrary_func and cu_seqlens are mutually exclusive"
         residual, q, k, v = self._qkv_projection(hidden_states)
 
         input_dtype = q.dtype
@@ -520,33 +421,20 @@ class JaggedGPTLayer(nn.Module):
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
+                dropout_p=self.attention_dropout if self.training else 0.0,
                 softmax_scale=self.head_dim ** (-0.5),
                 causal=True,
             )
             attn_out = attn_flat.unsqueeze(0)
-        elif arbitrary_func is not None:
-            # Mode 2: arbitrary mask (e.g. beam isolation).
-            from flash_attn.cute.interface import flash_attn_func
-
-            attn_out, _ = flash_attn_func(
-                q,
-                k,
-                v,
-                softmax_scale=self.head_dim ** (-0.5),
-                causal=False,
-                arbitrary=True,
-                linear_k_block_sparse_tensors=linear_k,
-                linear_q_block_sparse_tensors=linear_q,
-                aux_tensors=[arbitrary_func],
-            )
         else:
-            # Mode 3: dense per-batch causal fast path.
-            from flash_attn.cute.interface import flash_attn_func
+            # Mode 2: dense per-batch causal fast path.
+            from flash_attn.flash_attn_interface import flash_attn_func
 
-            attn_out, _ = flash_attn_func(
+            attn_out = flash_attn_func(
                 q,
                 k,
                 v,
+                dropout_p=self.attention_dropout if self.training else 0.0,
                 softmax_scale=self.head_dim ** (-0.5),
                 causal=True,
             )
@@ -691,13 +579,11 @@ class JaggedGPTLayer(nn.Module):
 
 
 class JaggedFlashAttnBlock(nn.Module):
-    """
-    A stack of JaggedGPTLayers — the GPT decoder block using the
-    arbitrary-mask FlashAttention path with ``arbitrary_func`` masks.
+    """A stack of default FA2/CuTe SID-GR transformer layers.
 
-    This module owns its own weights (not shared with Megatron-Core).
-    It is used in place of Megatron's TransformerBlock for the
-    inference path used by ``SIDGRModel.generate_beam_decode``.
+    This module owns its own weights (not shared with Megatron-Core). Standard
+    FA2 is used for training and prefill; ``gr_decode_atten`` is used for
+    cached beam decode.
 
     Usage::
 
@@ -708,7 +594,7 @@ class JaggedFlashAttnBlock(nn.Module):
             ffn_hidden_size=1024,
         )
         # padded input: [B, S, D]
-        output = block(hidden_states, arbitrary_func=af, seqlen=S)
+        output = block(hidden_states)
     """
 
     def __init__(
@@ -717,61 +603,60 @@ class JaggedFlashAttnBlock(nn.Module):
         hidden_size: int,
         num_attention_heads: int,
         ffn_hidden_size: int,
+        kv_channels: Optional[int] = None,
+        normalization: str = "LayerNorm",
         layernorm_epsilon: float = 1e-5,
         hidden_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
         activation: str = "gelu",
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.head_dim = hidden_size // num_attention_heads
+        self.head_dim = (
+            kv_channels
+            if kv_channels is not None
+            else hidden_size // num_attention_heads
+        )
         self.layers = nn.ModuleList(
             [
                 JaggedGPTLayer(
                     hidden_size=hidden_size,
                     num_attention_heads=num_attention_heads,
                     ffn_hidden_size=ffn_hidden_size,
+                    kv_channels=kv_channels,
+                    normalization=normalization,
                     layernorm_epsilon=layernorm_epsilon,
                     hidden_dropout=hidden_dropout,
+                    attention_dropout=attention_dropout,
                     activation=activation,
                 )
                 for _ in range(num_layers)
             ]
         )
-        self.final_layernorm = nn.LayerNorm(hidden_size, eps=layernorm_epsilon)
+        norm_cls = nn.RMSNorm if normalization == "RMSNorm" else nn.LayerNorm
+        self.final_layernorm = norm_cls(hidden_size, eps=layernorm_epsilon)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        arbitrary_func: Optional[torch.Tensor] = None,
-        seqlen: Optional[int] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
-            hidden_states: [batch, seqlen, hidden_size] padded input.
-            arbitrary_func: [batch, 1, n_func, seqlen+256] int32 mask tensor.
-                If None, uses standard causal attention.
-            seqlen: sequence length (used for block sparsity construction).
-                If None, inferred from hidden_states.shape[1].
+            hidden_states: flattened ``[1, total_tokens, hidden_size]`` when
+                ``cu_seqlens`` is set, otherwise padded ``[B, S, hidden_size]``.
+            cu_seqlens: offsets for standard FA2 varlen causal attention.
+            max_seqlen: maximum sequence length, required with ``cu_seqlens``.
 
         Returns:
             hidden_states: [batch, seqlen, hidden_size]
         """
-        if seqlen is None:
-            seqlen = hidden_states.shape[1]
-
-        # Build block sparsity from arbitrary_func (once per forward, shared by all layers)
-        linear_k, linear_q = None, None
-        if arbitrary_func is not None:
-            linear_k, linear_q = build_block_sparsity(
-                arbitrary_func, seqlen, seqlen, self.head_dim
-            )
-
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
-                arbitrary_func=arbitrary_func,
-                linear_k=linear_k,
-                linear_q=linear_q,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
 
         hidden_states = self.final_layernorm(hidden_states)
@@ -780,52 +665,31 @@ class JaggedFlashAttnBlock(nn.Module):
     def prefill(
         self,
         hidden_states: torch.Tensor,
-        arbitrary_func: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
-        seqlen: Optional[int] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward through all layers, returning per-layer KV caches.
 
         Args:
             hidden_states: ``[1, total_tokens, hidden]`` when ``cu_seqlens``
                 is set, otherwise ``[B, S, hidden]``.
-            arbitrary_func: generic mask (mutually exclusive with
-                ``cu_seqlens``).
             cu_seqlens: ``[B + 1]`` int32 offsets for the varlen + causal
                 fast path (jagged input, per-sample causal). Standard
                 FA2 ``flash_attn_varlen_func`` requires ``max_seqlen``
                 to be supplied alongside.
             max_seqlen: max sequence length across the batch; required
                 when ``cu_seqlens`` is set.
-            seqlen: only used for ``arbitrary_func`` block-sparsity
-                construction; ignored otherwise.
 
         Returns:
             hidden_states: same leading shape as input.
             kv_caches: list of (k, v) per layer.
         """
-        assert not (
-            arbitrary_func is not None and cu_seqlens is not None
-        ), "arbitrary_func and cu_seqlens are mutually exclusive"
-        if seqlen is None:
-            seqlen = hidden_states.shape[1]
-
-        linear_k, linear_q = None, None
-        if arbitrary_func is not None:
-            linear_k, linear_q = build_block_sparsity(
-                arbitrary_func, seqlen, seqlen, self.head_dim
-            )
-
         kv_caches = []
         for layer in self.layers:
             hidden_states, kv = layer.prefill(
                 hidden_states,
-                arbitrary_func=arbitrary_func,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                linear_k=linear_k,
-                linear_q=linear_q,
             )
             kv_caches.append(kv)
 
@@ -891,23 +755,7 @@ class JaggedFlashAttnBlock(nn.Module):
 
 
 class JaggedTransformerBlock(nn.Module):
-    """
-    Wrapper that accepts jagged (variable-length) hidden states and a
-    pre-built arbitrary_func tensor in the flattened (B=1) coordinate space.
-
-    All batch sequences are concatenated into a single sequence of length
-    *total_tokens* (no padding).  The arbitrary_func encodes both the
-    block-diagonal batch isolation and the desired attention pattern
-    (causal, target-grouped, etc.).
-
-    Internally:
-      1. Reshape jagged [total_tokens, D] → [1, total_tokens, D]
-      2. Forward through JaggedFlashAttnBlock (FA with arbitrary mask)
-      3. Reshape [1, total_tokens, D] → [total_tokens, D]
-
-    This is intended to replace Megatron-Core's TransformerBlock in
-    SIDGRDecoder.
-    """
+    """Standard FA2 varlen wrapper for jagged ``[total_tokens, D]`` input."""
 
     def __init__(
         self,
@@ -915,8 +763,11 @@ class JaggedTransformerBlock(nn.Module):
         hidden_size: int,
         num_attention_heads: int,
         ffn_hidden_size: int,
+        kv_channels: Optional[int] = None,
+        normalization: str = "LayerNorm",
         layernorm_epsilon: float = 1e-5,
         hidden_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
         activation: str = "gelu",
     ):
         super().__init__()
@@ -925,33 +776,36 @@ class JaggedTransformerBlock(nn.Module):
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             ffn_hidden_size=ffn_hidden_size,
+            kv_channels=kv_channels,
+            normalization=normalization,
             layernorm_epsilon=layernorm_epsilon,
             hidden_dropout=hidden_dropout,
+            attention_dropout=attention_dropout,
             activation=activation,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        arbitrary_func: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: jagged [total_tokens, hidden_size].
-            arbitrary_func: [1, 1, n_func, total_tokens + pad] int32 tensor
-                in flattened (B=1) coordinate space, encoding both batch
-                isolation and the attention pattern.
+            cu_seqlens: [batch + 1] int32 cumulative offsets.
+            max_seqlen: maximum sequence length in the batch.
 
         Returns:
             jagged output [total_tokens, hidden_size].
         """
-        total_tokens = hidden_states.shape[0]
-
         # [total_tokens, D] → [1, total_tokens, D]
         flat_input = hidden_states.unsqueeze(0)
 
         output = self.block(
-            flat_input, arbitrary_func=arbitrary_func, seqlen=total_tokens
+            flat_input,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
 
         # [1, total_tokens, D] → [total_tokens, D]

@@ -36,9 +36,6 @@ from modules.gpt_loss_module import GPTSIDLossModule
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 from .attention_mask import (
-    build_jagged_causal_arbitrary_func,
-    build_jagged_target_aware_arbitrary_func,
-    dense_mask_to_jagged_arbitrary_func,
     padded_causal_mask_with_optional_bos,
     padded_target_aware_causal_mask,
 )
@@ -96,12 +93,11 @@ class SIDGRDecoder(MegatronModule):
 
     Supports two backend modes controlled by *use_jagged_flash_attn*:
 
-    * **True** (default) — ``JaggedTransformerBlock``: flattens all batch
-      sequences into one (B=1) and uses the arbitrary-mask FlashAttention
-      path (``flash_attn.cute``) with ``arbitrary_func`` mask encoding.
-      Zero padding.
-    * **False** — Megatron-Core ``TransformerBlock``: pads jagged to dense,
-      uses ``DotProductAttention`` with a dense arbitrary attention mask.
+    * **True** (default) — ``JaggedTransformerBlock``: standard FA2 varlen
+      causal attention for training/prefill and the repo-vendored CuTe DSL
+      kernel for beam decode.
+    * **False** (reference) — Megatron-Core ``TransformerBlock``: pads jagged
+      to dense and uses ``DotProductAttention`` with a dense attention mask.
     """
 
     def __init__(
@@ -113,7 +109,7 @@ class SIDGRDecoder(MegatronModule):
         ] = "learned_absolute",
         relative_attention_num_buckets: int = 32,
         relative_attention_max_distance: int = 128,
-        use_jagged_flash_attn: bool = False,
+        use_jagged_flash_attn: bool = True,
     ):
         super().__init__(config=decoder_config)
 
@@ -132,12 +128,23 @@ class SIDGRDecoder(MegatronModule):
         )
 
         if use_jagged_flash_attn:
+            if self.config.tensor_model_parallel_size != 1:
+                raise ValueError(
+                    "The default FA2 + gr_decode_atten backend supports only "
+                    "tensor_model_parallel_size=1. Set "
+                    "use_jagged_flash_attn=False for the Megatron reference "
+                    "backend."
+                )
             self.decoder = JaggedTransformerBlock(
                 num_layers=self.config.num_layers,
                 hidden_size=self.config.hidden_size,
                 num_attention_heads=self.config.num_attention_heads,
                 ffn_hidden_size=self.config.ffn_hidden_size,
+                kv_channels=self.config.kv_channels,
+                normalization=self.config.normalization,
                 layernorm_epsilon=getattr(self.config, "layernorm_epsilon", 1e-5),
+                hidden_dropout=self.config.hidden_dropout,
+                attention_dropout=self.config.attention_dropout,
             )
         else:
             self.decoder = TransformerBlock(
@@ -146,7 +153,7 @@ class SIDGRDecoder(MegatronModule):
             )
 
     def get_jagged_flash_attn_block(self):
-        """Return the inner JaggedFlashAttnBlock used by generate_beam_decode.
+        """Return the inner default FA2/CuTe transformer block.
 
         Raises if this decoder was constructed without use_jagged_flash_attn.
         """
@@ -164,13 +171,17 @@ class SIDGRDecoder(MegatronModule):
         *,
         offsets: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
-        arbitrary_func: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         if self.use_jagged_flash_attn:
+            if offsets is None or max_seqlen is None:
+                raise ValueError(
+                    "FA2 varlen backend requires offsets and max_seqlen"
+                )
             return self.decoder(
                 hidden_states=hidden_states,
-                arbitrary_func=arbitrary_func,
+                cu_seqlens=offsets.to(torch.int32),
+                max_seqlen=max_seqlen,
             )
         else:
             # mcore path: expects dense [S, B, D] input
@@ -205,7 +216,7 @@ class SIDGRModel(MegatronModule):
         top_k_for_generation: int = 10,  # this is used for eval
         eval_metrics: Tuple[str, ...] = (),  # this is used for eval
         share_lm_head_across_hierarchies: bool = True,
-        use_jagged_flash_attn: bool = False,
+        use_jagged_flash_attn: bool = True,
     ):
         super(SIDGRModel, self).__init__(config=decoder_config)
         assert (
@@ -549,59 +560,43 @@ class SIDGRModel(MegatronModule):
         input_offsets: torch.Tensor,
         input_max_seqlen: int,
         attention_mask: Optional[torch.Tensor] = None,
-        arbitrary_func: Optional[torch.Tensor] = None,
         *,
         default_mask_add_bos_to_history: Optional[bool] = None,
     ) -> torch.Tensor:
         """
-        Jagged in/out. Routes Megatron-Core vs jagged Flash Attention.
+        Jagged in/out. Routes Megatron-Core vs the beam-decode transformer.
 
-        If both ``attention_mask`` and ``arbitrary_func`` are omitted, builds
-        the usual causal mask for the active backend (same behavior as before
-        the explicit-mask refactor). Pass either tensor to override.
-
-        * FA path:    ``arbitrary_func`` (B=1 flattened arbitrary mask).
-        * mcore path: ``attention_mask`` (dense ``[B, 1, N, N]``).
+        The default FA2 path uses ``input_offsets`` directly for varlen causal
+        attention. The Megatron reference path uses a dense
+        ``attention_mask`` and builds one when it is omitted.
 
         ``default_mask_add_bos_to_history`` controls optional-BOS layout for the
         built mcore mask: ``None`` uses ``self.add_bos_to_history_for_training``
         (training-style); ``generate`` passes ``False``.
         """
-        if attention_mask is None and arbitrary_func is None:
-            if self.decoder.use_jagged_flash_attn:
-                total_tokens = int(input_offsets[-1].item())
-                arbitrary_func = build_jagged_causal_arbitrary_func(
-                    input_offsets, total_tokens
-                )
-            else:
-                add_bos = (
-                    self.add_bos_to_history_for_training
-                    if default_mask_add_bos_to_history is None
-                    else default_mask_add_bos_to_history
-                )
-                attention_mask = padded_causal_mask_with_optional_bos(
-                    input_offsets,
-                    input_max_seqlen,
-                    add_bos_to_history=add_bos,
-                    bos_interval=self._num_hierarchies,
-                )
-
         if self.decoder.use_jagged_flash_attn:
-            # If caller provided a dense mask but we're on the jagged FA
-            # path, convert it to a flattened (B=1) arbitrary_func.
-            if arbitrary_func is None:
-                assert attention_mask is not None, (
-                    "decoder_step: at least one of attention_mask / "
-                    "arbitrary_func must be set"
-                )
-                total_tokens = int(input_offsets[-1].item())
-                valid_mask = ~attention_mask
-                arbitrary_func = dense_mask_to_jagged_arbitrary_func(
-                    valid_mask, input_offsets, total_tokens
+            if attention_mask is not None:
+                raise ValueError(
+                    "Explicit attention masks are supported only by the "
+                    "Megatron reference backend"
                 )
             return self.decoder(
                 hidden_states=input_hidden_states,
-                arbitrary_func=arbitrary_func,
+                offsets=input_offsets,
+                max_seqlen=input_max_seqlen,
+            )
+
+        if attention_mask is None:
+            add_bos = (
+                self.add_bos_to_history_for_training
+                if default_mask_add_bos_to_history is None
+                else default_mask_add_bos_to_history
+            )
+            attention_mask = padded_causal_mask_with_optional_bos(
+                input_offsets,
+                input_max_seqlen,
+                add_bos_to_history=add_bos,
+                bos_interval=self._num_hierarchies,
             )
         assert attention_mask is not None
         return self.decoder(
@@ -615,7 +610,6 @@ class SIDGRModel(MegatronModule):
         self,
         batch: GPTSIDBatch,
         attention_mask: Optional[torch.Tensor] = None,
-        arbitrary_func: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. prepare embeddings: embedding lookup + history, bos and candidate concat
         (
@@ -634,7 +628,6 @@ class SIDGRModel(MegatronModule):
             input_offsets,
             input_max_seqlen,
             attention_mask=attention_mask,
-            arbitrary_func=arbitrary_func,
         )
         # 3. postprocess: only keep the candidate hidden states
         candidate_hidden_states = self._postprocess_output(
@@ -682,15 +675,20 @@ class SIDGRModel(MegatronModule):
         self,
         batch: GPTSIDBatch,
         attention_mask: Optional[torch.Tensor] = None,
-        arbitrary_func: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate SIDs using the configured backend.
+
+        The default FA2 backend dispatches to the KV-cache
+        :meth:`generate_beam_decode` path. The full-prefix implementation below
+        is retained only as the Megatron reference backend.
         """
-        Generate the output sids for the given batch. The generation will autogressively generate the output sids with a constrained fixed-width beam search strategy.
-        Args:
-          batch (GPTSIDBatch): The batch of data.
-        Returns:
-          torch.Tensor: The generated sids.
-        """
+        if self.decoder.use_jagged_flash_attn:
+            if attention_mask is not None:
+                raise ValueError(
+                    "Explicit attention masks are supported only by the "
+                    "Megatron reference backend"
+                )
+            return self.generate_beam_decode(batch)
 
         # 0. prepare history and bos embeddings. Note that we do not append bos to history.
         (
@@ -772,46 +770,25 @@ class SIDGRModel(MegatronModule):
                     dtype=input_offsets.dtype,
                 )
 
-            # 2. Build the beam-isolating attention mask for this step.
+            # 2. Build the Megatron reference beam-isolating mask.
             # Each beam is its own "target region" of length candidate_length
             # so beams don't see each other's tokens. At step 0 there are no
             # generated codes yet (just history+BOS), so num_target_region=0.
-            # If the caller passed an explicit mask/arbitrary_func via the
-            # generate() args, honour it; otherwise build the proper one.
+            # If the caller passed an explicit mask, honour it.
             step_attention_mask = attention_mask
-            step_arbitrary_func = arbitrary_func
-            if step_attention_mask is None and step_arbitrary_func is None:
-                if self.decoder.use_jagged_flash_attn:
-                    # Direct vectorised build of the flattened arbitrary_func.
-                    # Avoids materialising the dense [B, 1, N, N] mask and
-                    # then converting it via a Python loop, which is two
-                    # orders of magnitude slower for typical seqlens.
-                    total_tokens = int(cated_offsets[-1].item())
-                    history_seqlen = torch.diff(input_offsets)
-                    # The flattened sequence layout is [hist+BOS, beam0, ...]
-                    # so the per-sample "history" length here includes BOS,
-                    # which is exactly torch.diff(input_offsets).
-                    step_arbitrary_func = build_jagged_target_aware_arbitrary_func(
-                        history_seqlen=history_seqlen,
-                        num_target_region=(0 if i == 0 else topk_prev_step),
-                        target_max_seqlen_per_region=candidate_length,
-                        offsets=cated_offsets,
-                        total_tokens=total_tokens,
-                    )
-                else:
-                    step_attention_mask = padded_target_aware_causal_mask(
-                        torch.diff(input_offsets),
-                        input_max_seqlen,
-                        0 if i == 0 else topk_prev_step,
-                        candidate_length,
-                    )
+            if step_attention_mask is None:
+                step_attention_mask = padded_target_aware_causal_mask(
+                    torch.diff(input_offsets),
+                    input_max_seqlen,
+                    0 if i == 0 else topk_prev_step,
+                    candidate_length,
+                )
 
             jagged_output_hidden_states = self.decoder_step(
                 cated_hidden_states,
                 cated_offsets,
                 cated_max_seqlen,
                 attention_mask=step_attention_mask,
-                arbitrary_func=step_arbitrary_func,
                 default_mask_add_bos_to_history=False,
             )
             # remove history[batchsize * topk_last_step * max(1,i), embedding_dim]
@@ -912,11 +889,12 @@ class SIDGRModel(MegatronModule):
                 ``cu_seqlens``) and the resulting jagged
                 ``[total_k, H, D]`` K/V caches are fed to the kernel via
                 ``cu_seqlens_k``. No padding compute anywhere.
-                ``False`` is a legacy fallback that pads history to
+                ``False`` selects a padded context-KV variant that pads history to
                 ``[B, max_seqlen, D]`` and uses ``seqused_k`` to mask
                 pad positions; measured 17 – 48 % slower at ``B=16``
                 across ``hist ∈ {256, 1024, 2048}`` and kept only for
-                callers that already produce padded inputs.
+                callers that already produce padded inputs and kernel-layout
+                comparisons.
                 Requires ``backend="3kernel"``.
         """
         # Backend whitelist: the kernel's interface silently treats any
@@ -992,9 +970,9 @@ class SIDGRModel(MegatronModule):
                     "beam_decode_attn kernel; the PyTorch reference "
                     "fallback does not implement jagged context K/V "
                     "(it only raises NotImplementedError when actually "
-                    "called). Ensure corelib/gr_decode_atten is on "
-                    "PYTHONPATH (Docker image sets this automatically), "
-                    "or use use_jagged_kv=False."
+                    "called). Ensure the vendored corelib/gr_decode_atten "
+                    "directory is present in the repository checkout, or "
+                    "use use_jagged_kv=False."
                 )
             try:
                 _kernel_sig = inspect.signature(kernel)
@@ -1067,10 +1045,7 @@ class SIDGRModel(MegatronModule):
             # stream through FA's `flash_attn_varlen_func` fast path. The
             # K/V caches that fall out are already jagged [total_tokens, H, D]
             # — exactly the layout the kernel expects when cu_seqlens_k is
-            # supplied. We hand cu_seqlens directly to FA (varlen + causal)
-            # instead of going through arbitrary_func + block-sparsity, which
-            # is ~6× slower at hist=2048 for the same semantics.
-            total_tokens = int(input_offsets[-1].item())
+            # supplied. We hand cu_seqlens directly to FA2 (varlen + causal).
             flat_history = history_embeddings.unsqueeze(0).to(
                 self._training_dtype
             )  # [1, total_tokens, D]
@@ -1078,7 +1053,6 @@ class SIDGRModel(MegatronModule):
                 flat_history,
                 cu_seqlens=input_offsets.to(torch.int32),
                 max_seqlen=input_max_seqlen,
-                seqlen=total_tokens,
             )
             prefill_output = prefill_output.squeeze(0)  # [total_tokens, D]
             context_kv_caches = [
@@ -1102,7 +1076,7 @@ class SIDGRModel(MegatronModule):
                 .to(self._training_dtype)
             )
             prefill_output, context_kv_caches = fa_block.prefill(
-                padded_history, arbitrary_func=None, seqlen=input_max_seqlen
+                padded_history
             )
             bos_positions = (history_seqlens - 1).clamp(min=0)  # [B]
             bos_hidden = prefill_output[

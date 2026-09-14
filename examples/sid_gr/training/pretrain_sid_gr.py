@@ -119,6 +119,7 @@ def main():
         top_k_for_generation=trainer_args.top_k_for_generation,
         eval_metrics=trainer_args.eval_metrics,
         share_lm_head_across_hierarchies=network_args.share_lm_head_across_hierarchies,
+        use_jagged_flash_attn=network_args.use_jagged_flash_attn,
     )
 
     optimizer_param = create_optimizer_params(optimizer_args)

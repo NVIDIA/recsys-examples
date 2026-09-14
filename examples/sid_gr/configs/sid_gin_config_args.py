@@ -234,6 +234,8 @@ class NetworkArgs:
         dtype_str (str): Data type: "bfloat16" or "float16". Default: "bfloat16".
         share_lm_head_across_hierarchies (bool): Whether to share language model head
             across hierarchies. Default: True.
+        use_jagged_flash_attn (bool): Use the default FA2 + gr_decode_atten
+            backend. Set to False only for the Megatron reference backend.
     """
 
     num_layers: int
@@ -247,6 +249,7 @@ class NetworkArgs:
 
     dtype_str: str = "bfloat16"
     share_lm_head_across_hierarchies: bool = True
+    use_jagged_flash_attn: bool = True
 
 
 @gin.configurable

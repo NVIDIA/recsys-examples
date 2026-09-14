@@ -81,19 +81,23 @@ The decoder supports two attention backends, controlled by `use_jagged_flash_att
 
 | Backend | Flag | Input Format | Mask Format | Dependency |
 |---------|------|-------------|-------------|------------|
-| Megatron-Core `TransformerBlock` | `False` | Padded dense `[S, B, D]` | Dense `[B, 1, N, N]` | megatron-core |
-| `JaggedTransformerBlock` (FA) | `True` | Flattened `[1, total_tokens, D]` (zero padding) | `arbitrary_func` interval encoding | [FlashAttention (arbitrary_mask branch)](https://github.com/jiayus-nvidia/flash-attention/tree/arbitrary_mask) |
+| `JaggedTransformerBlock` (default) | `True` | Packed `[total_tokens, D]` | FA2 varlen causal | standard FlashAttention + vendored `gr_decode_atten` |
+| Megatron-Core reference | `False` | Padded dense `[S, B, D]` | Dense `[B, 1, N, N]` | megatron-core |
 
-The FA backend flattens all batch sequences into a single sequence (B=1) and encodes the attention pattern via `arbitrary_func`. Block sparsity skips masked regions automatically. The caller is responsible for building the `arbitrary_func` or `attention_mask` tensor.
+Training and causal prefill use the standard FA2 package from the Docker base
+image. `generate()` defaults to a single FA2 prefill plus cached beam decode
+through the repo-vendored CuTe DSL kernel. The former arbitrary-mask
+FlashAttention dependency and compatibility API have been removed.
+
+Set `NetworkArgs.use_jagged_flash_attn = False` only when the Megatron
+reference path is needed. The default block is currently single-GPU and does
+not provide Megatron TP/SP/FP8 or Megatron-shaped checkpoint compatibility.
 
 ## Known Limitations
 
 **This implementation is under active development.**
 
-- **Beam search**: `generate()` does not use a KV cache and re-runs
-  the transformer prefix at every hierarchy step. `generate_beam_decode()`
-  uses a prefill-plus-KV-cache path via `beam_decode_attn`, but requires
-  `use_jagged_flash_attn=True` and the vendored CuTe kernel at
-  `corelib/gr_decode_atten/` (the Docker image puts it on `PYTHONPATH`
-  automatically).
+- **Beam search**: the default `generate()` path uses FA2 prefill plus a KV
+  cache via `gr_decode_atten`. The Megatron reference backend recomputes the
+  transformer prefix at every hierarchy step.
 - **Performance**: Not fully optimized
