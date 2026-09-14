@@ -20,7 +20,12 @@ The project is organized into three parts:
 - [Talos](./corelib/talos/README.md) for end-to-end automated optimization of a PyTorch model: it profiles the real workload, rewrites the hotspots it finds, verifies every change for numerical correctness and measured speedup, and iterates until the gains run out — driven entirely by a coding agent (Claude Code, Codex and others), with no human in the loop
 
 # What's New
-- **[2026/9/8]** Adds [Talos](./corelib/talos/README.md), an agent-driven optimization toolkit that profiles a PyTorch training workload, dispatches one hotspot per round to an isolated optimizer subagent, and keeps a change only after an independent judge confirms both numerical parity and a profiler-off step-time gain. Measured 2.22×–3.29× end-to-end speedups on DIN, DIEN, HSTU, and OneRec.
+- **[2026/9/13]** 🎉v26.08 released!
+  - Adds [Talos](./corelib/talos/README.md), an agent-driven PyTorch optimization toolkit that profiles real workloads, optimizes one measured hotspot at a time, and independently verifies numerical correctness and end-to-end speedup. The included DIN, DIEN, HSTU, and OneRec workloads show 2.22×–3.29× speedups.
+  - Adds DynamicEmb delta replay through `replay_increment()`, completing the `incremental_dump()` pipeline for synchronizing training updates to serving replicas without reloading a full checkpoint. See the [DynamicEmb API guide](./corelib/dynamicemb/DynamicEmb_APIs.md#replay_increment).
+  - Adds weighted-SUM support for DynamicEmb-backed TorchRec `EmbeddingBagCollection` in training and evaluation, including mixed-dimension tables and fused forward/backward kernels. See [Weighted EmbeddingBagCollection](./corelib/dynamicemb/DynamicEmb_APIs.md#weighted-embeddingbagcollection).
+  - Stores DynamicEmb checkpoints in each table's native `float32`, `float16`, or `bfloat16` precision, reducing checkpoint size for lower-precision tables while preserving compatibility with older float32 checkpoints.
+  - Upgrades NV-Embedding-Cache and extends the [HSTU AOTInductor workflow](./examples/hstu/inference_aoti/README.md) with version-aware Python export and native C++ loading.
 - **[2026/8/10]** 🎉v26.07 released!
   - Adds a `torch.export`-compatible RecSys KVCache backend and an end-to-end [HSTU AOTInductor inference workflow](./examples/hstu/inference_aoti/README.md) with packaged models, native C++ replay, a FlexKV-backed runtime, and Triton Server deployment; also publishes refreshed [AOTI and KV-cache benchmarks](./examples/hstu/inference_aoti/benchmark/README.md).
   - Improves [SID-GR inference](./examples/sid-gr-inference/README.md) with shared decode CUDA-graph memory pools and logits buffers, and adds opt-in, SGLang-compatible weight hot updates from disk or colocated CUDA IPC for slime-style RL workflows. See the [weight hot-update guide](./examples/sid-gr-inference/docs/weight_hot_update.md).
@@ -31,18 +36,18 @@ The project is organized into three parts:
   - Adds DynamicEmb incremental dump for LFU tables via a compound `LruLfu` score policy, and fixes the padded-buffer optimizer for mixed embedding dimensions and host VMM tensor sizing to avoid virtual-address-space exhaustion. See [DynamicEmb](./corelib/dynamicemb/README.md).
   - Updates FBGEMM for Blackwell HSTU attention and adds phase-selective CUDA-graph benchmark profiling with percentile (P10) reporting and attention heatmaps. See the [HSTU inference benchmark](./examples/hstu/inference/benchmark/README.md).
   - Extends [SID-GR inference](./examples/sid-gr-inference/README.md) with a shared-prefix-length argument and an environment-variable control for GR decode attention.
+<details>
+<summary>More</summary>
+
 - **[2026/6/15]** 🎉v26.05 released!
   - Adds a new [SID-GR inference example](./examples/sid-gr-inference/README.md) for large-beam generative retrieval serving and benchmarking.
   - Enables HSTU + DynamicEmb end-to-end training on Blackwell (`sm_100`) and refreshes HSTU benchmark fixes, docs, and training examples.
   - Extends beam-search decode attention to SM8x and improves DynamicEmb, segmented unique, and FlexKV benchmark coverage.
-<details>
-<summary>More</summary>
-
 - **[2026/5/20]** 🎉v26.04 released!
   - Refactors the previous async KV-cache manager into a standalone [RecSys KVCache Manager package](corelib/recsys_kvcache_manager/), a new FlexKV backend for multi-node/multi-tier KV storage, LLM-style KV APIs, and updated HSTU inference examples.
   - Introduces a new [beam-search decode attention kernel](./corelib/gr_decode_atten/) and CuTe kernels plus a `generate_beam_decode()` entry point, enabling more efficient KV-cache-based beam generation for the SID-GR model with vectorized masking utilities.
 - **[2026/4/14]** 🎉v26.03 released!
-  - We added Torch export and AOTInductor packaging for end-to-end HSTU C++ inference. See the [HSTU inference overview](./examples/hstu/inference/README.md) and the [C++ inference guide](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md).
+  - We added Torch export and AOTInductor packaging for end-to-end HSTU C++ inference. See the [HSTU inference overview](./examples/hstu/inference/README.md) and the [C++ inference guide](./examples/hstu/inference_aoti/guide_to_hstu_aoti_inference_setup.md).
   - We improved DynamicEmb with table fusion and expansion, relaxed embedding-table alignment (no longer power-of-two), and capacity sizing aligned to `bucket_capacity`. See [DynamicEmb](./corelib/dynamicemb/README.md).
   - We added an HSTU end-to-end training benchmark suite with progressive optimizations. See the [HSTU training benchmark](./examples/hstu/training/benchmark/README.md) and [E2E benchmark notes](./examples/hstu/training/benchmark/E2E_BENCHMARK.md).
   - We published HSTU inference benchmark results on B200 in the [HSTU inference benchmark](./examples/hstu/inference/benchmark/README.md).
@@ -95,7 +100,7 @@ For more detailed release notes, please refer to our [releases][releases].
 # Get Started
 The examples we supported:
 - [HSTU recommender examples](./examples/hstu/README.md)
-- [HSTU inference](./examples/hstu/inference/README.md) — KV cache, Triton Inference Server, [C++ AOTInductor](./examples/hstu/inference/GUIDE_TO_RUN_CPP_INFERENCE_DEMO.md)
+- [HSTU inference](./examples/hstu/inference/README.md) — KV cache, Triton Inference Server, [C++ AOTInductor](./examples/hstu/inference_aoti/guide_to_hstu_aoti_inference_setup.md)
 - [SID based generative recommender examples](./examples/sid_gr/README.md)
 - [SID-GR inference example](./examples/sid-gr-inference/README.md)
 
