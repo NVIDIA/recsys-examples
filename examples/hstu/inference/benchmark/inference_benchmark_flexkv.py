@@ -76,6 +76,13 @@ def get_timed_history_len(history_len: int, append_history_len: int) -> int:
     return history_len + append_history_len
 
 
+def ongoing_offload_tasks(kvcache_mgr):
+    backend = getattr(kvcache_mgr, "backend", None)
+    if backend is not None and hasattr(backend, "ongoing_offload_tasks"):
+        return backend.ongoing_offload_tasks
+    return getattr(kvcache_mgr, "ongoing_offload_tasks", [])
+
+
 def build_user_batches(
     base_user_id: int,
     num_batches: int,
@@ -114,7 +121,7 @@ def build_request(
         torch.randint(
             low=0,
             high=ACTION_VOCAB_SIZE,
-            size=(history_len,),
+            size=(history_len + num_candidates,),
             dtype=torch.long,
         )
         for _ in user_ids
@@ -376,18 +383,18 @@ def run_scenario_gpu_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario1.timed.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario1.timed.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -440,18 +447,18 @@ def run_scenario_gpu_miss_host_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario2.warmup.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario2.warmup.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -490,18 +497,18 @@ def run_scenario_gpu_miss_host_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario2.timed.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario2.timed.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -556,18 +563,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -617,7 +624,7 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
                 deadline = time.time() + offload_wait_timeout_s
                 torch.cuda.nvtx.range_push("scenario3.pressure.batch_offload_wait_all")
                 try:
-                    while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+                    while len(ongoing_offload_tasks(kvcache_mgr)) > 0:
                         torch.cuda.nvtx.range_push(
                             "scenario3.pressure.batch_offload_wait_all.try_wait"
                         )
@@ -625,12 +632,12 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
                             kvcache_mgr.offload_try_wait()
                         finally:
                             torch.cuda.nvtx.range_pop()
-                        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+                        if len(ongoing_offload_tasks(kvcache_mgr)) == 0:
                             break
                         if time.time() > deadline:
                             raise TimeoutError(
                                 f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                                f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                                f"pending={len(ongoing_offload_tasks(kvcache_mgr))}"
                             )
                         time.sleep(0.001)
                 finally:
@@ -643,18 +650,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario3.pressure.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario3.pressure.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -698,18 +705,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
