@@ -310,6 +310,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
 # kvcache_manager) and runtime libcuda link.
 # ============================================================================
 FROM ${DEVEL_IMAGE} AS build
+ARG TARGETPLATFORM
 
 RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
@@ -317,9 +318,40 @@ COPY . .
 
 RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
+    ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1
+
+# Keep the default NVE build aligned with this checkout when DEVEL_IMAGE is an
+# external pre-built image. The 26.05 compatibility install remains untouched.
+RUN rm -rf /workspace/deps/nve /opt/nve/default/python /workspace/build/pynve-default && \
+    cp -a third_party/nv-embedding-cache /workspace/deps/nve && \
+    mkdir -p /opt/nve/default/python && \
+    if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
+      export PYNVE_DISABLE_AVX512=1; \
+    fi && \
+    PYNVE_BUILD_DIR=/workspace/build/pynve-default \
+    PYNVE_WITH_TORCH_BINDINGS=1 \
+    CMAKE_TOOLCHAIN_FILE=/usr/local/share/recsys/nve_cuda_architectures.cmake \
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" \
+    CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
+    python3 -m pip install --no-build-isolation --no-deps \
+      --target /opt/nve/default/python \
+      /workspace/deps/nve && \
+    rm -rf /workspace/build/pynve-default
+
+# Build the default _C extension before packaging the Python library.
+RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
+    test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     cd /workspace/recsys-examples/corelib/dynamicemb && \
+    mkdir -p torch_binding_build && cd torch_binding_build && \
+    cmake .. \
+      -DNVE_ROOT=/workspace/deps/nve \
+      -DNVE_LIB_DIR=/opt/nve/default/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include && \
+    make -j && \
+    cd .. && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python setup.py install && \
+    cmake --install torch_binding_build && \
     cd /workspace/deps && rm -rf nvcomp && \
     NVCOMP_ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "linux-sbsa" || echo "linux-x86_64") && \
     wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/${NVCOMP_ARCH}/nvcomp-${NVCOMP_ARCH}-5.1.0.21_cuda12-archive.tar.xz && \
@@ -329,10 +361,7 @@ RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     cd /workspace/recsys-examples/examples/commons && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
     cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
-    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" pip3 install --no-build-isolation . && \
-    cd /workspace/recsys-examples/corelib/dynamicemb && \
-    mkdir -p torch_binding_build && cd torch_binding_build && \
-    cmake .. && make -j
+    TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" pip3 install --no-build-isolation .
 
 # ============================================================================
 # AOTI additions: version-independent C++ replay, two NVE loader

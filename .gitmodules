@@ -10,4 +10,4 @@
 	url = https://github.com/taco-project/FlexKV.git
 [submodule "third_party/nv-embedding-cache"]
 	path = third_party/nv-embedding-cache
-	url = https://github.com/NVIDIA/nv-embedding-cache.git
+	url = https://github.com/geoffreyQiu/nv-embedding-cache.git

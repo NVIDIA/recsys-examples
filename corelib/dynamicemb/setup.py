@@ -158,6 +158,15 @@ def get_extensions():
             "lookup_torch_binding.cu",
             "get_table_range_torch_binding.cu",
             "expand_table_ids_torch_binding.cu",
+            "indexer_directory.cpp",
+            "indexer_snapshot.cpp",
+            "indexer_ops.cu",
+            "incremental_update.cpp",
+            "exportable_embedding_pybind.cpp",
+            "indexer_directory_pybind.cpp",
+            "indexer_snapshot_pybind.cpp",
+            "update_subscriber_pybind.cu",
+            "update_subscriber_unavailable_pybind.cpp",
             # Built separately into standalone fatbins (Lex + custom LTO-IR),
             # shipped as package_data; NOT linked into the .so.
             "evict_lrulfu.cu",
@@ -297,7 +306,10 @@ setup(
     description="Plugin for Dynamic Embedding in TorchREC",
     packages=package,
     ext_modules=get_extensions(),
-    package_data={f"{library_name}.jit": ["*.fatbin"]},
+    package_data={
+        f"{library_name}.jit": ["*.fatbin"],
+        f"{library_name}.exportable_embedding": ["_C.so"],
+    },
     license="BSD-3",
     keywords=[
         "pytorch",
