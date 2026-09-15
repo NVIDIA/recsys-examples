@@ -72,7 +72,7 @@ class TritonPythonModel:
         (
             dataset_args,
             _,
-            dynamic_table_configs,
+            embedding_collection_configs,
             trained_emb_table_sizes,
         ) = get_inference_dataset_and_embedding_configs()
         data_processor = get_common_preprocessors("")[dataset_args.dataset_name]
@@ -100,7 +100,7 @@ class TritonPythonModel:
 
         with torch.inference_mode():
             self._model = get_exportable_model_for_inference(
-                dynamic_table_configs,
+                embedding_collection_configs,
                 trained_emb_table_sizes,
                 str(checkpoint_dir),
             )
