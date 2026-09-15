@@ -259,8 +259,9 @@ RUN git clone --recursive -b v26.05 \
 COPY docker/nve_cuda_architectures.cmake /usr/local/share/recsys/nve_cuda_architectures.cmake
 
 # Build into two isolated Python prefixes. NVE's upstream default feature set
-# is used for both builds and includes libnve-plugin-nvhm.so. The toolchain
-# also sets the native CUDA targets; TORCH_CUDA_ARCH_LIST covers only bindings.
+# includes the NVHashMap host-cache and Redis storage plugins used by the
+# exportable example.
+# The toolchain sets native CUDA targets; TORCH_CUDA_ARCH_LIST covers bindings.
 RUN set -eux; \
     if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
       export PYNVE_DISABLE_AVX512=1; \
@@ -312,6 +313,11 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
 FROM ${DEVEL_IMAGE} AS build
 ARG TARGETPLATFORM
 
+RUN apt-get update -y --fix-missing && \
+    apt-get install -y --no-install-recommends redis-server redis-tools && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
 COPY . .
@@ -338,7 +344,8 @@ RUN rm -rf /workspace/deps/nve /opt/nve/default/python /workspace/build/pynve-de
       /workspace/deps/nve && \
     rm -rf /workspace/build/pynve-default
 
-# Build the default _C extension before packaging the Python library.
+# Package the default _C extension, then stage its 26.05 stub build for the
+# same image's compatibility example.
 RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
@@ -351,6 +358,14 @@ RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     make -j && \
     cd .. && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python setup.py install && \
+    cmake -S . -B torch_binding_build -DNVE_VERSION=26.05 && \
+    cmake --build torch_binding_build --parallel 8 \
+      --target dynamicemb_exportable_embedding_python && \
+    mkdir -p /opt/dynamicemb/26.05/python && \
+    cp -a dynamicemb /opt/dynamicemb/26.05/python/ && \
+    cmake -S . -B torch_binding_build -UNVE_VERSION && \
+    cmake --build torch_binding_build --parallel 8 \
+      --target dynamicemb_exportable_embedding_python && \
     cmake --install torch_binding_build && \
     cd /workspace/deps && rm -rf nvcomp && \
     NVCOMP_ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "linux-sbsa" || echo "linux-x86_64") && \
@@ -362,6 +377,15 @@ RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python3 setup.py install && \
     cd /workspace/recsys-examples/corelib/recsys_kvcache_manager && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" pip3 install --no-build-isolation .
+
+RUN export CMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')" && \
+    cmake -S ./corelib/dynamicemb/example/exportable_embedding/cpp \
+      -B ./corelib/dynamicemb/example/exportable_embedding/cpp/build \
+      -DNVE_ROOT=/workspace/deps/nve \
+      -DNVE_LIB_DIR=/opt/nve/default/python/pynve \
+      -DNVTX_INCLUDE_DIR=/workspace/deps/NVTX/c/include \
+      -DDYNAMICEMB_LIB_DIR=/workspace/recsys-examples/corelib/dynamicemb/torch_binding_build && \
+    cmake --build ./corelib/dynamicemb/example/exportable_embedding/cpp/build -j 8
 
 # ============================================================================
 # AOTI additions: version-independent C++ replay, two NVE loader
