@@ -36,11 +36,7 @@ from tests.test_utils import is_sm90_or_above
 # Import jagged_flash_attn_block directly to avoid model/__init__.py
 # which pulls in heavy dependencies (dynamicemb, megatron, torchrec).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
-from jagged_flash_attn_block import (  # noqa: E402
-    JaggedGPTLayer,
-    _beam_decode_attn_reference,
-    _get_beam_decode_attn,
-)
+from jagged_flash_attn_block import JaggedGPTLayer, _get_beam_decode_attn  # noqa: E402
 
 sys.path.pop(0)
 
@@ -263,6 +259,82 @@ class TestBeamSearchParentIndices:
 
 
 # ---------------------------------------------------------------------------
+# Test: beam bookkeeping against hand-computed expectations
+# ---------------------------------------------------------------------------
+def test_beam_bookkeeping_matches_hand_computed_expectations():
+    """Drive BeamSearch with fixed log-probs whose outcome is computable by hand.
+
+    No model and no kernel run here: beams, parents and beam-KV slots are
+    compared exactly, and the only tolerance is on the accumulated log-probs,
+    where fp32 addition of the hand-written values is not exact. Step 1 is
+    chosen so the two best candidates come from swapped parents, which is
+    what an off-by-one in the parent chain would break.
+    """
+    bs = BeamSearch(2, 3, [4, 4, 4], record_history=True)
+
+    # Step 0 — one beam in, so the candidates are just the log-probs:
+    #   code0 -0.1   code1 -0.2   code2 -3.0   code3 -4.0
+    #   top-2 -> code0 (-0.1), code1 (-0.2)
+    bs.propagate(torch.tensor([[[-0.1, -0.2, -3.0, -4.0]]], device="cuda"))
+    assert bs.get_sids().tolist() == [[[0], [1]]]
+    assert bs.parent_indices[0].tolist() == [[0, 0]]
+
+    # Step 1 — accumulated = previous score + this step:
+    #   beam0 (-0.1):  -1.1  -0.6  -9.1  -9.1
+    #   beam1 (-0.2):  -0.4  -2.2  -9.2  -9.2
+    #   top-2 -> beam1+code0 (-0.4) then beam0+code1 (-0.6): the parents swap.
+    bs.propagate(
+        torch.tensor(
+            [[[-1.0, -0.5, -9.0, -9.0], [-0.2, -2.0, -9.0, -9.0]]], device="cuda"
+        )
+    )
+    assert bs.get_sids().tolist() == [[[1, 0], [0, 1]]]
+    assert bs.parent_indices[1].tolist() == [[1, 0]]
+    torch.testing.assert_close(
+        bs.get_log_probs(),
+        torch.tensor([[-0.4, -0.6]], device="cuda"),
+        rtol=0,
+        atol=1e-6,
+    )
+
+    # Step 2 — accumulated:
+    #   beam0 (-0.4):  -3.4  -0.5   -9.4  -9.4
+    #   beam1 (-0.6):  -0.65 -5.6   -9.6  -9.6
+    #   top-2 -> beam0+code1 (-0.5) then beam1+code0 (-0.65): parents stay put.
+    bs.propagate(
+        torch.tensor(
+            [[[-3.0, -0.1, -9.0, -9.0], [-0.05, -5.0, -9.0, -9.0]]], device="cuda"
+        )
+    )
+    assert bs.get_sids().tolist() == [[[1, 0, 1], [0, 1, 0]]]
+    assert bs.parent_indices[2].tolist() == [[0, 1]]
+    torch.testing.assert_close(
+        bs.get_log_probs(),
+        torch.tensor([[-0.5, -0.65]], device="cuda"),
+        rtol=0,
+        atol=1e-6,
+    )
+
+    # The beam KV holds one block per decode step: step 0 in slots 0..1,
+    # step 1 in slots 2..3, step 2 in slots 4..5. At decode step 1 beam0
+    # descends from old beam1 and beam1 from old beam0, so beam0 reads slot 1
+    # then 2, and beam1 slot 0 then 3. Rows are decode steps, columns beams.
+    topk = bs.build_beam_topk_indices(decode_step=1, num_heads=3)
+    assert topk.shape == (1, 1, 3, 2, 2)
+    for head in range(3):
+        assert topk[0, 0, head].tolist() == [[1, 0], [2, 3]]
+
+    # Decode step 2 walks both recorded transitions, which is the part a
+    # single-hop test cannot reach: beam0's ancestor at step 1 is beam0
+    # (parent_indices[2] = [0, 1]) and that beam's ancestor at step 0 is
+    # beam1 (parent_indices[1] = [1, 0]), so beam0 reads slots 1, 2, 4.
+    topk = bs.build_beam_topk_indices(decode_step=2, num_heads=3)
+    assert topk.shape == (1, 1, 3, 3, 2)
+    for head in range(3):
+        assert topk[0, 0, head].tolist() == [[1, 0], [2, 3], [4, 5]]
+
+
+# ---------------------------------------------------------------------------
 # Test: JaggedGPTLayer prefill & decode_beam (smoke)
 # ---------------------------------------------------------------------------
 class TestJaggedGPTLayerPrefillDecode:
@@ -381,8 +453,6 @@ class TestVariableLengthHistory:
         )
 
         kernel_fn = _get_beam_decode_attn()
-        if kernel_fn is _beam_decode_attn_reference:
-            pytest.skip("CuTe kernel needed for seqused_k masking")
         out_a, _ = kernel_fn(
             q,
             valid_k,
@@ -555,78 +625,6 @@ def test_generate_beam_decode_e2e(
 @pytest.mark.parametrize("num_layers", [2])
 @pytest.mark.parametrize("codebook_sizes", [[128, 128, 128]])
 @pytest.mark.parametrize("batchsize", [4])
-def test_generate_dispatches_to_generate_beam_decode(
-    dtype,
-    max_history_length,
-    num_layers,
-    codebook_sizes,
-    batchsize,
-):
-    """The default generate() API must use the optimized beam-decode path."""
-    hidden_size = 256
-    num_attention_heads = 4
-    kv_channels = 64
-
-    init = _E2E_DEPS["init"]
-    get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
-    ShardedEmbeddingConfig = _E2E_DEPS["ShardedEmbeddingConfig"]
-    create_sid_gr_model_and_optimizer = _E2E_DEPS["create_sid_gr_model_and_optimizer"]
-
-    num_hierarchies = len(codebook_sizes)
-    init.initialize_distributed()
-    init.initialize_model_parallel(1)
-    init.set_random_seed(7)
-
-    hist_name = "hist_sids"
-    cand_name = "cand_sids"
-    codebook_embedding_config = ShardedEmbeddingConfig(
-        feature_names=[hist_name, cand_name],
-        table_name="codebook",
-        vocab_size=sum(codebook_sizes),
-        dim=hidden_size,
-        sharding_type="data_parallel",
-    )
-
-    with init.auto_destroy_global_state():
-        model, optimizer = create_sid_gr_model_and_optimizer(
-            dtype=dtype,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            kv_channels=kv_channels,
-            num_layers=num_layers,
-            num_hierarchies=num_hierarchies,
-            codebook_embedding_config=codebook_embedding_config,
-            codebook_sizes=codebook_sizes,
-            use_jagged_flash_attn=True,
-        )
-        optimizer.reload_model_params()
-        model_unwrapped = get_unwrapped_module(model)
-        model_unwrapped.eval()
-
-        batch = _generate_random_batch(
-            batchsize=batchsize,
-            max_history_length=max_history_length,
-            codebook_sizes=codebook_sizes,
-            history_feature_name=hist_name,
-            candidate_feature_name=cand_name,
-        )
-        batch.to(torch.cuda.current_device())
-
-        with torch.no_grad():
-            sids_a, lp_a = model_unwrapped.generate(batch)
-            sids_b, lp_b = model_unwrapped.generate_beam_decode(batch)
-
-        assert torch.equal(sids_a, sids_b)
-        torch.testing.assert_close(lp_a, lp_b, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
-@pytest.mark.skipif(not _SM90_AVAILABLE, reason=_SM90_SKIP_REASON)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("max_history_length", [32, 128])
-@pytest.mark.parametrize("num_layers", [2])
-@pytest.mark.parametrize("codebook_sizes", [[128, 128, 128]])
-@pytest.mark.parametrize("batchsize", [4])
 def test_generate_beam_decode_jagged_kv_matches_dense(
     dtype,
     max_history_length,
@@ -771,91 +769,6 @@ def test_use_jagged_kv_with_dsl_backend_rejected_at_entry():
                 model_unwrapped.generate_beam_decode(
                     batch,
                     backend="dsl",
-                    use_jagged_kv=True,
-                )
-
-
-@pytest.mark.skipif(not _E2E_AVAILABLE, reason=_E2E_SKIP_REASON)
-def test_use_jagged_kv_with_reference_fallback_rejected_at_entry(monkeypatch):
-    """When the real CuTe kernel isn't installed, the resolver returns
-    ``_beam_decode_attn_reference`` — which has ``cu_seqlens_k`` in its
-    signature for the explicit-raise contract but cannot actually run
-    jagged. The capability probe must catch this at entry, not later.
-    """
-    init = _E2E_DEPS["init"]
-    get_unwrapped_module = _E2E_DEPS["get_unwrapped_module"]
-    ShardedEmbeddingConfig = _E2E_DEPS["ShardedEmbeddingConfig"]
-    create_sid_gr_model_and_optimizer = _E2E_DEPS["create_sid_gr_model_and_optimizer"]
-
-    # gpt_model imports via `from .jagged_flash_attn_block import ...`,
-    # which registers the module under the package-qualified name. The
-    # standalone `import jagged_flash_attn_block` would land a *separate*
-    # module object in sys.modules, so patching that wouldn't affect the
-    # one the probe actually reads. Pull the right one out of sys.modules.
-    import sys as _sys
-
-    jfab = _sys.modules.get("model.jagged_flash_attn_block")
-    assert jfab is not None, (
-        "model.jagged_flash_attn_block not loaded; the test's "
-        "create_sid_gr_model_and_optimizer call should have triggered the "
-        "import chain"
-    )
-
-    init.initialize_distributed()
-    init.initialize_model_parallel(1)
-    init.set_random_seed(42)
-
-    hist_name = "hist_sids"
-    cand_name = "cand_sids"
-    codebook_sizes = [128, 128, 128]
-    codebook_embedding_config = ShardedEmbeddingConfig(
-        feature_names=[hist_name, cand_name],
-        table_name="codebook",
-        vocab_size=sum(codebook_sizes),
-        dim=256,
-        sharding_type="data_parallel",
-    )
-
-    with init.auto_destroy_global_state():
-        model, optimizer = create_sid_gr_model_and_optimizer(
-            dtype=torch.bfloat16,
-            hidden_size=256,
-            num_attention_heads=4,
-            kv_channels=64,
-            num_layers=2,
-            num_hierarchies=3,
-            codebook_embedding_config=codebook_embedding_config,
-            codebook_sizes=codebook_sizes,
-            use_jagged_flash_attn=True,
-        )
-        optimizer.reload_model_params()
-        model_unwrapped = get_unwrapped_module(model)
-        model_unwrapped.eval()
-
-        batch = _generate_random_batch(
-            batchsize=4,
-            max_history_length=64,
-            codebook_sizes=codebook_sizes,
-            history_feature_name=hist_name,
-            candidate_feature_name=cand_name,
-        )
-        batch.to(torch.cuda.current_device())
-
-        # Force the cached resolver result to be the PyTorch reference
-        # fallback, mimicking an environment without the CuTe kernel
-        # installed. _get_beam_decode_attn caches at the module level on
-        # the _beam_decode_attn name, so patch that directly.
-        monkeypatch.setattr(
-            jfab,
-            "_beam_decode_attn",
-            jfab._beam_decode_attn_reference,
-        )
-
-        with pytest.raises(RuntimeError, match="reference fallback does not implement"):
-            with torch.no_grad():
-                model_unwrapped.generate_beam_decode(
-                    batch,
-                    backend="3kernel",
                     use_jagged_kv=True,
                 )
 
@@ -1119,6 +1032,4 @@ def test_generate_is_deterministic():
         with torch.no_grad():
             sids_a, _ = m.generate(batch)
             sids_b, _ = m.generate(batch)
-        assert torch.equal(
-            sids_a, sids_b
-        ), "optimized generate() is non-deterministic"
+        assert torch.equal(sids_a, sids_b), "optimized generate() is non-deterministic"

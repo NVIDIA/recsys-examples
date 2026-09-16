@@ -41,11 +41,10 @@ import torch.nn.functional as F
 # Standard flash_attn imports are deferred to runtime so this module can be
 # imported in CPU-only development environments.
 
-# beam_decode_attn kernel import — deferred so module loads without the kernel.
-# Falls back to a pure-PyTorch reference implementation when the CuTe kernel
-# is not installed (the real kernel requires ``cutlass`` and ``quack``).
+# beam_decode_attn kernel import — deferred so the module can be imported
+# without the kernel's dependencies (``cutlass``, ``quack``). Resolution
+# itself is strict: there is no fallback implementation.
 _beam_decode_attn = None
-_beam_decode_attn_import_error: Optional[ImportError] = None
 
 
 def _ensure_gr_decode_atten_on_path() -> None:
@@ -58,138 +57,22 @@ def _ensure_gr_decode_atten_on_path() -> None:
         sys.path.insert(0, gr_decode_dir)
 
 
-def _beam_decode_attn_reference(
-    q: torch.Tensor,
-    k_context: torch.Tensor,
-    v_context: torch.Tensor,
-    k_beam: torch.Tensor,
-    v_beam: torch.Tensor,
-    topk_indices: torch.Tensor,
-    decode_nums: int,
-    softmax_scale: Optional[float] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Pure-PyTorch reference for beam_decode_attn (single-pass).
-
-    Shapes follow the CuTe kernel convention:
-        q:            [B, Sq, W, Hq, D]
-        k_context:    [B, Sk, Hkv, D]
-        v_context:    [B, Sk, Hkv, D]
-        k_beam:       [B, dn*W, Hkv, D]
-        v_beam:       same
-        topk_indices: [B, Sq, Hq, max_dn, W] int32
-        seqused_k:    optional [B] int32; positions >= seqused_k[b] in
-                      k_context are masked out of the softmax (matches the
-                      CuTe kernel's seqused_k semantics).
-        cu_seqlens_k: not supported in the reference path (jagged context K
-                      would require a different layout). Raises if set.
-    Returns:
-        out: [B, Sq, W, Hq, D]  (same dtype as q)
-        lse: None
-    """
-    import math
-
-    if cu_seqlens_k is not None:
-        # Jagged context K is a kernel-only optimization. The reference uses
-        # dense expansion below, which doesn't have a sensible jagged form.
-        # Fail explicitly so callers don't think this code path validates
-        # use_jagged_kv=True.
-        raise NotImplementedError(
-            "_beam_decode_attn_reference does not implement jagged context "
-            "K/V (cu_seqlens_k). Run the CuTe kernel for jagged validation."
-        )
-
-    B, Sq, W, Hq, D = q.shape
-    Hkv = k_context.shape[2]
-    ngroups = Hq // Hkv
-    Sk = k_context.shape[1]
-
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(D)
-
-    q_f = q.float()
-    k_ctx_f = k_context.float()
-    v_ctx_f = v_context.float()
-    k_beam_f = k_beam.float()
-    v_beam_f = v_beam.float()
-
-    if ngroups > 1:
-        k_ctx_f = k_ctx_f.repeat_interleave(ngroups, dim=2)
-        v_ctx_f = v_ctx_f.repeat_interleave(ngroups, dim=2)
-        k_beam_f = k_beam_f.repeat_interleave(ngroups, dim=2)
-        v_beam_f = v_beam_f.repeat_interleave(ngroups, dim=2)
-
-    # Context KV → [B, 1, 1, Hq, Sk, D]
-    k_ctx_exp = k_ctx_f.permute(0, 2, 1, 3).unsqueeze(1).unsqueeze(2)
-    k_ctx_exp = k_ctx_exp.expand(B, Sq, W, Hq, Sk, D)
-    v_ctx_exp = v_ctx_f.permute(0, 2, 1, 3).unsqueeze(1).unsqueeze(2)
-    v_ctx_exp = v_ctx_exp.expand(B, Sq, W, Hq, Sk, D)
-
-    if decode_nums > 0:
-        idx = topk_indices[:, :, :, :decode_nums, :]  # [B, Sq, Hq, dn, W]
-        idx = idx.permute(0, 1, 4, 2, 3).contiguous()  # [B, Sq, W, Hq, dn]
-        b_idx = torch.arange(B, device=q.device)[:, None, None, None, None]
-        h_idx = torch.arange(Hq, device=q.device)[None, None, None, :, None]
-        k_beam_g = k_beam_f[b_idx, idx, h_idx]  # [B, Sq, W, Hq, dn, D]
-        v_beam_g = v_beam_f[b_idx, idx, h_idx]
-        k_all = torch.cat([k_ctx_exp, k_beam_g], dim=4)
-        v_all = torch.cat([v_ctx_exp, v_beam_g], dim=4)
-    else:
-        k_all = k_ctx_exp
-        v_all = v_ctx_exp
-
-    scores = torch.einsum("bqwhd,bqwhsd->bqwhs", q_f * softmax_scale, k_all)
-
-    if seqused_k is not None:
-        # Mask out context K positions >= seqused_k[b] before softmax.
-        # Beam K positions (concatenated to context K above) are always
-        # valid, so they're not masked.
-        ctx_pos = torch.arange(Sk, device=q.device)
-        valid_ctx = ctx_pos[None, :] < seqused_k.to(torch.long)[:, None]  # [B, Sk]
-        if decode_nums > 0:
-            valid_beam = torch.ones(B, decode_nums, dtype=torch.bool, device=q.device)
-            valid = torch.cat([valid_ctx, valid_beam], dim=1)  # [B, Sk + dn]
-        else:
-            valid = valid_ctx
-        mask = ~valid[:, None, None, None, :]  # [B, 1, 1, 1, Sk(+dn)]
-        scores = scores.masked_fill(mask, float("-inf"))
-
-    attn = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bqwhs,bqwhsd->bqwhd", attn, v_all)
-    return out.to(q.dtype), None
-
-
 def _get_beam_decode_attn():
-    global _beam_decode_attn, _beam_decode_attn_import_error
+    global _beam_decode_attn
     if _beam_decode_attn is None:
         _ensure_gr_decode_atten_on_path()
         try:
             from interface import beam_decode_attn
-
-            _beam_decode_attn = beam_decode_attn
-            _beam_decode_attn_import_error = None
         except ImportError as exc:
-            _beam_decode_attn_import_error = exc
-            _beam_decode_attn = _beam_decode_attn_reference
+            raise ImportError(
+                "beam_decode_attn is unavailable. It is vendored at "
+                "corelib/gr_decode_atten/ and put on sys.path automatically, "
+                "so this usually means an incomplete checkout or missing "
+                "CuTe/CUTLASS dependencies in the environment."
+            ) from exc
+
+        _beam_decode_attn = beam_decode_attn
     return _beam_decode_attn
-
-
-def _build_padded_context_kv(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    seqused: torch.Tensor,
-    max_seqlen: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Identity pass-through for padded context K/V.
-
-    Padding-aware masking is handled by the kernel via the ``seqused_k``
-    argument (added in our local interface.py extension). This helper
-    exists for symmetry with the test-side construction and may grow
-    additional logic (e.g. reshape) in the future.
-    """
-    return k, v
 
 
 class JaggedGPTLayer(nn.Module):
@@ -251,9 +134,7 @@ class JaggedGPTLayer(nn.Module):
         # --- Attention sub-layers ---
         self.input_layernorm = norm_cls(hidden_size, eps=layernorm_epsilon)
         # Fused QKV projection: hidden_size → 3 * heads * head_dim
-        self.linear_qkv = nn.Linear(
-            hidden_size, 3 * self.attention_size, bias=False
-        )
+        self.linear_qkv = nn.Linear(hidden_size, 3 * self.attention_size, bias=False)
         # Output projection after attention
         self.linear_proj = nn.Linear(self.attention_size, hidden_size, bias=False)
         self.attn_dropout = nn.Dropout(hidden_dropout)

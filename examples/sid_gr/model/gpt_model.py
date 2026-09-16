@@ -175,9 +175,7 @@ class SIDGRDecoder(MegatronModule):
     ) -> torch.Tensor:
         if self.use_jagged_flash_attn:
             if offsets is None or max_seqlen is None:
-                raise ValueError(
-                    "FA2 varlen backend requires offsets and max_seqlen"
-                )
+                raise ValueError("FA2 varlen backend requires offsets and max_seqlen")
             return self.decoder(
                 hidden_states=hidden_states,
                 cu_seqlens=offsets.to(torch.int32),
@@ -331,7 +329,11 @@ class SIDGRModel(MegatronModule):
             beam_width=top_k_for_generation,
             num_hierarchies=num_hierarchies,
             codebook_sizes=codebook_sizes,
-            record_history=True,  # for debugging purpose
+            # The history tensors are only consumed by BeamSearch's own
+            # tests, and recording them costs a torch.exp() per step.
+            # parent_indices is appended regardless of this flag, so the
+            # beam-KV slot mapping is unaffected.
+            record_history=False,
         )
 
     def bfloat16(self):
@@ -949,31 +951,15 @@ class SIDGRModel(MegatronModule):
                 f"k_beam.shape[1] == decode_nums * beam_width assertion fails"
             )
 
-        # Capability probe for use_jagged_kv=True: fail at entry rather
-        # than deep in decode_beam. Catches two cases:
-        #   (a) installed kernel lacks the cu_seqlens_k kwarg (upstream).
-        #   (b) resolver fell back to _beam_decode_attn_reference, whose
-        #       signature includes cu_seqlens_k but only to raise
-        #       NotImplementedError on use.
+        # Capability probe for use_jagged_kv=True: fail at entry rather than
+        # deep in decode_beam, in case the installed kernel lacks the
+        # cu_seqlens_k kwarg (upstream does).
         if use_jagged_kv:
             import inspect
 
-            from .jagged_flash_attn_block import (
-                _beam_decode_attn_reference,
-                _get_beam_decode_attn,
-            )
+            from .jagged_flash_attn_block import _get_beam_decode_attn
 
             kernel = _get_beam_decode_attn()
-            if kernel is _beam_decode_attn_reference:
-                raise RuntimeError(
-                    "use_jagged_kv=True requires the real CuTe "
-                    "beam_decode_attn kernel; the PyTorch reference "
-                    "fallback does not implement jagged context K/V "
-                    "(it only raises NotImplementedError when actually "
-                    "called). Ensure the vendored corelib/gr_decode_atten "
-                    "directory is present in the repository checkout, or "
-                    "use use_jagged_kv=False."
-                )
             try:
                 _kernel_sig = inspect.signature(kernel)
             except (TypeError, ValueError) as exc:
@@ -1075,9 +1061,7 @@ class SIDGRModel(MegatronModule):
                 .view(batch_size, input_max_seqlen, -1)
                 .to(self._training_dtype)
             )
-            prefill_output, context_kv_caches = fa_block.prefill(
-                padded_history
-            )
+            prefill_output, context_kv_caches = fa_block.prefill(padded_history)
             bos_positions = (history_seqlens - 1).clamp(min=0)  # [B]
             bos_hidden = prefill_output[
                 torch.arange(batch_size, device=prefill_output.device),

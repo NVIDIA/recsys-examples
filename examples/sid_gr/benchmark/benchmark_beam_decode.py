@@ -135,19 +135,8 @@ def _resolve_dtype(name: str) -> torch.dtype:
 
 
 def require_beam_decode_kernel() -> None:
-    """Fail early if the benchmark would run against the PyTorch fallback."""
-    kernel = jfab._get_beam_decode_attn()
-    if kernel is jfab._beam_decode_attn_reference:
-        import_error = jfab._beam_decode_attn_import_error
-        detail = f" Last import error: {import_error!r}" if import_error else ""
-        raise RuntimeError(
-            "benchmark_beam_decode.py requires the real CuTe "
-            "beam_decode_attn kernel. The resolver fell back to the "
-            "PyTorch reference path, which is only for correctness "
-            "debugging and makes benchmark timings invalid. Ensure "
-            "corelib/gr_decode_atten is available in this checkout and "
-            f"that the Docker image has the CuTe/CUTLASS dependencies.{detail}"
-        )
+    """Resolve the kernel up front so a missing one fails before any timing."""
+    jfab._get_beam_decode_attn()
 
     interface_mod = sys.modules.get("interface")
     interface_path = getattr(interface_mod, "__file__", "<unknown>")
@@ -245,9 +234,9 @@ def run_one_config(args) -> None:
     # Sanity: both produce valid outputs
     sids_a = run_padded_kv()
     sids_b = run_beam_decode()
-    assert sids_a.shape == sids_b.shape, (
-        f"shape mismatch: padded={sids_a.shape}, selected={sids_b.shape}"
-    )
+    assert (
+        sids_a.shape == sids_b.shape
+    ), f"shape mismatch: padded={sids_a.shape}, selected={sids_b.shape}"
 
     print("=" * 80)
     print(
