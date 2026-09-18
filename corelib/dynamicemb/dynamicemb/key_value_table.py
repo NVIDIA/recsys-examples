@@ -712,9 +712,10 @@ def _expand_tables_impl(
                 and i < len(target_capacities)
                 and target_capacities[i] >= 0
             ):
-                # Target is always new key_index_map capacity; grow value buffer by ΔKIM
+                # Hash buckets can round the requested target up. Grow values
+                # by the actual key-map capacity change, including that padding.
                 # (NO_EVICTION may start with value rows < KIM cap, same formula as non–NO_EVICTION).
-                add_rows = target_capacities[i] - key_caps[i]
+                add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
                 vd = state.table_value_dims_cpu[i]
                 if add_rows > 0:
                     state.tables[i].extend((add_rows, vd))
