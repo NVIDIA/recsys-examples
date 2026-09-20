@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
 from torchrec.distributed.dist_data import KJTAllToAll
@@ -78,13 +79,6 @@ def _fx_wrap_gen_list_n_times(ls: List[str], n: int) -> List[str]:
     return ret
 
 
-_DIST_TYPE_CODES: Dict[str, int] = {
-    "continuous": 0,
-    "roundrobin": 1,
-    "hash_roundrobin": 2,
-}
-
-
 def dist_type_codes(
     dist_types: List[str], device: Optional[torch.device] = None
 ) -> torch.Tensor:
@@ -102,11 +96,11 @@ def dist_type_codes(
             "feature_hash_sizes."
         )
     try:
-        codes = [_DIST_TYPE_CODES[dist_type] for dist_type in dist_types]
+        codes = [DIST_TYPE_CODES[dist_type] for dist_type in dist_types]
     except KeyError as missing:
         raise ValueError(
             f"Not support dist type of {missing.args[0]!r}, "
-            f"expected one of {sorted(_DIST_TYPE_CODES)}"
+            f"expected one of {sorted(DIST_TYPE_CODES)}"
         ) from None
     return torch.tensor(codes, dtype=torch.int32, device=device)
 

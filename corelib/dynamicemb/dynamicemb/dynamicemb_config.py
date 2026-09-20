@@ -20,7 +20,7 @@ import os
 import warnings
 from dataclasses import dataclass, field, replace
 from math import sqrt
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from dynamicemb.optimizer import OptimType, get_optimizer_state_dim
@@ -39,7 +39,7 @@ from dynamicemb.types import (
 
 # fbgemm exports its own PoolingMode, so the bound C++ enum is aliased below to
 # keep the two apart wherever both are in scope.
-from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
+from dynamicemb_extensions import DistType, DynamicEmbDataType, EvictStrategy
 from dynamicemb_extensions import PoolingMode as BagPoolingMode
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
@@ -47,7 +47,23 @@ from torchrec.types import DataType
 DEFAULT_INDEX_TYPE = torch.int64
 DYNAMICEMB_CSTM_SCORE_CHECK = "DYNAMICEMB_CSTM_SCORE_CHECK"
 BATCH_SIZE_PER_DUMP = 65536
-SUPPORTED_DIST_TYPES = ("continuous", "roundrobin", "hash_roundrobin")
+# The key -> rank rule, as its user-facing name and as the code the bucketize
+# kernel switches on. The codes come from the bound C++ enum rather than being
+# restated here, the same way DynamicEmbPoolingMode takes its values from
+# BagPoolingMode -- ``dyn_emb::DistType`` in src/utils.h documents what each
+# one does.
+#
+# The two sides are named differently on purpose. The C++ enum uses the
+# block / cyclic vocabulary its own kernels are written in; these strings are
+# older, and they are written into every checkpoint's meta and compared on
+# load, so renaming them would strand existing checkpoints. This dict is the
+# only place the two meet, and the only place a rename would have to start.
+DIST_TYPE_CODES: Dict[str, int] = {
+    "continuous": int(DistType.KBlock),
+    "roundrobin": int(DistType.KCyclic),
+    "hash_roundrobin": int(DistType.KHashedCyclic),
+}
+SUPPORTED_DIST_TYPES: Tuple[str, ...] = tuple(DIST_TYPE_CODES)
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
 DEBUG_EMB_INITIALIZER_MOD = 100_000
 # Default hashtable bucket width in rows; keep in sync with
