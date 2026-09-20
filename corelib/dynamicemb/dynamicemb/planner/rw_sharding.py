@@ -171,7 +171,9 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             is_sequence=True,
             has_feature_processor=self._has_feature_processor,
             need_pos=False,
-            dist_type_per_feature=self._dist_type_per_feature,
+            dist_types=[
+                self._dist_type_per_feature[name] for name in self.feature_names()
+            ],
         )
 
     def create_lookup(
@@ -257,7 +259,9 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             is_sequence=False,
             has_feature_processor=self._has_feature_processor,
             need_pos=self._need_pos,
-            dist_type_per_feature=self._dist_type_per_feature,
+            dist_types=[
+                self._dist_type_per_feature[name] for name in self.feature_names()
+            ],
         )
 
     def create_lookup(

@@ -78,6 +78,39 @@ def _fx_wrap_gen_list_n_times(ls: List[str], n: int) -> List[str]:
     return ret
 
 
+_DIST_TYPE_CODES: Dict[str, int] = {
+    "continuous": 0,
+    "roundrobin": 1,
+    "hash_roundrobin": 2,
+}
+
+
+def dist_type_codes(
+    dist_types: List[str], device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """The per-feature ``dist_type`` as the int32 codes the kernel switches on.
+
+    Built once, when the distributor is, rather than per forward: the features
+    a distributor serves are fixed at construction, and so is their order.
+
+    There is no default: the caller holds the sharding's feature order, and a
+    rule guessed here would be applied to every key without a word.
+    """
+    if dist_types is None:
+        raise ValueError(
+            "dist_types is required, one entry per feature in the same order as "
+            "feature_hash_sizes."
+        )
+    try:
+        codes = [_DIST_TYPE_CODES[dist_type] for dist_type in dist_types]
+    except KeyError as missing:
+        raise ValueError(
+            f"Not support dist type of {missing.args[0]!r}, "
+            f"expected one of {sorted(_DIST_TYPE_CODES)}"
+        ) from None
+    return torch.tensor(codes, dtype=torch.int32, device=device)
+
+
 def bucketize_kjt_before_all2all(
     kjt: KeyedJaggedTensor,
     num_buckets: int,
@@ -85,7 +118,7 @@ def bucketize_kjt_before_all2all(
     output_permute: bool = False,
     bucketize_pos: bool = False,
     block_bucketize_row_pos: Optional[List[torch.Tensor]] = None,
-    dist_type_per_feature: Optional[Dict[str, str]] = None,
+    dist_type_per_feature: Optional[torch.Tensor] = None,
 ) -> Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]:
     """
     Bucketizes the `values` in KeyedJaggedTensor into `num_buckets` buckets,
@@ -102,6 +135,9 @@ def bucketize_kjt_before_all2all(
         bucketize_pos (bool): output the changed position of the bucketized values or
             not.
         block_bucketize_row_pos (Optional[List[torch.Tensor]]): The offsets of shard size for each feature.
+        dist_type_per_feature (Optional[torch.Tensor]): int32 key -> rank rule per
+            feature, from :func:`dist_type_codes`, in the same feature order as
+            ``block_sizes`` -- the kernel indexes both with the same ``t``.
 
     Returns:
         Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]: the bucketized `KeyedJaggedTensor` and the optional permute mapping from the unbucketized values to bucketized value.
@@ -112,24 +148,12 @@ def bucketize_kjt_before_all2all(
         block_sizes.numel() == num_features,
         f"Expecting block sizes for {num_features} features, but {block_sizes.numel()} received.",
     )
-    block_sizes_new_type = _fx_wrap_tensor_to_device_dtype(block_sizes, kjt.values())
-
-    dist_type_list = []
-    for key in kjt.keys():
-        assert key in dist_type_per_feature
-        dist_type_str = dist_type_per_feature[key]
-        if dist_type_str == "continuous":
-            dist_type = 0
-        elif dist_type_str == "roundrobin":
-            dist_type = 1
-        elif dist_type_str == "hash_roundrobin":
-            dist_type = 2
-        else:
-            raise ValueError("Not support dist type of ", dist_type_str)
-        dist_type_list.append(dist_type)
-    dist_type_t = torch.tensor(
-        dist_type_list, dtype=torch.int32, device=kjt.values().device
+    assert_fx_safe(
+        dist_type_per_feature.numel() == num_features,
+        f"Expecting dist types for {num_features} features, but {dist_type_per_feature.numel()} received.",
     )
+    block_sizes_new_type = _fx_wrap_tensor_to_device_dtype(block_sizes, kjt.values())
+    dist_type_t = dist_type_per_feature.to(device=kjt.values().device)
 
     (
         bucketized_lengths,
@@ -211,6 +235,8 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         is_sequence (bool): if this is for a sequence embedding.
         has_feature_processor (bool): existence of feature processor (ie. position
             weighted features).
+        dist_types (Optional[List[str]]): the key -> rank rule per feature, in the
+            same order as ``feature_hash_sizes``.
 
     """
 
@@ -223,7 +249,7 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         is_sequence: bool = False,
         has_feature_processor: bool = False,
         need_pos: bool = False,
-        dist_type_per_feature: Dict[str, str] = None,
+        dist_types: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         self._world_size: int = pg.size()
@@ -248,7 +274,14 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         self._has_feature_processor = has_feature_processor
         self._need_pos = need_pos
         self.unbucketize_permute_tensor: Optional[torch.Tensor] = None
-        self._dist_type_per_feature = dist_type_per_feature
+        # Same feature order as ``_feature_block_sizes_tensor`` above, because
+        # the kernel indexes both with the same ``t``. Both are built here, from
+        # the sharding's one feature ordering, so they cannot drift apart.
+        self.register_buffer(
+            "_dist_type_tensor",
+            dist_type_codes(dist_types, device=device),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -279,7 +312,7 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
                 if sparse_features.weights_or_none() is None
                 else self._need_pos
             ),
-            dist_type_per_feature=self._dist_type_per_feature,
+            dist_type_per_feature=self._dist_type_tensor,
         )
 
         return self._dist(bucketized_features)
