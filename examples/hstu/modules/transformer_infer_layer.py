@@ -51,14 +51,30 @@ def read_paged_history(table, page_ids, page_indptr, history_lengths, width):
 
 
 class TransformerInferLayer(nn.Module):
-    """Pre-LN MHA + GELU FFN, with independent recommendation candidates."""
+    """Apply Pre-LN MHA and a GELU FFN with independent candidates.
+
+    Args:
+        config: Inference configuration defining dimensions, dtype and limits.
+        layer_idx: Index into the shared per-layer KV-cache table collection.
+        device: Parameter device; defaults to the current CUDA device.
+
+    Attributes:
+        num_heads: Public attention head count for tensor layout inspection.
+        head_dim: Public per-head dimension for tensor layout inspection.
+        input_norm: Input normalization module in the checkpoint schema.
+        qkv: Fused Q/K/V projection module in the checkpoint schema.
+        proj: Attention output projection module in the checkpoint schema.
+        ffn_norm: Feed-forward normalization module in the checkpoint schema.
+        ffn: Feed-forward modules in the checkpoint schema.
+        output_buffer_: Output storage required by the shared graph runner.
+    """
 
     def __init__(self, config, layer_idx, device=None):
         super().__init__()
-        self.layer_idx = layer_idx
+        self._layer_idx = layer_idx
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
-        self.width = config.max_seq_len
+        self._max_seq_len = config.max_seq_len
         self._export_mode = config.export_mode
         self._residual = config.residual
         dtype = (
@@ -91,7 +107,7 @@ class TransformerInferLayer(nn.Module):
         )
         capacity = config.max_batch_size * config.max_seq_len
         self.register_buffer(
-            "qkv_buffer", torch.empty(capacity, 3 * inner, **kwargs), persistent=False
+            "_qkv_buffer", torch.empty(capacity, 3 * inner, **kwargs), persistent=False
         )
         self.register_buffer(
             "output_buffer_",
@@ -101,6 +117,7 @@ class TransformerInferLayer(nn.Module):
         self.requires_grad_(False)
 
     def project_qkv(self, hidden):
+        """Project packed hidden states to Q/K/V shaped as tokens, heads, dim."""
         mixed = self.qkv(self.input_norm(hidden))
         return tuple(
             x.reshape(-1, self.num_heads, self.head_dim) for x in mixed.chunk(3, dim=-1)
@@ -118,6 +135,13 @@ class TransformerInferLayer(nn.Module):
         page_indptr=None,
         history_lengths=None,
     ):
+        """Attend to causal history and each candidate's own position.
+
+        Offsets delimit packed users; candidates give their trailing candidate
+        counts. When a cache table is supplied, history_lengths includes the
+        cached prefix and newly appended history. Return packed attention
+        outputs with the head dimensions flattened.
+        """
         if query.shape[0] == 0:
             return query.new_empty((0, self.num_heads * self.head_dim))
         # A cached suffix often contains far fewer tokens than the configured
@@ -125,16 +149,16 @@ class TransformerInferLayer(nn.Module):
         # A fixed export bound permits token dimensions to cross max_seq_len
         # (the packed batch can exceed one user's limit) without shape guards.
         query_width = (
-            self.width
+            self._max_seq_len
             if torch.compiler.is_compiling()
-            else min(self.width, query.shape[0])
+            else min(self._max_seq_len, query.shape[0])
         )
         q, query_valid = _pad(query, offsets, query_width)
         k, _ = _pad(key, offsets, query_width)
         v, _ = _pad(value, offsets, query_width)
         lengths = offsets[1:] - offsets[:-1]
         torch._assert_async(
-            torch.all((lengths >= 0) & (lengths <= self.width)),
+            torch.all((lengths >= 0) & (lengths <= self._max_seq_len)),
             "sequence length exceeds Transformer max_seq_len",
         )
         torch._assert_async(
@@ -143,7 +167,7 @@ class TransformerInferLayer(nn.Module):
         )
         new_history = lengths - candidates
         query_local_positions = torch.arange(query_width, device=query.device)
-        key_width = self.width if cache_table is not None else query_width
+        key_width = self._max_seq_len if cache_table is not None else query_width
         positions = torch.arange(key_width, device=query.device)
         if cache_table is None:
             history_lengths = new_history
@@ -154,11 +178,11 @@ class TransformerInferLayer(nn.Module):
                 torch.all(cached_lengths >= 0), "negative cached prefix length"
             )
             torch._assert_async(
-                torch.all(history_lengths + candidates <= self.width),
+                torch.all(history_lengths + candidates <= self._max_seq_len),
                 "cached sequence exceeds Transformer max_seq_len",
             )
             history_k, history_v = read_paged_history(
-                cache_table, page_ids, page_indptr, history_lengths, self.width
+                cache_table, page_ids, page_indptr, history_lengths, self._max_seq_len
             )
             # Candidates are not persisted in the cache. Read them from this call.
             local_positions = (
@@ -193,6 +217,7 @@ class TransformerInferLayer(nn.Module):
         return _unpad(output, offsets, query.shape[0])
 
     def finish(self, hidden, attention):
+        """Apply the output projection, feed-forward block and residuals."""
         projected = self.proj(attention)
         hidden = hidden + projected if self._residual else projected
         output = self.ffn(self.ffn_norm(hidden))
@@ -204,7 +229,7 @@ class TransformerInferLayer(nn.Module):
         return self.finish(hidden, self.attention(q, k, v, offsets, candidates))
 
     def _append(self, key, value, offsets, candidates, metadata, batch_size):
-        table = metadata.kv_cache_table[self.layer_idx]
+        table = metadata.kv_cache_table[self._layer_idx]
         if table.is_cuda:
             return torch.ops.paged_kvcache_ops.append_kvcache(
                 key,
@@ -254,11 +279,11 @@ class TransformerInferLayer(nn.Module):
             table = (
                 self._append(k, v, offsets, candidates, metadata, batch_size)
                 if append
-                else metadata.kv_cache_table[self.layer_idx]
+                else metadata.kv_cache_table[self._layer_idx]
             )
             handle = metadata.kv_onload_handle
             if not self._export_mode and handle is not None:
-                handle.stream_wait_layer(self.layer_idx)
+                handle.stream_wait_layer(self._layer_idx)
             cache = dict(
                 cache_table=table,
                 page_ids=metadata.kv_indices,
@@ -269,13 +294,15 @@ class TransformerInferLayer(nn.Module):
         return self.finish(hidden, attended)
 
     def forward_naive(self, batch_size, num_tokens, hidden, jd, metadata):
+        """Run one layer, appending history when cache metadata is supplied."""
         hidden = hidden[:num_tokens]
         q, k, v = self.project_qkv(hidden)
         return self._compute(hidden, q, k, v, jd, metadata, batch_size, append=True)
 
     def forward_input(self, batch_size, num_tokens, hidden, jd, metadata):
+        """Store projected Q/K/V and append history for split graph execution."""
         mixed = self.qkv(self.input_norm(hidden[:num_tokens]))
-        self.qkv_buffer[:num_tokens].copy_(mixed)
+        self._qkv_buffer[:num_tokens].copy_(mixed)
         if metadata is not None:
             _, k, v = (
                 x.reshape(-1, self.num_heads, self.head_dim) for x in mixed.chunk(3, -1)
@@ -287,12 +314,13 @@ class TransformerInferLayer(nn.Module):
                 else torch.zeros_like(offsets[:-1])
             )
             self._append(k, v, offsets, candidates, metadata, batch_size)
-        return self.qkv_buffer[:num_tokens]
+        return self._qkv_buffer[:num_tokens]
 
     def forward_output(self, batch_size, num_tokens, hidden, jd, metadata):
+        """Attend with stored Q/K/V and return the shared output buffer view."""
         q, k, v = (
             x.reshape(-1, self.num_heads, self.head_dim)
-            for x in self.qkv_buffer[:num_tokens].chunk(3, -1)
+            for x in self._qkv_buffer[:num_tokens].chunk(3, -1)
         )
         output = self._compute(
             hidden[:num_tokens], q, k, v, jd, metadata, batch_size, append=False

@@ -6,6 +6,13 @@ import torch
 
 
 def load_dense_state_dict(module, state_dict, *args, **kwargs):
+    """Load dense weights using the selected backbone's checkpoint layout.
+
+    Filter sparse embedding keys and apply legacy HSTU transpositions only to
+    HSTU layers. Forward load options to PyTorch and return its incompatible-key
+    result. Missing or unexpected dense keys raise RuntimeError even when the
+    caller passes strict=False to allow filtering the sparse weights.
+    """
     hstu_layout = not module._use_exportable and module._backbone == "hstu"
     converted = {}
     for key, value in state_dict.items():
