@@ -13,221 +13,119 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
+from pathlib import Path
 
+import pytest
 import torch
-from commons.datasets.hstu_batch import FeatureConfig
-from commons.datasets.random_inference_dataset import RandomInferenceDataGenerator
-from configs import (
-    InferenceEmbeddingConfig,
-    RankingConfig,
-    get_inference_hstu_config,
-    get_kvcache_config,
+import torch.nn.functional as F
+
+HSTU_ROOT = Path(__file__).resolve().parents[1]
+for path in (HSTU_ROOT, HSTU_ROOT.parent):
+    sys.path.insert(0, str(path))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="requires the CUDA recommendation preprocessing operators",
 )
+@pytest.mark.parametrize("backbone", ["hstu", "transformer"])
+@torch.inference_mode()
+def test_hstu_process_inference(backbone):
+    # Exercise the current processor/block interfaces directly. The old test
+    # used a removed RandomInferenceDataGenerator and obsolete cache APIs even
+    # though it was testing only preprocessing and candidate extraction.
+    from commons.datasets.hstu_batch import HSTUBatch
+    from configs import get_inference_hstu_config
+    from modules.hstu_block_inference import HSTUBlockInference
+    from modules.transformer_infer_layer import TransformerInferLayer
+    from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
-sys.path.append("./model/")
-from inference_ranking_gr import InferenceRankingGR
-
-
-def get_test_setup():
-    max_batch_size = 2
-    max_seqlen = 1024
-
-    # context_emb_size = 1000
-    item_fea_name, item_vocab_size = "item_feat", 10000
-    action_fea_name, action_vocab_size = "act_feat", 128
-    feature_configs = [
-        FeatureConfig(
-            feature_names=[item_fea_name, action_fea_name],
-            max_item_ids=[item_vocab_size - 1, action_vocab_size - 1],
-            max_sequence_length=max_seqlen,
-            is_jagged=False,
-        ),
-    ]
-    max_contextual_seqlen = 0
-
-    hidden_dim_size = 512
-    num_heads = 4
-    head_dim = 128
-    num_layers = 4
-
-    hstu_config = get_inference_hstu_config(
-        hidden_dim_size,
-        num_layers,
-        num_heads,
-        head_dim,
-        max_batch_size,
-        max_seqlen,
+    device = torch.device("cuda")
+    cfg = get_inference_hstu_config(
+        hidden_size=128,
+        num_layers=1,
+        num_attention_heads=2,
+        head_dim=64,
+        max_batch_size=2,
+        max_seq_len=32,
+        dtype=torch.float32,
+        contextual_max_seqlen=1,
+        backbone=backbone,
     )
-
-    _blocks_in_primary_pool = 10240
-    _page_size = 32
-    _offload_chunksize = 128
-    kv_cache_config = get_kvcache_config(
-        blocks_in_primary_pool=_blocks_in_primary_pool,
-        page_size=_page_size,
-        offload_chunksize=_offload_chunksize,
+    block = HSTUBlockInference(cfg).to(device)
+    assert isinstance(block._attention_layers[0], TransformerInferLayer) == (
+        backbone == "transformer"
     )
-    emb_configs = [
-        InferenceEmbeddingConfig(
-            feature_names=["act_feat"],
-            table_name="act",
-            vocab_size=action_vocab_size,
-            dim=hidden_dim_size,
-            use_dynamicemb=False,
-        ),
-        InferenceEmbeddingConfig(
-            feature_names=["context_feat", "item_feat"]
-            if max_contextual_seqlen > 0
-            else ["item_feat"],
-            table_name="item",
-            vocab_size=item_vocab_size,
-            dim=hidden_dim_size,
-            use_dynamicemb=True,
-        ),
-    ]
-    num_tasks = 3
-    task_config = RankingConfig(
-        embedding_configs=emb_configs,
-        prediction_head_arch=[[128, 10, 1] for _ in range(num_tasks)],
-    )
-
-    model = InferenceRankingGR(
-        hstu_config=hstu_config,
-        kvcache_config=kv_cache_config,
-        task_config=task_config,
-        use_cudagraph=False,
-    )
-    model.bfloat16()
-    model.eval()
-
-    return model, feature_configs
-
-
-def test_hstu_process_inference():
-    max_batch_size = 2
-    max_seqlen = 1024
-    max_num_candidates = 128
-    max_incremental_seqlen = 64
-
-    item_fea_name = "item_feat"
-    action_fea_name = "act_feat"
-
-    with torch.inference_mode():
-        model_predict, feature_configs = get_test_setup()
-
-        data_generator = RandomInferenceDataGenerator(
-            feature_configs,
-            item_fea_name,
-            [],
-            action_fea_name,
-            1024,
-            max_batch_size,
-            max_seqlen,
-            max_num_candidates,
-            max_incremental_seqlen,
-            False,
+    row_lengths = {"context": [1, 1], "item": [3, 3], "action": [2, 1]}
+    embeddings = {}
+    for name, lengths in row_lengths.items():
+        embeddings[name] = JaggedTensor(
+            values=torch.randn(sum(lengths), 128, device=device),
+            lengths=torch.tensor(lengths, device=device),
         )
+    features = KeyedJaggedTensor(
+        keys=list(row_lengths),
+        values=torch.arange(11, device=device),
+        lengths=torch.tensor([1, 1, 3, 3, 2, 1], device=device),
+    )
+    batch = HSTUBatch(
+        features=features,
+        batch_size=2,
+        # The shared schema bounds include candidate slots for item and action,
+        # although inference action values themselves contain history only.
+        feature_to_max_seqlen={"context": 1, "item": 4, "action": 4},
+        contextual_feature_names=["context"],
+        item_feature_name="item",
+        action_feature_name="action",
+        max_num_candidates=2,
+        num_candidates=torch.tensor([1, 2], device=device),
+    )
+    jd = block._preprocessor(embeddings, batch)
+    ctx, items, actions = (
+        embeddings[k].values() for k in ("context", "item", "action")
+    )
+    expected = torch.stack(
+        [
+            ctx[0],
+            items[0],
+            actions[0],
+            items[1],
+            actions[1],
+            items[2],
+            ctx[1],
+            items[3],
+            actions[2],
+            items[4],
+            items[5],
+        ]
+    )
+    torch.testing.assert_close(jd.values, expected)
+    torch.testing.assert_close(
+        jd.seqlen, torch.tensor([6, 5], dtype=torch.int32, device=device)
+    )
+    post = block._postprocessor(jd)
+    expected_candidates = F.normalize(
+        items[torch.tensor([2, 4, 5], device=device)], dim=-1, eps=1e-6
+    )
+    torch.testing.assert_close(post.values, expected_candidates)
+    if backbone == "transformer":
+        output = block(embeddings, batch)
+        assert output.values.shape == (3, 128)
+        assert torch.isfinite(output.values).all()
+        from configs import InferenceEmbeddingConfig, RankingConfig
+        from modules.inference_dense_module import InferenceDenseModule
 
-        num_test_batches = 100
-
-        for idx in range(num_test_batches):
-            uids = data_generator.get_inference_batch_user_ids()
-
-            cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
-            truncate_start_pos = cached_start_pos + cached_len
-
-            batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
-
-            kvc_mtdt = model_predict.prepare_kv_cache(batch, uids, truncate_start_pos)
-
-            embs = model_predict._embedding_collection(batch.features)
-
-            jd = model_predict._hstu_block._preprocessor(embs, batch)
-
-            history_lens = [
-                (jd.seqlen[i].item() - jd.num_candidates[i].item()) // 2
-                for i in range(batch.batch_size)
-            ]
-
-            original_items = torch.tensor(
-                [
-                    embs["item_feat"].offsets()[i].item() + token_idx
-                    for i in range(batch.batch_size)
-                    for token_idx in range(history_lens[i])
-                ]
-            ).long()
-            new_items = torch.tensor(
-                [
-                    2 * token_idx + jd.seqlen_offsets[i].item()
-                    for i in range(batch.batch_size)
-                    for token_idx in range(history_lens[i])
-                ]
-            ).long()
-            assert torch.allclose(
-                embs["item_feat"].values()[original_items].to(torch.bfloat16),
-                jd.values[new_items],
-            )
-
-            original_actions = torch.tensor(
-                [
-                    embs["act_feat"].offsets()[i].item() + token_idx
-                    for i in range(batch.batch_size)
-                    for token_idx in range(history_lens[i])
-                ]
-            ).long()
-            new_actions = torch.tensor(
-                [
-                    2 * token_idx + 1 + jd.seqlen_offsets[i].item()
-                    for i in range(batch.batch_size)
-                    for token_idx in range(history_lens[i])
-                ]
-            ).long()
-            assert torch.allclose(
-                embs["act_feat"].values()[original_actions].to(torch.bfloat16),
-                jd.values[new_actions],
-            )
-
-            original_candidates = torch.tensor(
-                [
-                    embs["item_feat"].offsets()[i].item() + history_lens[i] + token_idx
-                    for i in range(batch.batch_size)
-                    for token_idx in range(jd.num_candidates[i].item())
-                ]
-            ).long()
-            new_candidates = torch.tensor(
-                [
-                    jd.seqlen_offsets[i].item() + history_lens[i] * 2 + token_idx
-                    for i in range(batch.batch_size)
-                    for token_idx in range(jd.num_candidates[i].item())
-                ]
-            ).long()
-            assert torch.allclose(
-                embs["item_feat"].values()[original_candidates].to(torch.bfloat16),
-                jd.values[new_candidates],
-            )
-
-            # post process
-            post_jd = model_predict._hstu_block._postprocessor(jd)
-            original_candidates = torch.tensor(
-                [
-                    embs["item_feat"].offsets()[i].item() + history_lens[i] + token_idx
-                    for i in range(batch.batch_size)
-                    for token_idx in range(jd.num_candidates[i].item())
-                ]
-            ).long()
-            new_candidates = torch.tensor(
-                [
-                    post_jd.seqlen_offsets[i].item() + token_idx
-                    for i in range(batch.batch_size)
-                    for token_idx in range(jd.num_candidates[i].item())
-                ]
-            ).long()
-            post_embs = (
-                embs["item_feat"].values()[original_candidates].to(torch.bfloat16)
-            )
-            post_embs = post_embs / torch.linalg.norm(
-                post_embs, ord=2, dim=-1, keepdim=True
-            ).clamp(min=1e-6)
-            assert torch.allclose(post_embs, post_jd.values)
-
-            model_predict.offload_kv_cache(uids, kvc_mtdt)
+        task = RankingConfig(
+            embedding_configs=[
+                InferenceEmbeddingConfig(["item"], "item", 16, 128, False)
+            ],
+            prediction_head_arch=[128, 2],
+            num_tasks=2,
+        )
+        dense = InferenceDenseModule(cfg, None, task, hstu_block=block).eval()
+        logits = dense(batch, embeddings)
+        expected_logits = dense._mlp(output.values)
+        torch.testing.assert_close(logits, expected_logits)
+        state = {k: v.clone() for k, v in dense.state_dict().items()}
+        dense.load_state_dict(state, strict=True)
+        torch.testing.assert_close(dense(batch, embeddings), logits)

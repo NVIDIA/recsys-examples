@@ -277,6 +277,9 @@ def make_inference_hstu_config(
         contextual_max_seqlen=contextual_max_seqlen,
         scaling_seqlen=hstu_config.scaling_seqlen,
         export_mode=True,
+        backbone=NetworkArgs().backbone,
+        transformer_ffn_dim=NetworkArgs().transformer_ffn_dim,
+        hstu_preprocessing_config=hstu_config.hstu_preprocessing_config,
     )
 
 

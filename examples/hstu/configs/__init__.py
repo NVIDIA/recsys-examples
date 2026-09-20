@@ -1,4 +1,4 @@
-from . import hstu_config, inference_config, task_config
+from . import hstu_config, inference_config
 from .hstu_config import (
     HSTUConfig,
     HSTULayerType,
@@ -13,7 +13,20 @@ from .inference_config import (
     InferenceHSTUConfig,
     get_inference_hstu_config,
 )
-from .task_config import RankingConfig, RetrievalConfig
+
+
+def __getattr__(name):
+    # Inference configuration and tensor-only layer tests do not require the
+    # training embedding stack. Load task/embedding schemas only when requested.
+    if name in ("task_config", "RankingConfig", "RetrievalConfig"):
+        from importlib import import_module
+
+        module = import_module(".task_config", __name__)
+        value = module if name == "task_config" else getattr(module, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "hstu_config",

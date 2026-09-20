@@ -178,8 +178,60 @@ def get_exportable_model_for_inference(
     dynamic_table_configs,
     trained_emb_table_sizes,
     checkpoint_dir,
+    max_batch_size=1,
+    total_max_seqlen=8192,
+    num_contextual_features=0,
 ):
     model = get_training_gr_model()
+    if NetworkArgs().backbone == "transformer":
+        from configs import get_inference_hstu_config
+        from dynamicemb.exportable_tables import apply_inference_embedding_collection
+        from model.inference_ranking_gr import InferenceRankingGR
+        from modules.exportable_embedding import apply_inference_sparse
+        from modules.inference_dense_module import InferenceDenseModule
+
+        # The training shell supplies the existing sparse/MLP/processor schemas.
+        # Its HSTU weights are never used; load a matching Transformer checkpoint.
+        model = apply_inference_embedding_collection(
+            model, dynamic_table_configs, trained_emb_table_sizes
+        )
+        cfg = model._hstu_config
+        inference_config = get_inference_hstu_config(
+            hidden_size=cfg.hidden_size,
+            num_layers=cfg.num_layers,
+            num_attention_heads=cfg.num_attention_heads,
+            head_dim=cfg.kv_channels,
+            max_batch_size=max_batch_size,
+            max_seq_len=total_max_seqlen,
+            norm_epsilon=cfg.layernorm_epsilon,
+            dtype=torch.bfloat16
+            if cfg.bf16
+            else torch.float16
+            if cfg.fp16
+            else torch.float32,
+            learnable_input_layernorm=cfg.learnable_input_layernorm,
+            residual=cfg.residual,
+            is_causal=cfg.is_causal,
+            target_group_size=cfg.target_group_size,
+            position_encoding_config=cfg.position_encoding_config,
+            hstu_preprocessing_config=cfg.hstu_preprocessing_config,
+            contextual_max_seqlen=num_contextual_features,
+            backbone="transformer",
+            transformer_ffn_dim=NetworkArgs().transformer_ffn_dim,
+            export_mode=True,
+        )
+        inference_model = InferenceRankingGR(
+            apply_inference_sparse(model._embedding_collection),
+            InferenceDenseModule(
+                inference_config, None, model._task_config, mlp=model._mlp
+            ),
+        )
+        if cfg.bf16:
+            inference_model.bfloat16()
+        elif cfg.fp16:
+            inference_model.half()
+        inference_model.load_checkpoint(checkpoint_dir)
+        return inference_model.eval()
     inference_model = apply_inference(
         model,
         dynamic_table_configs=dynamic_table_configs,
@@ -257,6 +309,9 @@ def export_inference_gr_ranking(
             dynamic_table_configs,
             trained_emb_table_sizes,
             checkpoint_dir,
+            max_batch_size,
+            total_max_seqlen,
+            num_contextual_features,
         )
 
         eval_module = get_multi_event_metric_module(
