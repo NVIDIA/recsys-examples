@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -21,7 +20,6 @@ from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.enumerators import (
-    GUARDED_COMPUTE_KERNELS,
     EmbeddingEnumerator,
     get_partition_by_type,
 )
@@ -48,8 +46,6 @@ from torchrec.modules.embedding_configs import DataType
 from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
 
 from .planners import DynamicEmbParameterConstraints
-
-logger: logging.Logger = logging.getLogger(__name__)
 
 BATCH_SIZE: int = 512
 
@@ -256,13 +252,12 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
                 sharding_options_per_table: List[ShardingOption] = []
 
                 for sharding_type in self._filter_sharding_types(
-                    name, sharder.sharding_types(self._compute_device), use_dynamicemb
+                    name, sharder.sharding_types(self._compute_device), sharder_key
                 ):
                     for compute_kernel in self._filter_compute_kernels(
                         name,
                         sharder.compute_kernels(sharding_type, self._compute_device),
                         sharding_type,
-                        use_dynamicemb,
                     ):
                         (
                             shard_sizes,
@@ -322,81 +317,39 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
 
         return sharding_options
 
+    def _use_dynamicemb(self, name: str) -> bool:
+        """Whether *name* is a DynamicEmb table.
+
+        Read off the constraint rather than passed in: the two hooks below are
+        the only things that need it, TorchRec already hands them the table's
+        name, and threading it down instead would mean forking ``enumerate``
+        to carry it -- which is what this used to do.
+        """
+        constraint = self._constraints.get(name) if self._constraints else None
+        return bool(getattr(constraint, "use_dynamicemb", False))
+
     def _filter_sharding_types(
-        self, name: str, allowed_sharding_types: List[str], use_dynamicemb: bool
+        self, name: str, allowed_sharding_types: List[str], sharder_key: str = ""
     ) -> List[str]:
-        if use_dynamicemb:
+        # A DynamicEmb table is row-wise and nothing else, so the rest of the
+        # search space is not applicable rather than merely unattractive.
+        if self._use_dynamicemb(name):
             return [ShardingType.ROW_WISE.value]
-        if not self._constraints or not self._constraints.get(name):
-            return allowed_sharding_types
-        constraints: DynamicEmbParameterConstraints = self._constraints[name]
-        if not constraints.sharding_types:
-            return allowed_sharding_types
-        constrained_sharding_types: List[str] = constraints.sharding_types
-
-        filtered_sharding_types = list(
-            set(constrained_sharding_types) & set(allowed_sharding_types)
+        return super()._filter_sharding_types(
+            name, allowed_sharding_types, sharder_key
         )
-
-        if not filtered_sharding_types:
-            logger.warn(
-                "No available sharding types after applying user provided "
-                f"constraints for {name}. Constrained sharding types: "
-                f"{constrained_sharding_types}, allowed sharding types: "
-                f"{allowed_sharding_types}, filtered sharding types: "
-                f"{filtered_sharding_types}. Please check if the constrained "
-                "sharding types are too restrictive, if the sharder allows the "
-                "sharding types, or if non-strings are passed in."
-            )
-        return filtered_sharding_types
 
     def _filter_compute_kernels(
         self,
         name: str,
         allowed_compute_kernels: List[str],
         sharding_type: str,
-        use_dynamicemb: bool,
     ) -> List[str]:
-        if use_dynamicemb:
+        # FUSED is a placeholder that keeps the table in the search space;
+        # DynamicEmbeddingShardingPlanner replaces the whole ParameterSharding,
+        # CUSTOMIZED_KERNEL included, once planning is done.
+        if self._use_dynamicemb(name):
             return [EmbeddingComputeKernel.FUSED.value]
-
-        # setup constrained_compute_kernels
-        if (
-            self._constraints
-            and self._constraints.get(name)
-            and self._constraints[name].compute_kernels
-        ):
-            # pyre-ignore
-            constrained_compute_kernels: List[str] = self._constraints[
-                name
-            ].compute_kernels
-        else:
-            constrained_compute_kernels: List[str] = [
-                compute_kernel.value
-                for compute_kernel in EmbeddingComputeKernel
-                if compute_kernel not in GUARDED_COMPUTE_KERNELS
-            ]
-
-        # setup filtered_compute_kernels
-        filtered_compute_kernels = list(
-            set(constrained_compute_kernels) & set(allowed_compute_kernels)
+        return super()._filter_compute_kernels(
+            name, allowed_compute_kernels, sharding_type
         )
-
-        # special rules
-        if EmbeddingComputeKernel.DENSE.value in filtered_compute_kernels:
-            if (
-                EmbeddingComputeKernel.FUSED.value in filtered_compute_kernels
-            ):  # always false for data_parallel
-                filtered_compute_kernels.remove(EmbeddingComputeKernel.DENSE.value)
-
-        if not filtered_compute_kernels:
-            logger.warn(
-                "No available compute kernels after applying user provided "
-                f"constraints for {name}. Constrained compute kernels: "
-                f"{constrained_compute_kernels}, allowed compute kernels: "
-                f"{allowed_compute_kernels}, filtered compute kernels: "
-                f"{filtered_compute_kernels}, sharding type: {sharding_type}. Please check if the constrained "
-                "compute kernels are too restrictive, if the sharder allows the "
-                "compute kernels, or if non-strings are passed in."
-            )
-        return filtered_compute_kernels
