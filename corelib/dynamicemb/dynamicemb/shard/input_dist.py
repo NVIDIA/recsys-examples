@@ -19,9 +19,10 @@ import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
-from torchrec.distributed.dist_data import KJTAllToAll
+from torchrec.distributed.sharding.rw_sharding import (
+    RwSparseFeaturesDist as _RwSparseFeaturesDist,
+)
 from torchrec.distributed.embedding_sharding import (
-    BaseSparseFeaturesDist,
     _fx_wrap_batch_size_per_feature,
     _fx_wrap_gen_list_n_times,
     _fx_wrap_max_B,
@@ -171,24 +172,20 @@ def _determine_output_weights(kjt, pos, bucketize_pos, bucketized_weights):
     return result
 
 
-class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
-    """
-    Bucketizes sparse features in RW fashion and then redistributes with an AlltoAll
-    collective operation.
+class RwSparseFeaturesDist(_RwSparseFeaturesDist):
+    """TorchRec's row-wise distributor, bucketizing by DynamicEmb's rule.
+
+    The distribution itself is entirely TorchRec's: the per-feature block
+    sizes, the KJTAllToAll and its splits, the sequence permute, all come from
+    ``super().__init__``. One call differs. TorchRec places a key by the block
+    of rows it falls in and rewrites it to its offset inside that block;
+    DynamicEmb has three rules (``dyn_emb::DistType``), two of which leave the
+    key global, because a hash table has no row index to rewrite it into.
 
     Args:
-        pg (dist.ProcessGroup): ProcessGroup for AlltoAll communication.
-        intra_pg (dist.ProcessGroup): ProcessGroup within single host group for AlltoAll
-            communication.
-        num_features (int): total number of features.
-        feature_hash_sizes (List[int]): hash sizes of features.
-        device (Optional[torch.device]): device on which buffers will be allocated.
-        is_sequence (bool): if this is for a sequence embedding.
-        has_feature_processor (bool): existence of feature processor (ie. position
-            weighted features).
-        dist_types (Optional[List[str]]): the key -> rank rule per feature, in the
-            same order as ``feature_hash_sizes``.
-
+        dist_types: the rule per feature, in the same order as
+            ``feature_hash_sizes`` -- the kernel indexes both with the same
+            ``t``, and building them together here is what keeps them aligned.
     """
 
     def __init__(
@@ -202,32 +199,15 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
     ) -> None:
-        super().__init__()
-        self._world_size: int = pg.size()
-        self._num_features = num_features
-        feature_block_sizes = [
-            (hash_size + self._world_size - 1) // self._world_size
-            for hash_size in feature_hash_sizes
-        ]
-        self.register_buffer(
-            "_feature_block_sizes_tensor",
-            torch.tensor(
-                feature_block_sizes,
-                device=device,
-                dtype=torch.int64,
-            ),
-        )
-        self._dist = KJTAllToAll(
+        super().__init__(
             pg=pg,
-            splits=[self._num_features] * self._world_size,
+            num_features=num_features,
+            feature_hash_sizes=feature_hash_sizes,
+            device=device,
+            is_sequence=is_sequence,
+            has_feature_processor=has_feature_processor,
+            need_pos=need_pos,
         )
-        self._is_sequence = is_sequence
-        self._has_feature_processor = has_feature_processor
-        self._need_pos = need_pos
-        self.unbucketize_permute_tensor: Optional[torch.Tensor] = None
-        # Same feature order as ``_feature_block_sizes_tensor`` above, because
-        # the kernel indexes both with the same ``t``. Both are built here, from
-        # the sharding's one feature ordering, so they cannot drift apart.
         self.register_buffer(
             "_dist_type_tensor",
             dist_type_codes(dist_types, device=device),
@@ -238,18 +218,7 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         self,
         sparse_features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KeyedJaggedTensor]]:
-        """
-        Bucketizes sparse feature values into world size number of buckets and then
-        performs AlltoAll operation.
-
-        Args:
-            sparse_features (KeyedJaggedTensor): sparse features to bucketize and
-                redistribute.
-
-        Returns:
-            Awaitable[Awaitable[KeyedJaggedTensor]]: awaitable of awaitable of KeyedJaggedTensor.
-        """
-
+        """Bucketize by ``dist_type``, then TorchRec's AlltoAll unchanged."""
         (
             bucketized_features,
             self.unbucketize_permute_tensor,
