@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import logging
-import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -35,6 +34,7 @@ from torchrec.distributed.planner.types import (
 from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.sharding_plan import (
     _calculate_cw_shard_sizes_and_offsets,
+    _calculate_rw_shard_sizes_and_offsets,
     _calculate_uneven_rw_shard_sizes_and_offsets,
 )
 from torchrec.distributed.types import (
@@ -107,43 +107,6 @@ def _extract_constraints_for_param(
         device_group,
         key_value_params,
     )
-
-
-def _calculate_rw_shard_sizes_and_offsets(
-    hash_size: int, num_devices: int, columns: int
-) -> Tuple[List[List[int]], List[List[int]]]:
-    """
-    Sets prefix of shard_sizes to be `math.ceil(hash_size/num_devices)`.
-
-    For example if hash_size = 10, num_devices = 4, we will allocate the rows as 3,3,3,1
-    (rather than 3,3,2,2).
-    This is due to implementation in RW sharding that sets block_size_lists to be ceil.
-    The balanced way is harder to support on GPU.
-    For more details see https://fb.quip.com/xbgbAchCTOL0
-
-    Also consider the example of hash_size = 5, num_devices = 4. The expected rows per
-    rank is [2,2,1,0].
-    """
-
-    block_size: int = math.ceil(hash_size / num_devices)
-    last_rank: int = hash_size // block_size
-    last_block_size: int = hash_size - block_size * last_rank
-    shard_sizes: List[List[int]] = []
-
-    for rank in range(num_devices):
-        if rank < last_rank:
-            local_row: int = block_size
-        elif rank == last_rank:
-            local_row: int = last_block_size
-        else:
-            local_row: int = 0
-        shard_sizes.append([local_row, columns])
-    shard_offsets = [[0, 0]]
-
-    for i in range(num_devices - 1):
-        shard_offsets.append([shard_sizes[i][0] + shard_offsets[i][0], 0])
-
-    return shard_sizes, shard_offsets
 
 
 def calculate_shard_sizes_and_offsets(

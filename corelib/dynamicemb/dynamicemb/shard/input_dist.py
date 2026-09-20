@@ -20,63 +20,20 @@ from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
 from torchrec.distributed.dist_data import KJTAllToAll
-from torchrec.distributed.embedding_sharding import BaseSparseFeaturesDist
+from torchrec.distributed.embedding_sharding import (
+    BaseSparseFeaturesDist,
+    _fx_wrap_batch_size_per_feature,
+    _fx_wrap_gen_list_n_times,
+    _fx_wrap_max_B,
+    _fx_wrap_stride,
+    _fx_wrap_stride_per_key_per_rank,
+    _fx_wrap_tensor_to_device_dtype,
+)
 from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 torch.fx.wrap("len")
-
-CACHE_LOAD_FACTOR_STR: str = "cache_load_factor"
-
-
-# torch.Tensor.to can not be fx symbolic traced as it does not go through __torch_dispatch__ => fx.wrap it
-@torch.fx.wrap
-def _fx_wrap_tensor_to_device_dtype(
-    t: torch.Tensor, tensor_device_dtype: torch.Tensor
-) -> torch.Tensor:
-    return t.to(device=tensor_device_dtype.device, dtype=tensor_device_dtype.dtype)
-
-
-@torch.fx.wrap
-def _fx_wrap_batch_size_per_feature(kjt: KeyedJaggedTensor) -> Optional[torch.Tensor]:
-    return (
-        torch.tensor(
-            kjt.stride_per_key(), device=kjt.device(), dtype=kjt.lengths().dtype
-        )
-        if kjt.variable_stride_per_key()
-        else None
-    )
-
-
-@torch.fx.wrap
-def _fx_wrap_max_B(kjt: KeyedJaggedTensor) -> int:
-    return max(kjt.stride_per_key()) if kjt.variable_stride_per_key() else -1
-
-
-@torch.fx.wrap
-def _fx_wrap_stride(kjt: KeyedJaggedTensor) -> Optional[int]:
-    return None if kjt.variable_stride_per_key() else kjt.stride()
-
-
-@torch.fx.wrap
-def _fx_wrap_stride_per_key_per_rank(
-    kjt: KeyedJaggedTensor, num_buckets: int
-) -> Optional[List[List[int]]]:
-    return (
-        kjt.stride_per_key_per_rank() * num_buckets
-        if kjt.variable_stride_per_key()
-        else None
-    )
-
-
-@torch.fx.wrap
-def _fx_wrap_gen_list_n_times(ls: List[str], n: int) -> List[str]:
-    # Syntax for dynamo (instead of generator kjt.keys() * num_buckets)
-    ret: List[str] = []
-    for _ in range(n):
-        ret.extend(ls)
-    return ret
 
 
 def dist_type_codes(
