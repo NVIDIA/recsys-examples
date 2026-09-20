@@ -65,13 +65,30 @@ def dist_type_per_feature(
 
     A DynamicEmb table always carries its rule, put into ``fused_params`` by the
     planner. A plain TorchRec table carries none and gets ``continuous``, which
-    is what TorchRec's own bucketizer does.
+    is what TorchRec's own bucketizer does -- but a DynamicEmb table must never
+    land there, so one arriving without a rule raises instead. ``continuous``
+    places a key by range and rewrites the index on the way in
+    (``new_idx = idx % blk_size``), so what the table stores is not a global
+    key; `incremental_dump`, `replay_increment` and the checkpoint loader all
+    refuse such a table. Falling back to it would turn a missing setting into a
+    table that silently cannot be dumped incrementally or reloaded.
     """
     per_feature: Dict[str, str] = {}
     for info in sharding_infos:
         fused_params = info.fused_params
         if fused_params is not None and "dist_type" in fused_params:
             dist_type = fused_params["dist_type"]
+        elif (
+            info.param_sharding.compute_kernel
+            == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+        ):
+            raise ValueError(
+                f"DynamicEmb table {info.embedding_config.name!r} reached "
+                "sharding without a dist_type. It is normally set by "
+                "DynamicEmbeddingShardingPlanner from "
+                "DynamicEmbTableOptions.dist_type; a plan built another way "
+                "has to carry it too. Use 'roundrobin' or 'hash_roundrobin'."
+            )
         else:
             dist_type = "continuous"
         for feature_name in info.embedding_config.feature_names:
