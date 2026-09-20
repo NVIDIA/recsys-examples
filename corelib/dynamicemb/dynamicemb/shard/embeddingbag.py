@@ -35,7 +35,7 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
-from ..planner.rw_sharding import RwPooledDynamicEmbeddingSharding
+from .rw_sharding import RwPooledDynamicEmbeddingSharding
 
 
 class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):

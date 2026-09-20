@@ -43,7 +43,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
-from dynamicemb.input_dist import dist_type_codes
+from dynamicemb.shard.input_dist import dist_type_codes
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder

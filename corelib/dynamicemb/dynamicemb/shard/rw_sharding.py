@@ -49,7 +49,7 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbedding,
     BatchedDynamicEmbeddingBag,
 )
-from ..input_dist import RwSparseFeaturesDist
+from .input_dist import RwSparseFeaturesDist
 
 
 def dist_type_per_feature(

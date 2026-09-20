@@ -55,7 +55,7 @@ from ..dynamicemb_config import (
     ScoreStrategy,
     get_eviction_score_strategy,
 )
-from ..planner.rw_sharding import RwSequenceDynamicEmbeddingSharding
+from .rw_sharding import RwSequenceDynamicEmbeddingSharding
 
 
 class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
