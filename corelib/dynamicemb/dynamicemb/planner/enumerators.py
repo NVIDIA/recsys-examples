@@ -47,7 +47,7 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_configs import DataType
 from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
 
-from .planner import DynamicEmbParameterConstraints
+from .planners import DynamicEmbParameterConstraints
 
 logger: logging.Logger = logging.getLogger(__name__)
 

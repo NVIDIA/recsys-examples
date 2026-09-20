@@ -15,7 +15,7 @@
 
 
 from .enumerators import DynamicEmbeddingEnumerator
-from .planner import (
+from .planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
     DynamicEmbParameterSharding,

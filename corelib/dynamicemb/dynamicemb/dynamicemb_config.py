@@ -497,7 +497,7 @@ class DynamicEmbTableOptions:
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
         If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
-        With :class:`~dynamicemb.planner.planner.DynamicEmbeddingShardingPlanner`, it is rounded up
+        With :class:`~dynamicemb.planner.planners.DynamicEmbeddingShardingPlanner`, it is rounded up
         to a multiple of the effective ``bucket_capacity`` in ``_prepare_dynemb_table_options``,
         then capped at ``max_capacity`` if the aligned value is larger.
         As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
@@ -567,7 +567,7 @@ class DynamicEmbTableOptions:
     Notes
     -----
     The ``DynamicEmb_APIs.md`` file in the ``dynamicemb`` package mirrors this class and related planner
-    behavior (e.g. :class:`~dynamicemb.planner.planner.DynamicEmbeddingShardingPlanner`).
+    behavior (e.g. :class:`~dynamicemb.planner.planners.DynamicEmbeddingShardingPlanner`).
     """
 
     embedding_dtype: Optional[torch.dtype] = None
