@@ -18,9 +18,9 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.enumerators import (
     EmbeddingEnumerator,
+    _extract_constraints_for_param,
     get_partition_by_type,
 )
 from torchrec.distributed.planner.types import (
@@ -31,78 +31,14 @@ from torchrec.distributed.planner.types import (
 )
 from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.sharding_plan import (
-    _calculate_cw_shard_sizes_and_offsets,
-    _calculate_rw_shard_sizes_and_offsets,
-    _calculate_uneven_rw_shard_sizes_and_offsets,
+    calculate_shard_sizes_and_offsets as _calculate_shard_sizes_and_offsets,
 )
-from torchrec.distributed.types import (
-    BoundsCheckMode,
-    CacheParams,
-    KeyValueParams,
-    ModuleSharder,
-    ShardingType,
-)
-from torchrec.modules.embedding_configs import DataType
+from torchrec.distributed.types import ModuleSharder, ShardingType
 from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
 
 from .planners import DynamicEmbParameterConstraints
 
 BATCH_SIZE: int = 512
-
-
-def _extract_constraints_for_param(
-    constraints: Optional[Dict[str, DynamicEmbParameterConstraints]], name: str
-) -> Tuple[
-    bool,
-    List[float],
-    Optional[int],
-    Optional[CacheParams],
-    Optional[bool],
-    Optional[bool],
-    Optional[BoundsCheckMode],
-    Optional[List[str]],
-    Optional[DataType],
-    Optional[str],
-    Optional[KeyValueParams],
-]:
-    use_dynamicemb = False
-    input_lengths = [POOLING_FACTOR]
-    col_wise_shard_dim = None
-    cache_params = None
-    enforce_hbm = None
-    stochastic_rounding = None
-    bounds_check_mode = None
-    feature_names = None
-    output_dtype = None
-    device_group = None
-    key_value_params = None
-
-    if constraints and constraints.get(name):
-        use_dynamicemb = constraints[name].use_dynamicemb
-        input_lengths = constraints[name].pooling_factors
-        col_wise_shard_dim = constraints[name].min_partition
-        cache_params = constraints[name].cache_params
-        enforce_hbm = constraints[name].enforce_hbm
-        stochastic_rounding = constraints[name].stochastic_rounding
-        bounds_check_mode = constraints[name].bounds_check_mode
-        feature_names = constraints[name].feature_names
-        output_dtype = constraints[name].output_dtype
-        device_group = constraints[name].device_group
-        key_value_params = constraints[name].key_value_params
-
-    return (
-        use_dynamicemb,
-        input_lengths,
-        col_wise_shard_dim,
-        cache_params,
-        enforce_hbm,
-        stochastic_rounding,
-        bounds_check_mode,
-        feature_names,
-        output_dtype,
-        device_group,
-        key_value_params,
-    )
 
 
 def calculate_shard_sizes_and_offsets(
@@ -114,52 +50,32 @@ def calculate_shard_sizes_and_offsets(
     col_wise_shard_dim: Optional[int] = None,
     device_memory_sizes: Optional[List[int]] = None,
 ) -> Tuple[List[List[int]], List[List[int]]]:
+    """TorchRec's, plus the one shape it has no way to describe.
+
+    A DynamicEmb table has no rows to divide. Its ``num_embeddings`` is a
+    nominal figure, the storage is a hash table sized by
+    ``DynamicEmbTableOptions``, and which rank holds a key is decided by
+    ``dist_type`` rather than by any row range. So there is nothing for the
+    row-wise arithmetic to compute, and the 1x1 shard per rank stands in for
+    it -- one entry per rank so the tensor still looks sharded to the planner,
+    sized so it is costed as the near-nothing it is. ``get_state_dict`` in
+    batched_dynamicemb_compute_kernel.py writes the same shape for the same
+    reason.
+
+    Every other table goes to TorchRec unchanged.
     """
-    Calculates sizes and offsets for tensor sharded according to provided sharding type.
-
-    Args:
-        tensor (torch.Tensor): tensor to be sharded.
-        world_size (int): total number of devices in topology.
-        local_world_size (int): total number of devices in host group topology.
-        sharding_type (str): provided ShardingType value.
-        col_wise_shard_dim (Optional[int]): dimension for column wise sharding split.
-
-    Returns:
-        Tuple[List[List[int]], List[List[int]]]: shard sizes, represented as a list of the dimensions of the sharded tensor on each device, and shard offsets, represented as a list of coordinates of placement on each device.
-
-    Raises:
-        ValueError: If `sharding_type` is not a valid ShardingType.
-    """
-
     if use_dynamicemb:
         sizes = [[1, 1]] * world_size
         offsets = [[i, 0] for i in range(world_size)]
         return sizes, offsets
 
-    (rows, columns) = tensor.shape
-
-    if sharding_type == ShardingType.DATA_PARALLEL.value:
-        return [[rows, columns]] * world_size, [[0, 0]] * world_size
-    elif sharding_type == ShardingType.TABLE_WISE.value:
-        return [[rows, columns]], [[0, 0]]
-    elif sharding_type == ShardingType.ROW_WISE.value:
-        return (
-            _calculate_rw_shard_sizes_and_offsets(rows, world_size, columns)
-            if not device_memory_sizes
-            else _calculate_uneven_rw_shard_sizes_and_offsets(
-                rows, world_size, columns, device_memory_sizes
-            )
-        )
-    elif sharding_type == ShardingType.TABLE_ROW_WISE.value:
-        return _calculate_rw_shard_sizes_and_offsets(rows, local_world_size, columns)
-    elif (
-        sharding_type == ShardingType.COLUMN_WISE.value
-        or sharding_type == ShardingType.TABLE_COLUMN_WISE.value
-    ):
-        return _calculate_cw_shard_sizes_and_offsets(columns, rows, col_wise_shard_dim)
-
-    raise ValueError(
-        f"Unrecognized or unsupported sharding type provided: {sharding_type}"
+    return _calculate_shard_sizes_and_offsets(
+        tensor=tensor,
+        world_size=world_size,
+        local_world_size=local_world_size,
+        sharding_type=sharding_type,
+        col_wise_shard_dim=col_wise_shard_dim,
+        device_memory_sizes=device_memory_sizes,
     )
 
 
@@ -232,7 +148,6 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
 
             for name, param in sharder.shardable_parameters(child_module).items():
                 (
-                    use_dynamicemb,
                     input_lengths,
                     col_wise_shard_dim,
                     cache_params,
@@ -267,7 +182,7 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
                             world_size=self._world_size,
                             local_world_size=self._local_world_size,
                             sharding_type=sharding_type,
-                            use_dynamicemb=use_dynamicemb,
+                            use_dynamicemb=self._use_dynamicemb(name),
                             col_wise_shard_dim=col_wise_shard_dim,
                             device_memory_sizes=self._device_memory_sizes,
                         )
