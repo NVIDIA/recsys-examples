@@ -140,6 +140,7 @@ class InferenceDenseModule(torch.nn.Module):
         self._hstu_config = hstu_config
         self._task_config = task_config
         self._use_exportable = use_exportable
+        self._backbone = getattr(hstu_config, "backbone", "hstu")
         if self._use_exportable:
             assert isinstance(
                 hstu_config, HSTUConfig
@@ -293,41 +294,9 @@ class InferenceDenseModule(torch.nn.Module):
         self.load_state_dict(model_state_dict, strict=False)
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
-        new_state_dict = {}
-        for k in model_state_dict:
-            if (
-                k.startswith(
-                    "_embedding_collection._data_parallel_embedding_collection.embeddings."
-                )
-                or "_model_parallel_embedding_collection" in k
-            ):
-                continue
+        from modules.inference_checkpoint import load_dense_state_dict
 
-            is_transposed = False
-
-            newk = k
-            if not self._use_exportable:
-                if k.endswith("_linear_uvqk_weight"):
-                    newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
-                    is_transposed = True
-                elif k.endswith("_linear_uvqk_bias"):
-                    newk = k.removesuffix("_linear_uvqk_bias") + "_linear_uvqk.bias"
-                elif k.endswith("_linear_proj_weight"):
-                    newk = k.removesuffix("_linear_proj_weight") + "_linear_proj.weight"
-                    is_transposed = True
-
-            new_state_dict[newk] = (
-                model_state_dict[k] if not is_transposed else model_state_dict[k].T
-            )
-
-        unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
-        if not self._use_exportable:
-            for hstu_layer in self._hstu_block._attention_layers:
-                hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
-                hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
-
-        assert unloaded_modules.missing_keys == []
-        assert unloaded_modules.unexpected_keys == []
+        return load_dense_state_dict(self, model_state_dict, *args, **kwargs)
 
     def forward_with_kvcache(
         self,
@@ -455,6 +424,8 @@ class InferenceDenseModule(torch.nn.Module):
         embeddings: Dict[str, JaggedTensor],
     ):
         with torch.inference_mode():
+            if not self._use_exportable:
+                return self.forward_nokvcache(batch, embeddings)
             # Forward through HSTU block
             jd_output, _ = self._hstu_block(embeddings, batch)
             # Prediction head
