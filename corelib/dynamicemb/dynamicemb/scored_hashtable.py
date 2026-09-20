@@ -26,6 +26,7 @@ import torch.distributed as dist
 from dynamicemb.dynamicemb_config import dtype_to_bytes
 from dynamicemb.key_ownership import (
     murmur3_hash_64bits,
+    owned_key_mask,
 )
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
 from dynamicemb_extensions import (
@@ -196,6 +197,7 @@ class ScoredHashTable(abc.ABC):
         key_file: str,
         score_files: Dict[str, str],
         table_id: Optional[int] = None,
+        dist_type: Optional[str] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -203,6 +205,12 @@ class ScoredHashTable(abc.ABC):
         Args:
             key_file (str): the file path of keys.
             score_files: Dict[str, str]: Dict from score name to score file path.
+            dist_type (Optional[str]): the key -> rank rule the file's keys were
+                distributed by, consulted only when the world size is > 1.
+                ``None`` keeps every key: a table loaded on its own, outside any
+                sharding, has no rule to apply. Optional here and required on
+                :class:`~dynamicemb.types.Counter` because a table can be loaded
+                standalone and a counter cannot.
         """
 
     @abc.abstractmethod
@@ -896,6 +904,7 @@ class LinearBucketTable(ScoredHashTable):
         key_file: str,
         score_files: Dict[str, str],
         table_id: Optional[int] = None,
+        dist_type: Optional[str] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -905,6 +914,11 @@ class LinearBucketTable(ScoredHashTable):
             score_files: Dict[str, str]: Dict from score name to score file path.
             table_id (Optional[int]): if provided, load keys into the specified logical table.
                 If None, defaults to table 0.
+            dist_type (Optional[str]): the key -> rank rule the file's keys were
+                distributed by, consulted only when the world size is > 1.
+                ``None`` keeps every key in the file: a table loaded on its own,
+                outside any sharding, has no rule to apply, and guessing one
+                would silently drop the keys it guessed wrong about.
         """
 
         load_table_id = table_id if table_id is not None else 0
@@ -975,8 +989,12 @@ class LinearBucketTable(ScoredHashTable):
                     scores = torch.clamp(dump_timestamp - scores, min=0)
                 scores_dict[score_name] = scores
 
-            if world_size > 1:
-                masks = keys % world_size == rank
+            masks = (
+                owned_key_mask(keys, rank, world_size, dist_type)
+                if dist_type is not None
+                else None
+            )
+            if masks is not None:
                 keys = keys[masks]
                 for score_name in scores_dict:
                     scores_dict[score_name] = scores_dict[score_name][masks]

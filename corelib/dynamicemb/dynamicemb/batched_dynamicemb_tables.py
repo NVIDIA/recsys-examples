@@ -1550,7 +1550,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             num_counter_key_files = len(counter_key_files)
             for i in range(num_counter_key_files):
                 counter_table.load(
-                    counter_key_files[i], counter_frequency_files[i], table_id
+                    counter_key_files[i],
+                    counter_frequency_files[i],
+                    table_id,
+                    self._dynamicemb_options[table_id].dist_type,
                 )
 
     def export_keys_values(

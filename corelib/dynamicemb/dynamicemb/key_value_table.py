@@ -34,6 +34,7 @@ from dynamicemb.dynamicemb_config import (
     score_dump_permutation,
     score_load_permutation,
 )
+from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.extendable_tensor import (
     DeviceExtendableBuffer,
     ExtendableBuffer,
@@ -1713,6 +1714,7 @@ def _iter_batches_from_files(
     dim: int,
     optstate_dim: int,
     device: torch.device,
+    dist_type: str,
     batch_size: int = 65536,
     num_scores: int = 1,
     emb_dtype: torch.dtype = EMBEDDING_TYPE,
@@ -1732,7 +1734,15 @@ def _iter_batches_from_files(
     The yielded tensors keep the file's dtype; the insert path casts to the
     table's.
 
-    Handles file I/O, deserialization, and distributed world_size filtering.
+    Handles file I/O, deserialization, and keeping only the keys this rank owns.
+
+    *dist_type* selects the ownership rule, which is the table's own -- the load
+    path checks it against the checkpoint's before getting here
+    (``_validate_load_meta``). It matters in two ways. When the checkpoint's
+    shard count matches the world size each rank reads only its own file, every
+    key in it already belongs to that rank, and the filter is a no-op -- but
+    only if the rule is the right one. When the counts differ the files are
+    re-split across ranks and the filter is what does the resharding.
     Pass *score_file_path* / *opt_file_path* as ``None`` to skip those files.
     """
     fkey = open(emb_key_path, "rb")
@@ -1782,8 +1792,8 @@ def _iter_batches_from_files(
                     opt_bytes, opt_state_dtype, device
                 ).view(-1, optstate_dim)
 
-            if world_size > 1:
-                masks = keys % world_size == rank
+            masks = owned_key_mask(keys, rank, world_size, dist_type)
+            if masks is not None:
                 keys = keys[masks]
                 embeddings = embeddings[masks]
                 if scores is not None:
@@ -1809,6 +1819,8 @@ class _LoadParams:
     file_optstate_dim: int
     include_optim: bool
     num_keys: int
+    # The table's key -> rank rule, already checked against the checkpoint's.
+    dist_type: str
     # Precisions the value files were written at, resolved from meta (fp32 for
     # checkpoints predating it). Pass both to ``_iter_batches_from_files``.
     emb_dtype: torch.dtype = EMBEDDING_TYPE
@@ -1933,6 +1945,7 @@ def _validate_load_meta(
         file_optstate_dim=file_optstate_dim,
         include_optim=include_optim,
         num_keys=num_keys,
+        dist_type=runtime_dist_type,
         emb_dtype=emb_dtype,
         opt_state_dtype=opt_state_dtype,
     )
@@ -2774,6 +2787,7 @@ class DynamicEmbStorage(Storage):
             params.dim,
             params.file_optstate_dim,
             device,
+            params.dist_type,
             num_scores=num_scores,
             emb_dtype=params.emb_dtype,
             opt_state_dtype=params.opt_state_dtype,
@@ -3750,6 +3764,7 @@ class HybridStorage(Storage):
             params.dim,
             params.file_optstate_dim,
             device,
+            params.dist_type,
             emb_dtype=params.emb_dtype,
             opt_state_dtype=params.opt_state_dtype,
         ):

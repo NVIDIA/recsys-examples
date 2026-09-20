@@ -116,8 +116,13 @@ class MultiTableKVCounter(Counter):
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         return self.table_.memory_usage(mem_type)
 
-    def load(self, key_file, counter_file, table_id: int) -> None:
-        self.table_.load(key_file, {self.score_name_: counter_file}, table_id=table_id)
+    def load(self, key_file, counter_file, table_id: int, dist_type: str) -> None:
+        self.table_.load(
+            key_file,
+            {self.score_name_: counter_file},
+            table_id=table_id,
+            dist_type=dist_type,
+        )
 
     def dump(self, key_file, counter_file, table_id: int) -> None:
         self.table_.dump(key_file, {self.score_name_: counter_file}, table_id=table_id)
