@@ -24,6 +24,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import dtype_to_bytes
+from dynamicemb.key_ownership import (
+    murmur3_hash_64bits,
+)
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
 from dynamicemb_extensions import (
     ScorePolicy,
@@ -276,42 +279,6 @@ class ScoredHashTable(abc.ABC):
 
 def uint64_to_int64(x):
     return x if x < (1 << 63) else x - (1 << 64)
-
-
-def murmur3_fmix64(keys):
-    """MurmurHash3's 64-bit finalizer -- the host twin of ``murmur3_fmix64`` in
-    ``src/murmur_hash.cuh``, and the only host copy of it.
-
-    Takes a Python int or anything ``np.asarray`` accepts, and returns the same
-    shape as ``uint64``. Only the avalanche step is here: callers narrow the
-    result themselves -- modulo the world size to pick an owning rank, masked to
-    a non-negative int64 to pick a hash bucket -- exactly as the two device
-    callers do.
-
-    A key is a bit pattern here, not a magnitude, so a negative one is
-    reinterpreted rather than rejected -- ``numpy`` refuses to build a ``uint64``
-    from a negative Python int, while ``astype`` on an array wraps the way C
-    would. Wrapping is likewise the algorithm and not an error for the
-    multiplies, which numpy is silent about for arrays but warns about for
-    scalars; the warning is turned off rather than left to depend on the input's
-    shape.
-    """
-    if isinstance(keys, (int, np.integer)):
-        k = np.uint64(int(keys) & 0xFFFFFFFFFFFFFFFF)
-    else:
-        k = np.asarray(keys).astype(np.uint64, copy=False)
-    with np.errstate(over="ignore"):
-        k = k ^ (k >> np.uint64(33))
-        k = k * np.uint64(0xFF51AFD7ED558CCD)
-        k = k ^ (k >> np.uint64(33))
-        k = k * np.uint64(0xC4CEB9FE1A85EC53)
-        k = k ^ (k >> np.uint64(33))
-    return k
-
-
-def murmur3_hash_64bits(key: int) -> int:
-    """Scalar :func:`murmur3_fmix64`, for constants computed once at import."""
-    return int(murmur3_fmix64(key))
 
 
 class LinearBucketTable(ScoredHashTable):
