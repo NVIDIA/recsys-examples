@@ -34,9 +34,14 @@ m store would spill into the start of v with the beta1 rule. ``all_dims_vec4``
 must therefore reflect *per-table* dims (as ``state.all_dims_vec4`` does), not
 just ``max_emb_dim``; a misaligned table must fall back to the scalar kernel.
 
+FTRL has the same shape of exposure: it keeps ``linear`` then ``accum``, each
+the row's own ``edim`` wide, so a narrow table's ``accum`` begins at
+``max_emb_dim + edim`` rather than at ``2 * max_emb_dim``.
+
 These tests build the buffer by hand for two tables of different dims and check
-that m and v land in the right place with the right update rule. They require a
-GPU + the compiled ``dynamicemb_extensions`` and are skipped otherwise.
+that the state slots land in the right place with the right update rule. They
+require a GPU + the compiled ``dynamicemb_extensions`` and are skipped
+otherwise.
 """
 
 import pytest
@@ -197,6 +202,110 @@ def test_adam_padded_buffer_matches_reference_with_grad(dims, dtype):
         torch.testing.assert_close(w, torch.full_like(w, w_ref))
         torch.testing.assert_close(m, torch.full_like(m, m_ref))
         torch.testing.assert_close(v, torch.full_like(v, v_ref))
+
+
+def _build_padded_ftrl_buffer(dims, max_emb_dim, weight, linear, accum, dtype, device):
+    """Layout one row per table: emb@0, linear@max_emb_dim, accum@max_emb_dim+edim."""
+    value_dim = 3 * max_emb_dim
+    n = len(dims)
+    values = torch.zeros(n, value_dim, dtype=dtype, device=device)
+    for row, edim in enumerate(dims):
+        values[row, :edim] = weight
+        values[row, max_emb_dim : max_emb_dim + edim] = linear
+        values[row, max_emb_dim + edim : max_emb_dim + 2 * edim] = accum
+    table_ids = torch.arange(n, dtype=torch.int64, device=device)
+    table_emb_dims = torch.tensor(dims, dtype=torch.int64, device=device)
+    return values, table_ids, table_emb_dims, value_dim
+
+
+@cuda
+@pytest.mark.parametrize(
+    "dims",
+    [
+        [8, 4],  # all dims multiple of 4 -> vec4 path
+        [8, 6],  # second table not vec4-aligned -> scalar path
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_ftrl_padded_buffer_mixed_dims_accum(dims, dtype):
+    """A narrow table's accum sits at max_emb_dim + edim, not at 2 * max_emb_dim.
+
+    Had the kernel reserved max_emb_dim per slot instead, the narrow table's
+    accum pointer would land in the padding past its state: it would read a
+    zero, advance that, write it back out of bounds of the live row, and leave
+    the real accum untouched at its seed. The assertions below catch all three
+    -- accum unadvanced, linear computed from the wrong accum, and padding
+    written.
+    """
+    device = torch.device("cuda")
+    max_emb_dim = max(dims)
+
+    lr = 0.1
+    learning_rate_power = -0.5
+    ftrl_beta = 0.0
+    l1_reg = 0.0
+    l2_reg = 0.0
+
+    weight_init = 0.5
+    linear_init = -1.0
+    accum_init = 4.0
+    grad = 1.0
+
+    # accum is the only state the gradient enters quadratically, so advancing it
+    # by exactly g^2 pins that the kernel found the right slot.
+    accum_expected = accum_init + grad * grad
+    sigma = (accum_expected**0.5 - accum_init**0.5) / lr
+    linear_expected = linear_init + grad - sigma * weight_init
+    weight_expected = -linear_expected / ((ftrl_beta + accum_expected**0.5) / lr)
+
+    values, table_ids, table_emb_dims, value_dim = _build_padded_ftrl_buffer(
+        dims, max_emb_dim, weight_init, linear_init, accum_init, dtype, device
+    )
+    before = values.clone()
+    grads = torch.full((len(dims), max_emb_dim), grad, dtype=dtype, device=device)
+
+    dynamicemb_extensions.ftrl_update_for_padded_buffer(
+        grads,
+        values,
+        table_ids,
+        table_emb_dims,
+        max_emb_dim,
+        value_dim,
+        _all_dims_vec4(dims),
+        lr,
+        learning_rate_power,
+        ftrl_beta,
+        l1_reg,
+        l2_reg,
+    )
+
+    for row, edim in enumerate(dims):
+        weight = values[row, :edim]
+        linear = values[row, max_emb_dim : max_emb_dim + edim]
+        accum = values[row, max_emb_dim + edim : max_emb_dim + 2 * edim]
+        torch.testing.assert_close(
+            accum,
+            torch.full_like(accum, accum_expected),
+            msg=f"accum wrong for table {row} (edim={edim})",
+        )
+        torch.testing.assert_close(
+            linear,
+            torch.full_like(linear, linear_expected),
+            msg=f"linear wrong for table {row} (edim={edim})",
+        )
+        torch.testing.assert_close(
+            weight,
+            torch.full_like(weight, weight_expected),
+            msg=f"weight wrong for table {row} (edim={edim})",
+        )
+        # Everything past this row's own state is reserved for wider tables and
+        # must be left alone.
+        tail = slice(max_emb_dim + 2 * edim, value_dim)
+        torch.testing.assert_close(
+            values[row, tail],
+            before[row, tail],
+            msg=f"padding past the state was written for table {row}",
+        )
 
 
 if __name__ == "__main__":

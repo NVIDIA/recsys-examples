@@ -497,6 +497,82 @@ Weighted pooling raises `ValueError` when: `pooling_mode != SUM`, the weights ar
 require grad while grad mode is enabled, or `frequency_counters` is passed alongside them (both are carried by the single KJT weights channel, so
 a caller has to pick one).
 
+## DynamicEmbOptimType
+
+The `optimizer` entry in `fused_params` normally takes an FBGEMM `EmbOptimType`. DynamicEmb also implements
+optimizers that `EmbOptimType` has no member for; those live in `DynamicEmbOptimType` and are accepted
+anywhere an optimizer type is. The two enums never compare equal, so an `EmbOptimType` check elsewhere
+cannot accidentally match one of them.
+
+    ```python
+    #How to import
+    from dynamicemb import DynamicEmbOptimType
+
+    @enum.unique
+    class DynamicEmbOptimType(enum.Enum):
+        FTRL = "ftrl"
+    ```
+
+### FTRL
+
+FTRL-Proximal, Algorithm 1 of *Ad Click Prediction: a View from the Trenches* (McMahan et al., KDD 2013),
+with the paper's fixed square root generalized to an arbitrary exponent. Per coordinate:
+
+```
+new_accum = accum + grad²
+linear   += grad − (new_accum^(−p) − accum^(−p)) / lr · weight        p = learning_rate_power
+weight    = 0                                                          if |linear| ≤ l1_reg
+          = (sign(linear)·l1_reg − linear)
+            / ((ftrl_beta + new_accum^(−p)) / lr + l2_reg)             otherwise
+accum     = new_accum
+```
+
+`lr`, `ftrl_beta`, `l1_reg` and `l2_reg` are the paper's α, β, λ1 and λ2; `p = -0.5` makes `n^(−p)` a
+square root and so recovers its `α / (β + √n)` learning rate exactly. Pass them through `fused_params` alongside `optimizer`:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `learning_rate` | `0.01` | α. Must be positive -- FTRL divides by it. |
+| `learning_rate_power` | `-0.5` | Exponent on the accumulator **in the learning rate**, so it must be `<= 0`: negative decays the rate, `0` holds it fixed, and a positive value would make it grow without bound (rejected). `-0.5` is the paper's own choice and takes a faster kernel path; other values follow TensorFlow's generalization. |
+| `ftrl_beta` | `0.0` | β. Keeps the per-coordinate learning rate finite while `accum` is still small -- the paper's way of bounding the first steps. |
+| `initial_accumulator_value` | `0.0` | Seeds `accum`; `linear` always starts at 0. Read the note below before setting it non-zero. |
+| `l1_reg` | `0.0` | λ1. |
+| `l2_reg` | `0.0` | λ2. |
+
+Two behaviours worth knowing before choosing FTRL:
+
+- **Per-row state is `2 × embedding_dim`**, laid out as `linear` then `accum` right after the embedding --
+  the same shape of layout Adam uses for its `m` and `v`. Checkpoints store it at full width.
+- **The weight is re-solved from `(linear, accum)` each step** rather than nudged from its previous value.
+  That is what lets `l1_reg` drive a weight to exactly zero instead of merely shrinking it.
+
+  It is also why seeding the state deserves care here. FTRL was written for linear regression, whose
+  weights start at zero; an embedding's do not, and a state of `linear = 0` is inconsistent with the
+  weight already sitting in the row. The first update reconciles them, keeping a fraction
+
+  ```
+  (√n₁ − √n₀) / (ftrl_beta + √n₁)        n₀ = initial_accumulator_value,  n₁ = n₀ + g²
+  ```
+
+  of the initializer. **Both** knobs that bound the early steps cost retention, and for the small
+  gradients typical of embeddings they cost nearly all of it:
+
+  | `n0` | `ftrl_beta` | `g = 1.0` | `g = 0.01` | `g = 0.0001` |
+  | --- | --- | --- | --- | --- |
+  | `0.0` | `0.0` | 100% | 100% | 100% |
+  | `0.1` | `0.0` | 69.8% | 0.05% | 0.000005% |
+  | `0.0` | `1.0` | 50% | 0.99% | 0.01% |
+  | `0.1` | `1.0` | 35.8% | 0.012% | 0.0000012% |
+
+  Only `initial_accumulator_value = 0` together with `ftrl_beta = 0` keeps the initializer whole. That
+  combination has its own cost: with `n₀ = 0` the first step is `w − α·sign(g)`, a full α-sized move
+  however small the gradient. Which matters more is a modelling choice -- if the initializer is doing
+  real work, keep both at 0 and pick α accordingly; if the early steps need damping, expect the
+  initializer to be mostly overwritten and size it as if rows started near zero.
+
+Unlike the `EmbOptimType` optimizers, FTRL has no FBGEMM counterpart, so `construct_twin_module` cannot
+build a TorchRec twin for a model that uses it.
+
 ## DynamicEmbTableOptions
 
 Per-table configuration for dynamic embedding, passed into `DynamicEmbParameterConstraints` as `dynamicemb_options`. The authoritative definition lives in `dynamicemb.dynamicemb_config.DynamicEmbTableOptions` (this section mirrors its docstring).

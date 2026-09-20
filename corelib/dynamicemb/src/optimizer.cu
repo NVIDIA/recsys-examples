@@ -20,6 +20,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "optimizer_kernel.cuh"
 #include "torch_utils.h"
 #include "utils.h"
+#include <cmath>
 #include <functional>
 
 namespace dyn_emb {
@@ -104,7 +105,7 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
         auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
         auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
 
-        SgdVecOptimizer<g_t, w_t> opt{lr};
+        SGDVecOptimizer<g_t, w_t> opt{lr};
 
         launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
             grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
@@ -238,6 +239,63 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
   });
 }
 
+// The accumulator is raised to -learning_rate_power, so -0.5 asks for a square
+// root -- the exponent the paper fixes, and by far the common choice. Test for
+// it here so the kernel can call sqrtf instead of a general powf. Exact
+// comparison is right: -0.5 is representable, and a value merely near it is a
+// different exponent the caller meant to ask for.
+namespace {
+inline bool ftrl_uses_sqrt(float learning_rate_power) {
+  return learning_rate_power == -0.5f;
+}
+} // namespace
+
+void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
+                                at::Tensor table_ptrs, at::Tensor table_ids,
+                                at::Tensor table_value_dims,
+                                at::Tensor table_emb_dims, const float lr,
+                                const float learning_rate_power,
+                                const float beta, const float l1_reg,
+                                const float l2_reg, int64_t max_emb_dim,
+                                bool all_dims_vec4, int64_t table_dtype) {
+  int64_t ev_nums = grads.size(0);
+  uint32_t grad_stride = grads.size(1);
+  if (ev_nums == 0)
+    return;
+  TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
+  TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
+  TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
+
+  uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
+  const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
+
+  auto grad_type = get_data_type(grads);
+  auto val_type = static_cast<DataType>(table_dtype);
+  auto index_type = get_data_type(indices);
+  int device_id = grads.device().index();
+
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
+    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+      DISPATCH_OFFSET_INT_TYPE(index_type, i_t, [&] {
+        auto grad_ptr = get_pointer<g_t>(grads);
+        auto table_ptrs_ptr = get_pointer<int64_t>(table_ptrs);
+        auto index_ptr = get_pointer<i_t>(indices);
+        auto tid_ptr = get_pointer<int64_t>(table_ids);
+        auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
+        auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
+
+        FTRLVecOptimizer<g_t, w_t> opt{lr,   learning_rate_power,
+                                       use_sqrt, beta,
+                                       l1_reg, l2_reg};
+
+        launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
+            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
+            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id);
+      });
+    });
+  });
+}
+
 template <typename GradType, typename WeightType, typename OptimizerType>
 void launch_update_kernel_for_padded_buffer(
     GradType *grads, WeightType *values, OptimizerType opt,
@@ -299,7 +357,7 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
-      SgdVecOptimizer<g_t, w_t> opt{lr};
+      SGDVecOptimizer<g_t, w_t> opt{lr};
       launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
           get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
           grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
@@ -409,6 +467,43 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
   });
 }
 
+void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
+                                   at::Tensor table_ids,
+                                   at::Tensor table_emb_dims, int64_t emb_dim,
+                                   int64_t value_dim, bool all_dims_vec4,
+                                   float lr, float learning_rate_power,
+                                   float beta, float l1_reg, float l2_reg) {
+  int64_t num_rows = grads.size(0);
+  uint32_t grad_stride = grads.size(1);
+  if (num_rows == 0)
+    return;
+  TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
+  TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
+  TORCH_CHECK(table_emb_dims.is_cuda(),
+              "table_emb_dims must be a CUDA tensor");
+  TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
+  uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
+  uint32_t value_stride = static_cast<uint32_t>(value_dim);
+  const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
+  auto grad_type = get_data_type(grads);
+  auto val_type = get_data_type(values);
+  int device_id = grads.device().index();
+  auto tid_ptr = get_pointer<int64_t>(table_ids);
+  auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
+    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+      FTRLVecOptimizer<g_t, w_t> opt{lr,     learning_rate_power,
+                                     use_sqrt, beta,
+                                     l1_reg, l2_reg};
+      launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
+          get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
+          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
+          tid_ptr, ted_ptr);
+    });
+  });
+}
+
 } // namespace dyn_emb
 
 // PYTHON WRAP
@@ -446,6 +541,14 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
         py::arg("table_dtype"));
 
+  m.def("ftrl_update_for_flat_table", &dyn_emb::ftrl_update_for_flat_table,
+        "FTRL optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
+        py::arg("indices"), py::arg("table_ptrs"), py::arg("table_ids"),
+        py::arg("table_value_dims"), py::arg("table_emb_dims"), py::arg("lr"),
+        py::arg("learning_rate_power"), py::arg("beta"), py::arg("l1_reg"),
+        py::arg("l2_reg"), py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
+        py::arg("table_dtype"));
+
   m.def("sgd_update_for_padded_buffer", &dyn_emb::sgd_update_for_padded_buffer,
         "SGD optimizer for contiguous padded buffer", py::arg("grads"),
         py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
@@ -473,4 +576,12 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("grads"), py::arg("values"), py::arg("table_ids"),
         py::arg("table_emb_dims"), py::arg("emb_dim"), py::arg("value_dim"),
         py::arg("all_dims_vec4"), py::arg("lr"), py::arg("eps"));
+
+  m.def("ftrl_update_for_padded_buffer",
+        &dyn_emb::ftrl_update_for_padded_buffer,
+        "FTRL optimizer for contiguous padded buffer", py::arg("grads"),
+        py::arg("values"), py::arg("table_ids"), py::arg("table_emb_dims"),
+        py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
+        py::arg("lr"), py::arg("learning_rate_power"), py::arg("beta"),
+        py::arg("l1_reg"), py::arg("l2_reg"));
 }

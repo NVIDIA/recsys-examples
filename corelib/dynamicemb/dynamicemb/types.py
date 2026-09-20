@@ -338,6 +338,13 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
     def init_optimizer_state(
         self,
     ) -> float:
+        """The scalar every optimizer-state element starts at.
+
+        For callers that need the value itself. To initialize a buffer, go
+        through the optimizer's ``reset_optimizer_states`` instead: a single
+        scalar cannot describe an optimizer whose state regions start at
+        different values.
+        """
         pass
 
     @abc.abstractmethod

@@ -438,7 +438,7 @@ def create_dynamic_embedding_tables(
         storage = var.tables
         num_tables = cfg.num_tables
         optstate_dim = storage.value_dim(0) - storage.embedding_dim(0)
-        initial_accumulator = storage.init_optimizer_state()
+        initial_accumulator = var.optimizer.get_initial_optimizer_state()
         caps_per_table = cfg.num_embeddings_per_feature
         max_num_embeddings = max(caps_per_table)
 

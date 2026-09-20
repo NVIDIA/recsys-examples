@@ -57,8 +57,11 @@ from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
     AdamDynamicEmbeddingOptimizer,
     BaseDynamicEmbeddingOptimizer,
+    DynamicEmbOptimType,
     EmbOptimType,
+    FTRLDynamicEmbeddingOptimizer,
     OptimizerArgs,
+    OptimType,
     RowWiseAdaGradDynamicEmbeddingOptimizer,
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
@@ -309,7 +312,7 @@ def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:
 def _tier_bytes_from_options(
     options_list: List[DynamicEmbTableOptions],
     optimizer: Optional["BaseDynamicEmbeddingOptimizer"],
-    emb_optimizer_type: EmbOptimType,
+    emb_optimizer_type: OptimType,
 ) -> List[Tuple[Optional[int], Optional[int], Optional[int], int, int, int]]:
     """Fallback for external-PS tiers where we can't peek into the storage.
 
@@ -425,7 +428,7 @@ def _print_memory_consume(
     dynamicemb_options: List[DynamicEmbTableOptions],
     optimizer: Optional["BaseDynamicEmbeddingOptimizer"],
     device_id: int,
-    emb_optimizer_type: EmbOptimType,
+    emb_optimizer_type: OptimType,
 ) -> None:
     """Value-only memory accounting (embedding + optimizer state rows).
 
@@ -562,7 +565,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         device: torch.device = None,
         enforce_hbm: bool = False,  # place all weights/momentums in HBM when using cache
         bounds_check_mode: BoundsCheckMode = BoundsCheckMode.WARNING,
-        optimizer: EmbOptimType = EmbOptimType.SGD,
+        optimizer: OptimType = EmbOptimType.SGD,
         # General Optimizer args
         stochastic_rounding: bool = True,
         gradient_clipping: bool = False,
@@ -572,8 +575,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # used by EXACT_ADAGRAD, EXACT_ROWWISE_ADAGRAD, EXACT_ROWWISE_WEIGHTED_ADAGRAD, LAMB, and ADAM only
         # NOTE that default is different from nn.optim.Adagrad default of 1e-10
         eps: float = 1.0e-8,
-        # used by EXACT_ADAGRAD, EXACT_ROWWISE_ADAGRAD, and EXACT_ROWWISE_WEIGHTED_ADAGRAD only
+        # used by EXACT_ADAGRAD, EXACT_ROWWISE_ADAGRAD, EXACT_ROWWISE_WEIGHTED_ADAGRAD
+        # and FTRL only. For FTRL this seeds the squared-gradient accumulator;
+        # prefer ftrl_beta to bound the first steps, see its note below.
         initial_accumulator_value: float = 0.0,
+        # used by FTRL only; ftrl_beta / l1_reg / l2_reg are the beta, lambda1
+        # and lambda2 of McMahan et al. 2013
+        learning_rate_power: float = -0.5,
+        ftrl_beta: float = 0.0,
+        l1_reg: float = 0.0,
+        l2_reg: float = 0.0,
         momentum: float = 0.9,  # used by LARS-SGD
         # EXACT_ADAGRAD, SGD, EXACT_SGD do not support weight decay
         # LAMB, ADAM, PARTIAL_ROWWISE_ADAM, PARTIAL_ROWWISE_LAMB, LARS_SGD support decoupled weight decay
@@ -727,6 +738,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             weight_decay_mode,
             counter_based_regularization,
             cowclip_regularization,
+            learning_rate_power,
+            ftrl_beta,
+            l1_reg,
+            l2_reg,
         )
         self._storage_externel = table_option.external_storage is not None
         self._create_cache_storage()
@@ -947,7 +962,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def _create_optimizer(
         self,
-        optimizer_type: EmbOptimType,
+        optimizer_type: OptimType,
         stochastic_rounding: bool,
         gradient_clipping: bool,
         max_gradient: float,
@@ -963,6 +978,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         weight_decay_mode: WeightDecayMode,
         counter_based_regularization: Optional[CounterBasedRegularizationDefinition],
         cowclip_regularization: Optional[CowClipDefinition],
+        learning_rate_power: float,
+        ftrl_beta: float,
+        l1_reg: float,
+        l2_reg: float,
     ) -> BaseDynamicEmbeddingOptimizer:
         self._optimizer_type = optimizer_type
         self.stochastic_rounding = stochastic_rounding
@@ -1043,6 +1062,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             weight_norm_coefficient=cowclip_regularization.weight_norm_coefficient,
             lower_bound=cowclip_regularization.lower_bound,
             regularization_mode=weight_decay_mode.value,
+            learning_rate_power=learning_rate_power,
+            ftrl_beta=ftrl_beta,
+            l1_reg=l1_reg,
+            l2_reg=l2_reg,
         )
         self._optimizer_args = optimizer_args
 
@@ -1066,6 +1089,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             optimizer = RowWiseAdaGradDynamicEmbeddingOptimizer(
                 optimizer_args,
                 self.embedding_dtype,
+            )
+        elif optimizer_type == DynamicEmbOptimType.FTRL:
+            optimizer = FTRLDynamicEmbeddingOptimizer(
+                optimizer_args,
             )
         else:
             raise ValueError(

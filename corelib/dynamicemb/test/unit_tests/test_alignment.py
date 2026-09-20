@@ -38,7 +38,11 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.get_planner import get_planner
 from dynamicemb.key_value_table import DynamicEmbCache, DynamicEmbStorage, HybridStorage
-from dynamicemb.optimizer import get_optimizer_state_dim
+from dynamicemb.optimizer import (
+    DynamicEmbOptimType,
+    OptimType,
+    get_optimizer_state_dim,
+)
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.types import MAX_BUCKET_CAPACITY
 from dynamicemb.utils import DTYPE_NUM_BYTES
@@ -105,7 +109,7 @@ class _EmbeddingCollectionWrapper(nn.Module):
 
 def build_dmp_for_alignment_test(
     eb_configs: List[EmbeddingConfig],
-    optimizer_type: EmbOptimType,
+    optimizer_type: OptimType,
     bucket_capacity: int,
     hbm_ratio: float,
     caching: bool,
@@ -263,6 +267,9 @@ def assert_cache_and_storage_shapes(
         EmbOptimType.SGD,
         EmbOptimType.ADAM,
         EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+        # The only optimizer whose state is two regions wide, so the only one
+        # whose value row is 3 * dim.
+        DynamicEmbOptimType.FTRL,
     ],
 )
 @pytest.mark.parametrize("hbm_ratio", [0.0, 0.25, 1.0])
@@ -272,7 +279,7 @@ def test_alignment_cache_storage_shapes(
     caching: bool,
     training: bool,
     bucket_capacity: int,
-    optimizer_type: EmbOptimType,
+    optimizer_type: OptimType,
     hbm_ratio: float,
     embedding_dim: int,
     num_embeddings_per_table: Tuple[int, ...],

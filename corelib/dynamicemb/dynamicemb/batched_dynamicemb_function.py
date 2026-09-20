@@ -475,7 +475,10 @@ def _prefetch_cache_path(
                 )
 
             if max_val_dim != max_emb_dim:
-                init_vals[:, max_emb_dim:] = storage.init_optimizer_state()
+                state.optimizer.reset_optimizer_states(
+                    init_vals[:, max_emb_dim:],
+                    emb_dims=state.table_emb_dims[insert_tids[is_new_in_insert]],
+                )
 
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(
@@ -675,7 +678,10 @@ def _prefetch_hbm_direct_path(
                 )
 
             if max_val_dim != max_emb_dim:
-                init_values[:, max_emb_dim:] = state.initial_optim_state
+                state.optimizer.reset_optimizer_states(
+                    init_values[:, max_emb_dim:],
+                    emb_dims=state.table_emb_dims[admitted_tids],
+                )
 
             score_arg = get_insert_score_arg(
                 state, n_admitted, device, admitted_scores, table_ids=admitted_tids
@@ -969,6 +975,7 @@ def dynamicemb_eval_forward(
 
 def _generic_forward_path(
     storage: Storage,
+    optimizer: BaseDynamicEmbeddingOptimizer,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
     max_emb_dim: int,
@@ -1059,9 +1066,11 @@ def _generic_forward_path(
                 )
 
         if max_val_dim != max_emb_dim:
-            unique_values[
-                missing_indices, max_emb_dim:
-            ] = storage.init_optimizer_state()
+            optimizer.reset_optimizer_states(
+                unique_values[:, max_emb_dim:],
+                indices=missing_indices,
+                emb_dims=storage.embedding_dims(on_device=True)[missing_table_ids],
+            )
 
         values_to_insert = unique_values[positions_in_unique]
 
@@ -1149,6 +1158,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 )
                 unique_values, persisted_unique_indices = _generic_forward_path(
                     storage,
+                    optimizer,
                     prefetch_state.unique_keys,
                     prefetch_state.unique_table_ids,
                     max_emb_dim,

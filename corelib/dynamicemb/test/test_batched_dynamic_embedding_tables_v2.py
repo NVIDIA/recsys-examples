@@ -56,9 +56,8 @@ from dynamicemb.key_value_table import (
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
+    DynamicEmbOptimType,
     get_optimizer_ckpt_state_dim,
-    pad_optimizer_states_from_checkpoint,
-    truncate_optimizer_states_for_checkpoint,
 )
 from dynamicemb.types import KEY_TYPE, CopyMode
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -877,7 +876,6 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         self._max_emb_dim = max(self._emb_dims)
         self._max_value_dim = max(self._value_dims)
         self._max_optstate_dim = max(self._optstate_dims)
-        self._initial_optim_state = optimizer.get_initial_optim_states()
 
         device_idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{device_idx}")
@@ -1097,10 +1095,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                 fscore.write(scores_out.cpu().numpy().tobytes())
             fembedding.write(embeddings.cpu().numpy().tobytes())
             if fopt_states is not None and opt_states is not None:
-                to_write = truncate_optimizer_states_for_checkpoint(
-                    self.optimizer,
-                    self._emb_dims[table_id],
+                to_write = self.optimizer.states_for_checkpoint(
                     opt_states,
+                    self._emb_dims[table_id],
                 )
                 fopt_states.write(to_write.cpu().numpy().tobytes())
 
@@ -1210,11 +1207,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                     dtype=torch.float32,
                     device=self.device,
                 ).view(-1, file_opt_dim)
-                opt_states = pad_optimizer_states_from_checkpoint(
-                    self.optimizer,
-                    dim,
+                opt_states = self.optimizer.states_from_checkpoint(
                     opt_states,
-                    self._initial_optim_state,
+                    dim,
                     torch.float32,
                     self.device,
                 )
@@ -1237,7 +1232,9 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                         n, value_dim, dtype=torch.float32, device=self.device
                     )
                     values[:, :dim] = embeddings
-                    values[:, dim:] = self._initial_optim_state
+                    self.optimizer.reset_optimizer_states(
+                        values[:, dim:], emb_dims=dim
+                    )
                 else:
                     values = embeddings
 
@@ -1313,7 +1310,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def init_optimizer_state(
         self,
     ) -> float:
-        return self._initial_optim_state
+        return self.optimizer.get_initial_optimizer_state()
 
 
 def create_split_table_batched_embedding(
@@ -1371,9 +1368,10 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             if opt_state_dim > 0:
-                values[
-                    :, max_emb_dim : max_emb_dim + opt_state_dim
-                ] = storage.init_optimizer_state()
+                optimizer.reset_optimizer_states(
+                    values[:, max_emb_dim : max_emb_dim + opt_state_dim],
+                    emb_dims=emb_dim,
+                )
             storage.set_score(1)
             storage.insert(indices, table_ids, values)
         elif isinstance(storage, PyDictStorage):
@@ -1383,7 +1381,9 @@ def init_embedding_tables(stbe, bdet):
             )
             values[:, :emb_dim] = split
             if val_dim > emb_dim:
-                values[:, emb_dim:] = pydict.init_optimizer_state()
+                optimizer.reset_optimizer_states(
+                    values[:, emb_dim:], emb_dims=emb_dim
+                )
             pydict.insert(indices, table_ids, values)
         else:
             raise ValueError("Not support table type")
@@ -2923,6 +2923,8 @@ def _assert_opt_values_ckpt_row_width(
         assert ckpt_elems == emb_dim
     elif opt_type == EmbOptimType.ADAM:
         assert ckpt_elems == emb_dim * 2
+    elif opt_type == DynamicEmbOptimType.FTRL:
+        assert ckpt_elems == emb_dim * 2
     elif opt_type == EmbOptimType.SGD:
         assert ckpt_elems == 0
     else:
@@ -2965,9 +2967,21 @@ def _assert_opt_values_ckpt_row_width(
                 "weight_decay": 0.0,
             },
         ),
+        (
+            DynamicEmbOptimType.FTRL,
+            {
+                "learning_rate": 0.01,
+                "learning_rate_power": -0.5,
+                # FTRL re-solves the weight from its state, so both halves have
+                # to start at zero or the first update discards the initializer.
+                "initial_accumulator_value": 0.0,
+                "l1_reg": 0.0,
+                "l2_reg": 0.0,
+            },
+        ),
         (EmbOptimType.SGD, {"learning_rate": 0.01}),
     ],
-    ids=["rowwise_adagrad", "adagrad", "adam", "sgd"],
+    ids=["rowwise_adagrad", "adagrad", "adam", "ftrl", "sgd"],
 )
 def test_dump_optimizer_states_ckpt_width(
     tmp_path,

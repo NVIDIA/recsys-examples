@@ -39,7 +39,7 @@ template <typename wgrad_t, typename weight_t> struct OptimizierInput {
 };
 
 template <typename wgrad_t, typename weight_t, int kWarpSize = 32>
-struct SgdVecOptimizer {
+struct SGDVecOptimizer {
   const float lr;
 
   DEVICE_INLINE void update4(const OptimizierInput<wgrad_t, weight_t> &input) {
@@ -400,6 +400,117 @@ struct RowWiseAdaGradVecOptimizer {
 
       tmp_weight -= tmp_grad;
       weight_ptr[i] = TypeConvertFunc<weight_t, float>::convert(tmp_weight);
+    }
+  }
+};
+
+// FTRL-Proximal, Algorithm 1 of McMahan et al. 2013, generalized to an
+// arbitrary learning-rate exponent the way TensorFlow's FtrlOptimizer does.
+// Per coordinate the state is `linear` (the accumulated linear term, z in the
+// paper) followed by `accum` (the sum of squared gradients, n), each `dim`
+// wide -- the same two-region layout Adam uses for m and v.
+//
+// The weight is re-solved in closed form from (linear, accum) each step instead
+// of being nudged from its previous value, which is what makes the L1 term
+// produce exact zeros rather than merely small weights.
+template <typename wgrad_t, typename weight_t, int kWarpSize = 32>
+struct FTRLVecOptimizer {
+  // alpha in the paper.
+  const float lr;
+  // The accumulator is raised to -learning_rate_power. The paper fixes that
+  // exponent at a square root, which -0.5 recovers and `use_sqrt` selects; the
+  // host decides, since the predicate is the same for every row.
+  const float learning_rate_power;
+  const bool use_sqrt;
+  // beta, which keeps the per-coordinate learning rate finite while accum is
+  // still small.
+  const float beta;
+  // lambda1 and lambda2 in the paper.
+  const float l1_reg;
+  const float l2_reg;
+
+  DEVICE_INLINE float accum_pow(const float accum) const {
+    return use_sqrt ? sqrtf(accum) : powf(accum, -learning_rate_power);
+  }
+
+  DEVICE_INLINE void update_one(float &weight, float &linear, float &accum,
+                                const float grad) const {
+    const float new_accum = accum + grad * grad;
+    const float new_accum_pow = accum_pow(new_accum);
+    linear += grad - (new_accum_pow - accum_pow(accum)) / lr * weight;
+    accum = new_accum;
+
+    // Computing the shrunk weight inside the branch keeps a 0/0 out of the
+    // arithmetic when accum and beta are both still zero.
+    if (fabsf(linear) > l1_reg) {
+      const float sign_linear = (0.0f < linear) - (linear < 0.0f);
+      weight = (l1_reg * sign_linear - linear) /
+               ((beta + new_accum_pow) / lr + l2_reg);
+    } else {
+      weight = 0.0f;
+    }
+  }
+
+  DEVICE_INLINE void update4(const OptimizierInput<wgrad_t, weight_t> &input) {
+
+    constexpr int VecSize = 4;
+    const int lane_id = threadIdx.x % kWarpSize;
+    const wgrad_t *wgrad_ptr = input.wgrad_ptr;
+    weight_t *weight_ptr = input.weight_ptr;
+    if (not weight_ptr)
+      return;
+    weight_t *linear_ptr = weight_ptr + input.state_offset;
+    weight_t *accum_ptr = linear_ptr + input.dim;
+
+    Vec4T<float> weight_vec;
+    Vec4T<float> linear_vec;
+    Vec4T<float> accum_vec;
+    Vec4T<float> grad_vec;
+
+    for (int i = 0; VecSize * (kWarpSize * i + lane_id) < input.dim; ++i) {
+      int idx4 = VecSize * (kWarpSize * i + lane_id);
+      weight_vec.load(weight_ptr + idx4);
+      linear_vec.load(linear_ptr + idx4);
+      accum_vec.load(accum_ptr + idx4);
+      grad_vec.load(wgrad_ptr + idx4);
+
+      update_one(weight_vec.val.x, linear_vec.val.x, accum_vec.val.x,
+                 grad_vec.val.x);
+      update_one(weight_vec.val.y, linear_vec.val.y, accum_vec.val.y,
+                 grad_vec.val.y);
+      update_one(weight_vec.val.z, linear_vec.val.z, accum_vec.val.z,
+                 grad_vec.val.z);
+      update_one(weight_vec.val.w, linear_vec.val.w, accum_vec.val.w,
+                 grad_vec.val.w);
+
+      linear_vec.store(linear_ptr + idx4);
+      accum_vec.store(accum_ptr + idx4);
+      weight_vec.store(weight_ptr + idx4);
+    }
+  }
+
+  DEVICE_INLINE void update(const OptimizierInput<wgrad_t, weight_t> &input) {
+
+    const wgrad_t *wgrad_ptr = input.wgrad_ptr;
+    weight_t *weight_ptr = input.weight_ptr;
+    if (not weight_ptr)
+      return;
+    weight_t *linear_ptr = weight_ptr + input.state_offset;
+    weight_t *accum_ptr = linear_ptr + input.dim;
+
+    for (int i = threadIdx.x; i < input.dim; i += blockDim.x) {
+      float tmp_grad = TypeConvertFunc<float, wgrad_t>::convert(wgrad_ptr[i]);
+      float tmp_linear =
+          TypeConvertFunc<float, weight_t>::convert(linear_ptr[i]);
+      float tmp_accum = TypeConvertFunc<float, weight_t>::convert(accum_ptr[i]);
+      float tmp_weight =
+          TypeConvertFunc<float, weight_t>::convert(weight_ptr[i]);
+
+      update_one(tmp_weight, tmp_linear, tmp_accum, tmp_grad);
+
+      weight_ptr[i] = TypeConvertFunc<weight_t, float>::convert(tmp_weight);
+      linear_ptr[i] = TypeConvertFunc<weight_t, float>::convert(tmp_linear);
+      accum_ptr[i] = TypeConvertFunc<weight_t, float>::convert(tmp_accum);
     }
   }
 };

@@ -41,8 +41,6 @@ from dynamicemb.extendable_tensor import (
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
-    pad_optimizer_states_from_checkpoint,
-    truncate_optimizer_states_for_checkpoint,
 )
 from dynamicemb.scored_hashtable import (
     ScoreArg,
@@ -419,7 +417,6 @@ class DynamicEmbTableState:
     emb_dtype: torch.dtype
     all_dims_vec4: bool
     optimizer: BaseDynamicEmbeddingOptimizer
-    initial_optim_state: float
     threads_in_wave: int
     score: Optional[int] = None
     training: bool = False
@@ -604,7 +601,6 @@ def create_table_state(
         emb_dtype=emb_dtype,
         all_dims_vec4=all_dims_vec4,
         optimizer=optimizer,
-        initial_optim_state=optimizer.get_initial_optim_states(),
         threads_in_wave=threads_in_wave,
         score=None,
         training=False,
@@ -1101,10 +1097,10 @@ def _split_value_row(
     width is not all payload: rowwise Adagrad reserves a fixed 16 bytes per row
     in the fused FBGEMM layout but only ever fills one accumulator scalar. The
     dumped block is therefore narrowed to the width the file checkpoint uses --
-    the same :func:`truncate_optimizer_states_for_checkpoint` ``_dump_table``
+    the same ``optimizer.states_for_checkpoint`` ``_dump_table``
     applies -- so a delta and a checkpoint describe a row identically, and the
     padding is not paid for on every dump. Replay expands it back with
-    :func:`pad_optimizer_states_from_checkpoint`.
+    ``optimizer.states_from_checkpoint``.
 
     Tables whose optimizer keeps no per-row state (e.g. plain SGD) get ``None``
     rather than a zero-width tensor, matching :func:`export_keys_values_iter`.
@@ -1117,9 +1113,7 @@ def _split_value_row(
     opt = values[:, -optim_state_dim:]
     return (
         emb,
-        truncate_optimizer_states_for_checkpoint(
-            state.optimizer, emb_dim, opt
-        ).contiguous(),
+        state.optimizer.states_for_checkpoint(opt, emb_dim).contiguous(),
     )
 
 
@@ -1697,10 +1691,9 @@ def _dump_table(
             scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
         if fopt_states and opt_states_batch is not None:
-            to_write = truncate_optimizer_states_for_checkpoint(
-                state.optimizer,
-                state.table_emb_dims_cpu[table_id],
+            to_write = state.optimizer.states_for_checkpoint(
                 opt_states_batch,
+                state.table_emb_dims_cpu[table_id],
             )
             fopt_states.write(_raw_bytes(to_write))
 
@@ -1970,7 +1963,7 @@ def _load_key_values(
     # table (load converts -- see _validate_load_meta), and everything below
     # this point -- padding, the cat, the store -- reads better for not having
     # to ask which dtype a tensor is at that line. Casting opt_states *before*
-    # pad_optimizer_states_from_checkpoint also converts the narrow checkpoint
+    # optimizer.states_from_checkpoint also converts the narrow checkpoint
     # block rather than the widened runtime one, and covers that function's one
     # path that returns its input uncast. Both casts are no-ops when the dtypes
     # already agree.
@@ -1979,21 +1972,17 @@ def _load_key_values(
         opt_states = opt_states.to(state.emb_dtype)
 
     if opt_states is None and runtime_optstate_dim > 0:
-        opt_states = (
-            torch.ones(
-                keys.numel(),
-                runtime_optstate_dim,
-                dtype=state.emb_dtype,
-                device=embeddings.device,
-            )
-            * state.initial_optim_state
+        opt_states = torch.empty(
+            keys.numel(),
+            runtime_optstate_dim,
+            dtype=state.emb_dtype,
+            device=embeddings.device,
         )
+        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
     elif opt_states is not None and runtime_optstate_dim > 0:
-        opt_states = pad_optimizer_states_from_checkpoint(
-            state.optimizer,
-            emb_dim_cfg,
+        opt_states = state.optimizer.states_from_checkpoint(
             opt_states,
-            state.initial_optim_state,
+            emb_dim_cfg,
             state.emb_dtype,
             embeddings.device,
         )
@@ -2107,7 +2096,7 @@ def _replay_write_values(
     - **Without it**, rows that already belonged to this same key keep their
       state, because writing just the embedding columns leaves the tail
       untouched. Every other row is new to this key, so its tail still holds the
-      previous occupant's moments and has to be reset to ``initial_optim_state``.
+      previous occupant's moments and has to be reset by the optimizer.
     """
     if rows.numel() == 0:
         return
@@ -2136,11 +2125,9 @@ def _replay_write_values(
                 f"block of shape {tuple(optimizer_states.shape)}."
             )
         # Back to the runtime width the fused value row expects.
-        opt = pad_optimizer_states_from_checkpoint(
-            state.optimizer,
-            emb_dim_cfg,
+        opt = state.optimizer.states_from_checkpoint(
             optimizer_states.to(device=embeddings.device),
-            state.initial_optim_state,
+            emb_dim_cfg,
             state.emb_dtype,
             embeddings.device,
         )
@@ -2155,12 +2142,12 @@ def _replay_write_values(
     fresh = torch.logical_not(keep)
     if bool(fresh.any()):
         fresh_emb = embeddings[fresh]
-        opt_states = torch.full(
+        opt_states = torch.empty(
             (fresh_emb.size(0), optstate_dim),
-            state.initial_optim_state,
             dtype=state.emb_dtype,
             device=fresh_emb.device,
         )
+        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
         store_to_flat_single_table(
             state,
             rows[fresh],
@@ -2432,7 +2419,7 @@ class DynamicEmbCache(Cache):
         return self._state.value_dim
 
     def init_optimizer_state(self) -> float:
-        return self._state.initial_optim_state
+        return self._state.optimizer.get_initial_optimizer_state()
 
     def evict_strategy(self) -> EvictStrategy:
         return self._state.evict_strategy
@@ -3044,7 +3031,7 @@ class DynamicEmbStorage(Storage):
         return self._state.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
-        return self._state.initial_optim_state
+        return self._state.optimizer.get_initial_optimizer_state()
 
     # -- Score management --
 
@@ -3153,7 +3140,7 @@ class HybridStorage(Storage):
         return self._hbm.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
-        return self._hbm.initial_optim_state
+        return self._hbm.optimizer.get_initial_optimizer_state()
 
     @property
     def num_tables(self) -> int:
@@ -3770,21 +3757,20 @@ class HybridStorage(Storage):
                 continue
 
             if opt_states is None and params.runtime_optstate_dim > 0:
-                opt_states = (
-                    torch.ones(
-                        keys.numel(),
-                        params.runtime_optstate_dim,
-                        dtype=self._hbm.emb_dtype,
-                        device=device,
-                    )
-                    * self._hbm.initial_optim_state
+                opt_states = torch.empty(
+                    keys.numel(),
+                    params.runtime_optstate_dim,
+                    dtype=self._hbm.emb_dtype,
+                    device=device,
+                )
+                self._hbm.optimizer.reset_optimizer_states(
+                    opt_states,
+                    emb_dims=self._hbm.table_emb_dims_cpu[table_id],
                 )
             elif opt_states is not None and params.runtime_optstate_dim > 0:
-                opt_states = pad_optimizer_states_from_checkpoint(
-                    self._hbm.optimizer,
-                    self._hbm.table_emb_dims_cpu[table_id],
+                opt_states = self._hbm.optimizer.states_from_checkpoint(
                     opt_states,
-                    self._hbm.initial_optim_state,
+                    self._hbm.table_emb_dims_cpu[table_id],
                     self._hbm.emb_dtype,
                     device,
                 )
