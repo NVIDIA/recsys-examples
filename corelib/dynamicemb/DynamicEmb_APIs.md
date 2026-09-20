@@ -23,7 +23,7 @@ This document consists of two parts, one is the introduction to the API, which c
 - [get_score](#get_score)
 - [set_score](#set_score)
 - [Counter](#counter)
-- [AdmissionStrategy](#admissionstrategy)
+- [AdmissionStrategy and MultiTableAdmitter](#admissionstrategy-and-multitableadmitter)
 
 ## DynamicEmbParameterConstraints
 
@@ -649,10 +649,14 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             If provided, only keys that meet the strategy's criteria will be inserted into the table.
             Keys that don't meet the criteria will still be initialized and used in the forward pass,
             but won't be stored in the table. Default is None (all keys are admitted).
+            Anything deciding takes -- a frequency counter, an initializer for
+            the rows it rejects -- is configured on the strategy itself, e.g.
+            ``FrequencyAdmissionStrategy(threshold=..., counter=KVCounter(...))``.
+            The module turns the strategies of the tables it fuses into one
+            ``MultiTableAdmitter``, which is what actually decides.
         admission_counter : Optional[Counter], optional
-            Counter for tracking the number of keys that have been admitted to the embedding table.
-            If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
-            Default is None (no counter is used).
+            Deprecated, and warns when set. Pass the counter to the strategy
+            that uses it instead.
         evicted_item_mode : EvictedItemMode, optional
             How the *last-tier* storage handles an item it evicts. ``DISCARD``
             (default) drops evicted keys with zero overhead. ``RETAIN_KEY`` retains
@@ -698,7 +702,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         external_storage: Storage = None
         index_type: Optional[torch.dtype] = None
         admit_strategy: Optional[AdmissionStrategy] = None
-        admission_counter: Optional[Counter] = None
+        admission_counter: Optional[Counter] = None  # deprecated
         evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
 
     ```
@@ -1090,84 +1094,50 @@ Setting the environment variable DYNAMICEMB_CSTM_SCORE_CHECK to 0 will not throw
 
 ## Counter
 
-**dynamicemb** provides an interface to the Counter which will be used in the embedding admission, and the users can customize the counter implementation by inherit the class `Counter`.
-
+A counter maps a key to an accumulated count. A strategy that admits by
+frequency owns one; the framework only carries it, reporting its memory and
+writing it into checkpoints, which is what `AdmissionStrategy.state()` hands
+over. Custom counters inherit `Counter`.
 
 ```python
 class Counter(abc.ABC):
-    """
-    Interface of a counter table which maps a key to a counter.
-    """
+    """Interface of a counter table which maps a key to a counter."""
 
     @abc.abstractmethod
     def add(
-        self, keys: torch.Tensor, frequencies: torch.Tensor, inplace: bool
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Add keys with frequencies to the `Counter` and get accumulated counter of each key.
-        For not existed keys, the frequencies will be assigned directly.
-        For existing keys, the frequencies will be accumulated.
-        Args:
-            keys (torch.Tensor): The input keys, should be unique keys.
-            frequencies (torch.Tensor): The input frequencies, serve as initial or incremental values of frequencies' states.
-            inplace: If true then store the accumulated_frequencies to counter.
-        Returns:
-            accumulated_frequencies (torch.Tensor): the frequencies' state in the `Counter` for the input keys.
-        """
-        accumulated_frequencies: torch.Tensor
-        return accumulated_frequencies
+        """Add frequencies to these keys and return their accumulated counts."""
 
     @abc.abstractmethod
-    def erase(self, keys) -> None:
-        """
-        Erase keys form the `Counter`.
-        Args:
-            keys (torch.Tensor): The input keys to be erased.
-        """
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Erase these keys."""
 
     @abc.abstractmethod
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
-        """
-        Get the consumption of a specific memory type.
-        Args:
-            mem_type (MemoryType): the specific memory type, default to MemoryType.DEVICE.
-        """
+        """Consumption of one kind of memory."""
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file) -> None:
-        """
-        Load keys and frequencies from input file path.
-        Args:
-            key_file (str): the file path of keys.
-            counter_file (str): the file path of frequencies.
-        """
+    def load(self, key_file, counter_file, table_id: int) -> None:
+        """Load one table's keys and counts from these files."""
 
     @abc.abstractmethod
-    def dump(self, key_file, counter_file) -> None:
-        """
-        Dump keys and frequencies to output file path.
-        Args:
-            key_file (str): the file path of keys.
-            counter_file (str): the file path of frequencies.
-        """
-        
-    @abc.abstractmethod
-    def create(self, device: torch.device) -> "Counter":
-        """
-        Create the counter table on the specified device.
-        """
+    def dump(self, key_file, counter_file, table_id: int) -> None:
+        """Dump one table's keys and counts to these files."""
 ```
 
-**dynamicemb** also provides a built-in counter implementation named `KVCounter`.
-There is as capacity limit of `KVCounter` which is bucketized, and the key with the smallest frequency will be evicted from the bucket for a new key if the bucket is full. 
+**dynamicemb** provides `KVCounter`, which sizes one table's share of a counter.
+It is configuration, not a `Counter`: the strategy holding it turns the shares
+of the tables it serves into a single fused `MultiTableKVCounter` when a module
+materializes it. The table is bucketized, and a full bucket evicts its
+smallest-frequency key to make room, so size the capacity for the keys still
+waiting to be admitted rather than for the embedding table.
 
 ```python
-
-class KVCounter(Counter):
-    """
-    Interface of a counter table which maps a key to a counter.
-    """
-
+class KVCounter:
     def __init__(
         self,
         capacity: int,
@@ -1176,52 +1146,125 @@ class KVCounter(Counter):
     )
 ```
 
-## AdmissionStrategy
+## AdmissionStrategy and MultiTableAdmitter
 
-**AdmissionStrategy** is another component for implementing embedding admission.
-The keys not in the dynamic embedding table, will first be passed to the `Counter`, after get the accumulated frequencies among the previous training process, the `AdmissionStrategy` will determine which keys will be admitted into the dynamic embedding table.
+Admission is two classes: what a table is configured with, and what a module
+runs.
+
+`AdmissionStrategy` is the configuration. It is inert -- it allocates nothing,
+touches no device, and may be given to as many tables as you like -- and it
+decides nothing. A fused module turns the configurations of the tables it fuses
+into the one thing that decides by calling `create_admitter`, which is where
+anything device-side comes into being.
 
 ```python
 class AdmissionStrategy(abc.ABC):
+    @classmethod
+    @abc.abstractmethod
+    def create_admitter(
+        cls,
+        table_strategies: List["AdmissionStrategy"],
+        device: torch.device,
+    ) -> "MultiTableAdmitter":
+        """The admitter these tables share, with its device state allocated.
+
+        Called once, by the module, with one configuration per table it fuses.
+        """
+
+    @classmethod
+    def one_configuration(cls, table_strategies) -> "AdmissionStrategy":
+        """The single configuration these tables agree on.
+
+        They were grouped on get_grouped_key, so they are already
+        interchangeable and the first stands for all.
+        """
+
+    def get_grouped_key(self):
+        """What has to match for two tables to share one fused module.
+
+        The default is the instance itself, so only the same object groups.
+        Override it to let equal but separately constructed configurations
+        share a module, returning everything that changes the decision and, for
+        what is resolved per table, only what the tables must agree on.
+        """
+```
+
+`MultiTableAdmitter` is what the module runs, and holds everything deciding
+takes. Only `admit` has to be implemented; the other two have defaults, so an
+admitter that merely decides is one method.
+
+```python
+class MultiTableAdmitter(abc.ABC):
     @abc.abstractmethod
     def admit(
         self,
         keys: torch.Tensor,
-        frequencies: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Admit keys with frequencies >= threshold.
+        """Which of these missing keys may enter the table.
+
+        ``frequencies`` is how often each key occurred in *this batch*, where
+        the module counts occurrences at all; None means treat each key as one.
+        It is an increment, not a running total -- any total is the admitter's
+        own to keep.
         """
 
-    @abc.abstractmethod
-    def get_initializer_args(self) -> Optional[DynamicEmbInitializerArgs]:
+    def state(self) -> Optional[Counter]:
+        """Persistent state the framework has to carry, or None.
+
+        Whatever an admitter accumulates across steps has to be reported in
+        memory accounting and survive a checkpoint. Return it here and the
+        framework does both.
         """
-        Get the initializer args for keys that are not admitted.
+
+    @property
+    def non_admitted_initializer(self):
+        """What writes the rows this admitter rejects, or None for the table's.
+
+        A rejected key still takes part in the forward, so its row has to be
+        written by something. Return a ``MultiTableInitializer`` to take that
+        on; the module does the calling.
         """
 ```
 
-**dynamicemb** provides built-in `FrequencyAdmissionStrategy`, which will return keys whose frequencies are not less than the threshold.
+**dynamicemb** provides two pairs.
+
+`FrequencyAdmissionStrategy` admits a key once it has been seen often enough,
+and carries the counter it accumulates into, so admission is configured in one
+place. Its admitter erases a key from that counter the moment it is admitted.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):
-    """
-    Frequency-based admission strategy.
-    Only admits keys whose frequency (score) meets or exceeds a threshold.
-    Parameters
-    ----------
-    threshold : int
-        Minimum frequency threshold for admission. Keys with frequency >= threshold
-        will be admitted into the embedding table.
-    initializer_args: Optional[DynamicEmbInitializerArgs]
-        Initializer arguments which determine how to initialize the embedding if the key is not admitted.
-    """
-
     def __init__(
         self,
         threshold: int,
+        counter: Optional[KVCounter] = None,
         initializer_args: Optional[DynamicEmbInitializerArgs] = None,
     )
+    # create_admitter -> MultiTableFrequencyAdmitter
 ```
+
+`ProbabilisticAdmissionStrategy` admits a key by a coin toss instead, and its
+admitter keeps no state at all -- `state()` is None and no counter is built for
+it. Admission is consulted only for a key that is missing, so a key gets a
+fresh toss every time it turns up and is not yet in the table: it takes
+`1 / probability` appearances on average to get in. A batch holding a key `k`
+times counts as `k` tosses.
+
+```python
+class ProbabilisticAdmissionStrategy(AdmissionStrategy):
+    def __init__(
+        self,
+        probability: float,
+        initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+    )
+    # create_admitter -> MultiTableProbabilisticAdmitter
+```
+
+For both, `initializer_args` says how to initialize the rows the admitter
+rejects; None leaves them to the table's own initializer, which is also the only
+way to get UNIFORM bounds derived from a table's row count.
 
 # Functionality and User interface
 

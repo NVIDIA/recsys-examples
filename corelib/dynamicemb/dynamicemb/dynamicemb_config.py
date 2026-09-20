@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import enum
 import math
 import os
@@ -25,17 +26,20 @@ import torch
 from dynamicemb.optimizer import get_optimizer_state_dim
 from dynamicemb.types import (
     BUCKET_ALIGNMENT,
+    DEFAULT_UNIFORM_LOWER,
+    DEFAULT_UNIFORM_UPPER,
     DEMB_TABLE_ALIGN_SIZE,
     MAX_BUCKET_CAPACITY,
     AdmissionStrategy,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     Storage,
+    group_key_of,
 )
-from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
 
-# fbgemm exports its own PoolingMode, so the bound C++ enum is aliased here to
+# fbgemm exports its own PoolingMode, so the bound C++ enum is aliased below to
 # keep the two apart wherever both are in scope.
+from dynamicemb_extensions import DynamicEmbDataType, EvictStrategy
 from dynamicemb_extensions import PoolingMode as BagPoolingMode
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
@@ -539,10 +543,12 @@ class DynamicEmbTableOptions:
         If provided, only keys that meet the strategy's criteria will be inserted into the table.
         Keys that don't meet the criteria will still be initialized and used in the forward pass,
         but won't be stored in the table. Default is None (all keys are admitted).
+        Anything the strategy needs to decide -- a frequency counter, an initializer for the
+        rows it rejects -- is configured on the strategy itself, not here.
     admission_counter : Optional[Counter], optional
-        Counter for tracking the number of keys that have been admitted to the embedding table.
-        If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
-        Default is None (no counter is used).
+        Deprecated, and warns when set. Pass the counter to the strategy that
+        uses it instead, e.g. ``FrequencyAdmissionStrategy(threshold=...,
+        counter=KVCounter(...))``.
     Notes
     -----
     The ``DynamicEmb_APIs.md`` file in the ``dynamicemb`` package mirrors this class and related planner
@@ -579,7 +585,13 @@ class DynamicEmbTableOptions:
     index_type: Optional[torch.dtype] = None
     dist_type: str = "roundrobin"
     admit_strategy: Optional[AdmissionStrategy] = None
+
     admission_counter: Optional[Any] = None
+    """Deprecated. A strategy that counts occurrences now owns the counter that
+    does it, so admission is configured in one place and cannot be configured
+    half way. Setting this still works and still gives each table its own
+    capacity, but warns; pass it to the strategy instead:
+    ``FrequencyAdmissionStrategy(threshold=..., counter=KVCounter(...))``."""
 
     score_function: Optional[Callable] = None
     """Optional custom eviction ranking for the compound LruLfu strategy
@@ -616,6 +628,34 @@ class DynamicEmbTableOptions:
     grouped onto shared storage."""
 
     def __post_init__(self):
+        if self.admission_counter is not None:
+            warnings.warn(
+                "admission_counter is deprecated and will be removed: pass the "
+                "counter to the strategy that uses it, "
+                "FrequencyAdmissionStrategy(threshold=..., "
+                "counter=KVCounter(...)), instead of setting it on the table.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # Fold it into the strategy here, so that nothing downstream has
+            # to know this field ever existed. Imported inside the branch
+            # because embedding_admission reaches back to this module, and
+            # because only the deprecated path pays for it.
+            #
+            # Only the strategy this field was ever meant for: AdmissionStrategy
+            # is a public base class, and another implementation's ``counter``
+            # would be that author's own thing. And onto a copy: one strategy is
+            # commonly handed to every table, and each may have sized its
+            # counter differently, which folding in place would flatten to
+            # whichever table was configured last. Delete with the field.
+            from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
+
+            if (
+                isinstance(self.admit_strategy, FrequencyAdmissionStrategy)
+                and self.admit_strategy.counter is None
+            ):
+                self.admit_strategy = copy.copy(self.admit_strategy)
+                self.admit_strategy.counter = self.admission_counter
         assert (
             self.eval_initializer_args.mode == DynamicEmbInitializerMode.CONSTANT
         ), "eval_initializer_args must be constant initialization"
@@ -642,15 +682,10 @@ class DynamicEmbTableOptions:
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
-            return NotImplementedError
+            return NotImplemented
         self_group_keys = self.get_grouped_key()
         other_group_keys = other.get_grouped_key()
         return self_group_keys == other_group_keys
-
-    def __ne__(self, other):
-        if not isinstance(other, DynamicEmbTableOptions):
-            return NotImplementedError
-        return not (self == other)
 
     def get_grouped_key(self):
         grouped_key = {}
@@ -660,7 +695,14 @@ class DynamicEmbTableOptions:
         grouped_key["index_type"] = self.index_type
         grouped_key["dist_type"] = self.dist_type
         grouped_key["score_strategy"] = self.score_strategy
-        grouped_key["admit_strategy"] = self.admit_strategy
+        # Each of these answers for itself, and leaves out whatever it
+        # resolves per table: an initializer answers with its mode and not its
+        # parameters, a strategy with its threshold and not its counter's
+        # capacity. Comparing the objects instead would split nearly every
+        # module into one table apiece.
+        grouped_key["initializer"] = group_key_of(self.initializer_args)
+        grouped_key["eval_initializer"] = group_key_of(self.eval_initializer_args)
+        grouped_key["admit_strategy"] = group_key_of(self.admit_strategy)
         # Tables with different eviction functions / decay must not be merged. The
         # tuple order (logical score order, which the score_function is written
         # against) is already captured by score_strategy above.
@@ -804,8 +846,8 @@ def complete_initializer_args(
         default_lower = -scale
         default_upper = scale
     else:
-        default_lower = 0.0
-        default_upper = 1.0
+        default_lower = DEFAULT_UNIFORM_LOWER
+        default_upper = DEFAULT_UNIFORM_UPPER
 
     return replace(
         initializer_args,

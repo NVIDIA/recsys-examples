@@ -3,6 +3,7 @@
 
 import os
 import random
+import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -11,11 +12,18 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.embedding_admission import FrequencyAdmissionStrategy
-from dynamicemb.types import DynamicEmbInitializerArgs
+from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
+from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
+
+# test_embedding_dump_load is the fixture module the tests in unit_tests share
+# -- test_lfu_scores and test_hybrid_storage_export import it too -- so it stays
+# a directory up and has to be put on the path from here.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import (
+    ADMISSION_COUNTER_CAPACITY,
+    TABLE_INITIALIZER_VALUE,
     assert_batched_dynamicemb_storage_class,
     create_model,
     get_optimizer_kwargs,
@@ -218,6 +226,40 @@ def validate_admission_keys(
         )
 
 
+def validate_non_admitted_embedding_values(
+    output: torch.Tensor,
+    expected_value: float,
+    iteration: int,
+):
+    """
+    Validate the embedding values a rejected key is looked up with.
+
+    Under a threshold no key can reach, admission rejects every key, so the
+    whole forward output comes from whichever initializer owns non-admitted
+    rows -- the strategy's when it has one, the table's otherwise. Any other
+    value means those rows were left uninitialized or the wrong initializer
+    wrote them.
+
+    Args:
+        output: Forward output, one row per looked-up key.
+        expected_value: The constant the owning initializer writes.
+        iteration: Iteration index, for the failure message.
+    """
+    expected = torch.full_like(output, expected_value)
+    if torch.allclose(output, expected, rtol=0, atol=1e-6):
+        return
+
+    mismatched = ~torch.isclose(output, expected, rtol=0, atol=1e-6)
+    num_mismatched = int(mismatched.sum())
+    sample = output[mismatched][:8].tolist()
+    raise AssertionError(
+        f"Iteration {iteration}: {num_mismatched} of {output.numel()} values "
+        f"of rejected keys are not {expected_value} "
+        f"(range [{float(output.min())}, {float(output.max())}], "
+        f"first mismatches {sample})"
+    )
+
+
 @click.command()
 @click.option("--num-embedding-collections", type=int, default=1)
 @click.option("--num-embeddings", type=str, default="1000")
@@ -254,6 +296,38 @@ def validate_admission_keys(
         "DEFAULT (_generic_forward_path), not HBM_DIRECT."
     ),
 )
+@click.option(
+    "--non-admitted-init-value",
+    type=float,
+    default=0.0,
+    help="Constant the admission strategy initializes non-admitted embeddings with.",
+)
+@click.option(
+    "--no-strategy-initializer",
+    is_flag=True,
+    help=(
+        "Give the admission strategy no initializer of its own, so non-admitted "
+        "rows fall back to the table's initializer."
+    ),
+)
+@click.option(
+    "--case",
+    type=str,
+    default=None,
+    help=(
+        "Run one case of the suite. It supplies the options it cares about; "
+        "anything also given on the command line still wins. --list-cases "
+        "prints the names, --list-cases --num-gpus N those worth that many."
+    ),
+)
+@click.option(
+    "--expect-all-rejected",
+    is_flag=True,
+    help=(
+        "Assert no key is admitted and every forward value equals the initializer "
+        "constant that owns non-admitted rows. Pass a threshold no key can reach."
+    ),
+)
 def test_admission_strategy_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -267,6 +341,10 @@ def test_admission_strategy_validation(
     cache_capacity_ratio: float,
     score_strategy: str,
     global_hbm_budget_scale: float,
+    non_admitted_init_value: float,
+    no_strategy_initializer: bool,
+    expect_all_rejected: bool,
+    case: Optional[str],
 ):
     """Test admission strategy correctness by comparing with naive frequency counting.
 
@@ -309,12 +387,24 @@ def test_admission_strategy_validation(
     if not caching and global_hbm_budget_scale < 1.0:
         print(f"  - Storage path: expect HybridStorage (prefetch StorageMode DEFAULT)")
 
-    # Create admission strategy
+    # Create admission strategy. Without an initializer of its own, a rejected
+    # key's row is left to the table initializer.
+    if no_strategy_initializer:
+        non_admitted_initializer_args = None
+        expected_non_admitted_value = TABLE_INITIALIZER_VALUE
+    else:
+        non_admitted_initializer_args = DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT,
+            value=non_admitted_init_value,
+        )
+        expected_non_admitted_value = non_admitted_init_value
+    if expect_all_rejected:
+        print(f"  - Expecting every key rejected, value {expected_non_admitted_value}")
+
     admission_strategy = FrequencyAdmissionStrategy(
         threshold=threshold,
-        initializer_args=DynamicEmbInitializerArgs(
-            value=0.0,
-        ),
+        counter=KVCounter(ADMISSION_COUNTER_CAPACITY),
+        initializer_args=non_admitted_initializer_args,
     )
 
     # Create model with admission strategy
@@ -369,6 +459,10 @@ def test_admission_strategy_validation(
     for iteration, kjt in enumerate(kjts):
         ret = model(kjt)
         torch.cuda.synchronize()
+        if expect_all_rejected:
+            validate_non_admitted_embedding_values(
+                ret, expected_non_admitted_value, iteration
+            )
         loss = ret.sum() * dist.get_world_size()
         loss.backward()
         torch.cuda.synchronize()
@@ -382,14 +476,163 @@ def test_admission_strategy_validation(
     print(f"\nValidating admission with threshold={threshold}...")
     validate_admission_keys(expected_frequencies, actual_keys, threshold)
 
+    if expect_all_rejected:
+        for table_name, keys in actual_keys.items():
+            if keys:
+                raise AssertionError(
+                    f"Table {table_name}: {len(keys)} keys admitted under "
+                    f"threshold={threshold}, expected none"
+                )
+        print(
+            f"✓ No key admitted; every looked-up value was "
+            f"{expected_non_admitted_value}"
+        )
+
     print(f"\n✓ Admission strategy test passed!")
 
 
+# The suite as a table rather than as copies of a torchrun line. A case names
+# only the options that differ from the command's defaults, and says which
+# process counts it means anything at. test_embedding_admission.sh asks for the
+# names and runs each one in its own process, so no parameter lives there.
+
+STORAGE_MODES = {
+    # The three ways a lookup reaches admission.
+    "hbm-direct": {},
+    "hybrid": {"global_hbm_budget_scale": 0.25},
+    "cache": {"caching": True, "cache_capacity_ratio": 0.3},
+}
+OPTIMIZERS = ("sgd", "adam", "rowwise_adagrad")
+SCORE_STRATEGIES = ("timestamp", "lfu", "step")
+
+_FOUR_TABLES = {
+    "num_embedding_collections": 2,
+    "num_embeddings": "10000,10000,10000,10000",
+    "multi_hot_sizes": "5,5,5,5",
+    "embedding_dim": 16,
+    "batch_size": 32,
+    "num_iterations": 10,
+    "threshold": 4,
+}
+_ONE_TABLE = {
+    "num_embedding_collections": 1,
+    "embedding_dim": 16,
+    "optimizer_type": "sgd",
+    "threshold": 4,
+}
+
+
+def _build_cases():
+    cases = {}
+
+    # Admission over every storage path, every optimizer and every score
+    # strategy a table can be built with.
+    for storage, storage_options in STORAGE_MODES.items():
+        for optimizer in OPTIMIZERS:
+            for score_strategy in SCORE_STRATEGIES:
+                cases[f"{storage}-{optimizer}-{score_strategy}"] = {
+                    "gpus": (1, 8),
+                    "options": {
+                        **_FOUR_TABLES,
+                        **storage_options,
+                        "optimizer_type": optimizer,
+                        "score_strategy": score_strategy,
+                    },
+                }
+
+    # Long enough for a key to accumulate its way past the threshold.
+    for storage, storage_options in (
+        ("hbm-direct", {}),
+        ("cache", {"caching": True, "cache_capacity_ratio": 0.4}),
+    ):
+        cases[f"high-frequency-{storage}"] = {
+            "gpus": (1,),
+            "options": {
+                **_ONE_TABLE,
+                **storage_options,
+                "num_embeddings": "5000",
+                "multi_hot_sizes": "3",
+                "batch_size": 16,
+                "num_iterations": 50,
+            },
+        }
+
+    # A cache far too small for the keys, so admission runs against eviction.
+    for optimizer in ("sgd", "adam"):
+        cases[f"tiny-cache-{optimizer}"] = {
+            "gpus": (1,),
+            "options": {
+                **_ONE_TABLE,
+                "optimizer_type": optimizer,
+                "num_embeddings": "10000",
+                "multi_hot_sizes": "5",
+                "batch_size": 64,
+                "num_iterations": 25,
+                "caching": True,
+                "cache_capacity_ratio": 0.08,
+            },
+        }
+
+    # A threshold no key can reach, so every value the forward returns comes
+    # from whichever initializer owns the rows admission rejects.
+    for owner, owner_options in (
+        ("strategy", {"non_admitted_init_value": 0.5}),
+        ("table", {"no_strategy_initializer": True}),
+    ):
+        for storage, storage_options in STORAGE_MODES.items():
+            cases[f"reject-all-{owner}-{storage}"] = {
+                "gpus": (1, 8),
+                "options": {
+                    **_FOUR_TABLES,
+                    **storage_options,
+                    **owner_options,
+                    "optimizer_type": "sgd",
+                    "threshold": 10**9,
+                    "expect_all_rejected": True,
+                },
+            }
+
+    return cases
+
+
+CASES = _build_cases()
+
+
+def case_names(num_gpus: Optional[int] = None) -> List[str]:
+    """The cases worth running at this process count, or all of them."""
+    return [
+        name
+        for name, case in CASES.items()
+        if num_gpus is None or num_gpus in case["gpus"]
+    ]
+
+
+def _case_options(argv: List[str]) -> Dict[str, object]:
+    """The options of the --case in argv, for click to take as defaults."""
+    if "--case" not in argv:
+        return {}
+    name = argv[argv.index("--case") + 1]
+    if name not in CASES:
+        raise SystemExit(f"unknown case {name!r}; --list-cases prints them")
+    return CASES[name]["options"]
+
+
 if __name__ == "__main__":
+    # Listing is answered before anything claims a device, so that the shell
+    # driver can ask for the names without a GPU.
+    if "--list-cases" in sys.argv:
+        num_gpus = (
+            int(sys.argv[sys.argv.index("--num-gpus") + 1])
+            if "--num-gpus" in sys.argv
+            else None
+        )
+        print("\n".join(case_names(num_gpus)))
+        sys.exit(0)
+
     LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(LOCAL_RANK)
 
     dist.init_process_group(backend="nccl")
-    test_admission_strategy_validation()
+    test_admission_strategy_validation(default_map=_case_options(sys.argv))
     dist.barrier()
     dist.destroy_process_group()

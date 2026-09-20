@@ -16,7 +16,7 @@
 import abc
 import enum
 from dataclasses import dataclass
-from typing import Generic, Iterator, Optional, Tuple, TypeVar
+from typing import Generic, Iterator, List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
@@ -53,6 +53,14 @@ class DynamicEmbInitializerMode(enum.Enum):
     DEBUG = "debug"
 
 
+# What an unbounded UNIFORM falls back to when there is no table to derive
+# bounds from. A table's own resolve to +/-sqrt(1 / num_embeddings) in the
+# planner; everywhere else -- a strategy's initializer, or an args object that
+# never reached the planner -- these are what it gets.
+DEFAULT_UNIFORM_LOWER: float = 0.0
+DEFAULT_UNIFORM_UPPER: float = 1.0
+
+
 @dataclass
 class DynamicEmbInitializerArgs:
     """
@@ -81,9 +89,24 @@ class DynamicEmbInitializerArgs:
     upper: float = None
     value: float = 0.0
 
+    def get_grouped_key(self):
+        """What has to match for two tables to share one initializer.
+
+        Only the mode. The parameters are resolved per table by
+        :class:`~dynamicemb.initializer.MultiTableInitializer`, so tables that
+        differ in them still fuse -- and they differ without being asked to,
+        since an unbounded UNIFORM resolves against each table's row count.
+        """
+        return self.mode
+
     def __eq__(self, other):
+        # Only the fields the mode actually reads take part: a CONSTANT's mean
+        # or a NORMAL's bounds are never used, so two args that differ there
+        # still initialize identically.
         if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
+            return NotImplemented
+        if self.mode != other.mode:
+            return False
         if self.mode == DynamicEmbInitializerMode.NORMAL:
             return self.mean == other.mean and self.std_dev == other.std_dev
         elif self.mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
@@ -97,12 +120,23 @@ class DynamicEmbInitializerArgs:
             return self.lower == other.lower and self.upper == other.upper
         elif self.mode == DynamicEmbInitializerMode.CONSTANT:
             return self.value == other.value
+        # DEBUG takes no parameters, so same mode is all there is to compare.
         return True
 
-    def __ne__(self, other):
-        if not isinstance(other, DynamicEmbInitializerArgs):
-            return NotImplementedError
-        return not (self == other)
+
+def group_key_of(obj: Optional[object]):
+    """Ask an object what has to match for its tables to be fused.
+
+    Objects that answer decide their own granularity, which is how a strategy,
+    a counter or an initializer lets tables differ in whatever it resolves per
+    table. Anything else stands for itself, so two tables group only when
+    handed the very same object -- conservative, and what happened before any
+    of them had a say.
+    """
+    if obj is None:
+        return None
+    get_grouped_key = getattr(obj, "get_grouped_key", None)
+    return get_grouped_key() if callable(get_grouped_key) else obj
 
 
 KEY_TYPE = torch.int64
@@ -438,22 +472,108 @@ class Counter(abc.ABC):
 
 
 class AdmissionStrategy(abc.ABC):
+    """How a table's admission is configured.
+
+    This is inert: it allocates nothing, touches no device, and may be handed
+    to as many tables as you like. It does not decide anything either -- a
+    module turns the configurations of the tables it fuses into the one thing
+    that does, by calling :meth:`create_admitter`.
+    """
+
+    @classmethod
+    @abc.abstractmethod
+    def create_admitter(
+        cls,
+        table_strategies: List["AdmissionStrategy"],
+        device: torch.device,
+    ) -> "MultiTableAdmitter":
+        """The admitter these tables share, with its device state allocated.
+
+        Called once, by the module, with one configuration per table it fuses.
+        This is where anything on the device comes into being: a counter's hash
+        table, an initializer's per-table parameters.
+        """
+
+    @classmethod
+    def one_configuration(
+        cls, table_strategies: List["AdmissionStrategy"]
+    ) -> "AdmissionStrategy":
+        """The single configuration these tables agree on.
+
+        They were grouped on :meth:`get_grouped_key`, so they are already
+        interchangeable and the first stands for all; this says so rather than
+        take element zero and leave the reader to wonder.
+        """
+        keys = {strategy.get_grouped_key() for strategy in table_strategies}
+        if len(keys) != 1:
+            raise ValueError(
+                f"Tables of one module must agree on their admission strategy, "
+                f"got {len(keys)} different ones: {keys}"
+            )
+        return table_strategies[0]
+
+    def get_grouped_key(self):
+        """What has to match for two tables to share one fused module.
+
+        The tables of a fused module share a single admitter, so this decides
+        which configurations are interchangeable. The default is the instance
+        itself: only the very same object groups, which is how strategies
+        behaved before they had a say. Override it to let equal but separately
+        constructed configurations share a module -- return everything that
+        changes the decision, and for anything resolved per table return only
+        what the tables must agree on.
+        """
+        return id(self)
+
+
+class MultiTableAdmitter(abc.ABC):
+    """What a fused module runs: one admitter over all of its tables.
+
+    Built by :meth:`AdmissionStrategy.create_admitter`, and the only half that
+    holds anything -- whatever deciding takes, it owns.
+    """
+
     @abc.abstractmethod
     def admit(
         self,
         keys: torch.Tensor,
-        frequencies: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Admit keys with frequencies >= threshold.
+        """Which of these missing keys may enter the table.
+
+        Args:
+            keys (torch.Tensor): The keys to decide on, deduplicated.
+            table_ids (torch.Tensor): The table each key belongs to. One module
+                spans several, so a decision may be made per table.
+            frequencies (Optional[torch.Tensor]): How often each key occurred in
+                *this batch*, where the module counts occurrences at all; None
+                means treat each key as one occurrence. An increment, not a
+                running total -- any total is the admitter's own to keep.
+
+        Returns:
+            torch.Tensor: Boolean mask over `keys`, True where admitted.
         """
 
-    @abc.abstractmethod
-    def initialize_non_admitted_embeddings(
-        self,
-        buffer: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> None:
+    def state(self) -> Optional[Counter]:
+        """Persistent state the framework has to carry, or None.
+
+        Whatever an admitter accumulates across steps lives on the device, has
+        to be reported in memory accounting, and has to survive a checkpoint.
+        Return it here and the framework does all three; keeping it private
+        would only mean it is none of those.
         """
-        Initialize the embeddings for the keys that are not admitted.
+        return None
+
+    @property
+    def non_admitted_initializer(self):
+        """What writes the rows this admitter rejects, or None for the table's.
+
+        A rejected key still takes part in the forward, so its row has to be
+        written by something. Returning a ``MultiTableInitializer`` here hands
+        that job to it; None leaves those rows to the table's own initializer.
+        The module does the calling, so buffer layout stays out of an
+        admitter's business, and which of the two writes them is settled once,
+        when the admitter is built, and not renegotiated on every batch.
         """
+        return None

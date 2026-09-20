@@ -29,6 +29,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <curand_kernel.h>
 #include <pybind11/pybind11.h>
 #include <random>
+#include <string>
 
 namespace dyn_emb {
 
@@ -37,16 +38,41 @@ DEVICE_INLINE unsigned int worker_id() {
   return grid.thread_rank();
 }
 
-struct UniformEmbeddingGenerator {
+// The parameters a generator reads. Both forms serve a fused module's buffer,
+// which holds several logical tables; what differs is the parameters, shared
+// by every table or held one row per table. Each kernel is built for exactly
+// one of the two: the shared form keeps its parameters in registers and never
+// reads memory for them, and neither form carries the other's fields.
+template <bool kPerTable, int kNumParams> struct InitParams;
+
+template <int kNumParams> struct InitParams<false, kNumParams> {
+  float values[kNumParams];
+
+  DEVICE_INLINE float get(int64_t vec_id, int slot) const {
+    return values[slot];
+  }
+};
+
+template <int kNumParams> struct InitParams<true, kNumParams> {
+  const float *table_params; // [num_tables, kNumParams], row-major
+  const int64_t *table_ids;  // buffer row -> table, the convention keys uses
+
+  DEVICE_INLINE float get(int64_t vec_id, int slot) const {
+    return table_params[table_ids[vec_id] * kNumParams + slot];
+  }
+};
+
+template <bool kPerTable> struct UniformEmbeddingGenerator {
+  static constexpr int kNumParams = 2; // {lower, upper}
+  using Params = InitParams<kPerTable, kNumParams>;
+
   struct Args {
     curandState *state;
-    float lower;
-    float upper;
+    Params params;
   };
 
   DEVICE_INLINE UniformEmbeddingGenerator(Args args)
-      : load_(false), state_(args.state), lower(args.lower), upper(args.upper) {
-  }
+      : load_(false), state_(args.state), params_(args.params) {}
 
   DEVICE_INLINE float generate(int64_t vec_id) {
     if (!load_) {
@@ -54,6 +80,8 @@ struct UniformEmbeddingGenerator {
       load_ = true;
     }
     auto tmp = curand_uniform_double(&this->localState_);
+    float lower = params_.get(vec_id, 0);
+    float upper = params_.get(vec_id, 1);
     return static_cast<float>((upper - lower) * tmp + lower);
   }
 
@@ -66,21 +94,21 @@ struct UniformEmbeddingGenerator {
   bool load_;
   curandState localState_;
   curandState *state_;
-  float lower;
-  float upper;
+  Params params_;
 };
 
-struct NormalEmbeddingGenerator {
+template <bool kPerTable> struct NormalEmbeddingGenerator {
+  static constexpr int kNumParams = 2; // {mean, std_dev}
+  using Params = InitParams<kPerTable, kNumParams>;
+
   struct Args {
     curandState *state;
-    float mean;
-    float std_dev;
+    Params params;
   };
 
   DEVICE_INLINE
   NormalEmbeddingGenerator(Args args)
-      : load_(false), state_(args.state), mean(args.mean),
-        std_dev(args.std_dev) {}
+      : load_(false), state_(args.state), params_(args.params) {}
 
   DEVICE_INLINE
   float generate(int64_t vec_id) {
@@ -89,6 +117,8 @@ struct NormalEmbeddingGenerator {
       load_ = true;
     }
     auto tmp = curand_normal_double(&this->localState_);
+    float mean = params_.get(vec_id, 0);
+    float std_dev = params_.get(vec_id, 1);
     return static_cast<float>(std_dev * tmp + mean);
   }
 
@@ -101,23 +131,21 @@ struct NormalEmbeddingGenerator {
   bool load_;
   curandState localState_;
   curandState *state_;
-  float mean;
-  float std_dev;
+  Params params_;
 };
 
-struct TruncatedNormalEmbeddingGenerator {
+template <bool kPerTable> struct TruncatedNormalEmbeddingGenerator {
+  static constexpr int kNumParams = 4; // {mean, std_dev, lower, upper}
+  using Params = InitParams<kPerTable, kNumParams>;
+
   struct Args {
     curandState *state;
-    float mean;
-    float std_dev;
-    float lower;
-    float upper;
+    Params params;
   };
 
   DEVICE_INLINE
   TruncatedNormalEmbeddingGenerator(Args args)
-      : load_(false), state_(args.state), mean(args.mean),
-        std_dev(args.std_dev), lower(args.lower), upper(args.upper) {}
+      : load_(false), state_(args.state), params_(args.params) {}
 
   DEVICE_INLINE
   float generate(int64_t vec_id) {
@@ -125,6 +153,12 @@ struct TruncatedNormalEmbeddingGenerator {
       localState_ = state_[worker_id()];
       load_ = true;
     }
+    float mean = params_.get(vec_id, 0);
+    float std_dev = params_.get(vec_id, 1);
+    float lower = params_.get(vec_id, 2);
+    float upper = params_.get(vec_id, 3);
+    // Inverse CDF, so the result is the normal conditioned on [lower, upper]
+    // rather than one clipped to it -- no mass piles up on the bounds.
     auto l = normcdf((lower - mean) / std_dev);
     auto u = normcdf((upper - mean) / std_dev);
     u = 2 * u - 1;
@@ -148,13 +182,31 @@ struct TruncatedNormalEmbeddingGenerator {
   bool load_;
   curandState localState_;
   curandState *state_;
-  float mean;
-  float std_dev;
-  float lower;
-  float upper;
+  Params params_;
   double scale = sqrt(2.0f);
 };
 
+template <bool kPerTable> struct ConstEmbeddingGenerator {
+  static constexpr int kNumParams = 1; // {value}
+  using Params = InitParams<kPerTable, kNumParams>;
+
+  struct Args {
+    Params params;
+  };
+
+  DEVICE_INLINE
+  ConstEmbeddingGenerator(Args args) : params_(args.params) {}
+
+  DEVICE_INLINE
+  float generate(int64_t vec_id) { return params_.get(vec_id, 0); }
+
+  DEVICE_INLINE void destroy() {}
+
+  Params params_;
+};
+
+// DEBUG derives its value from the key alone and takes no parameters, so its
+// tables cannot disagree and it needs no per-table form.
 template <typename K> struct MappingEmbeddingGenerator {
   struct Args {
     const K *keys;
@@ -174,22 +226,6 @@ template <typename K> struct MappingEmbeddingGenerator {
 
   uint64_t mod;
   const K *keys;
-};
-
-struct ConstEmbeddingGenerator {
-  struct Args {
-    float val;
-  };
-
-  DEVICE_INLINE
-  ConstEmbeddingGenerator(Args args) : val(args.val) {}
-
-  DEVICE_INLINE
-  float generate(int64_t vec_id) { return val; }
-
-  DEVICE_INLINE void destroy() {}
-
-  float val;
 };
 
 } // namespace dyn_emb

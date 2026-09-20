@@ -43,8 +43,7 @@ from dynamicemb.dynamicemb_config import (
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
-from dynamicemb.embedding_admission import MultiTableKVCounter
-from dynamicemb.initializer import create_initializer_from_args
+from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
@@ -625,7 +624,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
-        self._admit_strategy = self._dynamicemb_options[0].admit_strategy
+        # Every table of a module has the same eviction strategy: it is part of
+        # what they were grouped on, and one physical table has one score
+        # layout. The admission strategy is materialized further down, once the
+        # device it allocates on is known.
         self._evict_strategy = self._dynamicemb_options[0].evict_strategy.value
         if device is not None:
             self.device_id = int(str(device)[-1])
@@ -728,11 +730,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
         self._storage_externel = table_option.external_storage is not None
         self._create_cache_storage()
-        self._initializers = []
-        self._eval_initializers = []
         self._create_initializers()
-
-        self._admission_counter = self._create_admission_counter(table_options)
+        self._create_admitter()
         self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
@@ -902,29 +901,49 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
 
     def _create_initializers(self) -> None:
-        for option in self._dynamicemb_options:
-            initializer = create_initializer_from_args(option.initializer_args)
-            self._initializers.append(initializer)
-            eval_initializer = create_initializer_from_args(
-                option.eval_initializer_args
-            )
-            self._eval_initializers.append(eval_initializer)
+        """One initializer per module, not per table.
 
-    def _create_admission_counter(
-        self, table_options: List[DynamicEmbTableOptions]
-    ) -> Optional["Counter"]:
+        The tables share a value buffer, so a row is addressed by its position
+        in that buffer; a MultiTableInitializer turns that position into the
+        owning table's parameters. Tables are only grouped by initializer mode,
+        so their parameters really can differ -- and do by default, since an
+        unbounded UNIFORM resolves against each table's num_embeddings.
         """
-        Create one fused admission counter for all tables.
-        """
-        counters = [option.admission_counter for option in table_options]
-        if all(counter is None for counter in counters):
-            return None
-        assert all(
-            counter is not None for counter in counters
-        ), "All tables must either have or not have an admission counter"
-        return MultiTableKVCounter(
-            counters, device=torch.device(f"cuda:{self.device_id}")
+        device = torch.device(f"cuda:{self.device_id}")
+        self._initializer = MultiTableInitializer.create(
+            [option.initializer_args for option in self._dynamicemb_options], device
         )
+        self._eval_initializer = MultiTableInitializer.create(
+            [option.eval_initializer_args for option in self._dynamicemb_options],
+            device,
+        )
+
+    def _create_admitter(self) -> None:
+        """Turn the tables' admission configurations into the one this runs.
+
+        The configurations the caller wrote are inert; this is where the
+        admitter's device state -- a counter's hash table, an initializer's
+        per-table parameters -- is allocated. Whatever of it has to be
+        checkpointed and accounted for comes back through ``state()``.
+        """
+        table_strategies = [
+            option.admit_strategy for option in self._dynamicemb_options
+        ]
+        if all(strategy is None for strategy in table_strategies):
+            self._admitter = None
+            self._admission_counter = None
+            return
+        if any(strategy is None for strategy in table_strategies):
+            # Unreachable while admit_strategy is part of the grouping key;
+            # say so rather than let a None reach the forward.
+            raise ValueError(
+                "Either every table of a module has an admission strategy or "
+                "none does."
+            )
+        self._admitter = type(table_strategies[0]).create_admitter(
+            table_strategies, torch.device(f"cuda:{self.device_id}")
+        )
+        self._admission_counter = self._admitter.state()
 
     def _create_optimizer(
         self,
@@ -1209,7 +1228,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._storage,
                 self.feature_offsets,
                 self.output_dtype,
-                self._eval_initializers,
+                self._eval_initializer,
                 layout,
                 self._evict_strategy,
                 frequency_counters,
@@ -1231,12 +1250,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._cache,
             self._storage,
             self.output_dtype,
-            self._initializers,
+            self._initializer,
             self._optimizer,
             layout,
-            self._admit_strategy,
+            self._admitter,
             self._evict_strategy,
-            self._admission_counter,
             pooling_weights,
             self._empty_tensor,
         )
@@ -1283,12 +1301,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._cache,
                 self._storage,
                 self.feature_offsets,
-                self._initializers,
+                self._initializer,
                 forward_stream,
                 self._evict_strategy,
                 frequency_counters,
-                self._admit_strategy,
-                self._admission_counter,
+                self._admitter,
                 outstanding_keys_ref=self._prefetch_outstanding_keys
                 if self._cache is not None
                 else None,

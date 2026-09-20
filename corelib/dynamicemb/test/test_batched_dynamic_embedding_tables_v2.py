@@ -2308,11 +2308,12 @@ def test_multi_table_with_admission(opt_type, opt_params, caching):
     value_type = torch.float32
     max_capacity = 2048
 
-    admit_strategy = FrequencyAdmissionStrategy(threshold=2)
+    admit_strategy = FrequencyAdmissionStrategy(
+        threshold=2, counter=KVCounter(capacity=max_capacity)
+    )
 
     dyn_emb_table_options_list = []
     for dim in dims:
-        counter = KVCounter(capacity=max_capacity)
         opt = DynamicEmbTableOptions(
             dim=dim,
             init_capacity=max_capacity,
@@ -2324,7 +2325,6 @@ def test_multi_table_with_admission(opt_type, opt_params, caching):
             caching=caching,
             local_hbm_for_values=1024**3,
             admit_strategy=admit_strategy,
-            admission_counter=counter,
         )
         dyn_emb_table_options_list.append(opt)
 

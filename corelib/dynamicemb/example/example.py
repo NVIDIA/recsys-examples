@@ -581,23 +581,21 @@ def get_planner(
 
         # Setup admission strategy if threshold > 0
         admit_strategy = None
-        admission_counter = None
         if args.admission_threshold > 0:
             print(
                 f"Admission strategy enabled with threshold={args.admission_threshold}"
             )
-            # Create counter config (actual table will be created during sharding)
-            admission_counter = KVCounter(
-                capacity=get_sharded_table_capacity(
-                    eb_config, world_size, bucket_capacity
-                ),
-                bucket_capacity=kv_counter_bucket_capacity,
-                key_type=torch.int64,
-            )
-
-            # Create admission strategy with threshold
+            # The strategy carries the counter it accumulates into; the table
+            # itself is allocated when the module materializes the strategy.
             admit_strategy = FrequencyAdmissionStrategy(
                 threshold=args.admission_threshold,
+                counter=KVCounter(
+                    capacity=get_sharded_table_capacity(
+                        eb_config, world_size, bucket_capacity
+                    ),
+                    bucket_capacity=kv_counter_bucket_capacity,
+                    key_type=torch.int64,
+                ),
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.CONSTANT,
                     value=0.0,  # Initialize rejected keys to 0
@@ -637,7 +635,6 @@ def get_planner(
                 training=training,
                 bucket_capacity=bucket_capacity,
                 admit_strategy=admit_strategy,
-                admission_counter=admission_counter,
             ),
         )
 

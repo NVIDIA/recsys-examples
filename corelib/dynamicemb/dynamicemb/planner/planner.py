@@ -127,7 +127,9 @@ def _prepare_dynemb_table_options(
 ):
     """Check ``constraints`` ↔ ``eb_configs`` naming, then fill per-table DynamicEmb options.
 
-    For each DynamicEmb table: ``complete_initializer_args``, then
+    For each DynamicEmb table: ``complete_initializer_args`` -- the only place
+    that still knows ``num_embeddings``, which an unbounded UNIFORM needs, since
+    ``max_capacity`` becomes the per-rank row count a few lines down -- then
     ``_sharded_table_bucket_layout`` (sets effective ``bucket_capacity`` and per-rank
     ``max_capacity``), then ``local_hbm_for_values`` from
     ``global_hbm_for_values`` and world size; then default ``index_type`` / ``embedding_dtype``,
