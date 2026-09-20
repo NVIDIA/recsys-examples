@@ -294,6 +294,7 @@ class InferenceDenseModule(torch.nn.Module):
         self.load_state_dict(model_state_dict, strict=False)
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
+        """Load dense weights and refresh backbone-specific inference state."""
         from modules.inference_checkpoint import load_dense_state_dict
 
         return load_dense_state_dict(self, model_state_dict, *args, **kwargs)

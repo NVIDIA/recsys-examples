@@ -356,20 +356,27 @@ def test_export_real_layer_dynamic_batch_and_tokens(tmp_path):
 
 
 class CachedAttention(nn.Module):
+    """Expose the production paged reader through tensor-only export inputs."""
+
     def __init__(self, layer):
         super().__init__()
-        self.layer = layer
+        self._layer = layer
 
     def forward(self, x, off, candidates, table, ids, indptr, history):
-        q, k, v = self.layer.project_qkv(x)
-        return self.layer.finish(
+        """Run attention against an already populated cache."""
+        q, k, v = self._layer.project_qkv(x)
+        return self._layer.finish(
             x,
-            self.layer.attention(q, k, v, off, candidates, table, ids, indptr, history),
+            self._layer.attention(
+                q, k, v, off, candidates, table, ids, indptr, history
+            ),
         )
 
 
 @dataclass
 class CacheExportMetadata:
+    """Hold cache tensors used by the CPU export fixture."""
+
     kv_cache_table: list
     kv_indices: torch.Tensor
     kv_indptr: torch.Tensor
@@ -379,16 +386,21 @@ class CacheExportMetadata:
 
 @dataclass
 class JaggedExportMetadata:
+    """Hold packed sequence offsets and candidate counts for export."""
+
     seqlen_offsets: torch.Tensor
     num_candidates: torch.Tensor
 
 
 class CachedLayer(nn.Module):
+    """Expose production cache append and attention as tensor-only inputs."""
+
     def __init__(self, layer):
         super().__init__()
-        self.layer = layer
+        self._layer = layer
 
     def forward(self, x, off, candidates, table, ids, indptr, history):
+        """Append new history to the input cache and compute layer outputs."""
         metadata = CacheExportMetadata(
             kv_cache_table=[table],
             kv_indices=ids,
@@ -397,7 +409,7 @@ class CachedLayer(nn.Module):
             kv_onload_handle=None,
         )
         jd = JaggedExportMetadata(seqlen_offsets=off, num_candidates=candidates)
-        return self.layer.forward_naive(
+        return self._layer.forward_naive(
             candidates.shape[0], x.shape[0], x, jd, metadata
         )
 

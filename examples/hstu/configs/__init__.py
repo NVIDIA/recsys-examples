@@ -16,6 +16,7 @@ from .inference_config import (
 
 
 def __getattr__(name):
+    """Load task schemas on demand without importing training dependencies."""
     # Inference configuration and tensor-only layer tests do not require the
     # training embedding stack. Load task/embedding schemas only when requested.
     if name in ("task_config", "RankingConfig", "RetrievalConfig"):

@@ -182,6 +182,12 @@ def get_exportable_model_for_inference(
     total_max_seqlen=8192,
     num_contextual_features=0,
 ):
+    """Build and load the selected inference backbone for no-cache export.
+
+    Reuse the training model's sparse and prediction-head schemas. Transformer
+    export creates fresh dense layers and requires a matching checkpoint;
+    batch and sequence limits bound its padded attention tensors.
+    """
     model = get_training_gr_model()
     if NetworkArgs().backbone == "transformer":
         from configs import get_inference_hstu_config
