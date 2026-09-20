@@ -36,38 +36,33 @@ for num_gpus in ${NUM_GPUS[@]}; do
   done
 done
 
-echo "Running hash_roundrobin opt-in smoke"
-torchrun \
-  --nnodes 1 \
-  --nproc_per_node 1 \
-  ./test/unit_tests/test_embedding_dump_load.py \
-  --optimizer-type sgd \
-  --score-strategy step \
-  --dist-type hash_roundrobin \
-  --mode "dump" \
-  --optim False \
-  --counter False \
-  --save-path "debug_weight_hash_roundrobin_smoke" \
-  --num-embedding-collections 1 \
-  --num-embeddings 1000000 \
-  --multi-hot-sizes 10 \
-  --embedding-dim 16 || exit 1
+# hash_roundrobin, dumped and reloaded at the same world size. Multi-rank is
+# the point: a rank's checkpoint file holds the keys with murmur(k) % ws == r,
+# so a loader applying the roundrobin rule instead keeps only the ~1/ws of them
+# that also satisfy k % ws == r and silently drops the rest. Single rank cannot
+# see that -- there is no filtering to get wrong.
+HASH_RR_NUM_GPUS=(1 2)
 
-torchrun \
-  --nnodes 1 \
-  --nproc_per_node 1 \
-  ./test/unit_tests/test_embedding_dump_load.py \
-  --optimizer-type sgd \
-  --score-strategy step \
-  --dist-type hash_roundrobin \
-  --mode "load" \
-  --optim False \
-  --counter False \
-  --save-path "debug_weight_hash_roundrobin_smoke" \
-  --num-embedding-collections 1 \
-  --num-embeddings 1000000 \
-  --multi-hot-sizes 10 \
-  --embedding-dim 16 || exit 1
+for num_gpus in ${HASH_RR_NUM_GPUS[@]}; do
+  for mode in "dump" "load"; do
+    echo "hash_roundrobin: num_gpus: $num_gpus, mode: $mode"
+    torchrun \
+      --nnodes 1 \
+      --nproc_per_node $num_gpus \
+      ./test/unit_tests/test_embedding_dump_load.py \
+      --optimizer-type sgd \
+      --score-strategy step \
+      --dist-type hash_roundrobin \
+      --mode "${mode}" \
+      --optim False \
+      --counter False \
+      --save-path "debug_weight_hash_roundrobin_${num_gpus}" \
+      --num-embedding-collections 1 \
+      --num-embeddings 1000000 \
+      --multi-hot-sizes 10 \
+      --embedding-dim 16 || exit 1
+  done
+done
 
 for num_load_gpus in ${NUM_GPUS[@]}; do
   for num_dump_gpus in ${NUM_GPUS[@]}; do

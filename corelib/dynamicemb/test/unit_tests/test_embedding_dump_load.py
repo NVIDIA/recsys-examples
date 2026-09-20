@@ -43,6 +43,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
+from dynamicemb.input_dist import dist_type_codes
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
@@ -467,10 +468,13 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
                 seen_sharding = True
 
         for input_dist in getattr(sharded_module, "_input_dists", []):
-            if hasattr(input_dist, "_dist_type_per_feature"):
-                assert set(input_dist._dist_type_per_feature.values()) == {
-                    expected_dist_type
-                }
+            codes = getattr(input_dist, "_dist_type_tensor", None)
+            if codes is not None:
+                # The distributor holds the rule as the kernel's int32 codes,
+                # resolved once at construction; go through the same function
+                # rather than restating the mapping here.
+                expected_code = int(dist_type_codes([expected_dist_type])[0])
+                assert set(codes.tolist()) == {expected_code}
                 seen_input_dist = True
 
     assert seen_sharding, "Did not find any DynamicEmb sharding carrying dist_type."
