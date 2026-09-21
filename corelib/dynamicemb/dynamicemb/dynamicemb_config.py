@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from dynamicemb.optimizer import OptimType, get_optimizer_state_dim
+from dynamicemb.utils import DTYPE_NUM_BYTES
 from dynamicemb.types import (
     BUCKET_ALIGNMENT,
     DEFAULT_UNIFORM_LOWER,
@@ -977,6 +978,52 @@ def get_sharded_table_capacity(
     )
     return int(num_buckets * effective_bucket)
 
+
+
+def get_local_value_bytes_by_tier(
+    options: "DynamicEmbTableOptions",
+    optimizer_type: Optional[OptimType],
+) -> Tuple[int, int]:
+    """One table's per-rank value bytes, as ``(hbm, host)``.
+
+    Where :func:`get_table_value_bytes` answers how much a table's values weigh
+    across every rank, this answers where one rank's share of them lands, which
+    is not the same question: ``local_hbm_for_values`` is a budget, and a table
+    spends the difference on the host tier.
+
+    The split follows the branch ``BatchedDynamicEmbeddingTablesV2`` takes when
+    it builds the storage. Rows that fit the HBM budget stay there; the rest go
+    to the host. Under ``caching`` the HBM is a cache in front of a host tier
+    that keeps every row, rather than a disjoint partition of them, so the host
+    figure is the whole table and not the remainder.
+
+    ``optimizer_type`` of ``None`` counts the rows without optimizer state --
+    the honest answer when the caller cannot tell which optimizer a table
+    trains with, and a floor rather than a guess.
+
+    Returns ``(hbm_budget, 0)`` for a table whose options have not been through
+    ``_prepare_dynemb_table_options``: ``max_capacity``, ``dim`` and
+    ``embedding_dtype`` are settled there, and without them there is nothing to
+    size from.
+    """
+    hbm_budget = options.local_hbm_for_values
+    dim = options.dim
+    dtype = options.embedding_dtype
+    if not dim or dtype is None or not options.max_capacity:
+        return hbm_budget, 0
+
+    state_dim = (
+        get_optimizer_state_dim(optimizer_type, dim, dtype)
+        if optimizer_type is not None
+        else 0
+    )
+    total = options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
+
+    if options.caching:
+        return hbm_budget, total
+    if total > hbm_budget:
+        return hbm_budget, total - hbm_budget
+    return total, 0
 
 def get_table_value_bytes(
     embedding_config: BaseEmbeddingConfig,

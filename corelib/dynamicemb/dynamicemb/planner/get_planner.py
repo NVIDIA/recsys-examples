@@ -32,9 +32,7 @@ from torchrec.distributed.embedding_types import ShardingType
 
 # from torchrec.distributed import ModuleShardingPlan
 from torchrec.distributed.planner import Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
+from .storage_reservations import DynamicEmbStorageReservation
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
@@ -130,5 +128,7 @@ def get_planner(
         topology=topology,
         constraints=constraints,
         enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
+        storage_reservation=DynamicEmbStorageReservation(
+            dynamicemb_options=dynamicemb_options_dict,
+        ),
     )
