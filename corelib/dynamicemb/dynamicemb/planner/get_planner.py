@@ -81,8 +81,11 @@ def get_planner(
                 compute_kernels=compute_kernel_type,
             )
         elif config.name in dynamicemb_options_dict:
-            # TODO add dynamic embedding compute kernels
-            compute_kernel_type = []
+            # No compute_kernels: a DynamicEmb table's kernel is not something
+            # to search over. DynamicEmbeddingEnumerator._filter_compute_kernels
+            # pins it to one placeholder so the table stays in the search space,
+            # and DynamicEmbeddingShardingPlanner then replaces the whole
+            # ParameterSharding, CUSTOMIZED_KERNEL included.
             dynamicemb_options = dynamicemb_options_dict[config.name]
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[ShardingType.ROW_WISE.value],
