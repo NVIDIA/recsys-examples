@@ -18,23 +18,18 @@ from typing import Dict, List, Set
 
 import torch
 import torch.distributed as dist
+from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.planner import Topology
+from torchrec.distributed.types import BoundsCheckMode, ShardingType
+from torchrec.modules.embedding_configs import EmbeddingConfig
 
-# import our own finalize model grads
 from ..dynamicemb_config import DynamicEmbTableOptions
 from .enumerators import DynamicEmbeddingEnumerator
 from .planners import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
 from .planners import DynamicEmbParameterConstraints
-from torch import distributed as dist
-from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.embedding_types import ShardingType
-
-# from torchrec.distributed import ModuleShardingPlan
-from torchrec.distributed.planner import Topology
 from .storage_reservations import DynamicEmbStorageReservation
-from torchrec.distributed.types import BoundsCheckMode, ShardingType
-from torchrec.modules.embedding_configs import EmbeddingConfig
 
 # refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91
 # compute_kernel is somehow coupled with sharding_type.
@@ -60,7 +55,11 @@ def get_planner(
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
     device: torch.device,
     pipeline_type: str = "none",
-    ddr_cap: int = 512 * 1024 * 1024 * 1024,  # Assume a Node have 512GB memory
+    # Host memory of one node, not one rank: Topology keeps ddr per rank and
+    # this is divided by the local world size below. A terabyte is a
+    # conservative figure for the nodes this runs on rather than a measurement
+    # of any of them -- a caller who knows their machine should say so.
+    ddr_cap: int = 1024 * 1024 * 1024 * 1024,
     intra_host_bw: int = 450e9,  # Nvlink bandwidth
     inter_host_bw: int = 25e9,  # NIC bandwidth
 ):
@@ -110,12 +109,19 @@ def get_planner(
         constraints.update({config.name: constraint})
     hbm_cap = torch.cuda.get_device_properties(0).total_memory
 
+    # Topology stores ddr per rank -- `[ddr_cap] * world_size`, replicated, not
+    # divided. `ddr_cap` is a node's host memory, shared by the ranks on it, so
+    # handing it over as-is tells the planner every rank owns the whole node's
+    # RAM: eight times too much on an eight-GPU node. Divide it here, which is
+    # right while the ranks of a node spend it evenly -- they do under row-wise,
+    # where each holds a slice of every table.
+    local_world_size = get_local_size()
     topology = Topology(
-        local_world_size=get_local_size(),
+        local_world_size=local_world_size,
         world_size=dist.get_world_size(),
         compute_device=device.type,
         hbm_cap=hbm_cap,
-        ddr_cap=ddr_cap,  # For HVK  , if we need to put embedding vector into Host memory , it is important set ddr capacity
+        ddr_cap=ddr_cap // local_world_size,
         intra_host_bw=intra_host_bw,
         inter_host_bw=inter_host_bw,
     )
