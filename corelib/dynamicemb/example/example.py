@@ -555,7 +555,10 @@ def get_planner(
     device, eb_configs, batch_size, optimizer_type, training, caching, args
 ):
     hbm_cap = 80 * 1024 * 1024 * 1024  # H100's HBM bytes per GPU
-    ddr_cap = 512 * 1024 * 1024 * 1024  # Assume a Node have 512GB memory
+    # Host memory of one node, shared by every rank on it. Topology wants this
+    # per rank -- it replicates whatever it is given to each device rather than
+    # dividing it -- so the conversion happens where the Topology is built.
+    ddr_cap_per_node = 512 * 1024 * 1024 * 1024
     intra_host_bw = 450e9  # Nvlink bandwidth
     inter_host_bw = 25e9  # NIC bandwidth
     world_size = dist.get_world_size()
@@ -640,12 +643,13 @@ def get_planner(
 
         dict_const[eb_config.name] = const
 
+    local_world_size = get_local_size()
     topology = Topology(
-        local_world_size=get_local_size(),
+        local_world_size=local_world_size,
         world_size=dist.get_world_size(),
         compute_device=device.type,
-        hbm_cap=hbm_cap,
-        ddr_cap=ddr_cap,
+        hbm_cap=hbm_cap,  # per GPU already
+        ddr_cap=ddr_cap_per_node // local_world_size,
         intra_host_bw=intra_host_bw,
         inter_host_bw=inter_host_bw,
     )
