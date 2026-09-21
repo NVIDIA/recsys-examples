@@ -35,6 +35,7 @@ from dynamicemb.incremental_dump import (
     replay_increment,
     set_score,
 )
+from dynamicemb.planner import DynamicEmbStorageReservation
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -48,9 +49,6 @@ from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torchrec.distributed.comm import intra_and_cross_node_pg
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, PoolingType
 
@@ -141,7 +139,9 @@ def get_planner(
         world_size=dist.get_world_size(),
         compute_device=device.type,
         hbm_cap=platform.hbm_cap,
-        ddr_cap=1024 * 1024 * 1024 * 1024,
+        # One node's host memory, not one rank's: Topology replicates
+        # whatever it is given to every device instead of dividing it.
+        ddr_cap=1024 * 1024 * 1024 * 1024 // torchrec.distributed.comm.get_local_size(),
         intra_host_bw=platform.intra_host_bw,
         inter_host_bw=platform.inter_host_bw,
     )
@@ -156,7 +156,7 @@ def get_planner(
         constraints=dict_const,
         batch_size=batch_size,
         enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
+        storage_reservation=DynamicEmbStorageReservation(dict_const),
         debug=True,
     )
 

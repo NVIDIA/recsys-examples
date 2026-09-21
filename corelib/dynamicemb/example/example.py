@@ -29,6 +29,7 @@ from dynamicemb import (
 )
 from dynamicemb.incremental_dump import get_score, incremental_dump, replay_increment
 from dynamicemb.optimizer import EmbOptimType
+from dynamicemb.planner import DynamicEmbStorageReservation
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -48,9 +49,6 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
 )
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
 from torchrec.distributed.planner.types import ShardingPlan
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -668,7 +666,7 @@ def get_planner(
         constraints=dict_const,
         batch_size=batch_size,
         enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
+        storage_reservation=DynamicEmbStorageReservation(dict_const),
         debug=True,
     )
 

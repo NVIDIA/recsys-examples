@@ -119,20 +119,32 @@ class DynamicEmbStorageReservation(HeuristicalStorageReservation):
     planner's constructor -- after ``get_planner`` builds the Topology, and well
     before ``plan`` calls this.
 
+    Takes the constraints rather than the options, because the constraints are
+    what a caller has in hand where a planner is built, and because the options
+    reached this way are the same objects the planner mutates -- so the figures
+    are whatever it settled on, not a second calculation that could disagree.
+    They cannot come from ``reserve``'s own ``constraints`` argument:
+    ``DynamicEmbeddingShardingPlanner`` gives the TorchRec planner only the
+    non-DynamicEmb ones.
+
     Args:
-        dynamicemb_options: the per-table options, by table name. The same
-            objects the constraints hold, so the figures are whatever the
-            planner settled on.
+        constraints: every table's constraints, DynamicEmb or not. Entries
+            without ``use_dynamicemb`` are ignored.
         percentage: passed through to ``HeuristicalStorageReservation``.
     """
 
     def __init__(
         self,
-        dynamicemb_options: Dict[str, DynamicEmbTableOptions],
+        constraints: Optional[Dict[str, ParameterConstraints]] = None,
         percentage: float = 0.05,
     ) -> None:
         super().__init__(percentage=percentage)
-        self._dynamicemb_options = dynamicemb_options
+        self._dynamicemb_options: Dict[str, DynamicEmbTableOptions] = {
+            name: constraint.dynamicemb_options
+            for name, constraint in (constraints or {}).items()
+            if getattr(constraint, "use_dynamicemb", False)
+            and getattr(constraint, "dynamicemb_options", None) is not None
+        }
         self._dynamicemb_storage: Optional[Storage] = None
 
     def reserve(

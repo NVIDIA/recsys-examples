@@ -1004,6 +1004,15 @@ def get_local_value_bytes_by_tier(
     ``_prepare_dynemb_table_options``: ``max_capacity``, ``dim`` and
     ``embedding_dtype`` are settled there, and without them there is nothing to
     size from.
+
+    **A table is modelled on its own, and the runtime decides per grouped
+    module.** ``BatchedDynamicEmbeddingTablesV2`` sums `total` and
+    ``local_hbm_for_values`` across the tables it was grouped with, takes one
+    HBM-or-host decision for all of them, and turns caching on for the whole
+    group if *any* member asked for it. So a mixed group is under-counted here,
+    and a table that fits on its own can still be spilled because its group did
+    not. The grouping does not exist yet when this is called -- ``group_tables``
+    runs after planning -- so this cannot be more than a per-table estimate.
     """
     hbm_budget = options.local_hbm_for_values
     dim = options.dim
@@ -1018,9 +1027,17 @@ def get_local_value_bytes_by_tier(
     )
     total = options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
 
+    # An external store takes the backing tier off this box, so it costs the
+    # rank no host memory. It is honoured in exactly the two layouts that have
+    # a backing tier to move -- CACHING_PS and HOST_PS. HybridStorage ignores
+    # it and warns, so the host tier there is local and still counts.
+    external = options.external_storage is not None
+
     if options.caching:
-        return hbm_budget, total
+        return hbm_budget, 0 if external else total
     if total > hbm_budget:
+        if external and hbm_budget <= 0:
+            return 0, 0
         return hbm_budget, total - hbm_budget
     return total, 0
 

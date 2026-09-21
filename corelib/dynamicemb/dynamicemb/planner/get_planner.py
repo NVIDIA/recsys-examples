@@ -134,7 +134,5 @@ def get_planner(
         topology=topology,
         constraints=constraints,
         enumerator=enumerator,
-        storage_reservation=DynamicEmbStorageReservation(
-            dynamicemb_options=dynamicemb_options_dict,
-        ),
+        storage_reservation=DynamicEmbStorageReservation(constraints),
     )
