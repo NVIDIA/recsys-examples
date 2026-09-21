@@ -495,6 +495,34 @@ up as a higher eviction rate, i.e. **accuracy**, not an OOM. It may also push a
 table out of HBM into the host tier and change lookup latency. Quantify before
 building: the cross-node saving has to beat this.
 
+**R1b — the same N×, applied to a budget that already does not account for it.**
+The planner is told the whole device (`hbm_cap =
+torch.cuda.get_device_properties(0).total_memory` in `planner/get_planner.py`)
+and gives back five percent (`HeuristicalStorageReservation(percentage=0.05)`).
+Nothing subtracts what the DynamicEmb tables will take: `local_hbm_for_values`
+is computed in `_prepare_dynemb_table_options` and read only when the tables are
+built, never by the planner. The DynamicEmb tables are simultaneously *free* in
+the search space -- one 1x1 shard per rank, because the planner does not decide
+their placement -- and *absent* from the budget, so TorchRec tables are planned
+into HBM that is already spoken for. `DynamicEmbeddingShardingPlanner`'s
+docstring says so outright: "The memory budget does not include the consumption
+of dynamicemb."
+
+This predates TRW and is not caused by it. What TRW does is multiply it: with
+`local_hbm_for_values` becoming `global / local_size` instead of
+`global / world_size`, the unaccounted HBM per rank grows by the same N as the
+capacity. A gap that costs a model nothing today, because the tables happen to
+fit, becomes N times wider on the exact configurations TRW is for.
+
+Unlike R1 this one is fixable, and TorchRec has the seam for it: a
+`StorageReservation` is precisely the place to declare memory that is spent but
+not searched over. Doing it there rather than by shrinking `hbm_cap` keeps the
+reason visible. Three things have to be settled first: a `caching=True` table's
+`global_hbm_for_values` is a cache size and not the table, a HybridStorage
+table only spends part of it on HBM, and the figure is finalised in
+`_prepare_dynemb_table_options` -- which runs after `get_planner` has already
+built the Topology.
+
 **R2 — the staggered shuffle is new per-step work.** §4.4. RW has no equivalent.
 It is a full gather over the bucketized values every step, on the critical path,
 *before* the a2a it is meant to enable. Needs to be measured against the traffic
