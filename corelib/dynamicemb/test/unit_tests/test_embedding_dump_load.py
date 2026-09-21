@@ -42,7 +42,7 @@ from dynamicemb.dynamicemb_config import (
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
-from dynamicemb.get_planner import get_planner
+from dynamicemb.planner import get_planner
 from dynamicemb.key_ownership import murmur3_fmix64
 from dynamicemb.shard.input_dist import dist_type_codes
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage

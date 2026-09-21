@@ -20,12 +20,12 @@ import torch
 import torch.distributed as dist
 
 # import our own finalize model grads
-from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
-from dynamicemb.planner import DynamicEmbeddingEnumerator
-from dynamicemb.planner import (
+from ..dynamicemb_config import DynamicEmbTableOptions
+from .enumerators import DynamicEmbeddingEnumerator
+from .planners import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
-from dynamicemb.planner import DynamicEmbParameterConstraints
+from .planners import DynamicEmbParameterConstraints
 from torch import distributed as dist
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_types import ShardingType
