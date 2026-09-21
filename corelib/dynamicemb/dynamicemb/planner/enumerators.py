@@ -13,70 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
-import torch
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.planner.enumerators import (
-    EmbeddingEnumerator,
-    _extract_constraints_for_param,
-    get_partition_by_type,
-)
+from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.types import (
     Shard,
     ShardEstimator,
     ShardingOption,
     Topology,
 )
-from torchrec.distributed.planner.utils import sharder_name
-from torchrec.distributed.sharding_plan import (
-    calculate_shard_sizes_and_offsets as _calculate_shard_sizes_and_offsets,
-)
 from torchrec.distributed.types import ModuleSharder, ShardingType
-from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
 
 from .planners import DynamicEmbParameterConstraints
 
 BATCH_SIZE: int = 512
-
-
-def calculate_shard_sizes_and_offsets(
-    tensor: torch.Tensor,
-    world_size: int,
-    local_world_size: int,
-    sharding_type: str,
-    use_dynamicemb: bool,
-    col_wise_shard_dim: Optional[int] = None,
-    device_memory_sizes: Optional[List[int]] = None,
-) -> Tuple[List[List[int]], List[List[int]]]:
-    """TorchRec's, plus the one shape it has no way to describe.
-
-    A DynamicEmb table has no rows to divide. Its ``num_embeddings`` is a
-    nominal figure, the storage is a hash table sized by
-    ``DynamicEmbTableOptions``, and which rank holds a key is decided by
-    ``dist_type`` rather than by any row range. So there is nothing for the
-    row-wise arithmetic to compute, and the 1x1 shard per rank stands in for
-    it -- one entry per rank so the tensor still looks sharded to the planner,
-    sized so it is costed as the near-nothing it is. ``get_state_dict`` in
-    batched_dynamicemb_compute_kernel.py writes the same shape for the same
-    reason.
-
-    Every other table goes to TorchRec unchanged.
-    """
-    if use_dynamicemb:
-        sizes = [[1, 1]] * world_size
-        offsets = [[i, 0] for i in range(world_size)]
-        return sizes, offsets
-
-    return _calculate_shard_sizes_and_offsets(
-        tensor=tensor,
-        world_size=world_size,
-        local_world_size=local_world_size,
-        sharding_type=sharding_type,
-        col_wise_shard_dim=col_wise_shard_dim,
-        device_memory_sizes=device_memory_sizes,
-    )
 
 
 class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
@@ -116,120 +68,38 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
         module: nn.Module,
         sharders: List[ModuleSharder[nn.Module]],
     ) -> List[ShardingOption]:
-        self._sharder_map = {
-            sharder_name(sharder.module_type): sharder for sharder in sharders
-        }
-        sharding_options: List[ShardingOption] = []
+        """TorchRec's search space, with the DynamicEmb tables' shards replaced.
 
-        named_modules_queue = [("", module)]
-        while named_modules_queue:
-            if not self._use_exact_enumerate_order:
-                child_path, child_module = named_modules_queue.pop()
-            else:
-                child_path, child_module = named_modules_queue.pop(0)
-            sharder_key = sharder_name(type(child_module))
-            sharder = self._sharder_map.get(sharder_key, None)
-            if not sharder:
-                for n, m in child_module.named_children():
-                    if child_path != "":
-                        named_modules_queue.append((child_path + "." + n, m))
-                    else:
-                        named_modules_queue.append((n, m))
-                continue
+        A DynamicEmb table has no rows to divide: its ``num_embeddings`` is
+        nominal, its storage is a hash table sized by ``DynamicEmbTableOptions``,
+        and ``DynamicEmbeddingShardingPlanner`` replaces its ParameterSharding
+        outright once planning is done. The planner still has to see it -- the
+        plan is keyed by module, and dropping the table drops the module with it
+        -- so it is sized as the near-nothing it costs the planner: one 1x1
+        shard per rank.
 
-            # Determine the pooling state for all sharding_options using this
-            # (child_module, child_path). With this optimization, we change enumerate()
-            # from being O(N^2) with respect to the number of tables to O(N). The
-            # previous quadratic behavior is because in populate_estimates() invoked below, each
-            # sharding_option needs to determine its pooling state, which is does via
-            # an expensive O(N) walk through the list of embedding tables. With this
-            # change sharding_option.is_pooled becomes O(1).
-            is_pooled = ShardingOption.module_pooled(child_module, child_path)
+        Done after the fact rather than inside the walk, because the sizing
+        TorchRec calls is a module function with no seam to override. The walk
+        itself is where everything else lives -- memoization, the sharder data
+        map the estimators index into, ZCH bucket sizes, weight stashing -- and
+        a copy of it here is a copy that stops receiving all of that.
 
-            for name, param in sharder.shardable_parameters(child_module).items():
-                (
-                    input_lengths,
-                    col_wise_shard_dim,
-                    cache_params,
-                    enforce_hbm,
-                    stochastic_rounding,
-                    bounds_check_mode,
-                    feature_names,
-                    output_dtype,
-                    device_group,
-                    key_value_params,
-                ) = _extract_constraints_for_param(self._constraints, name)
-
-                # skip for other device groups
-                if device_group and device_group != self._compute_device:
-                    continue
-
-                sharding_options_per_table: List[ShardingOption] = []
-
-                for sharding_type in self._filter_sharding_types(
-                    name, sharder.sharding_types(self._compute_device), sharder_key
-                ):
-                    for compute_kernel in self._filter_compute_kernels(
-                        name,
-                        sharder.compute_kernels(sharding_type, self._compute_device),
-                        sharding_type,
-                    ):
-                        (
-                            shard_sizes,
-                            shard_offsets,
-                        ) = calculate_shard_sizes_and_offsets(
-                            tensor=param,
-                            world_size=self._world_size,
-                            local_world_size=self._local_world_size,
-                            sharding_type=sharding_type,
-                            use_dynamicemb=self._use_dynamicemb(name),
-                            col_wise_shard_dim=col_wise_shard_dim,
-                            device_memory_sizes=self._device_memory_sizes,
-                        )
-                        dependency = None
-                        if isinstance(child_module, EmbeddingTower):
-                            dependency = child_path
-                        elif isinstance(child_module, EmbeddingTowerCollection):
-                            raise RuntimeError("please revisit this logic")
-                            # tower_index = _get_tower_index(name, child_module)
-                            # dependency = child_path + ".tower_" + str(tower_index)
-                        sharding_options_per_table.append(
-                            ShardingOption(
-                                name=name,
-                                tensor=param,
-                                module=(child_path, child_module),
-                                input_lengths=input_lengths,
-                                batch_size=self._batch_size,
-                                compute_kernel=compute_kernel,
-                                sharding_type=sharding_type,
-                                partition_by=get_partition_by_type(sharding_type),
-                                shards=[
-                                    Shard(size=size, offset=offset)
-                                    for size, offset in zip(shard_sizes, shard_offsets)
-                                ],
-                                cache_params=cache_params,
-                                enforce_hbm=enforce_hbm,
-                                stochastic_rounding=stochastic_rounding,
-                                bounds_check_mode=bounds_check_mode,
-                                dependency=dependency,
-                                is_pooled=is_pooled,
-                                feature_names=feature_names,
-                                output_dtype=output_dtype,
-                                key_value_params=key_value_params,
-                            )
-                        )
-                if not sharding_options_per_table:
-                    raise RuntimeError(
-                        "No available sharding type and compute kernel combination "
-                        f"after applying user provided constraints for {name}. "
-                        f"Module: {sharder_key}, sharder: {sharder.__class__.__name__}, compute device: {self._compute_device}. "
-                        f"To debug, search above for warning logs about no available sharding types/compute kernels for table: {name}"
-                    )
-
-                sharding_options.extend(sharding_options_per_table)
-
-        self.populate_estimates(sharding_options)
-
+        Re-estimating is not optional: ``super().enumerate`` costed these
+        options from their real row counts before this rewrote them.
+        """
+        sharding_options = super().enumerate(module, sharders)
+        dynamicemb_options = [
+            option
+            for option in sharding_options
+            if self._use_dynamicemb(option.name)
+        ]
+        for option in dynamicemb_options:
+            option.shards = [
+                Shard(size=[1, 1], offset=[rank, 0])
+                for rank in range(self._world_size)
+            ]
+        if dynamicemb_options:
+            self.populate_estimates(dynamicemb_options)
         return sharding_options
 
     def _use_dynamicemb(self, name: str) -> bool:
