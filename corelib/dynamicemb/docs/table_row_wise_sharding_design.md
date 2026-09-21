@@ -377,6 +377,26 @@ For a TRW table both divisors must be `local_size`. Two problems:
 Also audit `get_sharded_table_capacity` (`dynamicemb_config.py:889`) and every
 caller in tests/examples that divides by world size.
 
+**The planner's reservation stops being uniform.**
+`DynamicEmbStorageReservation` (`planner/storage_reservations.py`) subtracts
+`sum(local_hbm_for_values)` from every device, which is right only because
+row-wise puts a slice of every table on every rank. Under TRW a table's HBM
+lands on the `local_size` ranks of one node and is zero everywhere else, so
+subtracting the same figure from every device charges ranks that hold nothing
+-- the planner would then refuse plans that fit. It fails loudly, but for a
+reason that is hard to guess from the error.
+
+The shape of the fix is per-rank rather than per-cluster:
+
+    for device in reserved_topology.devices:
+        device.storage -= self._hbm_on_rank(device.rank)
+
+`Topology.devices` is a list of `DeviceHardware`, each with its own `rank` and
+`storage`, so TorchRec can express this; nothing has needed it yet because
+every reservation upstream subtracts a uniform quantity. What `_hbm_on_rank`
+needs is which ranks hold which table, and that is exactly what the node
+placement decision of §4.1 produces -- so this lands with §4.1, not after it.
+
 ### 4.3 Sharding class
 
 New `TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding)` in
