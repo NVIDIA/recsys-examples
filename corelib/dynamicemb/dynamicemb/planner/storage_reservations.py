@@ -135,7 +135,6 @@ class DynamicEmbStorageReservation(HeuristicalStorageReservation):
         self._dynamicemb_options = dynamicemb_options
         self._dynamicemb_storage: Optional[Storage] = None
 
-
     def reserve(
         self,
         topology: Topology,
@@ -156,9 +155,7 @@ class DynamicEmbStorageReservation(HeuristicalStorageReservation):
         hbm_per_rank = 0
         ddr_per_rank = 0
         for name, options in self._dynamicemb_options.items():
-            hbm, ddr = get_local_value_bytes_by_tier(
-                options, optimizer_types.get(name)
-            )
+            hbm, ddr = get_local_value_bytes_by_tier(options, optimizer_types.get(name))
             hbm_per_rank += hbm
             ddr_per_rank += ddr
         if hbm_per_rank <= 0 and ddr_per_rank <= 0:

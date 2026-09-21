@@ -979,7 +979,6 @@ def get_sharded_table_capacity(
     return int(num_buckets * effective_bucket)
 
 
-
 def get_local_value_bytes_by_tier(
     options: "DynamicEmbTableOptions",
     optimizer_type: Optional[OptimType],
@@ -1024,6 +1023,7 @@ def get_local_value_bytes_by_tier(
     if total > hbm_budget:
         return hbm_budget, total - hbm_budget
     return total, 0
+
 
 def get_table_value_bytes(
     embedding_config: BaseEmbeddingConfig,

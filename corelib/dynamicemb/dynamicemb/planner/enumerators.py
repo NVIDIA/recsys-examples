@@ -89,14 +89,11 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
         """
         sharding_options = super().enumerate(module, sharders)
         dynamicemb_options = [
-            option
-            for option in sharding_options
-            if self._use_dynamicemb(option.name)
+            option for option in sharding_options if self._use_dynamicemb(option.name)
         ]
         for option in dynamicemb_options:
             option.shards = [
-                Shard(size=[1, 1], offset=[rank, 0])
-                for rank in range(self._world_size)
+                Shard(size=[1, 1], offset=[rank, 0]) for rank in range(self._world_size)
             ]
         if dynamicemb_options:
             self.populate_estimates(dynamicemb_options)
@@ -120,9 +117,7 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
         # search space is not applicable rather than merely unattractive.
         if self._use_dynamicemb(name):
             return [ShardingType.ROW_WISE.value]
-        return super()._filter_sharding_types(
-            name, allowed_sharding_types, sharder_key
-        )
+        return super()._filter_sharding_types(name, allowed_sharding_types, sharder_key)
 
     def _filter_compute_kernels(
         self,
