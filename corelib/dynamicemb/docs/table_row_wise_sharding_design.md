@@ -36,12 +36,13 @@ one node's budget and the cross-node all-to-all is a measured bottleneck.
 ## 2. Where RW lives today
 
 ```
-plan       planner/planner.py:322-345   _dyn_emb_plan, sharding_type hardcoded ROW_WISE (:341)
-           planner/planner.py:174-182   per-rank capacity = f(world_size)
+plan       planner/planners.py:324-346  _dyn_emb_plan, sharding_type hardcoded ROW_WISE (:343)
+           planner/planners.py:176-184  per-rank capacity = f(world_size)
+reserve    planner/storage_reservations.py  its HBM/host is taken out of the budget
 sharding   shard/embeddingbag.py:62     RW -> RwPooledDynamicEmbeddingSharding
-           planner/rw_sharding.py:183   subclass of torchrec RwPooledEmbeddingSharding
-input      input_dist.py:199            bucketize(num_buckets=world_size) -> KJTAllToAll
-kernel     src/sparse_block_bucketize_features.cu:215 / :292
+           shard/rw_sharding.py:220     subclass of torchrec RwPooledEmbeddingSharding
+input      shard/input_dist.py:175      bucketize(num_buckets=world_size) -> KJTAllToAll
+kernel     src/sparse_block_bucketize_features.cu:217 / :299
 lookup     batched_dynamicemb_compute_kernel.py -> BatchedDynamicEmbeddingBag
 output     (inherited) torchrec RwPooledEmbeddingDist -- reduce-scatter
 ```
@@ -324,7 +325,7 @@ downgrade in §3.1.
 
 **Must be verified:** the variable-batch path in §3.2(f). The recat order,
 `_preprocess_batch_size_per_rank`, and DynamicEmb's
-`stride_per_key_per_rank * num_buckets` (`input_dist.py:62-69`, where
+`stride_per_key_per_rank * num_buckets` (`shard/input_dist.py:141`, where
 `num_buckets` becomes `L`) must all agree. Each can be individually right and
 the combination wrong, and the symptom is mismatched samples, not an error (F4).
 
@@ -400,7 +401,7 @@ placement decision of §4.1 produces -- so this lands with §4.1, not after it.
 ### 4.3 Sharding class
 
 New `TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding)` in
-`planner/tw_rw_sharding.py`, overriding exactly two methods, mirroring what
+`shard/twrw_sharding.py`, overriding exactly two methods, mirroring what
 `RwPooledDynamicEmbeddingSharding` does today:
 
 - `create_input_dist` → DynamicEmb's bucketizer with `num_buckets = local_size`
@@ -416,7 +417,7 @@ Dispatch in `shard/embeddingbag.py:62` gains a `TABLE_ROW_WISE` branch.
 
 ### 4.4 Input dist: a new full-data permute
 
-DynamicEmb's `RwSparseFeaturesDist` (`input_dist.py:199`) has no equivalent of
+DynamicEmb's `RwSparseFeaturesDist` (`shard/input_dist.py:175`) has no equivalent of
 TorchRec's `_staggered_shuffle` (`twrw_sharding.py:439`), because RW's a2a splits
 are uniform (`[num_features] * world_size`) and the bucketized layout is already
 ordered by destination rank.
@@ -485,20 +486,23 @@ clear error rather than a fallback.
 
 ## 5. Files to change
 
+Paths are as of the cleanup this branch sits on: the sharding runtime moved
+into `shard/`, `planner/planner.py` became `planner/planners.py`, and the
+key -> rank rule now lives in `key_ownership.py`.
+
 | File | Change | Size |
 |---|---|---|
 | `dynamicemb_config.py` | `host_index` (or equivalent) in `DynamicEmbTableOptions`; `_sharded_table_bucket_layout` takes a per-table divisor | S |
-| `planner/planner.py` | TRW branch in `_dyn_emb_plan`; per-table capacity divisor; ordering of `_prepare_dynemb_table_options` | M |
-| `planner/enumerators.py` | `_filter_sharding_types` must allow TRW; the `[[1,1]]*world_size` fake shard becomes `local_size` entries | S |
-| `planner/tw_rw_sharding.py` | **new** — `TwRwPooledDynamicEmbeddingSharding` | M |
+| `planner/planners.py` | TRW branch in `_dyn_emb_plan`; per-table capacity divisor; ordering of `_prepare_dynemb_table_options` | M |
+| `planner/enumerators.py` | `_filter_sharding_types` must allow TRW; the 1x1 rewrite in `enumerate` becomes `local_size` shards on the owning node's ranks | S |
+| `planner/storage_reservations.py` | the HBM/host subtraction becomes per-rank (§4.2) | S |
+| `shard/twrw_sharding.py` | **new** -- `TwRwPooledDynamicEmbeddingSharding` | M |
 | `shard/embeddingbag.py` | dispatch TRW | S |
-| `input_dist.py` | `TwRwSparseFeaturesDist` with staggered shuffle; hoist the dist_type tensor into `__init__` | M |
-| `batched_dynamicemb_tables.py` | shard-index file naming; `find_files` reads meta; `owned_key_mask` generalized | M |
-| `key_value_table.py` | load mask → shared ownership fn (also fixes §8.1) | S |
-| `scored_hashtable.py` | counter load mask → shared ownership fn | S |
-| `construct_twin_module.py` | twin mask → shared ownership fn | S |
+| `shard/input_dist.py` | `TwRwSparseFeaturesDist` with the staggered shuffle | M |
+| `key_ownership.py` | the rule takes a shard base, not only a fan-out | S |
+| `batched_dynamicemb_tables.py` | shard-index file naming; `find_files` reads meta | M |
 | `incremental_dump.py` | meta carries the ownership triple | S |
-| `src/sparse_block_bucketize_features.cu` | none required | — |
+| `src/sparse_block_bucketize_features.cu` | none required | -- |
 
 The CUDA bucketizer needs **no change**: it is already parameterized by
 `my_size`, and `roundrobin` / `hash_roundrobin` already preserve the global key
@@ -594,7 +598,7 @@ rather than implementing TRW reshard.
 `_preprocess_batch_size_per_rank` / `_preprocess_batch_size_per_rank_per_feature`
 machinery (`twrw_sharding.py:590-648`) that the RW path never exercises. Mean-
 while DynamicEmb's bucketizer multiplies `stride_per_key_per_rank` by
-`num_buckets` (`input_dist.py:62-69`), which under TRW is `local_size`, not
+`num_buckets` (`shard/input_dist.py:141`), which under TRW is `local_size`, not
 `world_size`. These two must agree. This is the easiest place to be subtly wrong
 and the hardest to cover with a test.
 
@@ -626,76 +630,71 @@ only where a table lives will hang.
 
 ---
 
-## 8. Pre-existing defects found while writing this
+## 8. Pre-existing defects found while writing this, and fixed since
 
-### 8.1 Checkpoint load drops keys for `hash_roundrobin` tables
+All four were found while reading for this document and are fixed on the branch
+this one sits on. Kept here because each says something about how the code got
+that way, and because the shape of §8.1 is the one TRW is most likely to
+reproduce.
 
-`_iter_batches_from_files` (`key_value_table.py:1715`) applies, unconditionally
-when `world_size > 1`:
+### 8.1 Checkpoint load dropped keys for `hash_roundrobin` tables
 
-```python
-masks = keys % world_size == rank
-```
+`_iter_batches_from_files` filtered with a bare `keys % world_size == rank` --
+the roundrobin rule spelled out by hand. A `hash_roundrobin` table's rank `r`
+file holds the keys with `murmur(k) % ws == r`; that filter kept only the ones
+that also satisfied `k % ws == r`, roughly `1/ws` of them, and discarded the
+rest in silence. It was signed where the device kernel is unsigned, so a
+negative key disagreed with the kernel even under roundrobin.
 
-This is the **roundrobin** rule. For a `hash_roundrobin` table, rank `r`'s
-checkpoint file holds keys satisfying `murmur(k) % ws == r`, and the mask keeps
-only those that *also* satisfy `k % ws == r` — roughly `1/ws` of them. The rest
-are silently discarded on load.
+Its test could not have caught it: the checks decided what each rank should
+hold with the same hand-written rule, and the `hash_roundrobin` coverage ran at
+one rank, where the only rank owns everything and the oracle cannot be wrong.
+Raised to two ranks with the oracle fixed, the case separates the trees exactly
+as it should -- `main` fails, the fix passes.
 
-Reachable in the ordinary matched-file path: `get_loading_files`
-(`batched_dynamicemb_tables.py:237`) hands rank `r` its own file when
-`world_size == num_key_files`, and the mask is still applied.
+**The rule was written out by hand in six places, not five.** The sixth was in
+the test. Anything that recomputes ownership under TRW has to be found the same
+way, and `test/` is part of where to look.
 
-Not covered by tests: the `hash_roundrobin` dump/load smoke runs with
-`--nproc_per_node 1` (`test/unit_tests/test_embedding_dump_load.sh:42,58`), where
-the mask is skipped entirely; the multi-GPU dump/load tests use the default
-`roundrobin`, where the mask is a no-op.
+### 8.2 `continuous` was the silent fallback for a missing `dist_type`
 
-`scored_hashtable.py:1012` has the same line with the same problem for the
-admission counter.
+A feature whose `fused_params` carried no `dist_type` fell back to
+`continuous`, which is right for a plain TorchRec table and wrong for a
+DynamicEmb one: it rewrites indices on the way in, so the table stores
+something that is not a global key, and incremental dump, replay and checkpoint
+load all refuse it. A missing setting became a table that could not be dumped
+incrementally, and said nothing at the point the setting was missing. It now
+raises.
 
-> Derived by reading, not by running — confirm with a 2-GPU
-> dump/load of a `hash_roundrobin` table before fixing.
+### 8.3 The "same dist_type for all tables" assertion was unnecessary
 
-Fixing this is a prerequisite for TRW anyway (§4.6), and it is worth its own
-commit and its own test regardless of whether TRW proceeds.
+It forbade two DynamicEmb tables in one sharding from using different rules.
+The kernel reads the rule per feature, so nothing needed them to agree -- and
+the assertion had a branch that bypassed it, so the invariant it claimed was
+already routinely violated by the common case of a DynamicEmb table beside a
+plain one.
 
-### 8.2 `continuous` is the silent fallback for a missing `dist_type`
+### 8.4 The `dist_type` tensor was rebuilt every forward
 
-`planner/rw_sharding.py:126` and `:227` default a feature with no `dist_type` in
-its `fused_params` to `"continuous"`. Correct for plain TorchRec tables; for a
-DynamicEmb table it would silently select a mode that rewrites indices
-(`new_idx = idx % blk_size`) and that `incremental_dump` refuses
-(`DynamicEmb_APIs.md:808`). Should raise for DynamicEmb tables.
-
-### 8.3 The "same dist_type for all tables" assertion is unnecessary
-
-`planner/rw_sharding.py:119-124` / `:221-226` forbid two DynamicEmb tables in one
-sharding from using different `dist_type`s. The kernel is per-feature
-(`dist_type_per_feature[t]`); the restriction has no basis.
-
-### 8.4 The `dist_type` tensor is rebuilt every forward
-
-`input_dist.py:117-132` rebuilds a per-feature int32 tensor on every step from a
-Python loop over `kjt.keys()`, while the sibling `_feature_block_sizes_tensor` is
-a constructor-time buffer. Both are per-feature constants in the same order. It
-should be a buffer; doing so also removes an unguarded ordering assumption
-between the two arrays, which the kernel indexes with the same `t`.
-
----
+A Python loop over `kjt.keys()` and a `torch.tensor(..., device=cuda)` per step,
+while its sibling `_feature_block_sizes_tensor` was a constructor-time buffer.
+Both describe the same fixed features. Building them together also removed an
+unguarded assumption: the kernel indexes both with the same `t`, and nothing
+checked that the orders agreed.
 
 ## 9. Suggested staging
 
 | Milestone | Content | Gate |
 |---|---|---|
-| **M0** | §8.1–§8.4. One ownership function (§4.6), all five call sites on it. 2-GPU `hash_roundrobin` dump/load test. | No TRW code yet; ships on its own merit |
+| ~~**M0**~~ | **Done.** §8.1-§8.4, one ownership function (§4.6) with all six call sites on it, a 2-GPU `hash_roundrobin` dump/load test, and the planner cleanup that came with it: the copied `enumerate` and filters handed back to TorchRec, and the budget in §6 R1b. | Shipped on its own merit, as intended |
 | **M1** | Measure R1: per-rank capacity and eviction rate at `local_size` vs `world_size` divisor, on a real table | **Go/no-go for the whole project** |
 | **M2** | Placement + capacity (§4.1, §4.2) with user-specified `host_index`. Plan is TRW-shaped; nothing consumes it yet | Plan inspection test |
 | **M3** | `TwRwPooledDynamicEmbeddingSharding` + staggered-shuffle input dist (§4.3, §4.4). **TRW tables reject dump/load/incremental-dump with a clear error** | Numerical parity vs RW on a small model |
 | **M4** | Checkpoint (§4.5), ownership under TRW (§4.6), incremental dump (§4.7) | Dump→load round-trip across TRW |
 | **M5** | Perf validation: R2, R3 measured against the cross-node saving | Beat RW on the target topology, or stop |
 
-M1 before M2 is deliberate: R1 is inherent to TRW and cannot be engineered away.
+M1 is now the first thing to do, and M1 before M2 is deliberate: R1 is
+inherent to TRW and cannot be engineered away.
 If N× capacity pressure is unacceptable for the target tables, nothing after it
 matters.
 
