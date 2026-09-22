@@ -25,6 +25,8 @@ import copy
 import pytest
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+import torchrec
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.types import Storage, Topology
 from torchrec.distributed.types import (
     EnumerableShardingSpec,
@@ -33,7 +35,14 @@ from torchrec.distributed.types import (
 )
 
 from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
-from dynamicemb.planner.plan import per_rank_storage, shard_rank, topology_minus
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
+
+from dynamicemb.planner.plan import (
+    module_without_tables,
+    per_rank_storage,
+    shard_rank,
+    topology_minus,
+)
 from dynamicemb.planner.planners import DynamicEmbParameterSharding
 
 WORLD_SIZE = 4
@@ -193,3 +202,70 @@ def test_topology_minus_does_not_clamp():
 def test_topology_minus_rejects_a_length_mismatch():
     with pytest.raises(ValueError, match="entries but the topology has"):
         topology_minus(_topology(), [Storage(0, 0, 0)] * (WORLD_SIZE - 1))
+
+
+# --- module_without_tables -------------------------------------------------
+
+
+def _ebc(names):
+    return torchrec.EmbeddingBagCollection(
+        tables=[
+            EmbeddingBagConfig(
+                name=name,
+                embedding_dim=DIM,
+                num_embeddings=ROWS,
+                feature_names=[f"f_{name}"],
+            )
+            for name in names
+        ],
+        device=torch.device("meta"),
+    )
+
+
+class _Model(torch.nn.Module):
+    def __init__(self, ebc):
+        super().__init__()
+        self.sparse = torch.nn.Module()
+        self.sparse.ebc = ebc
+        self.dense = torch.nn.Linear(DIM, DIM, device=torch.device("meta"))
+
+
+def _sharders():
+    return [EmbeddingBagCollectionSharder()]
+
+
+def test_named_tables_are_gone_from_the_copy():
+    model = _Model(_ebc(["a", "b", "c"]))
+    reduced = module_without_tables(model, {"a", "c"}, _sharders())
+
+    assert set(reduced.sparse.ebc.embedding_bags.keys()) == {"b"}
+    # the caller's module is untouched
+    assert set(model.sparse.ebc.embedding_bags.keys()) == {"a", "b", "c"}
+
+
+def test_the_tree_keeps_its_shape_so_plan_paths_still_match():
+    model = _Model(_ebc(["a", "b"]))
+    reduced = module_without_tables(model, {"a"}, _sharders())
+
+    assert [n for n, _ in reduced.named_children()] == [
+        n for n, _ in model.named_children()
+    ]
+    assert type(reduced.sparse.ebc) is type(model.sparse.ebc)
+    # only the path to the pruned collection is copied; the rest is shared
+    assert reduced.dense is model.dense
+
+
+def test_a_collection_of_only_dynamicemb_tables_becomes_empty():
+    """It stays in the tree. Removing it would change the paths the plan is
+    keyed by, and an empty collection simply yields no shardable parameters."""
+    model = _Model(_ebc(["a", "b"]))
+    reduced = module_without_tables(model, {"a", "b"}, _sharders())
+
+    assert len(reduced.sparse.ebc.embedding_bags) == 0
+    assert _sharders()[0].shardable_parameters(reduced.sparse.ebc) == {}
+
+
+def test_nothing_is_copied_when_nothing_is_removed():
+    model = _Model(_ebc(["a"]))
+    assert module_without_tables(model, set(), _sharders()) is model
+    assert module_without_tables(model, {"absent"}, _sharders()) is model

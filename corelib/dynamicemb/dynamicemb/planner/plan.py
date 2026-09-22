@@ -30,19 +30,27 @@ error messages use (``planner/planners.py:1138``, ``planner/stats.py:1109``).
 """
 
 import copy
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from torch import nn
 from torchrec.distributed.planner.types import Storage, Topology
+from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.types import (
     EnumerableShardingSpec,
+    ModuleSharder,
     ParameterSharding,
     ShardMetadata,
 )
 
 from ..dynamicemb_config import get_local_value_bytes_by_tier
 
-__all__ = ["shard_rank", "per_rank_storage", "topology_minus"]
+__all__ = [
+    "shard_rank",
+    "per_rank_storage",
+    "topology_minus",
+    "module_without_tables",
+]
 
 
 def shard_rank(shard: ShardMetadata) -> int:
@@ -139,3 +147,99 @@ def topology_minus(topology: Topology, per_rank: List[Storage]) -> Topology:
     for device in reduced.devices:
         device.storage -= per_rank[device.rank]
     return reduced
+
+
+# EmbeddingBagCollection keeps its tables in `embedding_bags`, EmbeddingCollection
+# in `embeddings`. Both are nn.ModuleDicts keyed by table name, which is what
+# `shardable_parameters` reads.
+_TABLE_CONTAINERS = ("embedding_bags", "embeddings")
+
+
+def _collection_without(collection: nn.Module, table_names: Set[str]) -> nn.Module:
+    """A copy of one collection with the named tables gone from its ModuleDict.
+
+    The ModuleDict is pruned rather than the collection rebuilt from a subset of
+    its configs, because rebuilding needs constructor arguments that are not all
+    recoverable -- ``EmbeddingCollection`` takes ``need_indices``,
+    ``use_gather_select`` and ``use_gather_select_per_sharding``, none of which
+    have public accessors -- and because it would drop the subclass a caller may
+    have passed, which `sharder_name(type(module))` matches on.
+
+    ``_embedding_bag_configs`` and ``_feature_names`` are deliberately left
+    whole. Planning reads the tables through ``shardable_parameters``, which goes
+    through the ModuleDict, so the enumerator no longer sees them; the storage
+    reservation sizes the input KJT from the feature names, and the KJT really
+    does carry the DynamicEmb features at runtime, so leaving them counted is the
+    accurate answer rather than a leftover.
+    """
+    for attribute in _TABLE_CONTAINERS:
+        tables = getattr(collection, attribute, None)
+        if isinstance(tables, nn.ModuleDict):
+            break
+    else:
+        raise ValueError(
+            f"{type(collection).__name__} holds its tables in neither "
+            f"{' nor '.join(_TABLE_CONTAINERS)}, so the DynamicEmb ones cannot "
+            "be taken out of it for TorchRec to plan the rest."
+        )
+
+    kept = nn.ModuleDict()
+    for name, table in tables.items():
+        if name not in table_names:
+            kept[name] = table
+
+    reduced = copy.copy(collection)
+    # copy.copy shares __dict__, so _modules is the same dict object until it is
+    # replaced; without this the assignment below would reach into the caller's
+    # module.
+    reduced._modules = dict(collection._modules)
+    setattr(reduced, attribute, kept)
+    return reduced
+
+
+def module_without_tables(
+    module: nn.Module,
+    table_names: Set[str],
+    sharders: List[ModuleSharder[nn.Module]],
+) -> nn.Module:
+    """``module`` as TorchRec should plan it: without the DynamicEmb tables.
+
+    TorchRec's enumerator walks the module it is given and enumerates every table
+    a sharder claims, so tables DynamicEmb has already placed have to be out of
+    that module rather than filtered out of the result. Filtering afterwards
+    still runs the estimators over them, which sizes shards from a capacity that
+    is not what a DynamicEmb table means by ``num_embeddings``.
+
+    Only the modules on the path to a pruned collection are copied; everything
+    else is shared, and the module the caller passes is not touched. The tree
+    keeps its shape, so the paths in the returned plan are the paths the caller's
+    module has -- which is what `ShardingPlan` is keyed by.
+
+    A collection whose tables are all DynamicEmb becomes an empty one rather than
+    disappearing: `shardable_parameters` then yields nothing and the enumerator
+    moves on, while removing it outright would change the tree the paths come
+    from.
+    """
+    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
+
+    def prune(node: nn.Module) -> nn.Module:
+        sharder = sharder_map.get(sharder_name(type(node)))
+        if sharder is not None:
+            owned = set(sharder.shardable_parameters(node)) & table_names
+            return _collection_without(node, owned) if owned else node
+
+        replacements = {
+            name: pruned
+            for name, child in node.named_children()
+            if (pruned := prune(child)) is not child
+        }
+        if not replacements:
+            return node
+
+        copied = copy.copy(node)
+        copied._modules = dict(node._modules)
+        for name, child in replacements.items():
+            setattr(copied, name, child)
+        return copied
+
+    return prune(module)
