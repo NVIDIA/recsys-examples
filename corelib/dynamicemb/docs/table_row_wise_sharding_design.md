@@ -482,6 +482,86 @@ reduce-scatter). Not in this project. The planner must therefore **reject**
 `TABLE_ROW_WISE` for any DynamicEmb table in an `EmbeddingCollection`, with a
 clear error rather than a fallback.
 
+### 4.9 The inheritance boundary
+
+Everything in §4 either extends TorchRec by **subclassing** or by **calling its
+API**. Which one is not a matter of taste: it follows from the direction of the
+call.
+
+**Rule — subclass only where TorchRec calls us; use composition where we call
+TorchRec.**
+
+#### Seams where TorchRec calls us (subclassing is the only entry)
+
+These are template-method hooks: a TorchRec base class invokes them from inside
+its own `__init__` / construction flow. There is no registration table to put an
+implementation into, so overriding is the only way in.
+
+| Hook | Declared by | Our override |
+|---|---|---|
+| `ModuleSharder.shard()` | `distributed/types.py:1462` | `shard/embeddingbag.py:85`, `shard/embedding.py:355` |
+| `create_embedding_bag_sharding()` (classmethod) | `distributed/embeddingbag.py:979` | `shard/embeddingbag.py:46` |
+| `create_embedding_sharding()` (classmethod) | `distributed/embedding.py` | `shard/embedding.py:103` |
+| `EmbeddingSharding.create_lookup()` | `distributed/embedding_sharding.py:1232` | `shard/rw_sharding.py:179,267` |
+| `BaseEmbeddingLookup._create_embedding_kernel()` | `distributed/embedding_lookup.py:254,693` | `shard/rw_sharding.py:100,193` |
+| `get_additional_fused_params()` (duck-typed) | `torchrec/distributed/utils.py:518-526` | `planner/planners.py:99` |
+
+Plus one enum value, `EmbeddingComputeKernel.CUSTOMIZED_KERNEL`
+(`embedding_types.py:98`).
+
+**`CUSTOMIZED_KERNEL` is a skip-pass, not a dispatch table.** It appears in
+exactly five places upstream -- `embedding.py:937,967`, `embeddingbag.py:1212,1240`,
+`utils.py:523` -- and every one of them *skips* something: state_dict handling,
+fused_params validation. The upstream comment says so directly: *"Skip state_dict
+handling for CUSTOMIZED_KERNEL, this should be implemented in child class."*
+The branch that actually selects our kernel is ours (`shard/rw_sharding.py:107`):
+
+```python
+if config.compute_kernel is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL:
+    return super()._create_embedding_kernel(...)      # hand back to TorchRec
+return BatchedDynamicEmbeddingBag(config=config, pg=pg, device=device)
+```
+
+So the chain that ends at `BatchedDynamicEmbeddingTablesV2` is ours at every
+step that matters; TorchRec supplies the scaffolding and the skip-pass, nothing
+more.
+
+This is a real cost, not a free win. `shard/rw_sharding.py:111-117` carries a
+`Version(torchrec.__version__) < Version("1.5.0")` branch because
+`_create_embedding_kernel` gained an `env` parameter. Six seams means six
+signatures to track. The mitigation is to keep the count at six and to keep each
+override thin -- a dispatch and a `super()` call, no copied logic -- not to try
+to eliminate them.
+
+#### Seams where we call TorchRec (composition)
+
+Planning is the other direction: we drive, TorchRec answers. Nothing upstream
+calls back into a planner subclass, so subclassing here buys nothing and costs
+the same maintenance. These become wrapped, not inherited:
+
+| Component | Today | Target |
+|---|---|---|
+| `EmbeddingEnumerator` | subclass, `enumerate()` post-filters | held as a field; call `enumerate()` and filter the result |
+| `HeuristicalStorageReservation` | subclass | held as a field; call `reserve()` with a pre-reduced budget |
+| `EmbeddingShardingPlanner` | subclass | held as a field; call `collective_plan()`, then merge |
+
+`ParameterSharding` / `ParameterConstraints` stay subclassed even though they sit
+on this side of the line: they are plain dataclasses carrying data across the
+boundary, not behaviour, and `get_additional_fused_params` (above) is the
+upstream-sanctioned way to move that data. Subclassing a dataclass to add
+defaulted fields is upgrade-safe; `get_additional_fused_params` computes its
+payload as a **field-set difference** (`planners.py:100-107`), so fields added
+upstream are excluded automatically.
+
+#### Why this is exactly the C2 split
+
+Approach C2 -- DynamicEmb builds its own plan, reports the per-rank memory it
+consumed, hands the reduced budget and the remaining tables to TorchRec's
+planner, then merges the two plans -- moves work only across the **second**
+table. Nothing in the first table changes. That is the argument for C2 beyond
+the placement problem in §4.1: it is the half of the surface where the
+dependency *can* be reduced to API level.
+
 ---
 
 ## 5. Files to change
@@ -687,16 +767,20 @@ checked that the orders agreed.
 | Milestone | Content | Gate |
 |---|---|---|
 | ~~**M0**~~ | **Done.** §8.1-§8.4, one ownership function (§4.6) with all six call sites on it, a 2-GPU `hash_roundrobin` dump/load test, and the planner cleanup that came with it: the copied `enumerate` and filters handed back to TorchRec, and the budget in §6 R1b. | Shipped on its own merit, as intended |
-| **M1** | Measure R1: per-rank capacity and eviction rate at `local_size` vs `world_size` divisor, on a real table | **Go/no-go for the whole project** |
+| ~~**M1**~~ | ~~Measure R1 as a go/no-go~~ **Cancelled.** Customer demand for TWRW is strong enough that it ships regardless of the R1 outcome. The measurement still has value as *sizing* input for §4.2 and for the `host_index` guidance in §10.3 -- it is folded into M5, not a gate. |  |
 | **M2** | Placement + capacity (§4.1, §4.2) with user-specified `host_index`. Plan is TRW-shaped; nothing consumes it yet | Plan inspection test |
 | **M3** | `TwRwPooledDynamicEmbeddingSharding` + staggered-shuffle input dist (§4.3, §4.4). **TRW tables reject dump/load/incremental-dump with a clear error** | Numerical parity vs RW on a small model |
 | **M4** | Checkpoint (§4.5), ownership under TRW (§4.6), incremental dump (§4.7) | Dump→load round-trip across TRW |
 | **M5** | Perf validation: R2, R3 measured against the cross-node saving | Beat RW on the target topology, or stop |
 
-M1 is now the first thing to do, and M1 before M2 is deliberate: R1 is
-inherent to TRW and cannot be engineered away.
-If N× capacity pressure is unacceptable for the target tables, nothing after it
-matters.
+With M1 cancelled, M2 is the first thing to do. R1 is still inherent to TRW and
+cannot be engineered away -- dropping the gate does not make the N× capacity
+pressure go away, it only means the answer no longer decides whether to build.
+It decides which tables a user should put on TRW, so it belongs in the
+documentation rather than in the schedule.
+
+The seams in §4.9 partition this schedule: M2 is entirely on the composition
+side of the line, M3 entirely on the inheritance side.
 
 ---
 
