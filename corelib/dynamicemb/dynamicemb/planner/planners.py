@@ -16,7 +16,7 @@
 import math
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from torch import distributed as dist
@@ -46,7 +46,6 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to
 
 from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
-    DynamicEmbKernel,
     DynamicEmbTableOptions,
     _sharded_table_bucket_layout,
     align_to_table_size,
@@ -80,45 +79,56 @@ class DynamicEmbParameterConstraints(ParameterConstraints):
 
 @dataclass
 class DynamicEmbParameterSharding(ParameterSharding):
-    """
-    DynamicEmb-specific parameter constraints that extend ParameterSharding.
+    """A ``ParameterSharding`` that carries one DynamicEmb table's options across
+    the TorchRec boundary.
+
+    ``compute_kernel`` has to be ``CUSTOMIZED_KERNEL``: that value is what makes
+    TorchRec call :meth:`get_additional_fused_params`
+    (``torchrec/distributed/utils.py:518``) and skip its own ``state_dict``
+    handling. It is an inherited field with no default, so every construction
+    states it.
+
+    ``dynamicemb_options`` is the only field added here. Anything a DynamicEmb
+    table needs downstream belongs inside it rather than beside it -- a second
+    copy on this dataclass is one more thing that can disagree with the options
+    object the same plan already carries.
     """
 
-    # provide a default value for compute_kernel
-    compute_kernel: str = EmbeddingComputeKernel.CUSTOMIZED_KERNEL
-
-    # introduced fields by DynamicEmbParameterSharding
-    customized_compute_kernel: Optional[str] = DynamicEmbKernel
-    dist_type: str = "roundrobin"
-    dynamicemb_options: Optional[DynamicEmbTableOptions] = field(
+    dynamicemb_options: DynamicEmbTableOptions = field(
         default_factory=DynamicEmbTableOptions
     )
 
-    def get_additional_fused_params(self):
-        all_fields = {
-            f.name: getattr(self, f.name) for f in fields(DynamicEmbParameterSharding)
+    @classmethod
+    def _additional_field_names(cls) -> Set[str]:
+        """The fields this class adds on top of ``ParameterSharding``.
+
+        A set difference rather than a written-out list, so that fields added
+        upstream are excluded on their own and fields added here are picked up
+        by both directions below without a second edit.
+        """
+        return {f.name for f in fields(cls)} - {
+            f.name for f in fields(ParameterSharding)
         }
-        parameter_sharding_fields = {
-            f.name: getattr(self, f.name) for f in fields(ParameterSharding)
-        }
-        return {
-            k: v for k, v in all_fields.items() if k not in parameter_sharding_fields
-        }
+
+    def get_additional_fused_params(self) -> Dict[str, Any]:
+        """TorchRec's hook for a customized kernel's extra per-table params.
+
+        Called from ``torchrec/distributed/utils.py:518-526`` -- by ``hasattr``,
+        not by type -- and only when ``compute_kernel == CUSTOMIZED_KERNEL``.
+        The result is merged into ``GroupedEmbeddingConfig.fused_params``.
+        """
+        return {name: getattr(self, name) for name in self._additional_field_names()}
 
     @staticmethod
     def pop_additional_fused_params(fused_params: Dict[str, Any]) -> None:
-        """Remove DynamicEmb-only keys from ``GroupedEmbeddingConfig.fused_params`` before
+        """Undo :meth:`get_additional_fused_params` before
         :class:`~dynamicemb.batched_dynamicemb_tables.BatchedDynamicEmbeddingTablesV2`.
 
-        These entries are used for planning / per-table options and are not valid ``**fused_params``
-        for that module.
+        These entries are for planning and per-table options; they are not valid
+        ``**fused_params`` for that module.
         """
-        for f in (
-            "customized_compute_kernel",
-            "dist_type",
-            "dynamicemb_options",
-        ):
-            fused_params.pop(f, None)
+        for name in DynamicEmbParameterSharding._additional_field_names():
+            fused_params.pop(name, None)
 
 
 def _prepare_dynemb_table_options(
@@ -341,11 +351,8 @@ class DynamicEmbeddingShardingPlanner:
                     )
                 ),
                 sharding_type=ShardingType.ROW_WISE.value,
-                # compute_kernel=EmbeddingComputeKernel.DynamicEmb.value,
                 ranks=[i for i in range(world_size)],
                 compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
-                customized_compute_kernel=DynamicEmbKernel,
-                dist_type=opts.dist_type,
                 dynamicemb_options=opts,
             )
             self._dyn_emb_plan[dyn_emb_name] = tmp_para_sharding
