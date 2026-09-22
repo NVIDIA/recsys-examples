@@ -731,19 +731,28 @@ current caller does this, and the failure would be a wrong placement rather than
 an error. **Recommend: deep-copy each `ParameterSharding` on insertion**, so a
 plan the caller passes on cannot reach back into the planner.
 
-**F11 — the key -> rank fan-out has two sources, and `DMPCollection` splits
+**F11 — the key -> rank fan-out has three sources, and a sub-group splits
 them.** Routing takes it from the sharding process group -- `RwSparseFeaturesDist`
 inherits `self._world_size = pg.size()` (`torchrec .../sharding/rw_sharding.py:395`)
 and bucketizes into that many buckets (`shard/input_dist.py:227`). Ownership takes
 it from the default group: `self._shard_world_size = dist.get_world_size()`
 (`batched_dynamicemb_tables.py:566`), which is what `owned_key_mask` is given on
-the dump/load path (`batched_dynamicemb_tables.py:2056`).
+the dump/load path (`batched_dynamicemb_tables.py:2056`). Planning takes it from
+the default group too, and ignores the `pg` it was handed:
+`_prepare_dynemb_table_options` and `_dyn_emb_plan` both open with
+`world_size = dist.get_world_size()` (`planner/planners.py:152,333`), so the row
+count per shard, the `local_hbm_for_values` divisor (`:196`) and the number of
+`ShardMetadata` entries are all sized for the whole job while TorchRec sizes its
+half of the same plan for `pg.size()`.
 
-Under `DistributedModelParallel` the two are equal and nothing shows. Under
-`DMPCollection` (2D parallel) the embedding is sharded over `sharding_group_size`
-ranks and replicated across groups, so `pg.size() < dist.get_world_size()` and
-the two halves of DynamicEmb disagree with each other: a rank is fed the keys of
-one partition and dumps the keys of another. Neither raises.
+Under `DistributedModelParallel` on the default group all three are equal and
+nothing shows. They come apart whenever the sharding group is not the whole job
+-- `DMPCollection` (2D parallel), where the embedding is sharded over
+`sharding_group_size` ranks and replicated across groups, or simply a `pg`
+argument to `collective_plan` that is not `GroupMember.WORLD`. Then
+`pg.size() < dist.get_world_size()`, and the three halves of DynamicEmb disagree
+with each other and with TorchRec: a rank is planned for one partition, fed the
+keys of a second, and dumps the keys of a third. Nothing raises.
 
 This is independent of TRW -- it is true on the branch today -- but TRW makes it
 worse, since TRW introduces a second legitimate reason for the fan-out to differ
