@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import math
 import warnings
 from dataclasses import dataclass, field, fields
@@ -33,8 +34,9 @@ from torchrec.distributed.planner.types import (
     StorageReservation,
     Topology,
 )
-from torchrec.distributed.sharding_plan import placement
+from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.planner.utils import sharder_name
+from torchrec.distributed.sharding_plan import placement
 from torchrec.distributed.types import (
     EmbeddingModuleShardingPlan,
     EnumerableShardingSpec,
@@ -46,6 +48,8 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
 
+from .plan import module_without_tables, per_rank_storage, topology_minus
+from .storage_reservations import DynamicEmbStorageReservation, _optimizer_types
 from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DynamicEmbTableOptions,
@@ -224,7 +228,7 @@ def _prepare_dynemb_table_options(
             opts.embedding_dtype = data_type_to_dtype(tmp_config.data_type)
 
 
-class DynamicEmbeddingShardingPlanner:
+class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
     def __init__(
         self,
         eb_configs: List[BaseEmbeddingConfig],
@@ -280,8 +284,6 @@ class DynamicEmbeddingShardingPlanner:
             A flag indicating whether to enable debug mode. Defaults to True.
         """
 
-        super(DynamicEmbeddingShardingPlanner, self).__init__()
-
         _prepare_dynemb_table_options(constraints, eb_configs)
 
         dyn_emb_table_consts = {
@@ -315,7 +317,22 @@ class DynamicEmbeddingShardingPlanner:
                 hbm_cap=HBM_CAP,
                 ddr_cap=DDR_CAP,
             )
-        self._torchrec_planner = EmbeddingShardingPlanner(
+        if isinstance(storage_reservation, DynamicEmbStorageReservation):
+            # It subtracted the DynamicEmb tables from the budget; `plan` now
+            # takes them out of the Topology instead, so leaving it in place
+            # would charge for them twice. Fall back to the default rather than
+            # refuse: it was the documented way to build this planner.
+            warnings.warn(
+                "DynamicEmbStorageReservation is no longer needed and is being "
+                "ignored: DynamicEmbeddingShardingPlanner now reduces the "
+                "Topology by what the DynamicEmb tables cost. Pass your own "
+                "StorageReservation, or none, for TorchRec's own reservation.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            storage_reservation = None
+
+        super().__init__(
             topology=topology,
             batch_size=batch_size,
             enumerator=enumerator,
@@ -359,14 +376,46 @@ class DynamicEmbeddingShardingPlanner:
             )
             self._dyn_emb_plan[dyn_emb_name] = tmp_para_sharding
 
+    def plan(
+        self,
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+    ) -> ShardingPlan:
+        """This rank's plan for both halves of the model.
+
+        Parameters
+        ----------
+        module : nn.Module
+            The PyTorch module to be sharded.
+        sharders : List[ModuleSharder[nn.Module]]
+            A list of module sharders.
+
+        Returns
+        -------
+        ShardingPlan
+            One plan covering the DynamicEmb tables and the TorchRec ones.
+        """
+        return self._attach_options(self._decide(module, sharders))
+
     def collective_plan(
         self,
         module: nn.Module,
         sharders: List[ModuleSharder[nn.Module]],
         pg: Optional[dist.ProcessGroup] = dist.GroupMember.WORLD,
     ) -> ShardingPlan:
-        """
-        Generate a collective sharding plan.
+        """One rank decides and the rest are told, as TorchRec's own planner does.
+
+        Deciding on every rank and trusting them to agree would be correct only
+        as long as every rank was handed identical constraints and an identical
+        topology, which nothing checks. Rank 0 deciding makes the question moot.
+
+        What crosses the wire is the decisions -- sharding type, ranks, shard
+        sizes and offsets and placements. The ``DynamicEmbTableOptions`` are
+        reattached from this rank's own constraints afterwards, because some of
+        what they hold is rank-local by nature: ``external_storage`` is a live
+        handle to a store this process opened, and ``score_function`` is a
+        Python callable. Sending rank 0's copy of either would be wrong even
+        where pickle allows it.
 
         Parameters
         ----------
@@ -380,11 +429,88 @@ class DynamicEmbeddingShardingPlanner:
         Returns
         -------
         ShardingPlan
-            The generated sharding plan.
+            The generated sharding plan, identical on every rank.
         """
-        torchrec_plan = self._torchrec_planner.collective_plan(module, sharders, pg)
+        return self._attach_options(
+            invoke_on_rank_and_broadcast_result(pg, 0, self._decide, module, sharders)
+        )
+
+    def _decide(
+        self,
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+    ) -> ShardingPlan:
+        """Both halves of the plan, with the per-table options left off.
+
+        In order: the DynamicEmb tables are already settled (``__init__`` did
+        that -- their capacity comes from their options and their placement from
+        the key -> rank rule, so there is nothing to search); what they cost
+        comes out of the Topology; TorchRec plans what is left of the model
+        inside what is left of the memory; the two halves are put back together.
+
+        The Topology is swapped rather than passed, because the enumerator and
+        the estimators were built against ``self._topology`` in ``__init__``.
+        They read it for bandwidths and device type, not for the budget -- the
+        budget is the Topology that ``reserve`` returns, which is derived from
+        this one -- so the swap reaches the decision that depends on it.
+
+        ``_insert_dynamicemb_plan`` gets the caller's module, not the reduced
+        one: the reduced one no longer admits to having these tables, which is
+        the whole point of it, so it cannot say what path they live under.
+        """
+        table_names = set(self._dyn_emb_plan)
+        reduced_module = module_without_tables(module, table_names, sharders)
+        spent = per_rank_storage(
+            self._dyn_emb_plan,
+            _optimizer_types(module, sharders),
+            len(self._topology.devices),
+        )
+
+        whole_topology = self._topology
+        try:
+            self._topology = topology_minus(whole_topology, spent)
+            torchrec_plan = super().plan(reduced_module, sharders)
+        finally:
+            self._topology = whole_topology
+
         self._insert_dynamicemb_plan(torchrec_plan, module, sharders)
         return torchrec_plan
+
+    def _attach_options(self, plan: ShardingPlan) -> ShardingPlan:
+        """Put this rank's DynamicEmbTableOptions back on the plan.
+
+        See :meth:`collective_plan` for why they were taken off. The plan's own
+        shard metadata is checked against them when the kernel is built
+        (``_get_dynamicemb_options_per_table``), so a rank whose options
+        disagree with the decisions it was sent does not go unnoticed.
+        """
+        for module_plan in plan.plan.values():
+            for table_name, parameter_sharding in module_plan.items():
+                settled = self._dyn_emb_plan.get(table_name)
+                if settled is not None:
+                    parameter_sharding.dynamicemb_options = settled.dynamicemb_options
+        return plan
+
+    @staticmethod
+    def _for_the_plan(
+        settled: DynamicEmbParameterSharding,
+    ) -> DynamicEmbParameterSharding:
+        """A copy of a settled table's ParameterSharding, fit to hand out.
+
+        Two things the original must not be exposed to. The options come off
+        because they are reattached per rank after the broadcast
+        (:meth:`collective_plan`), and stripping the original would empty the
+        planner's own record of the table. The shard metadata is deep-copied
+        because TorchRec writes to it: ``replace_placement_with_meta_device``
+        rewrites every placement in place when DMP's device is ``meta``
+        (``distributed/embeddingbag.py:995``), which would otherwise reach back
+        into the planner and leave a second `plan` call handing out metadata the
+        first DMP had already rewritten.
+        """
+        handed_out = copy.copy(settled)
+        handed_out.sharding_spec = copy.deepcopy(settled.sharding_spec)
+        handed_out.dynamicemb_options = None
+        return handed_out
 
     def _insert_dynamicemb_plan(
         self,
@@ -430,7 +556,7 @@ class DynamicEmbeddingShardingPlanner:
                 module_plan = torchrec_plan.plan.setdefault(
                     path, EmbeddingModuleShardingPlan()
                 )
-                module_plan[table_name] = parameter_sharding
+                module_plan[table_name] = self._for_the_plan(parameter_sharding)
                 placed.add(table_name)
 
         missing = set(self._dyn_emb_plan) - placed

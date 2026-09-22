@@ -29,7 +29,6 @@ from .planners import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
 from .planners import DynamicEmbParameterConstraints
-from .storage_reservations import DynamicEmbStorageReservation
 
 # refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91
 # compute_kernel is somehow coupled with sharding_type.
@@ -134,5 +133,7 @@ def get_planner(
         topology=topology,
         constraints=constraints,
         enumerator=enumerator,
-        storage_reservation=DynamicEmbStorageReservation(constraints),
+        # No storage_reservation: the planner takes the DynamicEmb tables out of
+        # the Topology itself, and TorchRec's default reservation then covers
+        # what it is for -- the dense modules and the input KJT.
     )
