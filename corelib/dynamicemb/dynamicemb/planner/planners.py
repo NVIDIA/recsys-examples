@@ -16,7 +16,7 @@
 import math
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import distributed as dist
@@ -34,7 +34,9 @@ from torchrec.distributed.planner.types import (
     Topology,
 )
 from torchrec.distributed.sharding_plan import placement
+from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.types import (
+    EmbeddingModuleShardingPlan,
     EnumerableShardingSpec,
     ModuleSharder,
     ParameterSharding,
@@ -381,16 +383,60 @@ class DynamicEmbeddingShardingPlanner:
             The generated sharding plan.
         """
         torchrec_plan = self._torchrec_planner.collective_plan(module, sharders, pg)
-        dyn_emb_names = self._dyn_emb_plan.keys()
-        for dyn_emb_name in dyn_emb_names:
-            for (
-                torchrec_module_name,
-                torchrec_module_plan,
-            ) in torchrec_plan.plan.items():
-                for table_name, table_plan in torchrec_module_plan.items():
-                    if dyn_emb_name == table_name:
-                        torchrec_module_plan[table_name] = self._dyn_emb_plan[
-                            table_name
-                        ]
-
+        self._insert_dynamicemb_plan(torchrec_plan, module, sharders)
         return torchrec_plan
+
+    def _insert_dynamicemb_plan(
+        self,
+        torchrec_plan: ShardingPlan,
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+    ) -> None:
+        """Add the DynamicEmb tables' ParameterShardings to a plan built without them.
+
+        The enumerator leaves them out of the search space -- their capacity and
+        their placement are settled here, not searched for -- so nothing in
+        ``torchrec_plan`` describes them, and a module holding only DynamicEmb
+        tables is missing from it entirely. ``DistributedModelParallel`` shards a
+        module only if the plan has an entry for its path, silently leaving it
+        alone otherwise, so the entries have to be put there rather than
+        overwritten.
+
+        Which means finding the path each table lives under, which the planner
+        would have discovered on our behalf. Walking for it repeats the
+        enumerator's descent, in the same order and by the same rule -- a module
+        a sharder claims is a leaf, anything else is recursed into -- because
+        the paths have to be the ones the planner would have produced.
+        """
+        if not self._dyn_emb_plan:
+            return
+
+        sharder_map = {
+            sharder_name(sharder.module_type): sharder for sharder in sharders
+        }
+        queue: List[Tuple[str, nn.Module]] = [("", module)]
+        placed: Set[str] = set()
+        while queue:
+            path, child_module = queue.pop()
+            sharder = sharder_map.get(sharder_name(type(child_module)))
+            if sharder is None:
+                for name, child in child_module.named_children():
+                    queue.append((f"{path}.{name}" if path else name, child))
+                continue
+            for table_name in sharder.shardable_parameters(child_module):
+                parameter_sharding = self._dyn_emb_plan.get(table_name)
+                if parameter_sharding is None:
+                    continue
+                module_plan = torchrec_plan.plan.setdefault(
+                    path, EmbeddingModuleShardingPlan()
+                )
+                module_plan[table_name] = parameter_sharding
+                placed.add(table_name)
+
+        missing = set(self._dyn_emb_plan) - placed
+        if missing:
+            raise RuntimeError(
+                f"No sharder claims a module holding the DynamicEmb tables "
+                f"{sorted(missing)}, so they cannot be placed in the plan. "
+                "Pass a DynamicEmb sharder for every collection that has one."
+            )

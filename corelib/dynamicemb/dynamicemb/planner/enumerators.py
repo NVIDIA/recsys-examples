@@ -16,15 +16,13 @@
 from typing import Dict, List, Optional, Union
 
 from torch import nn
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.types import (
-    Shard,
     ShardEstimator,
     ShardingOption,
     Topology,
 )
-from torchrec.distributed.types import ModuleSharder, ShardingType
+from torchrec.distributed.types import ModuleSharder
 
 from .planners import DynamicEmbParameterConstraints
 
@@ -63,73 +61,38 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
         )
         self._constraints = constraints
 
+    def _use_dynamicemb(self, name: str) -> bool:
+        """Whether *name* is a DynamicEmb table.
+
+        Read off the constraint rather than passed in: TorchRec hands the hooks
+        the table's name, and the constraint is reachable from it.
+        """
+        constraint = self._constraints.get(name) if self._constraints else None
+        return bool(getattr(constraint, "use_dynamicemb", False))
+
     def enumerate(
         self,
         module: nn.Module,
         sharders: List[ModuleSharder[nn.Module]],
     ) -> List[ShardingOption]:
-        """TorchRec's search space, with the DynamicEmb tables' shards replaced.
+        """TorchRec's search space, with the DynamicEmb tables taken out of it.
 
-        A DynamicEmb table has no rows to divide: its ``num_embeddings`` is
-        nominal, its storage is a hash table sized by ``DynamicEmbTableOptions``,
-        and ``DynamicEmbeddingShardingPlanner`` replaces its ParameterSharding
-        outright once planning is done. The planner still has to see it -- the
-        plan is keyed by module, and dropping the table drops the module with it
-        -- so it is sized as the near-nothing it costs the planner: one 1x1
-        shard per rank.
+        They are not TorchRec's to place. A DynamicEmb table's capacity comes
+        from ``DynamicEmbTableOptions`` rather than from ``num_embeddings``,
+        which is nominal for a hash table, so anything the estimators cost here
+        is a number about a table that does not exist. Its sharding and its
+        ranks are decided by ``DynamicEmbeddingShardingPlanner``, which writes
+        the ParameterSharding itself and reports what the tables spend through
+        ``DynamicEmbStorageReservation`` -- so the TorchRec planner sees the
+        memory, and plans the remaining tables into what is left.
 
-        Done after the fact rather than inside the walk, because the sizing
-        TorchRec calls is a module function with no seam to override. The walk
-        itself is where everything else lives -- memoization, the sharder data
-        map the estimators index into, ZCH bucket sizes, weight stashing -- and
-        a copy of it here is a copy that stops receiving all of that.
-
-        Re-estimating is not optional: ``super().enumerate`` costed these
-        options from their real row counts before this rewrote them.
+        Leaving them in would mean carrying a placeholder through the search
+        space with no way to make it honest: sized truthfully it would be
+        partitioned on numbers we do not believe, and sized at nothing it would
+        be a ghost that costs nothing and can be placed anywhere.
         """
-        sharding_options = super().enumerate(module, sharders)
-        dynamicemb_options = [
-            option for option in sharding_options if self._use_dynamicemb(option.name)
+        return [
+            option
+            for option in super().enumerate(module, sharders)
+            if not self._use_dynamicemb(option.name)
         ]
-        for option in dynamicemb_options:
-            option.shards = [
-                Shard(size=[1, 1], offset=[rank, 0]) for rank in range(self._world_size)
-            ]
-        if dynamicemb_options:
-            self.populate_estimates(dynamicemb_options)
-        return sharding_options
-
-    def _use_dynamicemb(self, name: str) -> bool:
-        """Whether *name* is a DynamicEmb table.
-
-        Read off the constraint rather than passed in: the two hooks below are
-        the only things that need it, TorchRec already hands them the table's
-        name, and threading it down instead would mean forking ``enumerate``
-        to carry it -- which is what this used to do.
-        """
-        constraint = self._constraints.get(name) if self._constraints else None
-        return bool(getattr(constraint, "use_dynamicemb", False))
-
-    def _filter_sharding_types(
-        self, name: str, allowed_sharding_types: List[str], sharder_key: str = ""
-    ) -> List[str]:
-        # A DynamicEmb table is row-wise and nothing else, so the rest of the
-        # search space is not applicable rather than merely unattractive.
-        if self._use_dynamicemb(name):
-            return [ShardingType.ROW_WISE.value]
-        return super()._filter_sharding_types(name, allowed_sharding_types, sharder_key)
-
-    def _filter_compute_kernels(
-        self,
-        name: str,
-        allowed_compute_kernels: List[str],
-        sharding_type: str,
-    ) -> List[str]:
-        # FUSED is a placeholder that keeps the table in the search space;
-        # DynamicEmbeddingShardingPlanner replaces the whole ParameterSharding,
-        # CUSTOMIZED_KERNEL included, once planning is done.
-        if self._use_dynamicemb(name):
-            return [EmbeddingComputeKernel.FUSED.value]
-        return super()._filter_compute_kernels(
-            name, allowed_compute_kernels, sharding_type
-        )
