@@ -29,6 +29,37 @@
 import torch
 
 
+class _BatchedDotProduct(torch.autograd.Function):
+    """Batched dot product with a 64-bit-index-safe backward path."""
+
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(
+        ctx,
+        item_embeddings: torch.Tensor,
+        input_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(item_embeddings, input_embeddings)
+        return torch.bmm(item_embeddings, input_embeddings.unsqueeze(2)).squeeze(2)
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, grad_output: torch.Tensor):
+        item_embeddings, input_embeddings = ctx.saved_tensors
+        grad_output = grad_output.unsqueeze(2)
+        grad_item_embeddings = (
+            grad_output * input_embeddings.unsqueeze(1)
+            if ctx.needs_input_grad[0]
+            else None
+        )
+        grad_input_embeddings = (
+            torch.bmm(item_embeddings.transpose(1, 2), grad_output).squeeze(2)
+            if ctx.needs_input_grad[1]
+            else None
+        )
+        return grad_item_embeddings, grad_input_embeddings
+
+
 class DotProductSimilarity(torch.nn.Module):
     def __init__(self, dtype) -> None:
         super().__init__()
@@ -62,7 +93,7 @@ class DotProductSimilarity(torch.nn.Module):
                 ).view(-1, X)
             else:
                 # assert input_embeddings.size(0) == item_embeddings.size(0)
-                # [B, X, D] x ([B, D] -> [B, D, 1]) => [B, X, 1] -> [B, X]
-                return torch.bmm(
-                    item_embeddings, input_embeddings.unsqueeze(2)
-                ).squeeze(2)
+                # PyTorch 26.07 routes bmm's outer-product backward through a
+                # Triton kernel with 32-bit indexing. Use an equivalent backward
+                # that remains safe when B * X * D exceeds that indexing range.
+                return _BatchedDotProduct.apply(item_embeddings, input_embeddings)

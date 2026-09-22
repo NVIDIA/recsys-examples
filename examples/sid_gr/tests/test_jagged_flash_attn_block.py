@@ -35,7 +35,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
-from attention_mask import build_jagged_causal_arbitrary_func
 from jagged_flash_attn_block import (
     JaggedFlashAttnBlock,
     JaggedGPTLayer,
@@ -45,7 +44,7 @@ from jagged_flash_attn_block import (
 sys.path.pop(0)
 
 try:
-    from flash_attn.cute.interface import flash_attn_func  # noqa: F401
+    from flash_attn.flash_attn_interface import flash_attn_func  # noqa: F401
 
     HAS_FLASH_ATTN = True
 except ImportError:
@@ -148,6 +147,29 @@ class TestJaggedGPTLayerSmoke:
         out = block(x)
         assert out.shape == (2, 32, 256)
 
+    def test_kv_channels_controls_head_dim(self):
+        """The production config may use heads * kv_channels != hidden_size."""
+        layer = (
+            JaggedGPTLayer(
+                hidden_size=128,
+                num_attention_heads=6,
+                kv_channels=64,
+                ffn_hidden_size=512,
+                normalization="RMSNorm",
+            )
+            .cuda()
+            .bfloat16()
+            .eval()
+        )
+        x = torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16)
+
+        with torch.no_grad():
+            out = layer(x)
+
+        assert layer.linear_qkv.out_features == 3 * 6 * 64
+        assert layer.linear_proj.in_features == 6 * 64
+        assert out.shape == x.shape
+
 
 @pytest.mark.skipif(not HAS_FLASH_ATTN, reason="flash_attn not installed")
 class TestJaggedGPTLayerCorrectness:
@@ -157,8 +179,8 @@ class TestJaggedGPTLayerCorrectness:
     @pytest.mark.parametrize("seqlen", [16, 32])
     def test_causal_matches_reference(self, hidden_size, num_heads, seqlen):
         """
-        With causal=True (no arbitrary_func), JaggedGPTLayer should produce
-        the same output as the PyTorch reference (within bf16 precision).
+        JaggedGPTLayer's causal FA2 path should produce the same output as the
+        PyTorch reference (within bf16 precision).
         """
         B = 2
         ffn_size = hidden_size * 4
@@ -184,45 +206,9 @@ class TestJaggedGPTLayerCorrectness:
 
         with torch.no_grad():
             ref_out = ref_layer(x, is_causal=True)
-            test_out = test_layer(x, arbitrary_func=None)
+            test_out = test_layer(x)
 
         torch.testing.assert_close(test_out, ref_out, atol=5e-2, rtol=5e-2)
-
-    @pytest.mark.parametrize("hidden_size,num_heads", [(256, 4)])
-    def test_arbitrary_causal_matches_standard_causal(self, hidden_size, num_heads):
-        """
-        An arbitrary_func encoding a causal mask should produce the same
-        result as the built-in causal=True path.
-        """
-        B, S = 1, 32
-        ffn_size = hidden_size * 4
-        torch.manual_seed(42)
-
-        layer = (
-            JaggedGPTLayer(
-                hidden_size=hidden_size,
-                num_attention_heads=num_heads,
-                ffn_hidden_size=ffn_size,
-                hidden_dropout=0.0,
-            )
-            .cuda()
-            .bfloat16()
-        )
-
-        x = torch.randn(B, S, hidden_size, device="cuda", dtype=torch.bfloat16)
-
-        # Build causal arbitrary_func: F0[i] = i+1
-        n_func = 1
-        af = torch.zeros(B, 1, n_func, S + 256, dtype=torch.int32, device="cuda")
-        for i in range(S):
-            af[:, :, 0, i] = i + 1
-
-        with torch.no_grad():
-            out_causal = layer(x, arbitrary_func=None)
-            out_arb = layer(x, arbitrary_func=af)
-
-        torch.testing.assert_close(out_arb, out_causal, atol=5e-2, rtol=5e-2)
-
 
 @pytest.mark.skipif(not HAS_FLASH_ATTN, reason="flash_attn not installed")
 class TestJaggedGPTLayerBackward:
@@ -281,7 +267,7 @@ class TestJaggedGPTLayerBackward:
         x_test = x_ref.detach().clone().requires_grad_(True)
 
         ref_out = ref_layer(x_ref, is_causal=True)
-        test_out = test_layer(x_test, arbitrary_func=None)
+        test_out = test_layer(x_test)
 
         dout = torch.randn_like(ref_out)
         ref_out.backward(dout)
@@ -328,9 +314,8 @@ def _build_padded_causal_block_diagonal_mask(offsets, max_seqlen):
 @pytest.mark.skipif(not HAS_FLASH_ATTN, reason="flash_attn not installed")
 class TestJaggedTransformerBlockVsPadded:
     """
-    Compare the B=1 flattened FA path (JaggedTransformerBlock) against the
-    padded PyTorch reference to make sure the flatten + arbitrary_func
-    approach produces correct outputs.
+    Compare FA2 varlen (JaggedTransformerBlock) against the padded PyTorch
+    reference.
     """
 
     @pytest.mark.parametrize("num_layers", [1, 2])
@@ -372,10 +357,13 @@ class TestJaggedTransformerBlockVsPadded:
         # Build jagged input [total_tokens, H]
         jagged_input = torch.randn(total_tokens, H, device="cuda", dtype=torch.bfloat16)
 
-        # --- FA path: flatten to B=1, build arbitrary_func ---
-        arbitrary_func = build_jagged_causal_arbitrary_func(offsets, total_tokens)
+        # --- FA2 varlen path ---
         with torch.no_grad():
-            fa_output = test_block(jagged_input, arbitrary_func=arbitrary_func)
+            fa_output = test_block(
+                jagged_input,
+                cu_seqlens=offsets.to(torch.int32),
+                max_seqlen=max_seqlen,
+            )
 
         # --- Reference path: pad each sequence, run per-batch ---
         with torch.no_grad():
@@ -415,10 +403,9 @@ class TestJaggedTransformerBlockVsPadded:
         )
 
         x = torch.randn(total, H, device="cuda", dtype=torch.bfloat16)
-        af = build_jagged_causal_arbitrary_func(offsets, total)
 
         with torch.no_grad():
-            out = block(x, arbitrary_func=af)
+            out = block(x, cu_seqlens=offsets.to(torch.int32), max_seqlen=5)
 
         assert out.shape == (total, H)
 
@@ -448,21 +435,24 @@ class TestJaggedTransformerBlockVsPadded:
         # Run combined [A, B]
         combined = torch.cat([seq_a, seq_b], dim=0)
         offsets_ab = torch.tensor([0, 5, 12], device="cuda")
-        af_ab = build_jagged_causal_arbitrary_func(offsets_ab, 12)
         with torch.no_grad():
-            out_ab = block(combined, arbitrary_func=af_ab)
+            out_ab = block(
+                combined, cu_seqlens=offsets_ab.to(torch.int32), max_seqlen=7
+            )
 
         # Run A alone
         offsets_a = torch.tensor([0, 5], device="cuda")
-        af_a = build_jagged_causal_arbitrary_func(offsets_a, 5)
         with torch.no_grad():
-            out_a = block(seq_a, arbitrary_func=af_a)
+            out_a = block(
+                seq_a, cu_seqlens=offsets_a.to(torch.int32), max_seqlen=5
+            )
 
         # Run B alone
         offsets_b = torch.tensor([0, 7], device="cuda")
-        af_b = build_jagged_causal_arbitrary_func(offsets_b, 7)
         with torch.no_grad():
-            out_b = block(seq_b, arbitrary_func=af_b)
+            out_b = block(
+                seq_b, cu_seqlens=offsets_b.to(torch.int32), max_seqlen=7
+            )
 
         torch.testing.assert_close(out_ab[:5], out_a, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(out_ab[5:], out_b, atol=1e-3, rtol=1e-3)
