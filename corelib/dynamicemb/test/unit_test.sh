@@ -17,6 +17,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
     "test/unit_tests/optimizer/test_ftrl_optimizer.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
+    "test/unit_tests/test_expansion_value_capacity.py"
 )
 
 LOAD_DUMP_TEST_FILES=(
