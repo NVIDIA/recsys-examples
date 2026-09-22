@@ -708,6 +708,50 @@ mis-set learning rate.
 nodes that hold none of the TRW tables. A code path that builds the sharding
 only where a table lives will hang.
 
+**F10 — the plan is shared by reference, and TorchRec writes to it.** Nothing
+between `collective_plan` and the kernel copies a `ParameterSharding`: DMP hands
+`self._plan.get_plan_for_module(path)` straight to `sharder.shard()`
+(`model_parallel.py:538-546`), and `create_sharding_infos_by_sharding` stores the
+same object on the `EmbeddingShardingInfo` (`embeddingbag.py:333`,
+`embedding.py:284,725`) -- in the same call that `copy.deepcopy`s
+`feature_names`, so the asymmetry is deliberate on TorchRec's side, not an
+oversight.
+
+TorchRec then writes to it in two places. `replace_placement_with_meta_device`
+rewrites every `ShardMetadata.placement` in place when DMP's device is `meta`
+(`embeddingbag.py:995-996`, `177-188`), which is the normal way to build a plan
+on `cuda` and a model on `meta`. `DMPCollection._remap_sharding_plan` assigns
+`param_sharding.ranks` and rewrites the shards (`model_parallel.py:1782-1820`).
+
+For us this reaches further than it does for TorchRec, because
+`_insert_dynamicemb_plan` inserts the entries held on the planner instance
+(`self._dyn_emb_plan`) by reference. A second `collective_plan` from the same
+planner would then hand out metadata already rewritten by the first DMP. No
+current caller does this, and the failure would be a wrong placement rather than
+an error. **Recommend: deep-copy each `ParameterSharding` on insertion**, so a
+plan the caller passes on cannot reach back into the planner.
+
+**F11 — the key -> rank fan-out has two sources, and `DMPCollection` splits
+them.** Routing takes it from the sharding process group -- `RwSparseFeaturesDist`
+inherits `self._world_size = pg.size()` (`torchrec .../sharding/rw_sharding.py:395`)
+and bucketizes into that many buckets (`shard/input_dist.py:227`). Ownership takes
+it from the default group: `self._shard_world_size = dist.get_world_size()`
+(`batched_dynamicemb_tables.py:566`), which is what `owned_key_mask` is given on
+the dump/load path (`batched_dynamicemb_tables.py:2056`).
+
+Under `DistributedModelParallel` the two are equal and nothing shows. Under
+`DMPCollection` (2D parallel) the embedding is sharded over `sharding_group_size`
+ranks and replicated across groups, so `pg.size() < dist.get_world_size()` and
+the two halves of DynamicEmb disagree with each other: a rank is fed the keys of
+one partition and dumps the keys of another. Neither raises.
+
+This is independent of TRW -- it is true on the branch today -- but TRW makes it
+worse, since TRW introduces a second legitimate reason for the fan-out to differ
+from the world size (`local_size`), and §4.6 already has to thread a shard base
+through the rule. **Recommend: give the rule one source, taken from the sharding
+environment rather than from `dist`, and reject `DMPCollection` explicitly until
+that is done.**
+
 ---
 
 ## 8. Pre-existing defects found while writing this, and fixed since
