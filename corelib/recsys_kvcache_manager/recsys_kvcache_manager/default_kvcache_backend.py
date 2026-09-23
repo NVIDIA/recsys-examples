@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -138,6 +139,20 @@ class DefaultKVCacheBackend(KVCacheBackend):
                         f"[WARNING] Onboarding failed for {wait_result.failed_user_ids}, but continue with `fail_open` policy."
                     )
         return wait_result
+
+    def onboard_wait_layer(
+        self,
+        task_handle: Optional[HostKVTaskHandle],
+        layer_idx: int,
+    ) -> None:
+        if (
+            task_handle is None
+            or task_handle.handle is None
+            or task_handle.status == HostKVTaskStatus.SKIPPED
+            or not task_handle.is_layerwise
+        ):
+            return
+        task_handle.wait_layer(layer_idx)
 
     def offload_launch(
         self,
@@ -313,6 +328,33 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 }
             else:
                 flexkv_as_batch = bool(flexkv_as_batch_raw)
+            flexkv_enable_layerwise = extra.get("flexkv_enable_layerwise", None)
+            if isinstance(flexkv_enable_layerwise, str):
+                flexkv_enable_layerwise = flexkv_enable_layerwise.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            elif flexkv_enable_layerwise is not None:
+                flexkv_enable_layerwise = bool(flexkv_enable_layerwise)
+            flexkv_layerwise_eventfd_socket = extra.get(
+                "flexkv_layerwise_eventfd_socket", None
+            )
+            flexkv_layerwise_counter_id = int(
+                extra.get("flexkv_layerwise_counter_id", 0)
+            )
+            flexkv_layer_granularity = extra.get("flexkv_layer_granularity", None)
+            if flexkv_layer_granularity is None or int(flexkv_layer_granularity) <= 0:
+                env_gran = os.environ.get(
+                    "RECSYS_FLEXKV_LAYER_GRANULARITY",
+                    os.environ.get("FLEXKV_LAYER_GRANULARITY", ""),
+                )
+                flexkv_layer_granularity = (
+                    int(env_gran) if str(env_gran).strip() else -1
+                )
+            else:
+                flexkv_layer_granularity = int(flexkv_layer_granularity)
 
             return FlexKVStorage(
                 mode=flexkv_mode,
@@ -331,6 +373,10 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
                 config_path=flexkv_config_path,
+                enable_layerwise=flexkv_enable_layerwise,
+                layerwise_eventfd_socket=flexkv_layerwise_eventfd_socket,
+                layerwise_counter_id=flexkv_layerwise_counter_id,
+                layer_granularity=flexkv_layer_granularity,
             )
         else:
             raise NotImplementedError(

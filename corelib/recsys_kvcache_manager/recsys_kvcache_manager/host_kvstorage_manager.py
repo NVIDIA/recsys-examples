@@ -58,6 +58,7 @@ class HostKVTaskHandle:
     metadata: Optional[Dict[str, Any]] = None
     time_launched: Optional[float] = None
     is_layerwise: bool = False
+    onboard_wait_by_layer: Optional[Any] = None
 
     def __post_init__(self):
         if self.status not in {
@@ -71,9 +72,20 @@ class HostKVTaskHandle:
                 self.handle is not None
             ), "underlying handle must be provided for initialized tasks"
 
-    def stream_wait_layer(self, layer_idx: int) -> None:
-        if self.is_layerwise:
+    def wait_layer(self, layer_idx: int) -> None:
+        """FlexKV per-layer wait: onboard_wait_by_layer → eventfd os.read."""
+        if not self.is_layerwise:
+            return
+        if self.onboard_wait_by_layer is not None:
+            return self.onboard_wait_by_layer(self, layer_idx)
+        if self.handle is not None and hasattr(self.handle, "wait_layer"):
             self.handle.wait_layer(layer_idx)
+
+    def stream_wait_layer(self, layer_idx: int) -> None:
+        """Native per-layer wait: CUDA event on the current stream. FlexKV must not use this."""
+        if self.backend == "flexkv" or not self.is_layerwise:
+            return
+        self.handle.wait_layer(layer_idx)
 
 
 @dataclass

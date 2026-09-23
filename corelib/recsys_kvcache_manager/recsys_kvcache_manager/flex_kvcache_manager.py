@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from flexkv.common.config import LayerGroupSpec
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.server.client import KVTPClient
 
@@ -36,6 +37,10 @@ from .host_kvstorage_manager import (
     HostKVTaskHandle,
     HostKVTaskStatus,
     HostKVWaitResult,
+)
+from .flexkv_layerwise import (
+    FlexKVLayerwiseEventfdSender,
+    create_layerwise_eventfd_socket_path,
 )
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
@@ -56,6 +61,12 @@ class _FlexKVOnloadHandle:
     task_ids: Union[List[int], torch.Tensor]
     uids: torch.Tensor
     slot_mappings: List[torch.Tensor]
+    layer_eventfds: Optional[List[int]] = None
+
+    def wait_layer(self, layer_idx: int) -> None:
+        if self.layer_eventfds is None:
+            return
+        os.read(self.layer_eventfds[layer_idx], 8)
 
 
 @dataclass
@@ -79,7 +90,7 @@ class FlexKVCacheLayout(KVCacheLayout):
             [
                 self.num_layer,
                 self.num_block,
-                self._kv_dim,
+                self.kv_dim,
                 self.tokens_per_block,
                 self.num_head,
                 self.head_size,
@@ -115,6 +126,10 @@ class FlexKVStorage(HostKVStorageBase):
         hostkv_wait_timeout_ms: int = 0,
         host_kvstorage_fail_policy: str = "fail_open",
         config_path: Optional[str] = None,
+        enable_layerwise: Optional[bool] = None,
+        layerwise_eventfd_socket: Optional[str] = None,
+        layerwise_counter_id: int = 0,
+        layer_granularity: int = -1,
     ) -> None:
         self.mode = mode
         self.server_addr = server_addr
@@ -132,6 +147,14 @@ class FlexKVStorage(HostKVStorageBase):
         self.enable_mps = bool(enable_mps)
         self.as_batch = bool(as_batch)
         self.config_path = config_path or ""
+        self.enable_layerwise = enable_layerwise
+        self.layerwise_eventfd_socket = (
+            layerwise_eventfd_socket
+            or os.environ.get("FLEXKV_LAYERWISE_EVENTFD_SOCKET")
+            or create_layerwise_eventfd_socket_path()
+        )
+        self.layerwise_counter_id = int(layerwise_counter_id)
+        self.layer_granularity = int(layer_granularity)
         self.backend_name = "flexkv"
 
         self._gpu_cache_table_list: Optional[List[torch.Tensor]] = None
@@ -144,6 +167,7 @@ class FlexKVStorage(HostKVStorageBase):
         self._client = None
         self._ready = False
         self._page_offsets: Optional[torch.Tensor] = None
+        self._layerwise_eventfd_sender: Optional[FlexKVLayerwiseEventfdSender] = None
 
     def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
         assert (
@@ -167,16 +191,34 @@ class FlexKVStorage(HostKVStorageBase):
             tokens_per_block=int(first_table.shape[2]),
             num_head=int(first_table.shape[3]),
             head_size=int(first_table.shape[4]),
-            is_mla=False,
         )
         tp_client = KVTPClient(
             gpu_register_port=self._gpu_register_port,
             dp_client_id=0,
             device_id=device_id,
         )
+        register_kwargs: Dict[str, Any] = {}
+        if self.enable_layerwise:
+            register_kwargs.update(
+                layer_groups=[
+                    LayerGroupSpec(
+                        num_layers=gpu_layout.num_layer,
+                        num_kv_heads=gpu_layout.num_head,
+                        head_size=gpu_layout.head_size,
+                        layer_indices=list(range(gpu_layout.num_layer)),
+                        dtype=self.dtype,
+                    )
+                ],
+                gpu_layouts=[gpu_layout],
+                handles_per_group=[self._gpu_cache_table_list],
+            )
         tp_client.register_to_server(
-            kv_caches=self._gpu_cache_table_list, kv_layout=gpu_layout
+            kv_caches=self._gpu_cache_table_list,
+            kv_layout=gpu_layout,
+            **register_kwargs,
         )
+        if self.enable_layerwise and self._layerwise_eventfd_sender is not None:
+            self._layerwise_eventfd_sender.wait_until_ready()
         self._registered = True
 
         # Client becomes operational only after transfer manager is ready.
@@ -190,7 +232,7 @@ class FlexKVStorage(HostKVStorageBase):
         if self._client is not None:
             return
         try:
-            from flexkv.common.config import CacheConfig, ModelConfig
+            from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, ModelConfig
             from flexkv.kvmanager import KVManager
         except Exception as e:
             raise RuntimeError(f"FlexKV SDK import failed: {e}") from e
@@ -224,6 +266,51 @@ class FlexKVStorage(HostKVStorageBase):
 
             user_cfg = load_user_config_from_file(self.config_path)
             update_default_config_from_user_config(model_cfg, cache_cfg, user_cfg)
+        if self.enable_layerwise is None:
+            enable_layerwise_env = os.environ.get("RECSYS_FLEXKV_ENABLE_LAYERWISE", "0")
+            self.enable_layerwise = enable_layerwise_env.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        elif isinstance(self.enable_layerwise, str):
+            self.enable_layerwise = self.enable_layerwise.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        else:
+            self.enable_layerwise = bool(self.enable_layerwise)
+        GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = bool(self.enable_layerwise)
+        os.environ["FLEXKV_ENABLE_LAYERWISE_TRANSFER"] = (
+            "1" if self.enable_layerwise else "0"
+        )
+        gran = int(self.layer_granularity)
+        if gran <= 0:
+            env_gran = os.environ.get(
+                "RECSYS_FLEXKV_LAYER_GRANULARITY",
+                os.environ.get("FLEXKV_LAYER_GRANULARITY", ""),
+            )
+            if str(env_gran).strip():
+                gran = int(env_gran)
+        # Recsys SSD-span switch. Independent of is_layerwise: N>0 splits
+        # DISK2H even for a naive whole wait. Layerwise with N unset is 1.
+        if self.enable_layerwise and gran <= 0:
+            gran = 1
+        self.layer_granularity = gran
+        cache_cfg.layer_granularity = gran
+        GLOBAL_CONFIG_FROM_ENV.layer_granularity = gran
+        os.environ["FLEXKV_LAYER_GRANULARITY"] = str(gran)
+        if self.enable_layerwise:
+            os.environ["FLEXKV_LAYERWISE_EVENTFD_SOCKET"] = self.layerwise_eventfd_socket
+            if self._layerwise_eventfd_sender is None:
+                self._layerwise_eventfd_sender = FlexKVLayerwiseEventfdSender(
+                    num_layers=self.num_layers,
+                    socket_path=self.layerwise_eventfd_socket,
+                )
+            self._layerwise_eventfd_sender.start()
         self._client = KVManager(
             model_config=model_cfg,
             cache_config=cache_cfg,
@@ -387,12 +474,21 @@ class FlexKVStorage(HostKVStorageBase):
             task_ids=onboard_task_ids,
             uids=torch.tensor(onboard_uids, dtype=torch.int64),
             slot_mappings=onboard_slot_mappings,
+            layer_eventfds=(
+                self._layerwise_eventfd_sender.layer_eventfds(
+                    self.layerwise_counter_id
+                )
+                if self.enable_layerwise and self._layerwise_eventfd_sender is not None
+                else None
+            ),
         )
         onload_task_handle = HostKVTaskHandle(
             backend="flexkv",
             user_ids=onload_handle.uids,
             handle=onload_handle,
             status=HostKVTaskStatus.LAUNCHED,
+            is_layerwise=bool(self.enable_layerwise),
+            onboard_wait_by_layer=self.onboard_kvcache_wait_by_layer,
             metadata={
                 "onboard_start_indices": torch.tensor(
                     onboard_start_indices, dtype=torch.int32
@@ -401,11 +497,25 @@ class FlexKVStorage(HostKVStorageBase):
             },
         )
 
-        use_batch = self.as_batch and len(onboard_task_ids) > 1
+        # Recsys `as_batch` is multi-user GET merging (len>1). FlexKV only
+        # builds LAYERWISE ops inside merge_to_batch_graph, which requires
+        # launch(..., as_batch=True). That is a FlexKV API constraint, not a
+        # Recsys as_batch bug. Force batch for layerwise even on a single GET.
+        use_batch = (self.as_batch and len(onboard_task_ids) > 1) or bool(
+            self.enable_layerwise
+        )
+        launch_kwargs: Dict[str, Any] = {"as_batch": use_batch}
+        if self.enable_layerwise:
+            launch_kwargs.update(
+                {
+                    "layerwise_transfer": True,
+                    "counter_id": self.layerwise_counter_id,
+                }
+            )
         self._client.launch(
             onload_handle.task_ids,
             onload_handle.slot_mappings,
-            as_batch=use_batch,
+            **launch_kwargs,
         )
         return onload_task_handle
 
@@ -444,6 +554,17 @@ class FlexKVStorage(HostKVStorageBase):
                 failed_mask=failed_flag,
                 failed_user_ids=failed_user_ids,
             )
+
+    def onboard_kvcache_wait_by_layer(
+        self, task_handle: HostKVTaskHandle, layer_idx: int
+    ) -> None:
+        if (
+            task_handle is None
+            or task_handle.handle is None
+            or not task_handle.is_layerwise
+        ):
+            return
+        task_handle.handle.wait_layer(layer_idx)
 
     def offload_kvcache_launch(
         self,

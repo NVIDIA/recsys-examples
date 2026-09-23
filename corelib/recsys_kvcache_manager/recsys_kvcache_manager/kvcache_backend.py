@@ -56,6 +56,11 @@ class KVCacheBackend(ABC):
     ) -> Optional[HostKVWaitResult]:
         ...
 
+    def onboard_wait_layer(self, task_handle: Optional[HostKVTaskHandle], layer_idx: int) -> None:
+        if task_handle is None or not task_handle.is_layerwise:
+            return
+        task_handle.wait_layer(layer_idx)
+
     @abstractmethod
     def offload_launch(
         self,

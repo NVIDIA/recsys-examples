@@ -48,6 +48,8 @@ class BenchmarkConfig:
     ssd_pressure_users: int = 0
     ssd_pressure_batch_size: int = 8
     ssd_pressure_batch_sleep_s: float = 1.0
+    flexkv_enable_layerwise: int = 0
+    flexkv_layer_granularity: int = -1
     offload_wait_timeout_s: float = 60.0
     only_onboard: bool = False
 
@@ -184,6 +186,8 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
         "flexkv_as_batch": 1,
         "flexkv_num_cpu_blocks": int(cfg.flexkv_num_cpu_blocks),
         "flexkv_num_local_blocks": int(cfg.flexkv_num_local_blocks),
+        "flexkv_enable_layerwise": int(getattr(cfg, "flexkv_enable_layerwise", 0)),
+        "flexkv_layer_granularity": int(getattr(cfg, "flexkv_layer_granularity", -1)),
     }
     if cfg.flexkv_config_path:
         extra_configs["flexkv_config_path"] = cfg.flexkv_config_path
@@ -643,6 +647,21 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable-cudagraph", action="store_true")
     parser.add_argument("--ablation", type=str, default=None)
+    parser.add_argument(
+        "--layerwise",
+        action="store_true",
+        help="Enable FlexKV layerwise onboard (eventfd wait per original layer).",
+    )
+    parser.add_argument(
+        "--layer-granularity",
+        type=int,
+        default=None,
+        help=(
+            "Recsys SSD DISK2H span size N (also RECSYS_FLEXKV_LAYER_GRANULARITY). "
+            "Works with or without --layerwise. Layerwise default is 1. "
+            "<=0 keeps a whole-KV DISK2H."
+        ),
+    )
     args, _ = parser.parse_known_args()
 
     cfg = BENCHMARK_CONFIG
@@ -665,6 +684,10 @@ if __name__ == "__main__":
         cfg = replace(cfg, ssd_pressure_batch_sleep_s=args.ssd_pressure_batch_sleep_s)
     if args.disable_cudagraph:
         cfg = replace(cfg, disable_cudagraph=True)
+    if args.layerwise:
+        cfg = replace(cfg, flexkv_enable_layerwise=1)
+    if args.layer_granularity is not None:
+        cfg = replace(cfg, flexkv_layer_granularity=args.layer_granularity)
     if args.only_onboard:
         cfg = replace(cfg, only_onboard=True)
     if args.ablation not in (None, "baseline"):

@@ -365,7 +365,12 @@ class PagedHSTUInferLayer(torch.nn.Module):
             )
 
             if not self._export_mode and kv_cache_metadata.kv_onload_handle is not None:
-                kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)
+                handle = kv_cache_metadata.kv_onload_handle
+                if handle.backend == "flexkv":
+                    if handle.is_layerwise:
+                        handle.wait_layer(self.layer_idx)
+                else:
+                    handle.stream_wait_layer(self.layer_idx)
             if self._export_mode:
                 jagged_attn_output = self.hstu_attn_export_impl(
                     query,

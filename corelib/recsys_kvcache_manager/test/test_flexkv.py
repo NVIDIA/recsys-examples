@@ -34,6 +34,15 @@ def create_testing_kvcache_manager() -> KVCacheManager:
         "flexkv_enable_mps": 0,
         "flexkv_as_batch": 1,
     }
+    flexkv_enable_layerwise = os.environ.get("RECSYS_FLEXKV_ENABLE_LAYERWISE", "")
+    if flexkv_enable_layerwise:
+        extra_configs["flexkv_enable_layerwise"] = flexkv_enable_layerwise
+    flexkv_layer_granularity = os.environ.get(
+        "RECSYS_FLEXKV_LAYER_GRANULARITY",
+        os.environ.get("FLEXKV_LAYER_GRANULARITY", ""),
+    )
+    if flexkv_layer_granularity:
+        extra_configs["flexkv_layer_granularity"] = int(flexkv_layer_granularity)
     if flexkv_config_path:
         extra_configs["flexkv_config_path"] = flexkv_config_path
 
