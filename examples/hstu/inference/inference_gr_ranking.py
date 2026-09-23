@@ -159,6 +159,8 @@ def get_inference_hstu_model(
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=num_contextual_features,
+        backbone=network_args.backbone,
+        transformer_ffn_dim=network_args.transformer_ffn_dim,
     )
 
     sm_major = torch.cuda.get_device_capability()[0]
