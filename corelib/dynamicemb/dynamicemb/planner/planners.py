@@ -19,10 +19,8 @@ import warnings
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import torch
 from torch import distributed as dist
 from torch import nn
-from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, ParameterConstraints
 from torchrec.distributed.planner.types import StorageReservation, Topology
@@ -53,10 +51,6 @@ from ..dynamicemb_config import (
     align_to_table_size,
     complete_initializer_args,
 )
-
-HBM_CAP: int = 32 * 1024 * 1024 * 1024
-DDR_CAP: int = 128 * 1024 * 1024 * 1024
-GB: int = 1024 * 1024 * 1024 * 1024
 
 
 @dataclass
@@ -298,18 +292,19 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         self._settled = False
 
         if topology is None:
+            # TorchRec builds one from `None`, and builds it better than this
+            # used to: it passes `pod_size`, which sizes the high-bandwidth
+            # interconnect domain and is what tells a perf model that crossing
+            # a node costs more than staying inside one. Warn anyway -- the
+            # capacities it falls back to are constants, 32GB of HBM and 128GB
+            # of host, and a DynamicEmb table is usually planned against a
+            # machine that is nothing like that.
             warnings.warn(
-                "No topology provided. This may lead to planner raise OOM (Out of Memory) errors, "
-                "as the planner might not have enough information to optimize memory usage. "
-                "Consider providing a TorchREC topology to avoid potential issues.",
+                "No topology provided, so TorchRec's default capacities are "
+                "used: 32GB of HBM and 128GB of host memory per rank. Those are "
+                "constants rather than a measurement, and the DynamicEmb tables "
+                "are sized against them. Pass a Topology describing the machine.",
                 RuntimeWarning,
-            )
-            topology = Topology(
-                local_world_size=get_local_size(),
-                world_size=dist.get_world_size(),
-                compute_device="cuda" if torch.cuda.is_available() else "cpu",
-                hbm_cap=HBM_CAP,
-                ddr_cap=DDR_CAP,
             )
 
         super().__init__(
