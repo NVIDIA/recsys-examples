@@ -61,6 +61,9 @@ class KVCacheBackend(ABC):
             return
         task_handle.wait_layer(layer_idx)
 
+    def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        raise NotImplementedError("prefetch_kvcache is only implemented for FlexKV")
+
     @abstractmethod
     def offload_launch(
         self,

@@ -613,6 +613,15 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     print(f"[Scenario3] timed run completed, iters={timed_iters}")
 
 
+def run_prefetch_online(model, batch, uids, seq, gap_ms: float):
+    kvc_mgr = model.dense_module.kvcache
+    index_meta, _lookup_res = kvc_mgr.lookup_kvcache(uids, seq)
+    kvc_mgr.prefetch_kvcache(index_meta)
+    if gap_ms > 0:
+        time.sleep(gap_ms / 1000.0)
+    return model.forward_with_kvcache(batch, uids, seq)
+
+
 def shutdown_flexkv_client(model_predict) -> None:
     kvcache_mgr = getattr(getattr(model_predict, "dense_module", None), "kvcache", None)
     host_mgr = getattr(kvcache_mgr, "host_kvstorage_manager", None)
@@ -661,6 +670,12 @@ if __name__ == "__main__":
             "Works with or without --layerwise. Layerwise default is 1. "
             "<=0 keeps a whole-KV DISK2H."
         ),
+    )
+    parser.add_argument(
+        "--prefetch-gap-ms",
+        type=float,
+        default=None,
+        help="If set, call prefetch_kvcache then sleep this many ms before GET.",
     )
     args, _ = parser.parse_known_args()
 

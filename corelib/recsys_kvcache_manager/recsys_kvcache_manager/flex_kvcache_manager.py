@@ -566,6 +566,27 @@ class FlexKVStorage(HostKVStorageBase):
             return
         task_handle.handle.wait_layer(layer_idx)
 
+    def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        task_ids = []
+        for token_ids, namespace in zip(index_meta.token_ids, index_meta.namespaces):
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.detach().cpu().contiguous()
+                if token_ids.dtype != torch.int64:
+                    token_ids = token_ids.to(torch.int64)
+                token_ids = token_ids.numpy()
+            task_ids.append(
+                self._client.prefetch_async(
+                    token_ids=token_ids,
+                    namespace=namespace,
+                )
+            )
+        return HostKVTaskHandle(
+            backend="flexkv",
+            user_ids=index_meta.user_ids,
+            handle=task_ids,
+            status=HostKVTaskStatus.LAUNCHED,
+        )
+
     def offload_kvcache_launch(
         self,
         offload_user_ids: torch.Tensor,
