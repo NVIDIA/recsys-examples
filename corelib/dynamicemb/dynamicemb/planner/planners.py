@@ -17,7 +17,7 @@ import copy
 import math
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch import distributed as dist
@@ -25,15 +25,7 @@ from torch import nn
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, ParameterConstraints
-from torchrec.distributed.planner.types import (
-    Enumerator,
-    Partitioner,
-    PerfModel,
-    Proposer,
-    Stats,
-    StorageReservation,
-    Topology,
-)
+from torchrec.distributed.planner.types import StorageReservation, Topology
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.sharding_plan import placement
@@ -228,79 +220,78 @@ def _prepare_dynemb_table_options(
             opts.embedding_dtype = data_type_to_dtype(tmp_config.data_type)
 
 
+def _table_configs(
+    module: nn.Module,
+    sharders: List[ModuleSharder[nn.Module]],
+) -> List[BaseEmbeddingConfig]:
+    """Every shardable table's config, found the way the planner finds tables.
+
+    This is what the ``eb_configs`` argument used to carry. Reading it off the
+    module instead means the caller states their tables once, where they build
+    the collection, rather than again when they build the planner -- and that
+    the two cannot disagree.
+    """
+    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
+    configs: List[BaseEmbeddingConfig] = []
+    queue: List[nn.Module] = [module]
+    while queue:
+        node = queue.pop()
+        if sharder_name(type(node)) in sharder_map:
+            for accessor in ("embedding_bag_configs", "embedding_configs"):
+                if hasattr(node, accessor):
+                    configs.extend(getattr(node, accessor)())
+                    break
+            continue
+        queue.extend(child for _, child in node.named_children())
+    return configs
+
+
 class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
     def __init__(
         self,
-        eb_configs: List[BaseEmbeddingConfig],
         topology: Optional[Topology] = None,
-        batch_size: Optional[int] = None,
-        enumerator: Optional[Enumerator] = None,
-        storage_reservation: Optional[StorageReservation] = None,
-        proposer: Optional[Union[Proposer, List[Proposer]]] = None,
-        partitioner: Optional[Partitioner] = None,
-        performance_model: Optional[PerfModel] = None,
-        stats: Optional[Union[Stats, List[Stats]]] = None,
         constraints: Optional[Dict[str, DynamicEmbParameterConstraints]] = None,
-        debug: bool = True,
+        storage_reservation: Optional[StorageReservation] = None,
+        **kwargs: Any,
     ):
-        """
-        DynamicEmbeddingShardingPlanner wraps the API of EmbeddingShardingPlanner from the Torchrec repo,
-        giving it the ability to plan dynamic embedding tables. The only difference from EmbeddingShardingPlanner
-        is that DynamicEmbeddingShardingPlanner has an additional parameter `eb_configs`, which is a list of
-        TorchREC BaseEmbeddingConfig. Per-rank table options are filled in ``_prepare_dynemb_table_options``
-        (initializer bounds, sharded table capacity via ``_sharded_table_bucket_layout``, and per-rank HBM budget).
+        """A TorchRec planner that also plans DynamicEmb tables.
+
+        Takes what :class:`~torchrec.distributed.planner.planners.EmbeddingShardingPlanner`
+        takes, and nothing else. ``constraints`` is the only argument that means
+        anything more here: a :class:`DynamicEmbParameterConstraints` with
+        ``use_dynamicemb=True`` marks a table as DynamicEmb's, and those tables
+        are settled by :meth:`_settle` rather than handed to TorchRec.
+
+        Arguments other than the three below are forwarded to TorchRec
+        unchanged, so ``callbacks``, ``timeout_seconds``, ``plan_loader`` and
+        whatever else it grows work here too.
 
         Parameters
         ----------
-        eb_configs : List[BaseEmbeddingConfig]
-            A list of TorchREC BaseEmbeddingConfig in the TorchREC model
         topology : Optional[Topology], optional
             The topology of GPU and Host memory. If None, a default topology will be created. Defaults to None.
             The creation and usage are consistent with the same types in TorchREC.
-            Note: The memory budget does not include the consumption of dynamicemb.
-        batch_size : Optional[int], optional
-            The batch size for training. Defaults to None, will set 512 in Planner.
-        enumerator : Optional[Enumerator], optional
-            An enumerator for sharding. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
+            State what the machine has: what the DynamicEmb tables cost is taken
+            out of it at plan time, and TorchRec is given the difference.
+        constraints : Optional[Dict[str, DynamicEmbParameterConstraints]], optional
+            A dictionary of constraints for every TorchREC embedding table and Dynamic embedding table. Defaults to None.
+            Per-table DynamicEmb options are filled in here at plan time
+            (initializer bounds, sharded capacity via ``_sharded_table_bucket_layout``,
+            and the per-rank HBM budget), so the options a caller passes are
+            completed in place rather than copied.
         storage_reservation : Optional[StorageReservation], optional
             Storage reservation details. Defaults to None.
             The creation and usage are consistent with the same types in TorchREC.
-        proposer : Optional[Union[Proposer, List[Proposer]]], optional
-            A proposer or a list of proposers for proposing sharding plans. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        partitioner : Optional[Partitioner], optional
-            A partitioner for partitioning the embedding tables. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        performance_model : Optional[PerfModel], optional
-            A performance model for evaluating sharding plans. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        stats : Optional[Union[Stats, List[Stats]]], optional
-            Statistics or a list of statistics for the sharding process. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        constraints : Optional[Dict[str, DynamicEmbParameterConstraints]], optional
-            A dictionary of constraints for every TorchREC embedding table and Dynamic embedding table. Defaults to None.
-        debug : bool, optional
-            A flag indicating whether to enable debug mode. Defaults to True.
+            It is for what TorchRec reserves for -- dense modules and the input
+            KJT -- and sees a Topology the DynamicEmb tables are already out of.
+        **kwargs
+            Forwarded to ``EmbeddingShardingPlanner``: ``batch_size``,
+            ``enumerator``, ``proposer``, ``partitioner``, ``performance_model``,
+            ``stats``, ``debug``, and the rest.
         """
-
-        _prepare_dynemb_table_options(constraints, eb_configs)
-
-        dyn_emb_table_consts = {
-            key: constraint
-            for key, constraint in constraints.items()
-            if constraint.use_dynamicemb
-        }
-        torchrec_tables_consts = {
-            key: constraint
-            for key, constraint in constraints.items()
-            if not constraint.use_dynamicemb
-        }
-        dyn_emb_table_eb_configs = {
-            config.name: config
-            for config in eb_configs
-            if constraints.get(config.name) and constraints[config.name].use_dynamicemb
-        }
+        self._constraints: Dict[str, DynamicEmbParameterConstraints] = constraints or {}
+        self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
+        self._settled = False
 
         if topology is None:
             warnings.warn(
@@ -309,7 +300,6 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 "Consider providing a TorchREC topology to avoid potential issues.",
                 RuntimeWarning,
             )
-
             topology = Topology(
                 local_world_size=get_local_size(),
                 world_size=dist.get_world_size(),
@@ -317,6 +307,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 hbm_cap=HBM_CAP,
                 ddr_cap=DDR_CAP,
             )
+
         if isinstance(storage_reservation, DynamicEmbStorageReservation):
             # It subtracted the DynamicEmb tables from the budget; `plan` now
             # takes them out of the Topology instead, so leaving it in place
@@ -334,47 +325,74 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
 
         super().__init__(
             topology=topology,
-            batch_size=batch_size,
-            enumerator=enumerator,
+            constraints={
+                name: constraint
+                for name, constraint in self._constraints.items()
+                if not constraint.use_dynamicemb
+            },
             storage_reservation=storage_reservation,
-            proposer=proposer,
-            partitioner=partitioner,
-            performance_model=performance_model,
-            stats=stats,
-            constraints=torchrec_tables_consts,
-            debug=debug,
+            **kwargs,
         )
-        # generate DynamicEmb table's plan
-        compute_device = topology.compute_device
-        local_size = topology.local_world_size
+
+    def _settle(
+        self,
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+    ) -> None:
+        """Decide the DynamicEmb tables, from the module's own table configs.
+
+        Their capacity comes from ``DynamicEmbTableOptions`` and their placement
+        from the key -> rank rule, so this is arithmetic over the constraints
+        rather than a search, and it does not need TorchRec to have planned
+        anything yet.
+
+        It runs on every rank, outside the broadcast in :meth:`collective_plan`,
+        for two reasons. The options it fills in stay on the rank that filled
+        them -- they are the half of a DynamicEmb table that does not cross the
+        wire -- and :meth:`_attach_options` needs them everywhere, while
+        :meth:`_decide` runs on rank 0 alone. What does need one rank's
+        authority is the placement, and that is what the broadcast covers.
+
+        Once per planner: the options are filled in place, and a second pass
+        would re-align already aligned capacities and warn about it.
+        """
+        if self._settled:
+            return
+
+        configs = {
+            config.name: config
+            for config in _table_configs(module, sharders)
+            if self._constraints.get(config.name)
+            and self._constraints[config.name].use_dynamicemb
+        }
+        _prepare_dynemb_table_options(self._constraints, list(configs.values()))
+
+        compute_device = self._topology.compute_device
+        local_size = self._topology.local_world_size
         world_size = dist.get_world_size()
 
-        self._dyn_emb_plan = {}
-        for dyn_emb_name, dynamicemb_constraint in dyn_emb_table_consts.items():
-            opts = dynamicemb_constraint.dynamicemb_options
-            num_embeddings_per_rank = opts.max_capacity
-            embedding_dim = dyn_emb_table_eb_configs[dyn_emb_name].embedding_dim
-
-            tmp_para_sharding = DynamicEmbParameterSharding(
-                sharding_spec=(
-                    EnumerableShardingSpec(
-                        [
-                            ShardMetadata(
-                                shard_sizes=[num_embeddings_per_rank, embedding_dim],
-                                # TODO:0 is we don't have column-wise sharding now
-                                shard_offsets=[num_embeddings_per_rank * i, 0],
-                                placement=placement(compute_device, i, local_size),
-                            )
-                            for i in range(world_size)
-                        ]
-                    )
+        for name, config in configs.items():
+            opts = self._constraints[name].dynamicemb_options
+            rows = opts.max_capacity
+            self._dyn_emb_plan[name] = DynamicEmbParameterSharding(
+                sharding_spec=EnumerableShardingSpec(
+                    [
+                        ShardMetadata(
+                            shard_sizes=[rows, config.embedding_dim],
+                            # TODO:0 is we don't have column-wise sharding now
+                            shard_offsets=[rows * i, 0],
+                            placement=placement(compute_device, i, local_size),
+                        )
+                        for i in range(world_size)
+                    ]
                 ),
                 sharding_type=ShardingType.ROW_WISE.value,
-                ranks=[i for i in range(world_size)],
+                ranks=list(range(world_size)),
                 compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
                 dynamicemb_options=opts,
             )
-            self._dyn_emb_plan[dyn_emb_name] = tmp_para_sharding
+
+        self._settled = True
 
     def plan(
         self,
@@ -395,6 +413,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         ShardingPlan
             One plan covering the DynamicEmb tables and the TorchRec ones.
         """
+        self._settle(module, sharders)
         return self._attach_options(self._decide(module, sharders))
 
     def collective_plan(
@@ -431,6 +450,10 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         ShardingPlan
             The generated sharding plan, identical on every rank.
         """
+        # Every rank settles: the options it fills in are the half of a
+        # DynamicEmb table that stays local, and _attach_options needs them
+        # everywhere. Only the placement needs one rank's authority.
+        self._settle(module, sharders)
         return self._attach_options(
             invoke_on_rank_and_broadcast_result(pg, 0, self._decide, module, sharders)
         )

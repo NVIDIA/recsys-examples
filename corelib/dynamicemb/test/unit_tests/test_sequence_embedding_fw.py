@@ -29,7 +29,6 @@ from dynamicemb import (
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
 )
-from dynamicemb.planner import DynamicEmbStorageReservation
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -141,12 +140,10 @@ def get_planner(args, device, eb_configs):
     )
 
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
         topology=topology,
         constraints=dict_const,
         batch_size=args.batch_size,
         enumerator=enumerator,
-        storage_reservation=DynamicEmbStorageReservation(dict_const),
         debug=True,
     )
 

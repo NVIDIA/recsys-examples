@@ -129,7 +129,6 @@ def get_planner(
         constraints=constraints,
     )
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
         topology=topology,
         constraints=constraints,
         enumerator=enumerator,

@@ -45,7 +45,6 @@ from dynamicemb import (
     EvictedItemMode,
 )
 from dynamicemb.incremental_dump import pop_evicted_keys
-from dynamicemb.planner import DynamicEmbStorageReservation
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -112,12 +111,10 @@ def _get_planner(table_name, eb_config, score_strategy, batch_size, device):
         topology=topology, constraints={table_name: const}
     )
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=[eb_config],
         topology=topology,
         constraints={table_name: const},
         batch_size=batch_size,
         enumerator=enumerator,
-        storage_reservation=DynamicEmbStorageReservation({table_name: const}),
         debug=True,
     )
 

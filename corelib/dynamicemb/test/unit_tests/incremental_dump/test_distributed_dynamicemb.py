@@ -35,7 +35,6 @@ from dynamicemb.incremental_dump import (
     replay_increment,
     set_score,
 )
-from dynamicemb.planner import DynamicEmbStorageReservation
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
@@ -151,12 +150,10 @@ def get_planner(
     )
 
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
         topology=topology,
         constraints=dict_const,
         batch_size=batch_size,
         enumerator=enumerator,
-        storage_reservation=DynamicEmbStorageReservation(dict_const),
         debug=True,
     )
 
