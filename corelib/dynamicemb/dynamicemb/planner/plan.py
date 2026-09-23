@@ -36,6 +36,7 @@ from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torch import nn
 from torchrec.distributed.planner.types import Storage, Topology
 from torchrec.distributed.planner.utils import sharder_name
+from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
 from torchrec.distributed.types import (
     EnumerableShardingSpec,
     ModuleSharder,
@@ -46,6 +47,7 @@ from torchrec.distributed.types import (
 from ..dynamicemb_config import get_local_value_bytes_by_tier
 
 __all__ = [
+    "optimizer_types",
     "shard_rank",
     "per_rank_storage",
     "topology_minus",
@@ -67,6 +69,51 @@ def shard_rank(shard: ShardMetadata) -> int:
     if isinstance(placement, str):
         return int(placement.split("/", 1)[0].removeprefix("rank:"))
     return placement.rank()
+
+
+def optimizer_types(
+    module: nn.Module,
+    sharders: List[ModuleSharder[nn.Module]],
+) -> Dict[str, Optional[OptimType]]:
+    """The optimizer each table trains with, by table name, from either convention.
+
+    TorchRec lets a model say this two ways, and DynamicEmb's own tests use both.
+    `apply_optimizer_in_backward` puts the class on the parameter, which is where
+    TorchRec's estimator reads it (`shard_estimators.py`) and what
+    `optimizer_type_to_emb_opt_type` exists to convert; a sharder's `fused_params`
+    carries the EmbOptimType directly. The parameter wins where both are present,
+    matching `merge_fused_params`.
+
+    A table with neither is reported as ``None``: the caller reserves its rows
+    and nothing for optimizer state, which keeps the reservation a floor rather
+    than a guess.
+    """
+    from_sharders: Optional[OptimType] = None
+    for sharder in sharders:
+        fused_params = getattr(sharder, "fused_params", None) or {}
+        from_sharders = fused_params.get("optimizer", from_sharders)
+
+    per_table: Dict[str, Optional[OptimType]] = {}
+    for param_name, param in module.named_parameters():
+        parts = param_name.split(".")
+        if len(parts) < 2:
+            continue
+        # `embeddings.<table>.weight` for an EC, `embedding_bags.<table>.weight`
+        # for an EBC, either of them arbitrarily nested.
+        table_name = parts[-2]
+        optimizer_classes = getattr(param, "_optimizer_classes", None)
+        if optimizer_classes:
+            try:
+                per_table[table_name] = optimizer_type_to_emb_opt_type(
+                    optimizer_classes[0]
+                )
+                continue
+            except ValueError:
+                # An optimizer TorchRec has no EmbOptimType for -- DynamicEmb's
+                # own FTRL is one -- so fall through to what the sharder says.
+                pass
+        per_table[table_name] = from_sharders
+    return per_table
 
 
 def per_rank_storage(

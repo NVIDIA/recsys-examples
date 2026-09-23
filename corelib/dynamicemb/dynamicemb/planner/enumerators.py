@@ -82,9 +82,9 @@ class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
         which is nominal for a hash table, so anything the estimators cost here
         is a number about a table that does not exist. Its sharding and its
         ranks are decided by ``DynamicEmbeddingShardingPlanner``, which writes
-        the ParameterSharding itself and reports what the tables spend through
-        ``DynamicEmbStorageReservation`` -- so the TorchRec planner sees the
-        memory, and plans the remaining tables into what is left.
+        the ParameterSharding itself and takes what the tables spend out of the
+        Topology -- so the TorchRec planner plans the remaining tables into what
+        is left.
 
         Leaving them in would mean carrying a placeholder through the search
         space with no way to make it honest: sized truthfully it would be

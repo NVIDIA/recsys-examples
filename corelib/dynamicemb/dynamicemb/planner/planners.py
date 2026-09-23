@@ -40,8 +40,12 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
 
-from .plan import module_without_tables, per_rank_storage, topology_minus
-from .storage_reservations import DynamicEmbStorageReservation, _optimizer_types
+from .plan import (
+    module_without_tables,
+    optimizer_types,
+    per_rank_storage,
+    topology_minus,
+)
 from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DynamicEmbTableOptions,
@@ -308,21 +312,6 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 ddr_cap=DDR_CAP,
             )
 
-        if isinstance(storage_reservation, DynamicEmbStorageReservation):
-            # It subtracted the DynamicEmb tables from the budget; `plan` now
-            # takes them out of the Topology instead, so leaving it in place
-            # would charge for them twice. Fall back to the default rather than
-            # refuse: it was the documented way to build this planner.
-            warnings.warn(
-                "DynamicEmbStorageReservation is no longer needed and is being "
-                "ignored: DynamicEmbeddingShardingPlanner now reduces the "
-                "Topology by what the DynamicEmb tables cost. Pass your own "
-                "StorageReservation, or none, for TorchRec's own reservation.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            storage_reservation = None
-
         super().__init__(
             topology=topology,
             constraints={
@@ -485,7 +474,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         reduced_module = module_without_tables(module, table_names, sharders)
         spent = per_rank_storage(
             self._dyn_emb_plan,
-            _optimizer_types(module, sharders),
+            optimizer_types(module, sharders),
             len(self._topology.devices),
         )
 

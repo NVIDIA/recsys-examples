@@ -21,14 +21,12 @@ from .planners import (
     DynamicEmbParameterSharding,
 )
 
-from .storage_reservations import DynamicEmbStorageReservation
 
 # Last: it builds the three above, so they have to exist first.
 from .get_planner import get_planner
 
 __all__ = [
     "DynamicEmbeddingEnumerator",
-    "DynamicEmbStorageReservation",
     "get_planner",
     "DynamicEmbeddingShardingPlanner",
     "DynamicEmbParameterConstraints",
