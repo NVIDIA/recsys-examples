@@ -291,22 +291,6 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
         self._settled = False
 
-        if topology is None:
-            # TorchRec builds one from `None`, and builds it better than this
-            # used to: it passes `pod_size`, which sizes the high-bandwidth
-            # interconnect domain and is what tells a perf model that crossing
-            # a node costs more than staying inside one. Warn anyway -- the
-            # capacities it falls back to are constants, 32GB of HBM and 128GB
-            # of host, and a DynamicEmb table is usually planned against a
-            # machine that is nothing like that.
-            warnings.warn(
-                "No topology provided, so TorchRec's default capacities are "
-                "used: 32GB of HBM and 128GB of host memory per rank. Those are "
-                "constants rather than a measurement, and the DynamicEmb tables "
-                "are sized against them. Pass a Topology describing the machine.",
-                RuntimeWarning,
-            )
-
         super().__init__(
             topology=topology,
             constraints={
