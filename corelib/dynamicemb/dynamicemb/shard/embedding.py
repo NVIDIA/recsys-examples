@@ -120,6 +120,19 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 device=device,
                 qcomm_codecs_registry=qcomm_codecs_registry,
             )
+        elif sharding_type == ShardingType.TABLE_ROW_WISE.value:
+            # Refused rather than fallen through. Table-row-wise is a pooled
+            # arrangement: its saving comes from reducing inside a node before
+            # crossing between them, and a sequence output has nothing to
+            # reduce -- TorchRec's own sequence side has no TwRw sharding
+            # either. Falling through would raise, but somewhere that does not
+            # say why.
+            raise NotImplementedError(
+                f"Table {[i.embedding_config.name for i in sharding_infos]} asks "
+                f"for {sharding_type} in an EmbeddingCollection. DynamicEmb "
+                "supports table-row-wise for pooled tables only "
+                "(EmbeddingBagCollection); use row_wise here."
+            )
         else:
             return super().create_embedding_sharding(
                 sharding_type=sharding_type,

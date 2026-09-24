@@ -1404,6 +1404,35 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         return max(scores)
 
+    def _refuse_if_table_row_wise(self, what: str) -> None:
+        """Table-row-wise tables cannot be checkpointed yet (M4, not M3).
+
+        ``_shard_world_size`` is the whole world, which is the fan-out a
+        row-wise table's keys were spread over and the modulo base the dump and
+        load paths filter with. A table-row-wise table's keys were spread over
+        one node -- ``local_world_size`` ranks -- starting at that node's first
+        rank. Filtering them by the world would keep roughly ``local/world`` of
+        them on each rank and drop the rest in silence, which is the shape of
+        the defect in section 8.1 of the design document.
+
+        So this refuses rather than writes something that cannot be read back.
+        Sections 4.5 to 4.7 are what make the layout carry the ownership triple;
+        until then, row-wise is the shardings that checkpoints.
+        """
+        placed = sorted(
+            name
+            for name, option in zip(self._table_names, self._dynamicemb_options)
+            if getattr(option, "host_index", None) is not None
+        )
+        if placed:
+            raise NotImplementedError(
+                f"{what} is not supported for table-row-wise DynamicEmb tables "
+                f"{placed}. Their keys are spread over one node's ranks, while "
+                "the checkpoint layout records a fan-out over the whole world, "
+                "so what was written could not be read back. Shard them "
+                "row-wise to checkpoint them."
+            )
+
     def dump(
         self,
         save_dir: str,
@@ -1412,6 +1441,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
+        self._refuse_if_table_row_wise("Dumping")
         if table_names is None:
             table_names = self._table_names
 
@@ -1488,6 +1518,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ):
+        self._refuse_if_table_row_wise("Loading")
         if table_names is None:
             table_names = self._table_names
 
@@ -1670,6 +1701,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
           score is not less than the threshold are dumped. This is not a time-based
           increment.
         """
+        self._refuse_if_table_row_wise("Incremental dump")
         from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
             DeltaDumpResult,
         )

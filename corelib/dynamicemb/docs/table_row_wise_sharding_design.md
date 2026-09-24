@@ -538,7 +538,7 @@ every reservation upstream subtracts a uniform quantity. What `_hbm_on_rank`
 needs is which ranks hold which table, and that is exactly what the node
 placement decision of §4.1 produces -- so this lands with §4.1, not after it.
 
-### 4.3 Sharding class
+### 4.3 Sharding class. Done (M3).
 
 New `TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding)` in
 `shard/twrw_sharding.py`, overriding exactly two methods, mirroring what
@@ -555,7 +555,21 @@ New `TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding)` in
 
 Dispatch in `shard/embeddingbag.py:62` gains a `TABLE_ROW_WISE` branch.
 
-### 4.4 Input dist: a new full-data permute
+**Shipped as written.** `shard/twrw_sharding.py` overrides exactly those two
+methods, and the dispatch branch is one `elif`. `GroupedPooledEmbeddingsLookup`
+is reused unchanged from the row-wise module -- it only overrides
+`_create_embedding_kernel`, which is sharding-type agnostic.
+
+`create_lookup` passes `sharding_type=TABLE_ROW_WISE`, which is not decoration:
+it is what downgrades MEAN to SUM in the kernel (§3.1). Passing `ROW_WISE` would
+be arithmetically identical today and wrong the moment TorchRec separates them.
+
+`shard/embedding.py` **refuses** `TABLE_ROW_WISE` rather than letting it fall
+through to `super()` (§4.8): a sequence output has nothing to reduce inside a
+node, so the arrangement has no meaning there, and TorchRec's own sequence side
+has no TwRw sharding to fall through to.
+
+### 4.4 Input dist: a full-data permute, inherited. Done (M3).
 
 DynamicEmb's `RwSparseFeaturesDist` (`shard/input_dist.py:175`) has no equivalent of
 TorchRec's `_staggered_shuffle` (`twrw_sharding.py:439`), because RW's a2a splits
@@ -569,6 +583,17 @@ the a2a itself takes `stagger=world_size // local_size`.
 
 This permute is **new work RW does not do**: a gather over the whole value
 tensor, every step. See §6.
+
+**It did not have to be written.** TorchRec's `TwRwSparseFeaturesDist` already
+computes `_sf_staggered_shuffle` in its constructor and applies it between the
+bucketize and the a2a, so DynamicEmb's subclass overrides `forward` for the one
+call that differs -- the bucketizer -- exactly as the row-wise one does, and
+inherits the shuffle.
+
+That is not a lucky accident: the shuffle is arithmetic over *feature counts*,
+not over keys, so it is correct whatever the bucketizer did with the values.
+§3.4 listed it under "must be written"; that was wrong. What is real is the
+cost, which §6 R2 already records: we pay for the gather, we just do not own it.
 
 ### 4.5 Checkpoint layout
 
@@ -961,7 +986,7 @@ checked that the orders agreed.
 | ~~**M0**~~ | **Done.** §8.1-§8.4, one ownership function (§4.6) with all six call sites on it, a 2-GPU `hash_roundrobin` dump/load test, and the planner cleanup that came with it: the copied `enumerate` and filters handed back to TorchRec, and the budget in §6 R1b. | Shipped on its own merit, as intended |
 | ~~**M1**~~ | ~~Measure R1 as a go/no-go~~ **Cancelled.** Customer demand for TWRW is strong enough that it ships regardless of the R1 outcome. The measurement still has value as *sizing* input for §4.2 and for the `host_index` guidance in §10.3 -- it is folded into M5, not a gate. |  |
 | ~~**M2**~~ | **Done.** Placement + capacity (§4.1, §4.2). Nodes are chosen by a `HostPlacer` component, with `host_index` surviving as a pin. Plan is TRW-shaped; nothing consumes it yet -- `shard/embeddingbag.py` still dispatches only ROW_WISE, so a TRW table reaches TorchRec's own TwRw sharding and will not work. M3 is what makes it run. | `table_fanout` / `table_layout` / `BalancedHostPlacer` unit tests; plan inspection still owed |
-| **M3** | `TwRwPooledDynamicEmbeddingSharding` + staggered-shuffle input dist (§4.3, §4.4). **TRW tables reject dump/load/incremental-dump with a clear error** | Numerical parity vs RW on a small model |
+| ~~**M3**~~ | **Written, unrun.** `TwRwPooledDynamicEmbeddingSharding` + the input dist (§4.3, §4.4); the staggered shuffle turned out to be inherited. TRW tables reject dump / load / incremental-dump with a clear error, and `EmbeddingCollection` refuses TRW outright. | Numerical parity vs RW on a small model -- **still owed, and the gate M3 does not pass without** |
 | **M4** | Checkpoint (§4.5), ownership under TRW (§4.6), incremental dump (§4.7) | Dump→load round-trip across TRW |
 | **M5** | Perf validation: R2, R3 measured against the cross-node saving | Beat RW on the target topology, or stop |
 

@@ -386,10 +386,16 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             sharding_type = _sharding_type_of(constraint)
             rows = opts.max_capacity
 
+            # Written back rather than only used here: downstream reads the
+            # options, not the plan, so a table the HostPlacer placed would
+            # otherwise look unplaced. Every rank ran the same placement, so
+            # every rank writes the same thing.
+            opts.host_index = hosts.get(name)
+
             # Row-wise is every rank; table-row-wise is one node's ranks. The
             # shard metadata follows, so there are `local_size` entries for a
             # TRW table rather than `world_size` (§4.1).
-            ranks = table_layout(sharding_type, hosts.get(name), world_size, local_size)
+            ranks = table_layout(sharding_type, opts.host_index, world_size, local_size)
 
             self._dyn_emb_plan[name] = DynamicEmbParameterSharding(
                 sharding_spec=EnumerableShardingSpec(
