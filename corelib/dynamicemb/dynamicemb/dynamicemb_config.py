@@ -554,6 +554,19 @@ class DynamicEmbTableOptions:
         Input distribution policy for row-wise sharding. Supported values are
         ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
         ``roundrobin``.
+    host_index : Optional[int], optional
+        Pins this table to a node, under ``TABLE_ROW_WISE`` sharding. Leave it
+        unset -- the default -- and the planner's
+        :class:`~dynamicemb.planner.placement.HostPlacer` chooses, packing the
+        table-row-wise tables across nodes by what they weigh. Set it only to
+        override that.
+
+        Nodes are numbered ``0 .. world_size // local_world_size - 1``, and the
+        table lands on that node's ``local_world_size`` ranks. Mirrors TorchREC's
+        ``table_row_wise(host_index=...)``.
+
+        Meaningless under row-wise sharding, and refused rather than ignored
+        there: a row-wise table is on every rank, so there is no node to name.
     admit_strategy : Optional[AdmissionStrategy], optional
         Admission strategy for controlling which keys are allowed to enter the embedding table.
         If provided, only keys that meet the strategy's criteria will be inserted into the table.
@@ -600,6 +613,7 @@ class DynamicEmbTableOptions:
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
     dist_type: str = "roundrobin"
+    host_index: Optional[int] = None
     admit_strategy: Optional[AdmissionStrategy] = None
 
     admission_counter: Optional[Any] = None

@@ -41,6 +41,7 @@ from torchrec.distributed.types import (
     EnumerableShardingSpec,
     ModuleSharder,
     ParameterSharding,
+    ShardingType,
     ShardMetadata,
 )
 
@@ -52,6 +53,8 @@ __all__ = [
     "per_rank_storage",
     "topology_minus",
     "module_without_tables",
+    "table_fanout",
+    "table_layout",
 ]
 
 
@@ -290,3 +293,80 @@ def module_without_tables(
         return copied
 
     return prune(module)
+
+
+def table_fanout(sharding_type: str, world_size: int, local_size: int) -> int:
+    """How many pieces a table's rows are split into.
+
+    ``world_size`` for row-wise, which sits on every rank; ``local_size`` for
+    table-row-wise, which sits on one node. This is what a table's per-rank
+    capacity and HBM budget are divided by, and what the bucketizer distributes
+    keys over.
+
+    It does not depend on *which* node a table-row-wise table lands on, only on
+    how big a node is -- so capacity can be settled before placement is, and an
+    automatic placer can size a table before it decides where to put it.
+
+    Raises:
+        ValueError: an unsupported sharding type, or a world that does not
+            divide into whole nodes.
+    """
+    if sharding_type == ShardingType.ROW_WISE.value:
+        return world_size
+    if sharding_type != ShardingType.TABLE_ROW_WISE.value:
+        raise ValueError(
+            f"DynamicEmb tables support {ShardingType.ROW_WISE.value} and "
+            f"{ShardingType.TABLE_ROW_WISE.value}, not {sharding_type!r}."
+        )
+    if local_size <= 0 or world_size % local_size:
+        raise ValueError(
+            f"A world of {world_size} does not divide into nodes of {local_size}, "
+            f"so {ShardingType.TABLE_ROW_WISE.value} has no node to place a table on."
+        )
+    return local_size
+
+
+def table_layout(
+    sharding_type: str,
+    host_index: Optional[int],
+    world_size: int,
+    local_size: int,
+) -> List[int]:
+    """The ranks a DynamicEmb table's shards sit on, in shard order.
+
+    Row-wise puts a shard on every rank, so the answer is every rank and
+    ``host_index`` means nothing -- there is no node to name when the table is on
+    all of them. Table-row-wise puts the table on one node, so the answer is that
+    node's ranks and ``host_index`` says which node.
+
+    The length is :func:`table_fanout`.
+
+    Raises:
+        ValueError: whatever :func:`table_fanout` raises, or a ``host_index``
+            that is missing, out of range, or set on a row-wise table.
+    """
+    fanout = table_fanout(sharding_type, world_size, local_size)
+
+    if sharding_type == ShardingType.ROW_WISE.value:
+        if host_index is not None:
+            raise ValueError(
+                f"host_index={host_index} was set on a {sharding_type} table. It "
+                "says which node holds a table, and a row-wise table is on every "
+                "rank of every node."
+            )
+        return list(range(world_size))
+
+    num_nodes = world_size // fanout
+    if host_index is None:
+        raise ValueError(
+            f"A {sharding_type} table needs a host_index saying which of the "
+            f"{num_nodes} nodes holds it. Set DynamicEmbTableOptions.host_index, "
+            "or leave it unset and let the planner's host placer choose."
+        )
+    if not 0 <= host_index < num_nodes:
+        raise ValueError(
+            f"host_index={host_index} is outside the {num_nodes} nodes of a world "
+            f"of {world_size} with {local_size} ranks each."
+        )
+    base = host_index * fanout
+    return list(range(base, base + fanout))

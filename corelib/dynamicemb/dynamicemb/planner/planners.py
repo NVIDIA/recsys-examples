@@ -23,7 +23,7 @@ from torch import distributed as dist
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, ParameterConstraints
-from torchrec.distributed.planner.types import StorageReservation, Topology
+from torchrec.distributed.planner.types import Storage, StorageReservation, Topology
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.sharding_plan import placement
@@ -38,15 +38,19 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to_dtype
 
+from .placement import BalancedHostPlacer, HostPlacer, TableToPlace
 from .plan import (
     module_without_tables,
     optimizer_types,
     per_rank_storage,
+    table_fanout,
+    table_layout,
     topology_minus,
 )
 from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DynamicEmbTableOptions,
+    get_local_value_bytes_by_tier,
     _sharded_table_bucket_layout,
     align_to_table_size,
     complete_initializer_args,
@@ -127,11 +131,35 @@ class DynamicEmbParameterSharding(ParameterSharding):
             fused_params.pop(name, None)
 
 
+def _sharding_type_of(constraint: DynamicEmbParameterConstraints) -> str:
+    """The sharding type a DynamicEmb table is declared with.
+
+    Read off ``ParameterConstraints.sharding_types``, the field TorchRec already
+    has for this, rather than a DynamicEmb-only one. A DynamicEmb table is not
+    searched over, so the list has to name exactly one.
+    """
+    declared = constraint.sharding_types
+    if not declared:
+        return ShardingType.ROW_WISE.value
+    if len(declared) != 1:
+        raise ValueError(
+            f"A DynamicEmb table is placed, not searched for, so it needs exactly "
+            f"one sharding type; got {declared}."
+        )
+    return declared[0]
+
+
 def _prepare_dynemb_table_options(
     constraints: Dict[str, DynamicEmbParameterConstraints],
     eb_configs: List[BaseEmbeddingConfig],
+    world_size: int,
+    local_size: int,
 ):
     """Check ``constraints`` ↔ ``eb_configs`` naming, then fill per-table DynamicEmb options.
+
+    ``world_size`` and ``local_size`` are passed rather than read from ``dist``
+    so that the capacity a table is sized for and the ranks it is placed on come
+    from one statement of the machine, the planner's Topology.
 
     For each DynamicEmb table: ``complete_initializer_args`` -- the only place
     that still knows ``num_embeddings``, which an unbounded UNIFORM needs, since
@@ -143,7 +171,6 @@ def _prepare_dynemb_table_options(
     ``init_capacity`` exceeds ``max_capacity``, clamp it to ``max_capacity``; if ``init_capacity``
     was unset, set it to ``max_capacity``; set ``dim`` from ``BaseEmbeddingConfig.embedding_dim``.
     """
-    world_size = dist.get_world_size()
     if constraints is None or eb_configs is None:
         raise ValueError("Constraints and eb_configs must not be None")
 
@@ -179,15 +206,20 @@ def _prepare_dynemb_table_options(
             opts.initializer_args,
             embedding_config=tmp_config,
         )
+        # The divisor is how many pieces the table's rows are split into, which
+        # is the world under row-wise and one node under table-row-wise -- so it
+        # is per table, not global (§4.2). It does not depend on *which* node,
+        # which is why a table can be sized before it is placed.
+        fanout = table_fanout(_sharding_type_of(tmp_constraint), world_size, local_size)
         num_buckets, effective_bucket_capacity = _sharded_table_bucket_layout(
             tmp_config,
-            world_size,
+            fanout,
             opts.bucket_capacity,
         )
         opts.bucket_capacity = effective_bucket_capacity
         aligned_per_rank_rows = num_buckets * effective_bucket_capacity
         opts.max_capacity = aligned_per_rank_rows
-        opts.local_hbm_for_values = math.ceil(opts.global_hbm_for_values / world_size)
+        opts.local_hbm_for_values = math.ceil(opts.global_hbm_for_values / fanout)
 
         if opts.init_capacity is not None:
             aligned_init = align_to_table_size(
@@ -250,6 +282,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         topology: Optional[Topology] = None,
         constraints: Optional[Dict[str, DynamicEmbParameterConstraints]] = None,
         storage_reservation: Optional[StorageReservation] = None,
+        host_placer: Optional[HostPlacer] = None,
         **kwargs: Any,
     ):
         """A TorchRec planner that also plans DynamicEmb tables.
@@ -290,6 +323,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         self._constraints: Dict[str, DynamicEmbParameterConstraints] = constraints or {}
         self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
         self._planned_dynamicemb = False
+        self._host_placer: HostPlacer = host_placer or BalancedHostPlacer()
 
         super().__init__(
             topology=topology,
@@ -333,15 +367,30 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             if self._constraints.get(config.name)
             and self._constraints[config.name].use_dynamicemb
         }
-        _prepare_dynemb_table_options(self._constraints, list(configs.values()))
-
-        compute_device = self._topology.compute_device
+        # One source for both, so what a table's capacity is divided by and what
+        # its shards are placed on cannot disagree. The Topology is the planner's
+        # statement of the machine; `dist` would be a second opinion (F11).
+        world_size = self._topology.world_size
         local_size = self._topology.local_world_size
-        world_size = dist.get_world_size()
+
+        _prepare_dynemb_table_options(
+            self._constraints, list(configs.values()), world_size, local_size
+        )
+
+        hosts = self._choose_hosts(configs, module, sharders, world_size, local_size)
+        compute_device = self._topology.compute_device
 
         for name, config in configs.items():
-            opts = self._constraints[name].dynamicemb_options
+            constraint = self._constraints[name]
+            opts = constraint.dynamicemb_options
+            sharding_type = _sharding_type_of(constraint)
             rows = opts.max_capacity
+
+            # Row-wise is every rank; table-row-wise is one node's ranks. The
+            # shard metadata follows, so there are `local_size` entries for a
+            # TRW table rather than `world_size` (§4.1).
+            ranks = table_layout(sharding_type, hosts.get(name), world_size, local_size)
+
             self._dyn_emb_plan[name] = DynamicEmbParameterSharding(
                 sharding_spec=EnumerableShardingSpec(
                     [
@@ -349,18 +398,78 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                             shard_sizes=[rows, config.embedding_dim],
                             # TODO:0 is we don't have column-wise sharding now
                             shard_offsets=[rows * i, 0],
-                            placement=placement(compute_device, i, local_size),
+                            placement=placement(compute_device, rank, local_size),
                         )
-                        for i in range(world_size)
+                        for i, rank in enumerate(ranks)
                     ]
                 ),
-                sharding_type=ShardingType.ROW_WISE.value,
-                ranks=list(range(world_size)),
+                sharding_type=sharding_type,
+                ranks=ranks,
                 compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
                 dynamicemb_options=opts,
             )
 
         self._planned_dynamicemb = True
+
+    def _choose_hosts(
+        self,
+        configs: Dict[str, BaseEmbeddingConfig],
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+        world_size: int,
+        local_size: int,
+    ) -> Dict[str, Optional[int]]:
+        """Which node each table-row-wise table lands on.
+
+        Row-wise tables get ``None``: they are on every rank, so there is no
+        node to name, and `table_layout` refuses one.
+
+        The work goes to a :class:`~dynamicemb.planner.placement.HostPlacer`,
+        which the caller can replace. What this does is prepare its inputs --
+        what each table costs a rank, and what the row-wise tables have already
+        taken from every rank, so the placer is fitting into the room that will
+        actually be there rather than into an empty machine.
+
+        `host_index` is passed through as a pin rather than acted on here, so a
+        caller who has named some nodes and left others to the placer gets both,
+        and the placer can fit the rest around what it was told.
+        """
+        optimizers = optimizer_types(module, sharders)
+        by_type: Dict[str, List[str]] = {}
+        for name in configs:
+            by_type.setdefault(_sharding_type_of(self._constraints[name]), []).append(
+                name
+            )
+
+        trw = by_type.get(ShardingType.TABLE_ROW_WISE.value, [])
+        if not trw:
+            return {}
+
+        def rank_cost(name: str) -> Storage:
+            hbm, ddr = get_local_value_bytes_by_tier(
+                self._constraints[name].dynamicemb_options, optimizers.get(name)
+            )
+            return Storage(hbm=hbm, ddr=ddr, ssd=0)
+
+        # The row-wise tables are on every rank, so they shift no choice between
+        # nodes -- but they do decide whether a table-row-wise one still fits.
+        committed = [Storage(hbm=0, ddr=0, ssd=0) for _ in range(world_size)]
+        for name in by_type.get(ShardingType.ROW_WISE.value, []):
+            cost = rank_cost(name)
+            committed = [spent + cost for spent in committed]
+
+        return self._host_placer.place(
+            [
+                TableToPlace(
+                    name=name,
+                    cost=rank_cost(name),
+                    pinned=self._constraints[name].dynamicemb_options.host_index,
+                )
+                for name in sorted(trw)
+            ],
+            self._topology,
+            committed,
+        )
 
     def plan(
         self,

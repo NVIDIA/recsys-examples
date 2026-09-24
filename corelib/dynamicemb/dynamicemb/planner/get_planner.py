@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import torch
 import torch.distributed as dist
@@ -52,6 +52,10 @@ def get_planner(
     data_parallel_embedding_table_names: Set[str],
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
     device: torch.device,
+    # Which DynamicEmb tables go on a single node each. Which node is chosen by
+    # the planner's HostPlacer; name one here by setting host_index on the
+    # table's options, which pins it.
+    table_row_wise_embedding_table_names: Optional[Set[str]] = None,
     pipeline_type: str = "none",
     # Host memory of one node, not one rank: Topology keeps ddr per rank and
     # this is divided by the local world size below. A terabyte is a
@@ -76,16 +80,20 @@ def get_planner(
                 compute_kernels=compute_kernel_type,
             )
         elif config.name in dynamicemb_options_dict:
-            # No compute_kernels, and no sharding_types worth arguing over:
-            # a DynamicEmb table never reaches TorchRec's search space. The
-            # planner takes it out of the module before handing the rest over,
-            # and writes its ParameterSharding itself, CUSTOMIZED_KERNEL
-            # included. What is left here that matters is `use_dynamicemb`,
-            # which is how the planner tells the two kinds of table apart, and
-            # `dynamicemb_options`, which is the table.
+            # No compute_kernels: a DynamicEmb table never reaches TorchRec's
+            # search space. The planner takes it out of the module before
+            # handing the rest over, and writes its ParameterSharding itself,
+            # CUSTOMIZED_KERNEL included. `sharding_types` still names one,
+            # because the planner reads it back to decide the table's placement
+            # and the divisor its capacity is sized by -- it is a statement, not
+            # a search space.
             dynamicemb_options = dynamicemb_options_dict[config.name]
             constraint = DynamicEmbParameterConstraints(
-                sharding_types=[ShardingType.ROW_WISE.value],
+                sharding_types=[
+                    ShardingType.TABLE_ROW_WISE.value
+                    if config.name in (table_row_wise_embedding_table_names or ())
+                    else ShardingType.ROW_WISE.value
+                ],
                 bounds_check_mode=BoundsCheckMode.NONE,  # dynamic embedding has no bounding!
                 enforce_hbm=True,
                 use_dynamicemb=True,

@@ -137,7 +137,35 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
 | 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
-| 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / world_size)`** so each rank gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). |
+| 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). |
+
+**The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
+
+**Asking for `TABLE_ROW_WISE`.** Through `get_planner`, list the table in `table_row_wise_embedding_table_names`. Constructing constraints yourself, name it in `sharding_types`:
+
+    DynamicEmbParameterConstraints(
+        sharding_types=[ShardingType.TABLE_ROW_WISE.value],
+        use_dynamicemb=True,
+        dynamicemb_options=DynamicEmbTableOptions(...),
+    )
+
+**Which node it lands on is chosen for you.** The planner packs the table-row-wise tables across nodes by what they weigh, fitting them into the room the row-wise tables leave behind. You do not have to say.
+
+To override, set **`host_index`** on `DynamicEmbTableOptions` to a node numbered `0 .. world_size // local_world_size - 1`. It is a pin, not a requirement: pinned tables are placed first and the rest are fitted around them, so you can name the nodes you care about and leave the others alone. Setting it on a row-wise table is an error rather than ignored — such a table is on every rank, so there is no node to name.
+
+To replace the rule, pass a `HostPlacer` to the planner:
+
+    from dynamicemb.planner import BalancedHostPlacer, HostPlacer, TableToPlace
+
+    class MyPlacer(HostPlacer):
+        def place(self, tables, topology, committed) -> Dict[str, int]:
+            ...   # {table name: host index}, deterministic on every rank
+
+    DynamicEmbeddingShardingPlanner(topology=..., constraints=..., host_placer=MyPlacer())
+
+`BalancedHostPlacer` is the default: largest table first onto the emptiest node, measured against the tightest rank of a node rather than the node's total, because a table-row-wise table charges every rank of its node the same.
+
+**Not usable yet.** The plan comes out `TABLE_ROW_WISE`-shaped, but nothing consumes it — the sharding runtime still dispatches only `ROW_WISE`.
 
 **User-supplied values that should be set before planning** (typical DMP path) include at least:
 

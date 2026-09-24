@@ -41,6 +41,7 @@ from dynamicemb.planner.plan import (
     module_without_tables,
     per_rank_storage,
     shard_rank,
+    table_layout,
     topology_minus,
 )
 from dynamicemb.planner.planners import DynamicEmbParameterSharding
@@ -269,3 +270,65 @@ def test_nothing_is_copied_when_nothing_is_removed():
     model = _Model(_ebc(["a"]))
     assert module_without_tables(model, set(), _sharders()) is model
     assert module_without_tables(model, {"absent"}, _sharders()) is model
+
+
+# --- table_layout: which ranks hold a table, and what its rows divide by ----
+
+WORLD, LOCAL = 8, 4  # two nodes of four
+RW = ShardingType.ROW_WISE.value
+TRW = ShardingType.TABLE_ROW_WISE.value
+
+
+def test_row_wise_is_every_rank():
+    assert table_layout(RW, None, WORLD, LOCAL) == list(range(WORLD))
+
+
+def test_table_row_wise_is_one_node():
+    assert table_layout(TRW, 0, WORLD, LOCAL) == [0, 1, 2, 3]
+    assert table_layout(TRW, 1, WORLD, LOCAL) == [4, 5, 6, 7]
+
+
+def test_the_length_is_the_fanout():
+    """What the length means, and why §4.2 needs it per table: a row-wise
+    table's rows are split `world_size` ways, a TRW table's `local_size`."""
+    assert len(table_layout(RW, None, WORLD, LOCAL)) == WORLD
+    assert len(table_layout(TRW, 1, WORLD, LOCAL)) == LOCAL
+
+
+def test_host_index_on_a_row_wise_table_is_an_error():
+    """Not ignored. A row-wise table is on every rank, so naming a node for it
+    means the caller expected something the plan will not do."""
+    with pytest.raises(ValueError, match="on every rank of every node"):
+        table_layout(RW, 0, WORLD, LOCAL)
+
+
+def test_table_row_wise_without_a_host_index_is_an_error():
+    with pytest.raises(ValueError, match="needs a host_index"):
+        table_layout(TRW, None, WORLD, LOCAL)
+
+
+def test_host_index_past_the_last_node_is_an_error():
+    with pytest.raises(ValueError, match="outside the 2 nodes"):
+        table_layout(TRW, 2, WORLD, LOCAL)
+
+
+def test_a_world_that_is_not_whole_nodes_is_an_error():
+    with pytest.raises(ValueError, match="does not divide into nodes"):
+        table_layout(TRW, 0, 7, LOCAL)
+
+
+def test_an_unsupported_sharding_type_is_an_error():
+    with pytest.raises(ValueError, match="not 'column_wise'"):
+        table_layout(ShardingType.COLUMN_WISE.value, None, WORLD, LOCAL)
+
+
+def test_a_table_row_wise_table_only_costs_its_own_node():
+    """§4.1 and §4.2 meeting §2: the placement decides who pays, and
+    per_rank_storage reads it off the shard metadata."""
+    ranks = table_layout(TRW, 1, WORLD, LOCAL)
+    sharding = _sharding(ranks)
+    spent = per_rank_storage(
+        {"t": sharding}, optimizer_types={"t": None}, world_size=WORLD
+    )
+    assert all(s == Storage(0, 0, 0) for s in spent[:LOCAL])
+    assert all(s.ddr > 0 for s in spent[LOCAL:])
