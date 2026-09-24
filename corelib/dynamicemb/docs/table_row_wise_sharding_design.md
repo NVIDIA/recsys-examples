@@ -391,17 +391,43 @@ a2a overlap with the TBE backward.
 
 ### 3.4 What this leaves DynamicEmb to do
 
+*Confirmed against the implementation in M3. Two entries were wrong when this
+was written, and both were wrong in the same direction: they counted as new work
+something TorchRec already does. Both are corrected below with the reason,
+because the reason generalises -- **anything parameterized by a count rather
+than by a key is already ours to reuse**, and that covers more of TWRW than it
+looks like it should.*
+
 **Reusable as-is:** the staggered shuffle, `KJTAllToAll`'s stagger/recat, both
 output collectives, the entire backward, and the gradient-division accounting.
 All of it lives in TorchRec and is not DynamicEmb-aware.
 
-**Must be replaced (two methods):** `create_input_dist`, to use DynamicEmb's
-bucketizer with `num_buckets = L`; and `create_lookup`, to reach
-`BatchedDynamicEmbeddingBag`. The CUDA bucketizer itself needs no change (§4.3).
+**Must be replaced (two methods, and it really is two):** `create_input_dist`,
+to use DynamicEmb's bucketizer with `num_buckets = L`; and `create_lookup`, to
+reach `BatchedDynamicEmbeddingBag`. `shard/twrw_sharding.py` overrides those and
+nothing else.
 
-**Must be written:** the staggered shuffle. DynamicEmb's `RwSparseFeaturesDist`
-has no equivalent, and it is not optional — without it the a2a splits do not
-line up (§4.4).
+**~~Must be written: the staggered shuffle.~~ It did not have to be.** This
+contradicted the first entry above, and the first entry was the right one.
+`TwRwSparseFeaturesDist` computes `_sf_staggered_shuffle` in its constructor and
+applies it between the bucketize and the a2a, so overriding `forward` for the one
+call that differs inherits it.
+
+The reason it is inheritable: the shuffle is arithmetic over **feature counts**,
+not over keys. It reorders `[bucket][all features]` into
+`[node][bucket][that node's features]`, which depends on how many features each
+node holds and on nothing the bucketizer did to the values. DynamicEmb changes
+where a *key* goes; it does not change how many features there are.
+
+What was right about the entry is the cost, which §6 R2 records: the permute is a
+gather over the whole value tensor every step, and row-wise does not pay it. We
+pay for it without owning it.
+
+**The CUDA bucketizer needs no change either, and for a related reason.** It is
+parameterized by `my_size`, so passing `local_size` where `world_size` used to go
+is the whole change; and `roundrobin` / `hash_roundrobin` already leave the key
+global (`new_idx = idx`), so there is no row-index arithmetic in it that a node's
+worth of rows would invalidate. `src/` is untouched by this project.
 
 **Must be passed correctly:** `sharding_type=TABLE_ROW_WISE`, for the MEAN→SUM
 downgrade in §3.1.
@@ -584,16 +610,9 @@ the a2a itself takes `stagger=world_size // local_size`.
 This permute is **new work RW does not do**: a gather over the whole value
 tensor, every step. See §6.
 
-**It did not have to be written.** TorchRec's `TwRwSparseFeaturesDist` already
-computes `_sf_staggered_shuffle` in its constructor and applies it between the
-bucketize and the a2a, so DynamicEmb's subclass overrides `forward` for the one
-call that differs -- the bucketizer -- exactly as the row-wise one does, and
-inherits the shuffle.
-
-That is not a lucky accident: the shuffle is arithmetic over *feature counts*,
-not over keys, so it is correct whatever the bucketizer did with the values.
-§3.4 listed it under "must be written"; that was wrong. What is real is the
-cost, which §6 R2 already records: we pay for the gather, we just do not own it.
+**It did not have to be written** -- TorchRec's `TwRwSparseFeaturesDist` already
+does it, and §3.4 says why it is inheritable. What is real is the cost, which §6
+R2 records: we pay for the gather without owning it.
 
 ### 4.5 Checkpoint layout
 
@@ -737,20 +756,23 @@ key -> rank rule now lives in `key_ownership.py`.
 
 | File | Change | Size |
 |---|---|---|
-| `dynamicemb_config.py` | `host_index` (or equivalent) in `DynamicEmbTableOptions`; `_sharded_table_bucket_layout` takes a per-table divisor | S |
-| `planner/planners.py` | TRW branch in `_settle`; per-table capacity divisor; ordering of `_prepare_dynemb_table_options` | M |
-| `planner/plan.py` | none required -- `per_rank_storage` is already per rank, and reads the shard metadata `_settle` writes | -- |
-| `shard/twrw_sharding.py` | **new** -- `TwRwPooledDynamicEmbeddingSharding` | M |
-| `shard/embeddingbag.py` | dispatch TRW | S |
-| `shard/input_dist.py` | `TwRwSparseFeaturesDist` with the staggered shuffle | M |
-| `key_ownership.py` | the rule takes a shard base, not only a fan-out | S |
-| `batched_dynamicemb_tables.py` | shard-index file naming; `find_files` reads meta | M |
-| `incremental_dump.py` | meta carries the ownership triple | S |
+| `dynamicemb_config.py` | `host_index` in `DynamicEmbTableOptions`. Done (M2). `_sharded_table_bucket_layout` needed no change -- it already takes the divisor as an argument; what changed is who computes it (`table_fanout`) | S |
+| `planner/planners.py` | TRW branch in `_plan_dynamicemb`; per-table capacity divisor. Done (M2). The ordering worry did not arise -- see §4.2 | M |
+| `planner/plan.py` | **new in M2** -- `table_fanout`, `table_layout`. `per_rank_storage` needed no change: already per rank, and reads the shard metadata `_plan_dynamicemb` writes | S |
+| `planner/placement.py` | **new in M2** -- `HostPlacer`, `BalancedHostPlacer` | S |
+| `shard/twrw_sharding.py` | **new** -- `TwRwPooledDynamicEmbeddingSharding` and `TwRwSparseFeaturesDist`. Done (M3): 169 lines of code, two overridden methods and one overridden `forward` | S |
+| `shard/embeddingbag.py` | dispatch TRW. Done (M3): one `elif` | S |
+| `shard/embedding.py` | refuse TRW. Done (M3) -- §4.8 | S |
+| `shard/input_dist.py` | none required -- the staggered shuffle is inherited, see §3.4 | -- |
+| `key_ownership.py` | the rule takes a shard base, not only a fan-out. **M4** -- until then the four checkpoint entry points refuse a TRW table | S |
+| `batched_dynamicemb_tables.py` | shard-index file naming; `find_files` reads meta. **M4**. M3 added the refusal (`_refuse_if_table_row_wise`, four entry points) | M |
+| `incremental_dump.py` | meta carries the ownership triple. **M4** | S |
 | `src/sparse_block_bucketize_features.cu` | none required | -- |
 
-The CUDA bucketizer needs **no change**: it is already parameterized by
-`my_size`, and `roundrobin` / `hash_roundrobin` already preserve the global key
-(`new_idx = idx`). Passing `local_size` is enough.
+The CUDA bucketizer needs **no change**, confirmed in M3: it is already
+parameterized by `my_size`, and `roundrobin` / `hash_roundrobin` already preserve
+the global key (`new_idx = idx`). Passing `local_size` is enough, and `src/` is
+untouched by this project.
 
 ---
 
