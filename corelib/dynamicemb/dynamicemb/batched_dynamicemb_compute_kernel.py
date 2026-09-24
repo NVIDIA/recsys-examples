@@ -54,6 +54,14 @@ def pooling_mode_to_dynamicemb(pooling: PoolingMode) -> DynamicEmbPoolingMode:
         raise Exception(f"Invalid pooling type {pooling}")
 
 
+def _placement_rank(placement) -> int:
+    if placement is None:
+        raise ValueError("Shard metadata without a placement has no rank.")
+    if isinstance(placement, str):
+        return int(placement.split("/", 1)[0].removeprefix("rank:"))
+    return placement.rank()
+
+
 def get_state_dict(
     embedding_tables: List[ShardedEmbeddingTable],
     params: Union[
@@ -96,8 +104,17 @@ def get_state_dict(
 
             local_metadatas = deepcopy(embedding_table.global_metadata.shards_metadata)
 
-            world_size = pg.size()
-            assert world_size == len(local_metadatas)
+            # One placeholder shard per shard of the table, not per rank of pg:
+            # a table-row-wise table has local_world_size shards on one node's
+            # ranks while pg is still the world.
+            num_shards = len(local_metadatas)
+            shard_ranks = [_placement_rank(md.placement) for md in local_metadatas]
+            if pg.rank() not in shard_ranks:
+                raise RuntimeError(
+                    f"Rank {pg.rank()} holds no shard of table {embedding_table.name} "
+                    f"(shards on ranks {shard_ranks}) but was asked for its state."
+                )
+            my_shard = shard_ranks.index(pg.rank())
             for i, local_metadata in enumerate(local_metadatas):
                 local_metadata.shard_offsets = [i, 0]
                 local_metadata.shard_sizes = [1, 1]
@@ -106,7 +123,7 @@ def get_state_dict(
                 shards_metadata=local_metadatas,
                 size=torch.Size(
                     [
-                        world_size,
+                        num_shards,
                         1,
                     ]
                 ),
@@ -121,7 +138,7 @@ def get_state_dict(
                 #  `Union[Module, Tensor]`.
                 # pyre-fixme[6]: For 2nd argument expected `ShardMetadata` but got
                 #  `Optional[ShardMetadata]`.
-                Shard(param, local_metadatas[pg.rank()])
+                Shard(param, local_metadatas[my_shard])
             )
         else:
             destination[key] = param
