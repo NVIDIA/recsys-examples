@@ -1896,6 +1896,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 though the metadata matched. Unlike the checks above this fires
                 mid-write, so the table may hold a partial replay.
         """
+        self._refuse_if_table_row_wise("Replaying an increment")
         storage = self._storage
         if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
             raise TypeError(
