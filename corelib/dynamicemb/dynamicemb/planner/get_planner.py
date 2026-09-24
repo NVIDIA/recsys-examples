@@ -24,7 +24,6 @@ from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 
 from ..dynamicemb_config import DynamicEmbTableOptions
-from .enumerators import DynamicEmbeddingEnumerator
 from .planners import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )
@@ -77,11 +76,13 @@ def get_planner(
                 compute_kernels=compute_kernel_type,
             )
         elif config.name in dynamicemb_options_dict:
-            # No compute_kernels: a DynamicEmb table's kernel is not something
-            # to search over. DynamicEmbeddingEnumerator._filter_compute_kernels
-            # pins it to one placeholder so the table stays in the search space,
-            # and DynamicEmbeddingShardingPlanner then replaces the whole
-            # ParameterSharding, CUSTOMIZED_KERNEL included.
+            # No compute_kernels, and no sharding_types worth arguing over:
+            # a DynamicEmb table never reaches TorchRec's search space. The
+            # planner takes it out of the module before handing the rest over,
+            # and writes its ParameterSharding itself, CUSTOMIZED_KERNEL
+            # included. What is left here that matters is `use_dynamicemb`,
+            # which is how the planner tells the two kinds of table apart, and
+            # `dynamicemb_options`, which is the table.
             dynamicemb_options = dynamicemb_options_dict[config.name]
             constraint = DynamicEmbParameterConstraints(
                 sharding_types=[ShardingType.ROW_WISE.value],
@@ -124,14 +125,9 @@ def get_planner(
         intra_host_bw=intra_host_bw,
         inter_host_bw=inter_host_bw,
     )
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=constraints,
-    )
     return DynamicEmbeddingShardingPlanner(
         topology=topology,
         constraints=constraints,
-        enumerator=enumerator,
         # No storage_reservation: the planner takes the DynamicEmb tables out of
         # the Topology itself, and TorchRec's default reservation then covers
         # what it is for -- the dense modules and the input KJT.

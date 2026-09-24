@@ -46,7 +46,6 @@ from dynamicemb import (
 )
 from dynamicemb.incremental_dump import pop_evicted_keys
 from dynamicemb.planner import (
-    DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
@@ -107,14 +106,10 @@ def _get_planner(table_name, eb_config, score_strategy, batch_size, device):
         intra_host_bw=platform.intra_host_bw,
         inter_host_bw=platform.inter_host_bw,
     )
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology, constraints={table_name: const}
-    )
     return DynamicEmbeddingShardingPlanner(
         topology=topology,
         constraints={table_name: const},
         batch_size=batch_size,
-        enumerator=enumerator,
         debug=True,
     )
 

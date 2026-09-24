@@ -30,7 +30,6 @@ from dynamicemb import (
     get_table_value_bytes,
 )
 from dynamicemb.planner import (
-    DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
@@ -150,16 +149,10 @@ def get_planner(args, device, eb_configs):
             inter_host_bw=args.inter_host_bw,
         )
 
-        enumerator = DynamicEmbeddingEnumerator(
-            topology=topology,
-            constraints=dict_const,
-        )
-
         return DynamicEmbeddingShardingPlanner(
             topology=topology,
             constraints=dict_const,
             batch_size=args.batch_size,
-            enumerator=enumerator,
             debug=True,
         )
     else:
@@ -188,16 +181,10 @@ def get_planner(args, device, eb_configs):
                 inter_host_bw=args.inter_host_bw,
             )
 
-            enumerator = DynamicEmbeddingEnumerator(
-                topology=topology,
-                constraints=dict_const,
-            )
-
         return DynamicEmbeddingShardingPlanner(
             topology=topology,
             constraints=dict_const,
             batch_size=args.batch_size,
-            enumerator=enumerator,
             debug=True,
         )
 

@@ -14,7 +14,6 @@
 # limitations under the License.
 
 
-from .enumerators import DynamicEmbeddingEnumerator
 from .planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -26,7 +25,6 @@ from .planners import (
 from .get_planner import get_planner
 
 __all__ = [
-    "DynamicEmbeddingEnumerator",
     "get_planner",
     "DynamicEmbeddingShardingPlanner",
     "DynamicEmbParameterConstraints",

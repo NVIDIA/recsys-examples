@@ -36,7 +36,6 @@ from dynamicemb.incremental_dump import (
     set_score,
 )
 from dynamicemb.planner import (
-    DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
@@ -144,16 +143,10 @@ def get_planner(
         intra_host_bw=platform.intra_host_bw,
         inter_host_bw=platform.inter_host_bw,
     )
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=dict_const,
-    )
-
     return DynamicEmbeddingShardingPlanner(
         topology=topology,
         constraints=dict_const,
         batch_size=batch_size,
-        enumerator=enumerator,
         debug=True,
     )
 

@@ -28,7 +28,6 @@ from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.key_value_table import Storage
 from dynamicemb.planner import (
-    DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
@@ -187,16 +186,10 @@ def get_planner(
         intra_host_bw=platform.intra_host_bw,
         inter_host_bw=platform.inter_host_bw,
     )
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=dict_const,
-    )
-
     return DynamicEmbeddingShardingPlanner(
         topology=topology,
         constraints=dict_const,
         batch_size=batch_size,
-        enumerator=enumerator,
         debug=True,
     )
 

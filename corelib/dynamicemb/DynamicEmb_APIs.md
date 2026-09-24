@@ -5,7 +5,6 @@ This document consists of two parts, one is the introduction to the API, which c
 
 ## APIs
 - [DynamicEmbParameterConstraints](#dynamicembparameterconstraints)
-- [DynamicEmbeddingEnumerator](#dynamicembeddingenumerator)
 - [DynamicEmbeddingShardingPlanner](#dynamicembeddingshardingplanner)
 - [Sharding planner](#sharding-planner)
 - [DynamicEmbeddingCollectionSharder](#dynamicembeddingcollectionsharder)
@@ -52,46 +51,13 @@ The `DynamicEmbParameterConstraints` function inherits from TorchREC's `Paramete
 
     ```
 
-## DynamicEmbeddingEnumerator
-
-The `DynamicEmbeddingEnumerator` function inherits from TorchREC's `EmbeddingEnumerator` function and its usage is exactly the same as `EmbeddingEnumerator`. This class differentiates between TorchREC's embedding tables and dynamic embedding tables during enumeration in the sharding plan.
-
-    ```python
-    #How to import
-    from dynamicemb.planner import DynamicEmbeddingEnumerator
-
-    #API arguments
-    class DynamicEmbeddingEnumerator(EmbeddingEnumerator):
-    def __init__(
-        self,
-        topology: Topology,
-        batch_size: Optional[int] = BATCH_SIZE,
-        constraints: Optional[Dict[str, DynamicEmbParameterConstraints]] = None,
-        estimator: Optional[Union[ShardEstimator, List[ShardEstimator]]] = None,
-    ) -> None:
-        """
-        DynamicEmbeddingEnumerator extends the EmbeddingEnumerator to handle dynamic embedding tables.
-
-        Parameters
-        ----------
-        topology : Topology
-            The topology of the GPU and Host memory.
-        batch_size : Optional[int], optional
-            The batch size for training. Defaults to BATCH_SIZE.
-            The creation and usage are consistent with the same types in TorchREC.
-        constraints : Optional[Dict[str, DynamicEmbParameterConstraints]], optional
-            A dictionary of constraints for the parameters. Defaults to None.
-        estimator : Optional[Union[ShardEstimator, List[ShardEstimator]]], optional
-            An estimator or a list of estimators for estimating shard sizes. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        """
-    ```
-
 ## DynamicEmbeddingShardingPlanner
 
-Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic embedding tables. Unlike `EmbeddingShardingPlanner`, it requires an additional `eb_configs` argument so DynamicEmb can derive per-rank capacities and bucket widths from the global `EmbeddingConfig` and the process-group world size.
+A subclass of TorchREC's `EmbeddingShardingPlanner` that also plans dynamic embedding tables. It takes the same arguments and nothing more; a table is DynamicEmb's when its `DynamicEmbParameterConstraints` has `use_dynamicemb=True`.
 
-On construction it runs the internal preparation step described under [Sharding planner](#sharding-planner), then builds the TorchREC sub-planner and DynamicEmb shard metadata as before.
+Planning happens in two steps. The DynamicEmb tables are settled first -- their capacity comes from `DynamicEmbTableOptions` and their placement from the key-to-rank rule, so there is nothing to search -- and what they cost is taken out of the `Topology` per rank. TorchRec then plans the rest of the model, on a copy of the module with those tables removed, inside the memory that is left. The two halves are returned as one `ShardingPlan`.
+
+The table configs come from the module at plan time, so there is no `eb_configs` argument: state the tables once, where the collection is built. `collective_plan` decides on rank 0 and broadcasts, as TorchREC's own planner does; the per-table options are reattached from each rank's own constraints afterwards, since `external_storage` and `score_function` are local to the process that made them.
 
 For row-wise DynamicEmb sharding, the supported `dist_type` values are:
 
@@ -106,63 +72,43 @@ For row-wise DynamicEmb sharding, the supported `dist_type` values are:
     from dynamicemb.planner import DynamicEmbeddingShardingPlanner
 
     #API arguments
-    class DynamicEmbeddingShardingPlanner:
+    class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
     def __init__(self,
-        eb_configs: List[BaseEmbeddingConfig],
         topology: Optional[Topology] = None,
-        batch_size: Optional[int] = None,
-        enumerator: Optional[Enumerator] = None,
-        storage_reservation: Optional[StorageReservation] = None,
-        proposer: Optional[Union[Proposer, List[Proposer]]] = None,
-        partitioner: Optional[Partitioner] = None,
-        performance_model: Optional[PerfModel] = None,
-        stats: Optional[Union[Stats, List[Stats]]] = None,
         constraints: Optional[Dict[str, DynamicEmbParameterConstraints]] = None,
-        debug: bool = True):
+        storage_reservation: Optional[StorageReservation] = None,
+        **kwargs):
 
         """
-        DynamicEmbeddingShardingPlanner wraps EmbeddingShardingPlanner and adds `eb_configs` (TorchREC
-        table configs) so per-rank DynamicEmb options can be filled before planning. See the
-        "Sharding planner" section in DynamicEmb_APIs.md for how `DynamicEmbTableOptions` are adjusted.
+        A TorchRec planner that also plans DynamicEmb tables.
+
+        Takes what EmbeddingShardingPlanner takes, and nothing else. Only the three
+        arguments below mean anything different here; the rest -- batch_size,
+        enumerator, proposer, partitioner, performance_model, stats, debug,
+        callbacks, timeout_seconds, plan_loader -- are forwarded unchanged.
 
         Parameters
         ----------
-        eb_configs : List[BaseEmbeddingConfig]
-            A list of TorchREC BaseEmbeddingConfig in the TorchREC model
         topology : Optional[Topology], optional
-            The topology of GPU and Host memory. If None, a default topology will be created. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-            Note: The memory budget does not include the consumption of dynamicemb.
-        batch_size : Optional[int], optional
-            The batch size for training. Defaults to None, will set 512 in Planner.
-        enumerator : Optional[Enumerator], optional
-            An enumerator for sharding. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
+            The topology of GPU and Host memory. If None, TorchREC builds a default.
+            State what the machine has: what the DynamicEmb tables cost is taken out
+            of it at plan time, and TorchRec is given the difference.
+        constraints : Optional[Dict[str, DynamicEmbParameterConstraints]], optional
+            A dictionary of constraints for every TorchREC embedding table and Dynamic
+            embedding table. A constraint with `use_dynamicemb=True` marks the table as
+            DynamicEmb's. Per-table DynamicEmb options are filled in here at plan time,
+            so the options a caller passes are completed in place rather than copied.
         storage_reservation : Optional[StorageReservation], optional
             Storage reservation details. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        proposer : Optional[Union[Proposer, List[Proposer]]], optional
-            A proposer or a list of proposers for proposing sharding plans. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        partitioner : Optional[Partitioner], optional
-            A partitioner for partitioning the embedding tables. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        performance_model : Optional[PerfModel], optional
-            A performance model for evaluating sharding plans. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        stats : Optional[Union[Stats, List[Stats]]], optional
-            Statistics or a list of statistics for the sharding process. Defaults to None.
-            The creation and usage are consistent with the same types in TorchREC.
-        constraints : Optional[Dict[str, DynamicEmbParameterConstraints]], optional
-            A dictionary of constraints for every TorchREC embedding table and Dynamic embedding table. Defaults to None.
-        debug : bool, optional
-            A flag indicating whether to enable debug mode. Defaults to True.
+            The creation and usage are consistent with the same types in TorchREC. It is
+            for what TorchRec reserves for -- dense modules and the input KJT -- and
+            sees a Topology the DynamicEmb tables are already out of.
         """
     ```
 
 ## Sharding planner
 
-When you construct `DynamicEmbeddingShardingPlanner`, the implementation first validates that `constraints` and `eb_configs` are consistent (every `EmbeddingCollection` / table name appears exactly once in `eb_configs`, matches the keys of `constraints`, and there are no extra keys). Then, **for each table with** `DynamicEmbParameterConstraints.use_dynamicemb == True`, it updates that table’s `DynamicEmbTableOptions` in **`dynamicemb_options`** via the internal routine `_prepare_dynemb_table_options` (order matters):
+At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the module and validates that they and `constraints` are consistent (every table name appears exactly once, matches the keys of `constraints`, and there are no extra keys). Then, **for each table with** `DynamicEmbParameterConstraints.use_dynamicemb == True`, it updates that table’s `DynamicEmbTableOptions` in **`dynamicemb_options`** via the internal routine `_prepare_dynemb_table_options` (order matters):
 
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
