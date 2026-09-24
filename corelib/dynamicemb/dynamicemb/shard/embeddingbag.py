@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
+from torch import nn
 from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     EmbeddingShardingContext,
@@ -43,6 +44,23 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
     supported_compute_kernels: List[str] = [
         kernel.value for kernel in EmbeddingComputeKernel
     ] + [DynamicEmbKernel]
+
+    def _initialize_torch_state(self, *args: Any, **kwargs: Any) -> None:
+        super()._initialize_torch_state(*args, **kwargs)
+        # TorchRec registers an empty weight for shards a rank does not hold but
+        # skips CUSTOMIZED_KERNEL tables; a table-row-wise DynamicEmb table lives
+        # on one node, so the other nodes' ranks need that placeholder too, or
+        # reset_parameters and state_dict find no weight to touch.
+        for table_name, parameter_sharding in self.module_sharding_plan.items():
+            if (
+                parameter_sharding.compute_kernel
+                != EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+            ):
+                continue
+            if not hasattr(self.embedding_bags[table_name], "weight"):
+                self.embedding_bags[table_name].register_parameter(
+                    "weight", nn.Parameter(torch.empty(0, device=self._device))
+                )
 
     @classmethod
     def create_embedding_bag_sharding(
