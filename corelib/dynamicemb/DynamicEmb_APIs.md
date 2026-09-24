@@ -110,25 +110,24 @@ For row-wise DynamicEmb sharding, the supported `dist_type` values are:
 
 ### What happens when you call it
 
-`plan` and `collective_plan` are the same three phases:
+`DynamicEmbeddingShardingPlanner` inherits from TorchREC's `EmbeddingShardingPlanner`. Internally it plans in four steps:
 
-```
-settle  ->  decide  ->  attach
-```
+1. **Plan the DynamicEmb tables**, producing a `ParameterSharding` for each.
+2. **Modify the planner's `Topology`** to deduct what those tables cost.
+3. **Plan the remaining tables** — TorchREC's own planning, over the memory that is left.
+4. **Assemble both halves** into one `ShardingPlan`.
 
-**Settle** — on every rank, once per planner. Reads the table configs off the module, fills each DynamicEmb table's `DynamicEmbTableOptions` in place (the table below), and builds one `DynamicEmbParameterSharding` per table: `ROW_WISE`, one shard per rank of `[max_capacity, embedding_dim]`, placement by rank. Nothing is searched — a DynamicEmb table's capacity comes from its options and its placement from the key-to-rank rule.
+**Step 1.** The table configs are read off the module, each DynamicEmb table's `DynamicEmbTableOptions` are filled in place (the table below), and one `ParameterSharding` is written per table: `ROW_WISE`, one shard per rank of `[max_capacity, embedding_dim]`, placement by rank. Nothing is searched — a DynamicEmb table's capacity comes from its options and its placement from the key-to-rank rule.
 
-**Decide** — under `collective_plan`, on rank 0 only.
+**Step 2.** What each rank spends on those tables is worked out from the shard metadata written in step 1, including optimizer state (read from the sharders' `fused_params` or the parameters' `_optimizer_classes`), and taken out of the `Topology` per rank. Your `Topology` is not modified — say what the machine has, and the planner hands TorchREC the difference.
 
-1. A copy of the module is made with the DynamicEmb tables removed. Only the modules on the path to a pruned collection are copied; your module is not touched, and the tree keeps its shape so the plan's paths stay yours.
-2. What those tables cost each rank is worked out from the shard metadata settled above, including optimizer state (read from the sharders' `fused_params` or the parameters' `_optimizer_classes`).
-3. That cost comes out of the `Topology`, per rank.
-4. TorchRec plans the rest of the model, on the reduced module, inside the reduced `Topology`. Your `storage_reservation`, `enumerator`, `proposer`, `partitioner` and `stats` all apply here, unchanged.
-5. The DynamicEmb entries are added back to the plan under the paths they live at in your module.
+**Step 3.** TorchREC plans the rest of the model, on a copy of your module with the DynamicEmb tables removed. Only the modules on the path to a pruned collection are copied, so your module is not touched, and the tree keeps its shape so the plan's paths stay yours. Your `storage_reservation`, `enumerator`, `proposer`, `partitioner` and `stats` all apply here, unchanged.
 
-**Attach** — on every rank. Reattaches this rank's `DynamicEmbTableOptions`. The decisions are broadcast from rank 0; the options are not, because `external_storage` is a live handle and `score_function` a callable, both local to the process that made them.
+**Step 4.** The DynamicEmb entries are added back to the plan under the paths they live at in your module, and the result is returned as one `ShardingPlan`.
 
-So: the DynamicEmb tables never enter TorchRec's search space, their memory is accounted for before TorchRec plans anything, and every rank gets the same placement decisions.
+Under `collective_plan`, step 1 runs on every rank and steps 2–4 on rank 0, whose result is broadcast — as TorchREC's own planner does. The per-table options are reattached from each rank's own constraints afterwards rather than sent, because `external_storage` is a live handle and `score_function` a callable, both local to the process that made them.
+
+So: the DynamicEmb tables never enter TorchREC's search space, their memory is accounted for before TorchREC plans anything, and every rank gets the same placement decisions.
 
 ### What the planner writes into your options
 

@@ -258,7 +258,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         takes, and nothing else. ``constraints`` is the only argument that means
         anything more here: a :class:`DynamicEmbParameterConstraints` with
         ``use_dynamicemb=True`` marks a table as DynamicEmb's, and those tables
-        are settled by :meth:`_settle` rather than handed to TorchRec.
+        are planned by :meth:`_plan_dynamicemb` rather than handed to TorchRec.
 
         Arguments other than the three below are forwarded to TorchRec
         unchanged, so ``callbacks``, ``timeout_seconds``, ``plan_loader`` and
@@ -289,7 +289,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         """
         self._constraints: Dict[str, DynamicEmbParameterConstraints] = constraints or {}
         self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
-        self._settled = False
+        self._planned_dynamicemb = False
 
         super().__init__(
             topology=topology,
@@ -302,12 +302,12 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             **kwargs,
         )
 
-    def _settle(
+    def _plan_dynamicemb(
         self,
         module: nn.Module,
         sharders: List[ModuleSharder[nn.Module]],
     ) -> None:
-        """Decide the DynamicEmb tables, from the module's own table configs.
+        """Step 1: plan the DynamicEmb tables, from the module's own table configs.
 
         Their capacity comes from ``DynamicEmbTableOptions`` and their placement
         from the key -> rank rule, so this is arithmetic over the constraints
@@ -318,13 +318,13 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         for two reasons. The options it fills in stay on the rank that filled
         them -- they are the half of a DynamicEmb table that does not cross the
         wire -- and :meth:`_attach_options` needs them everywhere, while
-        :meth:`_decide` runs on rank 0 alone. What does need one rank's
+        :meth:`_plan_torchrec` runs on rank 0 alone. What does need one rank's
         authority is the placement, and that is what the broadcast covers.
 
         Once per planner: the options are filled in place, and a second pass
         would re-align already aligned capacities and warn about it.
         """
-        if self._settled:
+        if self._planned_dynamicemb:
             return
 
         configs = {
@@ -360,7 +360,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 dynamicemb_options=opts,
             )
 
-        self._settled = True
+        self._planned_dynamicemb = True
 
     def plan(
         self,
@@ -381,8 +381,8 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         ShardingPlan
             One plan covering the DynamicEmb tables and the TorchRec ones.
         """
-        self._settle(module, sharders)
-        return self._attach_options(self._decide(module, sharders))
+        self._plan_dynamicemb(module, sharders)
+        return self._attach_options(self._plan_torchrec(module, sharders))
 
     def collective_plan(
         self,
@@ -418,52 +418,66 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         ShardingPlan
             The generated sharding plan, identical on every rank.
         """
-        # Every rank settles: the options it fills in are the half of a
+        # Step 1 runs on every rank: the options it fills in are the half of a
         # DynamicEmb table that stays local, and _attach_options needs them
         # everywhere. Only the placement needs one rank's authority.
-        self._settle(module, sharders)
+        self._plan_dynamicemb(module, sharders)
         return self._attach_options(
-            invoke_on_rank_and_broadcast_result(pg, 0, self._decide, module, sharders)
+            invoke_on_rank_and_broadcast_result(
+                pg, 0, self._plan_torchrec, module, sharders
+            )
         )
 
-    def _decide(
+    def _plan_torchrec(
         self,
         module: nn.Module,
         sharders: List[ModuleSharder[nn.Module]],
     ) -> ShardingPlan:
-        """Both halves of the plan, with the per-table options left off.
+        """Steps 2 to 4: deduct, plan the rest, assemble.
 
-        In order: the DynamicEmb tables are already settled (``__init__`` did
-        that -- their capacity comes from their options and their placement from
-        the key -> rank rule, so there is nothing to search); what they cost
-        comes out of the Topology; TorchRec plans what is left of the model
-        inside what is left of the memory; the two halves are put back together.
+        By the time this runs, :meth:`_plan_dynamicemb` has produced a
+        ParameterSharding for each DynamicEmb table, so:
 
-        The Topology is swapped rather than passed, because the enumerator and
+        2. what they cost is taken out of this planner's Topology, per rank;
+        3. TorchRec plans the remaining tables inside what is left, on a copy of
+           the module those tables have been taken out of;
+        4. both halves are assembled into one ShardingPlan.
+
+        The Topology is assigned rather than passed, because the enumerator and
         the estimators were built against ``self._topology`` in ``__init__``.
         They read it for bandwidths and device type, not for the budget -- the
         budget is the Topology that ``reserve`` returns, which is derived from
-        this one -- so the swap reaches the decision that depends on it.
+        this one -- so assigning it reaches the decision that depends on it. It
+        is put back afterwards: the caller's Topology says what the machine has,
+        and a second `plan` call has to start from that again rather than from a
+        machine that already looks spent.
 
-        ``_insert_dynamicemb_plan`` gets the caller's module, not the reduced
-        one: the reduced one no longer admits to having these tables, which is
-        the whole point of it, so it cannot say what path they live under.
+        Step 4 walks the caller's module, not the reduced one: the reduced one
+        no longer admits to having these tables, which is the whole point of it,
+        so it cannot say what path they live under.
+
+        The per-table options are left off what goes on the plan; see
+        :meth:`collective_plan`.
         """
-        table_names = set(self._dyn_emb_plan)
-        reduced_module = module_without_tables(module, table_names, sharders)
+        # 2. deduct what the DynamicEmb tables spend from the budget
         spent = per_rank_storage(
             self._dyn_emb_plan,
             optimizer_types(module, sharders),
             len(self._topology.devices),
         )
-
         whole_topology = self._topology
         try:
             self._topology = topology_minus(whole_topology, spent)
+
+            # 3. TorchRec plans the tables that are left, in the memory that is left
+            reduced_module = module_without_tables(
+                module, set(self._dyn_emb_plan), sharders
+            )
             torchrec_plan = super().plan(reduced_module, sharders)
         finally:
             self._topology = whole_topology
 
+        # 4. assemble
         self._insert_dynamicemb_plan(torchrec_plan, module, sharders)
         return torchrec_plan
 

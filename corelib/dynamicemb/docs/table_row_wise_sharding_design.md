@@ -50,71 +50,75 @@ output     (inherited) torchrec RwPooledEmbeddingDist -- reduce-scatter
 
 ### 2.1 How the planner works now
 
-`DynamicEmbeddingShardingPlanner` subclasses `EmbeddingShardingPlanner`. Both of
-its entry points are the same three phases:
+`DynamicEmbeddingShardingPlanner` subclasses TorchRec's
+`EmbeddingShardingPlanner`, and plans in four steps:
 
-```
-settle  ->  decide  ->  attach
-```
+1. **Plan the DynamicEmb tables**, producing a `ParameterSharding` for each.
+2. **Modify the planner's Topology** to deduct what those tables cost.
+3. **Plan the remaining tables** -- TorchRec's own planning, over what is left.
+4. **Assemble both halves** into one `ShardingPlan`.
 
 ```python
 def plan(self, module, sharders):                  # one rank
-    self._settle(module, sharders)
-    return self._attach_options(self._decide(module, sharders))
+    self._plan_dynamicemb(module, sharders)                       # 1
+    return self._attach_options(self._plan_torchrec(module, sharders))   # 2-4
 
 def collective_plan(self, module, sharders, pg):   # all of them
-    self._settle(module, sharders)                 # every rank
-    plan = invoke_on_rank_and_broadcast_result(pg, 0, self._decide, module, sharders)
-    return self._attach_options(plan)              # every rank
+    self._plan_dynamicemb(module, sharders)                       # 1, every rank
+    plan = invoke_on_rank_and_broadcast_result(
+        pg, 0, self._plan_torchrec, module, sharders               # 2-4, rank 0
+    )
+    return self._attach_options(plan)                              # every rank
 ```
 
-**`__init__` splits the constraints and does nothing else.** The base is handed
-only the TorchRec half. There is no module and no sharders yet, so nothing that
-depends on the optimizer can be computed here -- which is why the other two
-phases exist.
+`__init__` splits the constraints and does nothing else: the base is handed only
+the TorchRec half. There is no module and no sharders yet, so nothing that
+depends on the optimizer can be computed there.
 
-**`_settle`, on every rank, once per planner.** It reads the table configs off
-the module (`_table_configs`, which is what the `eb_configs` argument used to
-carry), fills each DynamicEmb table's options in place
-(`_prepare_dynemb_table_options`: initializer bounds, `max_capacity` via
-`_sharded_table_bucket_layout`, `local_hbm_for_values`, `dim`, `index_type`,
-`embedding_dtype`), and builds one `DynamicEmbParameterSharding` per table --
-`ROW_WISE`, `world_size` shards of `[max_capacity, dim]`, placement by rank.
+**Step 1 -- `_plan_dynamicemb`.** Reads the table configs off the module
+(`_table_configs`, which is what the `eb_configs` argument used to carry), fills
+each DynamicEmb table's options in place (`_prepare_dynemb_table_options`:
+initializer bounds, `max_capacity` via `_sharded_table_bucket_layout`,
+`local_hbm_for_values`, `dim`, `index_type`, `embedding_dtype`), and writes one
+`DynamicEmbParameterSharding` per table -- `ROW_WISE`, `world_size` shards of
+`[max_capacity, dim]`, placement by rank. Nothing is searched: capacity comes
+from the options and placement from the key -> rank rule.
 
-It runs outside the broadcast because the options it fills are the half of a
-DynamicEmb table that does not travel -- `external_storage` is a live handle and
-`score_function` a callable -- and `_attach_options` needs them everywhere.
+It runs once per planner, and on every rank rather than inside the broadcast,
+because the options it fills are the half of a DynamicEmb table that does not
+travel -- `external_storage` is a live handle, `score_function` a callable --
+and step 4's reattachment needs them everywhere.
 
-**`_decide`, on rank 0 alone under `collective_plan`.**
+**Steps 2 to 4 -- `_plan_torchrec`,** on rank 0 alone under `collective_plan`:
 
 ```python
-reduced_module = module_without_tables(module, table_names, sharders)   # 1
 spent = per_rank_storage(self._dyn_emb_plan, optimizer_types(...), n)   # 2
 try:
-    self._topology = topology_minus(whole_topology, spent)              # 3
-    torchrec_plan = super().plan(reduced_module, sharders)              # 4
+    self._topology = topology_minus(whole_topology, spent)              # 2
+    reduced_module = module_without_tables(module, table_names, sharders)
+    torchrec_plan = super().plan(reduced_module, sharders)              # 3
 finally:
     self._topology = whole_topology
-self._insert_dynamicemb_plan(torchrec_plan, module, sharders)           # 5
+self._insert_dynamicemb_plan(torchrec_plan, module, sharders)           # 4
 ```
 
-1. Only the modules on the path to a pruned collection are copied, and the
-   collection keeps its type and its shape, so the plan's paths are the caller's
-   paths -- which is what `ShardingPlan` is keyed by.
-2. Optimizer types come from the sharders' `fused_params` or the parameters'
-   `_optimizer_classes`, and each shard's cost is charged to the rank it sits
-   on. Row-wise makes those equal; TRW will not (§4.2).
-3. `self._topology` is swapped rather than passed, because the enumerator and
-   the estimators were built against it in `__init__`.
-4. TorchRec plans what is left of the model inside what is left of the memory,
-   with the caller's own `storage_reservation` still doing what it does.
-5. The walk is over the *caller's* module: the pruned one no longer admits to
-   having these tables, so it cannot say what path they live under. What goes on
-   the plan is a copy with the options off and the shard metadata deep-copied
-   (F10).
-
-**`_attach_options`, on every rank.** Puts this rank's options back. The
-decisions travel; the configuration does not.
+- **2.** Optimizer types come from the sharders' `fused_params` or the
+  parameters' `_optimizer_classes`, and each shard's cost is charged to the rank
+  it sits on. Row-wise makes those equal; TRW will not (§4.2). `self._topology`
+  is assigned rather than passed, because the enumerator and the estimators were
+  built against it in `__init__`; it is restored afterwards, so a second `plan`
+  call starts from what the machine has rather than from what the first one left.
+- **3.** TorchRec plans the rest of the model, on a copy of the module with the
+  DynamicEmb tables taken out. Only the modules on the path to a pruned
+  collection are copied, and the collection keeps its type and its shape, so the
+  plan's paths are the caller's paths -- which is what `ShardingPlan` is keyed
+  by. The caller's `storage_reservation`, `enumerator`, `proposer`, `partitioner`
+  and `stats` all apply here, unchanged.
+- **4.** The walk is over the *caller's* module: the reduced one no longer admits
+  to having these tables, so it cannot say what path they live under. What goes
+  on the plan is a copy with the options off and the shard metadata deep-copied
+  (F10). `_attach_options` then puts this rank's options back -- the decisions
+  are broadcast, the configuration is not.
 
 Three consequences worth stating plainly, because the rest of this document
 assumed the older arrangement in places:
@@ -125,6 +129,8 @@ assumed the older arrangement in places:
   rank. Under TRW that is what lets `_cohost_partition` avoid a node DynamicEmb
   has already filled, without the two halves having to negotiate.
 - Ranks cannot disagree about placement: rank 0 decides and the rest are told.
+
+---
 
 Two facts drive most of this document:
 
