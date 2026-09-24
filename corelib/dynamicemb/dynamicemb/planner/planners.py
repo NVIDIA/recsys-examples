@@ -174,29 +174,28 @@ def _prepare_dynemb_table_options(
     if constraints is None or eb_configs is None:
         raise ValueError("Constraints and eb_configs must not be None")
 
-    # Extract names from eb_configs
     config_names = [config.name for config in eb_configs]
 
-    # Check if each BaseEmbeddingConfig's name matches the keys in the constraints dictionary
-    for config_name in config_names:
-        if config_name not in constraints:
-            raise ValueError(
-                f"Config name '{config_name}' does not match any key in constraints"
-            )
-
-    # Verify that each BaseEmbeddingConfig name is unique
     if len(set(config_names)) != len(config_names):
-        raise ValueError("Config names must be unique")
+        raise ValueError(f"Table names must be unique; got {sorted(config_names)}")
 
-    # Ensure that all constraints keys have corresponding BaseEmbeddingConfig with matching name
-    if set(config_names) != set(constraints.keys()):
+    # Only this direction. `eb_configs` is now read off the model rather than
+    # passed in beside the constraints, so the two are no longer two statements
+    # of the same list to be checked against each other -- one is the model. A
+    # constraint naming a table the model does not have is a typo and is caught;
+    # a table the model has and the constraints do not mention is not an error,
+    # it is a table planned with TorchRec's defaults.
+    unknown = set(constraints) - set(config_names)
+    if unknown:
         raise ValueError(
-            "Not all constraint keys have matching BaseEmbeddingConfig names"
+            f"Constraints name tables the model does not have: {sorted(unknown)}. "
+            f"The model's shardable tables are {sorted(config_names)}."
         )
 
     for i, config_name in enumerate(config_names):
-        tmp_constraint = constraints[config_name]
-        if not tmp_constraint.use_dynamicemb:
+        # A table the constraints do not mention is TorchRec's to plan.
+        tmp_constraint = constraints.get(config_name)
+        if tmp_constraint is None or not tmp_constraint.use_dynamicemb:
             continue
 
         tmp_config = eb_configs[i]
@@ -361,21 +360,27 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         if self._planned_dynamicemb:
             return
 
-        configs = {
-            config.name: config
-            for config in _table_configs(module, sharders)
-            if self._constraints.get(config.name)
-            and self._constraints[config.name].use_dynamicemb
-        }
         # One source for both, so what a table's capacity is divided by and what
         # its shards are placed on cannot disagree. The Topology is the planner's
         # statement of the machine; `dist` would be a second opinion (F11).
         world_size = self._topology.world_size
         local_size = self._topology.local_world_size
 
+        # Every table, not just the DynamicEmb ones: this checks that the
+        # constraints and the model describe the same set of tables, which is
+        # only a check if it sees both sides whole. It skips the tables that are
+        # not DynamicEmb's itself.
+        all_configs = _table_configs(module, sharders)
         _prepare_dynemb_table_options(
-            self._constraints, list(configs.values()), world_size, local_size
+            self._constraints, all_configs, world_size, local_size
         )
+
+        configs = {
+            config.name: config
+            for config in all_configs
+            if self._constraints.get(config.name)
+            and self._constraints[config.name].use_dynamicemb
+        }
 
         hosts = self._choose_hosts(configs, module, sharders, world_size, local_size)
         compute_device = self._topology.compute_device
@@ -386,11 +391,17 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             sharding_type = _sharding_type_of(constraint)
             rows = opts.max_capacity
 
-            # Written back rather than only used here: downstream reads the
-            # options, not the plan, so a table the HostPlacer placed would
-            # otherwise look unplaced. Every rank ran the same placement, so
-            # every rank writes the same thing.
-            opts.host_index = hosts.get(name)
+            if sharding_type != ShardingType.ROW_WISE.value:
+                # Written back rather than only used here: downstream reads the
+                # options, not the plan, so a table the HostPlacer placed would
+                # otherwise look unplaced. Every rank ran the same placement, so
+                # every rank writes the same thing.
+                #
+                # Only here. A row-wise table keeps whatever the caller set, so
+                # that `table_layout` can refuse a host_index on one -- writing
+                # None over it first would turn a refusal into a silent
+                # correction, which is the opposite of what that check is for.
+                opts.host_index = hosts[name]
 
             # Row-wise is every rank; table-row-wise is one node's ranks. The
             # shard metadata follows, so there are `local_size` entries for a

@@ -41,6 +41,7 @@ from dynamicemb.planner.plan import (
     module_without_tables,
     per_rank_storage,
     shard_rank,
+    table_fanout,
     table_layout,
     topology_minus,
 )
@@ -332,3 +333,21 @@ def test_a_table_row_wise_table_only_costs_its_own_node():
     )
     assert all(s == Storage(0, 0, 0) for s in spent[:LOCAL])
     assert all(s.ddr > 0 for s in spent[LOCAL:])
+
+
+# --- regressions the row-wise path must not suffer -------------------------
+
+
+def test_a_row_wise_table_is_split_the_same_way_it_always_was():
+    """`table_fanout` replaced a bare `dist.get_world_size()`. For row-wise it
+    has to be that same number, or every existing table resizes."""
+    for world, local in [(8, 4), (2, 2), (1, 1), (16, 8), (4, 1)]:
+        assert table_fanout(RW, world, local) == world
+
+
+def test_host_index_on_a_row_wise_table_still_reaches_the_refusal():
+    """The planner writes the placer's answer back into the options. It must not
+    do that for a row-wise table: overwriting with None first would turn the
+    refusal below into a silent correction."""
+    with pytest.raises(ValueError, match="on every rank of every node"):
+        table_layout(RW, 0, WORLD, LOCAL)
