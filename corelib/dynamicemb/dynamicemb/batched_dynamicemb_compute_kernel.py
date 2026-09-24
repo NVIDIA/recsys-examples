@@ -33,7 +33,8 @@ from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
 from torchrec.distributed.embedding_kernel import get_state_dict
-from torchrec.distributed.embedding_types import (  # EmbeddingComputeKernel,; GroupedEmbeddingConfig,
+from torchrec.distributed.embedding_types import (
+    ShardingType,  # EmbeddingComputeKernel,; GroupedEmbeddingConfig,
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
     compute_kernel_to_embedding_location,
@@ -282,8 +283,11 @@ class BatchedDynamicEmbeddingBag(
         config: GroupedEmbeddingConfig,
         pg: Optional[dist.ProcessGroup] = None,
         device: Optional[torch.device] = None,
+        sharding_type: Optional[ShardingType] = None,
     ) -> None:
-        super().__init__(config, pg, device)
+        # sharding_type is what turns MEAN into SUM in the kernel for row-wise and
+        # table-row-wise tables; TorchRec divides by the bag length once on output.
+        super().__init__(config, pg, device, sharding_type)
 
         _prepare_fused_params(config.fused_params)
 

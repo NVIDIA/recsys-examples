@@ -45,12 +45,11 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
         kernel.value for kernel in EmbeddingComputeKernel
     ] + [DynamicEmbKernel]
 
-    def _initialize_torch_state(self, *args: Any, **kwargs: Any) -> None:
-        super()._initialize_torch_state(*args, **kwargs)
+    def reset_parameters(self) -> None:
         # TorchRec registers an empty weight for shards a rank does not hold but
         # skips CUSTOMIZED_KERNEL tables; a table-row-wise DynamicEmb table lives
-        # on one node, so the other nodes' ranks need that placeholder too, or
-        # reset_parameters and state_dict find no weight to touch.
+        # on one node, so the other nodes' ranks need that placeholder before
+        # reset_parameters and state_dict look for a weight to touch.
         for table_name, parameter_sharding in self.module_sharding_plan.items():
             if (
                 parameter_sharding.compute_kernel
@@ -61,6 +60,7 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
                 self.embedding_bags[table_name].register_parameter(
                     "weight", nn.Parameter(torch.empty(0, device=self._device))
                 )
+        super().reset_parameters()
 
     @classmethod
     def create_embedding_bag_sharding(

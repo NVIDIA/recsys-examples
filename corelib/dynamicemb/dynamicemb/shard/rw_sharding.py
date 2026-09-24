@@ -218,6 +218,7 @@ class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
                 config=config,
                 pg=pg,
                 device=device,
+                sharding_type=sharding_type,
             )
 
 
