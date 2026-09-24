@@ -47,6 +47,15 @@ from torchrec.distributed.types import (
 
 from ..dynamicemb_config import get_local_value_bytes_by_tier
 
+_STORAGE_HAS_SSD = "ssd" in Storage.__dataclass_fields__
+
+
+def make_storage(hbm: int = 0, ddr: int = 0, ssd: int = 0) -> Storage:
+    """A Storage on any TorchRec: the ssd field only exists from 1.5.0."""
+    if _STORAGE_HAS_SSD:
+        return Storage(hbm=hbm, ddr=ddr, ssd=ssd)
+    return Storage(hbm=hbm, ddr=ddr)
+
 __all__ = [
     "optimizer_types",
     "shard_rank",
@@ -140,7 +149,7 @@ def per_rank_storage(
     is counted without optimizer state, which is a floor rather than a guess (see
     :func:`~dynamicemb.dynamicemb_config.get_local_value_bytes_by_tier`).
     """
-    totals = [Storage(hbm=0, ddr=0, ssd=0) for _ in range(world_size)]
+    totals = [make_storage() for _ in range(world_size)]
 
     for name, parameter_sharding in parameter_shardings.items():
         options = getattr(parameter_sharding, "dynamicemb_options", None)
@@ -162,7 +171,7 @@ def per_rank_storage(
         # already divided by the table's fan-out, so every shard of a table
         # weighs the same and only the set of ranks differs.
         hbm, ddr = get_local_value_bytes_by_tier(options, optimizer_types.get(name))
-        share = Storage(hbm=hbm, ddr=ddr, ssd=0)
+        share = make_storage(hbm=hbm, ddr=ddr)
 
         for shard in spec.shards:
             rank = shard_rank(shard)

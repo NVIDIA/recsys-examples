@@ -22,6 +22,8 @@ declared sizes, which is why it is a component of its own.
 import pytest
 from torchrec.distributed.planner.types import Storage, Topology
 
+from dynamicemb.planner.plan import make_storage
+
 from dynamicemb.planner.placement import BalancedHostPlacer, TableToPlace
 
 GB = 1024**3
@@ -40,12 +42,12 @@ def _topology(hbm: int = 80 * GB, ddr: int = 128 * GB) -> Topology:
 
 
 def _nothing_spent():
-    return [Storage(hbm=0, ddr=0, ssd=0) for _ in range(WORLD)]
+    return [make_storage(hbm=0, ddr=0, ssd=0) for _ in range(WORLD)]
 
 
 def _table(name, hbm_gb, pinned=None):
     return TableToPlace(
-        name=name, cost=Storage(hbm=hbm_gb * GB, ddr=0, ssd=0), pinned=pinned
+        name=name, cost=make_storage(hbm=hbm_gb * GB, ddr=0, ssd=0), pinned=pinned
     )
 
 
@@ -74,7 +76,7 @@ def test_a_pin_is_honoured_and_others_fit_around_it():
 def test_row_wise_tables_do_not_shift_the_choice_but_do_take_room():
     """They are on every rank, so they cost each node the same. What they change
     is whether a table-row-wise table still fits."""
-    everywhere = [Storage(hbm=40 * GB, ddr=0, ssd=0) for _ in range(WORLD)]
+    everywhere = [make_storage(hbm=40 * GB, ddr=0, ssd=0) for _ in range(WORLD)]
     chosen = BalancedHostPlacer().place(
         [_table("a", 10), _table("b", 10)], _topology(), everywhere
     )
@@ -92,14 +94,14 @@ def test_a_node_is_charged_on_every_one_of_its_ranks():
     assert chosen == {"a": 0}
     # node 0 now has 20GB per rank, so a 30GB table can only go to node 1
     spent = [
-        Storage(hbm=60 * GB if r < LOCAL else 0, ddr=0, ssd=0) for r in range(WORLD)
+        make_storage(hbm=60 * GB if r < LOCAL else 0, ddr=0, ssd=0) for r in range(WORLD)
     ]
     assert placer.place([_table("b", 30)], _topology(hbm=80 * GB), spent) == {"b": 1}
 
 
 def test_one_crowded_rank_rules_out_its_whole_node():
     uneven = [
-        Storage(hbm=(70 * GB if r == 3 else 0), ddr=0, ssd=0) for r in range(WORLD)
+        make_storage(hbm=(70 * GB if r == 3 else 0), ddr=0, ssd=0) for r in range(WORLD)
     ]
     chosen = BalancedHostPlacer().place([_table("a", 20)], _topology(), uneven)
     assert chosen == {"a": 1}

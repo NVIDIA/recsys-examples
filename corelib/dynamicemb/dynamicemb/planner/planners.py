@@ -40,6 +40,7 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to
 
 from .placement import BalancedHostPlacer, HostPlacer, TableToPlace
 from .plan import (
+    make_storage,
     module_without_tables,
     optimizer_types,
     per_rank_storage,
@@ -466,11 +467,11 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             hbm, ddr = get_local_value_bytes_by_tier(
                 self._constraints[name].dynamicemb_options, optimizers.get(name)
             )
-            return Storage(hbm=hbm, ddr=ddr, ssd=0)
+            return make_storage(hbm=hbm, ddr=ddr)
 
         # The row-wise tables are on every rank, so they shift no choice between
         # nodes -- but they do decide whether a table-row-wise one still fits.
-        committed = [Storage(hbm=0, ddr=0, ssd=0) for _ in range(world_size)]
+        committed = [make_storage() for _ in range(world_size)]
         for name in by_type.get(ShardingType.ROW_WISE.value, []):
             cost = rank_cost(name)
             committed = [spent + cost for spent in committed]

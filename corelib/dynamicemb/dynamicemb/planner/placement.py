@@ -33,6 +33,8 @@ from typing import Dict, List, Optional
 
 from torchrec.distributed.planner.types import Storage, Topology
 
+from .plan import make_storage
+
 __all__ = ["TableToPlace", "HostPlacer", "BalancedHostPlacer"]
 
 
@@ -126,10 +128,10 @@ class BalancedHostPlacer(HostPlacer):
 
         def tightest(node: int) -> Storage:
             ranks = range(node * local_size, (node + 1) * local_size)
-            return Storage(
+            return make_storage(
                 hbm=min(free[r].hbm for r in ranks),
                 ddr=min(free[r].ddr for r in ranks),
-                ssd=min(free[r].ssd for r in ranks),
+                ssd=min(getattr(free[r], "ssd", 0) for r in ranks),
             )
 
         def charge(node: int, cost: Storage) -> None:

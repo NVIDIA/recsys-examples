@@ -28,6 +28,8 @@ from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 import torchrec
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.types import Storage, Topology
+
+from dynamicemb.planner.plan import make_storage
 from torchrec.distributed.types import (
     EnumerableShardingSpec,
     ShardingType,
@@ -118,7 +120,7 @@ def test_row_wise_table_charges_every_rank_equally():
     )
     assert len(per_rank) == WORLD_SIZE
     values = ROWS * DIM * 4  # float32, no optimizer state
-    assert all(s == Storage(hbm=0, ddr=values, ssd=0) for s in per_rank)
+    assert all(s == make_storage(hbm=0, ddr=values, ssd=0) for s in per_rank)
 
 
 def test_a_table_on_one_node_charges_only_that_node():
@@ -135,8 +137,8 @@ def test_a_table_on_one_node_charges_only_that_node():
     values = ROWS * DIM * 4
     assert per_rank[0] == Storage(0, 0, 0)
     assert per_rank[1] == Storage(0, 0, 0)
-    assert per_rank[2] == Storage(hbm=0, ddr=values, ssd=0)
-    assert per_rank[3] == Storage(hbm=0, ddr=values, ssd=0)
+    assert per_rank[2] == make_storage(hbm=0, ddr=values, ssd=0)
+    assert per_rank[3] == make_storage(hbm=0, ddr=values, ssd=0)
 
 
 def test_tables_on_a_rank_add_up():
@@ -181,7 +183,7 @@ def test_a_shard_outside_the_world_is_an_error():
 
 def test_topology_minus_subtracts_per_rank_and_copies():
     topology = _topology()
-    per_rank = [Storage(hbm=i * GB, ddr=2 * i * GB, ssd=0) for i in range(WORLD_SIZE)]
+    per_rank = [make_storage(hbm=i * GB, ddr=2 * i * GB, ssd=0) for i in range(WORLD_SIZE)]
     before = copy.deepcopy([d.storage for d in topology.devices])
 
     reduced = topology_minus(topology, per_rank)
@@ -197,7 +199,7 @@ def test_topology_minus_does_not_clamp():
     """Zero means "no room"; negative means "already oversubscribed". Only the
     second is true here, and the planner's error path reports the shortfall."""
     topology = _topology(hbm=1 * GB)
-    reduced = topology_minus(topology, [Storage(hbm=4 * GB, ddr=0, ssd=0)] * WORLD_SIZE)
+    reduced = topology_minus(topology, [make_storage(hbm=4 * GB, ddr=0, ssd=0)] * WORLD_SIZE)
     assert reduced.devices[0].storage.hbm == -3 * GB
 
 
