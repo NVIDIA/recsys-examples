@@ -135,8 +135,8 @@ def test_a_table_on_one_node_charges_only_that_node():
         world_size=WORLD_SIZE,
     )
     values = ROWS * DIM * 4
-    assert per_rank[0] == Storage(0, 0, 0)
-    assert per_rank[1] == Storage(0, 0, 0)
+    assert per_rank[0] == make_storage()
+    assert per_rank[1] == make_storage()
     assert per_rank[2] == make_storage(hbm=0, ddr=values, ssd=0)
     assert per_rank[3] == make_storage(hbm=0, ddr=values, ssd=0)
 
@@ -205,7 +205,7 @@ def test_topology_minus_does_not_clamp():
 
 def test_topology_minus_rejects_a_length_mismatch():
     with pytest.raises(ValueError, match="entries but the topology has"):
-        topology_minus(_topology(), [Storage(0, 0, 0)] * (WORLD_SIZE - 1))
+        topology_minus(_topology(), [make_storage()] * (WORLD_SIZE - 1))
 
 
 # --- module_without_tables -------------------------------------------------
@@ -333,7 +333,7 @@ def test_a_table_row_wise_table_only_costs_its_own_node():
     spent = per_rank_storage(
         {"t": sharding}, optimizer_types={"t": None}, world_size=WORLD
     )
-    assert all(s == Storage(0, 0, 0) for s in spent[:LOCAL])
+    assert all(s == make_storage() for s in spent[:LOCAL])
     assert all(s.ddr > 0 for s in spent[LOCAL:])
 
 
