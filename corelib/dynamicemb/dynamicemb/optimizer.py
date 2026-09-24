@@ -254,7 +254,6 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         else:
             optim_states[indices] = fill
 
-
     def _check_state_width(
         self,
         optim_states: torch.Tensor,
