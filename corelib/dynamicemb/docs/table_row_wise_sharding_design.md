@@ -36,26 +36,103 @@ one node's budget and the cross-node all-to-all is a measured bottleneck.
 ## 2. Where RW lives today
 
 ```
-plan       planner/planners.py:324-346  _dyn_emb_plan, sharding_type hardcoded ROW_WISE (:343)
-           planner/planners.py:176-184  per-rank capacity = f(world_size)
-reserve    planner/storage_reservations.py  its HBM/host is taken out of the budget
-sharding   shard/embeddingbag.py:62     RW -> RwPooledDynamicEmbeddingSharding
-           shard/rw_sharding.py:220     subclass of torchrec RwPooledEmbeddingSharding
-input      shard/input_dist.py:175      bucketize(num_buckets=world_size) -> KJTAllToAll
+settle     planner/planners.py:305      _settle -- options filled, _dyn_emb_plan built
+           planner/planners.py:357      sharding_type hardcoded ROW_WISE
+           planner/planners.py:182-190  per-rank capacity and HBM budget = f(world_size)
+budget     planner/plan.py:119,176      per_rank_storage -> topology_minus
+sharding   shard/embeddingbag.py:63     RW -> RwPooledDynamicEmbeddingSharding
+           shard/rw_sharding.py:224     subclass of torchrec RwPooledEmbeddingSharding
+input      shard/input_dist.py:227      bucketize(num_buckets=world_size) -> KJTAllToAll
 kernel     src/sparse_block_bucketize_features.cu:217 / :299
 lookup     batched_dynamicemb_compute_kernel.py -> BatchedDynamicEmbeddingBag
 output     (inherited) torchrec RwPooledEmbeddingDist -- reduce-scatter
 ```
 
+### 2.1 How the planner works now
+
+`DynamicEmbeddingShardingPlanner` subclasses `EmbeddingShardingPlanner`. Both of
+its entry points are the same three phases:
+
+```
+settle  ->  decide  ->  attach
+```
+
+```python
+def plan(self, module, sharders):                  # one rank
+    self._settle(module, sharders)
+    return self._attach_options(self._decide(module, sharders))
+
+def collective_plan(self, module, sharders, pg):   # all of them
+    self._settle(module, sharders)                 # every rank
+    plan = invoke_on_rank_and_broadcast_result(pg, 0, self._decide, module, sharders)
+    return self._attach_options(plan)              # every rank
+```
+
+**`__init__` splits the constraints and does nothing else.** The base is handed
+only the TorchRec half. There is no module and no sharders yet, so nothing that
+depends on the optimizer can be computed here -- which is why the other two
+phases exist.
+
+**`_settle`, on every rank, once per planner.** It reads the table configs off
+the module (`_table_configs`, which is what the `eb_configs` argument used to
+carry), fills each DynamicEmb table's options in place
+(`_prepare_dynemb_table_options`: initializer bounds, `max_capacity` via
+`_sharded_table_bucket_layout`, `local_hbm_for_values`, `dim`, `index_type`,
+`embedding_dtype`), and builds one `DynamicEmbParameterSharding` per table --
+`ROW_WISE`, `world_size` shards of `[max_capacity, dim]`, placement by rank.
+
+It runs outside the broadcast because the options it fills are the half of a
+DynamicEmb table that does not travel -- `external_storage` is a live handle and
+`score_function` a callable -- and `_attach_options` needs them everywhere.
+
+**`_decide`, on rank 0 alone under `collective_plan`.**
+
+```python
+reduced_module = module_without_tables(module, table_names, sharders)   # 1
+spent = per_rank_storage(self._dyn_emb_plan, optimizer_types(...), n)   # 2
+try:
+    self._topology = topology_minus(whole_topology, spent)              # 3
+    torchrec_plan = super().plan(reduced_module, sharders)              # 4
+finally:
+    self._topology = whole_topology
+self._insert_dynamicemb_plan(torchrec_plan, module, sharders)           # 5
+```
+
+1. Only the modules on the path to a pruned collection are copied, and the
+   collection keeps its type and its shape, so the plan's paths are the caller's
+   paths -- which is what `ShardingPlan` is keyed by.
+2. Optimizer types come from the sharders' `fused_params` or the parameters'
+   `_optimizer_classes`, and each shard's cost is charged to the rank it sits
+   on. Row-wise makes those equal; TRW will not (§4.2).
+3. `self._topology` is swapped rather than passed, because the enumerator and
+   the estimators were built against it in `__init__`.
+4. TorchRec plans what is left of the model inside what is left of the memory,
+   with the caller's own `storage_reservation` still doing what it does.
+5. The walk is over the *caller's* module: the pruned one no longer admits to
+   having these tables, so it cannot say what path they live under. What goes on
+   the plan is a copy with the options off and the shard metadata deep-copied
+   (F10).
+
+**`_attach_options`, on every rank.** Puts this rank's options back. The
+decisions travel; the configuration does not.
+
+Three consequences worth stating plainly, because the rest of this document
+assumed the older arrangement in places:
+
+- A DynamicEmb table never enters TorchRec's search space, so nothing estimates
+  or partitions it. There is no placeholder to keep honest.
+- What those tables cost is out of the Topology before TorchRec sees it, per
+  rank. Under TRW that is what lets `_cohost_partition` avoid a node DynamicEmb
+  has already filled, without the two halves having to negotiate.
+- Ranks cannot disagree about placement: rank 0 decides and the rest are told.
+
 Two facts drive most of this document:
 
 **(a) DynamicEmb tables bypass the TorchRec planner's placement decision.**
-`DynamicEmbeddingShardingPlanner.__init__` builds `_dyn_emb_plan` directly
-(`planner.py:322-345`) and `collective_plan` overwrites whatever the TorchRec
-planner produced for those tables (`planner.py:376-384`). `sharding_type` is a
-literal at `planner.py:341`; `ranks` is `range(world_size)` at `:343`. The
-enumerator's `_filter_sharding_types` returning `[ROW_WISE]`
-(`planner/enumerators.py:366`) is *not* what makes a table RW.
+`_settle` builds `_dyn_emb_plan` directly (`planner/planners.py:305-362`) and
+`_decide` takes those tables out of the module before TorchRec sees it, then
+puts the entries back afterwards. `sharding_type` is a literal at
+`planner/planners.py:357`; `ranks` is `range(world_size)` at `:358`.
 
 Consequence: **there is no "which node" decision anywhere in the system.** RW
 never needed one. TRW cannot work without one. This is the single largest new
@@ -103,7 +180,7 @@ cut, not how many ranks exist; the shards must tile `[rows, dim]` exactly once.
 `W` entries would describe an RW layout, not a TRW one. Three places agree:
 
 ```python
-# enumerators.py:194 -- divisor is local_world_size, so L entries
+# torchrec planner/enumerators.py:194 -- divisor is local_world_size, so L entries
 return _calculate_rw_shard_sizes_and_offsets(rows, local_world_size, columns)
 
 # sharding_plan.py:815
@@ -335,7 +412,7 @@ the combination wrong, and the symptom is mismatched samples, not an error (F4).
 
 ### 4.1 Placement: a node decision that does not exist yet
 
-`planner.py:322-345` must produce, for a TRW table:
+`_settle` (`planner/planners.py:342-363`) must produce, for a TRW table:
 
 - `sharding_type = TABLE_ROW_WISE`
 - `ranks = [node * local_size + i for i in range(local_size)]`
@@ -353,8 +430,8 @@ separate problem and mixing it in makes the first version hard to debug.
 
 ### 4.2 Capacity: the divisor becomes per-table, and it is computed too early
 
-`_prepare_dynemb_table_options` (`planner.py:124`, per-table loop at `:162-210`) computes, for every
-DynamicEmb table:
+`_prepare_dynemb_table_options` (`planner/planners.py:130`, per-table loop at
+`:170-218`) computes, for every DynamicEmb table:
 
 ```python
 num_buckets, eff = _sharded_table_bucket_layout(cfg, world_size, opts.bucket_capacity)
@@ -369,11 +446,11 @@ For a TRW table both divisors must be `local_size`. Two problems:
 
 - The divisor becomes **per table** (RW tables keep `world_size`), so the helper
   needs the table's sharding type, not a global world size.
-- `_prepare_dynemb_table_options` runs at `planner.py:271`, **before** any
-  placement is known. Under option (1) above this is fine (`host_index` is user
-  input, available up front). Under option (2) the ordering inverts: placement
-  must run first, because capacity depends on it. Another reason to ship (1)
-  first.
+- `_prepare_dynemb_table_options` runs at the top of `_settle`
+  (`planner/planners.py:336`), **before** any placement is known. Under option
+  (1) above this is fine (`host_index` is user input, available up front). Under
+  option (2) the ordering inverts: placement must run first, because capacity
+  depends on it. Another reason to ship (1) first.
 
 Also audit `get_sharded_table_capacity` (`dynamicemb_config.py:889`) and every
 caller in tests/examples that divides by world size.
@@ -574,9 +651,8 @@ key -> rank rule now lives in `key_ownership.py`.
 | File | Change | Size |
 |---|---|---|
 | `dynamicemb_config.py` | `host_index` (or equivalent) in `DynamicEmbTableOptions`; `_sharded_table_bucket_layout` takes a per-table divisor | S |
-| `planner/planners.py` | TRW branch in `_dyn_emb_plan`; per-table capacity divisor; ordering of `_prepare_dynemb_table_options` | M |
-| `planner/enumerators.py` | `_filter_sharding_types` must allow TRW; the 1x1 rewrite in `enumerate` becomes `local_size` shards on the owning node's ranks | S |
-| `planner/storage_reservations.py` | the HBM/host subtraction becomes per-rank (§4.2) | S |
+| `planner/planners.py` | TRW branch in `_settle`; per-table capacity divisor; ordering of `_prepare_dynemb_table_options` | M |
+| `planner/plan.py` | none required -- `per_rank_storage` is already per rank, and reads the shard metadata `_settle` writes | -- |
 | `shard/twrw_sharding.py` | **new** -- `TwRwPooledDynamicEmbeddingSharding` | M |
 | `shard/embeddingbag.py` | dispatch TRW | S |
 | `shard/input_dist.py` | `TwRwSparseFeaturesDist` with the staggered shuffle | M |
@@ -690,7 +766,7 @@ but worth re-checking that grouping never mixes RW and TRW into one sharding.
 
 **F6 — EC must be rejected, not silently downgraded.** §4.8.
 
-**F7 — the fake shard metadata gains a third variant.** `planner.py:332-335`
+**F7 — the fake shard metadata gains a third variant.** `planner/planners.py:348-353`
 claims contiguous row ranges; `get_state_dict`
 (`batched_dynamicemb_compute_kernel.py:97-105`) rewrites them to `[1,1] @ [i,0]`;
 TRW adds a node dimension. Recommend collapsing the first two into one generator

@@ -108,6 +108,30 @@ For row-wise DynamicEmb sharding, the supported `dist_type` values are:
 
 ## Sharding planner
 
+### What happens when you call it
+
+`plan` and `collective_plan` are the same three phases:
+
+```
+settle  ->  decide  ->  attach
+```
+
+**Settle** — on every rank, once per planner. Reads the table configs off the module, fills each DynamicEmb table's `DynamicEmbTableOptions` in place (the table below), and builds one `DynamicEmbParameterSharding` per table: `ROW_WISE`, one shard per rank of `[max_capacity, embedding_dim]`, placement by rank. Nothing is searched — a DynamicEmb table's capacity comes from its options and its placement from the key-to-rank rule.
+
+**Decide** — under `collective_plan`, on rank 0 only.
+
+1. A copy of the module is made with the DynamicEmb tables removed. Only the modules on the path to a pruned collection are copied; your module is not touched, and the tree keeps its shape so the plan's paths stay yours.
+2. What those tables cost each rank is worked out from the shard metadata settled above, including optimizer state (read from the sharders' `fused_params` or the parameters' `_optimizer_classes`).
+3. That cost comes out of the `Topology`, per rank.
+4. TorchRec plans the rest of the model, on the reduced module, inside the reduced `Topology`. Your `storage_reservation`, `enumerator`, `proposer`, `partitioner` and `stats` all apply here, unchanged.
+5. The DynamicEmb entries are added back to the plan under the paths they live at in your module.
+
+**Attach** — on every rank. Reattaches this rank's `DynamicEmbTableOptions`. The decisions are broadcast from rank 0; the options are not, because `external_storage` is a live handle and `score_function` a callable, both local to the process that made them.
+
+So: the DynamicEmb tables never enter TorchRec's search space, their memory is accounted for before TorchRec plans anything, and every rank gets the same placement decisions.
+
+### What the planner writes into your options
+
 At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the module and validates that they and `constraints` are consistent (every table name appears exactly once, matches the keys of `constraints`, and there are no extra keys). Then, **for each table with** `DynamicEmbParameterConstraints.use_dynamicemb == True`, it updates that table’s `DynamicEmbTableOptions` in **`dynamicemb_options`** via the internal routine `_prepare_dynemb_table_options` (order matters):
 
 | Step | Field(s) | What happens |
