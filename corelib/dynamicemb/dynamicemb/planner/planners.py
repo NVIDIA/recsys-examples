@@ -320,7 +320,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             ``enumerator``, ``proposer``, ``partitioner``, ``performance_model``,
             ``stats``, ``debug``, and the rest.
         """
-        self._constraints: Dict[str, DynamicEmbParameterConstraints] = constraints or {}
+        all_constraints: Dict[str, DynamicEmbParameterConstraints] = constraints or {}
         self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
         self._planned_dynamicemb = False
         self._host_placer: HostPlacer = host_placer or BalancedHostPlacer()
@@ -329,12 +329,14 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             topology=topology,
             constraints={
                 name: constraint
-                for name, constraint in self._constraints.items()
+                for name, constraint in all_constraints.items()
                 if not constraint.use_dynamicemb
             },
             storage_reservation=storage_reservation,
             **kwargs,
         )
+        # After super().__init__: TorchRec assigns self._constraints itself and would discard the DynamicEmb entries.
+        self._constraints: Dict[str, DynamicEmbParameterConstraints] = all_constraints
 
     def _plan_dynamicemb(
         self,
