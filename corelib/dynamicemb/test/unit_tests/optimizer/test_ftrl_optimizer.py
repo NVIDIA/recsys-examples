@@ -81,9 +81,7 @@ def ftrl_step(
     new_accum_pow = new_accum**exponent
 
     linear = (
-        linear
-        + grad
-        - (new_accum_pow - accum**exponent) / learning_rate * weight
+        linear + grad - (new_accum_pow - accum**exponent) / learning_rate * weight
     )
     shrunk = (l1_reg * torch.sign(linear) - linear) / (
         (ftrl_beta + new_accum_pow) / learning_rate + l2_reg
@@ -132,9 +130,9 @@ def test_ftrl_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4):
     )
     flat = padded.clone()
     generator = torch.Generator(device="cpu").manual_seed(11)
-    grads = torch.randn(
-        num_rows, emb_dim, generator=generator, dtype=torch.float32
-    ).to(device)
+    grads = torch.randn(num_rows, emb_dim, generator=generator, dtype=torch.float32).to(
+        device
+    )
 
     table_ids = torch.zeros(num_rows, dtype=torch.int64, device=device)
     table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)

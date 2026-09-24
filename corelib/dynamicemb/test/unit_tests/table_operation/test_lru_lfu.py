@@ -869,6 +869,7 @@ def test_lru_lfu_plain_insert_evicts_via_cubin(current_device):
         founds.any()
     ), "plain insert must evict the high-freq keys via the custom cubin (DefaultEvictor would have kept them)"
 
+
 def test_lru_lfu_insert_after_erase_no_phantom_frequency(current_device):
     """A new key taking over a slot reclaimed by erase() must start with a clean
     score block. erase() resets word 0 only; word 1 (frequency) stays stale, and

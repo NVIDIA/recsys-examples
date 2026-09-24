@@ -23,7 +23,6 @@ from functools import partial
 from itertools import accumulate
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import (
@@ -44,6 +43,7 @@ from dynamicemb.dynamicemb_config import (
     warning_for_cstm_score,
 )
 from dynamicemb.initializer import MultiTableInitializer
+from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
@@ -66,7 +66,6 @@ from dynamicemb.optimizer import (
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
 )
-from dynamicemb.scored_hashtable import murmur3_fmix64
 from dynamicemb.types import ReplayStats
 from dynamicemb.utils import DTYPE_NUM_BYTES
 from dynamicemb_extensions import device_timestamp
@@ -137,64 +136,6 @@ def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str],
             )
 
     return files, len(files)
-
-
-def owned_key_mask(
-    keys: torch.Tensor,
-    rank: int,
-    world_size: int,
-    dist_type: str,
-) -> Optional[torch.Tensor]:
-    """Boolean mask selecting the keys *rank* owns under row-wise sharding.
-
-    ``incremental_dump`` all-gathers within its process group, so every rank holds
-    the whole delta; replay keeps only its own shard. Ownership is recomputed from
-    the key rather than read off the delta, so a globally gathered delta can be
-    handed to every rank unchanged.
-
-    *world_size* is the target's, but replay only ever runs with the source's
-    equal to it (``_replay_compatibility`` rejects otherwise), so this does not
-    reshard: a slot names a position inside one rank's table and carries no rank,
-    so two source ranks folded onto one target rank would collide on it.
-
-    Returns ``None`` when no filtering is needed (single rank), so callers can
-    skip the mask entirely.
-
-    Ownership is computed in ``uint64``, matching the device kernel for the
-    64-bit index types everyone uses. The kernel actually takes the hash modulo
-    in ``make_unsigned_t<index_t>``, so a 32-bit index type would truncate first
-    and disagree here -- for a world size that is not a power of two, where the
-    high bits reach the result. Not handled: 32-bit keys are not a configuration
-    this is built for.
-    """
-    if world_size <= 1:
-        return None
-    if dist_type == "continuous":
-        raise NotImplementedError(
-            "replay_increment does not support dist_type 'continuous': its "
-            "key->rank mapping is range-based and cannot be reconstructed from a "
-            "key alone. Use 'roundrobin' or 'hash_roundrobin'."
-        )
-    keys_np = keys.detach().cpu().numpy().astype(np.uint64, copy=False)
-    if dist_type == "hash_roundrobin":
-        owners = murmur3_fmix64(keys_np) % np.uint64(world_size)
-    else:  # roundrobin
-        owners = keys_np % np.uint64(world_size)
-    return torch.from_numpy(owners == np.uint64(rank))
-
-
-def owned_keys(
-    keys: Optional[Tensor], rank: int, world_size: int, dist_type: str
-) -> Optional[Tensor]:
-    """:func:`owned_key_mask` applied, tolerating a list that is absent or empty.
-
-    Removal lists are optional and often empty, so the caller would otherwise
-    repeat that guard at every use.
-    """
-    if keys is None or keys.numel() == 0:
-        return keys
-    mask = owned_key_mask(keys, rank, world_size, dist_type)
-    return keys if mask is None else keys[mask]
 
 
 def get_loading_files(
@@ -1463,6 +1404,35 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         return max(scores)
 
+    def _refuse_if_table_row_wise(self, what: str) -> None:
+        """Table-row-wise tables cannot be checkpointed yet (M4, not M3).
+
+        ``_shard_world_size`` is the whole world, which is the fan-out a
+        row-wise table's keys were spread over and the modulo base the dump and
+        load paths filter with. A table-row-wise table's keys were spread over
+        one node -- ``local_world_size`` ranks -- starting at that node's first
+        rank. Filtering them by the world would keep roughly ``local/world`` of
+        them on each rank and drop the rest in silence, which is the shape of
+        the defect in section 8.1 of the design document.
+
+        So this refuses rather than writes something that cannot be read back.
+        Sections 4.5 to 4.7 are what make the layout carry the ownership triple;
+        until then, row-wise is the shardings that checkpoints.
+        """
+        placed = sorted(
+            name
+            for name, option in zip(self._table_names, self._dynamicemb_options)
+            if getattr(option, "host_index", None) is not None
+        )
+        if placed:
+            raise NotImplementedError(
+                f"{what} is not supported for table-row-wise DynamicEmb tables "
+                f"{placed}. Their keys are spread over one node's ranks, while "
+                "the checkpoint layout records a fan-out over the whole world, "
+                "so what was written could not be read back. Shard them "
+                "row-wise to checkpoint them."
+            )
+
     def dump(
         self,
         save_dir: str,
@@ -1471,6 +1441,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
+        self._refuse_if_table_row_wise("Dumping")
         if table_names is None:
             table_names = self._table_names
 
@@ -1547,6 +1518,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ):
+        self._refuse_if_table_row_wise("Loading")
         if table_names is None:
             table_names = self._table_names
 
@@ -1609,7 +1581,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             num_counter_key_files = len(counter_key_files)
             for i in range(num_counter_key_files):
                 counter_table.load(
-                    counter_key_files[i], counter_frequency_files[i], table_id
+                    counter_key_files[i],
+                    counter_frequency_files[i],
+                    table_id,
+                    self._dynamicemb_options[table_id].dist_type,
                 )
 
     def export_keys_values(
@@ -1726,6 +1701,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
           score is not less than the threshold are dumped. This is not a time-based
           increment.
         """
+        self._refuse_if_table_row_wise("Incremental dump")
         from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
             DeltaDumpResult,
         )
@@ -1920,6 +1896,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 though the metadata matched. Unlike the checks above this fires
                 mid-write, so the table may hold a partial replay.
         """
+        self._refuse_if_table_row_wise("Replaying an increment")
         storage = self._storage
         if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
             raise TypeError(

@@ -456,7 +456,7 @@ class Counter(abc.ABC):
         """
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file, table_id: int) -> None:
+    def load(self, key_file, counter_file, table_id: int, dist_type: str) -> None:
         """
         Load keys and frequencies from input file path.
 
@@ -464,6 +464,12 @@ class Counter(abc.ABC):
             key_file (str): the file path of keys.
             counter_file (str): the file path of frequencies.
             table_id (int): the logical table to load into.
+            dist_type (str): the key -> rank rule the counter's table is
+                sharded by, so an implementation keeps only the keys this rank
+                owns. Required rather than optional: a counter belongs to a
+                sharded table, so its rule is always known, and an
+                implementation that guesses one drops the keys it guesses
+                wrong about without saying so.
         """
 
     @abc.abstractmethod

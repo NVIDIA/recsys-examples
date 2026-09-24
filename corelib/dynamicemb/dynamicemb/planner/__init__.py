@@ -14,15 +14,22 @@
 # limitations under the License.
 
 
-from .enumerators import DynamicEmbeddingEnumerator
-from .planner import (
+from .placement import BalancedHostPlacer, HostPlacer, TableToPlace
+from .planners import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
     DynamicEmbParameterSharding,
 )
 
+
+# Last: it builds the three above, so they have to exist first.
+from .get_planner import get_planner
+
 __all__ = [
-    "DynamicEmbeddingEnumerator",
+    "get_planner",
+    "BalancedHostPlacer",
+    "HostPlacer",
+    "TableToPlace",
     "DynamicEmbeddingShardingPlanner",
     "DynamicEmbParameterConstraints",
     "DynamicEmbParameterSharding",

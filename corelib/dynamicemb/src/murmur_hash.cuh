@@ -30,7 +30,7 @@ namespace dyn_emb {
 // which is why this header pulls in nothing but <cstdint>.
 //
 // Anything that has to agree with this on the host (``murmur3_fmix64`` in
-// dynamicemb/scored_hashtable.py) is a translation of exactly this function.
+// dynamicemb/key_ownership.py) is a translation of exactly this function.
 __host__ __device__ __forceinline__ uint64_t murmur3_fmix64(uint64_t key) {
   key ^= key >> 33;
   key *= UINT64_C(0xff51afd7ed558ccd);

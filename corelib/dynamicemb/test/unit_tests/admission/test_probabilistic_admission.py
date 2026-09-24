@@ -117,9 +117,7 @@ def test_repeats_within_a_batch_count_as_separate_tosses(occurrences):
     probability = 0.1
     keys, table_ids = _inputs()
     frequencies = torch.full_like(keys, occurrences)
-    admitted = _admitter(probability).admit(
-        keys, table_ids, frequencies
-    )
+    admitted = _admitter(probability).admit(keys, table_ids, frequencies)
     _assert_fraction(admitted, 1.0 - (1.0 - probability) ** occurrences)
 
 
@@ -133,9 +131,7 @@ def test_compounding_survives_a_probability_too_small_for_float32():
     probability, occurrences = 1e-8, 10**9
     keys, table_ids = _inputs()
     frequencies = torch.full_like(keys, occurrences)
-    admitted = _admitter(probability).admit(
-        keys, table_ids, frequencies
-    )
+    admitted = _admitter(probability).admit(keys, table_ids, frequencies)
     # Asserted coarsely on purpose. The true rate is 1 - e^-10 = 0.99995, which
     # leaves about nine rejections out of NUM_KEYS -- too few for the normal
     # approximation _assert_fraction rests on. Telling 0.99995 from 0 needs no

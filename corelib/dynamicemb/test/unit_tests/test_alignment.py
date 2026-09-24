@@ -36,7 +36,7 @@ from dynamicemb.dynamicemb_config import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.get_planner import get_planner
+from dynamicemb.planner import get_planner
 from dynamicemb.key_value_table import DynamicEmbCache, DynamicEmbStorage, HybridStorage
 from dynamicemb.optimizer import (
     DynamicEmbOptimType,

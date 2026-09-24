@@ -49,7 +49,55 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbedding,
     BatchedDynamicEmbeddingBag,
 )
-from ..input_dist import RwSparseFeaturesDist
+from .input_dist import RwSparseFeaturesDist
+
+
+def dist_type_per_feature(
+    sharding_infos: List[EmbeddingShardingInfo],
+) -> Dict[str, str]:
+    """The key -> rank rule each feature's keys are distributed by.
+
+    Per feature, not per sharding, because the bucketize kernel reads it per
+    feature (``dist_type_per_feature[t]`` in
+    ``src/sparse_block_bucketize_features.cu``). Two tables grouped into one
+    sharding may legitimately pick different rules, and nothing downstream
+    needs them to agree.
+
+    A DynamicEmb table always carries its rule, inside the
+    ``DynamicEmbTableOptions`` the planner puts into ``fused_params`` (via
+    ``DynamicEmbParameterSharding.get_additional_fused_params``). A plain
+    TorchRec table carries none and gets ``continuous``, which is what TorchRec's
+    own bucketizer does -- but a DynamicEmb table must never land there, so one
+    arriving without options raises instead. ``continuous`` places a key by range
+    and rewrites the index on the way in (``new_idx = idx % blk_size``), so what
+    the table stores is not a global key; `incremental_dump`, `replay_increment`
+    and the checkpoint loader all refuse such a table. Falling back to it would
+    turn a missing setting into a table that silently cannot be dumped
+    incrementally or reloaded.
+    """
+    per_feature: Dict[str, str] = {}
+    for info in sharding_infos:
+        fused_params = info.fused_params
+        options = fused_params.get("dynamicemb_options") if fused_params else None
+        if options is not None:
+            dist_type = options.dist_type
+        elif (
+            info.param_sharding.compute_kernel
+            == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+        ):
+            raise ValueError(
+                f"DynamicEmb table {info.embedding_config.name!r} reached "
+                "sharding without DynamicEmbTableOptions, so its dist_type is "
+                "unknown. DynamicEmbeddingShardingPlanner puts the options on "
+                "the DynamicEmbParameterSharding it builds; a plan built "
+                "another way has to carry them too. dist_type must be "
+                "'roundrobin' or 'hash_roundrobin'."
+            )
+        else:
+            dist_type = "continuous"
+        for feature_name in info.embedding_config.feature_names:
+            per_feature[feature_name] = dist_type
+    return per_feature
 
 
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
@@ -109,24 +157,9 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
     def _init_customized_distributor(
         self, sharding_infos: List[EmbeddingShardingInfo]
     ) -> None:
-        common_dist_type = None
-
-        self._dist_type_per_feature: Dict[str, str] = {}
-        for sharding_info in sharding_infos:
-            fused_params = sharding_info.fused_params
-            if fused_params is not None and "dist_type" in fused_params:
-                dist_type = fused_params["dist_type"]
-                if common_dist_type is None:
-                    common_dist_type = dist_type
-                else:
-                    assert (
-                        dist_type == common_dist_type
-                    ), "Customized distributor type must keep the same."
-            else:
-                dist_type = "continuous"
-            feature_names = sharding_info.embedding_config.feature_names
-            for f in feature_names:
-                self._dist_type_per_feature[f] = dist_type
+        self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
+            sharding_infos
+        )
 
     def create_input_dist(
         self,
@@ -142,7 +175,9 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             is_sequence=True,
             has_feature_processor=self._has_feature_processor,
             need_pos=False,
-            dist_type_per_feature=self._dist_type_per_feature,
+            dist_types=[
+                self._dist_type_per_feature[name] for name in self.feature_names()
+            ],
         )
 
     def create_lookup(
@@ -210,24 +245,9 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
     def _init_customized_distributor(
         self, sharding_infos: List[EmbeddingShardingInfo]
     ) -> None:
-        common_dist_type = None
-
-        self._dist_type_per_feature: Dict[str, str] = {}
-        for sharding_info in sharding_infos:
-            fused_params = sharding_info.fused_params
-            if fused_params is not None and "dist_type" in fused_params:
-                dist_type = fused_params["dist_type"]
-                if common_dist_type is None:
-                    common_dist_type = dist_type
-                else:
-                    assert (
-                        dist_type == common_dist_type
-                    ), "Customized distributor type must keep the same."
-            else:
-                dist_type = "continuous"
-            feature_names = sharding_info.embedding_config.feature_names
-            for f in feature_names:
-                self._dist_type_per_feature[f] = dist_type
+        self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
+            sharding_infos
+        )
 
     def create_input_dist(
         self,
@@ -243,7 +263,9 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             is_sequence=False,
             has_feature_processor=self._has_feature_processor,
             need_pos=self._need_pos,
-            dist_type_per_feature=self._dist_type_per_feature,
+            dist_types=[
+                self._dist_type_per_feature[name] for name in self.feature_names()
+            ],
         )
 
     def create_lookup(

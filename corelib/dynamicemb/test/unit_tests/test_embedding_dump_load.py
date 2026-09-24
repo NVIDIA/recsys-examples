@@ -42,7 +42,9 @@ from dynamicemb.dynamicemb_config import (
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
-from dynamicemb.get_planner import get_planner
+from dynamicemb.planner import get_planner
+from dynamicemb.key_ownership import murmur3_fmix64
+from dynamicemb.shard.input_dist import dist_type_codes
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
@@ -454,6 +456,24 @@ def check_counter_table_checkpoint(x, y):
                 ), f"counter frequency mismatch for table_id={table_id}"
 
 
+def owns_key(key: int, rank: int, world_size: int, dist_type: str) -> bool:
+    """Whether *rank* is the one holding *key*, under the rule the model uses.
+
+    The question `dynamicemb.key_ownership` answers for tensors, asked one
+    scalar at a time because the checks below walk the input KJTs in Python.
+
+    This used to be spelled `key % world_size == rank` inline, which is the
+    roundrobin rule written out by hand -- right for the default, wrong for
+    hash_roundrobin, and invisible either way at world_size 1, where the only
+    rank owns everything. The hash_roundrobin coverage ran at one rank.
+    """
+    if world_size <= 1:
+        return True
+    if dist_type == "hash_roundrobin":
+        return int(murmur3_fmix64(key)) % world_size == rank
+    return (int(key) & 0xFFFFFFFFFFFFFFFF) % world_size == rank
+
+
 def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
     seen_sharding = False
     seen_input_dist = False
@@ -467,10 +487,13 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
                 seen_sharding = True
 
         for input_dist in getattr(sharded_module, "_input_dists", []):
-            if hasattr(input_dist, "_dist_type_per_feature"):
-                assert set(input_dist._dist_type_per_feature.values()) == {
-                    expected_dist_type
-                }
+            codes = getattr(input_dist, "_dist_type_tensor", None)
+            if codes is not None:
+                # The distributor holds the rule as the kernel's int32 codes,
+                # resolved once at construction; go through the same function
+                # rather than restating the mapping here.
+                expected_code = int(dist_type_codes([expected_dist_type])[0])
+                assert set(codes.tolist()) == {expected_code}
                 seen_input_dist = True
 
     assert seen_sharding, "Did not find any DynamicEmb sharding carrying dist_type."
@@ -644,7 +667,10 @@ def test_model_load_dump(
                 for kjt in reversed(all_kjts):
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
-                        if key % world_size == rank and key not in visited_keys:
+                        if (
+                            owns_key(key, rank, world_size, dist_type)
+                            and key not in visited_keys
+                        ):
                             assert (
                                 key in key_to_score_dict
                             ), f"Key {key} must exist in table of rank {rank}."
@@ -658,7 +684,10 @@ def test_model_load_dump(
                 for kjt in reversed(all_kjts):
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
-                        if key % world_size == rank and key not in visited_keys:
+                        if (
+                            owns_key(key, rank, world_size, dist_type)
+                            and key not in visited_keys
+                        ):
                             assert (
                                 key in key_to_score_dict
                             ), f"Key {key} must exist in table of rank {rank}."

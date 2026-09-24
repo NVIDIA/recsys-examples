@@ -35,7 +35,8 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
-from ..planner.rw_sharding import RwPooledDynamicEmbeddingSharding
+from .rw_sharding import RwPooledDynamicEmbeddingSharding
+from .twrw_sharding import TwRwPooledDynamicEmbeddingSharding
 
 
 class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
@@ -61,6 +62,13 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
 
         if sharding_type == ShardingType.ROW_WISE.value:
             return RwPooledDynamicEmbeddingSharding(
+                sharding_infos=sharding_infos,
+                env=env,
+                device=device,
+                qcomm_codecs_registry=qcomm_codecs_registry,
+            )
+        elif sharding_type == ShardingType.TABLE_ROW_WISE.value:
+            return TwRwPooledDynamicEmbeddingSharding(
                 sharding_infos=sharding_infos,
                 env=env,
                 device=device,

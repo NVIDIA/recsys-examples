@@ -30,7 +30,6 @@ from dynamicemb import (
 from dynamicemb.incremental_dump import get_score, incremental_dump, replay_increment
 from dynamicemb.optimizer import EmbOptimType
 from dynamicemb.planner import (
-    DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
@@ -48,9 +47,6 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
 )
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
 from torchrec.distributed.planner.types import ShardingPlan
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -555,7 +551,10 @@ def get_planner(
     device, eb_configs, batch_size, optimizer_type, training, caching, args
 ):
     hbm_cap = 80 * 1024 * 1024 * 1024  # H100's HBM bytes per GPU
-    ddr_cap = 512 * 1024 * 1024 * 1024  # Assume a Node have 512GB memory
+    # Host memory of one node, shared by every rank on it. Topology wants this
+    # per rank -- it replicates whatever it is given to each device rather than
+    # dividing it -- so the conversion happens where the Topology is built.
+    ddr_cap_per_node = 512 * 1024 * 1024 * 1024
     intra_host_bw = 450e9  # Nvlink bandwidth
     inter_host_bw = 25e9  # NIC bandwidth
     world_size = dist.get_world_size()
@@ -640,31 +639,24 @@ def get_planner(
 
         dict_const[eb_config.name] = const
 
+    local_world_size = get_local_size()
     topology = Topology(
-        local_world_size=get_local_size(),
+        local_world_size=local_world_size,
         world_size=dist.get_world_size(),
         compute_device=device.type,
-        hbm_cap=hbm_cap,
-        ddr_cap=ddr_cap,
+        hbm_cap=hbm_cap,  # per GPU already
+        ddr_cap=ddr_cap_per_node // local_world_size,
         intra_host_bw=intra_host_bw,
         inter_host_bw=inter_host_bw,
     )
 
     # same usage of  torchrec's EmbeddingEnumerator
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=dict_const,
-    )
-
     # Almost same usage of  torchrec's EmbeddingShardingPlanner, except to input eb_configs,
     #   as dynamicemb need EmbeddingConfig info to help to plan.
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
         topology=topology,
         constraints=dict_const,
         batch_size=batch_size,
-        enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
         debug=True,
     )
 

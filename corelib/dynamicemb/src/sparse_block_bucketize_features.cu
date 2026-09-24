@@ -231,7 +231,8 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
   const auto stride = gridDim.x * blockDim.y;
   for (auto b_t = bt_start; b_t < lengths_size; b_t += stride) {
     const auto t = length_to_feature_idx ? length_to_feature_idx[b_t] : b_t / B;
-    int32_t dist_type = dist_type_per_feature ? dist_type_per_feature[t] : 0;
+    const DistType dist_type = static_cast<DistType>(
+        dist_type_per_feature ? dist_type_per_feature[t] : 0);
     index_t blk_size = block_sizes_data[t];
     offset_t rowstart = (b_t == 0 ? 0 : offsets_data[b_t - 1]);
     offset_t rowend = offsets_data[b_t];
@@ -247,13 +248,18 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
       for (auto i = rowstart + threadIdx.x; i < rowend; i += blockDim.x) {
         uindex_t idx = static_cast<uindex_t>(indices_data[i]);
         uindex_t p = 0;
-	if (dist_type == 1) {
-	    p = idx % my_size;
-        } else if (dist_type == 2) {
-	    p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) % my_size;
-	} else {
-	    p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
-	}
+        switch (dist_type) {
+        case DistType::kCyclic:
+          p = idx % my_size;
+          break;
+        case DistType::kHashedCyclic:
+          p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) %
+              my_size;
+          break;
+        default: // DistType::kBlock
+          p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
+          break;
+        }
         atomicAdd(&new_lengths_data[p * lengths_size + b_t], 1);
       }
       return;
@@ -309,7 +315,8 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
   using uoffset_t = std::make_unsigned_t<offset_t>;
   CUDA_1D_KERNEL_LOOP(b_t, lengths_size) {
     const auto t = length_to_feature_idx ? length_to_feature_idx[b_t] : b_t / B;
-    int32_t dist_type = dist_type_per_feature ? dist_type_per_feature[t] : 0;
+    const DistType dist_type = static_cast<DistType>(
+        dist_type_per_feature ? dist_type_per_feature[t] : 0);
     index_t blk_size = block_sizes_data[t];
     offset_t rowstart = (b_t == 0 ? 0 : offsets_data[b_t - 1]);
     offset_t rowend = offsets_data[b_t];
@@ -326,15 +333,20 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
       uindex_t p = 0;
       uindex_t new_idx = 0;
       if (!use_block_bucketize_pos) {
-        if (dist_type == 1) {
+        switch (dist_type) {
+        case DistType::kCyclic:
           p = idx % my_size;
           new_idx = idx;
-	} else if (dist_type == 2) {
-          p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) % my_size;
+          break;
+        case DistType::kHashedCyclic:
+          p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) %
+              my_size;
           new_idx = idx;
-        } else {
+          break;
+        default: // DistType::kBlock
           p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
           new_idx = idx < blk_size * my_size ? idx % blk_size : idx / my_size;
+          break;
         }
       } else {
         uindex_t lb = indices_to_lb[i];
