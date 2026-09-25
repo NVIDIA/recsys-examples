@@ -2818,7 +2818,8 @@ def test_dump_stores_table_precision(value_type, tmp_path):
     for table_id, name in enumerate(table_names):
         meta = _read_meta(native_dir, name)
         assert meta["embedding_dtype"] == dtype_name
-        assert meta["optim_state_dtype"] == dtype_name
+        # Rowwise Adagrad keeps its accumulator in fp32 whatever the table dtype.
+        assert meta["optim_state_dtype"] == "float32"
         assert meta["embedding_dim"] == dims[table_id]
 
         num_keys = _dumped_key_count(native_dir, name)
@@ -2828,15 +2829,14 @@ def test_dump_stores_table_precision(value_type, tmp_path):
             os.path.getsize(_shard_file(native_dir, name, "values"))
             == num_keys * dims[table_id] * elem
         )
-        # The optimizer block shares the value row, so it is written at the same
-        # precision -- check the file rather than trusting the meta string.
+        # The accumulator is written as fp32 whatever the table's precision --
+        # check the file rather than trusting the meta string.
         ckpt_opt_dim = get_optimizer_ckpt_state_dim(
             _DUMP_LOAD_OPT_TYPE, dims[table_id], value_type
         )
-        assert (
-            os.path.getsize(_shard_file(native_dir, name, "opt_values"))
-            == num_keys * ckpt_opt_dim * elem
-        )
+        assert os.path.getsize(
+            _shard_file(native_dir, name, "opt_values")
+        ) == num_keys * ckpt_opt_dim * _dtype_element_size(torch.float32)
 
     dst = _make_dump_load_tables(dims, table_names, value_type)
     dst.load(native_dir, optim=True)
