@@ -32,6 +32,7 @@ from torchrec.distributed.types import (
     QuantizedCommCodecs,
     ShardingEnv,
 )
+from torchrec.modules.embedding_configs import data_type_to_dtype
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -48,8 +49,14 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
     def reset_parameters(self) -> None:
         # TorchRec registers an empty weight for shards a rank does not hold but
         # skips CUSTOMIZED_KERNEL tables; a table-row-wise DynamicEmb table lives
-        # on one node, so the other nodes' ranks need that placeholder before
-        # reset_parameters and state_dict look for a weight to touch.
+        # on one node, so the other nodes' ranks need a placeholder before
+        # reset_parameters and state_dict look for a weight to touch. It has the
+        # same (1, 1) meta shape the kernel registers on owner ranks, so a
+        # checkpoint planner sees one identical entry per rank and dedups it.
+        dtypes = {
+            config.name: data_type_to_dtype(config.data_type)
+            for config in self._embedding_bag_configs
+        }
         for table_name, parameter_sharding in self.module_sharding_plan.items():
             if (
                 parameter_sharding.compute_kernel
@@ -58,7 +65,14 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
                 continue
             if not hasattr(self.embedding_bags[table_name], "weight"):
                 self.embedding_bags[table_name].register_parameter(
-                    "weight", nn.Parameter(torch.empty(0, device=self._device))
+                    "weight",
+                    nn.Parameter(
+                        torch.empty(
+                            (1, 1),
+                            device=torch.device("meta"),
+                            dtype=dtypes[table_name],
+                        )
+                    ),
                 )
         super().reset_parameters()
 
