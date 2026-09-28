@@ -115,6 +115,123 @@ def test_accumulator_matches_fp32_table(value_type, emb_dim, all_dims_vec4):
     torch.testing.assert_close(weights, ref_weights, rtol=tolerance, atol=tolerance)
 
 
+def _flat_table(value_type: torch.dtype, emb_dim: int, seed: int = 0):
+    """A flat table of NUM_ROWS rows: embedding, then the optimizer-state slot."""
+    optimizer = _optimizer(value_type)
+    value_dim = emb_dim + optimizer.get_state_dim(emb_dim)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    table = torch.zeros(NUM_ROWS, value_dim, dtype=value_type, device="cuda")
+    table[:, :emb_dim] = (torch.rand(NUM_ROWS, emb_dim, generator=generator) * 0.1).to(
+        device="cuda", dtype=value_type
+    )
+    optimizer.reset_optimizer_states(table[:, emb_dim:], emb_dims=emb_dim)
+    return optimizer, table
+
+
+def _flat_update(optimizer, table, grads, indices, emb_dim, all_dims_vec4):
+    optimizer.fused_update_for_flat_table(
+        grads,
+        indices,
+        torch.tensor([table.data_ptr()], dtype=torch.int64, device="cuda"),
+        torch.zeros(grads.size(0), dtype=torch.int64, device="cuda"),
+        torch.tensor([table.size(1)], dtype=torch.int64, device="cuda"),
+        torch.tensor([emb_dim], dtype=torch.int64, device="cuda"),
+        emb_dim,
+        all_dims_vec4,
+        table.dtype,
+    )
+
+
+def _flat_grads(emb_dim: int, seed: int = 1):
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return [
+        (torch.randn(NUM_ROWS, emb_dim, generator=generator) * GRAD_SCALE).to("cuda")
+        for _ in range(NUM_STEPS)
+    ]
+
+
+@cuda
+@pytest.mark.parametrize(
+    "value_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+@pytest.mark.parametrize(
+    "emb_dim, all_dims_vec4",
+    [(16, True), (7, False), (13, False)],
+    ids=["vec4", "odd7", "odd13"],
+)
+def test_flat_table_accumulator_matches_fp32_table(value_type, emb_dim, all_dims_vec4):
+    """The flat kernels place the state at each table's own emb_dim, not a padded offset.
+
+    With an odd emb_dim a row's state slot starts on a 2-byte boundary, and so
+    does every other row after the first, since the row stride is odd too.
+    """
+    indices = torch.arange(NUM_ROWS, dtype=torch.int64, device="cuda")
+    grads = _flat_grads(emb_dim)
+    ref_opt, ref = _flat_table(torch.float32, emb_dim)
+    opt, table = _flat_table(value_type, emb_dim)
+    for grad in grads:
+        _flat_update(ref_opt, ref, grad, indices, emb_dim, all_dims_vec4)
+        _flat_update(opt, table, grad, indices, emb_dim, all_dims_vec4)
+    torch.cuda.synchronize()
+
+    accumulator = opt.states_for_checkpoint(table[:, emb_dim:], emb_dim)
+    ref_accumulator = ref_opt.states_for_checkpoint(ref[:, emb_dim:], emb_dim)
+    assert accumulator.dtype == torch.float32
+    assert torch.all(accumulator > 0), "accumulator underflowed to zero"
+    assert torch.equal(accumulator, ref_accumulator)
+    tolerance = 1e-2 if value_type == torch.bfloat16 else 2e-3
+    torch.testing.assert_close(
+        table[:, :emb_dim].float(), ref[:, :emb_dim], rtol=tolerance, atol=tolerance
+    )
+
+
+@cuda
+@pytest.mark.parametrize(
+    "value_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+@pytest.mark.parametrize("emb_dim", [7, 13], ids=["odd7", "odd13"])
+def test_flat_table_update_leaves_other_rows_untouched(value_type, emb_dim):
+    """Updating a row must not spill its fp32 accumulator into the next row."""
+    opt, table = _flat_table(value_type, emb_dim)
+    before = table.clone()
+    indices = torch.full((NUM_ROWS,), -1, dtype=torch.int64, device="cuda")
+    updated = torch.arange(0, NUM_ROWS, 2, device="cuda")
+    indices[updated] = updated
+    _flat_update(opt, table, _flat_grads(emb_dim)[0], indices, emb_dim, False)
+    torch.cuda.synchronize()
+
+    untouched = torch.arange(1, NUM_ROWS, 2, device="cuda")
+    assert torch.equal(
+        table[untouched].view(torch.int16), before[untouched].view(torch.int16)
+    )
+    assert torch.all(opt.states_for_checkpoint(table[updated, emb_dim:], emb_dim) > 0)
+
+
+@cuda
+@pytest.mark.parametrize(
+    "value_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+@pytest.mark.parametrize("emb_dim", [7, 13], ids=["odd7", "odd13"])
+def test_flat_table_resumes_exactly_from_checkpoint(value_type, emb_dim):
+    """A table rebuilt from the dumped accumulator keeps updating bit-identically."""
+    indices = torch.arange(NUM_ROWS, dtype=torch.int64, device="cuda")
+    grads = _flat_grads(emb_dim)
+    opt, table = _flat_table(value_type, emb_dim)
+    for grad in grads[:-1]:
+        _flat_update(opt, table, grad, indices, emb_dim, False)
+
+    restored = table.clone()
+    dumped = opt.states_for_checkpoint(table[:, emb_dim:], emb_dim)
+    restored[:, emb_dim:] = opt.states_from_checkpoint(
+        dumped.clone(), emb_dim, value_type, restored.device
+    )
+
+    _flat_update(opt, table, grads[-1], indices, emb_dim, False)
+    _flat_update(opt, restored, grads[-1], indices, emb_dim, False)
+    torch.cuda.synchronize()
+    assert torch.equal(restored.view(torch.int16), table.view(torch.int16))
+
+
 @cuda
 @pytest.mark.parametrize(
     "value_type",
