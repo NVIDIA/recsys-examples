@@ -125,6 +125,9 @@ class HostKVStorageBase(ABC):
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         ...
 
+    def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        raise NotImplementedError("prefetch_kvcache is only implemented for FlexKV")
+
     @abstractmethod
     def offload_kvcache_launch(
         self,

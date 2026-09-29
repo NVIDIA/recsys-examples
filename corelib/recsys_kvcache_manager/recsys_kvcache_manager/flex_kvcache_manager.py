@@ -295,9 +295,12 @@ class FlexKVStorage(HostKVStorageBase):
             )
             if str(env_gran).strip():
                 gran = int(env_gran)
-        # Recsys SSD-span switch. Independent of is_layerwise: N>0 splits
-        # DISK2H even for a naive whole wait. Layerwise with N unset is 1.
-        if self.enable_layerwise and gran <= 0:
+        # layerwise is the master switch: SSD spans + H2D eventfd + HSTU
+        # wait_layer. N only sizes SSD spans. Off → ignore N, whole-block
+        # DISK2H. On + N unset → 1 (one original layer per DISK2H).
+        if not self.enable_layerwise:
+            gran = -1
+        elif gran <= 0:
             gran = 1
         self.layer_granularity = gran
         cache_cfg.layer_granularity = gran
@@ -567,6 +570,11 @@ class FlexKVStorage(HostKVStorageBase):
         task_handle.handle.wait_layer(layer_idx)
 
     def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        if getattr(index_meta, "namespaces", None) is None:
+            index_meta.namespaces = [
+                [f"uid:{int(uid)}"]
+                for uid in index_meta.user_ids.detach().cpu().tolist()
+            ]
         task_ids = []
         for token_ids, namespace in zip(index_meta.token_ids, index_meta.namespaces):
             if isinstance(token_ids, torch.Tensor):
@@ -574,12 +582,11 @@ class FlexKVStorage(HostKVStorageBase):
                 if token_ids.dtype != torch.int64:
                     token_ids = token_ids.to(torch.int64)
                 token_ids = token_ids.numpy()
-            task_ids.append(
-                self._client.prefetch_async(
-                    token_ids=token_ids,
-                    namespace=namespace,
-                )
+            task_id = self._client.prefetch_async(
+                token_ids=token_ids,
+                namespace=namespace,
             )
+            task_ids.append(task_id)
         return HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,

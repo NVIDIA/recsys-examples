@@ -155,12 +155,7 @@ class DefaultKVCacheBackend(KVCacheBackend):
         task_handle.wait_layer(layer_idx)
 
     def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
-        prefetch_fn = getattr(self.host_kvstorage_manager, "prefetch_kvcache", None)
-        if prefetch_fn is None:
-            raise NotImplementedError(
-                "prefetch_kvcache is only implemented for FlexKV"
-            )
-        return prefetch_fn(index_meta)
+        return self.host_kvstorage_manager.prefetch_kvcache(index_meta)
 
     def offload_launch(
         self,

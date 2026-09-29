@@ -26,6 +26,8 @@ ACTION_FEATURE_NAME = "act_feat"
 ITEM_VOCAB_SIZE = 10000
 ACTION_VOCAB_SIZE = 128
 SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit"})
+# Prefetch→GET overlap window. Drawn per ssd_hit timed iter; not a CLI.
+PREFETCH_GAP_MS_RANGE = (0.0, 20.0)
 
 
 InferenceRequest = Tuple[HSTUBatch, torch.Tensor, torch.Tensor]
@@ -583,9 +585,10 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
             max_seqlen,
         )
 
-        # timed run
+        # timed run: DISK2H prefetch, random gap, then GET.
         torch.cuda.nvtx.range_push(f"scenario3_timed_run_{iter_idx}")
-        model_predict.forward_with_kvcache(
+        run_forward_with_kvcache(
+            model_predict,
             batch,
             user_ids,
             total_history_lengths,
@@ -613,10 +616,11 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     print(f"[Scenario3] timed run completed, iters={timed_iters}")
 
 
-def run_prefetch_online(model, batch, uids, seq, gap_ms: float):
+def run_forward_with_kvcache(model, batch, uids, seq):
     kvc_mgr = model.dense_module.kvcache
     index_meta, _lookup_res = kvc_mgr.lookup_kvcache(uids, seq)
     kvc_mgr.prefetch_kvcache(index_meta)
+    gap_ms = random.uniform(*PREFETCH_GAP_MS_RANGE)
     if gap_ms > 0:
         time.sleep(gap_ms / 1000.0)
     return model.forward_with_kvcache(batch, uids, seq)
@@ -666,16 +670,9 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help=(
-            "Recsys SSD DISK2H span size N (also RECSYS_FLEXKV_LAYER_GRANULARITY). "
-            "Works with or without --layerwise. Layerwise default is 1. "
-            "<=0 keeps a whole-KV DISK2H."
+            "SSD DISK2H span size N while --layerwise is on. Unset defaults to 1. "
+            "Without --layerwise this flag is ignored."
         ),
-    )
-    parser.add_argument(
-        "--prefetch-gap-ms",
-        type=float,
-        default=None,
-        help="If set, call prefetch_kvcache then sleep this many ms before GET.",
     )
     args, _ = parser.parse_known_args()
 
@@ -730,6 +727,7 @@ if __name__ == "__main__":
         f"num_candidates={cfg.num_candidates}, batch_size={cfg.batch_size}, "
         f"disable_cudagraph={cfg.disable_cudagraph}, "
         f"mode={mode}, "
+        f"prefetch_gap_ms={PREFETCH_GAP_MS_RANGE[0]}-{PREFETCH_GAP_MS_RANGE[1]}, "
         f"scenarios={','.join(sorted(scenarios))}"
     )
     model_predict, page_size, max_seqlen = build_model(cfg, history_len)
