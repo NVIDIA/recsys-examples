@@ -17,7 +17,7 @@ import os
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -40,7 +40,9 @@ from .host_kvstorage_manager import (
 )
 from .flexkv_layerwise import (
     FlexKVLayerwiseEventfdSender,
+    LayerwiseCounterPool,
     create_layerwise_eventfd_socket_path,
+    drain_layer_eventfds,
 )
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
@@ -62,11 +64,24 @@ class _FlexKVOnloadHandle:
     uids: torch.Tensor
     slot_mappings: List[torch.Tensor]
     layer_eventfds: Optional[List[int]] = None
+    counter_id: Optional[int] = None
+    num_layers: int = 0
+    _on_release: Optional[Callable[[], None]] = None
+    _released: bool = False
 
     def wait_layer(self, layer_idx: int) -> None:
         if self.layer_eventfds is None:
             return
         os.read(self.layer_eventfds[layer_idx], 8)
+        if int(layer_idx) >= int(self.num_layers) - 1:
+            self.release_counter()
+
+    def release_counter(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._on_release is not None:
+            self._on_release()
 
 
 @dataclass
@@ -153,8 +168,11 @@ class FlexKVStorage(HostKVStorageBase):
             or os.environ.get("FLEXKV_LAYERWISE_EVENTFD_SOCKET")
             or create_layerwise_eventfd_socket_path()
         )
+        # Extra pin is unused: concurrent GETs take a free counter from the pool.
         self.layerwise_counter_id = int(layerwise_counter_id)
-        self.layer_granularity = int(layer_granularity)
+        self.layer_granularity = (
+            -1 if layer_granularity is None else int(layer_granularity)
+        )
         self.backend_name = "flexkv"
 
         self._gpu_cache_table_list: Optional[List[torch.Tensor]] = None
@@ -168,6 +186,7 @@ class FlexKVStorage(HostKVStorageBase):
         self._ready = False
         self._page_offsets: Optional[torch.Tensor] = None
         self._layerwise_eventfd_sender: Optional[FlexKVLayerwiseEventfdSender] = None
+        self._layerwise_counter_pool: Optional[LayerwiseCounterPool] = None
 
     def register_gpu_cache_tables(self, cache_table_list: List[torch.Tensor]) -> None:
         assert (
@@ -314,12 +333,29 @@ class FlexKVStorage(HostKVStorageBase):
                     socket_path=self.layerwise_eventfd_socket,
                 )
             self._layerwise_eventfd_sender.start()
+            self._layerwise_counter_pool = LayerwiseCounterPool(
+                self._layerwise_eventfd_sender.num_counters
+            )
         self._client = KVManager(
             model_config=model_cfg,
             cache_config=cache_cfg,
             dp_client_id=0,
         )
         self._client.start()
+
+    def _release_layerwise_counter(self, counter_id: int) -> None:
+        sender = self._layerwise_eventfd_sender
+        if sender is not None:
+            drain_layer_eventfds(sender.layer_eventfds(counter_id))
+        if self._layerwise_counter_pool is not None:
+            self._layerwise_counter_pool.release(counter_id)
+
+    def _wait_onload_then_release(self, handle: _FlexKVOnloadHandle) -> None:
+        try:
+            if handle.task_ids:
+                self._client.wait(handle.task_ids, completely=True)
+        finally:
+            handle.release_counter()
 
     def build_index_meta(
         self,
@@ -473,101 +509,115 @@ class FlexKVStorage(HostKVStorageBase):
                 status=HostKVTaskStatus.SKIPPED,
             )
 
-        onload_handle = _FlexKVOnloadHandle(
-            task_ids=onboard_task_ids,
-            uids=torch.tensor(onboard_uids, dtype=torch.int64),
-            slot_mappings=onboard_slot_mappings,
-            layer_eventfds=(
-                self._layerwise_eventfd_sender.layer_eventfds(
-                    self.layerwise_counter_id
-                )
-                if self.enable_layerwise and self._layerwise_eventfd_sender is not None
-                else None
-            ),
-        )
-        onload_task_handle = HostKVTaskHandle(
-            backend="flexkv",
-            user_ids=onload_handle.uids,
-            handle=onload_handle,
-            status=HostKVTaskStatus.LAUNCHED,
-            is_layerwise=bool(self.enable_layerwise),
-            onboard_wait_by_layer=self.onboard_kvcache_wait_by_layer,
-            metadata={
-                "onboard_start_indices": torch.tensor(
-                    onboard_start_indices, dtype=torch.int32
+        counter_id: Optional[int] = None
+        onload_handle: Optional[_FlexKVOnloadHandle] = None
+        try:
+            if self.enable_layerwise and self._layerwise_eventfd_sender is not None:
+                if self._layerwise_counter_pool is None:
+                    self._layerwise_counter_pool = LayerwiseCounterPool(
+                        self._layerwise_eventfd_sender.num_counters
+                    )
+                counter_id = self._layerwise_counter_pool.acquire()
+            onload_handle = _FlexKVOnloadHandle(
+                task_ids=onboard_task_ids,
+                uids=torch.tensor(onboard_uids, dtype=torch.int64),
+                slot_mappings=onboard_slot_mappings,
+                layer_eventfds=(
+                    self._layerwise_eventfd_sender.layer_eventfds(counter_id)
+                    if counter_id is not None
+                    and self._layerwise_eventfd_sender is not None
+                    else None
                 ),
-                "onboard_lengths": torch.tensor(onboard_lengths, dtype=torch.int32),
-            },
-        )
-
-        # Recsys `as_batch` is multi-user GET merging (len>1). FlexKV only
-        # builds LAYERWISE ops inside merge_to_batch_graph, which requires
-        # launch(..., as_batch=True). That is a FlexKV API constraint, not a
-        # Recsys as_batch bug. Force batch for layerwise even on a single GET.
-        use_batch = (self.as_batch and len(onboard_task_ids) > 1) or bool(
-            self.enable_layerwise
-        )
-        launch_kwargs: Dict[str, Any] = {"as_batch": use_batch}
-        if self.enable_layerwise:
-            launch_kwargs.update(
-                {
-                    "layerwise_transfer": True,
-                    "counter_id": self.layerwise_counter_id,
-                }
+                counter_id=counter_id,
+                num_layers=self.num_layers,
+                _on_release=(
+                    (lambda cid=counter_id: self._release_layerwise_counter(cid))
+                    if counter_id is not None
+                    else None
+                ),
             )
-        self._client.launch(
-            onload_handle.task_ids,
-            onload_handle.slot_mappings,
-            **launch_kwargs,
-        )
-        return onload_task_handle
+            onload_task_handle = HostKVTaskHandle(
+                backend="flexkv",
+                user_ids=onload_handle.uids,
+                handle=onload_handle,
+                status=HostKVTaskStatus.LAUNCHED,
+                is_layerwise=bool(self.enable_layerwise),
+                metadata={
+                    "onboard_start_indices": torch.tensor(
+                        onboard_start_indices, dtype=torch.int32
+                    ),
+                    "onboard_lengths": torch.tensor(onboard_lengths, dtype=torch.int32),
+                },
+            )
+
+            # Recsys `as_batch` is multi-user GET merging (len>1). FlexKV only
+            # builds LAYERWISE ops inside merge_to_batch_graph, which requires
+            # launch(..., as_batch=True). That is a FlexKV API constraint, not a
+            # Recsys as_batch bug. Force batch for layerwise even on a single GET.
+            use_batch = (self.as_batch and len(onboard_task_ids) > 1) or bool(
+                self.enable_layerwise
+            )
+            launch_kwargs: Dict[str, Any] = {"as_batch": use_batch}
+            if self.enable_layerwise:
+                launch_kwargs.update(
+                    {
+                        "layerwise_transfer": True,
+                        "counter_id": int(counter_id if counter_id is not None else 0),
+                    }
+                )
+            self._client.launch(
+                onload_handle.task_ids,
+                onload_handle.slot_mappings,
+                **launch_kwargs,
+            )
+            return onload_task_handle
+        except Exception:
+            if onload_handle is not None:
+                onload_handle.release_counter()
+            elif counter_id is not None:
+                self._release_layerwise_counter(counter_id)
+            raise
 
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
-        onboard_results: Dict[int, "KVResponse"] = self._client.wait(
-            task_handle.handle.task_ids,
-        )
+        try:
+            onboard_results: Dict[int, "KVResponse"] = self._client.wait(
+                task_handle.handle.task_ids,
+            )
 
-        failed_flag = list()
-        failed_user_ids = list()
-        ready = True
-        # Onboard for FlexKV may launch only a subset of batch users.
-        # task_ids/uids lengths must be used here instead of full batch user_ids.
-        for idx in range(len(task_handle.handle.task_ids)):
-            task_id = task_handle.handle.task_ids[idx]
-            res = onboard_results[task_id]
-            if res.status == KVResponseStatus.SUCCESS:
-                failed_flag.append(0)
-            elif res.status == KVResponseStatus.UNREADY:
-                # Flex KV wait should not return UNREADY
-                ready = False
-                continue
+            failed_flag = list()
+            failed_user_ids = list()
+            ready = True
+            # Onboard for FlexKV may launch only a subset of batch users.
+            # task_ids/uids lengths must be used here instead of full batch user_ids.
+            for idx in range(len(task_handle.handle.task_ids)):
+                task_id = task_handle.handle.task_ids[idx]
+                res = onboard_results[task_id]
+                if res.status == KVResponseStatus.SUCCESS:
+                    failed_flag.append(0)
+                elif res.status == KVResponseStatus.UNREADY:
+                    # Flex KV wait should not return UNREADY
+                    ready = False
+                    continue
+                else:
+                    failed_flag.append(1)
+                    failed_user_ids.append(task_handle.handle.uids[idx].item())
+
+            if len(failed_user_ids) == 0:
+                return HostKVWaitResult(
+                    status=HostKVTaskStatus.READY if ready else HostKVTaskStatus.LAUNCHED,
+                    ready=ready,
+                )
             else:
-                failed_flag.append(1)
-                failed_user_ids.append(task_handle.handle.uids[idx].item())
-
-        if len(failed_user_ids) == 0:
-            return HostKVWaitResult(
-                status=HostKVTaskStatus.READY if ready else HostKVTaskStatus.LAUNCHED,
-                ready=ready,
-            )
-        else:
-            return HostKVWaitResult(
-                status=HostKVTaskStatus.FAILED,
-                ready=False,
-                failed_mask=failed_flag,
-                failed_user_ids=failed_user_ids,
-            )
-
-    def onboard_kvcache_wait_by_layer(
-        self, task_handle: HostKVTaskHandle, layer_idx: int
-    ) -> None:
-        if (
-            task_handle is None
-            or task_handle.handle is None
-            or not task_handle.is_layerwise
-        ):
-            return
-        task_handle.handle.wait_layer(layer_idx)
+                return HostKVWaitResult(
+                    status=HostKVTaskStatus.FAILED,
+                    ready=False,
+                    failed_mask=failed_flag,
+                    failed_user_ids=failed_user_ids,
+                )
+        finally:
+            handle = getattr(task_handle, "handle", None)
+            if isinstance(handle, _FlexKVOnloadHandle):
+                handle.release_counter()
 
     def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
         if getattr(index_meta, "namespaces", None) is None:
@@ -752,6 +802,10 @@ class FlexKVStorage(HostKVStorageBase):
         return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
 
     def finish_task(self, task_handle: HostKVTaskHandle) -> List[int]:
+        handle = task_handle.handle
+        if isinstance(handle, _FlexKVOnloadHandle):
+            self._wait_onload_then_release(handle)
+            return [1 for _ in range(handle.uids.size(0))]
         # FlexKV wait success equals finish.
         # offload_kvcache_wait() may already try_wait() to SUCCESS and release tasks in
         # FlexKV; waiting again on those ids logs "not submitted" (NOTFOUND). Only wait
@@ -771,7 +825,10 @@ class FlexKVStorage(HostKVStorageBase):
     def cancel_task(self, task_handle: HostKVTaskHandle) -> bool:
         if task_handle is None or task_handle.handle is None:
             return False
-        self._client.cancel(task_handle.handle.task_ids)
+        handle = task_handle.handle
+        if isinstance(handle, _FlexKVOnloadHandle):
+            self._wait_onload_then_release(handle)
+        self._client.cancel(handle.task_ids)
         task_handle.status = HostKVTaskStatus.CANCELLED
         return True
 
