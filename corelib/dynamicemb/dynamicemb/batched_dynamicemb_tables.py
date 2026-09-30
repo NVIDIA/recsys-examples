@@ -1938,6 +1938,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # was. Pushing dirty cache entries down first makes the storage copy
             # this replay is about to overwrite the authoritative one.
             flush_cache(self._cache, storage)
+            # Flushing can grow and rehash the backing table. Revalidate the
+            # source slots after that layout-changing side effect, before any
+            # replay writes use the original plan.
+            plan = self._plan_replay(delta, content, storage)
 
         ts = device_timestamp()
         return {job.name: self._apply_replay(job, content, storage, ts) for job in plan}

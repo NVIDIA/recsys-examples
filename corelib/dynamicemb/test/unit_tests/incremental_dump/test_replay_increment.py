@@ -798,3 +798,31 @@ def test_replay_with_caching(current_device):
     _, src_vals = sorted_view(delta.keys[0], delta.values[0])
     _, out_vals = sorted_view(torch.tensor(keys), out.cpu())
     torch.testing.assert_close(out_vals, src_vals)
+
+
+def test_replay_rechecks_layout_after_cache_flush_expansion(current_device):
+    """A cache flush may rehash storage, invalidating the source slot plan."""
+    device = torch.device(f"cuda:{current_device}")
+    cfg = dict(
+        max_capacity=4096,
+        init_capacity=512,
+        bucket_capacity=128,
+        caching=True,
+        local_hbm_for_values=65536,
+    )
+    src = make_model(current_device, **cfg)
+    dst = make_model(current_device, **cfg)
+
+    delta_keys = list(range(1001, 1101))
+    extra_keys = list(range(5001, 5451))
+    touch(src, delta_keys, device)
+    delta = dump_all(src)
+
+    # Keep the target's cache dirty and force its backing table to grow when
+    # replay flushes it. The pre-flush plan still sees the original capacity.
+    all_keys = delta_keys + extra_keys
+    for start in range(0, len(all_keys), 50):
+        touch(dst, all_keys[start : start + 50], device)
+
+    with pytest.raises(ValueError, match="capacity mismatch"):
+        dst.replay_increment(delta)
