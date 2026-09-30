@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fcntl
 import os
 import socket
 import stat
@@ -26,6 +27,62 @@ from typing import List, Optional
 
 
 DEFAULT_LAYERWISE_EVENTFD_SOCKET = "/tmp/flexkv_layerwise_eventfd.sock"
+
+
+class LayerwiseCounterPool:
+    """One in-flight layerwise GET per eventfd counter set.
+
+    FlexKV ships three counter sets (triple buffer). Concurrent GETs must not
+    share a set: ``os.read`` drains the count, so two waiters on the same fd
+    steal each other's completion.
+    """
+
+    def __init__(self, num_counters: int) -> None:
+        self._n = int(num_counters)
+        if self._n <= 0:
+            raise ValueError(f"num_counters must be > 0, got {num_counters}")
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._busy = [False] * self._n
+        self._next = 0
+
+    def acquire(self, timeout_s: float = 180.0) -> int:
+        deadline = time.monotonic() + float(timeout_s)
+        with self._cv:
+            while True:
+                for offset in range(self._n):
+                    counter_id = (self._next + offset) % self._n
+                    if not self._busy[counter_id]:
+                        self._busy[counter_id] = True
+                        self._next = (counter_id + 1) % self._n
+                        return counter_id
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"no free layerwise counter_id in [0, {self._n})"
+                    )
+                self._cv.wait(timeout=remaining)
+
+    def release(self, counter_id: int) -> None:
+        cid = int(counter_id)
+        with self._cv:
+            if 0 <= cid < self._n and self._busy[cid]:
+                self._busy[cid] = False
+                self._cv.notify()
+
+
+def drain_layer_eventfds(fds: List[int]) -> None:
+    """Drop leftover eventfd counts so the next GET on this set starts clean."""
+    for fd in fds:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            while True:
+                os.read(fd, 8)
+        except BlockingIOError:
+            pass
+        finally:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
 
 
 def create_layerwise_eventfd_socket_path() -> str:

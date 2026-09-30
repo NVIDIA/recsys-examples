@@ -26,7 +26,6 @@ ACTION_FEATURE_NAME = "act_feat"
 ITEM_VOCAB_SIZE = 10000
 ACTION_VOCAB_SIZE = 128
 SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit"})
-# Prefetch→GET overlap window. Drawn per ssd_hit timed iter; not a CLI.
 PREFETCH_GAP_MS_RANGE = (0.0, 20.0)
 
 
@@ -618,7 +617,7 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
 
 def run_forward_with_kvcache(model, batch, uids, seq):
     kvc_mgr = model.dense_module.kvcache
-    index_meta, _lookup_res = kvc_mgr.lookup_kvcache(uids, seq)
+    index_meta = kvc_mgr.host_kvstorage_manager.build_index_meta(uids, seq)
     kvc_mgr.prefetch_kvcache(index_meta)
     gap_ms = random.uniform(*PREFETCH_GAP_MS_RANGE)
     if gap_ms > 0:
