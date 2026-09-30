@@ -626,6 +626,17 @@ class DynamicEmbTableOptions:
     (key, table_id) only, no value/score. Tables differing in this mode are not
     grouped onto shared storage."""
 
+    optimizer_state_dtype: Optional[torch.dtype] = None
+    """Precision the optimizer state is kept at, and the ``optim_state_dtype`` a
+    dump records. ``None`` keeps each optimizer's default. Only
+    ``EXACT_ROWWISE_ADAGRAD`` accepts anything besides the table's
+    ``embedding_dtype``: its accumulator defaults to ``torch.float32``, because a
+    running sum of mean squared gradients underflows to zero in fp16, and it may
+    be set to the table's ``embedding_dtype`` to store it at that precision
+    instead. It is a per-table option, not a ``fused_params`` entry, so that tables
+    sharded by FBGEMM never see it. Tables differing in it are not grouped onto
+    shared storage."""
+
     def __post_init__(self):
         if self.admission_counter is not None:
             warnings.warn(
@@ -709,6 +720,7 @@ class DynamicEmbTableOptions:
         # The retain path swaps the last-tier insert kernel (collect vs drop), a
         # per-storage choice, so tables differing in it must not share storage.
         grouped_key["evicted_item_mode"] = self.evicted_item_mode
+        grouped_key["optimizer_state_dtype"] = self.optimizer_state_dtype
         return grouped_key
 
     def __hash__(self):

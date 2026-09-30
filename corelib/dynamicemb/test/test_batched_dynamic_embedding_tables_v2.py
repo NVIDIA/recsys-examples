@@ -2460,6 +2460,7 @@ def _make_multi_table_bdeb_for_dump_load(
     value_type: torch.dtype,
     device_id: int,
     dist_type: str = "roundrobin",
+    optimizer_state_dtype: Optional[torch.dtype] = None,
 ) -> BatchedDynamicEmbeddingTablesV2:
     opts = []
     for dim in dims:
@@ -2475,6 +2476,7 @@ def _make_multi_table_bdeb_for_dump_load(
                 caching=False,
                 local_hbm_for_values=1024**3,
                 dist_type=dist_type,
+                optimizer_state_dtype=optimizer_state_dtype,
             )
         )
     return BatchedDynamicEmbeddingTablesV2(
@@ -2762,6 +2764,7 @@ def _make_dump_load_tables(
     table_names: List[str],
     value_type: torch.dtype,
     device_id: int = 0,
+    optimizer_state_dtype: Optional[torch.dtype] = None,
 ) -> BatchedDynamicEmbeddingTablesV2:
     return _make_multi_table_bdeb_for_dump_load(
         _DUMP_LOAD_OPT_TYPE,
@@ -2773,6 +2776,7 @@ def _make_dump_load_tables(
         torch.int64,
         value_type,
         device_id,
+        optimizer_state_dtype=optimizer_state_dtype,
     )
 
 
@@ -2851,6 +2855,76 @@ def test_dump_stores_table_precision(value_type, tmp_path):
         # Same precision on both sides, so the round trip is exact.
         torch.testing.assert_close(
             vals_mid[order_mid], vals_dst[order_dst], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    "value_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+def test_dump_records_configured_optimizer_state_dtype(value_type, tmp_path):
+    """A table keeping its accumulator at table precision dumps it that way, and loads back."""
+    device = _init_single_rank_pg()
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+
+    fp32_dir = _dump_fp32_source(tmp_path, dims, table_names, device)
+    mid = _make_dump_load_tables(
+        dims, table_names, value_type, optimizer_state_dtype=value_type
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mid.load(fp32_dir, optim=True)
+
+    native_dir = os.path.join(str(tmp_path), "native")
+    os.makedirs(native_dir, exist_ok=True)
+    mid.dump(native_dir, optim=True)
+
+    dtype_name = str(value_type).split(".")[-1]
+    for table_id, name in enumerate(table_names):
+        assert _read_meta(native_dir, name)["optim_state_dtype"] == dtype_name
+        num_keys = _dumped_key_count(native_dir, name)
+        assert num_keys > 0, f"{name}: nothing was dumped, the test proves nothing"
+        ckpt_opt_dim = get_optimizer_ckpt_state_dim(
+            _DUMP_LOAD_OPT_TYPE, dims[table_id], value_type
+        )
+        assert os.path.getsize(
+            _shard_file(native_dir, name, "opt_values")
+        ) == num_keys * ckpt_opt_dim * _dtype_element_size(value_type)
+
+    # The default table keeps an fp32 accumulator and must still read this one.
+    dst = _make_dump_load_tables(dims, table_names, value_type)
+    dst.load(native_dir, optim=True)
+    for name in table_names:
+        keys_mid, vals_mid = mid.export_keys_values(name, device)
+        keys_dst, vals_dst = dst.export_keys_values(name, device)
+        order_mid = keys_mid.argsort()
+        order_dst = keys_dst.argsort()
+        torch.testing.assert_close(keys_mid[order_mid], keys_dst[order_dst])
+        torch.testing.assert_close(
+            vals_mid[order_mid], vals_dst[order_dst], rtol=0, atol=0
+        )
+
+
+def test_optimizer_state_dtype_is_a_grouping_key():
+    default = DynamicEmbTableOptions(dim=8)
+    assert default == DynamicEmbTableOptions(dim=8)
+    assert default != DynamicEmbTableOptions(dim=8, optimizer_state_dtype=torch.float16)
+
+
+def test_unsupported_optimizer_state_dtype_is_rejected_at_construction():
+    _init_single_rank_pg()
+    with pytest.raises(ValueError, match="only supported by row-wise Adagrad"):
+        _make_multi_table_bdeb_for_dump_load(
+            EmbOptimType.ADAM,
+            {"learning_rate": 0.1},
+            [8],
+            ["table0"],
+            [0],
+            1024,
+            torch.int64,
+            torch.float16,
+            0,
+            optimizer_state_dtype=torch.float32,
         )
 
 

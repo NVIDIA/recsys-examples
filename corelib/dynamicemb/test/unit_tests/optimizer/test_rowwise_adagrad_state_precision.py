@@ -22,11 +22,17 @@ each step came out as ``lr * g / (|g| + eps)`` -- a constant-size step that neve
 decays. These tests pin the fix: the accumulator a 16-bit table carries must be
 bit-identical to the one an fp32 table carries for the same gradients, at embedding
 widths whose state slot is only 2-byte aligned, and it must survive a checkpoint.
+``optimizer_state_dtype`` can opt back into the table's dtype; those tests pin that
+path to the old behaviour and check that checkpoints move between the two.
 """
 
 import pytest
 import torch
-from dynamicemb.optimizer import OptimizerArgs, RowWiseAdaGradDynamicEmbeddingOptimizer
+from dynamicemb.optimizer import (
+    AdamDynamicEmbeddingOptimizer,
+    OptimizerArgs,
+    RowWiseAdaGradDynamicEmbeddingOptimizer,
+)
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
 
@@ -41,30 +47,43 @@ NUM_STEPS = 50
 GRAD_SCALE = 1e-5
 
 
-def _optimizer(value_type: torch.dtype) -> RowWiseAdaGradDynamicEmbeddingOptimizer:
+def _optimizer(
+    value_type: torch.dtype, state_dtype=None
+) -> RowWiseAdaGradDynamicEmbeddingOptimizer:
     return RowWiseAdaGradDynamicEmbeddingOptimizer(
         OptimizerArgs(
-            learning_rate=LEARNING_RATE, eps=EPS, initial_accumulator_value=0.0
+            learning_rate=LEARNING_RATE,
+            eps=EPS,
+            initial_accumulator_value=0.0,
+            optimizer_state_dtype=state_dtype,
         ),
         value_type,
     )
 
 
 def _train_padded_buffer(
-    value_type: torch.dtype, emb_dim: int, all_dims_vec4: bool, seed: int = 0
+    value_type: torch.dtype,
+    emb_dim: int,
+    all_dims_vec4: bool,
+    seed: int = 0,
+    state_dtype=None,
+    grads=None,
 ):
     """Run NUM_STEPS updates on one padded buffer; return (weights, accumulator)."""
     device = torch.device("cuda")
-    optimizer = _optimizer(value_type)
+    optimizer = _optimizer(value_type, state_dtype)
     state_dim = optimizer.get_state_dim(emb_dim)
     value_dim = emb_dim + state_dim
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
     init = torch.rand(NUM_ROWS, emb_dim, generator=generator) * 0.1
-    grads = [
-        (torch.randn(NUM_ROWS, emb_dim, generator=generator) * GRAD_SCALE).to(device)
-        for _ in range(NUM_STEPS)
-    ]
+    if grads is None:
+        grads = [
+            (torch.randn(NUM_ROWS, emb_dim, generator=generator) * GRAD_SCALE).to(
+                device
+            )
+            for _ in range(NUM_STEPS)
+        ]
 
     values = torch.empty(NUM_ROWS, value_dim, dtype=value_type, device=device)
     values[:, :emb_dim] = init.to(device=device, dtype=value_type)
@@ -115,9 +134,9 @@ def test_accumulator_matches_fp32_table(value_type, emb_dim, all_dims_vec4):
     torch.testing.assert_close(weights, ref_weights, rtol=tolerance, atol=tolerance)
 
 
-def _flat_table(value_type: torch.dtype, emb_dim: int, seed: int = 0):
+def _flat_table(value_type: torch.dtype, emb_dim: int, seed: int = 0, state_dtype=None):
     """A flat table of NUM_ROWS rows: embedding, then the optimizer-state slot."""
-    optimizer = _optimizer(value_type)
+    optimizer = _optimizer(value_type, state_dtype)
     value_dim = emb_dim + optimizer.get_state_dim(emb_dim)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     table = torch.zeros(NUM_ROWS, value_dim, dtype=value_type, device="cuda")
@@ -291,3 +310,115 @@ def test_reset_writes_fp32_initial_value(value_type):
     accumulator = optimizer.states_for_checkpoint(rows[:, emb_dim:], emb_dim)
     expected = torch.tensor([[0.0], [initial], [0.0], [initial]], device="cuda")
     assert torch.equal(accumulator, expected.float())
+
+
+def _reference_accumulator(value_type: torch.dtype, grads):
+    """The accumulator a kernel keeping it in value_type produces, step by step."""
+    accumulator = torch.zeros(NUM_ROWS, 1, dtype=value_type, device="cuda")
+    for grad in grads:
+        mean_square = grad.float().pow(2).mean(dim=1, keepdim=True)
+        accumulator = (accumulator.float() + mean_square).to(value_type)
+    return accumulator
+
+
+def _flat_table_accumulator(value_type, emb_dim, grads, state_dtype):
+    indices = torch.arange(NUM_ROWS, dtype=torch.int64, device="cuda")
+    opt, table = _flat_table(value_type, emb_dim, state_dtype=state_dtype)
+    for grad in grads:
+        _flat_update(opt, table, grad, indices, emb_dim, False)
+    torch.cuda.synchronize()
+    return opt.states_for_checkpoint(table[:, emb_dim:], emb_dim)
+
+
+@cuda
+@pytest.mark.parametrize(
+    "value_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+@pytest.mark.parametrize(
+    "path, emb_dim, all_dims_vec4",
+    [("padded", 16, True), ("padded", 7, False), ("flat", 7, False)],
+    ids=["padded_vec4", "padded_odd7", "flat_odd7"],
+)
+def test_table_dtype_state_keeps_accumulator_in_table_dtype(
+    value_type, path, emb_dim, all_dims_vec4
+):
+    """Opting into the table's dtype stores the accumulator the way it was before the fix."""
+    grads = _flat_grads(emb_dim)
+    if path == "padded":
+        _, accumulator = _train_padded_buffer(
+            value_type, emb_dim, all_dims_vec4, state_dtype=value_type, grads=grads
+        )
+    else:
+        accumulator = _flat_table_accumulator(value_type, emb_dim, grads, value_type)
+
+    assert _optimizer(value_type, value_type).get_state_dtype(value_type) == value_type
+    assert accumulator.dtype == value_type
+    assert accumulator.shape == (NUM_ROWS, 1)
+    if value_type == torch.float16:
+        # Each update is below fp16's smallest subnormal: the reason fp32 is the default.
+        assert torch.all(accumulator == 0)
+    else:
+        torch.testing.assert_close(
+            accumulator.float(),
+            _reference_accumulator(value_type, grads).float(),
+            rtol=1e-2,
+            atol=0,
+        )
+
+
+@cuda
+def test_explicit_float32_state_matches_default():
+    default_weights, default_accumulator = _train_padded_buffer(
+        torch.float16, 7, all_dims_vec4=False
+    )
+    weights, accumulator = _train_padded_buffer(
+        torch.float16, 7, all_dims_vec4=False, state_dtype=torch.float32
+    )
+    assert torch.equal(accumulator, default_accumulator)
+    assert torch.equal(weights, default_weights)
+
+
+@cuda
+@pytest.mark.parametrize(
+    "value_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+def test_fp32_checkpoint_loads_into_table_dtype_state(value_type):
+    emb_dim = 7
+    _, fp32_accumulator = _train_padded_buffer(value_type, emb_dim, False)
+    optimizer = _optimizer(value_type, value_type)
+
+    restored = optimizer.states_from_checkpoint(
+        fp32_accumulator, emb_dim, value_type, fp32_accumulator.device
+    )
+    assert torch.equal(
+        optimizer.states_for_checkpoint(restored, emb_dim),
+        fp32_accumulator.to(value_type),
+    )
+
+
+@pytest.mark.parametrize(
+    "value_type, state_dtype",
+    [
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float32, torch.float16),
+    ],
+    ids=["bf16_in_fp16", "fp16_in_bf16", "fp16_in_fp32"],
+)
+def test_rowwise_rejects_unsupported_state_dtype(value_type, state_dtype):
+    with pytest.raises(ValueError, match="optimizer_state_dtype"):
+        _optimizer(value_type, state_dtype).get_state_dtype(value_type)
+
+
+def test_other_optimizers_keep_state_in_table_dtype():
+    adam = AdamDynamicEmbeddingOptimizer(OptimizerArgs())
+    assert adam.get_state_dtype(torch.float16) == torch.float16
+    matching = AdamDynamicEmbeddingOptimizer(
+        OptimizerArgs(optimizer_state_dtype=torch.float16)
+    )
+    assert matching.get_state_dtype(torch.float16) == torch.float16
+    wider = AdamDynamicEmbeddingOptimizer(
+        OptimizerArgs(optimizer_state_dtype=torch.float32)
+    )
+    with pytest.raises(ValueError, match="only supported by row-wise Adagrad"):
+        wider.get_state_dtype(torch.float16)
