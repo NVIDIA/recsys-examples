@@ -198,6 +198,8 @@ class ScoredHashTable(abc.ABC):
         score_files: Dict[str, str],
         table_id: Optional[int] = None,
         dist_type: Optional[str] = None,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -905,6 +907,8 @@ class LinearBucketTable(ScoredHashTable):
         score_files: Dict[str, str],
         table_id: Optional[int] = None,
         dist_type: Optional[str] = None,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -954,8 +958,9 @@ class LinearBucketTable(ScoredHashTable):
                     f"The number of keys({num_keys}) in {key_file} does not match with number of scores({num_keys}) in {score_files[score_name]}."
                 )
 
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        if num_shards is None or shard_index is None:
+            num_shards = dist.get_world_size() if dist.is_initialized() else 1
+            shard_index = dist.get_rank() if dist.is_initialized() else 0
 
         dump_timestamp = device_timestamp()
 
@@ -990,7 +995,7 @@ class LinearBucketTable(ScoredHashTable):
                 scores_dict[score_name] = scores
 
             masks = (
-                owned_key_mask(keys, rank, world_size, dist_type)
+                owned_key_mask(keys, shard_index, num_shards, dist_type)
                 if dist_type is not None
                 else None
             )

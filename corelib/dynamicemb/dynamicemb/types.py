@@ -456,7 +456,15 @@ class Counter(abc.ABC):
         """
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file, table_id: int, dist_type: str) -> None:
+    def load(
+        self,
+        key_file,
+        counter_file,
+        table_id: int,
+        dist_type: str,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> None:
         """
         Load keys and frequencies from input file path.
 

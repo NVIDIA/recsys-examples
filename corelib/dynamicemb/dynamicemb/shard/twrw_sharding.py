@@ -205,7 +205,7 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
         kwargs = {}
         if Version(torchrec.__version__) >= Version("1.5.0"):
             kwargs["env"] = self._env
-        return GroupedPooledEmbeddingsLookup(
+        lookup = GroupedPooledEmbeddingsLookup(
             grouped_configs=self._grouped_embedding_configs_per_rank[self._rank],
             pg=self._pg,
             device=device if device is not None else self._device,
@@ -213,3 +213,9 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
             sharding_type=ShardingType.TABLE_ROW_WISE,
             **kwargs,
         )
+        # Checkpoint barriers run over the node that holds the table; the other
+        # node is busy with its own tables and may have a different count.
+        for emb in lookup._emb_modules:
+            if hasattr(emb, "emb_module"):
+                emb.emb_module._shard_pg = self._intra_pg
+        return lookup

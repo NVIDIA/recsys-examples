@@ -1719,8 +1719,15 @@ def _iter_batches_from_files(
     num_scores: int = 1,
     emb_dtype: torch.dtype = EMBEDDING_TYPE,
     opt_state_dtype: torch.dtype = OPT_STATE_TYPE,
+    shard_index: Optional[int] = None,
+    num_shards: Optional[int] = None,
 ) -> Iterator[Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]]:
     """Yield (keys, embeddings, scores, opt_states) batches from checkpoint files.
+
+    *shard_index* / *num_shards* are the table's own shard geometry (its position
+    among the ranks that hold it, and how many there are): the world for a
+    row-wise table, one node for a table-row-wise one. Left ``None`` they fall
+    back to the global rank and world size, which is the row-wise answer.
 
     ``num_scores`` is the number of score words per key in the score file. When
     > 1 (e.g. LruLfu's timestamp+frequency) the yielded ``scores`` is
@@ -1755,8 +1762,9 @@ def _iter_batches_from_files(
     fopt = open(opt_file_path, "rb") if opt_file_path else None
     num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
 
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    rank = dist.get_rank() if dist.is_initialized() else 0
+    if num_shards is None or shard_index is None:
+        num_shards = dist.get_world_size() if dist.is_initialized() else 1
+        shard_index = dist.get_rank() if dist.is_initialized() else 0
 
     try:
         for start in range(0, num_keys, batch_size):
@@ -1792,7 +1800,7 @@ def _iter_batches_from_files(
                     opt_bytes, opt_state_dtype, device
                 ).view(-1, optstate_dim)
 
-            masks = owned_key_mask(keys, rank, world_size, dist_type)
+            masks = owned_key_mask(keys, shard_index, num_shards, dist_type)
             if masks is not None:
                 keys = keys[masks]
                 embeddings = embeddings[masks]
@@ -2744,6 +2752,8 @@ class DynamicEmbStorage(Storage):
         opt_file_path: Optional[str],
         include_optim: bool = True,
         timestamp: int = 0,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
     ) -> Optional[int]:
         params = _validate_load_meta(
             self._state,
@@ -2791,6 +2801,8 @@ class DynamicEmbStorage(Storage):
             num_scores=num_scores,
             emb_dtype=params.emb_dtype,
             opt_state_dtype=params.opt_state_dtype,
+            shard_index=shard_index,
+            num_shards=num_shards,
         ):
             if (
                 scores is not None
@@ -3715,6 +3727,8 @@ class HybridStorage(Storage):
         opt_file_path: Optional[str],
         include_optim: bool = True,
         timestamp: int = 0,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
     ) -> Optional[int]:
         if (
             self._host.key_index_map.num_scores_ > 1
@@ -3767,6 +3781,8 @@ class HybridStorage(Storage):
             params.dist_type,
             emb_dtype=params.emb_dtype,
             opt_state_dtype=params.opt_state_dtype,
+            shard_index=shard_index,
+            num_shards=num_shards,
         ):
             if keys.numel() == 0:
                 continue

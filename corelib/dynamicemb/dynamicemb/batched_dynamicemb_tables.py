@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import warnings
 from collections import deque
@@ -542,6 +543,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         cowclip_regularization: Optional[
             CowClipDefinition
         ] = None,  # used by Rowwise Adagrad
+        shard_ranks: Optional[List[int]] = None,
         # TO align with FBGEMM TBE
         *args,
         **kwargs,
@@ -554,16 +556,29 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 table_option == other_option
             ), "All tables must match in grouped keys."
         self._dynamicemb_options = table_options
-        # world_size the table is sharded across at creation. dynamicemb only
-        # supports ROW_WISE sharding over the global WORLD (no 2D / sub-pg
-        # sharding), so the global ``dist.get_world_size()`` here equals the
-        # ``pg.size()`` that input_dist uses as the key->rank modulo base -- they
-        # are the authoritative shard count and this merely mirrors it. Recorded
-        # because DeltaDumpResult meta needs it for replay's key->rank
-        # reconstruction, independent of the gather ``pg`` passed to
-        # incremental_dump (which is only a comm scope). Constructed after DMP
-        # sharding, so dist is already init here; single-GPU (no dist) -> 1.
-        self._shard_world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # The ranks that hold these tables, in shard order: the world for a
+        # row-wise table, one node for a table-row-wise one. Everything that
+        # names a shard -- checkpoint files, the load-time key filter, the delta
+        # meta -- derives from this rather than from the global process group.
+        global_rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self._shard_ranks: List[int] = (
+            list(shard_ranks) if shard_ranks is not None else list(range(world_size))
+        )
+        if global_rank not in self._shard_ranks:
+            raise ValueError(
+                f"Rank {global_rank} holds no shard of tables {table_names} "
+                f"(shards on ranks {self._shard_ranks})."
+            )
+        self._num_shards = len(self._shard_ranks)
+        self._shard_index = self._shard_ranks.index(global_rank)
+        self._sharding_type = (
+            "row_wise" if self._num_shards == world_size else "table_row_wise"
+        )
+        # Set by the table-row-wise sharding to its intra-node group; a barrier
+        # over the world would deadlock when nodes hold different table counts.
+        self._shard_pg: Optional[dist.ProcessGroup] = None
+        self._shard_world_size = self._num_shards
         self.initializer_args = table_option.initializer_args
         self.index_type = table_option.index_type
         self.embedding_dtype = table_option.embedding_dtype
@@ -1433,6 +1448,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 "row-wise to checkpoint them."
             )
 
+    def _shard_barrier(self) -> None:
+        if not dist.is_initialized():
+            return
+        if self._shard_pg is not None:
+            dist.barrier(group=self._shard_pg)
+        else:
+            dist.barrier()
+
+    def _write_shard_meta(self, meta_file_path: str) -> None:
+        with open(meta_file_path) as meta_file:
+            meta_data = json.load(meta_file)
+        meta_data["sharding_type"] = self._sharding_type
+        meta_data["num_shards"] = self._num_shards
+        meta_data["shard_ranks"] = self._shard_ranks
+        with open(meta_file_path, "w") as meta_file:
+            json.dump(meta_data, meta_file, indent=4)
+
     def dump(
         self,
         save_dir: str,
@@ -1441,15 +1473,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
-        self._refuse_if_table_row_wise("Dumping")
         if table_names is None:
             table_names = self._table_names
 
-        if pg is None:
-            assert dist.is_initialized(), "Distributed is not initialized."
-            pg = dist.group.WORLD
-        rank = dist.get_rank(group=pg)
-        world_size = dist.get_world_size(group=pg)
+        # Files are named by the table's own shard, not by the caller's rank in
+        # pg: a table-row-wise table has local_world_size shards on one node.
+        rank = self._shard_index
+        world_size = self._num_shards
 
         self.flush()
 
@@ -1477,8 +1507,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
             storage = self._storage
-            if dist.is_initialized():
-                dist.barrier()
+            self._shard_barrier()
             ts = device_timestamp()
             storage.dump(
                 table_id,
@@ -1492,6 +1521,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 current_score=current_score,
                 timestamp=ts,
             )
+            if rank == 0:
+                self._write_shard_meta(meta_file_path)
 
             if not counter:
                 continue
@@ -1518,16 +1549,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ):
-        self._refuse_if_table_row_wise("Loading")
         if table_names is None:
             table_names = self._table_names
 
-        if pg is None and not dist.is_initialized():  # for inference load
-            rank = 0
-            world_size = 1
-        else:
-            rank = dist.get_rank(group=pg)
-            world_size = dist.get_world_size(group=pg)
+        rank = self._shard_index
+        world_size = self._num_shards
 
         storage = self._storage
         counter_table = self._admission_counter
@@ -1554,8 +1580,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
 
             num_key_files = len(emb_key_files)
-            if dist.is_initialized():
-                dist.barrier()
+            self._shard_barrier()
             ts = device_timestamp()
             for i in range(num_key_files):
                 loaded_score = storage.load(
@@ -1567,6 +1592,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     opt_value_files[i] if len(opt_value_files) > 0 else None,
                     include_optim=optim,
                     timestamp=ts,
+                    shard_index=rank,
+                    num_shards=world_size,
                 )
                 if loaded_score is not None and table_name in self._scores:
                     self._scores[table_name] = loaded_score
@@ -1585,6 +1612,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     counter_frequency_files[i],
                     table_id,
                     self._dynamicemb_options[table_id].dist_type,
+                    shard_index=rank,
+                    num_shards=world_size,
                 )
 
     def export_keys_values(

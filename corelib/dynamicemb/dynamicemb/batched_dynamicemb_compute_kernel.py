@@ -63,6 +63,22 @@ def _placement_rank(placement) -> int:
     return placement.rank()
 
 
+def _shard_ranks_of(tables: List[ShardedEmbeddingTable]) -> Optional[List[int]]:
+    """The ranks holding these tables in shard order, or None without shard metadata."""
+    layouts = {
+        tuple(_placement_rank(md.placement) for md in table.global_metadata.shards_metadata)
+        for table in tables
+        if table.global_metadata is not None
+    }
+    if not layouts:
+        return None
+    if len(layouts) != 1:
+        raise ValueError(
+            f"Tables grouped in one kernel are sharded differently: {sorted(layouts)}"
+        )
+    return list(layouts.pop())
+
+
 def get_state_dict(
     embedding_tables: List[ShardedEmbeddingTable],
     params: Union[
@@ -313,6 +329,7 @@ class BatchedDynamicEmbeddingBag(
                 feature_table_map=self._feature_table_map,
                 table_names=[t.name for t in config.embedding_tables],
                 device=device,
+                shard_ranks=_shard_ranks_of(config.embedding_tables),
                 **fused_params,
             )
         )
@@ -441,6 +458,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
                 feature_table_map=self._feature_table_map,
                 table_names=[t.name for t in config.embedding_tables],
                 device=device,
+                shard_ranks=_shard_ranks_of(config.embedding_tables),
                 **fused_params,
             )
         )
