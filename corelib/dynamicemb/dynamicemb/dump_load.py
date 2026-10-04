@@ -116,8 +116,9 @@ def DynamicEmbDump(
 
     Each dynamic embedding table will be stored as a key binary file and a value binary file, where the dtype of the key is int64_t,
     and the dtype of the value is the table's own ``embedding_dtype`` (float32, float16 or bfloat16) -- values are stored at the
-    precision the table holds them at, not widened to float32. Each optimizer state is also treated as a dynamic embedding table
-    and shares that precision.
+    precision the table holds them at, not widened to float32. Each optimizer state is also treated as a dynamic embedding table,
+    stored at the optimizer's state precision: the table's ``embedding_dtype``, except row-wise Adagrad's accumulator, which
+    defaults to float32 (see ``optimizer_state_dtype``).
 
     The value files carry no header, so the per-table meta JSON records ``embedding_dtype``, ``embedding_dim`` and
     ``optim_state_dtype``; :func:`DynamicEmbLoad` reads the files by them. A checkpoint written before those keys existed is read
@@ -227,7 +228,8 @@ def DynamicEmbLoad(
 
     Each dynamic embedding table will be stored as a key binary file and a value binary file, where the dtype of the key is int64_t,
     and the dtype of the value is the table's own ``embedding_dtype``. Each optimizer state is also treated as a dynamic embedding
-    table and shares that precision.
+    table, stored at the optimizer's state precision: the table's ``embedding_dtype``, except row-wise Adagrad's accumulator,
+    which defaults to float32 (see ``optimizer_state_dtype``).
 
     The value files are read at the precision and row width the per-table meta JSON records (``embedding_dtype`` /
     ``embedding_dim`` / ``optim_state_dtype``). A checkpoint written before those keys existed is read as float32 with the row

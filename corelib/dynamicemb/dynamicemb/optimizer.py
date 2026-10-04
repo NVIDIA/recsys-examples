@@ -132,6 +132,7 @@ class OptimizerArgs:
     ftrl_beta: float = 0.0
     l1_reg: float = 0.0
     l2_reg: float = 0.0
+    optimizer_state_dtype: Optional[torch.dtype] = None
 
 
 def string_to_opt_type(optimizer_str: str) -> OptimType:
@@ -207,6 +208,24 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
     def get_ckpt_state_dim(self, emb_dim: int) -> int:
         """Optimizer state width in checkpoint files (may be smaller than runtime)."""
         return self.get_state_dim(emb_dim)
+
+    def get_state_dtype(self, values_dtype: torch.dtype) -> torch.dtype:
+        """Precision the optimizer state is kept at, for a table of ``values_dtype``.
+
+        The state lives in the table's value row, so by default it shares the
+        table's dtype. It is also the precision :meth:`states_for_checkpoint`
+        returns and the checkpoint meta records as ``optim_state_dtype``.
+        Only row-wise Adagrad can keep it at another precision, so here
+        ``optimizer_state_dtype`` may only be unset or the table's dtype.
+        """
+        requested = self._opt_args.optimizer_state_dtype
+        if requested is not None and requested != values_dtype:
+            raise ValueError(
+                f"{type(self).__name__} keeps its state in the table's dtype "
+                f"({values_dtype}); optimizer_state_dtype={requested} is only "
+                "supported by row-wise Adagrad."
+            )
+        return values_dtype
 
     def set_learning_rate(self, new_lr) -> None:
         self._opt_args.learning_rate = new_lr
@@ -601,6 +620,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.eps,
+            torch_to_dyn_emb(self.get_state_dtype(values.dtype)).value,
         )
 
     def fused_update_for_flat_table(
@@ -627,6 +647,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             max_emb_dim,
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
+            torch_to_dyn_emb(self.get_state_dtype(table_dtype)).value,
         )
 
     def get_opt_args(self):
@@ -655,19 +676,71 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             EmbOptimType.EXACT_ROWWISE_ADAGRAD, emb_dim, self._emb_dtype
         )
 
+    def get_state_dtype(self, values_dtype: torch.dtype) -> torch.dtype:
+        """The accumulator's precision: fp32 unless ``optimizer_state_dtype`` asks for the table's dtype.
+
+        It is a running sum of mean squared gradients, which for embeddings sits
+        far below fp16's smallest subnormal (6e-8): stored as fp16 it rounds to
+        zero on every update and Adagrad loses its history, hence the fp32
+        default. The kernel keeps it in the first bytes of the 16-byte state
+        slot -- an fp32 in a 16-bit table as two raw 16-bit words (see
+        ``RowWiseAdaGradState``).
+        """
+        requested = self._opt_args.optimizer_state_dtype
+        if requested is None or requested == torch.float32:
+            return torch.float32
+        if requested == values_dtype:
+            return values_dtype
+        raise ValueError(
+            "Row-wise Adagrad keeps its accumulator in float32 or in the table's "
+            f"dtype ({values_dtype}); got optimizer_state_dtype={requested}."
+        )
+
+    def _packs_fp32_in_words(self, values_dtype: torch.dtype) -> bool:
+        return (
+            DTYPE_NUM_BYTES[values_dtype] == 2
+            and self.get_state_dtype(values_dtype) == torch.float32
+        )
+
+    def reset_optimizer_states(
+        self,
+        optim_states: torch.Tensor,
+        indices: Optional[torch.Tensor] = None,
+        emb_dims: Optional[Union[int, torch.Tensor]] = None,
+    ) -> None:
+        """Seed the slot with the initial accumulator value, at the state's precision."""
+        if not self._packs_fp32_in_words(optim_states.dtype):
+            super().reset_optimizer_states(optim_states, indices, emb_dims)
+            return
+        pattern = _fp32_as_words(
+            torch.full(
+                (optim_states.size(1) // 2,),
+                self.get_initial_optimizer_state(),
+                dtype=torch.float32,
+                device=optim_states.device,
+            )
+        )
+        words = optim_states.view(torch.int16)
+        if indices is None:
+            words[:] = pattern
+        else:
+            words[indices] = pattern
+
     def states_for_checkpoint(
         self,
         optim_states: torch.Tensor,
         emb_dim: int,
     ) -> torch.Tensor:
-        """Keep only the accumulator.
+        """Keep only the accumulator, as a ``(rows, 1)`` block at the state's precision.
 
         The runtime region is widened to a fixed 16 bytes for alignment in the
-        fused value row, but just its first element is ever written, so the
-        rest is slack a checkpoint should not carry.
+        fused value row, but only the accumulator at its start is ever written,
+        so the rest is slack a checkpoint should not carry.
         """
         self._check_state_width(optim_states, self.get_state_dim(emb_dim), "runtime")
-        return optim_states[:, : self.get_ckpt_state_dim(emb_dim)].contiguous()
+        if not self._packs_fp32_in_words(optim_states.dtype):
+            return optim_states[:, : self.get_ckpt_state_dim(emb_dim)].contiguous()
+        return optim_states[:, :2].contiguous().view(torch.float32)
 
     def states_from_checkpoint(
         self,
@@ -676,7 +749,12 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         values_dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        """Widen the accumulator back out to the aligned runtime region."""
+        """Widen the accumulator back out to the aligned runtime region.
+
+        The file may hold it at any precision -- fp32, or the table dtype from a
+        version or configuration that stored it there -- so it is read as fp32
+        and stored into the slot at the precision this table keeps it.
+        """
         ckpt_dim = self.get_ckpt_state_dim(emb_dim)
         self._check_state_width(optim_states, ckpt_dim, "checkpoint")
         out = torch.empty(
@@ -687,8 +765,17 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         # The slack the file does not cover is not read by the kernel, but seed
         # it the way a fresh row would be rather than leaving it uninitialized.
         self.reset_optimizer_states(out, emb_dims=emb_dim)
-        out[:, :ckpt_dim] = optim_states.to(dtype=values_dtype)
+        accumulator = optim_states.to(device=device, dtype=torch.float32)
+        if self._packs_fp32_in_words(values_dtype):
+            out.view(torch.int16)[:, :2] = _fp32_as_words(accumulator.contiguous())
+        else:
+            out[:, :ckpt_dim] = accumulator
         return out
+
+
+def _fp32_as_words(values: torch.Tensor) -> torch.Tensor:
+    """Reinterpret a contiguous fp32 tensor as twice as many int16 words."""
+    return values.view(torch.int16)
 
 
 class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):

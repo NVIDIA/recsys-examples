@@ -294,7 +294,50 @@ DEVICE_INLINE unsigned int nextPow2(unsigned int n) {
   return ++n;
 }
 
-template <typename wgrad_t, typename weight_t, int kWarpSize = 32>
+// Row-wise Adagrad's accumulator lives in the row's state slot as state_t:
+// either the table's own dtype, or fp32 in any table. fp32 is the default for
+// 16-bit tables because an fp16 accumulator underflows to zero for typical
+// embedding gradients (mean g^2 is often < 6e-8, fp16's smallest subnormal),
+// which silently disables the learning-rate decay.
+template <typename weight_t, typename state_t> struct RowWiseAdaGradState;
+
+// The accumulator in the table's own dtype.
+template <typename weight_t> struct RowWiseAdaGradState<weight_t, weight_t> {
+  static DEVICE_INLINE float load(const weight_t *slot) {
+    return TypeConvertFunc<float, weight_t>::convert(*slot);
+  }
+  static DEVICE_INLINE void store(weight_t *slot, float value) {
+    *slot = TypeConvertFunc<weight_t, float>::convert(value);
+  }
+};
+
+// An fp32 accumulator in a 16-bit table, held as two raw 16-bit words so the
+// access is only 2-byte aligned -- the slot starts right after the embedding,
+// and a flat table's embedding width need not be a multiple of two.
+template <typename weight_t> struct RowWiseAdaGradState<weight_t, float> {
+  static_assert(sizeof(weight_t) == 2,
+                "RowWiseAdaGradState: expected a 16-bit weight type");
+  static DEVICE_INLINE float load(const weight_t *slot) {
+    const uint16_t *words = reinterpret_cast<const uint16_t *>(slot);
+    const uint32_t bits = static_cast<uint32_t>(words[0]) |
+                          (static_cast<uint32_t>(words[1]) << 16);
+    return __uint_as_float(bits);
+  }
+  static DEVICE_INLINE void store(weight_t *slot, float value) {
+    const uint32_t bits = __float_as_uint(value);
+    uint16_t *words = reinterpret_cast<uint16_t *>(slot);
+    words[0] = static_cast<uint16_t>(bits & 0xFFFFu);
+    words[1] = static_cast<uint16_t>(bits >> 16);
+  }
+};
+
+template <> struct RowWiseAdaGradState<float, float> {
+  static DEVICE_INLINE float load(const float *slot) { return *slot; }
+  static DEVICE_INLINE void store(float *slot, float value) { *slot = value; }
+};
+
+template <typename wgrad_t, typename weight_t, typename state_t,
+          int kWarpSize = 32>
 struct RowWiseAdaGradVecOptimizer {
   const float lr;
   const float eps;
@@ -311,7 +354,7 @@ struct RowWiseAdaGradVecOptimizer {
       return;
     weight_t *gt_ptr = weight_ptr + input.state_offset;
 
-    float tmp_gt = TypeConvertFunc<float, weight_t>::convert(*gt_ptr);
+    float tmp_gt = RowWiseAdaGradState<weight_t, state_t>::load(gt_ptr);
     float tmp_g_pow = 0;
     /// TODO: vectorize
     for (int i = lane_id; i < input.dim; i += kWarpSize) {
@@ -324,7 +367,7 @@ struct RowWiseAdaGradVecOptimizer {
     tmp_gt += tmp_g_pow;
 
     if (lane_id == 0) {
-      *gt_ptr = TypeConvertFunc<weight_t, float>::convert(tmp_gt);
+      RowWiseAdaGradState<weight_t, state_t>::store(gt_ptr, tmp_gt);
     }
 
     Vec4T<float> weight_vec;
@@ -365,7 +408,7 @@ struct RowWiseAdaGradVecOptimizer {
       return;
     weight_t *gt_ptr = weight_ptr + input.state_offset;
 
-    float tmp_gt = TypeConvertFunc<float, weight_t>::convert(*gt_ptr);
+    float tmp_gt = RowWiseAdaGradState<weight_t, state_t>::load(gt_ptr);
     float tmp_g_pow = 0;
     for (int i = tid; i < input.dim; i += blockSize) {
       float tmp_g = TypeConvertFunc<float, wgrad_t>::convert(wgrad_ptr[i]);
@@ -388,7 +431,7 @@ struct RowWiseAdaGradVecOptimizer {
     tmp_g_pow /= input.dim;
     tmp_gt += tmp_g_pow;
     if (tid == 0) {
-      *gt_ptr = TypeConvertFunc<weight_t, float>::convert(tmp_gt);
+      RowWiseAdaGradState<weight_t, state_t>::store(gt_ptr, tmp_gt);
     }
 
     for (int i = tid; i < input.dim; i += blockSize) {

@@ -1667,10 +1667,11 @@ def _dump_table(
         # here, because there is no later pass that merges into the file.
         meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(state.emb_dtype)
         meta_data[META_EMBEDDING_DIM] = int(state.table_emb_dims_cpu[table_id])
-        # Optimizer states share the value row, hence the table's dtype too;
-        # recorded separately so the two can diverge later without breaking
-        # checkpoints written now.
-        meta_data[META_OPT_STATE_DTYPE] = dtype_to_meta_name(state.emb_dtype)
+        # Recorded separately from the embedding dtype because the two can
+        # differ: rowwise Adagrad keeps its accumulator in fp32 in any table.
+        meta_data[META_OPT_STATE_DTYPE] = dtype_to_meta_name(
+            state.optimizer.get_state_dtype(state.emb_dtype)
+        )
 
         if current_score is not None:
             meta_data["step_score"] = current_score
@@ -1959,18 +1960,14 @@ def _load_key_values(
     if opt_states is not None and not opt_states.is_cuda:
         raise RuntimeError("Opt states must be on GPU")
 
-    # Normalize both inputs to the table's precision up front, with the other
-    # argument checks. A checkpoint may carry a different precision than the
-    # table (load converts -- see _validate_load_meta), and everything below
-    # this point -- padding, the cat, the store -- reads better for not having
-    # to ask which dtype a tensor is at that line. Casting opt_states *before*
-    # optimizer.states_from_checkpoint also converts the narrow checkpoint
-    # block rather than the widened runtime one, and covers that function's one
-    # path that returns its input uncast. Both casts are no-ops when the dtypes
-    # already agree.
+    # Normalize the embeddings to the table's precision up front. A checkpoint
+    # may carry a different precision than the table (load converts -- see
+    # _validate_load_meta). The optimizer state is deliberately left alone:
+    # optimizer.states_from_checkpoint owns its conversion, because it need not
+    # be the table's dtype (rowwise Adagrad keeps an fp32 accumulator), and an
+    # elementwise cast here would round that accumulator away. The branch below
+    # only calls it when the state is non-empty, which is the case it casts.
     embeddings = embeddings.to(state.emb_dtype)
-    if opt_states is not None:
-        opt_states = opt_states.to(state.emb_dtype)
 
     if opt_states is None and runtime_optstate_dim > 0:
         opt_states = torch.empty(
