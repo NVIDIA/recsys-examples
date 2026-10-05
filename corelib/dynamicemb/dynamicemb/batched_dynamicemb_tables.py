@@ -698,6 +698,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ftrl_beta,
             l1_reg,
             l2_reg,
+            table_option.optimizer_state_dtype,
         )
         self._storage_externel = table_option.external_storage is not None
         self._create_cache_storage()
@@ -938,6 +939,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         ftrl_beta: float,
         l1_reg: float,
         l2_reg: float,
+        optimizer_state_dtype: Optional[torch.dtype],
     ) -> BaseDynamicEmbeddingOptimizer:
         self._optimizer_type = optimizer_type
         self.stochastic_rounding = stochastic_rounding
@@ -1022,6 +1024,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ftrl_beta=ftrl_beta,
             l1_reg=l1_reg,
             l2_reg=l2_reg,
+            optimizer_state_dtype=optimizer_state_dtype,
         )
         self._optimizer_args = optimizer_args
 
@@ -1054,6 +1057,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             raise ValueError(
                 f"Not supported optimizer type ,optimizer type = {optimizer_type} {type(optimizer_type)} {optimizer_type.value}."
             )
+        optimizer.get_state_dtype(self.embedding_dtype)
         return optimizer
 
     def split_embedding_weights(self) -> List[Tensor]:
@@ -1920,6 +1924,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # was. Pushing dirty cache entries down first makes the storage copy
             # this replay is about to overwrite the authoritative one.
             flush_cache(self._cache, storage)
+            # Flushing can grow and rehash the backing table. Revalidate the
+            # source slots after that layout-changing side effect, before any
+            # replay writes use the original plan.
+            plan = self._plan_replay(delta, content, storage)
 
         ts = device_timestamp()
         return {job.name: self._apply_replay(job, content, storage, ts) for job in plan}

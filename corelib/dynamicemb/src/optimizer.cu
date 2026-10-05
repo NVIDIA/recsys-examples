@@ -198,12 +198,28 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
   });
 }
 
+// Calls fn with a value of the row-wise Adagrad accumulator's type: the table's
+// own type, or float. No other pairing has a kernel.
+template <typename w_t, typename Fn>
+void dispatch_rowwise_adagrad_state_type(DataType state_type,
+                                         DataType val_type, Fn &&fn) {
+  TORCH_CHECK(state_type == val_type || state_type == DataType::Float32,
+              "row-wise Adagrad keeps its accumulator in the table's dtype or "
+              "in float32");
+  if (state_type == val_type) {
+    fn(w_t{});
+  } else {
+    fn(float{});
+  }
+}
+
 void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
                                     at::Tensor table_ptrs, at::Tensor table_ids,
                                     at::Tensor table_value_dims,
                                     at::Tensor table_emb_dims, const float lr,
                                     const float eps, int64_t max_emb_dim,
-                                    bool all_dims_vec4, int64_t table_dtype) {
+                                    bool all_dims_vec4, int64_t table_dtype,
+                                    int64_t state_dtype) {
   int64_t ev_nums = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (ev_nums == 0)
@@ -215,26 +231,33 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
 
   auto grad_type = get_data_type(grads);
   auto val_type = static_cast<DataType>(table_dtype);
+  auto state_type = static_cast<DataType>(state_dtype);
   auto index_type = get_data_type(indices);
   int device_id = grads.device().index();
 
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
-      DISPATCH_OFFSET_INT_TYPE(index_type, i_t, [&] {
-        auto grad_ptr = get_pointer<g_t>(grads);
-        auto table_ptrs_ptr = get_pointer<int64_t>(table_ptrs);
-        auto index_ptr = get_pointer<i_t>(indices);
-        auto tid_ptr = get_pointer<int64_t>(table_ids);
-        auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
-        auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
+      dispatch_rowwise_adagrad_state_type<w_t>(
+          state_type, val_type, [&](auto state_tag) {
+            using s_t = decltype(state_tag);
+            DISPATCH_OFFSET_INT_TYPE(index_type, i_t, [&] {
+              auto grad_ptr = get_pointer<g_t>(grads);
+              auto table_ptrs_ptr = get_pointer<int64_t>(table_ptrs);
+              auto index_ptr = get_pointer<i_t>(indices);
+              auto tid_ptr = get_pointer<int64_t>(table_ids);
+              auto tvd_ptr = get_pointer<int64_t>(table_value_dims);
+              auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
 
-        RowWiseAdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
+              RowWiseAdaGradVecOptimizer<g_t, w_t, s_t> opt{lr, eps};
 
-        launch_update_kernel_for_flat_table<g_t, w_t, i_t, decltype(opt)>(
-            grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr, ted_ptr, opt,
-            ev_nums, grad_stride, max_emb_dim_u32, all_dims_vec4, device_id,
-            [](int block_size) { return block_size * sizeof(float); });
-      });
+              launch_update_kernel_for_flat_table<g_t, w_t, i_t,
+                                                  decltype(opt)>(
+                  grad_ptr, table_ptrs_ptr, index_ptr, tid_ptr, tvd_ptr,
+                  ted_ptr, opt, ev_nums, grad_stride, max_emb_dim_u32,
+                  all_dims_vec4, device_id,
+                  [](int block_size) { return block_size * sizeof(float); });
+            });
+          });
     });
   });
 }
@@ -438,7 +461,7 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                        at::Tensor table_emb_dims,
                                        int64_t emb_dim, int64_t value_dim,
                                        bool all_dims_vec4, float lr,
-                                       float eps) {
+                                       float eps, int64_t state_dtype) {
   int64_t num_rows = grads.size(0);
   uint32_t grad_stride = grads.size(1);
   if (num_rows == 0)
@@ -452,17 +475,22 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
   auto val_type = get_data_type(values);
+  auto state_type = static_cast<DataType>(state_dtype);
   int device_id = grads.device().index();
   auto tid_ptr = get_pointer<int64_t>(table_ids);
   auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
-      RowWiseAdaGradVecOptimizer<g_t, w_t> opt{lr, eps};
-      launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
-          get_pointer<g_t>(grads), get_pointer<w_t>(values), opt, num_rows,
-          grad_stride, value_stride, emb_dim_u32, all_dims_vec4, device_id,
-          tid_ptr, ted_ptr,
-          [](int block_size) { return block_size * sizeof(float); });
+      dispatch_rowwise_adagrad_state_type<w_t>(
+          state_type, val_type, [&](auto state_tag) {
+            using s_t = decltype(state_tag);
+            RowWiseAdaGradVecOptimizer<g_t, w_t, s_t> opt{lr, eps};
+            launch_update_kernel_for_padded_buffer<g_t, w_t, decltype(opt)>(
+                get_pointer<g_t>(grads), get_pointer<w_t>(values), opt,
+                num_rows, grad_stride, value_stride, emb_dim_u32,
+                all_dims_vec4, device_id, tid_ptr, ted_ptr,
+                [](int block_size) { return block_size * sizeof(float); });
+          });
     });
   });
 }
@@ -539,7 +567,7 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("table_ids"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("lr"), py::arg("eps"),
         py::arg("max_emb_dim"), py::arg("all_dims_vec4"),
-        py::arg("table_dtype"));
+        py::arg("table_dtype"), py::arg("state_dtype"));
 
   m.def("ftrl_update_for_flat_table", &dyn_emb::ftrl_update_for_flat_table,
         "FTRL optimizer for multi-table buffer via table_ptrs", py::arg("grads"),
@@ -575,7 +603,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         "Row Wise Adagrad optimizer for contiguous padded buffer",
         py::arg("grads"), py::arg("values"), py::arg("table_ids"),
         py::arg("table_emb_dims"), py::arg("emb_dim"), py::arg("value_dim"),
-        py::arg("all_dims_vec4"), py::arg("lr"), py::arg("eps"));
+        py::arg("all_dims_vec4"), py::arg("lr"), py::arg("eps"),
+        py::arg("state_dtype"));
 
   m.def("ftrl_update_for_padded_buffer",
         &dyn_emb::ftrl_update_for_padded_buffer,

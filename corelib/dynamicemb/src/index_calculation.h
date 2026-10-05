@@ -42,10 +42,10 @@ void select_async(int64_t num_items, bool const *d_flags, T const *d_input,
                              stream);
 
   // 2. allocate the temp storage.
-  d_temp_storage =
+  auto temp_storage =
       at::empty({static_cast<int64_t>(temp_storage_bytes)},
-                at::TensorOptions().dtype(torch::kChar).device(device))
-          .data_ptr();
+                at::TensorOptions().dtype(torch::kChar).device(device));
+  d_temp_storage = temp_storage.data_ptr();
 
   // 3. select
   cub::DeviceSelect::Flagged(d_temp_storage, temp_storage_bytes, d_input,
@@ -67,10 +67,10 @@ void select_index_async(int64_t num_items, bool const *d_flags, T *d_output,
                              stream);
 
   // 2. allocate the temp storage.
-  d_temp_storage =
+  auto temp_storage =
       at::empty({static_cast<int64_t>(temp_storage_bytes)},
-                at::TensorOptions().dtype(torch::kChar).device(device))
-          .data_ptr();
+                at::TensorOptions().dtype(torch::kChar).device(device));
+  d_temp_storage = temp_storage.data_ptr();
 
   // 3. select
   cub::DeviceSelect::Flagged(d_temp_storage, temp_storage_bytes, counting_iter,
@@ -95,9 +95,10 @@ void flagged_compact_impl(int64_t num_items, bool const *d_flags,
   size_t temp_bytes = 0;
   cub::DeviceSelect::Flagged(d_temp, temp_bytes, in_zip, d_flags, out_zip,
                              d_num_selected, num_items, stream);
-  d_temp = at::empty({static_cast<int64_t>(temp_bytes)},
-                     at::TensorOptions().dtype(at::kByte).device(device))
-               .data_ptr();
+  auto temp_storage = at::empty(
+      {static_cast<int64_t>(temp_bytes)},
+      at::TensorOptions().dtype(at::kByte).device(device));
+  d_temp = temp_storage.data_ptr();
   cub::DeviceSelect::Flagged(d_temp, temp_bytes, in_zip, d_flags, out_zip,
                              d_num_selected, num_items, stream);
 }
