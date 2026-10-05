@@ -25,9 +25,9 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.key_value_table import Storage
 from dynamicemb.planner import (
-    DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
@@ -45,9 +45,6 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
 )
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 
@@ -144,6 +141,7 @@ def get_planner(
     multi_hot_sizes: List[int],
     device,
     use_dynamicemb,
+    dist_type: str = "roundrobin",
 ):
     dict_const = {}
     for i, config in enumerate(eb_configs):
@@ -159,6 +157,7 @@ def get_planner(
                 use_dynamicemb=True,
                 dynamicemb_options=DynamicEmbTableOptions(
                     global_hbm_for_values=1024**3,
+                    dist_type=dist_type,
                 ),
             )
         else:
@@ -181,22 +180,16 @@ def get_planner(
         world_size=dist.get_world_size(),
         compute_device=device.type,
         hbm_cap=platform.hbm_cap,
-        ddr_cap=1024 * 1024 * 1024 * 1024,
+        # One node's host memory, not one rank's: Topology replicates
+        # whatever it is given to every device instead of dividing it.
+        ddr_cap=1024 * 1024 * 1024 * 1024 // torchrec.distributed.comm.get_local_size(),
         intra_host_bw=platform.intra_host_bw,
         inter_host_bw=platform.inter_host_bw,
     )
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=dict_const,
-    )
-
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
         topology=topology,
         constraints=dict_const,
         batch_size=batch_size,
-        enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
         debug=True,
     )
 
@@ -221,6 +214,7 @@ class ConstructTwinModule:
         rank: int = 0,
         world_size: int = 1,
         scale_factor: int = 2,
+        dist_type: str = "roundrobin",
     ) -> None:
         super().__init__()
 
@@ -244,6 +238,10 @@ class ConstructTwinModule:
         self._world_size = world_size
         self._scale_factor = scale_factor
         self._init_fn = init_fn
+        # Used twice: to configure the DynamicEmb tables, and to decide which
+        # keys this rank owns when seeding them (``init_twin_embedding_model``).
+        # One value for both, so the seeding cannot disagree with the sharding.
+        self._dist_type = dist_type
 
         self._table_names = [f"t_{t}" for t in range(self._table_num)]
         self._feature_names = [f"f_{t}" for t in range(self._table_num)]
@@ -334,6 +332,7 @@ class ConstructTwinModule:
             self._multi_hot_sizes,
             device,
             use_dynamicemb=True,
+            dist_type=self._dist_type,
         )
         plan = planner.collective_plan(collection, [sharder], dist.GroupMember.WORLD)
         self._dynamicemb_model = DistributedModelParallel(
@@ -534,7 +533,11 @@ class ConstructTwinModule:
             indices = result["indices"]
             values = result["values"]
 
-            mask = indices % self._world_size == self._rank
+            mask = owned_key_mask(
+                indices, self._rank, self._world_size, self._dist_type
+            )
+            if mask is None:
+                mask = torch.ones_like(indices, dtype=torch.bool)
             filtered_indices = indices[mask]
 
             # Get the dimension for this feature

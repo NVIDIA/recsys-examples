@@ -946,6 +946,15 @@ void bind_dyn_emb_op(py::module &m) {
   // Python side takes its values from here, the same way
   // DynamicEmbEvictStrategy does for EvictStrategy.  Python imports it under
   // the alias BagPoolingMode, since fbgemm already exports a PoolingMode.
+  // Single source of truth for the key -> rank rule's numbering: the codes in
+  // dynamicemb/input_dist.py are read from here, so the kernel and the host
+  // cannot drift apart on what a 1 or a 2 means.
+  py::enum_<dyn_emb::DistType>(m, "DistType")
+      .value("KBlock", dyn_emb::DistType::kBlock)
+      .value("KCyclic", dyn_emb::DistType::kCyclic)
+      .value("KHashedCyclic", dyn_emb::DistType::kHashedCyclic)
+      .export_values();
+
   py::enum_<dyn_emb::PoolingMode>(m, "PoolingMode")
       .value("KSum", dyn_emb::PoolingMode::kSum)
       .value("KMean", dyn_emb::PoolingMode::kMean)

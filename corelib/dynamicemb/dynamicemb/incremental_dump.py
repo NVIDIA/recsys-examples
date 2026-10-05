@@ -108,8 +108,13 @@ class DeltaDumpResult:
             meta[i]["num_scores"]:       int  -- score words per key; part of the
                 slot layout replay compares against.
             meta[i]["world_size"]:       int  -- ranks the source table was
-                sharded across at creation (global WORLD), used by replay to
-                reconstruct key->rank. NOT the gather ``pg`` (a comm scope only).
+                sharded across at creation (the table's shard group: the whole
+                world for row-wise, one node for table-row-wise), used by
+                replay to reconstruct key->rank. NOT the gather ``pg``.
+            meta[i]["shard_index"]:      int  -- this rank's index inside that
+                shard group; a per-rank dump holds the keys this index owns.
+            meta[i]["shard_ranks"]:      List[int] -- the shard group's global
+                ranks, in shard-index order.
             meta[i]["table_options"]:    DynamicEmbTableOptions -- the table's
                 config object (a ``DynamicEmbTableOptions`` instance).
     """

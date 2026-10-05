@@ -249,9 +249,7 @@ def _apply_admission(
                 missing_indices,
             )
 
-        admit_mask = admitter.admit(
-            missing_keys, missing_table_ids, freq_for_admission
-        )
+        admit_mask = admitter.admit(missing_keys, missing_table_ids, freq_for_admission)
         non_admitted_initializer = admitter.non_admitted_initializer
 
         non_admitted_mask = ~admit_mask
@@ -396,9 +394,7 @@ def _prefetch_cache_path(
             freq_for_admission = (
                 miss_lfu_freq[new_in_miss] if miss_lfu_freq is not None else None
             )
-            admit_mask = admitter.admit(
-                new_keys_sub, new_tids_sub, freq_for_admission
-            )
+            admit_mask = admitter.admit(new_keys_sub, new_tids_sub, freq_for_admission)
 
             keys_to_insert_mask[new_in_miss] = admit_mask
 

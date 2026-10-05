@@ -24,7 +24,7 @@ from commons.distributed.finalize_model_grads import finalize_model_grads
 from commons.modules.embedding import DataParallelEmbeddingCollection
 from commons.optimizer import OptimizerParam
 from dynamicemb import DynamicEmbTableOptions
-from dynamicemb.get_planner import get_planner
+from dynamicemb.planner import get_planner
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
 )

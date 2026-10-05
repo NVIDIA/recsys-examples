@@ -61,6 +61,37 @@ enum class PoolingMode : int32_t {
   kNone = 2, // sequence lookup: one output row per key, nothing to combine
 };
 
+// How a feature's keys are spread over the ranks: the one rule that decides
+// which rank owns a key, carried per feature into the bucketize kernel.  Like
+// PoolingMode this is the single source of truth for the numbering --
+// dynamicemb/input_dist.py takes its codes from the bound enum, so a rule
+// reaches the kernel with no second table to keep in step.  Its host twin,
+// which has to agree key for key, is dynamicemb/key_ownership.py.
+//
+// Named for the block / cyclic / block-cyclic vocabulary this file's kernels
+// already use, and that FBGEMM's block_bucketize_sparse_features comes from.
+// The Python-facing dist_type strings are older and differ; they are written
+// into every checkpoint, so they stay as they are and
+// dynamicemb_config.DIST_TYPE_CODES is the one place the two names meet.
+enum class DistType : int32_t {
+  // Contiguous key ranges, one per rank: rank = key / block_size, with keys
+  // past the end falling back to a modulo.  Alone among these it rewrites the
+  // index on the way in, to the key's offset inside its block, so what a rank
+  // stores is not the global key -- which is why no key-derived rule can place
+  // it afterwards and why incremental dump, replay and checkpoint load all
+  // refuse a DynamicEmb table sharded this way.  It is TorchRec's own block
+  // bucketizer, and stays as the fallback for tables that are not DynamicEmb's.
+  // Python calls it "continuous".
+  kBlock = 0,
+  // rank = key % world_size.  One modulo, and balanced as long as keys are
+  // densely allocated.  Python calls it "roundrobin".
+  kCyclic = 1,
+  // rank = murmur3_fmix64(key) % world_size.  One avalanche per key, in
+  // exchange for not caring what structure the key space has.  Python calls it
+  // "hash_roundrobin".
+  kHashedCyclic = 2,
+};
+
 #define CASE_TYPE_USING_HINT(enum_type, type, HINT, ...)                       \
   case (enum_type): {                                                          \
     using HINT = type;                                                         \

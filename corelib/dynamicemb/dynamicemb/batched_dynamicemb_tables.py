@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import warnings
 from collections import deque
@@ -23,7 +24,6 @@ from functools import partial
 from itertools import accumulate
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_function import (
@@ -44,6 +44,7 @@ from dynamicemb.dynamicemb_config import (
     warning_for_cstm_score,
 )
 from dynamicemb.initializer import MultiTableInitializer
+from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
@@ -66,7 +67,6 @@ from dynamicemb.optimizer import (
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
 )
-from dynamicemb.scored_hashtable import murmur3_fmix64
 from dynamicemb.types import ReplayStats
 from dynamicemb.utils import DTYPE_NUM_BYTES
 from dynamicemb_extensions import device_timestamp
@@ -137,64 +137,6 @@ def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str],
             )
 
     return files, len(files)
-
-
-def owned_key_mask(
-    keys: torch.Tensor,
-    rank: int,
-    world_size: int,
-    dist_type: str,
-) -> Optional[torch.Tensor]:
-    """Boolean mask selecting the keys *rank* owns under row-wise sharding.
-
-    ``incremental_dump`` all-gathers within its process group, so every rank holds
-    the whole delta; replay keeps only its own shard. Ownership is recomputed from
-    the key rather than read off the delta, so a globally gathered delta can be
-    handed to every rank unchanged.
-
-    *world_size* is the target's, but replay only ever runs with the source's
-    equal to it (``_replay_compatibility`` rejects otherwise), so this does not
-    reshard: a slot names a position inside one rank's table and carries no rank,
-    so two source ranks folded onto one target rank would collide on it.
-
-    Returns ``None`` when no filtering is needed (single rank), so callers can
-    skip the mask entirely.
-
-    Ownership is computed in ``uint64``, matching the device kernel for the
-    64-bit index types everyone uses. The kernel actually takes the hash modulo
-    in ``make_unsigned_t<index_t>``, so a 32-bit index type would truncate first
-    and disagree here -- for a world size that is not a power of two, where the
-    high bits reach the result. Not handled: 32-bit keys are not a configuration
-    this is built for.
-    """
-    if world_size <= 1:
-        return None
-    if dist_type == "continuous":
-        raise NotImplementedError(
-            "replay_increment does not support dist_type 'continuous': its "
-            "key->rank mapping is range-based and cannot be reconstructed from a "
-            "key alone. Use 'roundrobin' or 'hash_roundrobin'."
-        )
-    keys_np = keys.detach().cpu().numpy().astype(np.uint64, copy=False)
-    if dist_type == "hash_roundrobin":
-        owners = murmur3_fmix64(keys_np) % np.uint64(world_size)
-    else:  # roundrobin
-        owners = keys_np % np.uint64(world_size)
-    return torch.from_numpy(owners == np.uint64(rank))
-
-
-def owned_keys(
-    keys: Optional[Tensor], rank: int, world_size: int, dist_type: str
-) -> Optional[Tensor]:
-    """:func:`owned_key_mask` applied, tolerating a list that is absent or empty.
-
-    Removal lists are optional and often empty, so the caller would otherwise
-    repeat that guard at every use.
-    """
-    if keys is None or keys.numel() == 0:
-        return keys
-    mask = owned_key_mask(keys, rank, world_size, dist_type)
-    return keys if mask is None else keys[mask]
 
 
 def get_loading_files(
@@ -601,6 +543,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         cowclip_regularization: Optional[
             CowClipDefinition
         ] = None,  # used by Rowwise Adagrad
+        shard_ranks: Optional[List[int]] = None,
         # TO align with FBGEMM TBE
         *args,
         **kwargs,
@@ -613,16 +556,29 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 table_option == other_option
             ), "All tables must match in grouped keys."
         self._dynamicemb_options = table_options
-        # world_size the table is sharded across at creation. dynamicemb only
-        # supports ROW_WISE sharding over the global WORLD (no 2D / sub-pg
-        # sharding), so the global ``dist.get_world_size()`` here equals the
-        # ``pg.size()`` that input_dist uses as the key->rank modulo base -- they
-        # are the authoritative shard count and this merely mirrors it. Recorded
-        # because DeltaDumpResult meta needs it for replay's key->rank
-        # reconstruction, independent of the gather ``pg`` passed to
-        # incremental_dump (which is only a comm scope). Constructed after DMP
-        # sharding, so dist is already init here; single-GPU (no dist) -> 1.
-        self._shard_world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # The ranks that hold these tables, in shard order: the world for a
+        # row-wise table, one node for a table-row-wise one. Everything that
+        # names a shard -- checkpoint files, the load-time key filter, the delta
+        # meta -- derives from this rather than from the global process group.
+        global_rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self._shard_ranks: List[int] = (
+            list(shard_ranks) if shard_ranks is not None else list(range(world_size))
+        )
+        if global_rank not in self._shard_ranks:
+            raise ValueError(
+                f"Rank {global_rank} holds no shard of tables {table_names} "
+                f"(shards on ranks {self._shard_ranks})."
+            )
+        self._num_shards = len(self._shard_ranks)
+        self._shard_index = self._shard_ranks.index(global_rank)
+        self._sharding_type = (
+            "row_wise" if self._num_shards == world_size else "table_row_wise"
+        )
+        # Set by the table-row-wise sharding to its intra-node group; a barrier
+        # over the world would deadlock when nodes hold different table counts.
+        self._shard_pg: Optional[dist.ProcessGroup] = None
+        self._shard_world_size = self._num_shards
         self.initializer_args = table_option.initializer_args
         self.index_type = table_option.index_type
         self.embedding_dtype = table_option.embedding_dtype
@@ -1467,6 +1423,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         return max(scores)
 
+    def _shard_barrier(self) -> None:
+        if not dist.is_initialized():
+            return
+        if self._shard_pg is not None:
+            dist.barrier(group=self._shard_pg)
+        else:
+            dist.barrier()
+
+    def _write_shard_meta(self, meta_file_path: str) -> None:
+        with open(meta_file_path) as meta_file:
+            meta_data = json.load(meta_file)
+        meta_data["sharding_type"] = self._sharding_type
+        meta_data["num_shards"] = self._num_shards
+        meta_data["shard_ranks"] = self._shard_ranks
+        with open(meta_file_path, "w") as meta_file:
+            json.dump(meta_data, meta_file, indent=4)
+
     def dump(
         self,
         save_dir: str,
@@ -1478,11 +1451,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if table_names is None:
             table_names = self._table_names
 
-        if pg is None:
-            assert dist.is_initialized(), "Distributed is not initialized."
-            pg = dist.group.WORLD
-        rank = dist.get_rank(group=pg)
-        world_size = dist.get_world_size(group=pg)
+        # Files are named by the table's own shard, not by the caller's rank in
+        # pg: a table-row-wise table has local_world_size shards on one node.
+        rank = self._shard_index
+        world_size = self._num_shards
 
         self.flush()
 
@@ -1510,8 +1482,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
             storage = self._storage
-            if dist.is_initialized():
-                dist.barrier()
+            self._shard_barrier()
             ts = device_timestamp()
             storage.dump(
                 table_id,
@@ -1525,6 +1496,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 current_score=current_score,
                 timestamp=ts,
             )
+            if rank == 0:
+                self._write_shard_meta(meta_file_path)
 
             if not counter:
                 continue
@@ -1554,12 +1527,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if table_names is None:
             table_names = self._table_names
 
-        if pg is None and not dist.is_initialized():  # for inference load
-            rank = 0
-            world_size = 1
-        else:
-            rank = dist.get_rank(group=pg)
-            world_size = dist.get_world_size(group=pg)
+        rank = self._shard_index
+        world_size = self._num_shards
 
         storage = self._storage
         counter_table = self._admission_counter
@@ -1586,8 +1555,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
 
             num_key_files = len(emb_key_files)
-            if dist.is_initialized():
-                dist.barrier()
+            self._shard_barrier()
             ts = device_timestamp()
             for i in range(num_key_files):
                 loaded_score = storage.load(
@@ -1599,6 +1567,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     opt_value_files[i] if len(opt_value_files) > 0 else None,
                     include_optim=optim,
                     timestamp=ts,
+                    shard_index=rank,
+                    num_shards=world_size,
                 )
                 if loaded_score is not None and table_name in self._scores:
                     self._scores[table_name] = loaded_score
@@ -1613,7 +1583,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             num_counter_key_files = len(counter_key_files)
             for i in range(num_counter_key_files):
                 counter_table.load(
-                    counter_key_files[i], counter_frequency_files[i], table_id
+                    counter_key_files[i],
+                    counter_frequency_files[i],
+                    table_id,
+                    self._dynamicemb_options[table_id].dist_type,
+                    shard_index=rank,
+                    num_shards=world_size,
                 )
 
     def export_keys_values(
@@ -1734,6 +1709,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             DeltaDumpResult,
         )
 
+        # A table-row-wise kernel exists only on its shard group's ranks, so a
+        # gather over a wider group would wait on ranks that never call it.
+        if pg is not None and self._shard_pg is not None:
+            pg = self._shard_pg
+
         storage = self._storage
         if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
             raise TypeError(
@@ -1798,6 +1778,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "bucket_capacity": self._bucket_capacity_of(storage),
                     "num_scores": self._num_scores_of(storage),
                     "world_size": self._shard_world_size,
+                    "shard_index": self._shard_index,
+                    "shard_ranks": list(self._shard_ranks),
                     "table_options": option,
                 }
             )
@@ -2109,14 +2091,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # filtering left this rank none of them.
         erased, evicted = job.erased_keys, job.evicted_keys
 
-        # Both global. Ownership follows how the table was sharded -- row-wise
-        # over the whole world, which is what ``_shard_world_size`` records and
-        # what ``meta["world_size"]`` is checked against. There is deliberately
-        # no process-group argument: replay is local (filter by ownership, then
-        # write), so a group could only narrow the modulus and mis-route every
-        # key, leaving each claimed by several ranks and the one that owns it
-        # claiming nothing.
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        # Ownership follows how the table was sharded: this rank's index inside
+        # the table's shard group, modulo the group's size -- the whole world
+        # for row-wise, one node for table-row-wise. ``meta["world_size"]`` is
+        # checked against that size. There is deliberately no process-group
+        # argument: replay is local (filter by ownership, then write), so a
+        # group could only narrow the modulus and mis-route every key, leaving
+        # each claimed by several ranks and the one that owns it claiming nothing.
+        rank = self._shard_index
         mask = owned_key_mask(keys, rank, self._shard_world_size, option.dist_type)
         if mask is not None:
             stats.skipped = int(keys.numel() - mask.sum().item())
