@@ -85,6 +85,10 @@ def main():
         trainer_args.pipeline_type == "prefetch"
     )
     network_args = NetworkArgs()
+    if network_args.backbone != "hstu":
+        raise ValueError(
+            "This training entry point supports HSTU only; Transformer is an inference backbone"
+        )
     optimizer_args = OptimizerArgs()
     tp_args = TensorModelParallelArgs()
 

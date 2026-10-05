@@ -9,6 +9,7 @@ from configs import InferenceHSTUConfig
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
+from modules.transformer_infer_layer import TransformerInferLayer
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
@@ -177,9 +178,14 @@ class HSTUBlockInference(torch.nn.Module):
         self._preprocessor = HSTUBlockPreprocessor(config, is_inference=True)
         self._postprocessor = HSTUBlockPostprocessor(is_inference=True)
 
+        layer_type = (
+            TransformerInferLayer
+            if config.backbone == "transformer"
+            else PagedHSTUInferLayer
+        )
         self._attention_layers = torch.nn.ModuleList(
             [
-                PagedHSTUInferLayer(config, layer_idx)
+                layer_type(config, layer_idx)
                 for layer_idx in range(self.config.num_layers)
             ]
         )
@@ -203,8 +209,14 @@ class HSTUBlockInference(torch.nn.Module):
         """
         with torch.inference_mode():
             jd = self._preprocessor(embeddings, batch)
-            for hstu_layer in self._attention_layers:
-                jd = hstu_layer(jd)
+            jd.values = self.predict(
+                batch.batch_size,
+                jd.values.shape[0],
+                jd.values,
+                jd,
+                None,
+                use_cudagraph=False,
+            )
             return self._postprocessor(jd)
 
     def predict(
