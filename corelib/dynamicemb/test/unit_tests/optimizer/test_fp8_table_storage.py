@@ -123,7 +123,7 @@ def test_fp8_weights_track_fp32_table(all_dims_vec4):
     weights, _ = _train_padded_buffer(FP8_STORAGE_DTYPE, init, grads, all_dims_vec4)
 
     error = weights - ref_weights
-    assert error.mean().abs() < 2e-4
+    assert error.mean().abs() < 4 * error.std() / error.numel() ** 0.5
     assert error.pow(2).mean().sqrt() < 0.5 * ref_weights.pow(2).mean().sqrt()
 
 
