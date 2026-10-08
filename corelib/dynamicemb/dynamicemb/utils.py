@@ -35,7 +35,50 @@ DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
     torch.float32: 4,
     torch.float16: 2,
     torch.bfloat16: 2,
+    torch.float8_e4m3fn: 1,
 }
+
+# An fp8 table stores e4m3 codes of ``value * FP8_STORAGE_SCALE`` (see
+# ``dyn_fp8_t`` in src/utils.h), so a torch float8_e4m3fn view of its bytes reads
+# 256x the value. Every fp8 tensor a table hands out or takes in is in that
+# scaled form; convert with :func:`decode_table_values` / :func:`encode_table_values`.
+FP8_STORAGE_DTYPE = torch.float8_e4m3fn
+FP8_STORAGE_SCALE = 256.0
+_FP8_E4M3_MAX = 448.0
+
+
+def decode_table_values(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Embedding values in ``dtype`` from a tensor at a table's storage precision."""
+    if values.dtype != FP8_STORAGE_DTYPE:
+        return values.to(dtype)
+    return (values.to(torch.float32) / FP8_STORAGE_SCALE).to(dtype)
+
+
+def encode_table_values(values: torch.Tensor, table_dtype: torch.dtype) -> torch.Tensor:
+    """Embedding values stored at ``table_dtype``, the inverse of :func:`decode_table_values`.
+
+    Round-to-nearest, which is exact for values already on the fp8 grid such as
+    an fp16 checkpoint of an fp8 table.
+    """
+    if table_dtype != FP8_STORAGE_DTYPE or values.dtype == FP8_STORAGE_DTYPE:
+        return values.to(table_dtype)
+    scaled = (values.to(torch.float32) * FP8_STORAGE_SCALE).clamp(
+        -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+    )
+    return scaled.to(FP8_STORAGE_DTYPE)
+
+
+def checkpoint_dtype(table_dtype: torch.dtype) -> torch.dtype:
+    """Precision a table's embeddings are dumped at: fp8 is dumped as fp16, losslessly.
+
+    fp16 holds every fp8 storage value exactly, and any loader can read it.
+    """
+    return torch.float16 if table_dtype == FP8_STORAGE_DTYPE else table_dtype
+
+
+def gradient_dtype(table_dtype: torch.dtype) -> torch.dtype:
+    """Precision the fused optimizer takes gradients in for a table of ``table_dtype``."""
+    return torch.float16 if table_dtype == FP8_STORAGE_DTYPE else table_dtype
 
 
 def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:
@@ -45,6 +88,8 @@ def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:
         return DynamicEmbDataType.BFloat16
     elif torch_dtype == torch.float16:
         return DynamicEmbDataType.Float16
+    elif torch_dtype == FP8_STORAGE_DTYPE:
+        return DynamicEmbDataType.Float8
     elif torch_dtype == torch.int64:
         return DynamicEmbDataType.Int64
     elif torch_dtype == torch.uint64:
