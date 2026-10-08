@@ -273,9 +273,12 @@ template <> struct Vec4T<__half> {
   }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst, int n) {
-    const float lanes[4] = {__half2float(value.h[0].x), __half2float(value.h[0].y), __half2float(value.h[1].x), __half2float(value.h[1].y)};
-    for (int i = 0; i < n && i < 4; ++i)
-      dst[i] = dyn_fp8_t(lanes[i]);
+    const float lanes[4] = {__half2float(value.h[0].x), __half2float(value.h[0].y),
+                             __half2float(value.h[1].x), __half2float(value.h[1].y)};
+    dyn_fp8_t codes[4];
+    for (int i = 0; i < 4; ++i)
+      codes[i] = dyn_fp8_t(lanes[i]);
+    store_fp8_codes(dst, n, codes);
   }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst) { store(dst, 4); }
@@ -502,9 +505,12 @@ template <> struct Vec4T<__nv_bfloat16> {
   }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst, int n) {
-    const float lanes[4] = {__bfloat162float(value.h[0].x), __bfloat162float(value.h[0].y), __bfloat162float(value.h[1].x), __bfloat162float(value.h[1].y)};
-    for (int i = 0; i < n && i < 4; ++i)
-      dst[i] = dyn_fp8_t(lanes[i]);
+    const float lanes[4] = {__bfloat162float(value.h[0].x), __bfloat162float(value.h[0].y),
+                             __bfloat162float(value.h[1].x), __bfloat162float(value.h[1].y)};
+    dyn_fp8_t codes[4];
+    for (int i = 0; i < 4; ++i)
+      codes[i] = dyn_fp8_t(lanes[i]);
+    store_fp8_codes(dst, n, codes);
   }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst) { store(dst, 4); }
@@ -807,27 +813,24 @@ template <> struct Vec4T<float> {
   }
 
   DEVICE_INLINE void load(const dyn_fp8_t *p, int n) {
+    dyn_fp8_t codes[4];
+    load_fp8_codes(p, n, codes);
     if (n > 0)
-      val.x = static_cast<float>(p[0]);
+      val.x = static_cast<float>(codes[0]);
     if (n > 1)
-      val.y = static_cast<float>(p[1]);
+      val.y = static_cast<float>(codes[1]);
     if (n > 2)
-      val.z = static_cast<float>(p[2]);
+      val.z = static_cast<float>(codes[2]);
     if (n > 3)
-      val.w = static_cast<float>(p[3]);
+      val.w = static_cast<float>(codes[3]);
   }
 
   DEVICE_INLINE void load(const dyn_fp8_t *p) { load(p, 4); }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst, int n) {
-    if (n > 0)
-      dst[0] = dyn_fp8_t(val.x);
-    if (n > 1)
-      dst[1] = dyn_fp8_t(val.y);
-    if (n > 2)
-      dst[2] = dyn_fp8_t(val.z);
-    if (n > 3)
-      dst[3] = dyn_fp8_t(val.w);
+    const dyn_fp8_t codes[4] = {dyn_fp8_t(val.x), dyn_fp8_t(val.y),
+                                dyn_fp8_t(val.z), dyn_fp8_t(val.w)};
+    store_fp8_codes(dst, n, codes);
   }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst) { store(dst, 4); }
@@ -853,8 +856,7 @@ template <> struct Vec4T<dyn_fp8_t> {
   DEVICE_INLINE float lane(int i) const { return static_cast<float>(code[i]); }
 
   DEVICE_INLINE void load(const dyn_fp8_t *p, int n) {
-    for (int i = 0; i < n && i < 4; ++i)
-      code[i] = p[i];
+    load_fp8_codes(p, n, code);
   }
 
   DEVICE_INLINE void load(const dyn_fp8_t *p) { load(p, 4); }
@@ -868,8 +870,7 @@ template <> struct Vec4T<dyn_fp8_t> {
   template <typename T> DEVICE_INLINE void load(const T *p) { load(p, 4); }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst, int n) const {
-    for (int i = 0; i < n && i < 4; ++i)
-      dst[i] = code[i];
+    store_fp8_codes(dst, n, code);
   }
 
   DEVICE_INLINE void store(dyn_fp8_t *dst) const { store(dst, 4); }

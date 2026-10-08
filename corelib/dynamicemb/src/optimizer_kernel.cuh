@@ -335,6 +335,8 @@ template <typename weight_t> struct RowWiseAdaGradState<weight_t, float> {
 // right after the embedding, at any byte offset.
 template <> struct RowWiseAdaGradState<dyn_fp8_t, float> {
   static DEVICE_INLINE float load(const dyn_fp8_t *slot) {
+    if ((reinterpret_cast<uintptr_t>(slot) & 3u) == 0)
+      return *reinterpret_cast<const float *>(slot);
     const uint8_t *bytes = reinterpret_cast<const uint8_t *>(slot);
     const uint32_t bits = static_cast<uint32_t>(bytes[0]) |
                           (static_cast<uint32_t>(bytes[1]) << 8) |
@@ -343,6 +345,10 @@ template <> struct RowWiseAdaGradState<dyn_fp8_t, float> {
     return __uint_as_float(bits);
   }
   static DEVICE_INLINE void store(dyn_fp8_t *slot, float value) {
+    if ((reinterpret_cast<uintptr_t>(slot) & 3u) == 0) {
+      *reinterpret_cast<float *>(slot) = value;
+      return;
+    }
     const uint32_t bits = __float_as_uint(value);
     uint8_t *bytes = reinterpret_cast<uint8_t *>(slot);
     bytes[0] = static_cast<uint8_t>(bits & 0xFFu);
