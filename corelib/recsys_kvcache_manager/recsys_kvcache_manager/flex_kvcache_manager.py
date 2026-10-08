@@ -277,6 +277,7 @@ class FlexKVStorage(HostKVStorageBase):
         if self.config_path:
             try:
                 from flexkv.common.config import (
+                    RankInfo,
                     load_user_config_from_file,
                     update_default_config_from_user_config,
                 )
@@ -284,7 +285,9 @@ class FlexKVStorage(HostKVStorageBase):
                 raise RuntimeError(f"FlexKV config import failed: {e}") from e
 
             user_cfg = load_user_config_from_file(self.config_path)
-            update_default_config_from_user_config(model_cfg, cache_cfg, user_cfg)
+            update_default_config_from_user_config(
+                RankInfo(model_config=model_cfg), cache_cfg, user_cfg
+            )
         if self.enable_layerwise is None:
             enable_layerwise_env = os.environ.get("RECSYS_FLEXKV_ENABLE_LAYERWISE", "0")
             self.enable_layerwise = enable_layerwise_env.strip().lower() in {
@@ -530,12 +533,27 @@ class FlexKVStorage(HostKVStorageBase):
                 ),
                 counter_id=counter_id,
                 num_layers=self.num_layers,
-                _on_release=(
-                    (lambda cid=counter_id: self._release_layerwise_counter(cid))
-                    if counter_id is not None
-                    else None
-                ),
             )
+            if counter_id is not None:
+                # Last-layer eventfd read can return before the GET task is
+                # terminal. Wait here, on the forward thread, then free the
+                # counter. release_counter() has already marked the handle
+                # released, so this must not call it again.
+                def _finish_layerwise_get(
+                    cid: int = counter_id,
+                    handle: _FlexKVOnloadHandle = onload_handle,
+                ) -> None:
+                    try:
+                        if handle.task_ids:
+                            self._client.wait(
+                                list(handle.task_ids),
+                                timeout=60.0,
+                                completely=True,
+                            )
+                    finally:
+                        self._release_layerwise_counter(cid)
+
+                onload_handle._on_release = _finish_layerwise_get
             onload_task_handle = HostKVTaskHandle(
                 backend="flexkv",
                 user_ids=onload_handle.uids,
