@@ -331,6 +331,27 @@ template <typename weight_t> struct RowWiseAdaGradState<weight_t, float> {
   }
 };
 
+// An fp32 accumulator in an fp8 table, held as four raw bytes: the slot starts
+// right after the embedding, at any byte offset.
+template <> struct RowWiseAdaGradState<dyn_fp8_t, float> {
+  static DEVICE_INLINE float load(const dyn_fp8_t *slot) {
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(slot);
+    const uint32_t bits = static_cast<uint32_t>(bytes[0]) |
+                          (static_cast<uint32_t>(bytes[1]) << 8) |
+                          (static_cast<uint32_t>(bytes[2]) << 16) |
+                          (static_cast<uint32_t>(bytes[3]) << 24);
+    return __uint_as_float(bits);
+  }
+  static DEVICE_INLINE void store(dyn_fp8_t *slot, float value) {
+    const uint32_t bits = __float_as_uint(value);
+    uint8_t *bytes = reinterpret_cast<uint8_t *>(slot);
+    bytes[0] = static_cast<uint8_t>(bits & 0xFFu);
+    bytes[1] = static_cast<uint8_t>((bits >> 8) & 0xFFu);
+    bytes[2] = static_cast<uint8_t>((bits >> 16) & 0xFFu);
+    bytes[3] = static_cast<uint8_t>(bits >> 24);
+  }
+};
+
 template <> struct RowWiseAdaGradState<float, float> {
   static DEVICE_INLINE float load(const float *slot) { return *slot; }
   static DEVICE_INLINE void store(float *slot, float value) { *slot = value; }

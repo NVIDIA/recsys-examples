@@ -51,8 +51,8 @@ void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
                    DataType dst_type, DataType offset_type, int device_num_sms,
                    cudaStream_t stream) {
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
+    DISPATCH_VALUE_DATATYPE_FUNCTION(src_type, src_t, [&] {
+      DISPATCH_VALUE_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
         using CopyDesc = ForwardSequenceFusedCopyDesc<src_t, dst_t, offset_t>;
         CopyDesc sequence_copy_desc{
             num_emb,          ev_size,
