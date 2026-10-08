@@ -124,6 +124,34 @@ struct dyn_fp8_t {
   }
 };
 static_assert(sizeof(dyn_fp8_t) == 1, "dyn_fp8_t must be one byte");
+
+// Up to four consecutive fp8 codes, moved as one 32-bit word when the address
+// allows it. Host-resident tables pay a PCIe transaction per access, so byte
+// accesses make an fp8 table slower than an fp16 one.
+__device__ __forceinline__ void load_fp8_codes(const dyn_fp8_t *src, int n,
+                                               dyn_fp8_t *codes) {
+  if (n == 4 && (reinterpret_cast<uintptr_t>(src) & 3u) == 0) {
+    const uint32_t word = *reinterpret_cast<const uint32_t *>(src);
+    for (int i = 0; i < 4; ++i)
+      codes[i].bits = static_cast<__nv_fp8_storage_t>((word >> (8 * i)) & 0xFFu);
+  } else {
+    for (int i = 0; i < n && i < 4; ++i)
+      codes[i] = src[i];
+  }
+}
+
+__device__ __forceinline__ void store_fp8_codes(dyn_fp8_t *dst, int n,
+                                                const dyn_fp8_t *codes) {
+  if (n == 4 && (reinterpret_cast<uintptr_t>(dst) & 3u) == 0) {
+    uint32_t word = 0;
+    for (int i = 0; i < 4; ++i)
+      word |= static_cast<uint32_t>(codes[i].bits) << (8 * i);
+    *reinterpret_cast<uint32_t *>(dst) = word;
+  } else {
+    for (int i = 0; i < n && i < 4; ++i)
+      dst[i] = codes[i];
+  }
+}
 #endif // __CUDACC__
 
 #define CASE_TYPE_USING_HINT(enum_type, type, HINT, ...)                       \
