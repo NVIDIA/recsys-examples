@@ -65,6 +65,8 @@ DataType scalartype_to_datatype(at::ScalarType scalar_type) {
     return DataType::Float16;
   case at::kBFloat16:
     return DataType::BFloat16;
+  case at::kFloat8_e4m3fn:
+    return DataType::Float8;
   case at::kLong:
     return DataType::Int64;
   case at::kInt:
@@ -86,6 +88,8 @@ at::ScalarType datatype_to_scalartype(dyn_emb::DataType dtype) {
     return at::kHalf;
   case dyn_emb::DataType::BFloat16:
     return at::kBFloat16;
+  case dyn_emb::DataType::Float8:
+    return at::kFloat8_e4m3fn;
   case dyn_emb::DataType::Int64:
     return at::kLong;
   case dyn_emb::DataType::UInt64:
@@ -108,6 +112,8 @@ at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta &typeMeta) {
     return at::kHalf;
   } else if (typeMeta == caffe2::TypeMeta::Make<at::BFloat16>()) {
     return at::kBFloat16;
+  } else if (typeMeta == caffe2::TypeMeta::Make<at::Float8_e4m3fn>()) {
+    return at::kFloat8_e4m3fn;
   } else if (typeMeta == caffe2::TypeMeta::Make<int64_t>()) {
     return at::kLong;
   } else if (typeMeta == caffe2::TypeMeta::Make<int>()) {

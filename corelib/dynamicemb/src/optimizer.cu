@@ -22,6 +22,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "utils.h"
 #include <cmath>
 #include <functional>
+#include <type_traits>
 
 namespace dyn_emb {
 
@@ -206,10 +207,17 @@ void dispatch_rowwise_adagrad_state_type(DataType state_type,
   TORCH_CHECK(state_type == val_type || state_type == DataType::Float32,
               "row-wise Adagrad keeps its accumulator in the table's dtype or "
               "in float32");
-  if (state_type == val_type) {
-    fn(w_t{});
-  } else {
+  if constexpr (std::is_same_v<w_t, dyn_fp8_t>) {
+    TORCH_CHECK(state_type == DataType::Float32,
+                "row-wise Adagrad on an fp8 table keeps its accumulator in "
+                "float32");
     fn(float{});
+  } else {
+    if (state_type == val_type) {
+      fn(w_t{});
+    } else {
+      fn(float{});
+    }
   }
 }
 
@@ -236,7 +244,7 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
   int device_id = grads.device().index();
 
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+    DISPATCH_VALUE_DATATYPE_FUNCTION(val_type, w_t, [&] {
       dispatch_rowwise_adagrad_state_type<w_t>(
           state_type, val_type, [&](auto state_tag) {
             using s_t = decltype(state_tag);
@@ -480,7 +488,7 @@ void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
   auto tid_ptr = get_pointer<int64_t>(table_ids);
   auto ted_ptr = get_pointer<int64_t>(table_emb_dims);
   DISPATCH_FLOAT_DATATYPE_FUNCTION(grad_type, g_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, w_t, [&] {
+    DISPATCH_VALUE_DATATYPE_FUNCTION(val_type, w_t, [&] {
       dispatch_rowwise_adagrad_state_type<w_t>(
           state_type, val_type, [&](auto state_tag) {
             using s_t = decltype(state_tag);

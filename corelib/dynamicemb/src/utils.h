@@ -21,6 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <stdio.h>
@@ -37,6 +38,7 @@ enum class DataType : uint32_t {
   Int32,
   UInt32,
   Size_t,
+  Float8,
 };
 
 // The EvictStrategy is consistent with HKV's EvictStrategy. If modifications
@@ -60,6 +62,69 @@ enum class PoolingMode : int32_t {
   kMean = 1,
   kNone = 2, // sequence lookup: one output row per key, nothing to combine
 };
+
+// 8-bit table storage: an e4m3 code holding value * 2^8. The shift moves e4m3's
+// range to [2^-17, 1.75] -- exponent bias 15, the format FBGEMM's FP8 comms use
+// -- which fits trained embeddings (|w| is typically 1e-3..0.4) where plain
+// e4m3fn would flush everything below 2^-9 and leave a third of the values
+// subnormal. Writes round stochastically: an optimizer step is often smaller
+// than half an e4m3 step (1/16 of |w|), and round-to-nearest would discard it,
+// freezing rows after a few dozen updates. Values already on the e4m3 grid
+// (e.g. loaded from an fp16 dump of this table) are stored exactly.
+#ifdef __CUDACC__
+constexpr float kFp8StorageScale = 256.0f;
+constexpr float kFp8StorageInvScale = 1.0f / 256.0f;
+
+__device__ __forceinline__ uint32_t fp8_rounding_noise(float value) {
+  uint32_t h = __float_as_uint(value) ^ static_cast<uint32_t>(clock64()) ^
+               ((threadIdx.x + blockIdx.x * blockDim.x) * 0x9E3779B9u);
+  h ^= h >> 16;
+  h *= 0x85EBCA6Bu;
+  h ^= h >> 13;
+  h *= 0xC2B2AE35u;
+  h ^= h >> 16;
+  return h;
+}
+
+__device__ __forceinline__ __nv_fp8_storage_t float_to_fp8_storage(float value) {
+  float scaled = value * kFp8StorageScale;
+  const float magnitude = fabsf(scaled);
+  if (magnitude < 448.0f) {
+    const uint32_t noise = fp8_rounding_noise(scaled);
+    if (magnitude >= 0.015625f) {
+      // Normal e4m3 keeps 3 of fp32's 23 mantissa bits: dither the 20 dropped
+      // bits, then truncate.
+      uint32_t bits = __float_as_uint(scaled);
+      bits = (bits + (noise & 0xFFFFFu)) & ~0xFFFFFu;
+      scaled = __uint_as_float(bits);
+    } else {
+      // Subnormal e4m3 is a fixed grid of 2^-9.
+      constexpr float kSubnormalStep = 0.001953125f;
+      scaled = floorf(scaled / kSubnormalStep +
+                      static_cast<float>(noise >> 8) * (1.0f / 16777216.0f)) *
+               kSubnormalStep;
+    }
+  }
+  return __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+}
+
+__device__ __forceinline__ float fp8_storage_to_float(__nv_fp8_storage_t bits) {
+  return __half2float(__half(__nv_cvt_fp8_to_halfraw(bits, __NV_E4M3))) *
+         kFp8StorageInvScale;
+}
+
+struct dyn_fp8_t {
+  __nv_fp8_storage_t bits;
+
+  dyn_fp8_t() = default;
+  __device__ __forceinline__ explicit dyn_fp8_t(float value)
+      : bits(float_to_fp8_storage(value)) {}
+  __device__ __forceinline__ operator float() const {
+    return fp8_storage_to_float(bits);
+  }
+};
+static_assert(sizeof(dyn_fp8_t) == 1, "dyn_fp8_t must be one byte");
+#endif // __CUDACC__
 
 #define CASE_TYPE_USING_HINT(enum_type, type, HINT, ...)                       \
   case (enum_type): {                                                          \
@@ -98,6 +163,18 @@ enum class PoolingMode : int32_t {
     CASE_TYPE_USING_HINT(DataType::Float32, float, HINT, __VA_ARGS__)          \
     CASE_TYPE_USING_HINT(DataType::Float16, __half, HINT, __VA_ARGS__)         \
     CASE_TYPE_USING_HINT(DataType::BFloat16, __nv_bfloat16, HINT, __VA_ARGS__) \
+  default:                                                                     \
+    exit(EXIT_FAILURE);                                                        \
+  }
+
+// Every type a table can store its values in: the float types plus the 8-bit
+// dyn_fp8_t storage format, which no gradient or accumulator ever uses.
+#define DISPATCH_VALUE_DATATYPE_FUNCTION(DATA_TYPE, HINT, ...)                 \
+  switch (DATA_TYPE) {                                                         \
+    CASE_TYPE_USING_HINT(DataType::Float32, float, HINT, __VA_ARGS__)          \
+    CASE_TYPE_USING_HINT(DataType::Float16, __half, HINT, __VA_ARGS__)         \
+    CASE_TYPE_USING_HINT(DataType::BFloat16, __nv_bfloat16, HINT, __VA_ARGS__) \
+    CASE_TYPE_USING_HINT(DataType::Float8, dyn_fp8_t, HINT, __VA_ARGS__)       \
   default:                                                                     \
     exit(EXIT_FAILURE);                                                        \
   }
@@ -208,6 +285,50 @@ template <> struct TypeConvertFunc<nv_bfloat16, nv_bfloat16> {
     return val;
   }
 };
+
+#ifdef __CUDACC__
+template <> struct TypeConvertFunc<dyn_fp8_t, float> {
+  static __forceinline__ __device__ dyn_fp8_t convert(float val) {
+    return dyn_fp8_t(val);
+  }
+};
+
+template <> struct TypeConvertFunc<float, dyn_fp8_t> {
+  static __forceinline__ __device__ float convert(dyn_fp8_t val) {
+    return static_cast<float>(val);
+  }
+};
+
+template <> struct TypeConvertFunc<dyn_fp8_t, __half> {
+  static __forceinline__ __device__ dyn_fp8_t convert(__half val) {
+    return dyn_fp8_t(__half2float(val));
+  }
+};
+
+template <> struct TypeConvertFunc<__half, dyn_fp8_t> {
+  static __forceinline__ __device__ __half convert(dyn_fp8_t val) {
+    return __float2half(static_cast<float>(val));
+  }
+};
+
+template <> struct TypeConvertFunc<dyn_fp8_t, nv_bfloat16> {
+  static __forceinline__ __device__ dyn_fp8_t convert(nv_bfloat16 val) {
+    return dyn_fp8_t(__bfloat162float(val));
+  }
+};
+
+template <> struct TypeConvertFunc<nv_bfloat16, dyn_fp8_t> {
+  static __forceinline__ __device__ nv_bfloat16 convert(dyn_fp8_t val) {
+    return __float2bfloat16(static_cast<float>(val));
+  }
+};
+
+template <> struct TypeConvertFunc<dyn_fp8_t, dyn_fp8_t> {
+  static __forceinline__ __device__ dyn_fp8_t convert(dyn_fp8_t val) {
+    return val;
+  }
+};
+#endif // __CUDACC__
 
 template <> struct TypeConvertFunc<float, long long> {
   static __forceinline__ __device__ float convert(long long val) {
