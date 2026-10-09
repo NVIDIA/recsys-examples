@@ -402,6 +402,19 @@ class InferenceDenseModule(torch.nn.Module):
                 )
                 jagged_data.values = hstu_output
 
+            if (
+                onboard_handle is not None
+                and onboard_handle.handle is not None
+                and onboard_handle.status != HostKVTaskStatus.SKIPPED
+                and onboard_handle.backend == "flexkv"
+                and onboard_handle.is_layerwise
+            ):
+                torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
+                try:
+                    self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
             self.kvcache.offload_try_wait()
             self.kvcache.offload_launch(kv_index_meta, kvcache_metadata)
 
