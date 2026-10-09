@@ -775,6 +775,8 @@ def dyn_emb_to_torch(data_type: DynamicEmbDataType) -> torch.dtype:
         return torch.bfloat16
     elif data_type == DynamicEmbDataType.Float16:
         return torch.float16
+    elif data_type == DynamicEmbDataType.Float8:
+        return torch.float8_e4m3fn
     elif data_type == DynamicEmbDataType.Int64:
         return torch.int64
     elif data_type == DynamicEmbDataType.UInt64:
@@ -791,6 +793,7 @@ def dyn_emb_to_torch(data_type: DynamicEmbDataType) -> torch.dtype:
 
 def dtype_to_bytes(dtype: torch.dtype) -> int:
     dtype_size_map = {
+        torch.float8_e4m3fn: 1,
         torch.float16: 2,
         torch.bfloat16: 2,
         torch.float32: 4,

@@ -2905,6 +2905,159 @@ def test_dump_records_configured_optimizer_state_dtype(value_type, tmp_path):
         )
 
 
+def test_fp8_table_dumps_lossless_fp16_and_round_trips(tmp_path):
+    device = _init_single_rank_pg()
+    dims = [8, 16]
+    table_names = ["table0", "table1"]
+
+    fp32_dir = _dump_fp32_source(tmp_path, dims, table_names, device)
+    mid = _make_dump_load_tables(dims, table_names, torch.float8_e4m3fn)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mid.load(fp32_dir, optim=True)
+
+    native_dir = os.path.join(str(tmp_path), "native")
+    os.makedirs(native_dir, exist_ok=True)
+    mid.dump(native_dir, optim=True)
+
+    for table_id, name in enumerate(table_names):
+        meta = _read_meta(native_dir, name)
+        assert meta["embedding_dtype"] == "float16"
+        assert meta["optim_state_dtype"] == "float32"
+        num_keys = _dumped_key_count(native_dir, name)
+        assert num_keys > 0, f"{name}: nothing was dumped, the test proves nothing"
+        assert os.path.getsize(
+            _shard_file(native_dir, name, "values")
+        ) == num_keys * dims[table_id] * _dtype_element_size(torch.float16)
+
+    src = _make_dump_load_tables(dims, table_names, torch.float32)
+    src.load(fp32_dir, optim=True)
+    dst = _make_dump_load_tables(dims, table_names, torch.float8_e4m3fn)
+    dst.load(native_dir, optim=True)
+    redump_dir = os.path.join(str(tmp_path), "redump")
+    os.makedirs(redump_dir, exist_ok=True)
+    dst.dump(redump_dir, optim=True)
+    for name in table_names:
+        keys_src, vals_src = src.export_keys_values(name, device)
+        keys_mid, vals_mid = mid.export_keys_values(name, device)
+        keys_dst, vals_dst = dst.export_keys_values(name, device)
+        assert vals_mid.dtype == torch.float16
+        order_src, order_mid, order_dst = (
+            keys_src.argsort(),
+            keys_mid.argsort(),
+            keys_dst.argsort(),
+        )
+        torch.testing.assert_close(keys_mid[order_mid], keys_dst[order_dst])
+        torch.testing.assert_close(
+            vals_mid[order_mid], vals_dst[order_dst], rtol=0, atol=0
+        )
+        fp32_vals = vals_src[order_src].float()
+        assert torch.all(
+            (vals_mid[order_mid].float() - fp32_vals).abs()
+            <= fp32_vals.abs() / 8 + 2.0**-17
+        )
+        for kind in ("values", "opt_values"):
+            with open(_shard_file(native_dir, name, kind), "rb") as first, open(
+                _shard_file(redump_dir, name, kind), "rb"
+            ) as second:
+                assert sorted(_rows(first.read(), num_keys=keys_mid.numel())) == sorted(
+                    _rows(second.read(), num_keys=keys_dst.numel())
+                )
+
+
+def _rows(raw: bytes, num_keys: int) -> List[bytes]:
+    width = len(raw) // num_keys
+    return [raw[i * width : (i + 1) * width] for i in range(num_keys)]
+
+
+def _rowwise_adagrad_bdeb(
+    value_type: torch.dtype,
+    dims: List[int],
+    caching: bool,
+    local_hbm_for_values: int,
+    pooling_mode: DynamicEmbPoolingMode,
+) -> BatchedDynamicEmbeddingTablesV2:
+    options = [
+        DynamicEmbTableOptions(
+            dim=dim,
+            init_capacity=4096,
+            max_capacity=4096,
+            index_type=torch.int64,
+            embedding_dtype=value_type,
+            device_id=0,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=caching,
+            local_hbm_for_values=local_hbm_for_values,
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT, value=12 / 256
+            ),
+        )
+        for dim in dims
+    ]
+    return BatchedDynamicEmbeddingTablesV2(
+        table_names=[f"table{i}" for i in range(len(dims))],
+        table_options=options,
+        feature_table_map=list(range(len(dims))),
+        pooling_mode=pooling_mode,
+        optimizer=EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+        use_index_dedup=True,
+        learning_rate=0.01,
+        eps=1e-8,
+    )
+
+
+@pytest.mark.parametrize(
+    "caching, local_hbm_for_values",
+    [(False, 1024**3), (True, 64 * 1024), (False, 0)],
+    ids=["hbm", "cache", "host"],
+)
+@pytest.mark.parametrize(
+    "pooling_mode", [DynamicEmbPoolingMode.SUM, DynamicEmbPoolingMode.NONE]
+)
+def test_fp8_table_trains_like_fp32_table(caching, local_hbm_for_values, pooling_mode):
+    device = torch.device("cuda:0")
+    dims = [16, 16] if pooling_mode == DynamicEmbPoolingMode.NONE else [8, 16, 32]
+    tables = {
+        value_type: _rowwise_adagrad_bdeb(
+            value_type, dims, caching, local_hbm_for_values, pooling_mode
+        )
+        for value_type in (torch.float32, torch.float8_e4m3fn)
+    }
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    batch_size, pooling = 128, 4
+    num_features = len(dims)
+    for step in range(30):
+        indices = torch.randint(
+            0, 1500, (batch_size * pooling * num_features,), generator=generator
+        ).to(device)
+        offsets = torch.arange(
+            0, indices.numel() + 1, pooling, dtype=torch.int64, device=device
+        )
+        outputs = {}
+        for value_type, bdeb in tables.items():
+            embs = bdeb(indices, offsets)
+            target = torch.linspace(-1, 1, embs.numel(), device=device).view_as(embs)
+            (embs.float() * target).sum().backward()
+            outputs[value_type] = embs.detach().float()
+        reference, fp8 = outputs[torch.float32], outputs[torch.float8_e4m3fn]
+        assert torch.isfinite(fp8).all()
+        if step == 0:
+            torch.testing.assert_close(fp8, reference, rtol=0, atol=0)
+        else:
+            error = (fp8 - reference).pow(2).mean().sqrt()
+            assert error < 0.25 * reference.pow(2).mean().sqrt(), step
+    for name in [f"table{i}" for i in range(num_features)]:
+        keys32, vals32 = tables[torch.float32].export_keys_values(name, device)
+        keys8, vals8 = tables[torch.float8_e4m3fn].export_keys_values(name, device)
+        assert vals8.dtype == torch.float16
+        order32, order8 = keys32.argsort(), keys8.argsort()
+        torch.testing.assert_close(keys32[order32], keys8[order8])
+        drift32 = vals32[order32].float() - 12 / 256
+        drift8 = vals8[order8].float() - 12 / 256
+        assert drift32.abs().mean() > 1e-3
+        assert (drift8 - drift32).mean().abs() < 0.05 * drift32.abs().mean()
+
+
 def test_optimizer_state_dtype_is_a_grouping_key():
     default = DynamicEmbTableOptions(dim=8)
     assert default == DynamicEmbTableOptions(dim=8)

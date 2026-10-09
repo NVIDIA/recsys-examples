@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
 import torch  # usort:skip
-from dynamicemb.utils import DTYPE_NUM_BYTES, torch_to_dyn_emb
+from dynamicemb.utils import DTYPE_NUM_BYTES, FP8_STORAGE_DTYPE, torch_to_dyn_emb
 from dynamicemb_extensions import (
     adagrad_update_for_flat_table,
     adagrad_update_for_padded_buffer,
@@ -218,6 +218,12 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         Only row-wise Adagrad can keep it at another precision, so here
         ``optimizer_state_dtype`` may only be unset or the table's dtype.
         """
+        if values_dtype == FP8_STORAGE_DTYPE:
+            raise ValueError(
+                f"{type(self).__name__} keeps its state in the table's dtype; "
+                "fp8 tables are only supported with row-wise Adagrad, which keeps "
+                "its accumulator in float32."
+            )
         requested = self._opt_args.optimizer_state_dtype
         if requested is not None and requested != values_dtype:
             raise ValueError(
@@ -689,6 +695,11 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         requested = self._opt_args.optimizer_state_dtype
         if requested is None or requested == torch.float32:
             return torch.float32
+        if values_dtype == FP8_STORAGE_DTYPE:
+            raise ValueError(
+                "Row-wise Adagrad on an fp8 table keeps its accumulator in float32; "
+                f"got optimizer_state_dtype={requested}."
+            )
         if requested == values_dtype:
             return values_dtype
         raise ValueError(
@@ -698,7 +709,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def _packs_fp32_in_words(self, values_dtype: torch.dtype) -> bool:
         return (
-            DTYPE_NUM_BYTES[values_dtype] == 2
+            DTYPE_NUM_BYTES[values_dtype] < 4
             and self.get_state_dtype(values_dtype) == torch.float32
         )
 
@@ -712,15 +723,17 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         if not self._packs_fp32_in_words(optim_states.dtype):
             super().reset_optimizer_states(optim_states, indices, emb_dims)
             return
+        words_per_fp32 = 4 // DTYPE_NUM_BYTES[optim_states.dtype]
         pattern = _fp32_as_words(
             torch.full(
-                (optim_states.size(1) // 2,),
+                (optim_states.size(1) // words_per_fp32,),
                 self.get_initial_optimizer_state(),
                 dtype=torch.float32,
                 device=optim_states.device,
-            )
+            ),
+            optim_states.dtype,
         )
-        words = optim_states.view(torch.int16)
+        words = _as_words(optim_states)
         if indices is None:
             words[:] = pattern
         else:
@@ -740,7 +753,10 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         self._check_state_width(optim_states, self.get_state_dim(emb_dim), "runtime")
         if not self._packs_fp32_in_words(optim_states.dtype):
             return optim_states[:, : self.get_ckpt_state_dim(emb_dim)].contiguous()
-        return optim_states[:, :2].contiguous().view(torch.float32)
+        words_per_fp32 = 4 // DTYPE_NUM_BYTES[optim_states.dtype]
+        return _as_words(optim_states[:, :words_per_fp32].contiguous()).view(
+            torch.float32
+        )
 
     def states_from_checkpoint(
         self,
@@ -767,15 +783,27 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         self.reset_optimizer_states(out, emb_dims=emb_dim)
         accumulator = optim_states.to(device=device, dtype=torch.float32)
         if self._packs_fp32_in_words(values_dtype):
-            out.view(torch.int16)[:, :2] = _fp32_as_words(accumulator.contiguous())
+            words_per_fp32 = 4 // DTYPE_NUM_BYTES[values_dtype]
+            _as_words(out)[:, :words_per_fp32] = _fp32_as_words(
+                accumulator.contiguous(), values_dtype
+            )
         else:
             out[:, :ckpt_dim] = accumulator
         return out
 
 
-def _fp32_as_words(values: torch.Tensor) -> torch.Tensor:
-    """Reinterpret a contiguous fp32 tensor as twice as many int16 words."""
-    return values.view(torch.int16)
+def _word_dtype(values_dtype: torch.dtype) -> torch.dtype:
+    return torch.int16 if DTYPE_NUM_BYTES[values_dtype] == 2 else torch.uint8
+
+
+def _as_words(values: torch.Tensor) -> torch.Tensor:
+    """Reinterpret a 16- or 8-bit table tensor as raw integer words of the same width."""
+    return values.view(_word_dtype(values.dtype))
+
+
+def _fp32_as_words(values: torch.Tensor, values_dtype: torch.dtype) -> torch.Tensor:
+    """Reinterpret a contiguous fp32 tensor as the raw words of a ``values_dtype`` table."""
+    return values.view(_word_dtype(values_dtype))
 
 
 class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
