@@ -375,45 +375,46 @@ class InferenceDenseModule(torch.nn.Module):
                 finally:
                     torch.cuda.nvtx.range_pop()
 
-            # num_tokens = batch.features.values().shape[0]
-            num_tokens = jagged_data.values.shape[0]
-            if self.use_cudagraph:
-                self._hidden_states[:num_tokens, ...].copy_(
-                    jagged_data.values, non_blocking=True
-                )
-                copy_jagged_metadata(self._jagged_metadata, jagged_data)
-                copy_kvcache_metadata(self._kvcache_metadata, kvcache_metadata)
+            try:
+                # num_tokens = batch.features.values().shape[0]
+                num_tokens = jagged_data.values.shape[0]
+                if self.use_cudagraph:
+                    self._hidden_states[:num_tokens, ...].copy_(
+                        jagged_data.values, non_blocking=True
+                    )
+                    copy_jagged_metadata(self._jagged_metadata, jagged_data)
+                    copy_kvcache_metadata(self._kvcache_metadata, kvcache_metadata)
 
-                hstu_output = self._hstu_block.predict(
-                    batch.batch_size,
-                    num_tokens,
-                    self._hidden_states,
-                    self._jagged_metadata,
-                    kvcache_metadata,
-                )
-                jagged_data.values = hstu_output
-            else:
-                hstu_output = self._hstu_block.predict(
-                    batch.batch_size,
-                    num_tokens,
-                    jagged_data.values,
-                    jagged_data,
-                    kvcache_metadata,
-                )
-                jagged_data.values = hstu_output
-
-            if (
-                onboard_handle is not None
-                and onboard_handle.handle is not None
-                and onboard_handle.status != HostKVTaskStatus.SKIPPED
-                and onboard_handle.backend == "flexkv"
-                and onboard_handle.is_layerwise
-            ):
-                torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
-                try:
-                    self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
-                finally:
-                    torch.cuda.nvtx.range_pop()
+                    hstu_output = self._hstu_block.predict(
+                        batch.batch_size,
+                        num_tokens,
+                        self._hidden_states,
+                        self._jagged_metadata,
+                        kvcache_metadata,
+                    )
+                    jagged_data.values = hstu_output
+                else:
+                    hstu_output = self._hstu_block.predict(
+                        batch.batch_size,
+                        num_tokens,
+                        jagged_data.values,
+                        jagged_data,
+                        kvcache_metadata,
+                    )
+                    jagged_data.values = hstu_output
+            finally:
+                if (
+                    onboard_handle is not None
+                    and onboard_handle.handle is not None
+                    and onboard_handle.status != HostKVTaskStatus.SKIPPED
+                    and onboard_handle.backend == "flexkv"
+                    and onboard_handle.is_layerwise
+                ):
+                    torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
+                    try:
+                        self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
+                    finally:
+                        torch.cuda.nvtx.range_pop()
 
             self.kvcache.offload_try_wait()
             self.kvcache.offload_launch(kv_index_meta, kvcache_metadata)
